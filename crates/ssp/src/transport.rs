@@ -501,9 +501,19 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             return RecvOutcome::Duplicate;
         }
         // Must hold the diff base, else drop (out-of-order / replay defense).
-        if !self.received_states.iter().any(|s| s.num == instr.old_num) {
+        let Some(ref_idx) = self
+            .received_states
+            .iter()
+            .position(|s| s.num == instr.old_num)
+        else {
             return RecvOutcome::MissingBase;
-        }
+        };
+        // Clone the base BEFORE the throwaway GC. A peer controls `throwaway_num`, and
+        // `process_throwaway_until` legitimately drops every state below it — including this
+        // base when `throwaway_num > old_num`. Re-resolving the base after the GC and
+        // `.expect()`-ing it is a peer-triggerable panic (remote DoS of a pure state machine).
+        // Owning the clone makes the GC harmless.
+        let mut new_state = self.received_states[ref_idx].state.clone();
 
         self.process_throwaway_until(instr.throwaway_num);
 
@@ -515,13 +525,6 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             self.receiver_quench_timer = now + RECEIVER_QUENCH_MS;
         }
 
-        // Re-resolve the base after the throwaway GC (positions may have shifted).
-        let ref_idx = self
-            .received_states
-            .iter()
-            .position(|s| s.num == instr.old_num)
-            .expect("base existed before throwaway and old_num >= throwaway");
-        let mut new_state = self.received_states[ref_idx].state.clone();
         if !instr.diff.is_empty() {
             match decode_diff::<Remote::Diff>(&instr.diff) {
                 Ok(d) => new_state.apply(&d),
@@ -580,4 +583,63 @@ fn encode_diff<D: Serialize>(diff: &D) -> Vec<u8> {
 
 fn decode_diff<D: DeserializeOwned>(bytes: &[u8]) -> Result<D, postcard::Error> {
     postcard::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmosh_wire::{Fragmenter, Instruction};
+    use serde::{Deserialize, Serialize};
+
+    /// A trivial absolute-value state: each diff fully describes the target, so we can craft
+    /// arbitrary instructions without worrying about diff bases.
+    #[derive(Clone, Default, PartialEq, Debug)]
+    struct Abs(u64);
+    #[derive(Serialize, Deserialize, Clone)]
+    struct AbsDiff(u64);
+    impl SyncState for Abs {
+        type Diff = AbsDiff;
+        fn diff_from(&self, _base: &Self) -> AbsDiff {
+            AbsDiff(self.0)
+        }
+        fn apply(&mut self, d: &AbsDiff) {
+            self.0 = d.0;
+        }
+    }
+
+    fn instr(old: u64, new: u64, throwaway: u64, val: u64) -> Instruction {
+        Instruction {
+            old_num: old,
+            new_num: new,
+            ack_num: 0,
+            throwaway_num: throwaway,
+            diff: postcard::to_allocvec(&AbsDiff(val)).unwrap(),
+        }
+    }
+
+    /// Encode a (small) instruction as a single datagram, the way the wire layer ships it.
+    fn datagram(i: &Instruction) -> Vec<u8> {
+        let frags = Fragmenter::new().fragment(i, 1200).unwrap();
+        assert_eq!(frags.len(), 1, "test instruction must fit one fragment");
+        frags[0].encode().unwrap()
+    }
+
+    /// Regression for P1a: a peer-supplied `throwaway_num > old_num` makes the throwaway GC
+    /// drop the diff base. Before the fix, recv() re-resolved the base after the GC with
+    /// `.expect()` and panicked on this peer-controlled input. After the fix, the base is
+    /// cloned before the GC and applied safely.
+    #[test]
+    fn throwaway_gc_dropping_base_does_not_panic() {
+        let mut t = Transport::<Abs, Abs>::new(0, 1200);
+        // received_states = [0, 2]
+        assert_eq!(t.recv(10, &datagram(&instr(0, 2, 0, 22))), RecvOutcome::NewState);
+        assert_eq!(t.remote_state().0, 22);
+        // old=0 base, but throwaway_num=1 GCs num 0 (the base) before apply.
+        assert_eq!(t.recv(20, &datagram(&instr(0, 5, 1, 55))), RecvOutcome::NewState);
+        assert_eq!(
+            t.remote_state().0,
+            55,
+            "diff must apply against the base cloned before the throwaway GC"
+        );
+    }
 }

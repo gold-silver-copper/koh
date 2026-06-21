@@ -10,11 +10,16 @@ It is the transport+terminal core for an eventual Bevy-based Android terminal fo
 over your phone to your main PC. This repo is that core: two binaries, `rmosh-server` and
 `rmosh-client`, that give you a real remote shell by endpoint id.
 
-> Status: the protocol core, terminal model, PTY host, predictor, and iroh transport are
-> implemented and tested. 46 tests pass, including property tests, a network-chaos simulator,
-> an in-process client↔server scenario that converges at 50% packet loss, and **end-to-end
-> tests over a real iroh connection** — both the full loop in one process and the real
-> `rmosh-client` binary driven through an allocated PTY (see [Testing tiers](#testing-tiers)).
+> Status: feature-complete against mosh's core. The protocol core, terminal model, PTY host,
+> predictor, and iroh transport are implemented and tested, plus the defining mosh features:
+> **detachable/reattachable sessions** (close the lid, reconnect, your shell is right where you
+> left it), **terminal-reply synthesis** (DSR/DA/DECRQM, so vim/htop/fzf behave), and
+> **remote-shell exit-status propagation**. Client terminal I/O runs on
+> [termina](https://github.com/helix-editor/termina) with synchronized output (no crossterm).
+> 68 tests pass, including property tests, a network-chaos simulator, an in-process
+> client↔server scenario that converges at 50% packet loss, a reattach acceptance test, and
+> **end-to-end tests over a real iroh connection** — both the full loop in one process and the
+> real `rmosh-client` binary driven through an allocated PTY (see [Testing tiers](#testing-tiers)).
 
 ## The one idea
 
@@ -83,9 +88,10 @@ extends down to the framing layer. Identical retransmits reuse fragment ids so a
 received instruction can complete across retransmissions. The datagram budget is taken from
 `Connection::max_datagram_size()` (re-queried, since it tracks the path MTU).
 
-`IrohChannel` also exposes a one-shot reliable uni-stream (`send_reliable`/`recv_reliable`) as
-an escape hatch for very large repaints; the default path uses the fragmenter, which the chaos
-tests exercise down to a 30-byte MTU at 30% loss.
+Every state (even a full repaint) goes through the fragmenter over unreliable datagrams — there
+is no reliable-stream fallback, since a reliable ordered stream would reintroduce the
+head-of-line blocking the whole design avoids. The chaos tests exercise the fragmenter down to
+a 30-byte MTU at 30% loss.
 
 ### Authorization (who gets a shell)
 
@@ -103,12 +109,12 @@ is the authorization layer on top.
 
 ```sh
 cargo build --release          # builds rmosh-server and rmosh-client
-cargo test  --workspace        # 46 tests: unit, property, chaos sim, real-iroh e2e, PTY binary
+cargo test  --workspace        # 68 tests: unit, property, chaos sim, real-iroh e2e, reattach, PTY binary
 ```
 
 Pinned toolchain-adjacent versions live in the root `Cargo.toml`: `iroh =1.0.0` (which brings
 its own QUIC backend, `noq`, a quinn fork — we never depend on quinn directly), `vt100 0.16`,
-`portable-pty 0.9`, `crossterm 0.29`, `postcard 1.1`.
+`portable-pty 0.9`, `termina 0.3` (client terminal I/O), `postcard 1.1`.
 
 ## Run a session by endpoint id
 
@@ -152,8 +158,12 @@ rmosh-server --relay-url https://relay.example:3340 --allow 3f9c…
 rmosh-client 871b… --relay-url https://relay.example:3340
 ```
 
-For session persistence across reconnects, run `tmux` inside the session — rmosh intentionally
-does no multiplexing (one session, one shell), exactly like mosh.
+Sessions are **detachable**, like mosh: the server keeps your shell (and its live screen)
+running after a disconnect, keyed by your client endpoint id, so reconnecting from the same
+client drops you back exactly where you left off — no `tmux` required for survival across
+suspend/resume or IP changes. A detached session is reaped after `--session-ttl-secs` (default
+24h) or immediately when its shell exits. rmosh still does no multiplexing (one session, one
+shell, exactly like mosh) — use `tmux` if you want windows/panes.
 
 ## The predictor
 
@@ -166,10 +176,12 @@ subsequent predictions hidden, with no explicit password heuristic. Engagement i
 SRTT with hysteresis (show > 30ms, flag/underline > 80ms).
 
 The port faithfully implements epoch-gated confirmation, adaptive engagement, flagging, glitch
-escalation, and no-echo suppression. To stay tractable it predicts in overwrite mode for ASCII
-printables, backspace, and CR/LF; control/escape/CSI and non-ASCII input open a fresh epoch but
-make no concrete guess (they fall back to the server's real echo). A wrong or unconfirmed guess
-is always reconciled away — it never corrupts the display.
+escalation, and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
+backspace, CR/LF, the left/right arrow keys (CSI **and** SS3/application-cursor form), and whole
+UTF-8 graphemes including double-width CJK/emoji (cursor advances by two cells). Control/escape
+sequences it doesn't model open a fresh epoch but make no concrete guess (they fall back to the
+server's real echo). A wrong or unconfirmed guess is always reconciled away — it never corrupts
+the display.
 
 ## Testing tiers
 
@@ -203,12 +215,17 @@ TTY is just an allocated PTY. Both are real and hermetic.
   keystroke → client → iroh datagram → server → PTY-hosted `sh` → vt100 → iroh → client render
   (through a `ClientTerminal` mock backend). Asserts the typed command's output round-trips.
 - **`crates/client/tests/e2e_pty_binary.rs`** — the **real `rmosh-client` binary** attached to
-  an allocated PTY (so `isatty()` is true and raw-mode + crossterm run for real), driven by
+  an allocated PTY (so `isatty()` is true and raw-mode + termina run for real), driven by
   scripted keystrokes with rendered frames read back from the master, connected with `--direct`
   to an in-process loopback server.
+- **`crates/server/tests/reattach.rs`** — the detachable-session acceptance test: type a marker,
+  disconnect, reconnect from the *same* client endpoint, assert the session re-syncs to the
+  persisted screen (the shell kept running while detached).
+- **`crates/server/tests/exit_status.rs`** — a loopback session where `sh` runs `exit 42`;
+  asserts the client observes exit code `42` on the shutdown frame (so the binary exits with it).
 
 The seam that makes this cheap: terminal I/O is abstracted behind `ClientTerminal`, so the same
-session loop runs against the real crossterm path (binary) or a captured-cells mock (fast test).
+session loop runs against the real termina path (binary) or a captured-cells mock (fast test).
 
 ### Tier 2 — docker-compose: relay, NAT, OS-chaos, roaming (`testing/tier2/`)
 
@@ -223,7 +240,23 @@ re-syncs. This is runnable scaffolding (requires Docker + Linux); it is not part
 
 A small final human acceptance pass, not for an agent: paste the endpoint id on an actual
 Android phone, connect to an actual Mac over the public relay, type on a laggy cell link, and
-feel the predictions. The last 1% sign-off after Tiers 0–2 are green.
+feel the predictions. The last 1% sign-off after Tiers 0–2 are green. The headless tiers prove
+correctness; only a real two-device run over a real radio proves *feel* and migration, so this
+step stays manual. Concrete checklist (each maps to a parity feature):
+
+1. **Predictor feel** — on a cell link, type a long command; characters appear instantly
+   (underlined while RTT is high), then settle as the server confirms.
+2. **Suspend/resume + roaming** — lock the phone or switch Wi-Fi↔cellular mid-session; the
+   client shows "link down — resuming…", then re-syncs to the *current* screen (no backlog)
+   once QUIC migrates.
+3. **Detach/reattach** — fully quit the client (Ctrl-^ then `.`) with a long-running program
+   on screen, reconnect later; the shell is right where you left it (the server kept it alive).
+4. **Interactive apps** — run `vim`, `htop`, `fzf`; they render and respond (terminal-reply
+   synthesis answers their DSR/DA/DECRQM probes).
+5. **Exit status** — `exit 42` in the remote shell; the client process exits with code 42
+   (`echo $?` locally).
+6. **Perf** — under packet loss, a burst of output never stalls the current frame, and
+   keystroke→echo latency tracks RTT, not output volume (the state-collapse guarantee).
 
 ## Acceptance criteria (mosh feel)
 
@@ -234,6 +267,9 @@ feel the predictions. The last 1% sign-off after Tiers 0–2 are green.
 | A burst of superseded output never delays the current screen | datagram transport + state collapse; proven by the chaos monotonicity guard |
 | Password prompts show no predicted echo | emergent no-echo suppression in the predictor |
 | Reconnect lands you where the screen is *now* | SSP always diffs toward the latest state |
+| Detach and reattach later, shell still running | server-side detachable sessions keyed by client id (reattach test) |
+| Interactive apps (vim/htop/fzf) that probe the terminal work | server synthesizes DSR/DA/DECRQM replies |
+| Client exits with the remote shell's status | exit code rides the shutdown frame (exit_status test) |
 
 ## Non-goals / divergences
 
@@ -241,16 +277,19 @@ feel the predictions. The last 1% sign-off after Tiers 0–2 are green.
   protobuf, and drop OCB/heartbeats/chaff).
 - **No multiplexing** — one session, one shell; use tmux.
 - iroh-ssh was a reference for the iroh bootstrap only, not a base to extend.
-- Terminal *replies* (DSR/DA query responses the shell expects back) are not yet synthesized;
-  most interactive apps are fine, some may probe. Title/bell propagate; OSC-52 clipboard does
-  not yet.
+- **No scrollback sync** — like mosh, only the visible screen is synchronized (use a pager/tmux).
+- Title/bell propagate and terminal *replies* (DSR/DA/DECRQM) are synthesized server-side, so
+  interactive apps that probe the terminal (vim/htop/fzf) work. **OSC-52 clipboard** is not yet
+  forwarded to the local clipboard (the one remaining optional mosh-adjacent nicety).
 
 ## Roadmap
 
 This core is the foundation for a 100%-Rust mobile (Android) terminal — likely Bevy-based —
-that vibe-codes over rmosh to your main PC. Natural next steps: the reliable-stream path for
-huge repaints, terminal-reply synthesis, scrollback sync, and a Bevy front-end reusing
-`terminal` + `input` + `predict` + `transport-iroh` directly.
+that vibe-codes over rmosh to your main PC. With mosh's core behaviors now in place (detachable
+sessions, terminal-reply synthesis, exit-status propagation, the predictor), the natural next
+steps are OSC-52 clipboard forwarding, two-device real-network/perf acceptance over the public
+relay (Tier 3), and a Bevy front-end reusing `terminal` + `input` + `predict` +
+`transport-iroh` directly.
 
 ## License
 

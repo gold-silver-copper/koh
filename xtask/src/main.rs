@@ -151,16 +151,17 @@ fn run_session(loss: f64, seed: u64) -> anyhow::Result<SessionResult> {
     })
 }
 
-/// Drive a client-side predictor against authoritative frames to confirm the
-/// predict→confirm and predict→suppress (no-echo) reconciliation hold over the real screen type.
+/// Drive a client-side predictor against authoritative frames to confirm the epoch gate:
+/// a keystroke stays hidden until the server confirms it echoes, then is confirmed-and-cleared.
 fn run_predictor_reconciliation() -> anyhow::Result<()> {
     let mut pe = PredictionEngine::new(DisplayPreference::Always);
     pe.set_local_frame_sent(0);
 
+    // SECURITY: the first keystroke is epoch-gated and must NOT be shown before confirmation.
     let blank = TerminalScreen::default();
     pe.new_user_byte(100, b'h', blank.screen());
-    if pe.overlay(blank.screen()).is_empty() {
-        anyhow::bail!("predictor should show the typed char");
+    if !pe.overlay(blank.screen()).is_empty() {
+        anyhow::bail!("predictor leaked a keystroke before the server confirmed it echoes");
     }
 
     // Server echoes 'h' and acks frame 1 -> prediction confirmed and cleared.

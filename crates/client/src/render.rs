@@ -191,16 +191,24 @@ mod tests {
 
     #[test]
     fn renders_prediction_overlay_glyph() {
-        // A predicted glyph not present on the authoritative screen must appear in the output.
-        let screen = screen_of(b"");
+        // A predicted glyph (once the server has confirmed it echoes) must appear in the output.
+        // Predictions are epoch-gated and hidden until confirmed, so confirm a first keystroke,
+        // then a subsequent typed char becomes visible and should render.
         let mut pe = PredictionEngine::new(DisplayPreference::Always);
         pe.set_local_frame_sent(0);
-        pe.new_user_byte(0, b'Z', &screen);
-        let overlay = pe.overlay(&screen);
-        assert!(!overlay.is_empty());
+        let blank = screen_of(b"");
+        pe.new_user_byte(0, b'a', &blank); // hidden (epoch 1, unconfirmed)
+        let echoed = screen_of(b"a");
+        pe.set_local_frame_late_acked(1);
+        pe.cull(50, &echoed); // confirms -> confirmed_epoch = 1
+
+        pe.set_local_frame_sent(1);
+        pe.new_user_byte(60, b'Z', &echoed); // now visible at (0,1)
+        let overlay = pe.overlay(&echoed);
+        assert!(!overlay.is_empty(), "confirmed prediction should be visible");
 
         let mut buf = Vec::new();
-        render(&mut buf, &screen, &overlay, None).unwrap();
+        render(&mut buf, &echoed, &overlay, None).unwrap();
         assert!(
             String::from_utf8_lossy(&buf).contains('Z'),
             "predicted glyph not rendered"

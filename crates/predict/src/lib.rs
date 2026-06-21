@@ -136,10 +136,13 @@ impl PredictionEngine {
             pref,
             cells: BTreeMap::new(),
             cursor: None,
-            // We keep prediction_epoch == confirmed_epoch during ordinary typing so the
-            // *current* epoch's predictions show immediately; `become_tentative` opens a new
-            // (hidden) epoch only for risky/uncertain actions, gated until the server confirms.
-            prediction_epoch: 0,
+            // SECURITY: predictions start one epoch *ahead* of what's confirmed, so a freshly
+            // typed character (stamped `prediction_epoch = 1`) is tentative — `tentative(0)` is
+            // `1 > 0` = true — and therefore hidden until the server proves it echoes by
+            // advancing `confirmed_epoch` to 1 (a `Correct` validation in `cull`). This is what
+            // keeps a password typed into a non-echoing prompt from flashing on screen. Starting
+            // both at 0 would draw the first keystroke before any server confirmation.
+            prediction_epoch: 1,
             confirmed_epoch: 0,
             local_frame_sent: 0,
             late_acked: 0,
@@ -551,54 +554,83 @@ mod tests {
         p.screen().clone()
     }
 
-    #[test]
-    fn predicts_typed_char_on_slow_link() {
-        let mut e = PredictionEngine::new(DisplayPreference::Adaptive);
-        e.set_srtt(120.0); // slow link -> predictions engage + flag
+    /// Drive a confirmation round: type `first` (hidden), have the server echo it on `echoed`
+    /// and ack frame 1, cull (advancing `confirmed_epoch`). Returns the engine ready for
+    /// subsequent typing to be *visible*.
+    fn confirm_first_keystroke(pref: DisplayPreference, srtt: f64) -> (PredictionEngine, Screen) {
+        let mut e = PredictionEngine::new(pref);
+        e.set_srtt(srtt);
         e.set_local_frame_sent(0);
-        let screen = screen_of(b"");
-        e.new_user_byte(100, b'x', &screen);
-        let ov = e.overlay(&screen);
-        assert_eq!(ov.cell(0, 0).map(|c| c.glyph.as_str()), Some("x"));
-        assert!(ov.cell(0, 0).unwrap().underline, "slow link should flag");
-        assert_eq!(ov.cursor(), Some((0, 1)));
+        let blank = screen_of(b"");
+        e.new_user_byte(100, b'x', &blank);
+        assert!(
+            e.overlay(&blank).is_empty(),
+            "the very first keystroke must be hidden until the server confirms it echoes"
+        );
+        let echoed = screen_of(b"x");
+        e.set_local_frame_late_acked(1);
+        e.cull(200, &echoed); // grades 'x' Correct -> confirmed_epoch = 1
+        (e, echoed)
+    }
+
+    #[test]
+    fn predictions_hidden_until_server_confirms_echo() {
+        // P0 (security): a secret typed before ANY server confirmation must never be drawn,
+        // even with Display::Always (proving the *epoch* gate, not the SRTT gate, suppresses it).
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.set_local_frame_sent(0);
+        let blank = screen_of(b"");
+        for &b in b"hunter2" {
+            e.new_user_byte(100, b, &blank);
+        }
+        assert!(
+            e.overlay(&blank).is_empty(),
+            "predictions must stay hidden until the server confirms it echoes"
+        );
+    }
+
+    #[test]
+    fn confirmed_echo_makes_subsequent_typing_visible() {
+        // After the server proves it echoes (one Correct), later typing in the confirmed epoch shows.
+        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+        e.set_local_frame_sent(1);
+        e.new_user_byte(300, b'y', &echoed); // cursor now at (0,1)
+        let ov = e.overlay(&echoed);
+        assert_eq!(
+            ov.cell(0, 1).map(|c| c.glyph.as_str()),
+            Some("y"),
+            "typing after confirmation must be visible"
+        );
+    }
+
+    #[test]
+    fn slow_link_flags_confirmed_predictions() {
+        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Adaptive, 120.0);
+        e.set_local_frame_sent(1);
+        e.new_user_byte(300, b'y', &echoed);
+        let ov = e.overlay(&echoed);
+        assert_eq!(ov.cell(0, 1).map(|c| c.glyph.as_str()), Some("y"));
+        assert!(ov.cell(0, 1).unwrap().underline, "slow link should flag predictions");
     }
 
     #[test]
     fn no_prediction_shown_on_fast_link() {
-        let mut e = PredictionEngine::new(DisplayPreference::Adaptive);
-        e.set_srtt(5.0); // fast link: real echo beats prediction
-        e.set_local_frame_sent(0);
-        let screen = screen_of(b"");
-        e.new_user_byte(100, b'x', &screen);
-        assert!(e.overlay(&screen).is_empty());
+        // Even after a confirmation, a fast link keeps the SRTT gate closed so the real echo wins.
+        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Adaptive, 5.0);
+        e.set_local_frame_sent(1);
+        e.new_user_byte(300, b'y', &echoed);
+        assert!(e.overlay(&echoed).is_empty());
     }
 
     #[test]
-    fn correct_server_echo_confirms_and_clears() {
+    fn no_echo_keeps_secret_hidden_and_cleans_up() {
+        // Password-prompt style: the server never echoes -> never shown, then culled away.
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        e.new_user_byte(100, b'x', &blank); // predict 'x' at (0,0), expiration frame 1
-        assert_eq!(e.overlay(&blank).len(), 1);
+        e.new_user_byte(100, b's', &blank);
+        assert!(e.overlay(&blank).is_empty(), "non-echoed input is never shown");
 
-        // Server frame shows 'x', and echo-acks frame 1.
-        let echoed = screen_of(b"x");
-        e.set_local_frame_late_acked(1);
-        e.cull(200, &echoed);
-        assert!(e.overlay(&echoed).is_empty(), "confirmed prediction is dropped");
-    }
-
-    #[test]
-    fn mispredict_is_reconciled_away() {
-        // Password-prompt style: server does NOT echo. Prediction must not stick.
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
-        e.set_local_frame_sent(0);
-        let blank = screen_of(b"");
-        e.new_user_byte(100, b's', &blank); // predict 's'
-        assert_eq!(e.overlay(&blank).len(), 1);
-
-        // Server frame for that input shows nothing (no echo); echo-acks frame 1.
         let still_blank = screen_of(b"");
         e.set_local_frame_late_acked(1);
         e.cull(200, &still_blank);

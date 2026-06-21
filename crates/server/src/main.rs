@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use iroh::EndpointId;
-use rmosh_server::run_session;
+use rmosh_server::{run_attached, session, SessionExit};
 use rmosh_transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
     load_or_create_secret_key, parse_endpoint_id, parse_relay_url, ALPN,
@@ -44,6 +44,11 @@ struct Args {
     /// Scrollback lines retained by the server-side emulator.
     #[arg(long, default_value_t = 1000)]
     scrollback: usize,
+
+    /// Keep a detached session's shell alive this long (seconds) for the client to reconnect.
+    /// Default 24h (mosh-style "close the laptop, reopen later").
+    #[arg(long, default_value_t = 86_400)]
+    session_ttl_secs: u64,
 
     /// Host via a self-hosted relay URL instead of n0's public relays.
     #[arg(long, value_name = "URL")]
@@ -146,10 +151,18 @@ async fn main() -> anyhow::Result<()> {
             .or_else(|| std::env::var("RMOSH_PASSPHRASE").ok()),
     );
 
+    // Detachable session store: one shell per authorized client, surviving disconnects so a
+    // reconnecting client lands back in the same session at the current screen. The reaper
+    // collects sessions whose shell exited or that have been detached past the TTL.
+    let store: session::SessionStore = Default::default();
+    let session_ttl = std::time::Duration::from_secs(args.session_ttl_secs);
+    tokio::spawn(session::run_reaper(store.clone(), session_ttl));
+
     while let Some(incoming) = endpoint.accept().await {
         let allow = allow.clone();
         let shell = shell.clone();
         let passphrase = passphrase.clone();
+        let store = store.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(c) => c,
@@ -184,11 +197,31 @@ async fn main() -> anyhow::Result<()> {
                     return;
                 }
             }
-            info!(peer = %format_endpoint_id(&peer), "client authorized; starting session");
-            if let Err(e) = run_session(conn, shell, scrollback).await {
-                error!(error = %e, "session ended with error");
+            info!(peer = %format_endpoint_id(&peer), "client authorized; attaching session");
+            // Attach to (or create) this client's detachable session, then serve the connection.
+            let handle = match session::attach(&store, peer, shell.as_deref(), scrollback).await {
+                Ok(h) => h,
+                Err(e) => {
+                    error!(error = %e, "failed to start session");
+                    conn.close(1u32.into(), b"session error");
+                    return;
+                }
+            };
+            match run_attached(conn, handle).await {
+                Ok(SessionExit::Detached) => {
+                    // Keep the shell running for reattach.
+                    session::detach(&store, peer).await;
+                    info!(peer = %format_endpoint_id(&peer), "client detached (session retained)");
+                }
+                Ok(SessionExit::ShellExited) => {
+                    session::reap(&store, peer).await;
+                    info!(peer = %format_endpoint_id(&peer), "shell exited; session reaped");
+                }
+                Err(e) => {
+                    error!(error = %e, "session loop error");
+                    session::detach(&store, peer).await;
+                }
             }
-            info!(peer = %format_endpoint_id(&peer), "session ended");
         });
     }
 

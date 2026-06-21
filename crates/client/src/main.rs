@@ -68,6 +68,10 @@ struct Args {
     /// Print this client's endpoint id (to add to the server's --allow list) and exit.
     #[arg(long)]
     show_id: bool,
+
+    /// Shared passphrase, if the server requires one. Also read from $RMOSH_PASSPHRASE.
+    #[arg(long)]
+    passphrase: Option<String>,
 }
 
 fn default_key_file() -> PathBuf {
@@ -148,6 +152,16 @@ async fn main() -> anyhow::Result<()> {
         .connect(target, ALPN)
         .await
         .context("connecting to server (is your id on its allowlist?)")?;
+
+    // Optional passphrase second factor (no-op if the server doesn't require one). Runs on the
+    // raw connection before it's wrapped, since the handshake borrows &conn.
+    let passphrase = args
+        .passphrase
+        .clone()
+        .or_else(|| std::env::var("RMOSH_PASSPHRASE").ok());
+    rmosh_transport_iroh::auth::handshake_client(&conn, passphrase.as_deref())
+        .await
+        .context("passphrase handshake (wrong or missing --passphrase?)")?;
     eprintln!("connected. (Ctrl-^ then . to disconnect)");
 
     let channel = rmosh_transport_iroh::IrohChannel::new(conn);

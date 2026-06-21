@@ -34,7 +34,14 @@ async fn real_client_binary_renders_over_pty() {
     let server_task = tokio::spawn(async move {
         if let Some(incoming) = server_ep.accept().await {
             if let Ok(conn) = incoming.await {
-                let _ = run_session(conn, Some("sh".into()), 0).await;
+                // The client *binary* runs the passphrase handshake after connect; mirror the
+                // server side (no passphrase) so its accept_bi() completes, like the real server.
+                if rmosh_transport_iroh::auth::handshake_server(&conn, None)
+                    .await
+                    .is_ok()
+                {
+                    let _ = run_session(conn, Some("sh".into()), 0).await;
+                }
             }
         }
     });

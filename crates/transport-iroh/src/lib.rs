@@ -23,6 +23,8 @@ use iroh::endpoint::{presets, Connection, ConnectionError, PathId, VarInt};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use rmosh_wire::DEFAULT_MAX_DATAGRAM;
 
+pub mod auth;
+
 /// The ALPN that identifies the rmosh protocol on the wire.
 pub const ALPN: &[u8] = b"rmosh/iroh/1";
 

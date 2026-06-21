@@ -52,6 +52,11 @@ struct Args {
     /// Bind without any relay/discovery (LAN / loopback). Clients dial with --direct <ip:port>.
     #[arg(long, conflicts_with = "relay_url")]
     local: bool,
+
+    /// Require a shared passphrase (defense-in-depth on top of the node-id allowlist).
+    /// The passphrase never crosses the wire. Also read from $RMOSH_PASSPHRASE.
+    #[arg(long)]
+    passphrase: Option<String>,
 }
 
 fn default_key_file() -> PathBuf {
@@ -124,6 +129,9 @@ async fn main() -> anyhow::Result<()> {
     } else {
         eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
     }
+    if args.passphrase.is_some() || std::env::var("RMOSH_PASSPHRASE").is_ok() {
+        eprintln!("│ 2nd factor  : passphrase required");
+    }
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
 
@@ -131,10 +139,17 @@ async fn main() -> anyhow::Result<()> {
     let scrollback = args.scrollback;
     let allow = std::sync::Arc::new(allow);
     let allow_any = args.allow_any;
+    // Optional passphrase (a second factor); also from $RMOSH_PASSPHRASE.
+    let passphrase = std::sync::Arc::new(
+        args.passphrase
+            .clone()
+            .or_else(|| std::env::var("RMOSH_PASSPHRASE").ok()),
+    );
 
     while let Some(incoming) = endpoint.accept().await {
         let allow = allow.clone();
         let shell = shell.clone();
+        let passphrase = passphrase.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(c) => c,
@@ -148,6 +163,26 @@ async fn main() -> anyhow::Result<()> {
                 warn!(peer = %format_endpoint_id(&peer), "rejected: not on allowlist");
                 conn.close(1u32.into(), b"not authorized");
                 return;
+            }
+            // Second factor: the passphrase nonce-challenge (no-op if none configured), bounded
+            // by a 10s timeout so a stalled/malicious client can't pin a session slot.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                rmosh_transport_iroh::auth::handshake_server(&conn, passphrase.as_deref()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(peer = %format_endpoint_id(&peer), error = %e, "passphrase handshake rejected");
+                    conn.close(1u32.into(), b"auth failed");
+                    return;
+                }
+                Err(_) => {
+                    warn!(peer = %format_endpoint_id(&peer), "passphrase handshake timed out");
+                    conn.close(1u32.into(), b"auth timeout");
+                    return;
+                }
             }
             info!(peer = %format_endpoint_id(&peer), "client authorized; starting session");
             if let Err(e) = run_session(conn, shell, scrollback).await {

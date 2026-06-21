@@ -117,6 +117,18 @@ enum Validity {
     IncorrectOrExpired,
 }
 
+/// Tracks a multi-byte escape sequence across `new_user_byte` calls (input arrives one byte at
+/// a time), so escape bytes are consumed rather than mis-drawn as literal glyphs.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum EscState {
+    /// Not mid-escape.
+    Ground,
+    /// Saw `ESC`.
+    Esc,
+    /// Saw `ESC [` (also covers `ESC O` after normalization) — awaiting the final byte.
+    Csi,
+}
+
 /// The prediction engine. Drive it: [`set_local_frame_sent`](Self::set_local_frame_sent)
 /// before feeding typed bytes; [`new_user_byte`](Self::new_user_byte) per typed byte;
 /// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) + [`set_srtt`](Self::set_srtt)
@@ -136,6 +148,8 @@ pub struct PredictionEngine {
     last_quick_confirmation: u64,
     last_size: Option<(u16, u16)>,
     last_byte: u8,
+    /// Escape-sequence parser state across raw input bytes (for arrow-key prediction).
+    esc: EscState,
     /// false = insert mode (typing mid-line shifts the row right; backspace shifts left);
     /// true = overwrite mode (single-cell edits). Readline/shells default to insert.
     predict_overwrite: bool,
@@ -164,6 +178,7 @@ impl PredictionEngine {
             last_quick_confirmation: 0,
             last_size: None,
             last_byte: 0,
+            esc: EscState::Ground,
             predict_overwrite: false,
         }
     }
@@ -241,6 +256,25 @@ impl PredictionEngine {
         }
     }
 
+    /// Predict a horizontal cursor move (`dir > 0` = right, `dir < 0` = left), clamped to the
+    /// row. Cursor-only prediction in the current epoch, confirmed via `cursor_validity`; like
+    /// a typed char it does not open a new epoch. Vertical arrows are not predicted (the caller
+    /// `become_tentative`s them).
+    fn predict_arrow(&mut self, screen: &Screen, dir: i32) {
+        self.init_cursor(screen);
+        let exp = self.local_frame_sent + 1;
+        let (_, cols) = screen.size();
+        if let Some(c) = self.cursor.as_mut() {
+            if dir > 0 && c.col + 1 < cols {
+                c.col += 1;
+                c.expiration_frame = exp;
+            } else if dir < 0 && c.col > 0 {
+                c.col -= 1;
+                c.expiration_frame = exp;
+            }
+        }
+    }
+
     /// Record a typed byte and speculate its on-screen effect against `screen` (the latest
     /// authoritative frame). Validates existing predictions first (`cull`).
     pub fn new_user_byte(&mut self, now: u64, byte: u8, screen: &Screen) {
@@ -257,6 +291,37 @@ impl PredictionEngine {
 
         let (rows, cols) = screen.size();
         if rows == 0 || cols == 0 {
+            return;
+        }
+
+        // Consume bytes that belong to a multi-byte escape sequence (so they're never mis-drawn
+        // as literal glyphs) and predict the common, safe left/right arrows. `ESC O x` was
+        // normalized to `ESC [ x` above, so both cursor-key and application-cursor arrows land
+        // in the `Csi` arm.
+        match self.esc {
+            EscState::Esc => {
+                self.esc = if byte == b'[' {
+                    EscState::Csi
+                } else {
+                    self.become_tentative(); // an escape we don't model -> wait for the server
+                    EscState::Ground
+                };
+                return;
+            }
+            EscState::Csi => {
+                self.esc = EscState::Ground;
+                match byte {
+                    b'C' => self.predict_arrow(screen, 1),  // right
+                    b'D' => self.predict_arrow(screen, -1), // left
+                    // up/down/home/end/parameterized (digits, ';'): can't predict safely, bail.
+                    _ => self.become_tentative(),
+                }
+                return;
+            }
+            EscState::Ground => {}
+        }
+        if byte == 0x1b {
+            self.esc = EscState::Esc;
             return;
         }
 
@@ -808,5 +873,33 @@ mod tests {
         let ov = e.overlay(&screen);
         let c = ov.cell(0, 1).expect("unknown hint should be present");
         assert!(c.unknown && c.underline && c.glyph.is_empty());
+    }
+
+    #[test]
+    fn left_arrow_predicts_cursor_and_leaves_no_glyph() {
+        // After confirming a keystroke (cursor at (0,1)), a left arrow predicts the cursor one
+        // column left and must NOT leave literal '[' / 'D' glyphs from the escape bytes.
+        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+        e.set_local_frame_sent(1);
+        for &b in b"\x1b[D" {
+            e.new_user_byte(300, b, &echoed); // ESC [ D
+        }
+        let ov = e.overlay(&echoed);
+        assert_eq!(ov.cursor(), Some((0, 0)), "left arrow predicts the cursor one col left");
+        assert!(
+            ov.cell(0, 0).is_none() && ov.cell(0, 1).is_none(),
+            "arrow escape bytes must not be drawn as literal glyphs"
+        );
+    }
+
+    #[test]
+    fn ss3_left_arrow_is_normalized_and_predicted() {
+        // Application-cursor-mode arrow: ESC O D must behave like ESC [ D.
+        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+        e.set_local_frame_sent(1);
+        for &b in b"\x1bOD" {
+            e.new_user_byte(300, b, &echoed); // ESC O D
+        }
+        assert_eq!(e.overlay(&echoed).cursor(), Some((0, 0)));
     }
 }

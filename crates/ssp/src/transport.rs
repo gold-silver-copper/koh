@@ -713,4 +713,58 @@ mod tests {
             t.sent_states.len()
         );
     }
+
+    /// Ported from mosh src/tests/network-no-diff.test: the sender must not generate a new diff/
+    /// state while the application state is unchanged (mosh's regression was the server busy-
+    /// looping / repainting when nothing changed). An unchanged state may be retransmitted for
+    /// reliability but mints no new state number; a real change always gets a fresh one.
+    #[test]
+    fn unchanged_state_mints_no_new_content_state() {
+        let mut t = Transport::<Abs, Abs>::new(0, 1200);
+        t.set_connected(true);
+        t.observe_rtt(20.0);
+
+        // A real change is sent.
+        t.current_mut().0 = 1;
+        let mut now = 0u64;
+        let mut sent = Vec::new();
+        for _ in 0..100 {
+            now += 20;
+            sent = t.tick(now);
+            if !sent.is_empty() {
+                break;
+            }
+        }
+        assert!(!sent.is_empty(), "a changed state must be sent");
+        let after_first = t.newest_sent_num();
+
+        // Unchanged across many ticks (well inside the ACK_INTERVAL): the transport may RETRANSMIT
+        // the still-unacked state (reliability), but it must not mint a NEW state number — there
+        // is no new screen content to diff. This is the heart of mosh's no-diff guarantee.
+        for _ in 0..10 {
+            now += 20;
+            let _ = t.tick(now); // retransmits allowed; content is unchanged
+            assert_eq!(
+                t.newest_sent_num(),
+                after_first,
+                "unchanged state must not mint a new content state (retransmit reuses the number)"
+            );
+        }
+
+        // A subsequent real change is sent again, with a fresh state number.
+        t.current_mut().0 = 2;
+        let mut sent_again = Vec::new();
+        for _ in 0..100 {
+            now += 20;
+            sent_again = t.tick(now);
+            if !sent_again.is_empty() {
+                break;
+            }
+        }
+        assert!(!sent_again.is_empty(), "a later change must be sent");
+        assert!(
+            t.newest_sent_num() > after_first,
+            "the changed state gets a fresh number"
+        );
+    }
 }

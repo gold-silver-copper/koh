@@ -75,8 +75,10 @@ pub async fn run_client<T: ClientTerminal>(
     transport.current_mut().push_resize(initial_rows, initial_cols);
 
     let mut pending_escape = false;
-    let mut last_recv = clock.now_ms();
     let mut dirty = true;
+    // Whether the "link down" banner was painted last frame, so we can force a repaint to
+    // clear it the moment the peer reappears (recovery may arrive as a Duplicate, not NewState).
+    let mut status_was_shown = false;
 
     loop {
         let now = clock.now_ms();
@@ -127,7 +129,6 @@ pub async fn run_client<T: ClientTerminal>(
                 match dg {
                     Ok(bytes) => {
                         if transport.recv(now, &bytes) == RecvOutcome::NewState {
-                            last_recv = now;
                             let echo_ack = transport.remote_state().echo_ack();
                             let screen = transport.remote_state().screen().clone();
                             predictor.set_local_frame_late_acked(echo_ack);
@@ -160,11 +161,19 @@ pub async fn run_client<T: ClientTerminal>(
             channel.send(&datagram);
         }
 
-        let staleness = now.saturating_sub(last_recv);
-        let status =
-            (staleness > 3000).then(|| format!("[rmosh] link down — resuming… {}s", staleness / 1000));
+        // Link-down is driven by transport liveness, which refreshes on ANY decoded inbound
+        // (including duplicate keepalives) — so a quiet-but-alive session never falsely trips
+        // the banner. No banner before first contact (last_heard == 0 -> still connecting).
+        let status = if transport.last_heard() > 0 && !transport.link_up_within(now, 3000) {
+            let since = now.saturating_sub(transport.last_heard());
+            Some(format!("[rmosh] link down — resuming… {}s", since / 1000))
+        } else {
+            None
+        };
 
-        if dirty || status.is_some() {
+        // Repaint on new content, while the banner is up, or once more to clear a stale banner.
+        if dirty || status.is_some() || status_was_shown {
+            status_was_shown = status.is_some();
             let screen = transport.remote_state().screen();
             let overlay = predictor.overlay(screen);
             term.render(screen, &overlay, status.as_deref())?;

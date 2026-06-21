@@ -194,6 +194,19 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         self.rtt.srtt_ms()
     }
 
+    /// Wall-clock (ms) of the most recent decoded inbound datagram, or 0 if we've never heard
+    /// from the peer. Updated on *every* inbound (incl. duplicates/keepalives), so the driver
+    /// can drive its "link down / resuming" UI off real liveness rather than only new state.
+    pub fn last_heard(&self) -> u64 {
+        self.last_heard
+    }
+
+    /// Whether the peer has been heard from within the last `window` ms. Returns `false` until
+    /// the first datagram is received (so the UI shows "connecting", not "link down", at start).
+    pub fn link_up_within(&self, now: u64, window: u64) -> bool {
+        self.last_heard > 0 && now.saturating_sub(self.last_heard) <= window
+    }
+
     // ----- shutdown -----
 
     /// Begin a clean shutdown: outgoing instructions carry the [`SHUTDOWN_SENTINEL`]
@@ -484,6 +497,12 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
                 return RecvOutcome::Incomplete;
             }
         };
+        // Any decoded datagram is a sign of life from the peer, so refresh the
+        // active-retransmission liveness gate here — NOT only when a new newest-in-order state
+        // lands. On a lossy link the peer's retransmits/dups/acks may be all that arrives; if
+        // those didn't refresh `last_heard`, we'd stop retransmitting our own state to a peer
+        // that is demonstrably still connected (mosh sets last_heard on every recv).
+        self.last_heard = now;
         let instr = match self.assembly.add(frag) {
             Ok(Some(i)) => i,
             Ok(None) => return RecvOutcome::Incomplete,
@@ -548,9 +567,9 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             }
             None => {
                 self.received_states.push(ts);
-                // Newest in-order state: advance our ack, mark the peer heard, owe a fast ack.
+                // Newest in-order state: advance our ack, owe a fast ack. (`last_heard` was
+                // already refreshed for this datagram above, on any decoded inbound.)
                 self.ack_num = self.received_states.last().unwrap().num;
-                self.last_heard = now;
                 if !instr.diff.is_empty() {
                     self.pending_data_ack = true;
                 }
@@ -641,5 +660,22 @@ mod tests {
             55,
             "diff must apply against the base cloned before the throwaway GC"
         );
+    }
+
+    /// Regression for P1c: `last_heard` (the active-retransmission liveness gate) must refresh
+    /// on EVERY decoded datagram, including duplicate keepalives — not only on a new state.
+    /// Otherwise a peer whose only-arriving traffic is dups/retransmits falsely times out.
+    #[test]
+    fn last_heard_updates_on_duplicate() {
+        let mut t = Transport::<Abs, Abs>::new(0, 1200);
+        let dg = datagram(&instr(0, 2, 0, 22));
+        assert_eq!(t.recv(10, &dg), RecvOutcome::NewState);
+        assert_eq!(t.last_heard(), 10);
+        // The identical datagram again is a Duplicate (new_num 2 already held)...
+        assert_eq!(t.recv(9000, &dg), RecvOutcome::Duplicate);
+        // ...but it still proves the peer is alive, so liveness must advance.
+        assert_eq!(t.last_heard(), 9000, "a duplicate keepalive must refresh last_heard");
+        assert!(t.link_up_within(9100, 10_000));
+        assert!(!t.link_up_within(20_000, 10_000));
     }
 }

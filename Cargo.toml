@@ -39,7 +39,6 @@ iroh = "=1.0.0"
 # --- terminal / pty / tui ---
 vt100 = "=0.16.2"
 portable-pty = "=0.9.0"
-crossterm = "=0.29.0"
 unicode-width = "0.2"
 
 # --- serialization ---

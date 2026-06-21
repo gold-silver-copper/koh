@@ -1,27 +1,46 @@
 //! Painting the synchronized `vt100` screen (plus prediction overlays and a status line)
-//! onto the local terminal via crossterm.
+//! onto the local terminal, emitting escape sequences via **termina**.
 //!
 //! We render cell-by-cell — rather than just blitting `screen.contents_formatted()` — because
 //! the predictor needs to draw speculative cells (underlined) *on top of* the authoritative
-//! grid. Style changes are diffed against the previous cell so we emit minimal SGR.
+//! grid. Style changes are diffed against the previous cell so we emit minimal SGR. Each frame
+//! is wrapped in synchronized output (DEC mode 2026) so the terminal shows it atomically
+//! (no tearing/flicker on full repaints or resizes).
+//!
+//! termina has no `queue!`/`execute!` / `Command` layer: every escape is a `Display`-able
+//! `Csi`/`Csi::Mode`/`Csi::Sgr` value written into any `io::Write` (here, the termina terminal,
+//! which itself impls `io::Write`).
 
 use std::io::{self, Write};
 
-use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::queue;
-use crossterm::style::{
-    Attribute, Color as CtColor, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
-};
 use rmosh_predict::Overlay;
+use termina::escape::csi::{Csi, Cursor, DecPrivateMode, DecPrivateModeCode, Mode, Sgr};
+use termina::style::{ColorSpec, Intensity, RgbColor, Underline};
+use termina::OneBased;
 use vt100::{Color as VtColor, Screen};
 
-/// Map a vt100 color to a crossterm color.
-pub fn to_ct_color(c: VtColor) -> CtColor {
+/// Map a vt100 color to a termina color spec.
+pub fn to_spec(c: VtColor) -> ColorSpec {
     match c {
-        VtColor::Default => CtColor::Reset,
-        VtColor::Idx(i) => CtColor::AnsiValue(i),
-        VtColor::Rgb(r, g, b) => CtColor::Rgb { r, g, b },
+        VtColor::Default => ColorSpec::Reset,
+        VtColor::Idx(i) => ColorSpec::PaletteIndex(i),
+        VtColor::Rgb(r, g, b) => ColorSpec::from(RgbColor::new(r, g, b)),
     }
+}
+
+/// `Csi` to move the cursor to a 0-based `(row, col)`.
+fn move_to(row: u16, col: u16) -> Csi {
+    Csi::Cursor(Cursor::Position {
+        line: OneBased::from_zero_based(row),
+        col: OneBased::from_zero_based(col),
+    })
+}
+
+fn set_mode(code: DecPrivateModeCode) -> Csi {
+    Csi::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(code)))
+}
+fn reset_mode(code: DecPrivateModeCode) -> Csi {
+    Csi::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(code)))
 }
 
 /// A compact style fingerprint so we only re-emit SGR when it actually changes.
@@ -38,32 +57,33 @@ struct Style {
 
 fn emit_style(out: &mut impl Write, s: Style) -> io::Result<()> {
     // Reset clears everything (incl. colors), then re-apply.
-    queue!(out, SetAttribute(Attribute::Reset))?;
+    write!(out, "{}", Csi::Sgr(Sgr::Reset))?;
     if s.bold {
-        queue!(out, SetAttribute(Attribute::Bold))?;
+        write!(out, "{}", Csi::Sgr(Sgr::Intensity(Intensity::Bold)))?;
     }
     if s.dim {
-        queue!(out, SetAttribute(Attribute::Dim))?;
+        write!(out, "{}", Csi::Sgr(Sgr::Intensity(Intensity::Dim)))?;
     }
     if s.italic {
-        queue!(out, SetAttribute(Attribute::Italic))?;
+        write!(out, "{}", Csi::Sgr(Sgr::Italic(true)))?;
     }
     if s.underline {
-        queue!(out, SetAttribute(Attribute::Underlined))?;
+        write!(out, "{}", Csi::Sgr(Sgr::Underline(Underline::Single)))?;
     }
     if s.inverse {
-        queue!(out, SetAttribute(Attribute::Reverse))?;
+        write!(out, "{}", Csi::Sgr(Sgr::Reverse(true)))?;
     }
-    queue!(
+    write!(
         out,
-        SetForegroundColor(to_ct_color(s.fg)),
-        SetBackgroundColor(to_ct_color(s.bg))
+        "{}{}",
+        Csi::Sgr(Sgr::Foreground(to_spec(s.fg))),
+        Csi::Sgr(Sgr::Background(to_spec(s.bg)))
     )?;
     Ok(())
 }
 
 /// Render the authoritative `screen` with prediction `overlay` and an optional `status` line
-/// (drawn reverse-video on the last row) to `out`. Leaves the cursor at its real position.
+/// (drawn reverse-video on the last row) to `out`, wrapped in one synchronized-output frame.
 pub fn render(
     out: &mut impl Write,
     screen: &Screen,
@@ -71,11 +91,14 @@ pub fn render(
     status: Option<&str>,
 ) -> io::Result<()> {
     let (rows, cols) = screen.size();
-    queue!(out, Hide)?;
+
+    // Begin Synchronized Update (atomic frame) and hide the cursor while we paint.
+    write!(out, "{}", set_mode(DecPrivateModeCode::SynchronizedOutput))?;
+    write!(out, "{}", reset_mode(DecPrivateModeCode::ShowCursor))?;
 
     let mut cur_style: Option<Style> = None;
     for row in 0..rows {
-        queue!(out, MoveTo(0, row))?;
+        write!(out, "{}", move_to(row, 0))?;
         let mut col = 0u16;
         while col < cols {
             let cell = screen.cell(row, col);
@@ -136,12 +159,12 @@ pub fn render(
             } else {
                 " ".to_string()
             };
-            queue!(out, Print(if glyph.is_empty() { " ".into() } else { glyph }))?;
+            write!(out, "{}", if glyph.is_empty() { " " } else { &glyph })?;
             col += 1;
         }
     }
 
-    queue!(out, SetAttribute(Attribute::Reset))?;
+    write!(out, "{}", Csi::Sgr(Sgr::Reset))?;
 
     if let Some(st) = status {
         let mut line = format!(" {st} ");
@@ -149,21 +172,25 @@ pub fn render(
         if line.len() > max {
             line.truncate(max);
         }
-        queue!(
+        write!(
             out,
-            MoveTo(0, rows.saturating_sub(1)),
-            SetAttribute(Attribute::Reverse),
-            Print(line),
-            SetAttribute(Attribute::Reset)
+            "{}{}{}{}",
+            move_to(rows.saturating_sub(1), 0),
+            Csi::Sgr(Sgr::Reverse(true)),
+            line,
+            Csi::Sgr(Sgr::Reset)
         )?;
     }
 
     // Place and show the cursor: the predicted cursor wins if present, else the real one.
     let (crow, ccol) = overlay.cursor().unwrap_or_else(|| screen.cursor_position());
-    queue!(out, MoveTo(ccol, crow))?;
+    write!(out, "{}", move_to(crow, ccol))?;
     if !screen.hide_cursor() {
-        queue!(out, Show)?;
+        write!(out, "{}", set_mode(DecPrivateModeCode::ShowCursor))?;
     }
+
+    // End Synchronized Update: the terminal now reveals the whole frame at once.
+    write!(out, "{}", reset_mode(DecPrivateModeCode::SynchronizedOutput))?;
     out.flush()
 }
 
@@ -186,6 +213,16 @@ mod tests {
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("hi"), "rendered text missing");
         assert!(s.contains('\x1b'), "expected ANSI escape sequences");
+    }
+
+    #[test]
+    fn render_wraps_frame_in_synchronized_output() {
+        let screen = screen_of(b"x");
+        let mut buf = Vec::new();
+        render(&mut buf, &screen, &Overlay::empty(), None).unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("\x1b[?2026h"), "frame must begin synchronized output");
+        assert!(s.contains("\x1b[?2026l"), "frame must end synchronized output");
     }
 
     #[test]

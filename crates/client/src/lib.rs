@@ -1,11 +1,11 @@
 //! Library surface of `rmosh-client`: the session loop, abstracted over a [`ClientTerminal`]
-//! so it can run either against the real crossterm/stdin terminal (the binary) or against a
-//! scripted mock (integration tests) — no real TTY required for the latter.
+//! so it can run either against the real terminal (the binary, via [`TerminaTerminal`]) or
+//! against a scripted mock (integration tests) — no real TTY required for the latter.
 //!
-//! Terminal *input* (typed bytes) and *resize* events arrive as channels the caller wires up;
-//! terminal *output* goes through [`ClientTerminal::render`]. The binary's `main` connects the
-//! real crossterm renderer + a raw-stdin reader + a `SIGWINCH` task; a test connects a
-//! capturing mock + a scripted input channel.
+//! Terminal *input* (typed bytes) and *resize* ticks arrive as channels the caller wires up;
+//! terminal *output* and *size* go through [`ClientTerminal`]. The binary's `main` connects the
+//! termina renderer + a raw-stdin reader + a `SIGWINCH` task; a test connects a capturing mock
+//! + a scripted input channel.
 
 mod render;
 
@@ -17,6 +17,8 @@ use rmosh_predict::{DisplayPreference, Overlay, PredictionEngine};
 use rmosh_ssp::{RecvOutcome, Transport, SHUTDOWN_SENTINEL};
 use rmosh_terminal::TerminalScreen;
 use rmosh_transport_iroh::{IrohChannel, MonoClock};
+use termina::escape::csi::{Csi, DecPrivateMode, DecPrivateModeCode, Mode};
+use termina::{PlatformTerminal, Terminal as _};
 use tokio::sync::mpsc;
 
 pub use render::render;
@@ -24,8 +26,8 @@ pub use render::render;
 /// The escape prefix (Ctrl-^); followed by '.' it disconnects the session.
 pub const ESCAPE_PREFIX: u8 = 0x1e;
 
-/// Where the client paints frames. The real binary writes to the terminal via crossterm; a
-/// test captures cells/text as data.
+/// Where the client paints frames and reads the window size. The real binary draws to the
+/// terminal via termina ([`TerminaTerminal`]); a test captures cells/text as data.
 pub trait ClientTerminal {
     fn render(
         &mut self,
@@ -33,37 +35,85 @@ pub trait ClientTerminal {
         overlay: &Overlay,
         status: Option<&str>,
     ) -> std::io::Result<()>;
+
+    /// The current window size as `(rows, cols)`.
+    fn size(&self) -> std::io::Result<(u16, u16)>;
 }
 
-/// The production terminal: paints the synced grid + prediction overlay via crossterm.
-pub struct CrosstermTerminal<W: Write> {
-    pub out: W,
+/// The production terminal: a termina `PlatformTerminal` put into raw mode + the alternate
+/// screen on construction, restored on drop. It paints the synced grid + prediction overlay.
+pub struct TerminaTerminal {
+    term: PlatformTerminal,
 }
 
-impl<W: Write> ClientTerminal for CrosstermTerminal<W> {
+impl TerminaTerminal {
+    /// Acquire the terminal, enter raw mode + the alternate screen, and hide the cursor.
+    pub fn enter() -> std::io::Result<Self> {
+        let mut term = PlatformTerminal::new()?;
+        term.enter_raw_mode()?;
+        write!(
+            term,
+            "{}{}",
+            Csi::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ClearAndEnableAlternateScreen
+            ))),
+            Csi::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ShowCursor
+            ))),
+        )?;
+        term.flush()?;
+        Ok(TerminaTerminal { term })
+    }
+}
+
+impl ClientTerminal for TerminaTerminal {
     fn render(
         &mut self,
         screen: &vt100::Screen,
         overlay: &Overlay,
         status: Option<&str>,
     ) -> std::io::Result<()> {
-        render::render(&mut self.out, screen, overlay, status)
+        render::render(&mut self.term, screen, overlay, status)
+    }
+
+    fn size(&self) -> std::io::Result<(u16, u16)> {
+        let d = self.term.get_dimensions()?;
+        Ok((d.rows, d.cols))
+    }
+}
+
+impl Drop for TerminaTerminal {
+    fn drop(&mut self) {
+        // Show the cursor and leave the alternate screen; the PlatformTerminal's own Drop
+        // restores cooked mode afterward.
+        let _ = write!(
+            self.term,
+            "{}{}",
+            Csi::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ShowCursor
+            ))),
+            Csi::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ClearAndEnableAlternateScreen
+            ))),
+        );
+        let _ = self.term.flush();
     }
 }
 
 /// Run a client session against `channel`, drawing through `term`.
 ///
 /// `input_rx` carries raw typed bytes (the caller must keep its sender alive for the session;
-/// when it closes, the session ends). `resize_rx` carries new `(rows, cols)` window sizes;
-/// keep its sender alive even if you never resize, so the loop doesn't spin on a closed channel.
-/// `initial_rows`/`initial_cols` seed the first resize sent to the server.
+/// when it closes, the session ends). `resize_rx` carries resize *ticks* — each one prompts the
+/// loop to re-read the current size from `term`; keep its sender alive even if you never resize,
+/// so the loop doesn't spin on a closed channel. `initial_rows`/`initial_cols` seed the first
+/// resize sent to the server (the caller reads them from `term.size()`).
 pub async fn run_client<T: ClientTerminal>(
     channel: IrohChannel,
     pref: DisplayPreference,
     initial_rows: u16,
     initial_cols: u16,
     mut input_rx: mpsc::Receiver<Vec<u8>>,
-    mut resize_rx: mpsc::Receiver<(u16, u16)>,
+    mut resize_rx: mpsc::Receiver<()>,
     mut term: T,
 ) -> anyhow::Result<()> {
     let clock = MonoClock::new();
@@ -145,10 +195,13 @@ pub async fn run_client<T: ClientTerminal>(
             }
 
             maybe = resize_rx.recv() => {
-                if let Some((rows, cols)) = maybe {
-                    transport.current_mut().push_resize(rows, cols);
-                    predictor.reset();
-                    dirty = true;
+                // A resize tick: read the fresh size from the terminal and propagate it.
+                if maybe.is_some() {
+                    if let Ok((rows, cols)) = term.size() {
+                        transport.current_mut().push_resize(rows, cols);
+                        predictor.reset();
+                        dirty = true;
+                    }
                 }
                 // A closed resize channel is fine; keep its sender alive to avoid spinning.
             }

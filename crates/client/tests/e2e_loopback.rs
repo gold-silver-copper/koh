@@ -34,6 +34,10 @@ impl ClientTerminal for MockTerminal {
         *self.latest.lock().unwrap() = screen.contents();
         Ok(())
     }
+
+    fn size(&self) -> std::io::Result<(u16, u16)> {
+        Ok((24, 80))
+    }
 }
 
 #[tokio::test]
@@ -69,7 +73,7 @@ async fn full_session_over_loopback_pty() {
 
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(64);
     // Keep the resize sender alive for the session (never resize here).
-    let (resize_tx, resize_rx) = mpsc::channel::<(u16, u16)>(8);
+    let (resize_tx, resize_rx) = mpsc::channel::<()>(8);
 
     let client_task = tokio::spawn(async move {
         let _ = run_client(

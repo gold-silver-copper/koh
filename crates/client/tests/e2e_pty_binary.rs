@@ -1,13 +1,13 @@
 //! Tier 1b: drive the **real `rmosh-client` binary** attached to an allocated PTY.
 //!
 //! This is the standard way to test a terminal program headlessly: open a pseudo-terminal,
-//! launch the client on the slave (so `isatty()` is true and raw mode + crossterm run for
+//! launch the client on the slave (so `isatty()` is true and raw mode + termina run for
 //! real), and drive the master side by writing scripted keystrokes and reading back the
 //! rendered frames. The server is an in-process loopback endpoint; the client connects with
 //! `--direct`, so the whole thing is hermetic — no relay, no second machine, no real TTY.
 //!
 //! Unlike the mock-terminal e2e, this exercises the actual binary: argument parsing, raw-mode
-//! lifecycle, the crossterm renderer, and stdin passthrough — the real terminal path.
+//! lifecycle, the termina renderer, and stdin passthrough — the real terminal path.
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};

@@ -2,7 +2,7 @@
 //!
 //! The client end of an rmosh session: connects to a server by endpoint id, captures local
 //! keystrokes (raw stdin passthrough — byte-perfect), synchronizes the remote screen over
-//! QUIC datagrams, speculatively echoes typing, and renders with crossterm. The session loop
+//! QUIC datagrams, speculatively echoes typing, and renders with termina. The session loop
 //! itself lives in the library ([`rmosh_client::run_client`]); this binary wires up the real
 //! terminal I/O. Press the escape prefix `Ctrl-^` then `.` to disconnect.
 
@@ -12,11 +12,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
-use crossterm::cursor::Show;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use rmosh_client::{run_client, CrosstermTerminal};
+use rmosh_client::{run_client, ClientTerminal, TerminaTerminal};
 use rmosh_predict::DisplayPreference;
 use rmosh_transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, format_endpoint_id,
@@ -78,24 +74,6 @@ fn default_key_file() -> PathBuf {
     directories::ProjectDirs::from("", "", "rmosh")
         .map(|d| d.config_dir().join("client.key"))
         .unwrap_or_else(|| PathBuf::from("rmosh-client.key"))
-}
-
-/// RAII guard that puts the terminal in raw mode + alternate screen and restores it on drop.
-struct TerminalGuard;
-
-impl TerminalGuard {
-    fn enter() -> std::io::Result<Self> {
-        enable_raw_mode()?;
-        crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
-        Ok(TerminalGuard)
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), Show, LeaveAlternateScreen);
-        let _ = disable_raw_mode();
-    }
 }
 
 #[tokio::main]
@@ -166,9 +144,9 @@ async fn main() -> anyhow::Result<()> {
 
     let channel = rmosh_transport_iroh::IrohChannel::new(conn);
 
-    // --- real terminal I/O wiring ---
-    let _guard = TerminalGuard::enter().context("entering raw mode")?;
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    // --- real terminal I/O wiring (termina: raw mode + alt screen, restored on drop) ---
+    let term = TerminaTerminal::enter().context("entering raw mode / alt screen")?;
+    let (rows, cols) = term.size().unwrap_or((24, 80));
 
     // Raw stdin reader (byte-perfect passthrough) on a dedicated blocking thread.
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -191,25 +169,20 @@ async fn main() -> anyhow::Result<()> {
         })
         .context("spawning stdin reader")?;
 
-    // SIGWINCH -> resize events. The sender is kept alive for the task's lifetime.
-    let (resize_tx, resize_rx) = mpsc::channel::<(u16, u16)>(8);
+    // SIGWINCH -> resize ticks (run_client re-reads term.size() on each). Sender kept alive.
+    let (resize_tx, resize_rx) = mpsc::channel::<()>(8);
     let mut sigwinch = signal(SignalKind::window_change()).context("installing SIGWINCH handler")?;
     tokio::spawn(async move {
         while sigwinch.recv().await.is_some() {
-            if let Ok((cols, rows)) = crossterm::terminal::size() {
-                if resize_tx.send((rows, cols)).await.is_err() {
-                    break;
-                }
+            if resize_tx.send(()).await.is_err() {
+                break;
             }
         }
     });
 
-    let term = CrosstermTerminal {
-        out: std::io::stdout(),
-    };
     let result = run_client(channel, args.predict.into(), rows, cols, input_rx, resize_rx, term).await;
+    // `term` is moved into run_client and dropped there, restoring the terminal.
 
-    drop(_guard); // restore the terminal before printing any error
     endpoint.close().await;
     result
 }

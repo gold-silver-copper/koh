@@ -38,10 +38,15 @@ pub const DEFAULT_MAX_DATAGRAM: usize = 1200;
 /// rmosh never interoperates with mosh.)
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Worst-case serialized overhead of a [`Fragment`] header (everything but `payload` bytes):
-/// `id` varint (≤10) + `index` varint (≤3) + `final_` bool (1) + `payload` length varint (≤5),
-/// rounded up for safety. Used to size payload chunks so a serialized `Fragment` never exceeds MTU.
-pub const FRAGMENT_HEADER_OVERHEAD: usize = 24;
+/// Exact serialized overhead of a [`Fragment`] header: an 8-byte big-endian `id` plus a 2-byte
+/// big-endian `(final << 15) | index` field. A serialized fragment is therefore *exactly*
+/// `FRAGMENT_HEADER_OVERHEAD + payload.len()` bytes, so the fragmenter packs each datagram up to
+/// the MTU with no wasted slack (a fixed framing, matching the reference — not an estimate).
+pub const FRAGMENT_HEADER_OVERHEAD: usize = 10;
+
+/// Maximum fragment index: the index occupies the low 15 bits of the header's 2-byte field (the
+/// top bit is the `final` flag), capping one instruction at 32768 fragments.
+pub const MAX_FRAGMENT_INDEX: u16 = 0x7fff;
 
 /// Errors produced while (de)serializing or reassembling wire structures.
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +57,10 @@ pub enum WireError {
     MtuTooSmall { mtu: usize, min: usize },
     #[error("protocol version mismatch: peer sent {peer}, we speak {ours}")]
     VersionMismatch { peer: u32, ours: u32 },
+    #[error("fragment too short: {len} bytes (need >= {min})")]
+    ShortFragment { len: usize, min: usize },
+    #[error("instruction needs {count} fragments, exceeds the {max}-fragment limit")]
+    TooManyFragments { count: usize, max: usize },
 }
 
 /// The unit of state synchronization. Produced by `ssp::Transport`, serialized, then
@@ -111,12 +120,12 @@ impl Instruction {
 /// keeps only the highest `id` it has seen, so a newer instruction's fragments supersede
 /// and discard a stale partial — this is the "drop superseded state" property at the
 /// framing layer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fragment {
     /// Identifies the serialized instruction this fragment belongs to. Monotonic; bumped
     /// only when the instruction *content* changes (so identical retransmits reuse fragments).
     pub id: u64,
-    /// 0-based index of this fragment within its instruction.
+    /// 0-based index of this fragment within its instruction (≤ [`MAX_FRAGMENT_INDEX`]).
     pub index: u16,
     /// True for the last fragment of the instruction.
     pub final_: bool,
@@ -125,14 +134,38 @@ pub struct Fragment {
 }
 
 impl Fragment {
-    /// Serialize this fragment to bytes ready for a datagram.
+    /// Serialize to datagram bytes: `id` (8 BE) ++ `(final << 15) | index` (2 BE) ++ `payload`.
+    /// Exactly `FRAGMENT_HEADER_OVERHEAD + payload.len()` bytes.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        Ok(postcard::to_allocvec(self)?)
+        let combined: u16 =
+            ((self.final_ as u16) << 15) | (self.index & MAX_FRAGMENT_INDEX);
+        let mut out = Vec::with_capacity(FRAGMENT_HEADER_OVERHEAD + self.payload.len());
+        out.extend_from_slice(&self.id.to_be_bytes());
+        out.extend_from_slice(&combined.to_be_bytes());
+        out.extend_from_slice(&self.payload);
+        Ok(out)
     }
 
-    /// Deserialize a fragment from datagram bytes.
+    /// Parse the fixed 10-byte header (inverse of [`encode`](Fragment::encode)).
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        Ok(postcard::from_bytes(bytes)?)
+        if bytes.len() < FRAGMENT_HEADER_OVERHEAD {
+            return Err(WireError::ShortFragment {
+                len: bytes.len(),
+                min: FRAGMENT_HEADER_OVERHEAD,
+            });
+        }
+        let mut id_bytes = [0u8; 8];
+        id_bytes.copy_from_slice(&bytes[0..8]);
+        let id = u64::from_be_bytes(id_bytes);
+        let mut combined_bytes = [0u8; 2];
+        combined_bytes.copy_from_slice(&bytes[8..10]);
+        let combined = u16::from_be_bytes(combined_bytes);
+        Ok(Fragment {
+            id,
+            index: combined & MAX_FRAGMENT_INDEX,
+            final_: combined & 0x8000 != 0,
+            payload: bytes[FRAGMENT_HEADER_OVERHEAD..].to_vec(),
+        })
     }
 }
 
@@ -195,6 +228,12 @@ impl Fragmenter {
             return Ok(fragments);
         }
         let total = serialized.len().div_ceil(chunk);
+        if total > MAX_FRAGMENT_INDEX as usize + 1 {
+            return Err(WireError::TooManyFragments {
+                count: total,
+                max: MAX_FRAGMENT_INDEX as usize + 1,
+            });
+        }
         for (i, piece) in serialized.chunks(chunk).enumerate() {
             fragments.push(Fragment {
                 id,
@@ -367,6 +406,38 @@ mod tests {
             }
         }
         assert_eq!(got.unwrap(), instr);
+    }
+
+    #[test]
+    fn fragment_header_is_exact_and_packs_to_mtu() {
+        assert_eq!(FRAGMENT_HEADER_OVERHEAD, 10);
+        // A single fragment encodes to exactly 10 + payload, and round-trips (incl. final flag).
+        let f = Fragment {
+            id: 0xdead_beef_cafe_babe,
+            index: 5,
+            final_: true,
+            payload: vec![7u8; 100],
+        };
+        let bytes = f.encode().unwrap();
+        assert_eq!(bytes.len(), FRAGMENT_HEADER_OVERHEAD + 100);
+        assert_eq!(Fragment::decode(&bytes).unwrap(), f);
+
+        // Every non-final fragment of a large instruction fills the MTU EXACTLY (no slack —
+        // the old estimated 24-byte overhead wasted ~14 bytes per datagram).
+        let mut fr = Fragmenter::new();
+        let frags = fr.fragment(&sample_instruction(5000), 200).unwrap();
+        assert!(frags.len() > 1);
+        for f in &frags[..frags.len() - 1] {
+            assert_eq!(f.encode().unwrap().len(), 200, "non-final fragments pack to exactly the MTU");
+        }
+    }
+
+    #[test]
+    fn decode_rejects_short_fragment() {
+        assert!(matches!(
+            Fragment::decode(&[0u8; 5]),
+            Err(WireError::ShortFragment { .. })
+        ));
     }
 
     #[test]

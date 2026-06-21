@@ -6,12 +6,16 @@ use rmosh_ssp::NEVER;
 use crate::{TerminalScreen, ECHO_TIMEOUT_MS};
 
 /// Captures window title / icon / bell from `vt100`'s callback stream (none are stored on
-/// `Screen` itself).
+/// `Screen` itself), and synthesizes the host-bound replies to terminal queries (DSR / device
+/// attributes / DECRQM) that `vt100` does not answer on its own.
 #[derive(Default)]
 struct Callbacks {
     title: String,
     icon: String,
     bell_count: u64,
+    /// Bytes the emulator must send back to the application (query answers). Drained into the
+    /// PTY input by the caller — never echoed onto the synced screen.
+    host_replies: Vec<u8>,
 }
 
 impl vt100::Callbacks for Callbacks {
@@ -23,6 +27,59 @@ impl vt100::Callbacks for Callbacks {
     }
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bell_count += 1;
+    }
+
+    /// Answer the terminal queries interactive apps (vim/htop/fzf/…) block on. vt100 routes
+    /// these unrecognized CSIs here; we generate the reply the real terminal would send.
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        // First parameter (empty/`ESC[c` => 0; explicit `ESC[0c` => 0; `ESC[6n` => 6).
+        let p0 = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+        match (i1, i2, c) {
+            // Device Status Report. cursor_position() is 0-indexed; the report is 1-indexed.
+            (None, _, 'n') => match p0 {
+                6 => {
+                    let (row, col) = screen.cursor_position();
+                    self.host_replies
+                        .extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+                }
+                5 => self.host_replies.extend_from_slice(b"\x1b[0n"), // "terminal OK"
+                _ => {}
+            },
+            // DECDSR (cursor position bracketed by `?`), used by some apps.
+            (Some(b'?'), _, 'n') if p0 == 6 => {
+                let (row, col) = screen.cursor_position();
+                self.host_replies
+                    .extend_from_slice(format!("\x1b[?{};{}R", row + 1, col + 1).as_bytes());
+            }
+            // Primary Device Attributes (`ESC[c` / `ESC[0c`): answer as a VT220 (matches mosh).
+            (None, _, 'c') => self.host_replies.extend_from_slice(b"\x1b[?62;1;6c"),
+            // Secondary Device Attributes (`ESC[>c`).
+            (Some(b'>'), _, 'c') => self.host_replies.extend_from_slice(b"\x1b[>1;10;0c"),
+            // DECRQM mode request (`ESC[?<n>$p`): report bracketed-paste accurately, others as
+            // "not recognized" (0) — an honest answer is safer than lying about a mode.
+            (Some(b'?'), Some(b'$'), 'p') => {
+                let status = match p0 {
+                    2004 => {
+                        if screen.bracketed_paste() {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    _ => 0u16,
+                };
+                self.host_replies
+                    .extend_from_slice(format!("\x1b[?{p0};{status}$y").as_bytes());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -50,6 +107,13 @@ impl ServerTerminal {
     /// Feed a chunk of the child shell's output into the screen model.
     pub fn process(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
+    }
+
+    /// Take and clear any host-bound replies (DSR/DA/DECRQM answers) produced while processing
+    /// PTY output. The caller MUST write these back to the PTY input so the querying app sees
+    /// them; they are never part of the synced screen.
+    pub fn take_host_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.parser.callbacks_mut().host_replies)
     }
 
     /// Resize the emulated screen (after applying a client resize to the PTY).
@@ -138,6 +202,25 @@ impl ServerTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answers_cursor_position_report() {
+        let mut t = ServerTerminal::new(24, 80, 0);
+        t.process(b"\x1b[5;3H"); // move cursor to row 5, col 3 (1-indexed input)
+        t.process(b"\x1b[6n"); // DSR: report cursor position
+        assert_eq!(t.take_host_replies(), b"\x1b[5;3R"); // 1-indexed report
+        // Drained: a second take is empty.
+        assert!(t.take_host_replies().is_empty());
+    }
+
+    #[test]
+    fn answers_device_attributes() {
+        let mut t = ServerTerminal::new(24, 80, 0);
+        t.process(b"\x1b[c"); // primary DA
+        assert_eq!(t.take_host_replies(), b"\x1b[?62;1;6c");
+        t.process(b"\x1b[>c"); // secondary DA
+        assert_eq!(t.take_host_replies(), b"\x1b[>1;10;0c");
+    }
 
     #[test]
     fn echo_ack_debounces() {

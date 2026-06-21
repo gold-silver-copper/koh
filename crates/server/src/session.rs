@@ -70,7 +70,15 @@ async fn drain(handle: SharedSession, mut pty_rx: mpsc::Receiver<Vec<u8>>) {
     loop {
         match pty_rx.recv().await {
             Some(chunk) => {
-                handle.session.lock().await.emu.process(&chunk);
+                let mut s = handle.session.lock().await;
+                s.emu.process(&chunk);
+                // Answer any terminal queries the shell/app emitted (DSR/DA/DECRQM) by writing
+                // the replies straight back to the PTY — they are host I/O, not screen content.
+                let replies = s.emu.take_host_replies();
+                if !replies.is_empty() {
+                    let _ = s.pty.write_input(&replies);
+                }
+                drop(s);
                 handle.changed.notify_one();
             }
             None => {

@@ -403,7 +403,13 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
     fn send_to_receiver(&mut self, now: u64, old_num: u64, diff: Vec<u8>) -> Vec<Vec<u8>> {
         let back_num = self.sent_states.back().unwrap().num;
         let current_eq_back = self.current_state == self.sent_states.back().unwrap().state;
-        let mut new_num = if current_eq_back { back_num } else { back_num + 1 };
+        // saturating_add: once a shutdown sentinel state (num == u64::MAX) is the back, a
+        // `+ 1` would overflow (debug panic) before the sentinel override on the next line.
+        let mut new_num = if current_eq_back {
+            back_num
+        } else {
+            back_num.saturating_add(1)
+        };
         if self.shutdown_in_progress {
             new_num = SHUTDOWN_SENTINEL;
         }
@@ -425,13 +431,19 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
     /// Pure ack / keep-alive: advances `new_num`, stores the (unchanged) state, empty diff.
     fn send_empty_ack(&mut self, now: u64) -> Vec<Vec<u8>> {
         let back_num = self.sent_states.back().unwrap().num;
-        let new_num = if self.shutdown_in_progress {
-            SHUTDOWN_SENTINEL
-        } else {
-            back_num + 1
-        };
+        // saturating_add so an already-sentinel back never overflows; override for shutdown.
+        let mut new_num = back_num.saturating_add(1);
+        if self.shutdown_in_progress {
+            new_num = SHUTDOWN_SENTINEL;
+        }
         let old_num = self.assumed_receiver_num;
-        self.add_sent_state(now, new_num, self.current_state.clone());
+        if new_num == back_num {
+            // Repeat of an existing num (e.g. the shutdown sentinel every tick): bump the
+            // timestamp, don't push a duplicate-num state and churn `sent_states`.
+            self.sent_states.back_mut().unwrap().timestamp = now;
+        } else {
+            self.add_sent_state(now, new_num, self.current_state.clone());
+        }
         let out = self.send_in_fragments(old_num, new_num, Vec::new());
         self.next_ack_time = now + ACK_INTERVAL;
         self.next_send_time = NEVER;
@@ -677,5 +689,26 @@ mod tests {
         assert_eq!(t.last_heard(), 9000, "a duplicate keepalive must refresh last_heard");
         assert!(t.link_up_within(9100, 10_000));
         assert!(!t.link_up_within(20_000, 10_000));
+    }
+
+    /// Regression for P1d: a long shutdown must not overflow (`back_num + 1` on the sentinel)
+    /// nor push a fresh u64::MAX state every tick. Exactly one sentinel state should be resident.
+    #[test]
+    fn shutdown_dedups_sentinel_and_never_overflows() {
+        let mut t = Transport::<Abs, Abs>::new(0, 1200);
+        t.set_connected(true);
+        t.start_shutdown(0);
+        // Many ticks at the frame rate; pre-fix this churned sent_states with sentinels (and
+        // risked a `u64::MAX + 1` overflow). Reaching the end without panicking is half the test.
+        for i in 0..200u64 {
+            let _ = t.tick(i * 100);
+        }
+        assert_eq!(t.newest_sent_num(), SHUTDOWN_SENTINEL);
+        // base (num 0) + a single deduped sentinel — not a queue churned toward the 32 cap.
+        assert!(
+            t.sent_states.len() <= 2,
+            "shutdown sentinel must be deduped (bump ts), got {} sent_states",
+            t.sent_states.len()
+        );
     }
 }

@@ -10,17 +10,19 @@
 //! The headline behavior — instant echo of ordinary typing, with epoch-gated confirmation
 //! driven by the server's debounced **echo-ack** (not the raw network ack), adaptive
 //! engagement by SRTT, underline flagging, and emergent password/no-echo suppression — is
-//! faithful. To stay tractable it predicts in **overwrite** mode and only for ASCII
-//! printables, backspace, and CR/LF; control/escape/CSI bytes and non-ASCII (wide/emoji)
-//! input open a fresh epoch but make no concrete prediction (they fall back to the server's
-//! real echo). This never corrupts the display — a wrong or unconfirmed guess is reconciled
-//! away — it just doesn't *speed up* those rarer cases.
+//! faithful. It predicts ASCII printables, backspace, CR/LF, the left/right arrow keys, and
+//! whole UTF-8 graphemes (including double-width CJK/emoji, whose cursor advances by two
+//! cells). Control/escape/CSI bytes it doesn't model (and ambiguous edge-of-row cases) open a
+//! fresh epoch but make no concrete prediction — they fall back to the server's real echo.
+//! This never corrupts the display — a wrong or unconfirmed guess is reconciled away — it just
+//! doesn't *speed up* those rarer cases.
 //!
 //! The render-facing output is an [`Overlay`]: the cells to draw speculatively and the
 //! predicted cursor position. It is empty whenever the display policy says "don't show."
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use unicode_width::UnicodeWidthStr;
 use vt100::{Color, Screen};
 
 // --- constants (mosh terminaloverlay.h, milliseconds / counts) ---
@@ -150,6 +152,10 @@ pub struct PredictionEngine {
     last_byte: u8,
     /// Escape-sequence parser state across raw input bytes (for arrow-key prediction).
     esc: EscState,
+    /// Partial UTF-8 sequence accumulated across calls (input arrives one byte at a time), and
+    /// the total byte length its leading byte announced. Empty/0 when not mid-grapheme.
+    utf8_buf: Vec<u8>,
+    utf8_need: usize,
     /// false = insert mode (typing mid-line shifts the row right; backspace shifts left);
     /// true = overwrite mode (single-cell edits). Readline/shells default to insert.
     predict_overwrite: bool,
@@ -179,6 +185,8 @@ impl PredictionEngine {
             last_size: None,
             last_byte: 0,
             esc: EscState::Ground,
+            utf8_buf: Vec::new(),
+            utf8_need: 0,
             predict_overwrite: false,
         }
     }
@@ -275,6 +283,53 @@ impl PredictionEngine {
         }
     }
 
+    /// Predict a full UTF-8 grapheme `g` (already decoded from accumulated bytes). Places the
+    /// glyph at the cursor and advances by its display width — two cells for CJK/emoji, whose
+    /// continuation cell vt100 leaves empty (so we predict nothing there). Zero-width
+    /// (combining) graphemes and ones that would land on the wrap-ambiguous right edge fall back
+    /// to a tentative epoch. Overwrite-only (no insert-mode tail shift for wide chars — that
+    /// rarer case is left to the server's real echo).
+    fn predict_wide(&mut self, now: u64, g: &str, screen: &Screen) {
+        let w = g.width();
+        if w == 0 {
+            self.become_tentative(); // combining / zero-width: can't place safely
+            return;
+        }
+        let (_, cols) = screen.size();
+        self.init_cursor(screen);
+        let (row, col) = {
+            let c = self.cursor.as_ref().unwrap();
+            (c.row, c.col)
+        };
+        // Need the whole glyph to fit strictly before the last column (the edge is wrap-ambiguous).
+        if col + (w as u16) >= cols {
+            self.become_tentative();
+            self.init_cursor(screen);
+            return;
+        }
+        let exp = self.local_frame_sent + 1;
+        let epoch = self.prediction_epoch;
+        let original = cell_glyph(screen, row, col);
+        let (fg, bg) = glyph_style(screen, row, col);
+        self.cells.insert(
+            (row, col),
+            PredCell {
+                expiration_frame: exp,
+                tentative_epoch: epoch,
+                prediction_time: now,
+                glyph: g.to_string(),
+                fg,
+                bg,
+                original_contents: vec![original],
+                unknown: false,
+            },
+        );
+        if let Some(c) = self.cursor.as_mut() {
+            c.expiration_frame = exp;
+            c.col += w as u16;
+        }
+    }
+
     /// Record a typed byte and speculate its on-screen effect against `screen` (the latest
     /// authoritative frame). Validates existing predictions first (`cull`).
     pub fn new_user_byte(&mut self, now: u64, byte: u8, screen: &Screen) {
@@ -292,6 +347,30 @@ impl PredictionEngine {
         let (rows, cols) = screen.size();
         if rows == 0 || cols == 0 {
             return;
+        }
+
+        // Continue accumulating an in-progress UTF-8 grapheme; predict it once complete. Done
+        // before the escape handling because continuation bytes (0x80..=0xbf) must never be
+        // interpreted as escape finals.
+        if self.utf8_need > 0 {
+            if (0x80..=0xbf).contains(&byte) {
+                self.utf8_buf.push(byte);
+                if self.utf8_buf.len() >= self.utf8_need {
+                    let decoded = std::str::from_utf8(&self.utf8_buf).ok().map(str::to_string);
+                    self.utf8_buf.clear();
+                    self.utf8_need = 0;
+                    match decoded {
+                        Some(s) => self.predict_wide(now, &s, screen),
+                        None => self.become_tentative(),
+                    }
+                }
+                return;
+            }
+            // Malformed (continuation expected, got something else): abandon the partial grapheme
+            // and reprocess this byte from scratch below.
+            self.utf8_buf.clear();
+            self.utf8_need = 0;
+            self.become_tentative();
         }
 
         // Consume bytes that belong to a multi-byte escape sequence (so they're never mis-drawn
@@ -322,6 +401,23 @@ impl PredictionEngine {
         }
         if byte == 0x1b {
             self.esc = EscState::Esc;
+            return;
+        }
+
+        // A UTF-8 lead byte (>= 0x80) starts a 2-4 byte grapheme; buffer it and await the rest.
+        if byte >= 0x80 {
+            self.utf8_need = match byte {
+                0xc0..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf7 => 4,
+                _ => 0, // stray continuation or invalid lead -> nothing concrete to predict
+            };
+            if self.utf8_need >= 2 {
+                self.utf8_buf.clear();
+                self.utf8_buf.push(byte);
+            } else {
+                self.become_tentative();
+            }
             return;
         }
 
@@ -457,7 +553,7 @@ impl PredictionEngine {
                 self.newline_cr(screen);
             }
             _ => {
-                // Control / ESC / CSI / non-ASCII: open a new epoch, predict nothing concrete.
+                // Other C0 control bytes we don't model: open a new epoch, predict nothing.
                 self.become_tentative();
             }
         }
@@ -901,5 +997,32 @@ mod tests {
             e.new_user_byte(300, b, &echoed); // ESC O D
         }
         assert_eq!(e.overlay(&echoed).cursor(), Some((0, 0)));
+    }
+
+    #[test]
+    fn double_width_grapheme_predicted_and_advances_cursor_by_two() {
+        // A CJK character is double-width: its multi-byte UTF-8 arrives one byte at a time and is
+        // reassembled into a single predicted glyph, with the cursor stepping forward two cells
+        // (and no stray glyph in the continuation cell).
+        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+        e.set_local_frame_sent(1);
+        for &b in "世".as_bytes() {
+            e.new_user_byte(300, b, &echoed); // cursor seeds from the real screen at (0,1)
+        }
+        let ov = e.overlay(&echoed);
+        assert_eq!(
+            ov.cell(0, 1).map(|c| c.glyph.as_str()),
+            Some("世"),
+            "the wide grapheme is predicted at the cursor column"
+        );
+        assert!(
+            ov.cell(0, 2).is_none(),
+            "the continuation cell of a wide char carries no predicted glyph"
+        );
+        assert_eq!(
+            ov.cursor(),
+            Some((0, 3)),
+            "cursor advances by two cells for a double-width char"
+        );
     }
 }

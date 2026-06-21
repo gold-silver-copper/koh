@@ -19,11 +19,26 @@ use std::path::Path;
 use std::time::Duration;
 
 use bytes::Bytes;
-use iroh::endpoint::{presets, Connection, ConnectionError, PathId, VarInt};
+use iroh::endpoint::{
+    presets, Connection, ConnectionError, IdleTimeout, PathId, QuicTransportConfig, VarInt,
+};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use rmosh_wire::DEFAULT_MAX_DATAGRAM;
 
 pub mod auth;
+
+/// Keepalive + connection idle-timeout tuned so a brief client suspend doesn't drop the
+/// connection. iroh's defaults already PING every 5s and drop a *path* after 15s, but the
+/// *connection* idle timeout defaults to ~30s; we raise it to 60s. (Longer suspends are
+/// handled by reattaching to a detachable server session, not by holding one connection open.)
+fn rmosh_transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .keep_alive_interval(Duration::from_secs(5))
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(Duration::from_secs(60)).expect("60s fits in IdleTimeout"),
+        ))
+        .build()
+}
 
 /// The ALPN that identifies the rmosh protocol on the wire.
 pub const ALPN: &[u8] = b"rmosh/iroh/1";
@@ -87,7 +102,9 @@ pub fn format_endpoint_id(id: &EndpointId) -> String {
 /// bare endpoint id is dialable). `accept` registers our ALPN so the endpoint can accept
 /// incoming connections (server side).
 pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
-    let mut builder = Endpoint::builder(presets::N0).secret_key(secret);
+    let mut builder = Endpoint::builder(presets::N0)
+        .secret_key(secret)
+        .transport_config(rmosh_transport_config());
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
@@ -101,7 +118,9 @@ pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, 
 /// [`EndpointAddr`] (id + direct socket address), e.g. via [`loopback_addr`]. It avoids any
 /// dependency on n0's public relay/DNS, so it is fully hermetic.
 pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
-    let mut builder = Endpoint::builder(presets::Minimal).secret_key(secret);
+    let mut builder = Endpoint::builder(presets::Minimal)
+        .secret_key(secret)
+        .transport_config(rmosh_transport_config());
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
@@ -146,7 +165,8 @@ pub async fn bind_endpoint_with_relay(
 ) -> Result<Endpoint, SetupError> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
-        .relay_mode(RelayMode::custom([relay]));
+        .relay_mode(RelayMode::custom([relay]))
+        .transport_config(rmosh_transport_config());
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }

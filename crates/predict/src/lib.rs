@@ -47,11 +47,16 @@ pub enum DisplayPreference {
 /// A speculative cell for the renderer to draw on top of the authoritative grid.
 #[derive(Clone, Debug)]
 pub struct PredictedCell {
+    /// The predicted glyph. **Empty when [`unknown`](PredictedCell::unknown)** — the renderer
+    /// must then only hint (underline the existing real cell), never overwrite its content.
     pub glyph: String,
     pub fg: Color,
     pub bg: Color,
     /// Whether to underline it (mosh's "flagging" on high-latency links).
     pub underline: bool,
+    /// "Something changed here but we don't know what" (e.g. content shifted in from off-screen
+    /// by an insert/backspace). Rendered as an underline-only hint, never a guessed glyph.
+    pub unknown: bool,
 }
 
 /// The render-facing snapshot of current predictions.
@@ -89,8 +94,11 @@ struct PredCell {
     glyph: String,
     fg: Color,
     bg: Color,
-    /// What was there before, so an unchanged cell grades "no credit" (can't falsely confirm).
-    original: String,
+    /// History of prior contents at this cell so a rewrite that lands back on an earlier value
+    /// grades "no credit" (can't falsely confirm an epoch).
+    original_contents: Vec<String>,
+    /// "Changed here, not sure what" — never drawn as a glyph; underline-only hint.
+    unknown: bool,
 }
 
 #[derive(Clone)]
@@ -128,6 +136,9 @@ pub struct PredictionEngine {
     last_quick_confirmation: u64,
     last_size: Option<(u16, u16)>,
     last_byte: u8,
+    /// false = insert mode (typing mid-line shifts the row right; backspace shifts left);
+    /// true = overwrite mode (single-cell edits). Readline/shells default to insert.
+    predict_overwrite: bool,
 }
 
 impl PredictionEngine {
@@ -153,6 +164,18 @@ impl PredictionEngine {
             last_quick_confirmation: 0,
             last_size: None,
             last_byte: 0,
+            predict_overwrite: false,
+        }
+    }
+
+    /// Read the predicted-or-real glyph + style + unknown-ness at a cell — the source content a
+    /// row-shift copies from. Prefers an active prediction over the authoritative screen.
+    fn pred_or_real_glyph(&self, screen: &Screen, row: u16, col: u16) -> (String, Color, Color, bool) {
+        if let Some(p) = self.cells.get(&(row, col)) {
+            (p.glyph.clone(), p.fg, p.bg, p.unknown)
+        } else {
+            let (fg, bg) = glyph_style(screen, row, col);
+            (cell_glyph(screen, row, col), fg, bg, false)
         }
     }
 
@@ -251,18 +274,45 @@ impl PredictionEngine {
                     let c = self.cursor.as_ref().unwrap();
                     (c.row, c.col)
                 };
+                let exp = self.local_frame_sent + 1;
+                let epoch = self.prediction_epoch;
+                // Insert mode: shift the row right (cols-1 down to col+1) so the tail moves over
+                // to make room — matching what a readline-style line editor will render. Iterate
+                // right-to-left so each cell reads its left neighbor's pre-shift content.
+                if !self.predict_overwrite {
+                    for i in ((col + 1)..cols).rev() {
+                        let (g, fg, bg, src_unknown) = self.pred_or_real_glyph(screen, row, i - 1);
+                        let original = cell_glyph(screen, row, i);
+                        // The rightmost cell takes content pushed off-screen -> unknown.
+                        let unknown = i == cols - 1 || src_unknown;
+                        self.cells.insert(
+                            (row, i),
+                            PredCell {
+                                expiration_frame: exp,
+                                tentative_epoch: epoch,
+                                prediction_time: now,
+                                glyph: if unknown { String::new() } else { g },
+                                fg,
+                                bg,
+                                original_contents: vec![original],
+                                unknown,
+                            },
+                        );
+                    }
+                }
                 let original = cell_glyph(screen, row, col);
                 let (fg, bg) = glyph_style(screen, row, col);
                 self.cells.insert(
                     (row, col),
                     PredCell {
-                        expiration_frame: self.local_frame_sent + 1,
-                        tentative_epoch: self.prediction_epoch,
+                        expiration_frame: exp,
+                        tentative_epoch: epoch,
                         prediction_time: now,
                         glyph: (byte as char).to_string(),
                         fg,
                         bg,
-                        original,
+                        original_contents: vec![original],
+                        unknown: false,
                     },
                 );
                 if let Some(c) = self.cursor.as_mut() {
@@ -276,7 +326,7 @@ impl PredictionEngine {
                 }
             }
             0x7f | 0x08 => {
-                // Backspace (overwrite/erase mode): step back and blank the cell.
+                // Backspace: step the cursor back one column.
                 self.init_cursor(screen);
                 let (row, col, do_pred) = {
                     let c = self.cursor.as_mut().unwrap();
@@ -289,19 +339,51 @@ impl PredictionEngine {
                     }
                 };
                 if do_pred {
-                    let original = cell_glyph(screen, row, col);
-                    self.cells.insert(
-                        (row, col),
-                        PredCell {
-                            expiration_frame: self.local_frame_sent + 1,
-                            tentative_epoch: self.prediction_epoch,
-                            prediction_time: now,
-                            glyph: " ".to_string(),
-                            fg: Color::Default,
-                            bg: Color::Default,
-                            original,
-                        },
-                    );
+                    let exp = self.local_frame_sent + 1;
+                    let epoch = self.prediction_epoch;
+                    if self.predict_overwrite {
+                        // Overwrite mode: just blank the cell at the new cursor position.
+                        let original = cell_glyph(screen, row, col);
+                        self.cells.insert(
+                            (row, col),
+                            PredCell {
+                                expiration_frame: exp,
+                                tentative_epoch: epoch,
+                                prediction_time: now,
+                                glyph: " ".to_string(),
+                                fg: Color::Default,
+                                bg: Color::Default,
+                                original_contents: vec![original],
+                                unknown: false,
+                            },
+                        );
+                    } else {
+                        // Insert mode: shift the row left from col to the right edge; the far
+                        // right column gains whatever was off-screen -> unknown (underline hint,
+                        // never a guessed glyph). Left-to-right so each cell reads its unshifted
+                        // right neighbor.
+                        for i in col..cols {
+                            let original = cell_glyph(screen, row, i);
+                            let (g, fg, bg, unknown) = if i + 1 < cols {
+                                self.pred_or_real_glyph(screen, row, i + 1)
+                            } else {
+                                (String::new(), Color::Default, Color::Default, true)
+                            };
+                            self.cells.insert(
+                                (row, i),
+                                PredCell {
+                                    expiration_frame: exp,
+                                    tentative_epoch: epoch,
+                                    prediction_time: now,
+                                    glyph: if unknown { String::new() } else { g },
+                                    fg,
+                                    bg,
+                                    original_contents: vec![original],
+                                    unknown,
+                                },
+                            );
+                        }
+                    }
                 }
             }
             0x0d | 0x0a => {
@@ -433,7 +515,7 @@ impl PredictionEngine {
 
     /// Build the render overlay for the current frame, honoring the display policy and epoch
     /// gating. Empty when nothing should be shown.
-    pub fn overlay(&self, _screen: &Screen) -> Overlay {
+    pub fn overlay(&self, screen: &Screen) -> Overlay {
         let show = match self.pref {
             DisplayPreference::Never => false,
             DisplayPreference::Always => true,
@@ -442,10 +524,29 @@ impl PredictionEngine {
         if !show {
             return Overlay::empty();
         }
+        let (_, cols) = screen.size();
         let mut ov = Overlay::empty();
         for (&(row, col), cell) in self.cells.iter() {
             if self.tentative(cell.tentative_epoch) {
                 continue; // hidden until its epoch is confirmed
+            }
+            if cell.unknown {
+                // "Something changed here, not sure what": only hint with an underline (and
+                // only when flagging, and not in the always-ambiguous last column). Never push
+                // a glyph — the renderer underlines the real cell instead of overwriting it.
+                if self.flagging && col != cols.saturating_sub(1) {
+                    ov.cells.insert(
+                        (row, col),
+                        PredictedCell {
+                            glyph: String::new(),
+                            fg: Color::Default,
+                            bg: Color::Default,
+                            underline: true,
+                            unknown: true,
+                        },
+                    );
+                }
+                continue;
             }
             ov.cells.insert(
                 (row, col),
@@ -454,6 +555,7 @@ impl PredictionEngine {
                     fg: cell.fg,
                     bg: cell.bg,
                     underline: self.flagging,
+                    unknown: false,
                 },
             );
         }
@@ -512,13 +614,17 @@ fn cell_validity(
     if late_acked < cell.expiration_frame {
         return Validity::Pending;
     }
+    if cell.unknown {
+        // We never predicted a concrete glyph here, so it can never *confirm* an epoch.
+        return Validity::CorrectNoCredit;
+    }
     if is_blank(&cell.glyph) {
         return Validity::CorrectNoCredit; // too easy to falsely match
     }
     let actual = cell_glyph(screen, row, col);
     if actual == cell.glyph {
-        if actual == cell.original {
-            Validity::CorrectNoCredit // it already looked like this; no credit
+        if cell.original_contents.iter().any(|o| o == &actual) {
+            Validity::CorrectNoCredit // it already looked like this earlier; no credit
         } else {
             Validity::Correct
         }
@@ -647,5 +753,60 @@ mod tests {
         let screen = screen_of(b"");
         e.new_user_byte(100, b'x', &screen);
         assert!(e.overlay(&screen).is_empty());
+    }
+
+    #[test]
+    fn insert_mode_shifts_row_right() {
+        // Screen "ab" with the cursor on 'b' (col 1). Typing 'X' should INSERT before 'b',
+        // shifting the tail right — not overwrite 'b'. (Inspect predicted cells directly; the
+        // epoch gate hides them from overlay() until confirmed, but the shift populates cells.)
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.set_local_frame_sent(0);
+        let screen = screen_of(b"ab\x1b[1;2H"); // cursor -> row1 col2 = (0,1)
+        e.new_user_byte(0, b'X', &screen);
+        assert_eq!(e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()), Some("X"), "typed char at col");
+        assert_eq!(e.cells.get(&(0, 2)).map(|c| c.glyph.as_str()), Some("b"), "tail shifted right");
+    }
+
+    #[test]
+    fn insert_mode_backspace_shifts_left_with_unknown_right_edge() {
+        // Screen "abc" cursor on 'c' (col 2). Backspace deletes 'b': 'c' shifts left to col 1,
+        // and the far-right column becomes unknown (content scrolled in from off-screen).
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.set_local_frame_sent(0);
+        let screen = screen_of(b"abc\x1b[1;3H"); // cursor -> (0,2)
+        e.new_user_byte(0, 0x7f, &screen); // backspace
+        let (_, cols) = screen.size();
+        assert_eq!(e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()), Some("c"), "tail shifted left");
+        assert!(
+            e.cells.get(&(0, cols - 1)).map(|c| c.unknown).unwrap_or(false),
+            "right edge is marked unknown after a mid-line backspace"
+        );
+    }
+
+    #[test]
+    fn unknown_cell_overlay_is_underline_hint_only() {
+        // An unknown cell, when flagging, renders as an underline-only hint: empty glyph (so the
+        // renderer underlines the real cell instead of overwriting it), unknown = true.
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.flagging = true;
+        e.confirmed_epoch = 5; // un-gate the cell below (tentative_epoch 1 <= 5)
+        e.cells.insert(
+            (0, 1),
+            PredCell {
+                expiration_frame: 0,
+                tentative_epoch: 1,
+                prediction_time: 0,
+                glyph: String::new(),
+                fg: Color::Default,
+                bg: Color::Default,
+                original_contents: Vec::new(),
+                unknown: true,
+            },
+        );
+        let screen = screen_of(b"");
+        let ov = e.overlay(&screen);
+        let c = ov.cell(0, 1).expect("unknown hint should be present");
+        assert!(c.unknown && c.underline && c.glyph.is_empty());
     }
 }

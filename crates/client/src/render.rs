@@ -85,11 +85,14 @@ pub fn render(
                     continue;
                 }
             }
-            // A prediction, if any, wins on glyph/underline for this cell.
+            // A prediction wins on glyph/underline for this cell — EXCEPT an "unknown" cell,
+            // which only hints: it underlines the real cell rather than overwriting its glyph.
             let pred = overlay.cell(row, col);
+            let concrete = pred.filter(|p| !p.unknown); // prediction carrying a real glyph
+            let hint_underline = pred.is_some_and(|p| p.unknown && p.underline);
 
-            let style = match (&pred, cell) {
-                (Some(p), _) => Style {
+            let style = if let Some(p) = concrete {
+                Style {
                     fg: p.fg,
                     bg: p.bg,
                     bold: false,
@@ -98,25 +101,27 @@ pub fn render(
                     // mosh flags predictions with underline on high-latency links.
                     underline: p.underline,
                     inverse: false,
-                },
-                (None, Some(c)) => Style {
+                }
+            } else if let Some(c) = cell {
+                Style {
                     fg: c.fgcolor(),
                     bg: c.bgcolor(),
                     bold: c.bold(),
                     dim: c.dim(),
                     italic: c.italic(),
-                    underline: c.underline(),
+                    underline: c.underline() || hint_underline,
                     inverse: c.inverse(),
-                },
-                (None, None) => Style {
+                }
+            } else {
+                Style {
                     fg: VtColor::Default,
                     bg: VtColor::Default,
                     bold: false,
                     dim: false,
                     italic: false,
-                    underline: false,
+                    underline: hint_underline,
                     inverse: false,
-                },
+                }
             };
 
             if cur_style != Some(style) {
@@ -124,10 +129,12 @@ pub fn render(
                 cur_style = Some(style);
             }
 
-            let glyph: String = match (&pred, cell) {
-                (Some(p), _) => p.glyph.clone(),
-                (None, Some(c)) if c.has_contents() => c.contents().to_string(),
-                _ => " ".to_string(),
+            let glyph: String = if let Some(p) = concrete {
+                p.glyph.clone()
+            } else if let Some(c) = cell.filter(|c| c.has_contents()) {
+                c.contents().to_string()
+            } else {
+                " ".to_string()
             };
             queue!(out, Print(if glyph.is_empty() { " ".into() } else { glyph }))?;
             col += 1;

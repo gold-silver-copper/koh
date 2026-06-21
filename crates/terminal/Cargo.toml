@@ -9,8 +9,6 @@ description = "rmosh TerminalScreen state (vt100-backed) with SSP diff/apply"
 rmosh-ssp.workspace = true
 serde.workspace = true
 vt100.workspace = true
-unicode-width.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

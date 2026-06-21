@@ -3066,8 +3066,6 @@ dependencies = [
  "proptest",
  "rmosh-ssp",
  "serde",
- "thiserror 2.0.18",
- "unicode-width",
  "vt100",
 ]
 

@@ -161,8 +161,9 @@ pub fn parse_relay_url(s: &str) -> Result<RelayUrl, SetupError> {
         .map_err(|e| SetupError::Other(anyhow::anyhow!("bad relay url: {e}")))
 }
 
-/// A datagram channel over a single iroh [`Connection`], plus a one-shot reliable
-/// uni-stream escape hatch for state too big to fragment comfortably.
+/// A datagram channel over a single iroh [`Connection`]. Oversized state is split by the
+/// [`rmosh_wire`] fragmenter across datagrams — never a reliable stream (which would
+/// reintroduce the head-of-line blocking the protocol exists to avoid).
 #[derive(Clone)]
 pub struct IrohChannel {
     conn: Connection,
@@ -221,22 +222,6 @@ impl IrohChannel {
             return Some(to_ms(p.rtt()));
         }
         self.conn.rtt(PathId::ZERO).map(to_ms)
-    }
-
-    /// Send a large blob over a one-shot reliable uni-stream (escape hatch for state too big
-    /// to want to fragment over datagrams). The default path fragments over datagrams; this
-    /// is kept for huge repaints.
-    pub async fn send_reliable(&self, data: &[u8]) -> anyhow::Result<()> {
-        let mut send = self.conn.open_uni().await?;
-        send.write_all(data).await?;
-        send.finish()?; // NOTE: noq's finish() is synchronous and returns Result.
-        Ok(())
-    }
-
-    /// Receive a blob from a peer's one-shot reliable uni-stream (pairs with [`send_reliable`](Self::send_reliable)).
-    pub async fn recv_reliable(&self, size_limit: usize) -> anyhow::Result<Vec<u8>> {
-        let mut recv = self.conn.accept_uni().await?;
-        Ok(recv.read_to_end(size_limit).await?)
     }
 
     /// Immediately close the connection with an application code + reason.

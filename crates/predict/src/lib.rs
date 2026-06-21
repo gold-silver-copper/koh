@@ -1025,4 +1025,34 @@ mod tests {
             "cursor advances by two cells for a double-width char"
         );
     }
+
+    #[test]
+    fn prediction_reassembles_multibyte_utf8_no_stray_byte() {
+        // mosh prediction-unicode regression: typing "glück" must predict 'ü', and "faĩl" 'ĩ' —
+        // NOT the low byte of the code point (mosh, being char/byte based, would briefly draw the
+        // low 8 bits: a raw 0xFC, or ')' for ĩ's 0x129 & 0xFF = 0x29, before the server corrected
+        // it). moshers2 reassembles the whole UTF-8 grapheme before predicting, so the predicted
+        // glyph is always the real character. (`)` is the meaningful char-level artifact; ü's raw
+        // 0xFC can't even exist in a Rust `String`, so reassembly itself is the guarantee.)
+        for (word, accent) in [("glück", "ü"), ("faĩl", "ĩ")] {
+            let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+            e.set_local_frame_sent(1);
+            for &b in word.as_bytes() {
+                e.new_user_byte(300, b, &echoed);
+            }
+            let ov = e.overlay(&echoed);
+            // The first typed char lands at col 1 (cursor seeded from the echoed "x"); the accent
+            // is the 3rd char, so column 3.
+            assert_eq!(
+                ov.cell(0, 3).map(|c| c.glyph.as_str()),
+                Some(accent),
+                "{word}: accented char must be predicted as the real grapheme"
+            );
+            for col in 0..80u16 {
+                if let Some(cell) = ov.cell(0, col) {
+                    assert_ne!(cell.glyph, ")", "{word}: ĩ must not collapse to its low byte ')'");
+                }
+            }
+        }
+    }
 }

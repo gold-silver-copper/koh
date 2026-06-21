@@ -1,0 +1,16 @@
+[package]
+name = "rmosh-predict"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rmosh prediction / local-echo engine (overlays, epochs, adaptive engage)"
+
+[dependencies]
+rmosh-terminal.workspace = true
+rmosh-input.workspace = true
+vt100.workspace = true
+unicode-width.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

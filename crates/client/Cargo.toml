@@ -1,0 +1,28 @@
+[package]
+name = "rmosh-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rmosh client: input + Transport<Input,Screen> + predictor + crossterm render"
+
+[[bin]]
+name = "rmosh-client"
+path = "src/main.rs"
+
+[dependencies]
+rmosh-wire.workspace = true
+rmosh-ssp.workspace = true
+rmosh-terminal.workspace = true
+rmosh-input.workspace = true
+rmosh-predict.workspace = true
+rmosh-transport-iroh.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+data-encoding.workspace = true
+directories.workspace = true
+vt100.workspace = true

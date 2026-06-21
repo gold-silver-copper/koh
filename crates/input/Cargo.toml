@@ -1,0 +1,14 @@
+[package]
+name = "rmosh-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rmosh UserInput state: keystrokes + resize as an SSP-synchronized object"
+
+[dependencies]
+rmosh-ssp.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

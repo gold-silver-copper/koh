@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wire",
+    "crates/ssp",
+    "crates/terminal",
+    "crates/input",
+    "crates/predict",
+    "crates/transport-iroh",
+    "crates/pty",
+    "crates/server",
+    "crates/client",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["rmosh authors"]
+repository = "https://example.invalid/rmosh"
+description = "mosh (mobile shell) reimplemented in Rust over iroh p2p QUIC"
+
+[workspace.dependencies]
+# --- internal crates ---
+rmosh-wire = { path = "crates/wire" }
+rmosh-ssp = { path = "crates/ssp" }
+rmosh-terminal = { path = "crates/terminal" }
+rmosh-input = { path = "crates/input" }
+rmosh-predict = { path = "crates/predict" }
+rmosh-transport-iroh = { path = "crates/transport-iroh" }
+rmosh-pty = { path = "crates/pty" }
+
+# --- transport (pinned: iroh API churns; see README) ---
+# iroh 1.0 brings its own QUIC backend (noq, a quinn fork); we never depend on quinn directly.
+iroh = "=1.0.0"
+
+# --- terminal / pty / tui ---
+vt100 = "=0.16.2"
+portable-pty = "=0.9.0"
+crossterm = "=0.29.0"
+unicode-width = "0.2"
+
+# --- serialization ---
+postcard = { version = "=1.1.3", features = ["use-std"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+bytes = "1"
+
+# --- async / runtime ---
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+n0-future = "0.3"
+futures-lite = "2"
+
+# --- utility ---
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.8"
+data-encoding = "2"
+directories = "5"
+
+# --- dev/test ---
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

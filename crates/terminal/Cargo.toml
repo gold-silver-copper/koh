@@ -1,0 +1,16 @@
+[package]
+name = "rmosh-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rmosh TerminalScreen state (vt100-backed) with SSP diff/apply"
+
+[dependencies]
+rmosh-ssp.workspace = true
+serde.workspace = true
+vt100.workspace = true
+unicode-width.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

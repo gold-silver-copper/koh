@@ -1,0 +1,19 @@
+[package]
+name = "rmosh-transport-iroh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rmosh iroh endpoint setup, dial-by-endpoint-id, datagram channel, RTT readout"
+
+[dependencies]
+rmosh-wire.workspace = true
+# All QUIC types (Connection, SendDatagramError, PathId, …) come from iroh::endpoint::*,
+# which re-exports iroh's transport backend (noq, a quinn fork). We do NOT depend on quinn.
+iroh.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+data-encoding.workspace = true
+rand.workspace = true

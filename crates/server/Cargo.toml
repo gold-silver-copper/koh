@@ -1,0 +1,27 @@
+[package]
+name = "rmosh-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rmosh server: PTY + terminal emulator + Transport<Screen,Input> over iroh"
+
+[[bin]]
+name = "rmosh-server"
+path = "src/main.rs"
+
+[dependencies]
+rmosh-wire.workspace = true
+rmosh-ssp.workspace = true
+rmosh-terminal.workspace = true
+rmosh-input.workspace = true
+rmosh-transport-iroh.workspace = true
+rmosh-pty.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+data-encoding.workspace = true
+directories.workspace = true
+rand.workspace = true

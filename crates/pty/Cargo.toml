@@ -1,0 +1,13 @@
+[package]
+name = "rmosh-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rmosh PTY allocation, shell spawn, SIGWINCH/resize, child reaping"
+
+[dependencies]
+portable-pty.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true

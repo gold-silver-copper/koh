@@ -340,4 +340,170 @@ mod tests {
         assert_eq!(c.exit_code(), Some(42));
         assert_ne!(base, c, "a state carrying an exit code differs from one without");
     }
+
+    // --- Ported mosh terminal-emulation / unicode regression tests, recast as SSP round-trip
+    // tests: feed the byte sequence from the corresponding mosh test to the server emulator, ship
+    // the snapshot through diff/apply onto a fresh client, and assert the client reconstructs the
+    // screen EXACTLY (moshers2's verification guarantee) plus the semantic outcome mosh checked.
+    // mosh source: src/tests/emulation-*.test, unicode-*.test. ---
+
+    /// Process `bytes`, ship server→client via diff/apply, assert exact reconstruction, and
+    /// return the reconstructed client screen for semantic assertions.
+    fn roundtrip(rows: u16, cols: u16, bytes: &[u8]) -> TerminalScreen {
+        let mut emu = ServerTerminal::new(rows, cols, 0);
+        emu.process(bytes);
+        let target = emu.snapshot();
+        let base = TerminalScreen::default();
+        let diff = target.diff_from(&base);
+        let mut client = base.clone();
+        client.apply(&diff);
+        assert_eq!(client, target, "client must reconstruct the server screen exactly");
+        client
+    }
+
+    /// Trimmed text of one screen row (blank cells as spaces), for line-level assertions.
+    fn row_text(s: &vt100::Screen, row: u16) -> String {
+        let (_, cols) = s.size();
+        (0..cols)
+            .map(|c| match s.cell(row, c).map(|x| x.contents()) {
+                Some(g) if !g.is_empty() => g.to_string(),
+                _ => " ".to_string(),
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn attributes_survive_roundtrip() {
+        // mosh emulation-attributes{,-16color,-256color8,-256color248,-truecolor}: SGR
+        // attributes and colors must reconstruct on the client.
+        let bytes = b"\x1b[1mB\x1b[m\x1b[4mU\x1b[m\x1b[7mR\x1b[m\x1b[3mI\x1b[m\
+                      \x1b[31mC\x1b[m\x1b[38;5;208mP\x1b[m\x1b[38;2;10;20;30mT\x1b[m";
+        let c = roundtrip(24, 80, bytes);
+        let s = c.screen();
+        assert!(s.cell(0, 0).unwrap().bold(), "bold");
+        assert!(s.cell(0, 1).unwrap().underline(), "underline");
+        assert!(s.cell(0, 2).unwrap().inverse(), "inverse");
+        assert!(s.cell(0, 3).unwrap().italic(), "italic");
+        assert_eq!(s.cell(0, 4).unwrap().fgcolor(), vt100::Color::Idx(1), "16-color red");
+        assert_eq!(s.cell(0, 5).unwrap().fgcolor(), vt100::Color::Idx(208), "256-color");
+        assert_eq!(s.cell(0, 6).unwrap().fgcolor(), vt100::Color::Rgb(10, 20, 30), "truecolor");
+    }
+
+    #[test]
+    fn cursor_motion_roundtrip() {
+        // mosh emulation-cursor-motion: absolute positioning (CSI row;colH) places glyphs, which
+        // must reconstruct on the client.
+        let bytes = b"\x1b[H\x1b[J\x1b[1;1HA\x1b[1;10HB\x1b[4;1HC\x1b[24;1Hdone";
+        let c = roundtrip(24, 80, bytes);
+        let s = c.screen();
+        assert_eq!(s.cell(0, 0).unwrap().contents(), "A");
+        assert_eq!(s.cell(0, 9).unwrap().contents(), "B");
+        assert_eq!(s.cell(3, 0).unwrap().contents(), "C");
+        assert_eq!(row_text(s, 23), "done");
+    }
+
+    #[test]
+    fn scroll_up_down_roundtrip() {
+        // mosh emulation-scroll: SU (CSI N S) then SD (CSI N T) shift the screen; the result
+        // must survive the round-trip. 24 numbered rows, scroll up 4, then down 2.
+        let mut bytes = Vec::from(&b"\x1b[H\x1b[J"[..]);
+        for i in 1..=24 {
+            bytes.extend_from_slice(format!("\x1b[{i};1Hline{i}").as_bytes());
+        }
+        bytes.extend_from_slice(b"\x1b[4S\x1b[2T");
+        let c = roundtrip(24, 80, &bytes);
+        let s = c.screen();
+        assert_eq!(row_text(s, 0), "", "two blank rows pushed in at the top after SD 2");
+        assert_eq!(row_text(s, 2), "line5", "line5 reached the top after SU 4, then down 2");
+        assert_eq!(row_text(s, 21), "line24", "last line still present");
+    }
+
+    #[test]
+    fn insert_delete_lines_roundtrip_no_panic() {
+        // mosh emulation-multiline-scroll: IL (CSI N L) / DL (CSI N M) with in- and out-of-range
+        // counts must not panic and must round-trip exactly.
+        let mut bytes = Vec::from(&b"\x1b[H\x1b[J"[..]);
+        for i in 1..=24 {
+            bytes.extend_from_slice(format!("\x1b[{i};1Hrow{i}").as_bytes());
+        }
+        for n in [0u32, 1, 2, 22, 26] {
+            bytes.extend_from_slice(format!("\x1b[3;1H\x1b[{n}L").as_bytes());
+            bytes.extend_from_slice(format!("\x1b[3;1H\x1b[{n}M").as_bytes());
+        }
+        let _ = roundtrip(24, 80, &bytes); // assertion: no panic + exact reconstruction
+    }
+
+    #[test]
+    fn back_and_forward_tab_unsupported_but_roundtrip_clean() {
+        // mosh emulation-back-tab: in mosh's hand-written emulator, CBT (CSI Z) / CHT (CSI I)
+        // move between tab stops. The `vt100` crate moshers2 delegates to does NOT implement
+        // them, so they are no-ops (a known, minor divergence from mosh). What we DO guarantee is
+        // that the unhandled sequences round-trip identically server↔client and corrupt nothing.
+        // If vt100 ever gains CBT/CHT, this test flips and should become the real mosh assertion
+        // ("hello, world" / a forward-tabbed "ab      tab").
+        let c = roundtrip(24, 80, b"hello, wurld\x1b[Zo");
+        assert_eq!(row_text(c.screen(), 0), "hello, wurldo", "CBT currently a no-op in vt100");
+        let c2 = roundtrip(24, 80, b"ab\x1b[Itab");
+        assert_eq!(row_text(c2.screen(), 0), "abtab", "CHT currently a no-op in vt100");
+    }
+
+    #[test]
+    fn column_80_no_premature_wrap_roundtrip() {
+        // mosh emulation-80th-column: filling exactly to the last column leaves the cursor in the
+        // deferred-wrap state; a following CRLF must not spill an extra blank wrapped line.
+        let mut bytes = Vec::from(&b"\x1b[H\x1b[J"[..]);
+        bytes.resize(bytes.len() + 80, b'E'); // 80 'E's, filling the row exactly
+        bytes.extend_from_slice(b"\r\nM");
+        let c = roundtrip(24, 80, &bytes);
+        let s = c.screen();
+        assert_eq!(row_text(s, 0), "E".repeat(80), "80 chars fill row 0");
+        assert_eq!(s.cell(1, 0).unwrap().contents(), "M", "M lands on row 1, no spurious wrap row");
+    }
+
+    #[test]
+    fn wrap_across_incremental_frames() {
+        // mosh emulation-wrap-across-frames: text filled to column 80 on frame N, then wrapped on
+        // frame N+1, broke mosh's round-trip verification (the wrap flag lived on the Cell). It
+        // must reconstruct across an INCREMENTAL diff (the persistent-parser path), not a repaint.
+        let mut emu = ServerTerminal::new(24, 80, 0);
+        emu.process(b"\x1b[H\x1b[J");
+        emu.process(&[b'a'; 80]); // frame N: fill to col 80 -> deferred-wrap state
+        let frame_n = emu.snapshot();
+        let mut client = TerminalScreen::default();
+        client.apply(&frame_n.diff_from(&TerminalScreen::default()));
+        assert_eq!(client, frame_n);
+
+        emu.process(b"b"); // frame N+1: one more char forces the wrap to row 1
+        let frame_n1 = emu.snapshot();
+        let diff = frame_n1.diff_from(&frame_n);
+        assert!(diff.resize.is_none(), "incremental path, not a full repaint");
+        client.apply(&diff);
+        assert_eq!(client, frame_n1, "wrap across frames must reconstruct incrementally");
+        assert_eq!(client.screen().cell(1, 0).unwrap().contents(), "b", "wrapped char on row 1");
+    }
+
+    #[test]
+    fn combining_mark_after_erase_does_not_panic() {
+        // mosh unicode-combine-fallback-assert: a combining mark applied right after erasing the
+        // cell it would attach to must not panic (mosh hit an internal assertion here).
+        let _ = roundtrip(24, 80, b"0\x1b[1J\xcc\xb4");
+    }
+
+    #[test]
+    fn combining_mark_on_blank_line_roundtrip() {
+        // mosh unicode-later-combining: a combining mark printed on an otherwise-empty line gets
+        // a base glyph and round-trips without dropping surrounding text.
+        let c = roundtrip(24, 80, b"abc\n\xcc\x82\ndef\n");
+        let contents = c.screen().contents();
+        assert!(contents.contains("abc") && contents.contains("def"));
+    }
+
+    #[test]
+    fn latin1_supplement_roundtrip() {
+        // mosh emulation-ascii-iso-8859: ISO-8859-1 supplement characters render and round-trip.
+        let c = roundtrip(24, 80, "àáâãäåæçèéêëìíîïñòóôõöøùúûüýþÿ".as_bytes());
+        assert!(c.screen().contents().contains("àáâãä"));
+    }
 }

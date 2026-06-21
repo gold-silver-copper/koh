@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use rmosh_wire::{Fragment, FragmentAssembly, Fragmenter, Instruction};
+use rmosh_wire::{Fragment, FragmentAssembly, Fragmenter, Instruction, PROTOCOL_VERSION};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tracing::trace;
@@ -452,6 +452,7 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
 
     fn send_in_fragments(&mut self, old_num: u64, new_num: u64, diff: Vec<u8>) -> Vec<Vec<u8>> {
         let instr = Instruction {
+            protocol_version: PROTOCOL_VERSION,
             old_num,
             new_num,
             ack_num: self.ack_num,
@@ -640,6 +641,7 @@ mod tests {
 
     fn instr(old: u64, new: u64, throwaway: u64, val: u64) -> Instruction {
         Instruction {
+            protocol_version: PROTOCOL_VERSION,
             old_num: old,
             new_num: new,
             ack_num: 0,

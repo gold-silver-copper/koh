@@ -18,7 +18,8 @@
 //! - `throwaway_num` — the peer may discard its sent states with number `<= throwaway_num`.
 //! - `diff`     — the opaque, already-serialized state diff (the `ssp` layer owns its meaning).
 //!
-//! Unlike mosh we drop `protocol_version` chaff and the OCB-nonce padding — QUIC owns crypto.
+//! Unlike mosh we drop the OCB-nonce padding/chaff — QUIC owns crypto — but we keep an
+//! in-band [`PROTOCOL_VERSION`] (rejected on decode) to catch diff-encoding skew the ALPN can't.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +29,14 @@ use serde::{Deserialize, Serialize};
 /// classic safe-everywhere QUIC packet size; subtracting QUIC overhead leaves us a safe
 /// ceiling for a single datagram payload. Real code should prefer `Connection::max_datagram_size`.
 pub const DEFAULT_MAX_DATAGRAM: usize = 1200;
+
+/// rmosh wire protocol version, carried in every [`Instruction`] and rejected on decode if it
+/// doesn't match. Bump on any incompatible change to the envelope or the diff encoding.
+///
+/// The ALPN only proves both ends speak *some* rmosh; this catches diff-encoding skew between
+/// rmosh builds that share an ALPN. (Unrelated to upstream mosh's `MOSH_PROTOCOL_VERSION` —
+/// rmosh never interoperates with mosh.)
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Worst-case serialized overhead of a [`Fragment`] header (everything but `payload` bytes):
 /// `id` varint (≤10) + `index` varint (≤3) + `final_` bool (1) + `payload` length varint (≤5),
@@ -41,12 +50,16 @@ pub enum WireError {
     Postcard(#[from] postcard::Error),
     #[error("MTU {mtu} too small for fragment header (need > {min})")]
     MtuTooSmall { mtu: usize, min: usize },
+    #[error("protocol version mismatch: peer sent {peer}, we speak {ours}")]
+    VersionMismatch { peer: u32, ours: u32 },
 }
 
 /// The unit of state synchronization. Produced by `ssp::Transport`, serialized, then
 /// fragmented for transport. See module docs for field semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Instruction {
+    /// Wire protocol version (see [`PROTOCOL_VERSION`]); rejected on [`decode`](Instruction::decode).
+    pub protocol_version: u32,
     /// Diff base: the sender's state number the diff transforms *from*.
     pub old_num: u64,
     /// Diff target: the sender's current state number the diff transforms *to*.
@@ -63,6 +76,7 @@ impl Instruction {
     /// A pure acknowledgement carrying no state change (`old_num == new_num`, empty diff).
     pub fn ack_only(state_num: u64, ack_num: u64, throwaway_num: u64) -> Self {
         Instruction {
+            protocol_version: PROTOCOL_VERSION,
             old_num: state_num,
             new_num: state_num,
             ack_num,
@@ -76,9 +90,18 @@ impl Instruction {
         Ok(postcard::to_allocvec(self)?)
     }
 
-    /// Deserialize from bytes with postcard.
+    /// Deserialize from bytes with postcard, rejecting a protocol-version mismatch at decode
+    /// time (before any state is touched) so a foreign/incompatible peer can't feed a diff with
+    /// a different encoding into our state mirror.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let instr: Instruction = postcard::from_bytes(bytes)?;
+        if instr.protocol_version != PROTOCOL_VERSION {
+            return Err(WireError::VersionMismatch {
+                peer: instr.protocol_version,
+                ours: PROTOCOL_VERSION,
+            });
+        }
+        Ok(instr)
     }
 }
 
@@ -264,6 +287,7 @@ mod tests {
 
     fn sample_instruction(diff_len: usize) -> Instruction {
         Instruction {
+            protocol_version: PROTOCOL_VERSION,
             old_num: 7,
             new_num: 9,
             ack_num: 4,
@@ -277,6 +301,25 @@ mod tests {
         let i = sample_instruction(300);
         let bytes = i.encode().unwrap();
         assert_eq!(Instruction::decode(&bytes).unwrap(), i);
+    }
+
+    #[test]
+    fn decode_rejects_protocol_version_mismatch() {
+        // A peer speaking a different (incompatible diff-encoding) version is rejected at decode
+        // time, before any state is touched — not silently fed into the state mirror.
+        let mut i = sample_instruction(10);
+        i.protocol_version = PROTOCOL_VERSION + 1;
+        let bytes = i.encode().unwrap();
+        match Instruction::decode(&bytes) {
+            Err(WireError::VersionMismatch { peer, ours }) => {
+                assert_eq!(peer, PROTOCOL_VERSION + 1);
+                assert_eq!(ours, PROTOCOL_VERSION);
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+        // A correctly-versioned instruction still decodes fine.
+        let ok = sample_instruction(10);
+        assert_eq!(Instruction::decode(&ok.encode().unwrap()).unwrap(), ok);
     }
 
     #[test]
@@ -366,6 +409,7 @@ mod tests {
         fn fragment_reassemble_roundtrip(diff_len in 0usize..20_000, mtu in 30usize..1500) {
             let mut f = Fragmenter::new();
             let instr = Instruction {
+                protocol_version: PROTOCOL_VERSION,
                 old_num: 1, new_num: 2, ack_num: 0, throwaway_num: 0,
                 diff: (0..diff_len).map(|i| (i % 256) as u8).collect(),
             };

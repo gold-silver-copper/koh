@@ -19,3 +19,8 @@ data-encoding.workspace = true
 rand.workspace = true
 # BLAKE3 for the optional passphrase nonce-challenge (passphrase never crosses the wire).
 blake3 = "1"
+
+[dev-dependencies]
+# drive the real SSP Transport over a real iroh datagram connection in the e2e test
+rmosh-ssp.workspace = true
+serde.workspace = true

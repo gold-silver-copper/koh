@@ -77,7 +77,21 @@ fn default_key_file() -> PathBuf {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match real_main().await {
+        // Exit with the remote shell's status (POSIX wait status is 8-bit).
+        Ok(Some(code)) => std::process::ExitCode::from(code as u8),
+        Ok(None) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("rmosh-client: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// The real client entry point; returns the remote shell's exit code if the session ended
+/// because the shell exited.
+async fn real_main() -> anyhow::Result<Option<u32>> {
     if let Ok(path) = std::env::var("RMOSH_LOG") {
         if let Ok(file) = std::fs::File::create(&path) {
             tracing_subscriber::fmt()
@@ -98,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
 
     if args.show_id {
         println!("{}", format_endpoint_id(&my_id));
-        return Ok(());
+        return Ok(None);
     }
 
     let server = args

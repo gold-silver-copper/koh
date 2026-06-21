@@ -92,6 +92,8 @@ pub struct ServerTerminal {
     echo_ack: u64,
     /// Pending `(input_frame_num, arrival_timestamp_ms)`, oldest first.
     input_history: Vec<(u64, u64)>,
+    /// The shell's exit code once it has exited (propagated to the client on shutdown).
+    exit_code: Option<u32>,
 }
 
 impl ServerTerminal {
@@ -101,7 +103,13 @@ impl ServerTerminal {
             scrollback,
             echo_ack: 0,
             input_history: Vec::new(),
+            exit_code: None,
         }
+    }
+
+    /// Record the shell's exit code; the next snapshot carries it to the client.
+    pub fn set_exit_code(&mut self, code: u32) {
+        self.exit_code = Some(code);
     }
 
     /// Feed a chunk of the child shell's output into the screen model.
@@ -194,6 +202,7 @@ impl ServerTerminal {
             screen: self.parser.screen().clone(),
             echo_ack: self.echo_ack,
             title: self.parser.callbacks().title.clone(),
+            exit_code: self.exit_code,
             parser: None,
         }
     }

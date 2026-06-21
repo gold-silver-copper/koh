@@ -107,6 +107,9 @@ impl Drop for TerminaTerminal {
 /// loop to re-read the current size from `term`; keep its sender alive even if you never resize,
 /// so the loop doesn't spin on a closed channel. `initial_rows`/`initial_cols` seed the first
 /// resize sent to the server (the caller reads them from `term.size()`).
+/// Returns the remote shell's exit code (`Some`) when the session ended because the shell
+/// exited, or `None` for a local quit / dropped connection — so the binary can exit with the
+/// remote status.
 pub async fn run_client<T: ClientTerminal>(
     channel: IrohChannel,
     pref: DisplayPreference,
@@ -115,7 +118,7 @@ pub async fn run_client<T: ClientTerminal>(
     mut input_rx: mpsc::Receiver<Vec<u8>>,
     mut resize_rx: mpsc::Receiver<()>,
     mut term: T,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<u32>> {
     let clock = MonoClock::new();
     let mut transport =
         Transport::<UserInput, TerminalScreen>::new(clock.now_ms(), channel.max_datagram_size());
@@ -234,14 +237,16 @@ pub async fn run_client<T: ClientTerminal>(
         }
 
         if transport.remote_num() == SHUTDOWN_SENTINEL {
+            let code = transport.remote_state().exit_code();
             let screen = transport.remote_state().screen();
             let overlay = Overlay::empty();
             let _ = term.render(screen, &overlay, Some("[rmosh] session ended"));
             tokio::time::sleep(Duration::from_millis(400)).await;
-            break;
+            channel.close(0, b"client exit");
+            return Ok(code);
         }
     }
 
     channel.close(0, b"client exit");
-    Ok(())
+    Ok(None)
 }

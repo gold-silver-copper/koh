@@ -51,6 +51,9 @@ pub struct TerminalScreen {
     echo_ack: u64,
     /// Window title (OSC 2), propagated so the client can mirror it.
     title: String,
+    /// Set once the remote shell has exited, carrying its exit code so the client can exit with
+    /// the same status (mosh parity). `None` while the shell is alive.
+    exit_code: Option<u32>,
     /// Long-lived parser, in sync with `screen` whenever `Some`. Not part of identity; dropped
     /// on `Clone` (Parser is not Clone) and lazily rebuilt from `screen` on the next `apply`.
     parser: Option<Box<vt100::Parser>>,
@@ -65,6 +68,7 @@ impl Clone for TerminalScreen {
             screen: self.screen.clone(),
             echo_ack: self.echo_ack,
             title: self.title.clone(),
+            exit_code: self.exit_code,
             parser: None,
         }
     }
@@ -76,6 +80,7 @@ impl std::fmt::Debug for TerminalScreen {
             .field("size", &self.screen.size())
             .field("echo_ack", &self.echo_ack)
             .field("title", &self.title)
+            .field("exit_code", &self.exit_code)
             .finish()
     }
 }
@@ -86,6 +91,7 @@ impl Default for TerminalScreen {
             screen: blank_screen(DEFAULT_ROWS, DEFAULT_COLS),
             echo_ack: 0,
             title: String::new(),
+            exit_code: None,
             parser: None,
         }
     }
@@ -101,6 +107,7 @@ impl TerminalScreen {
             screen: p.screen().clone(),
             echo_ack: 0,
             title: String::new(),
+            exit_code: None,
             parser: None,
         }
     }
@@ -108,6 +115,11 @@ impl TerminalScreen {
     /// Borrow the underlying `vt100::Screen` (for rendering and predictor reconciliation).
     pub fn screen(&self) -> &vt100::Screen {
         &self.screen
+    }
+
+    /// The remote shell's exit code, once it has exited (`None` while alive).
+    pub fn exit_code(&self) -> Option<u32> {
+        self.exit_code
     }
 
     /// `(rows, cols)`.
@@ -135,6 +147,8 @@ pub struct ScreenDiff {
     pub echo_ack: u64,
     /// New window title if it changed.
     pub title: Option<String>,
+    /// The remote shell's exit code, set on the final (shutdown) frame.
+    pub exit_code: Option<u32>,
     /// The `vt100` escape-sequence patch: `state_diff(base)` normally, or `state_formatted`
     /// (a self-contained repaint) when `resize` is set.
     pub vt: Vec<u8>,
@@ -155,6 +169,7 @@ impl SyncState for TerminalScreen {
             resize: resized.then(|| self.size()),
             echo_ack: self.echo_ack,
             title: (self.title != base.title).then(|| self.title.clone()),
+            exit_code: self.exit_code,
             vt,
         }
     }
@@ -187,6 +202,9 @@ impl SyncState for TerminalScreen {
         if let Some(title) = &diff.title {
             self.title = title.clone();
         }
+        if diff.exit_code.is_some() {
+            self.exit_code = diff.exit_code;
+        }
     }
 
     // subtract_prefix: screen state is absolute, so the default no-op is correct (mosh's
@@ -197,6 +215,8 @@ impl PartialEq for TerminalScreen {
     fn eq(&self, other: &Self) -> bool {
         self.echo_ack == other.echo_ack
             && self.title == other.title
+            // Include exit_code so the final "shell exited" state isn't collapsed as unchanged.
+            && self.exit_code == other.exit_code
             && self.screen.size() == other.screen.size()
             // Two screens are equal for collapse purposes iff they render identically
             // (contents + cursor + input modes), i.e. their state_diff is empty.
@@ -299,5 +319,25 @@ mod tests {
             base = target.clone();
             assert_eq!(client, base, "client must track server after incremental diff {i}");
         }
+    }
+
+    #[test]
+    fn exit_code_propagates_through_diff_apply() {
+        // When the shell exits, the server stamps the code; it must survive diff -> apply, and a
+        // state carrying an exit code must NOT compare equal to one without (so it isn't collapsed).
+        let mut emu = ServerTerminal::new(24, 80, 0);
+        emu.process(b"bye");
+        emu.set_exit_code(42);
+        let target = emu.snapshot();
+        assert_eq!(target.exit_code(), Some(42));
+
+        let base = TerminalScreen::default();
+        let diff = target.diff_from(&base);
+        assert_eq!(diff.exit_code, Some(42));
+
+        let mut c = base.clone();
+        c.apply(&diff);
+        assert_eq!(c.exit_code(), Some(42));
+        assert_ne!(base, c, "a state carrying an exit code differs from one without");
     }
 }

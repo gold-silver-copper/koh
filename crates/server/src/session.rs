@@ -82,8 +82,15 @@ async fn drain(handle: SharedSession, mut pty_rx: mpsc::Receiver<Vec<u8>>) {
                 handle.changed.notify_one();
             }
             None => {
-                // Shell exited: reader hit EOF.
-                handle.session.lock().await.child_alive = false;
+                // Shell exited: reader hit EOF. Reap the real exit code (the child is already a
+                // zombie, so try_wait returns it) and stamp it onto the emulator so the next
+                // snapshot — and thus the shutdown frame — carries it to the client.
+                let mut s = handle.session.lock().await;
+                s.child_alive = false;
+                if let Ok(Some(status)) = s.pty.try_wait() {
+                    s.emu.set_exit_code(status.exit_code());
+                }
+                drop(s);
                 handle.changed.notify_one();
                 break;
             }

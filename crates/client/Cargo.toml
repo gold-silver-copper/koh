@@ -26,3 +26,9 @@ tracing-subscriber.workspace = true
 data-encoding.workspace = true
 directories.workspace = true
 vt100.workspace = true
+
+[dev-dependencies]
+# the server lib, so the e2e test can run a real session over a loopback iroh connection
+rmosh-server.workspace = true
+# to attach the real client binary to an allocated PTY and drive it headlessly
+portable-pty.workspace = true

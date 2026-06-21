@@ -11,8 +11,10 @@ over your phone to your main PC. This repo is that core: two binaries, `rmosh-se
 `rmosh-client`, that give you a real remote shell by endpoint id.
 
 > Status: the protocol core, terminal model, PTY host, predictor, and iroh transport are
-> implemented and tested. 40 tests pass, including property tests, a network-chaos simulator,
-> and a full in-process client↔server integration scenario that converges at 50% packet loss.
+> implemented and tested. 46 tests pass, including property tests, a network-chaos simulator,
+> an in-process client↔server scenario that converges at 50% packet loss, and **end-to-end
+> tests over a real iroh connection** — both the full loop in one process and the real
+> `rmosh-client` binary driven through an allocated PTY (see [Testing tiers](#testing-tiers)).
 
 ## The one idea
 
@@ -101,7 +103,7 @@ is the authorization layer on top.
 
 ```sh
 cargo build --release          # builds rmosh-server and rmosh-client
-cargo test  --workspace        # 40 tests: unit, property, chaos sim, integration
+cargo test  --workspace        # 46 tests: unit, property, chaos sim, real-iroh e2e, PTY binary
 ```
 
 Pinned toolchain-adjacent versions live in the root `Cargo.toml`: `iroh =1.0.0` (which brings
@@ -137,6 +139,19 @@ client's in `~/…/rmosh/client.key`. Prediction policy is `--predict adaptive|a
 (default adaptive: it engages only when the link is slow enough to benefit). Set
 `RMOSH_LOG=/tmp/rmosh.log` to capture client logs without disturbing the TUI.
 
+By default the bare endpoint id is dialed via n0's public relay + DNS discovery. For a LAN or
+self-hosted setup you can skip that:
+
+```sh
+# same LAN / loopback, no relay: server prints its port, client dials it directly
+rmosh-server --local --allow 3f9c…            # connect: rmosh-client 871b… --direct <ip>:<port>
+rmosh-client 871b… --direct 192.168.1.5:41xxx
+
+# self-hosted relay (e.g. your own iroh-relay), both ends point at it
+rmosh-server --relay-url https://relay.example:3340 --allow 3f9c…
+rmosh-client 871b… --relay-url https://relay.example:3340
+```
+
 For session persistence across reconnects, run `tmux` inside the session — rmosh intentionally
 does no multiplexing (one session, one shell), exactly like mosh.
 
@@ -156,19 +171,59 @@ printables, backspace, and CR/LF; control/escape/CSI and non-ASCII input open a 
 make no concrete guess (they fall back to the server's real echo). A wrong or unconfirmed guess
 is always reconciled away — it never corrupts the display.
 
-## Testing
+## Testing tiers
+
+You never need a second *machine* to develop rmosh — you need a second *process* and
+occasionally a second *container*. "Real relay" becomes "local relay container"; "TTY" becomes
+"allocated PTY". The verification is layered cheapest-first; everything but Tier 3 is headless.
+
+### Tier 0 — pure logic, no infra (`cargo test`)
+
+The SSP, diff/apply, and predictor are network- and TTY-free, so they're tested deterministically:
 
 - **State round-trip** — `apply(diff(base→target))` over `base` equals `target`, for screens
   (incl. wide chars / emoji / combining marks) and input.
 - **Transport under chaos** (`ssp::testkit`) — two transports through a seeded
   lossy/latent/reordering/duplicating link; asserts convergence *and* that the newest applied
   state number never regresses (the no-head-of-line-blocking guard).
-- **Terminal** — diff/apply + resize repaint + equality.
-- **Predictor** — predict→confirm→clear, predict→no-echo→suppress, adaptive show/hide.
-- **PTY** — spawns real shells, streams output, echoes input, resizes.
-- **Integration** (`xtask`) — the full client↔server stack (input + screen + transport +
-  collapse + echo-ack) end-to-end over the chaos link:
-  `cargo run -p xtask -- chaos --loss 0.5` / `cargo run -p xtask -- integration`.
+- **Terminal / predictor / PTY / fragmenter** — diff+resize, predict→confirm→clear,
+  predict→no-echo→suppress, real-shell streaming, fragment supersede/reassemble.
+- **Whole-stack chaos** (`xtask`) — input + screen + transport + collapse + echo-ack over the
+  simulated link: `cargo run -p xtask -- chaos --loss 0.5`.
+
+### Tier 1 — two endpoints + a PTY on localhost, over *real* iroh (`cargo test`)
+
+The big unlock, with **zero infrastructure**: a second host is just a second endpoint, and a
+TTY is just an allocated PTY. Both are real and hermetic.
+
+- **`transport-iroh`** — two real iroh endpoints connect over loopback (relay-less,
+  `bind_endpoint_local`) and exchange datagrams: upgrades the iroh layer from "compiles against
+  the 1.0 API" to "actually established a connection."
+- **`crates/client/tests/e2e_loopback.rs`** — the *entire* loop in one process: scripted
+  keystroke → client → iroh datagram → server → PTY-hosted `sh` → vt100 → iroh → client render
+  (through a `ClientTerminal` mock backend). Asserts the typed command's output round-trips.
+- **`crates/client/tests/e2e_pty_binary.rs`** — the **real `rmosh-client` binary** attached to
+  an allocated PTY (so `isatty()` is true and raw-mode + crossterm run for real), driven by
+  scripted keystrokes with rendered frames read back from the master, connected with `--direct`
+  to an in-process loopback server.
+
+The seam that makes this cheap: terminal I/O is abstracted behind `ClientTerminal`, so the same
+session loop runs against the real crossterm path (binary) or a captured-cells mock (fast test).
+
+### Tier 2 — docker-compose: relay, NAT, OS-chaos, roaming (`testing/tier2/`)
+
+Where Docker earns its place — network realism a single process can't fake. See
+[`testing/tier2/`](testing/tier2/): a self-hosted **iroh relay** container (never n0's public
+relay), `tc qdisc netem` for OS-level loss/jitter/reorder *beneath* real QUIC, optional
+`iptables` NAT for hole-punching, and a **roaming/migration** test that detaches the client
+from one network and reattaches it (new IP) mid-session, asserting QUIC migration resumes and
+re-syncs. This is runnable scaffolding (requires Docker + Linux); it is not part of `cargo test`.
+
+### Tier 3 — real devices (manual)
+
+A small final human acceptance pass, not for an agent: paste the endpoint id on an actual
+Android phone, connect to an actual Mac over the public relay, type on a laggy cell link, and
+feel the predictions. The last 1% sign-off after Tiers 0–2 are green.
 
 ## Acceptance criteria (mosh feel)
 

@@ -14,12 +14,13 @@
 //! never put the steady flow on a reliable stream — that would reintroduce the
 //! head-of-line blocking mosh exists to avoid.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use bytes::Bytes;
 use iroh::endpoint::{presets, Connection, ConnectionError, PathId, VarInt};
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use rmosh_wire::DEFAULT_MAX_DATAGRAM;
 
 /// The ALPN that identifies the rmosh protocol on the wire.
@@ -90,6 +91,72 @@ pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, 
     }
     let ep = builder.bind().await.map_err(|e| SetupError::Other(e.into()))?;
     Ok(ep)
+}
+
+/// Build an iroh [`Endpoint`] with **no relay and no discovery** (`presets::Minimal`).
+///
+/// Use this for same-host / same-LAN sessions and for tests: peers must be dialed by a full
+/// [`EndpointAddr`] (id + direct socket address), e.g. via [`loopback_addr`]. It avoids any
+/// dependency on n0's public relay/DNS, so it is fully hermetic.
+pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
+    let mut builder = Endpoint::builder(presets::Minimal).secret_key(secret);
+    if accept {
+        builder = builder.alpns(vec![ALPN.to_vec()]);
+    }
+    let ep = builder.bind().await.map_err(|e| SetupError::Other(e.into()))?;
+    Ok(ep)
+}
+
+/// A dial-able [`EndpointAddr`] for `ep` over the IPv4 loopback interface (id + 127.0.0.1:port).
+/// Pair with [`bind_endpoint_local`] to connect two endpoints on one host without a relay.
+pub fn loopback_addr(ep: &Endpoint) -> EndpointAddr {
+    let mut addr = EndpointAddr::new(ep.id());
+    if let Some(port) = ep
+        .bound_sockets()
+        .iter()
+        .find(|s| s.is_ipv4())
+        .map(|s| s.port())
+    {
+        addr = addr.with_ip_addr(SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    addr
+}
+
+/// A dial-able [`EndpointAddr`] from a peer's id + a known direct socket address (LAN / loopback,
+/// no relay/discovery needed). Use with [`bind_endpoint_local`].
+pub fn direct_addr(id: EndpointId, addr: SocketAddr) -> EndpointAddr {
+    EndpointAddr::new(id).with_ip_addr(addr)
+}
+
+/// A dial-able [`EndpointAddr`] from a peer's id + a relay URL (relay-assisted, incl. NAT
+/// traversal). Use with [`bind_endpoint_with_relay`] pointed at the same relay.
+pub fn relay_addr(id: EndpointId, relay: RelayUrl) -> EndpointAddr {
+    EndpointAddr::new(id).with_relay_url(relay)
+}
+
+/// Build an iroh [`Endpoint`] whose only relay is `relay` (no n0 relays, no DNS discovery).
+/// Used for self-hosted relays (Tier 2 docker, private deployments): peers dial by id + this
+/// same relay URL ([`relay_addr`]). Covers NAT traversal / roaming via the local relay.
+pub async fn bind_endpoint_with_relay(
+    secret: SecretKey,
+    accept: bool,
+    relay: RelayUrl,
+) -> Result<Endpoint, SetupError> {
+    let mut builder = Endpoint::builder(presets::Minimal)
+        .secret_key(secret)
+        .relay_mode(RelayMode::custom([relay]));
+    if accept {
+        builder = builder.alpns(vec![ALPN.to_vec()]);
+    }
+    let ep = builder.bind().await.map_err(|e| SetupError::Other(e.into()))?;
+    Ok(ep)
+}
+
+/// Parse a relay URL string (e.g. `https://relay.example:3340`).
+pub fn parse_relay_url(s: &str) -> Result<RelayUrl, SetupError> {
+    s.trim()
+        .parse::<RelayUrl>()
+        .map_err(|e| SetupError::Other(anyhow::anyhow!("bad relay url: {e}")))
 }
 
 /// A datagram channel over a single iroh [`Connection`], plus a one-shot reliable
@@ -236,5 +303,39 @@ mod tests {
     #[test]
     fn parse_rejects_garbage() {
         assert!(parse_endpoint_id("not-a-real-endpoint-id").is_err());
+    }
+
+    /// Tier-1 foundation: two real iroh endpoints on loopback establish a connection and
+    /// exchange a datagram both ways over the genuine accept/connect/datagram API — no relay,
+    /// no second machine, fully hermetic.
+    #[tokio::test]
+    async fn two_endpoints_exchange_datagram_over_loopback() {
+        let server = bind_endpoint_local(generate_secret_key(), true)
+            .await
+            .expect("bind server");
+        let client = bind_endpoint_local(generate_secret_key(), false)
+            .await
+            .expect("bind client");
+        let server_addr = loopback_addr(&server);
+
+        let srv = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("accept");
+            let conn = incoming.await.expect("handshake");
+            let dg = conn.read_datagram().await.expect("read datagram");
+            conn.send_datagram(dg).expect("echo datagram"); // echo it back
+            conn.closed().await;
+        });
+
+        let conn = client
+            .connect(server_addr, ALPN)
+            .await
+            .expect("connect over loopback");
+        let chan = IrohChannel::new(conn);
+        assert!(chan.send(b"ping-over-real-iroh"), "datagram send should succeed");
+        let echoed = chan.recv().await.expect("recv echo");
+        assert_eq!(&echoed[..], b"ping-over-real-iroh");
+
+        chan.close(0, b"done");
+        let _ = srv.await;
     }
 }

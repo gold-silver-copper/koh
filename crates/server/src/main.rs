@@ -11,17 +11,14 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
 use iroh::EndpointId;
-use rmosh_input::{UserInput, WireEvent};
-use rmosh_ssp::{RecvOutcome, Transport};
-use rmosh_terminal::{ServerTerminal, TerminalScreen, DEFAULT_COLS, DEFAULT_ROWS};
+use rmosh_server::run_session;
 use rmosh_transport_iroh::{
-    bind_endpoint, format_endpoint_id, load_or_create_secret_key, parse_endpoint_id, IrohChannel,
-    MonoClock, ALPN,
+    bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
+    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, ALPN,
 };
 use tracing::{error, info, warn};
 
@@ -47,6 +44,14 @@ struct Args {
     /// Scrollback lines retained by the server-side emulator.
     #[arg(long, default_value_t = 1000)]
     scrollback: usize,
+
+    /// Host via a self-hosted relay URL instead of n0's public relays.
+    #[arg(long, value_name = "URL")]
+    relay_url: Option<String>,
+
+    /// Bind without any relay/discovery (LAN / loopback). Clients dial with --direct <ip:port>.
+    #[arg(long, conflicts_with = "relay_url")]
+    local: bool,
 }
 
 fn default_key_file() -> PathBuf {
@@ -82,11 +87,36 @@ async fn main() -> anyhow::Result<()> {
     let key_file = args.key_file.clone().unwrap_or_else(default_key_file);
     let secret = load_or_create_secret_key(&key_file)
         .with_context(|| format!("loading key from {}", key_file.display()))?;
-    let endpoint = bind_endpoint(secret, true).await.context("binding endpoint")?;
+
+    // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
+    let endpoint = if let Some(url) = &args.relay_url {
+        let relay = parse_relay_url(url)?;
+        bind_endpoint_with_relay(secret, true, relay).await.context("binding endpoint")?
+    } else if args.local {
+        bind_endpoint_local(secret, true).await.context("binding endpoint")?
+    } else {
+        bind_endpoint(secret, true).await.context("binding endpoint")?
+    };
     let my_id = endpoint.id();
+    let id_str = format_endpoint_id(&my_id);
+
+    // How a client should dial us, given the chosen profile.
+    let connect_hint = if let Some(url) = &args.relay_url {
+        format!("rmosh-client {id_str} --relay-url {url}")
+    } else if args.local {
+        let port = endpoint
+            .bound_sockets()
+            .iter()
+            .find(|s| s.is_ipv4())
+            .map(|s| s.port())
+            .unwrap_or(0);
+        format!("rmosh-client {id_str} --direct <this-host-ip>:{port}")
+    } else {
+        format!("rmosh-client {id_str}")
+    };
 
     eprintln!("┌─ rmosh-server ready ──────────────────────────────────────");
-    eprintln!("│ endpoint id : {}", format_endpoint_id(&my_id));
+    eprintln!("│ endpoint id : {id_str}");
     eprintln!("│ key file    : {}", key_file.display());
     eprintln!("│ alpn        : {}", String::from_utf8_lossy(ALPN));
     if args.allow_any {
@@ -94,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
     }
-    eprintln!("│ connect     : rmosh-client {}", format_endpoint_id(&my_id));
+    eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
 
     let shell = args.shell.clone();
@@ -128,116 +158,5 @@ async fn main() -> anyhow::Result<()> {
     }
 
     endpoint.close().await;
-    Ok(())
-}
-
-/// Drive one client session: PTY shell ⇄ `Transport<TerminalScreen, UserInput>` over datagrams.
-async fn run_session(
-    conn: iroh::endpoint::Connection,
-    shell: Option<String>,
-    scrollback: usize,
-) -> anyhow::Result<()> {
-    let channel = IrohChannel::new(conn);
-    let clock = MonoClock::new();
-    let mut transport =
-        Transport::<TerminalScreen, UserInput>::new(clock.now_ms(), channel.max_datagram_size());
-    transport.set_connected(true);
-
-    let (rows, cols) = (DEFAULT_ROWS, DEFAULT_COLS);
-    let mut emu = ServerTerminal::new(rows, cols, scrollback);
-    let (mut pty, mut pty_rx) = rmosh_pty::Pty::spawn(rows, cols, shell.as_deref(), "xterm-256color")
-        .context("spawning shell")?;
-    *transport.current_mut() = emu.snapshot();
-
-    let mut child_alive = true;
-
-    loop {
-        let now = clock.now_ms();
-        transport.set_mtu(channel.max_datagram_size());
-        if let Some(rtt) = channel.rtt_ms() {
-            transport.observe_rtt(rtt);
-        }
-        let wait = transport.wait_time(now);
-        let echo_wait = emu.echo_ack_wait_time(now);
-        let sleep_ms = wait.min(echo_wait).min(1000);
-
-        let mut dirty = false;
-
-        tokio::select! {
-            biased;
-
-            // The child shell produced output.
-            chunk = pty_rx.recv(), if child_alive => {
-                match chunk {
-                    Some(bytes) => { emu.process(&bytes); dirty = true; }
-                    None => { child_alive = false; } // shell exited; reader hit EOF
-                }
-            }
-
-            // A datagram arrived from the client.
-            dg = channel.recv() => {
-                match dg {
-                    Ok(bytes) => {
-                        let now = clock.now_ms();
-                        if transport.recv(now, &bytes) == RecvOutcome::NewState {
-                            let input_diff = transport.get_remote_diff();
-                            if !input_diff.is_empty() {
-                                let frame = transport.remote_num();
-                                for w in &input_diff {
-                                    match w {
-                                        WireEvent::Keys(b) => {
-                                            if let Err(e) = pty.write_input(b) {
-                                                warn!(error = %e, "pty write failed");
-                                            }
-                                        }
-                                        WireEvent::Resize { rows, cols } => {
-                                            let _ = pty.resize(*rows, *cols);
-                                            emu.resize(*rows, *cols);
-                                            dirty = true;
-                                        }
-                                    }
-                                }
-                                // Remember when this input frame arrived, for echo-ack debounce.
-                                emu.register_input_frame(frame, now);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        info!(reason = %e, "connection closed by peer");
-                        break;
-                    }
-                }
-            }
-
-            // Scheduler / echo-ack timer.
-            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
-        }
-
-        let now = clock.now_ms();
-        if emu.set_echo_ack(now) {
-            dirty = true;
-        }
-        if dirty {
-            *transport.current_mut() = emu.snapshot();
-        }
-
-        // Begin a clean shutdown once the shell has exited.
-        if !child_alive && !transport.shutdown_in_progress() {
-            transport.start_shutdown(now);
-        }
-
-        for datagram in transport.tick(now) {
-            channel.send(&datagram);
-        }
-
-        if transport.shutdown_in_progress()
-            && (transport.shutdown_acknowledged() || transport.shutdown_ack_timed_out(now))
-        {
-            break;
-        }
-    }
-
-    channel.close(0, b"session ended");
-    let _ = pty.kill();
     Ok(())
 }

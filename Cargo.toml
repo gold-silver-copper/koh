@@ -30,6 +30,7 @@ rmosh-input = { path = "crates/input" }
 rmosh-predict = { path = "crates/predict" }
 rmosh-transport-iroh = { path = "crates/transport-iroh" }
 rmosh-pty = { path = "crates/pty" }
+rmosh-server = { path = "crates/server" }
 
 # --- transport (pinned: iroh API churns; see README) ---
 # iroh 1.0 brings its own QUIC backend (noq, a quinn fork); we never depend on quinn directly.

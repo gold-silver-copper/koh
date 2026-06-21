@@ -159,3 +159,51 @@ pub fn render(
     }
     out.flush()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmosh_predict::{DisplayPreference, PredictionEngine};
+
+    fn screen_of(bytes: &[u8]) -> Screen {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(bytes);
+        p.screen().clone()
+    }
+
+    #[test]
+    fn renders_authoritative_text_with_escapes() {
+        let screen = screen_of(b"hi");
+        let mut buf = Vec::new();
+        render(&mut buf, &screen, &Overlay::empty(), None).unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("hi"), "rendered text missing");
+        assert!(s.contains('\x1b'), "expected ANSI escape sequences");
+    }
+
+    #[test]
+    fn renders_status_line() {
+        let screen = screen_of(b"");
+        let mut buf = Vec::new();
+        render(&mut buf, &screen, &Overlay::empty(), Some("link down")).unwrap();
+        assert!(String::from_utf8_lossy(&buf).contains("link down"));
+    }
+
+    #[test]
+    fn renders_prediction_overlay_glyph() {
+        // A predicted glyph not present on the authoritative screen must appear in the output.
+        let screen = screen_of(b"");
+        let mut pe = PredictionEngine::new(DisplayPreference::Always);
+        pe.set_local_frame_sent(0);
+        pe.new_user_byte(0, b'Z', &screen);
+        let overlay = pe.overlay(&screen);
+        assert!(!overlay.is_empty());
+
+        let mut buf = Vec::new();
+        render(&mut buf, &screen, &overlay, None).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf).contains('Z'),
+            "predicted glyph not rendered"
+        );
+    }
+}

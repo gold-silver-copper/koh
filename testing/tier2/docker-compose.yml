@@ -1,0 +1,48 @@
+# Tier 2 topology: a self-hosted relay plus a server and a client, where the server and the
+# client sit on *separate* bridge networks and can only meet via the relay — the closest you
+# get to "two machines" on one box. NET_ADMIN lets the scripts apply tc/netem and iptables.
+#
+#   docker compose -f testing/tier2/docker-compose.yml up --build -d
+#   docker compose -f testing/tier2/docker-compose.yml exec server  /scripts/run-server.sh
+#   docker compose -f testing/tier2/docker-compose.yml exec client  /scripts/netem.sh eth0 120 40 8 25
+#   ./testing/tier2/scripts/roaming-test.sh        # run on the host
+#
+# NOTE: this scaffolding is provided for whoever has Docker + Linux; it is NOT executed by the
+# crate's `cargo test`. Verify the relay flags against your `iroh-relay --help` (see README).
+
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: testing/tier2/Dockerfile
+    image: rmosh-tier2
+    # Dev-mode HTTP relay (no TLS) reachable at http://relay:3340. Adjust to your iroh-relay.
+    command: ["iroh-relay", "--dev"]
+    networks: [relaynet]
+
+  server:
+    image: rmosh-tier2
+    depends_on: [relay]
+    cap_add: ["NET_ADMIN"]
+    # `run-server.sh` reads RMOSH_RELAY_URL / RMOSH_ALLOW and prints the endpoint id.
+    environment:
+      RMOSH_RELAY_URL: "http://relay:3340"
+      RMOSH_ALLOW: "any"     # the harness uses --allow-any; pin a client id for a real test
+    # Server reaches the relay (relaynet) but is NOT on the client's network.
+    networks: [relaynet, servernet]
+
+  client:
+    image: rmosh-tier2
+    depends_on: [relay, server]
+    cap_add: ["NET_ADMIN"]
+    environment:
+      RMOSH_RELAY_URL: "http://relay:3340"
+    # Client reaches the relay (relaynet) but is NOT on the server's network -> relay path only.
+    networks: [relaynet, clientnet]
+
+networks:
+  relaynet:
+  servernet:
+  clientnet:
+  # A spare network the client roams *to* mid-session (see roaming-test.sh).
+  clientnet2:

@@ -41,13 +41,43 @@ fn blank_screen(rows: u16, cols: u16) -> vt100::Screen {
 }
 
 /// The synchronized screen state.
-#[derive(Clone, Debug)]
+///
+/// Holds an owned `vt100::Screen` snapshot (what `diff_from`/`PartialEq`/render read, and what
+/// survives `Clone` — `vt100::Parser` is not `Clone`), plus a live parser kept across `apply`
+/// calls so incremental diffs are `O(diff)`, not a full re-parse of the whole grid per frame.
 pub struct TerminalScreen {
     screen: vt100::Screen,
     /// Newest user-input frame number the server has echoed (drives the client predictor).
     echo_ack: u64,
     /// Window title (OSC 2), propagated so the client can mirror it.
     title: String,
+    /// Long-lived parser, in sync with `screen` whenever `Some`. Not part of identity; dropped
+    /// on `Clone` (Parser is not Clone) and lazily rebuilt from `screen` on the next `apply`.
+    parser: Option<Box<vt100::Parser>>,
+}
+
+impl Clone for TerminalScreen {
+    fn clone(&self) -> Self {
+        // Drop the live parser on clone; the snapshot carries the state and the next apply
+        // rebuilds the parser from it. Clone is the rare path (transport state snapshots), so a
+        // later one-time rebuild is fine — the per-frame apply stays cheap.
+        TerminalScreen {
+            screen: self.screen.clone(),
+            echo_ack: self.echo_ack,
+            title: self.title.clone(),
+            parser: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for TerminalScreen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalScreen")
+            .field("size", &self.screen.size())
+            .field("echo_ack", &self.echo_ack)
+            .field("title", &self.title)
+            .finish()
+    }
 }
 
 impl Default for TerminalScreen {
@@ -56,6 +86,7 @@ impl Default for TerminalScreen {
             screen: blank_screen(DEFAULT_ROWS, DEFAULT_COLS),
             echo_ack: 0,
             title: String::new(),
+            parser: None,
         }
     }
 }
@@ -70,6 +101,7 @@ impl TerminalScreen {
             screen: p.screen().clone(),
             echo_ack: 0,
             title: String::new(),
+            parser: None,
         }
     }
 
@@ -128,17 +160,29 @@ impl SyncState for TerminalScreen {
     }
 
     fn apply(&mut self, diff: &Self::Diff) {
-        let (rows, cols) = diff.resize.unwrap_or_else(|| self.size());
-        let mut p = vt100::Parser::new(rows, cols, 0);
-        if diff.resize.is_none() {
-            // Reload our current screen into a fresh parser, then replay the incremental diff.
-            p.process(&self.screen.state_formatted());
+        if let Some((rows, cols)) = diff.resize {
+            // Resize: vt100 doesn't reflow, so `vt` is a self-contained repaint at the new size.
+            // Rebuild the parser at the new geometry (rare path) and replay the repaint.
+            let mut p = Box::new(vt100::Parser::new(rows, cols, 0));
             p.process(&diff.vt);
+            self.screen = p.screen().clone();
+            self.parser = Some(p);
         } else {
-            // `vt` is a full repaint at the new size.
-            p.process(&diff.vt);
+            // Lazily (re)build the parser from the snapshot on the first apply / after a clone,
+            // then feed only the incremental diff bytes. Steady-state cost is O(diff.vt), not a
+            // full re-parse of the whole grid every frame.
+            let parser = self.parser.get_or_insert_with(|| {
+                let (rows, cols) = self.screen.size();
+                let mut p = Box::new(vt100::Parser::new(rows, cols, 0));
+                p.process(&self.screen.state_formatted());
+                p
+            });
+            if !diff.vt.is_empty() {
+                parser.process(&diff.vt);
+            }
+            // Keep the snapshot in sync for PartialEq / diff_from / render.
+            self.screen = parser.screen().clone();
         }
-        self.screen = p.screen().clone();
         self.echo_ack = self.echo_ack.max(diff.echo_ack);
         if let Some(title) = &diff.title {
             self.title = title.clone();
@@ -234,5 +278,26 @@ mod tests {
         }
         let final_snap = emu.snapshot();
         h.run_until(20_000, move |h| *h.b_view_of_a() == final_snap);
+    }
+
+    #[test]
+    fn many_incremental_applies_without_reclone_track_server() {
+        // The client holds ONE TerminalScreen and applies a long run of incremental diffs,
+        // exercising the persistent-parser path (the parser is built once on the first apply and
+        // reused — never rebuilt per frame). It must track the server's snapshot exactly.
+        let mut emu = ServerTerminal::new(24, 80, 0);
+        emu.process(b"line 0\r\n");
+        let mut client = emu.snapshot();
+        let mut base = client.clone();
+
+        for i in 1..=20 {
+            emu.process(format!("line {i}\r\n").as_bytes());
+            let target = emu.snapshot();
+            let diff = target.diff_from(&base);
+            assert!(diff.resize.is_none(), "no resize -> incremental (persistent) path");
+            client.apply(&diff); // same object, repeated apply (no clone between frames)
+            base = target.clone();
+            assert_eq!(client, base, "client must track server after incremental diff {i}");
+        }
     }
 }

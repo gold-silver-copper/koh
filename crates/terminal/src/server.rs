@@ -130,6 +130,7 @@ impl ServerTerminal {
             screen: self.parser.screen().clone(),
             echo_ack: self.echo_ack,
             title: self.parser.callbacks().title.clone(),
+            parser: None,
         }
     }
 }

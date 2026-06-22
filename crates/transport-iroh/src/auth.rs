@@ -19,6 +19,19 @@ const NO_PASS: u8 = 0;
 /// Tag byte: a nonce challenge follows; the client must answer with `BLAKE3(passphrase||nonce)`.
 const PASS_REQUIRED: u8 = 1;
 
+/// A fresh 32-byte challenge nonce straight from the OS CSPRNG.
+///
+/// Using `OsRng` directly (the same pattern as `generate_secret_key` in `lib.rs`) rather than
+/// `SecretKey::generate().to_bytes()` keeps nonce generation independent of iroh's key type and
+/// makes the security-relevant source explicit: each handshake must be replay-unique, so the
+/// nonce must come from a real CSPRNG, never a counter or a reused value.
+fn fresh_nonce() -> [u8; 32] {
+    use rand::RngCore;
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
 /// Errors from the passphrase nonce-challenge handshake (mirrors the `SetupError` pattern; no
 /// `anyhow` so the typed failure is matchable — the server distinguishes a transport drop from a
 /// genuine auth rejection). The QUIC bi-stream surfaces several distinct error types
@@ -50,8 +63,8 @@ pub async fn handshake_server(
             let _ = send.finish();
         }
         Some(pass) => {
-            // 32 random bytes from the OS RNG (reuse iroh's key generator as a CSPRNG source).
-            let nonce = iroh::SecretKey::generate().to_bytes();
+            // A fresh 32-byte nonce straight from the OS CSPRNG (replay-uniqueness depends on it).
+            let nonce = fresh_nonce();
             let mut msg = Vec::with_capacity(33);
             msg.push(PASS_REQUIRED);
             msg.extend_from_slice(&nonce);
@@ -114,5 +127,16 @@ mod tests {
         // Binaries absorb AuthError via anyhow (the client wraps it with `.context()?`).
         let absorbed: anyhow::Error = AuthError::ChallengeFailed.into();
         assert!(absorbed.to_string().contains("challenge failed"));
+    }
+
+    #[test]
+    fn successive_nonces_differ() {
+        // Replay-uniqueness: each handshake must use a fresh CSPRNG nonce. A collision across
+        // independent draws is cryptographically negligible, so any repeat is a regression
+        // (e.g. accidentally reusing a constant or a counter).
+        let a = fresh_nonce();
+        let b = fresh_nonce();
+        assert_ne!(a, b, "two OsRng nonces must differ");
+        assert_ne!(a, [0u8; 32], "a nonce must not be all-zero");
     }
 }

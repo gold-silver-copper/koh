@@ -3,9 +3,11 @@
 //! The server side's plumbing to the real shell. Allocates a pseudo-terminal, spawns the
 //! user's login shell under it, pumps the child's output to an async channel from a dedicated
 //! blocking thread (portable-pty's reader is blocking-only), forwards input bytes to the
-//! child, and propagates window-size changes (which `ioctl(TIOCSWINSZ)` turns into `SIGWINCH`).
+//! child via a second dedicated thread (so a slow child never blocks a tokio worker), and
+//! propagates window-size changes (which `ioctl(TIOCSWINSZ)` turns into `SIGWINCH`).
 
 use std::io::{self, Read, Write};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 
 use portable_pty::{
     native_pty_system, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize,
@@ -16,6 +18,10 @@ use tokio::sync::mpsc;
 const READ_CHUNK: usize = 8192;
 /// Bound on the output channel (chunks). Backpressure here naturally slows the reader thread.
 const OUTPUT_CHANNEL_DEPTH: usize = 512;
+/// Bound on the input channel (chunks) feeding the writer thread. Generous, because under normal
+/// interactive use the child drains its input promptly; a full queue means the child has stopped
+/// reading (flow-controlled or hung), which [`Pty::write_input`] surfaces rather than blocking on.
+const WRITE_CHANNEL_DEPTH: usize = 1024;
 
 /// Typed errors from PTY allocation, shell spawn, and resize (mirrors the
 /// `transport-iroh::SetupError` pattern so callers can match on the failure stage).
@@ -45,10 +51,14 @@ pub enum PtyError {
 /// A running shell behind a PTY.
 ///
 /// Construct with [`Pty::spawn`], which also returns the receiver of the child's output.
-/// Hold the `Pty` for the life of the session: dropping the writer signals EOF to the child.
+/// Hold the `Pty` for the life of the session: dropping it drops `writer_tx`, which lets the
+/// writer thread finish and drop the PTY's write handle — and `portable-pty` writes an EOT
+/// (Ctrl-D) on that drop, so the child sees EOF on its stdin.
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Bounded sender to the dedicated writer thread (which owns the blocking `Box<dyn Write>`).
+    /// Shared by both input producers (keystrokes + host query replies), so writes stay FIFO.
+    writer_tx: SyncSender<Vec<u8>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
 }
@@ -94,7 +104,7 @@ impl Pty {
             .master
             .try_clone_reader()
             .map_err(|e| PtyError::Reader(io::Error::other(e)))?;
-        let writer = pair
+        let mut writer = pair
             .master
             .take_writer()
             .map_err(|e| PtyError::Reader(io::Error::other(e)))?;
@@ -120,10 +130,31 @@ impl Pty {
                 }
             })?;
 
+        // Dedicated writer thread: it owns the blocking `Box<dyn Write>` and drains the bounded
+        // input channel, so `write_input` never blocks a tokio worker. `recv()` yields every
+        // buffered chunk before it observes the senders being dropped, so pending writes flush
+        // before the writer is dropped (and `portable-pty` then writes the EOT that EOFs the
+        // child). The thread exits as soon as the last sender (held in `Pty`) drops.
+        let (writer_tx, writer_rx) = sync_channel::<Vec<u8>>(WRITE_CHANNEL_DEPTH);
+        std::thread::Builder::new()
+            .name("rmosh-pty-writer".into())
+            .spawn(move || {
+                while let Ok(chunk) = writer_rx.recv() {
+                    if writer
+                        .write_all(&chunk)
+                        .and_then(|()| writer.flush())
+                        .is_err()
+                    {
+                        break; // master closed / child gone
+                    }
+                }
+                // `writer` drops here -> portable-pty sends EOT -> child sees EOF on stdin.
+            })?;
+
         Ok((
             Pty {
                 master: pair.master,
-                writer,
+                writer_tx,
                 child,
                 killer,
             },
@@ -131,10 +162,24 @@ impl Pty {
         ))
     }
 
-    /// Forward input bytes to the child (verbatim — this is the raw keystroke stream).
-    pub fn write_input(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(data)?;
-        self.writer.flush()
+    /// Forward input bytes to the child (verbatim — keystrokes or host query replies).
+    ///
+    /// Takes `&self` and never blocks: it enqueues `data` onto the bounded channel feeding the
+    /// writer thread. Both producers share one sender, and callers enqueue while holding the
+    /// session lock, so bytes stay FIFO (a DSR reply can't overtake the keystroke that triggered
+    /// it). Returns [`io::ErrorKind::BrokenPipe`] if the writer thread is gone, and
+    /// [`io::ErrorKind::WouldBlock`] if the queue is full — the defined over-limit policy: surface
+    /// backpressure rather than block a tokio worker or silently drop input (a full 1024-deep
+    /// queue means the child has stopped reading, i.e. the session is effectively dead).
+    pub fn write_input(&self, data: &[u8]) -> io::Result<()> {
+        match self.writer_tx.try_send(data.to_vec()) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "pty writer queue full (child not draining its input)",
+            )),
+            Err(TrySendError::Disconnected(_)) => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+        }
     }
 
     /// Propagate a window-size change; the kernel raises `SIGWINCH` in the child.
@@ -262,5 +307,57 @@ mod tests {
             "did not observe the marker in shell output: {}",
             String::from_utf8_lossy(&collected)
         );
+    }
+
+    #[tokio::test]
+    async fn write_input_takes_shared_ref_and_preserves_order() {
+        // `pty` is bound WITHOUT `mut`, proving write_input takes `&self`. Two separate enqueues
+        // must reach the child in FIFO order: the concatenated marker only appears if the second
+        // chunk did not overtake the first.
+        let (pty, mut rx) = Pty::spawn(24, 80, None, "xterm-256color").expect("spawn shell");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        pty.write_input(b"printf ORDER_").expect("first enqueue");
+        pty.write_input(b"AB_CD\n").expect("second enqueue");
+
+        let mut collected = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let in_order = loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(chunk)) => {
+                    collected.extend_from_slice(&chunk);
+                    if String::from_utf8_lossy(&collected).contains("ORDER_AB_CD") {
+                        break true;
+                    }
+                }
+                Ok(None) => break false,
+                Err(_) => break false,
+            }
+        };
+        drop(pty);
+        assert!(
+            in_order,
+            "FIFO ordering of two enqueues should yield ORDER_AB_CD; got: {}",
+            String::from_utf8_lossy(&collected)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_pty_eofs_child_and_stops_writer() {
+        // `cat` blocks reading stdin. Dropping the Pty drops the writer-thread sender; the writer
+        // thread then finishes and drops the PTY write handle, on which portable-pty sends EOT —
+        // so the child sees EOF, exits, the slave closes, and the output channel ends. If the
+        // writer thread were stuck (or never dropped its handle), the channel would never close.
+        let (pty, mut rx) = Pty::spawn(24, 80, Some("cat"), "xterm-256color").expect("spawn cat");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(pty); // no kill(): EOF must come purely from the writer handle being dropped
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(_)) => continue, // drain any echoed bytes
+                Ok(None) => break, // channel closed: child EOF'd + exited; writer thread ended
+                Err(_) => panic!("dropping Pty did not EOF the child within 5s (writer stuck?)"),
+            }
+        }
     }
 }

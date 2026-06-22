@@ -16,7 +16,7 @@ over your phone to your main PC. This repo is that core: two binaries, `rmosh-se
 > left it), **terminal-reply synthesis** (DSR/DA/DECRQM, so vim/htop/fzf behave), and
 > **remote-shell exit-status propagation**. Client terminal I/O runs on
 > [termina](https://github.com/helix-editor/termina) with synchronized output (no crossterm).
-> 84 tests pass, including property tests, a network-chaos simulator, an in-process
+> 105 tests pass, including property tests, a network-chaos simulator, an in-process
 > client↔server scenario that converges at 50% packet loss, a reattach acceptance test,
 > **end-to-end tests over a real iroh connection** (both the full loop in one process and the
 > real `rmosh-client` binary driven through an allocated PTY), and a suite of upstream **mosh
@@ -77,6 +77,25 @@ mosh's exact timers (`SEND_INTERVAL_MIN/MAX`, `ACK_INTERVAL`, `ACK_DELAY`, `SEND
 and the shutdown handshake. Because it is pure, the whole protocol is deterministically
 testable under simulated loss/latency/reordering/duplication.
 
+### Headless drivers (the protocol is I/O-free; the shells are thin)
+
+The client session loop is split the same way the `Transport` is: a synchronous, I/O-free
+**`ClientSession`** owns the transport, predictor, and escape/render state and exposes pure step
+methods — `on_input` (the `Ctrl-^`-prefix machine + prediction seeding), `on_datagram`,
+`on_resize`, and `on_tick` (which returns the datagrams to send, the next wait, the link-down
+banner, and the remote exit code) — none of which touch tokio, iroh, or a real terminal. The
+screen is *derived* from the transport, so the renderer draws through borrows with no extra
+clone. `run_client` is then a thin shell: the `tokio::select!` (kept `biased` for input
+priority), the channels/sleeps, and `term.render()`, delegating every protocol decision to the
+session. This makes the whole client deterministically unit-testable and lets a future front-end
+(the planned Bevy terminal) drive the same core without the I/O scaffolding.
+
+On the server side, **PTY writes are non-blocking**: a dedicated `rmosh-pty-writer` thread owns
+the blocking write handle and drains a bounded channel, so forwarding a keystroke (or a synthesized
+DSR/DA reply) only enqueues and never blocks a tokio worker on a slow child. Both producers share
+one sender and enqueue under the session lock, so byte order is preserved (a query reply can't
+overtake the keystroke that triggered it).
+
 ## Two design decisions called out by the spec
 
 ### Fragmentation (how oversized state crosses the wire)
@@ -108,11 +127,31 @@ iroh-ssh's "anyone with the endpoint id gets a shell" model. The server:
 QUIC/iroh already authenticates both ends by public key and encrypts everything; the allowlist
 is the authorization layer on top.
 
+#### Optional passphrase second factor
+
+For defense-in-depth against a **leaked but still-allowlisted client key** (the one residual
+case the allowlist can't cover), the server can require a shared passphrase (`--passphrase`, or
+preferably `$RMOSH_PASSPHRASE` since argv is visible in the process table). The handshake rides
+inside the already-encrypted, authenticated QUIC connection and never puts the passphrase on the
+wire: the server sends a fresh `OsRng` nonce and checks `BLAKE3(K ‖ nonce)`, where the
+pre-shared key `K = Argon2id(passphrase, salt)` (64 MiB / 3 iterations, a fixed deterministic
+salt so both sides derive the same `K`). The mitigation against an attacker who has the key and
+is *online-guessing* the passphrase is twofold:
+
+- **Per-guess cost** — every attempt forces a full Argon2id derivation (the work factor), and the
+  response is compared in **constant time** (`constant_time_eq`), so there's no timing oracle.
+- **Per-peer rate limit** — a peer that fails (or times out) the handshake too many times within a
+  sliding window is refused *cheaply, before the KDF runs*, until its failures age out; this also
+  bounds the server CPU an attacker can burn. The limiter's keyspace is GC'd on the reaper sweep.
+
+The passphrase is held in a `secrecy::SecretString` and the derived `K` in `zeroize::Zeroizing`,
+exposed only at the KDF call (this reduces heap exposure; argv/env remain OS-visible).
+
 ## Build
 
 ```sh
 cargo build --release          # builds rmosh-server and rmosh-client
-cargo test  --workspace        # 84 tests: unit, property, chaos sim, real-iroh e2e, reattach, PTY binary, ported mosh regressions
+cargo test  --workspace        # 105 tests: unit, property, chaos sim, real-iroh e2e, reattach, PTY binary, ported mosh regressions
 ```
 
 Pinned toolchain-adjacent versions live in the root `Cargo.toml`: `iroh =1.0.0` (which brings

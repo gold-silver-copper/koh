@@ -20,6 +20,7 @@ use rmosh_transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
     load_or_create_secret_key, parse_endpoint_id, parse_relay_url, ALPN,
 };
+use secrecy::{ExposeSecret, SecretString};
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -62,7 +63,8 @@ struct Args {
     local: bool,
 
     /// Require a shared passphrase (defense-in-depth on top of the node-id allowlist).
-    /// The passphrase never crosses the wire. Also read from $RMOSH_PASSPHRASE.
+    /// The passphrase never crosses the wire. Prefer $RMOSH_PASSPHRASE over this flag: a
+    /// command-line argument is visible in the process table, an env var is not.
     #[arg(long)]
     passphrase: Option<String>,
 }
@@ -153,11 +155,15 @@ async fn main() -> anyhow::Result<()> {
     let scrollback = args.scrollback;
     let allow = std::sync::Arc::new(allow);
     let allow_any = args.allow_any;
-    // Optional passphrase (a second factor); also from $RMOSH_PASSPHRASE.
-    let passphrase = std::sync::Arc::new(
+    // Optional passphrase (a second factor); also from $RMOSH_PASSPHRASE. Held as a SecretString
+    // so the working copy is zeroized on drop and never lands in a Debug/log dump — this reduces
+    // heap exposure (the original argv/env bytes remain OS-visible, hence the env-var preference).
+    // It is exposed as a &str only at the KDF call inside the handshake.
+    let passphrase: std::sync::Arc<Option<SecretString>> = std::sync::Arc::new(
         args.passphrase
             .clone()
-            .or_else(|| std::env::var("RMOSH_PASSPHRASE").ok()),
+            .or_else(|| std::env::var("RMOSH_PASSPHRASE").ok())
+            .map(SecretString::from),
     );
 
     // Detachable session store: one shell per authorized client, surviving disconnects so a
@@ -190,7 +196,10 @@ async fn main() -> anyhow::Result<()> {
             // by a 10s timeout so a stalled/malicious client can't pin a session slot.
             match tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                rmosh_transport_iroh::auth::handshake_server(&conn, passphrase.as_deref()),
+                rmosh_transport_iroh::auth::handshake_server(
+                    &conn,
+                    passphrase.as_ref().as_ref().map(|s| s.expose_secret()),
+                ),
             )
             .await
             {

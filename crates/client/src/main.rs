@@ -18,6 +18,7 @@ use rmosh_transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, format_endpoint_id,
     load_or_create_secret_key, parse_endpoint_id, parse_relay_url, relay_addr, ALPN,
 };
+use secrecy::{ExposeSecret, SecretString};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
@@ -65,7 +66,8 @@ struct Args {
     #[arg(long)]
     show_id: bool,
 
-    /// Shared passphrase, if the server requires one. Also read from $RMOSH_PASSPHRASE.
+    /// Shared passphrase, if the server requires one. Prefer $RMOSH_PASSPHRASE over this flag:
+    /// a command-line argument is visible in the process table, an env var is not.
     #[arg(long)]
     passphrase: Option<String>,
 }
@@ -150,14 +152,19 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
         .context("connecting to server (is your id on its allowlist?)")?;
 
     // Optional passphrase second factor (no-op if the server doesn't require one). Runs on the
-    // raw connection before it's wrapped, since the handshake borrows &conn.
-    let passphrase = args
+    // raw connection before it's wrapped, since the handshake borrows &conn. Held as a
+    // SecretString (zeroized on drop, never logged) and exposed as a &str only at the KDF call.
+    let passphrase: Option<SecretString> = args
         .passphrase
         .clone()
-        .or_else(|| std::env::var("RMOSH_PASSPHRASE").ok());
-    rmosh_transport_iroh::auth::handshake_client(&conn, passphrase.as_deref())
-        .await
-        .context("passphrase handshake (wrong or missing --passphrase?)")?;
+        .or_else(|| std::env::var("RMOSH_PASSPHRASE").ok())
+        .map(SecretString::from);
+    rmosh_transport_iroh::auth::handshake_client(
+        &conn,
+        passphrase.as_ref().map(|s| s.expose_secret()),
+    )
+    .await
+    .context("passphrase handshake (wrong or missing --passphrase?)")?;
     eprintln!("connected. (Ctrl-^ then . to disconnect)");
 
     let channel = rmosh_transport_iroh::IrohChannel::new(conn);

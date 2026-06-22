@@ -25,6 +25,8 @@ blake3 = "1"
 argon2 = "0.5"
 # Constant-time comparison of the challenge response (no early-exit timing oracle).
 constant_time_eq = "0.5"
+# Zeroize the derived PSK on drop (reduces how long it lingers in heap memory).
+zeroize = "1"
 
 [dev-dependencies]
 # drive the real SSP Transport over a real iroh datagram connection in the e2e test

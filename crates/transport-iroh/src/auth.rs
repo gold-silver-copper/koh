@@ -22,6 +22,7 @@ use std::sync::{LazyLock, Mutex};
 
 use constant_time_eq::constant_time_eq_32;
 use iroh::endpoint::Connection;
+use zeroize::Zeroizing;
 
 /// Tag byte: the server requires no passphrase.
 const NO_PASS: u8 = 0;
@@ -63,43 +64,48 @@ fn kdf_salt() -> [u8; 16] {
 
 /// Derive the 32-byte pre-shared key `K = Argon2id(passphrase, salt)`. Pure and deterministic, so
 /// the client and server independently derive the **same** `K` from the same passphrase.
-fn derive_psk(passphrase: &str) -> [u8; 32] {
+///
+/// The result is wrapped in [`Zeroizing`] so the derived key is wiped from the heap on drop. This
+/// reduces how long the PSK lingers in memory; the passphrase itself reaches us only as a `&str`
+/// view into the caller's [`secrecy::SecretString`], exposed solely for this call (argv/env still
+/// remain OS-visible — prefer `$RMOSH_PASSPHRASE` over `--passphrase`).
+fn derive_psk(passphrase: &str) -> Zeroizing<[u8; 32]> {
     let argon = argon2::Argon2::new(
         argon2::Algorithm::Argon2id,
         argon2::Version::V0x13,
         kdf_params(),
     );
-    let salt = kdf_salt();
-    let mut psk = [0u8; 32];
+    let mut psk = Zeroizing::new([0u8; 32]);
     argon
-        .hash_password_into(passphrase.as_bytes(), &salt, &mut psk)
+        .hash_password_into(passphrase.as_bytes(), &kdf_salt(), psk.as_mut_slice())
         .expect("Argon2id derivation with valid static params and a 32-byte output cannot fail");
     psk
 }
 
+/// Derived PSKs keyed by a BLAKE3 hash of their passphrase (never the plaintext); values are
+/// zeroized when dropped.
+type PskCache = HashMap<[u8; 32], Zeroizing<[u8; 32]>>;
+
 /// Process-wide cache of derived PSKs so reconnects (and repeated handshakes) don't re-run the
-/// deliberately-expensive KDF. Keyed by a BLAKE3 hash of the passphrase, not the plaintext, so
-/// the map never holds the passphrase itself. (The `.lock()` unwrap is a poison check, not
-/// peer-influenced input.)
-static PSK_CACHE: LazyLock<Mutex<HashMap<[u8; 32], [u8; 32]>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// deliberately-expensive KDF. The map never holds the passphrase itself.
+/// (The `.lock()` unwrap is a poison check, not peer-influenced input.)
+static PSK_CACHE: LazyLock<Mutex<PskCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Fetch `K` for `passphrase`, deriving + caching it on first use ("derive once at startup",
 /// realized as derive-on-first-handshake-then-reuse).
-fn cached_psk(passphrase: &str) -> [u8; 32] {
+fn cached_psk(passphrase: &str) -> Zeroizing<[u8; 32]> {
     let key = *blake3::hash(passphrase.as_bytes()).as_bytes();
-    if let Some(psk) = PSK_CACHE
-        .lock()
-        .expect("PSK cache mutex poisoned")
-        .get(&key)
     {
-        return *psk;
+        let cache = PSK_CACHE.lock().expect("PSK cache mutex poisoned");
+        if let Some(psk) = cache.get(&key) {
+            return psk.clone();
+        }
     }
     let psk = derive_psk(passphrase);
     PSK_CACHE
         .lock()
         .expect("PSK cache mutex poisoned")
-        .insert(key, psk);
+        .insert(key, psk.clone());
     psk
 }
 
@@ -227,15 +233,17 @@ mod tests {
     fn derive_psk_is_deterministic_and_both_peers_agree() {
         // Determinism is the whole point: the client and server independently call the SAME
         // derivation, so equal passphrases MUST yield equal PSKs (else the handshake can't pass).
+        // Deref the Zeroizing wrappers to compare the key bytes (Zeroizing deliberately omits
+        // PartialEq to discourage non-constant-time key comparisons).
         let server_k = derive_psk("correct horse battery staple");
         let client_k = derive_psk("correct horse battery staple");
-        assert_eq!(server_k, client_k, "both peers must derive the same PSK");
+        assert_eq!(*server_k, *client_k, "both peers must derive the same PSK");
         // The cached path must equal a fresh derivation.
-        assert_eq!(cached_psk("correct horse battery staple"), server_k);
+        assert_eq!(*cached_psk("correct horse battery staple"), *server_k);
         // A different passphrase yields a different PSK.
         assert_ne!(
-            server_k,
-            derive_psk("wrong horse"),
+            *server_k,
+            *derive_psk("wrong horse"),
             "distinct passphrases -> distinct PSKs"
         );
         // The fixed salt is stable (so the PSK is reproducible across runs).

@@ -26,6 +26,7 @@ data-encoding.workspace = true
 directories.workspace = true
 vt100.workspace = true
 termina = "0.3.3"
+secrecy = "0.10"
 
 [dev-dependencies]
 # the server lib, so the e2e test can run a real session over a loopback iroh connection

@@ -108,7 +108,10 @@ pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, 
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
-    let ep = builder.bind().await.map_err(|e| SetupError::Other(e.into()))?;
+    let ep = builder
+        .bind()
+        .await
+        .map_err(|e| SetupError::Other(e.into()))?;
     Ok(ep)
 }
 
@@ -124,7 +127,10 @@ pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endp
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
-    let ep = builder.bind().await.map_err(|e| SetupError::Other(e.into()))?;
+    let ep = builder
+        .bind()
+        .await
+        .map_err(|e| SetupError::Other(e.into()))?;
     Ok(ep)
 }
 
@@ -170,7 +176,10 @@ pub async fn bind_endpoint_with_relay(
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
-    let ep = builder.bind().await.map_err(|e| SetupError::Other(e.into()))?;
+    let ep = builder
+        .bind()
+        .await
+        .map_err(|e| SetupError::Other(e.into()))?;
     Ok(ep)
 }
 
@@ -297,7 +306,11 @@ mod tests {
 
         let sk1 = load_or_create_secret_key(&path).unwrap();
         let sk2 = load_or_create_secret_key(&path).unwrap();
-        assert_eq!(sk1.to_bytes(), sk2.to_bytes(), "second load must reuse the key");
+        assert_eq!(
+            sk1.to_bytes(),
+            sk2.to_bytes(),
+            "second load must reuse the key"
+        );
 
         // The endpoint id is stable and round-trips through its string form.
         let id = sk1.public();
@@ -338,7 +351,10 @@ mod tests {
             .await
             .expect("connect over loopback");
         let chan = IrohChannel::new(conn);
-        assert!(chan.send(b"ping-over-real-iroh"), "datagram send should succeed");
+        assert!(
+            chan.send(b"ping-over-real-iroh"),
+            "datagram send should succeed"
+        );
         let echoed = chan.recv().await.expect("recv echo");
         assert_eq!(&echoed[..], b"ping-over-real-iroh");
 

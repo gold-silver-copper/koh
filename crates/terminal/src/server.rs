@@ -138,7 +138,12 @@ impl ServerTerminal {
     /// reflect it yet; [`set_echo_ack`](Self::set_echo_ack) promotes it after the debounce.
     pub fn register_input_frame(&mut self, n: u64, now: u64) {
         // Frame numbers only advance; ignore stale/duplicate registrations.
-        if self.input_history.last().map(|(f, _)| n > *f).unwrap_or(true) {
+        if self
+            .input_history
+            .last()
+            .map(|(f, _)| n > *f)
+            .unwrap_or(true)
+        {
             self.input_history.push((n, now));
         }
     }
@@ -218,7 +223,7 @@ mod tests {
         t.process(b"\x1b[5;3H"); // move cursor to row 5, col 3 (1-indexed input)
         t.process(b"\x1b[6n"); // DSR: report cursor position
         assert_eq!(t.take_host_replies(), b"\x1b[5;3R"); // 1-indexed report
-        // Drained: a second take is empty.
+                                                         // Drained: a second take is empty.
         assert!(t.take_host_replies().is_empty());
     }
 

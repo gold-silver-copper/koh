@@ -111,7 +111,9 @@ fn run_session(loss: f64, seed: u64) -> anyhow::Result<SessionResult> {
     *h.b_mut() = emu.snapshot();
 
     // Initial sync: client receives the prompt.
-    h.run_until(5_000, |h| h.a.remote_state().screen().contents().contains('$'));
+    h.run_until(5_000, |h| {
+        h.a.remote_state().screen().contents().contains('$')
+    });
 
     // Client types a command (with the trailing CR a shell would see).
     let cmd = b"echo hello rmosh\r";

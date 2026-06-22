@@ -61,12 +61,22 @@ pub struct LinkParams {
 impl LinkParams {
     /// A clean, low-latency link.
     pub fn perfect() -> Self {
-        LinkParams { loss: 0.0, min_delay_ms: 5, max_delay_ms: 5, dup: 0.0 }
+        LinkParams {
+            loss: 0.0,
+            min_delay_ms: 5,
+            max_delay_ms: 5,
+            dup: 0.0,
+        }
     }
 
     /// A nasty mobile link: 30% loss, 20–120ms jitter, 5% duplication.
     pub fn lossy() -> Self {
-        LinkParams { loss: 0.30, min_delay_ms: 20, max_delay_ms: 120, dup: 0.05 }
+        LinkParams {
+            loss: 0.30,
+            min_delay_ms: 20,
+            max_delay_ms: 120,
+            dup: 0.05,
+        }
     }
 
     fn rtt_hint(&self) -> f64 {

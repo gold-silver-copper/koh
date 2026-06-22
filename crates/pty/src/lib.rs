@@ -7,7 +7,9 @@
 
 use std::io::{Read, Write};
 
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize};
+use portable_pty::{
+    native_pty_system, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize,
+};
 use tokio::sync::mpsc;
 
 /// Size of each output chunk read from the PTY master.
@@ -143,8 +145,8 @@ mod tests {
     #[tokio::test]
     async fn spawns_and_streams_output() {
         // Run a one-shot command in the PTY and confirm we receive its output + reap it.
-        let (mut pty, mut rx) = Pty::spawn(24, 80, Some("echo"), "xterm-256color")
-            .expect("spawn echo");
+        let (mut pty, mut rx) =
+            Pty::spawn(24, 80, Some("echo"), "xterm-256color").expect("spawn echo");
         // `CommandBuilder::new("echo")` then arg is awkward here (we only take a program),
         // so instead drive a tiny shell snippet via the default shell path below if needed.
         // `echo` with no args prints just a newline; assert we get *something* and EOF.
@@ -158,7 +160,10 @@ mod tests {
             }
         }
         // `echo` prints a newline (CR/LF in a pty).
-        assert!(collected.contains(&b'\n'), "expected a newline from echo, got {collected:?}");
+        assert!(
+            collected.contains(&b'\n'),
+            "expected a newline from echo, got {collected:?}"
+        );
         // Child should be reapable.
         let status = pty.wait().expect("wait");
         assert!(status.success() || status.exit_code() == 0);
@@ -189,6 +194,10 @@ mod tests {
         // Resize should not error while the shell is live.
         let _ = pty.resize(40, 120);
         let _ = pty.kill();
-        assert!(found, "did not observe the marker in shell output: {}", String::from_utf8_lossy(&collected));
+        assert!(
+            found,
+            "did not observe the marker in shell output: {}",
+            String::from_utf8_lossy(&collected)
+        );
     }
 }

@@ -23,7 +23,10 @@ use rmosh_transport_iroh::{
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
-#[command(name = "rmosh-server", about = "mosh-over-iroh server (PTY shell host)")]
+#[command(
+    name = "rmosh-server",
+    about = "mosh-over-iroh server (PTY shell host)"
+)]
 struct Args {
     /// Path to the persistent secret-key file (gives a stable endpoint id across restarts).
     #[arg(long)]
@@ -101,11 +104,17 @@ async fn main() -> anyhow::Result<()> {
     // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
     let endpoint = if let Some(url) = &args.relay_url {
         let relay = parse_relay_url(url)?;
-        bind_endpoint_with_relay(secret, true, relay).await.context("binding endpoint")?
+        bind_endpoint_with_relay(secret, true, relay)
+            .await
+            .context("binding endpoint")?
     } else if args.local {
-        bind_endpoint_local(secret, true).await.context("binding endpoint")?
+        bind_endpoint_local(secret, true)
+            .await
+            .context("binding endpoint")?
     } else {
-        bind_endpoint(secret, true).await.context("binding endpoint")?
+        bind_endpoint(secret, true)
+            .await
+            .context("binding endpoint")?
     };
     let my_id = endpoint.id();
     let id_str = format_endpoint_id(&my_id);

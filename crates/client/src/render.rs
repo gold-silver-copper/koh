@@ -190,7 +190,11 @@ pub fn render(
     }
 
     // End Synchronized Update: the terminal now reveals the whole frame at once.
-    write!(out, "{}", reset_mode(DecPrivateModeCode::SynchronizedOutput))?;
+    write!(
+        out,
+        "{}",
+        reset_mode(DecPrivateModeCode::SynchronizedOutput)
+    )?;
     out.flush()
 }
 
@@ -221,8 +225,14 @@ mod tests {
         let mut buf = Vec::new();
         render(&mut buf, &screen, &Overlay::empty(), None).unwrap();
         let s = String::from_utf8_lossy(&buf);
-        assert!(s.contains("\x1b[?2026h"), "frame must begin synchronized output");
-        assert!(s.contains("\x1b[?2026l"), "frame must end synchronized output");
+        assert!(
+            s.contains("\x1b[?2026h"),
+            "frame must begin synchronized output"
+        );
+        assert!(
+            s.contains("\x1b[?2026l"),
+            "frame must end synchronized output"
+        );
     }
 
     #[test]
@@ -249,7 +259,10 @@ mod tests {
         pe.set_local_frame_sent(1);
         pe.new_user_byte(60, b'Z', &echoed); // now visible at (0,1)
         let overlay = pe.overlay(&echoed);
-        assert!(!overlay.is_empty(), "confirmed prediction should be visible");
+        assert!(
+            !overlay.is_empty(),
+            "confirmed prediction should be visible"
+        );
 
         let mut buf = Vec::new();
         render(&mut buf, &echoed, &overlay, None).unwrap();

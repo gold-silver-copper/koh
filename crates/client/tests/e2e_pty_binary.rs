@@ -93,7 +93,9 @@ async fn real_client_binary_renders_over_pty() {
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
     // Type a command with a distinctive marker; it round-trips to `sh` and back as a frame.
-    writer.write_all(b"echo rmosh_pty_marker\r").expect("write keystrokes");
+    writer
+        .write_all(b"echo rmosh_pty_marker\r")
+        .expect("write keystrokes");
     writer.flush().ok();
 
     let contains_marker = |b: &Arc<Mutex<Vec<u8>>>| {

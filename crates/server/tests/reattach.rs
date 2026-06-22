@@ -86,7 +86,10 @@ async fn session_survives_disconnect_and_reattaches() {
         .expect("connect #1");
     let chan1 = IrohChannel::new(conn1);
     let saw1 = client_pump(&chan1, Some(b"echo REATTACH_MARKER_42\r"), MARKER, 10_000).await;
-    assert!(saw1, "marker should appear on the screen during the first connection");
+    assert!(
+        saw1,
+        "marker should appear on the screen during the first connection"
+    );
 
     // Disconnect (the shell keeps running in the detached session).
     chan1.close(0, b"client detached");

@@ -1,8 +1,6 @@
 //! The passphrase nonce-challenge handshake over a real loopback iroh connection.
 
-use rmosh_transport_iroh::{
-    auth, bind_endpoint_local, generate_secret_key, loopback_addr, ALPN,
-};
+use rmosh_transport_iroh::{auth, bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 
 /// Run one handshake round over a fresh loopback connection and return (server, client) results.
 async fn round(

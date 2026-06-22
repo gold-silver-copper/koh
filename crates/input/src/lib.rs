@@ -169,7 +169,10 @@ mod tests {
         let mut acked = UserInput::new();
         acked.push_bytes(b"hel");
         ui.subtract_prefix(&acked);
-        assert_eq!(ui.events(), &[InputEvent::Byte(b'l'), InputEvent::Byte(b'o')]);
+        assert_eq!(
+            ui.events(),
+            &[InputEvent::Byte(b'l'), InputEvent::Byte(b'o')]
+        );
     }
 
     #[test]
@@ -187,7 +190,9 @@ mod tests {
             h.run_steps(6);
         }
         let expected = typed.events().to_vec();
-        h.run_until(20_000, move |h| h.b_view_of_a().events() == expected.as_slice());
+        h.run_until(20_000, move |h| {
+            h.b_view_of_a().events() == expected.as_slice()
+        });
     }
 
     #[test]

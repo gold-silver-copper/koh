@@ -137,8 +137,7 @@ impl Fragment {
     /// Serialize to datagram bytes: `id` (8 BE) ++ `(final << 15) | index` (2 BE) ++ `payload`.
     /// Exactly `FRAGMENT_HEADER_OVERHEAD + payload.len()` bytes.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        let combined: u16 =
-            ((self.final_ as u16) << 15) | (self.index & MAX_FRAGMENT_INDEX);
+        let combined: u16 = ((self.final_ as u16) << 15) | (self.index & MAX_FRAGMENT_INDEX);
         let mut out = Vec::with_capacity(FRAGMENT_HEADER_OVERHEAD + self.payload.len());
         out.extend_from_slice(&self.id.to_be_bytes());
         out.extend_from_slice(&combined.to_be_bytes());
@@ -195,7 +194,11 @@ impl Fragmenter {
     /// Fragment `instr` into pieces that each serialize to `<= mtu` bytes.
     ///
     /// Returns at least one fragment (a zero-length instruction still yields one final fragment).
-    pub fn fragment(&mut self, instr: &Instruction, mtu: usize) -> Result<Vec<Fragment>, WireError> {
+    pub fn fragment(
+        &mut self,
+        instr: &Instruction,
+        mtu: usize,
+    ) -> Result<Vec<Fragment>, WireError> {
         if mtu <= FRAGMENT_HEADER_OVERHEAD {
             return Err(WireError::MtuTooSmall {
                 mtu,
@@ -428,7 +431,11 @@ mod tests {
         let frags = fr.fragment(&sample_instruction(5000), 200).unwrap();
         assert!(frags.len() > 1);
         for f in &frags[..frags.len() - 1] {
-            assert_eq!(f.encode().unwrap().len(), 200, "non-final fragments pack to exactly the MTU");
+            assert_eq!(
+                f.encode().unwrap().len(),
+                200,
+                "non-final fragments pack to exactly the MTU"
+            );
         }
     }
 

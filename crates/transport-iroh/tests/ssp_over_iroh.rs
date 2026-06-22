@@ -8,7 +8,9 @@
 use std::time::Duration;
 
 use rmosh_ssp::{SyncState, Transport};
-use rmosh_transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, ALPN};
+use rmosh_transport_iroh::{
+    bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, ALPN,
+};
 use serde::{Deserialize, Serialize};
 
 /// A growing byte-log state (no collapse), so the receiver's view equals the sender's exactly.
@@ -88,10 +90,17 @@ async fn ssp_transports_converge_over_real_iroh() {
         if tb.remote_state().0 == payload {
             break;
         }
-        assert!(now() < 15_000, "SSP did not converge over real iroh in time");
+        assert!(
+            now() < 15_000,
+            "SSP did not converge over real iroh in time"
+        );
     }
 
-    assert_eq!(tb.remote_state().0, payload, "B converged to A's state over real iroh");
+    assert_eq!(
+        tb.remote_state().0,
+        payload,
+        "B converged to A's state over real iroh"
+    );
 
     chan_a.close(0, b"done");
     drop((server, client));

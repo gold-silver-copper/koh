@@ -125,7 +125,9 @@ pub async fn run_client<T: ClientTerminal>(
     transport.set_connected(true);
     let mut predictor = PredictionEngine::new(pref);
 
-    transport.current_mut().push_resize(initial_rows, initial_cols);
+    transport
+        .current_mut()
+        .push_resize(initial_rows, initial_cols);
 
     let mut pending_escape = false;
     let mut dirty = true;

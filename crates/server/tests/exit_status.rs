@@ -72,10 +72,7 @@ async fn remote_shell_exit_status_reaches_client() {
         }
     });
 
-    let conn = client_ep
-        .connect(server_addr, ALPN)
-        .await
-        .expect("connect");
+    let conn = client_ep.connect(server_addr, ALPN).await.expect("connect");
     let chan = IrohChannel::new(conn);
 
     // `sh` runs `exit 42`; the shell terminates, the drain task reaps the real status and stamps

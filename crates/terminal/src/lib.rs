@@ -258,7 +258,11 @@ mod tests {
     #[test]
     fn resize_roundtrip_full_repaint() {
         let a = screen_from(24, 80, b"small screen content here");
-        let b = screen_from(40, 120, b"now a much wider and taller screen\r\nwith two lines");
+        let b = screen_from(
+            40,
+            120,
+            b"now a much wider and taller screen\r\nwith two lines",
+        );
         let diff = b.diff_from(&a);
         assert_eq!(diff.resize, Some((40, 120)));
         let mut c = a.clone();
@@ -289,7 +293,8 @@ mod tests {
     #[test]
     fn converges_over_lossy_link() {
         // Server (A) evolves its screen; client (B) must converge to the latest frame.
-        let mut h = SimHarness::<TerminalScreen, TerminalScreen>::new(LinkParams::lossy(), 77, 1200);
+        let mut h =
+            SimHarness::<TerminalScreen, TerminalScreen>::new(LinkParams::lossy(), 77, 1200);
         let mut emu = ServerTerminal::new(24, 80, 0);
         for i in 0..30u32 {
             emu.process(format!("\r\nframe {i} of output").as_bytes());
@@ -314,10 +319,16 @@ mod tests {
             emu.process(format!("line {i}\r\n").as_bytes());
             let target = emu.snapshot();
             let diff = target.diff_from(&base);
-            assert!(diff.resize.is_none(), "no resize -> incremental (persistent) path");
+            assert!(
+                diff.resize.is_none(),
+                "no resize -> incremental (persistent) path"
+            );
             client.apply(&diff); // same object, repeated apply (no clone between frames)
             base = target.clone();
-            assert_eq!(client, base, "client must track server after incremental diff {i}");
+            assert_eq!(
+                client, base,
+                "client must track server after incremental diff {i}"
+            );
         }
     }
 
@@ -338,7 +349,10 @@ mod tests {
         let mut c = base.clone();
         c.apply(&diff);
         assert_eq!(c.exit_code(), Some(42));
-        assert_ne!(base, c, "a state carrying an exit code differs from one without");
+        assert_ne!(
+            base, c,
+            "a state carrying an exit code differs from one without"
+        );
     }
 
     // --- Ported mosh terminal-emulation / unicode regression tests, recast as SSP round-trip
@@ -357,7 +371,10 @@ mod tests {
         let diff = target.diff_from(&base);
         let mut client = base.clone();
         client.apply(&diff);
-        assert_eq!(client, target, "client must reconstruct the server screen exactly");
+        assert_eq!(
+            client, target,
+            "client must reconstruct the server screen exactly"
+        );
         client
     }
 
@@ -386,9 +403,21 @@ mod tests {
         assert!(s.cell(0, 1).unwrap().underline(), "underline");
         assert!(s.cell(0, 2).unwrap().inverse(), "inverse");
         assert!(s.cell(0, 3).unwrap().italic(), "italic");
-        assert_eq!(s.cell(0, 4).unwrap().fgcolor(), vt100::Color::Idx(1), "16-color red");
-        assert_eq!(s.cell(0, 5).unwrap().fgcolor(), vt100::Color::Idx(208), "256-color");
-        assert_eq!(s.cell(0, 6).unwrap().fgcolor(), vt100::Color::Rgb(10, 20, 30), "truecolor");
+        assert_eq!(
+            s.cell(0, 4).unwrap().fgcolor(),
+            vt100::Color::Idx(1),
+            "16-color red"
+        );
+        assert_eq!(
+            s.cell(0, 5).unwrap().fgcolor(),
+            vt100::Color::Idx(208),
+            "256-color"
+        );
+        assert_eq!(
+            s.cell(0, 6).unwrap().fgcolor(),
+            vt100::Color::Rgb(10, 20, 30),
+            "truecolor"
+        );
     }
 
     #[test]
@@ -415,8 +444,16 @@ mod tests {
         bytes.extend_from_slice(b"\x1b[4S\x1b[2T");
         let c = roundtrip(24, 80, &bytes);
         let s = c.screen();
-        assert_eq!(row_text(s, 0), "", "two blank rows pushed in at the top after SD 2");
-        assert_eq!(row_text(s, 2), "line5", "line5 reached the top after SU 4, then down 2");
+        assert_eq!(
+            row_text(s, 0),
+            "",
+            "two blank rows pushed in at the top after SD 2"
+        );
+        assert_eq!(
+            row_text(s, 2),
+            "line5",
+            "line5 reached the top after SU 4, then down 2"
+        );
         assert_eq!(row_text(s, 21), "line24", "last line still present");
     }
 
@@ -444,9 +481,17 @@ mod tests {
         // If vt100 ever gains CBT/CHT, this test flips and should become the real mosh assertion
         // ("hello, world" / a forward-tabbed "ab      tab").
         let c = roundtrip(24, 80, b"hello, wurld\x1b[Zo");
-        assert_eq!(row_text(c.screen(), 0), "hello, wurldo", "CBT currently a no-op in vt100");
+        assert_eq!(
+            row_text(c.screen(), 0),
+            "hello, wurldo",
+            "CBT currently a no-op in vt100"
+        );
         let c2 = roundtrip(24, 80, b"ab\x1b[Itab");
-        assert_eq!(row_text(c2.screen(), 0), "abtab", "CHT currently a no-op in vt100");
+        assert_eq!(
+            row_text(c2.screen(), 0),
+            "abtab",
+            "CHT currently a no-op in vt100"
+        );
     }
 
     #[test]
@@ -459,7 +504,11 @@ mod tests {
         let c = roundtrip(24, 80, &bytes);
         let s = c.screen();
         assert_eq!(row_text(s, 0), "E".repeat(80), "80 chars fill row 0");
-        assert_eq!(s.cell(1, 0).unwrap().contents(), "M", "M lands on row 1, no spurious wrap row");
+        assert_eq!(
+            s.cell(1, 0).unwrap().contents(),
+            "M",
+            "M lands on row 1, no spurious wrap row"
+        );
     }
 
     #[test]
@@ -478,10 +527,20 @@ mod tests {
         emu.process(b"b"); // frame N+1: one more char forces the wrap to row 1
         let frame_n1 = emu.snapshot();
         let diff = frame_n1.diff_from(&frame_n);
-        assert!(diff.resize.is_none(), "incremental path, not a full repaint");
+        assert!(
+            diff.resize.is_none(),
+            "incremental path, not a full repaint"
+        );
         client.apply(&diff);
-        assert_eq!(client, frame_n1, "wrap across frames must reconstruct incrementally");
-        assert_eq!(client.screen().cell(1, 0).unwrap().contents(), "b", "wrapped char on row 1");
+        assert_eq!(
+            client, frame_n1,
+            "wrap across frames must reconstruct incrementally"
+        );
+        assert_eq!(
+            client.screen().cell(1, 0).unwrap().contents(),
+            "b",
+            "wrapped char on row 1"
+        );
     }
 
     #[test]

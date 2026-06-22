@@ -193,7 +193,12 @@ impl PredictionEngine {
 
     /// Read the predicted-or-real glyph + style + unknown-ness at a cell — the source content a
     /// row-shift copies from. Prefers an active prediction over the authoritative screen.
-    fn pred_or_real_glyph(&self, screen: &Screen, row: u16, col: u16) -> (String, Color, Color, bool) {
+    fn pred_or_real_glyph(
+        &self,
+        screen: &Screen,
+        row: u16,
+        col: u16,
+    ) -> (String, Color, Color, bool) {
         if let Some(p) = self.cells.get(&(row, col)) {
             (p.glyph.clone(), p.fg, p.bg, p.unknown)
         } else {
@@ -877,7 +882,10 @@ mod tests {
         e.new_user_byte(300, b'y', &echoed);
         let ov = e.overlay(&echoed);
         assert_eq!(ov.cell(0, 1).map(|c| c.glyph.as_str()), Some("y"));
-        assert!(ov.cell(0, 1).unwrap().underline, "slow link should flag predictions");
+        assert!(
+            ov.cell(0, 1).unwrap().underline,
+            "slow link should flag predictions"
+        );
     }
 
     #[test]
@@ -896,7 +904,10 @@ mod tests {
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
         e.new_user_byte(100, b's', &blank);
-        assert!(e.overlay(&blank).is_empty(), "non-echoed input is never shown");
+        assert!(
+            e.overlay(&blank).is_empty(),
+            "non-echoed input is never shown"
+        );
 
         let still_blank = screen_of(b"");
         e.set_local_frame_late_acked(1);
@@ -925,8 +936,16 @@ mod tests {
         e.set_local_frame_sent(0);
         let screen = screen_of(b"ab\x1b[1;2H"); // cursor -> row1 col2 = (0,1)
         e.new_user_byte(0, b'X', &screen);
-        assert_eq!(e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()), Some("X"), "typed char at col");
-        assert_eq!(e.cells.get(&(0, 2)).map(|c| c.glyph.as_str()), Some("b"), "tail shifted right");
+        assert_eq!(
+            e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
+            Some("X"),
+            "typed char at col"
+        );
+        assert_eq!(
+            e.cells.get(&(0, 2)).map(|c| c.glyph.as_str()),
+            Some("b"),
+            "tail shifted right"
+        );
     }
 
     #[test]
@@ -938,9 +957,16 @@ mod tests {
         let screen = screen_of(b"abc\x1b[1;3H"); // cursor -> (0,2)
         e.new_user_byte(0, 0x7f, &screen); // backspace
         let (_, cols) = screen.size();
-        assert_eq!(e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()), Some("c"), "tail shifted left");
+        assert_eq!(
+            e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
+            Some("c"),
+            "tail shifted left"
+        );
         assert!(
-            e.cells.get(&(0, cols - 1)).map(|c| c.unknown).unwrap_or(false),
+            e.cells
+                .get(&(0, cols - 1))
+                .map(|c| c.unknown)
+                .unwrap_or(false),
             "right edge is marked unknown after a mid-line backspace"
         );
     }
@@ -981,7 +1007,11 @@ mod tests {
             e.new_user_byte(300, b, &echoed); // ESC [ D
         }
         let ov = e.overlay(&echoed);
-        assert_eq!(ov.cursor(), Some((0, 0)), "left arrow predicts the cursor one col left");
+        assert_eq!(
+            ov.cursor(),
+            Some((0, 0)),
+            "left arrow predicts the cursor one col left"
+        );
         assert!(
             ov.cell(0, 0).is_none() && ov.cell(0, 1).is_none(),
             "arrow escape bytes must not be drawn as literal glyphs"
@@ -1050,7 +1080,10 @@ mod tests {
             );
             for col in 0..80u16 {
                 if let Some(cell) = ov.cell(0, col) {
-                    assert_ne!(cell.glyph, ")", "{word}: ĩ must not collapse to its low byte ')'");
+                    assert_ne!(
+                        cell.glyph, ")",
+                        "{word}: ĩ must not collapse to its low byte ')'"
+                    );
                 }
             }
         }

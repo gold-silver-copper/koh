@@ -463,7 +463,12 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         if new_num == SHUTDOWN_SENTINEL {
             self.shutdown_tries += 1;
         }
-        trace!(old_num, new_num, ack_num = self.ack_num, "sending instruction");
+        trace!(
+            old_num,
+            new_num,
+            ack_num = self.ack_num,
+            "sending instruction"
+        );
         let frags = match self.fragmenter.fragment(&instr, self.mtu) {
             Ok(f) => f,
             Err(e) => {
@@ -471,10 +476,7 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
                 return Vec::new();
             }
         };
-        frags
-            .iter()
-            .filter_map(|f| f.encode().ok())
-            .collect()
+        frags.iter().filter_map(|f| f.encode().ok()).collect()
     }
 
     fn add_sent_state(&mut self, now: u64, num: u64, state: Local) {
@@ -665,10 +667,16 @@ mod tests {
     fn throwaway_gc_dropping_base_does_not_panic() {
         let mut t = Transport::<Abs, Abs>::new(0, 1200);
         // received_states = [0, 2]
-        assert_eq!(t.recv(10, &datagram(&instr(0, 2, 0, 22))), RecvOutcome::NewState);
+        assert_eq!(
+            t.recv(10, &datagram(&instr(0, 2, 0, 22))),
+            RecvOutcome::NewState
+        );
         assert_eq!(t.remote_state().0, 22);
         // old=0 base, but throwaway_num=1 GCs num 0 (the base) before apply.
-        assert_eq!(t.recv(20, &datagram(&instr(0, 5, 1, 55))), RecvOutcome::NewState);
+        assert_eq!(
+            t.recv(20, &datagram(&instr(0, 5, 1, 55))),
+            RecvOutcome::NewState
+        );
         assert_eq!(
             t.remote_state().0,
             55,
@@ -688,7 +696,11 @@ mod tests {
         // The identical datagram again is a Duplicate (new_num 2 already held)...
         assert_eq!(t.recv(9000, &dg), RecvOutcome::Duplicate);
         // ...but it still proves the peer is alive, so liveness must advance.
-        assert_eq!(t.last_heard(), 9000, "a duplicate keepalive must refresh last_heard");
+        assert_eq!(
+            t.last_heard(),
+            9000,
+            "a duplicate keepalive must refresh last_heard"
+        );
         assert!(t.link_up_within(9100, 10_000));
         assert!(!t.link_up_within(20_000, 10_000));
     }

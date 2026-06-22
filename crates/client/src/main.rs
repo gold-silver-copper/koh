@@ -128,7 +128,9 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
     // Pick the dial strategy: a direct LAN/loopback address, a self-hosted relay, or the
     // default n0 relay+discovery (bare endpoint id).
     let (endpoint, target) = if let Some(addr) = args.direct {
-        let ep = bind_endpoint_local(secret, false).await.context("binding endpoint")?;
+        let ep = bind_endpoint_local(secret, false)
+            .await
+            .context("binding endpoint")?;
         (ep, direct_addr(server_id, addr))
     } else if let Some(url) = &args.relay_url {
         let relay = parse_relay_url(url)?;
@@ -137,7 +139,9 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
             .context("binding endpoint")?;
         (ep, relay_addr(server_id, relay))
     } else {
-        let ep = bind_endpoint(secret, false).await.context("binding endpoint")?;
+        let ep = bind_endpoint(secret, false)
+            .await
+            .context("binding endpoint")?;
         (ep, server_id.into())
     };
     let conn = endpoint
@@ -185,7 +189,8 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
 
     // SIGWINCH -> resize ticks (run_client re-reads term.size() on each). Sender kept alive.
     let (resize_tx, resize_rx) = mpsc::channel::<()>(8);
-    let mut sigwinch = signal(SignalKind::window_change()).context("installing SIGWINCH handler")?;
+    let mut sigwinch =
+        signal(SignalKind::window_change()).context("installing SIGWINCH handler")?;
     tokio::spawn(async move {
         while sigwinch.recv().await.is_some() {
             if resize_tx.send(()).await.is_err() {
@@ -194,7 +199,16 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
         }
     });
 
-    let result = run_client(channel, args.predict.into(), rows, cols, input_rx, resize_rx, term).await;
+    let result = run_client(
+        channel,
+        args.predict.into(),
+        rows,
+        cols,
+        input_rx,
+        resize_rx,
+        term,
+    )
+    .await;
     // `term` is moved into run_client and dropped there, restoring the terminal.
 
     endpoint.close().await;

@@ -10,19 +10,24 @@
 
 use std::time::Duration;
 
+use iroh::endpoint::Endpoint;
+use iroh::EndpointAddr;
 use rmosh_input::UserInput;
 use rmosh_server::session::{self, SessionStore};
 use rmosh_server::{run_attached, SessionExit};
 use rmosh_ssp::Transport;
 use rmosh_terminal::TerminalScreen;
-use iroh::endpoint::Endpoint;
-use iroh::EndpointAddr;
 use rmosh_transport_iroh::{
     bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, MonoClock, ALPN,
 };
 
 /// A running loopback server: endpoint, its dial address, the session store, and the accept task.
-type RunningServer = (Endpoint, EndpointAddr, SessionStore, tokio::task::JoinHandle<()>);
+type RunningServer = (
+    Endpoint,
+    EndpointAddr,
+    SessionStore,
+    tokio::task::JoinHandle<()>,
+);
 
 /// Start a loopback server with a session store and an accept loop that attaches each connection
 /// to its peer's detachable session (mirrors the real `rmosh-server` accept loop).
@@ -116,7 +121,10 @@ async fn xon_xoff_cycle_does_not_wedge_session() {
         15_000,
     )
     .await;
-    assert!(ok, "session must keep delivering output across a ^S/^Q cycle (no wedge)");
+    assert!(
+        ok,
+        "session must keep delivering output across a ^S/^Q cycle (no wedge)"
+    );
 
     chan.close(0, b"done");
     accept.abort();
@@ -141,8 +149,13 @@ async fn session_lifecycle_stress() {
                 .unwrap_or_else(|e| panic!("iteration {i}: connect failed: {e}")),
         );
         let marker = format!("MOSH_REPEAT_{i}");
-        let ok = client_script(&chan, &[(None, format!("echo {marker}\r").as_bytes())], &marker, 10_000)
-            .await;
+        let ok = client_script(
+            &chan,
+            &[(None, format!("echo {marker}\r").as_bytes())],
+            &marker,
+            10_000,
+        )
+        .await;
         assert!(ok, "iteration {i}: marker {marker} must round-trip");
         chan.close(0, b"next");
         drop(chan);
@@ -181,7 +194,10 @@ async fn session_lifecycle_stress_with_input() {
             10_000,
         )
         .await;
-        assert!(ok, "iteration {i}: marker {marker} must round-trip under input spam");
+        assert!(
+            ok,
+            "iteration {i}: marker {marker} must round-trip under input spam"
+        );
         // Abrupt drop (no graceful close) to exercise teardown-with-pending-input.
         drop(chan);
     }

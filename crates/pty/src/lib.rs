@@ -173,7 +173,12 @@ impl Pty {
     /// blocking `read` returns EOF — then drops the writer sender — so the writer's `recv` returns
     /// — guaranteeing both threads unblock before we join them, so this never deadlocks.
     pub fn shutdown(mut self) {
-        let _ = self.killer.kill();
+        // A failed kill is logged, not ignored: if the child somehow survives it keeps the slave
+        // fd open, the reader stays blocked on read(), and the join below would hang — so a warning
+        // is the breadcrumb for that (otherwise impossible-looking) stall.
+        if let Err(e) = self.killer.kill() {
+            tracing::warn!(error = %e, "pty kill on shutdown failed; reader join may stall");
+        }
         let reader = self.reader_handle.take();
         let writer = self.writer_handle.take();
         // Dropping `self` drops `writer_tx`, which lets the writer thread observe the channel

@@ -23,6 +23,7 @@ use rmosh_terminal::{ServerTerminal, DEFAULT_COLS, DEFAULT_ROWS};
 use rmosh_transport_iroh::ratelimit::FailureLimiter;
 use rmosh_transport_iroh::MonoClock;
 use tokio::sync::{mpsc, Mutex, Notify};
+use tokio_util::sync::CancellationToken;
 
 /// Default cadence the reaper sweeps for dead/expired sessions (injectable per call so tests can
 /// drive it without a real 5s wait).
@@ -143,16 +144,22 @@ pub async fn reap(store: &SessionStore, peer: EndpointId) {
 /// a stale entry). Runs until the store is dropped. `clock` is the same monotonic clock the accept
 /// loop stamps failures with, so the GC's window arithmetic agrees with `check`/`record_failure`.
 /// `interval` is injectable (the binary passes [`REAP_INTERVAL`]) so tests can drive a sweep
-/// without a real multi-second wait.
+/// without a real multi-second wait. `shutdown` lets the caller stop the reaper cleanly: the
+/// loop `select!`s the token against the sleep and returns when cancelled (rather than being
+/// `abort()`ed mid-sweep).
 pub async fn run_reaper(
     store: SessionStore,
     ttl: Duration,
     limiter: AuthLimiter,
     clock: MonoClock,
     interval: Duration,
+    shutdown: CancellationToken,
 ) {
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.cancelled() => return,
+        }
         // Evict aged-out auth-failure entries (poison unwrap is a panic check, not peer input).
         limiter
             .lock()
@@ -199,12 +206,14 @@ mod tests {
             "session is present before the sweep"
         );
 
+        let shutdown = CancellationToken::new();
         let task = tokio::spawn(run_reaper(
             store.clone(),
             Duration::from_secs(3600), // long TTL: collection is driven by child_alive, not TTL
             limiter,
             clock,
             Duration::from_millis(10),
+            shutdown.clone(),
         ));
 
         let mut reaped = false;
@@ -215,7 +224,12 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        task.abort();
+        // Graceful stop: cancel the token and the reaper future resolves on its own (no abort()).
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("reaper must exit promptly after cancellation")
+            .expect("reaper task should not panic");
         assert!(
             reaped,
             "the reaper must collect the dead session at the injected interval"

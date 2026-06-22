@@ -189,12 +189,14 @@ async fn main() -> anyhow::Result<()> {
     // auth-failure limiter on the same sweep).
     let store: session::SessionStore = Default::default();
     let session_ttl = std::time::Duration::from_secs(args.session_ttl_secs);
-    tokio::spawn(session::run_reaper(
+    let reaper_shutdown = tokio_util::sync::CancellationToken::new();
+    let reaper = tokio::spawn(session::run_reaper(
         store.clone(),
         session_ttl,
         limiter.clone(),
         clock,
         session::REAP_INTERVAL,
+        reaper_shutdown.clone(),
     ));
 
     while let Some(incoming) = endpoint.accept().await {
@@ -296,6 +298,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // The accept loop ended (endpoint closed): stop the reaper cleanly and wait for it to finish
+    // its current sweep before tearing down the endpoint.
+    reaper_shutdown.cancel();
+    let _ = reaper.await;
     endpoint.close().await;
     Ok(())
 }

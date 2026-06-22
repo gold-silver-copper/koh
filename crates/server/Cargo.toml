@@ -18,6 +18,7 @@ rmosh-transport-iroh.workspace = true
 rmosh-pty.workspace = true
 iroh.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true

@@ -61,6 +61,10 @@ pub struct Pty {
     writer_tx: SyncSender<Vec<u8>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Join handles for the reader/writer pump threads, kept so a graceful [`Pty::shutdown`] can
+    /// join them rather than leaking detached threads. `None` only after `shutdown` takes them.
+    reader_handle: Option<std::thread::JoinHandle<()>>,
+    writer_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Pty {
@@ -110,7 +114,7 @@ impl Pty {
             .map_err(|e| PtyError::Reader(io::Error::other(e)))?;
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_DEPTH);
-        std::thread::Builder::new()
+        let reader_handle = std::thread::Builder::new()
             .name("rmosh-pty-reader".into())
             .spawn(move || {
                 let mut buf = [0u8; READ_CHUNK];
@@ -136,7 +140,7 @@ impl Pty {
         // before the writer is dropped (and `portable-pty` then writes the EOT that EOFs the
         // child). The thread exits as soon as the last sender (held in `Pty`) drops.
         let (writer_tx, writer_rx) = sync_channel::<Vec<u8>>(WRITE_CHANNEL_DEPTH);
-        std::thread::Builder::new()
+        let writer_handle = std::thread::Builder::new()
             .name("rmosh-pty-writer".into())
             .spawn(move || {
                 while let Ok(chunk) = writer_rx.recv() {
@@ -157,9 +161,30 @@ impl Pty {
                 writer_tx,
                 child,
                 killer,
+                reader_handle: Some(reader_handle),
+                writer_handle: Some(writer_handle),
             },
             rx,
         ))
+    }
+
+    /// Gracefully tear down the session and join both I/O pump threads (rather than leaking them
+    /// as detached threads). Consumes the `Pty`. It first kills the child — so the reader's
+    /// blocking `read` returns EOF — then drops the writer sender — so the writer's `recv` returns
+    /// — guaranteeing both threads unblock before we join them, so this never deadlocks.
+    pub fn shutdown(mut self) {
+        let _ = self.killer.kill();
+        let reader = self.reader_handle.take();
+        let writer = self.writer_handle.take();
+        // Dropping `self` drops `writer_tx`, which lets the writer thread observe the channel
+        // close and exit; the child kill above lets the reader thread hit EOF and exit.
+        drop(self);
+        if let Some(h) = writer {
+            let _ = h.join();
+        }
+        if let Some(h) = reader {
+            let _ = h.join();
+        }
     }
 
     /// Forward input bytes to the child (verbatim — keystrokes or host query replies).
@@ -359,5 +384,25 @@ mod tests {
                 Err(_) => panic!("dropping Pty did not EOF the child within 5s (writer stuck?)"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_both_io_threads_without_deadlock() {
+        // Graceful teardown: shutdown() kills the child (so the reader's blocking read returns
+        // EOF) and drops the writer sender (so the writer's recv returns), then joins BOTH pump
+        // threads. It must return promptly — a hang would mean a thread never unblocked.
+        let (pty, mut rx) = Pty::spawn(24, 80, Some("sh"), "xterm-256color").expect("spawn shell");
+        // Keep the output channel drained so the reader thread never blocks on a full channel.
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || pty.shutdown()),
+        )
+        .await
+        .expect("shutdown must not deadlock (both threads must unblock and join)")
+        .expect("shutdown task panicked");
+        let _ = drain.await;
     }
 }

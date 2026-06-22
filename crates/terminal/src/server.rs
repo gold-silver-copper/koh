@@ -94,6 +94,9 @@ pub struct ServerTerminal {
     input_history: Vec<(u64, u64)>,
     /// The shell's exit code once it has exited (propagated to the client on shutdown).
     exit_code: Option<u32>,
+    /// Echo debounce (ms): how long after an input frame arrives before it counts as echoed.
+    /// Defaults to [`ECHO_TIMEOUT_MS`]; injectable so timing is testable without the wall clock.
+    echo_timeout_ms: u64,
 }
 
 impl ServerTerminal {
@@ -104,7 +107,14 @@ impl ServerTerminal {
             echo_ack: 0,
             input_history: Vec::new(),
             exit_code: None,
+            echo_timeout_ms: ECHO_TIMEOUT_MS,
         }
+    }
+
+    /// Override the echo debounce (ms). The server uses the [`ECHO_TIMEOUT_MS`] default; tests
+    /// inject a smaller value to exercise the promotion timing deterministically.
+    pub fn set_echo_timeout_ms(&mut self, ms: u64) {
+        self.echo_timeout_ms = ms;
     }
 
     /// Record the shell's exit code; the next snapshot carries it to the client.
@@ -148,11 +158,11 @@ impl ServerTerminal {
         }
     }
 
-    /// Promote `echo_ack` to the newest input frame that arrived at least `ECHO_TIMEOUT_MS`
+    /// Promote `echo_ack` to the newest input frame that arrived at least `echo_timeout_ms`
     /// ago (so the shell has had time to echo it). Returns whether it changed. Mosh
     /// `Complete::set_echo_ack`.
     pub fn set_echo_ack(&mut self, now: u64) -> bool {
-        let cutoff = now.saturating_sub(ECHO_TIMEOUT_MS);
+        let cutoff = now.saturating_sub(self.echo_timeout_ms);
         let mut newest = self.echo_ack;
         for &(frame, ts) in &self.input_history {
             if ts <= cutoff {
@@ -172,7 +182,7 @@ impl ServerTerminal {
         if self.input_history.len() < 2 {
             return NEVER;
         }
-        let fire_at = self.input_history[1].1 + ECHO_TIMEOUT_MS;
+        let fire_at = self.input_history[1].1 + self.echo_timeout_ms;
         fire_at.saturating_sub(now)
     }
 
@@ -246,6 +256,29 @@ mod tests {
         // After 50ms the frame is considered echoed.
         assert!(t.set_echo_ack(1050));
         assert_eq!(t.echo_ack(), 5);
+    }
+
+    #[test]
+    fn echo_ack_honors_injected_timeout() {
+        // With a 10ms debounce (not the 50ms default), a frame is echoed after 10ms, not 50 — a
+        // deterministic timing assertion only possible now that the timeout is injectable.
+        let mut t = ServerTerminal::new(24, 80, 0);
+        t.set_echo_timeout_ms(10);
+        t.register_input_frame(5, 1000);
+        assert!(
+            !t.set_echo_ack(1005),
+            "still inside the injected 10ms window"
+        );
+        assert_eq!(t.echo_ack(), 0);
+        assert!(t.set_echo_ack(1011), "past the injected 10ms window");
+        assert_eq!(t.echo_ack(), 5);
+        // The default (50ms) would not have promoted at 1011.
+        let mut d = ServerTerminal::new(24, 80, 0);
+        d.register_input_frame(5, 1000);
+        assert!(
+            !d.set_echo_ack(1011),
+            "the 50ms default has not elapsed yet"
+        );
     }
 
     #[test]

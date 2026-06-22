@@ -24,8 +24,9 @@ use rmosh_transport_iroh::ratelimit::FailureLimiter;
 use rmosh_transport_iroh::MonoClock;
 use tokio::sync::{mpsc, Mutex, Notify};
 
-/// How often the reaper sweeps for dead/expired sessions.
-const REAP_INTERVAL: Duration = Duration::from_secs(5);
+/// Default cadence the reaper sweeps for dead/expired sessions (injectable per call so tests can
+/// drive it without a real 5s wait).
+pub const REAP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Shared per-peer auth-failure limiter. A `std::sync::Mutex` (not tokio's) because its ops are
 /// synchronous and brief and are never held across an `.await`.
@@ -137,18 +138,21 @@ pub async fn reap(store: &SessionStore, peer: EndpointId) {
 }
 
 /// Background sweeper: reap sessions whose shell has exited, or that have been detached longer
-/// than `ttl`. Also piggybacks the auth-failure limiter's GC on each sweep, bounding its keyspace
-/// under `--allow-any` (where any number of distinct peers could each leave a stale entry). Runs
-/// until the store is dropped. `clock` is the same monotonic clock the accept loop stamps
-/// failures with, so the GC's window arithmetic agrees with `check`/`record_failure`.
+/// than `ttl`, every `interval`. Also piggybacks the auth-failure limiter's GC on each sweep,
+/// bounding its keyspace under `--allow-any` (where any number of distinct peers could each leave
+/// a stale entry). Runs until the store is dropped. `clock` is the same monotonic clock the accept
+/// loop stamps failures with, so the GC's window arithmetic agrees with `check`/`record_failure`.
+/// `interval` is injectable (the binary passes [`REAP_INTERVAL`]) so tests can drive a sweep
+/// without a real multi-second wait.
 pub async fn run_reaper(
     store: SessionStore,
     ttl: Duration,
     limiter: AuthLimiter,
     clock: MonoClock,
+    interval: Duration,
 ) {
     loop {
-        tokio::time::sleep(REAP_INTERVAL).await;
+        tokio::time::sleep(interval).await;
         // Evict aged-out auth-failure entries (poison unwrap is a panic check, not peer input).
         limiter
             .lock()
@@ -168,5 +172,53 @@ pub async fn run_reaper(
                 let _ = h.session.lock().await.pty.kill();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmosh_transport_iroh::generate_secret_key;
+
+    #[tokio::test]
+    async fn reaper_collects_dead_session_at_injected_interval() {
+        // Inject a 10ms sweep interval instead of the 5s default, so the reaper's collection of a
+        // dead session is observable in a fast, deterministic test.
+        let store: SessionStore = Default::default();
+        let limiter: AuthLimiter = Arc::new(StdMutex::new(FailureLimiter::new(1000, 3)));
+        let clock = MonoClock::new();
+        let peer = generate_secret_key().public();
+
+        // A real session whose shell we immediately mark as exited.
+        let handle = spawn_session(Some("sh"), 0).expect("spawn session");
+        handle.session.lock().await.child_alive = false;
+        store.lock().await.insert(peer, handle);
+        assert_eq!(
+            store.lock().await.len(),
+            1,
+            "session is present before the sweep"
+        );
+
+        let task = tokio::spawn(run_reaper(
+            store.clone(),
+            Duration::from_secs(3600), // long TTL: collection is driven by child_alive, not TTL
+            limiter,
+            clock,
+            Duration::from_millis(10),
+        ));
+
+        let mut reaped = false;
+        for _ in 0..200 {
+            if store.lock().await.is_empty() {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        assert!(
+            reaped,
+            "the reaper must collect the dead session at the injected interval"
+        );
     }
 }

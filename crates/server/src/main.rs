@@ -194,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         session_ttl,
         limiter.clone(),
         clock,
+        session::REAP_INTERVAL,
     ));
 
     while let Some(incoming) = endpoint.accept().await {

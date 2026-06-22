@@ -25,15 +25,45 @@ use std::collections::{BTreeMap, BTreeSet};
 use unicode_width::UnicodeWidthStr;
 use vt100::{Color, Screen};
 
-// --- constants (mosh terminaloverlay.h, milliseconds / counts) ---
-const SRTT_TRIGGER_LOW: f64 = 20.0;
-const SRTT_TRIGGER_HIGH: f64 = 30.0;
-const FLAG_TRIGGER_LOW: f64 = 50.0;
-const FLAG_TRIGGER_HIGH: f64 = 80.0;
-const GLITCH_THRESHOLD: u64 = 250;
-const GLITCH_REPAIR_COUNT: u32 = 10;
-const GLITCH_REPAIR_MININTERVAL: u64 = 150;
-const GLITCH_FLAG_THRESHOLD: u64 = 5000;
+/// Tunable engagement / flagging / glitch thresholds for the predictor (mosh `terminaloverlay.h`
+/// values). Lifted out of module constants so a front-end can tune responsiveness and tests can
+/// drive engagement deterministically. [`Default`] reproduces the historical hardcoded values, so
+/// `PredictionEngine::new` behaves exactly as before.
+#[derive(Debug, Clone, Copy)]
+pub struct PredictionConfig {
+    /// SRTT (ms) at/below which the engagement trigger releases (hysteresis with `srtt_trigger_high`).
+    pub srtt_trigger_low: f64,
+    /// SRTT (ms) above which predictions begin to show (Adaptive mode).
+    pub srtt_trigger_high: f64,
+    /// SRTT (ms) at/below which underline flagging stops.
+    pub flag_trigger_low: f64,
+    /// SRTT (ms) above which shown predictions are underline-flagged.
+    pub flag_trigger_high: f64,
+    /// A prediction pending at least this long (ms) escalates the glitch trigger.
+    pub glitch_threshold_ms: u64,
+    /// Glitch-repair counter target (how many fast confirmations cure a glitch).
+    pub glitch_repair_count: u32,
+    /// Minimum interval (ms) between successive glitch-repair decrements.
+    pub glitch_repair_min_interval_ms: u64,
+    /// A prediction pending at least this long (ms) forces maximal flagging.
+    pub glitch_flag_threshold_ms: u64,
+}
+
+impl Default for PredictionConfig {
+    fn default() -> Self {
+        // mosh terminaloverlay.h defaults.
+        PredictionConfig {
+            srtt_trigger_low: 20.0,
+            srtt_trigger_high: 30.0,
+            flag_trigger_low: 50.0,
+            flag_trigger_high: 80.0,
+            glitch_threshold_ms: 250,
+            glitch_repair_count: 10,
+            glitch_repair_min_interval_ms: 150,
+            glitch_flag_threshold_ms: 5000,
+        }
+    }
+}
 
 /// When predictions are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,10 +189,18 @@ pub struct PredictionEngine {
     /// false = insert mode (typing mid-line shifts the row right; backspace shifts left);
     /// true = overwrite mode (single-cell edits). Readline/shells default to insert.
     predict_overwrite: bool,
+    /// Tunable engagement / flagging / glitch thresholds (mosh defaults via [`PredictionConfig`]).
+    config: PredictionConfig,
 }
 
 impl PredictionEngine {
+    /// A predictor with the default (mosh) engagement thresholds.
     pub fn new(pref: DisplayPreference) -> Self {
+        Self::with_config(pref, PredictionConfig::default())
+    }
+
+    /// A predictor with explicit engagement thresholds (for tuning / deterministic tests).
+    pub fn with_config(pref: DisplayPreference, config: PredictionConfig) -> Self {
         PredictionEngine {
             pref,
             cells: BTreeMap::new(),
@@ -188,6 +226,7 @@ impl PredictionEngine {
             utf8_buf: Vec::new(),
             utf8_need: 0,
             predict_overwrite: false,
+            config,
         }
     }
 
@@ -582,18 +621,21 @@ impl PredictionEngine {
         let (rows, cols) = size;
 
         // SRTT trigger (show predictions) with hysteresis.
-        if self.srtt_ms > SRTT_TRIGGER_HIGH {
+        if self.srtt_ms > self.config.srtt_trigger_high {
             self.srtt_trigger = true;
-        } else if self.srtt_trigger && self.srtt_ms <= SRTT_TRIGGER_LOW && !self.active() {
+        } else if self.srtt_trigger
+            && self.srtt_ms <= self.config.srtt_trigger_low
+            && !self.active()
+        {
             self.srtt_trigger = false;
         }
         // Flagging (underline) with hysteresis.
-        if self.srtt_ms > FLAG_TRIGGER_HIGH {
+        if self.srtt_ms > self.config.flag_trigger_high {
             self.flagging = true;
-        } else if self.srtt_ms <= FLAG_TRIGGER_LOW {
+        } else if self.srtt_ms <= self.config.flag_trigger_low {
             self.flagging = false;
         }
-        if self.glitch_trigger > GLITCH_REPAIR_COUNT {
+        if self.glitch_trigger > self.config.glitch_repair_count {
             self.flagging = true;
         }
 
@@ -613,10 +655,12 @@ impl PredictionEngine {
                 Validity::Pending => {
                     // Long-pending predictions escalate visibility (glitch).
                     let age = now.saturating_sub(cell.prediction_time);
-                    if age >= GLITCH_FLAG_THRESHOLD {
-                        new_glitch = GLITCH_REPAIR_COUNT * 2;
-                    } else if age >= GLITCH_THRESHOLD && new_glitch < GLITCH_REPAIR_COUNT {
-                        new_glitch = GLITCH_REPAIR_COUNT;
+                    if age >= self.config.glitch_flag_threshold_ms {
+                        new_glitch = self.config.glitch_repair_count * 2;
+                    } else if age >= self.config.glitch_threshold_ms
+                        && new_glitch < self.config.glitch_repair_count
+                    {
+                        new_glitch = self.config.glitch_repair_count;
                     }
                 }
                 Validity::Correct => {
@@ -624,9 +668,10 @@ impl PredictionEngine {
                         max_confirm = cell.tentative_epoch;
                     }
                     // Reward fast confirmations: cure the glitch trigger gradually.
-                    if now.saturating_sub(cell.prediction_time) < GLITCH_THRESHOLD
+                    if now.saturating_sub(cell.prediction_time) < self.config.glitch_threshold_ms
                         && new_glitch > 0
-                        && now.saturating_sub(GLITCH_REPAIR_MININTERVAL) >= last_quick
+                        && now.saturating_sub(self.config.glitch_repair_min_interval_ms)
+                            >= last_quick
                     {
                         new_glitch -= 1;
                         last_quick = now;
@@ -885,6 +930,45 @@ mod tests {
         assert!(
             ov.cell(0, 1).unwrap().underline,
             "slow link should flag predictions"
+        );
+    }
+
+    #[test]
+    fn injected_srtt_threshold_gates_engagement_deterministically() {
+        // Adaptive mode shows predictions only when srtt_ms > config.srtt_trigger_high. With an
+        // injected threshold far above the link's SRTT, a confirmed keystroke stays hidden; with
+        // a threshold below it, the same keystroke engages. Only testable now that the trigger is
+        // injectable (it used to be a hardcoded const).
+        fn confirm_then_type_visible(cfg: PredictionConfig, srtt: f64) -> bool {
+            let mut e = PredictionEngine::with_config(DisplayPreference::Adaptive, cfg);
+            e.set_srtt(srtt);
+            e.set_local_frame_sent(0);
+            let blank = screen_of(b"");
+            e.new_user_byte(100, b'x', &blank);
+            let echoed = screen_of(b"x");
+            e.set_local_frame_late_acked(1);
+            e.cull(200, &echoed); // confirm epoch 1
+            e.set_local_frame_sent(1);
+            e.new_user_byte(300, b'y', &echoed);
+            !e.overlay(&echoed).is_empty()
+        }
+        let high = PredictionConfig {
+            srtt_trigger_high: 1_000.0,
+            srtt_trigger_low: 999.0,
+            ..Default::default()
+        };
+        assert!(
+            !confirm_then_type_visible(high, 120.0),
+            "srtt 120 below the injected 1000ms engage threshold -> predictions hidden"
+        );
+        let low = PredictionConfig {
+            srtt_trigger_high: 10.0,
+            srtt_trigger_low: 5.0,
+            ..Default::default()
+        };
+        assert!(
+            confirm_then_type_visible(low, 120.0),
+            "srtt 120 above the injected 10ms engage threshold -> predictions shown"
         );
     }
 

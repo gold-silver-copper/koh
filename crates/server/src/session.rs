@@ -14,16 +14,22 @@
 //! store → session, so there is no deadlock (the connection loop only ever locks the session).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use iroh::EndpointId;
 use rmosh_terminal::{ServerTerminal, DEFAULT_COLS, DEFAULT_ROWS};
+use rmosh_transport_iroh::ratelimit::FailureLimiter;
+use rmosh_transport_iroh::MonoClock;
 use tokio::sync::{mpsc, Mutex, Notify};
 
 /// How often the reaper sweeps for dead/expired sessions.
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Shared per-peer auth-failure limiter. A `std::sync::Mutex` (not tokio's) because its ops are
+/// synchronous and brief and are never held across an `.await`.
+pub type AuthLimiter = Arc<StdMutex<FailureLimiter<EndpointId>>>;
 
 /// A long-lived shell session that survives client disconnects.
 pub struct Session {
@@ -131,10 +137,23 @@ pub async fn reap(store: &SessionStore, peer: EndpointId) {
 }
 
 /// Background sweeper: reap sessions whose shell has exited, or that have been detached longer
-/// than `ttl`. Runs until the store is dropped.
-pub async fn run_reaper(store: SessionStore, ttl: Duration) {
+/// than `ttl`. Also piggybacks the auth-failure limiter's GC on each sweep, bounding its keyspace
+/// under `--allow-any` (where any number of distinct peers could each leave a stale entry). Runs
+/// until the store is dropped. `clock` is the same monotonic clock the accept loop stamps
+/// failures with, so the GC's window arithmetic agrees with `check`/`record_failure`.
+pub async fn run_reaper(
+    store: SessionStore,
+    ttl: Duration,
+    limiter: AuthLimiter,
+    clock: MonoClock,
+) {
     loop {
         tokio::time::sleep(REAP_INTERVAL).await;
+        // Evict aged-out auth-failure entries (poison unwrap is a panic check, not peer input).
+        limiter
+            .lock()
+            .expect("auth limiter mutex poisoned")
+            .gc(clock.now_ms());
         let mut map = store.lock().await;
         let mut dead = Vec::new();
         for (peer, h) in map.iter() {

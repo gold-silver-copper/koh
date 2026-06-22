@@ -26,6 +26,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use rmosh_wire::DEFAULT_MAX_DATAGRAM;
 
 pub mod auth;
+pub mod ratelimit;
 
 /// Keepalive + connection idle-timeout tuned so a brief client suspend doesn't drop the
 /// connection. iroh's defaults already PING every 5s and drop a *path* after 15s, but the

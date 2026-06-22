@@ -16,12 +16,21 @@ use anyhow::Context;
 use clap::Parser;
 use iroh::EndpointId;
 use rmosh_server::{run_attached, session, SessionExit};
+use rmosh_transport_iroh::ratelimit::FailureLimiter;
 use rmosh_transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
-    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, ALPN,
+    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, MonoClock, ALPN,
 };
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{error, info, warn};
+
+/// Auth-failure rate limit: a peer that fails (or times out) the passphrase handshake
+/// [`AUTH_MAX_FAILURES`] times within [`AUTH_FAIL_WINDOW_MS`] is refused — cheaply, before the
+/// expensive Argon2id KDF runs — until its older failures age out of the window. This is the
+/// throttle that makes the per-guess work factor a real defense against online guessing by a
+/// leaked-but-allowlisted client key, and bounds the CPU an attacker can make the server spend.
+const AUTH_FAIL_WINDOW_MS: u64 = 60_000;
+const AUTH_MAX_FAILURES: usize = 5;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -166,18 +175,33 @@ async fn main() -> anyhow::Result<()> {
             .map(SecretString::from),
     );
 
+    // Per-peer auth-failure limiter (keyed on the client's endpoint id) + the monotonic clock its
+    // window arithmetic uses. One clock, shared with every accept task and the reaper, so all the
+    // `now` values share a base.
+    let clock = MonoClock::new();
+    let limiter: session::AuthLimiter = std::sync::Arc::new(std::sync::Mutex::new(
+        FailureLimiter::new(AUTH_FAIL_WINDOW_MS, AUTH_MAX_FAILURES),
+    ));
+
     // Detachable session store: one shell per authorized client, surviving disconnects so a
     // reconnecting client lands back in the same session at the current screen. The reaper
-    // collects sessions whose shell exited or that have been detached past the TTL.
+    // collects sessions whose shell exited or that have been detached past the TTL (and GCs the
+    // auth-failure limiter on the same sweep).
     let store: session::SessionStore = Default::default();
     let session_ttl = std::time::Duration::from_secs(args.session_ttl_secs);
-    tokio::spawn(session::run_reaper(store.clone(), session_ttl));
+    tokio::spawn(session::run_reaper(
+        store.clone(),
+        session_ttl,
+        limiter.clone(),
+        clock,
+    ));
 
     while let Some(incoming) = endpoint.accept().await {
         let allow = allow.clone();
         let shell = shell.clone();
         let passphrase = passphrase.clone();
         let store = store.clone();
+        let limiter = limiter.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(c) => c,
@@ -192,6 +216,19 @@ async fn main() -> anyhow::Result<()> {
                 conn.close(1u32.into(), b"not authorized");
                 return;
             }
+            // Per-peer rate limit: refuse — cheaply, before the expensive KDF — a peer that has
+            // failed the handshake too many times recently. Checked after the allowlist so a
+            // bogus peer can't pollute the limiter's keyspace (unless --allow-any is set, where
+            // the reaper's gc bounds it).
+            if !limiter
+                .lock()
+                .expect("auth limiter mutex poisoned")
+                .check(&peer, clock.now_ms())
+            {
+                warn!(peer = %format_endpoint_id(&peer), "rejected: too many failed auth attempts");
+                conn.close(1u32.into(), b"rate limited");
+                return;
+            }
             // Second factor: the passphrase nonce-challenge (no-op if none configured), bounded
             // by a 10s timeout so a stalled/malicious client can't pin a session slot.
             match tokio::time::timeout(
@@ -203,14 +240,29 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    // Success clears this peer's failure history (a legit client that mistyped
+                    // once isn't penalized after it gets in).
+                    limiter
+                        .lock()
+                        .expect("auth limiter mutex poisoned")
+                        .record_success(&peer);
+                }
                 Ok(Err(e)) => {
                     warn!(peer = %format_endpoint_id(&peer), error = %e, "passphrase handshake rejected");
+                    limiter
+                        .lock()
+                        .expect("auth limiter mutex poisoned")
+                        .record_failure(peer, clock.now_ms());
                     conn.close(1u32.into(), b"auth failed");
                     return;
                 }
                 Err(_) => {
                     warn!(peer = %format_endpoint_id(&peer), "passphrase handshake timed out");
+                    limiter
+                        .lock()
+                        .expect("auth limiter mutex poisoned")
+                        .record_failure(peer, clock.now_ms());
                     conn.close(1u32.into(), b"auth timeout");
                     return;
                 }

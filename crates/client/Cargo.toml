@@ -33,3 +33,6 @@ secrecy = "0.10"
 rmosh-server.workspace = true
 # to attach the real client binary to an allocated PTY and drive it headlessly
 portable-pty.workspace = true
+
+[lints]
+workspace = true

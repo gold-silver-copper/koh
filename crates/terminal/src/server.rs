@@ -101,7 +101,7 @@ pub struct ServerTerminal {
 
 impl ServerTerminal {
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
-        ServerTerminal {
+        Self {
             parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback, Callbacks::default()),
             scrollback,
             echo_ack: 0,
@@ -148,12 +148,7 @@ impl ServerTerminal {
     /// reflect it yet; [`set_echo_ack`](Self::set_echo_ack) promotes it after the debounce.
     pub fn register_input_frame(&mut self, n: u64, now: u64) {
         // Frame numbers only advance; ignore stale/duplicate registrations.
-        if self
-            .input_history
-            .last()
-            .map(|(f, _)| n > *f)
-            .unwrap_or(true)
-        {
+        if self.input_history.last().is_none_or(|(f, _)| n > *f) {
             self.input_history.push((n, now));
         }
     }
@@ -179,10 +174,12 @@ impl ServerTerminal {
     /// Milliseconds until [`set_echo_ack`] could next advance, or [`NEVER`] if nothing pends.
     /// Mosh `Complete::wait_time`.
     pub fn echo_ack_wait_time(&self, now: u64) -> u64 {
-        if self.input_history.len() < 2 {
+        // The second-oldest pending frame is the next one whose debounce can fire; if there are
+        // fewer than two, nothing is waiting. `.get(1)` keeps this panic-free without an index.
+        let Some(&(_, arrived)) = self.input_history.get(1) else {
             return NEVER;
-        }
-        let fire_at = self.input_history[1].1 + self.echo_timeout_ms;
+        };
+        let fire_at = arrived + self.echo_timeout_ms;
         fire_at.saturating_sub(now)
     }
 

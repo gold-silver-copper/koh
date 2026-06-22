@@ -9,6 +9,17 @@
 //! Unlike the mock-terminal e2e, this exercises the actual binary: argument parsing, raw-mode
 //! lifecycle, the termina renderer, and stdin passthrough — the real terminal path.
 
+// Integration test: a failed unwrap/expect/assert IS the test failing.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::unwrap_in_result,
+    reason = "integration test code; panics are assertion failures"
+)]
+
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,7 +39,7 @@ async fn real_client_binary_renders_over_pty() {
         .bound_sockets()
         .iter()
         .find(|s| s.is_ipv4())
-        .map(|s| s.port())
+        .map(std::net::SocketAddr::port)
         .expect("server v4 port");
 
     let server_task = tokio::spawn(async move {
@@ -81,9 +92,8 @@ async fn real_client_binary_renders_over_pty() {
         let mut tmp = [0u8; 8192];
         loop {
             match reader.read(&mut tmp) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => buf_reader.lock().unwrap().extend_from_slice(&tmp[..n]),
-                Err(_) => break,
             }
         }
     });

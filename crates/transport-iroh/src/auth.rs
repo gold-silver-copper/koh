@@ -47,6 +47,10 @@ fn fresh_nonce() -> [u8; 32] {
 /// leaked-but-allowlisted client's passphrase cost real CPU/memory (the per-peer rate limiter
 /// then bounds the guess rate). It is *not* password storage, which is why the salt below is
 /// fixed rather than random.
+#[expect(
+    clippy::expect_used,
+    reason = "Params::new only errors on out-of-range values; these are compile-time constants"
+)]
 fn kdf_params() -> argon2::Params {
     argon2::Params::new(64 * 1024, 3, 1, Some(32)).expect("static Argon2id params are in range")
 }
@@ -69,6 +73,10 @@ fn kdf_salt() -> [u8; 16] {
 /// reduces how long the PSK lingers in memory; the passphrase itself reaches us only as a `&str`
 /// view into the caller's [`secrecy::SecretString`], exposed solely for this call (argv/env still
 /// remain OS-visible — prefer `$RMOSH_PASSPHRASE` over `--passphrase`).
+#[expect(
+    clippy::expect_used,
+    reason = "hash_password_into only errors on invalid params/output-len, fixed valid here"
+)]
 fn derive_psk(passphrase: &str) -> Zeroizing<[u8; 32]> {
     let argon = argon2::Argon2::new(
         argon2::Algorithm::Argon2id,
@@ -93,6 +101,10 @@ static PSK_CACHE: LazyLock<Mutex<PskCache>> = LazyLock::new(|| Mutex::new(HashMa
 
 /// Fetch `K` for `passphrase`, deriving + caching it on first use ("derive once at startup",
 /// realized as derive-on-first-handshake-then-reuse).
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned cache mutex is a panic-elsewhere bug, not peer-influenced input"
+)]
 fn cached_psk(passphrase: &str) -> Zeroizing<[u8; 32]> {
     let key = *blake3::hash(passphrase.as_bytes()).as_bytes();
     {
@@ -118,9 +130,10 @@ fn challenge_response(psk: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
     *blake3::hash(&input).as_bytes()
 }
 
-/// Errors from the passphrase nonce-challenge handshake (mirrors the `SetupError` pattern; no
-/// `anyhow` so the typed failure is matchable — the server distinguishes a transport drop from a
-/// genuine auth rejection). The QUIC bi-stream surfaces several distinct error types
+/// Errors from the passphrase nonce-challenge handshake (mirrors the `SetupError` pattern).
+///
+/// No `anyhow`, so the typed failure is matchable — the server distinguishes a transport drop from
+/// a genuine auth rejection. The QUIC bi-stream surfaces several distinct error types
 /// (`ConnectionError`/`WriteError`/`ReadExactError`); they are folded into one `io::Error` so the
 /// `Stream` variant has a single `#[from]` source. Binaries absorb `AuthError` via anyhow's
 /// blanket `From`.

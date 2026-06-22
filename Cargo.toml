@@ -68,3 +68,68 @@ proptest = "1"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# ---------------------------------------------------------------------------
+# Workspace lints. Every crate opts in with `[lints] workspace = true`.
+#
+# Goal: the libraries are PANIC-FREE by construction, enforced by clippy. The
+# panic-introducing lints below are denied; any genuinely-infallible site (a
+# poisoned-mutex check, a structurally-non-empty container, statically-valid
+# params) is justified with a local `#[expect(clippy::…, reason = "…")]`. Test
+# code keeps `unwrap`/`expect`/`panic`/`indexing` via a `cfg(test)` allow at the
+# top of each crate (a failed assertion in a test SHOULD panic).
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+# A bare `unsafe` block must justify itself; this codebase is 100% safe today.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Lint-group toggles (priority = -1 so individual lints below can override).
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# --- panic prevention (deny): no explicit panics in non-test code ---
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+get_unwrap = "deny"
+unwrap_in_result = "deny"
+panic_in_result_fn = "deny"
+exit = "deny"
+indexing_slicing = "deny"        # `a[i]` panics on out-of-bounds — use `.get()`
+string_slice = "deny"            # `s[a..b]` panics on a non-char-boundary
+expect_fun_call = "deny"
+
+# --- additional correctness / footgun restrictions (deny) ---
+mem_forget = "deny"
+lossy_float_literal = "deny"
+float_cmp_const = "deny"
+rc_buffer = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+
+# --- pedantic lints that are noisy or fight this codebase's deliberate style ---
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+doc_markdown = "allow"
+# `_ = future => {}` is the conventional tokio::select! arm; `() = ...` is noisier, not clearer.
+ignored_unit_patterns = "allow"
+# nursery lints with known false positives / churn
+cognitive_complexity = "allow"
+option_if_let_else = "allow"
+significant_drop_tightening = "allow"   # false-positives on single-statement lock guards
+duration_suboptimal_units = "allow"     # `from_secs(3600)` is clearer than a contrived larger unit
+# `const fn` on every getter is high-churn for debatable benefit (and `const` is part of the
+# public API surface — making it implicit everywhere is not obviously desirable); not enforced.
+missing_const_for_fn = "allow"

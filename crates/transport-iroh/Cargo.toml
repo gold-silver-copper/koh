@@ -32,3 +32,6 @@ zeroize = "1"
 # drive the real SSP Transport over a real iroh datagram connection in the e2e test
 rmosh-ssp.workspace = true
 serde.workspace = true
+
+[lints]
+workspace = true

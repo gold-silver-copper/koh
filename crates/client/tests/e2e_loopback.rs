@@ -7,6 +7,17 @@
 //! (Tier 0) deliberately cannot cover: that the genuine iroh accept/connect/datagram API
 //! actually carries our protocol.
 
+// Integration test: a failed unwrap/expect/assert IS the test failing.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::unwrap_in_result,
+    reason = "integration test code; panics are assertion failures"
+)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

@@ -117,9 +117,10 @@ pub async fn run_attached(
     }
 }
 
-/// Convenience: run a **standalone** (non-detachable) session for one connection — spawn a
-/// shell, serve it, and kill it when the connection ends. Used by integration tests and any
-/// caller that doesn't need reattach. The binary uses the [`session`] store + [`run_attached`].
+/// Convenience: run a **standalone** (non-detachable) session for one connection.
+///
+/// Spawns a shell, serves it, and kills it when the connection ends. Used by integration tests and
+/// any caller that doesn't need reattach. The binary uses the [`session`] store + [`run_attached`].
 pub async fn run_session(
     conn: iroh::endpoint::Connection,
     shell: Option<String>,

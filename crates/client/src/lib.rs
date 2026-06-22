@@ -62,7 +62,7 @@ impl TerminaTerminal {
             ))),
         )?;
         term.flush()?;
-        Ok(TerminaTerminal { term })
+        Ok(Self { term })
     }
 }
 
@@ -162,7 +162,7 @@ impl ClientSession {
         transport
             .current_mut()
             .push_resize(initial_rows, initial_cols);
-        ClientSession {
+        Self {
             transport,
             predictor: PredictionEngine::new(pref),
             pending_escape: false,

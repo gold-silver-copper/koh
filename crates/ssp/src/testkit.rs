@@ -9,6 +9,16 @@
 //! 2. **No head-of-line blocking** — the newest applied state number is monotonic; a
 //!    superseded older state is never delivered "late" as the current state.
 
+// This is a test harness: a violated invariant or an exceeded step budget SHOULD panic loudly
+// (it means a test is wrong), so the panic-prevention restrictions are relaxed here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "deterministic test harness: a failed invariant must panic the offending test"
+)]
+
 use crate::{SyncState, Transport, NEVER};
 
 /// A small, dependency-free, reproducible PRNG (SplitMix64).
@@ -19,7 +29,7 @@ pub struct Rng {
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
-        Rng { state: seed }
+        Self { state: seed }
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -61,7 +71,7 @@ pub struct LinkParams {
 impl LinkParams {
     /// A clean, low-latency link.
     pub fn perfect() -> Self {
-        LinkParams {
+        Self {
             loss: 0.0,
             min_delay_ms: 5,
             max_delay_ms: 5,
@@ -71,7 +81,7 @@ impl LinkParams {
 
     /// A nasty mobile link: 30% loss, 20–120ms jitter, 5% duplication.
     pub fn lossy() -> Self {
-        LinkParams {
+        Self {
             loss: 0.30,
             min_delay_ms: 20,
             max_delay_ms: 120,
@@ -92,7 +102,7 @@ pub struct Link {
 
 impl Link {
     pub fn new() -> Self {
-        Link::default()
+        Self::default()
     }
 
     /// Offer a datagram to the link at time `now`; loss/delay/dup are applied here.
@@ -157,7 +167,7 @@ impl<L: SyncState, R: SyncState> SimHarness<L, R> {
         let mut b = Transport::new(0, mtu);
         a.set_connected(true);
         b.set_connected(true);
-        SimHarness {
+        Self {
             a,
             b,
             a2b: Link::new(),

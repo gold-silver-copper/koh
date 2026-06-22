@@ -8,6 +8,16 @@
 //! `sh`), exactly like the real client's loop, so the full input → PTY → emulator → diff → client
 //! path is exercised without a TTY or a second machine.
 
+// Integration test: a failed unwrap/expect/assert IS the test failing.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::items_after_statements,
+    clippy::default_trait_access,
+    reason = "integration test code; panics are assertion failures"
+)]
 use std::time::Duration;
 
 use iroh::endpoint::Endpoint;

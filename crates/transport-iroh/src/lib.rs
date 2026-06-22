@@ -32,6 +32,14 @@ pub mod ratelimit;
 /// connection. iroh's defaults already PING every 5s and drop a *path* after 15s, but the
 /// *connection* idle timeout defaults to ~30s; we raise it to 60s. (Longer suspends are
 /// handled by reattaching to a detachable server session, not by holding one connection open.)
+#[expect(
+    clippy::expect_used,
+    reason = "60s is far below IdleTimeout's varint ceiling; the conversion is statically infallible"
+)]
+#[allow(
+    clippy::duration_suboptimal_units,
+    reason = "`from_secs(60)` is the intended, readable idle timeout"
+)]
 fn rmosh_transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
         .keep_alive_interval(Duration::from_secs(5))
@@ -100,8 +108,9 @@ pub fn format_endpoint_id(id: &EndpointId) -> String {
 }
 
 /// Build an iroh [`Endpoint`] with the `presets::N0` profile (relay + DNS discovery, so a
-/// bare endpoint id is dialable). `accept` registers our ALPN so the endpoint can accept
-/// incoming connections (server side).
+/// bare endpoint id is dialable).
+///
+/// `accept` registers our ALPN so the endpoint can accept incoming connections (server side).
 pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
@@ -143,7 +152,7 @@ pub fn loopback_addr(ep: &Endpoint) -> EndpointAddr {
         .bound_sockets()
         .iter()
         .find(|s| s.is_ipv4())
-        .map(|s| s.port())
+        .map(std::net::SocketAddr::port)
     {
         addr = addr.with_ip_addr(SocketAddr::from(([127, 0, 0, 1], port)));
     }
@@ -163,6 +172,7 @@ pub fn relay_addr(id: EndpointId, relay: RelayUrl) -> EndpointAddr {
 }
 
 /// Build an iroh [`Endpoint`] whose only relay is `relay` (no n0 relays, no DNS discovery).
+///
 /// Used for self-hosted relays (Tier 2 docker, private deployments): peers dial by id + this
 /// same relay URL ([`relay_addr`]). Covers NAT traversal / roaming via the local relay.
 pub async fn bind_endpoint_with_relay(
@@ -191,9 +201,10 @@ pub fn parse_relay_url(s: &str) -> Result<RelayUrl, SetupError> {
         .map_err(|e| SetupError::Other(anyhow::anyhow!("bad relay url: {e}")))
 }
 
-/// A datagram channel over a single iroh [`Connection`]. Oversized state is split by the
-/// [`rmosh_wire`] fragmenter across datagrams — never a reliable stream (which would
-/// reintroduce the head-of-line blocking the protocol exists to avoid).
+/// A datagram channel over a single iroh [`Connection`].
+///
+/// Oversized state is split by the [`rmosh_wire`] fragmenter across datagrams — never a reliable
+/// stream (which would reintroduce the head-of-line blocking the protocol exists to avoid).
 #[derive(Clone)]
 pub struct IrohChannel {
     conn: Connection,
@@ -201,7 +212,7 @@ pub struct IrohChannel {
 
 impl IrohChannel {
     pub fn new(conn: Connection) -> Self {
-        IrohChannel { conn }
+        Self { conn }
     }
 
     /// The peer's stable identity.
@@ -245,7 +256,12 @@ impl IrohChannel {
     /// before any path is established (e.g. mid-holepunch).
     pub fn rtt_ms(&self) -> Option<f64> {
         let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
-        if let Some(p) = self.conn.paths().iter().find(|p| p.is_selected()) {
+        if let Some(p) = self
+            .conn
+            .paths()
+            .iter()
+            .find(iroh::endpoint::Path::is_selected)
+        {
             return Some(to_ms(p.rtt()));
         }
         if let Some(p) = self.conn.paths().iter().next() {
@@ -279,7 +295,7 @@ impl Default for MonoClock {
 
 impl MonoClock {
     pub fn new() -> Self {
-        MonoClock {
+        Self {
             base: tokio::time::Instant::now(),
         }
     }

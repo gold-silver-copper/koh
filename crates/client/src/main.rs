@@ -32,9 +32,9 @@ enum PredictMode {
 impl From<PredictMode> for DisplayPreference {
     fn from(m: PredictMode) -> Self {
         match m {
-            PredictMode::Always => DisplayPreference::Always,
-            PredictMode::Never => DisplayPreference::Never,
-            PredictMode::Adaptive => DisplayPreference::Adaptive,
+            PredictMode::Always => Self::Always,
+            PredictMode::Never => Self::Never,
+            PredictMode::Adaptive => Self::Adaptive,
         }
     }
 }
@@ -73,9 +73,10 @@ struct Args {
 }
 
 fn default_key_file() -> PathBuf {
-    directories::ProjectDirs::from("", "", "rmosh")
-        .map(|d| d.config_dir().join("client.key"))
-        .unwrap_or_else(|| PathBuf::from("rmosh-client.key"))
+    directories::ProjectDirs::from("", "", "rmosh").map_or_else(
+        || PathBuf::from("rmosh-client.key"),
+        |d| d.config_dir().join("client.key"),
+    )
 }
 
 #[tokio::main]
@@ -117,6 +118,11 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
         return Ok(None);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "clap marks `server` required_unless_present=\"show_id\"; the --show-id branch \
+                  returned above, so reaching here guarantees Some"
+    )]
     let server = args
         .server
         .clone()
@@ -161,7 +167,7 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
         .map(SecretString::from);
     rmosh_transport_iroh::auth::handshake_client(
         &conn,
-        passphrase.as_ref().map(|s| s.expose_secret()),
+        passphrase.as_ref().map(SecretString::expose_secret),
     )
     .await
     .context("passphrase handshake (wrong or missing --passphrase?)")?;
@@ -182,13 +188,13 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
             let mut buf = [0u8; 1024];
             loop {
                 match stdin.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if input_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        let chunk = buf.get(..n).unwrap_or(&buf).to_vec();
+                        if input_tx.blocking_send(chunk).is_err() {
                             break;
                         }
                     }
-                    Err(_) => break,
                 }
             }
         })

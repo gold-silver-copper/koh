@@ -28,7 +28,7 @@ impl<K: Eq + Hash + Clone> FailureLimiter<K> {
     /// A limiter that refuses a key once it accumulates `max_failures` failures within the
     /// trailing `window_ms`.
     pub fn new(window_ms: u64, max_failures: usize) -> Self {
-        FailureLimiter {
+        Self {
             window_ms,
             max_failures,
             fails: HashMap::new(),

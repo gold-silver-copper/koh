@@ -79,9 +79,22 @@ struct Args {
 }
 
 fn default_key_file() -> PathBuf {
-    directories::ProjectDirs::from("", "", "rmosh")
-        .map(|d| d.config_dir().join("server.key"))
-        .unwrap_or_else(|| PathBuf::from("rmosh-server.key"))
+    directories::ProjectDirs::from("", "", "rmosh").map_or_else(
+        || PathBuf::from("rmosh-server.key"),
+        |d| d.config_dir().join("server.key"),
+    )
+}
+
+/// Lock the shared auth-failure limiter. The single justified panic site for it: a poisoned mutex
+/// is a panic-elsewhere bug, never peer-influenced input.
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned auth-limiter mutex is a bug, not peer input"
+)]
+fn lock_limiter(
+    limiter: &session::AuthLimiter,
+) -> std::sync::MutexGuard<'_, FailureLimiter<EndpointId>> {
+    limiter.lock().expect("auth limiter mutex poisoned")
 }
 
 #[tokio::main]
@@ -138,8 +151,7 @@ async fn main() -> anyhow::Result<()> {
             .bound_sockets()
             .iter()
             .find(|s| s.is_ipv4())
-            .map(|s| s.port())
-            .unwrap_or(0);
+            .map_or(0, std::net::SocketAddr::port);
         format!("rmosh-client {id_str} --direct <this-host-ip>:{port}")
     } else {
         format!("rmosh-client {id_str}")
@@ -187,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
     // reconnecting client lands back in the same session at the current screen. The reaper
     // collects sessions whose shell exited or that have been detached past the TTL (and GCs the
     // auth-failure limiter on the same sweep).
-    let store: session::SessionStore = Default::default();
+    let store = session::SessionStore::default();
     let session_ttl = std::time::Duration::from_secs(args.session_ttl_secs);
     let reaper_shutdown = tokio_util::sync::CancellationToken::new();
     let reaper = tokio::spawn(session::run_reaper(
@@ -223,11 +235,7 @@ async fn main() -> anyhow::Result<()> {
             // failed the handshake too many times recently. Checked after the allowlist so a
             // bogus peer can't pollute the limiter's keyspace (unless --allow-any is set, where
             // the reaper's gc bounds it).
-            if !limiter
-                .lock()
-                .expect("auth limiter mutex poisoned")
-                .check(&peer, clock.now_ms())
-            {
+            if !lock_limiter(&limiter).check(&peer, clock.now_ms()) {
                 warn!(peer = %format_endpoint_id(&peer), "rejected: too many failed auth attempts");
                 conn.close(1u32.into(), b"rate limited");
                 return;
@@ -238,7 +246,10 @@ async fn main() -> anyhow::Result<()> {
                 std::time::Duration::from_secs(10),
                 rmosh_transport_iroh::auth::handshake_server(
                     &conn,
-                    passphrase.as_ref().as_ref().map(|s| s.expose_secret()),
+                    passphrase
+                        .as_ref()
+                        .as_ref()
+                        .map(ExposeSecret::expose_secret),
                 ),
             )
             .await
@@ -246,26 +257,17 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Ok(())) => {
                     // Success clears this peer's failure history (a legit client that mistyped
                     // once isn't penalized after it gets in).
-                    limiter
-                        .lock()
-                        .expect("auth limiter mutex poisoned")
-                        .record_success(&peer);
+                    lock_limiter(&limiter).record_success(&peer);
                 }
                 Ok(Err(e)) => {
                     warn!(peer = %format_endpoint_id(&peer), error = %e, "passphrase handshake rejected");
-                    limiter
-                        .lock()
-                        .expect("auth limiter mutex poisoned")
-                        .record_failure(peer, clock.now_ms());
+                    lock_limiter(&limiter).record_failure(peer, clock.now_ms());
                     conn.close(1u32.into(), b"auth failed");
                     return;
                 }
                 Err(_) => {
                     warn!(peer = %format_endpoint_id(&peer), "passphrase handshake timed out");
-                    limiter
-                        .lock()
-                        .expect("auth limiter mutex poisoned")
-                        .record_failure(peer, clock.now_ms());
+                    lock_limiter(&limiter).record_failure(peer, clock.now_ms());
                     conn.close(1u32.into(), b"auth timeout");
                     return;
                 }

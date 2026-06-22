@@ -27,3 +27,6 @@ data-encoding.workspace = true
 directories.workspace = true
 rand.workspace = true
 secrecy = "0.10"
+
+[lints]
+workspace = true

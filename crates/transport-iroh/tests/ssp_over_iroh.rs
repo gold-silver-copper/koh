@@ -5,6 +5,15 @@
 //! them: it runs the actual SSP send/recv loop across genuine QUIC datagrams (loopback, no
 //! relay), asserting the receiver converges to the sender's state.
 
+// Integration test: every `unwrap`/`expect`/panic here IS the test's assertion of success.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "integration test code; a failed unwrap/expect is the test failing"
+)]
+
 use std::time::Duration;
 
 use rmosh_ssp::{SyncState, Transport};

@@ -1,5 +1,14 @@
 //! The passphrase nonce-challenge handshake over a real loopback iroh connection.
 
+// Integration test: every `unwrap`/`expect`/panic here IS the test's assertion of success.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "integration test code; a failed unwrap/expect is the test failing"
+)]
+
 use rmosh_transport_iroh::auth::AuthError;
 use rmosh_transport_iroh::{auth, bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 

@@ -41,10 +41,12 @@ pub const DEFAULT_MAX_DATAGRAM: usize = 1200;
 /// rmosh never interoperates with mosh.)
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Exact serialized overhead of a [`Fragment`] header: an 8-byte big-endian `id` plus a 2-byte
-/// big-endian `(final << 15) | index` field. A serialized fragment is therefore *exactly*
-/// `FRAGMENT_HEADER_OVERHEAD + payload.len()` bytes, so the fragmenter packs each datagram up to
-/// the MTU with no wasted slack (a fixed framing, matching the reference — not an estimate).
+/// Exact serialized overhead of a [`Fragment`] header.
+///
+/// It is an 8-byte big-endian `id` plus a 2-byte big-endian `(final << 15) | index` field. A
+/// serialized fragment is therefore *exactly* `FRAGMENT_HEADER_OVERHEAD + payload.len()` bytes, so
+/// the fragmenter packs each datagram up to the MTU with no wasted slack (a fixed framing,
+/// matching the reference — not an estimate).
 pub const FRAGMENT_HEADER_OVERHEAD: usize = 10;
 
 /// Maximum fragment index: the index occupies the low 15 bits of the header's 2-byte field (the
@@ -86,8 +88,8 @@ pub struct Instruction {
 
 impl Instruction {
     /// A pure acknowledgement carrying no state change (`old_num == new_num`, empty diff).
-    pub fn ack_only(state_num: u64, ack_num: u64, throwaway_num: u64) -> Self {
-        Instruction {
+    pub const fn ack_only(state_num: u64, ack_num: u64, throwaway_num: u64) -> Self {
+        Self {
             protocol_version: PROTOCOL_VERSION,
             old_num: state_num,
             new_num: state_num,
@@ -106,7 +108,7 @@ impl Instruction {
     /// time (before any state is touched) so a foreign/incompatible peer can't feed a diff with
     /// a different encoding into our state mirror.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        let instr: Instruction = postcard::from_bytes(bytes)?;
+        let instr: Self = postcard::from_bytes(bytes)?;
         if instr.protocol_version != PROTOCOL_VERSION {
             return Err(WireError::VersionMismatch {
                 peer: instr.protocol_version,
@@ -140,7 +142,7 @@ impl Fragment {
     /// Serialize to datagram bytes: `id` (8 BE) ++ `(final << 15) | index` (2 BE) ++ `payload`.
     /// Exactly `FRAGMENT_HEADER_OVERHEAD + payload.len()` bytes.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        let combined: u16 = ((self.final_ as u16) << 15) | (self.index & MAX_FRAGMENT_INDEX);
+        let combined: u16 = (u16::from(self.final_) << 15) | (self.index & MAX_FRAGMENT_INDEX);
         let mut out = Vec::with_capacity(FRAGMENT_HEADER_OVERHEAD + self.payload.len());
         out.extend_from_slice(&self.id.to_be_bytes());
         out.extend_from_slice(&combined.to_be_bytes());
@@ -149,24 +151,24 @@ impl Fragment {
     }
 
     /// Parse the fixed 10-byte header (inverse of [`encode`](Fragment::encode)).
+    ///
+    /// Decodes untrusted peer bytes, so it is written without any indexing or `unwrap`:
+    /// `split_first_chunk` peels the fixed-size header fields and yields the rest as payload,
+    /// returning [`WireError::ShortFragment`] if the input is too short — it cannot panic.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        if bytes.len() < FRAGMENT_HEADER_OVERHEAD {
-            return Err(WireError::ShortFragment {
-                len: bytes.len(),
-                min: FRAGMENT_HEADER_OVERHEAD,
-            });
-        }
-        let mut id_bytes = [0u8; 8];
-        id_bytes.copy_from_slice(&bytes[0..8]);
-        let id = u64::from_be_bytes(id_bytes);
-        let mut combined_bytes = [0u8; 2];
-        combined_bytes.copy_from_slice(&bytes[8..10]);
-        let combined = u16::from_be_bytes(combined_bytes);
-        Ok(Fragment {
+        let short = || WireError::ShortFragment {
+            len: bytes.len(),
+            min: FRAGMENT_HEADER_OVERHEAD,
+        };
+        let (id_bytes, rest) = bytes.split_first_chunk::<8>().ok_or_else(short)?;
+        let (combined_bytes, payload) = rest.split_first_chunk::<2>().ok_or_else(short)?;
+        let id = u64::from_be_bytes(*id_bytes);
+        let combined = u16::from_be_bytes(*combined_bytes);
+        Ok(Self {
             id,
             index: combined & MAX_FRAGMENT_INDEX,
             final_: combined & 0x8000 != 0,
-            payload: bytes[FRAGMENT_HEADER_OVERHEAD..].to_vec(),
+            payload: payload.to_vec(),
         })
     }
 }
@@ -186,11 +188,11 @@ pub struct Fragmenter {
 
 impl Fragmenter {
     pub fn new() -> Self {
-        Fragmenter::default()
+        Self::default()
     }
 
     /// The id that would be assigned to the next *new* instruction. Useful for tests/telemetry.
-    pub fn current_id(&self) -> u64 {
+    pub const fn current_id(&self) -> u64 {
         self.next_id
     }
 
@@ -284,7 +286,7 @@ pub struct FragmentAssembly {
 
 impl FragmentAssembly {
     pub fn new() -> Self {
-        FragmentAssembly::default()
+        Self::default()
     }
 
     /// Feed a fragment. Returns `Ok(Some(instruction))` once the instruction it belongs to is

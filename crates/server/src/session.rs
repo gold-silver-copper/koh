@@ -76,33 +76,29 @@ pub fn spawn_session(shell: Option<&str>, scrollback: usize) -> anyhow::Result<S
 /// Owns `pty_rx` exclusively (it is not `Clone`), so the screen stays current while detached.
 async fn drain(handle: SharedSession, mut pty_rx: mpsc::Receiver<Vec<u8>>) {
     loop {
-        match pty_rx.recv().await {
-            Some(chunk) => {
-                let mut s = handle.session.lock().await;
-                s.emu.process(&chunk);
-                // Answer any terminal queries the shell/app emitted (DSR/DA/DECRQM) by writing
-                // the replies straight back to the PTY — they are host I/O, not screen content.
-                let replies = s.emu.take_host_replies();
-                if !replies.is_empty() {
-                    let _ = s.pty.write_input(&replies);
-                }
-                drop(s);
-                handle.changed.notify_one();
+        let Some(chunk) = pty_rx.recv().await else {
+            // Shell exited: reader hit EOF. Reap the real exit code (the child is already a
+            // zombie, so try_wait returns it) and stamp it onto the emulator so the next
+            // snapshot — and thus the shutdown frame — carries it to the client.
+            let mut s = handle.session.lock().await;
+            s.child_alive = false;
+            if let Ok(Some(status)) = s.pty.try_wait() {
+                s.emu.set_exit_code(status.exit_code());
             }
-            None => {
-                // Shell exited: reader hit EOF. Reap the real exit code (the child is already a
-                // zombie, so try_wait returns it) and stamp it onto the emulator so the next
-                // snapshot — and thus the shutdown frame — carries it to the client.
-                let mut s = handle.session.lock().await;
-                s.child_alive = false;
-                if let Ok(Some(status)) = s.pty.try_wait() {
-                    s.emu.set_exit_code(status.exit_code());
-                }
-                drop(s);
-                handle.changed.notify_one();
-                break;
-            }
+            drop(s);
+            handle.changed.notify_one();
+            break;
+        };
+        let mut s = handle.session.lock().await;
+        s.emu.process(&chunk);
+        // Answer any terminal queries the shell/app emitted (DSR/DA/DECRQM) by writing the
+        // replies straight back to the PTY — they are host I/O, not screen content.
+        let replies = s.emu.take_host_replies();
+        if !replies.is_empty() {
+            let _ = s.pty.write_input(&replies);
         }
+        drop(s);
+        handle.changed.notify_one();
     }
 }
 
@@ -160,14 +156,15 @@ async fn teardown(handle: SharedSession) {
 }
 
 /// Background sweeper: reap sessions whose shell has exited, or that have been detached longer
-/// than `ttl`, every `interval`. Also piggybacks the auth-failure limiter's GC on each sweep,
-/// bounding its keyspace under `--allow-any` (where any number of distinct peers could each leave
-/// a stale entry). Runs until the store is dropped. `clock` is the same monotonic clock the accept
-/// loop stamps failures with, so the GC's window arithmetic agrees with `check`/`record_failure`.
-/// `interval` is injectable (the binary passes [`REAP_INTERVAL`]) so tests can drive a sweep
-/// without a real multi-second wait. `shutdown` lets the caller stop the reaper cleanly: the
-/// loop `select!`s the token against the sleep and returns when cancelled (rather than being
-/// `abort()`ed mid-sweep).
+/// than `ttl`, every `interval`.
+///
+/// Also piggybacks the auth-failure limiter's GC on each sweep, bounding its keyspace under
+/// `--allow-any` (where any number of distinct peers could each leave a stale entry). Runs until
+/// the store is dropped. `clock` is the same monotonic clock the accept loop stamps failures with,
+/// so the GC's window arithmetic agrees with `check`/`record_failure`. `interval` is injectable
+/// (the binary passes [`REAP_INTERVAL`]) so tests can drive a sweep without a real multi-second
+/// wait. `shutdown` lets the caller stop the reaper cleanly: the loop `select!`s the token against
+/// the sleep and returns when cancelled (rather than being `abort()`ed mid-sweep).
 pub async fn run_reaper(
     store: SessionStore,
     ttl: Duration,
@@ -181,7 +178,11 @@ pub async fn run_reaper(
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.cancelled() => return,
         }
-        // Evict aged-out auth-failure entries (poison unwrap is a panic check, not peer input).
+        // Evict aged-out auth-failure entries (poison is a panic-elsewhere bug, not peer input).
+        #[expect(
+            clippy::expect_used,
+            reason = "a poisoned auth-limiter mutex is a bug, not input"
+        )]
         limiter
             .lock()
             .expect("auth limiter mutex poisoned")
@@ -190,7 +191,7 @@ pub async fn run_reaper(
         let mut dead = Vec::new();
         for (peer, h) in map.iter() {
             let s = h.session.lock().await;
-            let detached_expired = s.last_detach.map(|t| t.elapsed() >= ttl).unwrap_or(false);
+            let detached_expired = s.last_detach.is_some_and(|t| t.elapsed() >= ttl);
             if !s.child_alive || detached_expired {
                 dead.push(*peer);
             }
@@ -212,7 +213,7 @@ mod tests {
     async fn reaper_collects_dead_session_at_injected_interval() {
         // Inject a 10ms sweep interval instead of the 5s default, so the reaper's collection of a
         // dead session is observable in a fast, deterministic test.
-        let store: SessionStore = Default::default();
+        let store = SessionStore::default();
         let limiter: AuthLimiter = Arc::new(StdMutex::new(FailureLimiter::new(1000, 3)));
         let clock = MonoClock::new();
         let peer = generate_secret_key().public();

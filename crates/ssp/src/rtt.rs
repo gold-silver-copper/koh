@@ -5,6 +5,14 @@
 //! mosh's exact `send_interval()` ("two frames per RTT") and `timeout()` (RTO) behavior.
 //! Using these instead of raw quinn RTT keeps the timer math identical to upstream mosh.
 
+// Deliberately NOT using `f64::mul_add` here: a fused multiply-add rounds differently from the
+// separate `*` and `+`, which would diverge from mosh's exact EWMA/RTO arithmetic (the whole point
+// of this module is byte-for-byte timer parity with upstream).
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "preserve mosh's exact non-FMA timer arithmetic"
+)]
+
 use tracing::trace;
 
 use crate::{SEND_INTERVAL_MAX, SEND_INTERVAL_MIN};
@@ -25,7 +33,7 @@ pub struct RttEstimator {
 impl Default for RttEstimator {
     fn default() -> Self {
         // mosh init: SRTT = 1000, RTTVAR = 500, RTT_hit = false.
-        RttEstimator {
+        Self {
             srtt: 1000.0,
             rttvar: 500.0,
             hit: false,
@@ -50,13 +58,13 @@ impl RttEstimator {
             return;
         }
         self.last = Some(r_ms);
-        if !self.hit {
+        if self.hit {
+            self.rttvar = 0.75 * self.rttvar + 0.25 * (self.srtt - r_ms).abs();
+            self.srtt = 0.875 * self.srtt + 0.125 * r_ms;
+        } else {
             self.srtt = r_ms;
             self.rttvar = r_ms / 2.0;
             self.hit = true;
-        } else {
-            self.rttvar = 0.75 * self.rttvar + 0.25 * (self.srtt - r_ms).abs();
-            self.srtt = 0.875 * self.srtt + 0.125 * r_ms;
         }
         trace!(
             sample = r_ms,
@@ -67,7 +75,7 @@ impl RttEstimator {
     }
 
     /// Smoothed RTT in milliseconds.
-    pub fn srtt_ms(&self) -> f64 {
+    pub const fn srtt_ms(&self) -> f64 {
         self.srtt
     }
 
@@ -85,6 +93,10 @@ impl RttEstimator {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    reason = "these tests assert EXACT float values on purpose (e.g. the EWMA must not drift)"
+)]
 mod tests {
     use super::*;
 

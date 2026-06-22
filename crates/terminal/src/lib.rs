@@ -64,7 +64,7 @@ impl Clone for TerminalScreen {
         // Drop the live parser on clone; the snapshot carries the state and the next apply
         // rebuilds the parser from it. Clone is the rare path (transport state snapshots), so a
         // later one-time rebuild is fine — the per-frame apply stays cheap.
-        TerminalScreen {
+        Self {
             screen: self.screen.clone(),
             echo_ack: self.echo_ack,
             title: self.title.clone(),
@@ -76,18 +76,20 @@ impl Clone for TerminalScreen {
 
 impl std::fmt::Debug for TerminalScreen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `parser` is deliberately omitted: it is a non-identity cache (dropped on clone,
+        // lazily rebuilt) and `vt100::Parser` is not `Debug`. Mark the struct non-exhaustive.
         f.debug_struct("TerminalScreen")
             .field("size", &self.screen.size())
             .field("echo_ack", &self.echo_ack)
             .field("title", &self.title)
             .field("exit_code", &self.exit_code)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl Default for TerminalScreen {
     fn default() -> Self {
-        TerminalScreen {
+        Self {
             screen: blank_screen(DEFAULT_ROWS, DEFAULT_COLS),
             echo_ack: 0,
             title: String::new(),
@@ -103,7 +105,7 @@ impl TerminalScreen {
     pub fn from_bytes(rows: u16, cols: u16, bytes: &[u8]) -> Self {
         let mut p = vt100::Parser::new(rows, cols, 0);
         p.process(bytes);
-        TerminalScreen {
+        Self {
             screen: p.screen().clone(),
             echo_ack: 0,
             title: String::new(),
@@ -200,7 +202,7 @@ impl SyncState for TerminalScreen {
         }
         self.echo_ack = self.echo_ack.max(diff.echo_ack);
         if let Some(title) = &diff.title {
-            self.title = title.clone();
+            self.title.clone_from(title);
         }
         if diff.exit_code.is_some() {
             self.exit_code = diff.exit_code;
@@ -238,7 +240,7 @@ mod tests {
         let base = TerminalScreen::default();
         let target = screen_from(24, 80, b"hello \x1b[31mworld\x1b[m");
         let diff = target.diff_from(&base);
-        let mut c = base.clone();
+        let mut c = base;
         c.apply(&diff);
         assert_eq!(c, target);
     }
@@ -250,7 +252,7 @@ mod tests {
         let diff = b.diff_from(&a);
         assert!(!diff.vt.is_empty());
         assert!(diff.resize.is_none());
-        let mut c = a.clone();
+        let mut c = a;
         c.apply(&diff);
         assert_eq!(c, b);
     }
@@ -265,7 +267,7 @@ mod tests {
         );
         let diff = b.diff_from(&a);
         assert_eq!(diff.resize, Some((40, 120)));
-        let mut c = a.clone();
+        let mut c = a;
         c.apply(&diff);
         assert_eq!(c, b);
         assert_eq!(c.size(), (40, 120));
@@ -285,7 +287,7 @@ mod tests {
         let base = TerminalScreen::default();
         let target = screen_from(24, 80, "日本語 café 🦀 e\u{0301}".as_bytes());
         let diff = target.diff_from(&base);
-        let mut c = base.clone();
+        let mut c = base;
         c.apply(&diff);
         assert_eq!(c, target);
     }
@@ -369,7 +371,7 @@ mod tests {
         let target = emu.snapshot();
         let base = TerminalScreen::default();
         let diff = target.diff_from(&base);
-        let mut client = base.clone();
+        let mut client = base;
         client.apply(&diff);
         assert_eq!(
             client, target,
@@ -382,7 +384,7 @@ mod tests {
     fn row_text(s: &vt100::Screen, row: u16) -> String {
         let (_, cols) = s.size();
         (0..cols)
-            .map(|c| match s.cell(row, c).map(|x| x.contents()) {
+            .map(|c| match s.cell(row, c).map(vt100::Cell::contents) {
                 Some(g) if !g.is_empty() => g.to_string(),
                 _ => " ".to_string(),
             })

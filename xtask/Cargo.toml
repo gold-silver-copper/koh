@@ -17,3 +17,6 @@ rmosh-input.workspace = true
 rmosh-predict.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+
+[lints]
+workspace = true

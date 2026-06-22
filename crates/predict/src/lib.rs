@@ -26,7 +26,9 @@ use unicode_width::UnicodeWidthStr;
 use vt100::{Color, Screen};
 
 /// Tunable engagement / flagging / glitch thresholds for the predictor (mosh `terminaloverlay.h`
-/// values). Lifted out of module constants so a front-end can tune responsiveness and tests can
+/// values).
+///
+/// Lifted out of module constants so a front-end can tune responsiveness and tests can
 /// drive engagement deterministically. [`Default`] reproduces the historical hardcoded values, so
 /// `PredictionEngine::new` behaves exactly as before.
 #[derive(Debug, Clone, Copy)]
@@ -52,7 +54,7 @@ pub struct PredictionConfig {
 impl Default for PredictionConfig {
     fn default() -> Self {
         // mosh terminaloverlay.h defaults.
-        PredictionConfig {
+        Self {
             srtt_trigger_low: 20.0,
             srtt_trigger_high: 30.0,
             flag_trigger_low: 50.0,
@@ -100,7 +102,7 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn empty() -> Self {
-        Overlay::default()
+        Self::default()
     }
     /// The predicted cell at `(row, col)`, if any.
     pub fn cell(&self, row: u16, col: u16) -> Option<&PredictedCell> {
@@ -161,7 +163,9 @@ enum EscState {
     Csi,
 }
 
-/// The prediction engine. Drive it: [`set_local_frame_sent`](Self::set_local_frame_sent)
+/// The prediction engine.
+///
+/// Drive it: [`set_local_frame_sent`](Self::set_local_frame_sent)
 /// before feeding typed bytes; [`new_user_byte`](Self::new_user_byte) per typed byte;
 /// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) + [`set_srtt`](Self::set_srtt)
 /// + [`cull`](Self::cull) when a server frame arrives; [`overlay`](Self::overlay) to render.
@@ -201,7 +205,7 @@ impl PredictionEngine {
 
     /// A predictor with explicit engagement thresholds (for tuning / deterministic tests).
     pub fn with_config(pref: DisplayPreference, config: PredictionConfig) -> Self {
-        PredictionEngine {
+        Self {
             pref,
             cells: BTreeMap::new(),
             cursor: None,
@@ -290,8 +294,7 @@ impl PredictionEngine {
             let (row, col) = self
                 .cursor
                 .as_ref()
-                .map(|c| (c.row, c.col))
-                .unwrap_or((crow, ccol));
+                .map_or((crow, ccol), |c| (c.row, c.col));
             self.cursor = Some(PredCursor {
                 expiration_frame: self.local_frame_sent + 1,
                 tentative_epoch: self.prediction_epoch,
@@ -299,6 +302,26 @@ impl PredictionEngine {
                 col,
             });
         }
+    }
+
+    /// The predicted cursor, which [`init_cursor`](Self::init_cursor) has just guaranteed is
+    /// present. Only call immediately after `init_cursor`.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "init_cursor just set self.cursor to Some"
+    )]
+    fn cursor_after_init(&self) -> &PredCursor {
+        self.cursor.as_ref().unwrap()
+    }
+
+    /// The predicted cursor (mutable), which [`init_cursor`](Self::init_cursor) has just
+    /// guaranteed is present. Only call immediately after `init_cursor`.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "init_cursor just set self.cursor to Some"
+    )]
+    fn cursor_after_init_mut(&mut self) -> &mut PredCursor {
+        self.cursor.as_mut().unwrap()
     }
 
     fn newline_cr(&mut self, screen: &Screen) {
@@ -347,7 +370,7 @@ impl PredictionEngine {
         let (_, cols) = screen.size();
         self.init_cursor(screen);
         let (row, col) = {
-            let c = self.cursor.as_ref().unwrap();
+            let c = self.cursor_after_init();
             (c.row, c.col)
         };
         // Need the whole glyph to fit strictly before the last column (the edge is wrap-ambiguous).
@@ -474,14 +497,14 @@ impl PredictionEngine {
             0x20..=0x7e => {
                 // Ordinary printable ASCII.
                 self.init_cursor(screen);
-                let col = self.cursor.as_ref().unwrap().col;
+                let col = self.cursor_after_init().col;
                 if col + 1 >= cols {
                     // Last column is ambiguous (wrap vs. overwrite); hide until confirmed.
                     self.become_tentative();
                     self.init_cursor(screen);
                 }
                 let (row, col) = {
-                    let c = self.cursor.as_ref().unwrap();
+                    let c = self.cursor_after_init();
                     (c.row, c.col)
                 };
                 let exp = self.local_frame_sent + 1;
@@ -538,18 +561,18 @@ impl PredictionEngine {
             0x7f | 0x08 => {
                 // Backspace: step the cursor back one column.
                 self.init_cursor(screen);
+                let exp = self.local_frame_sent + 1;
                 let (row, col, do_pred) = {
-                    let c = self.cursor.as_mut().unwrap();
+                    let c = self.cursor_after_init_mut();
                     if c.col > 0 {
                         c.col -= 1;
-                        c.expiration_frame = self.local_frame_sent + 1;
+                        c.expiration_frame = exp;
                         (c.row, c.col, true)
                     } else {
                         (c.row, c.col, false)
                     }
                 };
                 if do_pred {
-                    let exp = self.local_frame_sent + 1;
                     let epoch = self.prediction_epoch;
                     if self.predict_overwrite {
                         // Overwrite mode: just blank the cell at the new cursor position.
@@ -654,7 +677,7 @@ impl PredictionEngine {
         let mut new_glitch = self.glitch_trigger;
         let mut last_quick = self.last_quick_confirmation;
 
-        for (&(row, col), cell) in self.cells.iter() {
+        for (&(row, col), cell) in &self.cells {
             let v = cell_validity(cell, screen, row, col, rows, cols, late);
             match v {
                 Validity::Pending => {
@@ -742,7 +765,7 @@ impl PredictionEngine {
         }
         let (_, cols) = screen.size();
         let mut ov = Overlay::empty();
-        for (&(row, col), cell) in self.cells.iter() {
+        for (&(row, col), cell) in &self.cells {
             if self.tentative(cell.tentative_epoch) {
                 continue; // hidden until its epoch is confirmed
             }
@@ -1052,10 +1075,7 @@ mod tests {
             "tail shifted left"
         );
         assert!(
-            e.cells
-                .get(&(0, cols - 1))
-                .map(|c| c.unknown)
-                .unwrap_or(false),
+            e.cells.get(&(0, cols - 1)).is_some_and(|c| c.unknown),
             "right edge is marked unknown after a mid-line backspace"
         );
     }

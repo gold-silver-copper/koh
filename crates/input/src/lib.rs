@@ -43,7 +43,7 @@ pub struct UserInput {
 
 impl UserInput {
     pub fn new() -> Self {
-        UserInput::default()
+        Self::default()
     }
 
     /// Append a single typed byte.
@@ -120,7 +120,9 @@ impl SyncState for UserInput {
         // fall back to the real common prefix rather than `debug_assert!`-panicking on a divergent
         // base from untrusted peer input.
         let n = common_prefix_len(&self.events, &base.events);
-        coalesce(&self.events[n..])
+        // `n` is a common-prefix length, so `n <= self.events.len()` always and `get(n..)` is
+        // `Some`; the `unwrap_or_default` keeps this genuinely panic-free without an `indexing`.
+        coalesce(self.events.get(n..).unwrap_or_default())
     }
 
     fn apply(&mut self, diff: &Self::Diff) {
@@ -233,8 +235,8 @@ mod tests {
             h.a_mut().push_byte(b'a' + (round % 26));
             typed.push_byte(b'a' + (round % 26));
             if round % 7 == 0 {
-                h.a_mut().push_resize(20 + round as u16, 80);
-                typed.push_resize(20 + round as u16, 80);
+                h.a_mut().push_resize(20 + u16::from(round), 80);
+                typed.push_resize(20 + u16::from(round), 80);
             }
             h.run_steps(6);
         }

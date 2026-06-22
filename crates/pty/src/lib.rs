@@ -121,8 +121,11 @@ impl Pty {
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break, // EOF: slave closed (EIO is mapped to 0 on unix)
+                        // `Read::read` guarantees `n <= buf.len()`, so `get(..n)` is always
+                        // `Some`; the `else` is a panic-free fallback that can't actually run.
                         Ok(n) => {
-                            if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            let Some(chunk) = buf.get(..n) else { break };
+                            if tx.blocking_send(chunk.to_vec()).is_err() {
                                 break; // receiver dropped: session over
                             }
                         }
@@ -156,7 +159,7 @@ impl Pty {
             })?;
 
         Ok((
-            Pty {
+            Self {
                 master: pair.master,
                 writer_tx,
                 child,
@@ -256,6 +259,10 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    #[allow(
+        clippy::items_after_statements,
+        reason = "`_assert_typed` is a deliberate compile-time signature assertion kept beside the runtime checks it documents"
+    )]
     fn pty_error_variants_are_constructible_and_reachable() {
         let mk = || io::Error::other("boom");
         // Each stage variant is constructible and renders a non-empty message.
@@ -281,6 +288,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::match_wild_err_arm,
+        reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"
+    )]
     async fn spawns_and_streams_output() {
         // Run a one-shot command in the PTY and confirm we receive its output + reap it.
         let (mut pty, mut rx) =
@@ -308,6 +319,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "channel-close (`Ok(None)`) and deadline (`Err(_)`) are conceptually distinct outcomes kept as separate arms for readability, even though both set `found = false`"
+    )]
     async fn interactive_shell_echoes_input() {
         // Spawn the default shell, send a command, and verify the echoed output comes back.
         let (mut pty, mut rx) = Pty::spawn(24, 80, None, "xterm-256color").expect("spawn shell");
@@ -340,6 +355,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "channel-close (`Ok(None)`) and deadline (`Err(_)`) are conceptually distinct outcomes kept as separate arms for readability, even though both set `in_order = false`"
+    )]
     async fn write_input_takes_shared_ref_and_preserves_order() {
         // `pty` is bound WITHOUT `mut`, proving write_input takes `&self`. Two separate enqueues
         // must reach the child in FIFO order: the concatenated marker only appears if the second
@@ -372,6 +391,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::needless_continue,
+        clippy::match_wild_err_arm,
+        reason = "the explicit `continue` documents the drain-and-keep-reading intent; the `Err(_)` deadline arm panics because a timeout here IS the test failing"
+    )]
     async fn dropping_pty_eofs_child_and_stops_writer() {
         // `cat` blocks reading stdin. Dropping the Pty drops the writer-thread sender; the writer
         // thread then finishes and drops the PTY write handle, on which portable-pty sends EOT —

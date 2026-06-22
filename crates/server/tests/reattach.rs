@@ -3,6 +3,16 @@
 //! it's right where you left it." Hermetic: two loopback iroh connections from one client
 //! endpoint (so the peer id — the session key — is stable across reconnects).
 
+// Integration test: a failed unwrap/expect/assert IS the test failing.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::items_after_statements,
+    clippy::default_trait_access,
+    reason = "integration test code; panics are assertion failures"
+)]
 use std::time::Duration;
 
 use rmosh_input::UserInput;

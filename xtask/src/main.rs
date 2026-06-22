@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Chaos { loss, seed } => {
-            let r = run_session(loss, seed)?;
+            let r = run_session(loss, seed);
             println!(
                 "chaos: loss={loss} seed={seed} -> CONVERGED in {} steps ({} simulated ms); \
                  echo_ack={}",
@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
             println!("predictor reconciliation: OK");
         }
         Cmd::Integration { loss, seed } => {
-            let r = run_session(loss, seed)?;
+            let r = run_session(loss, seed);
             r.assert_ok()?;
             run_predictor_reconciliation()?;
             println!("integration: PASS (loss={loss}, seed={seed})");
@@ -96,7 +96,7 @@ impl SessionResult {
 /// Wire client (A: `Transport<UserInput, TerminalScreen>`) to server
 /// (B: `Transport<TerminalScreen, UserInput>`) through a lossy link, type a command, have a
 /// fake shell echo it, and drive everything to convergence — including the server's echo-ack.
-fn run_session(loss: f64, seed: u64) -> anyhow::Result<SessionResult> {
+fn run_session(loss: f64, seed: u64) -> SessionResult {
     let params = LinkParams {
         loss,
         min_delay_ms: 10,
@@ -144,13 +144,13 @@ fn run_session(loss: f64, seed: u64) -> anyhow::Result<SessionResult> {
     let target = emu.snapshot();
     let converge_steps = h.run_until(40_000, |h| *h.a.remote_state() == target);
 
-    Ok(SessionResult {
+    SessionResult {
         converge_steps,
         sim_ms: h.now(),
         client_text: h.a.remote_state().screen().contents(),
         client_echo_ack: h.a.remote_state().echo_ack(),
         expected_frame: frame,
-    })
+    }
 }
 
 /// Drive a client-side predictor against authoritative frames to confirm the epoch gate:
@@ -182,14 +182,13 @@ mod tests {
 
     #[test]
     fn integration_converges_clean_link() {
-        run_session(0.0, 1).unwrap().assert_ok().unwrap();
+        run_session(0.0, 1).assert_ok().unwrap();
     }
 
     #[test]
     fn integration_converges_lossy_link() {
         for seed in 1..6 {
             run_session(0.3, seed)
-                .unwrap()
                 .assert_ok()
                 .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         }

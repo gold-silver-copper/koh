@@ -131,10 +131,31 @@ pub async fn detach(store: &SessionStore, peer: EndpointId) {
     }
 }
 
-/// Remove + kill `peer`'s session (e.g. once its shutdown handshake has completed).
+/// Remove + tear down `peer`'s session (e.g. once its shutdown handshake has completed).
 pub async fn reap(store: &SessionStore, peer: EndpointId) {
-    if let Some(h) = store.lock().await.remove(&peer) {
-        let _ = h.session.lock().await.pty.kill();
+    let removed = store.lock().await.remove(&peer);
+    if let Some(h) = removed {
+        teardown(h).await;
+    }
+}
+
+/// Tear down a session we have just removed from the store.
+///
+/// If we now hold the **only** reference (the drain task has already ended — typical once the
+/// shell has exited), gracefully shut the PTY down: `Pty::shutdown` kills the child and joins both
+/// I/O pump threads, so they don't linger as detached threads. The join blocks, so it runs on
+/// `spawn_blocking`, never on an async worker. Otherwise some other holder (an attached connection,
+/// or the drain task) still owns it, so we just kill the child and let the threads exit when the
+/// last reference drops — joining there would mean reaching into shared state we don't own.
+async fn teardown(handle: SharedSession) {
+    match Arc::try_unwrap(handle) {
+        Ok(h) => {
+            let Session { pty, .. } = h.session.into_inner();
+            tokio::task::spawn_blocking(move || pty.shutdown());
+        }
+        Err(h) => {
+            let _ = h.session.lock().await.pty.kill();
+        }
     }
 }
 
@@ -174,10 +195,10 @@ pub async fn run_reaper(
                 dead.push(*peer);
             }
         }
-        for peer in dead {
-            if let Some(h) = map.remove(&peer) {
-                let _ = h.session.lock().await.pty.kill();
-            }
+        let doomed: Vec<SharedSession> = dead.iter().filter_map(|peer| map.remove(peer)).collect();
+        drop(map); // release the store lock before tearing down (teardown may lock a session)
+        for h in doomed {
+            teardown(h).await;
         }
     }
 }

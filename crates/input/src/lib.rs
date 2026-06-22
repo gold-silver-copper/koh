@@ -98,16 +98,28 @@ fn coalesce(tail: &[InputEvent]) -> Vec<WireEvent> {
     out
 }
 
+/// Length of the longest common prefix of two event logs.
+///
+/// For a well-behaved (append-only) peer the `base` always *is* a prefix of `self`, so this equals
+/// `base.len()` — the historical `min(base.len, self.len)`. But peer input is untrusted: an
+/// authorized-but-malicious peer can ship independent diffs from divergent bases that arrive
+/// out-of-order, leaving `base` NOT a prefix of `self`. Computing the real common-prefix length
+/// (instead of trusting `base.len()`) makes [`diff_from`](UserInput::diff_from) and
+/// [`subtract_prefix`](UserInput::subtract_prefix) robust: no panic on peer input, and the
+/// divergent tail is neither silently dropped (which would corrupt the synced stream) nor blindly
+/// discarded.
+fn common_prefix_len(a: &[InputEvent], b: &[InputEvent]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
 impl SyncState for UserInput {
     type Diff = Vec<WireEvent>;
 
     fn diff_from(&self, base: &Self) -> Self::Diff {
-        debug_assert!(
-            self.events.len() >= base.events.len()
-                && self.events[..base.events.len()] == base.events[..],
-            "diff base must be a prefix of self (invariant of an append-only log)"
-        );
-        let n = base.events.len().min(self.events.len());
+        // `base` SHOULD be a prefix of `self` (the append-only invariant) and is for honest peers;
+        // fall back to the real common prefix rather than `debug_assert!`-panicking on a divergent
+        // base from untrusted peer input.
+        let n = common_prefix_len(&self.events, &base.events);
         coalesce(&self.events[n..])
     }
 
@@ -121,7 +133,9 @@ impl SyncState for UserInput {
     }
 
     fn subtract_prefix(&mut self, prefix: &Self) {
-        let n = prefix.events.len().min(self.events.len());
+        // Drop only the genuinely-shared prefix; never drain past a divergence (which would
+        // corrupt this state and, via `get_remote_diff`, poison the delivered-state baseline).
+        let n = common_prefix_len(&self.events, &prefix.events);
         self.events.drain(0..n);
     }
 }
@@ -173,6 +187,41 @@ mod tests {
             ui.events(),
             &[InputEvent::Byte(b'l'), InputEvent::Byte(b'o')]
         );
+    }
+
+    #[test]
+    fn diff_from_divergent_base_is_robust_and_keeps_the_tail() {
+        // Untrusted peers can make `base` NOT a prefix of `self` (divergent diffs delivered
+        // out-of-order). This must NOT panic (old debug_assert) and must NOT silently drop the
+        // divergent tail (old min()-based code returned an empty diff, dropping real input).
+        let mut target = UserInput::new();
+        target.push_bytes(b"abd"); // [a, b, d]
+        let mut base = UserInput::new();
+        base.push_bytes(b"abc"); // [a, b, c] — diverges at index 2, same length
+                                 // The diff is the tail after the genuine common prefix [a, b]: just 'd'.
+        assert_eq!(
+            target.diff_from(&base),
+            vec![WireEvent::Keys(b"d".to_vec())]
+        );
+        // A prefix base still behaves exactly as before (the common path).
+        let mut prefix = UserInput::new();
+        prefix.push_bytes(b"ab");
+        assert_eq!(
+            target.diff_from(&prefix),
+            vec![WireEvent::Keys(b"d".to_vec())]
+        );
+    }
+
+    #[test]
+    fn subtract_prefix_divergent_keeps_divergent_tail() {
+        // A non-prefix argument must only drain the genuinely-shared prefix, never past the
+        // divergence (which would corrupt the state and poison the delivered baseline).
+        let mut s = UserInput::new();
+        s.push_bytes(b"abd");
+        let mut other = UserInput::new();
+        other.push_bytes(b"abc");
+        s.subtract_prefix(&other); // common prefix [a, b] (len 2) drained; 'd' kept
+        assert_eq!(s.events(), &[InputEvent::Byte(b'd')]);
     }
 
     #[test]

@@ -15,6 +15,11 @@ pub struct RttEstimator {
     srtt: f64,
     rttvar: f64,
     hit: bool,
+    /// The last sample actually incorporated. The driver calls `observe_rtt` every wakeup, but
+    /// quinn only refreshes its smoothed RTT on an ACK — so the *same* value arrives repeatedly
+    /// between ACKs. Dropping an unchanged repeat keeps those repeats from dragging the EWMA
+    /// (notably decaying `rttvar`, which would tighten the RTO toward `srtt`).
+    last: Option<f64>,
 }
 
 impl Default for RttEstimator {
@@ -24,6 +29,7 @@ impl Default for RttEstimator {
             srtt: 1000.0,
             rttvar: 500.0,
             hit: false,
+            last: None,
         }
     }
 }
@@ -39,6 +45,11 @@ impl RttEstimator {
         if !(r_ms.is_finite()) || r_ms >= 5000.0 {
             return;
         }
+        // Skip an unchanged repeat (quinn only updates its RTT on an ACK; we sample every wakeup).
+        if self.last == Some(r_ms) {
+            return;
+        }
+        self.last = Some(r_ms);
         if !self.hit {
             self.srtt = r_ms;
             self.rttvar = r_ms / 2.0;
@@ -103,5 +114,35 @@ mod tests {
         let before = e.srtt_ms();
         e.sample(9000.0); // ignored
         assert_eq!(e.srtt_ms(), before);
+    }
+
+    #[test]
+    fn repeated_identical_samples_do_not_drift_ewma() {
+        let mut e = RttEstimator::new();
+        e.sample(100.0); // seed
+        e.sample(20.0); // a genuine change establishes a non-trivial srtt + rttvar
+        let srtt = e.srtt_ms();
+        let rto = e.timeout();
+        // quinn only updates its RTT on an ACK; between ACKs the SAME value is sampled each wakeup.
+        for _ in 0..100 {
+            e.sample(20.0);
+        }
+        assert_eq!(
+            e.srtt_ms(),
+            srtt,
+            "srtt must not drift on a repeated identical sample"
+        );
+        assert_eq!(
+            e.timeout(),
+            rto,
+            "rttvar (hence the RTO) must not decay on repeats"
+        );
+        // A genuinely different sample is still incorporated.
+        e.sample(21.0);
+        assert_ne!(
+            e.srtt_ms(),
+            srtt,
+            "a changed sample still updates the estimate"
+        );
     }
 }

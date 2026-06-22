@@ -27,6 +27,9 @@ data-encoding.workspace = true
 directories.workspace = true
 rand.workspace = true
 secrecy = "0.10"
+# Render the endpoint id as a terminal QR for --qr. default-features = false drops the heavy
+# image/svg/pic renderers; we only use the built-in unicode (half-block) renderer.
+qrcode = { version = "=0.14.1", default-features = false }
 
 [lints]
 workspace = true

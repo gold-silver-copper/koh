@@ -175,6 +175,10 @@ rmosh-server --allow 3f9c…
 # └───────────────────────────────────────────────────────────
 ```
 
+Add `--qr` to the server to also print the endpoint id as a scannable terminal QR code
+(`rmosh-server --allow 3f9c… --qr`) — point a phone camera at it instead of copying 64 hex
+chars. It's rendered for a dark-background terminal.
+
 On the **client** (your phone/laptop), connect by the server's endpoint id:
 
 ```sh

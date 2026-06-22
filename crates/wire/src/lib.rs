@@ -21,6 +21,8 @@
 //! Unlike mosh we drop the OCB-nonce padding/chaff — QUIC owns crypto — but we keep an
 //! in-band [`PROTOCOL_VERSION`] (rejected on decode) to catch diff-encoding skew the ALPN can't.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
@@ -272,10 +274,12 @@ impl Fragmenter {
 #[derive(Debug, Default)]
 pub struct FragmentAssembly {
     current_id: Option<u64>,
-    /// Sparse store of received fragments for `current_id`, indexed by fragment index.
-    parts: Vec<Option<Vec<u8>>>,
+    /// Received fragments for `current_id`, keyed by index. A *map* (not a Vec sized to the
+    /// fragment index) so an untrusted peer that sends a single near-[`MAX_FRAGMENT_INDEX`]
+    /// fragment allocates one entry, not a ~32K-slot buffer — closing a cheap memory-amplification
+    /// knob while preserving the protocol's fragment-count ceiling.
+    parts: BTreeMap<u16, Vec<u8>>,
     final_index: Option<u16>,
-    have: usize,
 }
 
 impl FragmentAssembly {
@@ -308,44 +312,36 @@ impl FragmentAssembly {
                 self.current_id = Some(frag.id);
                 self.parts.clear();
                 self.final_index = None;
-                self.have = 0;
             }
         }
 
-        let idx = frag.index as usize;
-        if idx >= self.parts.len() {
-            self.parts.resize(idx + 1, None);
-        }
-        if self.parts[idx].is_none() {
-            self.have += 1;
-        }
         if frag.final_ {
             self.final_index = Some(frag.index);
         }
-        self.parts[idx] = Some(frag.payload);
+        self.parts.insert(frag.index, frag.payload);
 
-        // Complete only when we have a final marker and every index up to it.
+        // Complete only when we have a final marker and exactly indices `0..=final` are present
+        // (no gap, no stray index beyond the final).
         let Some(final_idx) = self.final_index else {
             return Ok(None);
         };
         let needed = final_idx as usize + 1;
-        if self.have != needed || self.parts.len() != needed {
-            return Ok(None);
-        }
-        if self.parts.iter().take(needed).any(|p| p.is_none()) {
+        if self.parts.len() != needed || self.parts.keys().next_back() != Some(&final_idx) {
             return Ok(None);
         }
 
         let mut buf = Vec::new();
-        for part in self.parts.iter().take(needed) {
-            buf.extend_from_slice(part.as_ref().unwrap());
+        for i in 0..=final_idx {
+            match self.parts.get(&i) {
+                Some(part) => buf.extend_from_slice(part),
+                None => return Ok(None), // gap (defensive; the count+max check rules it out)
+            }
         }
         // Reset so a duplicate of the just-completed final fragment doesn't re-emit forever:
         // bump past current_id by leaving it set; a re-sent identical fragment will rebuild and
         // re-complete, which is harmless (idempotent at the ssp layer), but we clear the buffer.
         self.parts.clear();
         self.final_index = None;
-        self.have = 0;
         trace!(
             id = self.current_id,
             fragments = needed,
@@ -514,6 +510,39 @@ mod tests {
             }
         }
         assert_eq!(got.unwrap(), newer);
+    }
+
+    #[test]
+    fn high_index_partial_does_not_complete_and_is_superseded() {
+        // A peer can send a near-MAX_FRAGMENT_INDEX, non-final fragment before any final marker.
+        // With the map-backed store this is a single entry (not a ~32K-slot buffer), it can't
+        // complete on its own, and a newer instruction supersedes it cleanly.
+        let mut asm = FragmentAssembly::new();
+        let high = Fragment {
+            id: 5,
+            index: MAX_FRAGMENT_INDEX,
+            final_: false,
+            payload: vec![1u8; 8],
+        };
+        assert!(
+            asm.add(high).unwrap().is_none(),
+            "a lone non-final fragment can never complete"
+        );
+        // A newer id (> 5) supersedes the stale high-index partial and reassembles normally.
+        let instr = sample_instruction(20);
+        let frags = Fragmenter::new().fragment(&instr, 1200).unwrap();
+        let mut got = None;
+        for mut fr in frags {
+            fr.id = 6; // force a superseding id; the assembler only cares about id ordering
+            if let Some(i) = asm.add(fr).unwrap() {
+                got = Some(i);
+            }
+        }
+        assert_eq!(
+            got.unwrap(),
+            instr,
+            "the newer instruction supersedes the stale high-index partial"
+        );
     }
 
     proptest! {

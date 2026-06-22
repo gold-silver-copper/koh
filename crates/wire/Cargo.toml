@@ -9,6 +9,7 @@ description = "rmosh wire format: SSP instruction envelope, framing, fragmentati
 serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

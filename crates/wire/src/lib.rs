@@ -22,6 +22,7 @@
 //! in-band [`PROTOCOL_VERSION`] (rejected on decode) to catch diff-encoding skew the ALPN can't.
 
 use serde::{Deserialize, Serialize};
+use tracing::trace;
 
 /// Conservative default datagram payload budget (bytes) when the path MTU is unknown.
 ///
@@ -222,6 +223,12 @@ impl Fragmenter {
         let chunk = mtu - FRAGMENT_HEADER_OVERHEAD;
         let mut fragments = Vec::new();
         if serialized.is_empty() {
+            trace!(
+                id,
+                changed,
+                mtu,
+                "fragmented empty instruction into 1 fragment"
+            );
             fragments.push(Fragment {
                 id,
                 index: 0,
@@ -237,6 +244,14 @@ impl Fragmenter {
                 max: MAX_FRAGMENT_INDEX as usize + 1,
             });
         }
+        trace!(
+            id,
+            fragments = total,
+            bytes = serialized.len(),
+            mtu,
+            changed,
+            "fragmented instruction"
+        );
         for (i, piece) in serialized.chunks(chunk).enumerate() {
             fragments.push(Fragment {
                 id,
@@ -272,10 +287,24 @@ impl FragmentAssembly {
     /// complete, `Ok(None)` while still waiting for more (or if the fragment was stale).
     pub fn add(&mut self, frag: Fragment) -> Result<Option<Instruction>, WireError> {
         match self.current_id {
-            Some(cur) if frag.id < cur => return Ok(None), // stale, superseded
-            Some(cur) if frag.id == cur => {}              // same instruction, accumulate
+            Some(cur) if frag.id < cur => {
+                trace!(
+                    stale_id = frag.id,
+                    current = cur,
+                    "dropping superseded fragment"
+                );
+                return Ok(None); // stale, superseded
+            }
+            Some(cur) if frag.id == cur => {} // same instruction, accumulate
             _ => {
                 // First fragment, or a newer instruction supersedes the partial.
+                if let Some(prev) = self.current_id {
+                    trace!(
+                        prev_id = prev,
+                        new_id = frag.id,
+                        "newer instruction supersedes partial"
+                    );
+                }
                 self.current_id = Some(frag.id);
                 self.parts.clear();
                 self.final_index = None;
@@ -317,6 +346,11 @@ impl FragmentAssembly {
         self.parts.clear();
         self.final_index = None;
         self.have = 0;
+        trace!(
+            id = self.current_id,
+            fragments = needed,
+            "reassembled complete instruction"
+        );
         let instr = Instruction::decode(&buf)?;
         Ok(Some(instr))
     }

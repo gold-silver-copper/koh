@@ -368,6 +368,11 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             let modestly_longer = resend_bytes.len() < 1000
                 && resend_bytes.len().saturating_sub(diff_bytes.len()) < 100;
             if shorter || modestly_longer {
+                trace!(
+                    from_num = self.sent_states[assumed_idx].num,
+                    to_num = self.sent_states.front().unwrap().num,
+                    "retargeting diff to the acked base (prospective resend)"
+                );
                 chosen_idx = 0;
                 diff = resend;
                 diff_bytes = resend_bytes;
@@ -497,6 +502,11 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
     fn process_acknowledgment_through(&mut self, ack: u64) {
         if self.sent_states.iter().any(|s| s.num == ack) {
             self.sent_states.retain(|s| s.num >= ack);
+            trace!(
+                ack,
+                sent_states = self.sent_states.len(),
+                "processed peer ack"
+            );
         }
     }
 

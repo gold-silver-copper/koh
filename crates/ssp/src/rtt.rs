@@ -5,6 +5,8 @@
 //! mosh's exact `send_interval()` ("two frames per RTT") and `timeout()` (RTO) behavior.
 //! Using these instead of raw quinn RTT keeps the timer math identical to upstream mosh.
 
+use tracing::trace;
+
 use crate::{SEND_INTERVAL_MAX, SEND_INTERVAL_MIN};
 
 /// Smoothed RTT / RTO estimator (mosh `Network::Connection` initial values + update rule).
@@ -45,6 +47,12 @@ impl RttEstimator {
             self.rttvar = 0.75 * self.rttvar + 0.25 * (self.srtt - r_ms).abs();
             self.srtt = 0.875 * self.srtt + 0.125 * r_ms;
         }
+        trace!(
+            sample = r_ms,
+            srtt = self.srtt,
+            rttvar = self.rttvar,
+            "rtt sample"
+        );
     }
 
     /// Smoothed RTT in milliseconds.

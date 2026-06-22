@@ -465,6 +465,11 @@ mod tests {
             s.overlay().is_empty(),
             "the first keystroke stays hidden until confirmed"
         );
+        assert_eq!(
+            s.predictor.confirmed_epoch(),
+            0,
+            "nothing is confirmed before the server frame arrives"
+        );
 
         // A real server frame that echoes 'x' and acks input frame 1 (past the echo debounce).
         let mut emu = ServerTerminal::new(24, 80, 0);
@@ -486,9 +491,16 @@ mod tests {
             s.screen().contents().contains('x'),
             "the new state is applied to the screen"
         );
+        // Pin the cull effect to on_datagram ITSELF: the epoch must advance here, before any
+        // further keystroke (an `on_input` would also call cull, which is why asserting only on a
+        // later keystroke's visibility wouldn't isolate this call).
+        assert_eq!(
+            s.predictor.confirmed_epoch(),
+            1,
+            "on_datagram's cull must grade the echoed 'x' Correct and advance the confirmed epoch"
+        );
 
-        // Proof the predictor was culled+confirmed by on_datagram: a subsequent keystroke is now
-        // VISIBLE — which only happens if cull graded the echoed 'x' Correct and advanced the epoch.
+        // And the downstream consequence holds: a subsequent keystroke is now VISIBLE.
         s.on_input(110, b"y");
         assert_eq!(
             s.overlay().cell(0, 1).map(|c| c.glyph.as_str()),

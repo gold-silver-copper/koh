@@ -249,6 +249,11 @@ impl PredictionEngine {
     pub fn set_display_preference(&mut self, pref: DisplayPreference) {
         self.pref = pref;
     }
+    /// The newest epoch the server has confirmed echoes (predictions at or below it may show).
+    /// Exposed for tests/telemetry: a confirmation is the observable effect of [`cull`](Self::cull).
+    pub fn confirmed_epoch(&self) -> u64 {
+        self.confirmed_epoch
+    }
     /// The newest local input frame number sent so far (predictions expire at this + 1).
     pub fn set_local_frame_sent(&mut self, n: u64) {
         self.local_frame_sent = n;

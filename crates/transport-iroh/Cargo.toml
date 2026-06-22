@@ -19,6 +19,12 @@ data-encoding.workspace = true
 rand.workspace = true
 # BLAKE3 for the optional passphrase nonce-challenge (passphrase never crosses the wire).
 blake3 = "1"
+# Argon2id work factor for the passphrase second factor: each online guess of a leaked-but-
+# allowlisted client's passphrase costs the attacker real CPU/memory (paired with the per-peer
+# rate limiter). Salt is fixed/deterministic so both peers derive the same PSK.
+argon2 = "0.5"
+# Constant-time comparison of the challenge response (no early-exit timing oracle).
+constant_time_eq = "0.5"
 
 [dev-dependencies]
 # drive the real SSP Transport over a real iroh datagram connection in the e2e test

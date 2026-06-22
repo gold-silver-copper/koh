@@ -1,12 +1,13 @@
 //! The passphrase nonce-challenge handshake over a real loopback iroh connection.
 
+use rmosh_transport_iroh::auth::AuthError;
 use rmosh_transport_iroh::{auth, bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 
 /// Run one handshake round over a fresh loopback connection and return (server, client) results.
 async fn round(
     server_pass: Option<&'static str>,
     client_pass: Option<&'static str>,
-) -> (anyhow::Result<()>, anyhow::Result<()>) {
+) -> (Result<(), AuthError>, Result<(), AuthError>) {
     let server = bind_endpoint_local(generate_secret_key(), true)
         .await
         .expect("bind server");
@@ -46,7 +47,11 @@ async fn passphrase_handshake_over_iroh() {
     let (sr, _cr) = round(Some("hunter2"), Some("hunter2")).await;
     assert!(sr.is_ok(), "matching passphrase should pass, got {sr:?}");
 
-    // (c) wrong passphrase -> the server rejects (the passphrase itself never crossed the wire).
+    // (c) wrong passphrase -> the server rejects with the typed `ChallengeFailed` (not a
+    // transport error), so the accept loop can tell a real rejection from a dropped connection.
     let (sr, _cr) = round(Some("hunter2"), Some("nope")).await;
-    assert!(sr.is_err(), "wrong passphrase must be rejected server-side");
+    assert!(
+        matches!(sr, Err(AuthError::ChallengeFailed)),
+        "wrong passphrase must be rejected server-side as ChallengeFailed, got {sr:?}"
+    );
 }

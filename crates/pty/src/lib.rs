@@ -5,7 +5,7 @@
 //! blocking thread (portable-pty's reader is blocking-only), forwards input bytes to the
 //! child, and propagates window-size changes (which `ioctl(TIOCSWINSZ)` turns into `SIGWINCH`).
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 
 use portable_pty::{
     native_pty_system, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize,
@@ -16,6 +16,31 @@ use tokio::sync::mpsc;
 const READ_CHUNK: usize = 8192;
 /// Bound on the output channel (chunks). Backpressure here naturally slows the reader thread.
 const OUTPUT_CHANNEL_DEPTH: usize = 512;
+
+/// Typed errors from PTY allocation, shell spawn, and resize (mirrors the
+/// `transport-iroh::SetupError` pattern so callers can match on the failure stage).
+///
+/// `portable-pty` surfaces its failures as `anyhow::Error`; we fold those into `io::Error`
+/// (via [`io::Error::other`]) so every variant carries one concrete payload. Only the reader
+/// thread's `Builder::spawn` is natively an `io::Error`, so it is the single `#[from]` source.
+/// Binaries keep `anyhow` internally — their `?`/`.context()` absorb `PtyError` via anyhow's
+/// blanket `From<E: Error + Send + Sync>`.
+#[derive(Debug, thiserror::Error)]
+pub enum PtyError {
+    /// Allocating the pseudo-terminal pair (`openpty`) failed.
+    #[error("opening pty: {0}")]
+    OpenPty(#[source] io::Error),
+    /// Spawning the shell under the slave side (`spawn_command`) failed.
+    #[error("spawning shell: {0}")]
+    Spawn(#[source] io::Error),
+    /// Wiring up the master read/write pumps failed: cloning the reader, taking the writer, or
+    /// starting the blocking reader thread (`Builder::spawn`, the native `io::Error` source).
+    #[error("starting pty reader: {0}")]
+    Reader(#[from] io::Error),
+    /// Propagating a window-size change to the kernel (`master.resize`) failed.
+    #[error("resizing pty: {0}")]
+    Resize(#[source] io::Error),
+}
 
 /// A running shell behind a PTY.
 ///
@@ -39,14 +64,16 @@ impl Pty {
         cols: u16,
         shell: Option<&str>,
         term: &str,
-    ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
+    ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
         let pty_system = native_pty_system();
-        let pair = pty_system.openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
 
         let mut cmd = match shell {
             Some(prog) => CommandBuilder::new(prog),
@@ -55,13 +82,22 @@ impl Pty {
         // A real terminal type so curses apps behave; the env is otherwise inherited.
         cmd.env("TERM", term);
 
-        let child = pair.slave.spawn_command(cmd)?;
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| PtyError::Spawn(io::Error::other(e)))?;
         let killer = child.clone_killer();
         // The slave fd is now owned by the child; drop our handle so EOF propagates correctly.
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| PtyError::Reader(io::Error::other(e)))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| PtyError::Reader(io::Error::other(e)))?;
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_DEPTH);
         std::thread::Builder::new()
@@ -102,13 +138,15 @@ impl Pty {
     }
 
     /// Propagate a window-size change; the kernel raises `SIGWINCH` in the child.
-    pub fn resize(&self, rows: u16, cols: u16) -> anyhow::Result<()> {
-        self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| PtyError::Resize(io::Error::other(e)))
     }
 
     /// Non-blocking check for child exit.
@@ -141,6 +179,31 @@ impl Pty {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn pty_error_variants_are_constructible_and_reachable() {
+        let mk = || io::Error::other("boom");
+        // Each stage variant is constructible and renders a non-empty message.
+        for e in [
+            PtyError::OpenPty(mk()),
+            PtyError::Spawn(mk()),
+            PtyError::Reader(mk()),
+            PtyError::Resize(mk()),
+        ] {
+            assert!(!e.to_string().is_empty(), "variant must Display");
+        }
+        // The `#[from] io::Error` source (the reader-thread spawn path) yields `Reader`.
+        let from_io: PtyError = mk().into();
+        assert!(matches!(from_io, PtyError::Reader(_)));
+        // A binary's `?`/`.context()` absorbs PtyError via anyhow's blanket `From` — the
+        // typed error stays internal to the lib but composes with anyhow at the edges.
+        let absorbed: anyhow::Error = PtyError::OpenPty(mk()).into();
+        assert!(absorbed.to_string().contains("opening pty"));
+        // The public spawn signature now carries the typed error.
+        fn _assert_typed(r: Result<(), PtyError>) -> Result<(), PtyError> {
+            r
+        }
+    }
 
     #[tokio::test]
     async fn spawns_and_streams_output() {

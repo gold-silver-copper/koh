@@ -76,6 +76,27 @@ struct Args {
     /// command-line argument is visible in the process table, an env var is not.
     #[arg(long)]
     passphrase: Option<String>,
+
+    /// Also print a scannable QR code of the endpoint id (point a phone camera at it instead of
+    /// copying 64 hex chars). Optimized for a dark-background terminal.
+    #[arg(long)]
+    qr: bool,
+}
+
+/// Render `data` as a QR code for a **dark-background** terminal, or `None` if it is too large to
+/// encode. The polarity follows the `qrcode` crate's documented terminal recipe — QR-dark modules
+/// become the terminal background and QR-light modules the foreground blocks — so a phone camera
+/// reads it as a normal dark-on-light code. (A light-background terminal would see it inverted.)
+fn connect_qr(data: &str) -> Option<String> {
+    use qrcode::render::unicode::Dense1x2;
+    let code = qrcode::QrCode::new(data).ok()?;
+    Some(
+        code.render::<Dense1x2>()
+            .dark_color(Dense1x2::Light)
+            .light_color(Dense1x2::Dark)
+            .quiet_zone(true)
+            .build(),
+    )
 }
 
 fn default_key_file() -> PathBuf {
@@ -171,6 +192,15 @@ async fn main() -> anyhow::Result<()> {
     }
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
+
+    if args.qr {
+        if let Some(qr) = connect_qr(&id_str) {
+            eprintln!("\nScan for the endpoint id (point a phone camera at it):\n");
+            eprintln!("{qr}");
+        } else {
+            warn!("could not render the connect QR (endpoint id too large to encode)");
+        }
+    }
 
     let shell = args.shell.clone();
     let scrollback = args.scrollback;
@@ -306,4 +336,26 @@ async fn main() -> anyhow::Result<()> {
     let _ = reaper.await;
     endpoint.close().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connect_qr;
+
+    #[test]
+    fn connect_qr_renders_an_id_and_handles_overlong_input() {
+        // A 64-hex endpoint id is well within QR capacity: renders to a multi-row block grid.
+        let id = "3f9c".repeat(16);
+        let qr = connect_qr(&id).expect("an endpoint id must fit in a QR");
+        assert!(qr.lines().count() > 5, "a QR should be a multi-row block");
+        assert!(
+            qr.contains('█') || qr.contains('▀') || qr.contains('▄'),
+            "the unicode renderer uses half-block glyphs"
+        );
+        // Far beyond QR capacity (~2953 bytes): graceful None, never a panic.
+        assert!(
+            connect_qr(&"a".repeat(10_000)).is_none(),
+            "overlong input must return None, not panic"
+        );
+    }
 }

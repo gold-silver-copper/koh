@@ -204,6 +204,18 @@ rmosh-server --relay-url https://relay.example:3340 --allow 3f9c…
 rmosh-client 871b… --relay-url https://relay.example:3340
 ```
 
+### Android / Termux
+
+A bare-id connection works in Termux out of the box. iroh constructs a DNS resolver for every
+endpoint, and its default reads the host's system DNS through Android's app JNI context — which a
+plain CLI (no Android app) doesn't have, so the read used to **panic**
+(`ndk-context: android context was not initialized`). rmosh now pins an explicit public
+nameserver (Google `8.8.8.8:53`) on Android, sidestepping that read entirely. Set
+`RMOSH_DNS=<ip>` or `RMOSH_DNS=<ip:port>` (e.g. `RMOSH_DNS=1.1.1.1`) on **any** platform to point
+iroh's discovery at a different resolver — useful if `8.8.8.8` is blocked on your network. (On
+desktop, leaving it unset keeps your system DNS, so split-horizon / corporate resolvers still
+work.)
+
 Sessions are **detachable**, like mosh: the server keeps your shell (and its live screen)
 running after a disconnect, keyed by your client endpoint id, so reconnecting from the same
 client drops you back exactly where you left off — no `tmux` required for survival across

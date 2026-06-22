@@ -107,6 +107,63 @@ pub fn format_endpoint_id(id: &EndpointId) -> String {
     id.to_string()
 }
 
+/// Parse a `$RMOSH_DNS` value: either `IP:PORT` (e.g. `8.8.8.8:53`) or a bare `IP`
+/// (e.g. `1.1.1.1`, defaulting to port 53). Returns `None` for anything unparseable.
+fn parse_dns_spec(spec: &str) -> Option<SocketAddr> {
+    let spec = spec.trim();
+    spec.parse::<SocketAddr>().ok().or_else(|| {
+        spec.parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, 53))
+    })
+}
+
+/// An explicit DNS resolver for iroh's discovery, or `None` to keep iroh's default
+/// (the host's system DNS).
+///
+/// iroh builds `DnsResolver::default()` for **every** endpoint it binds (see
+/// `Endpoint::builder(...).dns_resolver` / the `unwrap_or_default()` at bind time), and that
+/// default reads the host's resolver config. On Android that read goes through the app's JNI
+/// context, which a bare CLI (e.g. a Termux build) does not have — so it **panics**
+/// (`ndk-context: android context was not initialized`) instead of returning an error iroh could
+/// fall back from. We sidestep it by pinning an explicit public nameserver, which never touches
+/// the system config (`DnsResolver::with_nameserver`).
+///
+/// - `$RMOSH_DNS` (any platform): override the nameserver, as `IP` or `IP:PORT`. Lets a desktop
+///   opt in / pick a reachable resolver, and makes this path testable off-Android.
+/// - On Android, default to Google Public DNS (`8.8.8.8:53`) even when unset.
+/// - Elsewhere, `None`: keep iroh's system-DNS default (honors split-horizon / corporate DNS).
+// On Android every branch returns `Some`, so clippy flags the wrapper there; the `Option` exists
+// for the desktop `None` branch (which that target can't see), so scope the expectation to Android.
+#[cfg_attr(
+    target_os = "android",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Android always pins a nameserver (Some); the None arm is desktop-only"
+    )
+)]
+fn discovery_dns_resolver() -> Option<iroh::dns::DnsResolver> {
+    use iroh::dns::DnsResolver;
+    if let Some(addr) = std::env::var("RMOSH_DNS")
+        .ok()
+        .as_deref()
+        .and_then(parse_dns_spec)
+    {
+        return Some(DnsResolver::with_nameserver(addr));
+    }
+    #[cfg(target_os = "android")]
+    {
+        Some(DnsResolver::with_nameserver(SocketAddr::from((
+            [8, 8, 8, 8],
+            53,
+        ))))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        None
+    }
+}
+
 /// Build an iroh [`Endpoint`] with the `presets::N0` profile (relay + DNS discovery, so a
 /// bare endpoint id is dialable).
 ///
@@ -115,6 +172,9 @@ pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, 
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
         .transport_config(rmosh_transport_config());
+    if let Some(resolver) = discovery_dns_resolver() {
+        builder = builder.dns_resolver(resolver);
+    }
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
@@ -134,6 +194,11 @@ pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endp
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .transport_config(rmosh_transport_config());
+    // Even with no discovery, iroh constructs a default `DnsResolver` at bind time, which panics
+    // on a bare-CLI Android build; pin an explicit resolver there. See `discovery_dns_resolver`.
+    if let Some(resolver) = discovery_dns_resolver() {
+        builder = builder.dns_resolver(resolver);
+    }
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
@@ -184,6 +249,11 @@ pub async fn bind_endpoint_with_relay(
         .secret_key(secret)
         .relay_mode(RelayMode::custom([relay]))
         .transport_config(rmosh_transport_config());
+    // iroh builds a default `DnsResolver` at bind time even here, which panics on a bare-CLI
+    // Android build; pin an explicit resolver there. See `discovery_dns_resolver`.
+    if let Some(resolver) = discovery_dns_resolver() {
+        builder = builder.dns_resolver(resolver);
+    }
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
@@ -340,6 +410,46 @@ mod tests {
     #[test]
     fn parse_rejects_garbage() {
         assert!(parse_endpoint_id("not-a-real-endpoint-id").is_err());
+    }
+
+    #[test]
+    fn dns_spec_accepts_ip_and_ip_port_rejects_junk() {
+        // Bare IPv4 defaults to :53; explicit port is honored.
+        assert_eq!(
+            parse_dns_spec("1.1.1.1"),
+            Some(SocketAddr::from(([1, 1, 1, 1], 53)))
+        );
+        assert_eq!(
+            parse_dns_spec("8.8.8.8:5353"),
+            Some(SocketAddr::from(([8, 8, 8, 8], 5353)))
+        );
+        // IPv6 in both bare and bracketed-with-port forms.
+        assert_eq!(
+            parse_dns_spec("2001:4860:4860::8888").map(|a| a.port()),
+            Some(53)
+        );
+        assert_eq!(
+            parse_dns_spec("[2001:4860:4860::8888]:53").map(|a| a.port()),
+            Some(53)
+        );
+        // Whitespace is tolerated; junk is rejected (no panic, no partial parse).
+        assert_eq!(
+            parse_dns_spec("  9.9.9.9  "),
+            Some(SocketAddr::from(([9, 9, 9, 9], 53)))
+        );
+        assert_eq!(parse_dns_spec(""), None);
+        assert_eq!(parse_dns_spec("not-an-ip"), None);
+        assert_eq!(parse_dns_spec("8.8.8.8:"), None);
+        assert_eq!(parse_dns_spec("8.8.8.8:99999"), None);
+    }
+
+    /// The exact iroh call the Android bare-id fix depends on: building a resolver from an
+    /// explicit nameserver must succeed without reading (or panicking on) the host system DNS.
+    /// Running this on the host verifies the API we can't compile-check on the Android target.
+    #[test]
+    fn explicit_nameserver_resolver_builds() {
+        let _resolver =
+            iroh::dns::DnsResolver::with_nameserver(SocketAddr::from(([8, 8, 8, 8], 53)));
     }
 
     /// Tier-1 foundation: two real iroh endpoints on loopback establish a connection and

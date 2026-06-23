@@ -12,13 +12,13 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
-use rmosh_client::{run_client, ClientTerminal, TerminaTerminal};
+use rmosh_client::{run_client, ClientTerminal, IrohConnector, TerminaTerminal};
 use rmosh_predict::DisplayPreference;
 use rmosh_transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, format_endpoint_id,
-    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, relay_addr, ALPN,
+    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, relay_addr,
 };
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
@@ -152,28 +152,21 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
             .context("binding endpoint")?;
         (ep, server_id.into())
     };
-    let conn = endpoint
-        .connect(target, ALPN)
-        .await
-        .context("connecting to server (is your id on its allowlist?)")?;
-
-    // Optional passphrase second factor (no-op if the server doesn't require one). Runs on the
-    // raw connection before it's wrapped, since the handshake borrows &conn. Held as a
-    // SecretString (zeroized on drop, never logged) and exposed as a &str only at the KDF call.
-    let passphrase: Option<SecretString> = args
-        .passphrase
-        .clone()
-        .or_else(|| std::env::var("RMOSH_PASSPHRASE").ok())
-        .map(SecretString::from);
-    rmosh_transport_iroh::auth::handshake_client(
-        &conn,
-        passphrase.as_ref().map(SecretString::expose_secret),
-    )
-    .await
-    .context("passphrase handshake (wrong or missing --passphrase?)")?;
+    // Optional passphrase second factor (no-op if the server doesn't require one). Held as a
+    // SecretString (zeroized on drop, never logged) and shared with the connector so it survives
+    // across reconnect dials; exposed as a &str only at the KDF call inside the handshake.
+    let passphrase = std::sync::Arc::new(
+        args.passphrase
+            .clone()
+            .or_else(|| std::env::var("RMOSH_PASSPHRASE").ok())
+            .map(SecretString::from),
+    );
+    // One connector dials the server (and replays the handshake) for the initial connection and for
+    // every transparent reconnect. The first dial happens here — before raw mode — so a bad-id or
+    // wrong-passphrase error prints cleanly; later drops are re-dialed from inside run_client.
+    let connector = IrohConnector::new(endpoint.clone(), target, passphrase);
+    let channel = connector.connect().await?;
     eprintln!("connected. (Ctrl-^ then . to disconnect)");
-
-    let channel = rmosh_transport_iroh::IrohChannel::new(conn);
 
     // --- real terminal I/O wiring (termina: raw mode + alt screen, restored on drop) ---
     let term = TerminaTerminal::enter().context("entering raw mode / alt screen")?;
@@ -214,9 +207,9 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
 
     let result = run_client(
         channel,
+        connector,
         args.predict.into(),
-        rows,
-        cols,
+        (rows, cols),
         input_rx,
         resize_rx,
         term,

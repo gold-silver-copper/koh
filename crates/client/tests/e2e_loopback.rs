@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rmosh_client::{run_client, ClientTerminal};
+use rmosh_client::{run_client, ClientTerminal, IrohConnector};
 use rmosh_predict::{DisplayPreference, Overlay};
 use rmosh_server::run_session;
 use rmosh_transport_iroh::{
@@ -71,6 +71,13 @@ async fn full_session_over_loopback_pty() {
     });
 
     // --- client: connect and run the real session loop against a mock terminal ---
+    // A connector for the single connection this test uses. Reconnect is never triggered here:
+    // dropping the input sender ends the session via Quit before any link loss.
+    let connector = IrohConnector::new(
+        client_ep.clone(),
+        server_addr.clone(),
+        std::sync::Arc::new(None),
+    );
     let conn = client_ep
         .connect(server_addr, ALPN)
         .await
@@ -89,9 +96,9 @@ async fn full_session_over_loopback_pty() {
     let client_task = tokio::spawn(async move {
         let _ = run_client(
             channel,
+            connector,
             DisplayPreference::Never, // predictions are overlay-only; assert on the real grid
-            24,
-            80,
+            (24, 80),
             input_rx,
             resize_rx,
             term,

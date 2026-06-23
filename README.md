@@ -16,13 +16,13 @@ over your phone to your main PC. This repo is that core: two binaries, `rmosh-se
 > left it), **terminal-reply synthesis** (DSR/DA/DECRQM, so vim/htop/fzf behave), and
 > **remote-shell exit-status propagation**. Client terminal I/O runs on
 > [termina](https://github.com/helix-editor/termina) with synchronized output (no crossterm).
-> 105 tests pass, including property tests, a network-chaos simulator, an in-process
-> client↔server scenario that converges at 50% packet loss, a reattach acceptance test,
-> **end-to-end tests over a real iroh connection** (both the full loop in one process and the
-> real `rmosh-client` binary driven through an allocated PTY), and a suite of upstream **mosh
-> regression tests** ported to moshers2's architecture (terminal-emulation round-trips, the
-> unicode-prediction bug, pty-deadlock/repeat/window-resize, network-no-diff). See
-> [Testing tiers](#testing-tiers).
+> 114 tests pass, including property tests, a network-chaos simulator, an in-process
+> client↔server scenario that converges at 50% packet loss, a reattach acceptance test, an
+> auto-reconnect-after-forced-drop test, **end-to-end tests over a real iroh connection** (both
+> the full loop in one process and the real `rmosh-client` binary driven through an allocated
+> PTY), and a suite of upstream **mosh regression tests** ported to moshers2's architecture
+> (terminal-emulation round-trips, the unicode-prediction bug, pty-deadlock/repeat/window-resize,
+> network-no-diff). See [Testing tiers](#testing-tiers).
 
 ## The one idea
 
@@ -223,6 +223,15 @@ suspend/resume or IP changes. A detached session is reaped after `--session-ttl-
 24h) or immediately when its shell exits. rmosh still does no multiplexing (one session, one
 shell, exactly like mosh) — use `tmux` if you want windows/panes.
 
+The reconnect is **automatic and in-process**: the client doesn't exit when the link drops. A
+brief outage (e.g. a phone screen-off — Android freezes the process, so QUIC keepalives stop) is
+ridden out on the same connection thanks to a 5-minute connection idle timeout. A longer outage
+times the connection out; the client then transparently re-dials and reattaches to the same
+server session, holding the last screen under a `reconnecting…` banner in the meantime (`Ctrl-^ .`
+still quits). You stay in your shell instead of being dropped back to the local prompt. On Android
+especially, run `termux-wake-lock` (and set Termux to *Unrestricted* battery) so the OS doesn't
+freeze or kill the process during a long screen-off.
+
 ## The predictor
 
 The client guesses what each keystroke does to the screen and shows it immediately (underlined
@@ -279,6 +288,10 @@ TTY is just an allocated PTY. Both are real and hermetic.
 - **`crates/server/tests/reattach.rs`** — the detachable-session acceptance test: type a marker,
   disconnect, reconnect from the *same* client endpoint, assert the session re-syncs to the
   persisted screen (the shell kept running while detached).
+- **`crates/client/tests/e2e_reconnect.rs`** — the **auto-reconnect** regression test: mid-session,
+  the server force-closes the connection (what a screen-off idle-timeout does) while keeping the
+  shell; asserts the client transparently re-dials, reattaches to the *same* shell (the first
+  command's output is still on screen), and keeps working — instead of exiting to the prompt.
 - **`crates/server/tests/exit_status.rs`** — a loopback session where `sh` runs `exit 42`;
   asserts the client observes exit code `42` on the shutdown frame (so the binary exits with it).
 

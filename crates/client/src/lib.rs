@@ -10,13 +10,17 @@
 mod render;
 
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
+use iroh::{Endpoint, EndpointAddr};
 use rmosh_input::UserInput;
 use rmosh_predict::{DisplayPreference, Overlay, PredictionEngine};
 use rmosh_ssp::{RecvOutcome, Transport, SHUTDOWN_SENTINEL};
 use rmosh_terminal::TerminalScreen;
-use rmosh_transport_iroh::{IrohChannel, MonoClock};
+use rmosh_transport_iroh::{IrohChannel, MonoClock, ALPN};
+use secrecy::{ExposeSecret, SecretString};
 use termina::escape::csi::{Csi, DecPrivateMode, DecPrivateModeCode, Mode};
 use termina::{PlatformTerminal, Terminal as _};
 use tokio::sync::mpsc;
@@ -25,6 +29,82 @@ pub use render::render;
 
 /// The escape prefix (Ctrl-^); followed by '.' it disconnects the session.
 pub const ESCAPE_PREFIX: u8 = 0x1e;
+
+/// How long a single reconnect dial may run before it is abandoned and retried.
+const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Reconnect backoff: `BASE << min(attempt, 4)`, capped at `MAX` (0.5s → 1 → 2 → 4 → 8s).
+const RECONNECT_BACKOFF_BASE_MS: u64 = 500;
+const RECONNECT_BACKOFF_MAX_MS: u64 = 8_000;
+
+/// Dials the server and replays the passphrase handshake, yielding a fresh [`IrohChannel`].
+///
+/// One instance is reused for the **initial** connection and for every **transparent reconnect**
+/// after the link drops (e.g. a phone screen-off long enough that the QUIC connection idle-times
+/// out). Re-dialing the same endpoint id reattaches to the detachable server session — the server
+/// keeps the shell running and full-repaints the live screen onto the fresh connection — so the
+/// user lands back exactly where they were instead of being dropped to a local shell.
+pub struct IrohConnector {
+    endpoint: Endpoint,
+    target: EndpointAddr,
+    /// The optional passphrase second factor, shared (so it survives across reconnect dials) and
+    /// held as a `SecretString` (zeroized on drop, never logged); exposed only at the KDF call.
+    passphrase: Arc<Option<SecretString>>,
+}
+
+impl IrohConnector {
+    pub fn new(
+        endpoint: Endpoint,
+        target: EndpointAddr,
+        passphrase: Arc<Option<SecretString>>,
+    ) -> Self {
+        Self {
+            endpoint,
+            target,
+            passphrase,
+        }
+    }
+
+    /// Connect to the server and complete the passphrase handshake. Surfaces a bad-allowlist or
+    /// wrong-passphrase failure as an `Err` (the binary reports it before entering raw mode).
+    pub async fn connect(&self) -> anyhow::Result<IrohChannel> {
+        let conn = self
+            .endpoint
+            .connect(self.target.clone(), ALPN)
+            .await
+            .context("connecting to server (is your id on its allowlist?)")?;
+        let pass = self
+            .passphrase
+            .as_ref()
+            .as_ref()
+            .map(SecretString::expose_secret);
+        rmosh_transport_iroh::auth::handshake_client(&conn, pass)
+            .await
+            .context("passphrase handshake (wrong or missing --passphrase?)")?;
+        Ok(IrohChannel::new(conn))
+    }
+}
+
+/// Reconnect backoff for a failed dial attempt (1-based `attempt`), in milliseconds.
+fn backoff_ms(attempt: u32) -> u64 {
+    (RECONNECT_BACKOFF_BASE_MS << attempt.min(4)).min(RECONNECT_BACKOFF_MAX_MS)
+}
+
+/// Scan typed bytes for the disconnect escape (`Ctrl-^` then `.`) while reconnecting, mirroring
+/// [`ClientSession`]'s prefix machine. `pending` carries the "saw a lone prefix" state across
+/// calls; returns `true` once the user has typed the full quit sequence.
+fn escape_quit(chunk: &[u8], pending: &mut bool) -> bool {
+    for &b in chunk {
+        if *pending {
+            *pending = false;
+            if b == b'.' {
+                return true;
+            }
+        } else if b == ESCAPE_PREFIX {
+            *pending = true;
+        }
+    }
+    false
+}
 
 /// Where the client paints frames and reads the window size. The real binary draws to the
 /// terminal via termina ([`TerminaTerminal`]); a test captures cells/text as data.
@@ -279,7 +359,15 @@ impl ClientSession {
     }
 }
 
-/// Run a client session against `channel`, drawing through `term`.
+/// Run a client session, **transparently reconnecting** after the link drops.
+///
+/// Drives the session against `initial` (the already-established first connection); when that
+/// connection dies — typically a phone screen-off long enough that QUIC idle-times-out — it
+/// re-dials via `connector` and reattaches to the same detachable server session instead of
+/// exiting. A fresh [`ClientSession`] is built per connection (the server uses a fresh transport
+/// per attach and full-repaints the live screen), so the user resumes exactly where they were.
+/// While reconnecting, the last screen is held under a "reconnecting…" banner and the quit escape
+/// (`Ctrl-^ .`) still works.
 ///
 /// This is the thin I/O shell around [`ClientSession`]: it owns the `tokio::select!`, channels,
 /// sleeps, datagram send/recv/close, and `term.size()`/`render()`, delegating every protocol
@@ -288,29 +376,83 @@ impl ClientSession {
 /// `input_rx` carries raw typed bytes (the caller must keep its sender alive for the session;
 /// when it closes, the session ends). `resize_rx` carries resize *ticks* — each one prompts the
 /// loop to re-read the current size from `term`; keep its sender alive even if you never resize,
-/// so the loop doesn't spin on a closed channel. `initial_rows`/`initial_cols` seed the first
-/// resize sent to the server (the caller reads them from `term.size()`).
-/// Returns the remote shell's exit code (`Some`) when the session ended because the shell
-/// exited, or `None` for a local quit / dropped connection — so the binary can exit with the
-/// remote status.
+/// so the loop doesn't spin on a closed channel. `initial_size` (`(rows, cols)`) seeds the size if
+/// `term.size()` is unavailable.
+/// Returns the remote shell's exit code (`Some`) when the session ended because the shell exited,
+/// or `None` for a local quit (`Ctrl-^ .` or a closed input channel) — so the binary can exit with
+/// the remote status.
 pub async fn run_client<T: ClientTerminal>(
-    channel: IrohChannel,
+    initial: IrohChannel,
+    connector: IrohConnector,
     pref: DisplayPreference,
-    initial_rows: u16,
-    initial_cols: u16,
+    initial_size: (u16, u16),
     mut input_rx: mpsc::Receiver<Vec<u8>>,
     mut resize_rx: mpsc::Receiver<()>,
     mut term: T,
 ) -> anyhow::Result<Option<u32>> {
     let clock = MonoClock::new();
-    let mut session = ClientSession::new(
-        clock.now_ms(),
-        channel.max_datagram_size(),
-        pref,
-        initial_rows,
-        initial_cols,
-    );
+    let mut channel = initial;
+    loop {
+        // A fresh session per (re)connection mirrors the server's fresh-transport-per-attach, which
+        // full-repaints the live screen; re-seed the size from the terminal each time.
+        let (rows, cols) = term.size().unwrap_or(initial_size);
+        let mut session = ClientSession::new(
+            clock.now_ms(),
+            channel.max_datagram_size(),
+            pref,
+            rows,
+            cols,
+        );
 
+        match drive_connection(
+            &channel,
+            &mut session,
+            &mut term,
+            &mut input_rx,
+            &mut resize_rx,
+            &clock,
+        )
+        .await?
+        {
+            Disposition::Quit => {
+                channel.close(0, b"client exit");
+                return Ok(None);
+            }
+            Disposition::Ended(code) => {
+                channel.close(0, b"client exit");
+                return Ok(code);
+            }
+            Disposition::LinkLost => {
+                channel.close(0, b"reconnecting");
+                match reconnect(&connector, &mut term, &mut input_rx, &session, &clock).await {
+                    ReconnectOutcome::Connected(c) => channel = c,
+                    ReconnectOutcome::Quit => return Ok(None),
+                }
+            }
+        }
+    }
+}
+
+/// Why [`drive_connection`] returned: [`run_client`] decides whether to exit or reconnect.
+enum Disposition {
+    /// The user disconnected (`Ctrl-^ .`) or the input channel closed — exit, no reconnect.
+    Quit,
+    /// The server announced a clean shutdown; carry the remote shell's exit code out.
+    Ended(Option<u32>),
+    /// The connection dropped mid-session — the caller should reconnect and reattach.
+    LinkLost,
+}
+
+/// Drive one connection: the steady send/render/select loop, returning a [`Disposition`] instead
+/// of breaking — so the caller can reconnect on [`Disposition::LinkLost`] rather than exiting.
+async fn drive_connection<T: ClientTerminal>(
+    channel: &IrohChannel,
+    session: &mut ClientSession,
+    term: &mut T,
+    input_rx: &mut mpsc::Receiver<Vec<u8>>,
+    resize_rx: &mut mpsc::Receiver<()>,
+    clock: &MonoClock,
+) -> anyhow::Result<Disposition> {
     loop {
         let now = clock.now_ms();
         let tick = session.on_tick(now, channel.max_datagram_size(), channel.rtt_ms());
@@ -333,8 +475,7 @@ pub async fn run_client<T: ClientTerminal>(
                 Some("[rmosh] session ended"),
             );
             tokio::time::sleep(Duration::from_millis(400)).await;
-            channel.close(0, b"client exit");
-            return Ok(code);
+            return Ok(Disposition::Ended(code));
         }
 
         tokio::select! {
@@ -347,10 +488,10 @@ pub async fn run_client<T: ClientTerminal>(
                 match maybe {
                     Some(chunk) => {
                         if session.on_input(clock.now_ms(), &chunk) == InputOutcome::Quit {
-                            break;
+                            return Ok(Disposition::Quit);
                         }
                     }
-                    None => break, // input source closed
+                    None => return Ok(Disposition::Quit), // input source closed
                 }
             }
 
@@ -362,8 +503,8 @@ pub async fn run_client<T: ClientTerminal>(
                 match dg {
                     Ok(bytes) => session.on_datagram(clock.now_ms(), &bytes),
                     Err(e) => {
-                        tracing::info!(reason = %e, "server closed connection");
-                        break;
+                        tracing::info!(reason = %e, "link lost; will reconnect");
+                        return Ok(Disposition::LinkLost);
                     }
                 }
             }
@@ -381,9 +522,70 @@ pub async fn run_client<T: ClientTerminal>(
             _ = tokio::time::sleep(Duration::from_millis(tick.wait_ms)) => {}
         }
     }
+}
 
-    channel.close(0, b"client exit");
-    Ok(None)
+/// The result of a [`reconnect`] loop.
+enum ReconnectOutcome {
+    /// A fresh connection was established; resume the session on it.
+    Connected(IrohChannel),
+    /// The user disconnected (`Ctrl-^ .`) or input closed while reconnecting — exit.
+    Quit,
+}
+
+/// Re-dial the server with capped exponential backoff after the link drops, painting a
+/// "reconnecting…" banner over the last screen and staying responsive to the quit escape.
+///
+/// Retries indefinitely (an outage may outlast many attempts, mosh-style); the user can always
+/// `Ctrl-^ .` to give up. A single dial is bounded by [`RECONNECT_CONNECT_TIMEOUT`] and is *not*
+/// cancelled by banner repaints or non-quit keystrokes — it is pinned and polled in place — so a
+/// slow dial still completes.
+async fn reconnect<T: ClientTerminal>(
+    connector: &IrohConnector,
+    term: &mut T,
+    input_rx: &mut mpsc::Receiver<Vec<u8>>,
+    last: &ClientSession,
+    clock: &MonoClock,
+) -> ReconnectOutcome {
+    let started = clock.now_ms();
+    let mut pending_escape = false;
+    let mut attempt: u32 = 0;
+    'attempt: loop {
+        let dial = tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect());
+        tokio::pin!(dial);
+        loop {
+            let secs = clock.now_ms().saturating_sub(started) / 1000;
+            let banner = format!("[rmosh] disconnected — reconnecting… {secs}s (Ctrl-^ . to quit)");
+            let _ = term.render(last.screen(), &Overlay::empty(), Some(banner.as_str()));
+
+            tokio::select! {
+                biased;
+
+                maybe = input_rx.recv() => {
+                    match maybe {
+                        Some(chunk) => {
+                            if escape_quit(&chunk, &mut pending_escape) {
+                                return ReconnectOutcome::Quit;
+                            }
+                        }
+                        None => return ReconnectOutcome::Quit, // input source closed
+                    }
+                }
+
+                res = &mut dial => {
+                    match res {
+                        Ok(Ok(channel)) => return ReconnectOutcome::Connected(channel),
+                        Ok(Err(e)) => tracing::info!(reason = %e, attempt, "reconnect dial failed"),
+                        Err(_) => tracing::info!(attempt, "reconnect dial timed out"),
+                    }
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
+                    continue 'attempt;
+                }
+
+                _ = tokio::time::sleep(Duration::from_secs(1)) => { /* tick the banner clock */ }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -430,6 +632,41 @@ mod tests {
         );
         // The escape prefix (0x1e) followed by '.' disconnects.
         assert_eq!(s.on_input(0, &[ESCAPE_PREFIX, b'.']), InputOutcome::Quit);
+    }
+
+    #[test]
+    fn escape_quit_matches_the_session_machine_across_chunks() {
+        // The reconnect-path escape detector must agree with `ClientSession`'s prefix machine.
+        let mut p = false;
+        assert!(!escape_quit(b"hello", &mut p), "plain bytes never quit");
+        assert!(!p);
+        // Prefix + '.' in one chunk quits.
+        assert!(escape_quit(&[ESCAPE_PREFIX, b'.'], &mut p));
+        // Prefix split across chunks: state carries over, then '.' quits.
+        p = false;
+        assert!(!escape_quit(&[ESCAPE_PREFIX], &mut p));
+        assert!(p, "a lone prefix leaves us pending");
+        assert!(escape_quit(b".", &mut p));
+        // Prefix then a non-'.' byte does NOT quit and clears the pending state.
+        p = false;
+        assert!(!escape_quit(&[ESCAPE_PREFIX, b'x'], &mut p));
+        assert!(!p, "prefix + non-dot resets pending");
+        assert!(!escape_quit(b".", &mut p), "a later lone '.' must not quit");
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_then_caps() {
+        // 1-based attempts: 1s, 2s, 4s, 8s, then capped at 8s — never below base, never above max.
+        assert_eq!(backoff_ms(1), 1_000);
+        assert_eq!(backoff_ms(2), 2_000);
+        assert_eq!(backoff_ms(3), 4_000);
+        assert_eq!(backoff_ms(4), RECONNECT_BACKOFF_MAX_MS);
+        assert_eq!(backoff_ms(5), RECONNECT_BACKOFF_MAX_MS);
+        assert_eq!(
+            backoff_ms(99),
+            RECONNECT_BACKOFF_MAX_MS,
+            "shift is clamped, no overflow"
+        );
     }
 
     #[test]

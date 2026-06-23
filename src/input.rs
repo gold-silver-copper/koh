@@ -115,6 +115,17 @@ fn common_prefix_len(a: &[InputEvent], b: &[InputEvent]) -> usize {
 impl SyncState for UserInput {
     type Diff = Vec<WireEvent>;
 
+    // Client→server keystrokes/resizes are tiny; even a large paste is a few MiB. 4 MiB caps the
+    // decompression-amplification bomb (KOH-02) far below the 16 MiB global ceiling while still
+    // admitting a generous paste. `apply` expands one `InputEvent` per byte, so the per-event
+    // budget below (in events) bounds the resident accumulation (KOH-01).
+    const RECV_DECODE_LIMIT: usize = 4 * 1024 * 1024;
+    const RECEIVE_BUDGET_UNITS: usize = 8 * 1024 * 1024;
+
+    fn resource_units(&self) -> usize {
+        self.events.len()
+    }
+
     fn diff_from(&self, base: &Self) -> Self::Diff {
         // `base` SHOULD be a prefix of `self` (the append-only invariant) and is for honest peers;
         // fall back to the real common prefix rather than `debug_assert!`-panicking on a divergent

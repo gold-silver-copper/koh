@@ -38,6 +38,22 @@ use tracing::{error, info, warn};
 const AUTH_FAIL_WINDOW_MS: u64 = 60_000;
 const AUTH_MAX_FAILURES: usize = 5;
 
+/// Passphrases shorter than this trigger a startup warning: the challenge-response is offline-
+/// crackable by a server a client dials (KOH-03), so a low-entropy passphrase is weak. Not a hard
+/// floor (existing deployments keep working), just a loud nudge toward a high-entropy secret.
+const MIN_REASONABLE_PASSPHRASE_CHARS: usize = 12;
+
+/// Parse a CLI passphrase straight into a [`SecretString`] so the plaintext is never stored in a
+/// long-lived `String` and redacts in any debug/log output (KOH-14). Infallible — any string is a
+/// valid passphrase; emptiness is treated as "no passphrase" later, not rejected here.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "clap value_parser requires a Result-returning signature"
+)]
+fn parse_secret(s: &str) -> Result<SecretString, std::convert::Infallible> {
+    Ok(SecretString::from(s.to_owned()))
+}
+
 /// Arguments for `koh serve`.
 #[derive(ClapArgs, Debug)]
 pub struct ServeArgs {
@@ -83,8 +99,9 @@ pub struct ServeArgs {
     /// Require a shared passphrase (defense-in-depth on top of the node-id allowlist).
     /// The passphrase never crosses the wire. Prefer $KOH_PASSPHRASE over this flag: a
     /// command-line argument is visible in the process table, an env var is not.
-    #[arg(long)]
-    passphrase: Option<String>,
+    // `SecretString` so the value is zeroized on drop and redacts in any `{:?}`/log dump (KOH-14).
+    #[arg(long, value_parser = parse_secret)]
+    passphrase: Option<SecretString>,
 
     /// Maximum number of connections being handled concurrently (each holds a permit for its whole
     /// lifetime; excess incoming connections are refused cheaply, before the crypto handshake). This
@@ -193,6 +210,25 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         format!("koh connect {id_str}")
     };
 
+    // Resolve the optional passphrase second factor once: the `--passphrase` flag, else
+    // $KOH_PASSPHRASE. An *empty* value (`--passphrase ''` or an exported-but-empty env var) is
+    // treated as "no passphrase" — otherwise the server would advertise "required" yet accept the
+    // empty-string response from everyone (KOH-11). A short passphrase is offline-crackable by a
+    // server a client dials, so warn (KOH-03).
+    let configured_passphrase: Option<SecretString> = args
+        .passphrase
+        .clone()
+        .or_else(|| std::env::var("KOH_PASSPHRASE").ok().map(SecretString::from))
+        .filter(|p| !p.expose_secret().is_empty());
+    if let Some(p) = &configured_passphrase {
+        if p.expose_secret().chars().count() < MIN_REASONABLE_PASSPHRASE_CHARS {
+            warn!(
+                "passphrase is short (< {MIN_REASONABLE_PASSPHRASE_CHARS} chars); it is \
+                 offline-crackable by a server a client dials — prefer a long, high-entropy one"
+            );
+        }
+    }
+
     eprintln!("┌─ koh server ready ──────────────────────────────────────");
     eprintln!("│ endpoint id : {id_str}");
     eprintln!("│ key file    : {}", key_file.display());
@@ -202,7 +238,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     } else {
         eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
     }
-    if args.passphrase.is_some() || std::env::var("KOH_PASSPHRASE").is_ok() {
+    if configured_passphrase.is_some() {
         eprintln!("│ 2nd factor  : passphrase required");
     }
     eprintln!("│ connect     : {connect_hint}");
@@ -221,16 +257,10 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let scrollback = args.scrollback;
     let allow = std::sync::Arc::new(allow);
     let allow_any = args.allow_any;
-    // Optional passphrase (a second factor); also from $KOH_PASSPHRASE. Held as a SecretString
-    // so the working copy is zeroized on drop and never lands in a Debug/log dump — this reduces
-    // heap exposure (the original argv/env bytes remain OS-visible, hence the env-var preference).
-    // It is exposed as a &str only at the KDF call inside the handshake.
-    let passphrase: std::sync::Arc<Option<SecretString>> = std::sync::Arc::new(
-        args.passphrase
-            .clone()
-            .or_else(|| std::env::var("KOH_PASSPHRASE").ok())
-            .map(SecretString::from),
-    );
+    // The resolved passphrase (zeroized on drop, never logged), shared with every accept task and
+    // exposed as a &str only at the KDF call inside the handshake.
+    let passphrase: std::sync::Arc<Option<SecretString>> =
+        std::sync::Arc::new(configured_passphrase);
 
     // Per-peer auth-failure limiter (keyed on the client's endpoint id) + the monotonic clock its
     // window arithmetic uses. One clock, shared with every accept task and the reaper, so all the
@@ -265,6 +295,13 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // whole lifetime, so a flood can't spawn unbounded tasks (L-3). Excess dials are refused cheaply
     // (before the crypto handshake) via `Incoming::refuse`.
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(args.max_connections as usize));
+    // Separate, smaller cap on *un-authenticated, in-flight* handshakes (KOH-08): a slowloris that
+    // opens connections but never answers the nonce challenge would otherwise pin every connection
+    // permit for the whole handshake-timeout window. A pending permit is released the moment auth
+    // completes, so established sessions never count against this — only stalls do — and excess
+    // pending dials are refused cheaply (pre-handshake) like the connection cap.
+    let pending_cap = (args.max_connections as usize).div_ceil(4).max(4);
+    let handshake_limit = Arc::new(tokio::sync::Semaphore::new(pending_cap));
     let max_sessions = args.max_sessions as usize;
     let active = Arc::new(AtomicUsize::new(0));
     if args.network_timeout_secs > 0 {
@@ -292,6 +329,14 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             incoming.refuse();
             continue;
         };
+        // Pending-handshake cap (KOH-08): refuse if too many un-authenticated handshakes are
+        // already in flight, so stalls can't consume the whole connection budget. (`permit` above
+        // is released on this `continue`.)
+        let Ok(pending_permit) = handshake_limit.clone().try_acquire_owned() else {
+            warn!("refusing connection: too many handshakes in flight");
+            incoming.refuse();
+            continue;
+        };
         let allow = allow.clone();
         let shell = shell.clone();
         let passphrase = passphrase.clone();
@@ -304,6 +349,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             // Held for the whole task: releases the connection-cap permit on every exit path.
             let _permit = permit;
             let _active_guard = active_guard;
+            // Held only until auth completes (dropped explicitly on success, or on any early
+            // return below), so an established session doesn't occupy a pending-handshake slot.
+            let pending_permit = pending_permit;
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {
@@ -327,9 +375,10 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 return;
             }
             // Second factor: the passphrase nonce-challenge (no-op if none configured), bounded
-            // by a 10s timeout so a stalled/malicious client can't pin a session slot.
+            // by a 3s timeout so a stalled/malicious client can't pin a (pending-handshake) slot
+            // for long — a nonce exchange is sub-second on any real link (KOH-08).
             match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(3),
                 crate::transport_iroh::auth::handshake_server(
                     &conn,
                     passphrase
@@ -358,6 +407,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     return;
                 }
             }
+            // Authenticated: free the pending-handshake slot so it isn't held for the (potentially
+            // long-lived) session that follows (KOH-08). The connection-cap permit is still held.
+            drop(pending_permit);
             info!(peer = %format_endpoint_id(&peer), "client authorized; attaching session");
             // Attach to (or create) this client's detachable session, then serve the connection.
             let (handle, attach_kind) = match session::attach(

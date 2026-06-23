@@ -14,7 +14,7 @@ use crate::transport_iroh::{
 };
 use anyhow::Context;
 use clap::{Args, ValueEnum};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -62,8 +62,9 @@ pub struct ConnectArgs {
 
     /// Shared passphrase, if the server requires one. Prefer $KOH_PASSPHRASE over this flag:
     /// a command-line argument is visible in the process table, an env var is not.
-    #[arg(long)]
-    passphrase: Option<String>,
+    // `SecretString` so the value is zeroized on drop and redacts in any `{:?}`/log dump (KOH-14).
+    #[arg(long, value_parser = parse_secret)]
+    passphrase: Option<SecretString>,
 
     /// Honor remote OSC-52 clipboard writes (let the remote app set your system clipboard).
     /// OFF by default: a malicious/compromised server could otherwise silently overwrite your
@@ -93,6 +94,17 @@ pub struct IdArgs {
 
 fn default_key_file() -> PathBuf {
     crate::transport_iroh::default_key_path("client")
+}
+
+/// Parse a CLI passphrase straight into a [`SecretString`] so the plaintext is never stored in a
+/// long-lived `String` and redacts in any debug/log output (KOH-14). Infallible — emptiness is
+/// treated as "no passphrase" later, not rejected here.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "clap value_parser requires a Result-returning signature"
+)]
+fn parse_secret(s: &str) -> Result<SecretString, std::convert::Infallible> {
+    Ok(SecretString::from(s.to_owned()))
 }
 
 /// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so
@@ -151,7 +163,25 @@ pub fn run_id(args: IdArgs) -> anyhow::Result<()> {
 pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     // The TUI owns the terminal, so logs go to a file (set $KOH_LOG) to avoid corrupting it.
     if let Ok(path) = std::env::var("KOH_LOG") {
-        if let Ok(file) = std::fs::File::create(&path) {
+        // Create the log owner-only (0600): debug logs can carry sensitive material, and unlike the
+        // key file this was previously world-readable per umask (KOH-14).
+        let created = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&path)
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::File::create(&path)
+            }
+        };
+        if let Ok(file) = created {
             tracing_subscriber::fmt()
                 .with_writer(std::sync::Mutex::new(file))
                 .with_env_filter(
@@ -202,13 +232,24 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     };
     // Optional passphrase second factor (no-op if the server doesn't require one). Held as a
     // SecretString (zeroized on drop, never logged) and shared with the connector so it survives
-    // across reconnect dials; exposed as a &str only at the KDF call inside the handshake.
-    let passphrase = std::sync::Arc::new(
-        args.passphrase
-            .clone()
-            .or_else(|| std::env::var("KOH_PASSPHRASE").ok())
-            .map(SecretString::from),
-    );
+    // across reconnect dials; exposed as a &str only at the KDF call inside the handshake. An empty
+    // value (`--passphrase ''` or an exported-but-empty env var) is treated as "none" so it isn't
+    // mistaken for a configured factor (KOH-11); a short one is offline-crackable by a malicious
+    // server, so warn (KOH-03).
+    let configured_passphrase = args
+        .passphrase
+        .clone()
+        .or_else(|| std::env::var("KOH_PASSPHRASE").ok().map(SecretString::from))
+        .filter(|p| !p.expose_secret().is_empty());
+    if let Some(p) = &configured_passphrase {
+        if p.expose_secret().chars().count() < 12 {
+            eprintln!(
+                "koh: warning: passphrase is short (<12 chars); it is offline-crackable by a \
+                 server you dial — prefer a long, high-entropy one."
+            );
+        }
+    }
+    let passphrase = std::sync::Arc::new(configured_passphrase);
     // One connector dials the server (and replays the handshake) for the initial connection and for
     // every transparent reconnect. The first dial happens here — before raw mode — so a bad-id or
     // wrong-passphrase error prints cleanly; later drops are re-dialed from inside run_client.

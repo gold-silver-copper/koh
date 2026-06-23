@@ -1,6 +1,6 @@
 [package]
 name = "koh"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["koh authors"]
@@ -11,7 +11,7 @@ keywords = ["mosh", "shell", "terminal", "iroh", "p2p"]
 categories = ["command-line-utilities", "network-programming"]
 # Keep the published .crate lean: the porting-research notes and docker test infra aren't needed
 # to build or use koh.
-exclude = ["docs/", "testing/"]
+exclude = ["docs/", "testing/", "SECURITY_AUDIT_v0.3.1.md"]
 
 [[bin]]
 name = "koh"
@@ -26,8 +26,10 @@ vt100 = "=0.16.2"
 portable-pty = "=0.9.0"
 unicode-width = "0.2"
 termina = "0.3.3"
-# serialization
-postcard = { version = "=1.1.3", features = ["use-std"] }
+# serialization. default-features = false drops postcard's `heapless-cas` default, whose
+# `atomic-polyfill` transitive dep is unmaintained (RUSTSEC-2023-0089); we only need `use-std`
+# (which pulls `alloc`) for `to_allocvec`/`from_bytes`. See KOH-17.
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 bytes = "1"
 # DEFLATE compression of the SSP instruction payload before fragmenting (pure-Rust, no unsafe).

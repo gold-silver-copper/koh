@@ -12,6 +12,21 @@
 //! a different nonce), and every guess costs the attacker a full Argon2id derivation. The
 //! constant-time compare ([`constant_time_eq_32`]) closes the response-comparison timing oracle.
 //!
+//! ## Residual weakness: a malicious server can crack the passphrase offline (KOH-03)
+//!
+//! This is a hash challenge-response, not a PAKE, so any party that receives the client's
+//! `BLAKE3(K || nonce)` response can mount an **offline** dictionary attack (guess `p`, derive
+//! `Argon2id(p, salt)`, recompute the response, compare) — the public fixed salt and a
+//! server-chosen nonce do not prevent this. The legitimate server already knows `K`, so this only
+//! matters when a user is lured into dialing a *malicious* server's NodeId: that server learns one
+//! transcript and can grind the passphrase on its own hardware. Binding the response to the
+//! server's NodeId does **not** close this (the attacker server knows its own id), so we don't
+//! pretend it does; the only real cure is an augmented PAKE (SPAKE2+/OPAQUE), out of scope here.
+//! The deployed mitigations are therefore: (1) the memory-hard Argon2id work factor below, which
+//! makes only weak/dictionary passphrases realistically crackable; (2) a startup warning when the
+//! passphrase is short (see the CLIs); and (3) this being a *second* factor on top of the
+//! NodeId allowlist. **Use a high-entropy passphrase.**
+//!
 //! Ported from `moshers-iroh/src/auth.rs` (identical iroh 1.0 + blake3 1 API). Stream direction
 //! is deliberate: the **server opens** the bi-stream and the **client accepts** it — inverting
 //! that deadlocks both sides on their `*_bi()` calls.
@@ -208,24 +223,36 @@ pub async fn handshake_client(
     let (mut send, mut recv) = conn.accept_bi().await.map_err(io::Error::other)?;
     let mut tag = [0u8; 1];
     recv.read_exact(&mut tag).await.map_err(io::Error::other)?;
-    if tag[0] == PASS_REQUIRED {
-        let mut nonce = [0u8; 32];
-        recv.read_exact(&mut nonce)
-            .await
-            .map_err(io::Error::other)?;
-        let psk = cached_psk(passphrase.unwrap_or(""));
-        let resp = challenge_response(&psk, &nonce);
-        send.write_all(&resp).await.map_err(io::Error::other)?;
-        let _ = send.finish();
-        // Read the server's verdict so a wrong passphrase surfaces here as a typed failure, rather
-        // than the connection silently dropping after we've already reported success.
-        let mut verdict = [0u8; 1];
-        recv.read_exact(&mut verdict)
-            .await
-            .map_err(io::Error::other)?;
-        if verdict[0] != VERDICT_OK {
-            return Err(AuthError::ChallengeFailed);
+    match tag[0] {
+        PASS_REQUIRED => {
+            let mut nonce = [0u8; 32];
+            recv.read_exact(&mut nonce)
+                .await
+                .map_err(io::Error::other)?;
+            let psk = cached_psk(passphrase.unwrap_or(""));
+            let resp = challenge_response(&psk, &nonce);
+            send.write_all(&resp).await.map_err(io::Error::other)?;
+            let _ = send.finish();
+            // Read the server's verdict so a wrong passphrase surfaces here as a typed failure,
+            // rather than the connection silently dropping after we've already reported success.
+            let mut verdict = [0u8; 1];
+            recv.read_exact(&mut verdict)
+                .await
+                .map_err(io::Error::other)?;
+            if verdict[0] != VERDICT_OK {
+                return Err(AuthError::ChallengeFailed);
+            }
         }
+        NO_PASS => {
+            // Fail closed: if the user configured a (non-empty) passphrase but the server doesn't
+            // require one, refuse rather than silently dropping the second factor they asked for
+            // (KOH-13). Only the exact NodeId the client dialed (iroh-authenticated) can send this.
+            if passphrase.is_some_and(|p| !p.is_empty()) {
+                return Err(AuthError::ChallengeFailed);
+            }
+        }
+        // Any other tag is a protocol violation, not an implicit "ok" — reject it.
+        _ => return Err(AuthError::ChallengeFailed),
     }
     Ok(())
 }

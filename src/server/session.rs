@@ -192,7 +192,15 @@ async fn teardown(handle: SharedSession) {
             tokio::task::spawn_blocking(move || pty.shutdown());
         }
         Err(h) => {
-            let _ = h.session.lock().await.pty.kill();
+            // Some other holder (an attached connection, or the drain task) still owns the session,
+            // so we can't join the pump threads here. Kill the child — log a failed SIGHUP, then
+            // force SIGKILL so a SIGHUP-immune child can't keep the reader thread + fds wedged and
+            // stop the last `Arc` (hence the `Pty` Drop) from ever running (KOH-10).
+            let mut s = h.session.lock().await;
+            if let Err(e) = s.pty.kill() {
+                tracing::warn!(error = %e, "pty kill during teardown failed");
+            }
+            s.pty.kill_hard();
         }
     }
 }

@@ -56,10 +56,12 @@ pub const ACTIVE_RETRY_TIMEOUT: u64 = 10_000;
 pub const SHUTDOWN_RETRIES: u32 = 16;
 /// `sent_states` queue cap; the 16th-from-end is dropped when exceeded.
 pub const SENT_STATES_CAP: usize = 32;
-/// `received_states` anti-DoS cap; beyond this a 15s quench window applies.
+/// Hard ceiling on the number of retained `received_states` (anti-accumulation).
+///
+/// Inbound states beyond this are refused outright (not merely rate-limited), so a hostile peer
+/// that pins `old_num`/`throwaway_num` to prevent collapse cannot grow the list without bound
+/// (KOH-01). The per-state-type [`SyncState::RECEIVE_BUDGET_UNITS`] is the companion byte bound.
 pub const RECEIVED_STATES_CAP: usize = 1024;
-/// Quench window once `received_states` exceeds [`RECEIVED_STATES_CAP`].
-pub const RECEIVER_QUENCH_MS: u64 = 15_000;
 
 /// A synchronizable object: the unit the protocol keeps in sync.
 ///
@@ -79,6 +81,27 @@ pub const RECEIVER_QUENCH_MS: u64 = 15_000;
 pub trait SyncState: Clone + Default + PartialEq {
     /// The serializable delta type.
     type Diff: Serialize + DeserializeOwned;
+
+    /// Per-direction cap (bytes) on how large an inbound instruction targeting *this* state may
+    /// inflate to, an anti-amplification bound on untrusted peer input (KOH-02). Keystroke input
+    /// (`UserInput`) needs only a few hundred KiB even for a big paste; a screen repaint
+    /// (`TerminalScreen`) needs more. Defaults to the global ceiling so cost-free/trusted state
+    /// types (e.g. test stubs) keep the old behavior — concrete states override it.
+    const RECV_DECODE_LIMIT: usize = crate::wire::MAX_DECOMPRESSED;
+
+    /// Total resource budget (in [`resource_units`](SyncState::resource_units)) summed across every
+    /// *received* copy of this state the transport will retain before it refuses further inbound
+    /// states as a resource-exhaustion attack (KOH-01). A hostile-but-authorized peer can pin
+    /// `old_num`/`throwaway_num` so the receiver never collapses its `received_states`; this bounds
+    /// the memory that accumulation can pin. Default [`usize::MAX`] (unbounded — opt in per type).
+    const RECEIVE_BUDGET_UNITS: usize = usize::MAX;
+
+    /// This state's current resource cost, in the same units as
+    /// [`RECEIVE_BUDGET_UNITS`](SyncState::RECEIVE_BUDGET_UNITS). Called once per inbound state, so
+    /// it must be cheap (an `O(1)`/length read, never a deep walk). Default `0` (types opt in).
+    fn resource_units(&self) -> usize {
+        0
+    }
 
     /// Produce a diff that, applied to `base`, yields `self` (delta `base → self`).
     fn diff_from(&self, base: &Self) -> Self::Diff;

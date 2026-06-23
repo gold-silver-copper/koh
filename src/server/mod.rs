@@ -136,27 +136,38 @@ pub async fn run_attached(
                             if !input_diff.is_empty() {
                                 let frame = transport.remote_num();
                                 let mut s = handle.session.lock().await;
+                                // Coalesce the drained input before touching the PTY. A single
+                                // datagram set can pack a huge number of events; applying each
+                                // synchronously under the session lock — an `ioctl(TIOCSWINSZ)` +
+                                // SIGWINCH and a `vt100` grid realloc per resize — is a CPU/syscall
+                                // DoS (KOH-05). Intermediate resizes have no observable effect, so
+                                // only the final geometry is applied (once); keystrokes concatenate
+                                // in order. `application_cursor` can't change from client input (it
+                                // is driven by the shell's DECCKM output, processed under this same
+                                // lock), so it is read once. Each resize is still clamped to
+                                // [MIN_DIM, MAX_DIM] before the PTY/vt100 see it (H-1 / M-2).
+                                let app_cursor = s.emu.application_cursor();
+                                let mut keys = Vec::new();
+                                let mut last_resize: Option<(u16, u16)> = None;
                                 for w in &input_diff {
                                     match w {
                                         WireEvent::Keys(b) => {
-                                            let bytes = cursor_keys
-                                                .normalize(b, s.emu.application_cursor());
-                                            if let Err(e) = s.pty.write_input(&bytes) {
-                                                warn!(error = %e, "pty write failed");
-                                            }
+                                            keys.extend(cursor_keys.normalize(b, app_cursor));
                                         }
                                         WireEvent::Resize { rows, cols } => {
-                                            // Clamp the peer-supplied geometry before it reaches the
-                                            // PTY ioctl or the vt100 grid: an unbounded resize is an
-                                            // OOM bomb and a zero dimension panics vt100 (H-1 / M-2).
-                                            // `ServerTerminal::resize` clamps too; we clamp here so
-                                            // the PTY gets the same bounded values.
-                                            let (rows, cols) =
-                                                crate::terminal::clamp_dims(*rows, *cols);
-                                            let _ = s.pty.resize(rows, cols);
-                                            s.emu.resize(rows, cols);
+                                            last_resize =
+                                                Some(crate::terminal::clamp_dims(*rows, *cols));
                                         }
                                     }
+                                }
+                                if !keys.is_empty() {
+                                    if let Err(e) = s.pty.write_input(&keys) {
+                                        warn!(error = %e, "pty write failed");
+                                    }
+                                }
+                                if let Some((rows, cols)) = last_resize {
+                                    let _ = s.pty.resize(rows, cols);
+                                    s.emu.resize(rows, cols);
                                 }
                                 s.emu.register_input_frame(frame, now);
                             }

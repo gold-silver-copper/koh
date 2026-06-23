@@ -156,8 +156,16 @@ is *online-guessing* the passphrase is twofold:
 
 The passphrase is held in a `secrecy::SecretString` and the derived `K` in `zeroize::Zeroizing`,
 exposed only at the KDF call (this reduces heap exposure; argv/env remain OS-visible). The
-passphrase (and the other `KOH_*` operational vars) are **scrubbed from the spawned shell's
+passphrase (and every other `KOH_*` operational var) is **scrubbed from the spawned shell's
 environment**, so an authorized user can't `echo $KOH_PASSPHRASE` to recover the second factor.
+
+> **Use a high-entropy passphrase.** This is a hash challenge-response, not a PAKE, so a server a
+> client *dials* (e.g. a malicious or typo'd endpoint id) learns one `(nonce, BLAKE3(K ‖ nonce))`
+> transcript and can mount an **offline** dictionary attack on the passphrase — the fixed public
+> salt and a server-chosen nonce don't prevent this (the memory-hard Argon2id work factor only
+> makes weak/dictionary passphrases realistically crackable). koh treats an empty passphrase as
+> "none" and warns when one is shorter than 12 characters; a long, random passphrase is the real
+> defense (a PAKE that would eliminate offline cracking entirely is future work).
 
 #### Hardening against a hostile or compromised peer
 
@@ -266,6 +274,14 @@ still quits). You stay in your shell instead of being dropped back to the local 
 especially, run `termux-wake-lock` (and set Termux to *Unrestricted* battery) so the OS doesn't
 freeze or kill the process during a long screen-off.
 
+> **Fast wake-up after a long screen-off.** A system suspend pauses the *monotonic* clock that
+> iroh's idle timer runs on, so after a long deep-sleep iroh can't tell the connection went stale
+> and would otherwise hold it for up to the full ~5 minutes before giving up. The client guards
+> against this with a **wall-clock freeze detector**: if real time jumps more than 20s between two
+> (≤50ms-cadence) loop iterations, it concludes the process was suspended, drops the (almost
+> certainly dead) connection, and re-dials immediately — turning a multi-minute wake-up hang into a
+> ~1–2s reattach. A sub-20s glance still rides out silently on the existing connection.
+
 > **`--direct` caveat:** transparent re-dial targets the *same* address it first dialed, so a
 > `--direct <ip:port>` client can't reconnect if the server restarts on a new ephemeral **port**.
 > The relay/discovery path (a bare endpoint id) re-dials by node id and reconnects across address
@@ -344,8 +360,10 @@ driven over `adb`. See [`testing/android/`](testing/android/) — opt-in (`KOH_A
 never part of `cargo test`. A **smoke** suite proves the Android iroh/DNS path binds without the
 `ndk-context` panic (a runtime-only bug cross-compilation can't catch); a **stress** suite hammers
 koh under load, churn, and adverse conditions — connection churn, concurrent sessions, an auth
-flood, throughput + memory-longevity (leak checks), signal handling, the screen-off freeze,
-detachable-session reattach continuity, `tc netem` loss/jitter/reorder *beneath* real QUIC, a
+flood, throughput + memory-longevity (leak checks), signal handling, a short screen-off freeze
+(rides out on the same connection) and a long one (the wall-clock freeze detector forces a fast
+proactive reconnect), detachable-session reattach continuity, `tc netem` loss/jitter/reorder
+*beneath* real QUIC, a
 total-outage roaming analogue, and a bare-id connection over the public relay (real DNS resolution).
 This absorbed the old Docker `tier2/` scaffolding; a literal multi-network roam (the client's IP
 changing) and NAT hole-punching still need two hosts — see Tier 3.

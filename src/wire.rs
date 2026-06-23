@@ -66,6 +66,8 @@ pub enum WireError {
     ShortFragment { len: usize, min: usize },
     #[error("instruction needs {count} fragments, exceeds the {max}-fragment limit")]
     TooManyFragments { count: usize, max: usize },
+    #[error("reassembly buffer {bytes} bytes exceeds the {max}-byte limit")]
+    ReassemblyTooLarge { bytes: usize, max: usize },
     #[error("could not inflate instruction (corrupt or oversized payload)")]
     Decompress,
 }
@@ -74,9 +76,12 @@ pub enum WireError {
 /// spaces, repeated SGR, ASCII), so a mid level gives most of the ratio at negligible CPU.
 const COMPRESSION_LEVEL: u8 = 6;
 
-/// Hard cap on an inflated instruction (anti-decompression-bomb on untrusted peer input). A full
-/// repaint of a large scrolled-back screen is well under this; anything larger is rejected.
-const MAX_DECOMPRESSED: usize = 16 * 1024 * 1024;
+/// Global hard cap on an inflated instruction (anti-decompression-bomb on untrusted peer input).
+///
+/// A full repaint of a large scrolled-back screen is well under this; anything larger is rejected.
+/// The *per-direction* limit a transport actually applies is [`crate::ssp::SyncState::RECV_DECODE_LIMIT`]
+/// (e.g. far tighter for the keystroke direction); this is the default/ceiling.
+pub const MAX_DECOMPRESSED: usize = 16 * 1024 * 1024;
 
 /// The unit of state synchronization. Produced by `ssp::Transport`, serialized, then
 /// fragmented for transport. See module docs for field semantics.
@@ -121,11 +126,22 @@ impl Instruction {
         ))
     }
 
-    /// Deserialize: inflate (bounded, anti-bomb), then postcard, rejecting a protocol-version
-    /// mismatch at decode time (before any state is touched) so a foreign/incompatible peer can't
-    /// feed a diff with a different encoding into our state mirror.
+    /// Deserialize with the global [`MAX_DECOMPRESSED`] inflate ceiling. Prefer
+    /// [`decode_with_limit`](Instruction::decode_with_limit) with the receiver's per-direction
+    /// budget on the hot path.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, MAX_DECOMPRESSED)
+        Self::decode_with_limit(bytes, MAX_DECOMPRESSED)
+    }
+
+    /// Deserialize: inflate (bounded by `max_decompressed`, anti-bomb), then postcard, rejecting a
+    /// protocol-version mismatch at decode time (before any state is touched) so a
+    /// foreign/incompatible peer can't feed a diff with a different encoding into our state mirror.
+    ///
+    /// `max_decompressed` is the caller's per-direction cap (the keystroke direction is far tighter
+    /// than the screen direction), so one small datagram set can't be inflated into a huge resident
+    /// payload (KOH-02).
+    pub fn decode_with_limit(bytes: &[u8], max_decompressed: usize) -> Result<Self, WireError> {
+        let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, max_decompressed)
             .map_err(|_| WireError::Decompress)?;
         let instr: Self = postcard::from_bytes(&raw)?;
         if instr.protocol_version != PROTOCOL_VERSION {
@@ -292,7 +308,7 @@ impl Fragmenter {
 /// Keeps a buffer for the highest `id` seen so far. Fragments with a lower `id` are stale and
 /// dropped. A higher `id` clears the buffer and starts fresh. When all indices `0..=final` for
 /// the current id are present, the instruction is decoded and returned.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FragmentAssembly {
     current_id: Option<u64>,
     /// Received fragments for `current_id`, keyed by index. A *map* (not a Vec sized to the
@@ -301,11 +317,43 @@ pub struct FragmentAssembly {
     /// knob while preserving the protocol's fragment-count ceiling.
     parts: BTreeMap<u16, Vec<u8>>,
     final_index: Option<u16>,
+    /// Sum of `parts`' payload bytes for the current id, so a never-completing partial can't
+    /// buffer unbounded pre-decompression scratch (KOH-07).
+    buffered_bytes: usize,
+    /// The per-direction inflate ceiling passed to [`Instruction::decode_with_limit`] on
+    /// completion (and the basis for the `buffered_bytes` cap).
+    max_decompressed: usize,
+}
+
+impl Default for FragmentAssembly {
+    fn default() -> Self {
+        Self::with_limit(MAX_DECOMPRESSED)
+    }
 }
 
 impl FragmentAssembly {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A reassembler whose completed instructions inflate to at most `max_decompressed` bytes, and
+    /// whose pre-decompression scratch is bounded proportionally. Callers pass their per-direction
+    /// [`crate::ssp::SyncState::RECV_DECODE_LIMIT`].
+    pub fn with_limit(max_decompressed: usize) -> Self {
+        Self {
+            current_id: None,
+            parts: BTreeMap::new(),
+            final_index: None,
+            buffered_bytes: 0,
+            max_decompressed,
+        }
+    }
+
+    /// Upper bound on buffered (still-compressed) scratch: a small multiple of the decompressed
+    /// ceiling, so a legitimate near-limit instruction still reassembles while a flood of
+    /// never-completing fragments is cut off (KOH-07).
+    fn buffered_cap(&self) -> usize {
+        self.max_decompressed.saturating_mul(2).max(64 * 1024)
     }
 
     /// Feed a fragment. Returns `Ok(Some(instruction))` once the instruction it belongs to is
@@ -333,11 +381,28 @@ impl FragmentAssembly {
                 self.current_id = Some(frag.id);
                 self.parts.clear();
                 self.final_index = None;
+                self.buffered_bytes = 0;
             }
         }
 
         if frag.final_ {
             self.final_index = Some(frag.index);
+        }
+        // Track buffered bytes (subtracting any payload this index replaces) and refuse to hold
+        // more than a small multiple of the decompressed ceiling, so a peer that only ever ships
+        // never-completing partials can't pin unbounded scratch (KOH-07).
+        if let Some(old) = self.parts.get(&frag.index) {
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(old.len());
+        }
+        self.buffered_bytes = self.buffered_bytes.saturating_add(frag.payload.len());
+        let cap = self.buffered_cap();
+        if self.buffered_bytes > cap {
+            let bytes = self.buffered_bytes;
+            self.current_id = None;
+            self.parts.clear();
+            self.final_index = None;
+            self.buffered_bytes = 0;
+            return Err(WireError::ReassemblyTooLarge { bytes, max: cap });
         }
         self.parts.insert(frag.index, frag.payload);
 
@@ -363,12 +428,13 @@ impl FragmentAssembly {
         // re-complete, which is harmless (idempotent at the ssp layer), but we clear the buffer.
         self.parts.clear();
         self.final_index = None;
+        self.buffered_bytes = 0;
         trace!(
             id = self.current_id,
             fragments = needed,
             "reassembled complete instruction"
         );
-        let instr = Instruction::decode(&buf)?;
+        let instr = Instruction::decode_with_limit(&buf, self.max_decompressed)?;
         Ok(Some(instr))
     }
 }
@@ -423,6 +489,72 @@ mod tests {
         // panic — this is untrusted peer input.
         assert!(Instruction::decode(&[0xff, 0x00, 0x13, 0x37, 0xab, 0xcd]).is_err());
         assert!(Instruction::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_with_limit_rejects_oversized_inflation() {
+        // KOH-02: an instruction that inflates beyond the caller's per-direction limit is rejected,
+        // not expanded into a huge resident payload. A 512 KiB diff of zeros compresses tiny.
+        let big = Instruction {
+            protocol_version: PROTOCOL_VERSION,
+            old_num: 0,
+            new_num: 1,
+            ack_num: 0,
+            throwaway_num: 0,
+            diff: vec![0u8; 512 * 1024],
+        };
+        let bytes = big.encode().unwrap();
+        assert!(
+            bytes.len() < 4096,
+            "the bomb compresses small ({} bytes)",
+            bytes.len()
+        );
+        // The generous global ceiling admits it...
+        assert!(Instruction::decode(&bytes).is_ok());
+        // ...but a tight 256 KiB per-direction limit refuses the 512 KiB inflation.
+        assert!(matches!(
+            Instruction::decode_with_limit(&bytes, 256 * 1024),
+            Err(WireError::Decompress)
+        ));
+    }
+
+    #[test]
+    fn reassembly_rejects_oversized_buffered_bytes() {
+        // KOH-07: a peer shipping many never-completing non-final fragments under one id must not
+        // pin unbounded scratch — the buffered-bytes cap returns ReassemblyTooLarge and resets.
+        let mut asm = FragmentAssembly::with_limit(64 * 1024); // cap = max(2*64 KiB, 64 KiB) = 128 KiB
+        let mut rejected = false;
+        for i in 0..2000u16 {
+            let frag = Fragment {
+                id: 1,
+                index: i,
+                final_: false,
+                payload: vec![0u8; 1000],
+            };
+            match asm.add(frag) {
+                Ok(None) => {}
+                Err(WireError::ReassemblyTooLarge { .. }) => {
+                    rejected = true;
+                    break;
+                }
+                other => panic!("unexpected reassembly outcome: {other:?}"),
+            }
+        }
+        assert!(
+            rejected,
+            "a flood of non-final fragments must trip the buffered-bytes cap"
+        );
+        // After the reset a fresh, well-formed instruction still reassembles normally.
+        let frags = Fragmenter::new()
+            .fragment(&sample_instruction(20), 1200)
+            .unwrap();
+        let mut got = None;
+        for fr in frags {
+            if let Some(i) = asm.add(fr).unwrap() {
+                got = Some(i);
+            }
+        }
+        assert!(got.is_some(), "assembler recovers after an over-cap reset");
     }
 
     #[test]

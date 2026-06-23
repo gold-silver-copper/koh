@@ -11,8 +11,7 @@ use tracing::trace;
 
 use crate::ssp::{
     RttEstimator, SyncState, ACK_DELAY, ACK_INTERVAL, ACTIVE_RETRY_TIMEOUT, NEVER,
-    RECEIVED_STATES_CAP, RECEIVER_QUENCH_MS, SEND_MINDELAY, SENT_STATES_CAP, SHUTDOWN_RETRIES,
-    SHUTDOWN_SENTINEL,
+    RECEIVED_STATES_CAP, SEND_MINDELAY, SENT_STATES_CAP, SHUTDOWN_RETRIES, SHUTDOWN_SENTINEL,
 };
 
 /// A state snapshot tagged with its sequence number and the wall-clock ms it was created.
@@ -36,7 +35,9 @@ pub enum RecvOutcome {
     Duplicate,
     /// The diff's base (`old_num`) is not in our `received_states`; dropped (replay guard).
     MissingBase,
-    /// Dropped by the anti-DoS quench window.
+    /// Refused by the anti-accumulation bound: the received-state count ceiling
+    /// ([`RECEIVED_STATES_CAP`]) or the per-direction resource budget
+    /// ([`SyncState::RECEIVE_BUDGET_UNITS`]) would be exceeded.
     Quenched,
 }
 
@@ -69,7 +70,6 @@ pub struct Transport<Local: SyncState, Remote: SyncState> {
     shutdown_start: u64,
     // ---- receiver side (peer's remote state) ----
     received_states: Vec<TimestampedState<Remote>>,
-    receiver_quench_timer: u64,
     assembly: FragmentAssembly,
     /// Snapshot of the remote state the app last consumed via [`get_remote_diff`](Transport::get_remote_diff).
     last_delivered_remote: Remote,
@@ -110,8 +110,10 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             shutdown_tries: 0,
             shutdown_start: NEVER,
             received_states,
-            receiver_quench_timer: 0,
-            assembly: FragmentAssembly::new(),
+            // Reassemble inbound instructions under THIS direction's decompressed ceiling: the
+            // server (Remote = UserInput) gets the tight keystroke cap, the client (Remote =
+            // TerminalScreen) the screen cap (KOH-02).
+            assembly: FragmentAssembly::with_limit(Remote::RECV_DECODE_LIMIT),
             last_delivered_remote: Remote::default(),
             rtt: RttEstimator::new(),
             connected: false,
@@ -613,12 +615,11 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
 
         self.process_throwaway_until(instr.throwaway_num);
 
-        // Anti-DoS quench once the received list is huge.
-        if self.received_states.len() > RECEIVED_STATES_CAP {
-            if now < self.receiver_quench_timer {
-                return RecvOutcome::Quenched;
-            }
-            self.receiver_quench_timer = now + RECEIVER_QUENCH_MS;
+        // Anti-accumulation count ceiling: refuse (don't merely throttle) once the received list is
+        // at the cap, so a peer that pins `old_num`/`throwaway_num` to prevent collapse can't grow
+        // it without bound. Honest peers collapse well below the cap, so this never trips for them.
+        if self.received_states.len() >= RECEIVED_STATES_CAP {
+            return RecvOutcome::Quenched;
         }
 
         if !instr.diff.is_empty() {
@@ -630,6 +631,20 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
                 }
             }
         }
+
+        // Anti-accumulation *byte/units* budget across all retained received states (KOH-01).
+        // Recomputed each insert (received_states <= RECEIVED_STATES_CAP, so this is cheap) so it
+        // stays correct as `subtract_prefix` shrinks states. A hostile peer is refused here rather
+        // than allowed to OOM the receiver with many large, never-collapsing snapshots.
+        let retained: usize = self
+            .received_states
+            .iter()
+            .map(|s| s.state.resource_units())
+            .sum();
+        if retained.saturating_add(new_state.resource_units()) > Remote::RECEIVE_BUDGET_UNITS {
+            return RecvOutcome::Quenched;
+        }
+
         let ts = TimestampedState {
             timestamp: now,
             num: instr.new_num,
@@ -720,6 +735,60 @@ mod tests {
         let frags = Fragmenter::new().fragment(i, 1200).unwrap();
         assert_eq!(frags.len(), 1, "test instruction must fit one fragment");
         frags[0].encode().unwrap()
+    }
+
+    /// An absolute state whose "resource cost" is its value, with a tiny receive budget — so the
+    /// anti-accumulation bound can be exercised without crafting megabytes of input (KOH-01).
+    #[derive(Clone, Default, PartialEq, Debug)]
+    struct Grow(u64);
+    #[derive(Serialize, Deserialize, Clone)]
+    struct GrowDiff(u64);
+    impl SyncState for Grow {
+        type Diff = GrowDiff;
+        const RECEIVE_BUDGET_UNITS: usize = 100;
+        fn resource_units(&self) -> usize {
+            self.0 as usize
+        }
+        fn diff_from(&self, _base: &Self) -> GrowDiff {
+            GrowDiff(self.0)
+        }
+        fn apply(&mut self, d: &GrowDiff) {
+            self.0 = d.0;
+        }
+    }
+
+    fn grow_datagram(old: u64, new: u64, throwaway: u64, val: u64) -> Vec<u8> {
+        datagram(&Instruction {
+            protocol_version: PROTOCOL_VERSION,
+            old_num: old,
+            new_num: new,
+            ack_num: 0,
+            throwaway_num: throwaway,
+            diff: postcard::to_allocvec(&GrowDiff(val)).unwrap(),
+        })
+    }
+
+    #[test]
+    fn received_state_budget_refuses_accumulation() {
+        // KOH-01: a peer that pins old_num/throwaway to prevent collapse is refused once the
+        // retained received-state resource budget would be exceeded — not allowed to OOM us.
+        let mut t = Transport::<Grow, Grow>::new(0, 1200);
+        // First large state fits (base num-0 is 0 units + 60 = 60 <= the 100 budget).
+        assert_eq!(
+            t.recv(10, &grow_datagram(0, 1, 0, 60)),
+            RecvOutcome::NewState
+        );
+        // A second large state from the same (un-collapsed) base would push retained 60 + 60 over
+        // the budget, so it is refused rather than accumulated.
+        assert_eq!(
+            t.recv(20, &grow_datagram(0, 2, 0, 60)),
+            RecvOutcome::Quenched
+        );
+        assert_eq!(
+            t.remote_state().0,
+            60,
+            "the refused state must not have been applied"
+        );
     }
 
     /// Regression for P1a: a peer-supplied `throwaway_num > old_num` makes the throwaway GC

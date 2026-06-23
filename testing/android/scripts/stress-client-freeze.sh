@@ -1,9 +1,11 @@
 #!/bin/sh
-# Stress: client freeze → resume (the REAL screen-off scenario). A phone screen-off freezes the app,
-# stopping its keepalives. koh's 5-min connection idle timeout exists so the session rides that out
-# on the SAME connection. We SIGSTOP the client (not the server), hold well under the idle timeout,
-# SIGCONT, and assert: the client was actually stopped, it survives, it stayed on the same connection
-# (no detach/reconnect), and nothing panics.
+# Stress: SHORT client freeze → resume rides out on the SAME connection. A brief screen-off freezes
+# the app and stops its keepalives; koh rides a short gap out on the existing connection — it is well
+# under the 300s idle timeout AND, crucially, under the client's 20s wall-clock freeze detector,
+# which on a LONGER freeze would instead force a proactive reconnect (that path is covered by
+# stress-client-wake-reconnect). We SIGSTOP the client (not the server) for well under 20s, SIGCONT,
+# and assert: it was actually stopped, it survives, it stayed on the SAME connection (no
+# detach/reconnect), and nothing panics.
 set -eu
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 . "$HERE/stress-lib.sh"
@@ -11,7 +13,9 @@ HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 require_device_or_skip
 push_binary
 
-FREEZE="${KOH_STRESS_FREEZE_SECS:-$(scaled 15 60)}"
+# Kept under the 20s freeze-detector threshold so the session rides out on the same connection
+# (the longer freeze that trips proactive reconnect is exercised by stress-client-wake-reconnect).
+FREEZE="${KOH_STRESS_FREEZE_SECS:-$(scaled 8 12)}"
 CLILOG="/tmp/koh-freeze-cli-$$.log"
 echo "Stress: client freeze → resume — SIGSTOP the client for ${FREEZE}s, then SIGCONT (level=$STRESS_LEVEL)"
 
@@ -35,7 +39,7 @@ sleep 1
 st="$(proc_state "$CPID")"
 [ "$st" = T ] && ok "client is stopped (SIGSTOP'd, state=T) — simulating screen-off" || bad "client did not stop (state=$st)"
 
-sleep "$FREEZE"   # frozen, well under the 300s idle timeout
+sleep "$FREEZE"   # frozen, well under the 20s freeze detector (and the 300s idle timeout)
 
 # Resume the client.
 adb $ADB_SERIAL shell "kill -CONT $CPID" >/dev/null 2>&1 || true

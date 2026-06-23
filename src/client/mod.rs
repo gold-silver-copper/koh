@@ -53,6 +53,29 @@ const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RECONNECT_BACKOFF_BASE_MS: u64 = 500;
 const RECONNECT_BACKOFF_MAX_MS: u64 = 8_000;
 
+/// Wall-clock gap between two steady-loop iterations above which we assume the process was
+/// **suspended** (Android deep-sleep / screen-off freezes the process) rather than merely busy.
+///
+/// The loop polls at least every ~50ms (`TickResult::wait_ms` is capped at 50), so a gap this large
+/// can only mean the task was parked, unscheduled, for that whole span. On a phone that almost
+/// always means the QUIC connection is now stale — the NAT mapping has likely expired and the
+/// *server's* real-time idle timer has advanced — yet iroh's idle timer is driven by the **monotonic**
+/// clock, which pauses across suspend, so iroh won't notice and can hold the dead connection for up
+/// to its full ~5-minute idle timeout after wake. Detecting the freeze and reconnecting immediately
+/// (reattaching to the retained server session) turns that ~5-minute hang into a ~1–2s redial.
+///
+/// 20s is ~400× the loop cadence, so normal scheduling jitter never trips it; a sub-20s glance rides
+/// out on the existing connection (no visible reconnect). The cost of a false positive is only a
+/// brief "reconnecting…" banner and a repaint back into the same session, so we bias low.
+const STALE_AFTER_FREEZE: Duration = Duration::from_secs(20);
+
+/// Whether a wall-clock gap between steady-loop iterations looks like a resume from a process
+/// freeze (suspend), i.e. is at least [`STALE_AFTER_FREEZE`]. Pulled out so the threshold is
+/// unit-testable without driving a whole session.
+fn looks_like_resume_from_freeze(wall_gap: Duration) -> bool {
+    wall_gap >= STALE_AFTER_FREEZE
+}
+
 /// Dials the server and replays the passphrase handshake, yielding a fresh [`IrohChannel`].
 ///
 /// One instance is reused for the **initial** connection and for every **transparent reconnect**
@@ -614,7 +637,27 @@ async fn drive_connection<T: ClientTerminal>(
     clock: &MonoClock,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Disposition> {
+    // Wall-clock checkpoint for freeze detection. `MonoClock` (and iroh's idle timer) are monotonic
+    // and PAUSE across a system suspend, so they can't tell a long screen-off from a momentary
+    // stall; `SystemTime` keeps real time across suspend. A large gap between two (≤50ms-cadence)
+    // iterations therefore fingerprints a resume-from-freeze (see `STALE_AFTER_FREEZE`).
+    let mut last_wall = std::time::SystemTime::now();
     loop {
+        // If real time jumped far ahead of our ≤50ms polling cadence, the process was suspended
+        // (phone screen-off). The connection is almost certainly dead, so proactively drop it and
+        // reconnect — reattaching to the retained server session — instead of waiting out iroh's
+        // clock-skewed ~5-minute idle timeout. (A backwards clock step, e.g. NTP, reads as no gap.)
+        let wall_now = std::time::SystemTime::now();
+        let wall_gap = wall_now.duration_since(last_wall).unwrap_or(Duration::ZERO);
+        last_wall = wall_now;
+        if looks_like_resume_from_freeze(wall_gap) {
+            tracing::info!(
+                frozen_secs = wall_gap.as_secs(),
+                "detected resume from a process freeze (suspend/screen-off); forcing a reconnect"
+            );
+            return Ok(Disposition::LinkLost);
+        }
+
         let now = clock.now_ms();
         let tick = session.on_tick(now, channel.max_datagram_size(), channel.rtt_ms());
         for datagram in &tick.outgoing {
@@ -891,6 +934,21 @@ mod tests {
             RECONNECT_BACKOFF_MAX_MS,
             "shift is clamped, no overflow"
         );
+    }
+
+    #[test]
+    fn freeze_detection_fires_only_on_a_real_suspend_gap() {
+        // A normal loop cadence (the steady loop polls at least every ~50ms) must never look like a
+        // freeze, so an active session is never needlessly torn down...
+        assert!(!looks_like_resume_from_freeze(Duration::from_millis(0)));
+        assert!(!looks_like_resume_from_freeze(Duration::from_millis(50)));
+        assert!(!looks_like_resume_from_freeze(Duration::from_secs(5)));
+        // ...a sub-threshold glance still rides out on the existing connection...
+        assert_eq!(STALE_AFTER_FREEZE, Duration::from_secs(20));
+        assert!(!looks_like_resume_from_freeze(Duration::from_secs(19)));
+        // ...but a multi-second-to-minutes suspend (phone screen-off) forces a proactive reconnect.
+        assert!(looks_like_resume_from_freeze(STALE_AFTER_FREEZE));
+        assert!(looks_like_resume_from_freeze(Duration::from_secs(300)));
     }
 
     #[test]

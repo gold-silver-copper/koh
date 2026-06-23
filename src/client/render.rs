@@ -171,7 +171,14 @@ pub fn render(
         let mut line = format!(" {st} ");
         let max = cols as usize;
         if line.len() > max {
-            line.truncate(max);
+            // Truncate on a UTF-8 char boundary, never mid-scalar. `cols` is the peer-controlled
+            // (clamped) screen width, and the status strings contain multi-byte glyphs (em-dash,
+            // ellipsis), so a raw `String::truncate(max)` would panic and crash the client (KOH-04).
+            let mut end = max;
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
         }
         write!(
             out,
@@ -580,6 +587,26 @@ mod tests {
         let mut buf = Vec::new();
         render(&mut buf, &screen, &Overlay::empty(), Some("link down")).unwrap();
         assert!(String::from_utf8_lossy(&buf).contains("link down"));
+    }
+
+    #[test]
+    fn status_line_truncation_is_panic_free_across_all_widths() {
+        // KOH-04: the peer-controlled (clamped) screen width must never make the multi-byte status
+        // line panic via a mid-UTF-8 `String::truncate`. Sweep every width in [MIN_DIM, MAX_DIM]
+        // with the real link-down banner (em-dash U+2014 + ellipsis U+2026, whose bytes straddle
+        // widths 18/19/30/31) and assert render() never panics.
+        use crate::terminal::{MAX_DIM, MIN_DIM};
+        let status = "[koh] link down — resuming… 5s";
+        for cols in MIN_DIM..=MAX_DIM {
+            let screen = {
+                let mut p = vt100::Parser::new(MIN_DIM, cols, 0);
+                p.process(b"x");
+                p.screen().clone()
+            };
+            let mut buf = Vec::new();
+            render(&mut buf, &screen, &Overlay::empty(), Some(status))
+                .expect("render must not error or panic at any width");
+        }
     }
 
     #[test]

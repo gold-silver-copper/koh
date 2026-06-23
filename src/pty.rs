@@ -14,17 +14,6 @@ use portable_pty::{
 };
 use tokio::sync::mpsc;
 
-/// koh's operational environment variables, scrubbed from the spawned shell's environment (L-4).
-/// `$KOH_PASSPHRASE` is the security-critical one — the second-factor secret must never be readable
-/// from inside the session — the rest are internal config that shouldn't leak into the user's shell.
-const KOH_ENV_SCRUB: &[&str] = &[
-    "KOH_PASSPHRASE",
-    "KOH_LOG",
-    "KOH_STATE_DIR",
-    "KOH_DNS",
-    "KOH_CLIPBOARD",
-];
-
 /// Size of each output chunk read from the PTY master.
 const READ_CHUNK: usize = 8192;
 /// Bound on the output channel (chunks). Backpressure here naturally slows the reader thread.
@@ -44,13 +33,18 @@ fn default_shell() -> String {
 }
 
 /// Remove koh's operational env vars — notably the `$KOH_PASSPHRASE` second factor — from a
-/// command's environment before it spawns the session shell (L-4). `CommandBuilder::new` seeds the
-/// full parent environment, so `env_remove` strips an inherited value too. Pulled out of
-/// [`Pty::spawn`] so it is unit-testable without allocating a real PTY.
+/// command's environment before it spawns the session shell (L-4 / KOH-15). `CommandBuilder::new`
+/// seeds the full parent environment, so we strip *every* inherited `KOH_*` key by prefix (rather
+/// than a hand-maintained list that silently misses future vars). Pulled out of [`Pty::spawn`] so
+/// it is unit-testable without allocating a real PTY.
 fn scrub_koh_env(cmd: &mut CommandBuilder) {
-    for var in KOH_ENV_SCRUB {
-        cmd.env_remove(var);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("KOH_") {
+            cmd.env_remove(&key);
+        }
     }
+    // Belt-and-suspenders for the security-critical one, regardless of the snapshot above.
+    cmd.env_remove("KOH_PASSPHRASE");
 }
 
 fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
@@ -289,14 +283,46 @@ impl Pty {
         self.killer.clone_killer()
     }
 
-    /// Terminate the child (SIGHUP, then a hard kill if it lingers).
+    /// Terminate the child (SIGHUP via the portable-pty killer).
     pub fn kill(&mut self) -> std::io::Result<()> {
         self.killer.kill()
+    }
+
+    /// Force-kill the child with SIGKILL (which cannot be trapped). portable-pty's cloned killer
+    /// only sends SIGHUP, so a child that ignores SIGHUP (e.g. `trap '' HUP`) would otherwise keep
+    /// the PTY slave fd open and wedge the reader thread on a blocking `read()` forever — leaking a
+    /// thread + fds per session and defeating the reaper (KOH-10). Best effort: a child that has
+    /// already exited yields `ESRCH`, which is fine. Off-unix this is a no-op (the killer's own
+    /// terminate applies).
+    pub fn kill_hard(&self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.process_id() {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+            if let Ok(pid) = i32::try_from(pid) {
+                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+        }
     }
 
     /// The child's process id, if known.
     pub fn process_id(&self) -> Option<u32> {
         self.child.process_id()
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // A `Pty` dropped without an explicit [`Pty::shutdown`] (e.g. the Err path in
+        // `session::teardown`, or any future caller) must still guarantee the child dies, so the
+        // detached reader thread can't block forever on a still-open slave fd (KOH-10). SIGHUP
+        // first (a well-behaved shell exits cleanly), then SIGKILL so a SIGHUP-immune child also
+        // dies → the reader hits EOF and the pump threads exit. `writer_tx` drops with the struct,
+        // EOFing the child's stdin. We deliberately do NOT join the threads here (that could block
+        // the dropping thread, possibly a tokio worker); SIGKILL makes them exit promptly on their
+        // own, and `shutdown` remains the path that joins.
+        let _ = self.killer.kill();
+        self.kill_hard();
     }
 }
 

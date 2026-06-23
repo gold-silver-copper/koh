@@ -74,10 +74,13 @@ pub enum SetupError {
 /// stable [`EndpointId`], mirroring iroh-ssh's `--persist`.
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
     if path.exists() {
-        // Warn (once) if an existing key is group/other-readable: it is the node's whole identity,
-        // so a world-readable key is a local-impersonation risk. We don't silently chmod a file the
-        // user may manage themselves — just flag it. (No-op off-unix, where the mode is meaningless.)
-        warn_if_key_world_readable(path);
+        // Tighten an existing group/other-accessible key to 0600 (it is the node's whole identity,
+        // so a loose key is a local-impersonation risk), and refuse a world-writable containing dir
+        // where a co-tenant could swap the key out (KOH-16 / KOH-06).
+        tighten_or_warn_key_perms(path);
+        if let Some(parent) = path.parent() {
+            ensure_state_dir_secure(parent)?;
+        }
         let text = std::fs::read_to_string(path)?;
         let bytes = data_encoding::HEXLOWER_PERMISSIVE
             .decode(text.trim().as_bytes())
@@ -88,6 +91,8 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
         let sk = generate_secret_key();
         if let Some(parent) = path.parent() {
             create_dir_private(parent)?;
+            // Reject a world-writable state dir before writing the identity key into it (KOH-06).
+            ensure_state_dir_secure(parent)?;
         }
         // The key is the node identity (M-1): write it owner-only (0600) and never leave a
         // world-readable window. On unix, create the file with `create_new` + mode 0600 (so it is
@@ -150,24 +155,78 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     }
 }
 
-/// On unix, warn if `path`'s mode is group/other-readable (mode & 0o077 != 0). No-op elsewhere.
-fn warn_if_key_world_readable(path: &Path) {
+/// On unix, if `path` is group/other-accessible (mode & 0o077 != 0), proactively tighten it to
+/// 0600; only warn if that fails. The key IS the node identity, so a loose key is a local-
+/// impersonation risk — and an upgrade-in-place from a pre-0.3.1 build (created via a plain write,
+/// umask → typically 0644) lands here. Unlike the original warn-only behavior this re-permissions
+/// the key (tightening can only ever help) rather than leaving it exposed (KOH-16). No-op elsewhere.
+fn tighten_or_warn_key_perms(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = std::fs::metadata(path) {
             let mode = meta.permissions().mode();
             if mode & 0o077 != 0 {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{:o}", mode & 0o777),
-                    "secret key file is group/other-readable; tighten it with `chmod 600`"
-                );
+                match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+                    Ok(()) => tracing::warn!(
+                        path = %path.display(),
+                        prev_mode = format!("{:o}", mode & 0o777),
+                        "secret key file was group/other-accessible; tightened to 0600"
+                    ),
+                    Err(e) => tracing::warn!(
+                        path = %path.display(),
+                        mode = format!("{:o}", mode & 0o777),
+                        error = %e,
+                        "secret key file is group/other-accessible and could not be tightened; fix it with `chmod 600`"
+                    ),
+                }
             }
         }
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+/// Refuse a state dir a co-tenant could tamper with, and flag a merely-loose one (KOH-06 / KOH-12).
+///
+/// On unix: a group/other-**writable** dir lets another user unlink/replace the secret key even
+/// though the key file itself is 0600, so this hard-errors (pointing at `--key-file` /
+/// `$KOH_STATE_DIR`). A group/other-**readable** (but not writable) dir only grants traverse, so it
+/// just warns — `create_dir_private` already makes koh-created dirs 0700, so this only fires on a
+/// pre-existing loosened dir or a shared fallback location. No-op off-unix / for the CWD.
+fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if dir.as_os_str().is_empty() {
+            return Ok(()); // a relative "id.key" has an empty parent (the CWD); nothing to stat
+        }
+        if let Ok(meta) = std::fs::metadata(dir) {
+            let mode = meta.permissions().mode();
+            if mode & 0o022 != 0 {
+                return Err(SetupError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "state dir {} is group/other-writable (mode {:o}); a co-located user could \
+                         replace the secret key — tighten it (chmod 700) or pass --key-file / set \
+                         $KOH_STATE_DIR to a private path",
+                        dir.display(),
+                        mode & 0o777
+                    ),
+                )));
+            }
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    path = %dir.display(),
+                    mode = format!("{:o}", mode & 0o777),
+                    "state dir is group/other-accessible; tighten with `chmod 700`"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// The default persistent key path when `--key-file` isn't given, for `role` (`"client"`/`"server"`).

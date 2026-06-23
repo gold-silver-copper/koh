@@ -262,6 +262,18 @@ pub struct ScreenDiff {
 impl SyncState for TerminalScreen {
     type Diff = ScreenDiff;
 
+    // A repaint can be a few MiB, so keep the default 16 MiB inflate ceiling for the screen
+    // direction (a tighter cap risks dropping a legitimate large repaint). Each retained snapshot
+    // costs `rows × cols` cells (≤ MAX_DIM², dimension-bounded by `clamp_dims`); the budget caps
+    // total retained screens at ~8 full-size ones, so a hostile server that prevents collapse
+    // can't pin tens of GB on the client (KOH-01).
+    const RECEIVE_BUDGET_UNITS: usize = 8 * (MAX_DIM as usize) * (MAX_DIM as usize);
+
+    fn resource_units(&self) -> usize {
+        let (rows, cols) = self.screen.size();
+        (rows as usize) * (cols as usize)
+    }
+
     fn diff_from(&self, base: &Self) -> Self::Diff {
         let resized = self.size() != base.size();
         let vt = if resized {

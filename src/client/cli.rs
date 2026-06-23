@@ -199,6 +199,10 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     .await;
     // `term` is moved into run_client and dropped there, restoring the terminal.
 
-    endpoint.close().await;
+    // Close gracefully so the server can detach our session promptly — but cap the wait. On a dead
+    // link (e.g. the network died while the phone was suspended) iroh's graceful close blocks until
+    // the connection idle-times out (minutes), which would freeze the parent shell with no prompt
+    // until koh finally exits. After the cap we just drop the endpoint and exit immediately.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.close()).await;
     result
 }

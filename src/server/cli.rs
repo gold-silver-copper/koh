@@ -74,11 +74,6 @@ pub struct ServeArgs {
     /// command-line argument is visible in the process table, an env var is not.
     #[arg(long)]
     passphrase: Option<String>,
-
-    /// Also print a scannable QR code of the endpoint id (point a phone camera at it instead of
-    /// copying 64 hex chars). Optimized for a dark-background terminal.
-    #[arg(long)]
-    qr: bool,
 }
 
 /// Render `data` as a QR code for a **dark-background** terminal, or `None` if it is too large to
@@ -189,13 +184,13 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
 
-    if args.qr {
-        if let Some(qr) = connect_qr(&id_str) {
-            eprintln!("\nScan for the endpoint id (point a phone camera at it):\n");
-            eprintln!("{qr}");
-        } else {
-            warn!("could not render the connect QR (endpoint id too large to encode)");
-        }
+    // Always print a scannable QR of the endpoint id — point a phone camera at it instead of
+    // copying 64 hex chars.
+    if let Some(qr) = connect_qr(&id_str) {
+        eprintln!("\nScan for the endpoint id (point a phone camera at it):\n");
+        eprintln!("{qr}");
+    } else {
+        warn!("could not render the connect QR (endpoint id too large to encode)");
     }
 
     let shell = args.shell.clone();

@@ -185,9 +185,8 @@ koh serve --allow 3f9c…
 # └───────────────────────────────────────────────────────────
 ```
 
-Add `--qr` to the server to also print the endpoint id as a scannable terminal QR code
-(`koh serve --allow 3f9c… --qr`) — point a phone camera at it instead of copying 64 hex
-chars. It's rendered for a dark-background terminal.
+On launch the server also prints the endpoint id as a scannable terminal QR code — point a
+phone camera at it instead of copying 64 hex chars. It's rendered for a dark-background terminal.
 
 On the **client** (your phone/laptop), connect by the server's endpoint id:
 

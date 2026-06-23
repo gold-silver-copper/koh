@@ -1,0 +1,17 @@
+# A deliberately-MALICIOUS koh peer, for proving security findings on the emulator. It reuses koh's
+# PUBLIC library to send crafted protocol messages a stock peer never would. Kept OUT of the koh
+# package (testing/ is excluded from the published crate) and out of koh's build — its own crate.
+[package]
+name = "koh-evil-peer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "evil-client"
+path = "src/evil_client.rs"
+
+[dependencies]
+koh = { path = "../../.." }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"

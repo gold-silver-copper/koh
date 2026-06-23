@@ -126,6 +126,26 @@ wait_file_contains() {  # <devfile> <substr> <secs> -> 0 if seen
   done
   return 1
 }
+# Host-file variant (for PTY streams captured to a HOST file via pty_connect_host_bg).
+wait_file_contains_host() {  # <hostfile> <substr> <secs>
+  _j=0
+  while [ "$_j" -lt "$3" ]; do grep -aq "$2" "$1" 2>/dev/null && return 0; _j=$((_j + 1)); sleep 1; done
+  return 1
+}
+
+# --- malicious-peer deploy (security tests) --------------------------------------------------------
+EVIL_HOST="${KOH_EVIL_HOST:-$REPO_ROOT/testing/android/evil-peer/target/aarch64-linux-android/release/evil-client}"
+EVIL_DEV="${KOH_EVIL_DEV:-/data/local/tmp/evil-client}"
+# Push the cross-compiled malicious client; SKIP the test cleanly if it isn't built.
+push_evil() {
+  if [ ! -x "$EVIL_HOST" ]; then
+    echo "SKIP: evil-client not built. Build it first:"
+    echo "      (cd testing/android/evil-peer && CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=<ndk>/…/aarch64-linux-android24-clang cargo build --release --target aarch64-linux-android)"
+    exit 0
+  fi
+  adb $ADB_SERIAL push "$EVIL_HOST" "$EVIL_DEV" >/dev/null
+  adb $ADB_SERIAL shell chmod 755 "$EVIL_DEV"
+}
 
 # --- reporting -------------------------------------------------------------------------------------
 STRESS_FAIL=0

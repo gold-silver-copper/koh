@@ -1,0 +1,2 @@
+# Build artifacts of the (test-only) malicious-peer harness — never commit the binaries.
+/target

@@ -1,0 +1,38 @@
+Device: emulator-5554
+/Users/kisaczka/Desktop/code/moshers2/target/aarch64-linux-android/release/koh: 1 file pushed, 0 skipped. 492.9 MB/s (26867568 bytes in 0.052s)
+
+════════════════════════ sec-resize-oom-server ════════════════════════
+/Users/kisaczka/Desktop/code/moshers2/target/aarch64-linux-android/release/koh: 1 file pushed, 0 skipped. 523.1 MB/s (26867568 bytes in 0.049s)
+/Users/kisaczka/Desktop/code/moshers2/testing/android/evil-peer/target/aarch64-linux-android/release/evil-client: 1 file pushed, 0 skipped. 497.6 MB/s (22430160 bytes in 0.043s)
+Security H-1: malicious client resize(65000, 65000) must NOT OOM-kill the server
+    server pid=4324; witness attached
+  FAIL: server was KILLED by the malicious resize (H-1 confirmed) — every peer's session in this process died
+  ok: no panic/abort signature in the server log
+FAIL: sec-resize-oom-server
+
+════════════════════════ sec-resize-zero-panic ════════════════════════
+/Users/kisaczka/Desktop/code/moshers2/target/aarch64-linux-android/release/koh: 1 file pushed, 0 skipped. 483.9 MB/s (26867568 bytes in 0.053s)
+/Users/kisaczka/Desktop/code/moshers2/testing/android/evil-peer/target/aarch64-linux-android/release/evil-client: 1 file pushed, 0 skipped. 501.5 MB/s (22430160 bytes in 0.043s)
+Security M-2: malicious client resize(0, 0) must NOT panic/crash the server
+  ok: server survived the zero-dimension resize (clamped to a valid minimum)
+  FAIL: server PANICKED on the zero-dimension resize (M-2 confirmed)
+FAIL: sec-resize-zero-panic
+
+════════════════════════ sec-key-perms ════════════════════════
+/Users/kisaczka/Desktop/code/moshers2/target/aarch64-linux-android/release/koh: 1 file pushed, 0 skipped. 447.1 MB/s (26867568 bytes in 0.057s)
+Security M-1: the persistent secret key must be written 0600 (not world-readable)
+    key file mode: 666
+  FAIL: key file is mode 666 (group/other-readable) — M-1 confirmed: a local user can steal the node identity
+FAIL: sec-key-perms
+
+════════════════════════ sec-env-leak ════════════════════════
+/Users/kisaczka/Desktop/code/moshers2/target/aarch64-linux-android/release/koh: 1 file pushed, 0 skipped. 225.2 MB/s (26867568 bytes in 0.114s)
+Security L-4: the spawned shell must NOT inherit $KOH_PASSPHRASE
+/tmp/koh-flood-75029-datalocaltmpkohsecenvshellsh.sh: 1 file pushed, 0 skipped. 1.1 MB/s (100 bytes in 0.000s)
+  FAIL: the passphrase LEAKED into the shell env (L-4 confirmed): KOH_PASSPHRASE=<secret>
+FAIL: sec-env-leak
+
+█████████████████████████████████████████████████████████
+koh security tests: 0/4 assert the secure behavior
+demonstrating-a-vuln (or failing): sec-resize-oom-server sec-resize-zero-panic sec-key-perms sec-env-leak
+RESULT: FAIL (findings present or unverified)

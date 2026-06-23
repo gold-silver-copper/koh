@@ -22,7 +22,7 @@ subcommands — `koh serve` (host a shell), `koh connect <id>` (attach to one), 
 > left it), **terminal-reply synthesis** (DSR/DA/DECRQM, so vim/htop/fzf behave), and
 > **remote-shell exit-status propagation**. Client terminal I/O runs on
 > [termina](https://github.com/helix-editor/termina) with synchronized output (no crossterm).
-> 114 tests pass, including property tests, a network-chaos simulator, an in-process
+> 121 tests pass, including property tests, a network-chaos simulator, an in-process
 > client↔server scenario that converges at 50% packet loss, a reattach acceptance test, an
 > auto-reconnect-after-forced-drop test, **end-to-end tests over a real iroh connection** (both
 > the full loop in one process and the real `koh` binary driven through an allocated
@@ -161,7 +161,7 @@ exposed only at the KDF call (this reduces heap exposure; argv/env remain OS-vis
 
 ```sh
 cargo build --release          # builds the single `koh` binary (target/release/koh)
-cargo test                     # 114 tests: unit, property, chaos sim, real-iroh e2e, reattach, auto-reconnect, PTY binary, ported mosh regressions
+cargo test                     # 121 tests: unit, property, chaos sim, real-iroh e2e, reattach, auto-reconnect, PTY binary, ported mosh regressions
 ```
 
 Pinned toolchain-adjacent versions live in the root `Cargo.toml`: `iroh =1.0.0` (which brings

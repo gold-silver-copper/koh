@@ -109,11 +109,33 @@ KOH_ANDROID_EMULATOR=1 sh testing/android/scripts/stress-throughput.sh
 | `stress-client-freeze` | `SIGSTOP`/`SIGCONT` the **client** (the real screen-off) | session rides out the freeze on the *same* connection (no detach/reconnect), client survives |
 | `stress-reattach-continuity` | disconnect then reconnect the same peer | the shell is spawned **once** and *reused* (not recreated) — true "close the lid, reopen" continuity |
 | `stress-client-signals` | Ctrl-^ Ctrl-Z suspend + SIGTERM | client `SIGTSTP`s itself then resumes on `SIGCONT`; SIGTERM exits cleanly, no orphan |
-| `stress-netem` *(opt-in)* | `tc netem` loss + latency on loopback | session survives the loss, flood completes end-to-end, RSS bounded |
+| `stress-netem` *(opt-in)* | a long **chaos soak**: cycling loss/jitter/reorder/dup, heavy loss, total blackouts, high latency on `lo` (default 72s, `full` 300s) | session survives *every* phase on one connection (no detach/reconnect), no crash, no leak |
+| `stress-roaming` *(opt-in)* | total loopback outage (100% loss) mid-session, then recover | client rides out the outage on the *same* connection (no detach/reconnect) |
 | `stress-relay-discovery` *(opt-in)* | bare-id connect over the public relay | real discovery **DNS resolution** works on Android (not just resolver construction) |
 
-The two opt-in tests self-SKIP (exit 0) unless enabled: `KOH_STRESS_NETEM=1` (needs `adb root` + `tc`)
-and `KOH_ANDROID_NET=1` (needs the emulator to reach the internet).
+The opt-in tests self-SKIP (exit 0) unless enabled: `KOH_STRESS_NETEM=1` (netem + roaming; needs
+`adb root` + `tc`) and `KOH_ANDROID_NET=1` (relay-discovery; needs the emulator to reach the internet).
+
+### Migrated from the old `testing/tier2/` (Docker network-realism scaffolding)
+
+`tier2/` was stale, never-run Docker scaffolding (it referenced the pre-rename `rmosh-server`/
+`rmosh-client` binaries). Its coverage now lives here:
+
+- **OS-level chaos** (`tier2/scripts/netem.sh`) → `stress-netem` — the same `tc netem`
+  delay±jitter/loss/reorder/duplicate, run beneath the real QUIC stack on the device.
+- **Relay path** (server + client meet only via a relay) → `stress-relay-discovery` — a bare-id
+  connection over the public relay (the path the Android DNS fix exists for).
+- **Roaming / outage resilience** → `stress-roaming` — a transient total network outage mid-session
+  (the single-host analogue of "the network went away and came back").
+
+What a **single emulator can't** faithfully reproduce, by design — and where it's covered instead:
+
+- **True roaming / QUIC connection migration** (the client's *source IP* changing while the server
+  stays reachable) needs two network paths. One emulator over loopback has one. `stress-roaming`
+  covers the user-facing resilience (session survives the outage); a literal IP-change migration
+  needs two hosts (or the old Docker multi-network setup).
+- **NAT-traversal hole-punching** needs a real NAT topology; the relay *path* is exercised by
+  `stress-relay-discovery`, but punching through to a direct path isn't single-host-reproducible.
 
 Notes on the harness (learned the hard way against a real emulator):
 - All cross-process assertions read the **server log** or sample `/proc` — the client prints
@@ -149,7 +171,8 @@ testing/android/
     ├── stress-client-freeze.sh
     ├── stress-reattach-continuity.sh
     ├── stress-client-signals.sh
-    ├── stress-netem.sh            # opt-in (KOH_STRESS_NETEM=1): tc loss/latency
+    ├── stress-netem.sh            # opt-in (KOH_STRESS_NETEM=1): tc delay/jitter/loss/reorder/dup
+    ├── stress-roaming.sh          # opt-in (KOH_STRESS_NETEM=1): total-outage resilience (ex-tier2 roam)
     ├── stress-relay-discovery.sh  # opt-in (KOH_ANDROID_NET=1): real DNS via relay
     └── run-stress.sh      # stress orchestrator: guard → build → push → run all stress tests → tally
 ```

@@ -314,14 +314,18 @@ TTY is just an allocated PTY. Both are real and hermetic.
 The seam that makes this cheap: terminal I/O is abstracted behind `ClientTerminal`, so the same
 session loop runs against the real termina path (binary) or a captured-cells mock (fast test).
 
-### Tier 2 — docker-compose: relay, NAT, OS-chaos, roaming (`testing/tier2/`)
+### Tier 2 — Android emulator: runtime, network realism, resilience (`testing/android/`)
 
-Where Docker earns its place — network realism a single process can't fake. See
-[`testing/tier2/`](testing/tier2/): a self-hosted **iroh relay** container (never n0's public
-relay), `tc qdisc netem` for OS-level loss/jitter/reorder *beneath* real QUIC, optional
-`iptables` NAT for hole-punching, and a **roaming/migration** test that detaches the client
-from one network and reattaches it (new IP) mid-session, asserting QUIC migration resumes and
-re-syncs. This is runnable scaffolding (requires Docker + Linux); it is not part of `cargo test`.
+The layer a single in-process test can't reach: the **real `koh` binary on a real Android OS**,
+driven over `adb`. See [`testing/android/`](testing/android/) — opt-in (`KOH_ANDROID_EMULATOR=1`),
+never part of `cargo test`. A **smoke** suite proves the Android iroh/DNS path binds without the
+`ndk-context` panic (a runtime-only bug cross-compilation can't catch); a **stress** suite hammers
+koh under load, churn, and adverse conditions — connection churn, concurrent sessions, an auth
+flood, throughput + memory-longevity (leak checks), signal handling, the screen-off freeze,
+detachable-session reattach continuity, `tc netem` loss/jitter/reorder *beneath* real QUIC, a
+total-outage roaming analogue, and a bare-id connection over the public relay (real DNS resolution).
+This absorbed the old Docker `tier2/` scaffolding; a literal multi-network roam (the client's IP
+changing) and NAT hole-punching still need two hosts — see Tier 3.
 
 ### Tier 3 — real devices (manual)
 

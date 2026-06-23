@@ -280,8 +280,8 @@ pub fn relay_addr(id: EndpointId, relay: RelayUrl) -> EndpointAddr {
 
 /// Build an iroh [`Endpoint`] whose only relay is `relay` (no n0 relays, no DNS discovery).
 ///
-/// Used for self-hosted relays (Tier 2 docker, private deployments): peers dial by id + this
-/// same relay URL ([`relay_addr`]). Covers NAT traversal / roaming via the local relay.
+/// Used for self-hosted relays (private deployments): peers dial by id + this same relay URL
+/// ([`relay_addr`]). Covers NAT traversal / roaming via the local relay.
 pub async fn bind_endpoint_with_relay(
     secret: SecretKey,
     accept: bool,

@@ -12,7 +12,7 @@ You are working in the `koh` repo (`/Users/kisaczka/Desktop/code/moshers2`). `ko
 
 ## HARD CONSTRAINTS (read first)
 - **DO NOT modify `src/`** (the koh implementation) or any existing behavior. You may only **ADD**:
-  - test infra under **`testing/android/`** (mirror the existing `testing/tier2/` convention: a `README.md` + a `scripts/` dir),
+  - test infra under **`testing/android/`** (follow the convention: a `README.md` + a `scripts/` dir),
   - tooling config needed to build for Android,
   - an **optional**, opt-in `tests/android_emulator.rs`.
 - **Emulator tests must be OPT-IN:** env-gated behind **`KOH_ANDROID_EMULATOR=1`** (and `#[ignore]` on any Rust test). They must **never** run under default `cargo test`. With the var unset / no device, every entry point must cleanly **SKIP** (exit 0 / return), so host CI is unaffected.
@@ -175,7 +175,7 @@ adb shell "pkill -f $DEV" 2>/dev/null
 > Note: do **not** install the Termux APK — a real app *has* a JNI context and would NOT reproduce the bug. The bare `adb shell` CLI is the correct (and sufficient) reproduction.
 
 ### 5. Wrap it: runner + README (+ optional Rust gate)
-Create this layout (mirrors `testing/tier2/`):
+Create this layout:
 ```
 testing/android/
 ├── README.md                         # why emulator testing; what's tested; setup + run; constraints

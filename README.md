@@ -41,29 +41,31 @@ replay a backlog), responsiveness on lossy links, and no head-of-line blocking.
 
 ## Architecture
 
-A Cargo workspace of small, independently-tested crates:
+A single crate, organized into small, independently-tested modules:
 
 ```
-crates/
-├── wire/            SSP instruction envelope, postcard codec, fragmenter/reassembler
+src/
+├── lib.rs           crate root: module declarations + the architecture overview
+├── main.rs          the `koh` binary: `serve` / `connect` / `id` subcommand dispatch
+├── wire.rs          SSP instruction envelope, postcard codec, fragmenter/reassembler
 ├── ssp/             SyncState trait + generic Transport<Local,Remote> + send scheduler
 │                      + a deterministic lossy/reordering chaos sim harness (testkit)
 ├── terminal/        TerminalScreen state (vt100-backed) + ServerTerminal live emulator
-├── input/           UserInput state: keystrokes + resize as an append-only synced log
-├── predict/         local-echo prediction engine (overlays, epochs, adaptive engage)
-├── transport-iroh/  iroh endpoint setup, persistent identity, datagram channel, RTT
-├── pty/             PTY allocation, shell spawn, SIGWINCH, child reaping
-├── server/          koh-server lib: PTY + emulator + Transport<Screen,Input> + `serve`
-├── client/          koh-client lib: input + Transport<Input,Screen> + predictor + `connect`
-└── cli/             the `koh` binary: `serve` / `connect` / `id` subcommand dispatch
-xtask/               in-process integration + network-chaos drivers
+├── input.rs         UserInput state: keystrokes + resize as an append-only synced log
+├── predict.rs       local-echo prediction engine (overlays, epochs, adaptive engage)
+├── transport_iroh/  iroh endpoint setup, persistent identity, datagram channel, RTT, auth
+├── pty.rs           PTY allocation, shell spawn, SIGWINCH, child reaping
+├── server/          PTY + emulator + Transport<Screen,Input> over iroh + `serve`
+├── client/          input + Transport<Input,Screen> + predictor + termina render + `connect`
+└── sim.rs           in-process integration/chaos driver (used by tests + the chaos example)
+tests/               real-iroh e2e, reattach, auto-reconnect, PTY-binary, ported mosh regressions
+examples/chaos.rs    manual `cargo run --example chaos -- chaos --loss 0.5` driver
 ```
 
 Dependency direction is strict: `wire ← ssp ← {terminal, input}`, with `predict` over
-`{terminal, input}`, `transport-iroh` over `wire`, and `cli` (the `koh` binary) on top of
-`server` + `client`. Only `transport-iroh`, `server`, and `client` touch iroh — the entire
-protocol (`ssp`, `terminal`, `input`, `predict`, `wire`) is transport-agnostic and tested with
-no network at all.
+`{terminal, input}`, `transport_iroh` over `wire`, and `server`/`client` (+ the `main` binary) on
+top. Only `transport_iroh`, `server`, and `client` touch iroh — the entire protocol (`ssp`,
+`terminal`, `input`, `predict`, `wire`) is transport-agnostic and tested with no network at all.
 
 ### The two synchronized states
 
@@ -159,7 +161,7 @@ exposed only at the KDF call (this reduces heap exposure; argv/env remain OS-vis
 
 ```sh
 cargo build --release          # builds the single `koh` binary (target/release/koh)
-cargo test  --workspace        # 114 tests: unit, property, chaos sim, real-iroh e2e, reattach, auto-reconnect, PTY binary, ported mosh regressions
+cargo test                     # 114 tests: unit, property, chaos sim, real-iroh e2e, reattach, auto-reconnect, PTY binary, ported mosh regressions
 ```
 
 Pinned toolchain-adjacent versions live in the root `Cargo.toml`: `iroh =1.0.0` (which brings
@@ -276,31 +278,31 @@ The SSP, diff/apply, and predictor are network- and TTY-free, so they're tested 
 - **Terminal / predictor / PTY / fragmenter** — diff+resize, predict→confirm→clear,
   predict→no-echo→suppress, real-shell streaming, fragment supersede/reassemble.
 - **Whole-stack chaos** (`xtask`) — input + screen + transport + collapse + echo-ack over the
-  simulated link: `cargo run -p xtask -- chaos --loss 0.5`.
+  simulated link: `cargo run --example chaos -- chaos --loss 0.5` (or `cargo test --test integration`).
 
 ### Tier 1 — two endpoints + a PTY on localhost, over *real* iroh (`cargo test`)
 
 The big unlock, with **zero infrastructure**: a second host is just a second endpoint, and a
 TTY is just an allocated PTY. Both are real and hermetic.
 
-- **`transport-iroh`** — two real iroh endpoints connect over loopback (relay-less,
+- **`transport_iroh` module tests** — two real iroh endpoints connect over loopback (relay-less,
   `bind_endpoint_local`) and exchange datagrams: upgrades the iroh layer from "compiles against
   the 1.0 API" to "actually established a connection."
-- **`crates/client/tests/e2e_loopback.rs`** — the *entire* loop in one process: scripted
+- **`tests/e2e_loopback.rs`** — the *entire* loop in one process: scripted
   keystroke → client → iroh datagram → server → PTY-hosted `sh` → vt100 → iroh → client render
   (through a `ClientTerminal` mock backend). Asserts the typed command's output round-trips.
-- **`crates/cli/tests/e2e_pty_binary.rs`** — the **real `koh` binary** (`koh connect …`) attached
+- **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** (`koh connect …`) attached
   to an allocated PTY (so `isatty()` is true and raw-mode + termina run for real), driven by
   scripted keystrokes with rendered frames read back from the master, connected with `--direct`
   to an in-process loopback server.
-- **`crates/server/tests/reattach.rs`** — the detachable-session acceptance test: type a marker,
+- **`tests/reattach.rs`** — the detachable-session acceptance test: type a marker,
   disconnect, reconnect from the *same* client endpoint, assert the session re-syncs to the
   persisted screen (the shell kept running while detached).
-- **`crates/client/tests/e2e_reconnect.rs`** — the **auto-reconnect** regression test: mid-session,
+- **`tests/e2e_reconnect.rs`** — the **auto-reconnect** regression test: mid-session,
   the server force-closes the connection (what a screen-off idle-timeout does) while keeping the
   shell; asserts the client transparently re-dials, reattaches to the *same* shell (the first
   command's output is still on screen), and keeps working — instead of exiting to the prompt.
-- **`crates/server/tests/exit_status.rs`** — a loopback session where `sh` runs `exit 42`;
+- **`tests/exit_status.rs`** — a loopback session where `sh` runs `exit 42`;
   asserts the client observes exit code `42` on the shutdown frame (so the binary exits with it).
 
 The seam that makes this cheap: terminal I/O is abstracted behind `ClientTerminal`, so the same
@@ -367,8 +369,8 @@ This core is the foundation for a 100%-Rust mobile (Android) terminal — likely
 that vibe-codes over koh to your main PC. With mosh's core behaviors now in place (detachable
 sessions, terminal-reply synthesis, exit-status propagation, the predictor), the natural next
 steps are OSC-52 clipboard forwarding, two-device real-network/perf acceptance over the public
-relay (Tier 3), and a Bevy front-end reusing `terminal` + `input` + `predict` +
-`transport-iroh` directly.
+relay (Tier 3), and a Bevy front-end reusing the `terminal` + `input` + `predict` +
+`transport_iroh` modules directly.
 
 ## License
 

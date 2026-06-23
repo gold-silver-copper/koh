@@ -163,7 +163,8 @@ pub struct TerminaTerminal {
 
 impl TerminaTerminal {
     /// Acquire the terminal, enter raw mode + the alternate screen, and hide the cursor.
-    pub fn enter() -> std::io::Result<Self> {
+    /// `clipboard_enabled` gates honoring remote OSC-52 clipboard writes (default off; L-1).
+    pub fn enter(clipboard_enabled: bool) -> std::io::Result<Self> {
         let mut term = PlatformTerminal::new()?;
         term.enter_raw_mode()?;
         write!(
@@ -179,7 +180,8 @@ impl TerminaTerminal {
         term.flush()?;
         Ok(Self {
             term,
-            oob: render::OutOfBand::with_title_prefix(koh_title_prefix()),
+            oob: render::OutOfBand::with_title_prefix(koh_title_prefix())
+                .with_clipboard(clipboard_enabled),
         })
     }
 

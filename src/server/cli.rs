@@ -85,6 +85,18 @@ pub struct ServeArgs {
     /// command-line argument is visible in the process table, an env var is not.
     #[arg(long)]
     passphrase: Option<String>,
+
+    /// Maximum number of connections being handled concurrently (each holds a permit for its whole
+    /// lifetime; excess incoming connections are refused cheaply, before the crypto handshake). This
+    /// bounds the work a flood of dials — especially under `--allow-any` — can pin on the server.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
+    max_connections: u32,
+
+    /// Maximum number of distinct live sessions (one per authorized peer). A new peer is refused
+    /// once this many sessions exist; reconnecting to an existing session is always allowed. Bounds
+    /// the number of real shells a flood of distinct keys can spawn under `--allow-any`.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
+    max_sessions: u32,
 }
 
 /// Render `data` as a QR code for a **dark-background** terminal, or `None` if it is too large to
@@ -249,6 +261,11 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // cancels the same token, so a server nobody is connected to can self-exit.
     let shutdown = CancellationToken::new();
     spawn_signal_drain(shutdown.clone())?;
+    // Bound concurrent connection-handling tasks: each accepted connection holds a permit for its
+    // whole lifetime, so a flood can't spawn unbounded tasks (L-3). Excess dials are refused cheaply
+    // (before the crypto handshake) via `Incoming::refuse`.
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(args.max_connections as usize));
+    let max_sessions = args.max_sessions as usize;
     let active = Arc::new(AtomicUsize::new(0));
     if args.network_timeout_secs > 0 {
         spawn_idle_watchdog(
@@ -267,6 +284,14 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 None => break, // endpoint closed
             },
         };
+        // Connection cap (L-3): grab a permit before doing any work for this connection. If the
+        // server is at capacity, refuse the incoming dial cheaply — `refuse()` rejects it without
+        // the (expensive) crypto handshake, so a flood can't pin unbounded resources.
+        let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+            warn!("refusing connection: at max-connections capacity");
+            incoming.refuse();
+            continue;
+        };
         let allow = allow.clone();
         let shell = shell.clone();
         let passphrase = passphrase.clone();
@@ -276,6 +301,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         // path so the idle watchdog sees an accurate live-connection count.
         let active_guard = ConnGuard::new(active.clone());
         tokio::spawn(async move {
+            // Held for the whole task: releases the connection-cap permit on every exit path.
+            let _permit = permit;
             let _active_guard = active_guard;
             let conn = match incoming.await {
                 Ok(c) => c,
@@ -333,15 +360,30 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             }
             info!(peer = %format_endpoint_id(&peer), "client authorized; attaching session");
             // Attach to (or create) this client's detachable session, then serve the connection.
-            let (handle, attach_kind) =
-                match session::attach(&store, peer, shell.as_deref(), scrollback).await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        error!(error = %e, "failed to start session");
-                        conn.close(1u32.into(), b"session error");
-                        return;
-                    }
-                };
+            let (handle, attach_kind) = match session::attach(
+                &store,
+                peer,
+                shell.as_deref(),
+                scrollback,
+                max_sessions,
+            )
+            .await
+            {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    // At the live-session cap (L-3): refuse a brand-new peer rather than spawn
+                    // an unbounded shell. A reconnecting peer would have matched an existing
+                    // session above, so this only ever rejects a genuinely new one.
+                    warn!(peer = %format_endpoint_id(&peer), "refusing session: at max-sessions capacity");
+                    conn.close(1u32.into(), b"server at session capacity");
+                    return;
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to start session");
+                    conn.close(1u32.into(), b"session error");
+                    return;
+                }
+            };
             match attach_kind {
                 session::AttachKind::Created => {
                     info!(peer = %format_endpoint_id(&peer), "started a new session");

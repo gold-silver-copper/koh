@@ -125,12 +125,17 @@ pub enum AttachKind {
 
 /// Get-or-create the detachable session for `peer`. On reattach, clears the detach timer so the
 /// reaper won't collect it while the client is back, and reports how long it had been detached.
+///
+/// `max_sessions` caps the number of distinct live sessions (L-3): reattaching to `peer`'s existing
+/// session is always allowed, but creating a NEW session when the store already holds `max_sessions`
+/// is refused (returns `Ok(None)`), so a flood of distinct keys can't spawn unbounded shells.
 pub async fn attach(
     store: &SessionStore,
     peer: EndpointId,
     shell: Option<&str>,
     scrollback: usize,
-) -> anyhow::Result<(SharedSession, AttachKind)> {
+    max_sessions: usize,
+) -> anyhow::Result<Option<(SharedSession, AttachKind)>> {
     let mut map = store.lock().await;
     if let Some(h) = map.get(&peer) {
         let mut s = h.session.lock().await;
@@ -138,12 +143,16 @@ pub async fn attach(
         s.last_detach = None;
         s.attached = s.attached.saturating_add(1);
         drop(s);
-        return Ok((h.clone(), AttachKind::Reattached { detached_for }));
+        return Ok(Some((h.clone(), AttachKind::Reattached { detached_for })));
+    }
+    // New peer: enforce the live-session cap before spawning a shell.
+    if map.len() >= max_sessions {
+        return Ok(None);
     }
     let handle = spawn_session(shell, scrollback)?;
     handle.session.lock().await.attached = 1;
     map.insert(peer, handle.clone());
-    Ok((handle, AttachKind::Created))
+    Ok(Some((handle, AttachKind::Created)))
 }
 
 /// Detach one client from `peer`'s session (the shell keeps running for reattach).
@@ -250,13 +259,17 @@ mod tests {
         let store = SessionStore::default();
         let peer = generate_secret_key().public();
 
-        let (h1, kind) = attach(&store, peer, Some("sh"), 0)
+        let (h1, kind) = attach(&store, peer, Some("sh"), 0, 64)
             .await
-            .expect("first attach");
+            .expect("first attach")
+            .expect("not at capacity");
         assert_eq!(kind, AttachKind::Created, "first attach creates a session");
 
         detach(&store, peer).await;
-        let (h2, kind) = attach(&store, peer, Some("sh"), 0).await.expect("reattach");
+        let (h2, kind) = attach(&store, peer, Some("sh"), 0, 64)
+            .await
+            .expect("reattach")
+            .expect("not at capacity");
         assert!(
             matches!(
                 kind,
@@ -283,8 +296,14 @@ mod tests {
         let store = SessionStore::default();
         let peer = generate_secret_key().public();
 
-        let (h, _) = attach(&store, peer, Some("sh"), 0).await.expect("attach A");
-        let (_, _) = attach(&store, peer, Some("sh"), 0).await.expect("attach B");
+        let (h, _) = attach(&store, peer, Some("sh"), 0, 64)
+            .await
+            .expect("attach A")
+            .expect("not at capacity");
+        let (_, _) = attach(&store, peer, Some("sh"), 0, 64)
+            .await
+            .expect("attach B")
+            .expect("not at capacity");
         assert_eq!(
             h.session.lock().await.attached,
             2,
@@ -312,6 +331,50 @@ mod tests {
         }
 
         let _ = h.session.lock().await.pty.kill();
+    }
+
+    #[tokio::test]
+    async fn attach_enforces_session_cap_but_allows_reattach() {
+        // L-3: with a cap of 2, a third DISTINCT peer is refused (Ok(None)) — a flood of keys can't
+        // spawn unbounded shells — but an already-present peer can always reattach.
+        let store = SessionStore::default();
+        let p1 = generate_secret_key().public();
+        let p2 = generate_secret_key().public();
+        let p3 = generate_secret_key().public();
+
+        let (h1, _) = attach(&store, p1, Some("sh"), 0, 2)
+            .await
+            .expect("attach p1")
+            .expect("under cap");
+        let (h2, _) = attach(&store, p2, Some("sh"), 0, 2)
+            .await
+            .expect("attach p2")
+            .expect("under cap");
+
+        // Store is now full (2/2): a brand-new peer is refused.
+        let rejected = attach(&store, p3, Some("sh"), 0, 2)
+            .await
+            .expect("attach p3 ok-result");
+        assert!(
+            rejected.is_none(),
+            "a new peer beyond the cap must be refused"
+        );
+
+        // But an existing peer reattaches fine even at capacity.
+        detach(&store, p1).await;
+        let reattach = attach(&store, p1, Some("sh"), 0, 2)
+            .await
+            .expect("reattach p1")
+            .expect("reattach is allowed at capacity");
+        assert!(
+            matches!(reattach.1, AttachKind::Reattached { .. }),
+            "an existing peer reattaches at capacity, got {:?}",
+            reattach.1
+        );
+
+        for h in [h1, h2] {
+            let _ = h.session.lock().await.pty.kill();
+        }
     }
 
     #[tokio::test]

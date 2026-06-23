@@ -3,18 +3,9 @@
 
 use crate::ssp::NEVER;
 
-use crate::terminal::{TerminalScreen, ECHO_TIMEOUT_MS};
-
-/// Captures window title / icon / bell from `vt100`'s callback stream (none are stored on
-/// `Screen` itself), and synthesizes the host-bound replies to terminal queries (DSR / device
-/// attributes / DECRQM) that `vt100` does not answer on its own.
-/// Upper bound on a forwarded clipboard payload (mosh's `MAXIMUM_CLIPBOARD_SIZE`): a larger
-/// OSC-52 set is dropped rather than synced, so a remote app can't make us ship megabytes.
-const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
-
-/// Cap on a synced window title / icon name, in characters (mosh truncates OSC 0/1/2 at parse).
-/// No real app sends a multi-KiB title, so this just bounds a hostile/runaway one.
-const MAX_TITLE_LEN: usize = 256;
+use crate::terminal::{
+    clamp_dims, TerminalScreen, ECHO_TIMEOUT_MS, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
+};
 
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
 fn title_from(bytes: &[u8]) -> String {
@@ -24,6 +15,9 @@ fn title_from(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Captures window title / icon / bell from `vt100`'s callback stream (none are stored on
+/// `Screen` itself), and synthesizes the host-bound replies to terminal queries (DSR / device
+/// attributes / DECRQM) that `vt100` does not answer on its own.
 #[derive(Default)]
 struct Callbacks {
     title: String,
@@ -159,8 +153,12 @@ impl ServerTerminal {
         std::mem::take(&mut self.parser.callbacks_mut().host_replies)
     }
 
-    /// Resize the emulated screen (after applying a client resize to the PTY).
+    /// Resize the emulated screen (after applying a client resize to the PTY). The dimensions are
+    /// peer-controlled, so they are clamped to `[MIN_DIM, MAX_DIM]` here — vt100 allocates the grid
+    /// eagerly, so an unbounded resize OOM-aborts the (cross-tenant) server and a zero dimension
+    /// panics it (H-1 / M-2). Defense in depth: the call site clamps too, this is the chokepoint.
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        let (rows, cols) = clamp_dims(rows, cols);
         self.parser.screen_mut().set_size(rows, cols);
     }
 
@@ -337,6 +335,35 @@ mod tests {
             "snapshot carries the OSC-52 clipboard"
         );
         assert_eq!(snap.bell_count(), 1, "snapshot carries the bell count");
+    }
+
+    #[test]
+    fn server_resize_clamps_oom_and_zero() {
+        use crate::terminal::{MAX_DIM, MIN_DIM};
+        // The server emulator must clamp a peer-controlled resize before vt100 allocates the grid:
+        // a giant resize would OOM-abort the (cross-tenant) server, a zero dimension would panic it.
+        let mut t = ServerTerminal::new(24, 80, 0);
+        t.resize(65000, 65000); // must not OOM
+        assert_eq!(
+            t.size(),
+            (MAX_DIM, MAX_DIM),
+            "giant resize clamped to MAX_DIM"
+        );
+        t.resize(0, 0); // must not panic
+        assert_eq!(
+            t.size(),
+            (MIN_DIM, MIN_DIM),
+            "zero resize clamped to MIN_DIM"
+        );
+        // Critically: feeding wrappy/wide shell output into the clamped grid must NOT panic vt100
+        // (a 1×1 grid underflows its wrap math — MIN_DIM=2 is the smallest size it tolerates). This
+        // is the in-process guard for the M-2 regression the emulator surfaced.
+        t.process("AAAA日本🦀\r\nBBBB\r\n".repeat(8).as_bytes());
+        let _ = t.snapshot();
+        // A normal resize is untouched, and a snapshot after a clamped resize is still coherent.
+        t.resize(40, 120);
+        assert_eq!(t.size(), (40, 120));
+        let _ = t.snapshot();
     }
 
     #[test]

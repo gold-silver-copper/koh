@@ -34,10 +34,70 @@ pub const DEFAULT_COLS: u16 = 80;
 /// Server-side debounce before a received input frame is considered "echoed" (mosh `ECHO_TIMEOUT`).
 pub const ECHO_TIMEOUT_MS: u64 = 50;
 
+/// Bounds on a peer-controlled terminal geometry.
+///
+/// `vt100::Parser` allocates `rows × cols` cells **eagerly**, so an unclamped resize from a hostile
+/// peer is an out-of-memory bomb — `(65000, 65000)` is ≈135 GB. And vt100 **panics on a degenerate
+/// grid**: whenever *either* dimension is below 2 its wrap/scroll math underflows (`Option::unwrap`
+/// on a `None` row in `grid::col_wrap`), so a `(0, 0)` — or even `(1, 80)` — resize crashes the
+/// session. Hence `MIN_DIM = 2`, the smallest geometry vt100 handles safely (verified empirically
+/// against vt100 0.16). Every peer-influenced `(rows, cols)` MUST pass through [`clamp_dims`] before
+/// it reaches vt100, on both the server (a client's `Resize`) and the client (a server's
+/// `ScreenDiff.resize`). `MAX_DIM` is generous versus any real terminal (1000×1000 already dwarfs
+/// any display).
+pub const MIN_DIM: u16 = 2;
+pub const MAX_DIM: u16 = 1000;
+
+/// Upper bound on a synced window title / icon name, in characters.
+///
+/// mosh truncates OSC 0/1/2 at parse; no real app sends a multi-KiB title, so this just bounds a
+/// hostile/runaway one. Enforced on the trusted server emulator *and* re-applied on the client,
+/// which must never trust the wire.
+pub const MAX_TITLE_LEN: usize = 256;
+
+/// Upper bound on a forwarded clipboard payload (mosh's `MAXIMUM_CLIPBOARD_SIZE`).
+///
+/// A larger OSC-52 set is dropped/truncated rather than synced, so a remote app can't make either
+/// end ship megabytes. Enforced server-side at capture *and* client-side at apply.
+pub const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
+
+/// Clamp a peer-supplied `(rows, cols)` into `[MIN_DIM, MAX_DIM]`.
+///
+/// The single chokepoint both the server and the client funnel a resize through before constructing
+/// a `vt100` grid, so the two paths can never disagree. Closes the resize OOM (H-1) and the
+/// zero-dimension panic (M-2).
+#[must_use]
+pub fn clamp_dims(rows: u16, cols: u16) -> (u16, u16) {
+    (rows.clamp(MIN_DIM, MAX_DIM), cols.clamp(MIN_DIM, MAX_DIM))
+}
+
 /// Build a blank `vt100::Screen` of the given size (the only way to get an owned `Screen`,
 /// since `Screen::new` is `pub(crate)`).
 fn blank_screen(rows: u16, cols: u16) -> vt100::Screen {
     vt100::Parser::new(rows, cols, 0).screen().clone()
+}
+
+/// Truncate `s` to at most `max` characters (not bytes), preserving whole grapheme scalars.
+fn capped_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+/// Truncate `s` to at most `max` bytes, never splitting a multi-byte UTF-8 scalar (so the result is
+/// always valid UTF-8). Used for the clipboard cap, which is a byte budget.
+fn capped_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    // Walk back to the nearest char boundary at or below `max`.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or("").to_string()
 }
 
 /// The synchronized screen state.
@@ -225,7 +285,11 @@ impl SyncState for TerminalScreen {
     fn apply(&mut self, diff: &Self::Diff) {
         if let Some((rows, cols)) = diff.resize {
             // Resize: vt100 doesn't reflow, so `vt` is a self-contained repaint at the new size.
-            // Rebuild the parser at the new geometry (rare path) and replay the repaint.
+            // Rebuild the parser at the new geometry (rare path) and replay the repaint. CLAMP the
+            // peer-supplied dimensions first — the server is trusted to clamp before it ships a
+            // resize, but the client must never construct an unbounded/zero grid on the wire's say-so
+            // (defense in depth: closes the client-side resize OOM / zero-dim panic, H-1 / M-2).
+            let (rows, cols) = clamp_dims(rows, cols);
             let mut p = Box::new(vt100::Parser::new(rows, cols, 0));
             p.process(&diff.vt);
             self.screen = p.screen().clone();
@@ -250,14 +314,18 @@ impl SyncState for TerminalScreen {
         // Monotonic: never regress on a reordered/older diff (the SSP guarantees no state
         // regression, but `max` is the defensive, obviously-correct choice).
         self.bell_count = self.bell_count.max(diff.bell_count);
+        // Title / icon / clipboard arrive from the wire. The server emulator caps them, but the
+        // client must NOT trust that — a malicious server (or one speaking a future/looser protocol)
+        // could ship an oversized payload to bloat the client or stuff its terminal. Re-apply the
+        // same caps here before storing/emitting (L-2).
         if let Some(title) = &diff.title {
-            self.title.clone_from(title);
+            self.title = capped_chars(title, MAX_TITLE_LEN);
         }
         if let Some(icon) = &diff.icon {
-            self.icon.clone_from(icon);
+            self.icon = capped_chars(icon, MAX_TITLE_LEN);
         }
         if let Some(clipboard) = &diff.clipboard {
-            self.clipboard.clone_from(clipboard);
+            self.clipboard = capped_bytes(clipboard, MAXIMUM_CLIPBOARD_SIZE);
         }
         if diff.exit_code.is_some() {
             self.exit_code = diff.exit_code;
@@ -333,6 +401,112 @@ mod tests {
         c.apply(&diff);
         assert_eq!(c, b);
         assert_eq!(c.size(), (40, 120));
+    }
+
+    #[test]
+    fn clamp_dims_bounds_both_extremes() {
+        assert_eq!(
+            clamp_dims(65000, 65000),
+            (MAX_DIM, MAX_DIM),
+            "huge -> MAX_DIM"
+        );
+        assert_eq!(clamp_dims(0, 0), (MIN_DIM, MIN_DIM), "zero -> MIN_DIM");
+        assert_eq!(clamp_dims(24, 80), (24, 80), "in-range passes through");
+        assert_eq!(
+            clamp_dims(0, 5000),
+            (MIN_DIM, MAX_DIM),
+            "mixed clamps each axis"
+        );
+    }
+
+    #[test]
+    fn client_apply_clamps_oom_resize() {
+        // A malicious server ships a (65000, 65000) resize. The client must NOT build a 135 GB
+        // vt100 grid: apply clamps to MAX_DIM and reconstructs a bounded screen without OOM/panic.
+        let mut c = TerminalScreen::default();
+        let diff = ScreenDiff {
+            resize: Some((65000, 65000)),
+            echo_ack: 0,
+            title: None,
+            icon: None,
+            clipboard: None,
+            bell_count: 0,
+            exit_code: None,
+            vt: b"hello".to_vec(),
+        };
+        c.apply(&diff); // must not OOM/panic
+        assert_eq!(c.size(), (MAX_DIM, MAX_DIM), "client clamps a giant resize");
+    }
+
+    #[test]
+    fn client_apply_clamps_zero_resize() {
+        // A (0, 0) resize would crash vt100 (its wrap/scroll math underflows on a sub-2 grid). The
+        // client clamps to MIN_DIM and then safely replays a repaint of wrappy/wide content — which
+        // would panic at 1×1 — proving MIN_DIM is large enough for vt100, not merely non-zero.
+        let mut c = TerminalScreen::default();
+        let diff = ScreenDiff {
+            resize: Some((0, 0)),
+            echo_ack: 0,
+            title: None,
+            icon: None,
+            clipboard: None,
+            bell_count: 0,
+            exit_code: None,
+            vt: "AAAA日本🦀\r\nBBBB\r\n".repeat(8).into_bytes(),
+        };
+        c.apply(&diff); // must not panic
+        assert_eq!(
+            c.size(),
+            (MIN_DIM, MIN_DIM),
+            "client clamps a zero-dimension resize"
+        );
+    }
+
+    #[test]
+    fn client_apply_caps_oversized_title_and_clipboard() {
+        // A malicious server ships an oversized title + clipboard. The client re-applies the caps
+        // (it must not trust the wire even though the honest server emulator already caps them).
+        let mut c = TerminalScreen::default();
+        let big_title = "T".repeat(MAX_TITLE_LEN + 1000);
+        let big_clip = "C".repeat(MAXIMUM_CLIPBOARD_SIZE + 1000);
+        let diff = ScreenDiff {
+            resize: None,
+            echo_ack: 0,
+            title: Some(big_title),
+            icon: Some("I".repeat(MAX_TITLE_LEN + 5)),
+            clipboard: Some(big_clip),
+            bell_count: 0,
+            exit_code: None,
+            vt: Vec::new(),
+        };
+        c.apply(&diff);
+        assert_eq!(
+            c.title().chars().count(),
+            MAX_TITLE_LEN,
+            "title capped client-side"
+        );
+        assert_eq!(
+            c.icon().chars().count(),
+            MAX_TITLE_LEN,
+            "icon capped client-side"
+        );
+        assert!(
+            c.clipboard().len() <= MAXIMUM_CLIPBOARD_SIZE,
+            "clipboard capped client-side"
+        );
+    }
+
+    #[test]
+    fn capped_bytes_never_splits_utf8() {
+        // A multi-byte scalar straddling the byte budget must be dropped whole, leaving valid UTF-8.
+        let s = "a".repeat(MAXIMUM_CLIPBOARD_SIZE - 1) + "é"; // 'é' is 2 bytes, crosses the cap
+        let out = capped_bytes(&s, MAXIMUM_CLIPBOARD_SIZE);
+        assert!(out.len() <= MAXIMUM_CLIPBOARD_SIZE);
+        assert_eq!(
+            out.len(),
+            MAXIMUM_CLIPBOARD_SIZE - 1,
+            "the straddling scalar is dropped whole"
+        );
     }
 
     #[test]

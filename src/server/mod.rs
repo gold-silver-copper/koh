@@ -146,8 +146,15 @@ pub async fn run_attached(
                                             }
                                         }
                                         WireEvent::Resize { rows, cols } => {
-                                            let _ = s.pty.resize(*rows, *cols);
-                                            s.emu.resize(*rows, *cols);
+                                            // Clamp the peer-supplied geometry before it reaches the
+                                            // PTY ioctl or the vt100 grid: an unbounded resize is an
+                                            // OOM bomb and a zero dimension panics vt100 (H-1 / M-2).
+                                            // `ServerTerminal::resize` clamps too; we clamp here so
+                                            // the PTY gets the same bounded values.
+                                            let (rows, cols) =
+                                                crate::terminal::clamp_dims(*rows, *cols);
+                                            let _ = s.pty.resize(rows, cols);
+                                            s.emu.resize(rows, cols);
                                         }
                                     }
                                 }

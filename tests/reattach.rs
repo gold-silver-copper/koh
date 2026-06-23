@@ -76,7 +76,8 @@ async fn session_survives_disconnect_and_reattaches() {
             tokio::spawn(async move {
                 let Ok(conn) = incoming.await else { return };
                 let peer = conn.remote_id();
-                let Ok((handle, _)) = session::attach(&store, peer, Some("sh"), 0).await else {
+                let Ok(Some((handle, _))) = session::attach(&store, peer, Some("sh"), 0, 64).await
+                else {
                     return;
                 };
                 match run_attached(conn, handle).await {

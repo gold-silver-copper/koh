@@ -74,6 +74,10 @@ pub enum SetupError {
 /// stable [`EndpointId`], mirroring iroh-ssh's `--persist`.
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
     if path.exists() {
+        // Warn (once) if an existing key is group/other-readable: it is the node's whole identity,
+        // so a world-readable key is a local-impersonation risk. We don't silently chmod a file the
+        // user may manage themselves — just flag it. (No-op off-unix, where the mode is meaningless.)
+        warn_if_key_world_readable(path);
         let text = std::fs::read_to_string(path)?;
         let bytes = data_encoding::HEXLOWER_PERMISSIVE
             .decode(text.trim().as_bytes())
@@ -83,11 +87,87 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
     } else {
         let sk = generate_secret_key();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_dir_private(parent)?;
         }
-        std::fs::write(path, data_encoding::HEXLOWER.encode(&sk.to_bytes()))?;
+        // The key is the node identity (M-1): write it owner-only (0600) and never leave a
+        // world-readable window. On unix, create the file with `create_new` + mode 0600 (so it is
+        // born private — no chmod race) and rename it into place atomically; elsewhere, fall back to
+        // a plain write (best effort — the platform's own ACLs apply).
+        write_secret_file(
+            path,
+            data_encoding::HEXLOWER.encode(&sk.to_bytes()).as_bytes(),
+        )?;
         Ok(sk)
     }
+}
+
+/// Create `dir` (recursively) restricted to the owner (mode 0700 on unix) so a freshly-created
+/// state dir doesn't expose its contents. Off-unix this is a plain recursive create.
+fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // `recursive(true)` is idempotent if the dir already exists; the mode applies to the
+        // components it creates.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Write `contents` to `path` as an owner-only (0600) file, atomically and without ever exposing a
+/// world-readable window. On unix: create a sibling temp file with `create_new` + mode 0600, write,
+/// fsync, then rename over `path`. Off-unix: a plain write (the platform's default ACLs apply).
+fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        // Clean up any stale temp from a previous crashed run so `create_new` can succeed.
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+        drop(f);
+        // Atomic publish; if the rename fails, don't leave the temp behind.
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
+/// On unix, warn if `path`'s mode is group/other-readable (mode & 0o077 != 0). No-op elsewhere.
+fn warn_if_key_world_readable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode();
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{:o}", mode & 0o777),
+                    "secret key file is group/other-readable; tighten it with `chmod 600`"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// The default persistent key path when `--key-file` isn't given, for `role` (`"client"`/`"server"`).
@@ -474,6 +554,34 @@ mod tests {
         let id = sk1.public();
         let s = format_endpoint_id(&id);
         assert_eq!(parse_endpoint_id(&s).unwrap(), id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_key_file_is_owner_only() {
+        // M-1: a freshly-created secret key must be 0600 (no group/other bits) and its parent dir
+        // must not be group/other-writable — the key is the node identity, so a world-readable key
+        // is a local-impersonation risk.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("koh-key-perm-{}", std::process::id()));
+        let path = dir.join("id.key");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let _ = load_or_create_secret_key(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "key file must not be group/other-accessible, got {mode:o}"
+        );
+        let dmode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(
+            dmode & 0o077,
+            0,
+            "state dir must not be group/other-accessible, got {dmode:o}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

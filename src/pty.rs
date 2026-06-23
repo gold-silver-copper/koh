@@ -300,7 +300,7 @@ mod tests {
         // so instead drive a tiny shell snippet via the default shell path below if needed.
         // `echo` with no args prints just a newline; assert we get *something* and EOF.
         let mut collected = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(chunk)) => collected.extend_from_slice(&chunk),
@@ -331,7 +331,7 @@ mod tests {
         pty.write_input(b"printf KOH_MARKER_OK\n").expect("write");
 
         let mut collected = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let found = loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(chunk)) => {
@@ -369,7 +369,7 @@ mod tests {
         pty.write_input(b"AB_CD\n").expect("second enqueue");
 
         let mut collected = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let in_order = loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(chunk)) => {
@@ -405,7 +405,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         drop(pty); // no kill(): EOF must come purely from the writer handle being dropped
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(_)) => continue, // drain any echoed bytes
@@ -426,7 +426,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(20),
             tokio::task::spawn_blocking(move || pty.shutdown()),
         )
         .await

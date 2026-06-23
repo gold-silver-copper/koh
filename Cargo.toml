@@ -1,60 +1,48 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/wire",
-    "crates/ssp",
-    "crates/terminal",
-    "crates/input",
-    "crates/predict",
-    "crates/transport-iroh",
-    "crates/pty",
-    "crates/server",
-    "crates/client",
-    "crates/cli",
-    "xtask",
-]
-
-[workspace.package]
+[package]
+name = "koh"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["koh authors"]
-repository = "https://example.invalid/koh"
-description = "mosh (mobile shell) reimplemented in Rust over iroh p2p QUIC"
+repository = "https://github.com/gold-silver-copper/koh"
+description = "koh — a resilient peer-to-peer remote shell: mosh, rewritten in Rust over iroh"
+readme = "README.md"
+keywords = ["mosh", "shell", "terminal", "iroh", "p2p"]
+categories = ["command-line-utilities", "network-programming"]
+# Keep the published .crate lean: the porting-research notes and docker test infra aren't needed
+# to build or use koh.
+exclude = ["docs/", "testing/"]
 
-[workspace.dependencies]
-# --- internal crates ---
-koh-wire = { path = "crates/wire" }
-koh-ssp = { path = "crates/ssp" }
-koh-terminal = { path = "crates/terminal" }
-koh-input = { path = "crates/input" }
-koh-predict = { path = "crates/predict" }
-koh-transport-iroh = { path = "crates/transport-iroh" }
-koh-pty = { path = "crates/pty" }
-koh-server = { path = "crates/server" }
-koh-client = { path = "crates/client" }
+[[bin]]
+name = "koh"
+path = "src/main.rs"
 
-# --- transport (pinned: iroh API churns; see README) ---
-# iroh 1.0 brings its own QUIC backend (noq, a quinn fork); we never depend on quinn directly.
+[dependencies]
+# transport (pinned: iroh API churns; see README). iroh 1.0 brings its own QUIC backend (noq, a
+# quinn fork); we never depend on quinn directly.
 iroh = "=1.0.0"
-
-# --- terminal / pty / tui ---
+# terminal / pty / tui
 vt100 = "=0.16.2"
 portable-pty = "=0.9.0"
 unicode-width = "0.2"
-
-# --- serialization ---
+termina = "0.3.3"
+# serialization
 postcard = { version = "=1.1.3", features = ["use-std"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 bytes = "1"
-
-# --- async / runtime ---
+# async / runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-n0-future = "0.3"
-futures-lite = "2"
-
-# --- utility ---
+# auth (passphrase second factor)
+blake3 = "1"
+argon2 = "0.5"
+constant_time_eq = "0.5"
+zeroize = "1"
+secrecy = "0.10"
+# render the endpoint id as a terminal QR for `koh serve --qr`; default-features = false drops the
+# heavy image/svg/pic renderers (we only use the built-in unicode half-block renderer).
+qrcode = { version = "=0.14.1", default-features = false }
+# utility
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -64,7 +52,7 @@ rand = "0.8"
 data-encoding = "2"
 directories = "5"
 
-# --- dev/test ---
+[dev-dependencies]
 proptest = "1"
 
 [profile.release]
@@ -72,20 +60,17 @@ opt-level = 3
 lto = "thin"
 
 # ---------------------------------------------------------------------------
-# Workspace lints. Every crate opts in with `[lints] workspace = true`.
-#
-# Goal: the libraries are PANIC-FREE by construction, enforced by clippy. The
+# Lints. Goal: the library is PANIC-FREE by construction, enforced by clippy. The
 # panic-introducing lints below are denied; any genuinely-infallible site (a
 # poisoned-mutex check, a structurally-non-empty container, statically-valid
 # params) is justified with a local `#[expect(clippy::…, reason = "…")]`. Test
-# code keeps `unwrap`/`expect`/`panic`/`indexing` via a `cfg(test)` allow at the
-# top of each crate (a failed assertion in a test SHOULD panic).
+# code keeps `unwrap`/`expect`/`panic`/`indexing` via the keys in `clippy.toml`.
 # ---------------------------------------------------------------------------
-[workspace.lints.rust]
+[lints.rust]
 # A bare `unsafe` block must justify itself; this codebase is 100% safe today.
 unsafe_code = "forbid"
 
-[workspace.lints.clippy]
+[lints.clippy]
 # Lint-group toggles (priority = -1 so individual lints below can override).
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }

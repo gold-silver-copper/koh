@@ -28,23 +28,26 @@ use rmosh_wire::DEFAULT_MAX_DATAGRAM;
 pub mod auth;
 pub mod ratelimit;
 
-/// Keepalive + connection idle-timeout tuned so a brief client suspend doesn't drop the
-/// connection. iroh's defaults already PING every 5s and drop a *path* after 15s, but the
-/// *connection* idle timeout defaults to ~30s; we raise it to 60s. (Longer suspends are
-/// handled by reattaching to a detachable server session, not by holding one connection open.)
+/// Keepalive + connection idle-timeout tuned so a phone screen-off doesn't drop the connection.
+/// iroh's defaults already PING every 5s and drop a *path* after 15s, but the *connection* idle
+/// timeout defaults to ~30s; we raise it to 300s (5 min) so a short suspend (Android freezing the
+/// process, so keepalives stop) is ridden out on the *same* connection with no visible reconnect.
+/// Longer outages are handled above this layer: the client transparently re-dials and reattaches
+/// to the detachable server session (see `rmosh_client::run_client`), so we don't need to hold a
+/// dead connection open indefinitely here.
 #[expect(
     clippy::expect_used,
-    reason = "60s is far below IdleTimeout's varint ceiling; the conversion is statically infallible"
+    reason = "300s is far below IdleTimeout's varint ceiling; the conversion is statically infallible"
 )]
 #[allow(
     clippy::duration_suboptimal_units,
-    reason = "`from_secs(60)` is the intended, readable idle timeout"
+    reason = "`from_secs(300)` is the intended, readable idle timeout"
 )]
 fn rmosh_transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
         .keep_alive_interval(Duration::from_secs(5))
         .max_idle_timeout(Some(
-            IdleTimeout::try_from(Duration::from_secs(60)).expect("60s fits in IdleTimeout"),
+            IdleTimeout::try_from(Duration::from_secs(300)).expect("300s fits in IdleTimeout"),
         ))
         .build()
 }

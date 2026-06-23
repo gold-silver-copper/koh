@@ -28,6 +28,10 @@ use zeroize::Zeroizing;
 const NO_PASS: u8 = 0;
 /// Tag byte: a nonce challenge follows; the client must answer with `BLAKE3(passphrase||nonce)`.
 const PASS_REQUIRED: u8 = 1;
+/// Verdict byte the server sends after validating the challenge response, so the **client** learns
+/// the outcome instead of optimistically reporting success and then being silently dropped.
+const VERDICT_OK: u8 = 1;
+const VERDICT_REJECT: u8 = 0;
 
 /// A fresh 32-byte challenge nonce straight from the OS CSPRNG.
 ///
@@ -176,9 +180,14 @@ pub async fn handshake_server(
             let mut resp = [0u8; 32];
             recv.read_exact(&mut resp).await.map_err(io::Error::other)?;
             let expect = challenge_response(&psk, &nonce);
-            let _ = send.finish();
             // Constant-time compare: no early-exit timing oracle on the response bytes.
-            if !constant_time_eq_32(&resp, &expect) {
+            let ok = constant_time_eq_32(&resp, &expect);
+            // Tell the client the verdict before finishing, so it can report a clear failure instead
+            // of printing "connected." and then being dropped.
+            let verdict = if ok { VERDICT_OK } else { VERDICT_REJECT };
+            send.write_all(&[verdict]).await.map_err(io::Error::other)?;
+            let _ = send.finish();
+            if !ok {
                 return Err(AuthError::ChallengeFailed);
             }
         }
@@ -189,8 +198,9 @@ pub async fn handshake_server(
 /// Client side of the passphrase handshake (run after connect, before wrapping the connection).
 ///
 /// Reads the challenge and, if a passphrase is required, answers with `BLAKE3(K || nonce)` where
-/// `K = Argon2id(passphrase, salt)`. A client with no passphrase derives `K` from the empty
-/// string, so the rejection (if the server requires one) surfaces on the server side.
+/// `K = Argon2id(passphrase, salt)`, then reads the server's 1-byte verdict. A wrong/missing
+/// passphrase therefore surfaces here as [`AuthError::ChallengeFailed`] — the client no longer
+/// reports success and then gets silently dropped.
 pub async fn handshake_client(
     conn: &Connection,
     passphrase: Option<&str>,
@@ -207,6 +217,15 @@ pub async fn handshake_client(
         let resp = challenge_response(&psk, &nonce);
         send.write_all(&resp).await.map_err(io::Error::other)?;
         let _ = send.finish();
+        // Read the server's verdict so a wrong passphrase surfaces here as a typed failure, rather
+        // than the connection silently dropping after we've already reported success.
+        let mut verdict = [0u8; 1];
+        recv.read_exact(&mut verdict)
+            .await
+            .map_err(io::Error::other)?;
+        if verdict[0] != VERDICT_OK {
+            return Err(AuthError::ChallengeFailed);
+        }
     }
     Ok(())
 }

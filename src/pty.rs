@@ -23,6 +23,28 @@ const OUTPUT_CHANNEL_DEPTH: usize = 512;
 /// reading (flow-controlled or hung), which [`Pty::write_input`] surfaces rather than blocking on.
 const WRITE_CHANNEL_DEPTH: usize = 1024;
 
+/// Resolve the session shell when the caller didn't pass `--shell`. Prefers `$SHELL`; otherwise a
+/// platform default. portable-pty's `new_default_prog` falls back to `/bin/sh`, which does **not**
+/// exist on Android (it's `/system/bin/sh`) — so a `koh serve` with no `--shell` would fail to spawn
+/// a session there (and the Bevy Android app, which has no `$SHELL`, would hit the same). The logic
+/// lives in the pure [`resolve_shell`] so it is unit-testable without touching the process env.
+fn default_shell() -> String {
+    resolve_shell(std::env::var_os("SHELL"))
+}
+
+fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
+    if let Some(sh) = shell_env {
+        if !sh.is_empty() {
+            return sh.to_string_lossy().into_owned();
+        }
+    }
+    if cfg!(target_os = "android") {
+        "/system/bin/sh".to_string()
+    } else {
+        "/bin/sh".to_string()
+    }
+}
+
 /// Typed errors from PTY allocation, shell spawn, and resize (mirrors the
 /// `transport-iroh::SetupError` pattern so callers can match on the failure stage).
 ///
@@ -91,7 +113,7 @@ impl Pty {
 
         let mut cmd = match shell {
             Some(prog) => CommandBuilder::new(prog),
-            None => CommandBuilder::new_default_prog(),
+            None => CommandBuilder::new(default_shell()),
         };
         // A real terminal type so curses apps behave; the env is otherwise inherited.
         cmd.env("TERM", term);
@@ -256,6 +278,30 @@ impl Pty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_shell_prefers_env_then_platform_default() {
+        use std::ffi::OsString;
+        // An explicit non-empty `$SHELL` wins.
+        assert_eq!(
+            resolve_shell(Some(OsString::from("/usr/bin/fish"))),
+            "/usr/bin/fish"
+        );
+        // Empty `$SHELL` behaves like unset → a concrete absolute platform default.
+        let empty = resolve_shell(Some(OsString::new()));
+        let unset = resolve_shell(None);
+        assert_eq!(empty, unset, "empty SHELL falls through like unset");
+        assert!(
+            unset.starts_with('/') && !unset.is_empty(),
+            "an absolute fallback path"
+        );
+        // On Android the default must be the shell that actually exists (NOT /bin/sh).
+        if cfg!(target_os = "android") {
+            assert_eq!(unset, "/system/bin/sh");
+        } else {
+            assert_eq!(unset, "/bin/sh");
+        }
+    }
 
     #[test]
     #[allow(

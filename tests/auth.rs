@@ -52,15 +52,27 @@ async fn passphrase_handshake_over_iroh() {
     assert!(sr.is_ok(), "no-passphrase server: {sr:?}");
     assert!(cr.is_ok(), "no-passphrase client: {cr:?}");
 
-    // (b) matching passphrase -> the server accepts.
-    let (sr, _cr) = round(Some("hunter2"), Some("hunter2")).await;
-    assert!(sr.is_ok(), "matching passphrase should pass, got {sr:?}");
+    // (b) matching passphrase -> BOTH sides succeed (the client reads the server's accept verdict).
+    let (sr, cr) = round(Some("hunter2"), Some("hunter2")).await;
+    assert!(
+        sr.is_ok(),
+        "matching passphrase should pass server-side, got {sr:?}"
+    );
+    assert!(
+        cr.is_ok(),
+        "matching passphrase should pass client-side, got {cr:?}"
+    );
 
-    // (c) wrong passphrase -> the server rejects with the typed `ChallengeFailed` (not a
-    // transport error), so the accept loop can tell a real rejection from a dropped connection.
-    let (sr, _cr) = round(Some("hunter2"), Some("nope")).await;
+    // (c) wrong passphrase -> the server rejects with the typed `ChallengeFailed`, AND the client
+    // learns it via the verdict byte (so it reports a clear failure instead of a misleading
+    // "connected." followed by a silent drop).
+    let (sr, cr) = round(Some("hunter2"), Some("nope")).await;
     assert!(
         matches!(sr, Err(AuthError::ChallengeFailed)),
         "wrong passphrase must be rejected server-side as ChallengeFailed, got {sr:?}"
+    );
+    assert!(
+        matches!(cr, Err(AuthError::ChallengeFailed)),
+        "the client must learn the rejection via the verdict, got {cr:?}"
     );
 }

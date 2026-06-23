@@ -75,10 +75,7 @@ pub struct IdArgs {
 }
 
 fn default_key_file() -> PathBuf {
-    directories::ProjectDirs::from("", "", "koh").map_or_else(
-        || PathBuf::from("koh-client.key"),
-        |d| d.config_dir().join("client.key"),
-    )
+    crate::transport_iroh::default_key_path("client")
 }
 
 /// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so
@@ -122,8 +119,12 @@ fn warn_if_locale_not_utf8() {
 /// `koh id` — print this machine's koh id (to add to a server's `--allow` list) and exit.
 pub fn run_id(args: IdArgs) -> anyhow::Result<()> {
     let key_file = args.key_file.unwrap_or_else(default_key_file);
-    let secret = load_or_create_secret_key(&key_file)
-        .with_context(|| format!("loading client key from {}", key_file.display()))?;
+    let secret = load_or_create_secret_key(&key_file).with_context(|| {
+        format!(
+            "loading client key from {} (pass --key-file to use a writable path)",
+            key_file.display()
+        )
+    })?;
     println!("{}", format_endpoint_id(&secret.public()));
     Ok(())
 }
@@ -150,8 +151,12 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     warn_if_locale_not_utf8();
 
     let key_file = args.key_file.clone().unwrap_or_else(default_key_file);
-    let secret = load_or_create_secret_key(&key_file)
-        .with_context(|| format!("loading client key from {}", key_file.display()))?;
+    let secret = load_or_create_secret_key(&key_file).with_context(|| {
+        format!(
+            "loading client key from {} (pass --key-file to use a writable path)",
+            key_file.display()
+        )
+    })?;
     let my_id = secret.public();
     let server_id = parse_endpoint_id(&args.server).context("parsing server endpoint id")?;
 

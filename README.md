@@ -243,6 +243,11 @@ still quits). You stay in your shell instead of being dropped back to the local 
 especially, run `termux-wake-lock` (and set Termux to *Unrestricted* battery) so the OS doesn't
 freeze or kill the process during a long screen-off.
 
+> **`--direct` caveat:** transparent re-dial targets the *same* address it first dialed, so a
+> `--direct <ip:port>` client can't reconnect if the server restarts on a new ephemeral **port**.
+> The relay/discovery path (a bare endpoint id) re-dials by node id and reconnects across address
+> changes — use it (or a fixed port) when you need reconnection to survive a server restart.
+
 ## The predictor
 
 The client guesses what each keystroke does to the screen and shows it immediately (underlined

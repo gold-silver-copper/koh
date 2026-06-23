@@ -90,6 +90,45 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
     }
 }
 
+/// The default persistent key path when `--key-file` isn't given, for `role` (`"client"`/`"server"`).
+///
+/// Prefers the platform config dir via `ProjectDirs` (desktop unchanged). On Android that yields
+/// nothing, so rather than a relative `koh-<role>.key` in the (often read-only / nondeterministic)
+/// CWD, resolve a **stable, writable** base — see [`state_dir_from`]. The parent dir is created when
+/// the key is first written (`load_or_create_secret_key`); a non-writable location surfaces as a
+/// clear error there (the caller names the path and can suggest `--key-file`).
+pub fn default_key_path(role: &str) -> std::path::PathBuf {
+    if let Some(dirs) = directories::ProjectDirs::from("", "", "koh") {
+        return dirs.config_dir().join(format!("{role}.key"));
+    }
+    state_dir_from(
+        std::env::var_os("KOH_STATE_DIR"),
+        std::env::var_os("HOME"),
+        std::env::var_os("TMPDIR"),
+    )
+    .join(format!("{role}.key"))
+}
+
+/// Resolve koh's state dir from explicit env values (pure, so it's unit-testable): `$KOH_STATE_DIR`,
+/// else `$HOME/.config/koh` (Termux sets `$HOME`), else `$TMPDIR/koh`, else `/data/local/tmp/koh`.
+fn state_dir_from(
+    koh_state: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    tmpdir: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    let nonempty = |o: Option<std::ffi::OsString>| o.filter(|v| !v.is_empty());
+    if let Some(d) = nonempty(koh_state) {
+        return std::path::PathBuf::from(d);
+    }
+    if let Some(h) = nonempty(home) {
+        return std::path::PathBuf::from(h).join(".config").join("koh");
+    }
+    if let Some(t) = nonempty(tmpdir) {
+        return std::path::PathBuf::from(t).join("koh");
+    }
+    std::path::PathBuf::from("/data/local/tmp/koh")
+}
+
 /// Generate a fresh random secret key (uses the OS RNG so it's independent of iroh's rand version).
 pub fn generate_secret_key() -> SecretKey {
     use rand::RngCore;
@@ -387,6 +426,35 @@ impl MonoClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_dir_resolves_in_priority_order() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        let s = |x: &str| Some(OsString::from(x));
+        // KOH_STATE_DIR wins outright.
+        assert_eq!(
+            state_dir_from(s("/x"), s("/home/u"), s("/tmp")),
+            PathBuf::from("/x")
+        );
+        // Else $HOME/.config/koh (the Termux case).
+        assert_eq!(
+            state_dir_from(None, s("/home/u"), s("/tmp")),
+            PathBuf::from("/home/u/.config/koh")
+        );
+        // Empty values are skipped, not used.
+        assert_eq!(
+            state_dir_from(Some(OsString::new()), Some(OsString::new()), s("/tmp")),
+            PathBuf::from("/tmp/koh")
+        );
+        // Last resort: a writable Android scratch dir, never a relative CWD path.
+        let last = state_dir_from(None, None, None);
+        assert_eq!(last, PathBuf::from("/data/local/tmp/koh"));
+        assert!(
+            last.is_absolute(),
+            "the default must be absolute, not CWD-relative"
+        );
+    }
 
     #[test]
     fn secret_key_roundtrips_through_disk() {

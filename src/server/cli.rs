@@ -104,10 +104,7 @@ fn connect_qr(data: &str) -> Option<String> {
 }
 
 fn default_key_file() -> PathBuf {
-    directories::ProjectDirs::from("", "", "koh").map_or_else(
-        || PathBuf::from("koh-server.key"),
-        |d| d.config_dir().join("server.key"),
-    )
+    crate::transport_iroh::default_key_path("server")
 }
 
 /// Lock the shared auth-failure limiter. The single justified panic site for it: a poisoned mutex
@@ -145,8 +142,12 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let key_file = args.key_file.clone().unwrap_or_else(default_key_file);
-    let secret = load_or_create_secret_key(&key_file)
-        .with_context(|| format!("loading key from {}", key_file.display()))?;
+    let secret = load_or_create_secret_key(&key_file).with_context(|| {
+        format!(
+            "loading server key from {} (pass --key-file to use a writable path)",
+            key_file.display()
+        )
+    })?;
 
     // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
     let endpoint = if let Some(url) = &args.relay_url {

@@ -1901,6 +1901,155 @@ dependencies = [
 ]
 
 [[package]]
+name = "koh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "koh-client",
+ "koh-server",
+ "koh-transport-iroh",
+ "portable-pty",
+ "tokio",
+]
+
+[[package]]
+name = "koh-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "data-encoding",
+ "directories",
+ "iroh",
+ "koh-input",
+ "koh-predict",
+ "koh-server",
+ "koh-ssp",
+ "koh-terminal",
+ "koh-transport-iroh",
+ "koh-wire",
+ "secrecy",
+ "termina",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vt100",
+]
+
+[[package]]
+name = "koh-input"
+version = "0.1.0"
+dependencies = [
+ "koh-ssp",
+ "proptest",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "koh-predict"
+version = "0.1.0"
+dependencies = [
+ "koh-input",
+ "koh-terminal",
+ "proptest",
+ "tracing",
+ "unicode-width",
+ "vt100",
+]
+
+[[package]]
+name = "koh-pty"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "portable-pty",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "koh-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "data-encoding",
+ "directories",
+ "iroh",
+ "koh-input",
+ "koh-pty",
+ "koh-ssp",
+ "koh-terminal",
+ "koh-transport-iroh",
+ "koh-wire",
+ "qrcode",
+ "rand 0.8.6",
+ "secrecy",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "koh-ssp"
+version = "0.1.0"
+dependencies = [
+ "koh-wire",
+ "postcard",
+ "proptest",
+ "rand 0.8.6",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "koh-terminal"
+version = "0.1.0"
+dependencies = [
+ "koh-ssp",
+ "proptest",
+ "serde",
+ "vt100",
+]
+
+[[package]]
+name = "koh-transport-iroh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "blake3",
+ "bytes",
+ "constant_time_eq 0.5.0",
+ "data-encoding",
+ "iroh",
+ "koh-ssp",
+ "koh-wire",
+ "rand 0.8.6",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "koh-wire"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "proptest",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2987,143 +3136,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rmosh-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "data-encoding",
- "directories",
- "iroh",
- "portable-pty",
- "rmosh-input",
- "rmosh-predict",
- "rmosh-server",
- "rmosh-ssp",
- "rmosh-terminal",
- "rmosh-transport-iroh",
- "rmosh-wire",
- "secrecy",
- "termina",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "vt100",
-]
-
-[[package]]
-name = "rmosh-input"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "rmosh-ssp",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "rmosh-predict"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "rmosh-input",
- "rmosh-terminal",
- "tracing",
- "unicode-width",
- "vt100",
-]
-
-[[package]]
-name = "rmosh-pty"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "portable-pty",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rmosh-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "data-encoding",
- "directories",
- "iroh",
- "qrcode",
- "rand 0.8.6",
- "rmosh-input",
- "rmosh-pty",
- "rmosh-ssp",
- "rmosh-terminal",
- "rmosh-transport-iroh",
- "rmosh-wire",
- "secrecy",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rmosh-ssp"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "proptest",
- "rand 0.8.6",
- "rmosh-wire",
- "serde",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "rmosh-terminal"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "rmosh-ssp",
- "serde",
- "vt100",
-]
-
-[[package]]
-name = "rmosh-transport-iroh"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "blake3",
- "bytes",
- "constant_time_eq 0.5.0",
- "data-encoding",
- "iroh",
- "rand 0.8.6",
- "rmosh-ssp",
- "rmosh-wire",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "rmosh-wire"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "proptest",
- "serde",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -4785,10 +4797,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "rmosh-input",
- "rmosh-predict",
- "rmosh-ssp",
- "rmosh-terminal",
+ "koh-input",
+ "koh-predict",
+ "koh-ssp",
+ "koh-terminal",
 ]
 
 [[package]]

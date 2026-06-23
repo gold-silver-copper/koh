@@ -9,8 +9,8 @@
     reason = "integration test code; a failed unwrap/expect is the test failing"
 )]
 
-use rmosh_transport_iroh::auth::AuthError;
-use rmosh_transport_iroh::{auth, bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
+use koh_transport_iroh::auth::AuthError;
+use koh_transport_iroh::{auth, bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 
 /// Run one handshake round over a fresh loopback connection and return (server, client) results.
 async fn round(

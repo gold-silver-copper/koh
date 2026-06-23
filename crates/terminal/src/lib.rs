@@ -1,4 +1,4 @@
-//! # rmosh-terminal — the `TerminalScreen` SSP state
+//! # koh-terminal — the `TerminalScreen` SSP state
 //!
 //! The server→client half of the synchronized world: the terminal *screen*, not a byte
 //! stream. The server parses the shell's escape-sequence output into a 2-D cell grid; the
@@ -21,7 +21,7 @@
 //! frame N is now on screen"), the optional window `title`, and the `vt` escape-sequence
 //! patch (`state_diff`, or a full `state_formatted` repaint after a resize).
 
-use rmosh_ssp::SyncState;
+use koh_ssp::SyncState;
 use serde::{Deserialize, Serialize};
 
 mod server;
@@ -229,7 +229,7 @@ impl PartialEq for TerminalScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmosh_ssp::testkit::{LinkParams, SimHarness};
+    use koh_ssp::testkit::{LinkParams, SimHarness};
 
     fn screen_from(rows: u16, cols: u16, bytes: &[u8]) -> TerminalScreen {
         TerminalScreen::from_bytes(rows, cols, bytes)
@@ -360,7 +360,7 @@ mod tests {
     // --- Ported mosh terminal-emulation / unicode regression tests, recast as SSP round-trip
     // tests: feed the byte sequence from the corresponding mosh test to the server emulator, ship
     // the snapshot through diff/apply onto a fresh client, and assert the client reconstructs the
-    // screen EXACTLY (moshers2's verification guarantee) plus the semantic outcome mosh checked.
+    // screen EXACTLY (koh's verification guarantee) plus the semantic outcome mosh checked.
     // mosh source: src/tests/emulation-*.test, unicode-*.test. ---
 
     /// Process `bytes`, ship server→client via diff/apply, assert exact reconstruction, and
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn back_and_forward_tab_unsupported_but_roundtrip_clean() {
         // mosh emulation-back-tab: in mosh's hand-written emulator, CBT (CSI Z) / CHT (CSI I)
-        // move between tab stops. The `vt100` crate moshers2 delegates to does NOT implement
+        // move between tab stops. The `vt100` crate koh delegates to does NOT implement
         // them, so they are no-ops (a known, minor divergence from mosh). What we DO guarantee is
         // that the unhandled sequences round-trip identically server↔client and corrupt nothing.
         // If vt100 ever gains CBT/CHT, this test flips and should become the real mosh assertion

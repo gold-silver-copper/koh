@@ -1,7 +1,7 @@
 //! The server-side live terminal emulator: a long-lived `vt100::Parser` fed by the PTY,
 //! plus the echo-ack debounce that tells the client which of its keystrokes are now visible.
 
-use rmosh_ssp::NEVER;
+use koh_ssp::NEVER;
 
 use crate::{TerminalScreen, ECHO_TIMEOUT_MS};
 

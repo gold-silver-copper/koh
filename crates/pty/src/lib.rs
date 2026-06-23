@@ -1,4 +1,4 @@
-//! # rmosh-pty — PTY allocation, shell spawn, resize, reaping
+//! # koh-pty — PTY allocation, shell spawn, resize, reaping
 //!
 //! The server side's plumbing to the real shell. Allocates a pseudo-terminal, spawns the
 //! user's login shell under it, pumps the child's output to an async channel from a dedicated
@@ -115,7 +115,7 @@ impl Pty {
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_DEPTH);
         let reader_handle = std::thread::Builder::new()
-            .name("rmosh-pty-reader".into())
+            .name("koh-pty-reader".into())
             .spawn(move || {
                 let mut buf = [0u8; READ_CHUNK];
                 loop {
@@ -144,7 +144,7 @@ impl Pty {
         // child). The thread exits as soon as the last sender (held in `Pty`) drops.
         let (writer_tx, writer_rx) = sync_channel::<Vec<u8>>(WRITE_CHANNEL_DEPTH);
         let writer_handle = std::thread::Builder::new()
-            .name("rmosh-pty-writer".into())
+            .name("koh-pty-writer".into())
             .spawn(move || {
                 while let Ok(chunk) = writer_rx.recv() {
                     if writer
@@ -328,7 +328,7 @@ mod tests {
         let (mut pty, mut rx) = Pty::spawn(24, 80, None, "xterm-256color").expect("spawn shell");
         // Give the shell a moment to start, then type a command that prints a marker.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        pty.write_input(b"printf RMOSH_MARKER_OK\n").expect("write");
+        pty.write_input(b"printf KOH_MARKER_OK\n").expect("write");
 
         let mut collected = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -336,7 +336,7 @@ mod tests {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(chunk)) => {
                     collected.extend_from_slice(&chunk);
-                    if String::from_utf8_lossy(&collected).contains("RMOSH_MARKER_OK") {
+                    if String::from_utf8_lossy(&collected).contains("KOH_MARKER_OK") {
                         break true;
                     }
                 }

@@ -3,7 +3,7 @@ name = "xtask"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "rmosh dev tasks: network-chaos harness, integration drivers"
+description = "koh dev tasks: network-chaos harness, integration drivers"
 publish = false
 
 [[bin]]
@@ -11,10 +11,10 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-rmosh-ssp.workspace = true
-rmosh-terminal.workspace = true
-rmosh-input.workspace = true
-rmosh-predict.workspace = true
+koh-ssp.workspace = true
+koh-terminal.workspace = true
+koh-input.workspace = true
+koh-predict.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 

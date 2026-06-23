@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use iroh::EndpointId;
-use rmosh_terminal::{ServerTerminal, DEFAULT_COLS, DEFAULT_ROWS};
-use rmosh_transport_iroh::ratelimit::FailureLimiter;
-use rmosh_transport_iroh::MonoClock;
+use koh_terminal::{ServerTerminal, DEFAULT_COLS, DEFAULT_ROWS};
+use koh_transport_iroh::ratelimit::FailureLimiter;
+use koh_transport_iroh::MonoClock;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
@@ -36,7 +36,7 @@ pub type AuthLimiter = Arc<StdMutex<FailureLimiter<EndpointId>>>;
 /// A long-lived shell session that survives client disconnects.
 pub struct Session {
     pub emu: ServerTerminal,
-    pub pty: rmosh_pty::Pty,
+    pub pty: koh_pty::Pty,
     /// False once the shell process has exited (the drain task hit EOF).
     pub child_alive: bool,
     /// When the last client detached (`None` while attached); drives TTL reaping.
@@ -58,7 +58,7 @@ pub fn spawn_session(shell: Option<&str>, scrollback: usize) -> anyhow::Result<S
     let (rows, cols) = (DEFAULT_ROWS, DEFAULT_COLS);
     let emu = ServerTerminal::new(rows, cols, scrollback);
     let (pty, pty_rx) =
-        rmosh_pty::Pty::spawn(rows, cols, shell, "xterm-256color").context("spawning shell")?;
+        koh_pty::Pty::spawn(rows, cols, shell, "xterm-256color").context("spawning shell")?;
     let handle = Arc::new(SessionHandle {
         session: Mutex::new(Session {
             emu,
@@ -207,7 +207,7 @@ pub async fn run_reaper(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmosh_transport_iroh::generate_secret_key;
+    use koh_transport_iroh::generate_secret_key;
 
     #[tokio::test]
     async fn reaper_collects_dead_session_at_injected_interval() {

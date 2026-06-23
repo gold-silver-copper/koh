@@ -1,4 +1,4 @@
-//! # rmosh-transport-iroh
+//! # koh-transport-iroh
 //!
 //! The iroh glue: endpoint setup, a persistent node identity, dial-by-endpoint-id, and a
 //! thin [`IrohChannel`] over a `Connection` that the SSP driver uses to ship datagrams and
@@ -10,7 +10,7 @@
 //!
 //! The steady SSP flow rides QUIC **unreliable datagrams** ([`IrohChannel::send`] /
 //! [`IrohChannel::recv`]). Oversized instructions are handled upstream by the
-//! [`rmosh_wire`] fragmenter (each fragment fits [`IrohChannel::max_datagram_size`]), so we
+//! [`koh_wire`] fragmenter (each fragment fits [`IrohChannel::max_datagram_size`]), so we
 //! never put the steady flow on a reliable stream — that would reintroduce the
 //! head-of-line blocking mosh exists to avoid.
 
@@ -23,7 +23,7 @@ use iroh::endpoint::{
     presets, Connection, ConnectionError, IdleTimeout, PathId, QuicTransportConfig, VarInt,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
-use rmosh_wire::DEFAULT_MAX_DATAGRAM;
+use koh_wire::DEFAULT_MAX_DATAGRAM;
 
 pub mod auth;
 pub mod ratelimit;
@@ -33,7 +33,7 @@ pub mod ratelimit;
 /// timeout defaults to ~30s; we raise it to 300s (5 min) so a short suspend (Android freezing the
 /// process, so keepalives stop) is ridden out on the *same* connection with no visible reconnect.
 /// Longer outages are handled above this layer: the client transparently re-dials and reattaches
-/// to the detachable server session (see `rmosh_client::run_client`), so we don't need to hold a
+/// to the detachable server session (see `koh_client::run_client`), so we don't need to hold a
 /// dead connection open indefinitely here.
 #[expect(
     clippy::expect_used,
@@ -43,7 +43,7 @@ pub mod ratelimit;
     clippy::duration_suboptimal_units,
     reason = "`from_secs(300)` is the intended, readable idle timeout"
 )]
-fn rmosh_transport_config() -> QuicTransportConfig {
+fn koh_transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
         .keep_alive_interval(Duration::from_secs(5))
         .max_idle_timeout(Some(
@@ -52,8 +52,8 @@ fn rmosh_transport_config() -> QuicTransportConfig {
         .build()
 }
 
-/// The ALPN that identifies the rmosh protocol on the wire.
-pub const ALPN: &[u8] = b"rmosh/iroh/1";
+/// The ALPN that identifies the koh protocol on the wire.
+pub const ALPN: &[u8] = b"koh/iroh/1";
 
 /// Errors from endpoint/identity setup.
 #[derive(Debug, thiserror::Error)]
@@ -110,7 +110,7 @@ pub fn format_endpoint_id(id: &EndpointId) -> String {
     id.to_string()
 }
 
-/// Parse a `$RMOSH_DNS` value: either `IP:PORT` (e.g. `8.8.8.8:53`) or a bare `IP`
+/// Parse a `$KOH_DNS` value: either `IP:PORT` (e.g. `8.8.8.8:53`) or a bare `IP`
 /// (e.g. `1.1.1.1`, defaulting to port 53). Returns `None` for anything unparseable.
 fn parse_dns_spec(spec: &str) -> Option<SocketAddr> {
     let spec = spec.trim();
@@ -132,7 +132,7 @@ fn parse_dns_spec(spec: &str) -> Option<SocketAddr> {
 /// fall back from. We sidestep it by pinning an explicit public nameserver, which never touches
 /// the system config (`DnsResolver::with_nameserver`).
 ///
-/// - `$RMOSH_DNS` (any platform): override the nameserver, as `IP` or `IP:PORT`. Lets a desktop
+/// - `$KOH_DNS` (any platform): override the nameserver, as `IP` or `IP:PORT`. Lets a desktop
 ///   opt in / pick a reachable resolver, and makes this path testable off-Android.
 /// - On Android, default to Google Public DNS (`8.8.8.8:53`) even when unset.
 /// - Elsewhere, `None`: keep iroh's system-DNS default (honors split-horizon / corporate DNS).
@@ -147,7 +147,7 @@ fn parse_dns_spec(spec: &str) -> Option<SocketAddr> {
 )]
 fn discovery_dns_resolver() -> Option<iroh::dns::DnsResolver> {
     use iroh::dns::DnsResolver;
-    if let Some(addr) = std::env::var("RMOSH_DNS")
+    if let Some(addr) = std::env::var("KOH_DNS")
         .ok()
         .as_deref()
         .and_then(parse_dns_spec)
@@ -174,7 +174,7 @@ fn discovery_dns_resolver() -> Option<iroh::dns::DnsResolver> {
 pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
-        .transport_config(rmosh_transport_config());
+        .transport_config(koh_transport_config());
     if let Some(resolver) = discovery_dns_resolver() {
         builder = builder.dns_resolver(resolver);
     }
@@ -196,7 +196,7 @@ pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, 
 pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
-        .transport_config(rmosh_transport_config());
+        .transport_config(koh_transport_config());
     // Even with no discovery, iroh constructs a default `DnsResolver` at bind time, which panics
     // on a bare-CLI Android build; pin an explicit resolver there. See `discovery_dns_resolver`.
     if let Some(resolver) = discovery_dns_resolver() {
@@ -251,7 +251,7 @@ pub async fn bind_endpoint_with_relay(
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .relay_mode(RelayMode::custom([relay]))
-        .transport_config(rmosh_transport_config());
+        .transport_config(koh_transport_config());
     // iroh builds a default `DnsResolver` at bind time even here, which panics on a bare-CLI
     // Android build; pin an explicit resolver there. See `discovery_dns_resolver`.
     if let Some(resolver) = discovery_dns_resolver() {
@@ -276,7 +276,7 @@ pub fn parse_relay_url(s: &str) -> Result<RelayUrl, SetupError> {
 
 /// A datagram channel over a single iroh [`Connection`].
 ///
-/// Oversized state is split by the [`rmosh_wire`] fragmenter across datagrams — never a reliable
+/// Oversized state is split by the [`koh_wire`] fragmenter across datagrams — never a reliable
 /// stream (which would reintroduce the head-of-line blocking the protocol exists to avoid).
 #[derive(Clone)]
 pub struct IrohChannel {
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn secret_key_roundtrips_through_disk() {
-        let dir = std::env::temp_dir().join(format!("rmosh-key-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("koh-key-test-{}", std::process::id()));
         let path = dir.join("id.key");
         let _ = std::fs::remove_dir_all(&dir);
 

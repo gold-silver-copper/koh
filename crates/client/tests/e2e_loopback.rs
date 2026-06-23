@@ -1,4 +1,4 @@
-//! Tier 1 end-to-end: the full rmosh stack over a **real iroh connection**, headless.
+//! Tier 1 end-to-end: the full koh stack over a **real iroh connection**, headless.
 //!
 //! Two iroh endpoints on loopback (no relay, no second machine), a real PTY-hosted shell on
 //! the server, and the real client session loop driven through a mock terminal — exercising
@@ -21,10 +21,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rmosh_client::{run_client, ClientTerminal, IrohConnector};
-use rmosh_predict::{DisplayPreference, Overlay};
-use rmosh_server::run_session;
-use rmosh_transport_iroh::{
+use koh_client::{run_client, ClientTerminal, IrohConnector};
+use koh_predict::{DisplayPreference, Overlay};
+use koh_server::run_session;
+use koh_transport_iroh::{
     bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, ALPN,
 };
 use tokio::sync::mpsc;
@@ -111,14 +111,14 @@ async fn full_session_over_loopback_pty() {
 
     // Type a command with a distinctive marker; the PTY echoes it and `sh` runs it.
     input_tx
-        .send(b"echo rmosh_e2e_marker\r".to_vec())
+        .send(b"echo koh_e2e_marker\r".to_vec())
         .await
         .expect("send keystrokes");
 
     // Poll the client's rendered screen until the marker round-trips back.
     let mut seen = false;
     for _ in 0..120 {
-        if latest.lock().unwrap().contains("rmosh_e2e_marker") {
+        if latest.lock().unwrap().contains("koh_e2e_marker") {
             seen = true;
             break;
         }

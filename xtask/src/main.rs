@@ -1,8 +1,8 @@
-//! # xtask — rmosh dev drivers
+//! # xtask — koh dev drivers
 //!
-//! In-process harnesses that exercise the full rmosh stack *without* iroh or a real terminal,
+//! In-process harnesses that exercise the full koh stack *without* iroh or a real terminal,
 //! by wiring the client and server transports through the deterministic chaotic link in
-//! [`rmosh_ssp::testkit`]. This is the §11 integration + chaos coverage: it proves the screen
+//! [`koh_ssp::testkit`]. This is the §11 integration + chaos coverage: it proves the screen
 //! and input states converge end-to-end under loss, that the predictor confirms/suppresses
 //! against real frames, and (via the harness's own guard) that superseded screens are never
 //! delivered late.
@@ -11,13 +11,13 @@
 //! The same scenarios run under `cargo test -p xtask`.
 
 use clap::{Parser, Subcommand};
-use rmosh_input::{UserInput, WireEvent};
-use rmosh_predict::{DisplayPreference, PredictionEngine};
-use rmosh_ssp::testkit::{LinkParams, SimHarness};
-use rmosh_terminal::{ServerTerminal, TerminalScreen};
+use koh_input::{UserInput, WireEvent};
+use koh_predict::{DisplayPreference, PredictionEngine};
+use koh_ssp::testkit::{LinkParams, SimHarness};
+use koh_terminal::{ServerTerminal, TerminalScreen};
 
 #[derive(Parser)]
-#[command(name = "xtask", about = "rmosh in-process integration / chaos drivers")]
+#[command(name = "xtask", about = "koh in-process integration / chaos drivers")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -76,7 +76,7 @@ struct SessionResult {
 
 impl SessionResult {
     fn assert_ok(&self) -> anyhow::Result<()> {
-        if !self.client_text.contains("hello rmosh") {
+        if !self.client_text.contains("hello koh") {
             anyhow::bail!(
                 "client screen missing expected output; got:\n{}",
                 self.client_text
@@ -116,7 +116,7 @@ fn run_session(loss: f64, seed: u64) -> SessionResult {
     });
 
     // Client types a command (with the trailing CR a shell would see).
-    let cmd = b"echo hello rmosh\r";
+    let cmd = b"echo hello koh\r";
     h.a_mut().push_bytes(cmd);
 
     // Drive until the server has received the whole command.
@@ -130,7 +130,7 @@ fn run_session(loss: f64, seed: u64) -> SessionResult {
         if let WireEvent::Keys(bytes) = w {
             for b in bytes {
                 if b == b'\r' {
-                    emu.process(b"\r\nhello rmosh\r\n$ ");
+                    emu.process(b"\r\nhello koh\r\n$ ");
                 } else {
                     emu.process(&[b]);
                 }

@@ -1,14 +1,20 @@
-# rmosh — mosh, rewritten in Rust over iroh
+# koh — mosh, rewritten in Rust over iroh
 
-`rmosh` ("moshers") is a from-scratch Rust reimplementation of [mosh](https://mosh.org)
+`koh` is a from-scratch Rust reimplementation of [mosh](https://mosh.org)
 (the mobile shell) whose transport is **[iroh](https://iroh.computer) peer-to-peer QUIC**
 instead of mosh's UDP/OCB. It gives you mosh's signature feel — instant local echo on laggy
 links, survival across suspend/resume and IP changes, no head-of-line blocking — while iroh
 handles encryption, NAT traversal, relay fallback, connection migration, and RTT.
 
+> The name is from *Avatar: The Last Airbender* (a nod to iroh): **Koh the Face Stealer** takes
+> you the instant you show any *past* expression — survival means showing only your *current*
+> face. That is this protocol exactly: only the **latest** screen state is authoritative; every
+> superseded state is collapsed and discarded.
+
 It is the transport+terminal core for an eventual Bevy-based Android terminal for vibe-coding
-over your phone to your main PC. This repo is that core: two binaries, `rmosh-server` and
-`rmosh-client`, that give you a real remote shell by endpoint id.
+over your phone to your main PC. This repo is that core: a single binary, `koh`, with three
+subcommands — `koh serve` (host a shell), `koh connect <id>` (attach to one), and `koh id`
+(print your id) — that give you a real remote shell by endpoint id.
 
 > Status: feature-complete against mosh's core. The protocol core, terminal model, PTY host,
 > predictor, and iroh transport are implemented and tested, plus the defining mosh features:
@@ -19,14 +25,14 @@ over your phone to your main PC. This repo is that core: two binaries, `rmosh-se
 > 114 tests pass, including property tests, a network-chaos simulator, an in-process
 > client↔server scenario that converges at 50% packet loss, a reattach acceptance test, an
 > auto-reconnect-after-forced-drop test, **end-to-end tests over a real iroh connection** (both
-> the full loop in one process and the real `rmosh-client` binary driven through an allocated
-> PTY), and a suite of upstream **mosh regression tests** ported to moshers2's architecture
+> the full loop in one process and the real `koh` binary driven through an allocated
+> PTY), and a suite of upstream **mosh regression tests** ported to koh's architecture
 > (terminal-emulation round-trips, the unicode-prediction bug, pty-deadlock/repeat/window-resize,
 > network-no-diff). See [Testing tiers](#testing-tiers).
 
 ## The one idea
 
-rmosh is **not a tunnel**. It does not ship a byte stream. It is a *state-synchronization*
+koh is **not a tunnel**. It does not ship a byte stream. It is a *state-synchronization*
 system whose payload happens to be a terminal. Each side holds an authoritative object and the
 protocol's only job is to bring the peer to the **latest** version of it — intermediate states
 are collapsed and discarded. If the screen changed 100 times in 40ms, only the final state is
@@ -47,15 +53,17 @@ crates/
 ├── predict/         local-echo prediction engine (overlays, epochs, adaptive engage)
 ├── transport-iroh/  iroh endpoint setup, persistent identity, datagram channel, RTT
 ├── pty/             PTY allocation, shell spawn, SIGWINCH, child reaping
-├── server/          rmosh-server: PTY + emulator + Transport<Screen,Input> over iroh
-└── client/          rmosh-client: input + Transport<Input,Screen> + predictor + render
+├── server/          koh-server lib: PTY + emulator + Transport<Screen,Input> + `serve`
+├── client/          koh-client lib: input + Transport<Input,Screen> + predictor + `connect`
+└── cli/             the `koh` binary: `serve` / `connect` / `id` subcommand dispatch
 xtask/               in-process integration + network-chaos drivers
 ```
 
 Dependency direction is strict: `wire ← ssp ← {terminal, input}`, with `predict` over
-`{terminal, input}`, `transport-iroh` over `wire`, and the binaries on top. Only
-`transport-iroh`, `server`, and `client` touch iroh — the entire protocol (`ssp`, `terminal`,
-`input`, `predict`, `wire`) is transport-agnostic and tested with no network at all.
+`{terminal, input}`, `transport-iroh` over `wire`, and `cli` (the `koh` binary) on top of
+`server` + `client`. Only `transport-iroh`, `server`, and `client` touch iroh — the entire
+protocol (`ssp`, `terminal`, `input`, `predict`, `wire`) is transport-agnostic and tested with
+no network at all.
 
 ### The two synchronized states
 
@@ -90,7 +98,7 @@ priority), the channels/sleeps, and `term.render()`, delegating every protocol d
 session. This makes the whole client deterministically unit-testable and lets a future front-end
 (the planned Bevy terminal) drive the same core without the I/O scaffolding.
 
-On the server side, **PTY writes are non-blocking**: a dedicated `rmosh-pty-writer` thread owns
+On the server side, **PTY writes are non-blocking**: a dedicated `koh-pty-writer` thread owns
 the blocking write handle and drains a bounded channel, so forwarding a keystroke (or a synthesized
 DSR/DA reply) only enqueues and never blocks a tokio worker on a slow child. Both producers share
 one sender and enqueue under the session lock, so byte order is preserved (a query reply can't
@@ -100,7 +108,7 @@ overtake the keystroke that triggered it).
 
 ### Fragmentation (how oversized state crosses the wire)
 
-**rmosh ships the SSP over QUIC *unreliable datagrams*, never a reliable stream for the steady
+**koh ships the SSP over QUIC *unreliable datagrams*, never a reliable stream for the steady
 flow** — a reliable ordered stream would reintroduce head-of-line blocking and defeat the
 "drop superseded state" property. We use mosh's own approach **(option a): a fragmenter**.
 A serialized instruction larger than the path MTU is split into datagram-sized `Fragment`s
@@ -117,7 +125,7 @@ a 30-byte MTU at 30% loss.
 
 ### Authorization (who gets a shell)
 
-On iroh, identity is the endpoint's public key. rmosh deliberately does **not** copy
+On iroh, identity is the endpoint's public key. koh deliberately does **not** copy
 iroh-ssh's "anyone with the endpoint id gets a shell" model. The server:
 
 - uses a **persistent secret key** (so its endpoint id is stable across restarts), and
@@ -131,7 +139,7 @@ is the authorization layer on top.
 
 For defense-in-depth against a **leaked but still-allowlisted client key** (the one residual
 case the allowlist can't cover), the server can require a shared passphrase (`--passphrase`, or
-preferably `$RMOSH_PASSPHRASE` since argv is visible in the process table). The handshake rides
+preferably `$KOH_PASSPHRASE` since argv is visible in the process table). The handshake rides
 inside the already-encrypted, authenticated QUIC connection and never puts the passphrase on the
 wire: the server sends a fresh `OsRng` nonce and checks `BLAKE3(K ‖ nonce)`, where the
 pre-shared key `K = Argon2id(passphrase, salt)` (64 MiB / 3 iterations, a fixed deterministic
@@ -150,8 +158,8 @@ exposed only at the KDF call (this reduces heap exposure; argv/env remain OS-vis
 ## Build
 
 ```sh
-cargo build --release          # builds rmosh-server and rmosh-client
-cargo test  --workspace        # 105 tests: unit, property, chaos sim, real-iroh e2e, reattach, PTY binary, ported mosh regressions
+cargo build --release          # builds the single `koh` binary (target/release/koh)
+cargo test  --workspace        # 114 tests: unit, property, chaos sim, real-iroh e2e, reattach, auto-reconnect, PTY binary, ported mosh regressions
 ```
 
 Pinned toolchain-adjacent versions live in the root `Cargo.toml`: `iroh =1.0.0` (which brings
@@ -164,44 +172,44 @@ On the **server** (your PC). First find out the client's id, then authorize it:
 
 ```sh
 # on the client machine, print its stable endpoint id:
-rmosh-client --show-id
+koh id
 #   3f9c…(64 hex chars)
 
 # on the server, allow that client and start:
-rmosh-server --allow 3f9c…
-# ┌─ rmosh-server ready ──────────────────────────────────────
+koh serve --allow 3f9c…
+# ┌─ koh server ready ──────────────────────────────────────
 # │ endpoint id : 871b…
-# │ connect     : rmosh-client 871b…
+# │ connect     : koh connect 871b…
 # └───────────────────────────────────────────────────────────
 ```
 
 Add `--qr` to the server to also print the endpoint id as a scannable terminal QR code
-(`rmosh-server --allow 3f9c… --qr`) — point a phone camera at it instead of copying 64 hex
+(`koh serve --allow 3f9c… --qr`) — point a phone camera at it instead of copying 64 hex
 chars. It's rendered for a dark-background terminal.
 
 On the **client** (your phone/laptop), connect by the server's endpoint id:
 
 ```sh
-rmosh-client 871b…
+koh connect 871b…
 # connected. (Ctrl-^ then . to disconnect)
 ```
 
-The server's identity persists in `~/…/rmosh/server.key` (override with `--key-file`); the
-client's in `~/…/rmosh/client.key`. Prediction policy is `--predict adaptive|always|never`
+The server's identity persists in `~/…/koh/server.key` (override with `--key-file`); the
+client's in `~/…/koh/client.key`. Prediction policy is `--predict adaptive|always|never`
 (default adaptive: it engages only when the link is slow enough to benefit). Set
-`RMOSH_LOG=/tmp/rmosh.log` to capture client logs without disturbing the TUI.
+`KOH_LOG=/tmp/koh.log` to capture client logs without disturbing the TUI.
 
 By default the bare endpoint id is dialed via n0's public relay + DNS discovery. For a LAN or
 self-hosted setup you can skip that:
 
 ```sh
 # same LAN / loopback, no relay: server prints its port, client dials it directly
-rmosh-server --local --allow 3f9c…            # connect: rmosh-client 871b… --direct <ip>:<port>
-rmosh-client 871b… --direct 192.168.1.5:41xxx
+koh serve --local --allow 3f9c…             # connect: koh connect 871b… --direct <ip>:<port>
+koh connect 871b… --direct 192.168.1.5:41xxx
 
 # self-hosted relay (e.g. your own iroh-relay), both ends point at it
-rmosh-server --relay-url https://relay.example:3340 --allow 3f9c…
-rmosh-client 871b… --relay-url https://relay.example:3340
+koh serve --relay-url https://relay.example:3340 --allow 3f9c…
+koh connect 871b… --relay-url https://relay.example:3340
 ```
 
 ### Android / Termux
@@ -209,9 +217,9 @@ rmosh-client 871b… --relay-url https://relay.example:3340
 A bare-id connection works in Termux out of the box. iroh constructs a DNS resolver for every
 endpoint, and its default reads the host's system DNS through Android's app JNI context — which a
 plain CLI (no Android app) doesn't have, so the read used to **panic**
-(`ndk-context: android context was not initialized`). rmosh now pins an explicit public
+(`ndk-context: android context was not initialized`). koh now pins an explicit public
 nameserver (Google `8.8.8.8:53`) on Android, sidestepping that read entirely. Set
-`RMOSH_DNS=<ip>` or `RMOSH_DNS=<ip:port>` (e.g. `RMOSH_DNS=1.1.1.1`) on **any** platform to point
+`KOH_DNS=<ip>` or `KOH_DNS=<ip:port>` (e.g. `KOH_DNS=1.1.1.1`) on **any** platform to point
 iroh's discovery at a different resolver — useful if `8.8.8.8` is blocked on your network. (On
 desktop, leaving it unset keeps your system DNS, so split-horizon / corporate resolvers still
 work.)
@@ -220,7 +228,7 @@ Sessions are **detachable**, like mosh: the server keeps your shell (and its liv
 running after a disconnect, keyed by your client endpoint id, so reconnecting from the same
 client drops you back exactly where you left off — no `tmux` required for survival across
 suspend/resume or IP changes. A detached session is reaped after `--session-ttl-secs` (default
-24h) or immediately when its shell exits. rmosh still does no multiplexing (one session, one
+24h) or immediately when its shell exits. koh still does no multiplexing (one session, one
 shell, exactly like mosh) — use `tmux` if you want windows/panes.
 
 The reconnect is **automatic and in-process**: the client doesn't exit when the link drops. A
@@ -252,7 +260,7 @@ the display.
 
 ## Testing tiers
 
-You never need a second *machine* to develop rmosh — you need a second *process* and
+You never need a second *machine* to develop koh — you need a second *process* and
 occasionally a second *container*. "Real relay" becomes "local relay container"; "TTY" becomes
 "allocated PTY". The verification is layered cheapest-first; everything but Tier 3 is headless.
 
@@ -281,8 +289,8 @@ TTY is just an allocated PTY. Both are real and hermetic.
 - **`crates/client/tests/e2e_loopback.rs`** — the *entire* loop in one process: scripted
   keystroke → client → iroh datagram → server → PTY-hosted `sh` → vt100 → iroh → client render
   (through a `ClientTerminal` mock backend). Asserts the typed command's output round-trips.
-- **`crates/client/tests/e2e_pty_binary.rs`** — the **real `rmosh-client` binary** attached to
-  an allocated PTY (so `isatty()` is true and raw-mode + termina run for real), driven by
+- **`crates/cli/tests/e2e_pty_binary.rs`** — the **real `koh` binary** (`koh connect …`) attached
+  to an allocated PTY (so `isatty()` is true and raw-mode + termina run for real), driven by
   scripted keystrokes with rendered frames read back from the master, connected with `--direct`
   to an in-process loopback server.
 - **`crates/server/tests/reattach.rs`** — the detachable-session acceptance test: type a marker,
@@ -331,7 +339,7 @@ step stays manual. Concrete checklist (each maps to a parity feature):
 
 ## Acceptance criteria (mosh feel)
 
-| Property | How rmosh delivers it |
+| Property | How koh delivers it |
 |---|---|
 | Keystrokes appear instantly on high-RTT links | predictor (adaptive, underlined, then confirmed) |
 | Survives suspend/resume + IP change, re-syncs to current screen | QUIC connection migration + SSP re-sync to latest (no backlog) |
@@ -356,7 +364,7 @@ step stays manual. Concrete checklist (each maps to a parity feature):
 ## Roadmap
 
 This core is the foundation for a 100%-Rust mobile (Android) terminal — likely Bevy-based —
-that vibe-codes over rmosh to your main PC. With mosh's core behaviors now in place (detachable
+that vibe-codes over koh to your main PC. With mosh's core behaviors now in place (detachable
 sessions, terminal-reply synthesis, exit-status propagation, the predictor), the natural next
 steps are OSC-52 clipboard forwarding, two-device real-network/perf acceptance over the public
 relay (Tier 3), and a Bevy front-end reusing `terminal` + `input` + `predict` +

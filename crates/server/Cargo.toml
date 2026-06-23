@@ -1,21 +1,17 @@
 [package]
-name = "rmosh-server"
+name = "koh-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "rmosh server: PTY + terminal emulator + Transport<Screen,Input> over iroh"
-
-[[bin]]
-name = "rmosh-server"
-path = "src/main.rs"
+description = "koh server: PTY + terminal emulator + Transport<Screen,Input> over iroh"
 
 [dependencies]
-rmosh-wire.workspace = true
-rmosh-ssp.workspace = true
-rmosh-terminal.workspace = true
-rmosh-input.workspace = true
-rmosh-transport-iroh.workspace = true
-rmosh-pty.workspace = true
+koh-wire.workspace = true
+koh-ssp.workspace = true
+koh-terminal.workspace = true
+koh-input.workspace = true
+koh-transport-iroh.workspace = true
+koh-pty.workspace = true
 iroh.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

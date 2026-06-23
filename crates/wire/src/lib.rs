@@ -1,6 +1,6 @@
-//! # rmosh-wire
+//! # koh-wire
 //!
-//! The on-the-wire representation for rmosh's State Synchronization Protocol (SSP),
+//! The on-the-wire representation for koh's State Synchronization Protocol (SSP),
 //! plus the (de)serialization and fragmentation/reassembly machinery that lets an
 //! [`Instruction`] travel over QUIC unreliable datagrams.
 //!
@@ -33,12 +33,12 @@ use tracing::trace;
 /// ceiling for a single datagram payload. Real code should prefer `Connection::max_datagram_size`.
 pub const DEFAULT_MAX_DATAGRAM: usize = 1200;
 
-/// rmosh wire protocol version, carried in every [`Instruction`] and rejected on decode if it
+/// koh wire protocol version, carried in every [`Instruction`] and rejected on decode if it
 /// doesn't match. Bump on any incompatible change to the envelope or the diff encoding.
 ///
-/// The ALPN only proves both ends speak *some* rmosh; this catches diff-encoding skew between
-/// rmosh builds that share an ALPN. (Unrelated to upstream mosh's `MOSH_PROTOCOL_VERSION` —
-/// rmosh never interoperates with mosh.)
+/// The ALPN only proves both ends speak *some* koh; this catches diff-encoding skew between
+/// koh builds that share an ALPN. (Unrelated to upstream mosh's `MOSH_PROTOCOL_VERSION` —
+/// koh never interoperates with mosh.)
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Exact serialized overhead of a [`Fragment`] header.

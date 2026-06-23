@@ -1,26 +1,24 @@
-//! # rmosh-client
+//! The `koh connect` / `koh id` command implementations.
 //!
-//! The client end of an rmosh session: connects to a server by endpoint id, captures local
-//! keystrokes (raw stdin passthrough — byte-perfect), synchronizes the remote screen over
-//! QUIC datagrams, speculatively echoes typing, and renders with termina. The session loop
-//! itself lives in the library ([`rmosh_client::run_client`]); this binary wires up the real
-//! terminal I/O. Press the escape prefix `Ctrl-^` then `.` to disconnect.
+//! Dial a server by id and run the reconnecting client session against the real terminal. The
+//! session loop itself lives in [`crate::run_client`]; this just wires up the real terminal I/O.
 
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::{Parser, ValueEnum};
-use rmosh_client::{run_client, ClientTerminal, IrohConnector, TerminaTerminal};
-use rmosh_predict::DisplayPreference;
-use rmosh_transport_iroh::{
+use clap::{Args, ValueEnum};
+use koh_predict::DisplayPreference;
+use koh_transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, format_endpoint_id,
     load_or_create_secret_key, parse_endpoint_id, parse_relay_url, relay_addr,
 };
 use secrecy::SecretString;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
+
+use crate::{run_client, ClientTerminal, IrohConnector, TerminaTerminal};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum PredictMode {
@@ -39,12 +37,11 @@ impl From<PredictMode> for DisplayPreference {
     }
 }
 
-#[derive(Parser, Debug)]
-#[command(name = "rmosh-client", about = "mosh-over-iroh client")]
-struct Args {
+/// Arguments for `koh connect <server-id>`.
+#[derive(Args, Debug)]
+pub struct ConnectArgs {
     /// Server endpoint id to connect to.
-    #[arg(required_unless_present = "show_id")]
-    server: Option<String>,
+    server: String,
 
     /// Path to the client's persistent secret key (its endpoint id must be on the server's allowlist).
     #[arg(long)]
@@ -62,74 +59,59 @@ struct Args {
     #[arg(long, value_name = "URL")]
     relay_url: Option<String>,
 
-    /// Print this client's endpoint id (to add to the server's --allow list) and exit.
-    #[arg(long)]
-    show_id: bool,
-
-    /// Shared passphrase, if the server requires one. Prefer $RMOSH_PASSPHRASE over this flag:
+    /// Shared passphrase, if the server requires one. Prefer $KOH_PASSPHRASE over this flag:
     /// a command-line argument is visible in the process table, an env var is not.
     #[arg(long)]
     passphrase: Option<String>,
 }
 
+/// Arguments for `koh id`.
+#[derive(Args, Debug)]
+pub struct IdArgs {
+    /// Path to the client's persistent secret key.
+    #[arg(long)]
+    key_file: Option<PathBuf>,
+}
+
 fn default_key_file() -> PathBuf {
-    directories::ProjectDirs::from("", "", "rmosh").map_or_else(
-        || PathBuf::from("rmosh-client.key"),
+    directories::ProjectDirs::from("", "", "koh").map_or_else(
+        || PathBuf::from("koh-client.key"),
         |d| d.config_dir().join("client.key"),
     )
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
-    match real_main().await {
-        // Exit with the remote shell's status (POSIX wait status is 8-bit).
-        Ok(Some(code)) => std::process::ExitCode::from(code as u8),
-        Ok(None) => std::process::ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("rmosh-client: {e:#}");
-            std::process::ExitCode::FAILURE
-        }
-    }
+/// `koh id` — print this machine's koh id (to add to a server's `--allow` list) and exit.
+pub fn run_id(args: IdArgs) -> anyhow::Result<()> {
+    let key_file = args.key_file.unwrap_or_else(default_key_file);
+    let secret = load_or_create_secret_key(&key_file)
+        .with_context(|| format!("loading client key from {}", key_file.display()))?;
+    println!("{}", format_endpoint_id(&secret.public()));
+    Ok(())
 }
 
-/// The real client entry point; returns the remote shell's exit code if the session ended
-/// because the shell exited.
-async fn real_main() -> anyhow::Result<Option<u32>> {
-    if let Ok(path) = std::env::var("RMOSH_LOG") {
+/// `koh connect <server-id>` — connect to a koh server and run the (auto-reconnecting) session.
+/// Returns the remote shell's exit code if the session ended because the shell exited.
+pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
+    // The TUI owns the terminal, so logs go to a file (set $KOH_LOG) to avoid corrupting it.
+    if let Ok(path) = std::env::var("KOH_LOG") {
         if let Ok(file) = std::fs::File::create(&path) {
             tracing_subscriber::fmt()
                 .with_writer(std::sync::Mutex::new(file))
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "rmosh=debug".into()),
+                        .unwrap_or_else(|_| "koh=debug".into()),
                 )
                 .init();
         }
     }
 
-    let args = Args::parse();
     let key_file = args.key_file.clone().unwrap_or_else(default_key_file);
     let secret = load_or_create_secret_key(&key_file)
         .with_context(|| format!("loading client key from {}", key_file.display()))?;
     let my_id = secret.public();
+    let server_id = parse_endpoint_id(&args.server).context("parsing server endpoint id")?;
 
-    if args.show_id {
-        println!("{}", format_endpoint_id(&my_id));
-        return Ok(None);
-    }
-
-    #[expect(
-        clippy::expect_used,
-        reason = "clap marks `server` required_unless_present=\"show_id\"; the --show-id branch \
-                  returned above, so reaching here guarantees Some"
-    )]
-    let server = args
-        .server
-        .clone()
-        .expect("clap requires server unless --show-id");
-    let server_id = parse_endpoint_id(&server).context("parsing server endpoint id")?;
-
-    eprintln!("rmosh-client id: {}", format_endpoint_id(&my_id));
+    eprintln!("koh id: {}", format_endpoint_id(&my_id));
     eprintln!("  (add this to the server with --allow if it isn't already)");
     eprintln!("connecting to {} …", format_endpoint_id(&server_id));
 
@@ -158,7 +140,7 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
     let passphrase = std::sync::Arc::new(
         args.passphrase
             .clone()
-            .or_else(|| std::env::var("RMOSH_PASSPHRASE").ok())
+            .or_else(|| std::env::var("KOH_PASSPHRASE").ok())
             .map(SecretString::from),
     );
     // One connector dials the server (and replays the handshake) for the initial connection and for
@@ -175,7 +157,7 @@ async fn real_main() -> anyhow::Result<Option<u32>> {
     // Raw stdin reader (byte-perfect passthrough) on a dedicated blocking thread.
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(64);
     std::thread::Builder::new()
-        .name("rmosh-stdin".into())
+        .name("koh-stdin".into())
         .spawn(move || {
             let mut stdin = std::io::stdin();
             let mut buf = [0u8; 1024];

@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use rmosh_wire::{Fragment, FragmentAssembly, Fragmenter, Instruction, PROTOCOL_VERSION};
+use koh_wire::{Fragment, FragmentAssembly, Fragmenter, Instruction, PROTOCOL_VERSION};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tracing::trace;
@@ -678,7 +678,7 @@ fn decode_diff<D: DeserializeOwned>(bytes: &[u8]) -> Result<D, postcard::Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmosh_wire::{Fragmenter, Instruction};
+    use koh_wire::{Fragmenter, Instruction};
     use serde::{Deserialize, Serialize};
 
     /// A trivial absolute-value state: each diff fully describes the target, so we can craft

@@ -1,4 +1,4 @@
-//! Library surface of `rmosh-client`: the session loop, abstracted over a [`ClientTerminal`]
+//! Library surface of `koh-client`: the session loop, abstracted over a [`ClientTerminal`]
 //! so it can run either against the real terminal (the binary, via [`TerminaTerminal`]) or
 //! against a scripted mock (integration tests) — no real TTY required for the latter.
 //!
@@ -7,7 +7,10 @@
 //! termina renderer + a raw-stdin reader + a `SIGWINCH` task; a test connects a capturing mock
 //! + a scripted input channel.
 
+pub mod cli;
 mod render;
+
+pub use cli::{connect, run_id, ConnectArgs, IdArgs};
 
 use std::io::Write;
 use std::sync::Arc;
@@ -15,11 +18,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{Endpoint, EndpointAddr};
-use rmosh_input::UserInput;
-use rmosh_predict::{DisplayPreference, Overlay, PredictionEngine};
-use rmosh_ssp::{RecvOutcome, Transport, SHUTDOWN_SENTINEL};
-use rmosh_terminal::TerminalScreen;
-use rmosh_transport_iroh::{IrohChannel, MonoClock, ALPN};
+use koh_input::UserInput;
+use koh_predict::{DisplayPreference, Overlay, PredictionEngine};
+use koh_ssp::{RecvOutcome, Transport, SHUTDOWN_SENTINEL};
+use koh_terminal::TerminalScreen;
+use koh_transport_iroh::{IrohChannel, MonoClock, ALPN};
 use secrecy::{ExposeSecret, SecretString};
 use termina::escape::csi::{Csi, DecPrivateMode, DecPrivateModeCode, Mode};
 use termina::{PlatformTerminal, Terminal as _};
@@ -77,7 +80,7 @@ impl IrohConnector {
             .as_ref()
             .as_ref()
             .map(SecretString::expose_secret);
-        rmosh_transport_iroh::auth::handshake_client(&conn, pass)
+        koh_transport_iroh::auth::handshake_client(&conn, pass)
             .await
             .context("passphrase handshake (wrong or missing --passphrase?)")?;
         Ok(IrohChannel::new(conn))
@@ -330,7 +333,7 @@ impl ClientSession {
         let status = if self.transport.last_heard() > 0 && !self.transport.link_up_within(now, 3000)
         {
             let since = now.saturating_sub(self.transport.last_heard());
-            Some(format!("[rmosh] link down — resuming… {}s", since / 1000))
+            Some(format!("[koh] link down — resuming… {}s", since / 1000))
         } else {
             None
         };
@@ -472,7 +475,7 @@ async fn drive_connection<T: ClientTerminal>(
             let _ = term.render(
                 session.screen(),
                 &Overlay::empty(),
-                Some("[rmosh] session ended"),
+                Some("[koh] session ended"),
             );
             tokio::time::sleep(Duration::from_millis(400)).await;
             return Ok(Disposition::Ended(code));
@@ -481,7 +484,7 @@ async fn drive_connection<T: ClientTerminal>(
         tokio::select! {
             // Input-priority: a queued screen update must never starve local keystrokes (mosh
             // keeps typing responsive even when the screen is busy). The server loop is the mirror
-            // image and is deliberately NOT biased (see `rmosh_server::run_attached`).
+            // image and is deliberately NOT biased (see `koh_server::run_attached`).
             biased;
 
             maybe = input_rx.recv() => {
@@ -554,7 +557,7 @@ async fn reconnect<T: ClientTerminal>(
         tokio::pin!(dial);
         loop {
             let secs = clock.now_ms().saturating_sub(started) / 1000;
-            let banner = format!("[rmosh] disconnected — reconnecting… {secs}s (Ctrl-^ . to quit)");
+            let banner = format!("[koh] disconnected — reconnecting… {secs}s (Ctrl-^ . to quit)");
             let _ = term.render(last.screen(), &Overlay::empty(), Some(banner.as_str()));
 
             tokio::select! {
@@ -591,8 +594,8 @@ async fn reconnect<T: ClientTerminal>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmosh_input::InputEvent;
-    use rmosh_terminal::ServerTerminal;
+    use koh_input::InputEvent;
+    use koh_terminal::ServerTerminal;
 
     /// Drive a server-side transport until it emits at least one datagram, returning them. Used to
     /// synthesize *real* server frames for the client session to consume — no iroh, no tokio.

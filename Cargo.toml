@@ -10,6 +10,7 @@ members = [
     "crates/pty",
     "crates/server",
     "crates/client",
+    "crates/cli",
     "xtask",
 ]
 
@@ -17,20 +18,21 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-authors = ["rmosh authors"]
-repository = "https://example.invalid/rmosh"
+authors = ["koh authors"]
+repository = "https://example.invalid/koh"
 description = "mosh (mobile shell) reimplemented in Rust over iroh p2p QUIC"
 
 [workspace.dependencies]
 # --- internal crates ---
-rmosh-wire = { path = "crates/wire" }
-rmosh-ssp = { path = "crates/ssp" }
-rmosh-terminal = { path = "crates/terminal" }
-rmosh-input = { path = "crates/input" }
-rmosh-predict = { path = "crates/predict" }
-rmosh-transport-iroh = { path = "crates/transport-iroh" }
-rmosh-pty = { path = "crates/pty" }
-rmosh-server = { path = "crates/server" }
+koh-wire = { path = "crates/wire" }
+koh-ssp = { path = "crates/ssp" }
+koh-terminal = { path = "crates/terminal" }
+koh-input = { path = "crates/input" }
+koh-predict = { path = "crates/predict" }
+koh-transport-iroh = { path = "crates/transport-iroh" }
+koh-pty = { path = "crates/pty" }
+koh-server = { path = "crates/server" }
+koh-client = { path = "crates/client" }
 
 # --- transport (pinned: iroh API churns; see README) ---
 # iroh 1.0 brings its own QUIC backend (noq, a quinn fork); we never depend on quinn directly.

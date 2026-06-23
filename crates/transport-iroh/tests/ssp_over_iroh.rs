@@ -16,8 +16,8 @@
 
 use std::time::Duration;
 
-use rmosh_ssp::{SyncState, Transport};
-use rmosh_transport_iroh::{
+use koh_ssp::{SyncState, Transport};
+use koh_transport_iroh::{
     bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, ALPN,
 };
 use serde::{Deserialize, Serialize};

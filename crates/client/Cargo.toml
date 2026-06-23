@@ -1,21 +1,17 @@
 [package]
-name = "rmosh-client"
+name = "koh-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "rmosh client: input + Transport<Input,Screen> + predictor + termina render"
-
-[[bin]]
-name = "rmosh-client"
-path = "src/main.rs"
+description = "koh client: input + Transport<Input,Screen> + predictor + termina render"
 
 [dependencies]
-rmosh-wire.workspace = true
-rmosh-ssp.workspace = true
-rmosh-terminal.workspace = true
-rmosh-input.workspace = true
-rmosh-predict.workspace = true
-rmosh-transport-iroh.workspace = true
+koh-wire.workspace = true
+koh-ssp.workspace = true
+koh-terminal.workspace = true
+koh-input.workspace = true
+koh-predict.workspace = true
+koh-transport-iroh.workspace = true
 iroh.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
@@ -30,9 +26,7 @@ secrecy = "0.10"
 
 [dev-dependencies]
 # the server lib, so the e2e test can run a real session over a loopback iroh connection
-rmosh-server.workspace = true
-# to attach the real client binary to an allocated PTY and drive it headlessly
-portable-pty.workspace = true
+koh-server.workspace = true
 
 [lints]
 workspace = true

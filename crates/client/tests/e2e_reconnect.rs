@@ -1,6 +1,6 @@
 //! Tier 1 end-to-end: the client **transparently reconnects and reattaches** after the link drops.
 //!
-//! This is the regression test for the "phone screen-off → rmosh exits to the shell" bug. It runs
+//! This is the regression test for the "phone screen-off → koh exits to the shell" bug. It runs
 //! the real client session loop ([`run_client`]) against a real PTY-hosted shell over loopback
 //! iroh, forcibly **closes the connection mid-session while keeping the server session alive**
 //! (exactly what a QUIC idle-timeout does when Android freezes the process), and asserts that the
@@ -24,11 +24,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rmosh_client::{run_client, ClientTerminal, IrohConnector};
-use rmosh_predict::{DisplayPreference, Overlay};
-use rmosh_server::session::spawn_session;
-use rmosh_server::{run_attached, SessionExit};
-use rmosh_transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel};
+use koh_client::{run_client, ClientTerminal, IrohConnector};
+use koh_predict::{DisplayPreference, Overlay};
+use koh_server::session::spawn_session;
+use koh_server::{run_attached, SessionExit};
+use koh_transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel};
 use tokio::sync::{mpsc, oneshot};
 
 /// Captures the latest authoritative screen as text, so the test can assert on what the user sees.
@@ -101,7 +101,7 @@ async fn client_reconnects_and_reattaches_after_a_forced_drop() {
             }
             // Every connection completes the (no-passphrase) auth handshake, exactly like the real
             // server — the client's connector always runs the client half, so this must answer it.
-            if rmosh_transport_iroh::auth::handshake_server(&conn, None)
+            if koh_transport_iroh::auth::handshake_server(&conn, None)
                 .await
                 .is_err()
             {

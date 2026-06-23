@@ -1,4 +1,4 @@
-//! Tier 1b: drive the **real `rmosh-client` binary** attached to an allocated PTY.
+//! Tier 1b: drive the **real `koh` binary** (`koh connect …`) attached to an allocated PTY.
 //!
 //! This is the standard way to test a terminal program headlessly: open a pseudo-terminal,
 //! launch the client on the slave (so `isatty()` is true and raw mode + termina run for
@@ -24,9 +24,9 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use koh_server::run_session;
+use koh_transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use rmosh_server::run_session;
-use rmosh_transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_client_binary_renders_over_pty() {
@@ -47,7 +47,7 @@ async fn real_client_binary_renders_over_pty() {
             if let Ok(conn) = incoming.await {
                 // The client *binary* runs the passphrase handshake after connect; mirror the
                 // server side (no passphrase) so its accept_bi() completes, like the real server.
-                if rmosh_transport_iroh::auth::handshake_server(&conn, None)
+                if koh_transport_iroh::auth::handshake_server(&conn, None)
                     .await
                     .is_ok()
                 {
@@ -58,7 +58,7 @@ async fn real_client_binary_renders_over_pty() {
     });
 
     // --- launch the real client binary attached to a PTY slave ---
-    let key_path = std::env::temp_dir().join(format!("rmosh-pty-test-{}.key", std::process::id()));
+    let key_path = std::env::temp_dir().join(format!("koh-pty-test-{}.key", std::process::id()));
     let _ = std::fs::remove_file(&key_path);
 
     let pty = native_pty_system();
@@ -71,7 +71,8 @@ async fn real_client_binary_renders_over_pty() {
         })
         .expect("openpty");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rmosh-client"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_koh"));
+    cmd.arg("connect");
     cmd.arg(&server_id);
     cmd.arg("--direct");
     cmd.arg(format!("127.0.0.1:{server_port}"));
@@ -104,12 +105,12 @@ async fn real_client_binary_renders_over_pty() {
 
     // Type a command with a distinctive marker; it round-trips to `sh` and back as a frame.
     writer
-        .write_all(b"echo rmosh_pty_marker\r")
+        .write_all(b"echo koh_pty_marker\r")
         .expect("write keystrokes");
     writer.flush().ok();
 
     let contains_marker = |b: &Arc<Mutex<Vec<u8>>>| {
-        String::from_utf8_lossy(&b.lock().unwrap()).contains("rmosh_pty_marker")
+        String::from_utf8_lossy(&b.lock().unwrap()).contains("koh_pty_marker")
     };
 
     let mut seen = false;

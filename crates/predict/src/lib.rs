@@ -1,4 +1,4 @@
-//! # rmosh-predict — the local-echo prediction engine
+//! # koh-predict — the local-echo prediction engine
 //!
 //! What makes typing feel instant on a laggy link. When the user types, the client *guesses*
 //! what each keystroke does to the screen and displays it immediately (underlined on high-RTT
@@ -1170,7 +1170,7 @@ mod tests {
         // mosh prediction-unicode regression: typing "glück" must predict 'ü', and "faĩl" 'ĩ' —
         // NOT the low byte of the code point (mosh, being char/byte based, would briefly draw the
         // low 8 bits: a raw 0xFC, or ')' for ĩ's 0x129 & 0xFF = 0x29, before the server corrected
-        // it). moshers2 reassembles the whole UTF-8 grapheme before predicting, so the predicted
+        // it). koh reassembles the whole UTF-8 grapheme before predicting, so the predicted
         // glyph is always the real character. (`)` is the meaningful char-level artifact; ü's raw
         // 0xFC can't even exist in a Rust `String`, so reassembly itself is the guarantee.)
         for (word, accent) in [("glück", "ü"), ("faĩl", "ĩ")] {

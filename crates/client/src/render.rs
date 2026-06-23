@@ -13,7 +13,7 @@
 
 use std::io::{self, Write};
 
-use rmosh_predict::Overlay;
+use koh_predict::Overlay;
 use termina::escape::csi::{Csi, Cursor, DecPrivateMode, DecPrivateModeCode, Mode, Sgr};
 use termina::style::{ColorSpec, Intensity, RgbColor, Underline};
 use termina::OneBased;
@@ -201,7 +201,7 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmosh_predict::{DisplayPreference, PredictionEngine};
+    use koh_predict::{DisplayPreference, PredictionEngine};
 
     fn screen_of(bytes: &[u8]) -> Screen {
         let mut p = vt100::Parser::new(24, 80, 0);

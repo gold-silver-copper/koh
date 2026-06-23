@@ -1,12 +1,12 @@
 [package]
-name = "rmosh-input"
+name = "koh-input"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "rmosh UserInput state: keystrokes + resize as an SSP-synchronized object"
+description = "koh UserInput state: keystrokes + resize as an SSP-synchronized object"
 
 [dependencies]
-rmosh-ssp.workspace = true
+koh-ssp.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

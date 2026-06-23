@@ -1,4 +1,4 @@
-//! Library surface of `rmosh-server`: the per-connection session loop, reused by the binary
+//! Library surface of `koh-server`: the per-connection session loop, reused by the binary
 //! and by integration tests (so the full PTY⇄emulator⇄transport path can be exercised over a
 //! real iroh connection without the `main` CLI/accept scaffolding).
 //!
@@ -6,14 +6,17 @@
 //! survives client disconnects; a per-connection [`run_attached`] loop drives a *fresh*
 //! `Transport` against it, so a reconnecting client re-syncs to the current screen.
 
+pub mod cli;
 pub mod session;
+
+pub use cli::{serve, ServeArgs};
 
 use std::time::Duration;
 
-use rmosh_input::{UserInput, WireEvent};
-use rmosh_ssp::{RecvOutcome, Transport};
-use rmosh_terminal::TerminalScreen;
-use rmosh_transport_iroh::{IrohChannel, MonoClock};
+use koh_input::{UserInput, WireEvent};
+use koh_ssp::{RecvOutcome, Transport};
+use koh_terminal::TerminalScreen;
+use koh_transport_iroh::{IrohChannel, MonoClock};
 use session::SharedSession;
 use tracing::{info, warn};
 

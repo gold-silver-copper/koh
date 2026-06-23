@@ -1,4 +1,4 @@
-//! # rmosh-ssp — State Synchronization Protocol
+//! # koh-ssp — State Synchronization Protocol
 //!
 //! A faithful Rust port of mosh's SSP, retargeted onto QUIC unreliable datagrams.
 //!
@@ -21,7 +21,7 @@
 //! QUIC/iroh subsumes mosh's UDP framing, OCB crypto, key exchange, roaming, NAT
 //! traversal, heartbeats, and RTT measurement. This crate keeps only what lives *above*
 //! the wire: the `sent_states`/`received_states` collapse logic, the `tick()` send
-//! scheduler, the seq/ack/throwaway envelope, and fragmentation (in [`rmosh_wire`]).
+//! scheduler, the seq/ack/throwaway envelope, and fragmentation (in [`koh_wire`]).
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -63,8 +63,8 @@ pub const RECEIVER_QUENCH_MS: u64 = 15_000;
 
 /// A synchronizable object: the unit the protocol keeps in sync.
 ///
-/// Implementors are the screen ([`rmosh_terminal`]) and the user-input stream
-/// ([`rmosh_input`]). The contract mirrors mosh's `MyState`/`RemoteState`:
+/// Implementors are the screen ([`koh_terminal`]) and the user-input stream
+/// ([`koh_input`]). The contract mirrors mosh's `MyState`/`RemoteState`:
 ///
 /// - [`diff_from`](SyncState::diff_from): produce the delta that transforms `base` into `self`.
 /// - [`apply`](SyncState::apply): mutate `self` by applying a delta.
@@ -88,7 +88,7 @@ pub trait SyncState: Clone + Default + PartialEq {
 
     /// Collapse storage by dropping the `prefix` already known to the peer.
     ///
-    /// Default is a no-op (correct but unbounded). [`rmosh_input::UserInput`] overrides
+    /// Default is a no-op (correct but unbounded). [`koh_input::UserInput`] overrides
     /// this to pop acked keystrokes; the screen state leaves it as the no-op.
     fn subtract_prefix(&mut self, _prefix: &Self) {}
 }

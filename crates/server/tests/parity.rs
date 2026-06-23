@@ -22,12 +22,12 @@ use std::time::Duration;
 
 use iroh::endpoint::Endpoint;
 use iroh::EndpointAddr;
-use rmosh_input::UserInput;
-use rmosh_server::session::{self, SessionStore};
-use rmosh_server::{run_attached, SessionExit};
-use rmosh_ssp::Transport;
-use rmosh_terminal::TerminalScreen;
-use rmosh_transport_iroh::{
+use koh_input::UserInput;
+use koh_server::session::{self, SessionStore};
+use koh_server::{run_attached, SessionExit};
+use koh_ssp::Transport;
+use koh_terminal::TerminalScreen;
+use koh_transport_iroh::{
     bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, MonoClock, ALPN,
 };
 
@@ -40,7 +40,7 @@ type RunningServer = (
 );
 
 /// Start a loopback server with a session store and an accept loop that attaches each connection
-/// to its peer's detachable session (mirrors the real `rmosh-server` accept loop).
+/// to its peer's detachable session (mirrors the real `koh-server` accept loop).
 async fn start_server() -> RunningServer {
     let server_ep = bind_endpoint_local(generate_secret_key(), true)
         .await
@@ -110,7 +110,7 @@ async fn client_script(channel: &IrohChannel, steps: &[Step<'_>], marker: &str, 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xon_xoff_cycle_does_not_wedge_session() {
     // mosh pty-deadlock.test: on BSD, a ^S written to the pty master between select() and read()
-    // could wedge the whole session. moshers2's PTY reader is a dedicated blocking thread (no
+    // could wedge the whole session. koh's PTY reader is a dedicated blocking thread (no
     // select+read race), so it is structurally immune to that specific deadlock; this guards the
     // observable contract — a ^S (XOFF) / ^Q (XON) cycle in the input stream must not break the
     // session, and output after it must still flow.

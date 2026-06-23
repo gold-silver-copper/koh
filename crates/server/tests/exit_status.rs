@@ -15,12 +15,12 @@
 )]
 use std::time::Duration;
 
-use rmosh_input::UserInput;
-use rmosh_server::session::{self, SessionStore};
-use rmosh_server::{run_attached, SessionExit};
-use rmosh_ssp::{Transport, SHUTDOWN_SENTINEL};
-use rmosh_terminal::TerminalScreen;
-use rmosh_transport_iroh::{
+use koh_input::UserInput;
+use koh_server::session::{self, SessionStore};
+use koh_server::{run_attached, SessionExit};
+use koh_ssp::{Transport, SHUTDOWN_SENTINEL};
+use koh_terminal::TerminalScreen;
+use koh_transport_iroh::{
     bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, MonoClock, ALPN,
 };
 

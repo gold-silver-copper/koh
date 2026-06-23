@@ -1,0 +1,26 @@
+[package]
+name = "koh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "koh — a resilient peer-to-peer remote shell (mosh, rewritten in Rust over iroh)"
+
+[[bin]]
+name = "koh"
+path = "src/main.rs"
+
+[dependencies]
+koh-server.workspace = true
+koh-client.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# drive the real `koh` binary attached to an allocated PTY, against an in-process loopback server
+# (koh-server is already a normal dependency, so it's available to tests too)
+koh-transport-iroh.workspace = true
+portable-pty.workspace = true
+
+[lints]
+workspace = true

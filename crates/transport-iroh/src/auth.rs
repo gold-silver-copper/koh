@@ -62,7 +62,7 @@ fn kdf_params() -> argon2::Params {
 /// not from salt secrecy.
 fn kdf_salt() -> [u8; 16] {
     let mut salt = [0u8; 16];
-    salt.copy_from_slice(&blake3::hash(b"rmosh-pass-kdf-v1").as_bytes()[..16]);
+    salt.copy_from_slice(&blake3::hash(b"koh-pass-kdf-v1").as_bytes()[..16]);
     salt
 }
 
@@ -72,7 +72,7 @@ fn kdf_salt() -> [u8; 16] {
 /// The result is wrapped in [`Zeroizing`] so the derived key is wiped from the heap on drop. This
 /// reduces how long the PSK lingers in memory; the passphrase itself reaches us only as a `&str`
 /// view into the caller's [`secrecy::SecretString`], exposed solely for this call (argv/env still
-/// remain OS-visible — prefer `$RMOSH_PASSPHRASE` over `--passphrase`).
+/// remain OS-visible — prefer `$KOH_PASSPHRASE` over `--passphrase`).
 #[expect(
     clippy::expect_used,
     reason = "hash_password_into only errors on invalid params/output-len, fixed valid here"

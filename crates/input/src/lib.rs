@@ -1,4 +1,4 @@
-//! # rmosh-input — the `UserInput` SSP state
+//! # koh-input — the `UserInput` SSP state
 //!
 //! The client→server half of the synchronized world: the user's keystrokes and window-size
 //! changes, modeled as an ordered, append-only log so it flows through the SSP just like the
@@ -13,7 +13,7 @@
 //! coalesces consecutive bytes into [`WireEvent::Keys`] blobs (mosh's `keystroke` packing),
 //! so a typed run costs one length-prefixed blob, not one tag per byte.
 
-use rmosh_ssp::SyncState;
+use koh_ssp::SyncState;
 use serde::{Deserialize, Serialize};
 
 /// One stored input event. Keystrokes are stored a byte at a time so the log stays a clean
@@ -145,7 +145,7 @@ impl SyncState for UserInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmosh_ssp::testkit::{LinkParams, SimHarness};
+    use koh_ssp::testkit::{LinkParams, SimHarness};
 
     #[test]
     fn diff_apply_roundtrip() {

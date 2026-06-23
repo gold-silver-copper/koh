@@ -17,6 +17,7 @@ use clap::{Args, ValueEnum};
 use secrecy::SecretString;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::{run_client, ClientTerminal, IrohConnector, TerminaTerminal};
 
@@ -80,6 +81,44 @@ fn default_key_file() -> PathBuf {
     )
 }
 
+/// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so
+/// the client unwinds cleanly and restores the terminal. Called before raw mode is entered (so the
+/// handlers are armed for the entire raw window); an install error surfaces while still cooked.
+fn spawn_signal_shutdown(shutdown: CancellationToken) -> anyhow::Result<()> {
+    let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut intr = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    let mut hup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = intr.recv() => {}
+            _ = hup.recv() => {}
+        }
+        shutdown.cancel();
+    });
+    Ok(())
+}
+
+/// Warn (once, to stderr) if the locale doesn't look UTF-8. koh assumes UTF-8 end to end; on a
+/// legacy locale, output may be mojibake. We only warn — koh still runs — where mosh refuses.
+fn warn_if_locale_not_utf8() {
+    // `$LC_ALL` overrides `$LC_CTYPE`, which overrides `$LANG` (POSIX precedence).
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()));
+    let looks_utf8 = locale.as_deref().is_some_and(|l| {
+        let l = l.to_ascii_lowercase();
+        l.contains("utf-8") || l.contains("utf8")
+    });
+    if !looks_utf8 {
+        let shown = locale.as_deref().unwrap_or("(unset)");
+        eprintln!(
+            "koh: warning: locale {shown} does not look UTF-8; non-ASCII output may be garbled. \
+             Set e.g. LANG=en_US.UTF-8."
+        );
+    }
+}
+
 /// `koh id` — print this machine's koh id (to add to a server's `--allow` list) and exit.
 pub fn run_id(args: IdArgs) -> anyhow::Result<()> {
     let key_file = args.key_file.unwrap_or_else(default_key_file);
@@ -104,6 +143,11 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
                 .init();
         }
     }
+
+    // koh assumes a UTF-8 terminal (the predictor reassembles UTF-8 graphemes; the renderer emits
+    // UTF-8). Warn — but don't refuse, unlike mosh — if the locale looks non-UTF-8, so mojibake is
+    // diagnosable rather than mysterious.
+    warn_if_locale_not_utf8();
 
     let key_file = args.key_file.clone().unwrap_or_else(default_key_file);
     let secret = load_or_create_secret_key(&key_file)
@@ -150,6 +194,14 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     let channel = connector.connect().await?;
     eprintln!("connected. (Ctrl-^ then . to disconnect)");
 
+    // Arm graceful shutdown BEFORE entering raw mode, so there's no window where a fatal signal —
+    // SIGTERM (`kill`), SIGINT (`kill -INT`; in raw mode Ctrl-C is a forwarded byte, not a signal),
+    // or SIGHUP (the controlling terminal closed) — kills us at default disposition with the TTY
+    // already raw. Cancelling the token makes run_client return, which drops `term` and restores the
+    // terminal; if a signal lands during setup below, the first loop iteration returns immediately.
+    let shutdown = CancellationToken::new();
+    spawn_signal_shutdown(shutdown.clone())?;
+
     // --- real terminal I/O wiring (termina: raw mode + alt screen, restored on drop) ---
     let term = TerminaTerminal::enter().context("entering raw mode / alt screen")?;
     let (rows, cols) = term.size().unwrap_or((24, 80));
@@ -195,6 +247,7 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
         input_rx,
         resize_rx,
         term,
+        shutdown,
     )
     .await;
     // `term` is moved into run_client and dropped there, restoring the terminal.

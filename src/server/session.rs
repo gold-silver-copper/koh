@@ -39,8 +39,14 @@ pub struct Session {
     pub pty: crate::pty::Pty,
     /// False once the shell process has exited (the drain task hit EOF).
     pub child_alive: bool,
-    /// When the last client detached (`None` while attached); drives TTL reaping.
+    /// When the last client detached (`None` while any client is attached); drives TTL reaping.
+    /// Only stamped once [`attached`](Self::attached) falls to 0, so an overlapping same-peer
+    /// connection detaching can't mark a session the other connection is still using as reapable.
     pub last_detach: Option<Instant>,
+    /// How many client connections are currently attached to this (one-per-peer) session. Normally
+    /// 0 or 1, but two concurrent connections from the same endpoint id share the handle, so the
+    /// detach timer must be reference-counted rather than set on the first detach.
+    pub attached: u32,
 }
 
 /// Shared session plus a notifier the drain task pulses whenever the screen changes.
@@ -65,6 +71,7 @@ pub fn spawn_session(shell: Option<&str>, scrollback: usize) -> anyhow::Result<S
             pty,
             child_alive: true,
             last_detach: None,
+            attached: 0,
         }),
         changed: Notify::new(),
     });
@@ -102,28 +109,54 @@ async fn drain(handle: SharedSession, mut pty_rx: mpsc::Receiver<Vec<u8>>) {
     }
 }
 
+/// Whether [`attach`] spawned a fresh session or reattached to an existing one.
+///
+/// Lets the server tell the peer it's resuming a running session (mosh-server's `warn_unattached`,
+/// mapped to koh's one-detachable-session-per-peer model: there is never a duplicate to warn about,
+/// only a resume).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachKind {
+    /// A brand-new shell session was spawned for this peer.
+    Created,
+    /// Reattached to the peer's existing session. `detached_for` is how long it had been detached
+    /// (`None` if it wasn't marked detached, e.g. a second overlapping connection).
+    Reattached { detached_for: Option<Duration> },
+}
+
 /// Get-or-create the detachable session for `peer`. On reattach, clears the detach timer so the
-/// reaper won't collect it while the client is back.
+/// reaper won't collect it while the client is back, and reports how long it had been detached.
 pub async fn attach(
     store: &SessionStore,
     peer: EndpointId,
     shell: Option<&str>,
     scrollback: usize,
-) -> anyhow::Result<SharedSession> {
+) -> anyhow::Result<(SharedSession, AttachKind)> {
     let mut map = store.lock().await;
     if let Some(h) = map.get(&peer) {
-        h.session.lock().await.last_detach = None;
-        return Ok(h.clone());
+        let mut s = h.session.lock().await;
+        let detached_for = s.last_detach.map(|t| t.elapsed());
+        s.last_detach = None;
+        s.attached = s.attached.saturating_add(1);
+        drop(s);
+        return Ok((h.clone(), AttachKind::Reattached { detached_for }));
     }
     let handle = spawn_session(shell, scrollback)?;
+    handle.session.lock().await.attached = 1;
     map.insert(peer, handle.clone());
-    Ok(handle)
+    Ok((handle, AttachKind::Created))
 }
 
-/// Mark `peer`'s session detached (records the time; the shell keeps running for reattach).
+/// Detach one client from `peer`'s session (the shell keeps running for reattach).
+///
+/// The detach timer is stamped only when the *last* attached client leaves, so a concurrent
+/// same-peer connection detaching can't mark a session the other is still using as reapable.
 pub async fn detach(store: &SessionStore, peer: EndpointId) {
     if let Some(h) = store.lock().await.get(&peer) {
-        h.session.lock().await.last_detach = Some(Instant::now());
+        let mut s = h.session.lock().await;
+        s.attached = s.attached.saturating_sub(1);
+        if s.attached == 0 {
+            s.last_detach = Some(Instant::now());
+        }
     }
 }
 
@@ -208,6 +241,78 @@ pub async fn run_reaper(
 mod tests {
     use super::*;
     use crate::transport_iroh::generate_secret_key;
+
+    #[tokio::test]
+    async fn attach_reports_created_then_reattached() {
+        // First attach for a peer creates a session; a later attach (after detach) reattaches to
+        // the same session and reports how long it was detached — the data the server logs as the
+        // mosh-style "resuming your session" notice.
+        let store = SessionStore::default();
+        let peer = generate_secret_key().public();
+
+        let (h1, kind) = attach(&store, peer, Some("sh"), 0)
+            .await
+            .expect("first attach");
+        assert_eq!(kind, AttachKind::Created, "first attach creates a session");
+
+        detach(&store, peer).await;
+        let (h2, kind) = attach(&store, peer, Some("sh"), 0).await.expect("reattach");
+        assert!(
+            matches!(
+                kind,
+                AttachKind::Reattached {
+                    detached_for: Some(_)
+                }
+            ),
+            "reattach after a detach reports the detached duration, got {kind:?}"
+        );
+        assert!(
+            Arc::ptr_eq(&h1, &h2),
+            "reattach returns the very same session handle, not a new one"
+        );
+
+        // Tear the shell down so the drain task ends and nothing lingers.
+        let _ = h2.session.lock().await.pty.kill();
+    }
+
+    #[tokio::test]
+    async fn overlapping_detach_does_not_arm_reaper_until_last_client_leaves() {
+        // Two concurrent connections from the same peer share one session. The first detach must
+        // NOT stamp last_detach (the other client is still using the shell); only the last detach
+        // arms the TTL reaper. Otherwise the reaper could collect the session under an active client.
+        let store = SessionStore::default();
+        let peer = generate_secret_key().public();
+
+        let (h, _) = attach(&store, peer, Some("sh"), 0).await.expect("attach A");
+        let (_, _) = attach(&store, peer, Some("sh"), 0).await.expect("attach B");
+        assert_eq!(
+            h.session.lock().await.attached,
+            2,
+            "both connections counted"
+        );
+
+        detach(&store, peer).await; // A leaves; B still attached
+        {
+            let s = h.session.lock().await;
+            assert_eq!(s.attached, 1, "one client remains");
+            assert!(
+                s.last_detach.is_none(),
+                "detach timer must NOT be armed while a client is still attached"
+            );
+        }
+
+        detach(&store, peer).await; // B leaves; now truly detached
+        {
+            let s = h.session.lock().await;
+            assert_eq!(s.attached, 0);
+            assert!(
+                s.last_detach.is_some(),
+                "detach timer arms only once the last client leaves"
+            );
+        }
+
+        let _ = h.session.lock().await.pty.kill();
+    }
 
     #[tokio::test]
     async fn reaper_collects_dead_session_at_injected_interval() {

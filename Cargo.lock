@@ -1920,6 +1920,7 @@ dependencies = [
  "directories",
  "iroh",
  "miniz_oxide",
+ "nix",
  "portable-pty",
  "postcard",
  "proptest",

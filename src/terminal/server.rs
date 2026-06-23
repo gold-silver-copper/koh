@@ -12,6 +12,18 @@ use crate::terminal::{TerminalScreen, ECHO_TIMEOUT_MS};
 /// OSC-52 set is dropped rather than synced, so a remote app can't make us ship megabytes.
 const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
 
+/// Cap on a synced window title / icon name, in characters (mosh truncates OSC 0/1/2 at parse).
+/// No real app sends a multi-KiB title, so this just bounds a hostile/runaway one.
+const MAX_TITLE_LEN: usize = 256;
+
+/// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
+fn title_from(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .take(MAX_TITLE_LEN)
+        .collect()
+}
+
 #[derive(Default)]
 struct Callbacks {
     title: String,
@@ -26,10 +38,10 @@ struct Callbacks {
 
 impl vt100::Callbacks for Callbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, t: &[u8]) {
-        self.title = String::from_utf8_lossy(t).into_owned();
+        self.title = title_from(t);
     }
     fn set_window_icon_name(&mut self, _: &mut vt100::Screen, n: &[u8]) {
-        self.icon = String::from_utf8_lossy(n).into_owned();
+        self.icon = title_from(n);
     }
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bell_count += 1;
@@ -334,5 +346,22 @@ mod tests {
         let big = "A".repeat(MAXIMUM_CLIPBOARD_SIZE + 1);
         t.process(format!("\x1b]52;c;{big}\x07").as_bytes());
         assert_eq!(t.snapshot().clipboard(), "", "oversized clipboard dropped");
+    }
+
+    #[test]
+    fn oversized_title_is_clamped() {
+        // A runaway/hostile OSC title is clamped to MAX_TITLE_LEN chars (mosh's parse-time cap),
+        // not stored unbounded.
+        let mut t = ServerTerminal::new(24, 80, 0);
+        let huge = "x".repeat(MAX_TITLE_LEN + 500);
+        t.process(format!("\x1b]2;{huge}\x07").as_bytes());
+        assert_eq!(
+            t.title().chars().count(),
+            MAX_TITLE_LEN,
+            "title clamped to the cap"
+        );
+        // A title within the cap is untouched.
+        t.process(b"\x1b]2;short\x07");
+        assert_eq!(t.title(), "short");
     }
 }

@@ -11,11 +11,16 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::transport_iroh::ratelimit::FailureLimiter;
 use anyhow::Context;
 use clap::Args as ClapArgs;
 use iroh::EndpointId;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 
 use crate::server::{run_attached, session, SessionExit};
 use crate::transport_iroh::{
@@ -60,6 +65,12 @@ pub struct ServeArgs {
     /// Default 24h (mosh-style "close the laptop, reopen later").
     #[arg(long, default_value_t = 86_400)]
     session_ttl_secs: u64,
+
+    /// Exit the server after this many seconds with NO active client connection (0 = never, the
+    /// default). A safety net for orphaned servers — mosh's `$MOSH_SERVER_NETWORK_TMOUT`. Note it
+    /// can reap a *retained, detached* session, so leave it 0 unless you want that trade-off.
+    #[arg(long, env = "KOH_SERVER_NETWORK_TMOUT", default_value_t = 0)]
+    network_timeout_secs: u64,
 
     /// Host via a self-hosted relay URL instead of n0's public relays.
     #[arg(long, value_name = "URL")]
@@ -232,13 +243,39 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         reaper_shutdown.clone(),
     ));
 
-    while let Some(incoming) = endpoint.accept().await {
+    // Graceful shutdown: a SIGTERM/SIGINT drains the accept loop cleanly (close the endpoint after
+    // the reaper stops) instead of hard-killing the process. The optional network-idle watchdog
+    // cancels the same token, so a server nobody is connected to can self-exit.
+    let shutdown = CancellationToken::new();
+    spawn_signal_drain(shutdown.clone())?;
+    let active = Arc::new(AtomicUsize::new(0));
+    if args.network_timeout_secs > 0 {
+        spawn_idle_watchdog(
+            active.clone(),
+            Duration::from_secs(args.network_timeout_secs),
+            shutdown.clone(),
+        );
+    }
+
+    loop {
+        let incoming = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            inc = endpoint.accept() => match inc {
+                Some(i) => i,
+                None => break, // endpoint closed
+            },
+        };
         let allow = allow.clone();
         let shell = shell.clone();
         let passphrase = passphrase.clone();
         let store = store.clone();
         let limiter = limiter.clone();
+        // Counts this connection as active for the whole task; the guard decrements on every exit
+        // path so the idle watchdog sees an accurate live-connection count.
+        let active_guard = ConnGuard::new(active.clone());
         tokio::spawn(async move {
+            let _active_guard = active_guard;
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {
@@ -295,14 +332,29 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             }
             info!(peer = %format_endpoint_id(&peer), "client authorized; attaching session");
             // Attach to (or create) this client's detachable session, then serve the connection.
-            let handle = match session::attach(&store, peer, shell.as_deref(), scrollback).await {
-                Ok(h) => h,
-                Err(e) => {
-                    error!(error = %e, "failed to start session");
-                    conn.close(1u32.into(), b"session error");
-                    return;
+            let (handle, attach_kind) =
+                match session::attach(&store, peer, shell.as_deref(), scrollback).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        error!(error = %e, "failed to start session");
+                        conn.close(1u32.into(), b"session error");
+                        return;
+                    }
+                };
+            match attach_kind {
+                session::AttachKind::Created => {
+                    info!(peer = %format_endpoint_id(&peer), "started a new session");
                 }
-            };
+                session::AttachKind::Reattached { detached_for } => {
+                    // mosh-server's "you have a detached session" notice, server-side: this peer is
+                    // resuming its running session rather than starting a fresh one.
+                    info!(
+                        peer = %format_endpoint_id(&peer),
+                        detached_secs = detached_for.map(|d| d.as_secs()),
+                        "reattaching to this peer's existing session"
+                    );
+                }
+            }
             match run_attached(conn, handle).await {
                 Ok(SessionExit::Detached) => {
                     // Keep the shell running for reattach.
@@ -321,12 +373,78 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         });
     }
 
-    // The accept loop ended (endpoint closed): stop the reaper cleanly and wait for it to finish
-    // its current sweep before tearing down the endpoint.
+    // The accept loop ended (endpoint closed, a shutdown signal, or the idle timeout): stop the
+    // reaper + idle watchdog cleanly and wait for the reaper to finish its current sweep before
+    // tearing down the endpoint. Cancelling `shutdown` here also stops the watchdog when we exited
+    // because the endpoint closed on its own (rather than via the token).
+    info!("draining: stopping reaper and closing endpoint");
+    shutdown.cancel();
     reaper_shutdown.cancel();
     let _ = reaper.await;
     endpoint.close().await;
     Ok(())
+}
+
+/// Tracks one live client connection: increments the active count on construction and decrements it
+/// on drop, so the idle watchdog sees an accurate count across every task exit path.
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl ConnGuard {
+    fn new(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Self(active)
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Cancel `shutdown` on the first SIGTERM/SIGINT so the accept loop drains gracefully (rather than
+/// the process dying mid-session). Returns an error only if a handler can't be installed.
+fn spawn_signal_drain(shutdown: CancellationToken) -> anyhow::Result<()> {
+    let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut intr = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = intr.recv() => {}
+        }
+        info!("received shutdown signal; draining");
+        shutdown.cancel();
+    });
+    Ok(())
+}
+
+/// Cancel `shutdown` once there have been zero active connections continuously for `timeout`
+/// (mosh's `$MOSH_SERVER_NETWORK_TMOUT`). Polls about once a second; resets the idle clock whenever
+/// a connection is live.
+fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration, shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        let tick = Duration::from_secs(1).min(timeout);
+        let mut idle_since: Option<Instant> = None;
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(tick) => {}
+            }
+            if active.load(Ordering::SeqCst) == 0 {
+                let since = *idle_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= timeout {
+                    info!(
+                        timeout_secs = timeout.as_secs(),
+                        "network idle timeout; shutting down"
+                    );
+                    shutdown.cancel();
+                    return;
+                }
+            } else {
+                idle_since = None;
+            }
+        }
+    });
 }
 
 #[cfg(test)]

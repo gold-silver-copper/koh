@@ -28,11 +28,24 @@ use secrecy::{ExposeSecret, SecretString};
 use termina::escape::csi::{Csi, DecPrivateMode, DecPrivateModeCode, Mode};
 use termina::{PlatformTerminal, Terminal as _};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 pub use render::{render, WindowState};
 
 /// The escape prefix (Ctrl-^); followed by '.' it disconnects the session.
 pub const ESCAPE_PREFIX: u8 = 0x1e;
+/// The escape suffix that suspends the client to the background (`Ctrl-^` then `Ctrl-Z`).
+///
+/// Mirrors mosh. In raw mode `Ctrl-Z` is a literal byte (no SIGTSTP from the tty), so the suspend
+/// is driven through the escape machine instead.
+pub const SUSPEND_KEY: u8 = 0x1a;
+
+/// The DEC private modes we may have forwarded to the user's terminal (X10 `?9` + all mouse modes
+/// and encodings, bracketed paste `?2004`, application cursor keys `?1`) plus normal keypad
+/// (`ESC >`). Reset together whenever we leave the alternate screen — on drop *or* on suspend — so
+/// the user's shell isn't left with mouse reporting on, injecting stray bytes at the prompt.
+const RESET_FORWARDED_MODES: &[u8] =
+    b"\x1b[?9l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>";
 
 /// How long a single reconnect dial may run before it is abandoned and retried.
 const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -127,6 +140,17 @@ pub trait ClientTerminal {
 
     /// The current window size as `(rows, cols)`.
     fn size(&self) -> std::io::Result<(u16, u16)>;
+
+    /// Suspend the client to the background (the `Ctrl-^ Ctrl-Z` escape): restore the user's
+    /// terminal to a usable cooked state, stop the process with `SIGTSTP`, and — once the user
+    /// foregrounds it again (`SIGCONT`) — re-enter raw mode + the alternate screen so the caller can
+    /// force a repaint. Blocks for the whole suspended duration (the entire process is stopped).
+    ///
+    /// Default: a no-op, so a scripted test terminal can never actually stop the test process; only
+    /// the real [`TerminaTerminal`] performs the suspend.
+    fn suspend_resume(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The production terminal: a termina `PlatformTerminal` put into raw mode + the alternate
@@ -155,8 +179,51 @@ impl TerminaTerminal {
         term.flush()?;
         Ok(Self {
             term,
-            oob: render::OutOfBand::default(),
+            oob: render::OutOfBand::with_title_prefix(koh_title_prefix()),
         })
+    }
+
+    /// Re-enter the alternate screen and hide the cursor (the raw-mode/alt-screen setup shared by
+    /// [`enter`](Self::enter) and the resume half of [`suspend_resume`](Self::suspend_resume)).
+    fn enter_screen(&mut self) -> std::io::Result<()> {
+        write!(
+            self.term,
+            "{}{}",
+            Csi::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ClearAndEnableAlternateScreen
+            ))),
+            Csi::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ShowCursor
+            ))),
+        )?;
+        self.term.flush()
+    }
+
+    /// Reset forwarded modes, show the cursor, and leave the alternate screen (the teardown shared
+    /// by [`Drop`] and the suspend half of [`suspend_resume`](Self::suspend_resume)).
+    fn leave_screen(&mut self) -> std::io::Result<()> {
+        self.term.write_all(RESET_FORWARDED_MODES)?;
+        write!(
+            self.term,
+            "{}{}",
+            Csi::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ShowCursor
+            ))),
+            Csi::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ClearAndEnableAlternateScreen
+            ))),
+        )?;
+        self.term.flush()
+    }
+}
+
+/// The window-title prefix to mirror onto the user's terminal (mosh's `[mosh] `). Empty — i.e.
+/// disabled — when `$KOH_TITLE_NOPREFIX` is set, matching `$MOSH_TITLE_NOPREFIX`.
+fn koh_title_prefix() -> String {
+    if std::env::var_os("KOH_TITLE_NOPREFIX").is_some() {
+        String::new()
+    } else {
+        "[koh] ".to_string()
     }
 }
 
@@ -178,29 +245,33 @@ impl ClientTerminal for TerminaTerminal {
         let d = self.term.get_dimensions()?;
         Ok((d.rows, d.cols))
     }
+
+    fn suspend_resume(&mut self) -> std::io::Result<()> {
+        // Restore the user's terminal (reset forwarded modes, show cursor, leave the alt screen)
+        // and return to cooked mode, so the suspended job sits at a normal shell.
+        self.leave_screen()?;
+        self.term.enter_cooked_mode()?;
+        let _ = writeln!(self.term, "\n[koh suspended — run `fg` to resume]");
+        let _ = self.term.flush();
+        // Stop ourselves. SIGTSTP halts the whole process; control returns here only once the user
+        // foregrounds the job (SIGCONT). `nix::raise` keeps the crate `forbid(unsafe)`.
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGTSTP)
+            .map_err(std::io::Error::other)?;
+        // Foregrounded again: re-enter raw mode + the alternate screen and force the next frame to
+        // re-assert the title / clipboard / input modes (the terminal was reset while we were away).
+        self.term.enter_raw_mode()?;
+        self.enter_screen()?;
+        self.oob.invalidate();
+        Ok(())
+    }
 }
 
 impl Drop for TerminaTerminal {
     fn drop(&mut self) {
-        // Reset the input modes we may have forwarded (bracketed-paste, all mouse modes — incl.
-        // X10 `?9` — and encodings, application cursor keys + keypad) so the user's terminal isn't
-        // left with mouse reporting on, injecting stray click bytes at the shell prompt.
-        let _ = self.term.write_all(
-            b"\x1b[?9l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>",
-        );
-        // Show the cursor and leave the alternate screen; the PlatformTerminal's own Drop
-        // restores cooked mode afterward.
-        let _ = write!(
-            self.term,
-            "{}{}",
-            Csi::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ShowCursor
-            ))),
-            Csi::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ClearAndEnableAlternateScreen
-            ))),
-        );
-        let _ = self.term.flush();
+        // Reset forwarded modes, show the cursor, and leave the alternate screen so the user's
+        // terminal isn't left with mouse reporting on (stray click bytes at the prompt). The
+        // PlatformTerminal's own Drop restores cooked mode afterward.
+        let _ = self.leave_screen();
     }
 }
 
@@ -209,6 +280,9 @@ impl Drop for TerminaTerminal {
 pub enum InputOutcome {
     /// The user typed the escape prefix followed by `.` — disconnect.
     Quit,
+    /// The user typed the escape prefix followed by `Ctrl-Z` — suspend to the background. Any bytes
+    /// before the escape in the same chunk were already forwarded; the caller drives the suspend.
+    Suspend,
     /// The bytes were consumed (forwarded to the server and/or seeded into the predictor).
     Forwarded,
 }
@@ -283,12 +357,17 @@ impl ClientSession {
     /// current remote screen, and appends the surviving bytes to the outgoing input stream.
     pub fn on_input(&mut self, now: u64, bytes: &[u8]) -> InputOutcome {
         let mut quit = false;
+        let mut suspend = false;
         let mut fwd: Vec<u8> = Vec::with_capacity(bytes.len());
         for &b in bytes {
             if self.pending_escape {
                 self.pending_escape = false;
                 if b == b'.' {
                     quit = true;
+                    break;
+                }
+                if b == SUSPEND_KEY {
+                    suspend = true;
                     break;
                 }
                 fwd.push(ESCAPE_PREFIX);
@@ -302,6 +381,8 @@ impl ClientSession {
         if quit {
             return InputOutcome::Quit;
         }
+        // Forward any bytes that preceded the escape before suspending, so nothing typed ahead of
+        // `Ctrl-^ Ctrl-Z` is dropped.
         if !fwd.is_empty() {
             self.predictor
                 .set_local_frame_sent(self.transport.newest_sent_num());
@@ -316,6 +397,9 @@ impl ClientSession {
             }
             self.transport.current_mut().push_bytes(&fwd);
             self.dirty = true;
+        }
+        if suspend {
+            return InputOutcome::Suspend;
         }
         InputOutcome::Forwarded
     }
@@ -428,8 +512,18 @@ impl ClientSession {
 /// so the loop doesn't spin on a closed channel. `initial_size` (`(rows, cols)`) seeds the size if
 /// `term.size()` is unavailable.
 /// Returns the remote shell's exit code (`Some`) when the session ended because the shell exited,
-/// or `None` for a local quit (`Ctrl-^ .` or a closed input channel) — so the binary can exit with
-/// the remote status.
+/// or `None` for a local quit (`Ctrl-^ .`, a closed input channel, or a cancelled `shutdown`) — so
+/// the binary can exit with the remote status.
+///
+/// `shutdown` is a [`CancellationToken`] the caller cancels on a fatal signal (SIGTERM/SIGINT/
+/// SIGHUP): the loop then returns as if the user quit, so `term` is dropped and the terminal is
+/// restored — rather than the process dying at default signal disposition with the TTY left raw.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the I/O shell wires up the channel, connector, prediction policy, size, the two \
+              input/resize channels, the terminal, and the shutdown token — each a distinct \
+              collaborator; bundling them into a struct would only move the list, not shorten it"
+)]
 pub async fn run_client<T: ClientTerminal>(
     initial: IrohChannel,
     connector: IrohConnector,
@@ -438,6 +532,7 @@ pub async fn run_client<T: ClientTerminal>(
     mut input_rx: mpsc::Receiver<Vec<u8>>,
     mut resize_rx: mpsc::Receiver<()>,
     mut term: T,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<Option<u32>> {
     let clock = MonoClock::new();
     // Opt-in overwrite-mode prediction for full-screen apps (mosh's $MOSH_PREDICTION_OVERWRITE).
@@ -464,6 +559,7 @@ pub async fn run_client<T: ClientTerminal>(
             &mut input_rx,
             &mut resize_rx,
             &clock,
+            &shutdown,
         )
         .await?
         {
@@ -477,7 +573,16 @@ pub async fn run_client<T: ClientTerminal>(
             }
             Disposition::LinkLost => {
                 channel.close(0, b"reconnecting");
-                match reconnect(&connector, &mut term, &mut input_rx, &session, &clock).await {
+                match reconnect(
+                    &connector,
+                    &mut term,
+                    &mut input_rx,
+                    &session,
+                    &clock,
+                    &shutdown,
+                )
+                .await
+                {
                     ReconnectOutcome::Connected(c) => channel = c,
                     ReconnectOutcome::Quit => return Ok(None),
                 }
@@ -505,6 +610,7 @@ async fn drive_connection<T: ClientTerminal>(
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
     resize_rx: &mut mpsc::Receiver<()>,
     clock: &MonoClock,
+    shutdown: &CancellationToken,
 ) -> anyhow::Result<Disposition> {
     loop {
         let now = clock.now_ms();
@@ -545,14 +651,25 @@ async fn drive_connection<T: ClientTerminal>(
 
             maybe = input_rx.recv() => {
                 match maybe {
-                    Some(chunk) => {
-                        if session.on_input(clock.now_ms(), &chunk) == InputOutcome::Quit {
-                            return Ok(Disposition::Quit);
+                    Some(chunk) => match session.on_input(clock.now_ms(), &chunk) {
+                        InputOutcome::Quit => return Ok(Disposition::Quit),
+                        InputOutcome::Suspend => {
+                            // Ctrl-^ Ctrl-Z: hand the terminal back to the shell, stop, and on
+                            // resume re-enter raw mode and force a full repaint. A no-op for the
+                            // scripted test terminal.
+                            term.suspend_resume()?;
+                            session.dirty = true;
                         }
-                    }
+                        InputOutcome::Forwarded => {}
+                    },
                     None => return Ok(Disposition::Quit), // input source closed
                 }
             }
+
+            // Graceful shutdown: a SIGTERM/SIGINT/SIGHUP (delivered via this token) returns Quit so
+            // `run_client` unwinds and drops the terminal — restoring cooked mode + the main screen
+            // — instead of the process dying at default disposition with the TTY left in raw mode.
+            _ = shutdown.cancelled() => return Ok(Disposition::Quit),
 
             // Cancel-safety: if a higher-priority arm fires first, this in-flight `read_datagram`
             // future is dropped. That is only sound because the pinned `iroh = "1.0.0"`'s
@@ -604,6 +721,7 @@ async fn reconnect<T: ClientTerminal>(
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
     last: &ClientSession,
     clock: &MonoClock,
+    shutdown: &CancellationToken,
 ) -> ReconnectOutcome {
     let started = clock.now_ms();
     let mut pending_escape = false;
@@ -645,6 +763,9 @@ async fn reconnect<T: ClientTerminal>(
                     tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
                     continue 'attempt;
                 }
+
+                // Honor a SIGTERM/SIGINT/SIGHUP even mid-reconnect, so the terminal is restored.
+                _ = shutdown.cancelled() => return ReconnectOutcome::Quit,
 
                 _ = tokio::time::sleep(Duration::from_secs(1)) => { /* tick the banner clock */ }
             }
@@ -696,6 +817,43 @@ mod tests {
         );
         // The escape prefix (0x1e) followed by '.' disconnects.
         assert_eq!(s.on_input(0, &[ESCAPE_PREFIX, b'.']), InputOutcome::Quit);
+    }
+
+    #[test]
+    fn escape_prefix_ctrl_z_suspends() {
+        let mut s = new_session();
+        // 0x1e then Ctrl-Z (0x1a) requests a background suspend.
+        assert_eq!(
+            s.on_input(0, &[ESCAPE_PREFIX, SUSPEND_KEY]),
+            InputOutcome::Suspend
+        );
+        // The suffix also works split across chunks (the pending-escape state carries over).
+        assert_eq!(s.on_input(0, &[ESCAPE_PREFIX]), InputOutcome::Forwarded);
+        assert_eq!(s.on_input(0, &[SUSPEND_KEY]), InputOutcome::Suspend);
+    }
+
+    #[test]
+    fn bytes_before_suspend_escape_are_forwarded_first() {
+        let mut s = new_session();
+        // Typing "hi" then Ctrl-^ Ctrl-Z in one chunk: "hi" must reach the server before we suspend.
+        assert_eq!(
+            s.on_input(0, &[b'h', b'i', ESCAPE_PREFIX, SUSPEND_KEY]),
+            InputOutcome::Suspend
+        );
+        let typed: Vec<u8> = s
+            .transport
+            .current()
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                InputEvent::Byte(b) => Some(*b),
+                InputEvent::Resize { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            typed, b"hi",
+            "pre-escape bytes are forwarded before suspending"
+        );
     }
 
     #[test]

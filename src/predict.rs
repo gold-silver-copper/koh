@@ -597,13 +597,19 @@ impl PredictionEngine {
                             },
                         );
                     } else {
-                        // Insert mode: shift the row left from col to the right edge; the far
-                        // right column gains whatever was off-screen -> unknown (underline hint,
-                        // never a guessed glyph). Left-to-right so each cell reads its unshifted
-                        // right neighbor.
+                        // Insert mode: shift the row left from col to the right edge; the last
+                        // TWO columns gain whatever was off-screen -> unknown (underline hint,
+                        // never a guessed glyph). mosh marks the cell unknown when `i + 2 >= width`
+                        // (terminaloverlay.cc), one column wider than the naive "only the last
+                        // column" — the right-edge cell a wide grapheme could straddle is ambiguous
+                        // too. Left-to-right so each cell reads its unshifted right neighbor.
                         for i in col..cols {
                             let original = cell_glyph(screen, row, i);
-                            let (g, fg, bg, unknown) = if i + 1 < cols {
+                            // `i < cols - 2` is mosh's `i + 2 < width`, written to never overflow
+                            // u16 (the screen width is peer-controlled; `i + 2` would wrap/panic at
+                            // cols == u16::MAX). The true branch then has `i + 1 < cols`, so the
+                            // `i + 1` read below is in bounds.
+                            let (g, fg, bg, unknown) = if i < cols.saturating_sub(2) {
                                 self.pred_or_real_glyph(screen, row, i + 1)
                             } else {
                                 (String::new(), Color::Default, Color::Default, true)
@@ -701,6 +707,11 @@ impl PredictionEngine {
         let mut max_confirm = confirmed;
         let mut new_glitch = self.glitch_trigger;
         let mut last_quick = self.last_quick_confirmation;
+        // mosh's "match rest of row to the actual renditions": each `(row, from_col, fg, bg)` run
+        // recolors the still-pending predicted cells from `from_col` to the row's end with a freshly
+        // confirmed cell's *actual* colors, so they don't flash a guessed rendition before their own
+        // frame lands. Applied after the validity pass (can't mutate `cells` while iterating it).
+        let mut rendition_runs: Vec<(u16, u16, Color, Color)> = Vec::new();
 
         for (&(row, col), cell) in &self.cells {
             let v = cell_validity(cell, screen, row, col, rows, cols, late);
@@ -729,6 +740,15 @@ impl PredictionEngine {
                         new_glitch -= 1;
                         last_quick = now;
                     }
+                    // Re-color the rest of this row's pending predictions to the actual confirmed
+                    // renditions (mosh terminaloverlay.cc): koh's `PredCell` carries only fg/bg, so
+                    // this ports the color/attr-flicker fix to the extent the cell model allows.
+                    let (afg, abg) = screen
+                        .cell(row, col)
+                        .map_or((Color::Default, Color::Default), |c| {
+                            (c.fgcolor(), c.bgcolor())
+                        });
+                    rendition_runs.push((row, col, afg, abg));
                     to_remove.push((row, col));
                 }
                 Validity::CorrectNoCredit => {
@@ -756,10 +776,30 @@ impl PredictionEngine {
         for k in &to_remove {
             self.cells.remove(k);
         }
+        // Apply the deferred rest-of-row rendition copies to the cells that survived the validity
+        // pass. Runs are in row-major / ascending-column order, so a later (further-right) confirmed
+        // cell's colors win for the overlap — matching mosh's sequential per-cell application.
+        for &(row, from_col, fg, bg) in &rendition_runs {
+            for (_, cell) in self.cells.range_mut((row, from_col)..=(row, u16::MAX)) {
+                cell.fg = fg;
+                cell.bg = bg;
+            }
+        }
         if !kill_epochs.is_empty() {
             self.cells
                 .retain(|_, c| !kill_epochs.contains(&c.tentative_epoch));
             self.become_tentative();
+            // mosh's kill_epoch re-seeds a fresh cursor at the *real* screen position in the new
+            // epoch, so a stale predicted cursor left over from the killed epoch can't keep being
+            // drawn. It is tentative (epoch > confirmed) and therefore hidden until confirmed, so
+            // the authoritative cursor shows through in the meantime.
+            let (crow, ccol) = screen.cursor_position();
+            self.cursor = Some(PredCursor {
+                expiration_frame: self.local_frame_sent + 1,
+                tentative_epoch: self.prediction_epoch,
+                row: crow,
+                col: ccol,
+            });
         }
 
         // Cursor validation.
@@ -1142,7 +1182,8 @@ mod tests {
     #[test]
     fn insert_mode_backspace_shifts_left_with_unknown_right_edge() {
         // Screen "abc" cursor on 'c' (col 2). Backspace deletes 'b': 'c' shifts left to col 1,
-        // and the far-right column becomes unknown (content scrolled in from off-screen).
+        // and the last TWO columns become unknown (content scrolled in from off-screen; mosh marks
+        // the cell unknown when `i + 2 >= width`, so both edge columns, not just the last one).
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of(b"abc\x1b[1;3H"); // cursor -> (0,2)
@@ -1155,7 +1196,138 @@ mod tests {
         );
         assert!(
             e.cells.get(&(0, cols - 1)).is_some_and(|c| c.unknown),
-            "right edge is marked unknown after a mid-line backspace"
+            "the last column is marked unknown after a mid-line backspace"
+        );
+        assert!(
+            e.cells.get(&(0, cols - 2)).is_some_and(|c| c.unknown),
+            "the second-to-last column is unknown too (mosh's `i + 2 >= width`)"
+        );
+        assert!(
+            e.cells.get(&(0, cols - 3)).is_some_and(|c| !c.unknown),
+            "the third-to-last column is still a concrete shifted cell, not unknown"
+        );
+    }
+
+    #[test]
+    fn insert_mode_backspace_does_not_overflow_at_max_width() {
+        // Regression: the unknown-column guard must be overflow-safe on a peer-controlled width.
+        // At cols == u16::MAX the left-shift loop reaches i = 65534, where a naive `i + 2` overflows
+        // u16 (panics under debug overflow-checks). The `i < cols - 2` form must not.
+        let p = vt100::Parser::new(1, u16::MAX, 0);
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.set_local_frame_sent(0);
+        // Predicted cursor near the right edge so the backspace runs its left-shift loop out to the
+        // final column (where the overflow would occur).
+        e.cursor = Some(PredCursor {
+            expiration_frame: 1,
+            tentative_epoch: 1,
+            row: 0,
+            col: u16::MAX - 1,
+        });
+        e.new_user_byte(0, 0x7f, p.screen()); // backspace — must not panic
+                                              // The two right-edge columns are unknown (mosh's `i + 2 >= width`), with no `i + 1` read.
+        assert!(
+            e.cells.get(&(0, u16::MAX - 1)).is_some_and(|c| c.unknown),
+            "last column unknown at max width"
+        );
+        assert!(
+            e.cells.get(&(0, u16::MAX - 2)).is_some_and(|c| c.unknown),
+            "second-to-last column unknown at max width"
+        );
+    }
+
+    #[test]
+    fn correct_grade_recolors_rest_of_row_pending_predictions() {
+        // mosh "match rest of row to the actual renditions": when a predicted cell confirms with a
+        // concrete on-screen color, the still-pending predicted cells to its right adopt that color
+        // (so they don't flash a guessed rendition before their own frame confirms).
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.set_local_frame_sent(0);
+        // Confirm an initial keystroke so later predictions are in a shown epoch.
+        let blank = screen_of(b"");
+        e.new_user_byte(0, b'a', &blank);
+        let echoed = screen_of(b"a");
+        e.set_local_frame_late_acked(1);
+        e.cull(50, &echoed); // confirmed_epoch = 1
+
+        // Type "bc": 'b' on frame 2 (will be confirmed), 'c' on frame 3 (stays pending), so 'c'
+        // survives the cull where 'b' confirms — and can be recolored.
+        e.set_local_frame_sent(1);
+        e.new_user_byte(60, b'b', &echoed);
+        e.set_local_frame_sent(2);
+        e.new_user_byte(61, b'c', &echoed);
+        assert_eq!(
+            e.cells.get(&(0, 2)).map(|c| c.fg),
+            Some(Color::Default),
+            "'c' starts with the default (guessed) foreground"
+        );
+
+        // The server echoes 'b' in a *colored* rendition (red fg) and acks frame 2; 'c' (frame 3)
+        // is still pending. Grading 'b' Correct must repaint the rest of the row — col 2's pending
+        // 'c' — with 'b''s actual red foreground.
+        let colored = screen_of(b"a\x1b[31mb");
+        e.set_local_frame_late_acked(2);
+        e.cull(70, &colored);
+        assert_eq!(
+            e.cells.get(&(0, 2)).map(|c| c.fg),
+            Some(Color::Idx(1)),
+            "the pending 'c' adopted the confirmed 'b' cell's actual red foreground"
+        );
+    }
+
+    #[test]
+    fn killed_epoch_reseeds_cursor_off_stale_position() {
+        // A tentative-epoch mispredict kills that epoch. mosh's kill_epoch re-seeds the cursor at
+        // the real screen position so a *confirmed-but-stale* predicted cursor — one that would
+        // otherwise keep being drawn at a position the killed predictions had moved it to — is
+        // displaced. Built from raw state to isolate exactly that condition.
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.confirmed_epoch = 1;
+        e.prediction_epoch = 2;
+        e.set_local_frame_sent(5);
+        e.set_local_frame_late_acked(5);
+        // A CONFIRMED (epoch 1 <= confirmed 1) cursor at a stale column, still Pending (expiration
+        // far ahead of late_acked) so the validation pass won't resolve it — it would keep drawing.
+        e.cursor = Some(PredCursor {
+            expiration_frame: 99,
+            tentative_epoch: 1,
+            row: 0,
+            col: 9,
+        });
+        // A TENTATIVE cell (epoch 2 > confirmed 1) the next frame contradicts -> kills epoch 2.
+        e.cells.insert(
+            (0, 3),
+            PredCell {
+                expiration_frame: 5,
+                tentative_epoch: 2,
+                prediction_time: 0,
+                glyph: "Q".to_string(),
+                fg: Color::Default,
+                bg: Color::Default,
+                original_contents: vec![String::new()],
+                unknown: false,
+            },
+        );
+        let blank = screen_of(b"");
+        assert_eq!(
+            e.overlay(&blank).cursor(),
+            Some((0, 9)),
+            "the stale confirmed cursor is drawn before the kill"
+        );
+        // The frame has no 'Q' at (0,3) -> epoch 2 is killed; the real cursor is at (0,0).
+        e.cull(10, &blank);
+        assert!(
+            e.overlay(&blank).cursor().is_none(),
+            "after kill_epoch the stale predicted cursor is displaced; the real cursor shows through"
+        );
+        let c = e
+            .cursor
+            .as_ref()
+            .expect("kill_epoch re-seeds a cursor rather than clearing it");
+        assert_eq!(
+            (c.row, c.col),
+            (0, 0),
+            "the re-seeded cursor sits at the real screen position"
         );
     }
 

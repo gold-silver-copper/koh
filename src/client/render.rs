@@ -221,6 +221,10 @@ pub struct WindowState<'a> {
 /// grid but aren't part of it.
 #[derive(Default)]
 pub struct OutOfBand {
+    /// Prepended to the window title (and to the icon when icon == title) so the OS title bar shows
+    /// you're in a koh session — mosh's `[mosh] ` prefix (`$MOSH_TITLE_NOPREFIX` to disable).
+    /// Empty disables it. Compared cells stay the *raw* title, so change-detection is unaffected.
+    title_prefix: String,
     /// Sticky (mosh's `title_initialized`): until the app sets a title/icon we don't touch the
     /// user's terminal title — and once it has, we DO propagate a later reset to empty.
     title_initialized: bool,
@@ -233,6 +237,24 @@ pub struct OutOfBand {
 }
 
 impl OutOfBand {
+    /// An [`OutOfBand`] that prefixes the window title with `title_prefix` (e.g. `"[koh] "`; pass
+    /// `""` to disable). All other state starts fresh.
+    pub fn with_title_prefix(title_prefix: String) -> Self {
+        Self {
+            title_prefix,
+            ..Self::default()
+        }
+    }
+
+    /// Invalidate the tracked out-of-band state so the next [`emit`](Self::emit) re-asserts the
+    /// title, clipboard, bell baseline, and input modes from scratch. Used after a suspend/resume
+    /// (the terminal left and re-entered raw mode + the alternate screen), where everything the
+    /// client had mirrored must be re-emitted. The `title_prefix` is preserved.
+    pub fn invalidate(&mut self) {
+        let prefix = std::mem::take(&mut self.title_prefix);
+        *self = Self::with_title_prefix(prefix);
+    }
+
     /// Emit this frame's title/icon / clipboard / bell / input-mode changes to `out`, updating the
     /// tracked state. Mirrors mosh's `Display::new_frame` out-of-band emission.
     pub fn emit(
@@ -286,7 +308,16 @@ impl OutOfBand {
         }
         self.last_title = title.to_string();
         self.last_icon = icon.to_string();
-        let (t, ic) = (sanitize_osc(title), sanitize_osc(icon));
+        // Prefix the title (and the icon only when it equals the title, preserving the
+        // combined-vs-split branch) — mosh `Framebuffer::prefix_window_title`. The prefix rides on
+        // top of the sanitized raw values; change-detection above used the raw (unprefixed) strings.
+        let icon_eq_title = icon == title;
+        let t = format!("{}{}", self.title_prefix, sanitize_osc(title));
+        let ic = if icon_eq_title {
+            format!("{}{}", self.title_prefix, sanitize_osc(icon))
+        } else {
+            sanitize_osc(icon)
+        };
         if ic == t {
             write!(out, "\x1b]0;{t}\x07")
         } else {
@@ -384,6 +415,47 @@ mod tests {
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("\x1b]1;the-icon\x07"), "icon OSC 1, got {s:?}");
         assert!(s.contains("\x1b]2;the title\x07"), "title OSC 2, got {s:?}");
+    }
+
+    #[test]
+    fn out_of_band_prefixes_title_and_equal_icon() {
+        let mut oob = OutOfBand::with_title_prefix("[koh] ".to_string());
+        let scr = screen_of(b"");
+
+        // icon == title: the prefix is applied to both, and the combined OSC 0 carries it.
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, win("vim", "vim", "", 0)).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf).contains("\x1b]0;[koh] vim\x07"),
+            "combined title is prefixed, got {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+
+        // icon != title: only the title (OSC 2) is prefixed; the icon (OSC 1) is left untouched,
+        // mirroring mosh's prefix_window_title (which preserves equivalence but doesn't prefix a
+        // distinct icon name).
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, win("the title", "the-icon", "", 0))
+            .unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("\x1b]1;the-icon\x07"),
+            "distinct icon unprefixed, got {s:?}"
+        );
+        assert!(
+            s.contains("\x1b]2;[koh] the title\x07"),
+            "title prefixed, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn out_of_band_default_has_no_title_prefix() {
+        // The Default constructor (used by tests and the no-prefix opt-out) adds nothing.
+        let mut oob = OutOfBand::default();
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &screen_of(b""), win("vim", "vim", "", 0))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf).contains("\x1b]0;vim\x07"));
     }
 
     #[test]

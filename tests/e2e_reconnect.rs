@@ -139,6 +139,7 @@ async fn client_reconnects_and_reattaches_after_a_forced_drop() {
             input_rx,
             resize_rx,
             term,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
     });

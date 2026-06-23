@@ -37,6 +37,15 @@ max_koh_rss_kb() {
   for _p in $(koh_pids); do _r=$(rss_kb "$_p"); [ "$_r" -gt "$_m" ] && _m=$_r; done
   echo "$_m"
 }
+# The koh pid that ISN'T <server-pid> (i.e. the connected client). Empty if none.
+other_pid() {  # other_pid <server-pid>
+  for _p in $(koh_pids); do [ "$_p" != "$1" ] && { echo "$_p"; return; }; done
+}
+# /proc/<pid>/stat state char (R run, S sleep, T stopped, Z zombie, …); empty if the pid is gone.
+proc_state() {
+  adb $ADB_SERIAL shell "cat /proc/$1/stat 2>/dev/null" 2>/dev/null | tr -d '\r' \
+    | sed -E 's/^[0-9]+ \(.*\) ([A-Za-z]).*/\1/'
+}
 
 # --- server lifecycle on device --------------------------------------------------------------------
 # start_server "<extra serve args>" — launch detached, wait for the banner, set SERVER_ID/SERVER_PORT.

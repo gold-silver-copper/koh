@@ -106,6 +106,14 @@ KOH_ANDROID_EMULATOR=1 sh testing/android/scripts/stress-throughput.sh
 | `stress-throughput` | server-side flood of 10⁴–10⁵ lines | whole flood processed end-to-end, no panic, server RSS bounded |
 | `stress-memory-longevity` | unbounded output for tens of seconds | RSS plateaus (no leak) under an absolute cap, no panic |
 | `stress-reconnect-restart` | hard-kill the server under a live client | client rides out the drop, stays alive (doesn't exit to shell), surfaces the link-down banner |
+| `stress-client-freeze` | `SIGSTOP`/`SIGCONT` the **client** (the real screen-off) | session rides out the freeze on the *same* connection (no detach/reconnect), client survives |
+| `stress-reattach-continuity` | disconnect then reconnect the same peer | the shell is spawned **once** and *reused* (not recreated) — true "close the lid, reopen" continuity |
+| `stress-client-signals` | Ctrl-^ Ctrl-Z suspend + SIGTERM | client `SIGTSTP`s itself then resumes on `SIGCONT`; SIGTERM exits cleanly, no orphan |
+| `stress-netem` *(opt-in)* | `tc netem` loss + latency on loopback | session survives the loss, flood completes end-to-end, RSS bounded |
+| `stress-relay-discovery` *(opt-in)* | bare-id connect over the public relay | real discovery **DNS resolution** works on Android (not just resolver construction) |
+
+The two opt-in tests self-SKIP (exit 0) unless enabled: `KOH_STRESS_NETEM=1` (needs `adb root` + `tc`)
+and `KOH_ANDROID_NET=1` (needs the emulator to reach the internet).
 
 Notes on the harness (learned the hard way against a real emulator):
 - All cross-process assertions read the **server log** or sample `/proc` — the client prints
@@ -138,5 +146,10 @@ testing/android/
     ├── stress-throughput.sh
     ├── stress-memory-longevity.sh
     ├── stress-reconnect-restart.sh
+    ├── stress-client-freeze.sh
+    ├── stress-reattach-continuity.sh
+    ├── stress-client-signals.sh
+    ├── stress-netem.sh            # opt-in (KOH_STRESS_NETEM=1): tc loss/latency
+    ├── stress-relay-discovery.sh  # opt-in (KOH_ANDROID_NET=1): real DNS via relay
     └── run-stress.sh      # stress orchestrator: guard → build → push → run all stress tests → tally
 ```

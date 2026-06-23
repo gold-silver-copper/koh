@@ -29,7 +29,7 @@ use termina::escape::csi::{Csi, DecPrivateMode, DecPrivateModeCode, Mode};
 use termina::{PlatformTerminal, Terminal as _};
 use tokio::sync::mpsc;
 
-pub use render::render;
+pub use render::{render, WindowState};
 
 /// The escape prefix (Ctrl-^); followed by '.' it disconnects the session.
 pub const ESCAPE_PREFIX: u8 = 0x1e;
@@ -115,15 +115,14 @@ fn escape_quit(chunk: &[u8], pending: &mut bool) -> bool {
 pub trait ClientTerminal {
     /// Paint one frame. `screen` is the authoritative grid (and carries the input modes —
     /// bracketed-paste / mouse / cursor-key — which the real terminal must mirror); `overlay` is
-    /// the prediction overlay; `status` is the optional status line; `title` is the remote window
-    /// title (OSC); `bell_count` is the server's monotonic bell count (ring on increase).
+    /// the prediction overlay; `status` is the optional status line; `win` is the out-of-band
+    /// window state (title / icon / clipboard / bell) to mirror onto the real terminal.
     fn render(
         &mut self,
         screen: &vt100::Screen,
         overlay: &Overlay,
         status: Option<&str>,
-        title: &str,
-        bell_count: u64,
+        win: render::WindowState<'_>,
     ) -> std::io::Result<()>;
 
     /// The current window size as `(rows, cols)`.
@@ -167,12 +166,11 @@ impl ClientTerminal for TerminaTerminal {
         screen: &vt100::Screen,
         overlay: &Overlay,
         status: Option<&str>,
-        title: &str,
-        bell_count: u64,
+        win: render::WindowState<'_>,
     ) -> std::io::Result<()> {
-        // Mirror the out-of-band terminal state (title / bell / input modes) onto the real
+        // Mirror the out-of-band terminal state (title/icon/clipboard/bell/modes) onto the real
         // terminal, then paint the cell grid.
-        self.oob.emit(&mut self.term, screen, title, bell_count)?;
+        self.oob.emit(&mut self.term, screen, win)?;
         render::render(&mut self.term, screen, overlay, status)
     }
 
@@ -307,7 +305,8 @@ impl ClientSession {
         if !fwd.is_empty() {
             self.predictor
                 .set_local_frame_sent(self.transport.newest_sent_num());
-            self.predictor.set_srtt(self.transport.srtt_ms());
+            self.predictor
+                .set_srtt(self.transport.send_interval() as f64);
             // Seed predictions against the current remote screen. The screen borrows `transport`
             // immutably while `predictor` is borrowed mutably — disjoint fields, so no clone is
             // needed; the borrow ends before `current_mut()` below.
@@ -327,7 +326,8 @@ impl ClientSession {
         if self.transport.recv(now, bytes) == RecvOutcome::NewState {
             let echo_ack = self.transport.remote_state().echo_ack();
             self.predictor.set_local_frame_late_acked(echo_ack);
-            self.predictor.set_srtt(self.transport.srtt_ms());
+            self.predictor
+                .set_srtt(self.transport.send_interval() as f64);
             let screen = self.transport.remote_state().screen();
             self.predictor.cull(now, screen);
             self.dirty = true;
@@ -395,14 +395,16 @@ impl ClientSession {
             .overlay(self.transport.remote_state().screen())
     }
 
-    /// The remote window title (OSC), for the client to mirror onto the real terminal.
-    pub fn title(&self) -> &str {
-        self.transport.remote_state().title()
-    }
-
-    /// The server's monotonic audible-bell count (the client rings when it increases).
-    pub fn bell_count(&self) -> u64 {
-        self.transport.remote_state().bell_count()
+    /// The out-of-band window state (title / icon / clipboard / bell) for the client to mirror
+    /// onto the real terminal alongside the cell grid.
+    pub fn window_state(&self) -> render::WindowState<'_> {
+        let ts = self.transport.remote_state();
+        render::WindowState {
+            title: ts.title(),
+            icon: ts.icon(),
+            clipboard: ts.clipboard(),
+            bell_count: ts.bell_count(),
+        }
     }
 }
 
@@ -518,8 +520,7 @@ async fn drive_connection<T: ClientTerminal>(
                 session.screen(),
                 &session.overlay(),
                 tick.status.as_deref(),
-                session.title(),
-                session.bell_count(),
+                session.window_state(),
             )?;
             session.status_was_shown = status_now;
             session.dirty = false;
@@ -530,8 +531,7 @@ async fn drive_connection<T: ClientTerminal>(
                 session.screen(),
                 &Overlay::empty(),
                 Some("[koh] session ended"),
-                session.title(),
-                session.bell_count(),
+                session.window_state(),
             );
             tokio::time::sleep(Duration::from_millis(400)).await;
             return Ok(Disposition::Ended(code));
@@ -618,8 +618,7 @@ async fn reconnect<T: ClientTerminal>(
                 last.screen(),
                 &Overlay::empty(),
                 Some(banner.as_str()),
-                last.title(),
-                last.bell_count(),
+                last.window_state(),
             );
 
             tokio::select! {

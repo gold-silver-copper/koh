@@ -42,8 +42,7 @@ impl ClientTerminal for MockTerminal {
         screen: &vt100::Screen,
         _overlay: &Overlay,
         _status: Option<&str>,
-        _title: &str,
-        _bell_count: u64,
+        _win: koh::client::WindowState<'_>,
     ) -> std::io::Result<()> {
         *self.latest.lock().unwrap() = screen.contents();
         Ok(())

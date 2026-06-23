@@ -223,9 +223,16 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         self.rtt.sample(rtt_ms);
     }
 
-    /// Current smoothed RTT estimate (ms) — used by the adaptive predictor.
+    /// Current smoothed RTT estimate (ms).
     pub fn srtt_ms(&self) -> f64 {
         self.rtt.srtt_ms()
+    }
+
+    /// The send interval (ms) = `clamp(ceil(SRTT/2), MIN, MAX)`. This — NOT raw SRTT — is what
+    /// the adaptive predictor's engage/flag thresholds are tuned against (mosh feeds the same
+    /// quantity to `PredictionEngine`; see `terminaloverlay.cc` SRTT handling).
+    pub fn send_interval(&self) -> u64 {
+        self.rtt.send_interval()
     }
 
     /// Wall-clock (ms) of the most recent decoded inbound datagram, or 0 if we've never heard

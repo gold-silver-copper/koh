@@ -109,6 +109,32 @@ mod tests {
     }
 
     #[test]
+    fn send_interval_is_clamped_half_srtt() {
+        // This is the quantity the adaptive predictor is tuned against (mosh feeds the same): on a
+        // ~100ms link the interval is ~50 (so engage at SRTT>60 vs the predictor's 30ms threshold).
+        let mut mid = RttEstimator::new();
+        for _ in 0..200 {
+            mid.sample(100.0);
+        }
+        assert!(
+            (45..=55).contains(&mid.send_interval()),
+            "≈ srtt/2 = 50, got {}",
+            mid.send_interval()
+        );
+        // A fast link clamps to the floor; a slow link to the ceiling.
+        let mut fast = RttEstimator::new();
+        for _ in 0..200 {
+            fast.sample(2.0);
+        }
+        assert_eq!(fast.send_interval(), SEND_INTERVAL_MIN);
+        let mut slow = RttEstimator::new();
+        for _ in 0..200 {
+            slow.sample(1000.0);
+        }
+        assert_eq!(slow.send_interval(), SEND_INTERVAL_MAX);
+    }
+
+    #[test]
     fn converges_to_low_rtt() {
         let mut e = RttEstimator::new();
         for _ in 0..200 {

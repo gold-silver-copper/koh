@@ -8,10 +8,16 @@ use crate::terminal::{TerminalScreen, ECHO_TIMEOUT_MS};
 /// Captures window title / icon / bell from `vt100`'s callback stream (none are stored on
 /// `Screen` itself), and synthesizes the host-bound replies to terminal queries (DSR / device
 /// attributes / DECRQM) that `vt100` does not answer on its own.
+/// Upper bound on a forwarded clipboard payload (mosh's `MAXIMUM_CLIPBOARD_SIZE`): a larger
+/// OSC-52 set is dropped rather than synced, so a remote app can't make us ship megabytes.
+const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
+
 #[derive(Default)]
 struct Callbacks {
     title: String,
     icon: String,
+    /// The remote-set clipboard payload (OSC 52, base64), capped at [`MAXIMUM_CLIPBOARD_SIZE`].
+    clipboard: String,
     bell_count: u64,
     /// Bytes the emulator must send back to the application (query answers). Drained into the
     /// PTY input by the caller — never echoed onto the synced screen.
@@ -27,6 +33,13 @@ impl vt100::Callbacks for Callbacks {
     }
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bell_count += 1;
+    }
+    /// OSC 52: the app set the system clipboard. `data` is already base64 (vt100). Forward the `c`
+    /// (clipboard) selection, capped; oversized sets are ignored.
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        if data.len() <= MAXIMUM_CLIPBOARD_SIZE {
+            self.clipboard = String::from_utf8_lossy(data).into_owned();
+        }
     }
 
     /// Answer the terminal queries interactive apps (vim/htop/fzf/…) block on. vt100 routes
@@ -203,6 +216,12 @@ impl ServerTerminal {
         self.parser.callbacks().bell_count
     }
 
+    /// Whether the emulated app has DECCKM (application cursor keys) on — used to normalize the
+    /// client's arrow-key bytes (SS3 vs CSI) before they reach the PTY.
+    pub fn application_cursor(&self) -> bool {
+        self.parser.screen().application_cursor()
+    }
+
     /// Scrollback length this emulator was built with.
     pub fn scrollback(&self) -> usize {
         self.scrollback
@@ -214,6 +233,8 @@ impl ServerTerminal {
             screen: self.parser.screen().clone(),
             echo_ack: self.echo_ack,
             title: self.parser.callbacks().title.clone(),
+            icon: self.parser.callbacks().icon.clone(),
+            clipboard: self.parser.callbacks().clipboard.clone(),
             bell_count: self.parser.callbacks().bell_count,
             exit_code: self.exit_code,
             parser: None,
@@ -289,16 +310,29 @@ mod tests {
     }
 
     #[test]
-    fn title_and_bell_captured() {
+    fn title_icon_bell_clipboard_captured() {
         let mut t = ServerTerminal::new(24, 80, 0);
-        t.process(b"\x1b]2;my-title\x07\x07");
+        t.process(b"\x1b]2;my-title\x07\x07\x1b]1;my-icon\x07\x1b]52;c;aGVsbG8=\x07");
         assert_eq!(t.title(), "my-title");
+        assert_eq!(t.icon_name(), "my-icon");
         assert_eq!(t.bell_count(), 1);
-        assert_eq!(t.snapshot().title(), "my-title");
+        let snap = t.snapshot();
+        assert_eq!(snap.title(), "my-title");
+        assert_eq!(snap.icon(), "my-icon", "snapshot carries the icon name");
         assert_eq!(
-            t.snapshot().bell_count(),
-            1,
-            "snapshot carries the bell count"
+            snap.clipboard(),
+            "aGVsbG8=",
+            "snapshot carries the OSC-52 clipboard"
         );
+        assert_eq!(snap.bell_count(), 1, "snapshot carries the bell count");
+    }
+
+    #[test]
+    fn oversized_clipboard_is_dropped() {
+        // A clipboard set above the cap must not be synced (anti-amplification).
+        let mut t = ServerTerminal::new(24, 80, 0);
+        let big = "A".repeat(MAXIMUM_CLIPBOARD_SIZE + 1);
+        t.process(format!("\x1b]52;c;{big}\x07").as_bytes());
+        assert_eq!(t.snapshot().clipboard(), "", "oversized clipboard dropped");
     }
 }

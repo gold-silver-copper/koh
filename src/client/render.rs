@@ -198,41 +198,63 @@ pub fn render(
     out.flush()
 }
 
-/// Strip control chars from a window title so it can't break the OSC sequence we wrap it in.
-fn sanitize_title(t: &str) -> String {
+/// Strip control chars from an OSC string payload so it can't break the sequence we wrap it in.
+fn sanitize_osc(t: &str) -> String {
     t.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// Tracks the *out-of-band* terminal state the client mirrors onto the real terminal — the window
-/// title (OSC), the bell, and the input modes (bracketed-paste / mouse / cursor-key) — so each is
-/// re-emitted only when it changes. These ride alongside the cell grid but aren't part of it.
+/// The out-of-band window state for one frame.
+///
+/// What the client mirrors onto the real terminal alongside the cell grid (window title, icon
+/// name, clipboard, bell). All sourced from the synced [`crate::terminal::TerminalScreen`].
+#[derive(Clone, Copy)]
+pub struct WindowState<'a> {
+    pub title: &'a str,
+    pub icon: &'a str,
+    pub clipboard: &'a str,
+    pub bell_count: u64,
+}
+
+/// Tracks the *out-of-band* terminal state the client mirrors onto the real terminal — window
+/// title / icon (OSC 0/1/2), clipboard (OSC 52), the bell, and the input modes (bracketed-paste /
+/// mouse / cursor-key) — so each is re-emitted only when it changes. These ride alongside the cell
+/// grid but aren't part of it.
 #[derive(Default)]
 pub struct OutOfBand {
+    /// Sticky (mosh's `title_initialized`): until the app sets a title/icon we don't touch the
+    /// user's terminal title — and once it has, we DO propagate a later reset to empty.
+    title_initialized: bool,
     last_title: String,
+    last_icon: String,
+    last_clipboard: String,
     last_bell: u64,
     /// Previous frame's screen, kept only to diff its input modes against the current frame.
     prev_screen: Option<Screen>,
 }
 
 impl OutOfBand {
-    /// Emit this frame's title / bell / input-mode changes to `out`, updating the tracked state.
-    /// The title is never blanked (mosh's title-initialized guard); the bell rings once when the
-    /// server's monotonic count climbs; input modes are diffed against the previous frame.
+    /// Emit this frame's title/icon / clipboard / bell / input-mode changes to `out`, updating the
+    /// tracked state. Mirrors mosh's `Display::new_frame` out-of-band emission.
     pub fn emit(
         &mut self,
         out: &mut impl Write,
         screen: &Screen,
-        title: &str,
-        bell_count: u64,
+        win: WindowState<'_>,
     ) -> io::Result<()> {
-        if !title.is_empty() && title != self.last_title {
-            write!(out, "\x1b]0;{}\x07", sanitize_title(title))?;
-            self.last_title = title.to_string();
+        self.emit_window_title(out, win.title, win.icon)?;
+        // Clipboard (OSC 52): re-emit on change. base64 from the server, sanitized defensively.
+        if win.clipboard != self.last_clipboard {
+            self.last_clipboard = win.clipboard.to_string();
+            if !win.clipboard.is_empty() {
+                write!(out, "\x1b]52;c;{}\x07", sanitize_osc(win.clipboard))?;
+            }
         }
-        if bell_count > self.last_bell {
+        // Bell: ring once when the server's bell count climbs (coalesced if several rang).
+        if win.bell_count > self.last_bell {
             out.write_all(b"\x07")?;
-            self.last_bell = bell_count;
+            self.last_bell = win.bell_count;
         }
+        // Input modes: re-assert bracketed-paste / mouse / cursor-key (diff vs the previous frame).
         let mode_bytes = match &self.prev_screen {
             Some(prev) => screen.input_mode_diff(prev),
             None => screen.input_mode_formatted(),
@@ -242,6 +264,34 @@ impl OutOfBand {
         }
         self.prev_screen = Some(screen.clone());
         Ok(())
+    }
+
+    /// Window title + icon (mosh `Display::new_frame`): a combined `]0;` when icon == title, else
+    /// `]1;icon` + `]2;title`. Guarded by the sticky title-initialized flag.
+    fn emit_window_title(
+        &mut self,
+        out: &mut impl Write,
+        title: &str,
+        icon: &str,
+    ) -> io::Result<()> {
+        if self.title_initialized {
+            if title == self.last_title && icon == self.last_icon {
+                return Ok(());
+            }
+        } else {
+            if title.is_empty() && icon.is_empty() {
+                return Ok(()); // nothing set yet — don't blank the user's terminal title
+            }
+            self.title_initialized = true;
+        }
+        self.last_title = title.to_string();
+        self.last_icon = icon.to_string();
+        let (t, ic) = (sanitize_osc(title), sanitize_osc(icon));
+        if ic == t {
+            write!(out, "\x1b]0;{t}\x07")
+        } else {
+            write!(out, "\x1b]1;{ic}\x07\x1b]2;{t}\x07")
+        }
     }
 }
 
@@ -282,28 +332,76 @@ mod tests {
         );
     }
 
+    /// Build a `WindowState` for tests.
+    fn win<'a>(title: &'a str, icon: &'a str, clipboard: &'a str, bell: u64) -> WindowState<'a> {
+        WindowState {
+            title,
+            icon,
+            clipboard,
+            bell_count: bell,
+        }
+    }
+
     #[test]
     fn out_of_band_title_emits_once_and_guards_empty() {
         let mut oob = OutOfBand::default();
         let scr = screen_of(b"");
 
-        // Empty title before the shell sets one: never blank the user's terminal title.
+        // Empty title/icon before the shell sets one: never blank the user's terminal title.
         let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, "", 0).unwrap();
+        oob.emit(&mut buf, &scr, win("", "", "", 0)).unwrap();
         assert!(
-            !String::from_utf8_lossy(&buf).contains("\x1b]0;"),
-            "no title OSC for an empty title"
+            !String::from_utf8_lossy(&buf).contains("\x1b]"),
+            "no OSC for an unset title"
         );
 
-        // A real title is emitted as OSC 0.
+        // A real title (icon == title) is emitted as the combined OSC 0.
         let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, "vim - file.rs", 0).unwrap();
+        oob.emit(&mut buf, &scr, win("vim - file.rs", "vim - file.rs", "", 0))
+            .unwrap();
         assert!(String::from_utf8_lossy(&buf).contains("\x1b]0;vim - file.rs\x07"));
 
-        // Unchanged title is not re-emitted.
+        // Unchanged → not re-emitted.
         let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, "vim - file.rs", 0).unwrap();
+        oob.emit(&mut buf, &scr, win("vim - file.rs", "vim - file.rs", "", 0))
+            .unwrap();
         assert!(!String::from_utf8_lossy(&buf).contains("\x1b]0;"));
+
+        // Once initialized, a reset to empty IS propagated (mosh's sticky guard).
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, win("", "", "", 0)).unwrap();
+        assert!(String::from_utf8_lossy(&buf).contains("\x1b]0;\x07"));
+    }
+
+    #[test]
+    fn out_of_band_splits_icon_and_title() {
+        let mut oob = OutOfBand::default();
+        let scr = screen_of(b"");
+        let mut buf = Vec::new();
+        // Distinct icon name + title → ESC]1;<icon> then ESC]2;<title> (mosh).
+        oob.emit(&mut buf, &scr, win("the title", "the-icon", "", 0))
+            .unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("\x1b]1;the-icon\x07"), "icon OSC 1, got {s:?}");
+        assert!(s.contains("\x1b]2;the title\x07"), "title OSC 2, got {s:?}");
+    }
+
+    #[test]
+    fn out_of_band_forwards_clipboard_on_change() {
+        let mut oob = OutOfBand::default();
+        let scr = screen_of(b"");
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, win("", "", "aGVsbG8=", 0))
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf).contains("\x1b]52;c;aGVsbG8=\x07"),
+            "clipboard OSC 52 forwarded"
+        );
+        // Same clipboard again → not re-emitted.
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, win("", "", "aGVsbG8=", 0))
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
     }
 
     #[test]
@@ -312,16 +410,16 @@ mod tests {
         let scr = screen_of(b"");
         // Establish the mode baseline (so later emits don't also carry mode bytes).
         let mut warm = Vec::new();
-        oob.emit(&mut warm, &scr, "", 0).unwrap();
+        oob.emit(&mut warm, &scr, win("", "", "", 0)).unwrap();
 
         // No increase → no bell.
         let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, "", 0).unwrap();
+        oob.emit(&mut buf, &scr, win("", "", "", 0)).unwrap();
         assert!(buf.is_empty(), "no bell when the count is unchanged");
 
         // Count climbs (possibly by more than one) → exactly one bell.
         let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, "", 3).unwrap();
+        oob.emit(&mut buf, &scr, win("", "", "", 3)).unwrap();
         assert_eq!(buf, b"\x07", "one bell on an increase, even if it jumped");
     }
 
@@ -330,12 +428,13 @@ mod tests {
         let mut oob = OutOfBand::default();
         // Baseline frame in default modes.
         let mut warm = Vec::new();
-        oob.emit(&mut warm, &screen_of(b""), "", 0).unwrap();
+        oob.emit(&mut warm, &screen_of(b""), win("", "", "", 0))
+            .unwrap();
 
         // The remote turns on bracketed paste + mouse reporting → re-asserted to the real terminal.
         let modes = screen_of(b"\x1b[?2004h\x1b[?1000h");
         let mut buf = Vec::new();
-        oob.emit(&mut buf, &modes, "", 0).unwrap();
+        oob.emit(&mut buf, &modes, win("", "", "", 0)).unwrap();
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("2004"), "bracketed-paste re-asserted, got {s:?}");
         assert!(s.contains("1000"), "mouse reporting re-asserted, got {s:?}");

@@ -51,6 +51,12 @@ pub struct TerminalScreen {
     echo_ack: u64,
     /// Window title (OSC 2), propagated so the client can mirror it.
     title: String,
+    /// Window icon name (OSC 1), propagated alongside the title (mosh emits `]1;`/`]2;` when the
+    /// two differ, else a combined `]0;`).
+    icon: String,
+    /// The terminal's clipboard selection set by the remote app via OSC 52 (base64 payload, capped
+    /// server-side), forwarded so a remote yank reaches the local clipboard. Empty if unset.
+    clipboard: String,
     /// Monotonic count of audible bells (BEL) the server has seen. The client rings its terminal
     /// once when this increases (mosh treats the bell count as part of frame identity).
     bell_count: u64,
@@ -71,6 +77,8 @@ impl Clone for TerminalScreen {
             screen: self.screen.clone(),
             echo_ack: self.echo_ack,
             title: self.title.clone(),
+            icon: self.icon.clone(),
+            clipboard: self.clipboard.clone(),
             bell_count: self.bell_count,
             exit_code: self.exit_code,
             parser: None,
@@ -86,6 +94,8 @@ impl std::fmt::Debug for TerminalScreen {
             .field("size", &self.screen.size())
             .field("echo_ack", &self.echo_ack)
             .field("title", &self.title)
+            .field("icon", &self.icon)
+            .field("clipboard", &self.clipboard)
             .field("bell_count", &self.bell_count)
             .field("exit_code", &self.exit_code)
             .finish_non_exhaustive()
@@ -98,6 +108,8 @@ impl Default for TerminalScreen {
             screen: blank_screen(DEFAULT_ROWS, DEFAULT_COLS),
             echo_ack: 0,
             title: String::new(),
+            icon: String::new(),
+            clipboard: String::new(),
             bell_count: 0,
             exit_code: None,
             parser: None,
@@ -115,6 +127,8 @@ impl TerminalScreen {
             screen: p.screen().clone(),
             echo_ack: 0,
             title: String::new(),
+            icon: String::new(),
+            clipboard: String::new(),
             bell_count: 0,
             exit_code: None,
             parser: None,
@@ -146,6 +160,16 @@ impl TerminalScreen {
         &self.title
     }
 
+    /// The window icon name (OSC 1), if the server has set one.
+    pub fn icon(&self) -> &str {
+        &self.icon
+    }
+
+    /// The remote-set clipboard payload (OSC 52, base64), or empty if none.
+    pub fn clipboard(&self) -> &str {
+        &self.clipboard
+    }
+
     /// Monotonic count of audible bells the server has seen (the client rings on an increase).
     pub fn bell_count(&self) -> u64 {
         self.bell_count
@@ -161,6 +185,10 @@ pub struct ScreenDiff {
     pub echo_ack: u64,
     /// New window title if it changed.
     pub title: Option<String>,
+    /// New window icon name if it changed.
+    pub icon: Option<String>,
+    /// New clipboard payload if it changed (OSC 52; the client re-emits it to the local terminal).
+    pub clipboard: Option<String>,
     /// The server's audible-bell count at the target state (absolute; the client rings when it
     /// increases past what it last saw). Always carried so a bell-only change isn't lost.
     pub bell_count: u64,
@@ -186,6 +214,8 @@ impl SyncState for TerminalScreen {
             resize: resized.then(|| self.size()),
             echo_ack: self.echo_ack,
             title: (self.title != base.title).then(|| self.title.clone()),
+            icon: (self.icon != base.icon).then(|| self.icon.clone()),
+            clipboard: (self.clipboard != base.clipboard).then(|| self.clipboard.clone()),
             bell_count: self.bell_count,
             exit_code: self.exit_code,
             vt,
@@ -223,6 +253,12 @@ impl SyncState for TerminalScreen {
         if let Some(title) = &diff.title {
             self.title.clone_from(title);
         }
+        if let Some(icon) = &diff.icon {
+            self.icon.clone_from(icon);
+        }
+        if let Some(clipboard) = &diff.clipboard {
+            self.clipboard.clone_from(clipboard);
+        }
         if diff.exit_code.is_some() {
             self.exit_code = diff.exit_code;
         }
@@ -236,6 +272,10 @@ impl PartialEq for TerminalScreen {
     fn eq(&self, other: &Self) -> bool {
         self.echo_ack == other.echo_ack
             && self.title == other.title
+            // Include icon + clipboard so an OSC 1 / OSC 52 change with an otherwise-identical
+            // screen still reaches the client (mosh likewise treats them as frame identity).
+            && self.icon == other.icon
+            && self.clipboard == other.clipboard
             // Include bell_count so a bell-only change (screen otherwise identical) isn't collapsed
             // away as unchanged — the bell must reach the client.
             && self.bell_count == other.bell_count
@@ -301,6 +341,25 @@ mod tests {
         let b = screen_from(24, 80, b"identical");
         assert_eq!(a, b);
         assert!(a.diff_from(&b).vt.is_empty());
+    }
+
+    #[test]
+    fn icon_and_clipboard_roundtrip_and_resist_collapse() {
+        let mut emu = ServerTerminal::new(24, 80, 0);
+        emu.process(b"\x1b]1;myicon\x07\x1b]2;mytitle\x07\x1b]52;c;aGk=\x07");
+        let target = emu.snapshot();
+        assert_eq!(target.icon(), "myicon");
+        assert_eq!(target.clipboard(), "aGk=");
+
+        let base = TerminalScreen::default();
+        let diff = target.diff_from(&base);
+        assert_eq!(diff.icon.as_deref(), Some("myicon"));
+        assert_eq!(diff.clipboard.as_deref(), Some("aGk="));
+        let mut c = base.clone();
+        c.apply(&diff);
+        assert_eq!(c, target, "icon + clipboard reconstruct via diff/apply");
+        // A state carrying an icon/clipboard must NOT collapse equal to one without them.
+        assert_ne!(base, c);
     }
 
     #[test]

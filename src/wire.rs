@@ -39,7 +39,7 @@ pub const DEFAULT_MAX_DATAGRAM: usize = 1200;
 /// The ALPN only proves both ends speak *some* koh; this catches diff-encoding skew between
 /// koh builds that share an ALPN. (Unrelated to upstream mosh's `MOSH_PROTOCOL_VERSION` —
 /// koh never interoperates with mosh.)
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Exact serialized overhead of a [`Fragment`] header.
 ///
@@ -66,7 +66,17 @@ pub enum WireError {
     ShortFragment { len: usize, min: usize },
     #[error("instruction needs {count} fragments, exceeds the {max}-fragment limit")]
     TooManyFragments { count: usize, max: usize },
+    #[error("could not inflate instruction (corrupt or oversized payload)")]
+    Decompress,
 }
+
+/// DEFLATE level for instruction payloads. Terminal diffs are extremely compressible (runs of
+/// spaces, repeated SGR, ASCII), so a mid level gives most of the ratio at negligible CPU.
+const COMPRESSION_LEVEL: u8 = 6;
+
+/// Hard cap on an inflated instruction (anti-decompression-bomb on untrusted peer input). A full
+/// repaint of a large scrolled-back screen is well under this; anything larger is rejected.
+const MAX_DECOMPRESSED: usize = 16 * 1024 * 1024;
 
 /// The unit of state synchronization. Produced by `ssp::Transport`, serialized, then
 /// fragmented for transport. See module docs for field semantics.
@@ -99,16 +109,25 @@ impl Instruction {
         }
     }
 
-    /// Serialize to bytes with postcard.
+    /// Serialize to bytes: postcard, then DEFLATE-compressed (mosh compresses the whole serialized
+    /// instruction *before* fragmenting, so compression directly raises how much screen change
+    /// fits per datagram). Always compressed — the tiny deflate overhead on small instructions is
+    /// dwarfed by the win on screen diffs, and it keeps the wire format flag-free.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        Ok(postcard::to_allocvec(self)?)
+        let raw = postcard::to_allocvec(self)?;
+        Ok(miniz_oxide::deflate::compress_to_vec(
+            &raw,
+            COMPRESSION_LEVEL,
+        ))
     }
 
-    /// Deserialize from bytes with postcard, rejecting a protocol-version mismatch at decode
-    /// time (before any state is touched) so a foreign/incompatible peer can't feed a diff with
-    /// a different encoding into our state mirror.
+    /// Deserialize: inflate (bounded, anti-bomb), then postcard, rejecting a protocol-version
+    /// mismatch at decode time (before any state is touched) so a foreign/incompatible peer can't
+    /// feed a diff with a different encoding into our state mirror.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        let instr: Self = postcard::from_bytes(bytes)?;
+        let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, MAX_DECOMPRESSED)
+            .map_err(|_| WireError::Decompress)?;
+        let instr: Self = postcard::from_bytes(&raw)?;
         if instr.protocol_version != PROTOCOL_VERSION {
             return Err(WireError::VersionMismatch {
                 peer: instr.protocol_version,
@@ -375,6 +394,35 @@ mod tests {
         let i = sample_instruction(300);
         let bytes = i.encode().unwrap();
         assert_eq!(Instruction::decode(&bytes).unwrap(), i);
+    }
+
+    #[test]
+    fn compression_shrinks_a_repetitive_diff_and_roundtrips() {
+        // A highly-repetitive diff (runs of one byte — the shape of a sparse screen repaint) must
+        // encode to far fewer bytes than its raw size, and still round-trip exactly.
+        let instr = Instruction {
+            protocol_version: PROTOCOL_VERSION,
+            old_num: 1,
+            new_num: 2,
+            ack_num: 0,
+            throwaway_num: 0,
+            diff: vec![b' '; 8000],
+        };
+        let encoded = instr.encode().unwrap();
+        assert!(
+            encoded.len() < 2000,
+            "8000-byte repetitive diff should compress well, got {} bytes",
+            encoded.len()
+        );
+        assert_eq!(Instruction::decode(&encoded).unwrap(), instr);
+    }
+
+    #[test]
+    fn decode_rejects_garbage_without_panicking() {
+        // Bytes that aren't a valid DEFLATE stream (or inflate to non-postcard) must error, never
+        // panic — this is untrusted peer input.
+        assert!(Instruction::decode(&[0xff, 0x00, 0x13, 0x37, 0xab, 0xcd]).is_err());
+        assert!(Instruction::decode(&[]).is_err());
     }
 
     #[test]

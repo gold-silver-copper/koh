@@ -197,8 +197,10 @@ koh connect 871b…
 
 The server's identity persists in `~/…/koh/server.key` (override with `--key-file`); the
 client's in `~/…/koh/client.key`. Prediction policy is `--predict adaptive|always|never`
-(default adaptive: it engages only when the link is slow enough to benefit). Set
-`KOH_LOG=/tmp/koh.log` to capture client logs without disturbing the TUI.
+(default adaptive: it engages only when the link is slow enough to benefit); set
+`KOH_PREDICT_OVERWRITE=yes` for overwrite-mode prediction in full-screen apps (mosh's
+`MOSH_PREDICTION_OVERWRITE`). Set `KOH_LOG=/tmp/koh.log` to capture client logs without
+disturbing the TUI.
 
 By default the bare endpoint id is dialed via n0's public relay + DNS discovery. For a LAN or
 self-hosted setup you can skip that:

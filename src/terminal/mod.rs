@@ -51,6 +51,9 @@ pub struct TerminalScreen {
     echo_ack: u64,
     /// Window title (OSC 2), propagated so the client can mirror it.
     title: String,
+    /// Monotonic count of audible bells (BEL) the server has seen. The client rings its terminal
+    /// once when this increases (mosh treats the bell count as part of frame identity).
+    bell_count: u64,
     /// Set once the remote shell has exited, carrying its exit code so the client can exit with
     /// the same status (mosh parity). `None` while the shell is alive.
     exit_code: Option<u32>,
@@ -68,6 +71,7 @@ impl Clone for TerminalScreen {
             screen: self.screen.clone(),
             echo_ack: self.echo_ack,
             title: self.title.clone(),
+            bell_count: self.bell_count,
             exit_code: self.exit_code,
             parser: None,
         }
@@ -82,6 +86,7 @@ impl std::fmt::Debug for TerminalScreen {
             .field("size", &self.screen.size())
             .field("echo_ack", &self.echo_ack)
             .field("title", &self.title)
+            .field("bell_count", &self.bell_count)
             .field("exit_code", &self.exit_code)
             .finish_non_exhaustive()
     }
@@ -93,6 +98,7 @@ impl Default for TerminalScreen {
             screen: blank_screen(DEFAULT_ROWS, DEFAULT_COLS),
             echo_ack: 0,
             title: String::new(),
+            bell_count: 0,
             exit_code: None,
             parser: None,
         }
@@ -109,6 +115,7 @@ impl TerminalScreen {
             screen: p.screen().clone(),
             echo_ack: 0,
             title: String::new(),
+            bell_count: 0,
             exit_code: None,
             parser: None,
         }
@@ -138,6 +145,11 @@ impl TerminalScreen {
     pub fn title(&self) -> &str {
         &self.title
     }
+
+    /// Monotonic count of audible bells the server has seen (the client rings on an increase).
+    pub fn bell_count(&self) -> u64 {
+        self.bell_count
+    }
 }
 
 /// The wire delta between two [`TerminalScreen`]s (mosh `HostMessage`).
@@ -149,6 +161,9 @@ pub struct ScreenDiff {
     pub echo_ack: u64,
     /// New window title if it changed.
     pub title: Option<String>,
+    /// The server's audible-bell count at the target state (absolute; the client rings when it
+    /// increases past what it last saw). Always carried so a bell-only change isn't lost.
+    pub bell_count: u64,
     /// The remote shell's exit code, set on the final (shutdown) frame.
     pub exit_code: Option<u32>,
     /// The `vt100` escape-sequence patch: `state_diff(base)` normally, or `state_formatted`
@@ -171,6 +186,7 @@ impl SyncState for TerminalScreen {
             resize: resized.then(|| self.size()),
             echo_ack: self.echo_ack,
             title: (self.title != base.title).then(|| self.title.clone()),
+            bell_count: self.bell_count,
             exit_code: self.exit_code,
             vt,
         }
@@ -201,6 +217,9 @@ impl SyncState for TerminalScreen {
             self.screen = parser.screen().clone();
         }
         self.echo_ack = self.echo_ack.max(diff.echo_ack);
+        // Monotonic: never regress on a reordered/older diff (the SSP guarantees no state
+        // regression, but `max` is the defensive, obviously-correct choice).
+        self.bell_count = self.bell_count.max(diff.bell_count);
         if let Some(title) = &diff.title {
             self.title.clone_from(title);
         }
@@ -217,6 +236,9 @@ impl PartialEq for TerminalScreen {
     fn eq(&self, other: &Self) -> bool {
         self.echo_ack == other.echo_ack
             && self.title == other.title
+            // Include bell_count so a bell-only change (screen otherwise identical) isn't collapsed
+            // away as unchanged — the bell must reach the client.
+            && self.bell_count == other.bell_count
             // Include exit_code so the final "shell exited" state isn't collapsed as unchanged.
             && self.exit_code == other.exit_code
             && self.screen.size() == other.screen.size()

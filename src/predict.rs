@@ -253,6 +253,12 @@ impl PredictionEngine {
     pub fn set_display_preference(&mut self, pref: DisplayPreference) {
         self.pref = pref;
     }
+    /// Choose insert-mode (default, `false`) vs overwrite-mode (`true`) prediction. In overwrite
+    /// mode a typed glyph replaces the cell under the cursor instead of shifting the tail right —
+    /// the correct behavior for full-screen apps. Mirrors mosh's `$MOSH_PREDICTION_OVERWRITE`.
+    pub fn set_predict_overwrite(&mut self, on: bool) {
+        self.predict_overwrite = on;
+    }
     /// The newest epoch the server has confirmed echoes (predictions at or below it may show).
     /// Exposed for tests/telemetry: a confirmation is the observable effect of [`cull`](Self::cull).
     pub fn confirmed_epoch(&self) -> u64 {
@@ -632,6 +638,25 @@ impl PredictionEngine {
     }
 
     /// Validate predictions against the freshly-arrived authoritative `screen`.
+    /// Re-evaluate prediction visibility at `now` against the (unchanged) authoritative `screen`,
+    /// so a long-pending prediction escalates to the glitch underline on time even on a silent
+    /// link. Returns whether the displayed flagging changed (the caller repaints if so).
+    ///
+    /// The age-based escalation otherwise only runs inside [`cull`](Self::cull) (on a datagram) or
+    /// [`new_user_byte`](Self::new_user_byte) (on a keystroke); on a quiet slow link it would not
+    /// fire until the next such event. The client loop wakes at least every 50ms, so calling this
+    /// keeps the escalation timely (mirrors mosh's `OverlayManager::wait_time`-driven update). It
+    /// delegates to `cull`, which is idempotent on an unchanged screen (correct predictions were
+    /// already confirmed/removed by the prior datagram), so the only effect here is re-timing.
+    pub fn tick(&mut self, now: u64, screen: &Screen) -> bool {
+        if self.pref == DisplayPreference::Never || self.cells.is_empty() {
+            return false;
+        }
+        let before = (self.flagging, self.glitch_trigger);
+        self.cull(now, screen);
+        before != (self.flagging, self.glitch_trigger)
+    }
+
     pub fn cull(&mut self, now: u64, screen: &Screen) {
         if self.pref == DisplayPreference::Never {
             return;
@@ -684,7 +709,7 @@ impl PredictionEngine {
                     // Long-pending predictions escalate visibility (glitch).
                     let age = now.saturating_sub(cell.prediction_time);
                     if age >= self.config.glitch_flag_threshold_ms {
-                        new_glitch = self.config.glitch_repair_count * 2;
+                        new_glitch = self.config.glitch_repair_count.saturating_mul(2);
                     } else if age >= self.config.glitch_threshold_ms
                         && new_glitch < self.config.glitch_repair_count
                     {
@@ -897,6 +922,60 @@ mod tests {
         let mut p = vt100::Parser::new(24, 80, 0);
         p.process(bytes);
         p.screen().clone()
+    }
+
+    #[test]
+    fn predict_overwrite_setter_is_honored_and_branch_runs() {
+        // The field was previously hardcoded false (the overwrite branch was dead code). The setter
+        // must flip it, and predicting in overwrite mode must execute the branch without panicking.
+        let mut pe = PredictionEngine::new(DisplayPreference::Always);
+        assert!(!pe.predict_overwrite, "default is insert mode");
+        pe.set_predict_overwrite(true);
+        assert!(pe.predict_overwrite, "setter enables overwrite mode");
+
+        pe.set_local_frame_sent(0);
+        let echoed = screen_of(b"abc");
+        pe.new_user_byte(0, b'Z', &echoed); // drives the overwrite-mode prediction path
+        let _ = pe.overlay(&echoed);
+    }
+
+    #[test]
+    fn tick_escalates_a_long_pending_prediction_without_a_datagram() {
+        let mut pe = PredictionEngine::new(DisplayPreference::Always);
+        // A *fast* link, so SRTT-based flagging is off and we isolate the time-based glitch
+        // escalation (the thing tick() exists to drive on a silent link).
+        pe.set_srtt(0.0);
+        pe.set_local_frame_sent(0);
+        let blank = screen_of(b"");
+        pe.new_user_byte(0, b'a', &blank); // hidden (epoch 1)
+        let echoed = screen_of(b"a");
+        pe.set_local_frame_late_acked(1);
+        pe.cull(50, &echoed); // confirm epoch 1 -> later predictions are shown
+        pe.set_local_frame_sent(1);
+        pe.new_user_byte(100, b'Z', &echoed); // shown, still-unconfirmed prediction
+        assert!(!pe.flagging, "not flagged on a fast link before escalation");
+        let before_glitch = pe.glitch_trigger;
+
+        // The server goes silent (no new datagram); only the loop ticks against the same screen.
+        // Past the glitch-flag threshold the long-pending prediction escalates the glitch trigger;
+        // the trigger turns on flagging (the underline) on the following tick (cull computes
+        // flagging from the glitch value *before* re-escalating it — true of the original code too,
+        // so the escalation lands within ~2 ticks ≈ 100ms instead of waiting for a datagram).
+        let t1 = 100 + pe.config.glitch_flag_threshold_ms + 1;
+        let c1 = pe.tick(t1, &echoed);
+        assert!(
+            pe.glitch_trigger > before_glitch,
+            "glitch escalated by age on a silent tick: {before_glitch} -> {}",
+            pe.glitch_trigger
+        );
+        assert!(c1, "tick reports the glitch change so the loop repaints");
+
+        let c2 = pe.tick(t1 + 1, &echoed);
+        assert!(
+            pe.flagging,
+            "the escalated glitch turns on the underline on the next tick"
+        );
+        assert!(c2, "tick reports the flagging change so the loop repaints");
     }
 
     /// Drive a confirmation round: type `first` (hidden), have the server echo it on `echoed`

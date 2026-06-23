@@ -198,6 +198,53 @@ pub fn render(
     out.flush()
 }
 
+/// Strip control chars from a window title so it can't break the OSC sequence we wrap it in.
+fn sanitize_title(t: &str) -> String {
+    t.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Tracks the *out-of-band* terminal state the client mirrors onto the real terminal — the window
+/// title (OSC), the bell, and the input modes (bracketed-paste / mouse / cursor-key) — so each is
+/// re-emitted only when it changes. These ride alongside the cell grid but aren't part of it.
+#[derive(Default)]
+pub struct OutOfBand {
+    last_title: String,
+    last_bell: u64,
+    /// Previous frame's screen, kept only to diff its input modes against the current frame.
+    prev_screen: Option<Screen>,
+}
+
+impl OutOfBand {
+    /// Emit this frame's title / bell / input-mode changes to `out`, updating the tracked state.
+    /// The title is never blanked (mosh's title-initialized guard); the bell rings once when the
+    /// server's monotonic count climbs; input modes are diffed against the previous frame.
+    pub fn emit(
+        &mut self,
+        out: &mut impl Write,
+        screen: &Screen,
+        title: &str,
+        bell_count: u64,
+    ) -> io::Result<()> {
+        if !title.is_empty() && title != self.last_title {
+            write!(out, "\x1b]0;{}\x07", sanitize_title(title))?;
+            self.last_title = title.to_string();
+        }
+        if bell_count > self.last_bell {
+            out.write_all(b"\x07")?;
+            self.last_bell = bell_count;
+        }
+        let mode_bytes = match &self.prev_screen {
+            Some(prev) => screen.input_mode_diff(prev),
+            None => screen.input_mode_formatted(),
+        };
+        if !mode_bytes.is_empty() {
+            out.write_all(&mode_bytes)?;
+        }
+        self.prev_screen = Some(screen.clone());
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +280,65 @@ mod tests {
             s.contains("\x1b[?2026l"),
             "frame must end synchronized output"
         );
+    }
+
+    #[test]
+    fn out_of_band_title_emits_once_and_guards_empty() {
+        let mut oob = OutOfBand::default();
+        let scr = screen_of(b"");
+
+        // Empty title before the shell sets one: never blank the user's terminal title.
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, "", 0).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&buf).contains("\x1b]0;"),
+            "no title OSC for an empty title"
+        );
+
+        // A real title is emitted as OSC 0.
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, "vim - file.rs", 0).unwrap();
+        assert!(String::from_utf8_lossy(&buf).contains("\x1b]0;vim - file.rs\x07"));
+
+        // Unchanged title is not re-emitted.
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, "vim - file.rs", 0).unwrap();
+        assert!(!String::from_utf8_lossy(&buf).contains("\x1b]0;"));
+    }
+
+    #[test]
+    fn out_of_band_rings_bell_on_increase_only() {
+        let mut oob = OutOfBand::default();
+        let scr = screen_of(b"");
+        // Establish the mode baseline (so later emits don't also carry mode bytes).
+        let mut warm = Vec::new();
+        oob.emit(&mut warm, &scr, "", 0).unwrap();
+
+        // No increase → no bell.
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, "", 0).unwrap();
+        assert!(buf.is_empty(), "no bell when the count is unchanged");
+
+        // Count climbs (possibly by more than one) → exactly one bell.
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &scr, "", 3).unwrap();
+        assert_eq!(buf, b"\x07", "one bell on an increase, even if it jumped");
+    }
+
+    #[test]
+    fn out_of_band_reasserts_input_modes_on_change() {
+        let mut oob = OutOfBand::default();
+        // Baseline frame in default modes.
+        let mut warm = Vec::new();
+        oob.emit(&mut warm, &screen_of(b""), "", 0).unwrap();
+
+        // The remote turns on bracketed paste + mouse reporting → re-asserted to the real terminal.
+        let modes = screen_of(b"\x1b[?2004h\x1b[?1000h");
+        let mut buf = Vec::new();
+        oob.emit(&mut buf, &modes, "", 0).unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("2004"), "bracketed-paste re-asserted, got {s:?}");
+        assert!(s.contains("1000"), "mouse reporting re-asserted, got {s:?}");
     }
 
     #[test]

@@ -214,6 +214,7 @@ impl ServerTerminal {
             screen: self.parser.screen().clone(),
             echo_ack: self.echo_ack,
             title: self.parser.callbacks().title.clone(),
+            bell_count: self.parser.callbacks().bell_count,
             exit_code: self.exit_code,
             parser: None,
         }
@@ -294,5 +295,10 @@ mod tests {
         assert_eq!(t.title(), "my-title");
         assert_eq!(t.bell_count(), 1);
         assert_eq!(t.snapshot().title(), "my-title");
+        assert_eq!(
+            t.snapshot().bell_count(),
+            1,
+            "snapshot carries the bell count"
+        );
     }
 }

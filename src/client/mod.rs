@@ -113,11 +113,17 @@ fn escape_quit(chunk: &[u8], pending: &mut bool) -> bool {
 /// Where the client paints frames and reads the window size. The real binary draws to the
 /// terminal via termina ([`TerminaTerminal`]); a test captures cells/text as data.
 pub trait ClientTerminal {
+    /// Paint one frame. `screen` is the authoritative grid (and carries the input modes —
+    /// bracketed-paste / mouse / cursor-key — which the real terminal must mirror); `overlay` is
+    /// the prediction overlay; `status` is the optional status line; `title` is the remote window
+    /// title (OSC); `bell_count` is the server's monotonic bell count (ring on increase).
     fn render(
         &mut self,
         screen: &vt100::Screen,
         overlay: &Overlay,
         status: Option<&str>,
+        title: &str,
+        bell_count: u64,
     ) -> std::io::Result<()>;
 
     /// The current window size as `(rows, cols)`.
@@ -128,6 +134,8 @@ pub trait ClientTerminal {
 /// screen on construction, restored on drop. It paints the synced grid + prediction overlay.
 pub struct TerminaTerminal {
     term: PlatformTerminal,
+    /// Tracks the title / bell / input modes mirrored to the real terminal (see [`render::OutOfBand`]).
+    oob: render::OutOfBand,
 }
 
 impl TerminaTerminal {
@@ -146,7 +154,10 @@ impl TerminaTerminal {
             ))),
         )?;
         term.flush()?;
-        Ok(Self { term })
+        Ok(Self {
+            term,
+            oob: render::OutOfBand::default(),
+        })
     }
 }
 
@@ -156,7 +167,12 @@ impl ClientTerminal for TerminaTerminal {
         screen: &vt100::Screen,
         overlay: &Overlay,
         status: Option<&str>,
+        title: &str,
+        bell_count: u64,
     ) -> std::io::Result<()> {
+        // Mirror the out-of-band terminal state (title / bell / input modes) onto the real
+        // terminal, then paint the cell grid.
+        self.oob.emit(&mut self.term, screen, title, bell_count)?;
         render::render(&mut self.term, screen, overlay, status)
     }
 
@@ -168,6 +184,12 @@ impl ClientTerminal for TerminaTerminal {
 
 impl Drop for TerminaTerminal {
     fn drop(&mut self) {
+        // Reset the input modes we may have forwarded (bracketed-paste, all mouse modes — incl.
+        // X10 `?9` — and encodings, application cursor keys + keypad) so the user's terminal isn't
+        // left with mouse reporting on, injecting stray click bytes at the shell prompt.
+        let _ = self.term.write_all(
+            b"\x1b[?9l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>",
+        );
         // Show the cursor and leave the alternate screen; the PlatformTerminal's own Drop
         // restores cooked mode afterward.
         let _ = write!(
@@ -238,6 +260,7 @@ impl ClientSession {
         now: u64,
         mtu: usize,
         pref: DisplayPreference,
+        predict_overwrite: bool,
         initial_rows: u16,
         initial_cols: u16,
     ) -> Self {
@@ -246,9 +269,11 @@ impl ClientSession {
         transport
             .current_mut()
             .push_resize(initial_rows, initial_cols);
+        let mut predictor = PredictionEngine::new(pref);
+        predictor.set_predict_overwrite(predict_overwrite);
         Self {
             transport,
-            predictor: PredictionEngine::new(pref),
+            predictor,
             pending_escape: false,
             dirty: true,
             status_was_shown: false,
@@ -326,6 +351,14 @@ impl ClientSession {
         if let Some(rtt) = rtt_ms {
             self.transport.observe_rtt(rtt);
         }
+        // Escalate a long-pending prediction to the glitch underline on time, even on a silent
+        // link (no datagram/keystroke to drive cull). Repaint if the flagging changed.
+        if self
+            .predictor
+            .tick(now, self.transport.remote_state().screen())
+        {
+            self.dirty = true;
+        }
         let outgoing = self.transport.tick(now);
 
         // Link-down is driven by transport liveness, which refreshes on ANY decoded inbound
@@ -361,6 +394,16 @@ impl ClientSession {
         self.predictor
             .overlay(self.transport.remote_state().screen())
     }
+
+    /// The remote window title (OSC), for the client to mirror onto the real terminal.
+    pub fn title(&self) -> &str {
+        self.transport.remote_state().title()
+    }
+
+    /// The server's monotonic audible-bell count (the client rings when it increases).
+    pub fn bell_count(&self) -> u64 {
+        self.transport.remote_state().bell_count()
+    }
 }
 
 /// Run a client session, **transparently reconnecting** after the link drops.
@@ -395,6 +438,9 @@ pub async fn run_client<T: ClientTerminal>(
     mut term: T,
 ) -> anyhow::Result<Option<u32>> {
     let clock = MonoClock::new();
+    // Opt-in overwrite-mode prediction for full-screen apps (mosh's $MOSH_PREDICTION_OVERWRITE).
+    let predict_overwrite = std::env::var("KOH_PREDICT_OVERWRITE")
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "yes" | "true"));
     let mut channel = initial;
     loop {
         // A fresh session per (re)connection mirrors the server's fresh-transport-per-attach, which
@@ -404,6 +450,7 @@ pub async fn run_client<T: ClientTerminal>(
             clock.now_ms(),
             channel.max_datagram_size(),
             pref,
+            predict_overwrite,
             rows,
             cols,
         );
@@ -467,7 +514,13 @@ async fn drive_connection<T: ClientTerminal>(
         // Repaint on new content, while the banner is up, or once more to clear a stale banner.
         let status_now = tick.status.is_some();
         if session.dirty || status_now || session.status_was_shown {
-            term.render(session.screen(), &session.overlay(), tick.status.as_deref())?;
+            term.render(
+                session.screen(),
+                &session.overlay(),
+                tick.status.as_deref(),
+                session.title(),
+                session.bell_count(),
+            )?;
             session.status_was_shown = status_now;
             session.dirty = false;
         }
@@ -477,6 +530,8 @@ async fn drive_connection<T: ClientTerminal>(
                 session.screen(),
                 &Overlay::empty(),
                 Some("[koh] session ended"),
+                session.title(),
+                session.bell_count(),
             );
             tokio::time::sleep(Duration::from_millis(400)).await;
             return Ok(Disposition::Ended(code));
@@ -559,7 +614,13 @@ async fn reconnect<T: ClientTerminal>(
         loop {
             let secs = clock.now_ms().saturating_sub(started) / 1000;
             let banner = format!("[koh] disconnected — reconnecting… {secs}s (Ctrl-^ . to quit)");
-            let _ = term.render(last.screen(), &Overlay::empty(), Some(banner.as_str()));
+            let _ = term.render(
+                last.screen(),
+                &Overlay::empty(),
+                Some(banner.as_str()),
+                last.title(),
+                last.bell_count(),
+            );
 
             tokio::select! {
                 biased;
@@ -612,7 +673,7 @@ mod tests {
     }
 
     fn new_session() -> ClientSession {
-        ClientSession::new(0, 1200, DisplayPreference::Always, 24, 80)
+        ClientSession::new(0, 1200, DisplayPreference::Always, false, 24, 80)
     }
 
     #[test]

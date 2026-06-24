@@ -194,7 +194,7 @@ impl ServerTerminal {
         changed
     }
 
-    /// Milliseconds until [`set_echo_ack`] could next advance, or [`NEVER`] if nothing pends.
+    /// Milliseconds until [`set_echo_ack`](Self::set_echo_ack) could next advance, or [`NEVER`] if nothing pends.
     /// Mosh `Complete::wait_time`.
     pub fn echo_ack_wait_time(&self, now: u64) -> u64 {
         // The second-oldest pending frame is the next one whose debounce can fire; if there are

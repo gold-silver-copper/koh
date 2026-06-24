@@ -1,6 +1,6 @@
 [package]
 name = "koh"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 # The effective floor is dictated by the `=`-pinned iroh 1.0.0 (edition 2024 + rust-version 1.91),
 # not by koh's own 2021 edition. Declaring it turns "cargo install on an old toolchain" into a clear
@@ -15,7 +15,7 @@ keywords = ["mosh", "shell", "terminal", "iroh", "p2p"]
 categories = ["command-line-utilities", "network-programming"]
 # Keep the published .crate lean: the porting-research notes, the test infra, the integration tests,
 # and the chaos example aren't needed to build or USE koh (the lib's own unit tests live in `src/`).
-exclude = ["docs/", "testing/", "tests/", "examples/", "SECURITY_AUDIT_v0.3.1.md"]
+exclude = ["docs/", "testing/", "tests/", "examples/", "fuzz/", "SECURITY_AUDIT_v0.3.1.md"]
 
 [[bin]]
 name = "koh"
@@ -54,6 +54,13 @@ argon2 = "0.5"
 constant_time_eq = "0.5"
 zeroize = "1"
 secrecy = "0.10"
+# At-rest encryption of the on-disk identity key (the `koh-key-v1` format, modeled on OpenSSH's
+# openssh-key-v1): a vetted AEAD over the 32-byte secret, keyed by Argon2id (reused from the PAKE).
+# Already in the lockfile transitively via iroh's QUIC backend, so promoting it to a direct dep adds
+# no new compiled crate — it makes koh own/audit the version. NOT home-grown crypto.
+aes-gcm = "0.10"
+# No-echo passphrase prompt for the encrypted identity key (the `ssh-keygen -p` / login analogue).
+rpassword = "7"
 # render the endpoint id as a terminal QR for `koh serve --qr`; default-features = false drops the
 # heavy image/svg/pic renderers (we only use the built-in unicode half-block renderer).
 qrcode = { version = "=0.14.1", default-features = false }

@@ -9,7 +9,7 @@
 //! a connection is only served if the client's endpoint id is on the `--allow` list (or
 //! `--allow-any` is explicitly set for testing).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -22,6 +22,8 @@ use iroh::EndpointId;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
+use crate::server::audit::{auth_event, Outcome};
+use crate::server::policy::{load_allow_file, Policy};
 use crate::server::{run_attached, session, SessionExit};
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
@@ -60,6 +62,20 @@ pub struct ServeArgs {
     /// INSECURE: accept any client. For local testing only.
     #[arg(long)]
     allow_any: bool,
+
+    /// Per-peer authorization policy file (sshd's `authorized_keys` options / `ForceCommand`).
+    /// One entry per line: `<endpoint-id> [restrict] [command="…"]`. `restrict` = read-only (the
+    /// peer's input never reaches the shell); `command="…"` runs a forced command via the login
+    /// shell instead of an interactive session. `#` comments and blank lines are ignored. Peers
+    /// listed here are authorized in addition to any `--allow` ids.
+    #[arg(long, value_name = "PATH")]
+    allow_file: Option<PathBuf>,
+
+    /// Make every authorized client read-only: a viewer can watch the shell live, but its
+    /// keystrokes and resizes never reach the PTY. Use `--allow-file` with `restrict` to make only
+    /// some peers read-only.
+    #[arg(long)]
+    read_only: bool,
 
     /// Shell to run (defaults to the user's login shell).
     #[arg(long)]
@@ -153,15 +169,36 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Build the allowlist.
-    let mut allow: HashSet<EndpointId> = HashSet::new();
+    // Build the allowlist as a per-peer policy map. A bare `--allow <id>` is a full read-write
+    // shell (modulo the global --read-only); `--allow-file` entries carry their own restrict /
+    // forced-command policy.
+    let mut allow: HashMap<EndpointId, Policy> = HashMap::new();
     for s in &args.allow {
         let id = parse_endpoint_id(s).with_context(|| format!("bad --allow id: {s}"))?;
-        allow.insert(id);
+        allow.insert(
+            id,
+            Policy {
+                read_only: args.read_only,
+                force_command: None,
+            },
+        );
+    }
+    if let Some(path) = &args.allow_file {
+        for (id, mut policy) in load_allow_file(path)? {
+            // The global --read-only is a floor: it can only ADD the restriction, never relax a
+            // per-peer one.
+            policy.read_only |= args.read_only;
+            if allow.insert(id, policy).is_some() {
+                anyhow::bail!(
+                    "endpoint id authorized by both --allow and --allow-file: {}",
+                    format_endpoint_id(&id)
+                );
+            }
+        }
     }
     if allow.is_empty() && !args.allow_any {
         anyhow::bail!(
-            "no clients authorized: pass --allow <endpoint-id> (repeatable), or --allow-any for testing"
+            "no clients authorized: pass --allow <endpoint-id> (repeatable), --allow-file <path>, or --allow-any for testing"
         );
     }
 
@@ -236,6 +273,16 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if configured_passphrase.is_some() {
         eprintln!("│ 2nd factor  : passphrase required");
     }
+    if args.read_only {
+        eprintln!("│ mode        : READ-ONLY (clients can watch, not type)");
+    }
+    let restricted = allow.values().filter(|p| p.read_only).count();
+    let forced = allow.values().filter(|p| p.force_command.is_some()).count();
+    if (restricted > 0 || forced > 0) && !args.read_only {
+        eprintln!(
+            "│ policy      : {restricted} restrict, {forced} forced-command (per allow-file)"
+        );
+    }
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
 
@@ -248,8 +295,18 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         warn!("could not render the connect QR (endpoint id too large to encode)");
     }
 
+    // Transport crypto posture (koh is a policy-taker: QUIC + TLS 1.3 come from iroh). Logged so an
+    // operator can see at a glance what protects the link — and that post-quantum KEX is not yet on.
+    info!(
+        transport = "QUIC + TLS 1.3 (iroh)",
+        kex = "X25519",
+        post_quantum = false,
+        "transport crypto posture"
+    );
+
     let shell = args.shell.clone();
     let scrollback = args.scrollback;
+    let global_read_only = args.read_only;
     let allow = std::sync::Arc::new(allow);
     let allow_any = args.allow_any;
     // The resolved passphrase (zeroized on drop, never logged), shared with every accept task and
@@ -383,8 +440,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 }
             };
             let peer = conn.remote_id();
-            if !allow_any && !allow.contains(&peer) {
-                warn!(peer = %format_endpoint_id(&peer), "rejected: not on allowlist");
+            if !allow_any && !allow.contains_key(&peer) {
+                auth_event("authz", Outcome::Rejected, Some(&peer), "not on allowlist");
                 conn.close(1u32.into(), b"not authorized");
                 return;
             }
@@ -393,7 +450,12 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             // bogus peer can't pollute the limiter's keyspace (unless --allow-any is set, where
             // the reaper's gc bounds it).
             if !lock_limiter(&limiter).check(&peer, clock.now_ms()) {
-                warn!(peer = %format_endpoint_id(&peer), "rejected: too many failed auth attempts");
+                auth_event(
+                    "authz",
+                    Outcome::Rejected,
+                    Some(&peer),
+                    "rate limit exceeded",
+                );
                 conn.close(1u32.into(), b"rate limited");
                 return;
             }
@@ -417,8 +479,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     // once isn't penalized after it gets in).
                     lock_limiter(&limiter).record_success(&peer);
                 }
-                Ok(Err(e)) => {
-                    warn!(peer = %format_endpoint_id(&peer), error = %e, "passphrase handshake rejected");
+                Ok(Err(_)) => {
+                    auth_event("auth", Outcome::Failed, Some(&peer), "passphrase rejected");
                     lock_limiter(&limiter).record_failure(peer, clock.now_ms());
                     conn.close(1u32.into(), b"auth failed");
                     return;
@@ -430,7 +492,12 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     // latency that has nothing to do with guessing. Only an explicit
                     // `ChallengeFailed` (the arm above) is a guess. The pending-handshake semaphore
                     // and this 3s bound already cap how long a stalling client can hold resources.
-                    warn!(peer = %format_endpoint_id(&peer), "passphrase handshake timed out (not counted as an auth failure)");
+                    auth_event(
+                        "auth",
+                        Outcome::Timeout,
+                        Some(&peer),
+                        "handshake timed out (not counted as a failure)",
+                    );
                     conn.close(1u32.into(), b"auth timeout");
                     return;
                 }
@@ -438,7 +505,28 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             // Authenticated: free the pending-handshake slot so it isn't held for the (potentially
             // long-lived) session that follows (KOH-08). The connection-cap permit is still held.
             drop(pending_permit);
-            info!(peer = %format_endpoint_id(&peer), "client authorized; attaching session");
+            auth_event(
+                "auth",
+                Outcome::Accepted,
+                Some(&peer),
+                "authorized; attaching session",
+            );
+            // Resolve this peer's authorization policy: an explicit allow-file entry, or the default
+            // (full read-write shell, plus the global --read-only if set). `restrict` = observe-only;
+            // `command="…"` = a forced command instead of a login shell. Only applied on a freshly
+            // created session — a reattach keeps the policy baked in at creation.
+            let policy = allow.get(&peer).cloned().unwrap_or(Policy {
+                read_only: global_read_only,
+                force_command: None,
+            });
+            if policy.read_only || policy.force_command.is_some() {
+                info!(
+                    peer = %format_endpoint_id(&peer),
+                    read_only = policy.read_only,
+                    forced_command = policy.force_command.is_some(),
+                    "applying per-peer policy"
+                );
+            }
             // Attach to (or create) this client's detachable session, then serve the connection.
             let (handle, attach_kind) = match session::attach(
                 &store,
@@ -446,6 +534,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 shell.as_deref(),
                 scrollback,
                 max_sessions,
+                policy.force_command.as_deref(),
+                policy.read_only,
             )
             .await
             {

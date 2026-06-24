@@ -71,6 +71,22 @@ pub fn clamp_dims(rows: u16, cols: u16) -> (u16, u16) {
     (rows.clamp(MIN_DIM, MAX_DIM), cols.clamp(MIN_DIM, MAX_DIM))
 }
 
+/// Feed `bytes` to a `vt100` parser, CONTAINING any panic the parser raises on adversarial input.
+///
+/// `vt100` is a third-party dependency outside koh's `forbid(unsafe)` + denied-panic-lint coverage.
+/// It is known to panic on degenerate input (sub-2 dimensions — guarded upstream of here by
+/// [`clamp_dims`]) and its full escape-parser surface (OSC/DCS/SGR/grapheme edges) is not exhaustively
+/// fuzzed. On the client this runs on **server-controlled** bytes, so an un-caught panic would unwind
+/// into the client's async task and crash the session. [`std::panic::catch_unwind`] turns that "remote
+/// client crash" into "drop one frame": returns `true` on success, `false` if a panic was caught (the
+/// caller then discards the frame and keeps the last-good screen). The default panic hook still logs
+/// the backtrace (to `$KOH_LOG`), so a genuine vt100 panic stays diagnosable + reportable upstream.
+/// `catch_unwind` is no-`unsafe`; `AssertUnwindSafe` is required only because `&mut Parser` is not
+/// `UnwindSafe`, and a poisoned parser is discarded by the caller.
+fn process_contained(parser: &mut vt100::Parser, bytes: &[u8]) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(bytes))).is_ok()
+}
+
 /// Build a blank `vt100::Screen` of the given size (the only way to get an owned `Screen`,
 /// since `Screen::new` is `pub(crate)`).
 fn blank_screen(rows: u16, cols: u16) -> vt100::Screen {
@@ -320,7 +336,11 @@ impl SyncState for TerminalScreen {
             // vt100 0.16's sub-2-dim panic. Mirror clamp on the server lives in `terminal/server.rs`.
             let (rows, cols) = clamp_dims(rows, cols);
             let mut p = Box::new(vt100::Parser::new(rows, cols, 0));
-            p.process(&diff.vt);
+            if !process_contained(&mut p, &diff.vt) {
+                // A peer-controlled repaint panicked vt100; CONTAIN it (see `process_contained`):
+                // drop this frame and keep the prior screen rather than crashing the client task.
+                return;
+            }
             self.screen = p.screen().clone();
             self.parser = Some(p);
         } else {
@@ -333,8 +353,11 @@ impl SyncState for TerminalScreen {
                 p.process(&self.screen.state_formatted());
                 p
             });
-            if !diff.vt.is_empty() {
-                parser.process(&diff.vt);
+            if !diff.vt.is_empty() && !process_contained(parser, &diff.vt) {
+                // Contained vt100 panic mid-stream: the parser's state is now unknown, so drop it
+                // (the next apply rebuilds from the last-good `screen`) and discard this frame.
+                self.parser = None;
+                return;
             }
             // Keep the snapshot in sync for PartialEq / diff_from / render.
             self.screen = parser.screen().clone();

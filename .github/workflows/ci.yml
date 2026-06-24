@@ -46,6 +46,11 @@ jobs:
           echo "layering edges OK"
       - name: test
         run: cargo test --locked
+      - name: docs (deny broken intra-doc links)
+        # Catches workspace-era / renamed intra-doc links before they ship a broken docs.rs build.
+        run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
 
   # Supply-chain tripwire: the `=` pins buy reproducibility, so this is what keeps them from
   # silently aging into a CVE. Advisory ignores (and the rationale) live in deny.toml.
@@ -56,3 +61,22 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories
+
+  # Coverage-guided fuzzing of the untrusted-input decode surfaces (the OpenSSH/OSS-Fuzz doctrine:
+  # one harness per attacker-reachable parser). Builds the harnesses, then a short smoke run that
+  # MUST stay crash-free — `screen_apply` proves the vt100 panic containment holds, `wire_decode`
+  # proves the wire decoders only Err (never panic) on arbitrary bytes.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: build fuzz targets
+        run: cargo +nightly fuzz build
+      - name: smoke (must stay crash-free)
+        run: |
+          cargo +nightly fuzz run screen_apply -- -max_total_time=45 -rss_limit_mb=4096
+          cargo +nightly fuzz run wire_decode  -- -max_total_time=45 -rss_limit_mb=4096

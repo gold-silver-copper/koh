@@ -137,6 +137,33 @@ iroh-ssh's "anyone with the endpoint id gets a shell" model. The server:
 QUIC/iroh already authenticates both ends by public key and encrypts everything; the allowlist
 is the authorization layer on top.
 
+#### Per-peer authorization (`--allow-file`)
+
+A bare `--allow <id>` grants a full interactive shell. To vary policy per peer — sshd's
+`authorized_keys` options / `ForceCommand` — pass `--allow-file <path>`, one entry per line:
+
+```text
+# observer: can watch the live shell but cannot type or resize it
+871b…aa  restrict
+# kiosk: always lands in a fixed command instead of a login shell
+a2d4…bf  command="tmux attach -t main"
+# both: a read-only view of a fixed command
+3f9c…01  restrict command="watch -n1 uptime"
+```
+
+- **`restrict`** is a *real* boundary: the peer's keystrokes and resizes are dropped before they
+  reach the PTY (enforced in the data path, not just advertised). `--read-only` applies this to
+  **every** authorized client.
+- **`command="…"`** runs via the login shell's `-c`, exactly like sshd's `ForceCommand`. Because
+  koh is a **single-uid** tool (the shell runs as whoever launched `koh serve`), a forced command
+  is a *convenience / soft restriction*, **not a jail**: a command that can spawn a subshell (an
+  editor's `:!sh`, a pager, …) escapes it. For anything resembling confinement, pair it with
+  `restrict` and a command that can't shell out.
+
+`#` comments and blank lines are ignored; a malformed id, unknown option, or duplicate id fails at
+startup rather than silently mis-authorizing. Each accepted connection's resolved policy is logged
+under the `koh::auth` target.
+
 #### Optional passphrase second factor
 
 For defense-in-depth against a **leaked but still-allowlisted client key** (the one residual case
@@ -240,6 +267,8 @@ All of koh's knobs as environment variables (most have a CLI-flag equivalent):
 | `RUST_LOG` | serve, connect | Log verbosity/filter (`tracing` `EnvFilter`), e.g. `koh=debug` or `koh::server=info`. Server logs to **stderr**; client logs to `$KOH_LOG`. | — |
 | `KOH_LOG` | connect | File the client writes logs to (created `0600`), so logging doesn't disturb the TUI. | — |
 | `KOH_PASSPHRASE` | serve, connect | The optional passphrase second factor. **Prefer this over `--passphrase`** — argv is visible in the process table. | `--passphrase` |
+| `KOH_KEY_PASSPHRASE` | serve, connect, key | Passphrase to decrypt an at-rest-encrypted identity key (`koh-key-v1`). Lets an unattended `koh serve` open an encrypted key without a TTY prompt. | — |
+| `KOH_KEY_NEW_PASSPHRASE` | key | Non-interactive new passphrase for `koh key passwd` (empty = remove encryption); for CI/automation instead of the prompt. | — |
 | `KOH_STATE_DIR` | serve, connect | Base directory for the identity key files (the server's error message points here when the default isn't writable). | `--key-file` (per file) |
 | `KOH_DNS` | serve, connect | Override the discovery DNS resolver (`IP` or `IP:PORT`); needed on some Android/Termux setups. | — |
 | `KOH_CLIPBOARD` | connect | `1` to honor remote OSC-52 clipboard writes (off by default; L-1). | `--clipboard` |
@@ -250,6 +279,26 @@ All of koh's knobs as environment variables (most have a CLI-flag equivalent):
 > Debugging a stuck session? Start the client with `RUST_LOG=koh=debug KOH_LOG=/tmp/koh.log` and the
 > server with `RUST_LOG=koh=debug` (it logs to stderr). At `debug` the client also reports link RTT,
 > so you can tell a slow link from a slow server.
+
+### Encrypting the identity key at rest
+
+The identity key *is* the node — anyone who can read `~/…/koh/{server,client}.key` owns the identity.
+By default it is stored as bare hex (`0600`), protected only by file permissions. `koh key` adds an
+opt-in, passphrase-encrypted format (`koh-key-v1`: **Argon2id + AES-256-GCM**, modeled on OpenSSH's
+`openssh-key-v1`), so the key is also guarded by something you *know* — the analogue of `ssh-keygen -p`
+on an encrypted SSH private key:
+
+```sh
+koh key passwd               # set / change / remove the passphrase (empty = remove); prompts
+koh key info                 # show encryption status + endpoint id (prompts if encrypted)
+koh key passwd --key-file ~/.config/koh/server.key   # operate on the server key
+```
+
+Encryption is opt-in and backward-compatible: existing bare-hex keys keep loading unchanged, and the
+endpoint id is preserved across a passphrase change. To open an encrypted key without an interactive
+prompt (e.g. an unattended `koh serve`), set `KOH_KEY_PASSPHRASE`; for non-interactive `koh key passwd`
+(CI), set `KOH_KEY_NEW_PASSPHRASE`. (This protects the key *at rest*; it is not hardware/agent-backed
+custody — see the roadmap.)
 
 By default the bare endpoint id is dialed via n0's public relay + DNS discovery. For a LAN or
 self-hosted setup you can skip that:

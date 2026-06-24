@@ -7,7 +7,9 @@
 //! survives client disconnects; a per-connection [`run_attached`] loop drives a *fresh*
 //! `Transport` against it, so a reconnecting client re-syncs to the current screen.
 
+pub mod audit;
 pub mod cli;
+pub mod policy;
 pub mod session;
 
 pub use cli::{serve, ServeArgs};
@@ -286,20 +288,26 @@ pub async fn run_attached(
                             let mut s = handle.session.lock().await;
                             let app_cursor = s.emu.application_cursor();
                             if let Some(input) = session.drain_input(app_cursor) {
-                                if !input.keys.is_empty() {
-                                    if let Err(e) = s.pty.write_input(&input.keys) {
-                                        warn!(error = %e, "pty write failed");
+                                // A read-only (observer) session still drains — `drain_input`'s
+                                // collapse of `received_states` is a required per-state side effect —
+                                // but the client's keystrokes and resizes never reach the PTY: a
+                                // `restrict`ed peer can watch the live shell, not drive it.
+                                if !s.read_only {
+                                    if !input.keys.is_empty() {
+                                        if let Err(e) = s.pty.write_input(&input.keys) {
+                                            warn!(error = %e, "pty write failed");
+                                        }
                                     }
-                                }
-                                if let Some((rows, cols)) = input.resize {
-                                    if let Err(e) = s.pty.resize(rows, cols) {
-                                        // A failed TIOCSWINSZ silently diverges the kernel winsize
-                                        // from the vt100 grid (full-screen-app corruption with no
-                                        // breadcrumb today); warn, but still resize the emulator so
-                                        // the screen geometry keeps tracking the client.
-                                        warn!(error = %e, rows, cols, "pty resize failed");
+                                    if let Some((rows, cols)) = input.resize {
+                                        if let Err(e) = s.pty.resize(rows, cols) {
+                                            // A failed TIOCSWINSZ silently diverges the kernel winsize
+                                            // from the vt100 grid (full-screen-app corruption with no
+                                            // breadcrumb today); warn, but still resize the emulator so
+                                            // the screen geometry keeps tracking the client.
+                                            warn!(error = %e, rows, cols, "pty resize failed");
+                                        }
+                                        s.emu.resize(rows, cols);
                                     }
-                                    s.emu.resize(rows, cols);
                                 }
                                 s.emu.register_input_frame(input.frame, now);
                                 drop(s);
@@ -340,7 +348,7 @@ pub async fn run_session(
     shell: Option<String>,
     scrollback: usize,
 ) -> anyhow::Result<()> {
-    let handle = session::spawn_session(shell.as_deref(), scrollback)?;
+    let handle = session::spawn_session(shell.as_deref(), scrollback, None, false)?;
     let _ = run_attached(conn, handle.clone()).await?;
     let _ = handle.session.lock().await.pty.kill();
     Ok(())

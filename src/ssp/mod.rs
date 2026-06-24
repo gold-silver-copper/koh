@@ -21,7 +21,7 @@
 //! QUIC/iroh subsumes mosh's UDP framing, OCB crypto, key exchange, roaming, NAT
 //! traversal, heartbeats, and RTT measurement. This crate keeps only what lives *above*
 //! the wire: the `sent_states`/`received_states` collapse logic, the `tick()` send
-//! scheduler, the seq/ack/throwaway envelope, and fragmentation (in [`koh_wire`]).
+//! scheduler, the seq/ack/throwaway envelope, and fragmentation (in [`wire`](crate::wire)).
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -66,8 +66,8 @@ pub(crate) const RECEIVED_STATES_CAP: usize = 1024;
 
 /// A synchronizable object: the unit the protocol keeps in sync.
 ///
-/// Implementors are the screen ([`koh_terminal`]) and the user-input stream
-/// ([`koh_input`]). The contract mirrors mosh's `MyState`/`RemoteState`:
+/// Implementors are the screen ([`terminal`](crate::terminal)) and the user-input stream
+/// ([`input`](crate::input)). The contract mirrors mosh's `MyState`/`RemoteState`:
 ///
 /// - [`diff_from`](SyncState::diff_from): produce the delta that transforms `base` into `self`.
 /// - [`apply`](SyncState::apply): mutate `self` by applying a delta.

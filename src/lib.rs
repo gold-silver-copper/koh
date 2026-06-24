@@ -32,7 +32,7 @@
 //! ## Public API stability
 //!
 //! koh ships **binary-first**. The *supported* library surface is [`server::serve`],
-//! [`client::connect`], [`client::run_id`], and the [`SyncState`](ssp::SyncState) /
+//! [`client::connect`], [`client::run_id`], [`keycmd::run`], and the [`SyncState`](ssp::SyncState) /
 //! [`Transport`](ssp::Transport) protocol core in [`ssp`]. Everything else is `pub` only so the in-tree
 //! integration tests and the `chaos` example can drive it as a downstream dependency; treat it as
 //! **internal and unstable** — it may change in any release without a semver-major bump. Do not build
@@ -40,6 +40,7 @@
 
 pub mod client;
 pub mod input;
+pub mod keycmd;
 pub mod predict;
 pub mod pty;
 pub mod server;

@@ -374,9 +374,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 conn.close(1u32.into(), b"rate limited");
                 return;
             }
-            // Second factor: the passphrase nonce-challenge (no-op if none configured), bounded
+            // Second factor: the passphrase PAKE handshake (no-op if none configured), bounded
             // by a 3s timeout so a stalled/malicious client can't pin a (pending-handshake) slot
-            // for long — a nonce exchange is sub-second on any real link (KOH-08).
+            // for long — the SPAKE2 exchange is sub-second on any real link (KOH-08).
             match tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 crate::transport_iroh::auth::handshake_server(

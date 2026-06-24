@@ -1,4 +1,4 @@
-//! The passphrase nonce-challenge handshake over a real loopback iroh connection.
+//! The passphrase PAKE (SPAKE2) handshake over a real loopback iroh connection.
 
 // Integration test: every `unwrap`/`expect`/panic here IS the test's assertion of success.
 #![allow(
@@ -74,5 +74,30 @@ async fn passphrase_handshake_over_iroh() {
     assert!(
         matches!(cr, Err(AuthError::ChallengeFailed)),
         "the client must learn the rejection via the verdict, got {cr:?}"
+    );
+
+    // (d) server requires a passphrase, client supplies none -> both reject (a missing factor can't
+    // produce the SPAKE2 key / confirmation), and neither side sees a transport error.
+    let (sr, cr) = round(Some("hunter2"), None).await;
+    assert!(
+        matches!(sr, Err(AuthError::ChallengeFailed)),
+        "a missing client passphrase must be rejected server-side, got {sr:?}"
+    );
+    assert!(
+        matches!(cr, Err(AuthError::ChallengeFailed)),
+        "a missing client passphrase must be rejected client-side, got {cr:?}"
+    );
+
+    // (e) server requires NO passphrase but the client has one -> the client fails CLOSED (KOH-13):
+    // it must not silently drop the second factor it was configured with. The server, which doesn't
+    // require auth, still returns Ok.
+    let (sr, cr) = round(None, Some("hunter2")).await;
+    assert!(
+        sr.is_ok(),
+        "a no-passphrase server still succeeds, got {sr:?}"
+    );
+    assert!(
+        matches!(cr, Err(AuthError::ChallengeFailed)),
+        "a client with a passphrase must refuse a server that requires none, got {cr:?}"
     );
 }

@@ -5,11 +5,11 @@
 # reported as telemetry (not a hard gate) because iroh coalesces same-node-id connections on loopback,
 # so driving 5+ DISTINCT failed handshakes from one peer is unreliable here.
 #
-# Scope note: this asserts FAILURE handling under load. Passphrase-auth SUCCESS is covered by the
-# in-process `transport_iroh::auth` unit tests (the BLAKE3/Argon2 challenge) and the loopback-e2e
-# smoke test — asserting a successful auth on-device is flaky over loopback under churn, so it is not
-# gated here. All assertions are on the SERVER log (the client prints "connected." before the server
-# validates, so client output can't tell pass from fail).
+# Scope note: this asserts FAILURE handling under load. Passphrase-auth SUCCESS (a correct passphrase
+# authenticating over the SPAKE2 PAKE on arm64) is covered by `stress-pake-auth`, plus the in-process
+# `transport_iroh::auth` unit + loopback integration tests — asserting success under THIS flood is
+# flaky over loopback coalescing, so it is not gated here. All assertions are on the SERVER log (the
+# client prints "connected." before the server validates, so client output can't tell pass from fail).
 set -eu
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 . "$HERE/stress-lib.sh"

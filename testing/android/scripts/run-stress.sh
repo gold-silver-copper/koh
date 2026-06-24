@@ -18,7 +18,7 @@ echo
 
 # The last two (netem, relay-discovery) self-SKIP (exit 0) unless their opt-in env + prerequisites
 # are present, so they're safe to always list here.
-TESTS="stress-bind-storm stress-connection-churn stress-concurrent-clients stress-auth-ratelimit stress-signal-storm stress-throughput stress-memory-longevity stress-reconnect-restart stress-client-freeze stress-client-wake-reconnect stress-reattach-continuity stress-client-signals stress-netem stress-roaming stress-relay-discovery"
+TESTS="stress-bind-storm stress-connection-churn stress-concurrent-clients stress-auth-ratelimit stress-pake-auth stress-signal-storm stress-throughput stress-memory-longevity stress-reconnect-restart stress-client-freeze stress-client-wake-reconnect stress-reattach-continuity stress-client-signals stress-netem stress-roaming stress-relay-discovery"
 total=0
 failed=0
 failed_names=""

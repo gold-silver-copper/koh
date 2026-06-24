@@ -139,33 +139,31 @@ is the authorization layer on top.
 
 #### Optional passphrase second factor
 
-For defense-in-depth against a **leaked but still-allowlisted client key** (the one residual
-case the allowlist can't cover), the server can require a shared passphrase (`--passphrase`, or
-preferably `$KOH_PASSPHRASE` since argv is visible in the process table). The handshake rides
-inside the already-encrypted, authenticated QUIC connection and never puts the passphrase on the
-wire: the server sends a fresh `OsRng` nonce and checks `BLAKE3(K ‖ nonce)`, where the
-pre-shared key `K = Argon2id(passphrase, salt)` (64 MiB / 3 iterations, a fixed deterministic
-salt so both sides derive the same `K`). The mitigation against an attacker who has the key and
-is *online-guessing* the passphrase is twofold:
+For defense-in-depth against a **leaked but still-allowlisted client key** (the one residual case
+the allowlist can't cover) — and against a user being lured into dialing a **malicious server's
+NodeId** — the server can require a shared passphrase (`--passphrase`, or preferably
+`$KOH_PASSPHRASE` since argv is visible in the process table). The handshake is a **balanced PAKE
+([SPAKE2](https://www.rfc-editor.org/rfc/rfc9382)) with explicit mutual key confirmation**, run
+inside the already-encrypted QUIC connection. Both peers map the passphrase through
+`Argon2id(passphrase, salt)` (64 MiB / 3 iterations, fixed deterministic salt so both derive the
+same value), run SPAKE2 over Ed25519 with it, derive a shared key, and each proves knowledge with
+a transcript-bound confirmation tag (compared in **constant time**). Two properties follow:
 
-- **Per-guess cost** — every attempt forces a full Argon2id derivation (the work factor), and the
-  response is compared in **constant time** (`constant_time_eq`), so there's no timing oracle.
-- **Per-peer rate limit** — a peer that fails (or times out) the handshake too many times within a
-  sliding window is refused *cheaply, before the KDF runs*, until its failures age out; this also
-  bounds the server CPU an attacker can burn. The limiter's keyspace is GC'd on the reaper sweep.
+- **No offline-crackable transcript** — SPAKE2's messages are group elements independent of the
+  passphrase to anyone who doesn't complete the protocol, so a server you merely *dial* learns
+  nothing it can grind offline. Guessing is forced **online** — one guess per live handshake —
+  where the Argon2id work factor and the **per-peer rate limiter** (a peer that fails too many
+  times in a sliding window is refused cheaply; the keyspace is GC'd on the reaper sweep) bound it.
+- **Mutual authentication** — the client refuses the session unless the *server's* confirmation tag
+  verifies, so an impostor server that doesn't know the passphrase can't authenticate (it can't
+  even harvest a crackable response). This closes the dial-a-malicious-server gap entirely.
 
-The passphrase is held in a `secrecy::SecretString` and the derived `K` in `zeroize::Zeroizing`,
-exposed only at the KDF call (this reduces heap exposure; argv/env remain OS-visible). The
-passphrase (and every other `KOH_*` operational var) is **scrubbed from the spawned shell's
-environment**, so an authorized user can't `echo $KOH_PASSPHRASE` to recover the second factor.
-
-> **Use a high-entropy passphrase.** This is a hash challenge-response, not a PAKE, so a server a
-> client *dials* (e.g. a malicious or typo'd endpoint id) learns one `(nonce, BLAKE3(K ‖ nonce))`
-> transcript and can mount an **offline** dictionary attack on the passphrase — the fixed public
-> salt and a server-chosen nonce don't prevent this (the memory-hard Argon2id work factor only
-> makes weak/dictionary passphrases realistically crackable). koh treats an empty passphrase as
-> "none" and warns when one is shorter than 12 characters; a long, random passphrase is the real
-> defense (a PAKE that would eliminate offline cracking entirely is future work).
+The passphrase is held in a `secrecy::SecretString` and the Argon2id output in `zeroize::Zeroizing`,
+exposed only at the KDF call (argv/env remain OS-visible). The passphrase (and every other `KOH_*`
+operational var) is **scrubbed from the spawned shell's environment**, so an authorized user can't
+`echo $KOH_PASSPHRASE` to recover the second factor. An empty passphrase is treated as "none"; a
+short one still warns (online guessing is cheaper the lower the entropy), but the PAKE means even a
+modest passphrase is no longer offline-crackable from a transcript.
 
 #### Hardening against a hostile or compromised peer
 

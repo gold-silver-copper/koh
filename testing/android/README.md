@@ -102,6 +102,7 @@ KOH_ANDROID_EMULATOR=1 sh testing/android/scripts/stress-throughput.sh
 | `stress-connection-churn` | rapid connect/disconnect vs one server | server survives, RSS bounded (no per-connection leak), no panic |
 | `stress-concurrent-clients` | N simultaneous distinct-peer sessions | all connect, server survives, RSS bounded |
 | `stress-auth-ratelimit` | failed-auth flood on a passphrase server | no wrong passphrase authorized, server survives, legit client still gets in (limiter engagement = telemetry) |
+| `stress-pake-auth` | one correct + one wrong passphrase vs a passphrase server | the SPAKE2 PAKE authenticates a **correct** passphrase on arm64 (proves the cross-compiled crypto works) and **rejects** a wrong one without ever authorizing it |
 | `stress-signal-storm` | repeated SIGTERM/SIGINT teardown | every signal drains gracefully, no orphan, no panic |
 | `stress-throughput` | server-side flood of 10⁴–10⁵ lines | whole flood processed end-to-end, no panic, server RSS bounded |
 | `stress-memory-longevity` | unbounded output for tens of seconds | RSS plateaus (no leak) under an absolute cap, no panic |
@@ -169,6 +170,7 @@ testing/android/
     ├── stress-throughput.sh
     ├── stress-memory-longevity.sh
     ├── stress-reconnect-restart.sh
+    ├── stress-pake-auth.sh
     ├── stress-client-freeze.sh
     ├── stress-client-wake-reconnect.sh
     ├── stress-reattach-continuity.sh

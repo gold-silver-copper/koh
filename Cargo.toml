@@ -1,6 +1,6 @@
 [package]
 name = "koh"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["koh authors"]
@@ -41,7 +41,10 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # internally; our crate stays `forbid(unsafe)`). `signal`-only, no default features. Already present
 # transitively, so this pins no new major version.
 nix = { version = "0.28", default-features = false, features = ["signal"] }
-# auth (passphrase second factor)
+# auth (passphrase second factor). The handshake is a balanced PAKE (SPAKE2, RFC 9382) so a server
+# a client merely *dials* cannot offline-crack the passphrase from a transcript (closes KOH-03).
+# Pinned (=) like the other crypto/transport deps: a PAKE's wire/curve details must not drift under us.
+spake2 = "=0.4.0"
 blake3 = "1"
 argon2 = "0.5"
 constant_time_eq = "0.5"

@@ -704,6 +704,11 @@ async fn drive_connection<T: ClientTerminal>(
                             // scripted test terminal.
                             term.suspend_resume()?;
                             session.dirty = true;
+                            // The process was parked for the whole foreground-suspend (possibly
+                            // minutes); reset the freeze checkpoint so that deliberate suspend isn't
+                            // misread as a screen-off freeze and forced into a needless reconnect
+                            // (KR-05). Real screen-off/deep-sleep doesn't go through this arm.
+                            last_wall = std::time::SystemTime::now();
                         }
                         InputOutcome::Forwarded => {}
                     },

@@ -359,6 +359,14 @@ impl FragmentAssembly {
     /// Feed a fragment. Returns `Ok(Some(instruction))` once the instruction it belongs to is
     /// complete, `Ok(None)` while still waiting for more (or if the fragment was stale).
     pub fn add(&mut self, frag: Fragment) -> Result<Option<Instruction>, WireError> {
+        // A legitimate fragment is empty ONLY when it is the single final fragment of an empty
+        // instruction (index 0, final). Any other empty-payload fragment is malformed — drop it up
+        // front (before it can supersede a live partial or consume a `parts` slot), so a peer can't
+        // flood ~32768 zero-length fragments (which add 0 to the byte cap, evading KOH-07) to pin
+        // one BTreeMap entry per index (KR-08).
+        if frag.payload.is_empty() && !(frag.index == 0 && frag.final_) {
+            return Ok(None);
+        }
         match self.current_id {
             Some(cur) if frag.id < cur => {
                 trace!(
@@ -555,6 +563,41 @@ mod tests {
             }
         }
         assert!(got.is_some(), "assembler recovers after an over-cap reset");
+    }
+
+    #[test]
+    fn empty_nonfinal_fragments_are_dropped_and_dont_accumulate() {
+        // KR-08: a flood of zero-length non-final fragments must be dropped (they'd add 0 to the
+        // byte cap and otherwise pin one map entry per index), must not disturb a live partial, and
+        // must leave the assembler able to reassemble a subsequent real instruction.
+        let mut asm = FragmentAssembly::with_limit(64 * 1024);
+        for i in 0..5000u16 {
+            let empty = Fragment {
+                id: 1,
+                index: i,
+                final_: false,
+                payload: Vec::new(),
+            };
+            assert!(
+                asm.add(empty).unwrap().is_none(),
+                "an empty non-final fragment is dropped, never buffered"
+            );
+        }
+        // A subsequent well-formed instruction (higher id) still reassembles — the empties left no
+        // residue and didn't advance any final marker.
+        let instr = sample_instruction(20);
+        let mut got = None;
+        for mut fr in Fragmenter::new().fragment(&instr, 1200).unwrap() {
+            fr.id = 2;
+            if let Some(i) = asm.add(fr).unwrap() {
+                got = Some(i);
+            }
+        }
+        assert_eq!(
+            got.unwrap(),
+            instr,
+            "a real instruction reassembles after an empty-fragment flood"
+        );
     }
 
     #[test]

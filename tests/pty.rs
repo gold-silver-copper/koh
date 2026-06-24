@@ -161,3 +161,40 @@ async fn shutdown_joins_both_io_threads_without_deadlock() {
     .expect("shutdown task panicked");
     let _ = drain.await;
 }
+
+#[tokio::test]
+#[allow(
+    clippy::match_wild_err_arm,
+    reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"
+)]
+async fn reaped_child_is_not_signaled_again() {
+    // KR-02: once the child is reaped (try_wait/wait returned Some), every kill path must be a
+    // no-op so it can't signal a recycled PID. We can't force PID reuse in a test, but we exercise
+    // the reaped-gate: a one-shot `echo` exits and is reaped, after which kill()/kill_hard()/
+    // shutdown() must be safe no-ops (no error, no panic).
+    let (mut pty, mut rx) = Pty::spawn(24, 80, Some("echo"), "xterm-256color").expect("spawn echo");
+    // Drain output to EOF so the child has exited.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break, // child exited, reader finished
+            Err(_) => panic!("timed out waiting for echo to exit"),
+        }
+    }
+    // Reap the child, setting the internal `reaped` flag (it may take a moment after EOF).
+    let mut reaped = false;
+    for _ in 0..200 {
+        if matches!(pty.try_wait(), Ok(Some(_))) {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(reaped, "the one-shot child must exit and be reaped");
+    // After reaping, every kill path is gated and must be a safe no-op (never signaling a PID we no
+    // longer own).
+    assert!(pty.kill().is_ok(), "kill() after reap is a gated no-op");
+    pty.kill_hard(); // must not signal a (possibly recycled) PID, must not panic
+    pty.shutdown(); // consumes; Drop is reaped-gated; must not panic
+}

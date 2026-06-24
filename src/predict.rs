@@ -380,7 +380,9 @@ impl PredictionEngine {
             (c.row, c.col)
         };
         // Need the whole glyph to fit strictly before the last column (the edge is wrap-ambiguous).
-        if col + (w as u16) >= cols {
+        // Written as `w >= cols - col` (saturating) to avoid a latent `col + w` u16 overflow, matching
+        // the hardened backspace path; in production `col, w` are clamped well below u16::MAX anyway.
+        if w as u16 >= cols.saturating_sub(col) {
             self.become_tentative();
             self.init_cursor(screen);
             return;

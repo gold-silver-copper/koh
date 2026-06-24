@@ -74,13 +74,23 @@ pub enum SetupError {
 /// stable [`EndpointId`], mirroring iroh-ssh's `--persist`.
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
     if path.exists() {
-        // Tighten an existing group/other-accessible key to 0600 (it is the node's whole identity,
-        // so a loose key is a local-impersonation risk), and refuse a world-writable containing dir
-        // where a co-tenant could swap the key out (KOH-16 / KOH-06).
-        tighten_or_warn_key_perms(path);
+        // Refuse a world-writable containing dir FIRST (KR-06): `tighten_or_warn_key_perms` chmods
+        // the key, and in a co-tenant-writable dir an attacker could plant `id.key` as a symlink to
+        // a victim file — so we must reject the dangerous dir before touching the key's perms. Only
+        // then tighten an existing group/other-accessible key to 0600 (it is the node's whole
+        // identity, so a loose key is a local-impersonation risk) (KOH-16 / KOH-06).
         if let Some(parent) = path.parent() {
             ensure_state_dir_secure(parent)?;
         }
+        // Refuse a symlinked key path entirely (KR-06): not only would the chmod follow it, but
+        // `read_to_string` below would too — a planted symlink could otherwise turn the key load
+        // into a read-oracle on any file koh can read. `symlink_metadata` does not follow the link.
+        #[cfg(unix)]
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            tracing::warn!(path = %path.display(), "secret key path is a symlink; refusing to load it");
+            return Err(SetupError::BadKeyFile);
+        }
+        tighten_or_warn_key_perms(path);
         let text = std::fs::read_to_string(path)?;
         let bytes = data_encoding::HEXLOWER_PERMISSIVE
             .decode(text.trim().as_bytes())
@@ -164,6 +174,16 @@ fn tighten_or_warn_key_perms(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Refuse to chmod a symlinked key (defense in depth on top of the KR-06 dir check): a key
+        // path that is a symlink is not something koh created, so don't follow it and re-permission
+        // its target. `symlink_metadata` does not follow the link.
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            tracing::warn!(
+                path = %path.display(),
+                "secret key path is a symlink; refusing to re-permission its target"
+            );
+            return;
+        }
         if let Ok(meta) = std::fs::metadata(path) {
             let mode = meta.permissions().mode();
             if mode & 0o077 != 0 {
@@ -642,6 +662,75 @@ mod tests {
             "state dir must not be group/other-accessible, got {dmode:o}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_state_dir_secure_refuses_world_writable() {
+        // KR-06: a group/other-writable state dir (where a co-tenant could swap the key) must be
+        // refused; a private 0700 dir is accepted.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("koh-ww-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            ensure_state_dir_secure(&dir).is_err(),
+            "a group/other-writable state dir must be refused"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            ensure_state_dir_secure(&dir).is_ok(),
+            "a 0700 state dir is accepted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tighten_does_not_follow_a_symlinked_key() {
+        // KR-06: `tighten_or_warn_key_perms` must not chmod the target of a symlinked key path (an
+        // attacker-planted symlink to a victim file), so the target's perms are left untouched.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("koh-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("victim");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("server.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        tighten_or_warn_key_perms(&link); // must refuse to follow the symlink
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "a symlinked key's target must not be re-permissioned"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_a_symlinked_key() {
+        // KR-06: a symlinked key path must be refused before `read_to_string` (which would follow it
+        // as a read-oracle on the target). The parent dir is 0700 so the dir check passes and we
+        // reach the symlink guard.
+        let dir = std::env::temp_dir().join(format!("koh-keylink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_dir_private(&dir).unwrap(); // 0700
+        let target = dir.join("secret");
+        std::fs::write(&target, b"deadbeef").unwrap();
+        let link = dir.join("server.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let result = load_or_create_secret_key(&link);
+        assert!(
+            matches!(result, Err(SetupError::BadKeyFile)),
+            "a symlinked key path must be refused, got {result:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -63,9 +63,11 @@ const SERVER_CONFIRM_LABEL: &[u8] = b"server";
 const CLIENT_CONFIRM_LABEL: &[u8] = b"client";
 
 /// Argon2id parameters for the passphrase KDF: 64 MiB memory, 3 iterations, 1 lane, 32-byte output.
-/// Argon2 is the SPAKE2 memory-hard map of the passphrase — it makes each *online* guess cost real
-/// CPU/memory (the per-peer rate limiter then bounds the rate). It is *not* password storage, which
-/// is why the salt below is fixed rather than random.
+/// Argon2 is the SPAKE2 memory-hard map of the passphrase. The work factor burdens the **guesser**:
+/// each distinct online guess forces the attacker to compute a full Argon2id derivation, so combined
+/// with the per-peer [`FailureLimiter`](crate::transport_iroh::ratelimit) the guess rate is bounded.
+/// The honest server derives its own value only **once** (then [`cached_psk`] reuses it), so this is
+/// not a per-guess server cost. It is *not* password storage, which is why the salt is fixed.
 #[expect(
     clippy::expect_used,
     reason = "Params::new only errors on out-of-range values; these are compile-time constants"
@@ -215,6 +217,12 @@ pub async fn handshake_server(
     };
     // Derive (or fetch the cached) Argon2id map BEFORE touching the network so the expensive KDF
     // can't be triggered repeatedly by an attacker who hangs up mid-handshake.
+    //
+    // Residual (KR-09): `start_symmetric` copies the PSK bytes into spake2's own (non-`Zeroize`)
+    // internal state, so a copy of the Argon2id *map* (not the passphrase, which stays in a
+    // `SecretString`) lingers on the heap until `state` drops. Bounded by the upstream `spake2`
+    // crate; only reachable with a separate local memory-disclosure primitive, and still requires
+    // an Argon2id-equivalent grind to relate back to a passphrase. Accepted as-is.
     let psk = cached_psk(pass);
     let (state, server_msg) = Spake2::<Ed25519Group>::start_symmetric(
         &Password::new(psk.as_slice()),

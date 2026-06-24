@@ -38,6 +38,13 @@ use tracing::{error, info, warn};
 const AUTH_FAIL_WINDOW_MS: u64 = 60_000;
 const AUTH_MAX_FAILURES: usize = 5;
 
+/// Deadline on the QUIC crypto handshake (`Incoming::await`) before a stalled dial is dropped and
+/// its connection + pending-handshake permits released (KR-01). A legitimate 1-RTT QUIC handshake
+/// finishes in well under this even on a slow mobile link; the cap exists so a peer can't pin a
+/// pending slot for the 300s idle timeout koh configures (`koh_transport_config`). The separate
+/// `passphrase` exchange has its own 3s bound below.
+const ACCEPT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Passphrases shorter than this trigger a startup warning: the challenge-response is offline-
 /// crackable by a server a client dials (KOH-03), so a low-entropy passphrase is weak. Not a hard
 /// floor (existing deployments keep working), just a loud nudge toward a high-entropy secret.
@@ -352,10 +359,18 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             // Held only until auth completes (dropped explicitly on success, or on any early
             // return below), so an established session doesn't occupy a pending-handshake slot.
             let pending_permit = pending_permit;
-            let conn = match incoming.await {
-                Ok(c) => c,
-                Err(e) => {
+            // Bound the QUIC handshake itself (KR-01): `incoming.await` has no internal deadline
+            // short of iroh's 300s idle timeout, so a peer that yields an `Incoming` then stalls
+            // would otherwise pin this conn + pending permit for ~5 min — and ~`pending_cap` such
+            // stalls would deny all new connections. The timeout releases both permits promptly.
+            let conn = match tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT, incoming).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
                     warn!(error = %e, "incoming handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    warn!("incoming handshake timed out (stalled QUIC handshake)");
                     return;
                 }
             };

@@ -1,11 +1,12 @@
 //! Per-peer failure rate limiter for the passphrase second factor.
 //!
-//! The Argon2id work factor in [`crate::transport_iroh::auth`] makes each online passphrase guess cost the
-//! **server** real CPU/memory, so an attacker holding a leaked-but-still-allowlisted client key
-//! could both (a) grind passphrases and (b) burn the server's resources doing so. This limiter
-//! caps how fast a single peer may fail the handshake: after `max_failures` failures inside a
-//! sliding `window_ms`, further attempts are refused **cheaply, before the KDF runs**, until the
-//! older failures age out of the window.
+//! The Argon2id work factor in [`crate::transport_iroh::auth`] makes each distinct online passphrase
+//! guess cost the **attacker** a full Argon2id derivation (the honest server derives its own value
+//! only once, then caches it — there is no per-guess server-side KDF cost). This limiter then bounds
+//! how *fast* a leaked-but-still-allowlisted key may grind: after `max_failures` failures inside a
+//! sliding `window_ms`, further attempts are refused **cheaply, before the handshake runs**, until
+//! the older failures age out of the window. (Under `--allow-any` a peer can rotate EndpointIds to
+//! sidestep this per-peer keying — see the audit; the allowlist deployment is the intended model.)
 //!
 //! It is a pure, clock-injected state machine (the caller passes `now` in milliseconds), so it is
 //! deterministically testable with no iroh/tokio/clock dependency — matching the `ssp` style.

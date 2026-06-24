@@ -182,13 +182,40 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
             }
         };
         if let Ok(file) = created {
-            tracing_subscriber::fmt()
-                .with_writer(std::sync::Mutex::new(file))
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "koh=debug".into()),
-                )
-                .init();
+            // Tighten to 0600 unconditionally via the fd (KR-07): the `mode` above only applies when
+            // the file is *created*, so a pre-existing looser `$KOH_LOG` (or one a co-tenant planted)
+            // would otherwise be reused/truncated with its loose bits intact. `File::set_permissions`
+            // fchmods the open fd, so it also avoids re-resolving the path through a symlink. If we
+            // CAN'T secure it (e.g. `$KOH_LOG` points at a foreign-owned file → EPERM), don't write
+            // potentially-sensitive debug logs into a file we couldn't lock down — warn and skip.
+            let secured = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let ok = file
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .is_ok();
+                    if !ok {
+                        eprintln!(
+                            "koh: warning: could not set $KOH_LOG to 0600; file logging disabled"
+                        );
+                    }
+                    ok
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            };
+            if secured {
+                tracing_subscriber::fmt()
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| "koh=debug".into()),
+                    )
+                    .init();
+            }
         }
     }
 
@@ -254,7 +281,17 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     // every transparent reconnect. The first dial happens here — before raw mode — so a bad-id or
     // wrong-passphrase error prints cleanly; later drops are re-dialed from inside run_client.
     let connector = IrohConnector::new(endpoint.clone(), target, passphrase);
-    let channel = connector.connect().await?;
+    // Bound the initial dial (KR-04): `connect()` performs unbounded handshake reads, so a
+    // malicious/typo'd server the client dials could otherwise hang it at "connecting…" until iroh's
+    // 300s idle timeout. Use the same cap as the transparent-reconnect path.
+    let channel =
+        match tokio::time::timeout(super::RECONNECT_CONNECT_TIMEOUT, connector.connect()).await {
+            Ok(r) => r?,
+            Err(_) => anyhow::bail!(
+                "timed out connecting to {} (the server may be unreachable or not responding)",
+                format_endpoint_id(&server_id)
+            ),
+        };
     eprintln!("connected. (Ctrl-^ then . to disconnect)");
 
     // Arm graceful shutdown BEFORE entering raw mode, so there's no window where a fatal signal —

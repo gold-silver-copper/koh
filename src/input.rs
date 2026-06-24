@@ -115,12 +115,17 @@ fn common_prefix_len(a: &[InputEvent], b: &[InputEvent]) -> usize {
 impl SyncState for UserInput {
     type Diff = Vec<WireEvent>;
 
-    // Client→server keystrokes/resizes are tiny; even a large paste is a few MiB. 4 MiB caps the
-    // decompression-amplification bomb (KOH-02) far below the 16 MiB global ceiling while still
-    // admitting a generous paste. `apply` expands one `InputEvent` per byte, so the per-event
-    // budget below (in events) bounds the resident accumulation (KOH-01).
-    const RECV_DECODE_LIMIT: usize = 4 * 1024 * 1024;
+    // Client→server keystrokes/resizes are tiny; even a large paste is a few MiB. The accumulation
+    // bound is `RECEIVE_BUDGET_UNITS` (in *events*) + the hard `received_states` count cap; the
+    // decode cap (in serialized *bytes*) is set to the budget **plus a margin** so the two agree at
+    // the boundary: a diff carrying a budget-full event count serializes to slightly more than the
+    // budget in bytes (postcard envelope/framing), so an exact-equal byte cap would fail to decode a
+    // budget-full paste and re-wedge it (a never-acked, retransmit-forever input stream). The margin
+    // makes the *event budget* the sole binding limit, so a legitimate large paste is delivered
+    // rather than rejected (KR-03). Still well below the 16 MiB global ceiling. (`apply` expands one
+    // `InputEvent` per byte.) A paste larger than the event budget is the documented limit.
     const RECEIVE_BUDGET_UNITS: usize = 8 * 1024 * 1024;
+    const RECV_DECODE_LIMIT: usize = Self::RECEIVE_BUDGET_UNITS + 4096;
 
     fn resource_units(&self) -> usize {
         self.events.len()

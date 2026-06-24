@@ -27,7 +27,7 @@ wait_file_contains_host "$WITLOG" "connected." 12 || true
 echo "    server pid=$SPID; witness attached"
 
 # Fire the attack.
-adb $ADB_SERIAL shell "$EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT $ROWS $COLS" >/dev/null 2>&1 || true
+adb $ADB_SERIAL shell "$EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT resize $ROWS $COLS" >/dev/null 2>&1 || true
 sleep 6
 
 SRV="$(cat_dev "$SRV_LOG")"

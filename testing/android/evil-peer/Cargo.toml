@@ -1,17 +1,27 @@
-# A deliberately-MALICIOUS koh peer, for proving security findings on the emulator. It reuses koh's
-# PUBLIC library to send crafted protocol messages a stock peer never would. Kept OUT of the koh
-# package (testing/ is excluded from the published crate) and out of koh's build — its own crate.
+# A deliberately-MALICIOUS koh peer harness, for proving security findings on the emulator. It
+# reuses koh's PUBLIC library to send crafted protocol messages a stock peer never would — both a
+# malicious CLIENT (attacking a koh server) and a malicious SERVER (attacking a koh client). Kept
+# OUT of the koh package (testing/ is excluded from the published crate) and out of koh's build.
 [package]
 name = "koh-evil-peer"
 version = "0.0.0"
 edition = "2021"
 publish = false
 
+# Malicious client: crafts wire/flood/auth attacks against a real `koh serve`.
 [[bin]]
 name = "evil-client"
 path = "src/evil_client.rs"
+
+# Malicious server: impersonates a `koh serve` to attack a real `koh connect` (auth direction).
+[[bin]]
+name = "evil-server"
+path = "src/evil_server.rs"
 
 [dependencies]
 koh = { path = "../../.." }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+# Craft the opaque `Instruction.diff` bytes (postcard-encoded `Vec<WireEvent>`) directly, the same
+# codec koh uses on the wire. Pinned to koh's version so the encoding matches exactly.
+postcard = { version = "=1.1.3", features = ["use-std"] }

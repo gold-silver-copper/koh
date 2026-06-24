@@ -46,6 +46,13 @@ proc_state() {
   adb $ADB_SERIAL shell "cat /proc/$1/stat 2>/dev/null" 2>/dev/null | tr -d '\r' \
     | sed -E 's/^[0-9]+ \(.*\) ([A-Za-z]).*/\1/'
 }
+# Total CPU jiffies (utime+stime, clock ticks ~100/s) burned by <pid>; 0 if gone. Used to catch a
+# busy-loop/per-event regression (coalesced work costs ~0 ticks; a per-event syscall storm burns
+# thousands). Strips the "pid (comm) " prefix first so a spaced comm can't shift the field offsets.
+cpu_jiffies() {
+  adb $ADB_SERIAL shell "cat /proc/$1/stat 2>/dev/null" 2>/dev/null | tr -d '\r' \
+    | sed -E 's/^[0-9]+ \(.*\) //' | awk '{print ($12+0)+($13+0)}'
+}
 
 # --- server lifecycle on device --------------------------------------------------------------------
 # start_server "<extra serve args>" — launch detached, wait for the banner, set SERVER_ID/SERVER_PORT.
@@ -134,17 +141,25 @@ wait_file_contains_host() {  # <hostfile> <substr> <secs>
 }
 
 # --- malicious-peer deploy (security tests) --------------------------------------------------------
-EVIL_HOST="${KOH_EVIL_HOST:-$REPO_ROOT/testing/android/evil-peer/target/aarch64-linux-android/release/evil-client}"
+EVIL_DIR="${KOH_EVIL_DIR:-$REPO_ROOT/testing/android/evil-peer/target/aarch64-linux-android/release}"
+EVIL_HOST="${KOH_EVIL_HOST:-$EVIL_DIR/evil-client}"
 EVIL_DEV="${KOH_EVIL_DEV:-/data/local/tmp/evil-client}"
-# Push the cross-compiled malicious client; SKIP the test cleanly if it isn't built.
+EVIL_SERVER_HOST="${KOH_EVIL_SERVER_HOST:-$EVIL_DIR/evil-server}"
+EVIL_SERVER_DEV="${KOH_EVIL_SERVER_DEV:-/data/local/tmp/evil-server}"
+# Push the cross-compiled malicious peer (both binaries); SKIP the test cleanly if not built.
 push_evil() {
   if [ ! -x "$EVIL_HOST" ]; then
-    echo "SKIP: evil-client not built. Build it first:"
+    echo "SKIP: evil-peer not built. Build it first:"
     echo "      (cd testing/android/evil-peer && CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=<ndk>/…/aarch64-linux-android24-clang cargo build --release --target aarch64-linux-android)"
     exit 0
   fi
   adb $ADB_SERIAL push "$EVIL_HOST" "$EVIL_DEV" >/dev/null
   adb $ADB_SERIAL shell chmod 755 "$EVIL_DEV"
+  # The malicious server is optional (only the auth-direction tests need it).
+  if [ -x "$EVIL_SERVER_HOST" ]; then
+    adb $ADB_SERIAL push "$EVIL_SERVER_HOST" "$EVIL_SERVER_DEV" >/dev/null
+    adb $ADB_SERIAL shell chmod 755 "$EVIL_SERVER_DEV"
+  fi
 }
 
 # --- reporting -------------------------------------------------------------------------------------

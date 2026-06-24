@@ -103,6 +103,7 @@ KOH_ANDROID_EMULATOR=1 sh testing/android/scripts/stress-throughput.sh
 | `stress-concurrent-clients` | N simultaneous distinct-peer sessions | all connect, server survives, RSS bounded |
 | `stress-auth-ratelimit` | failed-auth flood on a passphrase server | no wrong passphrase authorized, server survives, legit client still gets in (limiter engagement = telemetry) |
 | `stress-pake-auth` | one correct + one wrong passphrase vs a passphrase server | the SPAKE2 PAKE authenticates a **correct** passphrase on arm64 (proves the cross-compiled crypto works) and **rejects** a wrong one without ever authorizing it |
+| `stress-evil-peer` *(needs the cross-compiled evil-peer; else self-SKIPs)* | the **malicious-peer harness**: crafted wire/flood/auth attacks (decompression bomb, empty/partial-fragment floods, state accumulation, resize/keys floods, garbage, bad version, PAKE stall/garbage) from a malicious **client**, and impostor/downgrade attacks from a malicious **server** | the server stays **alive + memory-bounded + panic-free** under every client attack (witness session intact, fresh client still connects), rejects/times-out malicious PAKE attempts without authorizing one, and a real koh **client refuses** an impostor/downgrading server (never reaches "connected.") |
 | `stress-signal-storm` | repeated SIGTERM/SIGINT teardown | every signal drains gracefully, no orphan, no panic |
 | `stress-throughput` | server-side flood of 10⁴–10⁵ lines | whole flood processed end-to-end, no panic, server RSS bounded |
 | `stress-memory-longevity` | unbounded output for tens of seconds | RSS plateaus (no leak) under an absolute cap, no panic |
@@ -171,6 +172,7 @@ testing/android/
     ├── stress-memory-longevity.sh
     ├── stress-reconnect-restart.sh
     ├── stress-pake-auth.sh
+    ├── stress-evil-peer.sh
     ├── stress-client-freeze.sh
     ├── stress-client-wake-reconnect.sh
     ├── stress-reattach-continuity.sh

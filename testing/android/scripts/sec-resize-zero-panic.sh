@@ -14,7 +14,7 @@ echo "Security M-2: malicious client resize(0, 0) must NOT panic/crash the serve
 start_server "" || { bad "server failed to start"; finish "sec-resize-zero-panic"; }
 SPID="$(server_pid)"
 
-adb $ADB_SERIAL shell "$EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT 0 0" >/dev/null 2>&1 || true
+adb $ADB_SERIAL shell "$EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT resize 0 0" >/dev/null 2>&1 || true
 sleep 5
 
 SRV="$(cat_dev "$SRV_LOG")"

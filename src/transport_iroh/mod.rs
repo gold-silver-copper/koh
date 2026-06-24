@@ -526,6 +526,16 @@ pub fn parse_relay_url(s: &str) -> Result<RelayUrl, SetupError> {
 ///
 /// Oversized state is split by the [`koh_wire`] fragmenter across datagrams — never a reliable
 /// stream (which would reintroduce the head-of-line blocking the protocol exists to avoid).
+///
+/// Architectural note (AR-04): the driver loops (`server::run_attached`, `client::drive_connection`)
+/// take `&IrohChannel` **concretely**, not behind a `DatagramChannel` trait. This is deliberate: koh
+/// is architected around exactly one real transport (iroh subsumes crypto/NAT/roaming/RTT/MTU), and
+/// the pure `ssp::Transport` state machine — which `SimHarness` drives directly — already carries the
+/// transport-agnostic protocol logic. A trait here would buy only a deterministic *loop* test double
+/// (the loops are otherwise covered by real-iroh loopback e2e); it would also have to preserve the
+/// typed close-reason path (`client::server_close_reason`) and could not type-enforce the
+/// `read_datagram` cancel-safety the loops rely on. Extract the trait only if a second transport or
+/// that loop double genuinely earns its keep — until then the concrete type is the right call.
 #[derive(Clone)]
 pub struct IrohChannel {
     conn: Connection,

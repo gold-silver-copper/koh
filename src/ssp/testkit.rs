@@ -307,6 +307,13 @@ mod tests {
 
     impl SyncState for LogState {
         type Diff = LogDiff;
+        // Cost-free test stub: unbounded by design (it stays full for exact comparison), declared
+        // explicitly now the bounds are required.
+        const RECV_DECODE_LIMIT: usize = crate::wire::MAX_DECOMPRESSED;
+        const RECEIVE_BUDGET_UNITS: usize = usize::MAX;
+        fn resource_units(&self) -> usize {
+            0
+        }
         fn diff_from(&self, base: &Self) -> Self::Diff {
             // self is always a superset (suffix-extended) of base in this test.
             let n = base.0.len().min(self.0.len());

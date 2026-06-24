@@ -31,6 +31,19 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --all-targets --locked
+      - name: layering guard
+        # Enforce the two load-bearing dependency edges the architecture relies on (AR-02). Greps
+        # the `use crate::` import form only, so doc-comment rustdoc links can't false-positive.
+        run: |
+          if grep -rnE '^[[:space:]]*use crate::' src/predict.rs; then
+            echo "::error::predict.rs must import nothing from crate:: — keep it a standalone vt100-only library"
+            exit 1
+          fi
+          if grep -rnE '^[[:space:]]*use crate::wire' src/server src/client; then
+            echo "::error::server/client must not 'use crate::wire' directly — reach the wire through ssp::Transport"
+            exit 1
+          fi
+          echo "layering edges OK"
       - name: test
         run: cargo test --locked
 

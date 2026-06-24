@@ -728,6 +728,12 @@ mod tests {
     struct AbsDiff(u64);
     impl SyncState for Abs {
         type Diff = AbsDiff;
+        // Cost-free test stub: declare the (now-required) bounds explicitly as unbounded/zero.
+        const RECV_DECODE_LIMIT: usize = crate::wire::MAX_DECOMPRESSED;
+        const RECEIVE_BUDGET_UNITS: usize = usize::MAX;
+        fn resource_units(&self) -> usize {
+            0
+        }
         fn diff_from(&self, _base: &Self) -> AbsDiff {
             AbsDiff(self.0)
         }
@@ -779,6 +785,7 @@ mod tests {
     struct GrowDiff(u64);
     impl SyncState for Grow {
         type Diff = GrowDiff;
+        const RECV_DECODE_LIMIT: usize = crate::wire::MAX_DECOMPRESSED;
         const RECEIVE_BUDGET_UNITS: usize = 100;
         fn resource_units(&self) -> usize {
             self.0 as usize

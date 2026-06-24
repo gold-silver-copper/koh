@@ -31,6 +31,12 @@ struct LogDiff(Vec<u8>);
 
 impl SyncState for Log {
     type Diff = LogDiff;
+    // Cost-free test stub: unbounded by design, declared explicitly now the bounds are required.
+    const RECV_DECODE_LIMIT: usize = koh::wire::MAX_DECOMPRESSED;
+    const RECEIVE_BUDGET_UNITS: usize = usize::MAX;
+    fn resource_units(&self) -> usize {
+        0
+    }
     fn diff_from(&self, base: &Self) -> LogDiff {
         let n = base.0.len().min(self.0.len());
         LogDiff(self.0[n..].to_vec())

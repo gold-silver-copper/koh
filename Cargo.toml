@@ -1,6 +1,6 @@
 [package]
 name = "koh"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2021"
 # The effective floor is dictated by the `=`-pinned iroh 1.0.0 (edition 2024 + rust-version 1.91),
 # not by koh's own 2021 edition. Declaring it turns "cargo install on an old toolchain" into a clear

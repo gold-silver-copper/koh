@@ -86,23 +86,34 @@ pub trait SyncState: Clone + Default + PartialEq {
     /// Per-direction cap (bytes) on how large an inbound instruction targeting *this* state may
     /// inflate to, an anti-amplification bound on untrusted peer input (KOH-02). Keystroke input
     /// (`UserInput`) needs only a few hundred KiB even for a big paste; a screen repaint
-    /// (`TerminalScreen`) needs more. Defaults to the global ceiling so cost-free/trusted state
-    /// types (e.g. test stubs) keep the old behavior — concrete states override it.
-    const RECV_DECODE_LIMIT: usize = crate::wire::MAX_DECOMPRESSED;
+    /// (`TerminalScreen`) needs more.
+    ///
+    /// **Required (no default).** Previously this defaulted to the 16 MiB global ceiling, which meant
+    /// a new received-state type that forgot to set it silently inherited a generous cap; making it
+    /// required forces every state type to declare its bound consciously (AR-05). A cost-free/trusted
+    /// stub may set it to [`crate::wire::MAX_DECOMPRESSED`] explicitly.
+    const RECV_DECODE_LIMIT: usize;
 
     /// Total resource budget (in [`resource_units`](SyncState::resource_units)) summed across every
     /// *received* copy of this state the transport will retain before it refuses further inbound
     /// states as a resource-exhaustion attack (KOH-01). A hostile-but-authorized peer can pin
     /// `old_num`/`throwaway_num` so the receiver never collapses its `received_states`; this bounds
-    /// the memory that accumulation can pin. Default [`usize::MAX`] (unbounded — opt in per type).
-    const RECEIVE_BUDGET_UNITS: usize = usize::MAX;
+    /// the memory that accumulation can pin.
+    ///
+    /// **Required (no default).** This previously defaulted to [`usize::MAX`] (*unbounded*) — the
+    /// unsafe value — so a new received-state type that forgot it silently opted OUT of the KOH-01
+    /// accumulation bound. Required so the choice is conscious (AR-05); a cost-free stub may set
+    /// `usize::MAX` explicitly.
+    const RECEIVE_BUDGET_UNITS: usize;
 
     /// This state's current resource cost, in the same units as
     /// [`RECEIVE_BUDGET_UNITS`](SyncState::RECEIVE_BUDGET_UNITS). Called once per inbound state, so
-    /// it must be cheap (an `O(1)`/length read, never a deep walk). Default `0` (types opt in).
-    fn resource_units(&self) -> usize {
-        0
-    }
+    /// it must be cheap (an `O(1)`/length read, never a deep walk).
+    ///
+    /// **Required (no default).** Previously defaulted to `0`, which combined with the budget to
+    /// silently disable the byte/units bound (everything "costs nothing"); required so each type
+    /// states its cost model (AR-05).
+    fn resource_units(&self) -> usize;
 
     /// Produce a diff that, applied to `base`, yields `self` (delta `base → self`).
     fn diff_from(&self, base: &Self) -> Self::Diff;

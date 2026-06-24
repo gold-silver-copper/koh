@@ -327,6 +327,18 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         // Connection cap (L-3): grab a permit before doing any work for this connection. If the
         // server is at capacity, refuse the incoming dial cheaply — `refuse()` rejects it without
         // the (expensive) crypto handshake, so a flood can't pin unbounded resources.
+        // --- Trust-boundary admission pipeline (AR-06) ---
+        // An accepted connection runs an ORDERED gauntlet before it gets a session, deliberately
+        // inlined so each control is a single local edit and the order reads as one sequence:
+        //   (1) connection-cap permit, (2) pending-handshake permit (KOH-08), then in the task:
+        //   (3) QUIC-handshake timeout (KR-01), (4) node-id allowlist, (5) per-peer auth-failure
+        //   limiter, (6) the SPAKE2 passphrase handshake under a 3s timeout, then record the outcome
+        //   and attach. The order is load-bearing (the allowlist rejects an unknown peer before the
+        //   limiter is even consulted). The genuinely-pure controls (auth, the limiter, the
+        //   allowlist/caps) already live in auth.rs / ratelimit.rs / session.rs with their own unit
+        //   tests; what stays here is the I/O-bound permit/guard ownership dance, so it is documented
+        //   here rather than extracted (extraction wouldn't unlock iroh-free unit testing — every
+        //   step still needs a live connection).
         let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
             warn!("refusing connection: at max-connections capacity");
             incoming.refuse();

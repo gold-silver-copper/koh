@@ -75,6 +75,16 @@ pub fn spawn_session(shell: Option<&str>, scrollback: usize) -> anyhow::Result<S
         }),
         changed: Notify::new(),
     });
+    // The drain task is the one long-lived task with no *named* owner (AR-11): it holds an `Arc`
+    // clone and ends when its `pty_rx` closes — i.e. once the `Pty` (hence its reader thread) is gone,
+    // which happens when the last `SessionHandle` `Arc` drops (after `detach`/`reap` + the connection
+    // task exits) or when `teardown` SIGKILLs the child and the reader hits EOF. So it self-terminates
+    // on every teardown path without an explicit join; the only thing NOT done is joining the pump
+    // threads on a TTL-reap-while-a-connection-still-holds-the-Arc, where `Pty::Drop` reaps them when
+    // that last holder finally drops. Giving it a `CancellationToken`/`JoinHandle` is deferred: the
+    // cancel must fire ONLY at teardown (never on detach — the drain must keep the emulator current
+    // while detached, which is the close-laptop-reopen feature), and that edit is the most dangerous
+    // in this subsystem, so it is not worth it while both paths are already leak-free.
     tokio::spawn(drain(handle.clone(), pty_rx));
     Ok(handle)
 }
@@ -214,10 +224,16 @@ impl Drop for AttachGuard {
         if !self.armed {
             return;
         }
-        // Only reached on an unwind (the normal paths disarm first). We can't await in Drop, so
-        // spawn the balancing detach onto the current runtime. If there is no runtime in scope
-        // (e.g. dropped outside an async context) this is a best-effort no-op — acceptable, since
-        // the only caller holds the guard inside a tokio task.
+        // Only reached on an unwind (the normal paths disarm first). `detach` locks an async Mutex
+        // and `Drop` can't `.await`, so we spawn the balancing detach onto the current runtime — the
+        // one fire-and-forget recovery in an otherwise tightly-owned system (AR-12). Accepted
+        // residual: if no runtime is in scope (the server is tearing its runtime down) the spawn is
+        // a no-op and the attach isn't decremented — but a server abandoning its runtime is
+        // abandoning all sessions anyway, and even a leaked attach is collected once the orphaned
+        // shell exits (the reaper also reaps on `!child_alive`), so it is not pinned for the server's
+        // lifetime. (ConnGuard can stay a pure sync decrement because it touches no async-locked
+        // state; this guard can't.) Do NOT "fix" this with per-connection JoinSet panic-observation —
+        // that would complicate the accept loop's deliberate spawn-and-forget shape for a moot window.
         let store = self.store.clone();
         let peer = self.peer;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {

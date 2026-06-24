@@ -113,59 +113,163 @@ fn coalesce_drained_input(
     (keys, last_resize)
 }
 
+/// The coalesced client input one `NewState` datagram drained, ready to apply to the PTY/emulator.
+struct DrainedInput {
+    keys: Vec<u8>,
+    resize: Option<(u16, u16)>,
+    frame: u64,
+}
+
+/// The server's pure, I/O-free SSP core for one attached connection — the analogue of the client's
+/// [`ClientSession`](crate::client). It owns the `Transport`, the DECCKM arrow-key normalizer, and
+/// the dirty-snapshot flag, and exposes synchronous step methods (each taking `now: u64`) so the
+/// protocol bookkeeping — the echo-ack-gated snapshot decision (S-03), the KOH-05 coalescing handoff,
+/// and the shutdown-sentinel handshake — is unit-testable WITHOUT iroh, tokio, or a real PTY.
+/// [`run_attached`] is the thin async shell that locks the session, does the I/O, and calls these.
+///
+/// Unlike `ClientSession`, this core is deliberately **lock-coupled**: the authoritative screen lives
+/// in the session `Mutex` (shared with the drain task), so the shell snapshots it under the lock and
+/// hands the snapshot in — the core can't own the emulator. That makes the split weaker than the
+/// client's, but still lifts every protocol decision out of the async loop where it can be tested.
+struct ServerSession {
+    transport: Transport<TerminalScreen, UserInput>,
+    cursor_keys: CursorKeyNormalizer,
+    /// Whether the screen may have changed since the last grid snapshot (S-03).
+    dirty: bool,
+}
+
+impl ServerSession {
+    fn new(now: u64, mtu: usize) -> Self {
+        let mut transport = Transport::<TerminalScreen, UserInput>::new(now, mtu);
+        transport.set_connected(true);
+        Self {
+            transport,
+            cursor_keys: CursorKeyNormalizer::default(),
+            dirty: true, // snapshot on the first pass
+        }
+    }
+
+    /// Refresh the transport's MTU + RTT from the live channel at the top of each wake.
+    fn observe_link(&mut self, mtu: usize, rtt_ms: Option<f64>) {
+        self.transport.set_mtu(mtu);
+        if let Some(rtt) = rtt_ms {
+            self.transport.observe_rtt(rtt);
+        }
+    }
+
+    /// Whether a fresh grid snapshot must be installed this wake: the screen is dirty OR the echo-ack
+    /// advanced (which must ship even with no grid change, else prediction-confirmation timing
+    /// breaks). The shell takes the (expensive) snapshot under the session lock only when this is true.
+    const fn needs_snapshot(&self, echo_changed: bool) -> bool {
+        self.dirty || echo_changed
+    }
+
+    /// Install the freshly-taken screen snapshot (present iff [`needs_snapshot`](Self::needs_snapshot)
+    /// said so) and clear the dirty flag. A skipped snapshot leaves `current_state` equal to the
+    /// still-current screen, so the next `tick` correctly emits acks-only with no missed update.
+    fn install_snapshot(&mut self, snapshot: Option<TerminalScreen>) {
+        if let Some(screen) = snapshot {
+            *self.transport.current_mut() = screen;
+        }
+        self.dirty = false;
+    }
+
+    /// The next wake deadline (ms): the transport's own send/ack timer, the echo-ack debounce, 1s cap.
+    fn wait_ms(&mut self, now: u64, echo_wait: u64) -> u64 {
+        self.transport.wait_time(now).min(echo_wait).min(1000)
+    }
+
+    /// Mark the screen possibly-changed — a `changed` pulse, or applied input that resized the
+    /// emulator directly (a grid change not signaled through `changed`).
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Feed one inbound datagram into the transport; returns whether it produced a new in-order state.
+    /// Pure transport work — the shell calls this OUTSIDE the session lock.
+    fn recv(&mut self, now: u64, bytes: &[u8]) -> RecvOutcome {
+        self.transport.recv(now, bytes)
+    }
+
+    /// Drain the newly-received client input (after a `recv` returning `NewState`) and coalesce it for
+    /// the PTY (KOH-05). Always calls `get_remote_diff` — whose collapse of `received_states` is a
+    /// required side effect on every new state — then returns the bytes/resize to apply, or `None`
+    /// when the new state carried no input. `app_cursor` is read under the lock by the shell (it is
+    /// driven by the shell's DECCKM output, so it can't change from client input mid-drain).
+    fn drain_input(&mut self, app_cursor: bool) -> Option<DrainedInput> {
+        let diff = self.transport.get_remote_diff();
+        if diff.is_empty() {
+            return None;
+        }
+        let frame = self.transport.remote_num();
+        let (keys, resize) = coalesce_drained_input(&diff, &mut self.cursor_keys, app_cursor);
+        Some(DrainedInput {
+            keys,
+            resize,
+            frame,
+        })
+    }
+
+    /// Advance the shutdown handshake (begin it once the shell has exited) + timers, and produce this
+    /// wake's outgoing datagrams.
+    fn tick(&mut self, now: u64, child_alive: bool) -> Vec<Vec<u8>> {
+        if !child_alive && !self.transport.shutdown_in_progress() {
+            self.transport.start_shutdown(now);
+        }
+        self.transport.tick(now)
+    }
+
+    /// Whether the shutdown handshake has completed (peer acked the sentinel, or it timed out) so the
+    /// session may be reaped.
+    fn shutdown_complete(&self, now: u64) -> bool {
+        self.transport.shutdown_in_progress()
+            && (self.transport.shutdown_acknowledged()
+                || self.transport.shutdown_ack_timed_out(now))
+    }
+}
+
 /// Drive a client connection against an existing (shared, detachable) [`session::Session`].
 ///
-/// Uses a **fresh** `Transport<TerminalScreen, UserInput>` per attach, so the first tick diffs
-/// the live screen against the default base and re-syncs the (re)connecting client to the
-/// current screen. Crucially, it does **not** kill the PTY on disconnect — it returns
-/// [`SessionExit::Detached`] and leaves the shell running for the next reattach.
+/// The thin async/I/O shell around [`ServerSession`] (the pure protocol core): it locks the session,
+/// does the iroh + PTY I/O, and delegates every protocol decision to the core. Uses a **fresh**
+/// core per attach, so the first tick diffs the live screen against the default base and re-syncs the
+/// (re)connecting client to the current screen. Crucially, it does **not** kill the PTY on
+/// disconnect — it returns [`SessionExit::Detached`] and leaves the shell running for the next reattach.
+///
+/// Returns `anyhow::Result` for signature stability, but in practice only ever returns `Ok`: a
+/// dropped connection is `Ok(Detached)`, a completed shutdown is `Ok(ShellExited)`, and the internal
+/// failure paths (PTY write/resize) are logged-and-continued. The `Err` arm at call sites is dead
+/// today; it is kept so a future fallible step needn't change the signature.
 pub async fn run_attached(
     conn: iroh::endpoint::Connection,
     handle: SharedSession,
 ) -> anyhow::Result<SessionExit> {
     let channel = IrohChannel::new(conn);
     let clock = MonoClock::new();
-    let mut transport =
-        Transport::<TerminalScreen, UserInput>::new(clock.now_ms(), channel.max_datagram_size());
-    transport.set_connected(true);
-    // Normalizes the client's arrow keys to the app's DECCKM mode before they reach the PTY.
-    let mut cursor_keys = CursorKeyNormalizer::default();
-    // Whether the screen may have changed since the last grid snapshot (S-03). Snapshot on the
-    // first pass, then only after a `changed` pulse / applied input or an echo-ack advance — so an
-    // idle/timer wake doesn't clone the whole vt100 grid for nothing.
-    let mut dirty = true;
+    let mut session = ServerSession::new(clock.now_ms(), channel.max_datagram_size());
 
     loop {
         let now = clock.now_ms();
-        transport.set_mtu(channel.max_datagram_size());
-        if let Some(rtt) = channel.rtt_ms() {
-            transport.observe_rtt(rtt);
-        }
+        session.observe_link(channel.max_datagram_size(), channel.rtt_ms());
 
-        // Snapshot the live screen + echo-ack timing under the session lock. The snapshot clones the
-        // whole vt100 grid + title/icon/clipboard, so skip it when nothing changed since the last
-        // wake (S-03): a skipped snapshot leaves `current_state` equal to the still-current screen,
-        // so `tick` correctly emits acks-only with no missed update.
+        // Snapshot the live screen + read echo-ack timing under the session lock. The snapshot clones
+        // the whole vt100 grid + title/icon/clipboard, so the core gates it: take it only when the
+        // screen may have changed or the echo-ack advanced (S-03).
         let (echo_wait, child_alive) = {
             let mut s = handle.session.lock().await;
-            // set_echo_ack advances the echo-ack on a debounce even with no screen change; its
-            // return reports whether it changed. OR it in — else we'd stop shipping echo-ack
-            // confirmations and break the client's prediction-confirmation timing.
             let echo_changed = s.emu.set_echo_ack(now);
-            if dirty || echo_changed {
-                *transport.current_mut() = s.emu.snapshot();
-            }
+            let snapshot = session
+                .needs_snapshot(echo_changed)
+                .then(|| s.emu.snapshot());
+            session.install_snapshot(snapshot);
             (s.emu.echo_ack_wait_time(now), s.child_alive)
         };
-        dirty = false;
-        let wait = transport.wait_time(now);
-        let sleep_ms = wait.min(echo_wait).min(1000);
+        let sleep_ms = session.wait_ms(now, echo_wait);
 
         tokio::select! {
             // NOT biased: `changed` can hold a stored permit, which under `biased` would starve
             // client input. A fair select interleaves rendering and input.
-            // Screen changed: re-snapshot on the next pass.
-            _ = handle.changed.notified() => dirty = true,
+            _ = handle.changed.notified() => session.mark_dirty(),
 
             // Cancel-safety: when `changed` (or the timer) fires first, this in-flight `recv()`
             // future is dropped — sound only because the pinned `iroh = "1.0.0"`'s `read_datagram`
@@ -176,24 +280,18 @@ pub async fn run_attached(
                 match dg {
                     Ok(bytes) => {
                         let now = clock.now_ms();
-                        if transport.recv(now, &bytes) == RecvOutcome::NewState {
-                            let input_diff = transport.get_remote_diff();
-                            if !input_diff.is_empty() {
-                                let frame = transport.remote_num();
-                                let mut s = handle.session.lock().await;
-                                // Coalesce the drained input before touching the PTY (KOH-05; see
-                                // `coalesce_drained_input`). `application_cursor` can't change from
-                                // client input — it is driven by the shell's DECCKM output, processed
-                                // under this same lock — so it is read once.
-                                let app_cursor = s.emu.application_cursor();
-                                let (keys, last_resize) =
-                                    coalesce_drained_input(&input_diff, &mut cursor_keys, app_cursor);
-                                if !keys.is_empty() {
-                                    if let Err(e) = s.pty.write_input(&keys) {
+                        // recv() is pure transport — outside the lock. Drain + PTY apply happen under
+                        // the lock (which also guards `application_cursor`).
+                        if session.recv(now, &bytes) == RecvOutcome::NewState {
+                            let mut s = handle.session.lock().await;
+                            let app_cursor = s.emu.application_cursor();
+                            if let Some(input) = session.drain_input(app_cursor) {
+                                if !input.keys.is_empty() {
+                                    if let Err(e) = s.pty.write_input(&input.keys) {
                                         warn!(error = %e, "pty write failed");
                                     }
                                 }
-                                if let Some((rows, cols)) = last_resize {
+                                if let Some((rows, cols)) = input.resize {
                                     if let Err(e) = s.pty.resize(rows, cols) {
                                         // A failed TIOCSWINSZ silently diverges the kernel winsize
                                         // from the vt100 grid (full-screen-app corruption with no
@@ -203,10 +301,11 @@ pub async fn run_attached(
                                     }
                                     s.emu.resize(rows, cols);
                                 }
-                                s.emu.register_input_frame(frame, now);
+                                s.emu.register_input_frame(input.frame, now);
+                                drop(s);
                                 // Applied input may have resized the emulator (a direct grid change
                                 // not signaled via `changed`), so re-snapshot next pass.
-                                dirty = true;
+                                session.mark_dirty();
                             }
                         }
                     }
@@ -222,15 +321,10 @@ pub async fn run_attached(
         }
 
         let now = clock.now_ms();
-        if !child_alive && !transport.shutdown_in_progress() {
-            transport.start_shutdown(now);
-        }
-        for datagram in transport.tick(now) {
+        for datagram in session.tick(now, child_alive) {
             channel.send(&datagram);
         }
-        if transport.shutdown_in_progress()
-            && (transport.shutdown_acknowledged() || transport.shutdown_ack_timed_out(now))
-        {
+        if session.shutdown_complete(now) {
             channel.close(0, b"session ended");
             return Ok(SessionExit::ShellExited);
         }
@@ -254,8 +348,10 @@ pub async fn run_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{coalesce_drained_input, CursorKeyNormalizer};
-    use crate::input::WireEvent;
+    use super::{coalesce_drained_input, CursorKeyNormalizer, ServerSession};
+    use crate::input::{UserInput, WireEvent};
+    use crate::ssp::{RecvOutcome, Transport};
+    use crate::terminal::TerminalScreen;
 
     /// Feed `chunks` through one normalizer at the given app-cursor mode, return the PTY bytes.
     fn norm(chunks: &[&[u8]], app_cursor: bool) -> Vec<u8> {
@@ -326,5 +422,79 @@ mod tests {
         let (keys, last_resize) = coalesce_drained_input(&diff, &mut norm, false);
         assert_eq!(keys, b"x");
         assert!(last_resize.is_none(), "no resize event -> None");
+    }
+
+    // --- ServerSession pure-core tests (AR-01): the server's protocol bookkeeping, exercised with no
+    //     iroh / tokio / PTY — the deterministic-unit-test bar the client's ClientSession already had.
+
+    #[test]
+    fn server_session_snapshot_gating() {
+        // The S-03 dirty/echo-ack snapshot decision, isolated from the lock + the real emulator.
+        let mut s = ServerSession::new(0, 1200);
+        assert!(s.needs_snapshot(false), "the first pass always snapshots");
+        s.install_snapshot(Some(TerminalScreen::default()));
+        assert!(!s.needs_snapshot(false), "clean after a snapshot");
+        assert!(
+            s.needs_snapshot(true),
+            "an echo-ack advance forces a snapshot even when clean (else confirmations stall)"
+        );
+        s.mark_dirty();
+        assert!(
+            s.needs_snapshot(false),
+            "a changed-pulse / applied resize re-arms the snapshot"
+        );
+    }
+
+    #[test]
+    fn server_session_shutdown_handshake_progresses() {
+        // The shutdown-sentinel handshake progression, without a PTY or a peer.
+        let mut s = ServerSession::new(0, 1200);
+        let _ = s.tick(0, true); // child alive -> no shutdown started
+        assert!(!s.shutdown_complete(0));
+        let _ = s.tick(10, false); // child exited -> begin the shutdown handshake
+        assert!(
+            !s.shutdown_complete(10),
+            "shutdown just started: neither acked nor timed out yet"
+        );
+        assert!(
+            s.shutdown_complete(10_000_000),
+            "far in the future the unacked shutdown times out -> reapable"
+        );
+    }
+
+    #[test]
+    fn server_session_drains_coalesced_input_from_a_real_datagram() {
+        // Exercise recv + drain_input over a genuine wire datagram authored by a client-side
+        // Transport — the KOH-05 coalescing handoff, with no iroh/PTY. The client logs keys then two
+        // resizes; the server must drain the concatenated keys and ONLY the last (clamped) resize.
+        let mut client = Transport::<UserInput, TerminalScreen>::new(0, 1200);
+        client.set_connected(true);
+        client.current_mut().push_bytes(b"ls\r");
+        client.current_mut().push_resize(10, 20);
+        client.current_mut().push_resize(30, 40);
+        // Tick well past the send mindelay so the queued input is actually transmitted.
+        let datagrams = client.tick(1000);
+        assert!(
+            !datagrams.is_empty(),
+            "the client transmits its queued input"
+        );
+
+        let mut server = ServerSession::new(0, 1200);
+        let mut drained = None;
+        for dg in &datagrams {
+            if server.recv(1000, dg) == RecvOutcome::NewState {
+                drained = server.drain_input(false);
+            }
+        }
+        let input = drained.expect("the server drained the client's input");
+        assert_eq!(
+            input.keys, b"ls\r",
+            "keystrokes concatenate in order through the normalizer"
+        );
+        assert_eq!(
+            input.resize,
+            Some((30, 40)),
+            "KOH-05: only the final resize survives (clamped)"
+        );
     }
 }

@@ -622,6 +622,22 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             return RecvOutcome::Quenched;
         }
 
+        // Anti-accumulation *byte/units* budget across all retained received states (KOH-01).
+        // Summed BEFORE the (potentially multi-MB) decode+apply so a budget-saturated receiver
+        // short-circuits without doing the work (K-14): every new state contributes >= 0 units, so
+        // once the retained set alone meets the budget the outcome is already Quench — decoding and
+        // applying a state only to discard it is wasted CPU/alloc a hostile peer could repeat on
+        // every datagram. `received_states <= RECEIVED_STATES_CAP`, so the sum is cheap, and it is
+        // recomputed each datagram so it stays correct as `subtract_prefix` shrinks states.
+        let retained: usize = self
+            .received_states
+            .iter()
+            .map(|s| s.state.resource_units())
+            .sum();
+        if retained >= Remote::RECEIVE_BUDGET_UNITS {
+            return RecvOutcome::Quenched;
+        }
+
         if !instr.diff.is_empty() {
             match decode_diff::<Remote::Diff>(&instr.diff) {
                 Ok(d) => new_state.apply(&d),
@@ -632,15 +648,8 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             }
         }
 
-        // Anti-accumulation *byte/units* budget across all retained received states (KOH-01).
-        // Recomputed each insert (received_states <= RECEIVED_STATES_CAP, so this is cheap) so it
-        // stays correct as `subtract_prefix` shrinks states. A hostile peer is refused here rather
-        // than allowed to OOM the receiver with many large, never-collapsing snapshots.
-        let retained: usize = self
-            .received_states
-            .iter()
-            .map(|s| s.state.resource_units())
-            .sum();
+        // Precise check now that the new state is fully built: its exact size against the
+        // already-summed retained budget (received_states is unchanged by decode/apply above).
         if retained.saturating_add(new_state.resource_units()) > Remote::RECEIVE_BUDGET_UNITS {
             return RecvOutcome::Quenched;
         }
@@ -731,9 +740,26 @@ mod tests {
     }
 
     /// Encode a (small) instruction as a single datagram, the way the wire layer ships it.
+    ///
+    /// Each call models a DISTINCT send from the peer's single, monotonic [`Fragmenter`] (one per
+    /// connection in production — see `Transport::fragmenter`), so it stamps a fresh increasing
+    /// fragment id. Reusing the RETURNED bytes (not calling this again) reproduces the same id and is
+    /// therefore a genuine byte-identical replay — which is exactly what the fragment-layer replay
+    /// gate (K-06) drops. A fresh `Fragmenter::new()` per call (the old helper) instead reused id 1
+    /// for every datagram, which no real sender does and which the replay gate would treat as a
+    /// replay of the first instruction.
     fn datagram(i: &Instruction) -> Vec<u8> {
-        let frags = Fragmenter::new().fragment(i, 1200).unwrap();
+        thread_local! {
+            static NEXT_FRAG_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+        }
+        let id = NEXT_FRAG_ID.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
+        let mut frags = Fragmenter::new().fragment(i, 1200).unwrap();
         assert_eq!(frags.len(), 1, "test instruction must fit one fragment");
+        frags[0].id = id;
         frags[0].encode().unwrap()
     }
 
@@ -825,9 +851,23 @@ mod tests {
         let dg = datagram(&instr(0, 2, 0, 22));
         assert_eq!(t.recv(10, &dg), RecvOutcome::NewState);
         assert_eq!(t.last_heard(), 10);
-        // The identical datagram again is a Duplicate (new_num 2 already held)...
-        assert_eq!(t.recv(9000, &dg), RecvOutcome::Duplicate);
-        // ...but it still proves the peer is alive, so liveness must advance.
+        // (a) A byte-identical replay (same fragment id) is dropped at the fragment layer as a
+        // replay — it is NOT re-inflated/re-applied (K-06) — but `recv` still stamps last_heard for
+        // any decoded datagram BEFORE reassembly, so a re-sent keepalive of unchanged content still
+        // proves liveness.
+        assert_eq!(t.recv(5000, &dg), RecvOutcome::Incomplete);
+        assert_eq!(
+            t.last_heard(),
+            5000,
+            "a replayed keepalive still refreshes last_heard"
+        );
+        // (b) A DISTINCT datagram re-announcing an already-held new_num (a fresh fragment id — e.g. a
+        // keepalive whose carried ack advanced) reassembles past the replay gate and is caught by
+        // the SSP-level duplicate check (new_num 2 already held) — and likewise advances liveness.
+        assert_eq!(
+            t.recv(9000, &datagram(&instr(0, 2, 0, 22))),
+            RecvOutcome::Duplicate
+        );
         assert_eq!(
             t.last_heard(),
             9000,

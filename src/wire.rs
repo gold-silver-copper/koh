@@ -53,6 +53,16 @@ pub const FRAGMENT_HEADER_OVERHEAD: usize = 10;
 /// top bit is the `final` flag), capping one instruction at 32768 fragments.
 pub const MAX_FRAGMENT_INDEX: u16 = 0x7fff;
 
+/// Sanity ceiling on a single fragment's payload, decoded straight from untrusted bytes.
+///
+/// The live transport delivers fragments as QUIC datagrams, inherently bounded by the negotiated
+/// `max_datagram_size` (~1.2–1.5 KiB), so a real fragment is tiny. This explicit cap makes the
+/// transport-agnostic wire layer self-protecting rather than silently relying on that external
+/// invariant: it is far larger than any real datagram (so it never rejects honest traffic) yet far
+/// below the reassembly cap, so a future stream transport can't smuggle a multi-MB single fragment
+/// past [`FragmentAssembly`]'s per-id byte budget by hiding it in one over-large frame (K-12).
+pub const MAX_FRAGMENT_PAYLOAD: usize = 64 * 1024;
+
 /// Errors produced while (de)serializing or reassembling wire structures.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
@@ -64,6 +74,8 @@ pub enum WireError {
     VersionMismatch { peer: u32, ours: u32 },
     #[error("fragment too short: {len} bytes (need >= {min})")]
     ShortFragment { len: usize, min: usize },
+    #[error("fragment payload {len} bytes exceeds the {max}-byte per-fragment limit")]
+    FragmentTooLarge { len: usize, max: usize },
     #[error("instruction needs {count} fragments, exceeds the {max}-fragment limit")]
     TooManyFragments { count: usize, max: usize },
     #[error("reassembly buffer {bytes} bytes exceeds the {max}-byte limit")]
@@ -197,6 +209,15 @@ impl Fragment {
         };
         let (id_bytes, rest) = bytes.split_first_chunk::<8>().ok_or_else(short)?;
         let (combined_bytes, payload) = rest.split_first_chunk::<2>().ok_or_else(short)?;
+        // Bound a single fragment's payload up front (K-12). With the datagram transport this can't
+        // trip (datagrams are MTU-bounded), but it keeps the wire layer self-protecting if it is
+        // ever fed by a transport without that bound.
+        if payload.len() > MAX_FRAGMENT_PAYLOAD {
+            return Err(WireError::FragmentTooLarge {
+                len: payload.len(),
+                max: MAX_FRAGMENT_PAYLOAD,
+            });
+        }
         let id = u64::from_be_bytes(*id_bytes);
         let combined = u16::from_be_bytes(*combined_bytes);
         Ok(Self {
@@ -320,6 +341,13 @@ pub struct FragmentAssembly {
     /// Sum of `parts`' payload bytes for the current id, so a never-completing partial can't
     /// buffer unbounded pre-decompression scratch (KOH-07).
     buffered_bytes: usize,
+    /// The highest `id` that has already been fully reassembled + decoded. Fragments with an `id`
+    /// at or below this are a replay of an already-delivered instruction; they are dropped O(1)
+    /// **before** any reassembly or the (potentially multi-MB) inflate (K-06). Without this, a peer
+    /// replaying a completed fragment set at line rate forces a fresh `decode_with_limit` per replay
+    /// — re-running the DEFLATE inflate every time — only for the SSP layer to then discard it as a
+    /// duplicate after paying the full decompression cost.
+    last_completed_id: Option<u64>,
     /// The per-direction inflate ceiling passed to [`Instruction::decode_with_limit`] on
     /// completion (and the basis for the `buffered_bytes` cap).
     max_decompressed: usize,
@@ -345,6 +373,7 @@ impl FragmentAssembly {
             parts: BTreeMap::new(),
             final_index: None,
             buffered_bytes: 0,
+            last_completed_id: None,
             max_decompressed,
         }
     }
@@ -365,6 +394,17 @@ impl FragmentAssembly {
         // flood ~32768 zero-length fragments (which add 0 to the byte cap, evading KOH-07) to pin
         // one BTreeMap entry per index (KR-08).
         if frag.payload.is_empty() && !(frag.index == 0 && frag.final_) {
+            return Ok(None);
+        }
+        // Drop a replay of an already-decoded instruction O(1), before re-accumulating or paying the
+        // multi-MB inflate on completion (K-06). `current_id` is intentionally retained after a
+        // completion (idempotent at the SSP layer), so without this an identical fragment set would
+        // re-enter the accumulate branch and re-inflate on every replay.
+        if self.last_completed_id.is_some_and(|done| frag.id <= done) {
+            trace!(
+                replay_id = frag.id,
+                "dropping replay of an already-decoded instruction"
+            );
             return Ok(None);
         }
         match self.current_id {
@@ -431,9 +471,11 @@ impl FragmentAssembly {
                 None => return Ok(None), // gap (defensive; the count+max check rules it out)
             }
         }
-        // Reset so a duplicate of the just-completed final fragment doesn't re-emit forever:
-        // bump past current_id by leaving it set; a re-sent identical fragment will rebuild and
-        // re-complete, which is harmless (idempotent at the ssp layer), but we clear the buffer.
+        // Reset so a duplicate of the just-completed final fragment doesn't re-emit forever, and
+        // record this id as completed so any replay of its fragment set is dropped O(1) up front
+        // (K-06) rather than rebuilt and re-inflated. `current_id` stays set (id ordering for the
+        // supersede logic); `last_completed_id` is the cheap replay gate.
+        self.last_completed_id = self.current_id;
         self.parts.clear();
         self.final_index = None;
         self.buffered_bytes = 0;
@@ -597,6 +639,67 @@ mod tests {
             got.unwrap(),
             instr,
             "a real instruction reassembles after an empty-fragment flood"
+        );
+    }
+
+    #[test]
+    fn replayed_completed_instruction_is_dropped_without_redecoding() {
+        // K-06: once a fragment set completes, replaying it must be dropped O(1) (Ok(None)) — NOT
+        // reassembled and re-inflated — so a peer can't force a repeated multi-MB DEFLATE inflate by
+        // replaying one completed instruction at line rate. A single-fragment instruction is the
+        // tightest case (one datagram re-completes on every replay without the guard).
+        let mut f = Fragmenter::new();
+        let instr = sample_instruction(40);
+        let frags = f.fragment(&instr, 1200).unwrap();
+        assert_eq!(frags.len(), 1, "small instruction is one fragment");
+
+        let mut asm = FragmentAssembly::new();
+        assert_eq!(
+            asm.add(frags[0].clone()).unwrap().unwrap(),
+            instr,
+            "first delivery reassembles + decodes"
+        );
+        // Every subsequent replay of the SAME id is dropped up front, before any decode.
+        for _ in 0..5 {
+            assert!(
+                asm.add(frags[0].clone()).unwrap().is_none(),
+                "a replay of a completed instruction must be dropped, not re-decoded"
+            );
+        }
+
+        // A genuinely newer instruction (higher id) still flows through normally.
+        let mut newer = sample_instruction(40);
+        newer.new_num = 123;
+        let new_frags = f.fragment(&newer, 1200).unwrap();
+        assert!(new_frags[0].id > frags[0].id, "content change bumps the id");
+        assert_eq!(
+            asm.add(new_frags[0].clone()).unwrap().unwrap(),
+            newer,
+            "a newer instruction is not blocked by the replay gate"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_oversized_single_fragment() {
+        // K-12: a single fragment whose payload exceeds the per-fragment ceiling is refused at
+        // decode, before FragmentAssembly would buffer it — a self-protection bound that does not
+        // depend on the QUIC datagram size invariant.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_be_bytes()); // id
+        bytes.extend_from_slice(&0x8000u16.to_be_bytes()); // final, index 0
+        bytes.extend(std::iter::repeat_n(0u8, MAX_FRAGMENT_PAYLOAD + 1));
+        assert!(matches!(
+            Fragment::decode(&bytes),
+            Err(WireError::FragmentTooLarge { .. })
+        ));
+        // A payload exactly at the cap still decodes.
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&1u64.to_be_bytes());
+        ok.extend_from_slice(&0x8000u16.to_be_bytes());
+        ok.extend(std::iter::repeat_n(0u8, MAX_FRAGMENT_PAYLOAD));
+        assert!(
+            Fragment::decode(&ok).is_ok(),
+            "a payload at the cap is accepted"
         );
     }
 

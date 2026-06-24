@@ -271,7 +271,15 @@ impl SyncState for TerminalScreen {
 
     fn resource_units(&self) -> usize {
         let (rows, cols) = self.screen.size();
-        (rows as usize) * (cols as usize)
+        // Each retained snapshot also owns title/icon/clipboard byte buffers (capped upstream at
+        // MAX_TITLE_LEN / MAXIMUM_CLIPBOARD_SIZE, but a hostile server can still ship a distinct
+        // max-size clipboard per state). The grid-cell count alone ignored them (K-05), letting a
+        // flood of tiny-grid states pin tens of MiB of clipboard the budget never saw — so fold
+        // their lengths into the unit count so RECEIVE_BUDGET_UNITS bounds total retained memory.
+        ((rows as usize) * (cols as usize))
+            .saturating_add(self.title.len())
+            .saturating_add(self.icon.len())
+            .saturating_add(self.clipboard.len())
     }
 
     fn diff_from(&self, base: &Self) -> Self::Diff {
@@ -301,6 +309,13 @@ impl SyncState for TerminalScreen {
             // peer-supplied dimensions first — the server is trusted to clamp before it ships a
             // resize, but the client must never construct an unbounded/zero grid on the wire's say-so
             // (defense in depth: closes the client-side resize OOM / zero-dim panic, H-1 / M-2).
+            //
+            // K-13 — LOAD-BEARING: `apply()` runs in the SSP receive path BEFORE the per-direction
+            // `RECEIVE_BUDGET_UNITS` check (the budget bounds *accumulation* across retained states,
+            // not the cost of building one state), so this `clamp_dims` is the SOLE bound on a single
+            // resize's grid allocation. Do not remove it or move it after the parser build — an
+            // unclamped `(65000, 65000)` would allocate ~135 GB / panic here. MIN_DIM=2 also dodges
+            // vt100 0.16's sub-2-dim panic. Mirror clamp on the server lives in `terminal/server.rs`.
             let (rows, cols) = clamp_dims(rows, cols);
             let mut p = Box::new(vt100::Parser::new(rows, cols, 0));
             p.process(&diff.vt);

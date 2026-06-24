@@ -52,6 +52,12 @@ const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Reconnect backoff: `BASE << min(attempt, 4)`, capped at `MAX` (0.5s → 1 → 2 → 4 → 8s).
 const RECONNECT_BACKOFF_BASE_MS: u64 = 500;
 const RECONNECT_BACKOFF_MAX_MS: u64 = 8_000;
+/// Minimum time a connection must stay up to count as "proven" and reset the reconnect backoff. A
+/// connection that drops sooner than this — e.g. a malicious or compromised server that completes
+/// the handshake then immediately closes — is treated like a failed dial: the attempt counter keeps
+/// climbing and the next redial backs off, so such a server can't drive a tight reconnect/repaint
+/// churn loop (K-03). A genuine mid-session drop after this dwell reconnects promptly.
+const MIN_CONNECTION_DWELL_MS: u64 = 5_000;
 
 /// Wall-clock gap between two steady-loop iterations above which we assume the process was
 /// **suspended** (Android deep-sleep / screen-off freezes the process) rather than merely busy.
@@ -481,6 +487,15 @@ impl ClientSession {
             None
         };
 
+        // K-04 (trust boundary, documented by design): both `remote_num()` and the carried
+        // `exit_code` are peer-controlled, so a malicious/typo'd server can announce a shutdown with
+        // any exit code, which becomes koh's process exit status (`code as u8`). This is the same
+        // contract as ssh/mosh — the remote shell's exit code is *meant* to propagate — so we keep
+        // it rather than masking a useful signal. A wrapper that must distinguish "the remote shell
+        // exited N" from "the transport failed" should key off koh's own failure paths (a dropped
+        // connection returns via `LinkLost`/reconnect, never this clean-shutdown arm), not trust the
+        // peer-announced code as authoritative. The connection is already QUIC-authenticated to the
+        // dialed node id; an attacker who can send this frame can already disrupt the session.
         let ended = (self.transport.remote_num() == SHUTDOWN_SENTINEL)
             .then(|| self.transport.remote_state().exit_code());
 
@@ -564,6 +579,10 @@ pub async fn run_client<T: ClientTerminal>(
     let predict_overwrite = std::env::var("KOH_PREDICT_OVERWRITE")
         .is_ok_and(|v| matches!(v.as_str(), "1" | "yes" | "true"));
     let mut channel = initial;
+    // Persists ACROSS reconnect cycles (not reset per connection) so a server that keeps dropping us
+    // fast can't escape the backoff by completing each handshake — only a connection that proves
+    // itself (stays up past `MIN_CONNECTION_DWELL_MS`) resets it (K-03).
+    let mut attempt: u32 = 0;
     loop {
         // A fresh session per (re)connection mirrors the server's fresh-transport-per-attach, which
         // full-repaints the live screen; re-seed the size from the terminal each time.
@@ -577,6 +596,7 @@ pub async fn run_client<T: ClientTerminal>(
             cols,
         );
 
+        let conn_started = clock.now_ms();
         match drive_connection(
             &channel,
             &mut session,
@@ -598,6 +618,16 @@ pub async fn run_client<T: ClientTerminal>(
             }
             Disposition::LinkLost => {
                 channel.close(0, b"reconnecting");
+                // Did this connection prove itself? A drop after a real session resets the backoff
+                // (prompt reattach); a drop sooner than `MIN_CONNECTION_DWELL_MS` is treated like a
+                // failed dial — bump the attempt so `reconnect` backs off before redialing, so an
+                // accept-then-instantly-close server can't spin us in a tight loop (K-03).
+                let dwell = clock.now_ms().saturating_sub(conn_started);
+                if dwell >= MIN_CONNECTION_DWELL_MS {
+                    attempt = 0;
+                } else {
+                    attempt = attempt.saturating_add(1);
+                }
                 match reconnect(
                     &connector,
                     &mut term,
@@ -605,6 +635,7 @@ pub async fn run_client<T: ClientTerminal>(
                     &session,
                     &clock,
                     &shutdown,
+                    &mut attempt,
                 )
                 .await
                 {
@@ -772,11 +803,45 @@ async fn reconnect<T: ClientTerminal>(
     last: &ClientSession,
     clock: &MonoClock,
     shutdown: &CancellationToken,
+    attempt: &mut u32,
 ) -> ReconnectOutcome {
     let started = clock.now_ms();
     let mut pending_escape = false;
-    let mut attempt: u32 = 0;
     'attempt: loop {
+        // Back off BEFORE dialing whenever we've already failed a dial or the previous connection
+        // dropped too fast (`*attempt > 0`). The caller seeds `*attempt` from the just-dropped
+        // connection's dwell, so a server that completes the handshake then immediately closes is
+        // backed off here rather than redialed instantly — closing the tight-loop hole (K-03). On a
+        // proven-then-dropped connection `*attempt == 0`, so a normal reconnect dials at once. The
+        // wait stays responsive to the quit escape / shutdown and keeps the banner clock ticking.
+        if *attempt > 0 {
+            let wait_until = clock.now_ms().saturating_add(backoff_ms(*attempt));
+            while clock.now_ms() < wait_until {
+                let secs = clock.now_ms().saturating_sub(started) / 1000;
+                let banner =
+                    format!("[koh] disconnected — reconnecting… {secs}s (Ctrl-^ . to quit)");
+                let _ = term.render(
+                    last.screen(),
+                    &Overlay::empty(),
+                    Some(banner.as_str()),
+                    last.window_state(),
+                );
+                let remaining = wait_until.saturating_sub(clock.now_ms());
+                tokio::select! {
+                    biased;
+                    maybe = input_rx.recv() => match maybe {
+                        Some(chunk) => {
+                            if escape_quit(&chunk, &mut pending_escape) {
+                                return ReconnectOutcome::Quit;
+                            }
+                        }
+                        None => return ReconnectOutcome::Quit,
+                    },
+                    _ = shutdown.cancelled() => return ReconnectOutcome::Quit,
+                    _ = tokio::time::sleep(Duration::from_millis(remaining.min(1000))) => {}
+                }
+            }
+        }
         let dial = tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect());
         tokio::pin!(dial);
         loop {
@@ -806,11 +871,11 @@ async fn reconnect<T: ClientTerminal>(
                 res = &mut dial => {
                     match res {
                         Ok(Ok(channel)) => return ReconnectOutcome::Connected(channel),
-                        Ok(Err(e)) => tracing::info!(reason = %e, attempt, "reconnect dial failed"),
-                        Err(_) => tracing::info!(attempt, "reconnect dial timed out"),
+                        Ok(Err(e)) => tracing::info!(reason = %e, attempt = *attempt, "reconnect dial failed"),
+                        Err(_) => tracing::info!(attempt = *attempt, "reconnect dial timed out"),
                     }
-                    attempt = attempt.saturating_add(1);
-                    tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
+                    // Bump the attempt; the top-of-loop backoff waits before the next dial.
+                    *attempt = (*attempt).saturating_add(1);
                     continue 'attempt;
                 }
 

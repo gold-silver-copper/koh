@@ -74,24 +74,20 @@ pub enum SetupError {
 /// stable [`EndpointId`], mirroring iroh-ssh's `--persist`.
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
     if path.exists() {
-        // Refuse a world-writable containing dir FIRST (KR-06): `tighten_or_warn_key_perms` chmods
-        // the key, and in a co-tenant-writable dir an attacker could plant `id.key` as a symlink to
-        // a victim file — so we must reject the dangerous dir before touching the key's perms. Only
-        // then tighten an existing group/other-accessible key to 0600 (it is the node's whole
-        // identity, so a loose key is a local-impersonation risk) (KOH-16 / KOH-06).
+        // Refuse a dangerous containing dir FIRST (KOH-06/KR-06): the load below tightens the key's
+        // perms and reads it, and in a dir where another user can unlink/replace entries they could
+        // swap `id.key` for their own. (v0.4.2 narrowed this to a non-sticky *other*-writable dir so
+        // Android's group-writable /data/local/tmp still works — see `ensure_state_dir_secure`.)
         if let Some(parent) = path.parent() {
             ensure_state_dir_secure(parent)?;
         }
-        // Refuse a symlinked key path entirely (KR-06): not only would the chmod follow it, but
-        // `read_to_string` below would too — a planted symlink could otherwise turn the key load
-        // into a read-oracle on any file koh can read. `symlink_metadata` does not follow the link.
-        #[cfg(unix)]
-        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-            tracing::warn!(path = %path.display(), "secret key path is a symlink; refusing to load it");
-            return Err(SetupError::BadKeyFile);
-        }
-        tighten_or_warn_key_perms(path);
-        let text = std::fs::read_to_string(path)?;
+        // Open the key ONCE and do every subsequent step (fstat, perm-tighten, read) on that file
+        // descriptor (K-01). The previous flow was check-then-act — `symlink_metadata`, then a path
+        // `chmod`, then a path `read` — each re-resolving the path string, leaving a TOCTOU window
+        // in a group-writable dir where a co-tenant could swap `id.key` for a symlink *between* the
+        // checks. `read_key_file_secure` opens with `O_NOFOLLOW` (a symlinked key is refused at
+        // open) and operates only on the held fd, so there is no second path resolution to race.
+        let text = read_key_file_secure(path)?;
         let bytes = data_encoding::HEXLOWER_PERMISSIVE
             .decode(text.trim().as_bytes())
             .map_err(|_| SetupError::BadKeyFile)?;
@@ -165,46 +161,73 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     }
 }
 
-/// On unix, if `path` is group/other-accessible (mode & 0o077 != 0), proactively tighten it to
-/// 0600; only warn if that fails. The key IS the node identity, so a loose key is a local-
-/// impersonation risk — and an upgrade-in-place from a pre-0.3.1 build (created via a plain write,
-/// umask → typically 0644) lands here. Unlike the original warn-only behavior this re-permissions
-/// the key (tightening can only ever help) rather than leaving it exposed (KOH-16). No-op elsewhere.
-fn tighten_or_warn_key_perms(path: &Path) {
+/// Read the hex key text from `path`, doing every step on a single opened file descriptor so there
+/// is no path-based recheck window (K-01).
+///
+/// On unix: open with `O_NOFOLLOW` (a symlinked final component is refused at open — `ELOOP`),
+/// confirm via the fd that it is a regular file, tighten group/other-accessible perms to 0600 via
+/// the fd (`fchmod`, never a second path `chmod`), then read the contents from the same fd. A
+/// co-tenant who swaps `id.key` for a symlink can therefore neither redirect the `chmod`/read to
+/// another file nor race a gap between a check and an act — there is only the one open. On other
+/// platforms, fall back to a plain read (the platform's own ACLs apply, matching the key-write path).
+fn read_key_file_secure(path: &Path) -> Result<String, SetupError> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        // Refuse to chmod a symlinked key (defense in depth on top of the KR-06 dir check): a key
-        // path that is a symlink is not something koh created, so don't follow it and re-permission
-        // its target. `symlink_metadata` does not follow the link.
-        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-            tracing::warn!(
-                path = %path.display(),
-                "secret key path is a symlink; refusing to re-permission its target"
-            );
-            return;
-        }
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mode = meta.permissions().mode();
-            if mode & 0o077 != 0 {
-                match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-                    Ok(()) => tracing::warn!(
-                        path = %path.display(),
-                        prev_mode = format!("{:o}", mode & 0o777),
-                        "secret key file was group/other-accessible; tightened to 0600"
-                    ),
-                    Err(e) => tracing::warn!(
-                        path = %path.display(),
-                        mode = format!("{:o}", mode & 0o777),
-                        error = %e,
-                        "secret key file is group/other-accessible and could not be tightened; fix it with `chmod 600`"
-                    ),
-                }
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // `O_NOFOLLOW`: refuse to follow a symlink planted as the key path — otherwise the load
+        // could be turned into a chmod/read oracle on an arbitrary file koh can reach.
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.raw_os_error() == Some(nix::libc::ELOOP) => {
+                tracing::warn!(path = %path.display(), "secret key path is a symlink; refusing to load it");
+                return Err(SetupError::BadKeyFile);
             }
+            Err(e) => return Err(SetupError::Io(e)),
+        };
+        let meta = file.metadata().map_err(SetupError::Io)?;
+        if !meta.file_type().is_file() {
+            tracing::warn!(path = %path.display(), "secret key path is not a regular file; refusing to load it");
+            return Err(SetupError::BadKeyFile);
         }
+        tighten_key_perms_via_fd(&file, path, &meta);
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(SetupError::Io)?;
+        Ok(text)
     }
     #[cfg(not(unix))]
-    let _ = path;
+    {
+        Ok(std::fs::read_to_string(path)?)
+    }
+}
+
+/// On unix, tighten an existing group/other-accessible key file to 0600 — operating on the held
+/// **fd** (`File::set_permissions` is `fchmod`), so it can't be redirected to a different inode by a
+/// path swap (K-01). The key IS the node identity (KOH-16), so a loose key is a local-impersonation
+/// risk; an upgrade-in-place from a pre-0.3.1 build (plain write, umask → typically 0644) lands here.
+#[cfg(unix)]
+fn tighten_key_perms_via_fd(file: &std::fs::File, path: &Path, meta: &std::fs::Metadata) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        match file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => tracing::warn!(
+                path = %path.display(),
+                prev_mode = format!("{:o}", mode & 0o777),
+                "secret key file was group/other-accessible; tightened to 0600 (via fd)"
+            ),
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                mode = format!("{:o}", mode & 0o777),
+                error = %e,
+                "secret key file is group/other-accessible and could not be tightened; fix it with `chmod 600`"
+            ),
+        }
+    }
 }
 
 /// Refuse a state dir a co-tenant could tamper with, and flag a merely-loose one (KOH-06 / KOH-12).
@@ -714,9 +737,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tighten_does_not_follow_a_symlinked_key() {
-        // KR-06: `tighten_or_warn_key_perms` must not chmod the target of a symlinked key path (an
-        // attacker-planted symlink to a victim file), so the target's perms are left untouched.
+    fn fd_key_read_does_not_follow_a_symlinked_key() {
+        // K-01 / KR-06: the fd-based load (`O_NOFOLLOW`) must refuse a symlinked key path and never
+        // chmod or read its target — so an attacker-planted symlink to a victim file is inert (the
+        // target's perms and the load both reflect a refusal, not a follow).
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("koh-symlink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -727,13 +751,36 @@ mod tests {
         let link = dir.join("server.key");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        tighten_or_warn_key_perms(&link); // must refuse to follow the symlink
-
+        // The open itself fails on the symlink (ELOOP), surfaced as BadKeyFile — no follow.
+        assert!(
+            matches!(read_key_file_secure(&link), Err(SetupError::BadKeyFile)),
+            "a symlinked key must be refused at open, not followed"
+        );
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o644,
             "a symlinked key's target must not be re-permissioned"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_key_read_tightens_a_loose_real_key_via_the_fd() {
+        // K-01: a loose (group/other-accessible) real key is tightened to 0600 through the fd, and
+        // its contents still read back. Proves the fd path both fstats and fchmods the same inode.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("koh-loose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_dir_private(&dir).unwrap();
+        let key = dir.join("server.key");
+        std::fs::write(&key, b"deadbeef\n").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let text = read_key_file_secure(&key).expect("a loose real key still reads");
+        assert_eq!(text.trim(), "deadbeef", "contents read back through the fd");
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a loose key is tightened to 0600 via the fd");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

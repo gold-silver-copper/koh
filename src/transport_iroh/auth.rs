@@ -139,6 +139,17 @@ fn cached_psk(passphrase: &str) -> Zeroizing<[u8; 32]> {
     psk
 }
 
+/// Pre-derive and cache the Argon2id passphrase map at startup (K-11).
+///
+/// So the deliberately-expensive KDF never runs inside a per-connection handshake timeout on first
+/// contact. Idempotent (the process-wide [`PSK_CACHE`] makes the second call free) and keyed on the
+/// *local* passphrase, so it is not attacker-influenced work. A no-op for an empty passphrase.
+pub fn prewarm_psk(passphrase: &str) {
+    if !passphrase.is_empty() {
+        let _ = cached_psk(passphrase);
+    }
+}
+
 /// A direction-labeled key-confirmation tag binding the shared SPAKE2 key to the **full transcript**
 /// (both public messages). Different `label`s give the server and client distinct tags (no
 /// reflection); the transcript binding prevents splicing a tag across runs. `shared_key` is hashed
@@ -147,6 +158,15 @@ fn cached_psk(passphrase: &str) -> Zeroizing<[u8; 32]> {
 /// Each field is **length-prefixed** before hashing so the encoding is unambiguous regardless of
 /// field lengths — no `(label, server_msg, client_msg)` split can ever collide with another, even
 /// if a future label differs in length from the current 6-byte constants.
+///
+/// K-10 — LOAD-BEARING: both peers run `Spake2::start_symmetric` with the SAME identity, so the two
+/// SPAKE2 messages are structurally interchangeable and the spake2 0.4.0 transcript sorts them
+/// order-independently. The protocol's role separation (server-direction vs client-direction
+/// confirmation) is therefore provided ENTIRELY by the distinct [`SERVER_CONFIRM_LABEL`] /
+/// [`CLIENT_CONFIRM_LABEL`] here, NOT by the PAKE. A reflection attack is still inert (a server
+/// reflecting the client's message can't compute the password-bound key or either tag), but a
+/// future refactor that dropped or merged these labels would silently remove that separation — keep
+/// the two directions distinctly labeled (cf. magic-wormhole's side-labeled SPAKE2 usage).
 fn confirm_tag(shared_key: &[u8], label: &[u8], server_msg: &[u8], client_msg: &[u8]) -> [u8; 32] {
     let mac_key = blake3::derive_key("koh-pake-v1 key confirmation", shared_key);
     let mut h = blake3::Hasher::new_keyed(&mac_key);

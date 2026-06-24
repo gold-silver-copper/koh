@@ -169,6 +169,66 @@ pub async fn detach(store: &SessionStore, peer: EndpointId) {
     }
 }
 
+/// RAII safety net that releases an attached connection's session if its task unwinds (K-16).
+///
+/// If the per-connection task **panics** before it can run its explicit [`detach`]/[`reap`], this
+/// guard's `Drop` still releases the attach — decrementing `attached` and arming the detach timer —
+/// so a panicking task can't leak the session forever. Without it a panic skips the post-`await`
+/// cleanup, leaving `attached > 0` and `last_detach == None`, which the reaper (keyed on `!child_alive ||
+/// detached_expired`) never collects: a zombie shell + PTY pinned for the server's lifetime.
+///
+/// This mirrors [`ConnGuard`](crate::server::cli)'s Drop-decrements-the-count discipline, which the
+/// active-connection count already had but the session attach did not. On the normal return paths
+/// the task [`disarm`](Self::disarm)s the guard and does the precise cleanup (detach **vs** reap)
+/// itself; the guard only fires on an unexpected unwind. `Drop` can't `await`, so it spawns the
+/// async detach onto the current runtime (best-effort: a no-op if no runtime is in scope).
+#[must_use = "hold the guard for the connection's lifetime, then disarm() on a normal return"]
+pub struct AttachGuard {
+    store: SessionStore,
+    peer: EndpointId,
+    armed: bool,
+}
+
+impl AttachGuard {
+    /// Arm a guard for a freshly-attached `peer` connection. Hold it across the connection loop.
+    pub fn new(store: SessionStore, peer: EndpointId) -> Self {
+        Self {
+            store,
+            peer,
+            armed: true,
+        }
+    }
+
+    /// Disable the safety net once the connection returned normally and the caller will run the
+    /// precise [`detach`]/[`reap`] itself. Consumes the guard so its `Drop` becomes a no-op.
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Only reached on an unwind (the normal paths disarm first). We can't await in Drop, so
+        // spawn the balancing detach onto the current runtime. If there is no runtime in scope
+        // (e.g. dropped outside an async context) this is a best-effort no-op — acceptable, since
+        // the only caller holds the guard inside a tokio task.
+        let store = self.store.clone();
+        let peer = self.peer;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                detach(&store, peer).await;
+                tracing::warn!(
+                    %peer,
+                    "connection task unwound; released its session attach via the drop guard"
+                );
+            });
+        }
+    }
+}
+
 /// Remove + tear down `peer`'s session (e.g. once its shutdown handshake has completed).
 pub async fn reap(store: &SessionStore, peer: EndpointId) {
     let removed = store.lock().await.remove(&peer);
@@ -338,6 +398,70 @@ mod tests {
             );
         }
 
+        let _ = h.session.lock().await.pty.kill();
+    }
+
+    #[tokio::test]
+    async fn attach_guard_releases_the_attach_when_dropped_armed() {
+        // K-16: an armed guard dropped without disarm (the panic-unwind case) must release the
+        // attach — decrement `attached` to 0 and arm the detach timer — so the reaper can collect
+        // the session instead of it leaking with attached>0/last_detach=None forever.
+        let store = SessionStore::default();
+        let peer = generate_secret_key().public();
+        let (h, _) = attach(&store, peer, Some("sh"), 0, 64)
+            .await
+            .expect("attach")
+            .expect("under cap");
+        assert_eq!(h.session.lock().await.attached, 1);
+
+        // Simulate a connection task that unwinds before its explicit cleanup: the guard drops armed.
+        {
+            let _g = AttachGuard::new(store.clone(), peer);
+        }
+        // Drop spawns the async detach; give the runtime a few turns to run it.
+        let mut released = false;
+        for _ in 0..100 {
+            {
+                let s = h.session.lock().await;
+                if s.attached == 0 && s.last_detach.is_some() {
+                    released = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            released,
+            "an armed guard's Drop must detach the session (attached->0, detach timer armed)"
+        );
+        let _ = h.session.lock().await.pty.kill();
+    }
+
+    #[tokio::test]
+    async fn attach_guard_is_a_noop_once_disarmed() {
+        // The normal return path disarms the guard and does its own detach/reap; a disarmed guard
+        // must NOT also fire (which would double-decrement the refcount).
+        let store = SessionStore::default();
+        let peer = generate_secret_key().public();
+        let (h, _) = attach(&store, peer, Some("sh"), 0, 64)
+            .await
+            .expect("attach")
+            .expect("under cap");
+        assert_eq!(h.session.lock().await.attached, 1);
+
+        AttachGuard::new(store.clone(), peer).disarm();
+        // Let any erroneously-spawned detach run; the count must be unchanged by the disarmed guard.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let s = h.session.lock().await;
+        assert_eq!(
+            s.attached, 1,
+            "a disarmed guard must not release the attach"
+        );
+        assert!(
+            s.last_detach.is_none(),
+            "a disarmed guard must not arm the detach timer"
+        );
+        drop(s);
         let _ = h.session.lock().await.pty.kill();
     }
 

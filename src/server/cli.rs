@@ -268,6 +268,14 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // exposed as a &str only at the KDF call inside the handshake.
     let passphrase: std::sync::Arc<Option<SecretString>> =
         std::sync::Arc::new(configured_passphrase);
+    // Pre-derive (and process-cache) the Argon2id passphrase map now, BEFORE the accept loop, so
+    // the deliberately-expensive 64 MiB KDF never runs inside the first client's 3s handshake
+    // timeout on a loaded host (K-11; pairs with K-07 — a first-contact timeout would otherwise be
+    // the very latency that locks a user out). Idempotent and keyed on the server's own passphrase,
+    // so this is not attacker-influenced work.
+    if let Some(p) = passphrase.as_ref() {
+        crate::transport_iroh::auth::prewarm_psk(p.expose_secret());
+    }
 
     // Per-peer auth-failure limiter (keyed on the client's endpoint id) + the monotonic clock its
     // window arithmetic uses. One clock, shared with every accept task and the reaper, so all the
@@ -416,8 +424,13 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     return;
                 }
                 Err(_) => {
-                    warn!(peer = %format_endpoint_id(&peer), "passphrase handshake timed out");
-                    lock_limiter(&limiter).record_failure(peer, clock.now_ms());
+                    // A handshake TIMEOUT is NOT an auth failure, so it must not feed the per-peer
+                    // failure limiter (K-07): a legitimate client on a badly degraded link (or a
+                    // momentarily loaded server) would otherwise be rate-limited out by transient
+                    // latency that has nothing to do with guessing. Only an explicit
+                    // `ChallengeFailed` (the arm above) is a guess. The pending-handshake semaphore
+                    // and this 3s bound already cap how long a stalling client can hold resources.
+                    warn!(peer = %format_endpoint_id(&peer), "passphrase handshake timed out (not counted as an auth failure)");
                     conn.close(1u32.into(), b"auth timeout");
                     return;
                 }
@@ -465,7 +478,13 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     );
                 }
             }
-            match run_attached(conn, handle).await {
+            // Arm a RAII safety net BEFORE serving: if `run_attached` unwinds (panics), the guard's
+            // Drop still releases this connection's session attach so it can't leak (K-16). On a
+            // normal return we disarm and run the precise detach/reap below ourselves.
+            let attach_guard = session::AttachGuard::new(store.clone(), peer);
+            let outcome = run_attached(conn, handle).await;
+            attach_guard.disarm();
+            match outcome {
                 Ok(SessionExit::Detached) => {
                     // Keep the shell running for reattach.
                     session::detach(&store, peer).await;

@@ -164,33 +164,16 @@ a2d4…bf  command="tmux attach -t main"
 startup rather than silently mis-authorizing. Each accepted connection's resolved policy is logged
 under the `koh::auth` target.
 
-#### Optional passphrase second factor
+#### Single factor by design (no passphrase / second factor)
 
-For defense-in-depth against a **leaked but still-allowlisted client key** (the one residual case
-the allowlist can't cover) — and against a user being lured into dialing a **malicious server's
-NodeId** — the server can require a shared passphrase (`--passphrase`, or preferably
-`$KOH_PASSPHRASE` since argv is visible in the process table). The handshake is a **balanced PAKE
-([SPAKE2](https://www.rfc-editor.org/rfc/rfc9382)) with explicit mutual key confirmation**, run
-inside the already-encrypted QUIC connection. Both peers map the passphrase through
-`Argon2id(passphrase, salt)` (64 MiB / 3 iterations, fixed deterministic salt so both derive the
-same value), run SPAKE2 over Ed25519 with it, derive a shared key, and each proves knowledge with
-a transcript-bound confirmation tag (compared in **constant time**). Two properties follow:
-
-- **No offline-crackable transcript** — SPAKE2's messages are group elements independent of the
-  passphrase to anyone who doesn't complete the protocol, so a server you merely *dial* learns
-  nothing it can grind offline. Guessing is forced **online** — one guess per live handshake —
-  where the Argon2id work factor and the **per-peer rate limiter** (a peer that fails too many
-  times in a sliding window is refused cheaply; the keyspace is GC'd on the reaper sweep) bound it.
-- **Mutual authentication** — the client refuses the session unless the *server's* confirmation tag
-  verifies, so an impostor server that doesn't know the passphrase can't authenticate (it can't
-  even harvest a crackable response). This closes the dial-a-malicious-server gap entirely.
-
-The passphrase is held in a `secrecy::SecretString` and the Argon2id output in `zeroize::Zeroizing`,
-exposed only at the KDF call (argv/env remain OS-visible). The passphrase (and every other `KOH_*`
-operational var) is **scrubbed from the spawned shell's environment**, so an authorized user can't
-`echo $KOH_PASSPHRASE` to recover the second factor. An empty passphrase is treated as "none"; a
-short one still warns (online guessing is cheaper the lower the entropy), but the PAKE means even a
-modest passphrase is no longer offline-crackable from a transcript.
+koh authorizes on the node-id allowlist alone. There is **no over-the-wire passphrase / PAKE second
+factor**: the peer's node-id is already cryptographically authenticated by the iroh QUIC/TLS 1.3
+handshake, and the residual "leaked client key" risk is handled where it belongs — the identity key
+is **always encrypted at rest** (see below), so a stolen key file is useless without its passphrase.
+Removing the bespoke PAKE also removes koh's largest piece of un-audited custom crypto. The trade-off
+is honest: the node-id is now the *sole* authenticator of which machine you reached, so **verify a
+server's node-id out-of-band** before trusting a session — there is no second factor to catch a
+wrong/typo'd id.
 
 #### Hardening against a hostile or compromised peer
 
@@ -266,9 +249,8 @@ All of koh's knobs as environment variables (most have a CLI-flag equivalent):
 |---|---|---|---|
 | `RUST_LOG` | serve, connect | Log verbosity/filter (`tracing` `EnvFilter`), e.g. `koh=debug` or `koh::server=info`. Server logs to **stderr**; client logs to `$KOH_LOG`. | — |
 | `KOH_LOG` | connect | File the client writes logs to (created `0600`), so logging doesn't disturb the TUI. | — |
-| `KOH_PASSPHRASE` | serve, connect | The optional passphrase second factor. **Prefer this over `--passphrase`** — argv is visible in the process table. | `--passphrase` |
-| `KOH_KEY_PASSPHRASE` | serve, connect, key | Passphrase to decrypt an at-rest-encrypted identity key (`koh-key-v1`). Lets an unattended `koh serve` open an encrypted key without a TTY prompt. | — |
-| `KOH_KEY_NEW_PASSPHRASE` | key | Non-interactive new passphrase for `koh key passwd` (empty = remove encryption); for CI/automation instead of the prompt. | — |
+| `KOH_KEY_PASSPHRASE` | serve, connect, key | Passphrase to decrypt the (always-encrypted) identity key. Lets an unattended `koh serve`/`koh connect` open the key without a TTY prompt. | — |
+| `KOH_KEY_NEW_PASSPHRASE` | serve, connect, key | Passphrase used when **creating** a key on first run, and the new passphrase for `koh key passwd`; for CI/automation instead of the confirmed prompt. Must be non-empty. | — |
 | `KOH_STATE_DIR` | serve, connect | Base directory for the identity key files (the server's error message points here when the default isn't writable). | `--key-file` (per file) |
 | `KOH_DNS` | serve, connect | Override the discovery DNS resolver (`IP` or `IP:PORT`); needed on some Android/Termux setups. | — |
 | `KOH_CLIPBOARD` | connect | `1` to honor remote OSC-52 clipboard writes (off by default; L-1). | `--clipboard` |
@@ -280,25 +262,28 @@ All of koh's knobs as environment variables (most have a CLI-flag equivalent):
 > server with `RUST_LOG=koh=debug` (it logs to stderr). At `debug` the client also reports link RTT,
 > so you can tell a slow link from a slow server.
 
-### Encrypting the identity key at rest
+### The identity key (always encrypted at rest)
 
 The identity key *is* the node — anyone who can read `~/…/koh/{server,client}.key` owns the identity.
-By default it is stored as bare hex (`0600`), protected only by file permissions. `koh key` adds an
-opt-in, passphrase-encrypted format (`koh-key-v1`: **Argon2id + AES-256-GCM**, modeled on OpenSSH's
-`openssh-key-v1`), so the key is also guarded by something you *know* — the analogue of `ssh-keygen -p`
-on an encrypted SSH private key:
+koh **always** stores it passphrase-encrypted (`koh-key-v1`: **Argon2id + AES-256-GCM**, modeled on
+OpenSSH's `openssh-key-v1`); there is **no plaintext format**. So a stolen/backed-up key file is
+useless without the passphrase — file permissions are no longer the only thing protecting it.
+
+On first run, `koh serve`/`koh connect` generate the key and prompt for a passphrase to encrypt it
+(or read `$KOH_KEY_NEW_PASSPHRASE` when there's no TTY). Thereafter every command that loads the key
+prompts for it, or reads `$KOH_KEY_PASSPHRASE` for unattended use:
 
 ```sh
-koh key passwd               # set / change / remove the passphrase (empty = remove); prompts
-koh key info                 # show encryption status + endpoint id (prompts if encrypted)
+koh key passwd               # change the passphrase (like ssh-keygen -p); prompts with confirmation
+koh key info                 # show endpoint id (prompts for the passphrase)
 koh key passwd --key-file ~/.config/koh/server.key   # operate on the server key
 ```
 
-Encryption is opt-in and backward-compatible: existing bare-hex keys keep loading unchanged, and the
-endpoint id is preserved across a passphrase change. To open an encrypted key without an interactive
-prompt (e.g. an unattended `koh serve`), set `KOH_KEY_PASSPHRASE`; for non-interactive `koh key passwd`
-(CI), set `KOH_KEY_NEW_PASSPHRASE`. (This protects the key *at rest*; it is not hardware/agent-backed
-custody — see the roadmap.)
+The key material is never changed, so the endpoint id is preserved across a passphrase change. For
+an unattended `koh serve`, set `KOH_KEY_PASSPHRASE`. **Caveat:** at-rest encryption only protects a
+stolen key if the passphrase is *not* stored next to it — a daemon with `KOH_KEY_PASSPHRASE` in the
+same unit file on the same disk gains little. (This is at-rest custody only, not hardware/agent-backed
+— see the roadmap.)
 
 By default the bare endpoint id is dialed via n0's public relay + DNS discovery. For a LAN or
 self-hosted setup you can skip that:

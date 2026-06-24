@@ -23,10 +23,9 @@ credit reporters who want it.
 
 **In scope** (code koh authors):
 
-- The passphrase PAKE handshake (`src/transport_iroh/auth.rs`) and the at-rest identity-key format
-  (`src/transport_iroh/keyfile.rs`).
-- The connection accept gauntlet / authorization and rate limiter (`src/server/cli.rs`,
-  `src/transport_iroh/ratelimit.rs`).
+- The at-rest identity-key format (`src/transport_iroh/keyfile.rs`) — always-encrypted `koh-key-v1`.
+- The connection accept gauntlet / authorization (`src/server/cli.rs`, `src/server/policy.rs`) and the
+  admission barrier (`src/transport_iroh/admission.rs`).
 - The untrusted wire decoders (`src/wire.rs`) and the SSP state machine (`src/ssp/`).
 - The terminal apply path (`src/terminal/`), including the **contained** `vt100` parser surface.
 - On-disk identity-key handling and local-attacker hardening (`src/transport_iroh/`).

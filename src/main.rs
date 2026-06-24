@@ -6,7 +6,7 @@
 //! - `koh serve`   — host a PTY shell for authorized clients (the server side).
 //! - `koh connect` — connect to a server by its endpoint id and run the session (the client side).
 //! - `koh id`      — print this machine's koh id (to add to a server's `--allow` list).
-//! - `koh key`     — manage at-rest encryption of the identity key (set/change/remove passphrase).
+//! - `koh key`     — change the identity key's encryption passphrase (keys are always encrypted).
 //!
 //! Each subcommand delegates to a library entry point (`koh::server::serve`,
 //! `koh::client::connect`, `koh::client::run_id`); this binary is just argument parsing + dispatch.

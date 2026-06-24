@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::transport_iroh::ratelimit::FailureLimiter;
 use anyhow::Context;
 use clap::Args as ClapArgs;
 use iroh::EndpointId;
@@ -27,25 +26,14 @@ use crate::server::policy::{load_allow_file, Policy};
 use crate::server::{run_attached, session, SessionExit};
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
-    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, parse_secret, MonoClock, ALPN,
-    MIN_REASONABLE_PASSPHRASE_CHARS,
+    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, ALPN,
 };
-use secrecy::{ExposeSecret, SecretString};
 use tracing::{error, info, warn};
-
-/// Auth-failure rate limit: a peer that fails (or times out) the passphrase handshake
-/// [`AUTH_MAX_FAILURES`] times within [`AUTH_FAIL_WINDOW_MS`] is refused — cheaply, before the
-/// expensive Argon2id KDF runs — until its older failures age out of the window. This is the
-/// throttle that makes the per-guess work factor a real defense against online guessing by a
-/// leaked-but-allowlisted client key, and bounds the CPU an attacker can make the server spend.
-const AUTH_FAIL_WINDOW_MS: u64 = 60_000;
-const AUTH_MAX_FAILURES: usize = 5;
 
 /// Deadline on the QUIC crypto handshake (`Incoming::await`) before a stalled dial is dropped and
 /// its connection + pending-handshake permits released (KR-01). A legitimate 1-RTT QUIC handshake
 /// finishes in well under this even on a slow mobile link; the cap exists so a peer can't pin a
-/// pending slot for the 300s idle timeout koh configures (`koh_transport_config`). The separate
-/// `passphrase` exchange has its own 3s bound below.
+/// pending slot for the 300s idle timeout koh configures (`koh_transport_config`).
 const ACCEPT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Arguments for `koh serve`.
@@ -104,13 +92,6 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with = "relay_url")]
     local: bool,
 
-    /// Require a shared passphrase (defense-in-depth on top of the node-id allowlist).
-    /// The passphrase never crosses the wire. Prefer $KOH_PASSPHRASE over this flag: a
-    /// command-line argument is visible in the process table, an env var is not.
-    // `SecretString` so the value is zeroized on drop and redacts in any `{:?}`/log dump (KOH-14).
-    #[arg(long, value_parser = parse_secret)]
-    passphrase: Option<SecretString>,
-
     /// Maximum number of connections being handled concurrently (each holds a permit for its whole
     /// lifetime; excess incoming connections are refused cheaply, before the crypto handshake). This
     /// bounds the work a flood of dials — especially under `--allow-any` — can pin on the server.
@@ -142,18 +123,6 @@ fn connect_qr(data: &str) -> Option<String> {
 
 fn default_key_file() -> PathBuf {
     crate::transport_iroh::default_key_path("server")
-}
-
-/// Lock the shared auth-failure limiter. The single justified panic site for it: a poisoned mutex
-/// is a panic-elsewhere bug, never peer-influenced input.
-#[expect(
-    clippy::expect_used,
-    reason = "a poisoned auth-limiter mutex is a bug, not peer input"
-)]
-fn lock_limiter(
-    limiter: &session::AuthLimiter,
-) -> std::sync::MutexGuard<'_, FailureLimiter<EndpointId>> {
-    limiter.lock().expect("auth limiter mutex poisoned")
 }
 
 /// `koh serve` — host a PTY shell for authorized clients over iroh.
@@ -242,25 +211,6 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         format!("koh connect {id_str}")
     };
 
-    // Resolve the optional passphrase second factor once: the `--passphrase` flag, else
-    // $KOH_PASSPHRASE. An *empty* value (`--passphrase ''` or an exported-but-empty env var) is
-    // treated as "no passphrase" — otherwise the server would advertise "required" yet accept the
-    // empty-string response from everyone (KOH-11). A short passphrase is offline-crackable by a
-    // server a client dials, so warn (KOH-03).
-    let configured_passphrase: Option<SecretString> = args
-        .passphrase
-        .clone()
-        .or_else(|| std::env::var("KOH_PASSPHRASE").ok().map(SecretString::from))
-        .filter(|p| !p.expose_secret().is_empty());
-    if let Some(p) = &configured_passphrase {
-        if p.expose_secret().chars().count() < MIN_REASONABLE_PASSPHRASE_CHARS {
-            warn!(
-                "passphrase is short (< {MIN_REASONABLE_PASSPHRASE_CHARS} chars); it is \
-                 offline-crackable by a server a client dials — prefer a long, high-entropy one"
-            );
-        }
-    }
-
     eprintln!("┌─ koh server ready ──────────────────────────────────────");
     eprintln!("│ endpoint id : {id_str}");
     eprintln!("│ key file    : {}", key_file.display());
@@ -269,9 +219,6 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         eprintln!("│ auth        : ⚠ ALLOW-ANY (insecure)");
     } else {
         eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
-    }
-    if configured_passphrase.is_some() {
-        eprintln!("│ 2nd factor  : passphrase required");
     }
     if args.read_only {
         eprintln!("│ mode        : READ-ONLY (clients can watch, not type)");
@@ -309,39 +256,16 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let global_read_only = args.read_only;
     let allow = std::sync::Arc::new(allow);
     let allow_any = args.allow_any;
-    // The resolved passphrase (zeroized on drop, never logged), shared with every accept task and
-    // exposed as a &str only at the KDF call inside the handshake.
-    let passphrase: std::sync::Arc<Option<SecretString>> =
-        std::sync::Arc::new(configured_passphrase);
-    // Pre-derive (and process-cache) the Argon2id passphrase map now, BEFORE the accept loop, so
-    // the deliberately-expensive 64 MiB KDF never runs inside the first client's 3s handshake
-    // timeout on a loaded host (K-11; pairs with K-07 — a first-contact timeout would otherwise be
-    // the very latency that locks a user out). Idempotent and keyed on the server's own passphrase,
-    // so this is not attacker-influenced work.
-    if let Some(p) = passphrase.as_ref() {
-        crate::transport_iroh::auth::prewarm_psk(p.expose_secret());
-    }
-
-    // Per-peer auth-failure limiter (keyed on the client's endpoint id) + the monotonic clock its
-    // window arithmetic uses. One clock, shared with every accept task and the reaper, so all the
-    // `now` values share a base.
-    let clock = MonoClock::new();
-    let limiter: session::AuthLimiter = std::sync::Arc::new(std::sync::Mutex::new(
-        FailureLimiter::new(AUTH_FAIL_WINDOW_MS, AUTH_MAX_FAILURES),
-    ));
 
     // Detachable session store: one shell per authorized client, surviving disconnects so a
     // reconnecting client lands back in the same session at the current screen. The reaper
-    // collects sessions whose shell exited or that have been detached past the TTL (and GCs the
-    // auth-failure limiter on the same sweep).
+    // collects sessions whose shell exited or that have been detached past the TTL.
     let store = session::SessionStore::default();
     let session_ttl = std::time::Duration::from_secs(args.session_ttl_secs);
     let reaper_shutdown = tokio_util::sync::CancellationToken::new();
     let reaper = tokio::spawn(session::run_reaper(
         store.clone(),
         session_ttl,
-        limiter.clone(),
-        clock,
         session::REAP_INTERVAL,
         reaper_shutdown.clone(),
     ));
@@ -388,14 +312,12 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         // An accepted connection runs an ORDERED gauntlet before it gets a session, deliberately
         // inlined so each control is a single local edit and the order reads as one sequence:
         //   (1) connection-cap permit, (2) pending-handshake permit (KOH-08), then in the task:
-        //   (3) QUIC-handshake timeout (KR-01), (4) node-id allowlist, (5) per-peer auth-failure
-        //   limiter, (6) the SPAKE2 passphrase handshake under a 3s timeout, then record the outcome
-        //   and attach. The order is load-bearing (the allowlist rejects an unknown peer before the
-        //   limiter is even consulted). The genuinely-pure controls (auth, the limiter, the
-        //   allowlist/caps) already live in auth.rs / ratelimit.rs / session.rs with their own unit
-        //   tests; what stays here is the I/O-bound permit/guard ownership dance, so it is documented
-        //   here rather than extracted (extraction wouldn't unlock iroh-free unit testing — every
-        //   step still needs a live connection).
+        //   (3) QUIC-handshake timeout (KR-01), (4) node-id allowlist, (5) a 1-byte admission ack so
+        //   the client can tell "admitted" from a deliberate reject, then attach. Authorization is the
+        //   allowlist — the peer's node-id is already cryptographically authenticated by the QUIC/TLS
+        //   handshake, so there is no passphrase/second-factor step. The pure controls (allowlist /
+        //   caps / admission) live in session.rs / transport_iroh::admission with their own tests; what
+        //   stays here is the I/O-bound permit/guard ownership dance.
         let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
             warn!("refusing connection: at max-connections capacity");
             incoming.refuse();
@@ -411,9 +333,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         };
         let allow = allow.clone();
         let shell = shell.clone();
-        let passphrase = passphrase.clone();
         let store = store.clone();
-        let limiter = limiter.clone();
         // Counts this connection as active for the whole task; the guard decrements on every exit
         // path so the idle watchdog sees an accurate live-connection count.
         let active_guard = ConnGuard::new(active.clone());
@@ -445,68 +365,30 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 conn.close(1u32.into(), b"not authorized");
                 return;
             }
-            // Per-peer rate limit: refuse — cheaply, before the expensive KDF — a peer that has
-            // failed the handshake too many times recently. Checked after the allowlist so a
-            // bogus peer can't pollute the limiter's keyspace (unless --allow-any is set, where
-            // the reaper's gc bounds it).
-            if !lock_limiter(&limiter).check(&peer, clock.now_ms()) {
-                auth_event(
-                    "authz",
-                    Outcome::Rejected,
-                    Some(&peer),
-                    "rate limit exceeded",
-                );
-                conn.close(1u32.into(), b"rate limited");
-                return;
-            }
-            // Second factor: the passphrase PAKE handshake (no-op if none configured), bounded
-            // by a 3s timeout so a stalled/malicious client can't pin a (pending-handshake) slot
-            // for long — the SPAKE2 exchange is sub-second on any real link (KOH-08).
+            // Authorized: send the 1-byte admission ack so the client can distinguish "admitted"
+            // from a deliberate reject (without it a rejected client would re-dial forever). Bounded
+            // by a short timeout so a client that never accepts the stream can't pin the slot.
             match tokio::time::timeout(
                 std::time::Duration::from_secs(3),
-                crate::transport_iroh::auth::handshake_server(
-                    &conn,
-                    passphrase
-                        .as_ref()
-                        .as_ref()
-                        .map(ExposeSecret::expose_secret),
-                ),
+                crate::transport_iroh::admission::admit(&conn),
             )
             .await
             {
-                Ok(Ok(())) => {
-                    // Success clears this peer's failure history (a legit client that mistyped
-                    // once isn't penalized after it gets in).
-                    lock_limiter(&limiter).record_success(&peer);
-                }
-                Ok(Err(_)) => {
-                    auth_event("auth", Outcome::Failed, Some(&peer), "passphrase rejected");
-                    lock_limiter(&limiter).record_failure(peer, clock.now_ms());
-                    conn.close(1u32.into(), b"auth failed");
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %e, "admission ack failed");
                     return;
                 }
                 Err(_) => {
-                    // A handshake TIMEOUT is NOT an auth failure, so it must not feed the per-peer
-                    // failure limiter (K-07): a legitimate client on a badly degraded link (or a
-                    // momentarily loaded server) would otherwise be rate-limited out by transient
-                    // latency that has nothing to do with guessing. Only an explicit
-                    // `ChallengeFailed` (the arm above) is a guess. The pending-handshake semaphore
-                    // and this 3s bound already cap how long a stalling client can hold resources.
-                    auth_event(
-                        "auth",
-                        Outcome::Timeout,
-                        Some(&peer),
-                        "handshake timed out (not counted as a failure)",
-                    );
-                    conn.close(1u32.into(), b"auth timeout");
+                    warn!("admission ack timed out");
                     return;
                 }
             }
-            // Authenticated: free the pending-handshake slot so it isn't held for the (potentially
+            // Admitted: free the pending-handshake slot so it isn't held for the (potentially
             // long-lived) session that follows (KOH-08). The connection-cap permit is still held.
             drop(pending_permit);
             auth_event(
-                "auth",
+                "authz",
                 Outcome::Accepted,
                 Some(&peer),
                 "authorized; attaching session",

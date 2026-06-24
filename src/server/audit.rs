@@ -11,17 +11,13 @@
 
 use iroh::EndpointId;
 
-/// The admission/auth outcome — the stable status token, mirroring sshd's Accepted/Failed/Postponed.
+/// The admission outcome — the stable status token, mirroring sshd's Accepted/Refused.
 #[derive(Clone, Copy)]
 pub(crate) enum Outcome {
-    /// The peer passed this gate (authorized).
+    /// The peer passed the gate (its node-id is on the allowlist, or `--allow-any`).
     Accepted,
-    /// Rejected by policy: not on the allowlist, or rate-limited.
+    /// Rejected by policy: not on the allowlist.
     Rejected,
-    /// An explicit auth failure (wrong/missing passphrase) — counts toward the rate limiter.
-    Failed,
-    /// The handshake timed out (a transient/network outcome, NOT counted as a guess; see K-07).
-    Timeout,
 }
 
 impl Outcome {
@@ -29,8 +25,6 @@ impl Outcome {
         match self {
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
-            Self::Failed => "failed",
-            Self::Timeout => "timeout",
         }
     }
 }

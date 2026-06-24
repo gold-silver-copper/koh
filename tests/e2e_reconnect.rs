@@ -100,12 +100,9 @@ async fn client_reconnects_and_reattaches_after_a_forced_drop() {
                     }
                 });
             }
-            // Every connection completes the (no-passphrase) auth handshake, exactly like the real
-            // server — the client's connector always runs the client half, so this must answer it.
-            if koh::transport_iroh::auth::handshake_server(&conn, None)
-                .await
-                .is_err()
-            {
+            // Every connection sends the admission ack, exactly like the real server — the client's
+            // connector awaits it, so this must answer.
+            if koh::transport_iroh::admission::admit(&conn).await.is_err() {
                 continue;
             }
             match run_attached(conn, handle.clone()).await {
@@ -117,7 +114,7 @@ async fn client_reconnects_and_reattaches_after_a_forced_drop() {
 
     // --- client: the reconnecting session loop against a capturing mock terminal ---
     // The connector does the initial dial + handshake (and every reconnect), just like the binary.
-    let connector = IrohConnector::new(client_ep.clone(), server_addr.clone(), Arc::new(None));
+    let connector = IrohConnector::new(client_ep.clone(), server_addr.clone());
     let channel = connector
         .connect()
         .await

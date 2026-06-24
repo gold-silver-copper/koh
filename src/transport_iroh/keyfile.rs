@@ -1,9 +1,9 @@
 //! Encrypted-at-rest identity key — the `koh-key-v1` format.
 //!
-//! koh's identity key is the node's whole cryptographic identity. By default it is stored as bare
-//! lowercase hex (0600), so anyone who can read the file owns the identity. This module adds an
-//! OPT-IN, passphrase-encrypted format so the key is also protected by something the holder *knows*,
-//! not just filesystem permissions — closing the audit-flagged plaintext-on-disk gap.
+//! koh's identity key is the node's whole cryptographic identity. It is **always** stored in this
+//! passphrase-encrypted format (0600) — koh has no plaintext key path — so the key is protected by
+//! something the holder *knows*, not just filesystem permissions: a stolen/backed-up key file is
+//! useless without the passphrase.
 //!
 //! ## Modeled on OpenSSH's `openssh-key-v1`
 //!
@@ -16,9 +16,8 @@
 //! 16-byte tag *is* the wrong-passphrase + tamper detector — OpenSSH's two check-ints exist only
 //! because its `aes256-ctr` is unauthenticated; an AEAD makes them unnecessary.
 //!
-//! The KDF is Argon2id with the same parameters koh already uses for the PAKE
-//! ([`crate::transport_iroh::auth`]) — but here the salt is RANDOM per key (this *is* password
-//! storage, unlike the PAKE's intentionally-fixed salt). No home-grown crypto: AES-GCM (RustCrypto)
+//! The KDF is Argon2id (64 MiB / 3 passes) with a RANDOM per-key salt — this is password storage,
+//! so the salt's whole job is to defeat precomputation. No home-grown crypto: AES-GCM (RustCrypto)
 //! + Argon2id, used through their safe, `Result`-returning APIs.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -26,7 +25,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
 use zeroize::Zeroizing;
 
-/// Text header identifying an encrypted key file (the sniff anchor + greppable marker).
+/// Text header identifying a `koh-key-v1` key file (the decode anchor + greppable marker).
 const HEADER: &str = "koh-key-v1";
 
 const VERSION: u8 = 1;
@@ -52,15 +51,6 @@ const P_COST: u32 = 1;
 /// this is belt-and-suspenders.
 const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
 
-/// What kind of identity-key file a blob of text is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyfileKind {
-    /// The legacy/default format: 64 lowercase hex chars (the bare 32-byte secret).
-    PlaintextHex,
-    /// A `koh-key-v1` passphrase-encrypted key.
-    EncryptedV1,
-}
-
 /// Errors decoding/decrypting a key file. Typed + panic-free (untrusted-shaped, though local).
 #[derive(Debug, thiserror::Error)]
 pub enum KeyfileError {
@@ -76,20 +66,6 @@ pub enum KeyfileError {
     WrongPassphrase,
     #[error("key-file crypto error")]
     Crypto,
-}
-
-/// Classify a key file's text by its header (no decryption, no secret access).
-pub fn sniff(text: &str) -> KeyfileKind {
-    if text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .is_some_and(|first| first == HEADER)
-    {
-        KeyfileKind::EncryptedV1
-    } else {
-        KeyfileKind::PlaintextHex
-    }
 }
 
 /// Derive the 32-byte AES key from a passphrase + salt + Argon2 params (params come from the file on
@@ -215,19 +191,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sniff_distinguishes_formats() {
-        assert_eq!(sniff("koh-key-v1\nAAAA\n"), KeyfileKind::EncryptedV1);
-        assert_eq!(sniff(&"ab".repeat(32)), KeyfileKind::PlaintextHex);
-        assert_eq!(sniff("\n\nkoh-key-v1\nx"), KeyfileKind::EncryptedV1);
-        assert_eq!(sniff(""), KeyfileKind::PlaintextHex);
-    }
-
-    #[test]
     fn roundtrip_encrypt_decrypt() {
         let secret = [7u8; 32];
         let file = encrypt_key(&secret, "correct horse battery staple").unwrap();
         assert!(file.starts_with("koh-key-v1\n"), "has the header line");
-        assert_eq!(sniff(&file), KeyfileKind::EncryptedV1);
         let got = decrypt_key(&file, "correct horse battery staple").unwrap();
         assert_eq!(*got, secret);
     }

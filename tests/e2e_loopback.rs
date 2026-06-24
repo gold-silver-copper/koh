@@ -74,11 +74,7 @@ async fn full_session_over_loopback_pty() {
     // --- client: connect and run the real session loop against a mock terminal ---
     // A connector for the single connection this test uses. Reconnect is never triggered here:
     // dropping the input sender ends the session via Quit before any link loss.
-    let connector = IrohConnector::new(
-        client_ep.clone(),
-        server_addr.clone(),
-        std::sync::Arc::new(None),
-    );
+    let connector = IrohConnector::new(client_ep.clone(), server_addr.clone());
     let conn = client_ep
         .connect(server_addr, ALPN)
         .await

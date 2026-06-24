@@ -14,7 +14,6 @@ mod render;
 pub use cli::{connect, run_id, ConnectArgs, IdArgs};
 
 use std::io::Write;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::input::UserInput;
@@ -24,7 +23,6 @@ use crate::terminal::TerminalScreen;
 use crate::transport_iroh::{IrohChannel, MonoClock, ALPN};
 use anyhow::Context;
 use iroh::{Endpoint, EndpointAddr};
-use secrecy::{ExposeSecret, SecretString};
 use termina::escape::csi::{Csi, DecPrivateMode, DecPrivateModeCode, Mode};
 use termina::{PlatformTerminal, Terminal as _};
 use tokio::sync::mpsc;
@@ -82,7 +80,7 @@ fn looks_like_resume_from_freeze(wall_gap: Duration) -> bool {
     wall_gap >= STALE_AFTER_FREEZE
 }
 
-/// Dials the server and replays the passphrase handshake, yielding a fresh [`IrohChannel`].
+/// Dials the server and awaits its admission ack, yielding a fresh [`IrohChannel`].
 ///
 /// One instance is reused for the **initial** connection and for every **transparent reconnect**
 /// after the link drops (e.g. a phone screen-off long enough that the QUIC connection idle-times
@@ -92,47 +90,32 @@ fn looks_like_resume_from_freeze(wall_gap: Duration) -> bool {
 pub struct IrohConnector {
     endpoint: Endpoint,
     target: EndpointAddr,
-    /// The optional passphrase second factor, shared (so it survives across reconnect dials) and
-    /// held as a `SecretString` (zeroized on drop, never logged); exposed only at the KDF call.
-    passphrase: Arc<Option<SecretString>>,
 }
 
 impl IrohConnector {
-    pub fn new(
-        endpoint: Endpoint,
-        target: EndpointAddr,
-        passphrase: Arc<Option<SecretString>>,
-    ) -> Self {
-        Self {
-            endpoint,
-            target,
-            passphrase,
-        }
+    pub fn new(endpoint: Endpoint, target: EndpointAddr) -> Self {
+        Self { endpoint, target }
     }
 
-    /// Connect to the server and complete the passphrase handshake. Surfaces a bad-allowlist or
-    /// wrong-passphrase failure as an `Err` (the binary reports it before entering raw mode).
+    /// Connect to the server and await its admission ack. A server that rejects us (our node-id is
+    /// not on its allowlist, or it's at capacity) closes the connection instead of admitting; that
+    /// surfaces as an `Err` (the binary reports it before entering raw mode), so a rejected client
+    /// fails fast rather than re-dialing forever.
     pub async fn connect(&self) -> anyhow::Result<IrohChannel> {
         let conn = self
             .endpoint
             .connect(self.target.clone(), ALPN)
             .await
             .context("connecting to server (is your id on its allowlist?)")?;
-        let pass = self
-            .passphrase
-            .as_ref()
-            .as_ref()
-            .map(SecretString::expose_secret);
-        if let Err(e) = crate::transport_iroh::auth::handshake_client(&conn, pass).await {
-            // The server rejects with a specific application reason — "not authorized" / "rate
-            // limited" / "auth failed" / "server at session capacity" — each pointing at a different
-            // operator fix. Surface that real reason instead of a single static guess so the user
-            // doesn't debug the wrong thing. The reason is peer-controlled, so sanitize + cap it.
+        if let Err(e) = crate::transport_iroh::admission::await_admission(&conn).await {
+            // The server rejects with a specific application reason — "not authorized" / "server at
+            // session capacity" — each pointing at a different operator fix. Surface that real reason
+            // instead of a static guess. The reason is peer-controlled, so it is sanitized + capped.
             return Err(match server_close_reason(&conn) {
                 Some(reason) => anyhow::Error::new(e)
                     .context(format!("server rejected the connection: {reason}")),
                 None => anyhow::Error::new(e)
-                    .context("passphrase handshake (wrong or missing --passphrase?)"),
+                    .context("server did not admit the connection (is your id on its allowlist?)"),
             });
         }
         Ok(IrohChannel::new(conn))

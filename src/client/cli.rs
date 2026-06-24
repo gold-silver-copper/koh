@@ -10,12 +10,10 @@ use std::path::PathBuf;
 use crate::predict::DisplayPreference;
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, format_endpoint_id,
-    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, parse_secret, relay_addr,
-    MIN_REASONABLE_PASSPHRASE_CHARS,
+    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, relay_addr,
 };
 use anyhow::Context;
 use clap::{Args, ValueEnum};
-use secrecy::{ExposeSecret, SecretString};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -60,12 +58,6 @@ pub struct ConnectArgs {
     /// Dial the server via a self-hosted relay URL instead of n0's public relays.
     #[arg(long, value_name = "URL")]
     relay_url: Option<String>,
-
-    /// Shared passphrase, if the server requires one. Prefer $KOH_PASSPHRASE over this flag:
-    /// a command-line argument is visible in the process table, an env var is not.
-    // `SecretString` so the value is zeroized on drop and redacts in any `{:?}`/log dump (KOH-14).
-    #[arg(long, value_parser = parse_secret)]
-    passphrase: Option<SecretString>,
 
     /// Honor remote OSC-52 clipboard writes (let the remote app set your system clipboard).
     /// OFF by default: a malicious/compromised server could otherwise silently overwrite your
@@ -247,30 +239,10 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
             .context("binding endpoint")?;
         (ep, server_id.into())
     };
-    // Optional passphrase second factor (no-op if the server doesn't require one). Held as a
-    // SecretString (zeroized on drop, never logged) and shared with the connector so it survives
-    // across reconnect dials; exposed as a &str only at the KDF call inside the handshake. An empty
-    // value (`--passphrase ''` or an exported-but-empty env var) is treated as "none" so it isn't
-    // mistaken for a configured factor (KOH-11); a short one is offline-crackable by a malicious
-    // server, so warn (KOH-03).
-    let configured_passphrase = args
-        .passphrase
-        .clone()
-        .or_else(|| std::env::var("KOH_PASSPHRASE").ok().map(SecretString::from))
-        .filter(|p| !p.expose_secret().is_empty());
-    if let Some(p) = &configured_passphrase {
-        if p.expose_secret().chars().count() < MIN_REASONABLE_PASSPHRASE_CHARS {
-            eprintln!(
-                "koh: warning: passphrase is short (< {MIN_REASONABLE_PASSPHRASE_CHARS} chars); it \
-                 is offline-crackable by a server you dial — prefer a long, high-entropy one."
-            );
-        }
-    }
-    let passphrase = std::sync::Arc::new(configured_passphrase);
-    // One connector dials the server (and replays the handshake) for the initial connection and for
-    // every transparent reconnect. The first dial happens here — before raw mode — so a bad-id or
-    // wrong-passphrase error prints cleanly; later drops are re-dialed from inside run_client.
-    let connector = IrohConnector::new(endpoint.clone(), target, passphrase);
+    // One connector dials the server for the initial connection and for every transparent reconnect.
+    // The first dial happens here — before raw mode — so a bad-id / not-on-allowlist error prints
+    // cleanly; later drops are re-dialed from inside run_client.
+    let connector = IrohConnector::new(endpoint.clone(), target);
     // Bound the initial dial (KR-04): `connect()` performs unbounded handshake reads, so a
     // malicious/typo'd server the client dials could otherwise hang it at "connecting…" until iroh's
     // 300s idle timeout. Use the same cap as the transparent-reconnect path.

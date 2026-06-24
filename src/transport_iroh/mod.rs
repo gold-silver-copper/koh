@@ -27,9 +27,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::{Zeroize, Zeroizing};
 
-pub mod auth;
+pub mod admission;
 mod keyfile;
-pub mod ratelimit;
 
 /// Keepalive + connection idle-timeout tuned so a phone screen-off doesn't drop the connection.
 /// iroh's defaults already PING every 5s and drop a *path* after 15s, but the *connection* idle
@@ -63,7 +62,7 @@ pub const ALPN: &[u8] = b"koh/iroh/1";
 pub enum SetupError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("secret key file is not 32 bytes of hex")]
+    #[error("secret key file is invalid, a symlink, or not a regular file")]
     BadKeyFile,
     #[error("could not parse endpoint id: {0}")]
     BadEndpointId(String),
@@ -75,8 +74,8 @@ pub enum SetupError {
 
 /// Load a persistent [`SecretKey`] from `path`, or generate + persist one if absent.
 ///
-/// The file holds the 32-byte secret as lowercase hex. A stable key gives the server a
-/// stable [`EndpointId`], mirroring iroh-ssh's `--persist`.
+/// The key is always stored in the passphrase-encrypted `koh-key-v1` format (there is no plaintext
+/// format). A stable key gives the server a stable [`EndpointId`], mirroring iroh-ssh's `--persist`.
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
     if path.exists() {
         // Refuse a dangerous containing dir FIRST (KOH-06/KR-06): the load below tightens the key's
@@ -93,29 +92,13 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
         // checks. `read_key_file_secure` opens with `O_NOFOLLOW` (a symlinked key is refused at
         // open) and operates only on the held fd, so there is no second path resolution to race.
         let mut text = read_key_file_secure(path)?;
-        // The file is either the legacy bare-hex secret or a `koh-key-v1` passphrase-encrypted key
-        // (auto-detected by header — no flag, so existing keys keep loading unchanged). Decoded
-        // secret material is held in `Zeroizing` and the raw text is wiped before returning, closing
-        // the prior plaintext-lingers-in-memory gap on this path too.
-        let sk = match keyfile::sniff(&text) {
-            keyfile::KeyfileKind::EncryptedV1 => {
-                let pass = resolve_key_passphrase(path)?;
-                let secret = keyfile::decrypt_key(&text, pass.expose_secret())
-                    .map_err(|e| SetupError::Keyfile(e.to_string()))?;
-                SecretKey::from_bytes(&secret)
-            }
-            keyfile::KeyfileKind::PlaintextHex => {
-                let bytes = Zeroizing::new(
-                    data_encoding::HEXLOWER_PERMISSIVE
-                        .decode(text.trim().as_bytes())
-                        .map_err(|_| SetupError::BadKeyFile)?,
-                );
-                let arr = Zeroizing::new(
-                    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| SetupError::BadKeyFile)?,
-                );
-                SecretKey::from_bytes(&arr)
-            }
-        };
+        // The identity key is ALWAYS the `koh-key-v1` encrypted format (koh has no plaintext key
+        // path). Decrypt under the resolved passphrase; secret material stays in `Zeroizing` and the
+        // raw file text is wiped before returning.
+        let pass = resolve_key_passphrase(path)?;
+        let secret = keyfile::decrypt_key(&text, pass.expose_secret())
+            .map_err(|e| SetupError::Keyfile(e.to_string()))?;
+        let sk = SecretKey::from_bytes(&secret);
         text.zeroize();
         Ok(sk)
     } else {
@@ -125,20 +108,13 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
             // Reject a world-writable state dir before writing the identity key into it (KOH-06).
             ensure_state_dir_secure(parent)?;
         }
-        // The key is the node identity (M-1): write it owner-only (0600). A freshly-generated key is
-        // stored UNENCRYPTED by default (no forced migration / no surprise prompt); use `koh key
-        // passwd` to add a passphrase. `write_identity_key` does the born-private atomic 0600 write.
-        write_identity_key(path, &sk, None)?;
+        // The key is the node identity (M-1): write it owner-only (0600) AND encrypted at rest
+        // (`koh-key-v1`) — encryption is mandatory, so a fresh key requires a passphrase up front
+        // (a no-echo confirmed TTY prompt, or `$KOH_KEY_NEW_PASSPHRASE` when headless).
+        let pass = resolve_new_key_passphrase(path)?;
+        write_identity_key(path, &sk, pass.expose_secret())?;
         Ok(sk)
     }
-}
-
-/// Whether the identity key at `path` is stored in the encrypted `koh-key-v1` format (vs plaintext
-/// hex). Reads only the header for a status display (`koh key info`) — never touches the secret;
-/// best-effort (returns `false` if the file can't be read).
-pub(crate) fn identity_key_is_encrypted(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .is_ok_and(|t| matches!(keyfile::sniff(&t), keyfile::KeyfileKind::EncryptedV1))
 }
 
 /// Resolve the passphrase for an encrypted identity key: `$KOH_KEY_PASSPHRASE` if set (non-empty),
@@ -162,26 +138,56 @@ fn resolve_key_passphrase(path: &Path) -> Result<SecretString, SetupError> {
     )))
 }
 
-/// Persist `sk` to `path` atomically (born-private 0600). With `passphrase` set, store the
-/// `koh-key-v1` encrypted format; otherwise the legacy plaintext hex. The shared key-write path for
-/// `koh key`. The owned secret bytes are zeroized after use.
+/// Resolve a passphrase to encrypt a freshly-created identity key: `$KOH_KEY_NEW_PASSPHRASE` if set,
+/// else a confirmed no-echo TTY prompt, else a clear error. An empty passphrase is rejected —
+/// encryption is mandatory, so there is no plaintext fallback.
+fn resolve_new_key_passphrase(path: &Path) -> Result<SecretString, SetupError> {
+    use std::io::IsTerminal as _;
+    if let Ok(p) = std::env::var("KOH_KEY_NEW_PASSPHRASE") {
+        if p.is_empty() {
+            return Err(SetupError::Other(anyhow::anyhow!(
+                "$KOH_KEY_NEW_PASSPHRASE is empty; identity keys are always encrypted (set a non-empty passphrase)"
+            )));
+        }
+        return Ok(SecretString::from(p));
+    }
+    if std::io::stdin().is_terminal() {
+        let p1 = rpassword::prompt_password(format!(
+            "Set a passphrase to encrypt the new identity key {}: ",
+            path.display()
+        ))
+        .map_err(SetupError::Io)?;
+        if p1.is_empty() {
+            return Err(SetupError::Other(anyhow::anyhow!(
+                "an empty passphrase is not allowed; identity keys are always encrypted"
+            )));
+        }
+        let p2 = rpassword::prompt_password("Confirm passphrase: ").map_err(SetupError::Io)?;
+        if p1 != p2 {
+            return Err(SetupError::Other(anyhow::anyhow!(
+                "passphrases did not match"
+            )));
+        }
+        return Ok(SecretString::from(p1));
+    }
+    Err(SetupError::Other(anyhow::anyhow!(
+        "no identity key at {} and no TTY to prompt; set $KOH_KEY_NEW_PASSPHRASE to create an encrypted key",
+        path.display()
+    )))
+}
+
+/// Persist `sk` to `path` atomically (born-private 0600) in the `koh-key-v1` encrypted format. The
+/// shared key-write path for `koh key`. The owned secret bytes are zeroized after use. `passphrase`
+/// must be non-empty — koh has no plaintext key format.
 pub(crate) fn write_identity_key(
     path: &Path,
     sk: &SecretKey,
-    passphrase: Option<&str>,
+    passphrase: &str,
 ) -> Result<(), SetupError> {
     let secret = Zeroizing::new(sk.to_bytes());
-    match passphrase {
-        Some(pass) if !pass.is_empty() => {
-            let text = keyfile::encrypt_key(&secret, pass)
-                .map_err(|e| SetupError::Keyfile(e.to_string()))?;
-            write_secret_file(path, text.as_bytes())?;
-        }
-        _ => {
-            let hex = Zeroizing::new(data_encoding::HEXLOWER.encode(secret.as_slice()));
-            write_secret_file(path, hex.as_bytes())?;
-        }
-    }
+    let text = keyfile::encrypt_key(&secret, passphrase)
+        .map_err(|e| SetupError::Keyfile(e.to_string()))?;
+    write_secret_file(path, text.as_bytes())?;
     Ok(())
 }
 
@@ -399,24 +405,6 @@ pub fn generate_secret_key() -> SecretKey {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     SecretKey::from_bytes(&bytes)
-}
-
-/// Passphrases shorter than this trigger a startup warning: the passphrase is offline-crackable by
-/// a server a client merely dials (KOH-03), so a low-entropy one is weak. Not a hard floor (existing
-/// deployments keep working) — a loud nudge toward a high-entropy secret. Shared by both CLIs so the
-/// threshold can't drift between them.
-pub(crate) const MIN_REASONABLE_PASSPHRASE_CHARS: usize = 12;
-
-/// Parse a CLI passphrase straight into a [`secrecy::SecretString`] so the plaintext is never stored
-/// in a long-lived `String` and redacts in any debug/log output (KOH-14). Infallible — any string is
-/// a valid passphrase; emptiness is treated as "no passphrase" later, not rejected here. The clap
-/// `value_parser` shared by both `serve` and `connect`.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "clap value_parser requires a Result-returning signature"
-)]
-pub(crate) fn parse_secret(s: &str) -> Result<secrecy::SecretString, std::convert::Infallible> {
-    Ok(secrecy::SecretString::from(s.to_owned()))
 }
 
 /// Parse an [`EndpointId`] from its canonical (hex) string form, or the n0 base32 form.
@@ -750,17 +738,19 @@ mod tests {
 
     #[test]
     fn secret_key_roundtrips_through_disk() {
+        // Write an encrypted key and read it back through the keyfile codec. Avoids the env/TTY
+        // passphrase resolution of `load_or_create_secret_key` (which would need a racy env var).
         let dir = std::env::temp_dir().join(format!("koh-key-test-{}", std::process::id()));
         let path = dir.join("id.key");
         let _ = std::fs::remove_dir_all(&dir);
+        create_dir_private(&dir).unwrap();
 
-        let sk1 = load_or_create_secret_key(&path).unwrap();
-        let sk2 = load_or_create_secret_key(&path).unwrap();
-        assert_eq!(
-            sk1.to_bytes(),
-            sk2.to_bytes(),
-            "second load must reuse the key"
-        );
+        let sk1 = generate_secret_key();
+        write_identity_key(&path, &sk1, "test-pass").expect("write encrypted key");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let bytes = keyfile::decrypt_key(&text, "test-pass").expect("decrypts back");
+        let sk2 = SecretKey::from_bytes(&bytes);
+        assert_eq!(sk1.to_bytes(), sk2.to_bytes(), "round-trips through disk");
 
         // The endpoint id is stable and round-trips through its string form.
         let id = sk1.public();
@@ -773,15 +763,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn created_key_file_is_owner_only() {
-        // M-1: a freshly-created secret key must be 0600 (no group/other bits) and its parent dir
-        // must not be group/other-writable — the key is the node identity, so a world-readable key
-        // is a local-impersonation risk.
+        // M-1: a written secret key must be 0600 (no group/other bits) and its parent dir must not
+        // be group/other-writable — the key is the node identity, so a world-readable key is a
+        // local-impersonation risk.
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("koh-key-perm-{}", std::process::id()));
         let path = dir.join("id.key");
         let _ = std::fs::remove_dir_all(&dir);
+        create_dir_private(&dir).unwrap();
 
-        let _ = load_or_create_secret_key(&path).unwrap();
+        write_identity_key(&path, &generate_secret_key(), "test-pass")
+            .expect("write encrypted key");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(
             mode & 0o077,
@@ -917,42 +909,18 @@ mod tests {
         create_dir_private(&dir).unwrap();
         let key = dir.join("id.key");
         let sk = generate_secret_key();
-        write_identity_key(&key, &sk, Some("correct horse")).expect("write encrypted");
+        write_identity_key(&key, &sk, "correct horse").expect("write encrypted");
 
         let text = std::fs::read_to_string(&key).unwrap();
         assert!(
             text.starts_with("koh-key-v1"),
             "stored in the encrypted format"
         );
-        assert!(identity_key_is_encrypted(&key), "status reads as encrypted");
         let got = keyfile::decrypt_key(&text, "correct horse").expect("decrypts");
         assert_eq!(*got, sk.to_bytes(), "round-trips to the same secret");
         assert!(
             keyfile::decrypt_key(&text, "wrong").is_err(),
             "a wrong passphrase is rejected"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn plaintext_key_still_loads_and_default_write_is_plaintext() {
-        // Backward compatibility: a key written WITHOUT a passphrase is the legacy bare-hex format and
-        // loads unchanged (no prompt, no env), so existing keys keep working.
-        let dir = std::env::temp_dir().join(format!("koh-plain-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        create_dir_private(&dir).unwrap();
-        let key = dir.join("id.key");
-        let sk = generate_secret_key();
-        write_identity_key(&key, &sk, None).expect("write plaintext");
-        assert!(
-            !identity_key_is_encrypted(&key),
-            "default write is plaintext"
-        );
-        let loaded = load_or_create_secret_key(&key).expect("loads without a passphrase");
-        assert_eq!(
-            loaded.to_bytes(),
-            sk.to_bytes(),
-            "plaintext key loads back unchanged"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

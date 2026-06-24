@@ -45,12 +45,9 @@ async fn real_client_binary_renders_over_pty() {
     let server_task = tokio::spawn(async move {
         if let Some(incoming) = server_ep.accept().await {
             if let Ok(conn) = incoming.await {
-                // The client *binary* runs the passphrase handshake after connect; mirror the
-                // server side (no passphrase) so its accept_bi() completes, like the real server.
-                if koh::transport_iroh::auth::handshake_server(&conn, None)
-                    .await
-                    .is_ok()
-                {
+                // The real client binary awaits an admission ack after connect; mirror the server
+                // side so its accept_bi() completes, like `koh serve`.
+                if koh::transport_iroh::admission::admit(&conn).await.is_ok() {
                     let _ = run_session(conn, Some("sh".into()), 0).await;
                 }
             }
@@ -81,6 +78,10 @@ async fn real_client_binary_renders_over_pty() {
     cmd.arg("--key-file");
     cmd.arg(&key_path);
     cmd.env("TERM", "xterm-256color");
+    // The client creates its identity key on first run; keys are always encrypted, so supply the
+    // passphrase non-interactively (child-process env, so no race with the test process).
+    cmd.env("KOH_KEY_NEW_PASSPHRASE", "test-pass");
+    cmd.env("KOH_KEY_PASSPHRASE", "test-pass");
 
     let mut child = pair.slave.spawn_command(cmd).expect("spawn client binary");
     drop(pair.slave);

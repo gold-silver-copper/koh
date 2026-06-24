@@ -15,28 +15,26 @@ service.
 
 ## Attacker models
 
-1. **Malicious / compromised client** — a peer that dials the server. Pre-auth it can send handshake
-   bytes (stall, malformed/garbage PAKE, downgrade attempts). If it is on the allowlist *and* knows
-   the passphrase (or none is set) it reaches the SSP data plane and sends arbitrary UserInput / Resize
-   / fragmented instructions. **Goal it must be denied:** crash / OOM / hang the server, bypass a cap,
-   or escape the admission gauntlet. The server is the high-value target (it runs a shell).
+1. **Malicious / compromised client** — a peer that dials the server. If it is on the allowlist it
+   reaches the SSP data plane and sends arbitrary UserInput / Resize / fragmented instructions.
+   **Goal it must be denied:** crash / OOM / hang the server, bypass a cap, or escape the admission
+   gauntlet. The server is the high-value target (it runs a shell).
 2. **Malicious / compromised server** — a server a client dials (a wrong/typo'd node-id, or a popped
    host). It sends arbitrary screen-state instructions + out-of-band data (title/icon/bell/clipboard).
-   **Goal it must be denied:** crash / OOM / hang the client, impersonate a trusted server *without*
-   the passphrase, or downgrade auth to none. (It can, of course, mislead a user who chose to connect
-   to it — that is inherent.)
+   **Goal it must be denied:** crash / OOM / hang the client. It *can* mislead a user who chose to
+   connect to it — that is inherent, and with no second factor the node-id is the only thing tying a
+   session to a specific server, so node-ids should be verified out-of-band.
 3. **Network / MITM** — QUIC + TLS 1.3 (via iroh) give transport encryption and node-id
-   authentication. Considered: auth downgrade, replay, and whether any handshake transcript is
-   offline-crackable against the passphrase.
-4. **Local attacker** — another uid on the same host. Targets: the identity key file, the state dir,
-   the passphrase in env/argv/logs, signals to a recycled pid, temp files.
+   authentication by construction (no TOFU window). Considered: replay, and connection-level tamper.
+4. **Local attacker** — another uid on the same host. Targets: the (encrypted) identity key file and
+   its passphrase, the state dir, signals to a recycled pid, temp files.
 
 ## Trust boundaries & key defenses
 
 - **Peer identity:** both ends are authenticated by Ed25519 node-id *by construction* (no TOFU
-  window). Authorization is an explicit **allowlist** (off-list peers refused). An **optional** second
-  factor is a balanced **SPAKE2 PAKE** (Argon2id, mutual key confirmation, no offline-crackable
-  transcript; per-peer online rate limiter). The accept gauntlet (`src/server/cli.rs`) is the
+  window). Authorization is an explicit **allowlist** (off-list peers refused); this is the **single**
+  authentication factor — there is no passphrase/PAKE second factor (the residual leaked-key risk is
+  handled by mandatory at-rest key encryption, below). The accept gauntlet (`src/server/cli.rs`) is the
   trust-boundary checkpoint; its outcomes are logged structured under the `koh::auth` target. An
   admitted peer can be further constrained per node-id (`--allow-file`): **read-only** (`restrict` —
   input dropped before the PTY, a real boundary) and/or a **forced command** (sshd-style
@@ -47,9 +45,10 @@ service.
   `vt100` escape parser (a dependency outside koh's no-panic coverage) is wrapped in `catch_unwind`
   on the client so a crafted server repaint drops a frame instead of crashing the session.
 - **Process / local:** `forbid(unsafe)` crate-wide; identity key written `0600` (born-private atomic
-  write, `O_NOFOLLOW` read, fd-based perm-tighten) and **optionally encrypted at rest** (Argon2id +
-  AES-256-GCM; see `koh key`); passphrase carried as a redacted/zeroized `SecretString`; `KOH_*` env
-  scrubbed before exec'ing the shell; PTY kill gated against pid reuse.
+  write, `O_NOFOLLOW` read, fd-based perm-tighten) and **always encrypted at rest** (Argon2id +
+  AES-256-GCM, `koh-key-v1`; no plaintext format); its passphrase carried as a redacted/zeroized
+  `SecretString`; `KOH_*` env scrubbed before exec'ing the shell; PTY kill gated against pid reuse.
+  Note at-rest encryption only protects a stolen key if `$KOH_KEY_PASSPHRASE` is not stored beside it.
 
 The detailed finding history (security audit + the K-/AR-/CR- review series) lives in the git log and
 the inline `KOH-`/`KR-`/`K-`/`AR-` rationale tags.

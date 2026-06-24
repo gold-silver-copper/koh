@@ -1,6 +1,6 @@
 [package]
 name = "koh"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 # The effective floor is dictated by the `=`-pinned iroh 1.0.0 (edition 2024 + rust-version 1.91),
 # not by koh's own 2021 edition. Declaring it turns "cargo install on an old toolchain" into a clear
@@ -45,19 +45,16 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # internally; our crate stays `forbid(unsafe)`). `signal`-only, no default features. Already present
 # transitively, so this pins no new major version.
 nix = { version = "0.28", default-features = false, features = ["signal"] }
-# auth (passphrase second factor). The handshake is a balanced PAKE (SPAKE2, RFC 9382) so a server
-# a client merely *dials* cannot offline-crack the passphrase from a transcript (closes KOH-03).
-# Pinned (=) like the other crypto/transport deps: a PAKE's wire/curve details must not drift under us.
-spake2 = "=0.4.0"
+# Crypto for the encrypted-at-rest identity key (the `koh-key-v1` format): BLAKE3 (domain-separated
+# hashing) + Argon2id (the password KDF). RustCrypto, used through their safe Result-returning APIs.
 blake3 = "1"
 argon2 = "0.5"
-constant_time_eq = "0.5"
 zeroize = "1"
 secrecy = "0.10"
 # At-rest encryption of the on-disk identity key (the `koh-key-v1` format, modeled on OpenSSH's
-# openssh-key-v1): a vetted AEAD over the 32-byte secret, keyed by Argon2id (reused from the PAKE).
-# Already in the lockfile transitively via iroh's QUIC backend, so promoting it to a direct dep adds
-# no new compiled crate — it makes koh own/audit the version. NOT home-grown crypto.
+# openssh-key-v1): a vetted AEAD over the 32-byte secret, keyed by Argon2id. Already in the lockfile
+# transitively via iroh's QUIC backend, so promoting it to a direct dep adds no new compiled crate —
+# it makes koh own/audit the version. NOT home-grown crypto.
 aes-gcm = "0.10"
 # No-echo passphrase prompt for the encrypted identity key (the `ssh-keygen -p` / login analogue).
 rpassword = "7"

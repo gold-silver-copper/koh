@@ -87,6 +87,32 @@ impl CursorKeyNormalizer {
     }
 }
 
+/// Coalesce a batch of drained client input before it touches the PTY (KOH-05).
+///
+/// A single datagram set can pack a huge number of events; applying each synchronously — an
+/// `ioctl(TIOCSWINSZ)` + SIGWINCH and a `vt100` grid realloc per resize — is a CPU/syscall DoS.
+/// Intermediate resizes have no observable effect, so only the LAST geometry is kept (clamped to
+/// `[MIN_DIM, MAX_DIM]` before the PTY/vt100 ever see it, H-1 / M-2); keystrokes concatenate in
+/// order through the DECCKM normalizer. Pure (given the normalizer + `app_cursor`) so the
+/// security-relevant collapse is unit-testable without a real PTY/transport.
+fn coalesce_drained_input(
+    input_diff: &[WireEvent],
+    cursor_keys: &mut CursorKeyNormalizer,
+    app_cursor: bool,
+) -> (Vec<u8>, Option<(u16, u16)>) {
+    let mut keys = Vec::new();
+    let mut last_resize: Option<(u16, u16)> = None;
+    for w in input_diff {
+        match w {
+            WireEvent::Keys(b) => keys.extend(cursor_keys.normalize(b, app_cursor)),
+            WireEvent::Resize { rows, cols } => {
+                last_resize = Some(crate::terminal::clamp_dims(*rows, *cols));
+            }
+        }
+    }
+    (keys, last_resize)
+}
+
 /// Drive a client connection against an existing (shared, detachable) [`session::Session`].
 ///
 /// Uses a **fresh** `Transport<TerminalScreen, UserInput>` per attach, so the first tick diffs
@@ -104,6 +130,10 @@ pub async fn run_attached(
     transport.set_connected(true);
     // Normalizes the client's arrow keys to the app's DECCKM mode before they reach the PTY.
     let mut cursor_keys = CursorKeyNormalizer::default();
+    // Whether the screen may have changed since the last grid snapshot (S-03). Snapshot on the
+    // first pass, then only after a `changed` pulse / applied input or an echo-ack advance — so an
+    // idle/timer wake doesn't clone the whole vt100 grid for nothing.
+    let mut dirty = true;
 
     loop {
         let now = clock.now_ms();
@@ -112,21 +142,36 @@ pub async fn run_attached(
             transport.observe_rtt(rtt);
         }
 
-        // Snapshot the live screen + echo-ack timing under the session lock.
+        // Snapshot the live screen + echo-ack timing under the session lock. The snapshot clones the
+        // whole vt100 grid + title/icon/clipboard, so skip it when nothing changed since the last
+        // wake (S-03): a skipped snapshot leaves `current_state` equal to the still-current screen,
+        // so `tick` correctly emits acks-only with no missed update.
         let (echo_wait, child_alive) = {
             let mut s = handle.session.lock().await;
-            s.emu.set_echo_ack(now);
-            *transport.current_mut() = s.emu.snapshot();
+            // set_echo_ack advances the echo-ack on a debounce even with no screen change; its
+            // return reports whether it changed. OR it in — else we'd stop shipping echo-ack
+            // confirmations and break the client's prediction-confirmation timing.
+            let echo_changed = s.emu.set_echo_ack(now);
+            if dirty || echo_changed {
+                *transport.current_mut() = s.emu.snapshot();
+            }
             (s.emu.echo_ack_wait_time(now), s.child_alive)
         };
+        dirty = false;
         let wait = transport.wait_time(now);
         let sleep_ms = wait.min(echo_wait).min(1000);
 
         tokio::select! {
             // NOT biased: `changed` can hold a stored permit, which under `biased` would starve
             // client input. A fair select interleaves rendering and input.
-            _ = handle.changed.notified() => { /* screen changed; the loop re-snapshots above */ }
+            // Screen changed: re-snapshot on the next pass.
+            _ = handle.changed.notified() => dirty = true,
 
+            // Cancel-safety: when `changed` (or the timer) fires first, this in-flight `recv()`
+            // future is dropped — sound only because the pinned `iroh = "1.0.0"`'s `read_datagram`
+            // is cancel-safe (a dropped future loses no buffered datagram). This loop drops it far
+            // more often than the client (on every screen change, not just a timer tick), so any
+            // iroh bump must re-verify cancel-safety here too (see `client::drive_connection`).
             dg = channel.recv() => {
                 match dg {
                     Ok(bytes) => {
@@ -136,40 +181,32 @@ pub async fn run_attached(
                             if !input_diff.is_empty() {
                                 let frame = transport.remote_num();
                                 let mut s = handle.session.lock().await;
-                                // Coalesce the drained input before touching the PTY. A single
-                                // datagram set can pack a huge number of events; applying each
-                                // synchronously under the session lock — an `ioctl(TIOCSWINSZ)` +
-                                // SIGWINCH and a `vt100` grid realloc per resize — is a CPU/syscall
-                                // DoS (KOH-05). Intermediate resizes have no observable effect, so
-                                // only the final geometry is applied (once); keystrokes concatenate
-                                // in order. `application_cursor` can't change from client input (it
-                                // is driven by the shell's DECCKM output, processed under this same
-                                // lock), so it is read once. Each resize is still clamped to
-                                // [MIN_DIM, MAX_DIM] before the PTY/vt100 see it (H-1 / M-2).
+                                // Coalesce the drained input before touching the PTY (KOH-05; see
+                                // `coalesce_drained_input`). `application_cursor` can't change from
+                                // client input — it is driven by the shell's DECCKM output, processed
+                                // under this same lock — so it is read once.
                                 let app_cursor = s.emu.application_cursor();
-                                let mut keys = Vec::new();
-                                let mut last_resize: Option<(u16, u16)> = None;
-                                for w in &input_diff {
-                                    match w {
-                                        WireEvent::Keys(b) => {
-                                            keys.extend(cursor_keys.normalize(b, app_cursor));
-                                        }
-                                        WireEvent::Resize { rows, cols } => {
-                                            last_resize =
-                                                Some(crate::terminal::clamp_dims(*rows, *cols));
-                                        }
-                                    }
-                                }
+                                let (keys, last_resize) =
+                                    coalesce_drained_input(&input_diff, &mut cursor_keys, app_cursor);
                                 if !keys.is_empty() {
                                     if let Err(e) = s.pty.write_input(&keys) {
                                         warn!(error = %e, "pty write failed");
                                     }
                                 }
                                 if let Some((rows, cols)) = last_resize {
-                                    let _ = s.pty.resize(rows, cols);
+                                    if let Err(e) = s.pty.resize(rows, cols) {
+                                        // A failed TIOCSWINSZ silently diverges the kernel winsize
+                                        // from the vt100 grid (full-screen-app corruption with no
+                                        // breadcrumb today); warn, but still resize the emulator so
+                                        // the screen geometry keeps tracking the client.
+                                        warn!(error = %e, rows, cols, "pty resize failed");
+                                    }
                                     s.emu.resize(rows, cols);
                                 }
                                 s.emu.register_input_frame(frame, now);
+                                // Applied input may have resized the emulator (a direct grid change
+                                // not signaled via `changed`), so re-snapshot next pass.
+                                dirty = true;
                             }
                         }
                     }
@@ -217,7 +254,8 @@ pub async fn run_session(
 
 #[cfg(test)]
 mod tests {
-    use super::CursorKeyNormalizer;
+    use super::{coalesce_drained_input, CursorKeyNormalizer};
+    use crate::input::WireEvent;
 
     /// Feed `chunks` through one normalizer at the given app-cursor mode, return the PTY bytes.
     fn norm(chunks: &[&[u8]], app_cursor: bool) -> Vec<u8> {
@@ -254,5 +292,39 @@ mod tests {
         // The SS3 state carries across input chunks.
         assert_eq!(norm(&[b"\x1b", b"O", b"A"], false), b"\x1b[A");
         assert_eq!(norm(&[b"\x1b", b"[", b"A"], false), b"\x1b[A");
+    }
+
+    #[test]
+    fn coalesce_keeps_only_the_last_resize_and_concatenates_keys() {
+        // KOH-05: a batch with several resizes collapses to ONLY the last geometry (clamped), while
+        // keystrokes concatenate in order — the CPU/syscall-DoS mitigation, now unit-testable.
+        let mut norm = CursorKeyNormalizer::default();
+        let diff = vec![
+            WireEvent::Keys(b"ab".to_vec()),
+            WireEvent::Resize { rows: 10, cols: 20 },
+            WireEvent::Keys(b"cd".to_vec()),
+            WireEvent::Resize { rows: 30, cols: 40 },
+            WireEvent::Resize {
+                rows: 65000,
+                cols: 1,
+            }, // only this one survives, and it is clamped
+            WireEvent::Keys(b"ef".to_vec()),
+        ];
+        let (keys, last_resize) = coalesce_drained_input(&diff, &mut norm, false);
+        assert_eq!(keys, b"abcdef", "keystrokes concatenate in order");
+        assert_eq!(
+            last_resize,
+            Some(crate::terminal::clamp_dims(65000, 1)),
+            "only the final resize survives, clamped to [MIN_DIM, MAX_DIM]"
+        );
+    }
+
+    #[test]
+    fn coalesce_with_no_resize_returns_none() {
+        let mut norm = CursorKeyNormalizer::default();
+        let diff = vec![WireEvent::Keys(b"x".to_vec())];
+        let (keys, last_resize) = coalesce_drained_input(&diff, &mut norm, false);
+        assert_eq!(keys, b"x");
+        assert!(last_resize.is_none(), "no resize event -> None");
     }
 }

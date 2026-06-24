@@ -153,14 +153,17 @@ pub fn render(
                 cur_style = Some(style);
             }
 
-            let glyph: String = if let Some(p) = concrete {
-                p.glyph.clone()
+            // Borrow a &str per branch — no per-cell String allocation on the hot repaint path
+            // (S-04): `contents()` already returns &str and the predicted glyph is borrowed from the
+            // overlay, both outliving this write. An empty glyph renders as a blank cell.
+            let glyph: &str = if let Some(p) = concrete {
+                &p.glyph
             } else if let Some(c) = cell.filter(|c| c.has_contents()) {
-                c.contents().to_string()
+                c.contents()
             } else {
-                " ".to_string()
+                " "
             };
-            write!(out, "{}", if glyph.is_empty() { " " } else { &glyph })?;
+            write!(out, "{}", if glyph.is_empty() { " " } else { glyph })?;
             col += 1;
         }
     }

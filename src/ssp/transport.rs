@@ -15,6 +15,10 @@ use crate::ssp::{
 };
 
 /// A state snapshot tagged with its sequence number and the wall-clock ms it was created.
+///
+/// Internal SSP machinery: `mod transport` is private and the `ssp` re-export was dropped, so this
+/// is crate-only and not part of the public API (the never-empty-deque invariant is upheld inside
+/// [`Transport`]). `pub` here is already crate-bounded by the private module.
 #[derive(Debug, Clone)]
 pub struct TimestampedState<S> {
     pub timestamp: u64,
@@ -180,6 +184,10 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
     /// Consume the change since the app last looked: the diff from the previously-delivered
     /// remote state to the newest one, then collapse stored received states (mosh
     /// `get_remote_diff`). The server uses this to drain newly-typed input for the PTY.
+    ///
+    /// Intended to be called after a [`recv`](Self::recv) returning [`RecvOutcome::NewState`]. It is
+    /// always safe to call regardless: with no new state the returned diff is empty (`diff_from`
+    /// against the already-delivered state), so an unconditional caller just gets a no-op.
     pub fn get_remote_diff(&mut self) -> Remote::Diff {
         let newest = self.received_last().state.clone();
         let diff = newest.diff_from(&self.last_delivered_remote);
@@ -405,14 +413,16 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         // acked base if that is cheaper / self-healing (prospective resend optimization).
         let assumed_idx = self.assumed_idx();
         let mut chosen_idx = assumed_idx;
-        let mut diff = self
-            .current_state
-            .diff_from(&self.sent_states[assumed_idx].state);
-        let mut diff_bytes = encode_diff(&diff);
+        // Only the serialized bytes are transmitted; don't hold the typed diff (a repaint can be a
+        // few MiB) alive past serialization.
+        let mut diff_bytes = encode_diff(
+            &self
+                .current_state
+                .diff_from(&self.sent_states[assumed_idx].state),
+        );
 
         if self.assumed_receiver_num != self.sent_front().num {
-            let resend = self.current_state.diff_from(&self.sent_front().state);
-            let resend_bytes = encode_diff(&resend);
+            let resend_bytes = encode_diff(&self.current_state.diff_from(&self.sent_front().state));
             let shorter = resend_bytes.len() <= diff_bytes.len();
             let modestly_longer = resend_bytes.len() < 1000
                 && resend_bytes.len().saturating_sub(diff_bytes.len()) < 100;
@@ -423,11 +433,9 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
                     "retargeting diff to the acked base (prospective resend)"
                 );
                 chosen_idx = 0;
-                diff = resend;
                 diff_bytes = resend_bytes;
             }
         }
-        let _ = &diff; // typed diff kept only for clarity; we transmit the bytes.
 
         let chosen_base_num = self.sent_states[chosen_idx].num;
         // The diff is empty exactly when the live state equals the chosen base state.
@@ -814,6 +822,50 @@ mod tests {
             t.remote_state().0,
             60,
             "the refused state must not have been applied"
+        );
+    }
+
+    #[test]
+    fn recv_missing_base_is_reported_and_state_unchanged() {
+        // The diff base (old_num) must be held or the instruction is dropped as MissingBase — the
+        // out-of-order / replay defense. A fresh transport holds only the num-0 base, so an old_num
+        // of 5 references no held base.
+        let mut t = Transport::<Abs, Abs>::new(0, 1200);
+        assert_eq!(
+            t.recv(10, &datagram(&instr(5, 6, 0, 99))),
+            RecvOutcome::MissingBase
+        );
+        assert_eq!(t.remote_num(), 0, "no state was applied");
+    }
+
+    #[test]
+    fn recv_out_of_order_inserts_without_regressing_the_newest() {
+        // A state whose num lands BEFORE an already-held newer state is OutOfOrder: inserted in num
+        // order, but the newest-in-order value (what we render/ack) must not regress.
+        let mut t = Transport::<Abs, Abs>::new(0, 1200);
+        assert_eq!(
+            t.recv(10, &datagram(&instr(0, 2, 0, 22))),
+            RecvOutcome::NewState
+        );
+        assert_eq!(
+            t.recv(20, &datagram(&instr(2, 10, 0, 33))),
+            RecvOutcome::NewState
+        );
+        assert_eq!(t.remote_num(), 10);
+        // Deliver num 5 (between the held 2 and 10): inserted out of order.
+        assert_eq!(
+            t.recv(30, &datagram(&instr(2, 5, 0, 44))),
+            RecvOutcome::OutOfOrder
+        );
+        assert_eq!(
+            t.remote_num(),
+            10,
+            "the newest in-order state must not regress"
+        );
+        assert_eq!(
+            t.remote_state().0,
+            33,
+            "render still reflects the newest (num 10) state"
         );
     }
 

@@ -31,7 +31,7 @@ pub mod testkit;
 mod transport;
 
 pub use rtt::RttEstimator;
-pub use transport::{RecvOutcome, TimestampedState, Transport};
+pub use transport::{RecvOutcome, Transport};
 
 /// `u64::MAX` doubles as both the "never" deadline and the shutdown state sentinel,
 /// exactly as mosh uses `uint64_t(-1)`.
@@ -40,28 +40,29 @@ pub const NEVER: u64 = u64::MAX;
 pub const SHUTDOWN_SENTINEL: u64 = u64::MAX;
 
 // --- scheduler constants (mosh `transportsender.h`, milliseconds) ---
+// `pub(crate)`: internal SSP tuning knobs, referenced only within `src/ssp`; not public API.
 /// Floor on the inter-frame interval.
-pub const SEND_INTERVAL_MIN: u64 = 20;
+pub(crate) const SEND_INTERVAL_MIN: u64 = 20;
 /// Ceiling on the inter-frame interval.
-pub const SEND_INTERVAL_MAX: u64 = 250;
+pub(crate) const SEND_INTERVAL_MAX: u64 = 250;
 /// Interval between empty keep-alive acks when otherwise idle.
-pub const ACK_INTERVAL: u64 = 3000;
+pub(crate) const ACK_INTERVAL: u64 = 3000;
 /// Delay before a coalesced data-ack is flushed.
-pub const ACK_DELAY: u64 = 100;
+pub(crate) const ACK_DELAY: u64 = 100;
 /// Minimum coalescing window for a burst of new input before sending.
-pub const SEND_MINDELAY: u64 = 8;
+pub(crate) const SEND_MINDELAY: u64 = 8;
 /// Stop retransmitting if the peer has been silent this long (it may be roaming).
-pub const ACTIVE_RETRY_TIMEOUT: u64 = 10_000;
+pub(crate) const ACTIVE_RETRY_TIMEOUT: u64 = 10_000;
 /// Shutdown sentinel resends before giving up.
-pub const SHUTDOWN_RETRIES: u32 = 16;
+pub(crate) const SHUTDOWN_RETRIES: u32 = 16;
 /// `sent_states` queue cap; the 16th-from-end is dropped when exceeded.
-pub const SENT_STATES_CAP: usize = 32;
+pub(crate) const SENT_STATES_CAP: usize = 32;
 /// Hard ceiling on the number of retained `received_states` (anti-accumulation).
 ///
 /// Inbound states beyond this are refused outright (not merely rate-limited), so a hostile peer
 /// that pins `old_num`/`throwaway_num` to prevent collapse cannot grow the list without bound
 /// (KOH-01). The per-state-type [`SyncState::RECEIVE_BUDGET_UNITS`] is the companion byte bound.
-pub const RECEIVED_STATES_CAP: usize = 1024;
+pub(crate) const RECEIVED_STATES_CAP: usize = 1024;
 
 /// A synchronizable object: the unit the protocol keeps in sync.
 ///

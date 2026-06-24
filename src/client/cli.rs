@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use crate::predict::DisplayPreference;
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, format_endpoint_id,
-    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, relay_addr,
+    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, parse_secret, relay_addr,
+    MIN_REASONABLE_PASSPHRASE_CHARS,
 };
 use anyhow::Context;
 use clap::{Args, ValueEnum};
@@ -94,17 +95,6 @@ pub struct IdArgs {
 
 fn default_key_file() -> PathBuf {
     crate::transport_iroh::default_key_path("client")
-}
-
-/// Parse a CLI passphrase straight into a [`SecretString`] so the plaintext is never stored in a
-/// long-lived `String` and redacts in any debug/log output (KOH-14). Infallible — emptiness is
-/// treated as "no passphrase" later, not rejected here.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "clap value_parser requires a Result-returning signature"
-)]
-fn parse_secret(s: &str) -> Result<SecretString, std::convert::Infallible> {
-    Ok(SecretString::from(s.to_owned()))
 }
 
 /// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so
@@ -269,10 +259,10 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
         .or_else(|| std::env::var("KOH_PASSPHRASE").ok().map(SecretString::from))
         .filter(|p| !p.expose_secret().is_empty());
     if let Some(p) = &configured_passphrase {
-        if p.expose_secret().chars().count() < 12 {
+        if p.expose_secret().chars().count() < MIN_REASONABLE_PASSPHRASE_CHARS {
             eprintln!(
-                "koh: warning: passphrase is short (<12 chars); it is offline-crackable by a \
-                 server you dial — prefer a long, high-entropy one."
+                "koh: warning: passphrase is short (< {MIN_REASONABLE_PASSPHRASE_CHARS} chars); it \
+                 is offline-crackable by a server you dial — prefer a long, high-entropy one."
             );
         }
     }

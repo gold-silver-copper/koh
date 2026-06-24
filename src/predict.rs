@@ -115,9 +115,6 @@ impl Overlay {
     pub fn is_empty(&self) -> bool {
         self.cells.is_empty() && self.cursor.is_none()
     }
-    pub fn len(&self) -> usize {
-        self.cells.len()
-    }
 }
 
 #[derive(Clone)]
@@ -248,6 +245,43 @@ impl PredictionEngine {
             let (fg, bg) = glyph_style(screen, row, col);
             (cell_glyph(screen, row, col), fg, bg, false)
         }
+    }
+
+    /// Insert a prediction cell at `(row, col)`, stamping the shared, load-bearing invariant: the
+    /// expiration frame (`local_frame_sent + 1`), the current `prediction_epoch` (the security gate
+    /// that hides input until the server confirms it echoes), `now`, and a one-element
+    /// `original_contents` snapshot of the cell being overwritten (so a rewrite back to an earlier
+    /// value grades "no credit"). Centralizes the five identical literals so a future edit can't
+    /// drift one site's invariant on this security-sensitive path (S-07). The per-cell fields
+    /// (`glyph`/`fg`/`bg`/`unknown`) vary and are passed in.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-cell fields differ across the five sites; the invariant fields are stamped here"
+    )]
+    fn place_cell(
+        &mut self,
+        screen: &Screen,
+        row: u16,
+        col: u16,
+        glyph: String,
+        fg: Color,
+        bg: Color,
+        unknown: bool,
+        now: u64,
+    ) {
+        self.cells.insert(
+            (row, col),
+            PredCell {
+                expiration_frame: self.local_frame_sent + 1,
+                tentative_epoch: self.prediction_epoch,
+                prediction_time: now,
+                glyph,
+                fg,
+                bg,
+                original_contents: vec![cell_glyph(screen, row, col)],
+                unknown,
+            },
+        );
     }
 
     pub fn set_display_preference(&mut self, pref: DisplayPreference) {
@@ -388,22 +422,8 @@ impl PredictionEngine {
             return;
         }
         let exp = self.local_frame_sent + 1;
-        let epoch = self.prediction_epoch;
-        let original = cell_glyph(screen, row, col);
         let (fg, bg) = glyph_style(screen, row, col);
-        self.cells.insert(
-            (row, col),
-            PredCell {
-                expiration_frame: exp,
-                tentative_epoch: epoch,
-                prediction_time: now,
-                glyph: g.to_string(),
-                fg,
-                bg,
-                original_contents: vec![original],
-                unknown: false,
-            },
-        );
+        self.place_cell(screen, row, col, g.to_string(), fg, bg, false, now);
         if let Some(c) = self.cursor.as_mut() {
             c.expiration_frame = exp;
             c.col += w as u16;
@@ -515,46 +535,28 @@ impl PredictionEngine {
                     let c = self.cursor_after_init();
                     (c.row, c.col)
                 };
-                let exp = self.local_frame_sent + 1;
-                let epoch = self.prediction_epoch;
                 // Insert mode: shift the row right (cols-1 down to col+1) so the tail moves over
                 // to make room — matching what a readline-style line editor will render. Iterate
                 // right-to-left so each cell reads its left neighbor's pre-shift content.
                 if !self.predict_overwrite {
                     for i in ((col + 1)..cols).rev() {
                         let (g, fg, bg, src_unknown) = self.pred_or_real_glyph(screen, row, i - 1);
-                        let original = cell_glyph(screen, row, i);
                         // The rightmost cell takes content pushed off-screen -> unknown.
                         let unknown = i == cols - 1 || src_unknown;
-                        self.cells.insert(
-                            (row, i),
-                            PredCell {
-                                expiration_frame: exp,
-                                tentative_epoch: epoch,
-                                prediction_time: now,
-                                glyph: if unknown { String::new() } else { g },
-                                fg,
-                                bg,
-                                original_contents: vec![original],
-                                unknown,
-                            },
-                        );
+                        let glyph = if unknown { String::new() } else { g };
+                        self.place_cell(screen, row, i, glyph, fg, bg, unknown, now);
                     }
                 }
-                let original = cell_glyph(screen, row, col);
                 let (fg, bg) = glyph_style(screen, row, col);
-                self.cells.insert(
-                    (row, col),
-                    PredCell {
-                        expiration_frame: exp,
-                        tentative_epoch: epoch,
-                        prediction_time: now,
-                        glyph: (byte as char).to_string(),
-                        fg,
-                        bg,
-                        original_contents: vec![original],
-                        unknown: false,
-                    },
+                self.place_cell(
+                    screen,
+                    row,
+                    col,
+                    (byte as char).to_string(),
+                    fg,
+                    bg,
+                    false,
+                    now,
                 );
                 if let Some(c) = self.cursor.as_mut() {
                     c.expiration_frame = self.local_frame_sent + 1;
@@ -581,22 +583,17 @@ impl PredictionEngine {
                     }
                 };
                 if do_pred {
-                    let epoch = self.prediction_epoch;
                     if self.predict_overwrite {
                         // Overwrite mode: just blank the cell at the new cursor position.
-                        let original = cell_glyph(screen, row, col);
-                        self.cells.insert(
-                            (row, col),
-                            PredCell {
-                                expiration_frame: exp,
-                                tentative_epoch: epoch,
-                                prediction_time: now,
-                                glyph: " ".to_string(),
-                                fg: Color::Default,
-                                bg: Color::Default,
-                                original_contents: vec![original],
-                                unknown: false,
-                            },
+                        self.place_cell(
+                            screen,
+                            row,
+                            col,
+                            " ".to_string(),
+                            Color::Default,
+                            Color::Default,
+                            false,
+                            now,
                         );
                     } else {
                         // Insert mode: shift the row left from col to the right edge; the last
@@ -606,7 +603,6 @@ impl PredictionEngine {
                         // column" — the right-edge cell a wide grapheme could straddle is ambiguous
                         // too. Left-to-right so each cell reads its unshifted right neighbor.
                         for i in col..cols {
-                            let original = cell_glyph(screen, row, i);
                             // `i < cols - 2` is mosh's `i + 2 < width`, written to never overflow
                             // u16 (the screen width is peer-controlled; `i + 2` would wrap/panic at
                             // cols == u16::MAX). The true branch then has `i + 1 < cols`, so the
@@ -616,19 +612,8 @@ impl PredictionEngine {
                             } else {
                                 (String::new(), Color::Default, Color::Default, true)
                             };
-                            self.cells.insert(
-                                (row, i),
-                                PredCell {
-                                    expiration_frame: exp,
-                                    tentative_epoch: epoch,
-                                    prediction_time: now,
-                                    glyph: if unknown { String::new() } else { g },
-                                    fg,
-                                    bg,
-                                    original_contents: vec![original],
-                                    unknown,
-                                },
-                            );
+                            let glyph = if unknown { String::new() } else { g };
+                            self.place_cell(screen, row, i, glyph, fg, bg, unknown, now);
                         }
                     }
                 }
@@ -979,6 +964,64 @@ mod tests {
         let echoed = screen_of(b"abc");
         pe.new_user_byte(0, b'Z', &echoed); // drives the overwrite-mode prediction path
         let _ = pe.overlay(&echoed);
+    }
+
+    #[test]
+    fn malformed_utf8_midgrapheme_resets_without_panicking() {
+        // A lead byte announcing a multi-byte grapheme followed by a NON-continuation byte must
+        // reset the UTF-8 accumulator (no concrete prediction, fall back to the server's echo) and
+        // must never panic or mis-draw the bytes as literal glyphs.
+        let mut pe = PredictionEngine::new(DisplayPreference::Always);
+        pe.set_local_frame_sent(0);
+        let screen = screen_of(b"");
+        pe.new_user_byte(0, 0xE4, &screen); // lead byte of a 3-byte sequence
+        pe.new_user_byte(0, b'A', &screen); // not a continuation -> reset
+        assert!(
+            pe.utf8_buf.is_empty(),
+            "the UTF-8 accumulator must reset after a malformed sequence"
+        );
+        let _ = pe.overlay(&screen);
+    }
+
+    #[test]
+    fn wide_grapheme_in_overwrite_mode_runs_without_panicking() {
+        // The overwrite branch fed a double-width (CJK) grapheme — previously dead code, and the
+        // existing overwrite test drives only ASCII, never the wide-char arm.
+        let (mut e, screen) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+        e.set_predict_overwrite(true);
+        e.set_local_frame_sent(1);
+        for &b in "世".as_bytes() {
+            e.new_user_byte(300, b, &screen);
+        }
+        let _ = e.overlay(&screen);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// Feeding ARBITRARY byte streams (escape bytes, partial UTF-8, arrows interleaved) to the
+        /// byte-at-a-time predictor against a fixed screen must never panic and must keep the UTF-8
+        /// accumulator bounded (<= 4 bytes). The predictor is a stateful decoder over local input —
+        /// exactly the shape that fuzzes well — and a 1.4k-LOC module with no prior property coverage.
+        #[test]
+        fn prop_new_user_byte_is_panic_free_and_utf8_bounded(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        ) {
+            let mut pe = PredictionEngine::new(DisplayPreference::Always);
+            pe.set_local_frame_sent(0);
+            let screen = screen_of(b"ready prompt $ ");
+            let mut now = 0u64;
+            for b in &bytes {
+                pe.new_user_byte(now, *b, &screen); // must not panic on any byte sequence
+                now = now.saturating_add(1);
+                proptest::prop_assert!(
+                    pe.utf8_buf.len() <= 4,
+                    "UTF-8 accumulator grew past 4 bytes: {}",
+                    pe.utf8_buf.len()
+                );
+            }
+            let _ = pe.overlay(&screen); // must not panic on the accumulated prediction set
+        }
     }
 
     #[test]

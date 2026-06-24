@@ -1,7 +1,11 @@
 [package]
 name = "koh"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
+# The effective floor is dictated by the `=`-pinned iroh 1.0.0 (edition 2024 + rust-version 1.91),
+# not by koh's own 2021 edition. Declaring it turns "cargo install on an old toolchain" into a clear
+# "requires rustc 1.91" instead of a confusing mid-compile error. Keep in sync with iroh on each bump.
+rust-version = "1.91"
 license = "GPL-3.0-or-later"
 authors = ["koh authors"]
 repository = "https://github.com/gold-silver-copper/koh"
@@ -9,9 +13,9 @@ description = "koh — a resilient peer-to-peer remote shell: mosh, rewritten in
 readme = "README.md"
 keywords = ["mosh", "shell", "terminal", "iroh", "p2p"]
 categories = ["command-line-utilities", "network-programming"]
-# Keep the published .crate lean: the porting-research notes and docker test infra aren't needed
-# to build or use koh.
-exclude = ["docs/", "testing/", "SECURITY_AUDIT_v0.3.1.md"]
+# Keep the published .crate lean: the porting-research notes, the test infra, the integration tests,
+# and the chaos example aren't needed to build or USE koh (the lib's own unit tests live in `src/`).
+exclude = ["docs/", "testing/", "tests/", "examples/", "SECURITY_AUDIT_v0.3.1.md"]
 
 [[bin]]
 name = "koh"

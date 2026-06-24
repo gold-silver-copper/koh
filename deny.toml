@@ -1,0 +1,16 @@
+# cargo-deny configuration. Run locally with `cargo deny check advisories`.
+#
+# This is the supply-chain tripwire for koh's deliberate exact-version (`=`) dependency pins: the
+# pins buy reproducibility, and this is what keeps them from silently aging into a CVE. Scoped to
+# advisories on purpose — license/bans policy is intentionally not enforced here so the tripwire
+# can't fail on an unrelated policy detail in iroh's large transitive tree.
+
+[advisories]
+# Fail on any security vulnerability in the pinned tree. Specific accepted advisories (and why) are
+# listed below with a rationale.
+ignore = [
+    # paste 1.0.15 is UNMAINTAINED (no known vulnerability — advisory-only). It is a transitive
+    # proc-macro dependency pulled in via iroh's tree, not a direct koh dependency, so it cannot be
+    # removed without an upstream iroh change. No exploit path. Re-evaluate on each iroh bump.
+    "RUSTSEC-2024-0436",
+]

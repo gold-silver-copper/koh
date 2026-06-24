@@ -102,7 +102,10 @@ async fn drain(handle: SharedSession, mut pty_rx: mpsc::Receiver<Vec<u8>>) {
         // replies straight back to the PTY — they are host I/O, not screen content.
         let replies = s.emu.take_host_replies();
         if !replies.is_empty() {
-            let _ = s.pty.write_input(&replies);
+            if let Err(e) = s.pty.write_input(&replies) {
+                // debug, not warn: a just-exited child makes a failed reply write expected and noisy.
+                tracing::debug!(error = %e, "pty host-reply write failed");
+            }
         }
         drop(s);
         handle.changed.notify_one();

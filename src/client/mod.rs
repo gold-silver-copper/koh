@@ -123,16 +123,59 @@ impl IrohConnector {
             .as_ref()
             .as_ref()
             .map(SecretString::expose_secret);
-        crate::transport_iroh::auth::handshake_client(&conn, pass)
-            .await
-            .context("passphrase handshake (wrong or missing --passphrase?)")?;
+        if let Err(e) = crate::transport_iroh::auth::handshake_client(&conn, pass).await {
+            // The server rejects with a specific application reason — "not authorized" / "rate
+            // limited" / "auth failed" / "server at session capacity" — each pointing at a different
+            // operator fix. Surface that real reason instead of a single static guess so the user
+            // doesn't debug the wrong thing. The reason is peer-controlled, so sanitize + cap it.
+            return Err(match server_close_reason(&conn) {
+                Some(reason) => anyhow::Error::new(e)
+                    .context(format!("server rejected the connection: {reason}")),
+                None => anyhow::Error::new(e)
+                    .context("passphrase handshake (wrong or missing --passphrase?)"),
+            });
+        }
         Ok(IrohChannel::new(conn))
     }
+}
+
+/// The server's application close reason, if it rejected us with one. The reason is peer-controlled,
+/// so it is control-char-stripped and length-capped before it can reach the user's terminal.
+/// `close_reason()` is non-blocking (returns `None` if the peer didn't close with a reason), so this
+/// can't hang the error path.
+fn server_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
+    use iroh::endpoint::{ApplicationClose, ConnectionError};
+    let ConnectionError::ApplicationClosed(ApplicationClose { reason, .. }) =
+        conn.close_reason()?
+    else {
+        return None;
+    };
+    let cleaned: String = String::from_utf8_lossy(&reason)
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(80)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 /// Reconnect backoff for a failed dial attempt (1-based `attempt`), in milliseconds.
 fn backoff_ms(attempt: u32) -> u64 {
     (RECONNECT_BACKOFF_BASE_MS << attempt.min(4)).min(RECONNECT_BACKOFF_MAX_MS)
+}
+
+/// The reconnect attempt counter after a connection drops, given how long it stayed up (`dwell_ms`).
+///
+/// A connection that lasted at least [`MIN_CONNECTION_DWELL_MS`] proved itself, so the backoff
+/// resets to 0 (a genuine mid-session drop reconnects promptly). A shorter-lived one — e.g. a
+/// server that accepts then immediately closes — is treated like a failed dial: the counter
+/// increments (saturating) so the next redial backs off, preventing a tight reconnect/repaint churn
+/// loop (K-03). Pure so the branch logic is unit-testable without driving a real connection.
+const fn next_attempt_after_drop(attempt: u32, dwell_ms: u64) -> u32 {
+    if dwell_ms >= MIN_CONNECTION_DWELL_MS {
+        0
+    } else {
+        attempt.saturating_add(1)
+    }
 }
 
 /// Scan typed bytes for the disconnect escape (`Ctrl-^` then `.`) while reconnecting, mirroring
@@ -196,22 +239,17 @@ impl TerminaTerminal {
     pub fn enter(clipboard_enabled: bool) -> std::io::Result<Self> {
         let mut term = PlatformTerminal::new()?;
         term.enter_raw_mode()?;
-        write!(
-            term,
-            "{}{}",
-            Csi::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ClearAndEnableAlternateScreen
-            ))),
-            Csi::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ShowCursor
-            ))),
-        )?;
-        term.flush()?;
-        Ok(Self {
+        // Build the struct, then enter the alternate screen via the SAME helper the resume path
+        // uses, so the enter/leave escape sequences only ever live in one place (enter_screen /
+        // leave_screen). `enter_screen` writes to `self.term` and never reads `oob`, so building
+        // first is inert.
+        let mut this = Self {
             term,
             oob: render::OutOfBand::with_title_prefix(koh_title_prefix())
                 .with_clipboard(clipboard_enabled),
-        })
+        };
+        this.enter_screen()?;
+        Ok(this)
     }
 
     /// Re-enter the alternate screen and hide the cursor (the raw-mode/alt-screen setup shared by
@@ -623,11 +661,7 @@ pub async fn run_client<T: ClientTerminal>(
                 // failed dial — bump the attempt so `reconnect` backs off before redialing, so an
                 // accept-then-instantly-close server can't spin us in a tight loop (K-03).
                 let dwell = clock.now_ms().saturating_sub(conn_started);
-                if dwell >= MIN_CONNECTION_DWELL_MS {
-                    attempt = 0;
-                } else {
-                    attempt = attempt.saturating_add(1);
-                }
+                attempt = next_attempt_after_drop(attempt, dwell);
                 match reconnect(
                     &connector,
                     &mut term,
@@ -673,6 +707,10 @@ async fn drive_connection<T: ClientTerminal>(
     // stall; `SystemTime` keeps real time across suspend. A large gap between two (≤50ms-cadence)
     // iterations therefore fingerprints a resume-from-freeze (see `STALE_AFTER_FREEZE`).
     let mut last_wall = std::time::SystemTime::now();
+    // Last RTT we emitted a debug log for, so an operator with `RUST_LOG=koh=debug` can see whether a
+    // sluggish session is the link (RTT climbing) or the server — without spamming a line per tick
+    // (O-07). Only a meaningful change (>= 30 ms) is logged.
+    let mut last_logged_rtt: Option<f64> = None;
     loop {
         // If real time jumped far ahead of our ≤50ms polling cadence, the process was suspended
         // (phone screen-off). The connection is almost certainly dead, so proactively drop it and
@@ -690,7 +728,14 @@ async fn drive_connection<T: ClientTerminal>(
         }
 
         let now = clock.now_ms();
-        let tick = session.on_tick(now, channel.max_datagram_size(), channel.rtt_ms());
+        let rtt = channel.rtt_ms();
+        if let Some(ms) = rtt {
+            if last_logged_rtt.is_none_or(|prev| (prev - ms).abs() >= 30.0) {
+                tracing::debug!(rtt_ms = ms, "link rtt");
+                last_logged_rtt = Some(ms);
+            }
+        }
+        let tick = session.on_tick(now, channel.max_datagram_size(), rtt);
         for datagram in &tick.outgoing {
             channel.send(datagram);
         }
@@ -715,7 +760,13 @@ async fn drive_connection<T: ClientTerminal>(
                 Some("[koh] session ended"),
                 session.window_state(),
             );
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            // Brief dwell so the "session ended" banner is seen — but stay responsive to a
+            // SIGTERM/SIGINT/SIGHUP (this was the one await not inside the select!), so an impatient
+            // signal right after the shell exits restores the TTY now instead of after 400ms.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(400)) => {}
+                () = shutdown.cancelled() => {}
+            }
             return Ok(Disposition::Ended(code));
         }
 
@@ -1004,6 +1055,24 @@ mod tests {
             RECONNECT_BACKOFF_MAX_MS,
             "shift is clamped, no overflow"
         );
+    }
+
+    #[test]
+    fn dwell_gate_resets_on_proven_connection_and_climbs_on_flap() {
+        // K-03: a connection that lasted >= the dwell threshold proved itself -> backoff resets to 0
+        // (prompt reattach), regardless of the prior attempt count.
+        assert_eq!(next_attempt_after_drop(0, MIN_CONNECTION_DWELL_MS), 0);
+        assert_eq!(next_attempt_after_drop(5, MIN_CONNECTION_DWELL_MS), 0);
+        assert_eq!(
+            next_attempt_after_drop(5, MIN_CONNECTION_DWELL_MS + 10_000),
+            0
+        );
+        // A connection that dropped before the threshold (accept-then-close server) is a flap:
+        // the counter climbs so the next redial backs off.
+        assert_eq!(next_attempt_after_drop(0, 0), 1);
+        assert_eq!(next_attempt_after_drop(3, MIN_CONNECTION_DWELL_MS - 1), 4);
+        // Saturates rather than overflowing under a sustained flapping server.
+        assert_eq!(next_attempt_after_drop(u32::MAX, 0), u32::MAX);
     }
 
     #[test]

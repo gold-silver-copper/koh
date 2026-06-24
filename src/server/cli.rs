@@ -25,7 +25,8 @@ use tokio_util::sync::CancellationToken;
 use crate::server::{run_attached, session, SessionExit};
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
-    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, MonoClock, ALPN,
+    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, parse_secret, MonoClock, ALPN,
+    MIN_REASONABLE_PASSPHRASE_CHARS,
 };
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{error, info, warn};
@@ -44,22 +45,6 @@ const AUTH_MAX_FAILURES: usize = 5;
 /// pending slot for the 300s idle timeout koh configures (`koh_transport_config`). The separate
 /// `passphrase` exchange has its own 3s bound below.
 const ACCEPT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Passphrases shorter than this trigger a startup warning: the challenge-response is offline-
-/// crackable by a server a client dials (KOH-03), so a low-entropy passphrase is weak. Not a hard
-/// floor (existing deployments keep working), just a loud nudge toward a high-entropy secret.
-const MIN_REASONABLE_PASSPHRASE_CHARS: usize = 12;
-
-/// Parse a CLI passphrase straight into a [`SecretString`] so the plaintext is never stored in a
-/// long-lived `String` and redacts in any debug/log output (KOH-14). Infallible — any string is a
-/// valid passphrase; emptiness is treated as "no passphrase" later, not rejected here.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "clap value_parser requires a Result-returning signature"
-)]
-fn parse_secret(s: &str) -> Result<SecretString, std::convert::Infallible> {
-    Ok(SecretString::from(s.to_owned()))
-}
 
 /// Arguments for `koh serve`.
 #[derive(ClapArgs, Debug)]
@@ -160,7 +145,10 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "koh_server=info,koh=info".into()),
+                // The crate is `koh`; there is no `koh_server` target (single-crate layout), so a
+                // `koh_server=` directive matches nothing. `koh=info` covers every module; use
+                // e.g. `koh::server=info` via RUST_LOG for real per-module control.
+                .unwrap_or_else(|_| "koh=info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -550,6 +538,13 @@ fn spawn_signal_drain(shutdown: CancellationToken) -> anyhow::Result<()> {
 /// Cancel `shutdown` once there have been zero active connections continuously for `timeout`
 /// (mosh's `$MOSH_SERVER_NETWORK_TMOUT`). Polls about once a second; resets the idle clock whenever
 /// a connection is live.
+///
+/// Clock semantics: the idle measure is the monotonic `Instant` elapsed, which PAUSES across a host
+/// suspend (like the sibling `run_reaper`), so the watchdog counts *awake-idle* time — a slept laptop
+/// does not accrue idle time and self-reap a retained detached session. This is deliberate; switching
+/// to wall-clock (`SystemTime`) would make this default-off safety net fire across suspend, a
+/// regression for the detach-and-resume workflow. (Contrast the client freeze detector, which WANTS
+/// wall time to notice a long screen-off — see `client::looks_like_resume_from_freeze`.)
 fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration, shutdown: CancellationToken) {
     tokio::spawn(async move {
         let tick = Duration::from_secs(1).min(timeout);

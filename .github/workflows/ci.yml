@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly (Mon 06:00 UTC): re-run the advisory scan so a newly-disclosed CVE against the
+    # deliberately `=`-pinned dependency tree surfaces even with no code change.
+    - cron: "0 6 * * 1"
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The same green gate enforced locally: format, lints, and the full test suite.
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --locked
+      - name: test
+        run: cargo test --locked
+
+  # Supply-chain tripwire: the `=` pins buy reproducibility, so this is what keeps them from
+  # silently aging into a CVE. Advisory ignores (and the rationale) live in deny.toml.
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

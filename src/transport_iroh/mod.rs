@@ -328,6 +328,24 @@ pub fn generate_secret_key() -> SecretKey {
     SecretKey::from_bytes(&bytes)
 }
 
+/// Passphrases shorter than this trigger a startup warning: the passphrase is offline-crackable by
+/// a server a client merely dials (KOH-03), so a low-entropy one is weak. Not a hard floor (existing
+/// deployments keep working) — a loud nudge toward a high-entropy secret. Shared by both CLIs so the
+/// threshold can't drift between them.
+pub(crate) const MIN_REASONABLE_PASSPHRASE_CHARS: usize = 12;
+
+/// Parse a CLI passphrase straight into a [`secrecy::SecretString`] so the plaintext is never stored
+/// in a long-lived `String` and redacts in any debug/log output (KOH-14). Infallible — any string is
+/// a valid passphrase; emptiness is treated as "no passphrase" later, not rejected here. The clap
+/// `value_parser` shared by both `serve` and `connect`.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "clap value_parser requires a Result-returning signature"
+)]
+pub(crate) fn parse_secret(s: &str) -> Result<secrecy::SecretString, std::convert::Infallible> {
+    Ok(secrecy::SecretString::from(s.to_owned()))
+}
+
 /// Parse an [`EndpointId`] from its canonical (hex) string form, or the n0 base32 form.
 pub fn parse_endpoint_id(s: &str) -> Result<EndpointId, SetupError> {
     s.trim()

@@ -446,6 +446,38 @@ mod tests {
         );
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// The untrusted server->client `apply` path must NEVER panic on an arbitrary `ScreenDiff`
+        /// (any `vt` escape bytes, any peer dimensions/strings) and must always leave the screen
+        /// within the dimension clamp and the title/clipboard caps — the invariant prior audits lean
+        /// on (KOH-02/07, K-13, H-1/M-2). Every existing apply test feeds hand-crafted VALID bytes;
+        /// this fuzzes the degenerate-input space where vt100 historically panicked. `vt` is bounded
+        /// to a datagram-ish size so a failure is a logic panic, not an allocator OOM.
+        #[test]
+        fn apply_is_panic_free_and_holds_invariants(
+            vt in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096),
+            resize in proptest::option::of((proptest::prelude::any::<u16>(), proptest::prelude::any::<u16>())),
+            title in proptest::option::of(".{0,512}"),
+            icon in proptest::option::of(".{0,512}"),
+            clipboard in proptest::option::of(".{0,40000}"),
+            echo_ack in proptest::prelude::any::<u64>(),
+            bell_count in proptest::prelude::any::<u64>(),
+            exit_code in proptest::option::of(proptest::prelude::any::<u32>()),
+        ) {
+            let diff = ScreenDiff { resize, echo_ack, title, icon, clipboard, bell_count, exit_code, vt };
+            let mut screen = TerminalScreen::default();
+            screen.apply(&diff); // must not panic on adversarial input
+            let (rows, cols) = screen.size();
+            proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&rows), "rows {rows} escaped the clamp");
+            proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&cols), "cols {cols} escaped the clamp");
+            proptest::prop_assert!(screen.title.chars().count() <= MAX_TITLE_LEN);
+            proptest::prop_assert!(screen.icon.chars().count() <= MAX_TITLE_LEN);
+            proptest::prop_assert!(screen.clipboard.len() <= MAXIMUM_CLIPBOARD_SIZE);
+        }
+    }
+
     #[test]
     fn client_apply_clamps_oom_resize() {
         // A malicious server ships a (65000, 65000) resize. The client must NOT build a 135 GB

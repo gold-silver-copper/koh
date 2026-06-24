@@ -286,4 +286,60 @@ mod tests {
         }
         assert_eq!(reconstructed, b"echo hi\rwhoami");
     }
+
+    use proptest::prelude::*;
+
+    fn arb_event() -> impl Strategy<Value = InputEvent> {
+        prop_oneof![
+            any::<u8>().prop_map(InputEvent::Byte),
+            (any::<u16>(), any::<u16>()).prop_map(|(rows, cols)| InputEvent::Resize { rows, cols }),
+        ]
+    }
+
+    fn ui_from(events: &[InputEvent]) -> UserInput {
+        let mut ui = UserInput::new();
+        for e in events {
+            match e {
+                InputEvent::Byte(b) => ui.push_byte(*b),
+                InputEvent::Resize { rows, cols } => ui.push_resize(*rows, *cols),
+            }
+        }
+        ui
+    }
+
+    proptest! {
+        /// Append-only round-trip law: for any state and any PREFIX base, applying `diff_from` to
+        /// the base reconstructs the state exactly — the SSP keystroke-stream correctness invariant
+        /// over all event sequences, not just the few hand-written examples above.
+        #[test]
+        fn prop_diff_apply_roundtrip_for_prefix_base(
+            events in proptest::collection::vec(arb_event(), 0..64),
+            k in 0usize..=64,
+        ) {
+            let target = ui_from(&events);
+            let cut = k.min(events.len());
+            let base = ui_from(events.get(..cut).unwrap_or(&[]));
+            let mut c = base.clone();
+            c.apply(&target.diff_from(&base));
+            prop_assert_eq!(c, target);
+        }
+
+        /// Untrusted divergent input (base NOT a prefix of self, the out-of-order/replay class the
+        /// audits flagged) must never panic on diff_from/apply/subtract_prefix, and subtract_prefix
+        /// must drain ONLY the genuine common prefix — never past a divergence.
+        #[test]
+        fn prop_divergent_base_is_panic_free_and_subtract_is_bounded(
+            a in proptest::collection::vec(arb_event(), 0..48),
+            b in proptest::collection::vec(arb_event(), 0..48),
+        ) {
+            let s = ui_from(&a);
+            let base = ui_from(&b);
+            let mut applied = base.clone();
+            applied.apply(&s.diff_from(&base)); // must not panic on a divergent base
+            let mut s2 = s; // moved: not used after this
+            s2.subtract_prefix(&base);
+            let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+            prop_assert_eq!(s2.len(), a.len().saturating_sub(common));
+        }
+    }
 }

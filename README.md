@@ -22,7 +22,7 @@ subcommands — `koh serve` (host a shell), `koh connect <id>` (attach to one), 
 > left it), **terminal-reply synthesis** (DSR/DA/DECRQM, so vim/htop/fzf behave), and
 > **remote-shell exit-status propagation**. Client terminal I/O runs on
 > [termina](https://github.com/helix-editor/termina) with synchronized output (no crossterm).
-> 121 tests pass, including property tests, a network-chaos simulator, an in-process
+> A few hundred tests pass across the tiers below — unit and property tests, a network-chaos simulator, an in-process
 > client↔server scenario that converges at 50% packet loss, a reattach acceptance test, an
 > auto-reconnect-after-forced-drop test, **end-to-end tests over a real iroh connection** (both
 > the full loop in one process and the real `koh` binary driven through an allocated
@@ -190,7 +190,7 @@ koh treats every value on the wire as untrusted and bounds what a malicious peer
 
 ```sh
 cargo build --release          # builds the single `koh` binary (target/release/koh)
-cargo test                     # 121 tests: unit, property, chaos sim, real-iroh e2e, reattach, auto-reconnect, PTY binary, ported mosh regressions
+cargo test                     # unit, property, chaos sim, real-iroh e2e, reattach, auto-reconnect, PTY binary, ported mosh regressions
 ```
 
 Pinned toolchain-adjacent versions live in the root `Cargo.toml`: `iroh =1.0.0` (which brings
@@ -230,6 +230,26 @@ client's in `~/…/koh/client.key`. Prediction policy is `--predict adaptive|alw
 `KOH_PREDICT_OVERWRITE=yes` for overwrite-mode prediction in full-screen apps (mosh's
 `MOSH_PREDICTION_OVERWRITE`). Set `KOH_LOG=/tmp/koh.log` to capture client logs without
 disturbing the TUI.
+
+### Environment variables & logging
+
+All of koh's knobs as environment variables (most have a CLI-flag equivalent):
+
+| Variable | Applies to | Effect | Flag equivalent |
+|---|---|---|---|
+| `RUST_LOG` | serve, connect | Log verbosity/filter (`tracing` `EnvFilter`), e.g. `koh=debug` or `koh::server=info`. Server logs to **stderr**; client logs to `$KOH_LOG`. | — |
+| `KOH_LOG` | connect | File the client writes logs to (created `0600`), so logging doesn't disturb the TUI. | — |
+| `KOH_PASSPHRASE` | serve, connect | The optional passphrase second factor. **Prefer this over `--passphrase`** — argv is visible in the process table. | `--passphrase` |
+| `KOH_STATE_DIR` | serve, connect | Base directory for the identity key files (the server's error message points here when the default isn't writable). | `--key-file` (per file) |
+| `KOH_DNS` | serve, connect | Override the discovery DNS resolver (`IP` or `IP:PORT`); needed on some Android/Termux setups. | — |
+| `KOH_CLIPBOARD` | connect | `1` to honor remote OSC-52 clipboard writes (off by default; L-1). | `--clipboard` |
+| `KOH_PREDICT_OVERWRITE` | connect | `yes` for overwrite-mode prediction in full-screen apps. | — |
+| `KOH_TITLE_NOPREFIX` | connect | Set to drop the `[koh] ` window-title prefix (mosh's `MOSH_TITLE_NOPREFIX`). | — |
+| `KOH_SERVER_NETWORK_TMOUT` | serve | Seconds of zero-connection idle before the server exits (mosh's `MOSH_SERVER_NETWORK_TMOUT`). | `--network-timeout-secs` |
+
+> Debugging a stuck session? Start the client with `RUST_LOG=koh=debug KOH_LOG=/tmp/koh.log` and the
+> server with `RUST_LOG=koh=debug` (it logs to stderr). At `debug` the client also reports link RTT,
+> so you can tell a slow link from a slow server.
 
 By default the bare endpoint id is dialed via n0's public relay + DNS discovery. For a LAN or
 self-hosted setup you can skip that:

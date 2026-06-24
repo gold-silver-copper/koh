@@ -223,23 +223,32 @@ fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
         }
         if let Ok(meta) = std::fs::metadata(dir) {
             let mode = meta.permissions().mode();
-            if mode & 0o022 != 0 {
+            // The real threat (KOH-06) is a dir where *another user* can unlink/replace the key.
+            // That is precisely an **other-writable, non-sticky** dir: the sticky bit (e.g. /tmp's
+            // 1777) restricts unlink to file owners, and an other-writable bit is what lets an
+            // unrelated uid write. We must NOT hard-refuse merely group-writable dirs: Android's
+            // standard scratch /data/local/tmp is 0771 (group `shell`, NOT other-writable), and a
+            // single-user device has no co-tenant — refusing it broke koh on Android. So refuse
+            // only a non-sticky other-writable dir; warn (don't refuse) on anything looser than 0700.
+            let other_writable = mode & 0o002 != 0;
+            let sticky = mode & 0o1000 != 0;
+            if other_writable && !sticky {
                 return Err(SetupError::Io(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
-                        "state dir {} is group/other-writable (mode {:o}); a co-located user could \
-                         replace the secret key — tighten it (chmod 700) or pass --key-file / set \
-                         $KOH_STATE_DIR to a private path",
+                        "state dir {} is world-writable without the sticky bit (mode {:o}); any user \
+                         could replace the secret key — chmod 700 it, add the sticky bit, or pass \
+                         --key-file / set $KOH_STATE_DIR to a private path",
                         dir.display(),
-                        mode & 0o777
+                        mode & 0o7777
                     ),
                 )));
             }
             if mode & 0o077 != 0 {
                 tracing::warn!(
                     path = %dir.display(),
-                    mode = format!("{:o}", mode & 0o777),
-                    "state dir is group/other-accessible; tighten with `chmod 700`"
+                    mode = format!("{:o}", mode & 0o7777),
+                    "state dir is group/other-accessible; the key is still 0600, but prefer chmod 700"
                 );
             }
         }
@@ -667,22 +676,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ensure_state_dir_secure_refuses_world_writable() {
-        // KR-06: a group/other-writable state dir (where a co-tenant could swap the key) must be
-        // refused; a private 0700 dir is accepted.
+    fn ensure_state_dir_secure_refuses_only_nonsticky_world_writable() {
+        // KOH-06/KR-06: only a dir where ANOTHER user can replace the key must be refused — that is
+        // a non-sticky *other*-writable dir. A merely group-writable dir (Android's /data/local/tmp
+        // is 0771, NOT other-writable) and a sticky world-writable dir (Linux /tmp is 1777; sticky
+        // restricts unlink to file owners) must be ALLOWED, else koh can't start in those standard
+        // locations.
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("koh-ww-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let set =
+            |m: u32| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+
+        set(0o777); // other-writable, no sticky: anyone can replace the key
         assert!(
             ensure_state_dir_secure(&dir).is_err(),
-            "a group/other-writable state dir must be refused"
+            "a non-sticky world-writable dir must be refused"
         );
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        set(0o700);
         assert!(
             ensure_state_dir_secure(&dir).is_ok(),
-            "a 0700 state dir is accepted"
+            "a private 0700 dir is accepted"
+        );
+        set(0o771); // Android /data/local/tmp shape: group-writable, NOT other-writable
+        assert!(
+            ensure_state_dir_secure(&dir).is_ok(),
+            "a group-writable but not-other-writable dir (0771) must be allowed"
+        );
+        set(0o1777); // Linux /tmp shape: world-writable but sticky
+        assert!(
+            ensure_state_dir_secure(&dir).is_ok(),
+            "a sticky world-writable dir (1777) must be allowed"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

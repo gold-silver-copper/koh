@@ -42,11 +42,15 @@ pub struct UserInput {
 }
 
 impl UserInput {
+    /// Test-only alias for [`Default`]; production constructs via `UserInput::default()`.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Append a single typed byte.
+    /// Append a single typed byte. Test-only convenience; production coalesces via
+    /// [`push_bytes`](Self::push_bytes).
+    #[cfg(test)]
     pub fn push_byte(&mut self, b: u8) {
         self.events.push(InputEvent::Byte(b));
     }

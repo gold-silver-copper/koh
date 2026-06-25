@@ -182,7 +182,7 @@ fn resolve_new_key_passphrase(path: &Path) -> Result<SecretString, SetupError> {
 /// the at-rest encryption (Argon2id + AES-256-GCM) effectively defeatable by an offline attacker who
 /// already holds the key file — i.e. an *effectively unencrypted* key. koh has no plaintext key
 /// format and, by the same logic, no weak-passphrase escape from real encryption.
-const MIN_PASSPHRASE_CHARS: usize = 8;
+const MIN_PASSPHRASE_CHARS: usize = 12;
 
 /// Reject an identity-key passphrase weaker than [`MIN_PASSPHRASE_CHARS`]. Enforced as a HARD floor
 /// (not an advisory) on every key-creation / re-encryption path — the TTY prompt AND
@@ -335,8 +335,8 @@ fn tighten_key_perms_via_fd(file: &std::fs::File, path: &Path, meta: &std::fs::M
 /// Refuse a state dir a co-tenant could tamper with, and flag a merely-loose one (KOH-06 / KOH-12).
 ///
 /// On unix: a group/other-**writable** dir lets another user unlink/replace the secret key even
-/// though the key file itself is 0600, so this hard-errors (pointing at `--key-file` /
-/// `$KOH_STATE_DIR`). A group/other-**readable** (but not writable) dir only grants traverse, so it
+/// though the key file itself is 0600, so this hard-errors (pointing at `--key-file`). A
+/// group/other-**readable** (but not writable) dir only grants traverse, so it
 /// just warns — `create_dir_private` already makes koh-created dirs 0700, so this only fires on a
 /// pre-existing loosened dir or a shared fallback location. No-op off-unix / for the CWD.
 fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
@@ -363,7 +363,7 @@ fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
                     format!(
                         "state dir {} is world-writable without the sticky bit (mode {:o}); any user \
                          could replace the secret key — chmod 700 it, add the sticky bit, or pass \
-                         --key-file / set $KOH_STATE_DIR to a private path",
+                         --key-file pointing at a private path",
                         dir.display(),
                         mode & 0o7777
                     ),
@@ -383,43 +383,39 @@ fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
     Ok(())
 }
 
-/// The default persistent key path when `--key-file` isn't given, for `role` (`"client"`/`"server"`).
-///
-/// Prefers the platform config dir via `ProjectDirs` (desktop unchanged). On Android that yields
-/// nothing, so rather than a relative `koh-<role>.key` in the (often read-only / nondeterministic)
-/// CWD, resolve a **stable, writable** base — see [`state_dir_from`]. The parent dir is created when
-/// the key is first written (`load_or_create_secret_key`); a non-writable location surfaces as a
-/// clear error there (the caller names the path and can suggest `--key-file`).
-pub fn default_key_path(role: &str) -> std::path::PathBuf {
-    if let Some(dirs) = directories::ProjectDirs::from("", "", "koh") {
-        return dirs.config_dir().join(format!("{role}.key"));
+/// koh's config directory — the SINGLE place koh ever keeps files it owns. XDG-style and always
+/// under `~/.config`: `$XDG_CONFIG_HOME/koh` when set, else `$HOME/.config/koh`. There is
+/// deliberately no platform-specific dir (no macOS `Application Support`), no `$TMPDIR` /
+/// `/data/local/tmp` / CWD fallback, and no `$KOH_STATE_DIR` override — one canonical location.
+/// `None` only when neither `$XDG_CONFIG_HOME` nor `$HOME` is set (a daemon with no environment),
+/// in which case the caller must pass an explicit `--key-file`. Pure over its inputs (unit-testable).
+fn config_dir_from(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let nonempty = |o: Option<std::ffi::OsString>| o.filter(|v| !v.is_empty());
+    if let Some(x) = nonempty(xdg_config_home) {
+        return Some(std::path::PathBuf::from(x).join("koh"));
     }
-    state_dir_from(
-        std::env::var_os("KOH_STATE_DIR"),
-        std::env::var_os("HOME"),
-        std::env::var_os("TMPDIR"),
-    )
-    .join(format!("{role}.key"))
+    nonempty(home).map(|h| std::path::PathBuf::from(h).join(".config").join("koh"))
 }
 
-/// Resolve koh's state dir from explicit env values (pure, so it's unit-testable): `$KOH_STATE_DIR`,
-/// else `$HOME/.config/koh` (Termux sets `$HOME`), else `$TMPDIR/koh`, else `/data/local/tmp/koh`.
-fn state_dir_from(
-    koh_state: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-    tmpdir: Option<std::ffi::OsString>,
-) -> std::path::PathBuf {
-    let nonempty = |o: Option<std::ffi::OsString>| o.filter(|v| !v.is_empty());
-    if let Some(d) = nonempty(koh_state) {
-        return std::path::PathBuf::from(d);
-    }
-    if let Some(h) = nonempty(home) {
-        return std::path::PathBuf::from(h).join(".config").join("koh");
-    }
-    if let Some(t) = nonempty(tmpdir) {
-        return std::path::PathBuf::from(t).join("koh");
-    }
-    std::path::PathBuf::from("/data/local/tmp/koh")
+/// The default persistent key path for `role` (`"client"`/`"server"`) when `--key-file` isn't given.
+///
+/// `<config-dir>/<role>.key` under `~/.config/koh` (see [`config_dir_from`]). The dir is created 0700
+/// when the key is first written (`load_or_create_secret_key`). Errors (rather than scattering a key
+/// into the CWD/tmp) when `~/.config` can't be located — pass `--key-file` in that case.
+pub fn default_key_path(role: &str) -> Result<std::path::PathBuf, SetupError> {
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+    .map(|d| d.join(format!("{role}.key")))
+    .ok_or_else(|| {
+        SetupError::Other(anyhow::anyhow!(
+            "cannot locate ~/.config (neither $XDG_CONFIG_HOME nor $HOME is set); pass --key-file"
+        ))
+    })
 }
 
 /// Generate a fresh random secret key (uses the OS RNG so it's independent of iroh's rand version).
@@ -630,11 +626,6 @@ impl IrohChannel {
         Self { conn }
     }
 
-    /// The peer's stable identity.
-    pub fn remote_id(&self) -> EndpointId {
-        self.conn.remote_id()
-    }
-
     /// Send one datagram. Failures (peer congestion, too-large, unsupported) are *dropped* on
     /// purpose: the SSP resends the current state on the next tick, so a lost datagram is a
     /// non-event. Returns whether it was handed to the transport.
@@ -724,48 +715,48 @@ mod tests {
             "empty is rejected"
         );
         assert!(
-            enforce_passphrase_strength("hunter7").is_err(),
-            "7 chars is below the floor"
+            enforce_passphrase_strength(&"a".repeat(MIN_PASSPHRASE_CHARS - 1)).is_err(),
+            "one below the floor is rejected"
         );
         assert!(
-            enforce_passphrase_strength("hunter77").is_ok(),
+            enforce_passphrase_strength(&"a".repeat(MIN_PASSPHRASE_CHARS)).is_ok(),
             "exactly the {MIN_PASSPHRASE_CHARS}-char minimum is accepted"
         );
         assert!(enforce_passphrase_strength("correct horse battery staple").is_ok());
-        // Counts characters, not bytes: 7 two-byte chars is still below the floor.
+        // Counts characters, not bytes: (floor-1) two-byte chars is still below the floor.
         assert!(
-            enforce_passphrase_strength(&"é".repeat(7)).is_err(),
+            enforce_passphrase_strength(&"é".repeat(MIN_PASSPHRASE_CHARS - 1)).is_err(),
             "the floor counts chars, not bytes"
         );
-        assert!(enforce_passphrase_strength(&"é".repeat(8)).is_ok());
+        assert!(enforce_passphrase_strength(&"é".repeat(MIN_PASSPHRASE_CHARS)).is_ok());
     }
 
     #[test]
-    fn state_dir_resolves_in_priority_order() {
+    fn config_dir_is_xdg_then_home_and_never_elsewhere() {
         use std::ffi::OsString;
         use std::path::PathBuf;
         let s = |x: &str| Some(OsString::from(x));
-        // KOH_STATE_DIR wins outright.
+        // $XDG_CONFIG_HOME wins outright.
         assert_eq!(
-            state_dir_from(s("/x"), s("/home/u"), s("/tmp")),
-            PathBuf::from("/x")
+            config_dir_from(s("/x"), s("/home/u")),
+            Some(PathBuf::from("/x/koh"))
         );
-        // Else $HOME/.config/koh (the Termux case).
+        // Else $HOME/.config/koh.
         assert_eq!(
-            state_dir_from(None, s("/home/u"), s("/tmp")),
-            PathBuf::from("/home/u/.config/koh")
+            config_dir_from(None, s("/home/u")),
+            Some(PathBuf::from("/home/u/.config/koh"))
         );
         // Empty values are skipped, not used.
         assert_eq!(
-            state_dir_from(Some(OsString::new()), Some(OsString::new()), s("/tmp")),
-            PathBuf::from("/tmp/koh")
+            config_dir_from(Some(OsString::new()), s("/home/u")),
+            Some(PathBuf::from("/home/u/.config/koh"))
         );
-        // Last resort: a writable Android scratch dir, never a relative CWD path.
-        let last = state_dir_from(None, None, None);
-        assert_eq!(last, PathBuf::from("/data/local/tmp/koh"));
-        assert!(
-            last.is_absolute(),
-            "the default must be absolute, not CWD-relative"
+        // No XDG and no HOME: NO default (the caller must pass --key-file) — koh never falls back to
+        // a CWD/tmp/platform path. ~/.config is the only location koh ever picks on its own.
+        assert_eq!(config_dir_from(None, None), None);
+        assert_eq!(
+            config_dir_from(Some(OsString::new()), Some(OsString::new())),
+            None
         );
     }
 

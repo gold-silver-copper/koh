@@ -212,8 +212,8 @@ koh connect 871b…
 # connected. (Ctrl-^ then . to disconnect)
 ```
 
-The server's identity persists in `~/…/koh/server.key` (override with `--key-file`); the
-client's in `~/…/koh/client.key`. Prediction policy is `--predict adaptive|always|never`
+The server's identity persists in `~/.config/koh/server.key` (override with `--key-file`); the
+client's in `~/.config/koh/client.key`. Prediction policy is `--predict adaptive|always|never`
 (default adaptive: it engages only when the link is slow enough to benefit). Set
 `KOH_LOG=/tmp/koh.log` to capture client logs without disturbing the TUI.
 
@@ -226,8 +226,7 @@ All of koh's knobs as environment variables (most have a CLI-flag equivalent):
 | `RUST_LOG` | serve, connect | Log verbosity/filter (`tracing` `EnvFilter`), e.g. `koh=debug` or `koh::server=info`. Server logs to **stderr**; client logs to `$KOH_LOG`. | — |
 | `KOH_LOG` | connect | File the client writes logs to (created `0600`), so logging doesn't disturb the TUI. | — |
 | `KOH_KEY_PASSPHRASE` | serve, connect, key | Passphrase to decrypt the (always-encrypted) identity key. Lets an unattended `koh serve`/`koh connect` open the key without a TTY prompt. | — |
-| `KOH_KEY_NEW_PASSPHRASE` | serve, connect, key | Passphrase used when **creating** a key on first run, and the new passphrase for `koh key passwd`; for CI/automation instead of the confirmed prompt. Must meet the enforced minimum strength (≥ 8 chars). | — |
-| `KOH_STATE_DIR` | serve, connect | Base directory for the identity key files (the server's error message points here when the default isn't writable). | `--key-file` (per file) |
+| `KOH_KEY_NEW_PASSPHRASE` | serve, connect, key | Passphrase used when **creating** a key on first run, and the new passphrase for `koh key passwd`; for CI/automation instead of the confirmed prompt. Must meet the enforced minimum strength (≥ 12 chars). | — |
 | `KOH_DNS` | serve, connect | Override the discovery DNS resolver (`IP` or `IP:PORT`); needed on some Android/Termux setups. | — |
 
 > Debugging a stuck session? Start the client with `RUST_LOG=koh=debug KOH_LOG=/tmp/koh.log` and the
@@ -236,14 +235,19 @@ All of koh's knobs as environment variables (most have a CLI-flag equivalent):
 
 ### The identity key (always encrypted at rest)
 
-The identity key *is* the node — anyone who can read `~/…/koh/{server,client}.key` owns the identity.
-koh **always** stores it passphrase-encrypted (`koh-key-v1`: **Argon2id + AES-256-GCM**, modeled on
-OpenSSH's `openssh-key-v1`); there is **no plaintext format**. So a stolen/backed-up key file is
-useless without the passphrase — file permissions are no longer the only thing protecting it.
+The identity key *is* the node — anyone who can read it owns the identity. koh keeps every file it
+owns in **one place: `~/.config/koh/`** (`$XDG_CONFIG_HOME/koh` if set) — there is no platform-specific
+dir, no `/tmp` / `/data/local/tmp` fallback, and no CWD scatter; the keys are `{server,client}.key`
+there. (`--key-file` still points at an explicit path when you need one, e.g. on Android.)
+
+koh **always** stores the key passphrase-encrypted (`koh-key-v1`: **Argon2id (64 MiB / 4 passes) +
+AES-256-GCM**, modeled on OpenSSH's `openssh-key-v1`); there is **no plaintext format**. So a
+stolen/backed-up key file is useless without the passphrase — file permissions are no longer the only
+thing protecting it.
 
 On first run, `koh serve`/`koh connect` generate the key and prompt for a passphrase to encrypt it
 (or read `$KOH_KEY_NEW_PASSPHRASE` when there's no TTY). koh enforces a **minimum passphrase length
-(8 chars)** on creation and re-encryption — on every path, prompt or env — so an *effectively*
+(12 chars)** on creation and re-encryption — on every path, prompt or env — so an *effectively*
 unencrypted key can't be created, mirroring the no-plaintext-format rule. Thereafter every command
 that loads the key prompts for it, or reads `$KOH_KEY_PASSPHRASE` for unattended use:
 

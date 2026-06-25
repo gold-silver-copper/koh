@@ -125,9 +125,11 @@ struct PredCell {
     glyph: String,
     fg: Color,
     bg: Color,
-    /// History of prior contents at this cell so a rewrite that lands back on an earlier value
-    /// grades "no credit" (can't falsely confirm an epoch).
-    original_contents: Vec<String>,
+    /// The prior content at this cell (the glyph being overwritten) so a rewrite that lands back on
+    /// that earlier value grades "no credit" (can't falsely confirm an epoch). `None` for an
+    /// `unknown` cell, which never grades against it. Was a `Vec` (only ever 0/1 elements); an
+    /// `Option` drops the per-cell heap-vec on the O(cols)/keystroke row-shift path.
+    original_contents: Option<String>,
     /// "Changed here, not sure what" — never drawn as a glyph; underline-only hint.
     unknown: bool,
 }
@@ -279,9 +281,9 @@ impl PredictionEngine {
                 fg,
                 bg,
                 original_contents: if unknown {
-                    Vec::new()
+                    None
                 } else {
-                    vec![cell_glyph(screen, row, col)]
+                    Some(cell_glyph(screen, row, col))
                 },
                 unknown,
             },
@@ -909,7 +911,7 @@ fn cell_validity(
     }
     let actual = cell_glyph(screen, row, col);
     if actual == cell.glyph {
-        if cell.original_contents.iter().any(|o| o == &actual) {
+        if cell.original_contents.as_deref() == Some(actual.as_str()) {
             Validity::CorrectNoCredit // it already looked like this earlier; no credit
         } else {
             Validity::Correct
@@ -1360,7 +1362,7 @@ mod tests {
                 glyph: "Q".to_string(),
                 fg: Color::Default,
                 bg: Color::Default,
-                original_contents: vec![String::new()],
+                original_contents: Some(String::new()),
                 unknown: false,
             },
         );
@@ -1403,7 +1405,7 @@ mod tests {
                 glyph: String::new(),
                 fg: Color::Default,
                 bg: Color::Default,
-                original_contents: Vec::new(),
+                original_contents: None,
                 unknown: true,
             },
         );

@@ -7,7 +7,7 @@
 //! survives client disconnects; a per-connection [`run_attached`] loop drives a *fresh*
 //! `Transport` against it, so a reconnecting client re-syncs to the current screen.
 
-pub mod audit;
+mod audit;
 pub mod cli;
 pub mod session;
 

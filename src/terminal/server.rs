@@ -171,7 +171,8 @@ impl ServerTerminal {
         self.parser.screen_mut().set_size(rows, cols);
     }
 
-    /// `(rows, cols)`.
+    /// `(rows, cols)`. Test-only: production reads geometry from the snapshot, not the live emulator.
+    #[cfg(test)]
     pub fn size(&self) -> (u16, u16) {
         self.parser.screen().size()
     }
@@ -215,7 +216,8 @@ impl ServerTerminal {
         fire_at.saturating_sub(now)
     }
 
-    /// The current echo-ack value.
+    /// The current echo-ack value. Test-only; production reads it off the synced snapshot.
+    #[cfg(test)]
     pub fn echo_ack(&self) -> u64 {
         self.echo_ack
     }

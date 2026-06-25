@@ -98,10 +98,6 @@ fn connect_qr(data: &str) -> Option<String> {
     )
 }
 
-fn default_key_file() -> PathBuf {
-    crate::transport_iroh::default_key_path("server")
-}
-
 /// `koh serve` — host a PTY shell for authorized clients over iroh.
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -128,7 +124,10 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         );
     }
 
-    let key_file = args.key_file.clone().unwrap_or_else(default_key_file);
+    let key_file = match args.key_file.clone() {
+        Some(p) => p,
+        None => crate::transport_iroh::default_key_path("server")?,
+    };
     let secret = load_or_create_secret_key(&key_file).with_context(|| {
         format!(
             "loading server key from {} (pass --key-file to use a writable path)",

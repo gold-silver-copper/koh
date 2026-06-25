@@ -33,7 +33,7 @@ pub use server::ServerTerminal;
 pub const DEFAULT_ROWS: u16 = 24;
 pub const DEFAULT_COLS: u16 = 80;
 /// Server-side debounce before a received input frame is considered "echoed" (mosh `ECHO_TIMEOUT`).
-pub const ECHO_TIMEOUT_MS: u64 = 50;
+pub(crate) const ECHO_TIMEOUT_MS: u64 = 50;
 
 /// Bounds on a peer-controlled terminal geometry.
 ///
@@ -54,7 +54,7 @@ pub const MAX_DIM: u16 = 1000;
 /// mosh truncates OSC 0/1/2 at parse; no real app sends a multi-KiB title, so this just bounds a
 /// hostile/runaway one. Enforced on the trusted server emulator *and* re-applied on the client,
 /// which must never trust the wire.
-pub const MAX_TITLE_LEN: usize = 256;
+pub(crate) const MAX_TITLE_LEN: usize = 256;
 
 /// Upper bound on a forwarded clipboard payload (mosh's `MAXIMUM_CLIPBOARD_SIZE`).
 ///
@@ -351,12 +351,20 @@ impl SyncState for TerminalScreen {
             // Lazily (re)build the parser from the snapshot on the first apply / after a clone,
             // then feed only the incremental diff bytes. Steady-state cost is O(diff.vt), not a
             // full re-parse of the whole grid every frame.
-            let parser = self.parser.get_or_insert_with(|| {
+            if self.parser.is_none() {
                 let (rows, cols) = self.screen.size();
                 let mut p = Box::new(vt100::Parser::new(rows, cols, 0));
-                p.process(&self.screen.state_formatted());
-                p
-            });
+                // Contain the rebuild too. `state_formatted()` comes from our OWN prior-contained,
+                // dim-clamped screen so a panic here is very unlikely, but the containment doctrine is
+                // "every vt100 `process()` of bytes is wrapped" — keep the code matching the claim.
+                if !process_contained(&mut p, &self.screen.state_formatted()) {
+                    return; // keep the prior screen; a later apply retries the rebuild
+                }
+                self.parser = Some(p);
+            }
+            let Some(parser) = self.parser.as_mut() else {
+                return; // just set to Some above; this satisfies the no-unwrap lints
+            };
             if !diff.vt.is_empty() && !process_contained(parser, &diff.vt) {
                 // Contained vt100 panic mid-stream: the parser's state is now unknown, so drop it
                 // (the next apply rebuilds from the last-good `screen`) and discard this frame.

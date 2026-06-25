@@ -52,9 +52,9 @@ pub struct ServeArgs {
     #[arg(long = "allow", value_name = "ENDPOINT_ID")]
     allow: Vec<String>,
 
-    /// INSECURE: accept any client (a shell to anyone who can reach the endpoint). For local
-    /// testing — pair with `--local`. On a relayed/public bind it additionally requires
-    /// `KOH_I_UNDERSTAND_ALLOW_ANY=1`; combine with `--read-only` for an observe-only screen-share.
+    /// INSECURE: accept any client — a shell to anyone who can reach the endpoint, with no
+    /// allowlist. For local/testing use (pair with `--local`); on a public bind prefer
+    /// `--read-only` for an observe-only screen-share. Prints a loud warning when set.
     #[arg(long)]
     allow_any: bool,
 
@@ -178,20 +178,6 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             "no clients authorized: pass --allow <endpoint-id> (repeatable), --allow-file <path>, or --allow-any for testing"
         );
     }
-    // `--allow-any` serves a shell to ANY dialer. On a relayed/public bind that is a severe footgun,
-    // so require an explicit env acknowledgement there — a loud opt-in beyond the flag. On `--local`
-    // (LAN/loopback) it stays frictionless for testing. A public observe-only screen-share is the one
-    // defensible use (`--allow-any --read-only`); the ack still permits it.
-    if args.allow_any
-        && !args.local
-        && std::env::var("KOH_I_UNDERSTAND_ALLOW_ANY").as_deref() != Ok("1")
-    {
-        anyhow::bail!(
-            "--allow-any serves a shell to anyone who can reach this non-local endpoint; set \
-             KOH_I_UNDERSTAND_ALLOW_ANY=1 to confirm (or use --local for LAN testing; prefer \
-             --read-only for a public screen-share)"
-        );
-    }
 
     let key_file = args.key_file.clone().unwrap_or_else(default_key_file);
     let secret = load_or_create_secret_key(&key_file).with_context(|| {
@@ -238,7 +224,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!("│ key file    : {}", key_file.display());
     eprintln!("│ alpn        : {}", String::from_utf8_lossy(ALPN));
     if args.allow_any {
-        eprintln!("│ auth        : ⚠ ALLOW-ANY (insecure)");
+        eprintln!("│ auth        : ⚠ ALLOW-ANY (INSECURE) — a shell to ANYONE who can reach this");
+        eprintln!("│             :   endpoint, with no allowlist. Use only on trusted/local nets.");
     } else {
         eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
     }
@@ -260,6 +247,16 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
+
+    // Also surface --allow-any as a structured WARN (so it lands in logs / SIEM, not just the
+    // banner). It is permitted with no extra ceremony — this is the loud notice, not a gate.
+    if args.allow_any {
+        warn!(
+            local = args.local,
+            "--allow-any is set: ANY peer that can reach this endpoint gets a shell (no allowlist). \
+             Use only on trusted/local networks; prefer --read-only on a public bind."
+        );
+    }
 
     // Always print a scannable QR of the endpoint id — point a phone camera at it instead of
     // copying 64 hex chars.

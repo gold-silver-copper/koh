@@ -83,51 +83,71 @@ adaptive|always|never`, `--clipboard` (opt-in OSC-52), `--session-ttl-secs`,
 JNI-context panic (override with `KOH_DNS=1.1.1.1`). Run `termux-wake-lock` so the OS doesn't freeze
 the process during a long screen-off.
 
-## koh vs mosh
+## Alternatives
 
-koh shares mosh's SSP ancestry (predictive echo, datagram state-sync, roaming) but replaces mosh's
-two structural weaknesses: mosh has **no key exchange** — a single static AES-128-OCB key, printed
-by `mosh-server`, shipped over a piggybacked SSH login, and left in the client's `MOSH_KEY` env var
-(no forward secrecy, a second protocol in the trust path, a documented local key-theft exposure).
-koh rides iroh's per-session X25519 ECDHE keys (forward secrecy by construction), authenticates the
-peer by a pinned node-id with no SSH dependency, and has no session secret to leak. It also adds real
-**detach/reattach** (mosh has none — `mosh-server` dies with its session). mosh still wins on
-**maturity and ubiquity** (a decade of field exposure, packaged everywhere) and on inheriting SSH's
-account/PAM/2FA ecosystem for free.
+koh's bet is a **combination no single alternative has**: mosh-style predictive echo + detach/reattach
++ p2p with no listening port + memory-safe Rust. The honest landscape (✅ built-in · ❌ no · ⚠️ partial):
 
-| | mosh | koh |
-|---|---|---|
-| Transport crypto | AES-128-OCB, one **static** key | iroh QUIC + TLS 1.3, per-session AEAD |
-| Forward secrecy / rekey | none | yes (X25519 ECDHE per session) |
-| Bootstrap | requires an SSH login each time | self-contained; no SSH, no listening port |
-| Session secret at client | AES key in `MOSH_KEY` env | none (and `KOH_*` scrubbed from the shell) |
-| Detach / reattach | none (use tmux) | native, per-peer |
-| Identity at rest | none persistent | one key, always encrypted |
-| Maturity / ubiquity | **mature, everywhere** | young, single-maintainer, unaudited |
+| | **koh** | mosh | OpenSSH | Eternal Terminal | wush |
+|---|---|---|---|---|---|
+| Transport / reach | p2p QUIC, by node-id | UDP, over an SSH login | TCP `:22` | TCP `:2022`, over SSH | p2p WireGuard / DERP |
+| No listening port | ✅ | ❌ (needs `sshd`) | ❌ | ❌ (needs `sshd`) | ✅ |
+| Predictive local echo | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Reconnect / roam (survive IP change) | ✅ | ✅ | ❌ | ✅ | ⚠️ (WireGuard) |
+| Persistent session (detach → reattach) | ✅ | ❌ | ❌ (use tmux) | ✅ | ❌ |
+| Scrollback | ❌ (screen-sync only) | ❌ | ✅ | ✅ | ✅ |
+| File transfer | ❌ | ❌ | ✅ (scp/sftp) | ❌ | ✅ (`wush cp`) |
+| Port forwarding | ❌ | ❌ | ✅ | ✅ | ❌ |
+| Auth | node-id allowlist, **no TOFU** | via SSH | keys / 2FA / FIDO2, TOFU host | via SSH | shared overlay key |
+| Multi-user / accounts | ❌ (single-operator) | ✅ (SSH) | ✅ | ✅ (SSH) | ❌ |
+| Language | Rust, `forbid(unsafe)` | C++ | C | C++ | Go |
+| Maturity | new (2026) | mature, ubiquitous | universal | established | new (2024) |
 
-## koh vs ssh
+- **[mosh](https://mosh.org)** — the predictive-echo + roaming ancestor koh descends from. koh adds
+  detach/reattach, forward-secret per-session crypto, and p2p with no SSH dependency. *Still pick mosh*
+  for a battle-tested tool that's packaged everywhere and rides your existing SSH accounts/2FA.
+- **OpenSSH** — the universal everything-tool: forwarding, sftp, agent, jump hosts, multi-user. koh
+  isn't a replacement — it's a focused interactive shell that's safer by construction (no port, no
+  TOFU, Rust). ssh's edges koh lacks: post-quantum-default KEX, FIDO2 hardware keys, privilege
+  separation, and decades of audit. *Still pick ssh* for file transfer, tunnels, accounts, or scripting.
+- **[Eternal Terminal](https://eternalterminal.dev)** — reliable auto-reconnect + native scrollback +
+  port-forwarding over an SSH-bootstrapped TCP link. koh adds predictive echo and p2p (no port, no
+  SSH) but lacks ET's scrollback. *Still pick ET* if you live in scrollback, must cross a strict
+  TCP-only firewall, or want SSH-native auth.
+- **[wush](https://github.com/coder/wush)** — koh's closest modern-p2p cousin (WireGuard/DERP) and the
+  file-transfer king (`wush cp`). koh adds the mosh-feel (predictive echo, detach/reattach) and drops
+  the Tailscale/WireGuard dependency, but has **no file transfer yet**. *Still pick wush* for
+  one-command p2p file transfer.
 
-koh and OpenSSH are different tools, and most of what ssh has that koh lacks — port/agent/X11
-forwarding, ProxyJump, sftp, multiplexing, multi-user/PAM/ForceCommand — are **deliberate non-goals**
-for a single-operator p2p shell (each is also an attack surface). On the axes that overlap, koh is
-structurally ahead: **no listening TCP port** (no mass-scanning, no pre-auth-port RCE class, no
-brute-force floods), **no TOFU window** (the id *is* the address, authenticated every connect), a
-memory-safe `forbid(unsafe)` codebase two orders of magnitude smaller than sshd, and a single
-**always-encrypted** identity key (safer than ssh's common unencrypted-key default). ssh's real,
-non-shortcuttable edges: **post-quantum-default KEX** (koh inherits X25519-only from iroh — tracked,
-not yet available), **FIDO2 hardware keys**, runtime **privilege separation/sandboxing**, and
-decades of **audit + CVE-response maturity**.
+> Also at the edges: tmux/zellij (multiplexing), sshx/upterm (terminal sharing), Tailscale SSH /
+> Teleport (managed access). koh's lane is the **mobile-first, predictive, p2p interactive shell** —
+> and its biggest gaps vs the field are **file transfer** and **scrollback**.
 
-| | OpenSSH | koh |
-|---|---|---|
-| Listening surface | TCP/22, Internet-scannable | **none** — node-id + allowlist |
-| Host auth | known_hosts **TOFU** | dial-by-id, authenticated by construction, no TOFU |
-| Post-quantum KEX | default (mlkem768x25519) | not yet (X25519, inherited from iroh) |
-| Hardware keys (FIDO2) | yes | no (key always encrypted at rest) |
-| Privsep / sandbox | yes (privsep + seccomp/pledge) | none (mitigated: no unsafe, no open port) |
-| Memory safety | C | Rust, `forbid(unsafe)` |
-| Forwarding / sftp / multiplex / multi-user | full suite | **omitted by design** |
-| Maturity / audit | **decades, universal** | young, unaudited |
+## Why koh doesn't ride on SSH (the way mosh does)
+
+mosh isn't a standalone protocol — it **bootstraps over an SSH login**. `mosh user@host` runs `ssh`
+first, which authenticates you, drops you into your **account**, and launches `mosh-server`; mosh then
+takes over the interactive session over UDP. So mosh inherits SSH's auth, accounts, host keys,
+bastions, agent, and PAM/2FA **for free** — it only had to solve the responsive-roaming-session piece.
+
+koh deliberately doesn't, because every koh property depends on *not* needing SSH:
+
+- **No listening port.** Riding on SSH means a reachable `sshd` — an open TCP port plus its whole
+  codebase in the trust path. koh is reachable only by a non-enumerable node-id through relays /
+  hole-punching, *including a machine with no open ports at all* (your phone → your NAT'd PC). That's
+  the whole p2p/mobile premise.
+- **No TOFU, no second protocol, forward secrecy.** koh's node-id *is* the identity, authenticated by
+  the QUIC/TLS handshake on every connect — no `known_hosts` first-use window, and no static session
+  key piggybacked over a second protocol (mosh's `MOSH_KEY`). koh's own channel is already stronger, so
+  there's nothing to gain by bootstrapping over SSH.
+
+**The honest trade:** by solving auth itself — cryptographically, via the node-id allowlist — koh gives
+up what SSH handed mosh for free: **user accounts / multi-user, SSH's auth factors (passwords, 2FA,
+FIDO2, PAM) and policy (`ForceCommand`, `authorized_keys` options), and the universal `sshd` install
+base.** That is why koh is a *single-operator tool for machines you own*, not an ssh replacement. (A
+future opt-in "koh over an existing SSH connection" mode could inherit SSH's auth while keeping koh's
+predictive-echo + detach/reattach session — but it would re-add the open port and a second protocol, so
+it's deliberately out of scope today.)
 
 ## Security at a glance
 

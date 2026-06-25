@@ -15,6 +15,12 @@ scaled() { if [ "$STRESS_LEVEL" = full ]; then echo "$2"; else echo "$1"; fi; }
 DEVICE_SHELL="${KOH_DEVICE_SHELL:-/system/bin/sh}"   # Android has no /bin/sh; sessions need this
 SRV_KEY="${KOH_SRV_KEY:-/data/local/tmp/koh-server.key}"
 SRV_LOG="${KOH_SRV_LOG:-/data/local/tmp/koh-server.log}"
+# The shared client key the server allowlists by default — koh has no "accept any" mode, so a peer
+# must be on `--allow`. Tests that connect with a different key must register it via
+# `allow_client_key <key-file>` BEFORE `start_server`, or they will be (correctly) refused.
+CLI_KEY="${KOH_CLI_KEY:-/data/local/tmp/koh-client.key}"
+ALLOW_IDS=""   # extra `--allow <id>` flags beyond the shared CLI_KEY (built by allow_client_key)
+allow_client_key() { ALLOW_IDS="$ALLOW_IDS --allow $(koh_id_of "$1")"; }
 SERVER_ID=""
 SERVER_PORT=""
 
@@ -61,7 +67,10 @@ cpu_jiffies() {
 start_server() {
   _extra="${1:-}"
   case " $_extra " in *" --shell "*) _shellarg="" ;; *) _shellarg="--shell $DEVICE_SHELL" ;; esac
-  adb $ADB_SERIAL shell "rm -f $SRV_LOG; nohup $DEVICE_BIN serve --allow-any --local $_shellarg --key-file $SRV_KEY $_extra >$SRV_LOG 2>&1 &" >/dev/null
+  # Allowlist the shared client key (plus any registered via allow_client_key). koh requires at
+  # least one --allow; there is no accept-any mode.
+  _allow="--allow $(koh_id_of "$CLI_KEY")$ALLOW_IDS"
+  adb $ADB_SERIAL shell "rm -f $SRV_LOG; $KENV nohup $DEVICE_BIN serve $_allow --local $_shellarg --key-file $SRV_KEY $_extra >$SRV_LOG 2>&1 &" >/dev/null
   SERVER_ID=""; SERVER_PORT=""
   _i=0
   while [ "$_i" -lt 25 ]; do
@@ -80,8 +89,9 @@ stop_all_koh() { kill_remote_koh; sleep 1; }
 
 # --- client drivers --------------------------------------------------------------------------------
 # Non-TTY connect: reaches "connected." then errors at raw mode (no TTY) and exits. Sets OUT/RC.
-connect_once() {  # connect_once <key-file> [extra args]
-  run_remote "$DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file $1 --predict never ${2:-}"
+connect_once() {  # connect_once [key-file=$CLI_KEY] [extra args]  (run_remote injects $KENV)
+  _kf="${1:-$CLI_KEY}"
+  run_remote "$DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file $_kf --predict never ${2:-}"
 }
 
 # PTY connect (adb shell -t -t): the client gets a real TTY, enters raw mode and runs the TUI.
@@ -93,7 +103,7 @@ pty_connect_bg() {  # pty_connect_bg <key-file> <devlog> <hold-secs> [feed]
   _cap=$((_hold + 12))
   ( { [ -n "$_feed" ] && printf '%b' "$_feed"; sleep "$_hold"; printf '\036.'; sleep 2; } \
       | to "$_cap" adb $ADB_SERIAL shell -t -t \
-          "$DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file $_kf >$_log 2>&1" \
+          "$KENV $DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file $_kf >$_log 2>&1" \
       >/dev/null 2>&1 || true ) &
   PTY_BG_PID=$!
 }
@@ -107,7 +117,7 @@ pty_connect_host_bg() {  # pty_connect_host_bg <key-file> <HOST-logfile> <hold-s
   : > "$_hlog"
   ( { [ -n "$_feed" ] && printf '%b' "$_feed"; sleep "$_hold"; printf '\036.'; sleep 2; } \
       | to "$_cap" adb $ADB_SERIAL shell -t -t \
-          "$DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file $_kf" \
+          "$KENV $DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file $_kf" \
       > "$_hlog" 2>&1 || true ) &
   PTY_BG_PID=$!
 }

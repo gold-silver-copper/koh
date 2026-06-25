@@ -1,5 +1,10 @@
 # TASK: Fix the Android robustness issues the emulator tests surfaced, and add the high-value emulator tests
 
+> **NOTE (historical brief; auth model changed in 0.7.0).** Any passphrase / PAKE / second-factor or
+> `--allow-any` references below predate 0.7.0 and no longer match koh: the PAKE factor was removed,
+> servers require `--allow <id>`, and identity keys are always encrypted under `$KOH_KEY_PASSPHRASE`.
+> The live `scripts/` are the source of truth; this file is kept as history.
+
 ## GOAL
 Land four code fixes that the Android emulator tests revealed as real koh gaps, and add five new
 emulator tests that exercise koh's marquee Android behaviors. Keep every existing gate green.

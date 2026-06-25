@@ -15,7 +15,7 @@ push_binary
 
 echo "Test 1 — koh serve binds the iroh endpoint on Android (constructs DnsResolver) without panicking"
 # serve blocks on accept(); run it briefly and assert on the banner it prints before blocking.
-run_remote_blocking 12 "$DEVICE_BIN serve --allow-any --local --key-file /data/local/tmp/koh-server.key"
+run_remote_blocking 12 "$DEVICE_BIN serve --allow $(koh_id_of /data/local/tmp/koh-client.key) --local --key-file /data/local/tmp/koh-server.key"
 printf '%s\n' "$OUT" | grep -E 'koh server ready|endpoint id|connect|ndk-context|panic' | sed 's/^/    serve| /' | head -8
 
 fail=0

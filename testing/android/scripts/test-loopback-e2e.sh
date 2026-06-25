@@ -16,7 +16,8 @@ kill_remote_koh
 
 LOG=/data/local/tmp/koh-server.log
 echo "Test 3 — on-device loopback: serve + connect over --direct 127.0.0.1"
-adb_ shell "rm -f $LOG; nohup $DEVICE_BIN serve --allow-any --local --key-file /data/local/tmp/koh-server.key >$LOG 2>&1 &" >/dev/null
+CLIENT_ID="$(koh_id_of /data/local/tmp/koh-client.key)"
+adb_ shell "rm -f $LOG; $KENV nohup $DEVICE_BIN serve --allow $CLIENT_ID --local --key-file /data/local/tmp/koh-server.key >$LOG 2>&1 &" >/dev/null
 
 # Wait for the server to bind and write its banner.
 SRV=""

@@ -35,10 +35,9 @@ service.
   window). Authorization is an explicit **allowlist** (off-list peers refused); this is the **single**
   authentication factor — there is no passphrase/PAKE second factor (the residual leaked-key risk is
   handled by mandatory at-rest key encryption, below). The accept gauntlet (`src/server/cli.rs`) is the
-  trust-boundary checkpoint; its outcomes are logged structured under the `koh::auth` target. An
-  admitted peer can be further constrained per node-id (`--allow-file`): **read-only** (`restrict` —
-  input dropped before the PTY, a real boundary) and/or a **forced command** (sshd-style
-  `ForceCommand`; in koh's single-uid model a soft restriction, not a jail — see non-goals).
+  trust-boundary checkpoint; its outcomes are logged structured under the `koh::auth` target. The
+  optional global `--read-only` flag makes every admitted peer a viewer (input dropped before the
+  PTY, a real boundary); there is no per-peer authorization beyond the allowlist.
 - **Untrusted data plane:** the SSP core (`src/ssp/`, `src/wire.rs`) is a pure, panic-free-by-
   construction state machine with per-direction decode/inflate ceilings, a fragment replay gate, a
   reassembly byte cap, an accumulation budget, and dimension clamps before any vt100 allocation. The
@@ -56,10 +55,9 @@ the inline `KOH-`/`KR-`/`K-`/`AR-` rationale tags.
 ## Non-goals (where koh does NOT match a hardened multi-user service)
 
 - **No privilege separation / multi-user model:** the shell runs as the uid that ran `koh serve`;
-  there is no per-user mapping, PAM, or chroot. Per-node-id authorization *does* exist
-  (`--allow-file`: read-only `restrict` + a `ForceCommand`-style forced command), but in this
-  single-uid world a forced command is a soft restriction, not a sandbox — **read-only** is the
-  only one of the two that is a hard boundary (the input is dropped before it can reach the shell).
+  there is no per-user mapping, PAM, chroot, or `ForceCommand`-class policy. The only access control
+  is the node-id allowlist plus a global `--read-only` toggle (a real input-drop boundary); access
+  is otherwise uniform across allowed peers.
 - **No hardware-backed / certificate / agent identity:** the node-id key lives on disk (optionally
   passphrase-encrypted, but not in an HSM / FIDO2 token / agent).
 - **No post-quantum key exchange yet:** transport crypto is inherited from iroh; koh is a policy-taker.

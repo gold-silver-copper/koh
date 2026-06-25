@@ -9,7 +9,6 @@
 
 pub mod audit;
 pub mod cli;
-pub mod policy;
 pub mod session;
 
 pub use cli::{serve, ServeArgs};
@@ -291,7 +290,7 @@ pub async fn run_attached(
                                 // A read-only (observer) session still drains — `drain_input`'s
                                 // collapse of `received_states` is a required per-state side effect —
                                 // but the client's keystrokes and resizes never reach the PTY: a
-                                // `restrict`ed peer can watch the live shell, not drive it.
+                                // read-only peer can watch the live shell, not drive it.
                                 if !s.read_only {
                                     if !input.keys.is_empty() {
                                         if let Err(e) = s.pty.write_input(&input.keys) {
@@ -350,7 +349,7 @@ pub async fn run_session(
     shell: Option<String>,
     scrollback: usize,
 ) -> anyhow::Result<()> {
-    let handle = session::spawn_session(shell.as_deref(), scrollback, None, false)?;
+    let handle = session::spawn_session(shell.as_deref(), scrollback, false)?;
     let _ = run_attached(conn, handle.clone()).await?;
     let _ = handle.session.lock().await.pty.kill();
     Ok(())

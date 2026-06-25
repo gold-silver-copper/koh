@@ -19,8 +19,8 @@
 //!   on `vt100` + `unicode-width` (no `crate::` imports), so it is a standalone, transport- and
 //!   koh-agnostic terminal-prediction library — reusable as-is by a different front-end.
 //! - [`transport_iroh`] — iroh endpoint setup, persistent (encrypted) identity, datagram channel,
-//!   RTT, and a 1-byte connection-admission ack (authorization is the node-id allowlist in
-//!   [`server::policy`]).
+//!   RTT, and a 1-byte connection-admission ack (authorization is the node-id allowlist checked in
+//!   `koh serve`).
 //! - [`pty`] — PTY allocation, shell spawn, SIGWINCH, child reaping.
 //! - [`server`] — PTY + emulator + `Transport<Screen, Input>` over iroh, plus `koh serve`.
 //! - [`client`] — input + `Transport<Input, Screen>` + predictor + termina render, plus `koh connect`.

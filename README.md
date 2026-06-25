@@ -137,32 +137,12 @@ iroh-ssh's "anyone with the endpoint id gets a shell" model. The server:
 QUIC/iroh already authenticates both ends by public key and encrypts everything; the allowlist
 is the authorization layer on top.
 
-#### Per-peer authorization (`--allow-file`)
+#### Read-only mode
 
-A bare `--allow <id>` grants a full interactive shell. To vary policy per peer — sshd's
-`authorized_keys` options / `ForceCommand` — pass `--allow-file <path>`, one entry per line:
-
-```text
-# observer: can watch the live shell but cannot type or resize it
-871b…aa  restrict
-# kiosk: always lands in a fixed command instead of a login shell
-a2d4…bf  command="tmux attach -t main"
-# both: a read-only view of a fixed command
-3f9c…01  restrict command="watch -n1 uptime"
-```
-
-- **`restrict`** is a *real* boundary: the peer's keystrokes and resizes are dropped before they
-  reach the PTY (enforced in the data path, not just advertised). `--read-only` applies this to
-  **every** authorized client.
-- **`command="…"`** runs via the login shell's `-c`, exactly like sshd's `ForceCommand`. Because
-  koh is a **single-uid** tool (the shell runs as whoever launched `koh serve`), a forced command
-  is a *convenience / soft restriction*, **not a jail**: a command that can spawn a subshell (an
-  editor's `:!sh`, a pager, …) escapes it. For anything resembling confinement, pair it with
-  `restrict` and a command that can't shell out.
-
-`#` comments and blank lines are ignored; a malformed id, unknown option, or duplicate id fails at
-startup rather than silently mis-authorizing. Each accepted connection's resolved policy is logged
-under the `koh::auth` target.
+`--read-only` makes **every** authorized client a viewer: a connected peer can watch the live shell
+but its keystrokes and resizes are dropped before they reach the PTY (enforced in the data path, not
+just advertised) — a real boundary, useful for a broadcast / screen-share. There is no per-peer
+authorization beyond the allowlist; access is uniform across allowed ids.
 
 #### Single factor by design (no passphrase / second factor)
 

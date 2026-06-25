@@ -110,10 +110,7 @@ pub struct Pty {
 
 impl Pty {
     /// Allocate a PTY of `rows`×`cols`, spawn `shell` (or the user's default login shell when
-    /// `None`) with `args` and `TERM` set, and start streaming its output.
-    ///
-    /// `args` are passed verbatim to the program — empty for a normal interactive shell, or
-    /// `["-c", command]` to run a forced command via the shell (sshd's `ForceCommand` shape).
+    /// `None`) with `TERM` set, and start streaming its output.
     ///
     /// Returns the [`Pty`] handle plus an async receiver of raw output chunks. The reader runs
     /// on a dedicated OS thread; when the child closes the PTY the channel ends.
@@ -121,7 +118,6 @@ impl Pty {
         rows: u16,
         cols: u16,
         shell: Option<&str>,
-        args: &[&str],
         term: &str,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
         let pty_system = native_pty_system();
@@ -134,13 +130,8 @@ impl Pty {
             })
             .map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
 
-        let mut cmd = match shell {
-            Some(prog) => CommandBuilder::new(prog),
-            None => CommandBuilder::new(default_shell()),
-        };
-        for arg in args {
-            cmd.arg(arg);
-        }
+        let cmd_shell = shell.map_or_else(default_shell, str::to_owned);
+        let mut cmd = CommandBuilder::new(cmd_shell);
         // A real terminal type so curses apps behave; the env is otherwise inherited.
         cmd.env("TERM", term);
         // Scrub koh's operational env from the child (L-4). Most important: `$KOH_KEY_PASSPHRASE` —

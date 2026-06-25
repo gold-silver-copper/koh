@@ -1,11 +1,8 @@
-//! End-to-end verification of per-peer authorization (the `--allow-file` policies).
-//!
-//! These exercise the real `run_attached` data path over loopback iroh connections (mirroring
-//! `reattach.rs`'s harness), not just the parser:
-//!   * a `restrict` (read-only) session must DROP the client's keystrokes — they never reach the
-//!     shell — with a read-write positive control proving the harness *can* deliver input quickly,
-//!     so the negative isn't a false pass from a dead connection;
-//!   * a `command="…"` forced command must run instead of an interactive shell.
+//! End-to-end verification of the `--read-only` gate over the real `run_attached` data path
+//! (loopback iroh connections, mirroring `reattach.rs`'s harness):
+//!   * a read-only session must DROP the client's keystrokes — they never reach the shell —
+//!   * with a read-write positive control proving the harness *can* deliver input quickly, so the
+//!     negative isn't a false pass from a dead connection.
 
 // Integration test: a failed unwrap/expect/assert IS the test failing.
 #![allow(
@@ -58,12 +55,11 @@ async fn client_pump(channel: &IrohChannel, input: Option<&[u8]>, marker: &str, 
     }
 }
 
-/// Spawn an accept loop that attaches every peer with the given policy, then serves it.
-fn serve_with_policy(
+/// Spawn an accept loop that attaches every peer with the given `read_only` setting, then serves it.
+fn serve_readonly(
     ep: Endpoint,
     store: SessionStore,
     read_only: bool,
-    force_command: Option<&'static str>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
@@ -72,8 +68,7 @@ fn serve_with_policy(
                 let Ok(conn) = incoming.await else { return };
                 let peer = conn.remote_id();
                 let Ok(Some((handle, _))) =
-                    session::attach(&store, peer, Some("sh"), 0, 64, force_command, read_only)
-                        .await
+                    session::attach(&store, peer, Some("sh"), 0, 64, read_only).await
                 else {
                     return;
                 };
@@ -102,12 +97,7 @@ async fn endpoints() -> (Endpoint, Endpoint, iroh::EndpointAddr) {
 async fn read_only_drops_client_input() {
     let (server, client, addr) = endpoints().await;
     let store: SessionStore = Default::default();
-    let accept = serve_with_policy(
-        server.clone(),
-        store.clone(),
-        /* read_only */ true,
-        None,
-    );
+    let accept = serve_readonly(server.clone(), store.clone(), /* read_only */ true);
 
     let conn = client.connect(addr, ALPN).await.expect("connect");
     let chan = IrohChannel::new(conn);
@@ -128,12 +118,7 @@ async fn read_write_delivers_client_input() {
     // keystrokes (typically sub-second), proving the negative isn't a false pass from a dead link.
     let (server, client, addr) = endpoints().await;
     let store: SessionStore = Default::default();
-    let accept = serve_with_policy(
-        server.clone(),
-        store.clone(),
-        /* read_only */ false,
-        None,
-    );
+    let accept = serve_readonly(server.clone(), store.clone(), /* read_only */ false);
 
     let conn = client.connect(addr, ALPN).await.expect("connect");
     let chan = IrohChannel::new(conn);
@@ -141,29 +126,6 @@ async fn read_write_delivers_client_input() {
     assert!(
         appeared,
         "a read-write session must deliver the client's keystrokes to the shell"
-    );
-    chan.close(0, b"done");
-    accept.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn forced_command_runs_instead_of_shell() {
-    let (server, client, addr) = endpoints().await;
-    let store: SessionStore = Default::default();
-    // No client input: the forced command must run on its own and put its output on the screen.
-    let accept = serve_with_policy(
-        server.clone(),
-        store.clone(),
-        false,
-        Some("echo FORCED_OK_7"),
-    );
-
-    let conn = client.connect(addr, ALPN).await.expect("connect");
-    let chan = IrohChannel::new(conn);
-    let appeared = client_pump(&chan, None, "FORCED_OK_7", 10_000).await;
-    assert!(
-        appeared,
-        "the forced command's output must appear on the screen without any client input"
     );
     chan.close(0, b"done");
     accept.abort();

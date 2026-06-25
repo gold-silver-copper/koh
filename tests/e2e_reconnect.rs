@@ -80,7 +80,7 @@ async fn client_reconnects_and_reattaches_after_a_forced_drop() {
 
     // --- server: ONE detachable session, accepted over a loop so a reconnect reattaches it ---
     let server_task = tokio::spawn(async move {
-        let handle = spawn_session(Some("sh"), 0, None, false).expect("spawn session");
+        let handle = spawn_session(Some("sh"), 0, false).expect("spawn session");
         let mut arm_kill = Some(kill_rx);
         loop {
             let Some(incoming) = server_ep.accept().await else {

@@ -207,11 +207,10 @@ pub async fn detach(store: &SessionStore, peer: EndpointId) {
 /// cleanup, leaving `attached > 0` and `last_detach == None`, which the reaper (keyed on `!child_alive ||
 /// detached_expired`) never collects: a zombie shell + PTY pinned for the server's lifetime.
 ///
-/// This mirrors [`ConnGuard`](crate::server::cli)'s Drop-decrements-the-count discipline, which the
-/// active-connection count already had but the session attach did not. On the normal return paths
-/// the task [`disarm`](Self::disarm)s the guard and does the precise cleanup (detach **vs** reap)
-/// itself; the guard only fires on an unexpected unwind. `Drop` can't `await`, so it spawns the
-/// async detach onto the current runtime (best-effort: a no-op if no runtime is in scope).
+/// A standard RAII Drop-cleans-up-on-unwind discipline. On the normal return paths the task
+/// [`disarm`](Self::disarm)s the guard and does the precise cleanup (detach **vs** reap) itself; the
+/// guard only fires on an unexpected unwind. `Drop` can't `await`, so it spawns the async detach onto
+/// the current runtime (best-effort: a no-op if no runtime is in scope).
 #[must_use = "hold the guard for the connection's lifetime, then disarm() on a normal return"]
 pub struct AttachGuard {
     store: SessionStore,
@@ -248,9 +247,8 @@ impl Drop for AttachGuard {
         // a no-op and the attach isn't decremented — but a server abandoning its runtime is
         // abandoning all sessions anyway, and even a leaked attach is collected once the orphaned
         // shell exits (the reaper also reaps on `!child_alive`), so it is not pinned for the server's
-        // lifetime. (ConnGuard can stay a pure sync decrement because it touches no async-locked
-        // state; this guard can't.) Do NOT "fix" this with per-connection JoinSet panic-observation —
-        // that would complicate the accept loop's deliberate spawn-and-forget shape for a moot window.
+        // lifetime. Do NOT "fix" this with per-connection JoinSet panic-observation — that would
+        // complicate the accept loop's deliberate spawn-and-forget shape for a moot window.
         let store = self.store.clone();
         let peer = self.peer;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {

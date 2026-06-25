@@ -187,9 +187,6 @@ pub struct PredictionEngine {
     /// the total byte length its leading byte announced. Empty/0 when not mid-grapheme.
     utf8_buf: Vec<u8>,
     utf8_need: usize,
-    /// false = insert mode (typing mid-line shifts the row right; backspace shifts left);
-    /// true = overwrite mode (single-cell edits). Readline/shells default to insert.
-    predict_overwrite: bool,
     /// Tunable engagement / flagging / glitch thresholds (mosh defaults via [`PredictionConfig`]).
     config: PredictionConfig,
 }
@@ -226,7 +223,6 @@ impl PredictionEngine {
             esc: EscState::Ground,
             utf8_buf: Vec::new(),
             utf8_need: 0,
-            predict_overwrite: false,
             config,
         }
     }
@@ -284,12 +280,6 @@ impl PredictionEngine {
         );
     }
 
-    /// Choose insert-mode (default, `false`) vs overwrite-mode (`true`) prediction. In overwrite
-    /// mode a typed glyph replaces the cell under the cursor instead of shifting the tail right —
-    /// the correct behavior for full-screen apps. Mirrors mosh's `$MOSH_PREDICTION_OVERWRITE`.
-    pub fn set_predict_overwrite(&mut self, on: bool) {
-        self.predict_overwrite = on;
-    }
     /// The newest epoch the server has confirmed echoes (predictions at or below it may show) —
     /// bumped by [`cull`](Self::cull) when a prediction is confirmed. Test-only.
     #[cfg(test)]
@@ -533,17 +523,16 @@ impl PredictionEngine {
                     let c = self.cursor_after_init();
                     (c.row, c.col)
                 };
-                // Insert mode: shift the row right (cols-1 down to col+1) so the tail moves over
-                // to make room — matching what a readline-style line editor will render. Iterate
-                // right-to-left so each cell reads its left neighbor's pre-shift content.
-                if !self.predict_overwrite {
-                    for i in ((col + 1)..cols).rev() {
-                        let (g, fg, bg, src_unknown) = self.pred_or_real_glyph(screen, row, i - 1);
-                        // The rightmost cell takes content pushed off-screen -> unknown.
-                        let unknown = i == cols - 1 || src_unknown;
-                        let glyph = if unknown { String::new() } else { g };
-                        self.place_cell(screen, row, i, glyph, fg, bg, unknown, now);
-                    }
+                // Insert mode (the only mode koh predicts): shift the row right (cols-1 down to
+                // col+1) so the tail moves over to make room — matching what a readline-style line
+                // editor renders. Iterate right-to-left so each cell reads its left neighbor's
+                // pre-shift content.
+                for i in ((col + 1)..cols).rev() {
+                    let (g, fg, bg, src_unknown) = self.pred_or_real_glyph(screen, row, i - 1);
+                    // The rightmost cell takes content pushed off-screen -> unknown.
+                    let unknown = i == cols - 1 || src_unknown;
+                    let glyph = if unknown { String::new() } else { g };
+                    self.place_cell(screen, row, i, glyph, fg, bg, unknown, now);
                 }
                 let (fg, bg) = glyph_style(screen, row, col);
                 self.place_cell(
@@ -581,38 +570,24 @@ impl PredictionEngine {
                     }
                 };
                 if do_pred {
-                    if self.predict_overwrite {
-                        // Overwrite mode: just blank the cell at the new cursor position.
-                        self.place_cell(
-                            screen,
-                            row,
-                            col,
-                            " ".to_string(),
-                            Color::Default,
-                            Color::Default,
-                            false,
-                            now,
-                        );
-                    } else {
-                        // Insert mode: shift the row left from col to the right edge; the last
-                        // TWO columns gain whatever was off-screen -> unknown (underline hint,
-                        // never a guessed glyph). mosh marks the cell unknown when `i + 2 >= width`
-                        // (terminaloverlay.cc), one column wider than the naive "only the last
-                        // column" — the right-edge cell a wide grapheme could straddle is ambiguous
-                        // too. Left-to-right so each cell reads its unshifted right neighbor.
-                        for i in col..cols {
-                            // `i < cols - 2` is mosh's `i + 2 < width`, written to never overflow
-                            // u16 (the screen width is peer-controlled; `i + 2` would wrap/panic at
-                            // cols == u16::MAX). The true branch then has `i + 1 < cols`, so the
-                            // `i + 1` read below is in bounds.
-                            let (g, fg, bg, unknown) = if i < cols.saturating_sub(2) {
-                                self.pred_or_real_glyph(screen, row, i + 1)
-                            } else {
-                                (String::new(), Color::Default, Color::Default, true)
-                            };
-                            let glyph = if unknown { String::new() } else { g };
-                            self.place_cell(screen, row, i, glyph, fg, bg, unknown, now);
-                        }
+                    // Insert mode (the only mode): shift the row left from col to the right edge;
+                    // the last TWO columns gain whatever was off-screen -> unknown (underline hint,
+                    // never a guessed glyph). mosh marks the cell unknown when `i + 2 >= width`
+                    // (terminaloverlay.cc), one column wider than the naive "only the last column" —
+                    // the right-edge cell a wide grapheme could straddle is ambiguous too.
+                    // Left-to-right so each cell reads its unshifted right neighbor.
+                    for i in col..cols {
+                        // `i < cols - 2` is mosh's `i + 2 < width`, written to never overflow u16
+                        // (the screen width is peer-controlled; `i + 2` would wrap/panic at
+                        // cols == u16::MAX). The true branch then has `i + 1 < cols`, so the `i + 1`
+                        // read below is in bounds.
+                        let (g, fg, bg, unknown) = if i < cols.saturating_sub(2) {
+                            self.pred_or_real_glyph(screen, row, i + 1)
+                        } else {
+                            (String::new(), Color::Default, Color::Default, true)
+                        };
+                        let glyph = if unknown { String::new() } else { g };
+                        self.place_cell(screen, row, i, glyph, fg, bg, unknown, now);
                     }
                 }
             }
@@ -949,21 +924,6 @@ mod tests {
     }
 
     #[test]
-    fn predict_overwrite_setter_is_honored_and_branch_runs() {
-        // The field was previously hardcoded false (the overwrite branch was dead code). The setter
-        // must flip it, and predicting in overwrite mode must execute the branch without panicking.
-        let mut pe = PredictionEngine::new(DisplayPreference::Always);
-        assert!(!pe.predict_overwrite, "default is insert mode");
-        pe.set_predict_overwrite(true);
-        assert!(pe.predict_overwrite, "setter enables overwrite mode");
-
-        pe.set_local_frame_sent(0);
-        let echoed = screen_of(b"abc");
-        pe.new_user_byte(0, b'Z', &echoed); // drives the overwrite-mode prediction path
-        let _ = pe.overlay(&echoed);
-    }
-
-    #[test]
     fn malformed_utf8_midgrapheme_resets_without_panicking() {
         // A lead byte announcing a multi-byte grapheme followed by a NON-continuation byte must
         // reset the UTF-8 accumulator (no concrete prediction, fall back to the server's echo) and
@@ -978,19 +938,6 @@ mod tests {
             "the UTF-8 accumulator must reset after a malformed sequence"
         );
         let _ = pe.overlay(&screen);
-    }
-
-    #[test]
-    fn wide_grapheme_in_overwrite_mode_runs_without_panicking() {
-        // The overwrite branch fed a double-width (CJK) grapheme — previously dead code, and the
-        // existing overwrite test drives only ASCII, never the wide-char arm.
-        let (mut e, screen) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
-        e.set_predict_overwrite(true);
-        e.set_local_frame_sent(1);
-        for &b in "世".as_bytes() {
-            e.new_user_byte(300, b, &screen);
-        }
-        let _ = e.overlay(&screen);
     }
 
     proptest::proptest! {

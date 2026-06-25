@@ -30,17 +30,9 @@ use tokio_util::sync::CancellationToken;
 
 pub use render::WindowState;
 
-/// Parse a boolean opt-in env var: true for `1`/`true`/`yes`/`on` (trimmed, case-insensitive),
-/// false otherwise (including unset). Shared so every `KOH_*` toggle parses identically — e.g.
-/// `KOH_CLIPBOARD` and `KOH_PREDICT_OVERWRITE` no longer diverge on `TRUE`/`Yes`/`" 1 "`.
-pub(crate) fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
+/// The window-title prefix mirrored onto the user's terminal so the OS title bar shows you're in a
+/// koh session (mosh's `[mosh] `).
+const KOH_TITLE_PREFIX: &str = "[koh] ";
 
 /// The escape prefix (Ctrl-^); followed by '.' it disconnects the session.
 pub const ESCAPE_PREFIX: u8 = 0x1e;
@@ -241,7 +233,7 @@ impl TerminaTerminal {
         // first is inert.
         let mut this = Self {
             term,
-            oob: render::OutOfBand::with_title_prefix(koh_title_prefix())
+            oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string())
                 .with_clipboard(clipboard_enabled),
         };
         this.enter_screen()?;
@@ -279,16 +271,6 @@ impl TerminaTerminal {
             ))),
         )?;
         self.term.flush()
-    }
-}
-
-/// The window-title prefix to mirror onto the user's terminal (mosh's `[mosh] `). Empty — i.e.
-/// disabled — when `$KOH_TITLE_NOPREFIX` is set, matching `$MOSH_TITLE_NOPREFIX`.
-fn koh_title_prefix() -> String {
-    if std::env::var_os("KOH_TITLE_NOPREFIX").is_some() {
-        String::new()
-    } else {
-        "[koh] ".to_string()
     }
 }
 
@@ -397,7 +379,6 @@ impl ClientSession {
         now: u64,
         mtu: usize,
         pref: DisplayPreference,
-        predict_overwrite: bool,
         initial_rows: u16,
         initial_cols: u16,
     ) -> Self {
@@ -406,8 +387,7 @@ impl ClientSession {
         transport
             .current_mut()
             .push_resize(initial_rows, initial_cols);
-        let mut predictor = PredictionEngine::new(pref);
-        predictor.set_predict_overwrite(predict_overwrite);
+        let predictor = PredictionEngine::new(pref);
         Self {
             transport,
             predictor,
@@ -609,8 +589,6 @@ pub async fn run_client<T: ClientTerminal>(
     shutdown: CancellationToken,
 ) -> anyhow::Result<Option<u32>> {
     let clock = MonoClock::new();
-    // Opt-in overwrite-mode prediction for full-screen apps (mosh's $MOSH_PREDICTION_OVERWRITE).
-    let predict_overwrite = env_truthy("KOH_PREDICT_OVERWRITE");
     let mut channel = initial;
     // Persists ACROSS reconnect cycles (not reset per connection) so a server that keeps dropping us
     // fast can't escape the backoff by completing each handshake — only a connection that proves
@@ -624,7 +602,6 @@ pub async fn run_client<T: ClientTerminal>(
             clock.now_ms(),
             channel.max_datagram_size(),
             pref,
-            predict_overwrite,
             rows,
             cols,
         );
@@ -954,7 +931,7 @@ mod tests {
     }
 
     fn new_session() -> ClientSession {
-        ClientSession::new(0, 1200, DisplayPreference::Always, false, 24, 80)
+        ClientSession::new(0, 1200, DisplayPreference::Always, 24, 80)
     }
 
     #[test]

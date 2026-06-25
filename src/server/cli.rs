@@ -11,9 +11,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Args as ClapArgs;
@@ -81,13 +80,6 @@ pub struct ServeArgs {
     /// Default 24h (mosh-style "close the laptop, reopen later").
     #[arg(long, default_value_t = 86_400)]
     session_ttl_secs: u64,
-
-    /// Exit the server after this many seconds with NO active client connection (0 = never, the
-    /// default — matches mosh). A safety net for an orphaned standalone daemon. WARNING: a non-zero
-    /// value also reaps a *retained, detached* session once it has been idle this long, so a
-    /// long-lived daemon should set it comfortably LONGER than --session-ttl-secs (or leave it 0).
-    #[arg(long, env = "KOH_SERVER_NETWORK_TMOUT", default_value_t = 0)]
-    network_timeout_secs: u64,
 
     /// Host via a self-hosted relay URL instead of n0's public relays.
     #[arg(long, value_name = "URL")]
@@ -236,12 +228,6 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             "│ policy      : {restricted} restrict, {forced} forced-command (per allow-file)"
         );
     }
-    if args.network_timeout_secs > 0 {
-        eprintln!(
-            "│ idle-timeout: {}s (server exits — reaping any detached session — after this idle)",
-            args.network_timeout_secs
-        );
-    }
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
 
@@ -297,8 +283,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     ));
 
     // Graceful shutdown: a SIGTERM/SIGINT drains the accept loop cleanly (close the endpoint after
-    // the reaper stops) instead of hard-killing the process. The optional network-idle watchdog
-    // cancels the same token, so a server nobody is connected to can self-exit.
+    // the reaper stops) instead of hard-killing the process.
     let shutdown = CancellationToken::new();
     spawn_signal_drain(shutdown.clone())?;
     // Bound concurrent connection-handling tasks: each accepted connection holds a permit for its
@@ -314,14 +299,6 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let pending_cap = (args.max_connections as usize).div_ceil(4).max(4);
     let handshake_limit = Arc::new(tokio::sync::Semaphore::new(pending_cap));
     let max_sessions = args.max_sessions as usize;
-    let active = Arc::new(AtomicUsize::new(0));
-    if args.network_timeout_secs > 0 {
-        spawn_idle_watchdog(
-            active.clone(),
-            Duration::from_secs(args.network_timeout_secs),
-            shutdown.clone(),
-        );
-    }
 
     loop {
         let incoming = tokio::select! {
@@ -361,13 +338,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         let allow = allow.clone();
         let shell = shell.clone();
         let store = store.clone();
-        // Counts this connection as active for the whole task; the guard decrements on every exit
-        // path so the idle watchdog sees an accurate live-connection count.
-        let active_guard = ConnGuard::new(active.clone());
         tokio::spawn(async move {
             // Held for the whole task: releases the connection-cap permit on every exit path.
             let _permit = permit;
-            let _active_guard = active_guard;
             // Held only until auth completes (dropped explicitly on success, or on any early
             // return below), so an established session doesn't occupy a pending-handshake slot.
             let pending_permit = pending_permit;
@@ -500,33 +473,14 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         });
     }
 
-    // The accept loop ended (endpoint closed, a shutdown signal, or the idle timeout): stop the
-    // reaper + idle watchdog cleanly and wait for the reaper to finish its current sweep before
-    // tearing down the endpoint. Cancelling `shutdown` here also stops the watchdog when we exited
-    // because the endpoint closed on its own (rather than via the token).
+    // The accept loop ended (endpoint closed or a shutdown signal): stop the reaper cleanly and wait
+    // for it to finish its current sweep before tearing down the endpoint.
     info!("draining: stopping reaper and closing endpoint");
     shutdown.cancel();
     reaper_shutdown.cancel();
     let _ = reaper.await;
     endpoint.close().await;
     Ok(())
-}
-
-/// Tracks one live client connection: increments the active count on construction and decrements it
-/// on drop, so the idle watchdog sees an accurate count across every task exit path.
-struct ConnGuard(Arc<AtomicUsize>);
-
-impl ConnGuard {
-    fn new(active: Arc<AtomicUsize>) -> Self {
-        active.fetch_add(1, Ordering::SeqCst);
-        Self(active)
-    }
-}
-
-impl Drop for ConnGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 /// Cancel `shutdown` on the first SIGTERM/SIGINT so the accept loop drains gracefully (rather than
@@ -543,42 +497,6 @@ fn spawn_signal_drain(shutdown: CancellationToken) -> anyhow::Result<()> {
         shutdown.cancel();
     });
     Ok(())
-}
-
-/// Cancel `shutdown` once there have been zero active connections continuously for `timeout`
-/// (mosh's `$MOSH_SERVER_NETWORK_TMOUT`). Polls about once a second; resets the idle clock whenever
-/// a connection is live.
-///
-/// Clock semantics: the idle measure is the monotonic `Instant` elapsed, which PAUSES across a host
-/// suspend (like the sibling `run_reaper`), so the watchdog counts *awake-idle* time — a slept laptop
-/// does not accrue idle time and self-reap a retained detached session. This is deliberate; switching
-/// to wall-clock (`SystemTime`) would make this default-off safety net fire across suspend, a
-/// regression for the detach-and-resume workflow. (Contrast the client freeze detector, which WANTS
-/// wall time to notice a long screen-off — see `client::looks_like_resume_from_freeze`.)
-fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        let tick = Duration::from_secs(1).min(timeout);
-        let mut idle_since: Option<Instant> = None;
-        loop {
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(tick) => {}
-            }
-            if active.load(Ordering::SeqCst) == 0 {
-                let since = *idle_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= timeout {
-                    info!(
-                        timeout_secs = timeout.as_secs(),
-                        "network idle timeout; shutting down"
-                    );
-                    shutdown.cancel();
-                    return;
-                }
-            } else {
-                idle_since = None;
-            }
-        }
-    });
 }
 
 #[cfg(test)]

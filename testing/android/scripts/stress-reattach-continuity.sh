@@ -20,6 +20,7 @@ echo "Stress: reattach continuity — disconnect then reconnect the same peer (l
 push_flood_script "$FLOOD" "echo spawned >> $SPAWNS ; exec /system/bin/sh"
 adb $ADB_SERIAL shell "rm -f $SPAWNS" >/dev/null 2>&1 || true
 
+allow_client_key "$KEY"
 start_server "--shell $FLOOD" || { bad "server failed to start"; finish "stress-reattach-continuity"; }
 
 connect_a() {  # connect_a <host-log>; connects, holds briefly, quits cleanly

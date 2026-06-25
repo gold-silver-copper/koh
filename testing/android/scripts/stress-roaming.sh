@@ -31,6 +31,7 @@ adb $ADB_SERIAL wait-for-device >/dev/null 2>&1 || true
 adb $ADB_SERIAL shell 'command -v tc' >/dev/null 2>&1 || { echo "SKIP: 'tc' not present on this image"; exit 0; }
 cleanup_tc() { adb $ADB_SERIAL shell "tc qdisc del dev lo root" >/dev/null 2>&1 || true; }
 
+allow_client_key /data/local/tmp/koh-roam.key
 start_server "" || { bad "server failed to start"; finish "stress-roaming"; }
 SPID="$(server_pid)"
 CLILOG="/tmp/koh-roam-cli-$$.log"

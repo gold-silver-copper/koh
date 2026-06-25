@@ -13,6 +13,9 @@ push_binary
 CLIENTS="${KOH_STRESS_CLIENTS:-$(scaled 8 24)}"
 echo "Stress: concurrent clients — $CLIENTS simultaneous connects, distinct peers (level=$STRESS_LEVEL)"
 
+# Each client uses its own key → its own node-id; all must be on the allowlist (no accept-any mode).
+i=1
+while [ "$i" -le "$CLIENTS" ]; do allow_client_key "/data/local/tmp/cc-$i.key"; i=$((i + 1)); done
 start_server "" || { bad "server failed to start"; finish "stress-concurrent-clients"; }
 SPID="$(server_pid)"
 RSS0="$(rss_kb "$SPID")"
@@ -22,7 +25,7 @@ i=1
 while [ "$i" -le "$CLIENTS" ]; do
   adb $ADB_SERIAL shell "rm -f /data/local/tmp/cc-$i.log" >/dev/null 2>&1 || true
   ( to 30 adb $ADB_SERIAL shell \
-      "$DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file /data/local/tmp/cc-$i.key --predict never >/data/local/tmp/cc-$i.log 2>&1" \
+      "$KENV $DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file /data/local/tmp/cc-$i.key --predict never >/data/local/tmp/cc-$i.log 2>&1" \
       >/dev/null 2>&1 || true ) &
   i=$((i + 1))
 done

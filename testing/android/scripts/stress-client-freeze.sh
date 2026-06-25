@@ -19,6 +19,7 @@ FREEZE="${KOH_STRESS_FREEZE_SECS:-$(scaled 8 12)}"
 CLILOG="/tmp/koh-freeze-cli-$$.log"
 echo "Stress: client freeze → resume — SIGSTOP the client for ${FREEZE}s, then SIGCONT (level=$STRESS_LEVEL)"
 
+allow_client_key /data/local/tmp/koh-freeze.key
 start_server "" || { bad "server failed to start"; finish "stress-client-freeze"; }
 SPID="$(server_pid)"
 

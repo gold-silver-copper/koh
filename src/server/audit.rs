@@ -14,7 +14,7 @@ use iroh::EndpointId;
 /// The admission outcome — the stable status token, mirroring sshd's Accepted/Refused.
 #[derive(Clone, Copy)]
 pub(crate) enum Outcome {
-    /// The peer passed the gate (its node-id is on the allowlist, or `--allow-any`).
+    /// The peer passed the gate: its node-id is on the allowlist.
     Accepted,
     /// Rejected by policy: not on the allowlist.
     Rejected,
@@ -32,9 +32,10 @@ impl Outcome {
 /// Emit one structured authorization event with the stable schema (`event`, `outcome`, `peer`,
 /// `reason`) under the `koh::auth` target. `event` is always `authz` (the only admission gate is the
 /// allowlist); it stays in the schema so a consumer's filter is stable if more event kinds appear.
-/// INFO for an accepted outcome, WARN for a denial. `peer` is the node-id hex, or `-` if unknown.
-pub(crate) fn auth_event(outcome: Outcome, peer: Option<&EndpointId>, reason: &str) {
-    let peer = peer.map_or_else(|| "-".to_owned(), crate::transport_iroh::format_endpoint_id);
+/// INFO for an accepted outcome, WARN for a denial. `peer` is the node-id hex (always known: the
+/// QUIC/TLS handshake authenticates it before any admission decision).
+pub(crate) fn auth_event(outcome: Outcome, peer: &EndpointId, reason: &str) {
+    let peer = crate::transport_iroh::format_endpoint_id(peer);
     if matches!(outcome, Outcome::Accepted) {
         tracing::info!(target: "koh::auth", event = "authz", outcome = outcome.token(), peer = %peer, reason);
     } else {

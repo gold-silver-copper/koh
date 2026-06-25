@@ -6,8 +6,8 @@
 //! UserInput>`).
 //!
 //! Auth model (deliberately *not* iroh-ssh's "anyone with the endpoint id gets a shell"):
-//! a connection is only served if the client's endpoint id is on the `--allow` list (or
-//! `--allow-any` is explicitly set for testing).
+//! a connection is only served if the client's endpoint id is on the `--allow` list. There is no
+//! "accept any peer" escape hatch — an allowlist entry is the sole way in.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -41,20 +41,10 @@ pub struct ServeArgs {
     #[arg(long)]
     key_file: Option<PathBuf>,
 
-    /// Authorize a client endpoint id (repeatable). Required unless --allow-any.
+    /// Authorize a client endpoint id (repeatable). At least one is required — koh only serves
+    /// peers whose node-id is on this list.
     #[arg(long = "allow", value_name = "ENDPOINT_ID")]
     allow: Vec<String>,
-
-    /// INSECURE: accept any client — a shell to anyone who can reach the endpoint, with no
-    /// allowlist. For local/testing use (pair with `--local`); on a public bind prefer
-    /// `--read-only` for an observe-only screen-share. Prints a loud warning when set.
-    #[arg(long)]
-    allow_any: bool,
-
-    /// Make every authorized client read-only: a viewer can watch the shell live, but its
-    /// keystrokes and resizes never reach the PTY.
-    #[arg(long)]
-    read_only: bool,
 
     /// Shell to run (defaults to the user's login shell).
     #[arg(long)]
@@ -81,13 +71,13 @@ pub struct ServeArgs {
 
     /// Maximum number of connections being handled concurrently (each holds a permit for its whole
     /// lifetime; excess incoming connections are refused cheaply, before the crypto handshake). This
-    /// bounds the work a flood of dials — especially under `--allow-any` — can pin on the server.
+    /// bounds the work a flood of dials can pin on the server before the allowlist check rejects them.
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
     max_connections: u32,
 
     /// Maximum number of distinct live sessions (one per authorized peer). A new peer is refused
     /// once this many sessions exist; reconnecting to an existing session is always allowed. Bounds
-    /// the number of real shells a flood of distinct keys can spawn under `--allow-any`.
+    /// the number of real shells a flood of authorized keys can spawn.
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
     max_sessions: u32,
 }
@@ -125,16 +115,16 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Build the node-id allowlist. Every authorized peer gets the same access; `--read-only` (below)
-    // applies uniformly to all of them.
+    // Build the node-id allowlist — the sole authorization gate. Every authorized peer gets the
+    // same access. At least one entry is required: koh never serves an unlisted peer.
     let mut allow: HashSet<EndpointId> = HashSet::new();
     for s in &args.allow {
         let id = parse_endpoint_id(s).with_context(|| format!("bad --allow id: {s}"))?;
         allow.insert(id);
     }
-    if allow.is_empty() && !args.allow_any {
+    if allow.is_empty() {
         anyhow::bail!(
-            "no clients authorized: pass --allow <endpoint-id> (repeatable), or --allow-any for testing"
+            "no clients authorized: pass --allow <endpoint-id> (repeatable; get one from `koh id`)"
         );
     }
 
@@ -182,27 +172,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!("│ endpoint id : {id_str}");
     eprintln!("│ key file    : {}", key_file.display());
     eprintln!("│ alpn        : {}", String::from_utf8_lossy(ALPN));
-    if args.allow_any {
-        eprintln!("│ auth        : ⚠ ALLOW-ANY (INSECURE) — a shell to ANYONE who can reach this");
-        eprintln!("│             :   endpoint, with no allowlist. Use only on trusted/local nets.");
-    } else {
-        eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
-    }
-    if args.read_only {
-        eprintln!("│ mode        : READ-ONLY (clients can watch, not type)");
-    }
+    eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
-
-    // Also surface --allow-any as a structured WARN (so it lands in logs / SIEM, not just the
-    // banner). It is permitted with no extra ceremony — this is the loud notice, not a gate.
-    if args.allow_any {
-        warn!(
-            local = args.local,
-            "--allow-any is set: ANY peer that can reach this endpoint gets a shell (no allowlist). \
-             Use only on trusted/local networks; prefer --read-only on a public bind."
-        );
-    }
 
     // Always print a scannable QR of the endpoint id — point a phone camera at it instead of
     // copying 64 hex chars.
@@ -228,9 +200,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let shell = args.shell.clone();
     // Cast the validated u64 (clap range 0..=1_000_000) down to the usize the emulator wants.
     let scrollback = args.scrollback as usize;
-    let global_read_only = args.read_only;
     let allow = std::sync::Arc::new(allow);
-    let allow_any = args.allow_any;
 
     // Detachable session store: one shell per authorized client, surviving disconnects so a
     // reconnecting client lands back in the same session at the current screen. The reaper
@@ -323,8 +293,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 }
             };
             let peer = conn.remote_id();
-            if !allow_any && !allow.contains(&peer) {
-                auth_event(Outcome::Rejected, Some(&peer), "not on allowlist");
+            if !allow.contains(&peer) {
+                auth_event(Outcome::Rejected, &peer, "not on allowlist");
                 conn.close(1u32.into(), b"not authorized");
                 return;
             }
@@ -350,20 +320,14 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             // Admitted: free the pending-handshake slot so it isn't held for the (potentially
             // long-lived) session that follows (KOH-08). The connection-cap permit is still held.
             drop(pending_permit);
-            auth_event(
-                Outcome::Accepted,
-                Some(&peer),
-                "authorized; attaching session",
-            );
+            auth_event(Outcome::Accepted, &peer, "authorized; attaching session");
             // Attach to (or create) this client's detachable session, then serve the connection.
-            // `--read-only` (global) applies uniformly to every authorized peer.
             let (handle, attach_kind) = match session::attach(
                 &store,
                 peer,
                 shell.as_deref(),
                 scrollback,
                 max_sessions,
-                global_read_only,
             )
             .await
             {

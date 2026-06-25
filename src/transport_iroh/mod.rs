@@ -716,6 +716,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn passphrase_floor_rejects_weak_accepts_strong() {
+        // The "no effectively-unencrypted key" guard: a passphrase below the minimum is a hard error
+        // on every creation path, so a weak passphrase can't stand in for real encryption.
+        assert!(
+            enforce_passphrase_strength("").is_err(),
+            "empty is rejected"
+        );
+        assert!(
+            enforce_passphrase_strength("hunter7").is_err(),
+            "7 chars is below the floor"
+        );
+        assert!(
+            enforce_passphrase_strength("hunter77").is_ok(),
+            "exactly the {MIN_PASSPHRASE_CHARS}-char minimum is accepted"
+        );
+        assert!(enforce_passphrase_strength("correct horse battery staple").is_ok());
+        // Counts characters, not bytes: 7 two-byte chars is still below the floor.
+        assert!(
+            enforce_passphrase_strength(&"é".repeat(7)).is_err(),
+            "the floor counts chars, not bytes"
+        );
+        assert!(enforce_passphrase_strength(&"é".repeat(8)).is_ok());
+    }
+
+    #[test]
     fn state_dir_resolves_in_priority_order() {
         use std::ffi::OsString;
         use std::path::PathBuf;

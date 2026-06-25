@@ -9,7 +9,7 @@
 //! a connection is only served if the client's endpoint id is on the `--allow` list (or
 //! `--allow-any` is explicitly set for testing).
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +21,6 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
 use crate::server::audit::{auth_event, Outcome};
-use crate::server::policy::{load_allow_file, Policy};
 use crate::server::{run_attached, session, SessionExit};
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
@@ -52,17 +51,8 @@ pub struct ServeArgs {
     #[arg(long)]
     allow_any: bool,
 
-    /// Per-peer authorization policy file (sshd's `authorized_keys` options / `ForceCommand`).
-    /// One entry per line: `<endpoint-id> [restrict] [command="…"]`. `restrict` = read-only (the
-    /// peer's input never reaches the shell); `command="…"` runs a forced command via the login
-    /// shell instead of an interactive session. `#` comments and blank lines are ignored. Peers
-    /// listed here are authorized in addition to any `--allow` ids.
-    #[arg(long, value_name = "PATH")]
-    allow_file: Option<PathBuf>,
-
     /// Make every authorized client read-only: a viewer can watch the shell live, but its
-    /// keystrokes and resizes never reach the PTY. Use `--allow-file` with `restrict` to make only
-    /// some peers read-only.
+    /// keystrokes and resizes never reach the PTY.
     #[arg(long)]
     read_only: bool,
 
@@ -135,36 +125,16 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Build the allowlist as a per-peer policy map. A bare `--allow <id>` is a full read-write
-    // shell (modulo the global --read-only); `--allow-file` entries carry their own restrict /
-    // forced-command policy.
-    let mut allow: HashMap<EndpointId, Policy> = HashMap::new();
+    // Build the node-id allowlist. Every authorized peer gets the same access; `--read-only` (below)
+    // applies uniformly to all of them.
+    let mut allow: HashSet<EndpointId> = HashSet::new();
     for s in &args.allow {
         let id = parse_endpoint_id(s).with_context(|| format!("bad --allow id: {s}"))?;
-        allow.insert(
-            id,
-            Policy {
-                read_only: args.read_only,
-                force_command: None,
-            },
-        );
-    }
-    if let Some(path) = &args.allow_file {
-        for (id, mut policy) in load_allow_file(path)? {
-            // The global --read-only is a floor: it can only ADD the restriction, never relax a
-            // per-peer one.
-            policy.read_only |= args.read_only;
-            if allow.insert(id, policy).is_some() {
-                anyhow::bail!(
-                    "endpoint id authorized by both --allow and --allow-file: {}",
-                    format_endpoint_id(&id)
-                );
-            }
-        }
+        allow.insert(id);
     }
     if allow.is_empty() && !args.allow_any {
         anyhow::bail!(
-            "no clients authorized: pass --allow <endpoint-id> (repeatable), --allow-file <path>, or --allow-any for testing"
+            "no clients authorized: pass --allow <endpoint-id> (repeatable), or --allow-any for testing"
         );
     }
 
@@ -220,13 +190,6 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
     if args.read_only {
         eprintln!("│ mode        : READ-ONLY (clients can watch, not type)");
-    }
-    let restricted = allow.values().filter(|p| p.read_only).count();
-    let forced = allow.values().filter(|p| p.force_command.is_some()).count();
-    if (restricted > 0 || forced > 0) && !args.read_only {
-        eprintln!(
-            "│ policy      : {restricted} restrict, {forced} forced-command (per allow-file)"
-        );
     }
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
@@ -360,7 +323,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 }
             };
             let peer = conn.remote_id();
-            if !allow_any && !allow.contains_key(&peer) {
+            if !allow_any && !allow.contains(&peer) {
                 auth_event(Outcome::Rejected, Some(&peer), "not on allowlist");
                 conn.close(1u32.into(), b"not authorized");
                 return;
@@ -392,31 +355,15 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 Some(&peer),
                 "authorized; attaching session",
             );
-            // Resolve this peer's authorization policy: an explicit allow-file entry, or the default
-            // (full read-write shell, plus the global --read-only if set). `restrict` = observe-only;
-            // `command="…"` = a forced command instead of a login shell. Only applied on a freshly
-            // created session — a reattach keeps the policy baked in at creation.
-            let policy = allow.get(&peer).cloned().unwrap_or(Policy {
-                read_only: global_read_only,
-                force_command: None,
-            });
-            if policy.read_only || policy.force_command.is_some() {
-                info!(
-                    peer = %format_endpoint_id(&peer),
-                    read_only = policy.read_only,
-                    forced_command = policy.force_command.is_some(),
-                    "applying per-peer policy"
-                );
-            }
             // Attach to (or create) this client's detachable session, then serve the connection.
+            // `--read-only` (global) applies uniformly to every authorized peer.
             let (handle, attach_kind) = match session::attach(
                 &store,
                 peer,
                 shell.as_deref(),
                 scrollback,
                 max_sessions,
-                policy.force_command.as_deref(),
-                policy.read_only,
+                global_read_only,
             )
             .await
             {

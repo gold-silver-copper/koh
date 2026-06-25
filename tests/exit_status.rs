@@ -72,7 +72,7 @@ async fn remote_shell_exit_status_reaches_client() {
                 let Ok(conn) = incoming.await else { return };
                 let peer = conn.remote_id();
                 let Ok(Some((handle, _))) =
-                    session::attach(&store, peer, Some("sh"), 0, 64, None, false).await
+                    session::attach(&store, peer, Some("sh"), 0, 64, false).await
                 else {
                     return;
                 };

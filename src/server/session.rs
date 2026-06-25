@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Default cadence the reaper sweeps for dead/expired sessions (injectable per call so tests can
 /// drive it without a real 5s wait).
-pub const REAP_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const REAP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A long-lived shell session that survives client disconnects.
 pub struct Session {
@@ -189,7 +189,7 @@ pub async fn detach(store: &SessionStore, peer: EndpointId) {
 /// guard only fires on an unexpected unwind. `Drop` can't `await`, so it spawns the async detach onto
 /// the current runtime (best-effort: a no-op if no runtime is in scope).
 #[must_use = "hold the guard for the connection's lifetime, then disarm() on a normal return"]
-pub struct AttachGuard {
+pub(crate) struct AttachGuard {
     store: SessionStore,
     peer: EndpointId,
     armed: bool,
@@ -197,7 +197,7 @@ pub struct AttachGuard {
 
 impl AttachGuard {
     /// Arm a guard for a freshly-attached `peer` connection. Hold it across the connection loop.
-    pub fn new(store: SessionStore, peer: EndpointId) -> Self {
+    pub(crate) fn new(store: SessionStore, peer: EndpointId) -> Self {
         Self {
             store,
             peer,
@@ -207,7 +207,7 @@ impl AttachGuard {
 
     /// Disable the safety net once the connection returned normally and the caller will run the
     /// precise [`detach`]/[`reap`] itself. Consumes the guard so its `Drop` becomes a no-op.
-    pub fn disarm(mut self) {
+    pub(crate) fn disarm(mut self) {
         self.armed = false;
     }
 }
@@ -236,6 +236,17 @@ impl Drop for AttachGuard {
                     "connection task unwound; released its session attach via the drop guard"
                 );
             });
+        } else {
+            // No runtime in scope (the server is tearing its runtime down): the balancing detach
+            // can't be spawned, so this attach is not decremented here. It is NOT a permanent leak —
+            // the reaper also collects on `!child_alive`, so the session is reclaimed once the
+            // orphaned shell exits — but make the silent degrade an operator breadcrumb rather than
+            // an invisible one.
+            tracing::warn!(
+                %peer,
+                "connection task unwound with no tokio runtime in scope; session attach not \
+                 decremented now (reaped later when the shell exits)"
+            );
         }
     }
 }
@@ -283,7 +294,7 @@ async fn teardown(handle: SharedSession) {
 /// so tests can drive a sweep without a real multi-second wait. `shutdown` lets the caller stop the
 /// reaper cleanly: the loop `select!`s the token against the sleep and returns when cancelled
 /// (rather than being `abort()`ed mid-sweep).
-pub async fn run_reaper(
+pub(crate) async fn run_reaper(
     store: SessionStore,
     ttl: Duration,
     interval: Duration,

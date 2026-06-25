@@ -36,11 +36,6 @@ use tracing::{error, info, warn};
 /// pending slot for the 300s idle timeout koh configures (`koh_transport_config`).
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Effective ceiling on a detached session's TTL when `--allow-any` is set: an unauthenticated peer
-/// can spawn a shell, so a multi-hour TTL would leave abandoned shells alive far too long. The
-/// authenticated-allowlist path keeps the full configured TTL (the close-laptop/reopen workflow).
-const ALLOW_ANY_MAX_TTL_SECS: u64 = 600;
-
 /// Arguments for `koh serve`.
 #[derive(ClapArgs, Debug)]
 pub struct ServeArgs {
@@ -289,21 +284,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // reconnecting client lands back in the same session at the current screen. The reaper
     // collects sessions whose shell exited or that have been detached past the TTL.
     let store = session::SessionStore::default();
-    // Under --allow-any an unauthenticated peer can spawn a shell, so clamp the detached-session TTL;
-    // the allowlist path keeps the full configured TTL (the close-laptop/reopen workflow).
-    let effective_ttl_secs = if args.allow_any {
-        args.session_ttl_secs.min(ALLOW_ANY_MAX_TTL_SECS)
-    } else {
-        args.session_ttl_secs
-    };
-    if effective_ttl_secs < args.session_ttl_secs {
-        warn!(
-            requested = args.session_ttl_secs,
-            effective = effective_ttl_secs,
-            "clamped detached-session TTL because --allow-any is set"
-        );
-    }
-    let session_ttl = Duration::from_secs(effective_ttl_secs);
+    let session_ttl = Duration::from_secs(args.session_ttl_secs);
     let reaper_shutdown = tokio_util::sync::CancellationToken::new();
     let reaper = tokio::spawn(session::run_reaper(
         store.clone(),

@@ -45,9 +45,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # internally; our crate stays `forbid(unsafe)`). `signal`-only, no default features. Already present
 # transitively, so this pins no new major version.
 nix = { version = "0.28", default-features = false, features = ["signal"] }
-# Crypto for the encrypted-at-rest identity key (the `koh-key-v1` format): BLAKE3 (domain-separated
-# hashing) + Argon2id (the password KDF). RustCrypto, used through their safe Result-returning APIs.
-blake3 = "1"
+# Argon2id — the password KDF for the encrypted-at-rest identity key (`koh-key-v1`). RustCrypto,
+# used through its safe, `Result`-returning API.
 argon2 = "0.5"
 zeroize = "1"
 secrecy = "0.10"

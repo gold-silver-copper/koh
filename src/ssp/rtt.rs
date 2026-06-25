@@ -74,7 +74,9 @@ impl RttEstimator {
         );
     }
 
-    /// Smoothed RTT in milliseconds.
+    /// Smoothed RTT in milliseconds. Test-only: production reads the send interval via
+    /// [`send_interval`](Self::send_interval), not the raw SRTT.
+    #[cfg(test)]
     pub const fn srtt_ms(&self) -> f64 {
         self.srtt
     }

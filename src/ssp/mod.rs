@@ -8,7 +8,7 @@
 //! source of mosh's instant recovery, lossy-link responsiveness, and absence of
 //! head-of-line blocking.
 //!
-//! ## What this crate is (and isn't)
+//! ## What this module is (and isn't)
 //!
 //! [`Transport`] is a **pure state machine**. It owns no sockets, no clock, no async.
 //! The caller (the iroh driver, or a test harness) supplies the current time in
@@ -19,7 +19,7 @@
 //! ## The transport-layer division of labor (vs. mosh)
 //!
 //! QUIC/iroh subsumes mosh's UDP framing, OCB crypto, key exchange, roaming, NAT
-//! traversal, heartbeats, and RTT measurement. This crate keeps only what lives *above*
+//! traversal, heartbeats, and RTT measurement. This module keeps only what lives *above*
 //! the wire: the `sent_states`/`received_states` collapse logic, the `tick()` send
 //! scheduler, the seq/ack/throwaway envelope, and fragmentation (in [`wire`](crate::wire)).
 

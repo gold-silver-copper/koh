@@ -71,9 +71,11 @@ pub struct ServeArgs {
     #[arg(long)]
     shell: Option<String>,
 
-    /// Scrollback lines retained by the server-side emulator.
-    #[arg(long, default_value_t = 1000)]
-    scrollback: usize,
+    /// Scrollback lines retained by the server-side emulator (per session). Bounded like the other
+    /// resource knobs (`--max-connections`/`--max-sessions`): vt100 allocates the grid eagerly, so an
+    /// unbounded value × `--max-sessions` is a memory footgun. 0 = no scrollback.
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
+    scrollback: u64,
 
     /// Keep a detached session's shell alive this long (seconds) for the client to reconnect.
     /// Default 24h (mosh-style "close the laptop, reopen later").
@@ -275,7 +277,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     );
 
     let shell = args.shell.clone();
-    let scrollback = args.scrollback;
+    // Cast the validated u64 (clap range 0..=1_000_000) down to the usize the emulator wants.
+    let scrollback = args.scrollback as usize;
     let global_read_only = args.read_only;
     let allow = std::sync::Arc::new(allow);
     let allow_any = args.allow_any;

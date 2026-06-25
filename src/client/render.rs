@@ -240,7 +240,7 @@ pub struct WindowState<'a> {
 /// mouse / cursor-key) — so each is re-emitted only when it changes. These ride alongside the cell
 /// grid but aren't part of it.
 #[derive(Default)]
-pub struct OutOfBand {
+pub(super) struct OutOfBand {
     /// Prepended to the window title (and to the icon when icon == title) so the OS title bar shows
     /// you're in a koh session — mosh's `[mosh] ` prefix (`$MOSH_TITLE_NOPREFIX` to disable).
     /// Empty disables it. Compared cells stay the *raw* title, so change-detection is unaffected.
@@ -264,7 +264,7 @@ pub struct OutOfBand {
 impl OutOfBand {
     /// An [`OutOfBand`] that prefixes the window title with `title_prefix` (e.g. `"[koh] "`; pass
     /// `""` to disable). All other state starts fresh.
-    pub fn with_title_prefix(title_prefix: String) -> Self {
+    pub(super) fn with_title_prefix(title_prefix: String) -> Self {
         Self {
             title_prefix,
             ..Self::default()
@@ -274,7 +274,7 @@ impl OutOfBand {
     /// Enable (or disable) honoring remote OSC-52 clipboard writes (default off). Chainable:
     /// `OutOfBand::with_title_prefix(p).with_clipboard(enabled)`.
     #[must_use]
-    pub fn with_clipboard(mut self, enabled: bool) -> Self {
+    pub(super) fn with_clipboard(mut self, enabled: bool) -> Self {
         self.clipboard_enabled = enabled;
         self
     }
@@ -283,7 +283,7 @@ impl OutOfBand {
     /// title, clipboard, bell baseline, and input modes from scratch. Used after a suspend/resume
     /// (the terminal left and re-entered raw mode + the alternate screen), where everything the
     /// client had mirrored must be re-emitted. The `title_prefix` is preserved.
-    pub fn invalidate(&mut self) {
+    pub(super) fn invalidate(&mut self) {
         let prefix = std::mem::take(&mut self.title_prefix);
         let clipboard_enabled = self.clipboard_enabled;
         *self = Self::with_title_prefix(prefix).with_clipboard(clipboard_enabled);
@@ -291,7 +291,7 @@ impl OutOfBand {
 
     /// Emit this frame's title/icon / clipboard / bell / input-mode changes to `out`, updating the
     /// tracked state. Mirrors mosh's `Display::new_frame` out-of-band emission.
-    pub fn emit(
+    pub(super) fn emit(
         &mut self,
         out: &mut impl Write,
         screen: &Screen,

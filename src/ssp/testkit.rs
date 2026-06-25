@@ -23,7 +23,7 @@ use crate::ssp::{SyncState, Transport, NEVER};
 
 /// A small, dependency-free, reproducible PRNG (SplitMix64).
 #[derive(Debug, Clone)]
-pub struct Rng {
+pub(crate) struct Rng {
     state: u64,
 }
 
@@ -96,7 +96,7 @@ impl LinkParams {
 
 /// A one-directional in-flight datagram queue with random per-datagram delay.
 #[derive(Debug, Default)]
-pub struct Link {
+pub(crate) struct Link {
     inflight: Vec<(u64, Vec<u8>)>, // (deliver_at_ms, bytes)
 }
 
@@ -106,7 +106,7 @@ impl Link {
     }
 
     /// Offer a datagram to the link at time `now`; loss/delay/dup are applied here.
-    pub fn push(&mut self, rng: &mut Rng, now: u64, p: &LinkParams, dg: Vec<u8>) {
+    pub(crate) fn push(&mut self, rng: &mut Rng, now: u64, p: &LinkParams, dg: Vec<u8>) {
         if rng.next_f64() < p.loss {
             return; // dropped
         }
@@ -124,7 +124,7 @@ impl Link {
     }
 
     /// Drain and return all datagrams due at or before `now`, in delivery-time order.
-    pub fn due(&mut self, now: u64) -> Vec<Vec<u8>> {
+    pub(crate) fn due(&mut self, now: u64) -> Vec<Vec<u8>> {
         let mut ready: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut keep: Vec<(u64, Vec<u8>)> = Vec::new();
         for item in self.inflight.drain(..) {

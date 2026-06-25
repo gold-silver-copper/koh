@@ -47,14 +47,14 @@ enum Ss3State {
 /// port of mosh's `UserInput::input`). The `ESC` is emitted eagerly and the SS3 state carries
 /// across input chunks.
 #[derive(Default)]
-pub struct CursorKeyNormalizer {
+pub(crate) struct CursorKeyNormalizer {
     state: Ss3State,
 }
 
 impl CursorKeyNormalizer {
     /// Normalize `input` for an app whose application-cursor-keys mode is `app_cursor`, returning
     /// the bytes to feed the PTY.
-    pub fn normalize(&mut self, input: &[u8], app_cursor: bool) -> Vec<u8> {
+    pub(crate) fn normalize(&mut self, input: &[u8], app_cursor: bool) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len() + 1);
         for &b in input {
             match self.state {
@@ -311,8 +311,10 @@ pub async fn run_attached(
                                 }
                                 s.emu.register_input_frame(input.frame, now);
                                 drop(s);
-                                // Applied input may have resized the emulator (a direct grid change
-                                // not signaled via `changed`), so re-snapshot next pass.
+                                // A non-read-only branch may have resized the emulator (a direct grid
+                                // change not signaled via `changed`), so re-snapshot next pass. On the
+                                // read-only branch nothing mutated the grid — this is then a harmless
+                                // precautionary re-snapshot.
                                 session.mark_dirty();
                             }
                         }

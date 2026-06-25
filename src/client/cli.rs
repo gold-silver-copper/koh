@@ -201,7 +201,7 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     // diagnosable rather than mysterious.
     warn_if_locale_not_utf8();
 
-    let key_file = args.key_file.clone().unwrap_or_else(default_key_file);
+    let key_file = args.key_file.unwrap_or_else(default_key_file);
     let secret = load_or_create_secret_key(&key_file).with_context(|| {
         format!(
             "loading client key from {} (pass --key-file to use a writable path)",

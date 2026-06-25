@@ -1870,7 +1870,6 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
- "blake3",
  "bytes",
  "clap",
  "data-encoding",

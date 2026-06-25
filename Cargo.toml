@@ -68,7 +68,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
 data-encoding = "2"
-directories = "5"
 
 [dev-dependencies]
 proptest = "1"
@@ -76,6 +75,12 @@ proptest = "1"
 [profile.release]
 opt-level = 3
 lto = "thin"
+# Keep release as strict as debug on integer overflow: koh is an interactive tool (not a throughput
+# engine), so the per-op cost is negligible, and it makes a wrap-on-overflow of any peer-derived
+# arithmetic a loud panic in release too — not a silent miscompute. (`cast_*` lints are allowed, so
+# this is the backstop for a future raw `a + b` on a wire `u64`/`u16`.) NOTE: panic stays `unwind`,
+# never `abort` — the vt100 containment (`process_contained`) relies on `catch_unwind`.
+overflow-checks = true
 
 # ---------------------------------------------------------------------------
 # Lints. Goal: the library is PANIC-FREE by construction, enforced by clippy. The
@@ -87,6 +92,13 @@ lto = "thin"
 [lints.rust]
 # A bare `unsafe` block must justify itself; this codebase is 100% safe today.
 unsafe_code = "forbid"
+# Dead code is a hard compile error. `deny` (not `forbid`) because clap's derive macros
+# (`Args`/`Subcommand`/`ValueEnum`) emit an internal `#[allow(dead_code)]` that `forbid` rejects
+# outright (E0453) — `deny` is the strictest level compatible with the derives while still failing the
+# build on any genuine dead code we write. Combined with the minimal-surface discipline (test-only
+# helpers are `#[cfg(test)]`-gated, not left `pub`), this keeps the crate from accreting unused items;
+# it also covers the integration-test/example crates, so every helper there must be used too.
+dead_code = "deny"
 
 [lints.clippy]
 # Lint-group toggles (priority = -1 so individual lints below can override).

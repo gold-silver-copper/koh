@@ -16,10 +16,11 @@
 //! ## The diff carries more than the grid
 //!
 //! `vt100::Screen::contents_diff` does not express resize or the echo-ack. So [`ScreenDiff`]
-//! bundles three things, mirroring mosh's `HostMessage`: the optional `resize`, the
-//! `echo_ack` (which the client's predictor consumes as the authoritative "your input up to
-//! frame N is now on screen"), the optional window `title`, and the `vt` escape-sequence
-//! patch (`state_diff`, or a full `state_formatted` repaint after a resize).
+//! bundles the grid patch with the out-of-band channels, mirroring mosh's `HostMessage`: the
+//! optional `resize`, the `echo_ack` (which the client's predictor consumes as the authoritative
+//! "your input up to frame N is now on screen"), the window `title`/`icon`, the `clipboard` and
+//! `bell` out-of-band events, the shell's `exit_code`, and the `vt` escape-sequence patch
+//! (`state_diff`, or a full `state_formatted` repaint after a resize).
 
 use crate::ssp::SyncState;
 use serde::{Deserialize, Serialize};

@@ -302,7 +302,8 @@ fn read_key_file_secure(path: &Path) -> Result<String, SetupError> {
 /// On unix, tighten an existing group/other-accessible key file to 0600 — operating on the held
 /// **fd** (`File::set_permissions` is `fchmod`), so it can't be redirected to a different inode by a
 /// path swap (K-01). The key IS the node identity (KOH-16), so a loose key is a local-impersonation
-/// risk; an upgrade-in-place from a pre-0.3.1 build (plain write, umask → typically 0644) lands here.
+/// risk; a key file whose perms were loosened out-of-band (manual `chmod`, a restore from a
+/// permissive backup/umask) is re-tightened here on load.
 #[cfg(unix)]
 fn tighten_key_perms_via_fd(file: &std::fs::File, path: &Path, meta: &std::fs::Metadata) {
     use std::os::unix::fs::PermissionsExt as _;

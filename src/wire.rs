@@ -114,18 +114,6 @@ pub struct Instruction {
 }
 
 impl Instruction {
-    /// A pure acknowledgement carrying no state change (`old_num == new_num`, empty diff).
-    pub const fn ack_only(state_num: u64, ack_num: u64, throwaway_num: u64) -> Self {
-        Self {
-            protocol_version: PROTOCOL_VERSION,
-            old_num: state_num,
-            new_num: state_num,
-            ack_num,
-            throwaway_num,
-            diff: Vec::new(),
-        }
-    }
-
     /// Serialize to bytes: postcard, then DEFLATE-compressed (mosh compresses the whole serialized
     /// instruction *before* fragmenting, so compression directly raises how much screen change
     /// fits per datagram). Always compressed — the tiny deflate overhead on small instructions is
@@ -730,7 +718,14 @@ mod tests {
         // An ack-only instruction has an empty *diff*, but still serializes its seq/ack
         // fields, so it fits in exactly one (small, non-empty) fragment that round-trips.
         let mut f = Fragmenter::new();
-        let instr = Instruction::ack_only(5, 3, 1);
+        let instr = Instruction {
+            protocol_version: PROTOCOL_VERSION,
+            old_num: 5,
+            new_num: 5,
+            ack_num: 3,
+            throwaway_num: 1,
+            diff: Vec::new(),
+        };
         let frags = f.fragment(&instr, 1200).unwrap();
         assert_eq!(frags.len(), 1);
         assert!(frags[0].final_);

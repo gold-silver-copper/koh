@@ -62,8 +62,6 @@ pub struct Transport<Local: SyncState, Remote: SyncState> {
     next_send_time: u64,
     /// Newest remote `num` we have received in order — what we advertise as our ack.
     ack_num: u64,
-    /// The most recent ack value we actually put on the wire (for shutdown bookkeeping).
-    last_ack_sent: u64,
     pending_data_ack: bool,
     last_heard: u64,
     /// Start of the current input-coalescing window, or [`NEVER`] when none is pending.
@@ -106,7 +104,6 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             next_ack_time: now,
             next_send_time: now,
             ack_num: 0,
-            last_ack_sent: 0,
             pending_data_ack: false,
             last_heard: 0,
             mindelay_clock: NEVER,
@@ -219,11 +216,6 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
     /// Feed a smoothed RTT sample (ms), typically `Connection::rtt()` each tick.
     pub fn observe_rtt(&mut self, rtt_ms: f64) {
         self.rtt.sample(rtt_ms);
-    }
-
-    /// Current smoothed RTT estimate (ms).
-    pub fn srtt_ms(&self) -> f64 {
-        self.rtt.srtt_ms()
     }
 
     /// The send interval (ms) = `clamp(ceil(SRTT/2), MIN, MAX)`. This — NOT raw SRTT — is what
@@ -504,7 +496,6 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             throwaway_num: self.sent_front().num,
             diff,
         };
-        self.last_ack_sent = self.ack_num;
         if new_num == SHUTDOWN_SENTINEL {
             self.shutdown_tries += 1;
         }
@@ -595,6 +586,10 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             .iter()
             .position(|s| s.num == instr.old_num)
         else {
+            tracing::trace!(
+                old_num = instr.old_num,
+                "dropping instruction: diff base not held (out-of-order / replay)"
+            );
             return RecvOutcome::MissingBase;
         };
         // Clone the base BEFORE the throwaway GC. A peer controls `throwaway_num`, and
@@ -610,6 +605,13 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         // at the cap, so a peer that pins `old_num`/`throwaway_num` to prevent collapse can't grow
         // it without bound. Honest peers collapse well below the cap, so this never trips for them.
         if self.received_states.len() >= RECEIVED_STATES_CAP {
+            // debug, not warn: off by default (no spam in normal ops), but lets an operator
+            // distinguish a throttled hostile peer (KOH-01/02) from a benign duplicate under
+            // `RUST_LOG=koh=debug`. Same for the byte-budget quenches below.
+            tracing::debug!(
+                cap = RECEIVED_STATES_CAP,
+                "quenched: received-states count at cap"
+            );
             return RecvOutcome::Quenched;
         }
 
@@ -626,6 +628,11 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             .map(|s| s.state.resource_units())
             .sum();
         if retained >= Remote::RECEIVE_BUDGET_UNITS {
+            tracing::debug!(
+                retained_units = retained,
+                budget = Remote::RECEIVE_BUDGET_UNITS,
+                "quenched: receive byte budget saturated (pre-decode)"
+            );
             return RecvOutcome::Quenched;
         }
 
@@ -642,6 +649,10 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         // Precise check now that the new state is fully built: its exact size against the
         // already-summed retained budget (received_states is unchanged by decode/apply above).
         if retained.saturating_add(new_state.resource_units()) > Remote::RECEIVE_BUDGET_UNITS {
+            tracing::debug!(
+                budget = Remote::RECEIVE_BUDGET_UNITS,
+                "quenched: receive byte budget exceeded by new state (post-decode)"
+            );
             return RecvOutcome::Quenched;
         }
 

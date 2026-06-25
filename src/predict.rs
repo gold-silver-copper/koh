@@ -290,9 +290,9 @@ impl PredictionEngine {
     pub fn set_predict_overwrite(&mut self, on: bool) {
         self.predict_overwrite = on;
     }
-    /// The newest epoch the server has confirmed echoes (predictions at or below it may show).
-    /// The confirmation epoch — bumped by [`cull`](Self::cull) when a prediction is confirmed.
-    /// Read by the client status line (and tests) to surface prediction activity.
+    /// The newest epoch the server has confirmed echoes (predictions at or below it may show) —
+    /// bumped by [`cull`](Self::cull) when a prediction is confirmed. Test-only.
+    #[cfg(test)]
     pub fn confirmed_epoch(&self) -> u64 {
         self.confirmed_epoch
     }
@@ -628,7 +628,6 @@ impl PredictionEngine {
         }
     }
 
-    /// Validate predictions against the freshly-arrived authoritative `screen`.
     /// Re-evaluate prediction visibility at `now` against the (unchanged) authoritative `screen`,
     /// so a long-pending prediction escalates to the glitch underline on time even on a silent
     /// link. Returns whether the displayed flagging changed (the caller repaints if so).

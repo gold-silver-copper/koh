@@ -130,6 +130,7 @@ impl ServerTerminal {
 
     /// Override the echo debounce (ms). The server uses the [`ECHO_TIMEOUT_MS`] default; tests
     /// inject a smaller value to exercise the promotion timing deterministically.
+    #[cfg(test)]
     pub fn set_echo_timeout_ms(&mut self, ms: u64) {
         self.echo_timeout_ms = ms;
     }
@@ -219,17 +220,21 @@ impl ServerTerminal {
         self.echo_ack
     }
 
-    /// Window title set by the shell (OSC 2), if any.
+    /// Window title set by the shell (OSC 2), if any. Test-only — production reads it via
+    /// [`snapshot`](Self::snapshot)'s [`TerminalScreen`].
+    #[cfg(test)]
     pub fn title(&self) -> &str {
         &self.parser.callbacks().title
     }
 
-    /// Window icon name set by the shell (OSC 1), if any.
+    /// Window icon name set by the shell (OSC 1), if any. Test-only (see [`title`](Self::title)).
+    #[cfg(test)]
     pub fn icon_name(&self) -> &str {
         &self.parser.callbacks().icon
     }
 
-    /// Number of audible bells seen so far.
+    /// Number of audible bells seen so far. Test-only (see [`title`](Self::title)).
+    #[cfg(test)]
     pub fn bell_count(&self) -> u64 {
         self.parser.callbacks().bell_count
     }

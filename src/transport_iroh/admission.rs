@@ -33,8 +33,9 @@ pub enum AdmissionError {
 
 /// Server side: signal admission after the allowlist check passes.
 ///
-/// Non-blocking in practice — opening a QUIC stream and buffering one byte does not wait on the
-/// client — so a client that never accepts the stream cannot stall the server here.
+/// Fast in the common case (opening a QUIC stream and buffering one byte), but `open_bi()` can wait
+/// on stream-flow-control credit, so a stalling client is bounded by the caller's own short timeout
+/// (`koh serve`'s 3s admission deadline in `server::cli`), not relied on to never block.
 pub async fn admit(conn: &Connection) -> Result<(), io::Error> {
     let (mut send, _recv) = conn.open_bi().await.map_err(io::Error::other)?;
     send.write_all(&[ADMIT]).await.map_err(io::Error::other)?;

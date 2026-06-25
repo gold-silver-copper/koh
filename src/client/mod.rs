@@ -59,7 +59,8 @@ const RESET_FORWARDED_MODES: &[u8] =
 
 /// How long a single reconnect dial may run before it is abandoned and retried.
 const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Reconnect backoff: `BASE << min(attempt, 4)`, capped at `MAX` (0.5s → 1 → 2 → 4 → 8s).
+/// Reconnect backoff: `BASE << min(attempt, 4)`, capped at `MAX`. `backoff_ms` is only called for
+/// `attempt > 0` (attempt 0 redials immediately), so the realized sequence is 1 → 2 → 4 → 8s.
 const RECONNECT_BACKOFF_BASE_MS: u64 = 500;
 const RECONNECT_BACKOFF_MAX_MS: u64 = 8_000;
 /// Minimum time a connection must stay up to count as "proven" and reset the reconnect backoff. A

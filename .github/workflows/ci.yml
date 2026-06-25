@@ -14,13 +14,23 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: every job here only needs to read the repo. The release workflow grants its own
+# narrower-scoped write/id-token permissions per job.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The same green gate enforced locally: format, lints, and the full test suite.
+  # The same green gate enforced locally — format, lints (warnings are errors), the layering guard,
+  # the full test suite, and broken-doc-link detection — on BOTH supported desktop OSes.
   gate:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,8 +39,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
         run: cargo fmt --all --check
-      - name: clippy
-        run: cargo clippy --all-targets --locked
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: layering guard
         # Enforce the two load-bearing dependency edges the architecture relies on (AR-02). Greps
         # the `use crate::` import form only, so doc-comment rustdoc links can't false-positive.
@@ -51,6 +61,18 @@ jobs:
         run: cargo doc --no-deps --locked
         env:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
+
+  # Verify the declared MSRV (`rust-version = "1.91"`) actually builds — otherwise the declaration is
+  # a false promise to `cargo install` users on an older toolchain. Check, not test (the `=`-pinned
+  # lockfile makes it cheap and deterministic). Bump `rust-version` if this ever fails.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check on the declared MSRV
+        run: cargo check --locked --all-targets
 
   # Supply-chain tripwire: the `=` pins buy reproducibility, so this is what keeps them from
   # silently aging into a CVE. Advisory ignores (and the rationale) live in deny.toml.

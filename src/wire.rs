@@ -336,17 +336,7 @@ pub struct FragmentAssembly {
     max_decompressed: usize,
 }
 
-impl Default for FragmentAssembly {
-    fn default() -> Self {
-        Self::with_limit(MAX_DECOMPRESSED)
-    }
-}
-
 impl FragmentAssembly {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// A reassembler whose completed instructions inflate to at most `max_decompressed` bytes, and
     /// whose pre-decompression scratch is bounded proportionally. Callers pass their per-direction
     /// [`crate::ssp::SyncState::RECV_DECODE_LIMIT`].
@@ -636,7 +626,7 @@ mod tests {
         let frags = f.fragment(&instr, 1200).unwrap();
         assert_eq!(frags.len(), 1, "small instruction is one fragment");
 
-        let mut asm = FragmentAssembly::new();
+        let mut asm = FragmentAssembly::with_limit(MAX_DECOMPRESSED);
         assert_eq!(
             asm.add(frags[0].clone()).unwrap().unwrap(),
             instr,
@@ -731,7 +721,7 @@ mod tests {
         assert!(frags[0].final_);
         assert!(instr.diff.is_empty());
 
-        let mut asm = FragmentAssembly::new();
+        let mut asm = FragmentAssembly::with_limit(MAX_DECOMPRESSED);
         assert_eq!(asm.add(frags[0].clone()).unwrap().unwrap(), instr);
     }
 
@@ -749,7 +739,7 @@ mod tests {
         for fr in &frags {
             assert!(fr.encode().unwrap().len() <= 200, "fragment exceeds MTU");
         }
-        let mut asm = FragmentAssembly::new();
+        let mut asm = FragmentAssembly::with_limit(MAX_DECOMPRESSED);
         let mut got = None;
         for fr in frags {
             if let Some(i) = asm.add(fr).unwrap() {
@@ -817,7 +807,7 @@ mod tests {
         newer.new_num = 999;
         let new_frags = f.fragment(&newer, 300).unwrap();
 
-        let mut asm = FragmentAssembly::new();
+        let mut asm = FragmentAssembly::with_limit(MAX_DECOMPRESSED);
         // Deliver only part of the old instruction...
         assert!(asm.add(old_frags[0].clone()).unwrap().is_none());
         // ...then the full newer one. The stale partial must be discarded.
@@ -835,7 +825,7 @@ mod tests {
         // A peer can send a near-MAX_FRAGMENT_INDEX, non-final fragment before any final marker.
         // With the map-backed store this is a single entry (not a ~32K-slot buffer), it can't
         // complete on its own, and a newer instruction supersedes it cleanly.
-        let mut asm = FragmentAssembly::new();
+        let mut asm = FragmentAssembly::with_limit(MAX_DECOMPRESSED);
         let high = Fragment {
             id: 5,
             index: MAX_FRAGMENT_INDEX,
@@ -876,7 +866,7 @@ mod tests {
             for fr in &frags {
                 prop_assert!(fr.encode().unwrap().len() <= mtu);
             }
-            let mut asm = FragmentAssembly::new();
+            let mut asm = FragmentAssembly::with_limit(MAX_DECOMPRESSED);
             let mut got = None;
             for fr in frags {
                 if let Some(i) = asm.add(fr).unwrap() { got = Some(i); }

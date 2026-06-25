@@ -35,12 +35,12 @@ pub use render::WindowState;
 const KOH_TITLE_PREFIX: &str = "[koh] ";
 
 /// The escape prefix (Ctrl-^); followed by '.' it disconnects the session.
-pub const ESCAPE_PREFIX: u8 = 0x1e;
+pub(crate) const ESCAPE_PREFIX: u8 = 0x1e;
 /// The escape suffix that suspends the client to the background (`Ctrl-^` then `Ctrl-Z`).
 ///
 /// Mirrors mosh. In raw mode `Ctrl-Z` is a literal byte (no SIGTSTP from the tty), so the suspend
 /// is driven through the escape machine instead.
-pub const SUSPEND_KEY: u8 = 0x1a;
+pub(crate) const SUSPEND_KEY: u8 = 0x1a;
 
 /// The DEC private modes we may have forwarded to the user's terminal (X10 `?9` + all mouse modes
 /// and encodings, bracketed paste `?2004`, application cursor keys `?1`) plus normal keypad

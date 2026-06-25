@@ -40,8 +40,18 @@ async fn spawns_and_streams_output() {
         collected.contains(&b'\n'),
         "expected a newline from echo, got {collected:?}"
     );
-    // Child should be reapable.
-    let status = pty.wait().expect("wait");
+    // Child should be reapable. After EOF there's a benign race between the reader closing the
+    // channel and the exit status becoming collectible, so poll `try_wait` (the same pattern the
+    // reap test below uses) rather than a single blocking call.
+    let mut status = None;
+    for _ in 0..200 {
+        if let Ok(Some(s)) = pty.try_wait() {
+            status = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let status = status.expect("the one-shot child must exit and be reaped");
     assert!(status.success() || status.exit_code() == 0);
 }
 

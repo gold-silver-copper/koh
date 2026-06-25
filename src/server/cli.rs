@@ -34,7 +34,7 @@ use tracing::{error, info, warn};
 /// its connection + pending-handshake permits released (KR-01). A legitimate 1-RTT QUIC handshake
 /// finishes in well under this even on a slow mobile link; the cap exists so a peer can't pin a
 /// pending slot for the 300s idle timeout koh configures (`koh_transport_config`).
-const ACCEPT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Arguments for `koh serve`.
 #[derive(ClapArgs, Debug)]
@@ -47,7 +47,9 @@ pub struct ServeArgs {
     #[arg(long = "allow", value_name = "ENDPOINT_ID")]
     allow: Vec<String>,
 
-    /// INSECURE: accept any client. For local testing only.
+    /// INSECURE: accept any client — a shell to anyone who can reach the endpoint, with no
+    /// allowlist. For local/testing use (pair with `--local`); on a public bind prefer
+    /// `--read-only` for an observe-only screen-share. Prints a loud warning when set.
     #[arg(long)]
     allow_any: bool,
 
@@ -79,8 +81,9 @@ pub struct ServeArgs {
     session_ttl_secs: u64,
 
     /// Exit the server after this many seconds with NO active client connection (0 = never, the
-    /// default). A safety net for orphaned servers — mosh's `$MOSH_SERVER_NETWORK_TMOUT`. Note it
-    /// can reap a *retained, detached* session, so leave it 0 unless you want that trade-off.
+    /// default — matches mosh). A safety net for an orphaned standalone daemon. WARNING: a non-zero
+    /// value also reaps a *retained, detached* session once it has been idle this long, so a
+    /// long-lived daemon should set it comfortably LONGER than --session-ttl-secs (or leave it 0).
     #[arg(long, env = "KOH_SERVER_NETWORK_TMOUT", default_value_t = 0)]
     network_timeout_secs: u64,
 
@@ -216,7 +219,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!("│ key file    : {}", key_file.display());
     eprintln!("│ alpn        : {}", String::from_utf8_lossy(ALPN));
     if args.allow_any {
-        eprintln!("│ auth        : ⚠ ALLOW-ANY (insecure)");
+        eprintln!("│ auth        : ⚠ ALLOW-ANY (INSECURE) — a shell to ANYONE who can reach this");
+        eprintln!("│             :   endpoint, with no allowlist. Use only on trusted/local nets.");
     } else {
         eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
     }
@@ -230,13 +234,32 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             "│ policy      : {restricted} restrict, {forced} forced-command (per allow-file)"
         );
     }
+    if args.network_timeout_secs > 0 {
+        eprintln!(
+            "│ idle-timeout: {}s (server exits — reaping any detached session — after this idle)",
+            args.network_timeout_secs
+        );
+    }
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
+
+    // Also surface --allow-any as a structured WARN (so it lands in logs / SIEM, not just the
+    // banner). It is permitted with no extra ceremony — this is the loud notice, not a gate.
+    if args.allow_any {
+        warn!(
+            local = args.local,
+            "--allow-any is set: ANY peer that can reach this endpoint gets a shell (no allowlist). \
+             Use only on trusted/local networks; prefer --read-only on a public bind."
+        );
+    }
 
     // Always print a scannable QR of the endpoint id — point a phone camera at it instead of
     // copying 64 hex chars.
     if let Some(qr) = connect_qr(&id_str) {
-        eprintln!("\nScan for the endpoint id (point a phone camera at it):\n");
+        eprintln!(
+            "\nScan for the endpoint id (point a phone camera at it). Assumes a dark-background \
+             terminal;\non a light background it renders inverted — copy the id above instead:\n"
+        );
         eprintln!("{qr}");
     } else {
         warn!("could not render the connect QR (endpoint id too large to encode)");
@@ -261,7 +284,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // reconnecting client lands back in the same session at the current screen. The reaper
     // collects sessions whose shell exited or that have been detached past the TTL.
     let store = session::SessionStore::default();
-    let session_ttl = std::time::Duration::from_secs(args.session_ttl_secs);
+    let session_ttl = Duration::from_secs(args.session_ttl_secs);
     let reaper_shutdown = tokio_util::sync::CancellationToken::new();
     let reaper = tokio::spawn(session::run_reaper(
         store.clone(),
@@ -279,11 +302,12 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // whole lifetime, so a flood can't spawn unbounded tasks (L-3). Excess dials are refused cheaply
     // (before the crypto handshake) via `Incoming::refuse`.
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(args.max_connections as usize));
-    // Separate, smaller cap on *un-authenticated, in-flight* handshakes (KOH-08): a slowloris that
-    // opens connections but never answers the nonce challenge would otherwise pin every connection
-    // permit for the whole handshake-timeout window. A pending permit is released the moment auth
-    // completes, so established sessions never count against this — only stalls do — and excess
-    // pending dials are refused cheaply (pre-handshake) like the connection cap.
+    // Separate, smaller cap on *un-admitted, in-flight* handshakes (KOH-08): a slowloris that opens
+    // connections but stalls the QUIC handshake (or never accepts the admission stream) would
+    // otherwise pin every connection permit for the whole handshake-timeout window. A pending permit
+    // is released the moment admission completes (the `drop(pending_permit)` in the accept task), so
+    // established sessions never count against this — only stalls do — and excess pending dials are
+    // refused cheaply (pre-handshake) like the connection cap.
     let pending_cap = (args.max_connections as usize).div_ceil(4).max(4);
     let handshake_limit = Arc::new(tokio::sync::Semaphore::new(pending_cap));
     let max_sessions = args.max_sessions as usize;
@@ -361,7 +385,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             };
             let peer = conn.remote_id();
             if !allow_any && !allow.contains_key(&peer) {
-                auth_event("authz", Outcome::Rejected, Some(&peer), "not on allowlist");
+                auth_event(Outcome::Rejected, Some(&peer), "not on allowlist");
                 conn.close(1u32.into(), b"not authorized");
                 return;
             }
@@ -369,7 +393,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             // from a deliberate reject (without it a rejected client would re-dial forever). Bounded
             // by a short timeout so a client that never accepts the stream can't pin the slot.
             match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
+                Duration::from_secs(3),
                 crate::transport_iroh::admission::admit(&conn),
             )
             .await
@@ -388,7 +412,6 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             // long-lived) session that follows (KOH-08). The connection-cap permit is still held.
             drop(pending_permit);
             auth_event(
-                "authz",
                 Outcome::Accepted,
                 Some(&peer),
                 "authorized; attaching session",

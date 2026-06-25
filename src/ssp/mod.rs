@@ -30,7 +30,7 @@ mod rtt;
 pub mod testkit;
 mod transport;
 
-pub use rtt::RttEstimator;
+pub(crate) use rtt::RttEstimator;
 pub use transport::{RecvOutcome, Transport};
 
 /// `u64::MAX` doubles as both the "never" deadline and the shutdown state sentinel,

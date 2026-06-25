@@ -83,7 +83,10 @@ pub fn clamp_dims(rows: u16, cols: u16) -> (u16, u16) {
 /// the backtrace (to `$KOH_LOG`), so a genuine vt100 panic stays diagnosable + reportable upstream.
 /// `catch_unwind` is no-`unsafe`; `AssertUnwindSafe` is required only because `&mut Parser` is not
 /// `UnwindSafe`, and a poisoned parser is discarded by the caller.
-fn process_contained(parser: &mut vt100::Parser, bytes: &[u8]) -> bool {
+pub(crate) fn process_contained<C: vt100::Callbacks>(
+    parser: &mut vt100::Parser<C>,
+    bytes: &[u8],
+) -> bool {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(bytes))).is_ok()
 }
 

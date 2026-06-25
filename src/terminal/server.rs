@@ -106,7 +106,6 @@ impl vt100::Callbacks for Callbacks {
 /// produces a [`TerminalScreen`] snapshot for the SSP transport each tick.
 pub struct ServerTerminal {
     parser: vt100::Parser<Callbacks>,
-    scrollback: usize,
     /// The newest input frame number whose effects are considered on-screen.
     echo_ack: u64,
     /// Pending `(input_frame_num, arrival_timestamp_ms)`, oldest first.
@@ -122,7 +121,6 @@ impl ServerTerminal {
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         Self {
             parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback, Callbacks::default()),
-            scrollback,
             echo_ack: 0,
             input_history: Vec::new(),
             exit_code: None,
@@ -142,8 +140,18 @@ impl ServerTerminal {
     }
 
     /// Feed a chunk of the child shell's output into the screen model.
+    ///
+    /// Routed through [`process_contained`](crate::terminal::process_contained): a `vt100` panic on
+    /// shell output (an emulator bug, not wire-controlled — but `vt100` is outside koh's no-panic
+    /// coverage) is CONTAINED so it can't unwind out of the drain task and poison the session mutex.
+    /// On a contained panic the chunk is dropped and the parser keeps its prior state; subsequent
+    /// output repaints. The default hook still logs the backtrace to `$KOH_LOG` for an upstream report.
     pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+        if !crate::terminal::process_contained(&mut self.parser, bytes) {
+            tracing::error!(
+                "vt100 panicked on shell output; dropped the chunk (backtrace in logs)"
+            );
+        }
     }
 
     /// Take and clear any host-bound replies (DSR/DA/DECRQM answers) produced while processing
@@ -230,11 +238,6 @@ impl ServerTerminal {
     /// client's arrow-key bytes (SS3 vs CSI) before they reach the PTY.
     pub fn application_cursor(&self) -> bool {
         self.parser.screen().application_cursor()
-    }
-
-    /// Scrollback length this emulator was built with.
-    pub fn scrollback(&self) -> usize {
-        self.scrollback
     }
 
     /// Produce the SSP snapshot the transport will diff and ship.

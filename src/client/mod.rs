@@ -28,7 +28,19 @@ use termina::{PlatformTerminal, Terminal as _};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub use render::{render, WindowState};
+pub use render::WindowState;
+
+/// Parse a boolean opt-in env var: true for `1`/`true`/`yes`/`on` (trimmed, case-insensitive),
+/// false otherwise (including unset). Shared so every `KOH_*` toggle parses identically — e.g.
+/// `KOH_CLIPBOARD` and `KOH_PREDICT_OVERWRITE` no longer diverge on `TRUE`/`Yes`/`" 1 "`.
+pub(crate) fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
 
 /// The escape prefix (Ctrl-^); followed by '.' it disconnects the session.
 pub const ESCAPE_PREFIX: u8 = 0x1e;
@@ -597,8 +609,7 @@ pub async fn run_client<T: ClientTerminal>(
 ) -> anyhow::Result<Option<u32>> {
     let clock = MonoClock::new();
     // Opt-in overwrite-mode prediction for full-screen apps (mosh's $MOSH_PREDICTION_OVERWRITE).
-    let predict_overwrite = std::env::var("KOH_PREDICT_OVERWRITE")
-        .is_ok_and(|v| matches!(v.as_str(), "1" | "yes" | "true"));
+    let predict_overwrite = env_truthy("KOH_PREDICT_OVERWRITE");
     let mut channel = initial;
     // Persists ACROSS reconnect cycles (not reset per connection) so a server that keeps dropping us
     // fast can't escape the backoff by completing each handshake — only a connection that proves

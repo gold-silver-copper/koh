@@ -41,10 +41,11 @@ const TAG_LEN: usize = 16;
 const AAD_LEN: usize = 1 + 1 + 1 + SALT_LEN + 4 + 4 + 4 + NONCE_LEN;
 const PAYLOAD_LEN: usize = AAD_LEN + SECRET_LEN + TAG_LEN;
 
-/// Argon2id parameters for the key file: 64 MiB, 3 passes, 1 lane, 32-byte output. Stored in the
-/// file so a future retune still reads old files.
+/// Argon2id parameters for the key file: 64 MiB, 4 passes, 1 lane, 32-byte output. Stored in the
+/// file so a future retune still reads old files (the decrypt path reads the params from the file,
+/// so raising this only strengthens NEWLY-written keys and never breaks an existing one).
 const M_COST_KIB: u32 = 64 * 1024;
-const T_COST: u32 = 3;
+const T_COST: u32 = 4;
 const P_COST: u32 = 1;
 /// Defensive ceiling on a file-supplied Argon2 memory cost, so a corrupt/hostile local key file
 /// can't drive an enormous allocation. Generous vs the 64 MiB default; the key file is local-trust,
@@ -269,5 +270,48 @@ mod tests {
         let m = u32::from_le_bytes(payload[3 + 16..3 + 16 + 4].try_into().unwrap());
         assert_eq!(m, M_COST_KIB, "the cost is recorded in the file");
         assert_eq!(*decrypt_key(&file, "pw").unwrap(), [3u8; 32]);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// `decrypt_key` is the last untrusted-shaped decode surface without coverage-guided testing.
+        /// Arbitrary base64 payloads under the `koh-key-v1` header must ALWAYS `Err` — never panic,
+        /// never attempt a giant allocation: the fixed-`PAYLOAD_LEN` check and the version/algo/
+        /// param-ceiling guards reject malformed or hostile input before the AEAD. (KOH-A1)
+        #[test]
+        fn decrypt_key_never_panics_on_arbitrary_payload(
+            raw in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..400),
+        ) {
+            let text = format!("{HEADER}\n{}\n", data_encoding::BASE64.encode(&raw));
+            proptest::prop_assert!(decrypt_key(&text, "passphrase").is_err());
+        }
+
+        /// A well-formed header with valid algo bytes, CHEAP in-range KDF params, and arbitrary
+        /// salt/nonce/ciphertext must reach and fail the AEAD as `WrongPassphrase` — exercising the
+        /// Argon2id + AES-GCM path on untrusted bytes without panicking. (Costs are pinned tiny so the
+        /// 64 cases stay fast; the oversized-cost ceiling is covered by the unit tests above.)
+        #[test]
+        fn decrypt_key_wrong_ciphertext_is_wrong_passphrase(
+            salt in proptest::collection::vec(proptest::prelude::any::<u8>(), SALT_LEN..=SALT_LEN),
+            nonce in proptest::collection::vec(proptest::prelude::any::<u8>(), NONCE_LEN..=NONCE_LEN),
+            ct in proptest::collection::vec(proptest::prelude::any::<u8>(), SECRET_LEN + TAG_LEN..=SECRET_LEN + TAG_LEN),
+        ) {
+            let mut payload = Vec::with_capacity(PAYLOAD_LEN);
+            payload.push(VERSION);
+            payload.push(KDF_ARGON2ID);
+            payload.push(CIPHER_AES256GCM);
+            payload.extend_from_slice(&salt);
+            payload.extend_from_slice(&8u32.to_le_bytes()); // m = 8 KiB (Argon2 minimum; cheap)
+            payload.extend_from_slice(&1u32.to_le_bytes()); // t = 1
+            payload.extend_from_slice(&1u32.to_le_bytes()); // p = 1
+            payload.extend_from_slice(&nonce);
+            payload.extend_from_slice(&ct);
+            let text = format!("{HEADER}\n{}\n", data_encoding::BASE64.encode(&payload));
+            proptest::prop_assert!(matches!(
+                decrypt_key(&text, "passphrase"),
+                Err(KeyfileError::WrongPassphrase)
+            ));
+        }
     }
 }

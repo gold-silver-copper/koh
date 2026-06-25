@@ -37,7 +37,10 @@ enum KeyCmd {
 
 /// Run `koh key`.
 pub fn run(args: KeyArgs) -> anyhow::Result<()> {
-    let key_file = args.key_file.unwrap_or_else(|| default_key_path("client"));
+    let key_file = match args.key_file {
+        Some(p) => p,
+        None => default_key_path("client")?,
+    };
     anyhow::ensure!(
         key_file.exists(),
         "no identity key at {} — run `koh id` (or `koh connect`/`koh serve`) to create one first, \

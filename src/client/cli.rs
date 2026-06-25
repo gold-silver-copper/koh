@@ -74,10 +74,6 @@ pub struct IdArgs {
     key_file: Option<PathBuf>,
 }
 
-fn default_key_file() -> PathBuf {
-    crate::transport_iroh::default_key_path("client")
-}
-
 /// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so
 /// the client unwinds cleanly and restores the terminal. Called before raw mode is entered (so the
 /// handlers are armed for the entire raw window); an install error surfaces while still cooked.
@@ -118,7 +114,10 @@ fn warn_if_locale_not_utf8() {
 
 /// `koh id` — print this machine's koh id (to add to a server's `--allow` list) and exit.
 pub fn run_id(args: IdArgs) -> anyhow::Result<()> {
-    let key_file = args.key_file.unwrap_or_else(default_key_file);
+    let key_file = match args.key_file {
+        Some(p) => p,
+        None => crate::transport_iroh::default_key_path("client")?,
+    };
     let secret = load_or_create_secret_key(&key_file).with_context(|| {
         format!(
             "loading client key from {} (pass --key-file to use a writable path)",
@@ -195,7 +194,10 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     // diagnosable rather than mysterious.
     warn_if_locale_not_utf8();
 
-    let key_file = args.key_file.unwrap_or_else(default_key_file);
+    let key_file = match args.key_file {
+        Some(p) => p,
+        None => crate::transport_iroh::default_key_path("client")?,
+    };
     let secret = load_or_create_secret_key(&key_file).with_context(|| {
         format!(
             "loading client key from {} (pass --key-file to use a writable path)",

@@ -247,12 +247,16 @@ impl PredictionEngine {
     /// expiration frame (`local_frame_sent + 1`), the current `prediction_epoch` (the security gate
     /// that hides input until the server confirms it echoes), `now`, and a one-element
     /// `original_contents` snapshot of the cell being overwritten (so a rewrite back to an earlier
-    /// value grades "no credit"). Centralizes the five identical literals so a future edit can't
+    /// value grades "no credit"). Centralizes the identical invariant literals so a future edit can't
     /// drift one site's invariant on this security-sensitive path (S-07). The per-cell fields
     /// (`glyph`/`fg`/`bg`/`unknown`) vary and are passed in.
+    ///
+    /// `unknown` cells never grade against `original_contents` — [`cell_validity`] short-circuits them
+    /// to `CorrectNoCredit` before reading it — so for them we skip the snapshot entirely (it would be
+    /// a wasted heap `Vec` + glyph clone on the O(cols)-per-keystroke row-shift path).
     #[expect(
         clippy::too_many_arguments,
-        reason = "the per-cell fields differ across the five sites; the invariant fields are stamped here"
+        reason = "the per-cell fields differ across the call sites; the invariant fields are stamped here"
     )]
     fn place_cell(
         &mut self,
@@ -274,7 +278,11 @@ impl PredictionEngine {
                 glyph,
                 fg,
                 bg,
-                original_contents: vec![cell_glyph(screen, row, col)],
+                original_contents: if unknown {
+                    Vec::new()
+                } else {
+                    vec![cell_glyph(screen, row, col)]
+                },
                 unknown,
             },
         );
@@ -373,7 +381,9 @@ impl PredictionEngine {
         let exp = self.local_frame_sent + 1;
         let (_, cols) = screen.size();
         if let Some(c) = self.cursor.as_mut() {
-            if dir > 0 && c.col + 1 < cols {
+            // `c.col < cols - 1`, written saturating so a peer-controlled `cols == 0`/`c.col` near
+            // u16::MAX can't overflow the `+ 1` (matches the hardened predict_wide / backspace sites).
+            if dir > 0 && c.col < cols.saturating_sub(1) {
                 c.col += 1;
                 c.expiration_frame = exp;
             } else if dir < 0 && c.col > 0 {
@@ -514,7 +524,8 @@ impl PredictionEngine {
                 // Ordinary printable ASCII.
                 self.init_cursor(screen);
                 let col = self.cursor_after_init().col;
-                if col + 1 >= cols {
+                // `col >= cols - 1`, saturating so a peer-controlled `cols == 0` can't overflow `+ 1`.
+                if col >= cols.saturating_sub(1) {
                     // Last column is ambiguous (wrap vs. overwrite); hide until confirmed.
                     self.become_tentative();
                     self.init_cursor(screen);
@@ -547,7 +558,8 @@ impl PredictionEngine {
                 );
                 if let Some(c) = self.cursor.as_mut() {
                     c.expiration_frame = self.local_frame_sent + 1;
-                    if c.col + 1 < cols {
+                    // `c.col < cols - 1`, saturating to match the hardened sites (no `+ 1` overflow).
+                    if c.col < cols.saturating_sub(1) {
                         c.col += 1;
                     } else {
                         self.become_tentative();
@@ -834,7 +846,18 @@ impl PredictionEngine {
     pub fn reset(&mut self) {
         self.cells.clear();
         self.cursor = None;
+        self.reset_decoder();
         self.become_tentative();
+    }
+
+    /// Reset the incremental byte decoder (the escape-sequence state machine + the partial-UTF-8
+    /// buffer). [`reset`](Self::reset) runs on a resize; if that resize lands mid-escape or
+    /// mid-grapheme, the leftover bytes would otherwise survive and mis-decode the next typed byte.
+    fn reset_decoder(&mut self) {
+        self.esc = EscState::Ground;
+        self.utf8_buf.clear();
+        self.utf8_need = 0;
+        self.last_byte = 0;
     }
 }
 
@@ -936,6 +959,50 @@ mod tests {
         assert!(
             pe.utf8_buf.is_empty(),
             "the UTF-8 accumulator must reset after a malformed sequence"
+        );
+        let _ = pe.overlay(&screen);
+    }
+
+    #[test]
+    fn reset_clears_partial_decoder_state() {
+        // A resize calls reset() mid-stream. If it lands right after a UTF-8 lead byte (or inside an
+        // escape sequence), those partial bytes must NOT survive reset() to mis-decode the next typed
+        // byte. Regression: reset() used to clear the prediction cells/cursor but leave the decoder
+        // (esc / utf8_buf / utf8_need / last_byte) stale.
+        let mut pe = PredictionEngine::new(DisplayPreference::Always);
+        pe.set_local_frame_sent(0);
+        let screen = screen_of(b"");
+        // Mid-grapheme: feed the lead byte of a 2-byte sequence, leaving a continuation outstanding.
+        pe.new_user_byte(0, 0xC3, &screen);
+        assert_eq!(
+            pe.utf8_buf,
+            vec![0xC3],
+            "the lead byte is buffered awaiting its continuation"
+        );
+        assert_eq!(pe.utf8_need, 2);
+
+        pe.reset(); // a resize lands here
+
+        assert!(
+            pe.utf8_buf.is_empty(),
+            "reset must drop the partial UTF-8 buffer"
+        );
+        assert_eq!(pe.utf8_need, 0, "reset must clear the awaited-byte count");
+        assert_eq!(
+            pe.last_byte, 0,
+            "reset must clear the arrow-decode last-byte state"
+        );
+        assert!(
+            matches!(pe.esc, EscState::Ground),
+            "reset must return the escape state machine to Ground"
+        );
+
+        // The next byte now decodes cleanly as ASCII, not as a stray continuation of the dropped
+        // grapheme.
+        pe.new_user_byte(1, b'A', &screen);
+        assert!(
+            pe.utf8_buf.is_empty(),
+            "the post-reset byte decodes cleanly"
         );
         let _ = pe.overlay(&screen);
     }

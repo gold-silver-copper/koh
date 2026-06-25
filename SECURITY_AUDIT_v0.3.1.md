@@ -1,5 +1,13 @@
 # koh — Security Audit (v0.3.1)
 
+> **ARCHIVAL — point-in-time audit of v0.3.1; do NOT read as current.** Several findings below have
+> since been fixed or made moot by later churn: the byte-bound DoS vectors (KOH-01/02/07) were closed
+> in v0.3.1/v0.4.3; the "passphrase challenge" cryptographic weakness no longer applies — that auth
+> subsystem (`auth.rs`, the PAKE/passphrase factor) was **removed** in v0.7.0, and identity keys are
+> now always encrypted at rest. File references here (`auth.rs`, `ratelimit.rs`) predate the current
+> `src/transport_iroh/` layout (`admission.rs` / `keyfile.rs` / `mod.rs`). Kept for history; the live
+> picture is [`THREAT_MODEL.md`](THREAT_MODEL.md) + [`SECURITY.md`](SECURITY.md).
+
 ## 1. Executive summary
 
 koh's transport security (iroh QUIC + TLS, endpoint authentication by public-key NodeId) is sound, and the seven fixes from the 0.3.1 hardening pass all hold. The remaining risk is concentrated in the **post-authentication data plane**: once a peer holds a valid connection, several attacker-controlled wire fields drive **unbounded memory growth, CPU/syscall amplification, and one reachable client-side panic** that the crate's `panic`/`string_slice` lints do not catch. There is also one **cryptographic design weakness** (offline-crackable passphrase challenge with a fixed public salt and no server-identity binding) and a handful of local/config footguns.

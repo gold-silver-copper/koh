@@ -67,7 +67,7 @@ pub fn run_session(loss: f64, seed: u64) -> SessionResult {
     h.a_mut().push_bytes(cmd);
 
     // Drive until the server has received the whole command.
-    h.run_until(20_000, |h| h.b.remote_state().len() >= cmd.len());
+    h.run_until(20_000, |h| h.b.remote_state().events().len() >= cmd.len());
 
     // The fake shell: drain the input, echo each byte, and on CR emit the command output.
     let frame = h.b.remote_num();

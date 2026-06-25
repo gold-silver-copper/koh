@@ -46,14 +46,14 @@ enum Ss3State {
 /// port of mosh's `UserInput::input`). The `ESC` is emitted eagerly and the SS3 state carries
 /// across input chunks.
 #[derive(Default)]
-pub(crate) struct CursorKeyNormalizer {
+struct CursorKeyNormalizer {
     state: Ss3State,
 }
 
 impl CursorKeyNormalizer {
     /// Normalize `input` for an app whose application-cursor-keys mode is `app_cursor`, returning
     /// the bytes to feed the PTY.
-    pub(crate) fn normalize(&mut self, input: &[u8], app_cursor: bool) -> Vec<u8> {
+    fn normalize(&mut self, input: &[u8], app_cursor: bool) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len() + 1);
         for &b in input {
             match self.state {
@@ -287,34 +287,32 @@ pub async fn run_attached(
                             let mut s = handle.session.lock().await;
                             let app_cursor = s.emu.application_cursor();
                             if let Some(input) = session.drain_input(app_cursor) {
-                                // A read-only (observer) session still drains — `drain_input`'s
-                                // collapse of `received_states` is a required per-state side effect —
-                                // but the client's keystrokes and resizes never reach the PTY: a
-                                // read-only peer can watch the live shell, not drive it.
-                                if !s.read_only {
-                                    if !input.keys.is_empty() {
-                                        if let Err(e) = s.pty.write_input(&input.keys) {
-                                            warn!(error = %e, "pty write failed");
-                                        }
+                                if !input.keys.is_empty() {
+                                    if let Err(e) = s.pty.write_input(&input.keys) {
+                                        warn!(error = %e, "pty write failed");
                                     }
-                                    if let Some((rows, cols)) = input.resize {
-                                        if let Err(e) = s.pty.resize(rows, cols) {
-                                            // A failed TIOCSWINSZ silently diverges the kernel winsize
-                                            // from the vt100 grid (full-screen-app corruption with no
-                                            // breadcrumb today); warn, but still resize the emulator so
-                                            // the screen geometry keeps tracking the client.
-                                            warn!(error = %e, rows, cols, "pty resize failed");
-                                        }
-                                        s.emu.resize(rows, cols);
+                                }
+                                let resized = input.resize.is_some();
+                                if let Some((rows, cols)) = input.resize {
+                                    if let Err(e) = s.pty.resize(rows, cols) {
+                                        // A failed TIOCSWINSZ silently diverges the kernel winsize
+                                        // from the vt100 grid (full-screen-app corruption with no
+                                        // breadcrumb today); warn, but still resize the emulator so
+                                        // the screen geometry keeps tracking the client.
+                                        warn!(error = %e, rows, cols, "pty resize failed");
                                     }
+                                    s.emu.resize(rows, cols);
                                 }
                                 s.emu.register_input_frame(input.frame, now);
                                 drop(s);
-                                // A non-read-only branch may have resized the emulator (a direct grid
-                                // change not signaled via `changed`), so re-snapshot next pass. On the
-                                // read-only branch nothing mutated the grid — this is then a harmless
-                                // precautionary re-snapshot.
-                                session.mark_dirty();
+                                // Only a resize mutates the emulator grid directly (a change not
+                                // signaled through `changed`), so re-snapshot next pass only then.
+                                // Keystroke-driven changes arrive via the drain task's `changed` pulse
+                                // (which sets `dirty` through the select arm above), so an input frame
+                                // that didn't resize needs no forced snapshot.
+                                if resized {
+                                    session.mark_dirty();
+                                }
                             }
                         }
                     }
@@ -349,7 +347,7 @@ pub async fn run_session(
     shell: Option<String>,
     scrollback: usize,
 ) -> anyhow::Result<()> {
-    let handle = session::spawn_session(shell.as_deref(), scrollback, false)?;
+    let handle = session::spawn_session(shell.as_deref(), scrollback)?;
     let _ = run_attached(conn, handle.clone()).await?;
     let _ = handle.session.lock().await.pty.kill();
     Ok(())

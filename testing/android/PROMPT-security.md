@@ -1,5 +1,13 @@
 # TASK: Prove the koh security findings on the Android emulator, fix them, then release
 
+> **NOTE (historical brief; auth model changed in 0.7.0).** This was written against the pre-0.7.0
+> auth design and is **stale** on the auth/key direction: the over-the-wire passphrase / SPAKE2 PAKE
+> **second factor was removed** (so there is no `--passphrase`, no `auth.rs`, no PAKE stress suite),
+> `--allow-any` is gone (servers require `--allow <id>`), and identity keys are **always encrypted**
+> at rest under `$KOH_KEY_PASSPHRASE` (the env var is `KOH_KEY_PASSPHRASE`, **not** `KOH_PASSPHRASE`).
+> The L-4 env-scrub finding still applies — reframed as the identity-key passphrase. Treat the live
+> `scripts/` + `THREAT_MODEL.md` as the source of truth; this file is kept as history.
+
 ## GOAL
 Security TDD, **red → green**: first write Android-emulator tests that DEMONSTRATE each confirmed
 audit finding is real (they fail against current koh because the vuln is present), then implement the

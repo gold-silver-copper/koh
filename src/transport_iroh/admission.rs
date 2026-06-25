@@ -1,7 +1,7 @@
 //! Connection admission barrier (post-allowlist).
 //!
-//! After the server admits a peer — its node-id is on the allowlist (or `--allow-any`) — it opens a
-//! bi-stream and writes a single ADMIT byte; the client awaits it. This is **not** authentication:
+//! After the server admits a peer — its node-id is on the allowlist — it opens a bi-stream and
+//! writes a single ADMIT byte; the client awaits it. This is **not** authentication:
 //! the peer's node-id is already authenticated by iroh's QUIC/TLS handshake, and the allowlist is the
 //! authorization gate. The ack exists only as a synchronization point so the **client** can cleanly
 //! distinguish "admitted" from a deliberate server rejection (which closes the connection). Without

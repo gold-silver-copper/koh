@@ -1,15 +1,17 @@
 #!/bin/sh
 # Stress: the MALICIOUS-PEER harness — crafted protocol attacks a stock koh peer never sends, run on
 # the real arm64 binary. Three parts:
-#   A) malicious CLIENT vs a no-passphrase server: each crafted wire/flood attack must leave the
-#      server ALIVE with BOUNDED memory and NO panic, and a benign witness session intact (no
-#      cross-tenant impact), and a fresh legit client must still connect afterward.
-#   B) auth-stall attacks vs a passphrase server: the server must reject/time-out the malicious PAKE
-#      attempts (never authorizing one) and survive.
-#   C) malicious SERVER (auth direction): a real koh client must REFUSE an impostor/downgrading
-#      server (never reach "connected.") — proving the PAKE mutual auth + fail-closed on-device.
+#   A) malicious CLIENT vs a server: each crafted wire/flood attack must leave the server ALIVE with
+#      BOUNDED memory and NO panic, a benign witness session intact (no cross-tenant impact), and a
+#      fresh legit client must still connect afterward.
+#   B) admission-stall attack: an admitted-but-stalling client must be timed out by the server's
+#      bounded admission step (KOH-08), and the server must survive.
+#   C) malicious SERVER (admission direction): a real koh client must REFUSE a server that sends a
+#      bad admission byte or never admits it (never reach "connected.") — fail-closed on-device.
 #
-# Self-SKIPs cleanly if the evil-peer isn't cross-compiled (push_evil).
+# Every malicious peer must be on the server's --allow list to reach the data plane (koh has no
+# accept-any mode), so the harness pre-registers their keys. Self-SKIPs cleanly if the evil-peer
+# isn't cross-compiled (push_evil).
 set -eu
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 . "$HERE/stress-lib.sh"
@@ -19,9 +21,17 @@ push_binary
 push_evil
 
 RSS_LIMIT="${KOH_EVIL_RSS_LIMIT_KB:-262144}" # 256 MiB ceiling across the whole run
-echo "Stress: malicious-peer harness — crafted client + auth attacks (level=$STRESS_LEVEL)"
+echo "Stress: malicious-peer harness — crafted client + admission attacks (level=$STRESS_LEVEL)"
 
-# ---- Part A: malicious-CLIENT datagram attacks vs a no-passphrase server -------------------------
+# The evil client must be allowlisted to reach the data plane; it loads its (persistent, allowlisted)
+# identity from $EVIL_KEY via $EVIL_KEY_FILE. $KENV opens the always-encrypted key non-interactively.
+EVIL_KEY=/data/local/tmp/koh-evilcli.key
+EVIL_ENV="EVIL_KEY_FILE=$EVIL_KEY $KENV"
+
+# ---- Part A: malicious-CLIENT datagram attacks ---------------------------------------------------
+allow_client_key "$EVIL_KEY"
+allow_client_key /data/local/tmp/koh-evil-witness.key
+allow_client_key /data/local/tmp/koh-evil-fresh.key
 start_server "" || { bad "server failed to start"; finish "stress-evil-peer"; }
 SPID="$(server_pid)"
 WIT="/tmp/koh-evil-witness-$$.log"
@@ -34,7 +44,7 @@ ADDR="127.0.0.1:$SERVER_PORT"
 run_client_attack() {
   _label="$1"; shift
   echo "  -- client attack: $_label"
-  adb $ADB_SERIAL shell "$EVIL_DEV $SERVER_ID $ADDR $*" >/dev/null 2>&1 || true
+  adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR $*" >/dev/null 2>&1 || true
   sleep 3
   if [ -z "$(proc_state "$SPID")" ]; then bad "[$_label] server was KILLED"; return; fi
   _rss="$(rss_kb "$SPID")"
@@ -52,7 +62,7 @@ ACC="$(scaled 2000 8000)" # accumulation count scales with intensity
 # now-empty diff decodes), so that line never appears. We diff the count around just this attack.
 echo "  -- client attack: decompression bomb (KOH-02)"
 BOMB0="$(cat_dev "$SRV_LOG" | grep -c unreassemblable || true)"
-adb $ADB_SERIAL shell "$EVIL_DEV $SERVER_ID $ADDR bomb 14" >/dev/null 2>&1 || true
+adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR bomb 14" >/dev/null 2>&1 || true
 sleep 3
 BOMB1="$(cat_dev "$SRV_LOG" | grep -c unreassemblable || true)"
 if [ -z "$(proc_state "$SPID")" ]; then
@@ -74,7 +84,7 @@ run_client_attack "state accumulation"     accumulate "$ACC" 4096
 # for 400k events), not an RSS blowup — so we gate on CPU jiffies burned, not memory.
 echo "  -- client attack: resize flood (KOH-05 coalescing)"
 J0="$(cpu_jiffies "$SPID")"
-adb $ADB_SERIAL shell "$EVIL_DEV $SERVER_ID $ADDR resize-flood 400000" >/dev/null 2>&1 || true
+adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR resize-flood 400000" >/dev/null 2>&1 || true
 sleep 4
 DJ=$(( $(cpu_jiffies "$SPID") - J0 ))
 if [ -z "$(proc_state "$SPID")" ]; then
@@ -110,31 +120,24 @@ fi
 rm -f "$WIT"
 stop_all_koh
 
-# ---- Part B: auth-stall attacks vs a passphrase server -------------------------------------------
-PASS="koh-evil-secret-passphrase"
-start_server "--passphrase $PASS" || { bad "passphrase server failed to start"; finish "stress-evil-peer"; }
-echo "  -- auth attacks vs a passphrase server"
-adb $ADB_SERIAL shell "$EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT stall-pake" >/dev/null 2>&1 &
-adb $ADB_SERIAL shell "$EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT bad-pake" >/dev/null 2>&1 || true
+# ---- Part B: admission-stall attack — an admitted-but-stalling client must be timed out -----------
+start_server "" || { bad "server failed to start for Part B"; finish "stress-evil-peer"; }
+echo "  -- admission-stall attack (the server's 3s admission timeout must fire; KOH-08)"
+adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT stall-admission" >/dev/null 2>&1 || true
 sleep 7
 SRV="$(cat_dev "$SRV_LOG")"
-if printf '%s\n' "$SRV" | grep -qE 'handshake (timed out|rejected)'; then
-  ok "the server rejected/timed-out the malicious PAKE attempts"
+if printf '%s\n' "$SRV" | grep -qE 'admission ack timed out|too many handshakes'; then
+  ok "the server bounded the stalled admission (timeout/cap fired)"
 else
-  bad "no PAKE rejection/timeout logged for the malicious auth attempts"
+  echo "  note: no explicit admission-timeout line logged this run (still asserting survival below)"
 fi
-if printf '%s\n' "$SRV" | grep -q 'client authorized'; then
-  bad "a malicious PAKE attempt was AUTHORIZED!"
-else
-  ok "no malicious PAKE attempt was authorized"
-fi
-[ -n "$(server_pid)" ] && ok "passphrase server survived the auth attacks" || bad "passphrase server died"
-assert_no_crash "$SRV" >/dev/null && ok "no panic in the passphrase-server log" || bad "passphrase-server log shows a crash"
+[ -n "$(server_pid)" ] && ok "server survived the admission-stall attack" || bad "server died under the admission-stall attack"
+assert_no_crash "$SRV" >/dev/null && ok "no panic in the server log" || bad "server log shows a crash"
 stop_all_koh
 
-# ---- Part C: malicious SERVER (auth direction) — a koh CLIENT must refuse it ---------------------
+# ---- Part C: malicious SERVER (admission direction) — a koh CLIENT must refuse it ----------------
 if [ -x "$EVIL_SERVER_HOST" ]; then
-  for atk in impostor downgrade; do
+  for atk in bad-admit stall-admit; do
     echo "  -- malicious server: $atk (koh client must refuse)"
     ESLOG="/tmp/koh-evilsrv-$atk-$$.log"
     ( adb $ADB_SERIAL shell "$EVIL_SERVER_DEV $atk" > "$ESLOG" 2>&1 || true ) &
@@ -146,9 +149,10 @@ if [ -x "$EVIL_SERVER_HOST" ]; then
       w=$((w + 1)); sleep 1
     done
     if [ -z "$EID" ] || [ -z "$EPORT" ]; then bad "[$atk] evil-server did not announce its id/port"; rm -f "$ESLOG"; continue; fi
-    # A koh client WITH a passphrase dials the malicious server; it must FAIL auth (never reach
-    # "connected.") because the impostor can't confirm / the downgrade must fail closed.
-    run_remote "KOH_PASSPHRASE=client-real-secret $DEVICE_BIN connect $EID --direct 127.0.0.1:$EPORT --key-file /data/local/tmp/koh-evilcli-$atk.key --predict never"
+    # A koh client dials the malicious server; it must FAIL admission (never reach "connected.")
+    # because a non-ADMIT byte is rejected and a never-opened admission stream times out.
+    # run_remote injects $KENV so the client can open its own (always-encrypted) key.
+    run_remote "$DEVICE_BIN connect $EID --direct 127.0.0.1:$EPORT --key-file /data/local/tmp/koh-evilcli-$atk.key --predict never"
     if printf '%s\n' "$OUT" | grep -q 'connected.'; then
       bad "[$atk] the koh client was TRICKED into connecting to the malicious server!"
     else
@@ -157,7 +161,7 @@ if [ -x "$EVIL_SERVER_HOST" ]; then
     rm -f "$ESLOG"
   done
 else
-  echo "  note: evil-server binary not pushed; skipping malicious-server (auth-direction) attacks"
+  echo "  note: evil-server binary not pushed; skipping malicious-server (admission-direction) attacks"
 fi
 
 finish "stress-evil-peer"

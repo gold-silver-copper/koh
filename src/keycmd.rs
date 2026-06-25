@@ -11,7 +11,7 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use crate::transport_iroh::{
-    default_key_path, format_endpoint_id, load_or_create_secret_key, warn_if_weak_passphrase,
+    default_key_path, enforce_passphrase_strength, format_endpoint_id, load_or_create_secret_key,
     write_identity_key,
 };
 
@@ -77,7 +77,7 @@ pub fn run(args: KeyArgs) -> anyhow::Result<()> {
                 anyhow::ensure!(p1 == p2, "passphrases did not match");
                 p1
             };
-            warn_if_weak_passphrase(&new);
+            enforce_passphrase_strength(&new)?;
             write_identity_key(&key_file, &secret, &new)?;
             eprintln!(
                 "koh: identity key re-encrypted at {} (koh-key-v1). Set $KOH_KEY_PASSPHRASE for \

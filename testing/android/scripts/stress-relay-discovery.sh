@@ -29,7 +29,8 @@ echo "Stress: relay/discovery — bare-id connect over the public relay${DNS:+ (
 SRVLOG="/data/local/tmp/koh-relay-srv.log"
 SRVKEY="/data/local/tmp/koh-relay-srv.key"
 # Server with the DEFAULT profile (relay + discovery), NOT --local.
-adb $ADB_SERIAL shell "rm -f $SRVLOG; nohup ${DNS:+KOH_DNS=$DNS }$DEVICE_BIN serve --allow-any --shell /system/bin/sh --key-file $SRVKEY >$SRVLOG 2>&1 &" >/dev/null
+RELAY_CLI_ID="$(koh_id_of /data/local/tmp/koh-relay-cli.key)"
+adb $ADB_SERIAL shell "rm -f $SRVLOG; ${DNS:+KOH_DNS=$DNS }$KENV nohup $DEVICE_BIN serve --allow $RELAY_CLI_ID --shell /system/bin/sh --key-file $SRVKEY >$SRVLOG 2>&1 &" >/dev/null
 # Discovery/relay registration is slower than a local bind; wait longer for the banner.
 SID=""; i=0
 while [ "$i" -lt 30 ]; do
@@ -48,7 +49,7 @@ established=0
 OUT=""
 try=1
 while [ "$try" -le 3 ]; do
-  OUT="$(to 60 adb $ADB_SERIAL shell "${DNS:+KOH_DNS=$DNS }$DEVICE_BIN connect $SID --key-file /data/local/tmp/koh-relay-cli.key --predict never" 2>&1 || true)"
+  OUT="$(to 60 adb $ADB_SERIAL shell "${DNS:+KOH_DNS=$DNS }$KENV $DEVICE_BIN connect $SID --key-file /data/local/tmp/koh-relay-cli.key --predict never" 2>&1 || true)"
   sleep 2
   printf '%s\n' "$(cat_dev "$SRVLOG")" | grep -qE 'client authorized|started a new session' && { established=1; break; }
   try=$((try + 1))

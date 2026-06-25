@@ -68,6 +68,7 @@ push_flood_script "$FLOOD" "while true; do seq 1 500; sleep 0.1; done"
 adb $ADB_SERIAL shell "rm -f $CLILOG" >/dev/null 2>&1 || true
 
 cleanup_tc   # clean lo for the handshake
+allow_client_key /data/local/tmp/koh-chaos.key
 if ! start_server "--shell $FLOOD"; then bad "server failed to start"; cleanup_tc; finish "stress-netem"; fi
 SPID="$(server_pid)"; RSS0="$(rss_kb "$SPID")"
 

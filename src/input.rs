@@ -66,15 +66,6 @@ impl UserInput {
     pub fn events(&self) -> &[InputEvent] {
         &self.events
     }
-
-    /// Number of stored events.
-    pub fn len(&self) -> usize {
-        self.events.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
-    }
 }
 
 /// Coalesce a tail of stored events into compact wire events.
@@ -269,7 +260,7 @@ mod tests {
         let mut reconstructed: Vec<u8> = Vec::new();
 
         h.a_mut().push_bytes(b"echo hi"); // 7 events
-        h.run_until(2000, |h| h.b_view_of_a().len() >= 7);
+        h.run_until(2000, |h| h.b_view_of_a().events().len() >= 7);
         for w in h.b.get_remote_diff() {
             if let WireEvent::Keys(b) = w {
                 reconstructed.extend_from_slice(&b);
@@ -278,7 +269,7 @@ mod tests {
         assert_eq!(reconstructed, b"echo hi");
 
         h.a_mut().push_bytes(b"\rwhoami"); // +7 = 14 events total
-        h.run_until(2000, |h| h.b_view_of_a().len() >= 14);
+        h.run_until(2000, |h| h.b_view_of_a().events().len() >= 14);
         for w in h.b.get_remote_diff() {
             if let WireEvent::Keys(b) = w {
                 reconstructed.extend_from_slice(&b);
@@ -339,7 +330,7 @@ mod tests {
             let mut s2 = s; // moved: not used after this
             s2.subtract_prefix(&base);
             let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-            prop_assert_eq!(s2.len(), a.len().saturating_sub(common));
+            prop_assert_eq!(s2.events().len(), a.len().saturating_sub(common));
         }
     }
 }

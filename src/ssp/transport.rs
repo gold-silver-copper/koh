@@ -482,6 +482,12 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             self.add_sent_state(now, new_num, self.current_state.clone());
         }
         let out = self.send_in_fragments(old_num, new_num, Vec::new());
+        // This empty ack discharges any pending data-ack obligation, so clear the flag (mirroring
+        // `send_to_receiver`). Without this, `calculate_timers` keeps yanking `next_ack_time` back to
+        // `now + ACK_DELAY` (the guard below uses `pending_data_ack`), so an idle ack-only side would
+        // re-emit an empty ack every ~ACK_DELAY ms forever instead of settling onto the much slower
+        // ACK_INTERVAL idle cadence (~10x the idle datagram rate — mobile battery/radio cost).
+        self.pending_data_ack = false;
         self.next_ack_time = now + ACK_INTERVAL;
         self.next_send_time = NEVER;
         out
@@ -837,6 +843,50 @@ mod tests {
             RecvOutcome::MissingBase
         );
         assert_eq!(t.remote_num(), 0, "no state was applied");
+    }
+
+    #[test]
+    fn idle_empty_acks_settle_to_ack_interval_not_a_flood() {
+        // Regression: after receiving data (which owes a fast ack), an idle ack-only side must emit
+        // ONE settling empty ack and then fall back to the slow ACK_INTERVAL keepalive cadence — it
+        // must NOT re-emit an empty ack every ACK_DELAY ms forever. The bug was that `send_empty_ack`
+        // reset `next_ack_time` to ACK_INTERVAL but left `pending_data_ack` set, so `calculate_timers`
+        // kept yanking the deadline back to `now + ACK_DELAY`. ~10-30x the idle datagram rate on a
+        // quiesced link — exactly the mobile battery/radio cost ACK_INTERVAL exists to avoid.
+        let mut t = Transport::<Abs, Abs>::new(0, 1200);
+        t.set_connected(true);
+        // A non-empty inbound state owes a fast ack; our local state stays at its default, so every
+        // subsequent transmission is a pure empty ack (no diff to send).
+        assert_eq!(
+            t.recv(0, &datagram(&instr(0, 1, 0, 42))),
+            RecvOutcome::NewState
+        );
+        assert!(t.pending_data_ack, "a received data state owes an ack");
+
+        // Walk time forward in ACK_DELAY steps across a full ACK_INTERVAL, recording every tick that
+        // actually emits a datagram.
+        let mut ack_times = Vec::new();
+        let mut now = 0;
+        while now <= ACK_INTERVAL {
+            now += ACK_DELAY;
+            if !t.tick(now).is_empty() {
+                ack_times.push(now);
+            }
+        }
+        assert!(
+            !t.pending_data_ack,
+            "the empty ack must discharge the pending-data-ack obligation"
+        );
+        // No empty acks between the single settling ack and the slow keepalive: a flood would land
+        // repeatedly inside this window.
+        let flooded = ack_times
+            .iter()
+            .any(|&at| at > ACK_DELAY && at < ACK_INTERVAL);
+        assert!(
+            !flooded,
+            "idle side flooded empty acks every ~ACK_DELAY instead of settling onto ACK_INTERVAL; \
+             emissions at {ack_times:?}"
+        );
     }
 
     #[test]

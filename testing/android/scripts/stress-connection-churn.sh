@@ -13,6 +13,7 @@ push_binary
 CYCLES="${KOH_STRESS_CHURN_CYCLES:-$(scaled 30 150)}"
 echo "Stress: connection churn — $CYCLES connect/disconnect cycles vs one server (level=$STRESS_LEVEL)"
 
+allow_client_key /data/local/tmp/koh-churn.key
 start_server "" || { bad "server failed to start"; finish "stress-connection-churn"; }
 SPID="$(server_pid)"
 RSS0="$(rss_kb "$SPID")"

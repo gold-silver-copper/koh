@@ -11,7 +11,7 @@ push_binary
 
 KF=/data/local/tmp/koh-sec-id.key
 echo "Security M-1: the persistent secret key must be written 0600 (not world-readable)"
-adb $ADB_SERIAL shell "rm -f $KF; $DEVICE_BIN id --key-file $KF >/dev/null 2>&1"
+adb $ADB_SERIAL shell "rm -f $KF; $KENV $DEVICE_BIN id --key-file $KF >/dev/null 2>&1"
 mode="$(adb $ADB_SERIAL shell "stat -c '%a' $KF 2>/dev/null" | tr -d '\r')"
 echo "    key file mode: $mode"
 

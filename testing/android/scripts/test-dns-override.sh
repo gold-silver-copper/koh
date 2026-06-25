@@ -13,7 +13,7 @@ push_binary
 
 DNS="${KOH_DNS_TEST_VALUE:-1.1.1.1}"
 echo "Test 2 — koh serve with KOH_DNS=$DNS binds cleanly on Android (override branch)"
-run_remote_blocking 12 "KOH_DNS=$DNS $DEVICE_BIN serve --allow-any --local --key-file /data/local/tmp/koh-server.key"
+run_remote_blocking 12 "KOH_DNS=$DNS $DEVICE_BIN serve --allow $(koh_id_of /data/local/tmp/koh-client.key) --local --key-file /data/local/tmp/koh-server.key"
 printf '%s\n' "$OUT" | grep -E 'koh server ready|endpoint id|ndk-context|panic' | sed 's/^/    serve| /' | head -6
 
 fail=0

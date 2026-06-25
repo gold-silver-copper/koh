@@ -132,24 +132,19 @@ iroh-ssh's "anyone with the endpoint id gets a shell" model. The server:
 
 - uses a **persistent secret key** (so its endpoint id is stable across restarts), and
 - **allowlists client endpoint ids** — a connection is served only if the client's id is on
-  the `--allow` list. `--allow-any` exists for local testing and prints a loud warning.
+  the `--allow` list. At least one `--allow <id>` is **required**; there is no "accept any peer"
+  escape hatch, so a stray `koh serve` can never publish an open shell.
 
 QUIC/iroh already authenticates both ends by public key and encrypts everything; the allowlist
 is the authorization layer on top.
-
-#### Read-only mode
-
-`--read-only` makes **every** authorized client a viewer: a connected peer can watch the live shell
-but its keystrokes and resizes are dropped before they reach the PTY (enforced in the data path, not
-just advertised) — a real boundary, useful for a broadcast / screen-share. There is no per-peer
-authorization beyond the allowlist; access is uniform across allowed ids.
 
 #### Single factor by design (no passphrase / second factor)
 
 koh authorizes on the node-id allowlist alone. There is **no over-the-wire passphrase / PAKE second
 factor**: the peer's node-id is already cryptographically authenticated by the iroh QUIC/TLS 1.3
 handshake, and the residual "leaked client key" risk is handled where it belongs — the identity key
-is **always encrypted at rest** (see below), so a stolen key file is useless without its passphrase.
+is **always encrypted at rest** (see below) under a passphrase koh enforces a minimum strength on, so
+a stolen key file is useless without its passphrase.
 Removing the bespoke PAKE also removes koh's largest piece of un-audited custom crypto. The trade-off
 is honest: the node-id is now the *sole* authenticator of which machine you reached, so **verify a
 server's node-id out-of-band** before trusting a session — there is no second factor to catch a
@@ -173,8 +168,8 @@ koh treats every value on the wire as untrusted and bounds what a malicious peer
   node's identity, so a world-readable key would be a local-impersonation risk. koh warns if it finds
   an existing key with looser permissions.
 - **Connections and sessions are bounded** (`--max-connections`, `--max-sessions`, default 64 each):
-  excess dials are refused cheaply before the crypto handshake, and a flood of distinct keys can't
-  spawn unbounded shells under `--allow-any`.
+  excess dials are refused cheaply before the crypto handshake, and a flood of distinct authorized
+  keys can't spawn unbounded shells.
 
 ## Build
 
@@ -200,6 +195,9 @@ koh id
 koh serve --allow 3f9c…
 # ┌─ koh server ready ──────────────────────────────────────
 # │ endpoint id : 871b…
+# │ key file    : ~/…/koh/server.key
+# │ alpn        : koh/iroh/1
+# │ auth        : allowlist (1 client(s))
 # │ connect     : koh connect 871b…
 # └───────────────────────────────────────────────────────────
 ```
@@ -228,7 +226,7 @@ All of koh's knobs as environment variables (most have a CLI-flag equivalent):
 | `RUST_LOG` | serve, connect | Log verbosity/filter (`tracing` `EnvFilter`), e.g. `koh=debug` or `koh::server=info`. Server logs to **stderr**; client logs to `$KOH_LOG`. | — |
 | `KOH_LOG` | connect | File the client writes logs to (created `0600`), so logging doesn't disturb the TUI. | — |
 | `KOH_KEY_PASSPHRASE` | serve, connect, key | Passphrase to decrypt the (always-encrypted) identity key. Lets an unattended `koh serve`/`koh connect` open the key without a TTY prompt. | — |
-| `KOH_KEY_NEW_PASSPHRASE` | serve, connect, key | Passphrase used when **creating** a key on first run, and the new passphrase for `koh key passwd`; for CI/automation instead of the confirmed prompt. Must be non-empty. | — |
+| `KOH_KEY_NEW_PASSPHRASE` | serve, connect, key | Passphrase used when **creating** a key on first run, and the new passphrase for `koh key passwd`; for CI/automation instead of the confirmed prompt. Must meet the enforced minimum strength (≥ 8 chars). | — |
 | `KOH_STATE_DIR` | serve, connect | Base directory for the identity key files (the server's error message points here when the default isn't writable). | `--key-file` (per file) |
 | `KOH_DNS` | serve, connect | Override the discovery DNS resolver (`IP` or `IP:PORT`); needed on some Android/Termux setups. | — |
 
@@ -244,8 +242,10 @@ OpenSSH's `openssh-key-v1`); there is **no plaintext format**. So a stolen/backe
 useless without the passphrase — file permissions are no longer the only thing protecting it.
 
 On first run, `koh serve`/`koh connect` generate the key and prompt for a passphrase to encrypt it
-(or read `$KOH_KEY_NEW_PASSPHRASE` when there's no TTY). Thereafter every command that loads the key
-prompts for it, or reads `$KOH_KEY_PASSPHRASE` for unattended use:
+(or read `$KOH_KEY_NEW_PASSPHRASE` when there's no TTY). koh enforces a **minimum passphrase length
+(8 chars)** on creation and re-encryption — on every path, prompt or env — so an *effectively*
+unencrypted key can't be created, mirroring the no-plaintext-format rule. Thereafter every command
+that loads the key prompts for it, or reads `$KOH_KEY_PASSPHRASE` for unattended use:
 
 ```sh
 koh key passwd               # change the passphrase (like ssh-keygen -p); prompts with confirmation
@@ -445,8 +445,8 @@ step stays manual. Concrete checklist (each maps to a parity feature):
 
 This core is the foundation for a 100%-Rust mobile (Android) terminal — likely Bevy-based —
 that vibe-codes over koh to your main PC. With mosh's core behaviors now in place (detachable
-sessions, terminal-reply synthesis, exit-status propagation, the predictor), the natural next
-steps are OSC-52 clipboard forwarding, two-device real-network/perf acceptance over the public
+sessions, terminal-reply synthesis, exit-status propagation, the predictor, OSC-52 clipboard
+forwarding), the natural next steps are two-device real-network/perf acceptance over the public
 relay (Tier 3), and a Bevy front-end reusing the `terminal` + `input` + `predict` +
 `transport_iroh` modules directly.
 

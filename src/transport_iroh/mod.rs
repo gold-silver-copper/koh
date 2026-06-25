@@ -149,7 +149,7 @@ fn resolve_new_key_passphrase(path: &Path) -> Result<SecretString, SetupError> {
                 "$KOH_KEY_NEW_PASSPHRASE is empty; identity keys are always encrypted (set a non-empty passphrase)"
             )));
         }
-        warn_if_weak_passphrase(&p);
+        enforce_passphrase_strength(&p)?;
         return Ok(SecretString::from(p));
     }
     if std::io::stdin().is_terminal() {
@@ -169,7 +169,7 @@ fn resolve_new_key_passphrase(path: &Path) -> Result<SecretString, SetupError> {
                 "passphrases did not match"
             )));
         }
-        warn_if_weak_passphrase(&p1);
+        enforce_passphrase_strength(&p1)?;
         return Ok(SecretString::from(p1));
     }
     Err(SetupError::Other(anyhow::anyhow!(
@@ -178,17 +178,24 @@ fn resolve_new_key_passphrase(path: &Path) -> Result<SecretString, SetupError> {
     )))
 }
 
-/// Advisory (non-fatal) nudge for a short new key passphrase. Deliberately NOT a hard floor —
-/// automation may inject an externally-strong secret — but a low-entropy one is worth flagging
-/// (matches `ssh-keygen`, which warns rather than rejects). Shared by key creation and `koh key`.
-pub(crate) fn warn_if_weak_passphrase(passphrase: &str) {
-    const MIN_REASONABLE_CHARS: usize = 8;
-    if passphrase.chars().count() < MIN_REASONABLE_CHARS {
-        eprintln!(
-            "koh: warning: identity-key passphrase is short (< {MIN_REASONABLE_CHARS} chars); prefer \
-             a longer, higher-entropy one (advisory — not enforced)."
-        );
+/// The minimum identity-key passphrase length koh accepts. A passphrase shorter than this would make
+/// the at-rest encryption (Argon2id + AES-256-GCM) effectively defeatable by an offline attacker who
+/// already holds the key file — i.e. an *effectively unencrypted* key. koh has no plaintext key
+/// format and, by the same logic, no weak-passphrase escape from real encryption.
+const MIN_PASSPHRASE_CHARS: usize = 8;
+
+/// Reject an identity-key passphrase weaker than [`MIN_PASSPHRASE_CHARS`]. Enforced as a HARD floor
+/// (not an advisory) on every key-creation / re-encryption path — the TTY prompt AND
+/// `$KOH_KEY_NEW_PASSPHRASE` alike — so there is no way to land an effectively-unencrypted key on
+/// disk. Shared by key creation and `koh key`.
+pub(crate) fn enforce_passphrase_strength(passphrase: &str) -> Result<(), SetupError> {
+    if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(SetupError::Other(anyhow::anyhow!(
+            "identity-key passphrase is too short (< {MIN_PASSPHRASE_CHARS} chars); identity keys are \
+             always strongly encrypted — choose a longer, higher-entropy passphrase"
+        )));
     }
+    Ok(())
 }
 
 /// Persist `sk` to `path` atomically (born-private 0600) in the `koh-key-v1` encrypted format. The
@@ -707,6 +714,31 @@ impl MonoClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passphrase_floor_rejects_weak_accepts_strong() {
+        // The "no effectively-unencrypted key" guard: a passphrase below the minimum is a hard error
+        // on every creation path, so a weak passphrase can't stand in for real encryption.
+        assert!(
+            enforce_passphrase_strength("").is_err(),
+            "empty is rejected"
+        );
+        assert!(
+            enforce_passphrase_strength("hunter7").is_err(),
+            "7 chars is below the floor"
+        );
+        assert!(
+            enforce_passphrase_strength("hunter77").is_ok(),
+            "exactly the {MIN_PASSPHRASE_CHARS}-char minimum is accepted"
+        );
+        assert!(enforce_passphrase_strength("correct horse battery staple").is_ok());
+        // Counts characters, not bytes: 7 two-byte chars is still below the floor.
+        assert!(
+            enforce_passphrase_strength(&"é".repeat(7)).is_err(),
+            "the floor counts chars, not bytes"
+        );
+        assert!(enforce_passphrase_strength(&"é".repeat(8)).is_ok());
+    }
 
     #[test]
     fn state_dir_resolves_in_priority_order() {

@@ -24,6 +24,7 @@ echo "Stress: throughput — server-side flood of $LINES lines to an attached cl
 push_flood_script "$FLOOD" "seq 1 $LINES; echo TP_DONE > $SENT"
 adb $ADB_SERIAL shell "rm -f $SENT $CLILOG" >/dev/null 2>&1 || true
 
+allow_client_key /data/local/tmp/koh-tp.key
 start_server "--shell $FLOOD" || { bad "server failed to start"; finish "stress-throughput"; }
 SPID="$(server_pid)"
 RSS0="$(rss_kb "$SPID")"

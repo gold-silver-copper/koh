@@ -20,6 +20,7 @@ echo "Stress: memory longevity — ${DURATION}s of unbounded server-side output 
 push_flood_script "$FLOOD" "exec yes koh-longevity-flood"
 adb $ADB_SERIAL shell "rm -f $CLILOG" >/dev/null 2>&1 || true
 
+allow_client_key /data/local/tmp/koh-long.key
 start_server "--shell $FLOOD" || { bad "server failed to start"; finish "stress-memory-longevity"; }
 SPID="$(server_pid)"
 

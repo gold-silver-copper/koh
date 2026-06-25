@@ -19,6 +19,7 @@ echo "Stress: link-drop resilience — $ROUNDS round(s) of kill-server-under-a-l
 
 survived=0
 bannered=0
+allow_client_key /data/local/tmp/koh-rc.key   # the reconnecting client must be on the allowlist
 r=1
 while [ "$r" -le "$ROUNDS" ]; do
   echo "  round $r:"

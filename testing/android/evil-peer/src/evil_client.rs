@@ -3,7 +3,10 @@
 //! server-side defenses on the emulator. Every attack reuses koh's PUBLIC wire/transport code, so
 //! the malicious client allocates almost nothing — the SERVER is the one that must stay bounded.
 //!
-//! Usage: evil-client <server-id> <ip:port> <attack> [args...]   ($KOH_PASSPHRASE if the server needs one)
+//! Usage: evil-client <server-id> <ip:port> <attack> [args...]
+//!   The malicious client must be on the server's `--allow` list to reach the data plane, so the
+//!   harness pre-creates its key and sets `$EVIL_KEY_FILE` (+ `$KOH_KEY_PASSPHRASE` to open it);
+//!   without it a fresh ephemeral key is used (only the pre-admission attacks then apply).
 //!
 //! Attacks (defense each probes):
 //!   resize <rows> <cols>     oversized/zero terminal geometry            (H-1 / M-2 clamp_dims)
@@ -15,21 +18,33 @@
 //!   keys-flood <mib>         one diff of mib MiB of keystrokes (under cap) (bounded PTY write/budget)
 //!   garbage <n>              n random/short datagrams                    (Fragment::decode robustness)
 //!   bad-version              an Instruction with a bogus protocol ver    (PROTOCOL_VERSION reject)
-//!   stall-pake               accept the auth bi-stream, never answer     (KR-01 3s handshake timeout)
-//!   bad-pake                 a garbage SPAKE2 message                     (PAKE finish() reject)
+//!   stall-admission          connect but never accept the admission ack  (KOH-08 3s admission timeout)
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use koh::input::WireEvent;
 use koh::transport_iroh::{
-    auth, bind_endpoint_local, direct_addr, generate_secret_key, parse_endpoint_id, IrohChannel,
-    ALPN,
+    admission, bind_endpoint_local, direct_addr, generate_secret_key, load_or_create_secret_key,
+    parse_endpoint_id, IrohChannel, ALPN,
 };
 use koh::wire::{Fragment, Fragmenter, Instruction, PROTOCOL_VERSION};
 
 const MIB: usize = 1024 * 1024;
+
+/// The evil client's identity: a persistent key from `$EVIL_KEY_FILE` (so the harness can put its
+/// node-id on the server's `--allow` list), or a fresh ephemeral key when unset. Macro (not a fn) so
+/// it needn't name the non-re-exported `SecretKey` type — evil-peer depends on koh only, not iroh.
+macro_rules! evil_secret {
+    () => {
+        match std::env::var_os("EVIL_KEY_FILE") {
+            Some(p) => load_or_create_secret_key(&PathBuf::from(p))?,
+            None => generate_secret_key(),
+        }
+    };
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,19 +64,18 @@ async fn main() -> Result<()> {
     let server_id = parse_endpoint_id(id)?;
     let saddr: SocketAddr = addr.parse()?;
 
-    // The raw-bistream auth attacks do NOT run the normal handshake — they manually accept the
-    // server's auth stream and misbehave on it.
-    if matches!(attack, "stall-pake" | "bad-pake") {
-        return auth_attack(id, addr, attack).await;
+    // The admission-stall attack does NOT complete admission — it connects and then deliberately
+    // never accepts the server's admission ack, so the server's 3s admission timeout must fire.
+    if attack == "stall-admission" {
+        return admission_stall(id, addr).await;
     }
 
-    // Everything else passes the handshake first (KOH_PASSPHRASE if the server requires one), then
-    // injects crafted datagrams on the established connection.
-    let pass = std::env::var("KOH_PASSPHRASE").ok();
-    let ep = bind_endpoint_local(generate_secret_key(), false).await?;
+    // Everything else gets admitted first (the evil client must be on the server's allowlist; see
+    // $EVIL_KEY_FILE), then injects crafted datagrams on the established connection.
+    let ep = bind_endpoint_local(evil_secret!(), false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
-    auth::handshake_client(&conn, pass.as_deref()).await?;
-    eprintln!("evil-client: authenticated; running attack '{attack}'");
+    admission::await_admission(&conn).await?;
+    eprintln!("evil-client: admitted; running attack '{attack}'");
     let ch = IrohChannel::new(conn);
 
     match attack {
@@ -235,55 +249,22 @@ async fn bad_version(ch: &IrohChannel) {
     blast(ch, &mut f, &i, 4);
 }
 
-// --- raw-bistream auth attacks -----------------------------------------------------------------
+// --- admission-direction attack ----------------------------------------------------------------
 
-// The koh passphrase auth tags (private in koh::transport_iroh::auth) — hardcoded here because this
-// harness crafts raw bytes on the wire. Keep in sync with auth.rs if the tags ever change.
-const TAG_NO_PASS: u8 = 0;
-const TAG_PAKE_REQUIRED: u8 = 1;
-
-/// `stall-pake` / `bad-pake`: connect, accept the server's auth bi-stream, and either stall (never
-/// answer → the server's 3s handshake timeout must fire and release the permit) or send a garbage
-/// SPAKE2 message (→ the server's `finish` must reject it cleanly).
-async fn auth_attack(id_str: &str, addr_str: &str, attack: &str) -> Result<()> {
+/// `stall-admission`: connect (the evil client must be allowlisted) but then deliberately never
+/// accept the server's admission ack — just hold the connection. The server's bounded admission
+/// step (`koh serve`'s 3s deadline / KOH-08 pending-handshake cap) must fire and release the slot
+/// rather than letting a stalled admittee pin a permit. Crafts no raw auth bytes — there is no
+/// passphrase handshake anymore; admission is a single ADMIT byte the server writes.
+async fn admission_stall(id_str: &str, addr_str: &str) -> Result<()> {
     let server_id = parse_endpoint_id(id_str)?;
     let saddr: SocketAddr = addr_str.parse()?;
-    let ep = bind_endpoint_local(generate_secret_key(), false).await?;
+    let ep = bind_endpoint_local(evil_secret!(), false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
-    // koh's server OPENS the auth bi-stream; the client ACCEPTS it.
-    let (mut send, mut recv) = conn.accept_bi().await?;
-    let mut tag = [0u8; 1];
-    recv.read_exact(&mut tag).await?;
-    if tag[0] == TAG_NO_PASS {
-        eprintln!("evil-client: server requires no passphrase; nothing to attack");
-        return Ok(());
-    }
-    if tag[0] != TAG_PAKE_REQUIRED {
-        return Err(anyhow!("unexpected auth tag {}", tag[0]));
-    }
-    // Read the server's framed SPAKE2 message: [len:u8][bytes].
-    let mut len = [0u8; 1];
-    recv.read_exact(&mut len).await?;
-    let mut server_msg = vec![0u8; len[0] as usize];
-    recv.read_exact(&mut server_msg).await?;
-
-    match attack {
-        "stall-pake" => {
-            eprintln!("evil-client: stalling the passphrase handshake (server 3s timeout must fire)");
-            tokio::time::sleep(Duration::from_secs(8)).await; // > the server's 3s bound
-        }
-        "bad-pake" => {
-            eprintln!("evil-client: sending a garbage SPAKE2 message (server must reject)");
-            let garbage = [0xABu8; 33]; // valid length, invalid curve element
-            send.write_all(&[garbage.len() as u8]).await?;
-            send.write_all(&garbage).await?;
-            let _ = send.finish();
-            // Drain whatever the server sends (its confirmation/verdict) before exiting.
-            let mut sink = [0u8; 64];
-            let _ = recv.read(&mut sink).await;
-        }
-        _ => unreachable!(),
-    }
+    eprintln!("evil-client: connected; NOT accepting the admission ack (server timeout must fire)");
+    // Hold the connection open, never calling await_admission, longer than the server's 3s bound.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    drop(conn);
     drop(ep);
     Ok(())
 }

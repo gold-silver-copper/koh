@@ -285,15 +285,6 @@ impl Pty {
         r
     }
 
-    /// Block until the child exits, returning its status. The child is reaped on return (see KR-02).
-    pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        let r = self.child.wait();
-        if r.is_ok() {
-            self.reaped.store(true, Ordering::SeqCst);
-        }
-        r
-    }
-
     /// Terminate the child (SIGHUP via the portable-pty killer). No-op once the child is reaped, so
     /// we never SIGHUP a recycled PID (KR-02).
     pub fn kill(&mut self) -> std::io::Result<()> {

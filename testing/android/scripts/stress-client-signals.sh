@@ -12,6 +12,8 @@ push_binary
 
 echo "Stress: client signals — Ctrl-^ Ctrl-Z suspend/resume + SIGTERM graceful shutdown (level=$STRESS_LEVEL)"
 
+allow_client_key /data/local/tmp/koh-siga.key
+allow_client_key /data/local/tmp/koh-sigb.key
 start_server "" || { bad "server failed to start"; finish "stress-client-signals"; }
 SPID="$(server_pid)"
 
@@ -24,7 +26,7 @@ SPID="$(server_pid)"
 HLOG="/tmp/koh-sig-a-$$.log"; : > "$HLOG"
 ( sleep 5; printf '\036\032'; sleep 8; printf '\036.'; sleep 2 ) \
   | to 30 adb $ADB_SERIAL shell -t -t \
-      "$DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file /data/local/tmp/koh-siga.key" \
+      "$KENV $DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file /data/local/tmp/koh-siga.key" \
   > "$HLOG" 2>&1 &
 SIGA_BG=$!
 

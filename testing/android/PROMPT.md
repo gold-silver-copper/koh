@@ -1,5 +1,12 @@
 # TASK: Add Android-emulator-backed tests for `koh` on Apple Silicon macOS
 
+> **NOTE (historical brief; auth model changed since).** Recipes below that use `koh serve
+> --allow-any` predate 0.7.0: koh has **no accept-any mode** — start the server with `--allow <id>`,
+> where `<id>` comes from `koh id --key-file <client-key>`. Identity keys are also **always
+> encrypted** now, so every on-device koh invocation needs `KOH_KEY_PASSPHRASE` (and
+> `KOH_KEY_NEW_PASSPHRASE` to create one) in its env — the live harness wires this via `$KENV` in
+> `scripts/lib.sh`. The live scripts are the source of truth; this file is the original brief.
+
 ## GOAL
 Set up an Android SDK + headless arm64 emulator on this Apple Silicon Mac, then ADD opt-in, emulator-backed tests that prove `koh`'s Android DNS-panic fix holds at runtime — without touching `koh`'s source.
 

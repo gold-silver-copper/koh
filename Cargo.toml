@@ -15,7 +15,7 @@ keywords = ["mosh", "shell", "terminal", "iroh", "p2p"]
 categories = ["command-line-utilities", "network-programming"]
 # Keep the published .crate lean: the porting-research notes, the test infra, the integration tests,
 # and the chaos example aren't needed to build or USE koh (the lib's own unit tests live in `src/`).
-exclude = ["docs/", "testing/", "tests/", "examples/", "fuzz/", "SECURITY_AUDIT_v0.3.1.md"]
+exclude = ["docs/", "testing/", "tests/", "examples/", "fuzz/"]
 
 [[bin]]
 name = "koh"

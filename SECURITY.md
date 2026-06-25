@@ -2,9 +2,8 @@
 
 koh is a young, largely single-maintainer project. It has had several internal security, quality, and
 architecture reviews, but **no external/professional audit** — please calibrate trust accordingly (see
-[`THREAT_MODEL.md`](THREAT_MODEL.md) and the README's *Public API stability* notes). `forbid(unsafe)`
-and a denied-panic lint family shrink the surface that needs auditing, but they do not replace
-independent eyes.
+the [`THREAT_MODEL.md`](docs/THREAT_MODEL.md)). `forbid(unsafe)` and a denied-panic lint family shrink
+the surface that needs auditing, but they do not replace independent eyes.
 
 ## Reporting a vulnerability
 

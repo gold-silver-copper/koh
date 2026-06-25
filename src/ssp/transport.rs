@@ -18,12 +18,12 @@ use crate::ssp::{
 ///
 /// Internal SSP machinery: `mod transport` is private and the `ssp` re-export was dropped, so this
 /// is crate-only and not part of the public API (the never-empty-deque invariant is upheld inside
-/// [`Transport`]). `pub` here is already crate-bounded by the private module.
+/// [`Transport`]).
 #[derive(Debug, Clone)]
-pub struct TimestampedState<S> {
-    pub timestamp: u64,
-    pub num: u64,
-    pub state: S,
+struct TimestampedState<S> {
+    timestamp: u64,
+    num: u64,
+    state: S,
 }
 
 /// Outcome of feeding one datagram to [`Transport::recv`].
@@ -163,7 +163,10 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         &mut self.current_state
     }
 
-    /// Read the live local state.
+    /// Read the live local state. Test-only: production mutates via [`current_mut`](Self::current_mut)
+    /// and reads the peer's stream via [`remote_state`](Self::remote_state); it never reads the live
+    /// local state back.
+    #[cfg(test)]
     pub const fn current(&self) -> &Local {
         &self.current_state
     }
@@ -1053,5 +1056,55 @@ mod tests {
             t.newest_sent_num() > after_first,
             "the changed state gets a fresh number"
         );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+
+        /// Feed ARBITRARY SSP envelopes (old/new/ack/throwaway including `u64::MAX` / the shutdown
+        /// sentinel, inverted `old > new`, repeats) into the receive path. `recv` is the SSP
+        /// reconciliation trust boundary where every peer-controlled num drives held-base lookup,
+        /// throwaway GC (which once shipped a panic), the insertion-sort, and the cap/budget gates —
+        /// yet it had no property coverage. With release `overflow-checks` on, an unguarded `+`/`-` on
+        /// a wire num would panic here; instead it must never panic, and `received_states` must stay
+        /// non-empty and bounded under any sequence. (KSSP-01)
+        #[test]
+        fn recv_survives_arbitrary_envelopes(
+            ops in proptest::collection::vec(
+                (
+                    proptest::prelude::any::<u64>(),
+                    proptest::prelude::any::<u64>(),
+                    proptest::prelude::any::<u64>(),
+                    proptest::prelude::any::<u64>(),
+                    0u64..200,
+                ),
+                0..64,
+            ),
+        ) {
+            let mut t = Transport::<Grow, Grow>::new(0, 1200);
+            let mut now = 0u64;
+            for (old, new, ack, throwaway, val) in ops {
+                now = now.saturating_add(1);
+                let dg = datagram(&Instruction {
+                    protocol_version: PROTOCOL_VERSION,
+                    old_num: old,
+                    new_num: new,
+                    ack_num: ack,
+                    throwaway_num: throwaway,
+                    diff: postcard::to_allocvec(&GrowDiff(val)).unwrap(),
+                });
+                let _ = t.recv(now, &dg); // must never panic on any envelope
+                proptest::prop_assert!(
+                    !t.received_states.is_empty(),
+                    "received_states must never be empty (the never-empty invariant)"
+                );
+                proptest::prop_assert!(
+                    t.received_states.len() <= RECEIVED_STATES_CAP,
+                    "received_states {} exceeded the {} cap",
+                    t.received_states.len(),
+                    RECEIVED_STATES_CAP
+                );
+            }
+        }
     }
 }

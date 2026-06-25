@@ -873,5 +873,36 @@ mod tests {
             }
             prop_assert_eq!(got.unwrap(), instr);
         }
+
+        /// Feed ARBITRARY fragment sequences (ascending/descending/repeat ids, dup/gap indices,
+        /// varied payloads) into one reassembler. The interacting caps — replay gate, per-id byte
+        /// budget, stale-supersede, OOO/dup index handling — must hold under ANY interleaving: `add`
+        /// never panics, `last_completed_id` never regresses (the replay watermark is monotonic), and
+        /// `buffered_bytes` never exceeds the cap. (MC-04 — the caps each have a unit test, but their
+        /// interaction under random interleaving had none.)
+        #[test]
+        fn fragment_assembly_survives_adversarial_sequences(
+            ops in proptest::collection::vec(
+                (0u64..6, 0u16..8, any::<bool>(), 0usize..400),
+                0..200,
+            ),
+        ) {
+            let mut asm = FragmentAssembly::with_limit(4096);
+            let mut prev_done: Option<u64> = None;
+            for (id, index, final_, plen) in ops {
+                // `add` must never panic on any fragment — only ever Ok(Some/None) or Err.
+                let _ = asm.add(Fragment { id, index, final_, payload: vec![0u8; plen] });
+                if let Some(done) = asm.last_completed_id {
+                    if let Some(prev) = prev_done {
+                        prop_assert!(done >= prev, "last_completed_id regressed {} -> {}", prev, done);
+                    }
+                    prev_done = Some(done);
+                }
+                prop_assert!(
+                    asm.buffered_bytes <= asm.buffered_cap(),
+                    "buffered_bytes {} exceeded cap {}", asm.buffered_bytes, asm.buffered_cap()
+                );
+            }
+        }
     }
 }

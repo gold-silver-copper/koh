@@ -23,16 +23,16 @@ use crate::ssp::{SyncState, Transport, NEVER};
 
 /// A small, dependency-free, reproducible PRNG (SplitMix64).
 #[derive(Debug, Clone)]
-pub(crate) struct Rng {
+pub struct Rng {
     state: u64,
 }
 
 impl Rng {
-    pub(crate) fn new(seed: u64) -> Self {
+    pub fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
-    pub(crate) fn next_u64(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -41,12 +41,12 @@ impl Rng {
     }
 
     /// Uniform in `[0, 1)`.
-    pub(crate) fn next_f64(&mut self) -> f64 {
+    pub fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
     /// Uniform integer in `[lo, hi]`.
-    pub(crate) fn range(&mut self, lo: u64, hi: u64) -> u64 {
+    pub fn range(&mut self, lo: u64, hi: u64) -> u64 {
         if hi <= lo {
             lo
         } else {
@@ -70,6 +70,7 @@ pub struct LinkParams {
 
 impl LinkParams {
     /// A clean, low-latency link.
+    #[cfg(test)]
     pub fn perfect() -> Self {
         Self {
             loss: 0.0,
@@ -80,6 +81,7 @@ impl LinkParams {
     }
 
     /// A nasty mobile link: 30% loss, 20–120ms jitter, 5% duplication.
+    #[cfg(test)]
     pub fn lossy() -> Self {
         Self {
             loss: 0.30,
@@ -96,17 +98,13 @@ impl LinkParams {
 
 /// A one-directional in-flight datagram queue with random per-datagram delay.
 #[derive(Debug, Default)]
-pub(crate) struct Link {
+pub struct Link {
     inflight: Vec<(u64, Vec<u8>)>, // (deliver_at_ms, bytes)
 }
 
 impl Link {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// Offer a datagram to the link at time `now`; loss/delay/dup are applied here.
-    pub(crate) fn push(&mut self, rng: &mut Rng, now: u64, p: &LinkParams, dg: Vec<u8>) {
+    pub fn push(&mut self, rng: &mut Rng, now: u64, p: &LinkParams, dg: Vec<u8>) {
         if rng.next_f64() < p.loss {
             return; // dropped
         }
@@ -119,12 +117,12 @@ impl Link {
     }
 
     /// Earliest pending delivery time, if any.
-    pub(crate) fn next_due(&self) -> Option<u64> {
+    pub fn next_due(&self) -> Option<u64> {
         self.inflight.iter().map(|x| x.0).min()
     }
 
     /// Drain and return all datagrams due at or before `now`, in delivery-time order.
-    pub(crate) fn due(&mut self, now: u64) -> Vec<Vec<u8>> {
+    pub fn due(&mut self, now: u64) -> Vec<Vec<u8>> {
         let mut ready: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut keep: Vec<(u64, Vec<u8>)> = Vec::new();
         for item in self.inflight.drain(..) {
@@ -166,8 +164,8 @@ impl<L: SyncState, R: SyncState> SimHarness<L, R> {
         Self {
             a,
             b,
-            a2b: Link::new(),
-            b2a: Link::new(),
+            a2b: Link::default(),
+            b2a: Link::default(),
             now: 0,
             rng: Rng::new(seed),
             params,
@@ -191,13 +189,9 @@ impl<L: SyncState, R: SyncState> SimHarness<L, R> {
     }
 
     /// What B currently sees of A's stream (A → B direction).
+    #[cfg(test)]
     pub fn b_view_of_a(&self) -> &L {
         self.b.remote_state()
-    }
-
-    /// What A currently sees of B's stream (B → A direction).
-    pub fn a_view_of_b(&self) -> &R {
-        self.a.remote_state()
     }
 
     fn next_event_time(&mut self) -> Option<u64> {
@@ -279,6 +273,7 @@ impl<L: SyncState, R: SyncState> SimHarness<L, R> {
     }
 
     /// Step a fixed number of times (e.g. to let an injected change propagate).
+    #[cfg(test)]
     pub fn run_steps(&mut self, steps: usize) {
         for _ in 0..steps {
             if !self.step() {
@@ -351,7 +346,7 @@ mod tests {
         h.a_mut().0.extend_from_slice(b"from-a");
         h.b_mut().0.extend_from_slice(b"FROM-B");
         h.run_until(20_000, |h| {
-            h.b_view_of_a().0 == b"from-a" && h.a_view_of_b().0 == b"FROM-B"
+            h.b_view_of_a().0 == b"from-a" && h.a.remote_state().0 == b"FROM-B"
         });
     }
 

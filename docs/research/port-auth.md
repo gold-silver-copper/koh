@@ -1,5 +1,13 @@
 # Porting notes: optional passphrase second auth factor (P2)
 
+> **ARCHIVAL — NOT ADOPTED (historical research note).** This describes the abandoned
+> multi-crate layout (`crates/transport-iroh`, `rmosh-`/`moshers-` naming) and proposes a
+> passphrase **second factor** that koh deliberately did **not** ship: a brief SPAKE2/PAKE
+> factor was tried (v0.4.0) and then removed in v0.7.0. koh authorizes on the node-id allowlist
+> alone; the leaked-key risk is instead handled by mandatory at-rest key encryption. Code
+> snippets below (`allow_any`, the multi-crate paths) no longer match the single-crate tree.
+> Kept only as design history.
+
 Goal: add the reference's BLAKE3 nonce-challenge passphrase handshake (a second auth
 factor on top of the node-id allowlist) to the `rmosh-` crate. The passphrase NEVER
 crosses the wire — only `BLAKE3(passphrase || nonce)` does, with a fresh random nonce per

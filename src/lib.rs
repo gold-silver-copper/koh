@@ -24,6 +24,7 @@
 //! - [`pty`] — PTY allocation, shell spawn, SIGWINCH, child reaping.
 //! - [`server`] — PTY + emulator + `Transport<Screen, Input>` over iroh, plus `koh serve`.
 //! - [`client`] — input + `Transport<Input, Screen>` + predictor + termina render, plus `koh connect`.
+//! - [`keycmd`] — `koh key`: change the identity key's encryption passphrase (`ssh-keygen -p`-style).
 //!
 //! Dependency direction is strict: `wire ← ssp ← {terminal, input}`, with `predict` over
 //! `{terminal, input}`, `transport_iroh` over `wire`, and `server`/`client` on top. The entire

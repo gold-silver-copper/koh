@@ -1,7 +1,7 @@
 # Rust build artifacts
 /target
 
-# rmosh persistent identity keys (never commit secrets)
+# koh persistent identity keys (never commit secrets)
 **/*.key
 
 # OS cruft

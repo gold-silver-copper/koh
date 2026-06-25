@@ -57,7 +57,7 @@ secrecy = "0.10"
 aes-gcm = "0.10"
 # No-echo passphrase prompt for the encrypted identity key (the `ssh-keygen -p` / login analogue).
 rpassword = "7"
-# render the endpoint id as a terminal QR for `koh serve --qr`; default-features = false drops the
+# render the endpoint id as a terminal QR on `koh serve` (always printed); default-features = false drops the
 # heavy image/svg/pic renderers (we only use the built-in unicode half-block renderer).
 qrcode = { version = "=0.14.1", default-features = false }
 # utility

@@ -15,8 +15,10 @@ its API is internal and unstable (see the README).
 
 ## [Unreleased]
 
-The next release consolidates a large security/minimalism pass. It is **breaking** (flags, env vars,
-and the default key location changed).
+## [0.8.0] — 2026-06-25
+
+A large security/minimalism + release-maturity pass. **Breaking** (flags, env vars, and the default
+key location changed).
 
 ### Removed
 - **`--allow-any`** — there is no "accept any peer" mode; at least one `--allow <id>` is required, so a
@@ -77,7 +79,8 @@ and the default key location changed).
 - Initial release: the SSP protocol core, the terminal model, the PTY host, the local-echo predictor,
   and the iroh QUIC transport.
 
-[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/gold-silver-copper/koh/releases/tag/v0.8.0
 [0.7.0]: https://github.com/gold-silver-copper/koh/releases/tag/v0.7.0
 [0.5.0]: https://github.com/gold-silver-copper/koh/releases/tag/v0.5.0
 [0.4.4]: https://github.com/gold-silver-copper/koh/releases/tag/v0.4.4

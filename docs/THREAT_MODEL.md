@@ -2,7 +2,7 @@
 
 A map of who koh defends against, the trust boundaries, the properties it provides, and — as
 importantly — what it explicitly does **not** try to do. This exists so a reviewer knows where to
-look; pair it with [`SECURITY.md`](SECURITY.md).
+look; pair it with [`SECURITY.md`](../SECURITY.md).
 
 ## What koh is
 

@@ -35,8 +35,15 @@ endpoint id, with no listening port and no SSH**.
 ## Install
 
 ```sh
-cargo install --git https://github.com/gold-silver-copper/koh   # or: cargo build --release
+cargo install koh                                               # from crates.io
+# or, latest from git:  cargo install --git https://github.com/gold-silver-copper/koh
+# or, from a checkout:  cargo build --release
 ```
+
+**Platforms:** Linux and macOS (x86_64 and aarch64), and Android via [Termux](https://termux.dev).
+Windows is **not** supported (koh uses Unix PTYs + file-permission primitives) — use WSL2. koh is
+**binary-first**: the library crate is published only so the in-tree tests can drive it, and its API
+is **internal and unstable** — depend on the `koh` binary, not the crate API.
 
 ## Quickstart
 

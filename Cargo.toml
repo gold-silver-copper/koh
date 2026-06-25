@@ -7,15 +7,27 @@ edition = "2021"
 # "requires rustc 1.91" instead of a confusing mid-compile error. Keep in sync with iroh on each bump.
 rust-version = "1.91"
 license = "GPL-3.0-or-later"
-authors = ["koh authors"]
+authors = ["Stephen Korzen <stephen.korzen@gmail.com>"]
 repository = "https://github.com/gold-silver-copper/koh"
+homepage = "https://github.com/gold-silver-copper/koh"
+documentation = "https://docs.rs/koh"
 description = "koh — a resilient peer-to-peer remote shell: mosh, rewritten in Rust over iroh"
 readme = "README.md"
 keywords = ["mosh", "shell", "terminal", "iroh", "p2p"]
 categories = ["command-line-utilities", "network-programming"]
 # Keep the published .crate lean: the porting-research notes, the test infra, the integration tests,
-# and the chaos example aren't needed to build or USE koh (the lib's own unit tests live in `src/`).
-exclude = ["docs/", "testing/", "tests/", "examples/", "fuzz/"]
+# the chaos example, and the dev/CI tooling aren't needed to build or USE koh (the lib's own unit
+# tests live in `src/`). COPYING (the license) and CHANGELOG.md DO ship.
+exclude = [
+    "docs/",
+    "testing/",
+    "tests/",
+    "examples/",
+    "fuzz/",
+    ".github/",
+    "clippy.toml",
+    "deny.toml",
+]
 
 [[bin]]
 name = "koh"

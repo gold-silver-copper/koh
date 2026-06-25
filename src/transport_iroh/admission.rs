@@ -24,7 +24,9 @@ pub enum AdmissionError {
     /// The admission bi-stream failed (open/accept/read) — typically the server closing on rejection.
     #[error("admission stream error: {0}")]
     Stream(#[from] io::Error),
-    /// The server's admission stream did not carry the ADMIT byte.
+    /// The server's admission stream carried a byte other than ADMIT. Currently unreachable — the
+    /// server only ever writes ADMIT (a reject closes the connection, surfacing as `Stream`) — kept
+    /// as a defensive guard against a non-conforming or forward-incompatible server.
     #[error("server did not admit the connection")]
     Rejected,
 }

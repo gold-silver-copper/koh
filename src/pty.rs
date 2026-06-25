@@ -33,8 +33,8 @@ fn default_shell() -> String {
     resolve_shell(std::env::var_os("SHELL"))
 }
 
-/// Remove koh's operational env vars — notably the `$KOH_PASSPHRASE` second factor — from a
-/// command's environment before it spawns the session shell (L-4 / KOH-15). `CommandBuilder::new`
+/// Remove koh's operational env vars — notably the `$KOH_KEY_PASSPHRASE` identity-key secret — from
+/// a command's environment before it spawns the session shell (L-4 / KOH-15). `CommandBuilder::new`
 /// seeds the full parent environment, so we strip *every* inherited `KOH_*` key by prefix (rather
 /// than a hand-maintained list that silently misses future vars). Pulled out of [`Pty::spawn`] so
 /// it is unit-testable without allocating a real PTY.
@@ -44,8 +44,6 @@ fn scrub_koh_env(cmd: &mut CommandBuilder) {
             cmd.env_remove(&key);
         }
     }
-    // Belt-and-suspenders for the security-critical one, regardless of the snapshot above.
-    cmd.env_remove("KOH_PASSPHRASE");
 }
 
 fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
@@ -145,9 +143,9 @@ impl Pty {
         }
         // A real terminal type so curses apps behave; the env is otherwise inherited.
         cmd.env("TERM", term);
-        // Scrub koh's operational env from the child (L-4). Most important: `$KOH_PASSPHRASE` — the
-        // second-factor secret — must NOT reach the spawned shell, or any authorized user could
-        // `echo $KOH_PASSPHRASE` to recover it.
+        // Scrub koh's operational env from the child (L-4). Most important: `$KOH_KEY_PASSPHRASE` —
+        // the identity-key secret — must NOT reach the spawned shell, or any authorized user could
+        // `echo $KOH_KEY_PASSPHRASE` to recover it.
         scrub_koh_env(&mut cmd);
 
         let child = pair
@@ -339,7 +337,7 @@ impl Pty {
     }
 
     /// The child's process id, if known.
-    pub fn process_id(&self) -> Option<u32> {
+    fn process_id(&self) -> Option<u32> {
         self.child.process_id()
     }
 }
@@ -394,27 +392,27 @@ mod tests {
     }
 
     #[test]
-    fn scrub_removes_koh_passphrase_even_when_inherited() {
-        // L-4: even when the parent process has $KOH_PASSPHRASE set, the spawned shell's env must
-        // not — otherwise any authorized user could `echo $KOH_PASSPHRASE`. CommandBuilder::new
-        // seeds the full parent env, so this proves env_remove strips an *inherited* secret.
-        std::env::set_var("KOH_PASSPHRASE", "topsecret-unit");
+    fn scrub_removes_koh_key_passphrase_even_when_inherited() {
+        // L-4: even when the parent process has $KOH_KEY_PASSPHRASE set, the spawned shell's env
+        // must not — otherwise any authorized user could `echo $KOH_KEY_PASSPHRASE`. CommandBuilder
+        // ::new seeds the full parent env, so this proves env_remove strips an *inherited* secret.
+        std::env::set_var("KOH_KEY_PASSPHRASE", "topsecret-unit");
         std::env::set_var("KOH_DNS", "1.1.1.1");
         let mut cmd = CommandBuilder::new("/bin/sh");
         assert!(
-            cmd.get_env("KOH_PASSPHRASE").is_some(),
+            cmd.get_env("KOH_KEY_PASSPHRASE").is_some(),
             "the builder seeds the parent env, so the var is present before scrubbing"
         );
         scrub_koh_env(&mut cmd);
         assert!(
-            cmd.get_env("KOH_PASSPHRASE").is_none(),
-            "the second-factor passphrase must be scrubbed from the child env"
+            cmd.get_env("KOH_KEY_PASSPHRASE").is_none(),
+            "the identity-key passphrase must be scrubbed from the child env"
         );
         assert!(
             cmd.get_env("KOH_DNS").is_none(),
             "operational KOH_* vars are scrubbed too"
         );
-        std::env::remove_var("KOH_PASSPHRASE");
+        std::env::remove_var("KOH_KEY_PASSPHRASE");
         std::env::remove_var("KOH_DNS");
     }
 

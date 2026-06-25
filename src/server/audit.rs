@@ -29,14 +29,15 @@ impl Outcome {
     }
 }
 
-/// Emit one structured auth/admission event with the stable schema (`event`, `outcome`, `peer`,
-/// `reason`) under the `koh::auth` target. INFO for an accepted outcome, WARN for the rest (the
-/// security-relevant denials). `peer` is the node-id hex, or `-` if unknown.
-pub(crate) fn auth_event(event: &str, outcome: Outcome, peer: Option<&EndpointId>, reason: &str) {
+/// Emit one structured authorization event with the stable schema (`event`, `outcome`, `peer`,
+/// `reason`) under the `koh::auth` target. `event` is always `authz` (the only admission gate is the
+/// allowlist); it stays in the schema so a consumer's filter is stable if more event kinds appear.
+/// INFO for an accepted outcome, WARN for a denial. `peer` is the node-id hex, or `-` if unknown.
+pub(crate) fn auth_event(outcome: Outcome, peer: Option<&EndpointId>, reason: &str) {
     let peer = peer.map_or_else(|| "-".to_owned(), crate::transport_iroh::format_endpoint_id);
     if matches!(outcome, Outcome::Accepted) {
-        tracing::info!(target: "koh::auth", event, outcome = outcome.token(), peer = %peer, reason);
+        tracing::info!(target: "koh::auth", event = "authz", outcome = outcome.token(), peer = %peer, reason);
     } else {
-        tracing::warn!(target: "koh::auth", event, outcome = outcome.token(), peer = %peer, reason);
+        tracing::warn!(target: "koh::auth", event = "authz", outcome = outcome.token(), peer = %peer, reason);
     }
 }

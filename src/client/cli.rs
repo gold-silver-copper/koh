@@ -69,12 +69,7 @@ pub struct ConnectArgs {
 /// Whether remote OSC-52 clipboard writes should be honored: the `--clipboard` flag, or a truthy
 /// `$KOH_CLIPBOARD` (`1`/`true`/`yes`/`on`, case-insensitive). Default off (L-1).
 fn clipboard_opt_in(flag: bool) -> bool {
-    flag || std::env::var("KOH_CLIPBOARD").is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    flag || crate::client::env_truthy("KOH_CLIPBOARD")
 }
 
 /// Arguments for `koh id`.
@@ -243,9 +238,9 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     // The first dial happens here — before raw mode — so a bad-id / not-on-allowlist error prints
     // cleanly; later drops are re-dialed from inside run_client.
     let connector = IrohConnector::new(endpoint.clone(), target);
-    // Bound the initial dial (KR-04): `connect()` performs unbounded handshake reads, so a
-    // malicious/typo'd server the client dials could otherwise hang it at "connecting…" until iroh's
-    // 300s idle timeout. Use the same cap as the transparent-reconnect path.
+    // Bound the initial dial (KR-04): `connect()` does the QUIC handshake then awaits the server's
+    // admission ack, so a malicious/typo'd server that never admits could otherwise hang it at
+    // "connecting…" until iroh's 300s idle timeout. Use the same cap as the transparent-reconnect path.
     let channel =
         match tokio::time::timeout(super::RECONNECT_CONNECT_TIMEOUT, connector.connect()).await {
             Ok(r) => r?,

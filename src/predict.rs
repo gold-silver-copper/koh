@@ -284,9 +284,6 @@ impl PredictionEngine {
         );
     }
 
-    pub fn set_display_preference(&mut self, pref: DisplayPreference) {
-        self.pref = pref;
-    }
     /// Choose insert-mode (default, `false`) vs overwrite-mode (`true`) prediction. In overwrite
     /// mode a typed glyph replaces the cell under the cursor instead of shifting the tail right —
     /// the correct behavior for full-screen apps. Mirrors mosh's `$MOSH_PREDICTION_OVERWRITE`.
@@ -294,7 +291,8 @@ impl PredictionEngine {
         self.predict_overwrite = on;
     }
     /// The newest epoch the server has confirmed echoes (predictions at or below it may show).
-    /// Exposed for tests/telemetry: a confirmation is the observable effect of [`cull`](Self::cull).
+    /// The confirmation epoch — bumped by [`cull`](Self::cull) when a prediction is confirmed.
+    /// Read by the client status line (and tests) to surface prediction activity.
     pub fn confirmed_epoch(&self) -> u64 {
         self.confirmed_epoch
     }

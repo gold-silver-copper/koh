@@ -21,7 +21,7 @@ use termina::OneBased;
 use vt100::{Color as VtColor, Screen};
 
 /// Map a vt100 color to a termina color spec.
-pub fn to_spec(c: VtColor) -> ColorSpec {
+fn to_spec(c: VtColor) -> ColorSpec {
     match c {
         VtColor::Default => ColorSpec::Reset,
         VtColor::Idx(i) => ColorSpec::PaletteIndex(i),

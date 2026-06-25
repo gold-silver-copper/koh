@@ -41,8 +41,8 @@ const TAG_LEN: usize = 16;
 const AAD_LEN: usize = 1 + 1 + 1 + SALT_LEN + 4 + 4 + 4 + NONCE_LEN;
 const PAYLOAD_LEN: usize = AAD_LEN + SECRET_LEN + TAG_LEN;
 
-/// Argon2id parameters for the key file, matching the PAKE KDF: 64 MiB, 3 passes, 1 lane, 32-byte
-/// output. Stored in the file so a future retune still reads old files.
+/// Argon2id parameters for the key file: 64 MiB, 3 passes, 1 lane, 32-byte output. Stored in the
+/// file so a future retune still reads old files.
 const M_COST_KIB: u32 = 64 * 1024;
 const T_COST: u32 = 3;
 const P_COST: u32 = 1;
@@ -50,6 +50,11 @@ const P_COST: u32 = 1;
 /// can't drive an enormous allocation. Generous vs the 64 MiB default; the key file is local-trust,
 /// this is belt-and-suspenders.
 const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
+/// Ceilings on the file-supplied Argon2 time/parallelism costs, so a corrupt or hostile local key
+/// file (e.g. `t_cost = u32::MAX`) can't make `decrypt_key` spin ~forever. Generous vs the 3/1
+/// defaults; key files are local-trust, so this is belt-and-suspenders alongside the memory cap.
+const MAX_T_COST: u32 = 16;
+const MAX_P_COST: u32 = 8;
 
 /// Errors decoding/decrypting a key file. Typed + panic-free (untrusted-shaped, though local).
 #[derive(Debug, thiserror::Error)]
@@ -77,7 +82,7 @@ fn derive_aes_key(
     t_cost: u32,
     p_cost: u32,
 ) -> Result<Zeroizing<[u8; 32]>, KeyfileError> {
-    if m_cost > MAX_M_COST_KIB {
+    if m_cost > MAX_M_COST_KIB || t_cost > MAX_T_COST || p_cost > MAX_P_COST {
         return Err(KeyfileError::BadParams);
     }
     let params = argon2::Params::new(m_cost, t_cost, p_cost, Some(32))

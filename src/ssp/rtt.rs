@@ -18,7 +18,7 @@ use tracing::trace;
 use crate::ssp::{SEND_INTERVAL_MAX, SEND_INTERVAL_MIN};
 
 /// Smoothed RTT / RTO estimator (mosh `Network::Connection` initial values + update rule).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RttEstimator {
     srtt: f64,
     rttvar: f64,

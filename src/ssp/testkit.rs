@@ -1,9 +1,9 @@
 //! Deterministic network-chaos harness for the SSP.
 //!
 //! A discrete-event simulator that connects two [`Transport`]s through a pair of lossy,
-//! latent, reordering, duplicating links driven by a seeded PRNG. Used by this crate's
-//! convergence tests, by the `input`/`terminal` crates, and by `xtask` to hammer the
-//! protocol. It proves the two non-negotiable properties from the spec:
+//! latent, reordering, duplicating links driven by a seeded PRNG. Used by the convergence tests,
+//! the `sim` module, and the integration tests to hammer the protocol. It proves the two
+//! non-negotiable properties from the spec:
 //!
 //! 1. **Convergence** — the receiver always reaches the sender's latest state.
 //! 2. **No head-of-line blocking** — the newest applied state number is monotonic; a
@@ -28,11 +28,11 @@ pub struct Rng {
 }
 
 impl Rng {
-    pub fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
-    pub fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -41,12 +41,12 @@ impl Rng {
     }
 
     /// Uniform in `[0, 1)`.
-    pub fn next_f64(&mut self) -> f64 {
+    pub(crate) fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
     /// Uniform integer in `[lo, hi]`.
-    pub fn range(&mut self, lo: u64, hi: u64) -> u64 {
+    pub(crate) fn range(&mut self, lo: u64, hi: u64) -> u64 {
         if hi <= lo {
             lo
         } else {
@@ -101,7 +101,7 @@ pub struct Link {
 }
 
 impl Link {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -119,7 +119,7 @@ impl Link {
     }
 
     /// Earliest pending delivery time, if any.
-    pub fn next_due(&self) -> Option<u64> {
+    pub(crate) fn next_due(&self) -> Option<u64> {
         self.inflight.iter().map(|x| x.0).min()
     }
 
@@ -137,10 +137,6 @@ impl Link {
         self.inflight = keep;
         ready.sort_by_key(|x| x.0);
         ready.into_iter().map(|x| x.1).collect()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inflight.is_empty()
     }
 }
 

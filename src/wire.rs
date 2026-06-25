@@ -4,7 +4,7 @@
 //! plus the (de)serialization and fragmentation/reassembly machinery that lets an
 //! [`Instruction`] travel over QUIC unreliable datagrams.
 //!
-//! This crate is deliberately transport-agnostic: it knows nothing about iroh or
+//! This module is deliberately transport-agnostic: it knows nothing about iroh or
 //! quinn. It produces [`Fragment`]s that are guaranteed to fit a caller-supplied MTU,
 //! and reassembles them back into [`Instruction`]s, dropping superseded partials.
 //!
@@ -245,11 +245,6 @@ pub struct Fragmenter {
 impl Fragmenter {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// The id that would be assigned to the next *new* instruction. Useful for tests/telemetry.
-    pub const fn current_id(&self) -> u64 {
-        self.next_id
     }
 
     /// Fragment `instr` into pieces that each serialize to `<= mtu` bytes.

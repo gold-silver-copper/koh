@@ -191,4 +191,35 @@ mod tests {
     fn duplicate_id_is_rejected() {
         assert!(parse_allow_file(&format!("{ID0}\n{ID0} restrict")).is_err());
     }
+
+    #[test]
+    fn load_allow_file_reads_and_parses_from_disk() {
+        // `load_allow_file` (not just `parse_allow_file`) is what actually gates shell access, so
+        // cover the real read-from-disk path end to end.
+        let dir = std::env::temp_dir().join(format!("koh-allowfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allow");
+        std::fs::write(
+            &path,
+            format!("# header\n{ID0} restrict\n{ID1} command=\"top\"\n"),
+        )
+        .unwrap();
+
+        let entries = load_allow_file(&path).expect("loads + parses");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].1.read_only, "first entry is restrict");
+        assert_eq!(entries[1].1.force_command.as_deref(), Some("top"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_allow_file_missing_path_errors_with_path_in_context() {
+        let path = std::path::Path::new("/nonexistent/koh-allowfile-probe-xyz");
+        let err = load_allow_file(path).expect_err("a missing allow-file must error");
+        assert!(
+            format!("{err:#}").contains("koh-allowfile-probe-xyz"),
+            "the error should name the path; got: {err:#}"
+        );
+    }
 }

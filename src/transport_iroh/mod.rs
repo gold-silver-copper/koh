@@ -3,7 +3,7 @@
 //! The iroh glue: endpoint setup, a persistent node identity, dial-by-endpoint-id, and a
 //! thin [`IrohChannel`] over a `Connection` that the SSP driver uses to ship datagrams and
 //! read the path RTT. Everything QUIC-shaped (encryption, key exchange, NAT traversal,
-//! relay fallback, roaming/migration, RTT measurement) is iroh's job; this crate just
+//! relay fallback, roaming/migration, RTT measurement) is iroh's job; this module just
 //! exposes the few primitives the protocol above it needs.
 //!
 //! ## Datagrams, not streams
@@ -149,6 +149,7 @@ fn resolve_new_key_passphrase(path: &Path) -> Result<SecretString, SetupError> {
                 "$KOH_KEY_NEW_PASSPHRASE is empty; identity keys are always encrypted (set a non-empty passphrase)"
             )));
         }
+        warn_if_weak_passphrase(&p);
         return Ok(SecretString::from(p));
     }
     if std::io::stdin().is_terminal() {
@@ -168,12 +169,26 @@ fn resolve_new_key_passphrase(path: &Path) -> Result<SecretString, SetupError> {
                 "passphrases did not match"
             )));
         }
+        warn_if_weak_passphrase(&p1);
         return Ok(SecretString::from(p1));
     }
     Err(SetupError::Other(anyhow::anyhow!(
         "no identity key at {} and no TTY to prompt; set $KOH_KEY_NEW_PASSPHRASE to create an encrypted key",
         path.display()
     )))
+}
+
+/// Advisory (non-fatal) nudge for a short new key passphrase. Deliberately NOT a hard floor —
+/// automation may inject an externally-strong secret — but a low-entropy one is worth flagging
+/// (matches `ssh-keygen`, which warns rather than rejects). Shared by key creation and `koh key`.
+pub(crate) fn warn_if_weak_passphrase(passphrase: &str) {
+    const MIN_REASONABLE_CHARS: usize = 8;
+    if passphrase.chars().count() < MIN_REASONABLE_CHARS {
+        eprintln!(
+            "koh: warning: identity-key passphrase is short (< {MIN_REASONABLE_CHARS} chars); prefer \
+             a longer, higher-entropy one (advisory — not enforced)."
+        );
+    }
 }
 
 /// Persist `sk` to `path` atomically (born-private 0600) in the `koh-key-v1` encrypted format. The
@@ -612,11 +627,6 @@ impl IrohChannel {
         self.conn.remote_id()
     }
 
-    /// Borrow the underlying connection (for advanced use / lifecycle).
-    pub fn connection(&self) -> &Connection {
-        &self.conn
-    }
-
     /// Send one datagram. Failures (peer congestion, too-large, unsupported) are *dropped* on
     /// purpose: the SSP resends the current state on the next tick, so a lost datagram is a
     /// non-event. Returns whether it was handed to the transport.
@@ -666,11 +676,6 @@ impl IrohChannel {
     pub fn close(&self, code: u32, reason: &[u8]) {
         self.conn.close(VarInt::from_u32(code), reason);
     }
-
-    /// Resolve when the connection closes, yielding the reason.
-    pub async fn closed(&self) -> ConnectionError {
-        self.conn.closed().await
-    }
 }
 
 /// A monotonic millisecond clock for driving the SSP scheduler, anchored at a base instant.
@@ -695,11 +700,6 @@ impl MonoClock {
     /// Milliseconds since this clock was created.
     pub fn now_ms(&self) -> u64 {
         self.base.elapsed().as_millis() as u64
-    }
-
-    /// The base instant, for computing absolute sleep deadlines from ms offsets.
-    pub fn base(&self) -> tokio::time::Instant {
-        self.base
     }
 }
 

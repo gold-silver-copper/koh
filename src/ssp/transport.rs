@@ -200,14 +200,6 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         diff
     }
 
-    /// The highest `num` of *our* local stream that the peer has acknowledged.
-    ///
-    /// On the client this is "how much of my typed input the server has applied" — the
-    /// predictor uses it to confirm/kill local-echo predictions.
-    pub fn local_acked_num(&self) -> u64 {
-        self.sent_front().num
-    }
-
     /// `num` of the newest local state we have transmitted.
     pub fn newest_sent_num(&self) -> u64 {
         self.sent_back().num
@@ -217,10 +209,6 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
     /// and [`wait_time`](Self::wait_time) returns [`NEVER`].
     pub fn set_connected(&mut self, connected: bool) {
         self.connected = connected;
-    }
-
-    pub fn is_connected(&self) -> bool {
-        self.connected
     }
 
     /// Update the datagram payload budget (from `Connection::max_datagram_size()`).
@@ -276,11 +264,6 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
     /// The peer has acknowledged our shutdown (our acked base is the sentinel).
     pub fn shutdown_acknowledged(&self) -> bool {
         self.sent_front().num == SHUTDOWN_SENTINEL
-    }
-
-    /// We have acknowledged the *peer's* shutdown (we put the sentinel ack on the wire).
-    pub fn counterparty_shutdown_acknowledged(&self) -> bool {
-        self.last_ack_sent == SHUTDOWN_SENTINEL
     }
 
     /// We have given up waiting for the peer to ack our shutdown.

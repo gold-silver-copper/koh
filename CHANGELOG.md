@@ -20,6 +20,10 @@ its API is internal and unstable (see the README).
   epoch gate still suppresses the echo at non-echoing (password) prompts, and high-RTT links still
   underline-flag unconfirmed predictions. Previously the shipped default (`adaptive`) hid predictions
   entirely on low-latency links.
+- **The "link down — resuming…" banner no longer flashes on a single lost keepalive.** Its grace
+  was 3 s — exactly the keepalive interval — so one dropped or jittered keepalive on a lossy link
+  briefly tripped it. The grace is now three keepalive intervals (~9 s), so transient packet loss is
+  absorbed and the banner only appears on a genuine stall (`Ctrl-^ .` still quits immediately).
 
 ### Removed
 - **`koh connect --predict <always|never|adaptive>`** — there is no prediction toggle; prediction is

@@ -62,6 +62,19 @@ const RECONNECT_BACKOFF_MAX_MS: u64 = 8_000;
 /// churn loop (K-03). A genuine mid-session drop after this dwell reconnects promptly.
 const MIN_CONNECTION_DWELL_MS: u64 = 5_000;
 
+/// How long the link must be silent before the in-session "link down — resuming…" banner appears.
+///
+/// An idle, still-connected peer sends a keepalive every `crate::ssp::ACK_INTERVAL` (3 s), and
+/// the transport's `last_heard` refreshes on every decoded inbound (including duplicate keepalives)
+/// — so on a healthy link the gap between contacts never exceeds one interval. The trouble
+/// is on a *lossy* link: a single dropped or jittered keepalive pushes the gap just past one
+/// interval, so a threshold near `ACK_INTERVAL` flashes the banner on routine packet loss (the gap
+/// recovers the instant the next keepalive lands). Gate the banner at several keepalive intervals so
+/// a couple of missed keepalives are absorbed silently and the banner only surfaces on a genuine
+/// stall — at the cost of a few extra seconds before a real outage is announced (the user can always
+/// `Ctrl-^ .` to quit immediately).
+const LINK_DOWN_GRACE_MS: u64 = crate::ssp::ACK_INTERVAL * 3;
+
 /// Wall-clock gap between two steady-loop iterations above which we assume the process was
 /// **suspended** (Android deep-sleep / screen-off freezes the process) rather than merely busy.
 ///
@@ -492,8 +505,11 @@ impl ClientSession {
 
         // Link-down is driven by transport liveness, which refreshes on ANY decoded inbound
         // (including duplicate keepalives) — so a quiet-but-alive session never falsely trips the
-        // banner. No banner before first contact (last_heard == 0 -> still connecting).
-        let status = if self.transport.last_heard() > 0 && !self.transport.link_up_within(now, 3000)
+        // banner. The grace is several keepalive intervals (LINK_DOWN_GRACE_MS), so a dropped/jittered
+        // keepalive on a lossy link doesn't flash the banner the moment one packet is late. No banner
+        // before first contact (last_heard == 0 -> still connecting).
+        let status = if self.transport.last_heard() > 0
+            && !self.transport.link_up_within(now, LINK_DOWN_GRACE_MS)
         {
             let since = now.saturating_sub(self.transport.last_heard());
             Some(format!("[koh] link down — resuming… {}s", since / 1000))
@@ -1167,6 +1183,45 @@ mod tests {
             tick.ended,
             Some(Some(7)),
             "a SHUTDOWN_SENTINEL remote state reports the remote shell's exit code"
+        );
+    }
+
+    #[test]
+    fn link_down_banner_absorbs_a_missed_keepalive_but_shows_on_a_real_stall() {
+        // Regression: the "link down — resuming…" banner used a 3 s grace — exactly the keepalive
+        // interval (ssp::ACK_INTERVAL) — so a single dropped/jittered keepalive on a lossy link
+        // pushed the silence gap just past the grace and flashed the banner, then cleared the moment
+        // the next keepalive landed. The grace is now several keepalive intervals, so transient loss
+        // is absorbed while a genuine stall still surfaces.
+        let mut s = new_session();
+        // Stamp last_heard with a real decoded server frame at t = 1000.
+        let mut emu = ServerTerminal::new(24, 80, 0);
+        emu.process(b"ready prompt $ ");
+        let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
+        server.set_connected(true);
+        server.observe_rtt(20.0);
+        *server.current_mut() = emu.snapshot();
+        for dg in drive_until_nonempty(&mut server) {
+            s.on_datagram(1000, &dg);
+        }
+
+        // One missed keepalive ≈ two intervals of silence — still inside the grace, so no banner.
+        let absorbed = s.on_tick(1000 + 2 * crate::ssp::ACK_INTERVAL, 1200, Some(20.0));
+        assert!(
+            absorbed.status.is_none(),
+            "a single missed keepalive must not flash the link-down banner"
+        );
+        // Right at the grace boundary: still no banner (the gate is strictly past the grace).
+        let boundary = s.on_tick(1000 + LINK_DOWN_GRACE_MS, 1200, Some(20.0));
+        assert!(
+            boundary.status.is_none(),
+            "the banner must not show until the silence exceeds the grace"
+        );
+        // A sustained silence well past the grace is a real stall — the banner shows.
+        let stalled = s.on_tick(1000 + LINK_DOWN_GRACE_MS + 2_000, 1200, Some(20.0));
+        assert!(
+            stalled.status.is_some(),
+            "a silence past the grace shows the link-down banner"
         );
     }
 

@@ -91,7 +91,7 @@ stop_all_koh() { kill_remote_koh; sleep 1; }
 # Non-TTY connect: reaches "connected." then errors at raw mode (no TTY) and exits. Sets OUT/RC.
 connect_once() {  # connect_once [key-file=$CLI_KEY] [extra args]  (run_remote injects $KENV)
   _kf="${1:-$CLI_KEY}"
-  run_remote "$DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file $_kf --predict never ${2:-}"
+  run_remote "$DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file $_kf ${2:-}"
 }
 
 # PTY connect (adb shell -t -t): the client gets a real TTY, enters raw mode and runs the TUI.

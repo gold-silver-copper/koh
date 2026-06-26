@@ -103,8 +103,10 @@ high-RTT links), then confirms or corrects when the authoritative server frame a
 is driven by the server's **echo-ack** (a 50 ms-debounced "your input up to frame N is now on
 screen"), not the raw network ack. Password prompts get no predicted echo — suppression is
 *emergent*: non-echoed input fails validation, kills its epoch, and keeps subsequent predictions
-hidden, with no explicit password heuristic. Engagement is adaptive by SRTT with hysteresis (show
-> 30 ms, flag/underline > 80 ms).
+hidden, with no explicit password heuristic. Prediction is **always on** in koh (`DisplayPreference::
+Always`), so keystrokes engage on every link; the engine also implements an adaptive-by-SRTT
+engagement mode that the client no longer selects. The underline *flagging* stays SRTT-gated
+(> 80 ms) with hysteresis.
 
 The port faithfully implements epoch-gated confirmation, adaptive engagement, flagging, glitch
 escalation, and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
@@ -224,7 +226,7 @@ prove correctness; only a real two-device run over a real radio proves *feel* an
 
 | Property | How koh delivers it |
 |---|---|
-| Keystrokes appear instantly on high-RTT links | predictor (adaptive, underlined, then confirmed) |
+| Keystrokes appear instantly on every link | predictor (always on; underlined on high-RTT links, then confirmed) |
 | Survives suspend/resume + IP change, re-syncs to current screen | QUIC connection migration + SSP re-sync to latest (no backlog) |
 | A burst of superseded output never delays the current screen | datagram transport + state collapse; proven by the chaos monotonicity guard |
 | Password prompts show no predicted echo | emergent no-echo suppression in the predictor |

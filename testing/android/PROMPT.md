@@ -162,7 +162,7 @@ adb shell "pkill -f $DEV" 2>/dev/null
 # PASS iff: banner + 64-hex id present, no "ndk-context"/panic string.
 ```
 
-**Test 3 — on-device loopback smoke (serve + connect, no network).** Start `koh serve --allow-any` in the background on-device, capture its id + port from its log, then `koh connect <id> --direct 127.0.0.1:<port>` with non-interactive input. Adapt the exact serve/connect flags and log-parsing to what the binary actually prints (run `koh serve --help` / `koh connect --help` on-device first; do NOT guess flags). Use `--predict never` or equivalent for determinism.
+**Test 3 — on-device loopback smoke (serve + connect, no network).** Start `koh serve --allow-any` in the background on-device, capture its id + port from its log, then `koh connect <id> --direct 127.0.0.1:<port>` with non-interactive input. Adapt the exact serve/connect flags and log-parsing to what the binary actually prints (run `koh serve --help` / `koh connect --help` on-device first; do NOT guess flags).
 ```zsh
 # sketch — verify real flags against --help before finalizing:
 LOG=/data/local/tmp/koh-server.log
@@ -173,7 +173,7 @@ SERVER_ID="$(printf '%s' "$SRV" | grep -oE '[0-9a-f]{64}' | head -1)"
 # the port is the ":NNNN" on the "--direct <this-host-ip>:PORT" connect-hint line (NOT a QR digit)
 SERVER_PORT="$(printf '%s' "$SRV" | grep -- '--direct' | grep -oE ':[0-9]+' | tail -1 | tr -d ':')"
 # No TTY under `adb shell`, so the client prints "connected." then errors at raw mode — that's expected.
-OUT="$(timeout 20 adb shell "$DEV connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file /data/local/tmp/koh-client.key --predict never" 2>&1 || true)"
+OUT="$(timeout 20 adb shell "$DEV connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file /data/local/tmp/koh-client.key" 2>&1 || true)"
 adb shell "pkill -f $DEV" 2>/dev/null
 # PASS iff: client OUT contains "connected." (handshake completed over loopback — both sides bound an
 #           endpoint on-device), and NEITHER side prints "ndk-context"/panic. The trailing

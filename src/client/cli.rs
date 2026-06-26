@@ -13,29 +13,12 @@ use crate::transport_iroh::{
     load_or_create_secret_key, parse_endpoint_id, parse_relay_url, relay_addr,
 };
 use anyhow::Context;
-use clap::{Args, ValueEnum};
+use clap::Args;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{run_client, ClientTerminal, IrohConnector, TerminaTerminal};
-
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum PredictMode {
-    Always,
-    Never,
-    Adaptive,
-}
-
-impl From<PredictMode> for DisplayPreference {
-    fn from(m: PredictMode) -> Self {
-        match m {
-            PredictMode::Always => Self::Always,
-            PredictMode::Never => Self::Never,
-            PredictMode::Adaptive => Self::Adaptive,
-        }
-    }
-}
 
 /// Arguments for `koh connect <server-id>`.
 #[derive(Args, Debug)]
@@ -46,10 +29,6 @@ pub struct ConnectArgs {
     /// Path to the client's persistent secret key (its endpoint id must be on the server's allowlist).
     #[arg(long)]
     key_file: Option<PathBuf>,
-
-    /// Prediction display policy.
-    #[arg(long, value_enum, default_value_t = PredictMode::Adaptive)]
-    predict: PredictMode,
 
     /// Dial the server at a direct socket address (LAN / loopback; no relay or discovery).
     #[arg(long, value_name = "IP:PORT", conflicts_with = "relay_url")]
@@ -297,7 +276,10 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     let result = run_client(
         channel,
         connector,
-        args.predict.into(),
+        // Local-echo prediction is always on: keystrokes show immediately, with the engine's
+        // epoch gate still suppressing them at non-echoing (password) prompts. There is no
+        // user-facing toggle — the adaptive/never policies were removed.
+        DisplayPreference::Always,
         (rows, cols),
         input_rx,
         resize_rx,

@@ -49,7 +49,7 @@ established=0
 OUT=""
 try=1
 while [ "$try" -le 3 ]; do
-  OUT="$(to 60 adb $ADB_SERIAL shell "${DNS:+KOH_DNS=$DNS }$KENV $DEVICE_BIN connect $SID --key-file /data/local/tmp/koh-relay-cli.key --predict never" 2>&1 || true)"
+  OUT="$(to 60 adb $ADB_SERIAL shell "${DNS:+KOH_DNS=$DNS }$KENV $DEVICE_BIN connect $SID --key-file /data/local/tmp/koh-relay-cli.key" 2>&1 || true)"
   sleep 2
   printf '%s\n' "$(cat_dev "$SRVLOG")" | grep -qE 'client authorized|started a new session' && { established=1; break; }
   try=$((try + 1))

@@ -74,10 +74,9 @@ koh connect 871b… --relay-url https://relay.example:3340
 ```
 
 **Commands:** `koh serve` (host a shell), `koh connect <id>` (attach), `koh id` (print your id),
-`koh key passwd|info` (manage the identity key's passphrase). Useful flags: `--predict
-adaptive|always|never`, `--clipboard` (opt-in OSC-52), `--session-ttl-secs`,
-`--max-connections`/`--max-sessions`. koh keeps its keys under `~/.config/koh/` (override a path with
-`--key-file`).
+`koh key passwd|info` (manage the identity key's passphrase). Useful flags: `--clipboard` (opt-in
+OSC-52), `--session-ttl-secs`, `--max-connections`/`--max-sessions`. koh keeps its keys under
+`~/.config/koh/` (override a path with `--key-file`). Local-echo prediction is always on (no flag).
 
 **Android / Termux** works out of the box; koh pins a public DNS resolver to sidestep an Android
 JNI-context panic (override with `KOH_DNS=1.1.1.1`). Run `termux-wake-lock` so the OS doesn't freeze

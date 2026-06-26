@@ -43,7 +43,7 @@ if ! assert_no_crash "$SRV"; then kill_remote_koh; echo "FAIL: test-loopback-e2e
 echo "  server up: id=${ID%??????????????????????????????????????????????????????????}… port=$PORT"
 
 # Dial over loopback. No TTY here, so the client prints "connected." then errors at raw mode — fine.
-run_remote "$DEVICE_BIN connect $ID --direct 127.0.0.1:$PORT --key-file /data/local/tmp/koh-client.key --predict never"
+run_remote "$DEVICE_BIN connect $ID --direct 127.0.0.1:$PORT --key-file /data/local/tmp/koh-client.key"
 printf '%s\n' "$OUT" | grep -E 'connecting to|connected|ndk-context|panic|raw mode' | sed 's/^/    connect| /' | head -8
 kill_remote_koh
 

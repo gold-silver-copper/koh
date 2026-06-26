@@ -152,7 +152,7 @@ if [ -x "$EVIL_SERVER_HOST" ]; then
     # A koh client dials the malicious server; it must FAIL admission (never reach "connected.")
     # because a non-ADMIT byte is rejected and a never-opened admission stream times out.
     # run_remote injects $KENV so the client can open its own (always-encrypted) key.
-    run_remote "$DEVICE_BIN connect $EID --direct 127.0.0.1:$EPORT --key-file /data/local/tmp/koh-evilcli-$atk.key --predict never"
+    run_remote "$DEVICE_BIN connect $EID --direct 127.0.0.1:$EPORT --key-file /data/local/tmp/koh-evilcli-$atk.key"
     if printf '%s\n' "$OUT" | grep -q 'connected.'; then
       bad "[$atk] the koh client was TRICKED into connecting to the malicious server!"
     else

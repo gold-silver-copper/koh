@@ -15,6 +15,16 @@ its API is internal and unstable (see the README).
 
 ## [Unreleased]
 
+### Changed
+- **Local-echo prediction is always on.** Keystrokes now always render speculatively; the engine's
+  epoch gate still suppresses the echo at non-echoing (password) prompts, and high-RTT links still
+  underline-flag unconfirmed predictions. Previously the shipped default (`adaptive`) hid predictions
+  entirely on low-latency links.
+
+### Removed
+- **`koh connect --predict <always|never|adaptive>`** — there is no prediction toggle; prediction is
+  unconditionally on (see above).
+
 ## [0.8.0] — 2026-06-25
 
 A large security/minimalism + release-maturity pass. **Breaking** (flags, env vars, and the default

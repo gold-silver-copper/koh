@@ -73,8 +73,6 @@ async fn real_client_binary_renders_over_pty() {
     cmd.arg(&server_id);
     cmd.arg("--direct");
     cmd.arg(format!("127.0.0.1:{server_port}"));
-    cmd.arg("--predict");
-    cmd.arg("never");
     cmd.arg("--key-file");
     cmd.arg(&key_path);
     cmd.env("TERM", "xterm-256color");

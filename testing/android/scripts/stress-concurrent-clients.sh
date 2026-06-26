@@ -25,7 +25,7 @@ i=1
 while [ "$i" -le "$CLIENTS" ]; do
   adb $ADB_SERIAL shell "rm -f /data/local/tmp/cc-$i.log" >/dev/null 2>&1 || true
   ( to 30 adb $ADB_SERIAL shell \
-      "$KENV $DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file /data/local/tmp/cc-$i.key --predict never >/data/local/tmp/cc-$i.log 2>&1" \
+      "$KENV $DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file /data/local/tmp/cc-$i.key >/data/local/tmp/cc-$i.log 2>&1" \
       >/dev/null 2>&1 || true ) &
   i=$((i + 1))
 done

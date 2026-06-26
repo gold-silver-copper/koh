@@ -27,6 +27,8 @@ exclude = [
     ".github/",
     "clippy.toml",
     "deny.toml",
+    # the self-contained HTML slide deck (docs only, ~1.6 MB) — not needed to build or use koh.
+    "koh-presentation.html",
 ]
 
 [[bin]]

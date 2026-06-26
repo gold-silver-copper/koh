@@ -15,6 +15,8 @@ its API is internal and unstable (see the README).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-06-25
+
 ### Changed
 - **Local-echo prediction is always on.** Keystrokes now always render speculatively; the engine's
   epoch gate still suppresses the echo at non-echoing (password) prompts, and high-RTT links still

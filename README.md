@@ -80,8 +80,11 @@ koh is not an SSH replacement. It is a focused, mobile-friendly interactive shel
 | Detach / reattach session | ✅ | ❌ | ❌ | ✅ | ❌ |
 | No listening port | ✅ | ❌ | ❌ | ❌ | ✅ |
 | File transfer | ❌ | ❌ | ✅ | ❌ | ✅ |
+| Scrollback sync | ❌ | ❌ | ✅ | ✅ | ✅ |
 | No port forwarding needed | ✅ | ❌ | ❌ | ❌ | ✅ |
 | Multi-user accounts | ❌ | ✅ | ✅ | ✅ | ❌ |
+| SSH compatibility | ❌ | ✅ | ✅ | ✅ | ❌ |
+| Windows support | ❌ | ⚠️ | ✅ | ✅ | ✅ |
 | Main transport | iroh QUIC | UDP + SSH bootstrap | TCP/SSH | TCP + SSH bootstrap | WireGuard/DERP |
 
 Choose **koh** if you want a mobile-friendly, mosh-like shell over peer-to-peer QUIC.
@@ -90,14 +93,6 @@ Choose **koh** if you want a mobile-friendly, mosh-like shell over peer-to-peer 
 ## Status
 
 koh is experimental and intended for personal use on machines you control.
-
-Major limitations:
-
-- no SSH compatibility
-- no multi-user account model
-- no file transfer
-- no scrollback sync
-- no Windows support
 
 See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the security model, [`SECURITY.md`](SECURITY.md) for vulnerability reporting, and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for implementation details.
 

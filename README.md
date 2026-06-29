@@ -47,48 +47,14 @@ Keys live under `~/.config/koh/` by default.
 
 **Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
 
-## Tech stack
+## Highlights
 
-- Rust
-- iroh peer-to-peer QUIC transport
-- Unix PTYs
-- mosh-style terminal state synchronization and predictive local echo
-- Encrypted local identity keys
-- Linux, macOS, and Android/Termux
-
-## Why
-
-SSH is universal, but it is not ideal on mobile or unreliable networks. mosh fixed responsiveness and roaming, but still depends on SSH and reachable UDP.
-
-koh explores a smaller model for personal machines you control:
-
-- connect by peer id
-- no listening port
-- no SSH bootstrap
-- predictive local echo
-- detachable sessions
-- peer-to-peer NAT traversal via iroh
-
-koh is not an SSH replacement. It is a focused, mobile-friendly interactive shell.
-
-## Comparison
-
-| Feature | koh | mosh | OpenSSH | Eternal Terminal | wush |
-|---|---:|---:|---:|---:|---:|
-| Predictive local echo | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Reconnect after network change | ✅ | ✅ | ❌ | ✅ | ⚠️ |
-| Detach / reattach session | ✅ | ❌ | ❌ | ✅ | ❌ |
-| No listening port | ✅ | ❌ | ❌ | ❌ | ✅ |
-| File transfer | ❌ | ❌ | ✅ | ❌ | ✅ |
-| Scrollback sync | ❌ | ❌ | ✅ | ✅ | ✅ |
-| No port forwarding needed | ✅ | ❌ | ❌ | ❌ | ✅ |
-| Multi-user accounts | ❌ | ✅ | ✅ | ✅ | ❌ |
-| SSH compatibility | ❌ | ✅ | ✅ | ✅ | ❌ |
-| Windows support | ❌ | ⚠️ | ✅ | ✅ | ✅ |
-| Main transport | iroh QUIC | UDP + SSH bootstrap | TCP/SSH | TCP + SSH bootstrap | WireGuard/DERP |
-
-Choose **koh** if you want a mobile-friendly, mosh-like shell over peer-to-peer QUIC.
-
+- Built in Rust on iroh peer-to-peer QUIC; connects by endpoint id instead of hostname/port.
+- Mosh-style predictive local echo and screen-state sync for responsive shells on bad networks.
+- Detachable sessions survive suspend/resume, IP changes, and reconnects without tmux.
+- No SSH bootstrap, no listening port, and no port forwarding needed.
+- Intended for personal machines you control; not a full SSH replacement.
+- Does not provide multi-user accounts, file transfer, scrollback sync, or Windows support.
 
 ## Status
 

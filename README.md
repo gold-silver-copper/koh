@@ -63,12 +63,6 @@ Keys live under `~/.config/koh/` by default.
    cargo install koh
    ```
 
-4. For long-lived sessions, keep Termux awake:
-
-   ```sh
-   termux-wake-lock
-   ```
-
 If DNS resolution is broken on your Android device, try setting an explicit resolver:
 
 ```sh

@@ -47,6 +47,34 @@ Keys live under `~/.config/koh/` by default.
 
 **Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
 
+## Android / Termux install
+
+1. Install Termux from the [Termux GitHub releases](https://github.com/termux/termux-app/releases). Do not use the old Play Store build.
+2. In Termux, install Rust and build tools:
+
+   ```sh
+   pkg update
+   pkg install rust clang pkg-config
+   ```
+
+3. Install koh:
+
+   ```sh
+   cargo install koh
+   ```
+
+4. For long-lived sessions, keep Termux awake:
+
+   ```sh
+   termux-wake-lock
+   ```
+
+If DNS resolution is broken on your Android device, try setting an explicit resolver:
+
+```sh
+KOH_DNS=1.1.1.1 koh connect <server-id>
+```
+
 ## Highlights
 
 - Built in Rust on iroh peer-to-peer QUIC; connects by endpoint id instead of hostname/port.

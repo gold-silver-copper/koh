@@ -4,57 +4,22 @@ A Rust, peer-to-peer reimplementation of [mosh](https://mosh.org) built on [iroh
 
 koh gives you a responsive remote shell that survives network changes, suspend/resume, and reconnects — without SSH, open ports, or server-side accounts.
 
-## Tech stack
-
-- Rust
-- iroh peer-to-peer QUIC transport
-- Unix PTYs
-- mosh-style terminal state synchronization and predictive local echo
-- Encrypted local identity keys
-- Linux, macOS, and Android/Termux
-
-## Why
-
-SSH is universal, but it is not ideal on mobile or unreliable networks. mosh fixed responsiveness and roaming, but still depends on SSH and reachable UDP.
-
-koh explores a smaller model for personal machines you control:
-
-- connect by peer id
-- no listening port
-- no SSH bootstrap
-- predictive local echo
-- detachable sessions
-- peer-to-peer NAT traversal via iroh
-
-koh is not an SSH replacement. It is a focused, mobile-friendly interactive shell.
-
-## Install
+## Install and usage
 
 ```sh
 cargo install koh
 ```
 
-**Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
-
-## Usage
-
 koh authorizes by endpoint id. There are no passwords or accounts.
 
-On the client, print its id:
-
 ```sh
+# On the client, print its id:
 koh id
-```
 
-On the server, allow that client and start a shell host:
-
-```sh
+# On the server, allow that client and start a shell host:
 koh serve --allow <client-id>
-```
 
-On the client, connect to the server:
-
-```sh
+# On the client, connect to the server:
 koh connect <server-id>
 ```
 
@@ -80,6 +45,32 @@ Useful flags:
 
 Keys live under `~/.config/koh/` by default.
 
+**Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
+
+## Tech stack
+
+- Rust
+- iroh peer-to-peer QUIC transport
+- Unix PTYs
+- mosh-style terminal state synchronization and predictive local echo
+- Encrypted local identity keys
+- Linux, macOS, and Android/Termux
+
+## Why
+
+SSH is universal, but it is not ideal on mobile or unreliable networks. mosh fixed responsiveness and roaming, but still depends on SSH and reachable UDP.
+
+koh explores a smaller model for personal machines you control:
+
+- connect by peer id
+- no listening port
+- no SSH bootstrap
+- predictive local echo
+- detachable sessions
+- peer-to-peer NAT traversal via iroh
+
+koh is not an SSH replacement. It is a focused, mobile-friendly interactive shell.
+
 ## Comparison
 
 | Feature | koh | mosh | OpenSSH | Eternal Terminal | wush |
@@ -88,21 +79,13 @@ Keys live under `~/.config/koh/` by default.
 | Reconnect after network change | ✅ | ✅ | ❌ | ✅ | ⚠️ |
 | Detach / reattach session | ✅ | ❌ | ❌ | ✅ | ❌ |
 | No listening port | ✅ | ❌ | ❌ | ❌ | ✅ |
-| Peer-to-peer transport | ✅ | ❌ | ❌ | ❌ | ✅ |
 | File transfer | ❌ | ❌ | ✅ | ❌ | ✅ |
-| No port forwarding | ✅ | ✅ | ❌ | ❌ | ✅ |
+| No port forwarding needed | ✅ | ❌ | ❌ | ❌ | ✅ |
 | Multi-user accounts | ❌ | ✅ | ✅ | ✅ | ❌ |
 | Main transport | iroh QUIC | UDP + SSH bootstrap | TCP/SSH | TCP + SSH bootstrap | WireGuard/DERP |
 
 Choose **koh** if you want a mobile-friendly, mosh-like shell over peer-to-peer QUIC.
 
-Choose **mosh** if you want the mature, packaged-everywhere version of predictive roaming and already have SSH access.
-
-Choose **OpenSSH** if you need accounts, file transfer, tunnels, agent forwarding, FIDO2, PAM, jump hosts, or mature infrastructure.
-
-Choose **Eternal Terminal** if you want SSH-based reconnects, scrollback, and port forwarding.
-
-Choose **wush** if you primarily want peer-to-peer file transfer.
 
 ## Status
 

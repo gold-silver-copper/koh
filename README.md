@@ -34,18 +34,6 @@ koh is not an SSH replacement. It is a focused, mobile-friendly interactive shel
 cargo install koh
 ```
 
-Or from git:
-
-```sh
-cargo install --git https://github.com/gold-silver-copper/koh
-```
-
-From a checkout:
-
-```sh
-cargo build --release
-```
-
 **Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
 
 ## Usage
@@ -102,7 +90,7 @@ Keys live under `~/.config/koh/` by default.
 | No listening port | ✅ | ❌ | ❌ | ❌ | ✅ |
 | Peer-to-peer transport | ✅ | ❌ | ❌ | ❌ | ✅ |
 | File transfer | ❌ | ❌ | ✅ | ❌ | ✅ |
-| Port forwarding | ❌ | ❌ | ✅ | ✅ | ❌ |
+| No port forwarding | ✅ | ✅ | ❌ | ❌ | ✅ |
 | Multi-user accounts | ❌ | ✅ | ✅ | ✅ | ❌ |
 | Main transport | iroh QUIC | UDP + SSH bootstrap | TCP/SSH | TCP + SSH bootstrap | WireGuard/DERP |
 
@@ -125,7 +113,6 @@ Major limitations:
 - no SSH compatibility
 - no multi-user account model
 - no file transfer
-- no port forwarding
 - no scrollback sync
 - no Windows support
 

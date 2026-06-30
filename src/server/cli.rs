@@ -24,7 +24,7 @@ use crate::server::audit::{auth_event, Outcome};
 use crate::server::{run_attached, session, SessionExit};
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
-    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, ALPN,
+    generate_secret_key, load_or_create_secret_key, parse_endpoint_id, parse_relay_url, ALPN,
 };
 use tracing::{error, info, warn};
 
@@ -80,6 +80,18 @@ pub struct ServeArgs {
     /// the number of real shells a flood of authorized keys can spawn.
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
     max_sessions: u32,
+
+    /// Use an in-memory server identity for an SSH-bootstrapped one-shot server.
+    #[arg(long, hide = true)]
+    ephemeral_key: bool,
+
+    /// Print a machine-readable endpoint id marker to stdout after binding.
+    #[arg(long, hide = true)]
+    print_id_stdout: bool,
+
+    /// Do not render the QR code. Useful for machine-driven bootstraps.
+    #[arg(long, hide = true)]
+    no_qr: bool,
 }
 
 /// Render `data` as a QR code for a **dark-background** terminal, or `None` if it is too large to
@@ -124,16 +136,21 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         );
     }
 
-    let key_file = match args.key_file.clone() {
-        Some(p) => p,
-        None => crate::transport_iroh::default_key_path("server")?,
+    let (secret, key_file_label) = if args.ephemeral_key {
+        (generate_secret_key(), "(ephemeral)".to_string())
+    } else {
+        let key_file = match args.key_file.clone() {
+            Some(p) => p,
+            None => crate::transport_iroh::default_key_path("server")?,
+        };
+        let secret = load_or_create_secret_key(&key_file).with_context(|| {
+            format!(
+                "loading server key from {} (pass --key-file to use a writable path)",
+                key_file.display()
+            )
+        })?;
+        (secret, key_file.display().to_string())
     };
-    let secret = load_or_create_secret_key(&key_file).with_context(|| {
-        format!(
-            "loading server key from {} (pass --key-file to use a writable path)",
-            key_file.display()
-        )
-    })?;
 
     // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
     let endpoint = if let Some(url) = &args.relay_url {
@@ -169,22 +186,32 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     eprintln!("┌─ koh server ready ──────────────────────────────────────");
     eprintln!("│ endpoint id : {id_str}");
-    eprintln!("│ key file    : {}", key_file.display());
+    eprintln!("│ key file    : {key_file_label}");
     eprintln!("│ alpn        : {}", String::from_utf8_lossy(ALPN));
     eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
 
+    if args.print_id_stdout {
+        use std::io::Write as _;
+        println!("KOH_BOOTSTRAP_ENDPOINT_ID={id_str}");
+        std::io::stdout()
+            .flush()
+            .context("flushing bootstrap endpoint id")?;
+    }
+
     // Always print a scannable QR of the endpoint id — point a phone camera at it instead of
-    // copying 64 hex chars.
-    if let Some(qr) = connect_qr(&id_str) {
-        eprintln!(
-            "\nScan for the endpoint id (point a phone camera at it). Assumes a dark-background \
-             terminal;\non a light background it renders inverted — copy the id above instead:\n"
-        );
-        eprintln!("{qr}");
-    } else {
-        warn!("could not render the connect QR (endpoint id too large to encode)");
+    // copying 64 hex chars, unless a machine-driven bootstrap disabled it.
+    if !args.no_qr {
+        if let Some(qr) = connect_qr(&id_str) {
+            eprintln!(
+                "\nScan for the endpoint id (point a phone camera at it). Assumes a dark-background \
+                 terminal;\non a light background it renders inverted — copy the id above instead:\n"
+            );
+            eprintln!("{qr}");
+        } else {
+            warn!("could not render the connect QR (endpoint id too large to encode)");
+        }
     }
 
     // Transport crypto posture (koh is a policy-taker: QUIC + TLS 1.3 come from iroh). Logged so an

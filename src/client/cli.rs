@@ -14,6 +14,7 @@ use crate::transport_iroh::{
 };
 use anyhow::Context;
 use clap::Args;
+use iroh::SecretKey;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -43,6 +44,25 @@ pub struct ConnectArgs {
     /// clipboard (e.g. swap a copied command for `curl evil|sh`). A deliberate per-session opt-in.
     #[arg(long)]
     clipboard: bool,
+}
+
+impl ConnectArgs {
+    /// Build connect args from another subcommand after it has discovered the server id.
+    pub fn new(
+        server: String,
+        key_file: Option<PathBuf>,
+        direct: Option<SocketAddr>,
+        relay_url: Option<String>,
+        clipboard: bool,
+    ) -> Self {
+        Self {
+            server,
+            key_file,
+            direct,
+            relay_url,
+            clipboard,
+        }
+    }
 }
 
 /// Arguments for `koh id`.
@@ -110,6 +130,25 @@ pub fn run_id(args: IdArgs) -> anyhow::Result<()> {
 /// `koh connect <server-id>` — connect to a koh server and run the (auto-reconnecting) session.
 /// Returns the remote shell's exit code if the session ended because the shell exited.
 pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
+    let key_file = match args.key_file.clone() {
+        Some(p) => p,
+        None => crate::transport_iroh::default_key_path("client")?,
+    };
+    let secret = load_or_create_secret_key(&key_file).with_context(|| {
+        format!(
+            "loading client key from {} (pass --key-file to use a writable path)",
+            key_file.display()
+        )
+    })?;
+    connect_with_secret(args, secret).await
+}
+
+/// Connect using a caller-supplied client identity. Used by `koh ssh`, which needs to know the
+/// client id before it starts the remote server over SSH.
+pub async fn connect_with_secret(
+    args: ConnectArgs,
+    secret: SecretKey,
+) -> anyhow::Result<Option<u32>> {
     // The TUI owns the terminal, so logs go to a file (set $KOH_LOG) to avoid corrupting it.
     if let Ok(path) = std::env::var("KOH_LOG") {
         // Create the log owner-only (0600): debug logs can carry sensitive material, and unlike the
@@ -173,16 +212,6 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     // diagnosable rather than mysterious.
     warn_if_locale_not_utf8();
 
-    let key_file = match args.key_file {
-        Some(p) => p,
-        None => crate::transport_iroh::default_key_path("client")?,
-    };
-    let secret = load_or_create_secret_key(&key_file).with_context(|| {
-        format!(
-            "loading client key from {} (pass --key-file to use a writable path)",
-            key_file.display()
-        )
-    })?;
     let my_id = secret.public();
     let server_id = parse_endpoint_id(&args.server).context("parsing server endpoint id")?;
 

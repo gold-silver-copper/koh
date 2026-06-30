@@ -1,46 +1,50 @@
-# koh
+# koh2
 
-A Rust, peer-to-peer remote shell inspired by [mosh](https://mosh.org), built on [iroh](https://iroh.computer) / QUIC.
+An SSH-authenticated, peer-to-peer remote shell inspired by [mosh](https://mosh.org), built on [iroh](https://iroh.computer) / QUIC.
 
-koh gives you a responsive remote shell that survives network changes, suspend/resume, and reconnects — without SSH, open ports, or server-side accounts.
+koh2 uses [iroh-ssh](https://github.com/rustonbsd/iroh-ssh) to authenticate and launch a one-shot remote `koh` server without a public TCP SSH port. The interactive shell then attaches over koh's own iroh/QUIC protocol.
 
 ## Install and usage
 
+Install both binaries on both machines:
+
 ```sh
-cargo install koh
+cargo install iroh-ssh
+cargo install --path .
 ```
 
-koh authorizes by endpoint id. There are no passwords or accounts.
+On the server, run iroh-ssh in front of the local SSH daemon:
 
 ```sh
-# On the client, print its id:
-koh id
-
-# On the server, allow that client and start a shell host:
-koh serve --allow <client-id>
-
-# On the client, connect to the server:
-koh connect <server-id>
+iroh-ssh server --persist
 ```
 
-Useful commands:
+It prints an endpoint id like:
 
 ```sh
-koh id                    # print this machine's endpoint id
-koh serve --allow <id>    # host a shell for an allowed client
-koh connect <id>          # connect to a server id
-koh key passwd            # change the identity-key passphrase
-koh key info              # show identity-key information
+iroh-ssh user@<iroh-ssh-endpoint-id>
 ```
 
-Useful flags:
+On the client, connect with koh2:
 
 ```sh
---clipboard               # opt in to OSC-52 clipboard writes
---key-file <path>         # use a custom identity-key path
---session-ttl-secs <n>    # keep detached sessions around longer/shorter
---max-connections <n>     # limit concurrent connections
---max-sessions <n>        # limit sessions
+koh ssh user@<iroh-ssh-endpoint-id>
+```
+
+Flow:
+
+1. iroh-ssh connects to the server over iroh, not TCP port 22.
+2. SSH authenticates you against the server's local `sshd`.
+3. SSH launches a temporary remote `koh serve`.
+4. koh2 attaches to that temporary server over iroh/QUIC.
+
+Useful options:
+
+```sh
+koh ssh user@<id> --clipboard
+koh ssh user@<id> --key-file <path>
+koh ssh user@<id> --iroh-ssh-option -i --iroh-ssh-option ~/.ssh/id_ed25519
+koh ssh user@<id> --remote-koh /path/to/koh
 ```
 
 Keys live under `~/.config/koh/` by default.
@@ -57,31 +61,32 @@ Keys live under `~/.config/koh/` by default.
    pkg install rust clang pkg-config
    ```
 
-3. Install koh:
+3. From a koh2 checkout, install both binaries:
 
    ```sh
-   cargo install koh
+   cargo install iroh-ssh
+   cargo install --path .
    ```
 
 If DNS resolution is broken on your Android device, try setting an explicit resolver:
 
 ```sh
-KOH_DNS=1.1.1.1 koh connect <server-id>
+KOH_DNS=1.1.1.1 koh ssh user@<iroh-ssh-endpoint-id>
 ```
 
 ## Highlights
 
-- Built in Rust on iroh peer-to-peer QUIC; connects by endpoint id instead of hostname/port.
+- SSH authentication and account selection, carried over iroh instead of a public TCP SSH port.
+- The shell session runs over koh's peer-to-peer iroh/QUIC protocol after bootstrap.
 - Mosh-style predictive local echo and screen-state sync for responsive shells on bad networks.
 - Detachable sessions survive suspend/resume, IP changes, and reconnects without tmux.
-- No SSH bootstrap, no listening port, and no port forwarding needed.
-- Not wire-compatible with mosh or SSH; koh is its own protocol/tool.
-- Intended for personal machines you control; not a full SSH replacement.
-- Does not provide multi-user accounts, file transfer, scrollback sync, or Windows support.
+- No manual port forwarding, VPN, or Tailscale required.
+- Not wire-compatible with mosh or SSH; koh uses its own terminal sync protocol over iroh.
+- Does not provide file transfer, scrollback sync, or Windows support.
 
 ## Status
 
-koh is experimental and intended for personal use on machines you control.
+koh2 is experimental and intended for personal use on machines you control.
 
 See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the security model, [`SECURITY.md`](SECURITY.md) for vulnerability reporting, and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for implementation details.
 

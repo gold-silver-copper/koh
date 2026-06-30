@@ -1,8 +1,8 @@
 //! # koh
 //!
-//! mosh (the mobile shell), reimplemented in Rust over [iroh](https://iroh.computer) p2p QUIC.
-//! A resilient peer-to-peer remote shell: instant local echo on laggy links, survival across
-//! suspend/resume and IP changes, transparent reconnect/reattach, and no head-of-line blocking.
+//! An SSH-authenticated peer-to-peer remote shell inspired by mosh, built over
+//! [iroh](https://iroh.computer) p2p QUIC. iroh-ssh carries SSH auth over iroh and launches the
+//! remote process; the interactive session then uses koh's own state-sync protocol over iroh.
 //!
 //! This crate is both the library and the `koh` binary. It is a state-synchronization system
 //! whose payload happens to be a terminal — each side holds an authoritative object and the
@@ -24,7 +24,8 @@
 //! - [`pty`] — PTY allocation, shell spawn, SIGWINCH, child reaping.
 //! - [`server`] — PTY + emulator + `Transport<Screen, Input>` over iroh, plus `koh serve`.
 //! - [`client`] — input + `Transport<Input, Screen>` + predictor + termina render, plus `koh connect`.
-//! - [`keycmd`] — `koh key`: change the identity key's encryption passphrase (`ssh-keygen -p`-style).
+//! - [`ssh`] — `koh ssh`: launch a one-shot remote server through iroh-ssh, then connect over iroh.
+//! - [`keycmd`] — hidden key management command for changing the identity key's passphrase.
 //!
 //! Dependency direction is strict: `wire ← ssp ← {terminal, input}`, with `predict` over
 //! `{terminal, input}`, `transport_iroh` over `wire`, and `server`/`client` on top. The entire
@@ -34,7 +35,7 @@
 //!
 //! ## Public API stability
 //!
-//! koh ships **binary-first**. The *supported* library surface is [`server::serve`],
+//! koh ships **binary-first**. The *supported* library surface is [`ssh::run`], [`server::serve`],
 //! [`client::connect`], [`client::run_id`], [`keycmd::run`], and the [`SyncState`](ssp::SyncState) /
 //! [`Transport`](ssp::Transport) protocol core in [`ssp`]. Everything else is `pub` only so the in-tree
 //! integration tests and the `chaos` example can drive it as a downstream dependency; treat it as
@@ -47,6 +48,7 @@ pub mod keycmd;
 pub mod predict;
 pub mod pty;
 pub mod server;
+pub mod ssh;
 pub mod ssp;
 pub mod terminal;
 pub mod transport_iroh;

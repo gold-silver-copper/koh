@@ -11,7 +11,7 @@
 pub mod cli;
 mod render;
 
-pub use cli::{connect, run_id, ConnectArgs, IdArgs};
+pub use cli::{connect, connect_with_secret, run_id, ConnectArgs, IdArgs};
 
 use std::io::Write;
 use std::time::Duration;

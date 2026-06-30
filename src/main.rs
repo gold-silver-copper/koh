@@ -1,26 +1,24 @@
 //! # koh
 //!
-//! A resilient peer-to-peer remote shell — mosh (the mobile shell), reimplemented in Rust over
-//! [iroh](https://iroh.computer) p2p QUIC. One binary with four subcommands:
+//! An SSH-authenticated peer-to-peer remote shell inspired by mosh, built in Rust over
+//! [iroh](https://iroh.computer) p2p QUIC.
 //!
-//! - `koh serve`   — host a PTY shell for authorized clients (the server side).
-//! - `koh connect` — connect to a server by its endpoint id and run the session (the client side).
-//! - `koh id`      — print this machine's koh id (to add to a server's `--allow` list).
-//! - `koh key`     — change the identity key's encryption passphrase (keys are always encrypted).
-//!
-//! Each subcommand delegates to a library entry point (`koh::server::serve`, `koh::client::connect`,
-//! `koh::client::run_id`, `koh::keycmd::run`); this binary is just argument parsing + dispatch.
+//! The public command is `koh ssh user@<iroh-ssh-endpoint-id>`: iroh-ssh carries SSH auth over iroh
+//! and launches a one-shot remote `koh serve`, then the interactive shell attaches over koh's own
+//! iroh protocol. The lower-level `serve`, `connect`, and `id` commands remain hidden implementation
+//! details for the bootstrap path.
 
 use clap::{Parser, Subcommand};
 use koh::client::{ConnectArgs, IdArgs};
 use koh::keycmd::KeyArgs;
 use koh::server::ServeArgs;
+use koh::ssh::SshArgs;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "koh",
     version,
-    about = "koh — a resilient peer-to-peer remote shell (mosh over iroh)"
+    about = "koh — SSH auth over iroh, then a resilient peer-to-peer shell"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,13 +28,19 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Host a PTY shell for authorized clients.
+    #[command(hide = true)]
     Serve(ServeArgs),
     /// Connect to a koh server by its endpoint id.
+    #[command(hide = true)]
     Connect(ConnectArgs),
     /// Print this machine's koh id (add it to a server's --allow list).
+    #[command(hide = true)]
     Id(IdArgs),
+    /// Launch a one-shot remote koh server over iroh-ssh, then connect over iroh.
+    Ssh(SshArgs),
     /// Change the identity key's encryption passphrase (like `ssh-keygen -p`; keys are always
     /// encrypted).
+    #[command(hide = true)]
     Key(KeyArgs),
 }
 
@@ -58,6 +62,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<Option<u32>> {
         Cmd::Serve(args) => koh::server::serve(args).await.map(|()| None),
         Cmd::Connect(args) => koh::client::connect(args).await,
         Cmd::Id(args) => koh::client::run_id(args).map(|()| None),
+        Cmd::Ssh(args) => koh::ssh::run(args).await,
         Cmd::Key(args) => koh::keycmd::run(args).map(|()| None),
     }
 }

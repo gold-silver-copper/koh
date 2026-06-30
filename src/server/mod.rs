@@ -347,7 +347,7 @@ pub async fn run_session(
     shell: Option<String>,
     scrollback: usize,
 ) -> anyhow::Result<()> {
-    let handle = session::spawn_session(shell.as_deref(), scrollback)?;
+    let handle = session::spawn_session(shell.as_deref(), None, scrollback)?;
     let _ = run_attached(conn, handle.clone()).await?;
     let _ = handle.session.lock().await.pty.kill();
     Ok(())

@@ -3,10 +3,10 @@
 //! An SSH-authenticated peer-to-peer remote shell inspired by mosh, built in Rust over
 //! [iroh](https://iroh.computer) p2p QUIC.
 //!
-//! The public command is `koh ssh user@<iroh-ssh-endpoint-id>`: iroh-ssh carries SSH auth over iroh
-//! and launches a one-shot remote `koh serve`, then the interactive shell attaches over koh's own
-//! iroh protocol. The lower-level `serve`, `connect`, and `id` commands remain hidden implementation
-//! details for the bootstrap path.
+//! The public command mirrors mosh: `koh [options] [--] user@<iroh-ssh-endpoint-id> [command...]`.
+//! iroh-ssh carries SSH auth over iroh and launches a one-shot remote `koh serve`, then the
+//! interactive shell attaches over koh's own iroh protocol. The lower-level `serve`, `connect`, and
+//! `id` commands remain hidden implementation details for the bootstrap path.
 
 use clap::{Parser, Subcommand};
 use koh::client::{ConnectArgs, IdArgs};
@@ -20,9 +20,13 @@ use koh::ssh::SshArgs;
     version,
     about = "koh — SSH auth over iroh, then a resilient peer-to-peer shell"
 )]
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+
+    #[command(flatten)]
+    ssh: SshArgs,
 }
 
 #[derive(Subcommand, Debug)]
@@ -37,6 +41,7 @@ enum Cmd {
     #[command(hide = true)]
     Id(IdArgs),
     /// Launch a one-shot remote koh server over iroh-ssh, then connect over iroh.
+    #[command(hide = true)]
     Ssh(SshArgs),
     /// Change the identity key's encryption passphrase (like `ssh-keygen -p`; keys are always
     /// encrypted).
@@ -59,10 +64,11 @@ async fn main() -> std::process::ExitCode {
 
 async fn dispatch(cli: Cli) -> anyhow::Result<Option<u32>> {
     match cli.cmd {
-        Cmd::Serve(args) => koh::server::serve(args).await.map(|()| None),
-        Cmd::Connect(args) => koh::client::connect(args).await,
-        Cmd::Id(args) => koh::client::run_id(args).map(|()| None),
-        Cmd::Ssh(args) => koh::ssh::run(args).await,
-        Cmd::Key(args) => koh::keycmd::run(args).map(|()| None),
+        Some(Cmd::Serve(args)) => koh::server::serve(args).await.map(|()| None),
+        Some(Cmd::Connect(args)) => koh::client::connect(args).await,
+        Some(Cmd::Id(args)) => koh::client::run_id(args).map(|()| None),
+        Some(Cmd::Ssh(args)) => koh::ssh::run(args).await,
+        Some(Cmd::Key(args)) => koh::keycmd::run(args).map(|()| None),
+        None => koh::ssh::run(cli.ssh).await,
     }
 }

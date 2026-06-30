@@ -1863,6 +1863,7 @@ dependencies = [
  "rpassword",
  "secrecy",
  "serde",
+ "shell-words",
  "termina",
  "thiserror 2.0.18",
  "tokio",

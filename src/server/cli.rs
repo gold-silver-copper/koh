@@ -50,6 +50,10 @@ pub struct ServeArgs {
     #[arg(long)]
     shell: Option<String>,
 
+    /// Command to run inside the shell for SSH-bootstrapped mosh-style invocation.
+    #[arg(long, hide = true)]
+    command: Option<String>,
+
     /// Scrollback lines retained by the server-side emulator (per session). Bounded like the other
     /// resource knobs (`--max-connections`/`--max-sessions`): vt100 allocates the grid eagerly, so an
     /// unbounded value × `--max-sessions` is a memory footgun. 0 = no scrollback.
@@ -224,6 +228,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     );
 
     let shell = args.shell.clone();
+    let command = args.command.clone();
     // Cast the validated u64 (clap range 0..=1_000_000) down to the usize the emulator wants.
     let scrollback = args.scrollback as usize;
     let allow = std::sync::Arc::new(allow);
@@ -296,6 +301,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         };
         let allow = allow.clone();
         let shell = shell.clone();
+        let command = command.clone();
         let store = store.clone();
         tokio::spawn(async move {
             // Held for the whole task: releases the connection-cap permit on every exit path.
@@ -352,6 +358,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 &store,
                 peer,
                 shell.as_deref(),
+                command.as_deref(),
                 scrollback,
                 max_sessions,
             )

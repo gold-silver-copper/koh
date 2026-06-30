@@ -25,10 +25,16 @@ It prints an endpoint id like:
 iroh-ssh user@<iroh-ssh-endpoint-id>
 ```
 
-On the client, connect with koh2:
+On the client, connect with a mosh-style command:
 
 ```sh
-koh ssh user@<iroh-ssh-endpoint-id>
+koh user@<iroh-ssh-endpoint-id>
+```
+
+Run a remote command instead of the login shell:
+
+```sh
+koh user@<iroh-ssh-endpoint-id> -- tmux attach
 ```
 
 Flow:
@@ -41,10 +47,10 @@ Flow:
 Useful options:
 
 ```sh
-koh ssh user@<id> --clipboard
-koh ssh user@<id> --key-file <path>
-koh ssh user@<id> --iroh-ssh-option -i --iroh-ssh-option ~/.ssh/id_ed25519
-koh ssh user@<id> --remote-koh /path/to/koh
+koh --clipboard user@<id>
+koh --key-file <path> user@<id>
+koh --ssh "iroh-ssh -i ~/.ssh/id_ed25519" user@<id>
+koh --server /path/to/koh user@<id>
 ```
 
 Keys live under `~/.config/koh/` by default.
@@ -71,11 +77,12 @@ Keys live under `~/.config/koh/` by default.
 If DNS resolution is broken on your Android device, try setting an explicit resolver:
 
 ```sh
-KOH_DNS=1.1.1.1 koh ssh user@<iroh-ssh-endpoint-id>
+KOH_DNS=1.1.1.1 koh user@<iroh-ssh-endpoint-id>
 ```
 
 ## Highlights
 
+- Mosh-style CLI: `koh [options] [--] user@host [command...]`.
 - SSH authentication and account selection, carried over iroh instead of a public TCP SSH port.
 - The shell session runs over koh's peer-to-peer iroh/QUIC protocol after bootstrap.
 - Mosh-style predictive local echo and screen-state sync for responsive shells on bad networks.

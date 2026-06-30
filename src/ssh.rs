@@ -18,22 +18,22 @@ use crate::transport_iroh::{default_key_path, format_endpoint_id, load_or_create
 
 const BOOTSTRAP_MARKER: &str = "KOH_BOOTSTRAP_ENDPOINT_ID=";
 
-/// Arguments for `koh ssh <iroh-ssh-destination>`.
+/// Arguments for `koh [options] [--] <iroh-ssh-destination> [command...]`.
 #[derive(Args, Debug)]
 pub struct SshArgs {
     /// iroh-ssh destination, e.g. `user@<iroh-ssh-endpoint-id>`.
-    destination: String,
+    destination: Option<String>,
 
     /// Path to the local client's persistent secret key.
     #[arg(long)]
     key_file: Option<PathBuf>,
 
-    /// Local iroh-ssh binary to execute.
-    #[arg(long = "iroh-ssh", default_value = "iroh-ssh")]
+    /// Local iroh-ssh command to execute. `--ssh` is accepted as a mosh-compatible alias.
+    #[arg(long = "iroh-ssh", alias = "ssh", default_value = "iroh-ssh")]
     iroh_ssh: String,
 
-    /// Remote koh binary to execute on the iroh-ssh host.
-    #[arg(long, default_value = "koh")]
+    /// Remote koh command to execute on the iroh-ssh host. `--server` is accepted as a mosh-compatible alias.
+    #[arg(long = "remote-koh", alias = "server", default_value = "koh")]
     remote_koh: String,
 
     /// Pass an extra option to iroh-ssh. Repeat for multiple options, e.g.
@@ -57,10 +57,17 @@ pub struct SshArgs {
     /// Seconds to wait for the remote koh server to print its endpoint id.
     #[arg(long, default_value_t = 60)]
     bootstrap_timeout_secs: u64,
+
+    /// Command to run on the remote host instead of the login shell.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 /// Launch `koh serve` on a remote host over iroh-ssh, then attach to it over iroh.
 pub async fn run(args: SshArgs) -> Result<Option<u32>> {
+    let destination = args.destination.clone().context(
+        "missing destination; usage: koh [options] [--] user@<iroh-ssh-endpoint-id> [command...]",
+    )?;
     let key_file = match args.key_file.clone() {
         Some(p) => p,
         None => default_key_path("client")?,
@@ -73,15 +80,17 @@ pub async fn run(args: SshArgs) -> Result<Option<u32>> {
     })?;
     let client_id = format_endpoint_id(&secret.public());
 
-    let remote_command =
-        remote_serve_command(&args.remote_koh, &client_id, args.relay_url.as_deref());
-    eprintln!(
-        "bootstrapping remote koh over iroh-ssh: {}",
-        args.destination
+    let command = remote_command_string(&args.command);
+    let remote_command = remote_serve_command(
+        &args.remote_koh,
+        &client_id,
+        args.relay_url.as_deref(),
+        command.as_deref(),
     );
+    eprintln!("bootstrapping remote koh over iroh-ssh: {destination}");
 
-    let mut child =
-        spawn_iroh_ssh(&args, &remote_command).context("spawning iroh-ssh bootstrap")?;
+    let mut child = spawn_iroh_ssh(&args, &destination, &remote_command)
+        .context("spawning iroh-ssh bootstrap")?;
     let stdout = child
         .stdout
         .take()
@@ -123,10 +132,15 @@ pub async fn run(args: SshArgs) -> Result<Option<u32>> {
     result
 }
 
-fn spawn_iroh_ssh(args: &SshArgs, remote_command: &str) -> Result<Child> {
-    let mut cmd = Command::new(&args.iroh_ssh);
-    cmd.args(&args.iroh_ssh_options)
-        .arg(&args.destination)
+fn spawn_iroh_ssh(args: &SshArgs, destination: &str, remote_command: &str) -> Result<Child> {
+    let mut launcher = shell_words::split(&args.iroh_ssh)
+        .with_context(|| format!("parsing iroh-ssh command {:?}", args.iroh_ssh))?;
+    anyhow::ensure!(!launcher.is_empty(), "iroh-ssh command must not be empty");
+    let program = launcher.remove(0);
+    let mut cmd = Command::new(program);
+    cmd.args(launcher)
+        .args(&args.iroh_ssh_options)
+        .arg(destination)
         .arg(remote_command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -157,9 +171,14 @@ fn wait_for_server_id(
     }
 }
 
-fn remote_serve_command(remote_koh: &str, client_id: &str, relay_url: Option<&str>) -> String {
+fn remote_serve_command(
+    remote_koh: &str,
+    client_id: &str,
+    relay_url: Option<&str>,
+    command: Option<&str>,
+) -> String {
     let mut parts = vec![
-        shell_quote(remote_koh),
+        remote_server_command(remote_koh),
         "serve".to_string(),
         "--ephemeral-key".to_string(),
         "--print-id-stdout".to_string(),
@@ -171,7 +190,27 @@ fn remote_serve_command(remote_koh: &str, client_id: &str, relay_url: Option<&st
         parts.push("--relay-url".to_string());
         parts.push(shell_quote(url));
     }
+    if let Some(command) = command {
+        parts.push("--command".to_string());
+        parts.push(shell_quote(command));
+    }
     format!("exec {}", parts.join(" "))
+}
+
+fn remote_command_string(command: &[String]) -> Option<String> {
+    if command.is_empty() {
+        None
+    } else {
+        Some(command.join(" "))
+    }
+}
+
+fn remote_server_command(remote_koh: &str) -> String {
+    if remote_koh.chars().any(char::is_whitespace) {
+        remote_koh.to_string()
+    } else {
+        shell_quote(remote_koh)
+    }
 }
 
 fn shell_quote(s: &str) -> String {

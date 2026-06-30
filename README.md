@@ -1,6 +1,6 @@
 # koh
 
-A Rust, peer-to-peer reimplementation of [mosh](https://mosh.org) built on [iroh](https://iroh.computer) / QUIC.
+A Rust, peer-to-peer remote shell inspired by [mosh](https://mosh.org), built on [iroh](https://iroh.computer) / QUIC.
 
 koh gives you a responsive remote shell that survives network changes, suspend/resume, and reconnects — without SSH, open ports, or server-side accounts.
 
@@ -75,6 +75,7 @@ KOH_DNS=1.1.1.1 koh connect <server-id>
 - Mosh-style predictive local echo and screen-state sync for responsive shells on bad networks.
 - Detachable sessions survive suspend/resume, IP changes, and reconnects without tmux.
 - No SSH bootstrap, no listening port, and no port forwarding needed.
+- Not wire-compatible with mosh or SSH; koh is its own protocol/tool.
 - Intended for personal machines you control; not a full SSH replacement.
 - Does not provide multi-user accounts, file transfer, scrollback sync, or Windows support.
 
@@ -86,4 +87,4 @@ See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the security model, [`SEC
 
 ## License
 
-GPL-3.0-or-later, matching upstream mosh.
+GPL-3.0-or-later.

@@ -2,30 +2,38 @@
 
 An SSH-authenticated, peer-to-peer remote shell inspired by [mosh](https://mosh.org), built on [iroh](https://iroh.computer) / QUIC.
 
-koh2 uses [iroh-ssh](https://github.com/rustonbsd/iroh-ssh) to authenticate and launch a one-shot remote `koh` server without a public TCP SSH port. The interactive shell then attaches over koh's own iroh/QUIC protocol.
+koh2 keeps the mosh-style user experience — a simple `koh user@host` command, predictive local echo, reconnects, and detachable sessions — but uses [iroh-ssh](https://github.com/rustonbsd/iroh-ssh) for SSH authentication without exposing a public TCP SSH port.
 
-## Install and usage
+## Install
 
 Install both binaries on both machines:
 
 ```sh
 cargo install iroh-ssh
+cargo install --git https://github.com/gold-silver-copper/koh --branch koh2
+```
+
+If you are working from a checkout of this branch:
+
+```sh
 cargo install --path .
 ```
 
-On the server, run iroh-ssh in front of the local SSH daemon:
+## Usage
+
+On the server, run `iroh-ssh` in front of the local SSH daemon:
 
 ```sh
 iroh-ssh server --persist
 ```
 
-It prints an endpoint id like:
+It prints an address like:
 
 ```sh
 iroh-ssh user@<iroh-ssh-endpoint-id>
 ```
 
-On the client, connect with a mosh-style command:
+On the client, connect with koh:
 
 ```sh
 koh user@<iroh-ssh-endpoint-id>
@@ -37,13 +45,6 @@ Run a remote command instead of the login shell:
 koh user@<iroh-ssh-endpoint-id> -- tmux attach
 ```
 
-Flow:
-
-1. iroh-ssh connects to the server over iroh, not TCP port 22.
-2. SSH authenticates you against the server's local `sshd`.
-3. SSH launches a temporary remote `koh serve`.
-4. koh2 attaches to that temporary server over iroh/QUIC.
-
 Useful options:
 
 ```sh
@@ -53,49 +54,51 @@ koh --ssh "iroh-ssh -i ~/.ssh/id_ed25519" user@<id>
 koh --server /path/to/koh user@<id>
 ```
 
-Keys live under `~/.config/koh/` by default.
+## How it works
 
-**Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
+1. `iroh-ssh` reaches the server over iroh, not public TCP port 22.
+2. SSH authenticates you against the server's local `sshd`.
+3. SSH launches a temporary remote `koh serve`.
+4. koh attaches to that temporary server over koh's own iroh/QUIC terminal-sync protocol.
 
-## Android / Termux install
+## Highlights
+
+- Mosh-style CLI: `koh [options] [--] user@host [command...]`.
+- SSH authentication and account selection, carried over iroh.
+- No manual port forwarding, VPN, or Tailscale required.
+- Mosh-style predictive local echo and screen-state sync for bad networks.
+- Detachable sessions survive suspend/resume, IP changes, and reconnects.
+- Not wire-compatible with mosh or SSH; koh uses its own terminal protocol over iroh.
+- Does not provide file transfer, scrollback sync, or Windows support.
+
+## Android / Termux
 
 1. Install Termux from the [Termux GitHub releases](https://github.com/termux/termux-app/releases). Do not use the old Play Store build.
-2. In Termux, install Rust and build tools:
+2. Install Rust and build tools:
 
    ```sh
    pkg update
    pkg install rust clang pkg-config
    ```
 
-3. From a koh2 checkout, install both binaries:
+3. Install both binaries:
 
    ```sh
    cargo install iroh-ssh
-   cargo install --path .
+   cargo install --git https://github.com/gold-silver-copper/koh --branch koh2
    ```
 
-If DNS resolution is broken on your Android device, try setting an explicit resolver:
+If DNS resolution is broken on Android, try:
 
 ```sh
 KOH_DNS=1.1.1.1 koh user@<iroh-ssh-endpoint-id>
 ```
 
-## Highlights
-
-- Mosh-style CLI: `koh [options] [--] user@host [command...]`.
-- SSH authentication and account selection, carried over iroh instead of a public TCP SSH port.
-- The shell session runs over koh's peer-to-peer iroh/QUIC protocol after bootstrap.
-- Mosh-style predictive local echo and screen-state sync for responsive shells on bad networks.
-- Detachable sessions survive suspend/resume, IP changes, and reconnects without tmux.
-- No manual port forwarding, VPN, or Tailscale required.
-- Not wire-compatible with mosh or SSH; koh uses its own terminal sync protocol over iroh.
-- Does not provide file transfer, scrollback sync, or Windows support.
-
 ## Status
 
-koh2 is experimental and intended for personal use on machines you control.
+koh2 is experimental and intended for personal machines you control.
 
-See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the security model, [`SECURITY.md`](SECURITY.md) for vulnerability reporting, and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for implementation details.
+See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md), [`SECURITY.md`](SECURITY.md), and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for details.
 
 ## License
 

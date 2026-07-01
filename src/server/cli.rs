@@ -64,9 +64,10 @@ pub struct ServeArgs {
     allow: Vec<String>,
 
     /// Allowlist a FIDO2 security key (an OpenSSH `sk-ssh-ed25519@openssh.com` or
-    /// `sk-ecdsa-sha2-nistp256@openssh.com` public key, given inline or as a path to a `.pub` file;
-    /// repeatable). Requires `--require-sk` to take effect — the two together turn on a second,
-    /// hardware-key auth factor layered on top of `--allow`.
+    /// `sk-ecdsa-sha2-nistp256@openssh.com` public key, given inline or as a path to a key file — an
+    /// `authorized_keys`-style file contributes every key line it holds; repeatable). Requires
+    /// `--require-sk` to take effect — the two together turn on a second, hardware-key auth factor
+    /// layered on top of `--allow`.
     #[arg(long = "allow-sk", value_name = "PUBKEY_OR_FILE")]
     allow_sk: Vec<String>,
 
@@ -388,6 +389,11 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 // reason so the client surfaces a timeout rather than the generic "check your
                 // allowlist" message.
                 if sk_policy.is_some() {
+                    // A stalled security-key challenge IS an authn rejection, so record it in the same
+                    // structured `koh::auth` schema as an explicit SK verify failure — otherwise a peer
+                    // that repeatedly stalls the touch gate evades a SIEM/fail2ban rule keyed on
+                    // `event=authn outcome=rejected`.
+                    authn_event(Outcome::Rejected, &peer, "security-key admission timed out");
                     warn!(
                         "security-key admission step timed out (client never completed the touch)"
                     );

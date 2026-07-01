@@ -387,7 +387,32 @@ pub fn parse_authorized_key_line(text: &str) -> Result<SkPublicKey, SkError> {
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .ok_or(SkError::NoKeyFound)?;
-    let mut it = content.split_whitespace();
+    parse_one_key_line(content)
+}
+
+/// Parse EVERY non-comment/non-blank line of an OpenSSH authorized_keys-style file into a security key.
+///
+/// `--allow-sk <file>` naturally invites an authorized_keys-style list (one key per line), so all of
+/// them must be enrolled — dropping all but the first would silently reject listed keys. A malformed
+/// line is a hard error rather than being skipped: an allowlist should fail loudly (the server refuses
+/// to start) instead of admitting fewer keys than the operator listed.
+pub fn parse_authorized_keys(text: &str) -> Result<Vec<SkPublicKey>, SkError> {
+    let mut keys = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        keys.push(parse_one_key_line(line)?);
+    }
+    if keys.is_empty() {
+        return Err(SkError::NoKeyFound);
+    }
+    Ok(keys)
+}
+
+/// Parse a single OpenSSH authorized_keys-style entry (`type base64 [comment]`) into a security key.
+fn parse_one_key_line(line: &str) -> Result<SkPublicKey, SkError> {
+    let mut it = line.split_whitespace();
     let alg = it.next().ok_or(SkError::NoKeyFound)?;
     if alg.as_bytes() != SK_ED25519_TYPE && alg.as_bytes() != SK_ECDSA_P256_TYPE {
         return Err(SkError::UnsupportedKeyType(sanitize_alg(alg.as_bytes())));
@@ -399,33 +424,47 @@ pub fn parse_authorized_key_line(text: &str) -> Result<SkPublicKey, SkError> {
     SkPublicKey::from_blob(&blob)
 }
 
-/// Resolve a `--allow-sk` / `--sk-key` value that is either a path to a `.pub` file or an inline key.
+/// Resolve a `--allow-sk` / `--sk-key` value to every key it yields.
 ///
-/// An existing file is read and parsed; otherwise the value is parsed as an inline key line. A spec
-/// that fails to parse inline *and* looks like a filesystem path is reported as a missing file (rather
-/// than surfacing the path as a bogus "unsupported key type").
-pub fn load_sk_key_spec(spec: &str) -> Result<SkPublicKey, SkError> {
+/// The value is either a path to a key file or an inline key. An existing file is read and parsed as
+/// authorized_keys (every non-comment line); an inline spec yields exactly one key. A spec that fails
+/// to parse inline *and* looks like a filesystem path is reported as a missing file (rather than a
+/// bogus "unsupported key type").
+pub fn load_sk_key_spec_all(spec: &str) -> Result<Vec<SkPublicKey>, SkError> {
     let path = Path::new(spec);
     if path.is_file() {
         let text = std::fs::read_to_string(path)?;
-        return parse_authorized_key_line(&text);
+        return parse_authorized_keys(&text);
     }
     // Not a file — try it as an inline key line. (Base64 key bodies routinely contain `/`, so we
     // must NOT pre-classify by path characters; only fall back after an inline parse actually fails.)
-    parse_authorized_key_line(spec).map_err(|e| {
-        // A spec that couldn't be parsed as a key AND looks like a filesystem path is almost certainly
-        // a typo'd/missing file, so report that rather than a confusing "unsupported key type <path>".
-        let looks_like_path = spec.contains('/')
-            || spec.starts_with('~')
-            || Path::new(spec)
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("pub"));
-        if looks_like_path {
-            SkError::FileNotFound(spec.to_string())
-        } else {
-            e
-        }
-    })
+    parse_authorized_key_line(spec)
+        .map(|k| vec![k])
+        .map_err(|e| {
+            // A spec that couldn't be parsed as a key AND looks like a filesystem path is almost certainly
+            // a typo'd/missing file, so report that rather than a confusing "unsupported key type <path>".
+            let looks_like_path = spec.contains('/')
+                || spec.starts_with('~')
+                || Path::new(spec)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("pub"));
+            if looks_like_path {
+                SkError::FileNotFound(spec.to_string())
+            } else {
+                e
+            }
+        })
+}
+
+/// Resolve a spec to a single key (the client's `--sk-key` identity).
+///
+/// The client identifies with exactly one key — the first, if a file happens to list several. The
+/// server allowlist path uses [`load_sk_key_spec_all`] instead, which enrolls every key in a file.
+pub fn load_sk_key_spec(spec: &str) -> Result<SkPublicKey, SkError> {
+    load_sk_key_spec_all(spec)?
+        .into_iter()
+        .next()
+        .ok_or(SkError::NoKeyFound)
 }
 
 /// Build the challenge transcript that the client signs and the server re-derives.
@@ -482,11 +521,13 @@ impl ServerSk {
         Self { allowed: keys }
     }
 
-    /// Parse each `--allow-sk` spec (path or inline key) into the allowlist. Errors if none parse.
+    /// Parse each `--allow-sk` spec into the allowlist. A spec may be an inline key or a path to a key
+    /// file; a file contributes *every* key line it holds (authorized_keys-style), so a multi-key file
+    /// enrolls all of its keys rather than silently dropping all but the first. Errors if none parse.
     pub fn from_specs(specs: &[String]) -> Result<Self, SkError> {
         let mut allowed = Vec::with_capacity(specs.len());
         for s in specs {
-            allowed.push(load_sk_key_spec(s)?);
+            allowed.extend(load_sk_key_spec_all(s)?);
         }
         if allowed.is_empty() {
             return Err(SkError::NoKeyFound);
@@ -1243,6 +1284,49 @@ mod tests {
             load_sk_key_spec("ssh-rsa AAAAsomething"),
             Err(SkError::UnsupportedKeyType(_))
         ));
+    }
+
+    /// A multi-key `--allow-sk` file (authorized_keys-style) enrolls EVERY listed key, not just the
+    /// first, and a malformed line fails the whole allowlist loudly rather than silently dropping keys.
+    #[test]
+    fn allow_sk_file_enrolls_every_key() {
+        let a = SimAuthenticator::new([10u8; 32], b"ssh:");
+        let b = SimAuthenticator::new_ecdsa(b"ssh:");
+        let line = |auth: &SimAuthenticator, alg: &str| {
+            format!("{alg} {} admin", BASE64.encode(&auth.public_key_blob()))
+        };
+        let text = format!(
+            "# koh security-key allowlist\n\n{}\n{}\n",
+            line(&a, "sk-ssh-ed25519@openssh.com"),
+            line(&b, "sk-ecdsa-sha2-nistp256@openssh.com"),
+        );
+
+        // The pure parser returns BOTH keys (comment and blank line skipped).
+        let keys = parse_authorized_keys(&text).expect("both keys parse");
+        assert_eq!(keys.len(), 2, "every non-comment key line is enrolled");
+
+        // Wired through `from_specs` via a real file: both fingerprints land on the allowlist.
+        let path = std::env::temp_dir().join("koh_sk_multikey_allowlist_test.pub");
+        std::fs::write(&path, &text).unwrap();
+        let server = ServerSk::from_specs(&[path.to_string_lossy().into_owned()]).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(server.len(), 2, "from_specs enrolls all keys in a file");
+        let fps = server.fingerprints();
+        assert!(fps.contains(&a.public_key().fingerprint()));
+        assert!(fps.contains(&b.public_key().fingerprint()));
+
+        // A malformed line anywhere fails the whole file (fail-closed, loudly) — no silent drop.
+        let bad = format!(
+            "{}\nssh-rsa AAAAnotsupported bad\n",
+            line(&a, "sk-ssh-ed25519@openssh.com")
+        );
+        assert!(
+            matches!(
+                parse_authorized_keys(&bad),
+                Err(SkError::UnsupportedKeyType(_))
+            ),
+            "a malformed line fails the whole allowlist rather than being skipped"
+        );
     }
 
     /// An unsupported key type (e.g. P-384 ecdsa-sk, or a non-sk key) is rejected with a clear,

@@ -69,6 +69,13 @@ secrecy = "0.10"
 # transitively via iroh's QUIC backend, so promoting it to a direct dep adds no new compiled crate —
 # it makes koh own/audit the version. NOT home-grown crypto.
 aes-gcm = "0.10"
+# Optional FIDO2/security-key second factor (`--require-sk`): verify OpenSSH `sk-ssh-ed25519@openssh.com`
+# signatures. `ed25519-dalek` does the Ed25519 `verify_strict`; `sha2` builds the FIDO2 authenticator-data
+# hash. Both are ALREADY in the lockfile transitively via iroh's crypto stack, so promoting them to direct
+# deps adds no new compiled crate — it makes koh own/audit the version (same rationale as aes-gcm/argon2).
+# NOT home-grown crypto: the signature math is entirely ed25519-dalek. See `transport_iroh::sk_auth`.
+ed25519-dalek = "=3.0.0-rc.0"
+sha2 = "=0.11.0"
 # No-echo passphrase prompt for the encrypted identity key (the `ssh-keygen -p` / login analogue).
 rpassword = "7"
 # render the endpoint id as a terminal QR on `koh serve` (always printed); default-features = false drops the

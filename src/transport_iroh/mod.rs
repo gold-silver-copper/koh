@@ -29,6 +29,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub mod admission;
 mod keyfile;
+pub mod sk_auth;
 
 /// Keepalive + connection idle-timeout tuned so a phone screen-off doesn't drop the connection.
 /// iroh's defaults already PING every 5s and drop a *path* after 15s, but the *connection* idle

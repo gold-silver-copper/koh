@@ -33,10 +33,29 @@ service.
 
 - **Peer identity:** both ends are authenticated by Ed25519 node-id *by construction* (no TOFU
   window). Authorization is an explicit **allowlist** (off-list peers refused); at least one entry is
-  required, so there is no "accept any peer" mode. This is the **single** authentication factor —
-  there is no passphrase/PAKE second factor (the residual leaked-key risk is handled by mandatory
-  at-rest key encryption, below). The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
-  checkpoint; its outcomes are logged structured under the `koh::auth` target.
+  required, so there is no "accept any peer" mode. The node-id allowlist is the default (and, without
+  the opt-in below, the sole) authentication factor; the residual leaked-key risk is handled by
+  mandatory at-rest key encryption (below). The accept gauntlet (`src/server/cli.rs`) is the
+  trust-boundary checkpoint; its outcomes are logged structured under the `koh::auth` target
+  (`event = "authz"` for the allowlist, `event = "authn"` for the security-key factor).
+- **Optional FIDO2 security-key second factor (`--require-sk`):** an operator can require every client
+  to *also* prove possession of an allowlisted hardware security key (an OpenSSH
+  `sk-ssh-ed25519@openssh.com` credential) before admission. After the allowlist check but **before**
+  the admission ack — and therefore before any `session::attach`, PTY spawn, or terminal I/O — the
+  server issues a fresh per-connection challenge; the client signs it with its security key (via
+  `ssh-agent`, which drives the hardware touch) and returns the OpenSSH signature. koh verifies the
+  Ed25519 signature (`ed25519-dalek` `verify_strict`, no home-grown crypto) and **requires the
+  user-presence/touch flag**. The signed transcript (`transport_iroh::sk_auth::build_transcript`)
+  length-prefixes and binds the label `koh-sk-v1`, the ALPN, the version, **both** endpoint ids, and
+  the nonce, so a proof cannot be **replayed** onto another connection (fresh nonce → different
+  transcript) nor **relayed** to a different server (server id is bound). The wire is small, bounded,
+  and versioned; a failed/absent proof closes the connection with a clear reason. Verification lives
+  in `transport_iroh::sk_auth` with its own unit + real-iroh e2e tests. **Limitations:** koh does not
+  exchange a FIDO **attestation**, so it proves key possession + a touch, not that the key is genuinely
+  hardware-backed — enrol only public keys you generated on real hardware. Only `ed25519-sk` is
+  verified so far (`ecdsa-sk` is rejected with a clear message). A signature *counter* regression
+  (cloned-token detection) is not tracked across connections. This factor protects the **server** from
+  an attacker holding only a leaked node-id key; it does not protect a client from a malicious server.
 - **Untrusted data plane:** the SSP core (`src/ssp/`, `src/wire.rs`) is a pure, panic-free-by-
   construction state machine with per-direction decode/inflate ceilings, a fragment replay gate, a
   reassembly byte cap, an accumulation budget, and dimension clamps before any vt100 allocation. The
@@ -58,8 +77,10 @@ the inline `KOH-`/`KR-`/`K-`/`AR-` rationale tags.
 - **No privilege separation / multi-user model:** the shell runs as the uid that ran `koh serve`;
   there is no per-user mapping, PAM, chroot, or `ForceCommand`-class policy. The only access control
   is the node-id allowlist; access is uniform across allowed peers.
-- **No hardware-backed / certificate / agent identity:** the node-id key lives on disk (always
-  passphrase-encrypted, but not in an HSM / FIDO2 token / agent).
+- **No hardware-backed *primary* identity:** the node-id key lives on disk (always
+  passphrase-encrypted, but not in an HSM / FIDO2 token). A hardware key can be required as an
+  *optional second factor* (`--require-sk`, above), but the node-id itself is still a disk key. There
+  is no X.509 / SSH-certificate identity.
 - **No post-quantum key exchange yet:** transport crypto is inherited from iroh; koh is a policy-taker.
 - **Transport crypto is not koh's:** QUIC/TLS/KEX correctness is iroh/rustls/ring's responsibility.
 - **Not a substitute for ssh** where independent audit, compliance, or a multi-user/jail model is

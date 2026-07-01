@@ -20,8 +20,10 @@ use iroh::EndpointId;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
-use crate::server::audit::{auth_event, Outcome};
+use crate::server::audit::{auth_event, authn_event, Outcome};
 use crate::server::{run_attached, session, SessionExit};
+use crate::transport_iroh::admission::{admit, admit_with_sk, AdmitError, AdmitOutcome};
+use crate::transport_iroh::sk_auth::ServerSk;
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
     load_or_create_secret_key, parse_endpoint_id, parse_relay_url, ALPN,
@@ -34,6 +36,14 @@ use tracing::{error, info, warn};
 /// pending slot for the 300s idle timeout koh configures (`koh_transport_config`).
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Deadline on the admission step. Without `--require-sk` this is just the one-byte ack (3s is
+/// generous). With `--require-sk` the client must additionally touch its security key, so the window
+/// is widened to a human-interaction grace (still well under sshd's 120s `LoginGraceTime`). The
+/// pending-handshake permit is held for the whole window, so a slowloris under `--require-sk` can pin
+/// a pending slot for up to this long — bounded by `pending_cap`, which refuses excess dials cheaply.
+const ADMIT_TIMEOUT: Duration = Duration::from_secs(3);
+const SK_ADMIT_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Arguments for `koh serve`.
 #[derive(ClapArgs, Debug)]
 pub struct ServeArgs {
@@ -45,6 +55,17 @@ pub struct ServeArgs {
     /// peers whose node-id is on this list.
     #[arg(long = "allow", value_name = "ENDPOINT_ID")]
     allow: Vec<String>,
+
+    /// Allowlist a FIDO2 security key (an OpenSSH `sk-ssh-ed25519@openssh.com` public key, given
+    /// inline or as a path to a `.pub` file; repeatable). Requires `--require-sk` to take effect —
+    /// the two together turn on a second, hardware-key auth factor layered on top of `--allow`.
+    #[arg(long = "allow-sk", value_name = "PUBKEY_OR_FILE")]
+    allow_sk: Vec<String>,
+
+    /// Require every client to additionally prove possession of an allowlisted security key
+    /// (`--allow-sk`) before admission. Off by default: endpoint-id auth alone is unchanged.
+    #[arg(long = "require-sk")]
+    require_sk: bool,
 
     /// Shell to run (defaults to the user's login shell).
     #[arg(long)]
@@ -124,6 +145,30 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         );
     }
 
+    // Optional FIDO2 second factor. Enforcement is on iff `--require-sk` is set, and it *requires* at
+    // least one `--allow-sk` key. `--allow-sk` without `--require-sk` is a hard error (rather than a
+    // silent "keys listed but not enforced" footgun). When off, endpoint-id auth is byte-for-byte
+    // unchanged.
+    let sk_policy: Option<Arc<ServerSk>> = if args.require_sk {
+        if args.allow_sk.is_empty() {
+            anyhow::bail!(
+                "--require-sk needs at least one --allow-sk <public-key-or-file> (an OpenSSH \
+                 sk-ssh-ed25519@openssh.com key)"
+            );
+        }
+        let sk = ServerSk::from_specs(&args.allow_sk)
+            .context("parsing --allow-sk security-key allowlist")?;
+        Some(Arc::new(sk))
+    } else {
+        if !args.allow_sk.is_empty() {
+            anyhow::bail!(
+                "--allow-sk was given without --require-sk, so the security keys would not be \
+                 enforced; add --require-sk to require them (or drop --allow-sk)"
+            );
+        }
+        None
+    };
+
     let key_file = match args.key_file.clone() {
         Some(p) => p,
         None => crate::transport_iroh::default_key_path("server")?,
@@ -172,6 +217,15 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!("│ key file    : {}", key_file.display());
     eprintln!("│ alpn        : {}", String::from_utf8_lossy(ALPN));
     eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
+    if let Some(sk) = &sk_policy {
+        eprintln!(
+            "│ 2nd factor  : security key REQUIRED ({} key(s))",
+            sk.len()
+        );
+        for fp in sk.fingerprints() {
+            eprintln!("│              · {fp}");
+        }
+    }
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
 
@@ -270,6 +324,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         let allow = allow.clone();
         let shell = shell.clone();
         let store = store.clone();
+        let sk_policy = sk_policy.clone();
         tokio::spawn(async move {
             // Held for the whole task: releases the connection-cap permit on every exit path.
             let _permit = permit;
@@ -297,22 +352,50 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 conn.close(1u32.into(), b"not authorized");
                 return;
             }
-            // Authorized: send the 1-byte admission ack so the client can distinguish "admitted"
-            // from a deliberate reject (without it a rejected client would re-dial forever). Bounded
-            // by a short timeout so a client that never accepts the stream can't pin the slot.
-            match tokio::time::timeout(
-                Duration::from_secs(3),
-                crate::transport_iroh::admission::admit(&conn),
-            )
+            // Authorized on the endpoint-id allowlist. Now the admission step — which, under
+            // `--require-sk`, first runs the security-key challenge/response and verifies the proof,
+            // and ONLY on success writes the 1-byte admission ack. This gates everything below it
+            // (session attach, PTY spawn, terminal I/O) on the second factor. The 1-byte ack still
+            // lets the client distinguish "admitted" from a deliberate reject. Bounded by a timeout so
+            // a client that never responds (or never touches its key) can't pin the pending slot.
+            let admit_timeout = if sk_policy.is_some() {
+                SK_ADMIT_TIMEOUT
+            } else {
+                ADMIT_TIMEOUT
+            };
+            // One async block so both branches share a single future type (no boxing / no Either):
+            // the SK path verifies the proof then acks; the plain path just acks.
+            let Ok(admit_result) = tokio::time::timeout(admit_timeout, async {
+                match sk_policy.as_deref() {
+                    Some(sk) => admit_with_sk(&conn, my_id.as_bytes(), peer.as_bytes(), sk).await,
+                    None => admit(&conn)
+                        .await
+                        .map(|()| AdmitOutcome::none())
+                        .map_err(AdmitError::Io),
+                }
+            })
             .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(error = %e, "admission ack failed");
+            else {
+                warn!("admission (security-key) step timed out");
+                return;
+            };
+            match admit_result {
+                Ok(outcome) => {
+                    if let Some(fp) = &outcome.sk_fingerprint {
+                        authn_event(
+                            Outcome::Accepted,
+                            &peer,
+                            &format!("security key {fp} verified"),
+                        );
+                    }
+                }
+                Err(AdmitError::SkAuth(reason)) => {
+                    authn_event(Outcome::Rejected, &peer, &reason);
+                    conn.close(2u32.into(), b"security-key auth failed");
                     return;
                 }
-                Err(_) => {
-                    warn!("admission ack timed out");
+                Err(AdmitError::Io(e)) => {
+                    warn!(error = %e, "admission ack failed");
                     return;
                 }
             }

@@ -42,3 +42,17 @@ pub fn auth_event(outcome: Outcome, peer: &EndpointId, reason: &str) {
         tracing::warn!(target: "koh::auth", event = "authz", outcome = outcome.token(), peer = %peer, reason);
     }
 }
+
+/// Emit the security-key **authentication** event (`event = "authn"`), the second-factor analogue of
+/// [`auth_event`]'s allowlist authorization. Same stable schema/target so a SIEM matches on
+/// `event = "authn"` for FIDO2 outcomes. Mirrors sshd's separate publickey-*authentication* line.
+/// INFO for a verified key, WARN for a denial. `reason` is non-sensitive (a fingerprint or a failure
+/// summary — never key material).
+pub fn authn_event(outcome: Outcome, peer: &EndpointId, reason: &str) {
+    let peer = crate::transport_iroh::format_endpoint_id(peer);
+    if matches!(outcome, Outcome::Accepted) {
+        tracing::info!(target: "koh::auth", event = "authn", outcome = outcome.token(), peer = %peer, reason);
+    } else {
+        tracing::warn!(target: "koh::auth", event = "authn", outcome = outcome.token(), peer = %peer, reason);
+    }
+}

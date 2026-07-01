@@ -108,24 +108,47 @@ fn looks_like_resume_from_freeze(wall_gap: Duration) -> bool {
 pub struct IrohConnector {
     endpoint: Endpoint,
     target: EndpointAddr,
+    /// Optional FIDO2 second factor: when set, every dial (initial and each transparent reconnect)
+    /// re-proves possession of the security key against the server's fresh per-connection challenge.
+    sk: Option<std::sync::Arc<crate::transport_iroh::sk_auth::ClientSkCtx>>,
 }
 
 impl IrohConnector {
     pub fn new(endpoint: Endpoint, target: EndpointAddr) -> Self {
-        Self { endpoint, target }
+        Self {
+            endpoint,
+            target,
+            sk: None,
+        }
+    }
+
+    /// Attach a security-key signing context so this connector satisfies a server's `--require-sk`
+    /// challenge on every dial (see [`crate::transport_iroh::sk_auth`]).
+    #[must_use]
+    pub fn with_sk(mut self, ctx: crate::transport_iroh::sk_auth::ClientSkCtx) -> Self {
+        self.sk = Some(std::sync::Arc::new(ctx));
+        self
     }
 
     /// Connect to the server and await its admission ack. A server that rejects us (our node-id is
-    /// not on its allowlist, or it's at capacity) closes the connection instead of admitting; that
-    /// surfaces as an `Err` (the binary reports it before entering raw mode), so a rejected client
-    /// fails fast rather than re-dialing forever.
+    /// not on its allowlist, it's at capacity, or a required security-key proof failed) closes the
+    /// connection instead of admitting; that surfaces as an `Err` (the binary reports it before
+    /// entering raw mode), so a rejected client fails fast rather than re-dialing forever.
     pub async fn connect(&self) -> anyhow::Result<IrohChannel> {
         let conn = self
             .endpoint
             .connect(self.target.clone(), ALPN)
             .await
             .context("connecting to server (is your id on its allowlist?)")?;
-        if let Err(e) = crate::transport_iroh::admission::await_admission(&conn).await {
+        // With a security key configured, run the SK-aware admission (which answers a challenge if the
+        // server issues one); otherwise the plain one-byte admission. Both handle the no-SK server.
+        let admission = match &self.sk {
+            Some(ctx) => {
+                crate::transport_iroh::admission::await_admission_with_sk(&conn, ctx).await
+            }
+            None => crate::transport_iroh::admission::await_admission(&conn).await,
+        };
+        if let Err(e) = admission {
             // The server rejects with a specific application reason — "not authorized" / "server at
             // session capacity" — each pointing at a different operator fix. Surface that real reason
             // instead of a static guess. The reason is peer-controlled, so it is sanitized + capped.

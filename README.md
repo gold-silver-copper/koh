@@ -45,6 +45,38 @@ Useful flags:
 
 Keys live under `~/.config/koh/` by default.
 
+## Security keys (FIDO2, optional second factor)
+
+By default koh authorizes by endpoint id alone. For a machine you want locked down harder, you can
+*additionally* require a FIDO2 hardware security key (an OpenSSH `ed25519-sk` credential) — the server
+won't attach a session or spawn a shell until the client proves possession of an allowlisted key with
+a physical touch. This is layered on top of `--allow`, not a replacement for it.
+
+```sh
+# One-time: create a security-key-backed SSH key (touch the key when prompted).
+ssh-keygen -t ed25519-sk -f ~/.ssh/id_ed25519_sk
+
+# On the server, require the key in addition to the endpoint-id allowlist:
+koh serve --allow <client-id> --require-sk --allow-sk ~/.ssh/id_ed25519_sk.pub
+
+# On the client, load the key into your ssh-agent, then connect with it:
+ssh-add ~/.ssh/id_ed25519_sk
+koh connect <server-id> --sk-key ~/.ssh/id_ed25519_sk.pub
+```
+
+```sh
+--require-sk              # (server) require a security-key proof before admission
+--allow-sk <pub|file>     # (server) allowlist an sk-ssh-ed25519 public key (repeatable)
+--sk-key <pubkey-file>    # (client) authenticate with this security key via ssh-agent
+```
+
+Each connection (including transparent reconnects) issues a fresh challenge bound to both endpoint
+ids, so a captured proof cannot be replayed or relayed to another server, and you touch the key again
+on reconnect. koh verifies the signature and the user-presence (touch) flag but does not verify FIDO
+*attestation*, so enrol only keys you generated on real hardware. Only `ed25519-sk` is supported today
+(`ecdsa-sk` is rejected with a clear message). ssh-agent (unix) is the supported signer. See
+[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the full security model and limitations.
+
 **Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
 
 ## Android / Termux install

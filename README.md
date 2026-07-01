@@ -77,6 +77,11 @@ on reconnect. koh verifies the signature and the user-presence (touch) flag but 
 (`ecdsa-sk` is rejected with a clear message). ssh-agent (unix) is the supported signer. See
 [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the full security model and limitations.
 
+No hardware key? [`testing/fido2/`](testing/fido2/) is a one-command, Docker-based end-to-end test
+(`testing/fido2/run.sh`) that exercises this whole flow — real `koh`, real `ssh-agent`, real sk
+signatures — using OpenSSH's software FIDO2 authenticator, and checks that the right key is admitted
+and wrong/missing keys are rejected.
+
 **Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
 
 ## Android / Termux install

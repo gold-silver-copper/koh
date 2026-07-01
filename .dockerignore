@@ -1,0 +1,11 @@
+# Keep the Docker build context lean (used by testing/fido2). The FIDO2 image copies only
+# Cargo.toml/Cargo.lock/src + the harness; everything below is irrelevant to it and can be huge.
+target/
+.git/
+docs/
+tests/
+examples/
+fuzz/
+testing/android/
+koh-presentation.html
+**/*.crate

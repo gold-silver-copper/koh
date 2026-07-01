@@ -284,14 +284,13 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     // Bound the initial dial (KR-04): `connect()` does the QUIC handshake then awaits the server's
     // admission ack, so a malicious/typo'd server that never admits could otherwise hang it at
     // "connecting…" until iroh's 300s idle timeout. Use the same cap as the transparent-reconnect path.
-    let channel =
-        match tokio::time::timeout(super::RECONNECT_CONNECT_TIMEOUT, connector.connect()).await {
-            Ok(r) => r?,
-            Err(_) => anyhow::bail!(
-                "timed out connecting to {} (the server may be unreachable or not responding)",
-                format_endpoint_id(&server_id)
-            ),
-        };
+    let channel = match tokio::time::timeout(connector.dial_timeout(), connector.connect()).await {
+        Ok(r) => r?,
+        Err(_) => anyhow::bail!(
+            "timed out connecting to {} (the server may be unreachable or not responding)",
+            format_endpoint_id(&server_id)
+        ),
+    };
     eprintln!("connected. (Ctrl-^ then . to disconnect)");
 
     // Arm graceful shutdown BEFORE entering raw mode, so there's no window where a fatal signal —

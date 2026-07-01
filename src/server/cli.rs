@@ -42,7 +42,7 @@ const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// pending-handshake permit is held for the whole window, so a slowloris under `--require-sk` can pin
 /// a pending slot for up to this long — bounded by `pending_cap`, which refuses excess dials cheaply.
 const ADMIT_TIMEOUT: Duration = Duration::from_secs(3);
-const SK_ADMIT_TIMEOUT: Duration = Duration::from_secs(45);
+const SK_ADMIT_TIMEOUT: Duration = crate::transport_iroh::sk_auth::SK_TOUCH_GRACE;
 
 /// Arguments for `koh serve`.
 #[derive(ClapArgs, Debug)]

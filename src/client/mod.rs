@@ -51,6 +51,12 @@ const RESET_FORWARDED_MODES: &[u8] =
 
 /// How long a single reconnect dial may run before it is abandoned and retried.
 const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The dial budget when a security key is configured. A `--require-sk` dial includes a human hardware
+/// touch, which the server grants up to [`sk_auth::SK_TOUCH_GRACE`](crate::transport_iroh::sk_auth::SK_TOUCH_GRACE);
+/// the client must therefore wait a bit LONGER than the server (touch grace + handshake headroom) so a
+/// slow-but-legitimate touch isn't aborted client-side — and so the server's decision (admit or a
+/// clear reject) wins the race instead of the client timing out with a generic "unreachable" error.
+const RECONNECT_CONNECT_TIMEOUT_SK: Duration = Duration::from_secs(45);
 /// Reconnect backoff: `BASE << min(attempt, 4)`, capped at `MAX`. `backoff_ms` is only called for
 /// `attempt > 0` (attempt 0 redials immediately), so the realized sequence is 1 → 2 → 4 → 8s.
 const RECONNECT_BACKOFF_BASE_MS: u64 = 500;
@@ -130,6 +136,18 @@ impl IrohConnector {
         self
     }
 
+    /// How long a single dial by this connector may run. When a security key is configured the dial
+    /// includes a hardware touch, so it gets the wider [`RECONNECT_CONNECT_TIMEOUT_SK`] budget; the
+    /// plain path keeps the tight [`RECONNECT_CONNECT_TIMEOUT`]. Used for the initial dial and every
+    /// transparent reconnect so they stay consistent.
+    pub fn dial_timeout(&self) -> Duration {
+        if self.sk.is_some() {
+            RECONNECT_CONNECT_TIMEOUT_SK
+        } else {
+            RECONNECT_CONNECT_TIMEOUT
+        }
+    }
+
     /// Connect to the server and await its admission ack. A server that rejects us (our node-id is
     /// not on its allowlist, it's at capacity, or a required security-key proof failed) closes the
     /// connection instead of admitting; that surfaces as an `Err` (the binary reports it before
@@ -149,14 +167,27 @@ impl IrohConnector {
             None => crate::transport_iroh::admission::await_admission(&conn).await,
         };
         if let Err(e) = admission {
-            // The server rejects with a specific application reason — "not authorized" / "server at
-            // session capacity" — each pointing at a different operator fix. Surface that real reason
-            // instead of a static guess. The reason is peer-controlled, so it is sanitized + capped.
+            // A client-LOCAL security-key failure (no agent, wrong/unplugged key, declined/slow touch)
+            // leaves the connection open, so `server_close_reason` is None and the generic
+            // allowlist message below would misdirect the operator. Caption those with the real
+            // (self-descriptive) SkAuth cause instead.
+            if let crate::transport_iroh::admission::AdmissionError::SkAuth(_) = &e {
+                return Err(anyhow::Error::new(e).context(
+                    "security-key authentication failed (check your key is plugged in and loaded, \
+                     e.g. `ssh-add ~/.ssh/id_ed25519_sk`, and touch it when prompted)",
+                ));
+            }
+            // Otherwise the server rejected with a specific application reason — "not authorized" /
+            // "server at session capacity" / "security-key auth failed" — each pointing at a
+            // different operator fix. Surface that real reason instead of a static guess. The reason
+            // is peer-controlled, so it is sanitized + capped.
             return Err(match server_close_reason(&conn) {
                 Some(reason) => anyhow::Error::new(e)
                     .context(format!("server rejected the connection: {reason}")),
-                None => anyhow::Error::new(e)
-                    .context("server did not admit the connection (is your id on its allowlist?)"),
+                None => anyhow::Error::new(e).context(
+                    "server did not admit the connection (check your id is on its --allow list; if it \
+                     requires a security key, pass --sk-key)",
+                ),
             });
         }
         Ok(IrohChannel::new(conn))
@@ -904,7 +935,7 @@ async fn reconnect<T: ClientTerminal>(
                 }
             }
         }
-        let dial = tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect());
+        let dial = tokio::time::timeout(connector.dial_timeout(), connector.connect());
         tokio::pin!(dial);
         loop {
             let secs = clock.now_ms().saturating_sub(started) / 1000;
@@ -955,6 +986,22 @@ mod tests {
     use super::*;
     use crate::input::InputEvent;
     use crate::terminal::ServerTerminal;
+
+    /// Regression guard for the SK dial-timeout mismatch: a `--require-sk` dial includes a hardware
+    /// touch that the server (and ssh-agent) grant up to `SK_TOUCH_GRACE`, so the client's SK dial
+    /// budget MUST exceed that grace — otherwise a slow-but-legitimate touch is aborted client-side
+    /// before the server would have admitted it, making the feature flaky.
+    #[test]
+    fn sk_dial_timeout_exceeds_the_server_touch_grace() {
+        let grace = crate::transport_iroh::sk_auth::SK_TOUCH_GRACE;
+        assert!(
+            RECONNECT_CONNECT_TIMEOUT_SK > grace,
+            "client SK dial budget ({RECONNECT_CONNECT_TIMEOUT_SK:?}) must exceed the server/agent \
+             touch grace ({grace:?}) so a slow touch isn't aborted client-side"
+        );
+        // The plain (no-SK) path keeps its tight budget.
+        assert!(RECONNECT_CONNECT_TIMEOUT < RECONNECT_CONNECT_TIMEOUT_SK);
+    }
 
     /// Drive a server-side transport until it emits at least one datagram, returning them. Used to
     /// synthesize *real* server frames for the client session to consume — no iroh, no tokio.

@@ -5,7 +5,8 @@
 //! `--allow <endpoint-id>` authorizes it; when the operator additionally passes `--require-sk`, the
 //! server will not send the admission ack (and therefore never attaches a session, spawns a PTY, or
 //! processes a single byte of terminal I/O) until the client also proves possession of an allowlisted
-//! **hardware security key** — an OpenSSH `ecdsa-sk`/`ed25519-sk` FIDO2 credential.
+//! **hardware security key** — an OpenSSH `ed25519-sk` FIDO2 credential. (`ecdsa-sk` is not yet
+//! verified; it is rejected with a clear message — see the Scope/limitations section below.)
 //!
 //! ## What is verified
 //!
@@ -45,6 +46,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use data_encoding::{BASE64, BASE64_NOPAD};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -56,6 +58,15 @@ pub const SK_LABEL: &[u8] = b"koh-sk-v1";
 pub const SK_VERSION: u8 = 1;
 /// Server nonce length — a fresh one per connection.
 pub const NONCE_LEN: usize = 32;
+
+/// The single human-touch budget for a security-key handshake.
+///
+/// Shared so the server's admission deadline, the ssh-agent read deadline, and (with headroom) the
+/// client's dial deadline stay consistent by construction rather than three independent magic numbers.
+/// Generous for a real touch (typically a few seconds, plus reaching for the key / a PIN entry), yet
+/// far below sshd's 120s `LoginGraceTime` — an un-keyed but allowlisted peer can only stall a pending
+/// slot for this long.
+pub const SK_TOUCH_GRACE: Duration = Duration::from_secs(30);
 
 /// The only OpenSSH key type this pass verifies.
 const SK_ED25519_TYPE: &[u8] = b"sk-ssh-ed25519@openssh.com";
@@ -102,6 +113,19 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(digest.as_slice());
     out
+}
+
+/// Render a peer-supplied algorithm name for an error/log message: lossy UTF-8 with control
+/// characters stripped and the length capped. A hostile client controls the algorithm field of the
+/// blobs it sends, and that field can flow into the server's `koh::auth` audit log; without this a
+/// peer could inject terminal escapes / newlines (log forging) or ~2 KB of junk (log-volume
+/// amplification). Mirrors the client-side `server_close_reason` sanitization of peer-controlled text.
+fn sanitize_alg(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect()
 }
 
 /// Append an SSH `string` (a big-endian `u32` length prefix followed by the bytes) to `buf`.
@@ -172,9 +196,7 @@ fn parse_sk_ed25519_pubkey(blob: &[u8]) -> Result<([u8; 32], Vec<u8>), SkError> 
     let mut r = SshReader::new(blob);
     let alg = r.string()?;
     if alg != SK_ED25519_TYPE {
-        return Err(SkError::UnsupportedKeyType(
-            String::from_utf8_lossy(alg).into_owned(),
-        ));
+        return Err(SkError::UnsupportedKeyType(sanitize_alg(alg)));
     }
     let pk: [u8; 32] = r.string()?.try_into().map_err(|_| SkError::BadKeyLength)?;
     let application = r.string()?.to_vec();
@@ -186,9 +208,7 @@ fn parse_sk_ed25519_sig(blob: &[u8]) -> Result<([u8; 64], u8, u32), SkError> {
     let mut r = SshReader::new(blob);
     let alg = r.string()?;
     if alg != SK_ED25519_TYPE {
-        return Err(SkError::UnsupportedKeyType(
-            String::from_utf8_lossy(alg).into_owned(),
-        ));
+        return Err(SkError::UnsupportedKeyType(sanitize_alg(alg)));
     }
     let sig: [u8; 64] = r.string()?.try_into().map_err(|_| SkError::BadSignature)?;
     let flags = r.read_u8()?;
@@ -249,7 +269,7 @@ pub fn parse_authorized_key_line(text: &str) -> Result<SkPublicKey, SkError> {
     let mut it = content.split_whitespace();
     let alg = it.next().ok_or(SkError::NoKeyFound)?;
     if alg != "sk-ssh-ed25519@openssh.com" {
-        return Err(SkError::UnsupportedKeyType(alg.to_string()));
+        return Err(SkError::UnsupportedKeyType(sanitize_alg(alg.as_bytes())));
     }
     let b64 = it.next().ok_or(SkError::NoKeyFound)?;
     let blob = BASE64
@@ -391,10 +411,6 @@ pub trait SkSigner: Send + Sync {
     fn public_key_blob(&self) -> Vec<u8>;
     /// Sign the challenge `data`, returning the OpenSSH signature blob. May block (hardware touch).
     fn sign(&self, data: &[u8]) -> anyhow::Result<Vec<u8>>;
-    /// A short human description for logs / errors.
-    fn describe(&self) -> String {
-        "security key".to_string()
-    }
 }
 
 /// The client-side context threaded through the connector: which key to sign with and the two
@@ -465,10 +481,6 @@ impl SkSigner for SimAuthenticator {
             .map_err(|e| anyhow::anyhow!("simulated authenticator sign failed: {e}"))?;
         Ok(encode_sk_ed25519_sig(&sig.to_bytes(), flags, counter))
     }
-
-    fn describe(&self) -> String {
-        "simulated ed25519-sk authenticator (software)".to_string()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +511,9 @@ mod agent {
     /// Sanity cap on the identity count in an IDENTITIES_ANSWER.
     const MAX_AGENT_IDENTITIES: u32 = 4096;
     /// Read deadline covering the human touch on a signing request (a wedged agent can't hang koh).
-    const AGENT_SIGN_TIMEOUT: Duration = Duration::from_secs(45);
+    /// Shares the single [`SK_TOUCH_GRACE`](super::SK_TOUCH_GRACE) budget with the server's admission
+    /// deadline so the two never disagree about how long a touch may take.
+    const AGENT_SIGN_TIMEOUT: Duration = super::SK_TOUCH_GRACE;
     /// Short deadline for the (non-interactive) identity listing.
     const AGENT_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -606,10 +620,6 @@ mod agent {
 
         fn sign(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
             sign(&self.sock, self.key.blob(), data)
-        }
-
-        fn describe(&self) -> String {
-            format!("ssh-agent security key ({})", self.key.fingerprint())
         }
     }
 
@@ -840,6 +850,35 @@ mod tests {
             BASE64.encode(&auth.public_key_blob())
         );
         assert!(parse_authorized_key_line(&text).is_ok());
+    }
+
+    /// A peer-controlled algorithm name with control chars / excess length is sanitized before it can
+    /// reach the server audit log (no newlines/escapes, capped), so a rejected client can't forge or
+    /// flood log lines.
+    #[test]
+    fn peer_alg_string_is_sanitized_for_logging() {
+        // Direct: control chars stripped, length capped at 32.
+        let dirty = b"ssh-\x1b[2Jevil\ndrop\r\0table";
+        let clean = sanitize_alg(dirty);
+        assert!(
+            !clean.chars().any(char::is_control),
+            "no control chars survive"
+        );
+        assert!(clean.chars().count() <= 32, "length is capped");
+
+        // End-to-end: a signature blob whose algorithm field is garbage-with-escapes yields an
+        // UnsupportedKeyType error whose Display (what the audit log records) is control-char-free.
+        let mut blob = Vec::new();
+        push_ssh_string(&mut blob, b"ssh-\x1b]0;pwned\x07\nfake");
+        push_ssh_string(&mut blob, &[0u8; 64]);
+        blob.push(1);
+        blob.extend_from_slice(&0u32.to_be_bytes());
+        let err = parse_sk_ed25519_sig(&blob).expect_err("bogus alg rejected");
+        let msg = err.to_string();
+        assert!(
+            !msg.chars().any(char::is_control),
+            "the logged error message must be free of control chars, got {msg:?}"
+        );
     }
 
     /// ecdsa-sk (and any non-ed25519-sk type) is rejected with a clear, actionable message.

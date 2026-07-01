@@ -223,10 +223,10 @@ pub async fn await_admission_with_sk(
                 .map_err(io::Error::other)?;
 
             let transcript = sk_auth::build_transcript(&ctx.server_id, &ctx.client_id, &nonce);
-            // Signing may block on a hardware touch, so run it off the async worker.
+            // Signing may block on a hardware touch, so run it off the async worker. `transcript` is
+            // not needed again, so move it straight into the closure (no clone).
             let signer = std::sync::Arc::clone(&ctx.signer);
-            let data = transcript.clone();
-            let signature_blob = tokio::task::spawn_blocking(move || signer.sign(&data))
+            let signature_blob = tokio::task::spawn_blocking(move || signer.sign(&transcript))
                 .await
                 .map_err(|e| {
                     AdmissionError::SkAuth(format!("security-key signing task failed: {e}"))

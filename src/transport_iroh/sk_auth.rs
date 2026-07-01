@@ -5,8 +5,7 @@
 //! `--allow <endpoint-id>` authorizes it; when the operator additionally passes `--require-sk`, the
 //! server will not send the admission ack (and therefore never attaches a session, spawns a PTY, or
 //! processes a single byte of terminal I/O) until the client also proves possession of an allowlisted
-//! **hardware security key** — an OpenSSH `ed25519-sk` FIDO2 credential. (`ecdsa-sk` is not yet
-//! verified; it is rejected with a clear message — see the Scope/limitations section below.)
+//! **hardware security key** — an OpenSSH `ed25519-sk` or `ecdsa-sk` FIDO2 credential.
 //!
 //! ## What is verified
 //!
@@ -30,16 +29,17 @@
 //! ## The signature format
 //!
 //! koh verifies the exact wire format OpenSSH produces for FIDO2 keys (see `PROTOCOL.u2f` in OpenSSH),
-//! so a signature from `ssh-agent`, `ssh-keygen`, or a bare token interoperates unchanged. For
-//! `sk-ssh-ed25519@openssh.com` the Ed25519 signature is computed over
-//! `SHA256(application) || flags || counter || SHA256(challenge)`, and koh requires the **user-presence
-//! (touch) flag** to be set — a signature with no touch is rejected. The Ed25519 verification itself is
-//! `ed25519-dalek`'s `verify_strict` (no home-grown crypto).
+//! so a signature from `ssh-agent`, `ssh-keygen`, or a bare token interoperates unchanged. Both
+//! authenticator signatures are computed over `SHA256(application) || flags || counter ||
+//! SHA256(challenge)`, and koh requires the **user-presence (touch) flag** to be set — a signature
+//! with no touch is rejected. The signature checks are `ed25519-dalek`'s `verify_strict` (for
+//! `sk-ssh-ed25519@openssh.com`) and `p256::ecdsa`'s `Verifier` (for
+//! `sk-ecdsa-sha2-nistp256@openssh.com`) — no home-grown crypto.
 //!
 //! ## Scope / limitations
 //!
-//! - Only `sk-ssh-ed25519@openssh.com` is implemented in this pass; `sk-ecdsa-sha2-nistp256@openssh.com`
-//!   is parsed only far enough to reject it with a clear message (the dispatch point is [`SkError`]).
+//! - `sk-ssh-ed25519@openssh.com` and `sk-ecdsa-sha2-nistp256@openssh.com` are supported; other sk
+//!   types (e.g. P-384/P-521) are rejected with a clear message (the dispatch point is [`SkError`]).
 //! - koh cannot cryptographically *attest* that a key is genuinely hardware-backed (no FIDO attestation
 //!   is exchanged): it proves possession of the private key and a user-presence assertion. Enrol only
 //!   public keys you generated on real hardware. See the README threat model.
@@ -68,8 +68,14 @@ pub const NONCE_LEN: usize = 32;
 /// slot for this long.
 pub const SK_TOUCH_GRACE: Duration = Duration::from_secs(30);
 
-/// The only OpenSSH key type this pass verifies.
+/// The OpenSSH key type for Ed25519 security keys.
 const SK_ED25519_TYPE: &[u8] = b"sk-ssh-ed25519@openssh.com";
+/// The OpenSSH key type for ECDSA-P256 (NIST P-256) security keys.
+const SK_ECDSA_P256_TYPE: &[u8] = b"sk-ecdsa-sha2-nistp256@openssh.com";
+/// The curve name embedded in an `sk-ecdsa-sha2-nistp256` public key.
+const ECDSA_P256_CURVE: &[u8] = b"nistp256";
+/// A SEC1 *uncompressed* P-256 point: `0x04 || X(32) || Y(32)`.
+const P256_POINT_LEN: usize = 65;
 /// FIDO2 authenticator-data "user present" (touch) flag. koh requires this bit to be set.
 const FIDO_FLAG_USER_PRESENT: u8 = 0x01;
 /// Upper bound on any single SSH-encoded field koh will parse from a peer (keys/sigs are ~100 bytes).
@@ -90,7 +96,8 @@ pub enum SkError {
     #[error("no security key found in the provided key/file")]
     NoKeyFound,
     #[error(
-        "unsupported security-key type '{0}' (only sk-ssh-ed25519@openssh.com is supported so far)"
+        "unsupported security-key type '{0}' (supported: sk-ssh-ed25519@openssh.com, \
+         sk-ecdsa-sha2-nistp256@openssh.com)"
     )]
     UnsupportedKeyType(String),
     #[error("security-key public key has the wrong length")]
@@ -177,11 +184,37 @@ impl<'a> SshReader<'a> {
     }
 }
 
+/// The public-key material of a security key, tagged by algorithm.
+#[derive(Clone, Debug)]
+enum SkKeyMaterial {
+    /// A raw 32-byte Ed25519 public point.
+    Ed25519([u8; 32]),
+    /// A SEC1 *uncompressed* P-256 public point (`0x04 || X || Y`, 65 bytes).
+    EcdsaP256(Vec<u8>),
+}
+
+/// A parsed security-key signature, tagged by algorithm (the FIDO flags/counter are returned aside).
+#[derive(Debug)]
+enum ParsedSig {
+    Ed25519([u8; 64]),
+    EcdsaP256 { r: [u8; 32], s: [u8; 32] },
+}
+
 /// Encode an `sk-ssh-ed25519@openssh.com` public-key blob (the base64 body of an authorized_keys line).
 fn encode_sk_ed25519_pubkey(pk: &[u8; 32], application: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
     push_ssh_string(&mut b, SK_ED25519_TYPE);
     push_ssh_string(&mut b, pk);
+    push_ssh_string(&mut b, application);
+    b
+}
+
+/// Encode an `sk-ecdsa-sha2-nistp256@openssh.com` public-key blob.
+fn encode_sk_ecdsa_pubkey(point: &[u8], application: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    push_ssh_string(&mut b, SK_ECDSA_P256_TYPE);
+    push_ssh_string(&mut b, ECDSA_P256_CURVE);
+    push_ssh_string(&mut b, point);
     push_ssh_string(&mut b, application);
     b
 }
@@ -196,36 +229,91 @@ fn encode_sk_ed25519_sig(sig: &[u8; 64], flags: u8, counter: u32) -> Vec<u8> {
     b
 }
 
-/// Parse an `sk-ssh-ed25519@openssh.com` public-key blob into `(ed25519 point, application)`.
-fn parse_sk_ed25519_pubkey(blob: &[u8]) -> Result<([u8; 32], Vec<u8>), SkError> {
-    let mut r = SshReader::new(blob);
-    let alg = r.string()?;
-    if alg != SK_ED25519_TYPE {
-        return Err(SkError::UnsupportedKeyType(sanitize_alg(alg)));
-    }
-    let pk: [u8; 32] = r.string()?.try_into().map_err(|_| SkError::BadKeyLength)?;
-    let application = r.string()?.to_vec();
-    Ok((pk, application))
+/// Encode an `sk-ecdsa-sha2-nistp256@openssh.com` signature blob (`r`/`s` as SSH mpints, then the
+/// FIDO flags + counter).
+fn encode_sk_ecdsa_sig(r: &[u8], s: &[u8], flags: u8, counter: u32) -> Vec<u8> {
+    let mut inner = Vec::new();
+    push_ssh_string(&mut inner, &encode_mpint(r));
+    push_ssh_string(&mut inner, &encode_mpint(s));
+    let mut b = Vec::new();
+    push_ssh_string(&mut b, SK_ECDSA_P256_TYPE);
+    push_ssh_string(&mut b, &inner);
+    b.push(flags);
+    b.extend_from_slice(&counter.to_be_bytes());
+    b
 }
 
-/// Parse an `sk-ssh-ed25519@openssh.com` signature blob into `(ed25519 sig, flags, counter)`.
-fn parse_sk_ed25519_sig(blob: &[u8]) -> Result<([u8; 64], u8, u32), SkError> {
-    let mut r = SshReader::new(blob);
-    let alg = r.string()?;
-    if alg != SK_ED25519_TYPE {
-        return Err(SkError::UnsupportedKeyType(sanitize_alg(alg)));
+/// The minimal SSH `mpint` body for a non-negative big-endian integer: leading zero bytes stripped,
+/// with a `0x00` sign byte prepended when the high bit would otherwise be set. Zero is the empty body.
+fn encode_mpint(bytes: &[u8]) -> Vec<u8> {
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let trimmed = bytes.get(start..).unwrap_or(&[]);
+    let mut out = Vec::new();
+    if let Some(&first) = trimmed.first() {
+        if first & 0x80 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(trimmed);
     }
-    let sig: [u8; 64] = r.string()?.try_into().map_err(|_| SkError::BadSignature)?;
-    let flags = r.read_u8()?;
-    let counter = r.read_u32()?;
-    Ok((sig, flags, counter))
+    out
 }
 
-/// An allowlisted (or presented) FIDO2 security-key public key.
+/// Parse an SSH `mpint` body into a fixed 32-byte big-endian scalar (a P-256 `r`/`s`), rejecting
+/// anything that doesn't fit in 32 bytes.
+fn mpint_to_fixed(bytes: &[u8]) -> Result<[u8; 32], SkError> {
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let trimmed = bytes.get(start..).unwrap_or(&[]);
+    if trimmed.len() > 32 {
+        return Err(SkError::BadSignature);
+    }
+    let mut out = [0u8; 32];
+    let off = 32 - trimmed.len();
+    out.get_mut(off..)
+        .ok_or(SkError::BadSignature)?
+        .copy_from_slice(trimmed);
+    Ok(out)
+}
+
+/// Parse an OpenSSH sk signature blob (either algorithm) into `(signature, flags, counter)`.
+fn parse_sk_signature(blob: &[u8]) -> Result<(ParsedSig, u8, u32), SkError> {
+    let mut r = SshReader::new(blob);
+    let alg = r.string()?;
+    if alg == SK_ED25519_TYPE {
+        let sig: [u8; 64] = r.string()?.try_into().map_err(|_| SkError::BadSignature)?;
+        Ok((ParsedSig::Ed25519(sig), r.read_u8()?, r.read_u32()?))
+    } else if alg == SK_ECDSA_P256_TYPE {
+        // The ECDSA signature is itself an SSH blob: `string r_mpint, string s_mpint`.
+        let mut inner = SshReader::new(r.string()?);
+        let rr = mpint_to_fixed(inner.string()?)?;
+        let ss = mpint_to_fixed(inner.string()?)?;
+        Ok((
+            ParsedSig::EcdsaP256 { r: rr, s: ss },
+            r.read_u8()?,
+            r.read_u32()?,
+        ))
+    } else {
+        Err(SkError::UnsupportedKeyType(sanitize_alg(alg)))
+    }
+}
+
+/// Verify an ECDSA-P256 signature (SHA-256) over `signed`, given the SEC1 point and `r`/`s` scalars.
+fn verify_ecdsa_p256(
+    point: &[u8],
+    r: &[u8; 32],
+    s: &[u8; 32],
+    signed: &[u8],
+) -> Result<(), SkError> {
+    use p256::ecdsa::signature::Verifier as _;
+    let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(point).map_err(|_| SkError::BadKey)?;
+    let sig = p256::ecdsa::Signature::from_scalars(*r, *s).map_err(|_| SkError::BadSignature)?;
+    vk.verify(signed, &sig).map_err(|_| SkError::BadSignature)
+}
+
+/// An allowlisted (or presented) FIDO2 security-key public key (Ed25519 or ECDSA-P256).
 #[derive(Clone, Debug)]
 pub struct SkPublicKey {
-    /// The raw Ed25519 public point.
-    pk: [u8; 32],
+    /// The algorithm-tagged public-key material.
+    material: SkKeyMaterial,
     /// The FIDO2 application/relying-party string (`"ssh:"` for OpenSSH keys); part of the signed data.
     application: Vec<u8>,
     /// The canonical OpenSSH public-key blob — the identity used for allowlist membership + fingerprint.
@@ -233,21 +321,51 @@ pub struct SkPublicKey {
 }
 
 impl SkPublicKey {
-    /// Build from an already-encoded OpenSSH public-key blob (e.g. an `ssh-agent` identity).
+    /// Build from an already-encoded OpenSSH public-key blob (e.g. an `ssh-agent` identity). Dispatches
+    /// on the leading key-type string; both `sk-ssh-ed25519` and `sk-ecdsa-sha2-nistp256` are accepted.
     pub fn from_blob(blob: &[u8]) -> Result<Self, SkError> {
-        let (pk, application) = parse_sk_ed25519_pubkey(blob)?;
+        let mut r = SshReader::new(blob);
+        let alg = r.string()?;
+        let material = if alg == SK_ED25519_TYPE {
+            let pk: [u8; 32] = r.string()?.try_into().map_err(|_| SkError::BadKeyLength)?;
+            SkKeyMaterial::Ed25519(pk)
+        } else if alg == SK_ECDSA_P256_TYPE {
+            let curve = r.string()?;
+            if curve != ECDSA_P256_CURVE {
+                return Err(SkError::UnsupportedKeyType(sanitize_alg(curve)));
+            }
+            let point = r.string()?;
+            // OpenSSH ecdsa-sk keys carry an uncompressed SEC1 point; require exactly that shape.
+            if point.len() != P256_POINT_LEN || point.first() != Some(&0x04) {
+                return Err(SkError::BadKeyLength);
+            }
+            SkKeyMaterial::EcdsaP256(point.to_vec())
+        } else {
+            return Err(SkError::UnsupportedKeyType(sanitize_alg(alg)));
+        };
+        let application = r.string()?.to_vec();
         Ok(Self {
-            pk,
+            material,
             application,
             blob: blob.to_vec(),
         })
     }
 
-    /// Build from raw parts (re-deriving the canonical blob); used by the test authenticator.
-    fn from_parts(pk: [u8; 32], application: Vec<u8>) -> Self {
+    /// Build an Ed25519 key from raw parts (re-deriving the canonical blob); used by the test signer.
+    fn from_ed25519_parts(pk: [u8; 32], application: Vec<u8>) -> Self {
         let blob = encode_sk_ed25519_pubkey(&pk, &application);
         Self {
-            pk,
+            material: SkKeyMaterial::Ed25519(pk),
+            application,
+            blob,
+        }
+    }
+
+    /// Build an ECDSA-P256 key from a SEC1 point (re-deriving the canonical blob); used by the test signer.
+    fn from_ecdsa_parts(point: Vec<u8>, application: Vec<u8>) -> Self {
+        let blob = encode_sk_ecdsa_pubkey(&point, &application);
+        Self {
+            material: SkKeyMaterial::EcdsaP256(point),
             application,
             blob,
         }
@@ -273,7 +391,7 @@ pub fn parse_authorized_key_line(text: &str) -> Result<SkPublicKey, SkError> {
         .ok_or(SkError::NoKeyFound)?;
     let mut it = content.split_whitespace();
     let alg = it.next().ok_or(SkError::NoKeyFound)?;
-    if alg != "sk-ssh-ed25519@openssh.com" {
+    if alg.as_bytes() != SK_ED25519_TYPE && alg.as_bytes() != SK_ECDSA_P256_TYPE {
         return Err(SkError::UnsupportedKeyType(sanitize_alg(alg.as_bytes())));
     }
     let b64 = it.next().ok_or(SkError::NoKeyFound)?;
@@ -395,8 +513,9 @@ impl ServerSk {
     /// Verify a client's response against `transcript`:
     /// 1. the presented public key must exactly match an allowlisted key,
     /// 2. the proof must carry the user-presence (touch) flag,
-    /// 3. the Ed25519 signature must verify over the FIDO2 signed-data derived from the *trusted*
-    ///    allowlisted key's application (never a peer-supplied field).
+    /// 3. the signature must verify (Ed25519 or ECDSA-P256, matching the key's algorithm) over the
+    ///    FIDO2 signed-data derived from the *trusted* allowlisted key's application (never a
+    ///    peer-supplied field).
     pub fn verify(&self, transcript: &[u8], resp: &SkResponse) -> Result<VerifiedSk, SkError> {
         // Identity: the presented blob must be byte-identical to an allowlisted key. The public key
         // is not secret, so a plain comparison is fine (no timing concern).
@@ -406,17 +525,26 @@ impl ServerSk {
             .find(|k| k.blob == resp.pubkey_blob)
             .ok_or(SkError::KeyNotAllowed)?;
 
-        let (sig, flags, counter) = parse_sk_ed25519_sig(&resp.signature_blob)?;
+        let (parsed, flags, counter) = parse_sk_signature(&resp.signature_blob)?;
         if flags & FIDO_FLAG_USER_PRESENT == 0 {
             return Err(SkError::NoUserPresence);
         }
 
         // Reconstruct exactly what the authenticator signed, using the TRUSTED key's application.
         let signed = fido_signed_data(&matched.application, flags, counter, transcript);
-        let vk = VerifyingKey::from_bytes(&matched.pk).map_err(|_| SkError::BadKey)?;
-        let signature = Signature::from_bytes(&sig);
-        vk.verify_strict(&signed, &signature)
-            .map_err(|_| SkError::BadSignature)?;
+        match (&matched.material, &parsed) {
+            (SkKeyMaterial::Ed25519(pk), ParsedSig::Ed25519(sig)) => {
+                let vk = VerifyingKey::from_bytes(pk).map_err(|_| SkError::BadKey)?;
+                let signature = Signature::from_bytes(sig);
+                vk.verify_strict(&signed, &signature)
+                    .map_err(|_| SkError::BadSignature)?;
+            }
+            (SkKeyMaterial::EcdsaP256(point), ParsedSig::EcdsaP256 { r, s }) => {
+                verify_ecdsa_p256(point, r, s, &signed)?;
+            }
+            // The signature's algorithm must match the enrolled key's.
+            _ => return Err(SkError::BadSignature),
+        }
         Ok(VerifiedSk {
             fingerprint: matched.fingerprint(),
         })
@@ -444,28 +572,53 @@ pub struct ClientSkCtx {
     pub signer: std::sync::Arc<dyn SkSigner>,
 }
 
-/// A **software** stand-in for a FIDO2 `ed25519-sk` authenticator, for tests and demos.
+/// The in-memory private key of a [`SimAuthenticator`], tagged by algorithm.
+enum SimSigner {
+    Ed25519(SigningKey),
+    EcdsaP256(p256::ecdsa::SigningKey),
+}
+
+/// A **software** stand-in for a FIDO2 security-key authenticator (`ed25519-sk` or `ecdsa-sk`), for
+/// tests and demos.
 ///
 /// It produces byte-for-byte the same signature format a real token/`ssh-agent` emits, so the server
 /// verifier cannot (and is not meant to) distinguish it — which is exactly why koh's threat model
 /// states it proves key possession + a user-presence assertion, not genuine hardware backing. Do not
 /// treat a `SimAuthenticator` key as a hardware second factor.
 pub struct SimAuthenticator {
-    signing: SigningKey,
+    signer: SimSigner,
     key: SkPublicKey,
     counter: AtomicU32,
     user_present: bool,
 }
 
 impl SimAuthenticator {
-    /// Create a deterministic authenticator from a 32-byte seed and a FIDO2 application string
-    /// (`b"ssh:"` mirrors OpenSSH's default).
+    /// Create a deterministic **ed25519-sk** authenticator from a 32-byte seed and a FIDO2 application
+    /// string (`b"ssh:"` mirrors OpenSSH's default).
     pub fn new(seed: [u8; 32], application: &[u8]) -> Self {
         let signing = SigningKey::from_bytes(&seed);
         let pk = signing.verifying_key().to_bytes();
         Self {
-            signing,
-            key: SkPublicKey::from_parts(pk, application.to_vec()),
+            signer: SimSigner::Ed25519(signing),
+            key: SkPublicKey::from_ed25519_parts(pk, application.to_vec()),
+            counter: AtomicU32::new(1),
+            user_present: true,
+        }
+    }
+
+    /// Create an **ecdsa-sk** (NIST P-256) authenticator with a fresh random key. (Deterministic
+    /// seeding isn't offered: an arbitrary 32 bytes isn't necessarily a valid P-256 scalar, and tests
+    /// only need a working key, which they enrol via [`public_key`](Self::public_key).)
+    pub fn new_ecdsa(application: &[u8]) -> Self {
+        let signing = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let point = signing
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        Self {
+            signer: SimSigner::EcdsaP256(signing),
+            key: SkPublicKey::from_ecdsa_parts(point, application.to_vec()),
             counter: AtomicU32::new(1),
             user_present: true,
         }
@@ -497,11 +650,23 @@ impl SkSigner for SimAuthenticator {
         };
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         let signed = fido_signed_data(&self.key.application, flags, counter, data);
-        let sig = self
-            .signing
-            .try_sign(&signed)
-            .map_err(|e| anyhow::anyhow!("simulated authenticator sign failed: {e}"))?;
-        Ok(encode_sk_ed25519_sig(&sig.to_bytes(), flags, counter))
+        match &self.signer {
+            SimSigner::Ed25519(sk) => {
+                let sig = sk
+                    .try_sign(&signed)
+                    .map_err(|e| anyhow::anyhow!("simulated ed25519-sk sign failed: {e}"))?;
+                Ok(encode_sk_ed25519_sig(&sig.to_bytes(), flags, counter))
+            }
+            SimSigner::EcdsaP256(sk) => {
+                use p256::ecdsa::signature::Signer as _;
+                let sig: p256::ecdsa::Signature = sk
+                    .try_sign(&signed)
+                    .map_err(|e| anyhow::anyhow!("simulated ecdsa-sk sign failed: {e}"))?;
+                let bytes = sig.to_bytes();
+                let (r, s) = bytes.split_at(32);
+                Ok(encode_sk_ecdsa_sig(r, s, flags, counter))
+            }
+        }
     }
 }
 
@@ -704,6 +869,135 @@ mod tests {
 
     fn sim() -> SimAuthenticator {
         SimAuthenticator::new([42u8; 32], b"ssh:")
+    }
+
+    fn sim_ecdsa() -> SimAuthenticator {
+        SimAuthenticator::new_ecdsa(b"ssh:")
+    }
+
+    /// The full ecdsa-sk (NIST P-256) path mirrors the ed25519 coverage: a valid, user-present proof
+    /// verifies; tamper, replay, an un-allowlisted key, and a missing touch are all rejected.
+    #[test]
+    fn ecdsa_sk_valid_verifies_and_bad_proofs_rejected() {
+        let (server_id, client_id, nonce) = ids();
+        let auth = sim_ecdsa();
+        let server = ServerSk {
+            allowed: vec![auth.public_key()],
+        };
+        let transcript = build_transcript(&server_id, &client_id, &nonce);
+
+        // The enrolled key is genuinely an ecdsa-sk key on the wire.
+        assert!(auth
+            .public_key_blob()
+            .windows(SK_ECDSA_P256_TYPE.len())
+            .any(|w| w == SK_ECDSA_P256_TYPE));
+
+        // Valid, user-present proof verifies and reports the enrolled fingerprint.
+        let good = SkResponse {
+            pubkey_blob: auth.public_key_blob(),
+            signature_blob: auth.sign(&transcript).unwrap(),
+        };
+        assert_eq!(
+            server.verify(&transcript, &good).unwrap().fingerprint,
+            auth.public_key().fingerprint()
+        );
+
+        // A flipped signature byte is caught.
+        let mut sig = auth.sign(&transcript).unwrap();
+        let mid = sig.len() / 2;
+        sig[mid] ^= 0xff;
+        assert!(server
+            .verify(
+                &transcript,
+                &SkResponse {
+                    pubkey_blob: auth.public_key_blob(),
+                    signature_blob: sig,
+                },
+            )
+            .is_err());
+
+        // Replay: a proof over nonce A does not verify against a fresh nonce B.
+        let captured = auth
+            .sign(&build_transcript(&server_id, &client_id, &[0xAA; 32]))
+            .unwrap();
+        let fresh = build_transcript(&server_id, &client_id, &[0xBB; 32]);
+        assert!(matches!(
+            server.verify(
+                &fresh,
+                &SkResponse {
+                    pubkey_blob: auth.public_key_blob(),
+                    signature_blob: captured,
+                },
+            ),
+            Err(SkError::BadSignature)
+        ));
+
+        // A proof with no user-presence flag is rejected.
+        let notouch = SimAuthenticator::new_ecdsa(b"ssh:").without_user_presence();
+        let s2 = ServerSk {
+            allowed: vec![notouch.public_key()],
+        };
+        assert!(matches!(
+            s2.verify(
+                &transcript,
+                &SkResponse {
+                    pubkey_blob: notouch.public_key_blob(),
+                    signature_blob: notouch.sign(&transcript).unwrap(),
+                },
+            ),
+            Err(SkError::NoUserPresence)
+        ));
+
+        // An ecdsa key that isn't on the allowlist is rejected.
+        let attacker = sim_ecdsa();
+        assert!(matches!(
+            server.verify(
+                &transcript,
+                &SkResponse {
+                    pubkey_blob: attacker.public_key_blob(),
+                    signature_blob: attacker.sign(&transcript).unwrap(),
+                },
+            ),
+            Err(SkError::KeyNotAllowed)
+        ));
+    }
+
+    /// An ecdsa-sk public key round-trips through the authorized_keys text form.
+    #[test]
+    fn ecdsa_authorized_key_line_roundtrips() {
+        let auth = sim_ecdsa();
+        let blob = auth.public_key_blob();
+        let line = format!(
+            "sk-ecdsa-sha2-nistp256@openssh.com {} test@host",
+            BASE64.encode(&blob)
+        );
+        let parsed = parse_authorized_key_line(&line).expect("ecdsa-sk line parses");
+        assert_eq!(parsed.blob(), blob.as_slice());
+        assert_eq!(parsed.fingerprint(), auth.public_key().fingerprint());
+    }
+
+    /// A signature of one algorithm cannot satisfy an enrolled key of the other (the dispatch's
+    /// algorithm-mismatch arm), even though the presented public key matches the allowlist.
+    #[test]
+    fn algorithm_mismatch_rejected() {
+        let (server_id, client_id, nonce) = ids();
+        let transcript = build_transcript(&server_id, &client_id, &nonce);
+        let ed = sim(); // an enrolled ed25519 key
+        let server = ServerSk {
+            allowed: vec![ed.public_key()],
+        };
+        // Present ed's (allowlisted) pubkey but an ECDSA-typed signature blob → algorithm mismatch.
+        let bogus = encode_sk_ecdsa_sig(&[1u8; 32], &[2u8; 32], FIDO_FLAG_USER_PRESENT, 1);
+        assert!(matches!(
+            server.verify(
+                &transcript,
+                &SkResponse {
+                    pubkey_blob: ed.public_key_blob(),
+                    signature_blob: bogus,
+                },
+            ),
+            Err(SkError::BadSignature)
+        ));
     }
 
     /// A valid, user-present signature over the bound transcript verifies, and the fingerprint the
@@ -913,7 +1207,7 @@ mod tests {
         push_ssh_string(&mut blob, &[0u8; 64]);
         blob.push(1);
         blob.extend_from_slice(&0u32.to_be_bytes());
-        let err = parse_sk_ed25519_sig(&blob).expect_err("bogus alg rejected");
+        let err = parse_sk_signature(&blob).expect_err("bogus alg rejected");
         let msg = err.to_string();
         assert!(
             !msg.chars().any(char::is_control),
@@ -953,16 +1247,34 @@ mod tests {
         ));
     }
 
-    /// ecdsa-sk (and any non-ed25519-sk type) is rejected with a clear, actionable message.
+    /// An unsupported key type (e.g. P-384 ecdsa-sk, or a non-sk key) is rejected with a clear,
+    /// type-naming message; the two supported sk types are accepted through to blob parsing.
     #[test]
-    fn ecdsa_sk_rejected_clearly() {
-        let line = "sk-ecdsa-sha2-nistp256@openssh.com AAAAstuff comment";
-        match parse_authorized_key_line(line) {
+    fn unsupported_key_type_rejected_clearly() {
+        // P-384 sk keys are not supported.
+        match parse_authorized_key_line("sk-ecdsa-sha2-nistp384@openssh.com AAAAstuff comment") {
             Err(SkError::UnsupportedKeyType(t)) => {
-                assert!(t.contains("ecdsa"), "message names the offending type");
+                assert!(
+                    t.contains("nistp384"),
+                    "message names the offending type, got {t}"
+                );
             }
             other => panic!("expected UnsupportedKeyType, got {other:?}"),
         }
+        // A plain (non-sk) key is rejected too.
+        assert!(matches!(
+            parse_authorized_key_line("ssh-ed25519 AAAAstuff c"),
+            Err(SkError::UnsupportedKeyType(_))
+        ));
+        // The two supported sk types get PAST the type check (they fail later, on the bogus base64).
+        assert!(matches!(
+            parse_authorized_key_line("sk-ssh-ed25519@openssh.com !!! c"),
+            Err(SkError::BadBase64)
+        ));
+        assert!(matches!(
+            parse_authorized_key_line("sk-ecdsa-sha2-nistp256@openssh.com !!! c"),
+            Err(SkError::BadBase64)
+        ));
     }
 
     /// The transcript is sensitive to every bound field.

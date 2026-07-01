@@ -76,6 +76,11 @@ aes-gcm = "0.10"
 # NOT home-grown crypto: the signature math is entirely ed25519-dalek. See `transport_iroh::sk_auth`.
 ed25519-dalek = "=3.0.0-rc.0"
 sha2 = "=0.11.0"
+# ECDSA-P256 verification for the `ecdsa-sk` (sk-ecdsa-sha2-nistp256@openssh.com) security-key type.
+# Unlike ed25519-dalek/sha2 above (already in the tree), this RustCrypto stack is a genuinely NEW
+# dependency; it is pulled in only for the optional ecdsa-sk key type — ed25519-sk needs none of it.
+# Vetted, pure-Rust; verification is `p256::ecdsa`'s `Verifier`, not home-grown.
+p256 = { version = "=0.13.2", features = ["ecdsa"] }
 # No-echo passphrase prompt for the encrypted identity key (the `ssh-keygen -p` / login analogue).
 rpassword = "7"
 # render the endpoint id as a terminal QR on `koh serve` (always printed); default-features = false drops the

@@ -63,9 +63,10 @@ pub struct ServeArgs {
     #[arg(long = "allow", value_name = "ENDPOINT_ID")]
     allow: Vec<String>,
 
-    /// Allowlist a FIDO2 security key (an OpenSSH `sk-ssh-ed25519@openssh.com` public key, given
-    /// inline or as a path to a `.pub` file; repeatable). Requires `--require-sk` to take effect —
-    /// the two together turn on a second, hardware-key auth factor layered on top of `--allow`.
+    /// Allowlist a FIDO2 security key (an OpenSSH `sk-ssh-ed25519@openssh.com` or
+    /// `sk-ecdsa-sha2-nistp256@openssh.com` public key, given inline or as a path to a `.pub` file;
+    /// repeatable). Requires `--require-sk` to take effect — the two together turn on a second,
+    /// hardware-key auth factor layered on top of `--allow`.
     #[arg(long = "allow-sk", value_name = "PUBKEY_OR_FILE")]
     allow_sk: Vec<String>,
 
@@ -160,7 +161,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         if args.allow_sk.is_empty() {
             anyhow::bail!(
                 "--require-sk needs at least one --allow-sk <public-key-or-file> (an OpenSSH \
-                 sk-ssh-ed25519@openssh.com key)"
+                 sk-ssh-ed25519@openssh.com or sk-ecdsa-sha2-nistp256@openssh.com key)"
             );
         }
         let sk = ServerSk::from_specs(&args.allow_sk)

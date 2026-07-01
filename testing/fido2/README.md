@@ -35,11 +35,14 @@ run against them, each asserting the admission decision from the server's struct
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | allowlisted id **+ the correct security key** | **admitted** |
+| 1 | allowlisted id **+ the correct ed25519-sk key** | **admitted** |
+| 1b | allowlisted id **+ the correct ecdsa-sk (P-256) key** | **admitted** |
 | 2 | allowlisted id + a security key **not** on `--allow-sk` | rejected |
 | 3 | allowlisted id but **no** security-key proof | rejected |
 | 4 | correct security key but an **un-allowlisted endpoint id** | rejected (before the SK gate) |
 | 5 | **default** endpoint-id-only auth (server without `--require-sk`) | admitted |
+
+Both OpenSSH sk key types koh supports — `ed25519-sk` and `ecdsa-sk` (NIST P-256) — are exercised.
 
 ## How it maps to koh
 

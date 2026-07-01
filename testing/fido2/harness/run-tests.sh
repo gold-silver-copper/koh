@@ -56,10 +56,11 @@ trap cleanup EXIT
 # koh_id <keyfile> — print the koh endpoint id for a (created-on-demand) identity key.
 koh_id() { "$KOH" id --key-file "$1" 2>/dev/null; }
 
-# make_sk_key <name> <comment> — create an OpenSSH ed25519-sk key via the software authenticator.
+# make_sk_key <name> <type> <comment> — create an OpenSSH sk key (ed25519-sk|ecdsa-sk) via the
+# software authenticator.
 make_sk_key() {
-    ssh-keygen -t ed25519-sk -w "$SK_PROVIDER" -f "keys/$1" -N '' -C "$2" >/dev/null 2>&1 \
-        || { fail "could not create sk key $1"; exit 2; }
+    ssh-keygen -t "$2" -w "$SK_PROVIDER" -f "keys/$1" -N '' -C "$3" >/dev/null 2>&1 \
+        || { fail "could not create $2 key $1"; exit 2; }
 }
 
 # wait_for_ready <logfile> — block until a koh server prints its ready banner (or time out).
@@ -139,16 +140,17 @@ info "koh:        $("$KOH" --version 2>/dev/null || echo koh)"
 info "ssh:        $(ssh -V 2>&1)"
 info "sk-dummy:   $SK_PROVIDER"
 
-# 1. Security keys (software FIDO2). `good` is the one the server will trust; `wrong` is a valid sk
-#    key that is simply not on the server's allowlist.
-make_sk_key good  koh-good
-make_sk_key wrong koh-wrong
-info "created sk keys: $(cut -d' ' -f1 keys/good.pub) (good), (wrong)"
+# 1. Security keys (software FIDO2). `good` (ed25519-sk) and `good_ecdsa` (ecdsa-sk / P-256) are the
+#    ones the server will trust; `wrong` is a valid sk key that is simply not on the allowlist.
+make_sk_key good       ed25519-sk koh-good
+make_sk_key good_ecdsa ecdsa-sk   koh-good-ecdsa
+make_sk_key wrong      ed25519-sk koh-wrong
+info "created sk keys: $(cut -d' ' -f1 keys/good.pub) + $(cut -d' ' -f1 keys/good_ecdsa.pub) + (wrong)"
 
-# 2. ssh-agent holding both sk keys. `-P` allows our out-of-tree provider (OpenSSH defaults to a
+# 2. ssh-agent holding the sk keys. `-P` allows our out-of-tree provider (OpenSSH defaults to a
 #    system path allowlist and would otherwise refuse it).
 eval "$(ssh-agent -P "$SK_PROVIDER" -s)" >/dev/null
-ssh-add -S "$SK_PROVIDER" keys/good keys/wrong >/dev/null 2>&1 \
+ssh-add -S "$SK_PROVIDER" keys/good keys/good_ecdsa keys/wrong >/dev/null 2>&1 \
     || { fail "ssh-agent refused the sk keys"; exit 2; }
 info "ssh-agent loaded: $(ssh-add -l | wc -l | tr -d ' ') security key(s)"
 
@@ -166,7 +168,7 @@ step "Launching koh server (--require-sk)"
 SRV_LOG="logs/server_sk.log"
 "$KOH" serve --local --key-file "$SERVER_SK" \
     --allow "$CLIENT_OK_ID" \
-    --require-sk --allow-sk keys/good.pub >"$SRV_LOG" 2>&1 &
+    --require-sk --allow-sk keys/good.pub --allow-sk keys/good_ecdsa.pub >"$SRV_LOG" 2>&1 &
 SERVER_SK_PID=$!
 wait_for_ready "$SRV_LOG" || { fail "server did not become ready"; sed 's/^/        /' "$SRV_LOG"; exit 2; }
 SERVER_SK_ID="$(koh_id "$SERVER_SK")"
@@ -189,9 +191,13 @@ echo
 # ===========================================================================
 # Scenarios
 # ===========================================================================
-# T1 — allowlisted id + the correct security key  → admitted
-run_case "correct id + correct security key is admitted" \
+# T1 — allowlisted id + the correct ed25519-sk key  → admitted
+run_case "correct id + correct ed25519-sk key is admitted" \
     admit "$SERVER_SK_ID" "$PORT_SK" "$CLIENT_OK" "keys/good.pub"
+
+# T1b — allowlisted id + the correct ecdsa-sk (P-256) key  → admitted
+run_case "correct id + correct ecdsa-sk key is admitted" \
+    admit "$SERVER_SK_ID" "$PORT_SK" "$CLIENT_OK" "keys/good_ecdsa.pub"
 
 # T2 — allowlisted id + a security key NOT on --allow-sk → rejected
 run_case "wrong (un-allowlisted) security key is rejected" \

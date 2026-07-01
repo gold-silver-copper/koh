@@ -40,11 +40,13 @@ service.
   (`event = "authz"` for the allowlist, `event = "authn"` for the security-key factor).
 - **Optional FIDO2 security-key second factor (`--require-sk`):** an operator can require every client
   to *also* prove possession of an allowlisted hardware security key (an OpenSSH
-  `sk-ssh-ed25519@openssh.com` credential) before admission. After the allowlist check but **before**
+  `sk-ssh-ed25519@openssh.com` or `sk-ecdsa-sha2-nistp256@openssh.com` credential) before admission.
+  After the allowlist check but **before**
   the admission ack — and therefore before any `session::attach`, PTY spawn, or terminal I/O — the
   server issues a fresh per-connection challenge; the client signs it with its security key (via
   `ssh-agent`, which drives the hardware touch) and returns the OpenSSH signature. koh verifies the
-  Ed25519 signature (`ed25519-dalek` `verify_strict`, no home-grown crypto) and **requires the
+  signature (`ed25519-dalek` `verify_strict` for ed25519-sk, `p256::ecdsa` for ecdsa-sk — no
+  home-grown crypto) and **requires the
   user-presence/touch flag**. The signed transcript (`transport_iroh::sk_auth::build_transcript`)
   length-prefixes and binds the label `koh-sk-v1`, the ALPN, the version, **both** endpoint ids, and
   the nonce, so a proof cannot be **replayed** onto another connection (fresh nonce → different
@@ -52,8 +54,8 @@ service.
   and versioned; a failed/absent proof closes the connection with a clear reason. Verification lives
   in `transport_iroh::sk_auth` with its own unit + real-iroh e2e tests. **Limitations:** koh does not
   exchange a FIDO **attestation**, so it proves key possession + a touch, not that the key is genuinely
-  hardware-backed — enrol only public keys you generated on real hardware. Only `ed25519-sk` is
-  verified so far (`ecdsa-sk` is rejected with a clear message). A signature *counter* regression
+  hardware-backed — enrol only public keys you generated on real hardware. `ed25519-sk` and `ecdsa-sk`
+  (P-256) are verified; other sk curves (P-384/P-521) are rejected. A signature *counter* regression
   (cloned-token detection) is not tracked across connections. This factor protects the **server** from
   an attacker holding only a leaked node-id key; it does not protect a client from a malicious server.
 - **Untrusted data plane:** the SSP core (`src/ssp/`, `src/wire.rs`) is a pure, panic-free-by-

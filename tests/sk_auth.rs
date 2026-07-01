@@ -1,8 +1,8 @@
 //! End-to-end tests of the optional FIDO2 / security-key second factor over real loopback iroh
 //! connections. These drive the exact functions `koh serve` / `koh connect` call, in the same order
 //! (endpoint-id allowlist → `admit_with_sk` → attach), using a software [`SimAuthenticator`] in place
-//! of a hardware token (it produces byte-identical OpenSSH `sk-ssh-ed25519` signatures, so the server
-//! verifier can't tell the difference — which is the point).
+//! of a hardware token (it produces byte-identical OpenSSH `sk-ssh-ed25519` / `sk-ecdsa-sha2-nistp256`
+//! signatures, so the server verifier can't tell the difference — which is the point).
 //!
 //! Covered:
 //! - default endpoint-id auth still works (a server with no `--require-sk`), even for an SK-capable client;
@@ -92,6 +92,54 @@ async fn valid_id_and_valid_sk_proof_is_admitted() {
     assert!(
         outcome.sk_fingerprint.is_some(),
         "the server records the verified key's fingerprint"
+    );
+}
+
+/// The same happy path with an **ecdsa-sk** (NIST P-256) key, over real loopback iroh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valid_id_and_valid_ecdsa_sk_proof_is_admitted() {
+    let server = bind_endpoint_local(generate_secret_key(), true)
+        .await
+        .unwrap();
+    let client = bind_endpoint_local(generate_secret_key(), false)
+        .await
+        .unwrap();
+    let addr = loopback_addr(&server);
+    let server_id = *server.id().as_bytes();
+    let client_id = *client.id().as_bytes();
+
+    let auth = SimAuthenticator::new_ecdsa(b"ssh:");
+    let allow = ServerSk::from_keys(vec![auth.public_key()]);
+    let signer: Arc<dyn SkSigner> = Arc::new(auth);
+
+    let accept = tokio::spawn(async move {
+        let incoming = server.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let peer = *conn.remote_id().as_bytes();
+        let res = admit_with_sk(&conn, &server_id, &peer, &allow).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        res
+    });
+
+    let conn = client.connect(addr, ALPN).await.unwrap();
+    let ctx = ClientSkCtx {
+        server_id,
+        client_id,
+        signer,
+    };
+    let client_res = await_admission_with_sk(&conn, &ctx).await;
+    assert!(
+        client_res.is_ok(),
+        "a valid id + valid ecdsa-sk proof must be admitted, got {client_res:?}"
+    );
+    assert!(
+        accept
+            .await
+            .unwrap()
+            .expect("server verified")
+            .sk_fingerprint
+            .is_some(),
+        "the server records the verified ecdsa key's fingerprint"
     );
 }
 

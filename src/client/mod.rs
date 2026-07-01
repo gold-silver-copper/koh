@@ -172,9 +172,12 @@ impl IrohConnector {
             // allowlist message below would misdirect the operator. Caption those with the real
             // (self-descriptive) SkAuth cause instead.
             if let crate::transport_iroh::admission::AdmissionError::SkAuth(_) = &e {
+                // The wrapped SkAuth error carries the precise cause (agent/key/touch, or a protocol
+                // version skew); the hint covers the common cases without over-committing to one.
                 return Err(anyhow::Error::new(e).context(
                     "security-key authentication failed (check your key is plugged in and loaded, \
-                     e.g. `ssh-add ~/.ssh/id_ed25519_sk`, and touch it when prompted)",
+                     e.g. `ssh-add ~/.ssh/id_ed25519_sk`, touch it when prompted, and keep your koh \
+                     client up to date)",
                 ));
             }
             // Otherwise the server rejected with a specific application reason — "not authorized" /
@@ -194,10 +197,13 @@ impl IrohConnector {
     }
 }
 
-/// The server's application close reason, if it rejected us with one. The reason is peer-controlled,
-/// so it is control-char-stripped and length-capped before it can reach the user's terminal.
-/// `close_reason()` is non-blocking (returns `None` if the peer didn't close with a reason), so this
-/// can't hang the error path.
+/// The server's application close reason, if it rejected us with one. The reason is peer-controlled
+/// (a *malicious* server sets it), so before it can reach the user's terminal it is restricted to
+/// ASCII graphic characters + space — dropping not just C0 controls but also Unicode line-separators
+/// and bidi overrides (`U+2028`/`U+202E`), which `char::is_control` misses and which could otherwise
+/// forge lines or Trojan-source-reorder the printed error — and length-capped. koh's own close reasons
+/// are ASCII, so nothing legitimate is lost. `close_reason()` is non-blocking (returns `None` if the
+/// peer didn't close with a reason), so this can't hang the error path.
 fn server_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
     use iroh::endpoint::{ApplicationClose, ConnectionError};
     let ConnectionError::ApplicationClosed(ApplicationClose { reason, .. }) =
@@ -207,7 +213,7 @@ fn server_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
     };
     let cleaned: String = String::from_utf8_lossy(&reason)
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .take(80)
         .collect();
     (!cleaned.is_empty()).then_some(cleaned)
@@ -886,9 +892,10 @@ enum ReconnectOutcome {
 /// "reconnecting…" banner over the last screen and staying responsive to the quit escape.
 ///
 /// Retries indefinitely (an outage may outlast many attempts, mosh-style); the user can always
-/// `Ctrl-^ .` to give up. A single dial is bounded by [`RECONNECT_CONNECT_TIMEOUT`] and is *not*
-/// cancelled by banner repaints or non-quit keystrokes — it is pinned and polled in place — so a
-/// slow dial still completes.
+/// `Ctrl-^ .` to give up. A single dial is bounded by [`IrohConnector::dial_timeout`] (the tight
+/// [`RECONNECT_CONNECT_TIMEOUT`], or the wider [`RECONNECT_CONNECT_TIMEOUT_SK`] when a security key is
+/// configured) and is *not* cancelled by banner repaints or non-quit keystrokes — it is pinned and
+/// polled in place — so a slow dial still completes.
 async fn reconnect<T: ClientTerminal>(
     connector: &IrohConnector,
     term: &mut T,

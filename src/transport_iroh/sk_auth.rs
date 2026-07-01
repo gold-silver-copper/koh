@@ -81,6 +81,8 @@ const MAX_SSH_STRING: usize = 4096;
 pub enum SkError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("security-key file not found: {0}")]
+    FileNotFound(String),
     #[error("security-key message was truncated")]
     Truncated,
     #[error("security-key field exceeds the maximum length")]
@@ -115,16 +117,19 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Render a peer-supplied algorithm name for an error/log message: lossy UTF-8 with control
-/// characters stripped and the length capped. A hostile client controls the algorithm field of the
-/// blobs it sends, and that field can flow into the server's `koh::auth` audit log; without this a
-/// peer could inject terminal escapes / newlines (log forging) or ~2 KB of junk (log-volume
-/// amplification). Mirrors the client-side `server_close_reason` sanitization of peer-controlled text.
+/// Render a peer-supplied algorithm name for an error/log message: lossy UTF-8 restricted to ASCII
+/// graphic characters + space, and length-capped. A hostile client controls the algorithm field of
+/// the blobs it sends, and that field can flow into the server's `koh::auth` audit log; without this a
+/// peer could inject terminal escapes / newlines (log forging), Unicode line-separators / bidi
+/// overrides (`U+2028`/`U+202E` — line splitting and Trojan-source reordering that `char::is_control`
+/// does *not* catch), or ~2 KB of junk (log-volume amplification). SSH key-type names are ASCII, so
+/// this loses nothing legitimate. The 64-char cap is wide enough for every real type name (the longest,
+/// `webauthn-sk-ecdsa-sha2-nistp256@openssh.com`, is 43) while still bounding attacker junk.
 fn sanitize_alg(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .chars()
-        .filter(|c| !c.is_control())
-        .take(32)
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(64)
         .collect()
 }
 
@@ -278,16 +283,33 @@ pub fn parse_authorized_key_line(text: &str) -> Result<SkPublicKey, SkError> {
     SkPublicKey::from_blob(&blob)
 }
 
-/// Resolve a `--allow-sk` / `--sk-key` value that is either a path to a `.pub` file or an inline key
-/// line, then parse it. A path that exists is read; anything else is treated as an inline key string.
+/// Resolve a `--allow-sk` / `--sk-key` value that is either a path to a `.pub` file or an inline key.
+///
+/// An existing file is read and parsed; otherwise the value is parsed as an inline key line. A spec
+/// that fails to parse inline *and* looks like a filesystem path is reported as a missing file (rather
+/// than surfacing the path as a bogus "unsupported key type").
 pub fn load_sk_key_spec(spec: &str) -> Result<SkPublicKey, SkError> {
     let path = Path::new(spec);
-    let text = if path.is_file() {
-        std::fs::read_to_string(path)?
-    } else {
-        spec.to_string()
-    };
-    parse_authorized_key_line(&text)
+    if path.is_file() {
+        let text = std::fs::read_to_string(path)?;
+        return parse_authorized_key_line(&text);
+    }
+    // Not a file — try it as an inline key line. (Base64 key bodies routinely contain `/`, so we
+    // must NOT pre-classify by path characters; only fall back after an inline parse actually fails.)
+    parse_authorized_key_line(spec).map_err(|e| {
+        // A spec that couldn't be parsed as a key AND looks like a filesystem path is almost certainly
+        // a typo'd/missing file, so report that rather than a confusing "unsupported key type <path>".
+        let looks_like_path = spec.contains('/')
+            || spec.starts_with('~')
+            || Path::new(spec)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("pub"));
+        if looks_like_path {
+            SkError::FileNotFound(spec.to_string())
+        } else {
+            e
+        }
+    })
 }
 
 /// Build the challenge transcript that the client signs and the server re-derives.
@@ -852,19 +874,37 @@ mod tests {
         assert!(parse_authorized_key_line(&text).is_ok());
     }
 
-    /// A peer-controlled algorithm name with control chars / excess length is sanitized before it can
-    /// reach the server audit log (no newlines/escapes, capped), so a rejected client can't forge or
-    /// flood log lines.
+    /// A peer-controlled algorithm name is sanitized before it can reach the server audit log — C0
+    /// controls AND Unicode line-separators / bidi overrides stripped, length actually capped — so a
+    /// rejected client can't forge, reorder, or flood log lines. A *legitimate* type name is preserved.
     #[test]
     fn peer_alg_string_is_sanitized_for_logging() {
-        // Direct: control chars stripped, length capped at 32.
+        // C0 controls (ESC, NUL, CR/LF) are stripped.
         let dirty = b"ssh-\x1b[2Jevil\ndrop\r\0table";
-        let clean = sanitize_alg(dirty);
         assert!(
-            !clean.chars().any(char::is_control),
+            !sanitize_alg(dirty).chars().any(char::is_control),
             "no control chars survive"
         );
-        assert!(clean.chars().count() <= 32, "length is capped");
+        // Unicode line-separators and bidi overrides — which `char::is_control` does NOT catch — are
+        // stripped too (this is the regression the earlier `is_control`-only filter allowed).
+        assert_eq!(
+            sanitize_alg("a\u{2028}b\u{2029}c\u{202e}d".as_bytes()),
+            "abcd",
+            "U+2028/U+2029/U+202E must not survive"
+        );
+        // The length cap actually bites: an over-long input is truncated (guards against a future
+        // edit that widens/drops the cap and re-opens log-volume amplification).
+        assert!(
+            sanitize_alg(&vec![b'x'; 500]).chars().count() <= 64,
+            "over-long input is capped"
+        );
+        // ...but the cap does NOT truncate a real (mis-sent) key-type name — the whole point of the
+        // ecdsa-sk rejection is a message that names the offending type in full.
+        assert_eq!(
+            sanitize_alg(b"sk-ecdsa-sha2-nistp256@openssh.com"),
+            "sk-ecdsa-sha2-nistp256@openssh.com",
+            "a legitimate 34-char type name must survive intact"
+        );
 
         // End-to-end: a signature blob whose algorithm field is garbage-with-escapes yields an
         // UnsupportedKeyType error whose Display (what the audit log records) is control-char-free.
@@ -879,6 +919,38 @@ mod tests {
             !msg.chars().any(char::is_control),
             "the logged error message must be free of control chars, got {msg:?}"
         );
+    }
+
+    /// `load_sk_key_spec` reads an existing file, parses a genuine inline key, but reports a
+    /// path-shaped-yet-missing spec as a not-found file rather than a bogus "unsupported key type".
+    #[test]
+    fn load_sk_key_spec_distinguishes_inline_from_missing_path() {
+        // A valid inline key line parses (base64 bodies can contain '/', so path chars alone must
+        // never short-circuit inline parsing).
+        let auth = sim();
+        let line = format!(
+            "sk-ssh-ed25519@openssh.com {}",
+            BASE64.encode(&auth.public_key_blob())
+        );
+        assert!(load_sk_key_spec(&line).is_ok(), "inline key line parses");
+
+        // Path-shaped specs that don't exist are NotFound, not a mis-parsed key type.
+        for missing in [
+            "/no/such/id_ed25519_sk.pub",
+            "~/definitely-not-here.pub",
+            "totally-missing.pub",
+        ] {
+            match load_sk_key_spec(missing) {
+                Err(SkError::FileNotFound(p)) => assert_eq!(p, missing),
+                other => panic!("expected FileNotFound for {missing}, got {other:?}"),
+            }
+        }
+
+        // A non-path garbage spec still surfaces the real parse error.
+        assert!(matches!(
+            load_sk_key_spec("ssh-rsa AAAAsomething"),
+            Err(SkError::UnsupportedKeyType(_))
+        ));
     }
 
     /// ecdsa-sk (and any non-ed25519-sk type) is rejected with a clear, actionable message.

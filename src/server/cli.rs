@@ -42,7 +42,14 @@ const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// pending-handshake permit is held for the whole window, so a slowloris under `--require-sk` can pin
 /// a pending slot for up to this long — bounded by `pending_cap`, which refuses excess dials cheaply.
 const ADMIT_TIMEOUT: Duration = Duration::from_secs(3);
-const SK_ADMIT_TIMEOUT: Duration = crate::transport_iroh::sk_auth::SK_TOUCH_GRACE;
+/// The server's whole-admission deadline must exceed the client-side ssh-agent touch budget
+/// ([`SK_TOUCH_GRACE`](crate::transport_iroh::sk_auth::SK_TOUCH_GRACE)) by a network/handshake margin:
+/// the server's clock starts when it opens the challenge stream, ~1 round-trip *before* the agent's
+/// touch budget begins, so a touch the agent still accepts must have time to travel back before the
+/// server gives up. Equal timeouts would reject a valid late touch on a high-RTT relay path; the
+/// client dial budget in turn exceeds this (see `RECONNECT_CONNECT_TIMEOUT_SK`).
+const SK_ADMIT_TIMEOUT: Duration =
+    crate::transport_iroh::sk_auth::SK_TOUCH_GRACE.saturating_add(Duration::from_secs(5));
 
 /// Arguments for `koh serve`.
 #[derive(ClapArgs, Debug)]
@@ -376,7 +383,17 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             })
             .await
             else {
-                warn!("admission (security-key) step timed out");
+                // Name the actual step (only "(security-key)" when one is required), and close with a
+                // reason so the client surfaces a timeout rather than the generic "check your
+                // allowlist" message.
+                if sk_policy.is_some() {
+                    warn!(
+                        "security-key admission step timed out (client never completed the touch)"
+                    );
+                } else {
+                    warn!("admission step timed out");
+                }
+                conn.close(2u32.into(), b"admission timed out");
                 return;
             };
             match admit_result {
@@ -494,7 +511,20 @@ fn spawn_signal_drain(shutdown: CancellationToken) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::connect_qr;
+    use super::{connect_qr, SK_ADMIT_TIMEOUT};
+
+    /// Regression guard for the timeout clock-start asymmetry: the server's whole-admission deadline
+    /// must be strictly greater than the client-side ssh-agent touch budget (`SK_TOUCH_GRACE`), so a
+    /// touch the agent accepts near the top of its budget can still travel back before the server
+    /// gives up. Equal deadlines rejected valid late touches on high-RTT links.
+    #[test]
+    fn server_admit_timeout_exceeds_the_agent_touch_grace() {
+        assert!(
+            SK_ADMIT_TIMEOUT > crate::transport_iroh::sk_auth::SK_TOUCH_GRACE,
+            "server admit deadline ({SK_ADMIT_TIMEOUT:?}) must exceed the agent touch grace to allow \
+             for the round trip"
+        );
+    }
 
     #[test]
     fn connect_qr_renders_an_id_and_handles_overlong_input() {

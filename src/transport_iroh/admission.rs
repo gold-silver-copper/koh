@@ -223,13 +223,26 @@ pub async fn await_admission_with_sk(
                 .map_err(io::Error::other)?;
 
             let transcript = sk_auth::build_transcript(&ctx.server_id, &ctx.client_id, &nonce);
-            // Signing may block on a hardware touch, so run it off the async worker. `transcript` is
-            // not needed again, so move it straight into the closure (no clone).
+            // Signing can block for up to `SK_TOUCH_GRACE` on a hardware touch, so it must run off the
+            // async worker. Deliberately a *detached* OS thread rather than `tokio::task::spawn_blocking`:
+            // a `spawn_blocking` task cannot be aborted, and the runtime's shutdown (the `#[tokio::main]`
+            // Drop) *joins* the blocking pool — so if this dial is cancelled while a touch is pending
+            // (the user hits the quit escape, or a SIGTERM arrives mid-reconnect) the process would
+            // freeze until the agent read self-times-out (~`SK_TOUCH_GRACE`) before it could exit. A
+            // detached thread is not tracked by the runtime: dropping this future drops the receiver,
+            // the thread finishes its own bounded agent read and exits on its own, and process teardown
+            // is immediate. `transcript` is moved in (no clone).
             let signer = std::sync::Arc::clone(&ctx.signer);
-            let signature_blob = tokio::task::spawn_blocking(move || signer.sign(&transcript))
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(signer.sign(&transcript));
+            });
+            let signature_blob = rx
                 .await
-                .map_err(|e| {
-                    AdmissionError::SkAuth(format!("security-key signing task failed: {e}"))
+                .map_err(|_| {
+                    AdmissionError::SkAuth(
+                        "security-key signing task ended unexpectedly".to_string(),
+                    )
                 })?
                 .map_err(|e| AdmissionError::SkAuth(format!("security-key signing failed: {e}")))?;
             let pubkey_blob = ctx.signer.public_key_blob();

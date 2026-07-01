@@ -27,9 +27,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use koh::transport_iroh::admission::{
-    admit, admit_with_sk, await_admission, await_admission_with_sk, AdmitError,
+    admit, admit_with_sk, await_admission, await_admission_with_sk, AdmissionError, AdmitError,
 };
-use koh::transport_iroh::sk_auth::{ClientSkCtx, ServerSk, SimAuthenticator, SkSigner};
+use koh::transport_iroh::sk_auth::{ClientSkCtx, ServerSk, SimAuthenticator, SkSigner, NONCE_LEN};
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 
 /// A signer wrapper that records how many times it is asked to sign — used to prove the security-key
@@ -338,6 +338,113 @@ async fn unallowlisted_endpoint_id_rejected_before_sk() {
         "SK auth must not run for a peer rejected by the endpoint-id allowlist"
     );
     accept.await.unwrap();
+}
+
+/// The client rejects a server CHALLENGE that advertises an unsupported SK protocol version instead
+/// of trying to sign a transcript the two sides can't agree on — and it must not touch the key first.
+/// Locks the client-side version-skew branch in `await_admission_with_sk` (a refactor that dropped or
+/// inverted the version check would otherwise pass the whole suite, since every other test uses the
+/// single current version).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_rejects_challenge_with_bad_version() {
+    let server = bind_endpoint_local(generate_secret_key(), true)
+        .await
+        .unwrap();
+    let client = bind_endpoint_local(generate_secret_key(), false)
+        .await
+        .unwrap();
+    let addr = loopback_addr(&server);
+    let server_id = *server.id().as_bytes();
+    let client_id = *client.id().as_bytes();
+
+    // The signer must NEVER be asked to sign: the version check precedes any signing.
+    let auth = SimAuthenticator::new([7u8; 32], b"ssh:");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let signer: Arc<dyn SkSigner> = Arc::new(CountingSigner {
+        inner: auth,
+        calls: calls.clone(),
+    });
+
+    // The server hand-rolls a CHALLENGE frame with an unsupported version byte.
+    let accept = tokio::spawn(async move {
+        let incoming = server.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        // [CHALLENGE=2][version=0xFF (unsupported)][nonce(NONCE_LEN)]. `CHALLENGE` is admission.rs's
+        // private tag; hardcoded here on purpose so this test pins the exact wire byte a real client
+        // must recognize.
+        let mut frame = vec![2u8, 0xFF];
+        frame.extend_from_slice(&[0u8; NONCE_LEN]);
+        send.write_all(&frame).await.unwrap();
+        let _ = send.finish();
+        // Hold the connection open so the failure is the client's version check, not a reset.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let conn = client.connect(addr, ALPN).await.unwrap();
+    let ctx = ClientSkCtx {
+        server_id,
+        client_id,
+        signer,
+    };
+    let res = await_admission_with_sk(&conn, &ctx).await;
+    assert!(
+        matches!(res, Err(AdmissionError::SkAuth(_))),
+        "client must reject an unsupported challenge version as an SkAuth error, got {res:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the client must not sign before agreeing on the protocol version"
+    );
+    accept.await.unwrap();
+}
+
+/// The server's `admit_with_sk` rejects a client response frame whose leading version byte is
+/// unsupported, before it parses any key or signature. Locks the server-side version-skew branch in
+/// `read_sk_response`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_rejects_response_with_bad_version() {
+    let server = bind_endpoint_local(generate_secret_key(), true)
+        .await
+        .unwrap();
+    let client = bind_endpoint_local(generate_secret_key(), false)
+        .await
+        .unwrap();
+    let addr = loopback_addr(&server);
+    let server_id = *server.id().as_bytes();
+
+    let enrolled = SimAuthenticator::new([8u8; 32], b"ssh:");
+    let allow = ServerSk::from_keys(vec![enrolled.public_key()]);
+
+    let accept = tokio::spawn(async move {
+        let incoming = server.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let peer = *conn.remote_id().as_bytes();
+        // Bound it so a mis-framed exchange can't hang the test forever.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            admit_with_sk(&conn, &server_id, &peer, &allow),
+        )
+        .await
+    });
+
+    let conn = client.connect(addr, ALPN).await.unwrap();
+    // Accept the server's control stream, read its CHALLENGE (tag + version + nonce), then reply with
+    // a response frame carrying an unsupported version byte. `read_sk_response` rejects on the version
+    // before it reads the pubkey/signature fields, so that byte alone drives the outcome.
+    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+    let mut challenge = [0u8; 2 + NONCE_LEN]; // [CHALLENGE][version][nonce]
+    recv.read_exact(&mut challenge).await.unwrap();
+    send.write_all(&[0xFFu8]).await.unwrap(); // an unsupported response version
+    let _ = send.finish();
+
+    let server_res = accept.await.unwrap().expect("server did not hang");
+    assert!(
+        matches!(server_res, Err(AdmitError::SkAuth(_))),
+        "the server must reject an unsupported response version as an SkAuth failure, got {server_res:?}"
+    );
+    drop(conn);
 }
 
 /// Live-agent smoke test (opt-in: `cargo test --test sk_auth -- --ignored`). Validates the ssh-agent

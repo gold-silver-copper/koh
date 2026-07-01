@@ -112,8 +112,6 @@ pub enum SkError {
     NoUserPresence,
     #[error("presented security key is not on the allowlist")]
     KeyNotAllowed,
-    #[error("unsupported security-key protocol version")]
-    BadVersion,
 }
 
 /// SHA-256 of `data` as a fixed 32-byte array (a thin, panic-free wrapper over `sha2`).

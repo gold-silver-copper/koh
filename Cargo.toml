@@ -51,6 +51,7 @@ unicode-width = "0.2"
 # event/bracketed-paste features.
 termina = { version = "0.3.3", optional = true }
 crossterm = { version = "0.29", optional = true, default-features = false }
+qwertty = { version = "0.1", optional = true }
 # serialization. default-features = false drops postcard's `heapless-cas` default, whose
 # `atomic-polyfill` transitive dep is unmaintained (RUSTSEC-2023-0089); we only need `use-std`
 # (which pulls `alloc`) for `to_allocvec`/`from_bytes`. See KOH-17.
@@ -99,6 +100,7 @@ data-encoding = "2"
 default = ["backend-termina"]
 backend-termina = ["dep:termina"]
 backend-crossterm = ["dep:crossterm"]
+backend-qwertty = ["dep:qwertty"]
 
 [dev-dependencies]
 proptest = "1"

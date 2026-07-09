@@ -17,9 +17,9 @@
 //! ## Backend selection
 //!
 //! Exactly one backend is compiled into the `koh` binary, chosen by cargo feature: `backend-termina`
-//! (default) or `backend-crossterm`. [`DefaultBackend`] resolves to the enabled one; enabling both
-//! keeps `termina` as the default (a plain build is unchanged), and enabling neither is a compile
-//! error rather than a client that cannot paint.
+//! (default), `backend-crossterm`, or `backend-qwertty`. [`DefaultBackend`] resolves to the enabled
+//! one; enabling several keeps the highest-precedence (`termina` first, a plain build is unchanged),
+//! and enabling none is a compile error rather than a client that cannot paint.
 
 use std::io;
 
@@ -35,19 +35,35 @@ mod crossterm;
 #[cfg(feature = "backend-crossterm")]
 pub use self::crossterm::CrosstermBackend;
 
+#[cfg(feature = "backend-qwertty")]
+mod qwertty;
+#[cfg(feature = "backend-qwertty")]
+pub use self::qwertty::QwerttyBackend;
+
 /// The backend the `koh` binary paints through, resolved at build time.
 ///
-/// `backend-termina` wins whenever it is on (the default), so also enabling `backend-crossterm` does
-/// not change a default build; a build with *neither* feature trips the `compile_error!` below
+/// Precedence when several backend features are on: `backend-termina` (the default) beats
+/// `backend-crossterm` beats `backend-qwertty`, so enabling an alternate alongside the default does
+/// not change a default build. A build with *no* backend feature trips the `compile_error!` below
 /// instead of silently producing a client with no renderer.
 #[cfg(feature = "backend-termina")]
 pub type DefaultBackend = TerminaBackend;
 #[cfg(all(feature = "backend-crossterm", not(feature = "backend-termina")))]
 pub type DefaultBackend = CrosstermBackend;
+#[cfg(all(
+    feature = "backend-qwertty",
+    not(feature = "backend-termina"),
+    not(feature = "backend-crossterm")
+))]
+pub type DefaultBackend = QwerttyBackend;
 
-#[cfg(not(any(feature = "backend-termina", feature = "backend-crossterm")))]
+#[cfg(not(any(
+    feature = "backend-termina",
+    feature = "backend-crossterm",
+    feature = "backend-qwertty"
+)))]
 compile_error!(
-    "koh's client needs a terminal backend: enable `backend-termina` (default) or `backend-crossterm`"
+    "koh's client needs a terminal backend: enable `backend-termina` (default), `backend-crossterm`, or `backend-qwertty`"
 );
 
 /// The DEC private modes koh may have forwarded to the user's terminal (X10 `?9` + all mouse modes

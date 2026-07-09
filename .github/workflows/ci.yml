@@ -76,6 +76,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: clippy (crossterm backend, warnings are errors)
         run: cargo clippy --all-targets --locked --no-default-features --features backend-crossterm -- -D warnings
+      - name: clippy (qwertty backend, warnings are errors)
+        run: cargo clippy --all-targets --locked --no-default-features --features backend-qwertty -- -D warnings
 
   # Verify the declared MSRV (`rust-version = "1.91"`) actually builds — otherwise the declaration is
   # a false promise to `cargo install` users on an older toolchain. Check, not test (the `=`-pinned

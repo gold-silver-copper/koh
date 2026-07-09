@@ -3,7 +3,8 @@
 //! It runs either against the real terminal (the binary, via [`BackendTerminal`] over a pluggable
 //! [`KohBackend`]) or against a scripted mock (integration tests) — no real TTY required for the
 //! latter. The rendering path speaks only to [`KohBackend`] ([`backend`]), so it no longer depends
-//! on any specific terminal crate; `termina` (default) and `crossterm` are selectable at build time.
+//! on any specific terminal crate; `termina` (default), `crossterm`, and `qwertty` are selectable at
+//! build time.
 //!
 //! Terminal *input* (typed bytes) and *resize* ticks arrive as channels the caller wires up;
 //! terminal *output* and *size* go through [`ClientTerminal`]. The binary's `main` connects a
@@ -226,7 +227,7 @@ pub trait ClientTerminal {
 /// synced grid + prediction overlay by driving the backend.
 ///
 /// One implementation of the enter / render / suspend / teardown logic runs against `termina`
-/// (default), `crossterm`, or any future [`KohBackend`] — the choice is a compile-time feature
+/// (default), `crossterm`, `qwertty`, or any future [`KohBackend`] — the choice is a compile-time feature
 /// ([`DefaultBackend`]), not a fork of this type. The mode-ledger reset that restores the user's
 /// terminal on drop and suspend lives in [`KohBackend::leave_alt_screen`], so it is identical across
 /// backends.

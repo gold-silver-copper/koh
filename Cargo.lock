@@ -1881,6 +1881,7 @@ dependencies = [
  "postcard",
  "proptest",
  "qrcode",
+ "qwertty",
  "rand 0.8.6",
  "rpassword",
  "secrecy",
@@ -2782,6 +2783,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "qwertty"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60879b13e19e78eaa23d13a7534bef27de4e7267fe6aef358ec4a5cb291c5845"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]

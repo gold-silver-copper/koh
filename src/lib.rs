@@ -23,7 +23,9 @@
 //!   `koh serve`).
 //! - [`pty`] — PTY allocation, shell spawn, SIGWINCH, child reaping.
 //! - [`server`] — PTY + emulator + `Transport<Screen, Input>` over iroh, plus `koh serve`.
-//! - [`client`] — input + `Transport<Input, Screen>` + predictor + termina render, plus `koh connect`.
+//! - [`client`] — input + `Transport<Input, Screen>` + predictor + a backend-agnostic renderer
+//!   (the [`client::backend`] seam: `termina` by default; `crossterm` / `qwertty` optional), plus
+//!   `koh connect`.
 //! - [`keycmd`] — `koh key`: change the identity key's encryption passphrase (`ssh-keygen -p`-style).
 //!
 //! Dependency direction is strict: `wire ← ssp ← {terminal, input}`, with `predict` over

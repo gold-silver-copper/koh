@@ -15,6 +15,18 @@ its API is internal and unstable (see the README).
 
 ## [Unreleased]
 
+### Added
+- **Pluggable terminal backends for the client renderer** (`client::backend::KohBackend`), so an
+  alternate terminal crate can drive `koh connect` without touching the protocol, prediction, or
+  session code. The render path now speaks only to the backend trait — its default methods emit the
+  same standard ANSI/DEC koh always did (byte-for-byte with the previous `termina` output), so a
+  backend only has to wire up raw-mode + size. The backend is chosen at build time by cargo feature:
+  `backend-termina` (default — `cargo install koh` is unchanged), `backend-crossterm`, or
+  `backend-qwertty` (e.g. `--no-default-features --features backend-crossterm`). The out-of-band mode ledger
+  (forwarded-mode reset on drop/suspend) and the OSC-52 clipboard opt-in stay backend-independent, so
+  every backend restores the terminal identically. Implements
+  [#11](https://github.com/gold-silver-copper/koh/issues/11).
+
 ## [0.9.1] — 2026-06-29
 
 ### Changed

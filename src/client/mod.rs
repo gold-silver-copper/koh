@@ -1,19 +1,24 @@
 //! The koh client: the session loop, abstracted over a [`ClientTerminal`].
 //!
-//! It runs either against the real terminal (the binary, via [`TerminaTerminal`]) or against a
-//! scripted mock (integration tests) — no real TTY required for the latter.
+//! It runs either against the real terminal (the binary, via [`BackendTerminal`] over a pluggable
+//! [`KohBackend`]) or against a scripted mock (integration tests) — no real TTY required for the
+//! latter. The rendering path speaks only to [`KohBackend`] ([`backend`]), so it no longer depends
+//! on any specific terminal crate; `termina` (default), `crossterm`, and `qwertty` are selectable at
+//! build time.
 //!
 //! Terminal *input* (typed bytes) and *resize* ticks arrive as channels the caller wires up;
-//! terminal *output* and *size* go through [`ClientTerminal`]. The binary's `main` connects the
-//! termina renderer + a raw-stdin reader + a `SIGWINCH` task; a test connects a capturing mock
-//! + a scripted input channel.
+//! terminal *output* and *size* go through [`ClientTerminal`]. The binary's `main` connects a
+//! [`KohBackend`] renderer + a raw-stdin reader + a `SIGWINCH` task; a test connects a capturing
+//! mock + a scripted input channel.
 
+pub mod backend;
 pub mod cli;
 mod render;
 
+pub use backend::{DefaultBackend, KohBackend};
 pub use cli::{connect, run_id, ConnectArgs, IdArgs};
+pub use render::WindowState;
 
-use std::io::Write;
 use std::time::Duration;
 
 use crate::input::UserInput;
@@ -23,12 +28,8 @@ use crate::terminal::TerminalScreen;
 use crate::transport_iroh::{IrohChannel, MonoClock, ALPN};
 use anyhow::Context;
 use iroh::{Endpoint, EndpointAddr};
-use termina::escape::csi::{Csi, DecPrivateMode, DecPrivateModeCode, Mode};
-use termina::{PlatformTerminal, Terminal as _};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-pub use render::WindowState;
 
 /// The window-title prefix mirrored onto the user's terminal so the OS title bar shows you're in a
 /// koh session (mosh's `[mosh] `).
@@ -41,13 +42,6 @@ pub(crate) const ESCAPE_PREFIX: u8 = 0x1e;
 /// Mirrors mosh. In raw mode `Ctrl-Z` is a literal byte (no SIGTSTP from the tty), so the suspend
 /// is driven through the escape machine instead.
 pub(crate) const SUSPEND_KEY: u8 = 0x1a;
-
-/// The DEC private modes we may have forwarded to the user's terminal (X10 `?9` + all mouse modes
-/// and encodings, bracketed paste `?2004`, application cursor keys `?1`) plus normal keypad
-/// (`ESC >`). Reset together whenever we leave the alternate screen — on drop *or* on suspend — so
-/// the user's shell isn't left with mouse reporting on, injecting stray bytes at the prompt.
-const RESET_FORWARDED_MODES: &[u8] =
-    b"\x1b[?9l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>";
 
 /// How long a single reconnect dial may run before it is abandoned and retried.
 const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -197,7 +191,7 @@ fn escape_quit(chunk: &[u8], pending: &mut bool) -> bool {
 }
 
 /// Where the client paints frames and reads the window size. The real binary draws to the
-/// terminal via termina ([`TerminaTerminal`]); a test captures cells/text as data.
+/// terminal via a [`KohBackend`] ([`BackendTerminal`]); a test captures cells/text as data.
 pub trait ClientTerminal {
     /// Paint one frame. `screen` is the authoritative grid (and carries the input modes —
     /// bracketed-paste / mouse / cursor-key — which the real terminal must mirror); `overlay` is
@@ -226,68 +220,42 @@ pub trait ClientTerminal {
     }
 }
 
-/// The production terminal: a termina `PlatformTerminal` put into raw mode + the alternate
-/// screen on construction, restored on drop. It paints the synced grid + prediction overlay.
-pub struct TerminaTerminal {
-    term: PlatformTerminal,
+/// The production [`ClientTerminal`], generic over a pluggable [`KohBackend`].
+///
+/// Puts the backend into raw mode + the alternate screen on [`enter`](Self::enter), restored on
+/// drop. It owns the backend-independent out-of-band ledger ([`render::OutOfBand`]) and paints the
+/// synced grid + prediction overlay by driving the backend.
+///
+/// One implementation of the enter / render / suspend / teardown logic runs against `termina`
+/// (default), `crossterm`, `qwertty`, or any future [`KohBackend`] — the choice is a compile-time feature
+/// ([`DefaultBackend`]), not a fork of this type. The mode-ledger reset that restores the user's
+/// terminal on drop and suspend lives in [`KohBackend::leave_alt_screen`], so it is identical across
+/// backends.
+pub struct BackendTerminal<B: KohBackend> {
+    backend: B,
     /// Tracks the title / bell / input modes mirrored to the real terminal (see [`render::OutOfBand`]).
     oob: render::OutOfBand,
 }
 
-impl TerminaTerminal {
-    /// Acquire the terminal, enter raw mode + the alternate screen, and hide the cursor.
+impl<B: KohBackend> BackendTerminal<B> {
+    /// Take ownership of `backend`, enter raw mode + the alternate screen, and hide the cursor.
     /// `clipboard_enabled` gates honoring remote OSC-52 clipboard writes (default off; L-1).
-    pub fn enter(clipboard_enabled: bool) -> std::io::Result<Self> {
-        let mut term = PlatformTerminal::new()?;
-        term.enter_raw_mode()?;
-        // Build the struct, then enter the alternate screen via the SAME helper the resume path
-        // uses, so the enter/leave escape sequences only ever live in one place (enter_screen /
-        // leave_screen). `enter_screen` writes to `self.term` and never reads `oob`, so building
-        // first is inert.
+    pub fn enter(mut backend: B, clipboard_enabled: bool) -> std::io::Result<Self> {
+        backend.enter_raw_mode()?;
+        // Build the struct, then enter the alternate screen via the backend — the enter/leave escape
+        // sequences live only in `KohBackend` (`enter_alt_screen` / `leave_alt_screen`).
+        // `enter_alt_screen` writes to the backend and never reads `oob`, so building first is inert.
         let mut this = Self {
-            term,
+            backend,
             oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string())
                 .with_clipboard(clipboard_enabled),
         };
-        this.enter_screen()?;
+        this.backend.enter_alt_screen()?;
         Ok(this)
-    }
-
-    /// Re-enter the alternate screen and hide the cursor (the raw-mode/alt-screen setup shared by
-    /// [`enter`](Self::enter) and the resume half of [`suspend_resume`](Self::suspend_resume)).
-    fn enter_screen(&mut self) -> std::io::Result<()> {
-        write!(
-            self.term,
-            "{}{}",
-            Csi::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ClearAndEnableAlternateScreen
-            ))),
-            Csi::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ShowCursor
-            ))),
-        )?;
-        self.term.flush()
-    }
-
-    /// Reset forwarded modes, show the cursor, and leave the alternate screen (the teardown shared
-    /// by [`Drop`] and the suspend half of [`suspend_resume`](Self::suspend_resume)).
-    fn leave_screen(&mut self) -> std::io::Result<()> {
-        self.term.write_all(RESET_FORWARDED_MODES)?;
-        write!(
-            self.term,
-            "{}{}",
-            Csi::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ShowCursor
-            ))),
-            Csi::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ClearAndEnableAlternateScreen
-            ))),
-        )?;
-        self.term.flush()
     }
 }
 
-impl ClientTerminal for TerminaTerminal {
+impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
     fn render(
         &mut self,
         screen: &vt100::Screen,
@@ -297,43 +265,52 @@ impl ClientTerminal for TerminaTerminal {
     ) -> std::io::Result<()> {
         // Mirror the out-of-band terminal state (title/icon/clipboard/bell/modes) onto the real
         // terminal, then paint the cell grid.
-        self.oob.emit(&mut self.term, screen, win)?;
-        render::render(&mut self.term, screen, overlay, status)
+        self.oob.emit(&mut self.backend, screen, win)?;
+        render::render(&mut self.backend, screen, overlay, status)
     }
 
     fn size(&self) -> std::io::Result<(u16, u16)> {
-        let d = self.term.get_dimensions()?;
-        Ok((d.rows, d.cols))
+        self.backend.size()
     }
 
     fn suspend_resume(&mut self) -> std::io::Result<()> {
         // Restore the user's terminal (reset forwarded modes, show cursor, leave the alt screen)
         // and return to cooked mode, so the suspended job sits at a normal shell.
-        self.leave_screen()?;
-        self.term.enter_cooked_mode()?;
-        let _ = writeln!(self.term, "\n[koh suspended — run `fg` to resume]");
-        let _ = self.term.flush();
+        self.backend.leave_alt_screen()?;
+        self.backend.leave_raw_mode()?;
+        let _ = self
+            .backend
+            .write_bytes("\n[koh suspended — run `fg` to resume]\n".as_bytes());
+        let _ = self.backend.flush();
         // Stop ourselves. SIGTSTP halts the whole process; control returns here only once the user
         // foregrounds the job (SIGCONT). `nix::raise` keeps the crate `forbid(unsafe)`.
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGTSTP)
             .map_err(std::io::Error::other)?;
         // Foregrounded again: re-enter raw mode + the alternate screen and force the next frame to
         // re-assert the title / clipboard / input modes (the terminal was reset while we were away).
-        self.term.enter_raw_mode()?;
-        self.enter_screen()?;
+        self.backend.enter_raw_mode()?;
+        self.backend.enter_alt_screen()?;
         self.oob.invalidate();
         Ok(())
     }
 }
 
-impl Drop for TerminaTerminal {
+impl<B: KohBackend> Drop for BackendTerminal<B> {
     fn drop(&mut self) {
         // Reset forwarded modes, show the cursor, and leave the alternate screen so the user's
-        // terminal isn't left with mouse reporting on (stray click bytes at the prompt). The
-        // PlatformTerminal's own Drop restores cooked mode afterward.
-        let _ = self.leave_screen();
+        // terminal isn't left with mouse reporting on (stray click bytes at the prompt), then return
+        // to cooked mode. Both are best-effort on the teardown path.
+        let _ = self.backend.leave_alt_screen();
+        let _ = self.backend.leave_raw_mode();
     }
 }
+
+/// The production terminal on the default `termina` backend.
+///
+/// Kept as a named alias for callers that referenced the pre-abstraction type; new code should
+/// prefer [`BackendTerminal`] over [`DefaultBackend`] (or another [`KohBackend`]).
+#[cfg(feature = "backend-termina")]
+pub type TerminaTerminal = BackendTerminal<backend::TerminaBackend>;
 
 /// What [`ClientSession::on_input`] decided about a chunk of typed bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -43,7 +43,15 @@ iroh = "=1.0.0"
 vt100 = "=0.16.2"
 portable-pty = "=0.9.0"
 unicode-width = "0.2"
-termina = "0.3.3"
+# Terminal backends behind the `client::backend::KohBackend` seam. `termina` is the default and the
+# only one compiled by `cargo install koh` (see `[features]`); `crossterm` is an optional, off-by-
+# default alternate proving the abstraction. Both are gated so the published .crate's default build
+# keeps its exact dependency tree. `crossterm` uses `default-features = false` because koh emits its
+# own ANSI and reads raw stdin itself — it needs only crossterm's raw-mode + size ioctls, not the
+# event/bracketed-paste features.
+termina = { version = "0.3.3", optional = true }
+crossterm = { version = "0.29", optional = true, default-features = false }
+qwertty = { version = "0.1", optional = true }
 # serialization. default-features = false drops postcard's `heapless-cas` default, whose
 # `atomic-polyfill` transitive dep is unmaintained (RUSTSEC-2023-0089); we only need `use-std`
 # (which pulls `alloc`) for `to_allocvec`/`from_bytes`. See KOH-17.
@@ -82,6 +90,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
 data-encoding = "2"
+
+[features]
+# Terminal backends for the `koh connect` client (see `src/client/backend/`). Exactly one is
+# selected at build time — `client::backend::DefaultBackend` resolves to the first one enabled, and
+# the client fails to compile if none is. `backend-termina` is the default, so `cargo install koh`
+# and CI build the same tree as before; `backend-crossterm` is an off-by-default alternate that
+# exercises the `KohBackend` seam (build it with `--no-default-features --features backend-crossterm`).
+default = ["backend-termina"]
+backend-termina = ["dep:termina"]
+backend-crossterm = ["dep:crossterm"]
+backend-qwertty = ["dep:qwertty"]
 
 [dev-dependencies]
 proptest = "1"

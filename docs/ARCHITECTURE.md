@@ -31,7 +31,8 @@ src/
 ├── transport_iroh/  iroh endpoint setup, encrypted identity, datagram channel, RTT, admission
 ├── pty.rs           PTY allocation, shell spawn, SIGWINCH, child reaping
 ├── server/          PTY + emulator + Transport<Screen,Input> over iroh + `serve`
-├── client/          input + Transport<Input,Screen> + predictor + termina render + `connect`
+├── client/          input + Transport<Input,Screen> + predictor + backend-agnostic render + `connect`
+│   └── backend/     the KohBackend seam: termina (default) / crossterm / qwertty behind cargo features
 ├── keycmd.rs        `koh key` — change the identity key's passphrase
 └── sim.rs           in-process integration/chaos driver (used by tests + the chaos example)
 tests/               real-iroh e2e, reattach, auto-reconnect, PTY-binary, ported mosh regressions
@@ -202,7 +203,11 @@ just an allocated PTY. Both are real and hermetic.
   observes exit code `42` on the shutdown frame.
 
 The seam that makes this cheap: terminal I/O is abstracted behind `ClientTerminal`, so the same
-session loop runs against the real termina path (binary) or a captured-cells mock (fast test).
+session loop runs against the real backend path (binary) or a captured-cells mock (fast test). One
+layer down, the *rendering* is abstracted again behind `client::backend::KohBackend` — the escape
+emission has no dependency on any specific terminal crate (its default methods write standard ANSI),
+so `termina` (default), `crossterm`, and `qwertty` are interchangeable at build time and a new backend
+only wires up raw-mode + size.
 
 ### Tier 2 — Android emulator: runtime, network realism, resilience ([`testing/android/`](../testing/android/))
 

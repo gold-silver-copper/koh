@@ -62,6 +62,23 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
 
+  # The optional alternate terminal backend is OFF by default, so the main `gate` never compiles it.
+  # Lint + type-check it on its own so the `client::backend::KohBackend` seam can't silently bitrot
+  # (see src/client/backend/). `--all-targets` type-checks but doesn't run — the default `gate` job
+  # already runs the real PTY/e2e suite against the shipped `termina` backend.
+  backends:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (crossterm backend, warnings are errors)
+        run: cargo clippy --all-targets --locked --no-default-features --features backend-crossterm -- -D warnings
+      - name: clippy (qwertty backend, warnings are errors)
+        run: cargo clippy --all-targets --locked --no-default-features --features backend-qwertty -- -D warnings
+
   # Verify the declared MSRV (`rust-version = "1.91"`) actually builds — otherwise the declaration is
   # a false promise to `cargo install` users on an older toolchain. Check, not test (the `=`-pinned
   # lockfile makes it cheap and deterministic). Bump `rust-version` if this ever fails.

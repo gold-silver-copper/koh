@@ -18,7 +18,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{run_client, ClientTerminal, IrohConnector, TerminaTerminal};
+use crate::client::{run_client, BackendTerminal, ClientTerminal, DefaultBackend, IrohConnector};
 
 /// Arguments for `koh connect <server-id>`.
 #[derive(Args, Debug)]
@@ -234,10 +234,12 @@ pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
     let shutdown = CancellationToken::new();
     spawn_signal_shutdown(shutdown.clone())?;
 
-    // --- real terminal I/O wiring (termina: raw mode + alt screen, restored on drop) ---
+    // --- real terminal I/O wiring: raw mode + alt screen via the build-selected KohBackend
+    // (termina by default), restored on drop ---
     let clipboard_enabled = args.clipboard;
-    let term =
-        TerminaTerminal::enter(clipboard_enabled).context("entering raw mode / alt screen")?;
+    let backend = DefaultBackend::new().context("acquiring the terminal")?;
+    let term = BackendTerminal::enter(backend, clipboard_enabled)
+        .context("entering raw mode / alt screen")?;
     let (rows, cols) = term.size().unwrap_or((24, 80));
 
     // Raw stdin reader (byte-perfect passthrough) on a dedicated blocking thread.

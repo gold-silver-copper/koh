@@ -1,5 +1,5 @@
 //! Painting the synchronized `vt100` screen (plus prediction overlays and a status line)
-//! onto the local terminal, emitting escape sequences via **termina**.
+//! onto the local terminal through the pluggable [`KohBackend`] seam.
 //!
 //! We render cell-by-cell — rather than just blitting `screen.contents_formatted()` — because
 //! the predictor needs to draw speculative cells (underlined) *on top of* the authoritative
@@ -7,86 +7,22 @@
 //! is wrapped in synchronized output (DEC mode 2026) so the terminal shows it atomically
 //! (no tearing/flicker on full repaints or resizes).
 //!
-//! termina has no `queue!`/`execute!` / `Command` layer: every escape is a `Display`-able
-//! `Csi`/`Csi::Mode`/`Csi::Sgr` value written into any `io::Write` (here, the termina terminal,
-//! which itself impls `io::Write`).
+//! Nothing here knows which terminal crate is in use: the engine calls [`KohBackend`] methods
+//! (`begin_frame` / `move_to` / `set_style` / `print` / …), whose default implementations emit the
+//! same standard ANSI koh always did — so this path no longer depends on `termina` (or any other
+//! backend) types.
 
-use std::io::{self, Write};
+use std::io;
 
+use super::backend::{CellStyle, KohBackend};
 use crate::predict::Overlay;
 use crate::terminal::MAXIMUM_CLIPBOARD_SIZE;
-use termina::escape::csi::{Csi, Cursor, DecPrivateMode, DecPrivateModeCode, Mode, Sgr};
-use termina::style::{ColorSpec, Intensity, RgbColor, Underline};
-use termina::OneBased;
-use vt100::{Color as VtColor, Screen};
-
-/// Map a vt100 color to a termina color spec.
-fn to_spec(c: VtColor) -> ColorSpec {
-    match c {
-        VtColor::Default => ColorSpec::Reset,
-        VtColor::Idx(i) => ColorSpec::PaletteIndex(i),
-        VtColor::Rgb(r, g, b) => ColorSpec::from(RgbColor::new(r, g, b)),
-    }
-}
-
-/// `Csi` to move the cursor to a 0-based `(row, col)`.
-fn move_to(row: u16, col: u16) -> Csi {
-    Csi::Cursor(Cursor::Position {
-        line: OneBased::from_zero_based(row),
-        col: OneBased::from_zero_based(col),
-    })
-}
-
-fn set_mode(code: DecPrivateModeCode) -> Csi {
-    Csi::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(code)))
-}
-fn reset_mode(code: DecPrivateModeCode) -> Csi {
-    Csi::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(code)))
-}
-
-/// A compact style fingerprint so we only re-emit SGR when it actually changes.
-#[derive(PartialEq, Clone, Copy)]
-struct Style {
-    fg: VtColor,
-    bg: VtColor,
-    bold: bool,
-    dim: bool,
-    italic: bool,
-    underline: bool,
-    inverse: bool,
-}
-
-fn emit_style(out: &mut impl Write, s: Style) -> io::Result<()> {
-    // Reset clears everything (incl. colors), then re-apply.
-    write!(out, "{}", Csi::Sgr(Sgr::Reset))?;
-    if s.bold {
-        write!(out, "{}", Csi::Sgr(Sgr::Intensity(Intensity::Bold)))?;
-    }
-    if s.dim {
-        write!(out, "{}", Csi::Sgr(Sgr::Intensity(Intensity::Dim)))?;
-    }
-    if s.italic {
-        write!(out, "{}", Csi::Sgr(Sgr::Italic(true)))?;
-    }
-    if s.underline {
-        write!(out, "{}", Csi::Sgr(Sgr::Underline(Underline::Single)))?;
-    }
-    if s.inverse {
-        write!(out, "{}", Csi::Sgr(Sgr::Reverse(true)))?;
-    }
-    write!(
-        out,
-        "{}{}",
-        Csi::Sgr(Sgr::Foreground(to_spec(s.fg))),
-        Csi::Sgr(Sgr::Background(to_spec(s.bg)))
-    )?;
-    Ok(())
-}
+use vt100::{Color, Screen};
 
 /// Render the authoritative `screen` with prediction `overlay` and an optional `status` line
-/// (drawn reverse-video on the last row) to `out`, wrapped in one synchronized-output frame.
+/// (drawn reverse-video on the last row) to `backend`, wrapped in one synchronized-output frame.
 pub fn render(
-    out: &mut impl Write,
+    backend: &mut impl KohBackend,
     screen: &Screen,
     overlay: &Overlay,
     status: Option<&str>,
@@ -94,12 +30,11 @@ pub fn render(
     let (rows, cols) = screen.size();
 
     // Begin Synchronized Update (atomic frame) and hide the cursor while we paint.
-    write!(out, "{}", set_mode(DecPrivateModeCode::SynchronizedOutput))?;
-    write!(out, "{}", reset_mode(DecPrivateModeCode::ShowCursor))?;
+    backend.begin_frame()?;
 
-    let mut cur_style: Option<Style> = None;
+    let mut cur_style: Option<CellStyle> = None;
     for row in 0..rows {
-        write!(out, "{}", move_to(row, 0))?;
+        backend.move_to(row, 0)?;
         let mut col = 0u16;
         while col < cols {
             let cell = screen.cell(row, col);
@@ -116,7 +51,7 @@ pub fn render(
             let hint_underline = pred.is_some_and(|p| p.unknown && p.underline);
 
             let style = if let Some(p) = concrete {
-                Style {
+                CellStyle {
                     fg: p.fg,
                     bg: p.bg,
                     bold: false,
@@ -127,7 +62,7 @@ pub fn render(
                     inverse: false,
                 }
             } else if let Some(c) = cell {
-                Style {
+                CellStyle {
                     fg: c.fgcolor(),
                     bg: c.bgcolor(),
                     bold: c.bold(),
@@ -137,9 +72,9 @@ pub fn render(
                     inverse: c.inverse(),
                 }
             } else {
-                Style {
-                    fg: VtColor::Default,
-                    bg: VtColor::Default,
+                CellStyle {
+                    fg: Color::Default,
+                    bg: Color::Default,
                     bold: false,
                     dim: false,
                     italic: false,
@@ -149,7 +84,7 @@ pub fn render(
             };
 
             if cur_style != Some(style) {
-                emit_style(out, style)?;
+                backend.set_style(style)?;
                 cur_style = Some(style);
             }
 
@@ -163,12 +98,12 @@ pub fn render(
             } else {
                 " "
             };
-            write!(out, "{}", if glyph.is_empty() { " " } else { glyph })?;
+            backend.print(if glyph.is_empty() { " " } else { glyph })?;
             col += 1;
         }
     }
 
-    write!(out, "{}", Csi::Sgr(Sgr::Reset))?;
+    backend.reset_sgr()?;
 
     if let Some(st) = status {
         let mut line = format!(" {st} ");
@@ -183,30 +118,22 @@ pub fn render(
             }
             line.truncate(end);
         }
-        write!(
-            out,
-            "{}{}{}{}",
-            move_to(rows.saturating_sub(1), 0),
-            Csi::Sgr(Sgr::Reverse(true)),
-            line,
-            Csi::Sgr(Sgr::Reset)
-        )?;
+        backend.move_to(rows.saturating_sub(1), 0)?;
+        backend.set_reverse()?;
+        backend.print(&line)?;
+        backend.reset_sgr()?;
     }
 
     // Place and show the cursor: the predicted cursor wins if present, else the real one.
     let (crow, ccol) = overlay.cursor().unwrap_or_else(|| screen.cursor_position());
-    write!(out, "{}", move_to(crow, ccol))?;
+    backend.move_to(crow, ccol)?;
     if !screen.hide_cursor() {
-        write!(out, "{}", set_mode(DecPrivateModeCode::ShowCursor))?;
+        backend.show_cursor()?;
     }
 
     // End Synchronized Update: the terminal now reveals the whole frame at once.
-    write!(
-        out,
-        "{}",
-        reset_mode(DecPrivateModeCode::SynchronizedOutput)
-    )?;
-    out.flush()
+    backend.end_frame()?;
+    backend.flush()
 }
 
 /// Strip control chars from an OSC string payload so it can't break the sequence we wrap it in.
@@ -239,6 +166,10 @@ pub struct WindowState<'a> {
 /// title / icon (OSC 0/1/2), clipboard (OSC 52), the bell, and the input modes (bracketed-paste /
 /// mouse / cursor-key) — so each is re-emitted only when it changes. These ride alongside the cell
 /// grid but aren't part of it.
+///
+/// The ledger is **backend-independent**: it decides *what* to emit and *when* (change detection),
+/// then calls [`KohBackend`] methods to emit it — so every backend mirrors the same state, and a
+/// suspend/resume ([`invalidate`](Self::invalidate)) re-asserts it identically.
 #[derive(Default)]
 pub(super) struct OutOfBand {
     /// Prepended to the window title (and to the icon when icon == title) so the OS title bar shows
@@ -289,15 +220,15 @@ impl OutOfBand {
         *self = Self::with_title_prefix(prefix).with_clipboard(clipboard_enabled);
     }
 
-    /// Emit this frame's title/icon / clipboard / bell / input-mode changes to `out`, updating the
-    /// tracked state. Mirrors mosh's `Display::new_frame` out-of-band emission.
+    /// Emit this frame's title/icon / clipboard / bell / input-mode changes to `backend`, updating
+    /// the tracked state. Mirrors mosh's `Display::new_frame` out-of-band emission.
     pub(super) fn emit(
         &mut self,
-        out: &mut impl Write,
+        backend: &mut impl KohBackend,
         screen: &Screen,
         win: WindowState<'_>,
     ) -> io::Result<()> {
-        self.emit_window_title(out, win.title, win.icon)?;
+        self.emit_window_title(backend, win.title, win.icon)?;
         // Clipboard (OSC 52): OFF by default (L-1). A remote server must not silently overwrite the
         // user's system clipboard. Only when the user explicitly opted in (`--clipboard`) do we
         // forward it — and only a strict-base64 payload within the size cap
@@ -308,12 +239,12 @@ impl OutOfBand {
                 && win.clipboard.len() <= MAXIMUM_CLIPBOARD_SIZE
                 && is_base64_payload(win.clipboard)
             {
-                write!(out, "\x1b]52;c;{}\x07", win.clipboard)?;
+                backend.set_clipboard(win.clipboard)?;
             }
         }
         // Bell: ring once when the server's bell count climbs (coalesced if several rang).
         if win.bell_count > self.last_bell {
-            out.write_all(b"\x07")?;
+            backend.bell()?;
             self.last_bell = win.bell_count;
         }
         // Input modes: re-assert bracketed-paste / mouse / cursor-key (diff vs the previous frame).
@@ -322,7 +253,7 @@ impl OutOfBand {
             None => screen.input_mode_formatted(),
         };
         if !mode_bytes.is_empty() {
-            out.write_all(&mode_bytes)?;
+            backend.write_input_modes(&mode_bytes)?;
         }
         self.prev_screen = Some(screen.clone());
         Ok(())
@@ -332,7 +263,7 @@ impl OutOfBand {
     /// `]1;icon` + `]2;title`. Guarded by the sticky title-initialized flag.
     fn emit_window_title(
         &mut self,
-        out: &mut impl Write,
+        backend: &mut impl KohBackend,
         title: &str,
         icon: &str,
     ) -> io::Result<()> {
@@ -359,9 +290,9 @@ impl OutOfBand {
             sanitize_osc(icon)
         };
         if ic == t {
-            write!(out, "\x1b]0;{t}\x07")
+            backend.set_window_title(&t)
         } else {
-            write!(out, "\x1b]1;{ic}\x07\x1b]2;{t}\x07")
+            backend.set_window_icon_and_title(&ic, &t)
         }
     }
 }
@@ -369,6 +300,7 @@ impl OutOfBand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::backend::CaptureBackend;
     use crate::predict::{DisplayPreference, PredictionEngine};
 
     fn screen_of(bytes: &[u8]) -> Screen {
@@ -377,22 +309,23 @@ mod tests {
         p.screen().clone()
     }
 
+    /// Render into a capture backend and return the emitted bytes as a lossy string.
+    fn render_to_string(screen: &Screen, overlay: &Overlay, status: Option<&str>) -> String {
+        let mut backend = CaptureBackend::default();
+        render(&mut backend, screen, overlay, status).unwrap();
+        String::from_utf8_lossy(&backend.bytes).into_owned()
+    }
+
     #[test]
     fn renders_authoritative_text_with_escapes() {
-        let screen = screen_of(b"hi");
-        let mut buf = Vec::new();
-        render(&mut buf, &screen, &Overlay::empty(), None).unwrap();
-        let s = String::from_utf8_lossy(&buf);
+        let s = render_to_string(&screen_of(b"hi"), &Overlay::empty(), None);
         assert!(s.contains("hi"), "rendered text missing");
         assert!(s.contains('\x1b'), "expected ANSI escape sequences");
     }
 
     #[test]
     fn render_wraps_frame_in_synchronized_output() {
-        let screen = screen_of(b"x");
-        let mut buf = Vec::new();
-        render(&mut buf, &screen, &Overlay::empty(), None).unwrap();
-        let s = String::from_utf8_lossy(&buf);
+        let s = render_to_string(&screen_of(b"x"), &Overlay::empty(), None);
         assert!(
             s.contains("\x1b[?2026h"),
             "frame must begin synchronized output"
@@ -413,34 +346,35 @@ mod tests {
         }
     }
 
+    /// Run one `OutOfBand::emit` into a fresh capture backend and return the emitted bytes.
+    fn oob_emit(oob: &mut OutOfBand, screen: &Screen, win: WindowState<'_>) -> Vec<u8> {
+        let mut backend = CaptureBackend::default();
+        oob.emit(&mut backend, screen, win).unwrap();
+        backend.bytes
+    }
+
     #[test]
     fn out_of_band_title_emits_once_and_guards_empty() {
         let mut oob = OutOfBand::default();
         let scr = screen_of(b"");
 
         // Empty title/icon before the shell sets one: never blank the user's terminal title.
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("", "", "", 0)).unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("", "", "", 0));
         assert!(
             !String::from_utf8_lossy(&buf).contains("\x1b]"),
             "no OSC for an unset title"
         );
 
         // A real title (icon == title) is emitted as the combined OSC 0.
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("vim - file.rs", "vim - file.rs", "", 0))
-            .unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("vim - file.rs", "vim - file.rs", "", 0));
         assert!(String::from_utf8_lossy(&buf).contains("\x1b]0;vim - file.rs\x07"));
 
         // Unchanged → not re-emitted.
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("vim - file.rs", "vim - file.rs", "", 0))
-            .unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("vim - file.rs", "vim - file.rs", "", 0));
         assert!(!String::from_utf8_lossy(&buf).contains("\x1b]0;"));
 
         // Once initialized, a reset to empty IS propagated (mosh's sticky guard).
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("", "", "", 0)).unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("", "", "", 0));
         assert!(String::from_utf8_lossy(&buf).contains("\x1b]0;\x07"));
     }
 
@@ -448,10 +382,8 @@ mod tests {
     fn out_of_band_splits_icon_and_title() {
         let mut oob = OutOfBand::default();
         let scr = screen_of(b"");
-        let mut buf = Vec::new();
         // Distinct icon name + title → ESC]1;<icon> then ESC]2;<title> (mosh).
-        oob.emit(&mut buf, &scr, win("the title", "the-icon", "", 0))
-            .unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("the title", "the-icon", "", 0));
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("\x1b]1;the-icon\x07"), "icon OSC 1, got {s:?}");
         assert!(s.contains("\x1b]2;the title\x07"), "title OSC 2, got {s:?}");
@@ -463,8 +395,7 @@ mod tests {
         let scr = screen_of(b"");
 
         // icon == title: the prefix is applied to both, and the combined OSC 0 carries it.
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("vim", "vim", "", 0)).unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("vim", "vim", "", 0));
         assert!(
             String::from_utf8_lossy(&buf).contains("\x1b]0;[koh] vim\x07"),
             "combined title is prefixed, got {:?}",
@@ -474,9 +405,7 @@ mod tests {
         // icon != title: only the title (OSC 2) is prefixed; the icon (OSC 1) is left untouched,
         // mirroring mosh's prefix_window_title (which preserves equivalence but doesn't prefix a
         // distinct icon name).
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("the title", "the-icon", "", 0))
-            .unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("the title", "the-icon", "", 0));
         let s = String::from_utf8_lossy(&buf);
         assert!(
             s.contains("\x1b]1;the-icon\x07"),
@@ -492,9 +421,7 @@ mod tests {
     fn out_of_band_default_has_no_title_prefix() {
         // The Default constructor (used by tests and the no-prefix opt-out) adds nothing.
         let mut oob = OutOfBand::default();
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &screen_of(b""), win("vim", "vim", "", 0))
-            .unwrap();
+        let buf = oob_emit(&mut oob, &screen_of(b""), win("vim", "vim", "", 0));
         assert!(String::from_utf8_lossy(&buf).contains("\x1b]0;vim\x07"));
     }
 
@@ -503,10 +430,7 @@ mod tests {
         // L-1: a default OutOfBand must NOT forward a server-set clipboard — no OSC 52 reaches the
         // terminal even though the clipboard changed (the user never opted in).
         let mut oob = OutOfBand::default();
-        let scr = screen_of(b"");
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("", "", "aGVsbG8=", 0))
-            .unwrap();
+        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "aGVsbG8=", 0));
         assert!(
             !String::from_utf8_lossy(&buf).contains("\x1b]52;"),
             "no OSC-52 without explicit opt-in, got {:?}",
@@ -518,17 +442,13 @@ mod tests {
     fn out_of_band_forwards_clipboard_when_opted_in() {
         let mut oob = OutOfBand::default().with_clipboard(true);
         let scr = screen_of(b"");
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("", "", "aGVsbG8=", 0))
-            .unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 0));
         assert!(
             String::from_utf8_lossy(&buf).contains("\x1b]52;c;aGVsbG8=\x07"),
             "clipboard OSC 52 forwarded when opted in"
         );
         // Same clipboard again → not re-emitted.
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("", "", "aGVsbG8=", 0))
-            .unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 0));
         assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
     }
 
@@ -537,10 +457,7 @@ mod tests {
         // Even with the opt-in on, a non-base64 payload (e.g. raw shell injection) is dropped, not
         // written verbatim to the terminal.
         let mut oob = OutOfBand::default().with_clipboard(true);
-        let scr = screen_of(b"");
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("", "", "curl evil|sh", 0))
-            .unwrap();
+        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "curl evil|sh", 0));
         assert!(
             !String::from_utf8_lossy(&buf).contains("\x1b]52;"),
             "a non-base64 clipboard payload is rejected, got {:?}",
@@ -553,17 +470,14 @@ mod tests {
         let mut oob = OutOfBand::default();
         let scr = screen_of(b"");
         // Establish the mode baseline (so later emits don't also carry mode bytes).
-        let mut warm = Vec::new();
-        oob.emit(&mut warm, &scr, win("", "", "", 0)).unwrap();
+        let _ = oob_emit(&mut oob, &scr, win("", "", "", 0));
 
         // No increase → no bell.
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("", "", "", 0)).unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("", "", "", 0));
         assert!(buf.is_empty(), "no bell when the count is unchanged");
 
         // Count climbs (possibly by more than one) → exactly one bell.
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &scr, win("", "", "", 3)).unwrap();
+        let buf = oob_emit(&mut oob, &scr, win("", "", "", 3));
         assert_eq!(buf, b"\x07", "one bell on an increase, even if it jumped");
     }
 
@@ -571,14 +485,11 @@ mod tests {
     fn out_of_band_reasserts_input_modes_on_change() {
         let mut oob = OutOfBand::default();
         // Baseline frame in default modes.
-        let mut warm = Vec::new();
-        oob.emit(&mut warm, &screen_of(b""), win("", "", "", 0))
-            .unwrap();
+        let _ = oob_emit(&mut oob, &screen_of(b""), win("", "", "", 0));
 
         // The remote turns on bracketed paste + mouse reporting → re-asserted to the real terminal.
         let modes = screen_of(b"\x1b[?2004h\x1b[?1000h");
-        let mut buf = Vec::new();
-        oob.emit(&mut buf, &modes, win("", "", "", 0)).unwrap();
+        let buf = oob_emit(&mut oob, &modes, win("", "", "", 0));
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("2004"), "bracketed-paste re-asserted, got {s:?}");
         assert!(s.contains("1000"), "mouse reporting re-asserted, got {s:?}");
@@ -586,10 +497,8 @@ mod tests {
 
     #[test]
     fn renders_status_line() {
-        let screen = screen_of(b"");
-        let mut buf = Vec::new();
-        render(&mut buf, &screen, &Overlay::empty(), Some("link down")).unwrap();
-        assert!(String::from_utf8_lossy(&buf).contains("link down"));
+        let s = render_to_string(&screen_of(b""), &Overlay::empty(), Some("link down"));
+        assert!(s.contains("link down"));
     }
 
     #[test]
@@ -606,8 +515,8 @@ mod tests {
                 p.process(b"x");
                 p.screen().clone()
             };
-            let mut buf = Vec::new();
-            render(&mut buf, &screen, &Overlay::empty(), Some(status))
+            let mut backend = CaptureBackend::default();
+            render(&mut backend, &screen, &Overlay::empty(), Some(status))
                 .expect("render must not error or panic at any width");
         }
     }
@@ -633,11 +542,7 @@ mod tests {
             "confirmed prediction should be visible"
         );
 
-        let mut buf = Vec::new();
-        render(&mut buf, &echoed, &overlay, None).unwrap();
-        assert!(
-            String::from_utf8_lossy(&buf).contains('Z'),
-            "predicted glyph not rendered"
-        );
+        let s = render_to_string(&echoed, &overlay, None);
+        assert!(s.contains('Z'), "predicted glyph not rendered");
     }
 }

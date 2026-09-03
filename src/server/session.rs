@@ -54,11 +54,13 @@ pub type SessionStore = Arc<Mutex<HashMap<EndpointId, SharedSession>>>;
 
 /// Spawn a standalone session: a PTY shell + emulator + a background drain task that keeps the
 /// emulator current from the PTY output even with no client attached. Not placed in any store.
-pub fn spawn_session(shell: Option<&str>, scrollback: usize) -> anyhow::Result<SharedSession> {
+///
+/// `command` is the argv to host (`command[0]` the program); empty means the login shell.
+pub fn spawn_session(command: &[String], scrollback: usize) -> anyhow::Result<SharedSession> {
     let (rows, cols) = (DEFAULT_ROWS, DEFAULT_COLS);
     let emu = ServerTerminal::new(rows, cols, scrollback);
     let (pty, pty_rx) =
-        crate::pty::Pty::spawn(rows, cols, shell, "xterm-256color").context("spawning shell")?;
+        crate::pty::Pty::spawn(rows, cols, command, "xterm-256color").context("spawning shell")?;
     let handle = Arc::new(SessionHandle {
         session: Mutex::new(Session {
             emu,
@@ -139,7 +141,7 @@ pub enum AttachKind {
 pub async fn attach(
     store: &SessionStore,
     peer: EndpointId,
-    shell: Option<&str>,
+    command: &[String],
     scrollback: usize,
     max_sessions: usize,
 ) -> anyhow::Result<Option<(SharedSession, AttachKind)>> {
@@ -156,7 +158,7 @@ pub async fn attach(
     if map.len() >= max_sessions {
         return Ok(None);
     }
-    let handle = spawn_session(shell, scrollback)?;
+    let handle = spawn_session(command, scrollback)?;
     handle.session.lock().await.attached = 1;
     map.insert(peer, handle.clone());
     Ok(Some((handle, AttachKind::Created)))
@@ -335,14 +337,14 @@ mod tests {
         let store = SessionStore::default();
         let peer = generate_secret_key().public();
 
-        let (h1, kind) = attach(&store, peer, Some("sh"), 0, 64)
+        let (h1, kind) = attach(&store, peer, &["sh".to_owned()], 0, 64)
             .await
             .expect("first attach")
             .expect("not at capacity");
         assert_eq!(kind, AttachKind::Created, "first attach creates a session");
 
         detach(&store, peer).await;
-        let (h2, kind) = attach(&store, peer, Some("sh"), 0, 64)
+        let (h2, kind) = attach(&store, peer, &["sh".to_owned()], 0, 64)
             .await
             .expect("reattach")
             .expect("not at capacity");
@@ -372,11 +374,11 @@ mod tests {
         let store = SessionStore::default();
         let peer = generate_secret_key().public();
 
-        let (h, _) = attach(&store, peer, Some("sh"), 0, 64)
+        let (h, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
             .await
             .expect("attach A")
             .expect("not at capacity");
-        let (_, _) = attach(&store, peer, Some("sh"), 0, 64)
+        let (_, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
             .await
             .expect("attach B")
             .expect("not at capacity");
@@ -416,7 +418,7 @@ mod tests {
         // the session instead of it leaking with attached>0/last_detach=None forever.
         let store = SessionStore::default();
         let peer = generate_secret_key().public();
-        let (h, _) = attach(&store, peer, Some("sh"), 0, 64)
+        let (h, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
             .await
             .expect("attach")
             .expect("under cap");
@@ -451,7 +453,7 @@ mod tests {
         // must NOT also fire (which would double-decrement the refcount).
         let store = SessionStore::default();
         let peer = generate_secret_key().public();
-        let (h, _) = attach(&store, peer, Some("sh"), 0, 64)
+        let (h, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
             .await
             .expect("attach")
             .expect("under cap");
@@ -482,17 +484,17 @@ mod tests {
         let p2 = generate_secret_key().public();
         let p3 = generate_secret_key().public();
 
-        let (h1, _) = attach(&store, p1, Some("sh"), 0, 2)
+        let (h1, _) = attach(&store, p1, &["sh".to_owned()], 0, 2)
             .await
             .expect("attach p1")
             .expect("under cap");
-        let (h2, _) = attach(&store, p2, Some("sh"), 0, 2)
+        let (h2, _) = attach(&store, p2, &["sh".to_owned()], 0, 2)
             .await
             .expect("attach p2")
             .expect("under cap");
 
         // Store is now full (2/2): a brand-new peer is refused.
-        let rejected = attach(&store, p3, Some("sh"), 0, 2)
+        let rejected = attach(&store, p3, &["sh".to_owned()], 0, 2)
             .await
             .expect("attach p3 ok-result");
         assert!(
@@ -502,7 +504,7 @@ mod tests {
 
         // But an existing peer reattaches fine even at capacity.
         detach(&store, p1).await;
-        let reattach = attach(&store, p1, Some("sh"), 0, 2)
+        let reattach = attach(&store, p1, &["sh".to_owned()], 0, 2)
             .await
             .expect("reattach p1")
             .expect("reattach is allowed at capacity");
@@ -525,7 +527,7 @@ mod tests {
         let peer = generate_secret_key().public();
 
         // A real session whose shell we immediately mark as exited.
-        let handle = spawn_session(Some("sh"), 0).expect("spawn session");
+        let handle = spawn_session(&["sh".to_owned()], 0).expect("spawn session");
         handle.session.lock().await.child_alive = false;
         store.lock().await.insert(peer, handle);
         assert_eq!(

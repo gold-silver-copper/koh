@@ -16,7 +16,9 @@ pub mod cli;
 mod render;
 
 pub use backend::{DefaultBackend, KohBackend};
-pub use cli::{connect, run_id, ConnectArgs, IdArgs};
+pub use cli::{connect, run_id, ConnectConfig, IdConfig};
+#[cfg(feature = "cli")]
+pub use cli::{ConnectArgs, IdArgs};
 pub use render::WindowState;
 
 use std::time::Duration;

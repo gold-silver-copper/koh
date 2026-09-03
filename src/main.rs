@@ -9,7 +9,9 @@
 //! - `koh key`     — change the identity key's encryption passphrase (keys are always encrypted).
 //!
 //! Each subcommand delegates to a library entry point (`koh::server::serve`, `koh::client::connect`,
-//! `koh::client::run_id`, `koh::keycmd::run`); this binary is just argument parsing + dispatch.
+//! `koh::client::run_id`, `koh::keycmd::run`) via the clap `*Args` adapters, which convert into the
+//! clap-free `*Config` types those functions take; this binary is just argument parsing + dispatch.
+//! It exists only under the `cli` feature (on by default).
 
 use clap::{Parser, Subcommand};
 use koh::client::{ConnectArgs, IdArgs};

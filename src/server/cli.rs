@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+#[cfg(feature = "cli")]
 use clap::Args as ClapArgs;
 use iroh::EndpointId;
 use tokio::signal::unix::{signal, SignalKind};
@@ -34,7 +35,68 @@ use tracing::{error, info, warn};
 /// pending slot for the 300s idle timeout koh configures (`koh_transport_config`).
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Arguments for `koh serve`.
+/// Configuration for [`serve`] — the clap-free, library-facing form of `koh serve`'s arguments.
+///
+/// Every field is public so an embedding binary can build one directly (see the crate docs on
+/// library use). The `koh` binary builds it from [`ServeArgs`] via `From`. [`Default`] gives the
+/// same values as the CLI's defaults, with an empty `allow` list — which [`serve`] rejects, exactly
+/// as the CLI does, because an allowlist entry is the sole way in.
+#[derive(Debug, Clone)]
+pub struct ServeConfig {
+    /// Path to the persistent secret-key file (gives a stable endpoint id across restarts).
+    /// `None` = the platform default server key path.
+    pub key_file: Option<PathBuf>,
+    /// Authorized client endpoint ids. At least one is required — koh only serves peers whose
+    /// node-id is on this list.
+    pub allow: Vec<String>,
+    /// The program to host in the session PTY, as argv: `command[0]` is the program, the rest are
+    /// its arguments, passed verbatim (no shell splitting). Empty = the user's login shell.
+    pub command: Vec<String>,
+    /// Scrollback lines retained by the server-side emulator (per session). 0 = no scrollback.
+    /// Bounded to `0..=1_000_000`, like the CLI.
+    pub scrollback: u64,
+    /// Keep a detached session's shell alive this long (seconds) for the client to reconnect.
+    pub session_ttl_secs: u64,
+    /// Host via a self-hosted relay URL instead of n0's public relays. Takes precedence over
+    /// `local` if both are set.
+    pub relay_url: Option<String>,
+    /// Bind without any relay/discovery (LAN / loopback). Clients dial with `--direct <ip:port>`.
+    pub local: bool,
+    /// Maximum number of connections being handled concurrently (minimum 1).
+    pub max_connections: u32,
+    /// Maximum number of distinct live sessions, one per authorized peer (minimum 1).
+    pub max_sessions: u32,
+}
+
+/// The CLI's default for `--scrollback`.
+pub const DEFAULT_SCROLLBACK: u64 = 1000;
+/// The CLI's default for `--session-ttl-secs` (24h: mosh-style "close the laptop, reopen later").
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
+/// The CLI's default for `--max-connections`.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 64;
+/// The CLI's default for `--max-sessions`.
+pub const DEFAULT_MAX_SESSIONS: u32 = 64;
+/// Upper bound on `scrollback` (the CLI's `value_parser` range; re-checked in [`serve`]).
+pub const MAX_SCROLLBACK: u64 = 1_000_000;
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            key_file: None,
+            allow: Vec::new(),
+            command: Vec::new(),
+            scrollback: DEFAULT_SCROLLBACK,
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            relay_url: None,
+            local: false,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_sessions: DEFAULT_MAX_SESSIONS,
+        }
+    }
+}
+
+/// Arguments for `koh serve` (the clap adapter over [`ServeConfig`]; `cli` feature only).
+#[cfg(feature = "cli")]
 #[derive(ClapArgs, Debug)]
 pub struct ServeArgs {
     /// Path to the persistent secret-key file (gives a stable endpoint id across restarts).
@@ -46,19 +108,21 @@ pub struct ServeArgs {
     #[arg(long = "allow", value_name = "ENDPOINT_ID")]
     allow: Vec<String>,
 
-    /// Shell to run (defaults to the user's login shell).
-    #[arg(long)]
-    shell: Option<String>,
+    /// Program to run in the session (defaults to the user's login shell). Repeat to pass
+    /// arguments: `--shell zellij --shell attach --shell -c --shell main` runs
+    /// `zellij attach -c main`. The value is never split on whitespace.
+    #[arg(long, value_name = "PROGRAM_OR_ARG")]
+    shell: Vec<String>,
 
     /// Scrollback lines retained by the server-side emulator (per session). Bounded like the other
     /// resource knobs (`--max-connections`/`--max-sessions`): vt100 allocates the grid eagerly, so an
     /// unbounded value × `--max-sessions` is a memory footgun. 0 = no scrollback.
-    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
+    #[arg(long, default_value_t = DEFAULT_SCROLLBACK, value_parser = clap::value_parser!(u64).range(0..=MAX_SCROLLBACK))]
     scrollback: u64,
 
     /// Keep a detached session's shell alive this long (seconds) for the client to reconnect.
     /// Default 24h (mosh-style "close the laptop, reopen later").
-    #[arg(long, default_value_t = 86_400)]
+    #[arg(long, default_value_t = DEFAULT_SESSION_TTL_SECS)]
     session_ttl_secs: u64,
 
     /// Host via a self-hosted relay URL instead of n0's public relays.
@@ -72,14 +136,31 @@ pub struct ServeArgs {
     /// Maximum number of connections being handled concurrently (each holds a permit for its whole
     /// lifetime; excess incoming connections are refused cheaply, before the crypto handshake). This
     /// bounds the work a flood of dials can pin on the server before the allowlist check rejects them.
-    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS, value_parser = clap::value_parser!(u32).range(1..))]
     max_connections: u32,
 
     /// Maximum number of distinct live sessions (one per authorized peer). A new peer is refused
     /// once this many sessions exist; reconnecting to an existing session is always allowed. Bounds
     /// the number of real shells a flood of authorized keys can spawn.
-    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, default_value_t = DEFAULT_MAX_SESSIONS, value_parser = clap::value_parser!(u32).range(1..))]
     max_sessions: u32,
+}
+
+#[cfg(feature = "cli")]
+impl From<ServeArgs> for ServeConfig {
+    fn from(a: ServeArgs) -> Self {
+        Self {
+            key_file: a.key_file,
+            allow: a.allow,
+            command: a.shell,
+            scrollback: a.scrollback,
+            session_ttl_secs: a.session_ttl_secs,
+            relay_url: a.relay_url,
+            local: a.local,
+            max_connections: a.max_connections,
+            max_sessions: a.max_sessions,
+        }
+    }
 }
 
 /// Render `data` as a QR code for a **dark-background** terminal, or `None` if it is too large to
@@ -99,7 +180,13 @@ fn connect_qr(data: &str) -> Option<String> {
 }
 
 /// `koh serve` — host a PTY shell for authorized clients over iroh.
-pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+///
+/// The program hosted is [`ServeConfig::command`] (any argv, not only a shell). Accepts a
+/// [`ServeConfig`] or anything convertible into one ([`ServeArgs`] under the `cli` feature).
+///
+/// Installs a global `tracing` subscriber writing to stderr; call it once per process.
+pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
+    let args: ServeConfig = config.into();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -123,6 +210,17 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             "no clients authorized: pass --allow <endpoint-id> (repeatable; get one from `koh id`)"
         );
     }
+    // The CLI enforces these ranges in clap; a library caller bypasses that, so re-check here.
+    anyhow::ensure!(
+        args.scrollback <= MAX_SCROLLBACK,
+        "scrollback {} exceeds the maximum of {MAX_SCROLLBACK}",
+        args.scrollback
+    );
+    anyhow::ensure!(
+        args.max_connections >= 1,
+        "max_connections must be at least 1"
+    );
+    anyhow::ensure!(args.max_sessions >= 1, "max_sessions must be at least 1");
 
     let key_file = match args.key_file.clone() {
         Some(p) => p,
@@ -196,8 +294,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         "transport crypto posture"
     );
 
-    let shell = args.shell.clone();
-    // Cast the validated u64 (clap range 0..=1_000_000) down to the usize the emulator wants.
+    let command = std::sync::Arc::new(args.command.clone());
+    // Cast the validated u64 (range 0..=MAX_SCROLLBACK) down to the usize the emulator wants.
     let scrollback = args.scrollback as usize;
     let allow = std::sync::Arc::new(allow);
 
@@ -268,7 +366,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             continue;
         };
         let allow = allow.clone();
-        let shell = shell.clone();
+        let command = command.clone();
         let store = store.clone();
         tokio::spawn(async move {
             // Held for the whole task: releases the connection-cap permit on every exit path.
@@ -324,7 +422,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             let (handle, attach_kind) = match session::attach(
                 &store,
                 peer,
-                shell.as_deref(),
+                &command,
                 scrollback,
                 max_sessions,
             )
@@ -411,7 +509,48 @@ fn spawn_signal_drain(shutdown: CancellationToken) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::connect_qr;
+    use super::*;
+
+    #[test]
+    fn serve_config_default_matches_the_cli_defaults() {
+        let c = ServeConfig::default();
+        assert!(c.allow.is_empty() && c.command.is_empty());
+        assert_eq!(c.scrollback, 1000);
+        assert_eq!(c.session_ttl_secs, 86_400);
+        assert_eq!(c.max_connections, 64);
+        assert_eq!(c.max_sessions, 64);
+        assert!(!c.local && c.relay_url.is_none() && c.key_file.is_none());
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn serve_args_map_shell_to_command_argv_and_keep_defaults() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeArgs,
+        }
+        let cli = Cli::parse_from([
+            "koh", "--allow", "abc", "--shell", "zellij", "--shell", "attach",
+        ]);
+        let c: ServeConfig = cli.serve.into();
+        assert_eq!(c.command, ["zellij", "attach"]);
+        assert_eq!(c.allow, ["abc"]);
+        // Everything not given on the command line must equal `ServeConfig::default()`.
+        let d = ServeConfig::default();
+        assert_eq!(c.scrollback, d.scrollback);
+        assert_eq!(c.session_ttl_secs, d.session_ttl_secs);
+        assert_eq!(c.max_connections, d.max_connections);
+        assert_eq!(c.max_sessions, d.max_sessions);
+
+        // A single `--shell` is still just the program, as before.
+        let cli = Cli::parse_from(["koh", "--allow", "abc", "--shell", "/bin/zsh"]);
+        assert_eq!(ServeConfig::from(cli.serve).command, ["/bin/zsh"]);
+        // No `--shell` = login shell.
+        let cli = Cli::parse_from(["koh", "--allow", "abc"]);
+        assert!(ServeConfig::from(cli.serve).command.is_empty());
+    }
 
     #[test]
     fn connect_qr_renders_an_id_and_handles_overlong_input() {

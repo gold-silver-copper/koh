@@ -33,6 +33,24 @@ fn default_shell() -> String {
     resolve_shell(std::env::var_os("SHELL"))
 }
 
+/// Turn a `command` argv into a [`CommandBuilder`]: `command[0]` is the program, the rest are
+/// arguments. An empty `command` means "the session shell", resolved by `fallback` (the login
+/// shell in production; injected so this stays unit-testable without touching the process env).
+///
+/// Deliberately no whitespace splitting or quote parsing: a library caller that wants to host
+/// `zellij attach -c main` passes four elements, and a program whose path contains a space still
+/// works. Splitting a single `--shell` string is a CLI-layer choice, not a PTY concern.
+fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> CommandBuilder {
+    match command.split_first() {
+        Some((program, args)) => {
+            let mut cmd = CommandBuilder::new(program);
+            cmd.args(args);
+            cmd
+        }
+        None => CommandBuilder::new(fallback()),
+    }
+}
+
 /// Remove koh's operational env vars — notably the `$KOH_KEY_PASSPHRASE` identity-key secret — from
 /// a command's environment before it spawns the session shell (L-4 / KOH-15). `CommandBuilder::new`
 /// seeds the full parent environment, so we strip *every* inherited `KOH_*` key by prefix (rather
@@ -109,15 +127,18 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Allocate a PTY of `rows`×`cols`, spawn `shell` (or the user's default login shell when
-    /// `None`) with `TERM` set, and start streaming its output.
+    /// Allocate a PTY of `rows`×`cols`, spawn `command` (or the user's default login shell when
+    /// it is empty) with `TERM` set, and start streaming its output.
+    ///
+    /// `command[0]` is the program and the rest are its arguments, passed verbatim — no shell
+    /// splitting or quoting happens here.
     ///
     /// Returns the [`Pty`] handle plus an async receiver of raw output chunks. The reader runs
     /// on a dedicated OS thread; when the child closes the PTY the channel ends.
     pub fn spawn(
         rows: u16,
         cols: u16,
-        shell: Option<&str>,
+        command: &[String],
         term: &str,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
         let pty_system = native_pty_system();
@@ -130,8 +151,7 @@ impl Pty {
             })
             .map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
 
-        let cmd_shell = shell.map_or_else(default_shell, str::to_owned);
-        let mut cmd = CommandBuilder::new(cmd_shell);
+        let mut cmd = build_command(command, default_shell);
         // A real terminal type so curses apps behave; the env is otherwise inherited.
         cmd.env("TERM", term);
         // Scrub koh's operational env from the child (L-4). Most important: `$KOH_KEY_PASSPHRASE` —
@@ -348,6 +368,32 @@ impl Drop for Pty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_command_passes_argv_verbatim_and_falls_back_when_empty() {
+        // `command[0]` is the program, the tail its arguments — no splitting, no quoting.
+        let argv: Vec<String> = ["zellij", "attach", "-c", "my session"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        // The fallback must not be consulted for a non-empty argv; a sentinel proves it wasn't.
+        let cmd = build_command(&argv, || "FALLBACK-MUST-NOT-BE-USED".to_owned());
+        let got: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, argv, "argv must reach the child exactly as given");
+
+        // Empty argv means "the session shell", resolved by the injected fallback.
+        let cmd = build_command(&[], || "/custom/shell".to_owned());
+        let got: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, ["/custom/shell"]);
+    }
 
     #[test]
     fn resolve_shell_prefers_env_then_platform_default() {

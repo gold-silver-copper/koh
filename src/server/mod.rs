@@ -11,7 +11,9 @@ mod audit;
 pub mod cli;
 pub mod session;
 
-pub use cli::{serve, ServeArgs};
+#[cfg(feature = "cli")]
+pub use cli::ServeArgs;
+pub use cli::{serve, ServeConfig};
 
 use std::time::Duration;
 
@@ -344,10 +346,10 @@ pub async fn run_attached(
 /// any caller that doesn't need reattach. The binary uses the [`session`] store + [`run_attached`].
 pub async fn run_session(
     conn: iroh::endpoint::Connection,
-    shell: Option<String>,
+    command: &[String],
     scrollback: usize,
 ) -> anyhow::Result<()> {
-    let handle = session::spawn_session(shell.as_deref(), scrollback)?;
+    let handle = session::spawn_session(command, scrollback)?;
     let _ = run_attached(conn, handle.clone()).await?;
     let _ = handle.session.lock().await.pty.kill();
     Ok(())

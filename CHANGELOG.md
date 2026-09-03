@@ -3,8 +3,10 @@
 All notable changes to koh are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and koh aims to follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) for the **binary's CLI, the on-disk
-`koh-key-v1` key format, and the wire `PROTOCOL_VERSION`/ALPN**. The library crate is binary-first and
-its API is internal and unstable (see the README).
+`koh-key-v1` key format, and the wire `PROTOCOL_VERSION`/ALPN**. From 0.10.0 the library's config
+types and entry points (`ServeConfig`/`serve`, `ConnectConfig`/`connect`, `IdConfig`/`run_id`,
+`KeyConfig`/`keycmd::run`, and the `ssp` core) are covered too; everything else in the library is
+internal and unstable (see `src/lib.rs`).
 
 > **A note on versions.** [crates.io](https://crates.io/crates/koh) is the source of truth for what
 > was actually released. Two git-tag-only gaps exist from koh's early, fast-moving security-review
@@ -13,9 +15,35 @@ its API is internal and unstable (see the README).
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
 > 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.9.1.
 
-## [Unreleased]
+## [0.10.0] — 2026-09-03
+
+### Changed
+- **License: MIT** (was GPL-3.0-or-later). Releases before 0.10.0 remain available under their
+  original license. Motivation: koh is now consumed as a library by an MIT-licensed downstream
+  (`fux`), and a GPL library would force that crate's license.
+- **`cli` Cargo feature (on by default) now owns clap.** The `koh` binary, the `*Args` clap adapter
+  structs, the `chaos` example and the pty-binary e2e test are gated on it. `cargo install koh` is
+  unchanged; library users build with `default-features = false` plus one `backend-*` feature and
+  get a clap-free tree.
+- **Plain config types are the stable library surface.** `serve`, `connect`, `run_id` and
+  `keycmd::run` take `impl Into<…Config>`: `ServeConfig`, `ConnectConfig`, `IdConfig`, `KeyConfig`
+  (all public fields; `From<…Args>` under `cli`). Their `Default`/`new` match the CLI defaults,
+  and `serve` re-checks the ranges clap used to enforce so a library caller gets the same errors.
+- `session::spawn_session`, `session::attach`, `server::run_session` and `pty::Pty::spawn` take
+  the hosted program as an argv slice (`&[String]`) instead of `Option<&str>`; empty still means
+  the login shell.
 
 ### Added
+- **`ServeConfig::command`: host any program, with arguments.** `command[0]` is the program and the
+  rest its argv, passed verbatim — no whitespace splitting, so a path with a space still works. On
+  the CLI, `--shell` may now be repeated to build the argv (`--shell zellij --shell attach --shell
+  -c --shell main`); a single `--shell` behaves exactly as before.
+
+### Unchanged
+- Wire protocol, `PROTOCOL_VERSION`/ALPN, the `koh-key-v1` key format, and every CLI flag and
+  default.
+
+### Added (carried from the unreleased 0.9.x line)
 - **Pluggable terminal backends for the client renderer** (`client::backend::KohBackend`), so an
   alternate terminal crate can drive `koh connect` without touching the protocol, prediction, or
   session code. The render path now speaks only to the backend trait — its default methods emit the

@@ -73,14 +73,11 @@ pub trait SessionHost: Send + 'static {
     /// The client's terminal is now `rows × cols` (already clamped to `[MIN_DIM, MAX_DIM]`).
     fn resize(&mut self, client: ClientId, rows: u16, cols: u16);
 
-    /// User-input frame `frame` arrived at `now_ms`; see `ServerTerminal::register_input_frame`.
-    fn register_input_frame(&mut self, frame: u64, now_ms: u64);
-
-    /// Promote the echo-ack at `now_ms`; returns whether it advanced.
-    fn set_echo_ack(&mut self, now_ms: u64) -> bool;
-
-    /// Milliseconds until the echo-ack could next advance, or [`crate::ssp::NEVER`].
-    fn echo_ack_wait_time(&self, now_ms: u64) -> u64;
+    /// Stamp the echo-ack the connection loop computed for *its* client onto a snapshot it just
+    /// took (S-03, KS-02). Frame numbers are per connection, so the host never sees them: the
+    /// loop owns the input history and debounce, the host only knows where the ack goes in its
+    /// state. Called outside the session lock, on the snapshot alone.
+    fn stamp_echo_ack(state: &mut Self::State, echo_ack: u64);
 
     /// Whether the hosted app has DECCKM (application cursor keys) on, for the arrow-key
     /// normalizer. `false` when the notion does not apply.
@@ -170,16 +167,8 @@ impl SessionHost for PtyHost {
         self.emu.resize(rows, cols);
     }
 
-    fn register_input_frame(&mut self, frame: u64, now_ms: u64) {
-        self.emu.register_input_frame(frame, now_ms);
-    }
-
-    fn set_echo_ack(&mut self, now_ms: u64) -> bool {
-        self.emu.set_echo_ack(now_ms)
-    }
-
-    fn echo_ack_wait_time(&self, now_ms: u64) -> u64 {
-        self.emu.echo_ack_wait_time(now_ms)
+    fn stamp_echo_ack(state: &mut Self::State, echo_ack: u64) {
+        state.set_echo_ack(echo_ack);
     }
 
     fn application_cursor(&self) -> bool {
@@ -662,7 +651,6 @@ pub(crate) mod test_host {
     pub enum HostCall {
         Input(Vec<u8>),
         Resize(ClientId, u16, u16),
-        Frame(u64, u64),
         Detached(ClientId),
         Kill,
     }
@@ -672,8 +660,6 @@ pub(crate) mod test_host {
         pub state: GridState,
         pub calls: Vec<HostCall>,
         pub alive: bool,
-        pub echo_ack: u64,
-        pub pending_frame: Option<u64>,
         pub notify: Option<Arc<Notify>>,
     }
 
@@ -699,9 +685,11 @@ pub(crate) mod test_host {
         type State = GridState;
 
         fn snapshot(&mut self) -> GridState {
-            let mut s = self.state.clone();
-            s.echo_ack = self.echo_ack;
-            s
+            self.state.clone()
+        }
+
+        fn stamp_echo_ack(state: &mut GridState, echo_ack: u64) {
+            state.echo_ack = echo_ack;
         }
 
         fn input(&mut self, bytes: &[u8]) {
@@ -717,25 +705,6 @@ pub(crate) mod test_host {
             self.state.rows = rows;
             self.state.cols = cols;
             self.calls.push(HostCall::Resize(client, rows, cols));
-        }
-
-        fn register_input_frame(&mut self, frame: u64, now_ms: u64) {
-            self.pending_frame = Some(frame);
-            self.calls.push(HostCall::Frame(frame, now_ms));
-        }
-
-        fn set_echo_ack(&mut self, _now_ms: u64) -> bool {
-            match self.pending_frame.take() {
-                Some(f) if f > self.echo_ack => {
-                    self.echo_ack = f;
-                    true
-                }
-                _ => false,
-            }
-        }
-
-        fn echo_ack_wait_time(&self, _now_ms: u64) -> u64 {
-            crate::ssp::NEVER
         }
 
         fn alive(&self) -> bool {

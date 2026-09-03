@@ -21,7 +21,10 @@ internal and unstable (see `src/lib.rs`).
 - **The server hosts any `SyncState` producer, not only a PTY** (KH-01). `session::Session`,
   `SessionHandle`, `SessionStore`, `attach_with`, `detach`, `reap`, `run_reaper`, `ServerSession`,
   `run_attached` (now also taking a `ClientId`) and `run_session_with` are generic over a
-  `SessionHost`; `PtyHost` is the previous PTY + emulator code behind that trait. `serve` is
+  `SessionHost`; `PtyHost` is the previous PTY + emulator code behind that trait. The echo-ack
+  debounce moved out of `ServerTerminal` into the per-connection loop (KS-02): a host only
+  implements `stamp_echo_ack`, and `ServerTerminal::snapshot` leaves `echo_ack` at 0 for the loop
+  to stamp (`TerminalScreen::set_echo_ack`). `serve` is
   unchanged in behaviour and is `serve_with(config, Hosts::new().with(TERMINAL_ALPN, PtyHosts))`
   underneath. `serve` installs its tracing subscriber with `try_init`, so an embedding binary that
   already owns one no longer panics.

@@ -138,9 +138,7 @@ impl SessionHost for LogHost {
     fn snapshot(&mut self) -> Log { self.0.clone() }
     fn input(&mut self, b: &[u8]) { self.0 .0.push_str(&String::from_utf8_lossy(b)); }
     fn resize(&mut self, _: ClientId, _: u16, _: u16) {}
-    fn register_input_frame(&mut self, _: u64, _: u64) {}
-    fn set_echo_ack(&mut self, _: u64) -> bool { false }
-    fn echo_ack_wait_time(&self, _: u64) -> u64 { koh::ssp::NEVER }
+    fn stamp_echo_ack(_: &mut Log, _: u64) {} // a real state carries it for the predictor
     fn alive(&self) -> bool { true }
 }
 

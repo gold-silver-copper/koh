@@ -1,11 +1,8 @@
 //! The server-side live terminal emulator: a long-lived `vt100::Parser` fed by the PTY,
-//! plus the echo-ack debounce that tells the client which of its keystrokes are now visible.
+//! plus the terminal queries it answers on the host's behalf. The echo-ack debounce that tells the
+//! client which of its keystrokes are now visible lives per connection in `server` (KS-02).
 
-use crate::ssp::NEVER;
-
-use crate::terminal::{
-    clamp_dims, TerminalScreen, ECHO_TIMEOUT_MS, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
-};
+use crate::terminal::{clamp_dims, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN};
 
 /// A ConEmu / Windows Terminal progress report from the hosted app (KO-01).
 ///
@@ -165,35 +162,22 @@ impl vt100::Callbacks for Callbacks {
 
 /// The server's authoritative terminal. Owns the live parser (which is not `Clone`) and
 /// produces a [`TerminalScreen`] snapshot for the SSP transport each tick.
+///
+/// The echo-ack is **not** tracked here (KS-02): SSP frame numbers are per connection, so the
+/// per-connection `ServerSession` owns the input history and stamps its own ack onto each snapshot
+/// it takes. Snapshots leave `echo_ack` at 0 for that reason.
 pub struct ServerTerminal {
     parser: vt100::Parser<Callbacks>,
-    /// The newest input frame number whose effects are considered on-screen.
-    echo_ack: u64,
-    /// Pending `(input_frame_num, arrival_timestamp_ms)`, oldest first.
-    input_history: Vec<(u64, u64)>,
     /// The shell's exit code once it has exited (propagated to the client on shutdown).
     exit_code: Option<u32>,
-    /// Echo debounce (ms): how long after an input frame arrives before it counts as echoed.
-    /// Defaults to [`ECHO_TIMEOUT_MS`]; injectable so timing is testable without the wall clock.
-    echo_timeout_ms: u64,
 }
 
 impl ServerTerminal {
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         Self {
             parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback, Callbacks::default()),
-            echo_ack: 0,
-            input_history: Vec::new(),
             exit_code: None,
-            echo_timeout_ms: ECHO_TIMEOUT_MS,
         }
-    }
-
-    /// Override the echo debounce (ms). The server uses the [`ECHO_TIMEOUT_MS`] default; tests
-    /// inject a smaller value to exercise the promotion timing deterministically.
-    #[cfg(test)]
-    pub fn set_echo_timeout_ms(&mut self, ms: u64) {
-        self.echo_timeout_ms = ms;
     }
 
     /// Record the shell's exit code; the next snapshot carries it to the client.
@@ -250,51 +234,6 @@ impl ServerTerminal {
         self.parser.screen().size()
     }
 
-    /// Record that user-input frame `n` arrived at `now` (ms). The screen has had no time to
-    /// reflect it yet; [`set_echo_ack`](Self::set_echo_ack) promotes it after the debounce.
-    pub fn register_input_frame(&mut self, n: u64, now: u64) {
-        // Frame numbers only advance; ignore stale/duplicate registrations.
-        if self.input_history.last().is_none_or(|(f, _)| n > *f) {
-            self.input_history.push((n, now));
-        }
-    }
-
-    /// Promote `echo_ack` to the newest input frame that arrived at least `echo_timeout_ms`
-    /// ago (so the shell has had time to echo it). Returns whether it changed. Mosh
-    /// `Complete::set_echo_ack`.
-    pub fn set_echo_ack(&mut self, now: u64) -> bool {
-        let cutoff = now.saturating_sub(self.echo_timeout_ms);
-        let mut newest = self.echo_ack;
-        for &(frame, ts) in &self.input_history {
-            if ts <= cutoff {
-                newest = newest.max(frame);
-            }
-        }
-        // Drop history entries strictly older than the new echo_ack (keep it and newer).
-        self.input_history.retain(|&(frame, _)| frame >= newest);
-        let changed = self.echo_ack != newest;
-        self.echo_ack = newest;
-        changed
-    }
-
-    /// Milliseconds until [`set_echo_ack`](Self::set_echo_ack) could next advance, or [`NEVER`] if nothing pends.
-    /// Mosh `Complete::wait_time`.
-    pub fn echo_ack_wait_time(&self, now: u64) -> u64 {
-        // The second-oldest pending frame is the next one whose debounce can fire; if there are
-        // fewer than two, nothing is waiting. `.get(1)` keeps this panic-free without an index.
-        let Some(&(_, arrived)) = self.input_history.get(1) else {
-            return NEVER;
-        };
-        let fire_at = arrived + self.echo_timeout_ms;
-        fire_at.saturating_sub(now)
-    }
-
-    /// The current echo-ack value. Test-only; production reads it off the synced snapshot.
-    #[cfg(test)]
-    pub fn echo_ack(&self) -> u64 {
-        self.echo_ack
-    }
-
     /// Window title set by the shell (OSC 2), if any. Test-only — production reads it via
     /// [`snapshot`](Self::snapshot)'s [`TerminalScreen`].
     #[cfg(test)]
@@ -320,11 +259,12 @@ impl ServerTerminal {
         self.parser.screen().application_cursor()
     }
 
-    /// Produce the SSP snapshot the transport will diff and ship.
+    /// Produce the SSP snapshot the transport will diff and ship. `echo_ack` is 0: the connection
+    /// loop stamps its own (see [`SessionHost::stamp_echo_ack`](crate::server::SessionHost::stamp_echo_ack)).
     pub fn snapshot(&self) -> TerminalScreen {
         TerminalScreen {
             screen: self.parser.screen().clone(),
-            echo_ack: self.echo_ack,
+            echo_ack: 0,
             title: self.parser.callbacks().title.clone(),
             icon: self.parser.callbacks().icon.clone(),
             clipboard: self.parser.callbacks().clipboard.clone(),
@@ -356,50 +296,6 @@ mod tests {
         assert_eq!(t.take_host_replies(), b"\x1b[?62;1;6c");
         t.process(b"\x1b[>c"); // secondary DA
         assert_eq!(t.take_host_replies(), b"\x1b[>1;10;0c");
-    }
-
-    #[test]
-    fn echo_ack_debounces() {
-        let mut t = ServerTerminal::new(24, 80, 0);
-        t.register_input_frame(5, 1000);
-        // Too soon: nothing within the debounce window.
-        assert!(!t.set_echo_ack(1010));
-        assert_eq!(t.echo_ack(), 0);
-        // After 50ms the frame is considered echoed.
-        assert!(t.set_echo_ack(1050));
-        assert_eq!(t.echo_ack(), 5);
-    }
-
-    #[test]
-    fn echo_ack_honors_injected_timeout() {
-        // With a 10ms debounce (not the 50ms default), a frame is echoed after 10ms, not 50 — a
-        // deterministic timing assertion only possible now that the timeout is injectable.
-        let mut t = ServerTerminal::new(24, 80, 0);
-        t.set_echo_timeout_ms(10);
-        t.register_input_frame(5, 1000);
-        assert!(
-            !t.set_echo_ack(1005),
-            "still inside the injected 10ms window"
-        );
-        assert_eq!(t.echo_ack(), 0);
-        assert!(t.set_echo_ack(1011), "past the injected 10ms window");
-        assert_eq!(t.echo_ack(), 5);
-        // The default (50ms) would not have promoted at 1011.
-        let mut d = ServerTerminal::new(24, 80, 0);
-        d.register_input_frame(5, 1000);
-        assert!(
-            !d.set_echo_ack(1011),
-            "the 50ms default has not elapsed yet"
-        );
-    }
-
-    #[test]
-    fn echo_ack_is_monotonic_and_takes_newest() {
-        let mut t = ServerTerminal::new(24, 80, 0);
-        t.register_input_frame(3, 1000);
-        t.register_input_frame(7, 1005);
-        t.set_echo_ack(1100); // both older than 50ms -> newest = 7
-        assert_eq!(t.echo_ack(), 7);
     }
 
     #[test]

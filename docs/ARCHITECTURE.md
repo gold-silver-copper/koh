@@ -147,9 +147,8 @@ both into traits so an embedding binary (the `fux` multiplexer) can sync a state
 the same SSP-over-iroh machinery, with detachable sessions, reconnect and prediction intact.
 
 - **KH-01 — `SessionHost`.** The exact contract `run_attached` needs from the classic PTY +
-  emulator pair: `snapshot`, `input`, `resize(client, …)`, `register_input_frame`, `set_echo_ack`,
-  `echo_ack_wait_time`, `application_cursor`, `alive`, plus `attach_notify` / `client_detached` /
-  `kill` / `shutdown`. `PtyHost` is today's code moved, not rewritten; `Session<H>`, the store,
+  emulator pair: `snapshot`, `input`, `resize(client, …)`, `stamp_echo_ack`, `application_cursor`,
+  `alive`, plus `attach_notify` / `client_detached` / `kill` / `shutdown`. `PtyHost` is today's code moved, not rewritten; `Session<H>`, the store,
   `attach_with`, `detach`, `reap` and the reaper are generic. A `HostProvider` maps admitted peers
   to sessions: `PtyHosts` (one detachable session per peer, the 0.10 behaviour) or `SharedHost`
   (one host for every peer). `serve` is `serve_with` over a `PtyHosts` on the terminal ALPN. Each
@@ -166,6 +165,12 @@ the same SSP-over-iroh machinery, with detachable sessions, reconnect and predic
   refcount across viewers; the TTL reaper collects only at zero, or when the host reports
   `!alive()`. Resize policy is last-writer-wins for v1 (`coalesce_drained_input` keeps the last
   resize per connection; the host sees each with its `ClientId`).
+- **KS-02 — echo-ack is per connection; a host never sees frame numbers.** SSP frame numbers are
+  per transport, so the input history and the S-03 debounce live in the per-connection
+  `ServerSession` (`server::EchoAck`), not in the emulator. The loop takes the host's snapshot,
+  then calls `SessionHost::stamp_echo_ack(&mut state, ack)` with *its* client's ack before
+  installing it. With a host-global ack, the second viewer of a shared host was handed the first
+  viewer's frame number and its predictor treated every keystroke as already acked.
 - **KC-01 — `ClientState` / `ClientTerminal<S>` / `ScreenView`.** The client session is generic
   over the remote state: `ClientState` supplies the out-of-band window state, the exit code, the
   echo-ack, the input modes to mirror (`InputModes`, byte-identical to vt100's own sequences), and

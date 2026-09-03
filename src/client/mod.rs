@@ -1211,12 +1211,13 @@ mod tests {
         // A real server frame that echoes 'x' and acks input frame 1 (past the echo debounce).
         let mut emu = ServerTerminal::new(24, 80, 0);
         emu.process(b"x");
-        emu.register_input_frame(1, 0);
-        emu.set_echo_ack(100);
         let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
         server.set_connected(true);
         server.observe_rtt(20.0);
-        *server.current_mut() = emu.snapshot();
+        // The connection loop stamps its own ack onto the snapshot (KS-02).
+        let mut snap = emu.snapshot();
+        snap.set_echo_ack(1);
+        *server.current_mut() = snap;
         for dg in drive_until_nonempty(&mut server) {
             s.on_datagram(100, &dg);
         }

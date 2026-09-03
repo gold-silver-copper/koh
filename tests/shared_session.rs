@@ -241,6 +241,84 @@ async fn two_peers_share_one_pty_host() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_viewer_gets_its_own_echo_ack() {
+    // KS-02: echo-ack is per connection. A types 30 separate frames; then B types one. B's replica
+    // must be acked for its own frame and must never observe an ack above its own newest sent
+    // frame — a host-global ack would hand B A's frame number (~30) immediately.
+    let server_ep = bind_endpoint_local(generate_secret_key(), true)
+        .await
+        .expect("bind server");
+    let addr = loopback_addr(&server_ep);
+    let provider = shared_pty();
+    let accept = accept_loop(server_ep, provider.clone());
+
+    let ep_a = bind_endpoint_local(generate_secret_key(), false)
+        .await
+        .expect("bind A");
+    let ep_b = bind_endpoint_local(generate_secret_key(), false)
+        .await
+        .expect("bind B");
+    let chan_a = IrohChannel::new(ep_a.connect(addr.clone(), ALPN).await.expect("A connect"));
+    let chan_b = IrohChannel::new(ep_b.connect(addr, ALPN).await.expect("B connect"));
+    let mut client_a = TestClient::new(&chan_a);
+    let mut client_b = TestClient::new(&chan_b);
+    assert!(
+        client_a
+            .send_and_wait(Some(b"echo ECHO_A\r"), None, "ECHO_A", 10_000)
+            .await
+    );
+    for _ in 0..30 {
+        // One byte per frame; a space is harmless at the prompt. Each pump lets the frame ship.
+        let _ = client_a
+            .send_and_wait(Some(b" "), None, "\u{0}never", 40)
+            .await;
+        let (ack, sent) = (
+            client_b.transport.remote_state().echo_ack(),
+            client_b.transport.newest_sent_num(),
+        );
+        assert!(
+            ack <= sent,
+            "B acked above its own frames: ack {ack} > sent {sent}"
+        );
+    }
+    let a_ack = client_a.transport.remote_state().echo_ack();
+    assert!(a_ack >= 30, "A's own frames are acked to A: {a_ack}");
+
+    assert!(
+        client_b
+            .send_and_wait(Some(b"echo ECHO_B\r"), None, "ECHO_B", 10_000)
+            .await
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut b_ack = 0;
+    while std::time::Instant::now() < deadline {
+        let _ = client_b.send_and_wait(None, None, "\u{0}never", 50).await;
+        b_ack = client_b.transport.remote_state().echo_ack();
+        let sent = client_b.transport.newest_sent_num();
+        assert!(
+            b_ack <= sent,
+            "B acked above its own frames: ack {b_ack} > sent {sent}"
+        );
+        if b_ack >= 1 {
+            break;
+        }
+    }
+    assert!(
+        (1..30).contains(&b_ack),
+        "B is acked for its own frame, not A's: {b_ack}"
+    );
+
+    chan_a.close(0, b"done");
+    chan_b.close(0, b"done");
+    accept.abort();
+    let store = provider.store();
+    let handle = store.lock().await.values().next().cloned();
+    if let Some(h) = handle {
+        let _ = h.session.lock().await.host.pty.kill();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resize_from_either_client_reaches_the_host_and_the_last_one_wins() {
     // KS-01: two viewers with different geometries; the host applies each resize as it arrives
     // (last wins for v1), so the emulator ends at the second client's size.

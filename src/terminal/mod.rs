@@ -32,9 +32,6 @@ pub use server::{Progress, ServerTerminal, UNHANDLED_OSC_MAX_LEN, UNHANDLED_OSC_
 /// Default screen geometry, used for the initial (num 0) state both ends agree on.
 pub const DEFAULT_ROWS: u16 = 24;
 pub const DEFAULT_COLS: u16 = 80;
-/// Server-side debounce before a received input frame is considered "echoed" (mosh `ECHO_TIMEOUT`).
-pub(crate) const ECHO_TIMEOUT_MS: u64 = 50;
-
 /// Bounds on a peer-controlled terminal geometry.
 ///
 /// `vt100::Parser` allocates `rows × cols` cells **eagerly**, so an unclamped resize from a hostile
@@ -233,6 +230,12 @@ impl TerminalScreen {
     /// The server's echo-ack: the newest input frame number reflected on this screen.
     pub fn echo_ack(&self) -> u64 {
         self.echo_ack
+    }
+
+    /// Stamp the echo-ack the connection loop computed for its client (KS-02). The emulator's
+    /// snapshot leaves it at 0; `PtyHost::stamp_echo_ack` writes it here per connection.
+    pub fn set_echo_ack(&mut self, ack: u64) {
+        self.echo_ack = ack;
     }
 
     /// The window title, if the server has set one.

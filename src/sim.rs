@@ -72,7 +72,9 @@ pub fn run_session(loss: f64, seed: u64) -> SessionResult {
     // The fake shell: drain the input, echo each byte, and on CR emit the command output.
     let frame = h.b.remote_num();
     let arrival = h.now();
-    emu.register_input_frame(frame, arrival);
+    // The per-connection echo-ack tracker the server loop owns (KS-02).
+    let mut echo = crate::server::EchoAck::default();
+    echo.register_input_frame(frame, arrival);
     for w in h.b.get_remote_diff() {
         if let WireEvent::Keys(bytes) = w {
             for b in bytes {
@@ -84,11 +86,14 @@ pub fn run_session(loss: f64, seed: u64) -> SessionResult {
             }
         }
     }
-    // Past the echo-ack debounce: the input is now reflected on screen.
-    emu.set_echo_ack(arrival + 1_000);
-    *h.b_mut() = emu.snapshot();
+    // Past the echo-ack debounce: the input is now reflected on screen. Stamp the ack the way the
+    // connection loop does, after taking the snapshot.
+    echo.set_echo_ack(arrival + 1_000);
+    let mut snap = emu.snapshot();
+    snap.set_echo_ack(echo.echo_ack());
+    *h.b_mut() = snap.clone();
 
-    let target = emu.snapshot();
+    let target = snap;
     let converge_steps = h.run_until(40_000, |h| *h.a.remote_state() == target);
 
     SessionResult {

@@ -26,7 +26,6 @@ use koh::server::cli::Hosts;
 use koh::server::session::{SessionHost, SharedHost};
 use koh::server::{ClientId, PtyHosts};
 use koh::ssp::testkit::GridState;
-use koh::ssp::NEVER;
 use koh::transport_iroh::{
     bind_endpoint_local, bind_endpoint_local_alpns, generate_secret_key, loopback_addr,
     TERMINAL_ALPN,
@@ -41,8 +40,6 @@ const GRID_ALPN: &[u8] = b"test/grid/1";
 struct EchoHost {
     state: GridState,
     alive: bool,
-    pending_frame: Option<u64>,
-    echo_ack: u64,
     /// Shared with the test so it can end the host from outside.
     exit_request: Arc<Mutex<Option<u32>>>,
     /// Shared with the test so it can wake the attached loops after requesting the exit (what a
@@ -60,8 +57,6 @@ impl EchoHost {
         Self {
             state: GridState::default(),
             alive: true,
-            pending_frame: None,
-            echo_ack: 0,
             exit_request,
             notify,
             resizes,
@@ -77,9 +72,11 @@ impl SessionHost for EchoHost {
             self.alive = false;
             self.state.exit_code = Some(code);
         }
-        let mut s = self.state.clone();
-        s.echo_ack = self.echo_ack;
-        s
+        self.state.clone()
+    }
+
+    fn stamp_echo_ack(state: &mut GridState, echo_ack: u64) {
+        state.echo_ack = echo_ack;
     }
 
     fn input(&mut self, bytes: &[u8]) {
@@ -97,24 +94,6 @@ impl SessionHost for EchoHost {
         self.state.rows = rows;
         self.state.cols = cols;
         self.resizes.lock().unwrap().push((client, rows, cols));
-    }
-
-    fn register_input_frame(&mut self, frame: u64, _now_ms: u64) {
-        self.pending_frame = Some(frame);
-    }
-
-    fn set_echo_ack(&mut self, _now_ms: u64) -> bool {
-        match self.pending_frame.take() {
-            Some(f) if f > self.echo_ack => {
-                self.echo_ack = f;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn echo_ack_wait_time(&self, _now_ms: u64) -> u64 {
-        NEVER
     }
 
     fn alive(&self) -> bool {

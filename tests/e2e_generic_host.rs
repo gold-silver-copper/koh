@@ -24,13 +24,14 @@ use koh::client::{run_client, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::cli::Hosts;
 use koh::server::session::{SessionHost, SharedHost};
+use koh::server::ChangeSignal;
 use koh::server::{ClientId, PtyHosts};
 use koh::ssp::testkit::GridState;
 use koh::transport_iroh::{
     bind_endpoint_local, bind_endpoint_local_alpns, generate_secret_key, loopback_addr,
     TERMINAL_ALPN,
 };
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// The test ALPN for the grid state (KH-02).
@@ -44,7 +45,7 @@ struct EchoHost {
     exit_request: Arc<Mutex<Option<u32>>>,
     /// Shared with the test so it can wake the attached loops after requesting the exit (what a
     /// real host does from its own task).
-    notify: Arc<Mutex<Option<Arc<Notify>>>>,
+    notify: Arc<Mutex<Option<ChangeSignal>>>,
     resizes: Arc<Mutex<Vec<(ClientId, u16, u16)>>>,
 }
 
@@ -52,7 +53,7 @@ impl EchoHost {
     fn new(
         exit_request: Arc<Mutex<Option<u32>>>,
         resizes: Arc<Mutex<Vec<(ClientId, u16, u16)>>>,
-        notify: Arc<Mutex<Option<Arc<Notify>>>>,
+        notify: Arc<Mutex<Option<ChangeSignal>>>,
     ) -> Self {
         Self {
             state: GridState::default(),
@@ -86,7 +87,7 @@ impl SessionHost for EchoHost {
             .or_default()
             .extend_from_slice(bytes);
         if let Some(n) = self.notify.lock().unwrap().as_ref() {
-            n.notify_one();
+            n.pulse();
         }
     }
 
@@ -100,7 +101,7 @@ impl SessionHost for EchoHost {
         self.alive && self.exit_request.lock().unwrap().is_none()
     }
 
-    fn attach_notify(&mut self, changed: Arc<Notify>) {
+    fn attach_notify(&mut self, changed: ChangeSignal) {
         *self.notify.lock().unwrap() = Some(changed);
     }
 }
@@ -109,12 +110,12 @@ impl SessionHost for EchoHost {
 /// task would.
 fn request_exit(
     exit_request: &Arc<Mutex<Option<u32>>>,
-    notify: &Arc<Mutex<Option<Arc<Notify>>>>,
+    notify: &Arc<Mutex<Option<ChangeSignal>>>,
     code: u32,
 ) {
     *exit_request.lock().unwrap() = Some(code);
     if let Some(n) = notify.lock().unwrap().as_ref() {
-        n.notify_one();
+        n.pulse();
     }
 }
 

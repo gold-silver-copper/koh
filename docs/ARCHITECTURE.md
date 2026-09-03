@@ -171,6 +171,13 @@ the same SSP-over-iroh machinery, with detachable sessions, reconnect and predic
   then calls `SessionHost::stamp_echo_ack(&mut state, ack)` with *its* client's ack before
   installing it. With a host-global ack, the second viewer of a shared host was handed the first
   viewer's frame number and its predictor treated every keystroke as already acked.
+- **KS-03 — a change wakes every viewer.** `SessionHandle::changed` is a `ChangeSignal`, a
+  `tokio::sync::watch` version counter: the host (or the PTY drain task) `pulse`s it, and each
+  attached loop holds its own receiver and `select!`s on `changed()`. Every viewer wakes on one
+  pulse; a burst coalesces into one wake per viewer; and because a receiver remembers the version
+  it last saw, a pulse landing between a loop's snapshot and its wait is never lost. The previous
+  `Notify::notify_one` released a single waiter, so a second viewer lagged by up to the 1 s timer
+  cap.
 - **KC-01 — `ClientState` / `ClientTerminal<S>` / `ScreenView`.** The client session is generic
   over the remote state: `ClientState` supplies the out-of-band window state, the exit code, the
   echo-ack, the input modes to mirror (`InputModes`, byte-identical to vt100's own sequences), and

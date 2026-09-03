@@ -8,11 +8,13 @@
 //! peer can share one host ([`SharedHost`], KS-01). This is what gives mosh's "close the laptop,
 //! reopen, your session is right where you left it" behavior.
 //!
-//! Concurrency: the drain task and the attached connection loop both lock the shared session
-//! briefly (the drain to `process` output, the loop to snapshot / apply input). The drain pulses
-//! a [`Notify`] after each change so the attached loop re-renders promptly; `notify_one`
-//! coalesces a burst of output into a single wake (mosh-style collapse). Lock order is always
-//! store → session, so there is no deadlock (the connection loop only ever locks the session).
+//! Concurrency: the drain task and the attached connection loops all lock the shared session
+//! briefly (the drain to `process` output, a loop to snapshot / apply input). The drain pulses a
+//! [`ChangeSignal`] after each change so every attached loop re-renders promptly (KS-03): it is a
+//! `watch` version counter, so a burst of output coalesces into a single wake per loop
+//! (mosh-style collapse) and a pulse can never be lost, because each receiver remembers the
+//! version it last saw. Lock order is always store → session, so there is no deadlock (the
+//! connection loop only ever locks the session).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -24,7 +26,7 @@ use crate::ssp::SyncState;
 use crate::terminal::{ServerTerminal, DEFAULT_COLS, DEFAULT_ROWS};
 use anyhow::Context;
 use iroh::EndpointId;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Default cadence the reaper sweeps for dead/expired sessions (injectable per call so tests can
@@ -90,10 +92,10 @@ pub trait SessionHost: Send + 'static {
     /// the state (see [`crate::client::ClientState::exit_code`]).
     fn alive(&self) -> bool;
 
-    /// A host that changes on its own (not only in response to input) pulses this to wake the
-    /// attached connection loops. Called once when the session handle is built. Default: ignore
-    /// (the PTY host's drain task holds the handle itself).
-    fn attach_notify(&mut self, _changed: Arc<Notify>) {}
+    /// A host that changes on its own (not only in response to input) pulses this to wake
+    /// **every** attached connection loop (KS-03). Called once when the session handle is built.
+    /// Default: ignore (the PTY host's drain task holds the handle itself).
+    fn attach_notify(&mut self, _changed: ChangeSignal) {}
 
     /// One attached client went away (its connection task ended, KS-01).
     fn client_detached(&mut self, _client: ClientId) {}
@@ -209,17 +211,51 @@ pub struct Session<H: SessionHost = PtyHost> {
     pub attached: u32,
 }
 
-/// Shared session plus a notifier the host pulses whenever its state changes.
+/// The "state changed" broadcast a host pulses and every attached connection loop watches (KS-03).
+///
+/// A `tokio::sync::watch` version counter rather than a `Notify`: `Notify::notify_one` releases
+/// exactly one waiter, so with two viewers on a shared host the second only re-rendered on its
+/// timer cap. `watch` wakes every subscriber, and because each receiver remembers the version it
+/// last saw, a pulse that lands between a loop's snapshot and its wait is still observed — the
+/// property the stored `Notify` permit used to provide, now for any number of viewers. Bursts
+/// still coalesce: many pulses before a loop looks are one wake.
+#[derive(Clone, Debug)]
+pub struct ChangeSignal(watch::Sender<u64>);
+
+impl ChangeSignal {
+    fn new() -> Self {
+        Self(watch::Sender::new(0))
+    }
+
+    /// Announce that the state changed; every subscribed loop wakes once.
+    pub fn pulse(&self) {
+        self.0.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    /// A receiver for one connection loop; [`watch::Receiver::changed`] resolves after any pulse
+    /// newer than the version the receiver last saw.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.subscribe()
+    }
+}
+
+impl Default for ChangeSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Shared session plus the signal the host pulses whenever its state changes.
 pub struct SessionHandle<H: SessionHost = PtyHost> {
     pub session: Mutex<Session<H>>,
-    pub changed: Arc<Notify>,
+    pub changed: ChangeSignal,
 }
 
 impl<H: SessionHost> SessionHandle<H> {
-    /// Wrap a host in a handle with a fresh notifier (handed to the host via
+    /// Wrap a host in a handle with a fresh change signal (handed to the host via
     /// [`SessionHost::attach_notify`]), not attached to any client.
     pub fn new(mut host: H) -> SharedSession<H> {
-        let changed = Arc::new(Notify::new());
+        let changed = ChangeSignal::new();
         host.attach_notify(changed.clone());
         Arc::new(Self {
             session: Mutex::new(Session {
@@ -270,7 +306,7 @@ async fn drain(handle: SharedSession, mut pty_rx: mpsc::Receiver<Vec<u8>>) {
                 s.host.emu.set_exit_code(status.exit_code());
             }
             drop(s);
-            handle.changed.notify_one();
+            handle.changed.pulse();
             break;
         };
         let mut s = handle.session.lock().await;
@@ -285,7 +321,7 @@ async fn drain(handle: SharedSession, mut pty_rx: mpsc::Receiver<Vec<u8>>) {
             }
         }
         drop(s);
-        handle.changed.notify_one();
+        handle.changed.pulse();
     }
 }
 
@@ -660,7 +696,7 @@ pub(crate) mod test_host {
         pub state: GridState,
         pub calls: Vec<HostCall>,
         pub alive: bool,
-        pub notify: Option<Arc<Notify>>,
+        pub notify: Option<ChangeSignal>,
     }
 
     impl ScriptedHost {
@@ -676,7 +712,7 @@ pub(crate) mod test_host {
             self.alive = false;
             self.state.exit_code = Some(code);
             if let Some(n) = &self.notify {
-                n.notify_one();
+                n.pulse();
             }
         }
     }
@@ -711,7 +747,7 @@ pub(crate) mod test_host {
             self.alive
         }
 
-        fn attach_notify(&mut self, changed: Arc<Notify>) {
+        fn attach_notify(&mut self, changed: ChangeSignal) {
             self.notify = Some(changed);
         }
 
@@ -731,6 +767,42 @@ mod tests {
     use super::test_host::{HostCall, ScriptedHost};
     use super::*;
     use crate::transport_iroh::generate_secret_key;
+
+    #[tokio::test]
+    async fn a_pulse_wakes_every_subscribed_viewer_not_just_one() {
+        // KS-03: two connection loops subscribed to one signal both wake on a single pulse — the
+        // `notify_one` bug woke only the first.
+        let signal = ChangeSignal::new();
+        let mut a = signal.subscribe();
+        let mut b = signal.subscribe();
+        signal.pulse();
+        let both = async {
+            a.changed().await.expect("sender alive");
+            b.changed().await.expect("sender alive");
+        };
+        tokio::time::timeout(Duration::from_millis(100), both)
+            .await
+            .expect("both receivers wake within 100 ms");
+    }
+
+    #[tokio::test]
+    async fn a_pulse_between_snapshot_and_wait_is_not_lost() {
+        // KS-03: the loop marks the signal seen (`borrow_and_update`) before snapshotting; a pulse
+        // that lands after that mark must resolve the next `changed()` immediately, and a burst
+        // of pulses is one wake.
+        let signal = ChangeSignal::new();
+        let mut rx = signal.subscribe();
+        let _ = rx.borrow_and_update(); // "snapshot taken"
+        signal.pulse();
+        signal.pulse();
+        signal.pulse();
+        tokio::time::timeout(Duration::from_millis(100), rx.changed())
+            .await
+            .expect("the pulse after the mark wakes the loop")
+            .expect("sender alive");
+        let quiet = tokio::time::timeout(Duration::from_millis(50), rx.changed()).await;
+        assert!(quiet.is_err(), "the burst coalesced into one wake");
+    }
 
     #[tokio::test]
     async fn attach_reports_created_then_reattached() {

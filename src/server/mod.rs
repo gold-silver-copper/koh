@@ -16,7 +16,7 @@ pub mod session;
 pub use cli::ServeArgs;
 pub use cli::{serve, serve_with, ServeConfig};
 pub use session::{
-    ClientId, HostProvider, PtyHost, PtyHosts, SessionHost, SharedHost, SharedSession,
+    ChangeSignal, ClientId, HostProvider, PtyHost, PtyHosts, SessionHost, SharedHost, SharedSession,
 };
 
 use std::time::Duration;
@@ -363,6 +363,9 @@ pub async fn run_attached<H: SessionHost>(
     let channel = IrohChannel::new(conn);
     let clock = MonoClock::new();
     let mut session = ServerSession::<H::State>::new(clock.now_ms(), channel.max_datagram_size());
+    // This connection's view of the host's change signal (KS-03). Every attached loop has its
+    // own receiver, so one pulse wakes all of them.
+    let mut changed = handle.changed.subscribe();
 
     loop {
         let now = clock.now_ms();
@@ -374,10 +377,16 @@ pub async fn run_attached<H: SessionHost>(
         // or the echo-ack advanced (S-03). The ack is stamped onto the snapshot outside the lock.
         let echo_changed = session.set_echo_ack(now);
         let child_alive = {
+            let take = session.needs_snapshot(echo_changed);
+            if take {
+                // Mark the change signal seen BEFORE snapshotting: a pulse that lands after this
+                // point (from a change this snapshot may or may not include) re-fires `changed()`
+                // below and costs at most one redundant snapshot. Marking it after the snapshot
+                // could swallow a pulse for a change the snapshot missed.
+                let _ = changed.borrow_and_update();
+            }
             let mut s = handle.session.lock().await;
-            let mut snapshot = session
-                .needs_snapshot(echo_changed)
-                .then(|| s.host.snapshot());
+            let mut snapshot = take.then(|| s.host.snapshot());
             let alive = s.host.alive();
             drop(s);
             if let Some(state) = snapshot.as_mut() {
@@ -389,9 +398,11 @@ pub async fn run_attached<H: SessionHost>(
         let sleep_ms = session.wait_ms(now, session.echo_ack_wait_time(now));
 
         tokio::select! {
-            // NOT biased: `changed` can hold a stored permit, which under `biased` would starve
-            // client input. A fair select interleaves rendering and input.
-            _ = handle.changed.notified() => session.mark_dirty(),
+            // NOT biased: `changed` may already be pending (a pulse since the last snapshot), which
+            // under `biased` would starve client input. A fair select interleaves rendering and
+            // input. `watch` remembers the last seen version per receiver, so a pulse that landed
+            // between the snapshot above and this wait resolves immediately — never lost (KS-03).
+            _ = changed.changed() => session.mark_dirty(),
 
             // Cancel-safety: when `changed` (or the timer) fires first, this in-flight `recv()`
             // future is dropped — sound only because the pinned `iroh = "1.0.0"`'s `read_datagram`

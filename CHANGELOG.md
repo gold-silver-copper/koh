@@ -24,7 +24,9 @@ internal and unstable (see `src/lib.rs`).
   `SessionHost`; `PtyHost` is the previous PTY + emulator code behind that trait. The echo-ack
   debounce moved out of `ServerTerminal` into the per-connection loop (KS-02): a host only
   implements `stamp_echo_ack`, and `ServerTerminal::snapshot` leaves `echo_ack` at 0 for the loop
-  to stamp (`TerminalScreen::set_echo_ack`). `serve` is
+  to stamp (`TerminalScreen::set_echo_ack`). `SessionHandle::changed` is a `ChangeSignal` (a `watch`
+  version counter) rather than a `Notify`, so one pulse wakes every attached viewer (KS-03);
+  `SessionHost::attach_notify` receives it. `serve` is
   unchanged in behaviour and is `serve_with(config, Hosts::new().with(TERMINAL_ALPN, PtyHosts))`
   underneath. `serve` installs its tracing subscriber with `try_init`, so an embedding binary that
   already owns one no longer panics.

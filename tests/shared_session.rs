@@ -154,11 +154,19 @@ async fn two_peers_share_one_pty_host() {
             .await,
         "A sees its own marker"
     );
+    // KS-03: B's loop is woken by the same pulse as A's, so B sees the marker promptly. With the
+    // old single-waiter notify, B re-rendered only on its 1 s timer cap.
+    let started = std::time::Instant::now();
     assert!(
         client_b
             .send_and_wait(None, None, "SHARED_MARKER_1", 10_000)
             .await,
         "B, on the same host, sees A's marker without typing"
+    );
+    let lag = started.elapsed();
+    assert!(
+        lag < Duration::from_millis(500),
+        "B saw A's marker {lag:?} after A did; every viewer must wake on a change (KS-03)"
     );
     let handle = store
         .lock()
@@ -281,8 +289,15 @@ async fn second_viewer_gets_its_own_echo_ack() {
             "B acked above its own frames: ack {ack} > sent {sent}"
         );
     }
-    let a_ack = client_a.transport.remote_state().echo_ack();
-    assert!(a_ack >= 30, "A's own frames are acked to A: {a_ack}");
+    // Let A's acks drain. 30 pushes at 40 ms are well over 10 frames even if the transport's
+    // send interval coalesces some of them.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut a_ack = 0;
+    while std::time::Instant::now() < deadline && a_ack < 10 {
+        let _ = client_a.send_and_wait(None, None, "\u{0}never", 50).await;
+        a_ack = client_a.transport.remote_state().echo_ack();
+    }
+    assert!(a_ack >= 10, "A's own frames are acked to A: {a_ack}");
 
     assert!(
         client_b
@@ -304,8 +319,8 @@ async fn second_viewer_gets_its_own_echo_ack() {
         }
     }
     assert!(
-        (1..30).contains(&b_ack),
-        "B is acked for its own frame, not A's: {b_ack}"
+        b_ack >= 1 && b_ack < a_ack,
+        "B is acked for its own frame ({b_ack}), not A's ({a_ack})"
     );
 
     chan_a.close(0, b"done");

@@ -139,6 +139,52 @@ rides out silently on the existing connection.
 > The relay/discovery path (a bare endpoint id) re-dials by node id and reconnects across address
 > changes — use it (or a fixed port) when you need reconnection to survive a server restart.
 
+## Generic hosts and clients (0.11)
+
+The protocol was always generic — `Transport<Local, Remote>` takes any `SyncState` — but the
+server loop knew it drove a PTY and the client loop knew it painted a `vt100::Screen`. 0.11 lifts
+both into traits so an embedding binary (the `fux` multiplexer) can sync a state of its own through
+the same SSP-over-iroh machinery, with detachable sessions, reconnect and prediction intact.
+
+- **KH-01 — `SessionHost`.** The exact contract `run_attached` needs from the classic PTY +
+  emulator pair: `snapshot`, `input`, `resize(client, …)`, `register_input_frame`, `set_echo_ack`,
+  `echo_ack_wait_time`, `application_cursor`, `alive`, plus `attach_notify` / `client_detached` /
+  `kill` / `shutdown`. `PtyHost` is today's code moved, not rewritten; `Session<H>`, the store,
+  `attach_with`, `detach`, `reap` and the reaper are generic. A `HostProvider` maps admitted peers
+  to sessions: `PtyHosts` (one detachable session per peer, the 0.10 behaviour) or `SharedHost`
+  (one host for every peer). `serve` is `serve_with` over a `PtyHosts` on the terminal ALPN. Each
+  connection gets a `ClientId` so a shared host can key per-viewer state.
+- **KH-02 — the state type rides on the ALPN.** The SSP envelope's `diff` is opaque bytes, so two
+  state types on one wire format would be indistinguishable. Rather than tag the envelope (an
+  encoding change, hence a `PROTOCOL_VERSION` bump), each state type has its own ALPN:
+  `TERMINAL_ALPN` (`koh/iroh/1`, unchanged) for `TerminalScreen`; `Hosts::new().with(alpn,
+  provider)` registers more. iroh negotiates ALPN in the TLS handshake, so a client dialing an ALPN
+  the server does not bind never completes the handshake — no SSP bytes flow, no decode of foreign
+  state. The accepted connection's negotiated ALPN selects the provider.
+- **KS-01 — shared sessions.** `SharedHost` stores one session under a fixed key; every peer's
+  attach is a reattach with its own connection loop, `Transport` and `ClientId`. `attached` is a
+  refcount across viewers; the TTL reaper collects only at zero, or when the host reports
+  `!alive()`. Resize policy is last-writer-wins for v1 (`coalesce_drained_input` keeps the last
+  resize per connection; the host sees each with its `ClientId`).
+- **KC-01 — `ClientState` / `ClientTerminal<S>` / `ScreenView`.** The client session is generic
+  over the remote state: `ClientState` supplies the out-of-band window state, the exit code, the
+  echo-ack, the input modes to mirror (`InputModes`, byte-identical to vt100's own sequences), and
+  an optional `predict_target`. The predictor reads through `predict::ScreenView` (implemented for
+  `vt100::Screen`; the trait lives in `predict.rs` so the layering guard still holds). `connect`
+  is `connect_with` over `TERMINAL_ALPN`, the real terminal, raw stdin and SIGWINCH.
+- **KO-01 — OSC 9;4 progress, host-side.** `ServerTerminal` parses ConEmu/Windows Terminal
+  progress reports (`Progress { state, percent }`) and keeps a bounded ring of unhandled OSC
+  payloads for an embedding host's own detection. Neither is on the wire: adding a field to
+  `ScreenDiff` would change its postcard encoding.
+- **KB-01 — the bell hook.** `--on-bell <cmd>` / `ConnectConfig::bell_command` runs `sh -c` when
+  the remote bell count climbs: detached (fds on `/dev/null`), `KOH_*` scrubbed except
+  `KOH_BELL_COUNT` / `KOH_TITLE`, rate-limited to one spawn per second with bursts coalesced, the
+  child reaped off the session loop. The decision is a pure `BellHook::observe`.
+
+Test doubles for all of this live in-tree: `ssp::testkit::GridState` (a non-terminal state with
+multi-datagram diffs), `server::session::test_host::ScriptedHost` (unit tests), and the `EchoHost`
+in `tests/e2e_generic_host.rs`.
+
 ## Security internals
 
 The full picture is in the [threat model](THREAT_MODEL.md). In brief, the relevant boundaries:

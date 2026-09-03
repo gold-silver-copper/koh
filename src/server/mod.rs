@@ -3,9 +3,10 @@
 //! Reused by the binary and by integration tests (so the full PTY⇄emulator⇄transport path can be
 //! exercised over a real iroh connection without the CLI/accept scaffolding).
 //!
-//! Sessions are **detachable**: the long-lived PTY+emulator lives in [`session::Session`] and
-//! survives client disconnects; a per-connection [`run_attached`] loop drives a *fresh*
-//! `Transport` against it, so a reconnecting client re-syncs to the current screen.
+//! Sessions are **detachable**: the long-lived host (a PTY+emulator by default, any
+//! [`session::SessionHost`] in general — KH-01) lives in [`session::Session`] and survives client
+//! disconnects; a per-connection [`run_attached`] loop drives a *fresh* `Transport` against it, so
+//! a reconnecting client re-syncs to the current state.
 
 mod audit;
 pub mod cli;
@@ -13,16 +14,17 @@ pub mod session;
 
 #[cfg(feature = "cli")]
 pub use cli::ServeArgs;
-pub use cli::{serve, ServeConfig};
+pub use cli::{serve, serve_with, ServeConfig};
+pub use session::{
+    ClientId, HostProvider, PtyHost, PtyHosts, SessionHost, SharedHost, SharedSession,
+};
 
 use std::time::Duration;
 
 use crate::input::{UserInput, WireEvent};
-use crate::ssp::{RecvOutcome, Transport};
-use crate::terminal::TerminalScreen;
+use crate::ssp::{RecvOutcome, SyncState, Transport};
 use crate::transport_iroh::{IrohChannel, MonoClock};
-use session::SharedSession;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Why an attached connection loop returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,20 +132,21 @@ struct DrainedInput {
 /// and the shutdown-sentinel handshake — is unit-testable WITHOUT iroh, tokio, or a real PTY.
 /// [`run_attached`] is the thin async shell that locks the session, does the I/O, and calls these.
 ///
-/// Unlike `ClientSession`, this core is deliberately **lock-coupled**: the authoritative screen lives
-/// in the session `Mutex` (shared with the drain task), so the shell snapshots it under the lock and
-/// hands the snapshot in — the core can't own the emulator. That makes the split weaker than the
-/// client's, but still lifts every protocol decision out of the async loop where it can be tested.
-struct ServerSession {
-    transport: Transport<TerminalScreen, UserInput>,
+/// Unlike `ClientSession`, this core is deliberately **lock-coupled**: the authoritative state lives
+/// in the session `Mutex` (shared with the host's own tasks), so the shell snapshots it under the
+/// lock and hands the snapshot in — the core can't own the host. That makes the split weaker than
+/// the client's, but still lifts every protocol decision out of the async loop where it can be
+/// tested. Generic over the synced state `S` (KH-01): nothing here knows it is a terminal.
+struct ServerSession<S: SyncState> {
+    transport: Transport<S, UserInput>,
     cursor_keys: CursorKeyNormalizer,
     /// Whether the screen may have changed since the last grid snapshot (S-03).
     dirty: bool,
 }
 
-impl ServerSession {
+impl<S: SyncState> ServerSession<S> {
     fn new(now: u64, mtu: usize) -> Self {
-        let mut transport = Transport::<TerminalScreen, UserInput>::new(now, mtu);
+        let mut transport = Transport::<S, UserInput>::new(now, mtu);
         transport.set_connected(true);
         Self {
             transport,
@@ -170,9 +173,9 @@ impl ServerSession {
     /// Install the freshly-taken screen snapshot (present iff [`needs_snapshot`](Self::needs_snapshot)
     /// said so) and clear the dirty flag. A skipped snapshot leaves `current_state` equal to the
     /// still-current screen, so the next `tick` correctly emits acks-only with no missed update.
-    fn install_snapshot(&mut self, snapshot: Option<TerminalScreen>) {
-        if let Some(screen) = snapshot {
-            *self.transport.current_mut() = screen;
+    fn install_snapshot(&mut self, snapshot: Option<S>) {
+        if let Some(state) = snapshot {
+            *self.transport.current_mut() = state;
         }
         self.dirty = false;
     }
@@ -234,38 +237,40 @@ impl ServerSession {
 /// Drive a client connection against an existing (shared, detachable) [`session::Session`].
 ///
 /// The thin async/I/O shell around [`ServerSession`] (the pure protocol core): it locks the session,
-/// does the iroh + PTY I/O, and delegates every protocol decision to the core. Uses a **fresh**
-/// core per attach, so the first tick diffs the live screen against the default base and re-syncs the
-/// (re)connecting client to the current screen. Crucially, it does **not** kill the PTY on
-/// disconnect — it returns [`SessionExit::Detached`] and leaves the shell running for the next reattach.
+/// does the iroh + host I/O, and delegates every protocol decision to the core. Uses a **fresh**
+/// core per attach, so the first tick diffs the live state against the default base and re-syncs the
+/// (re)connecting client to the current state. Crucially, it does **not** kill the host on
+/// disconnect — it returns [`SessionExit::Detached`] and leaves it running for the next reattach.
+/// `client` identifies this connection to the host (KH-01, KS-01).
 ///
 /// Returns `anyhow::Result` for signature stability, but in practice only ever returns `Ok`: a
 /// dropped connection is `Ok(Detached)`, a completed shutdown is `Ok(ShellExited)`, and the internal
-/// failure paths (PTY write/resize) are logged-and-continued. The `Err` arm at call sites is dead
-/// today; it is kept so a future fallible step needn't change the signature.
-pub async fn run_attached(
+/// failure paths (PTY write/resize) are logged-and-continued inside the host. The `Err` arm at call
+/// sites is dead today; it is kept so a future fallible step needn't change the signature.
+pub async fn run_attached<H: SessionHost>(
     conn: iroh::endpoint::Connection,
-    handle: SharedSession,
+    handle: SharedSession<H>,
+    client: ClientId,
 ) -> anyhow::Result<SessionExit> {
     let channel = IrohChannel::new(conn);
     let clock = MonoClock::new();
-    let mut session = ServerSession::new(clock.now_ms(), channel.max_datagram_size());
+    let mut session = ServerSession::<H::State>::new(clock.now_ms(), channel.max_datagram_size());
 
     loop {
         let now = clock.now_ms();
         session.observe_link(channel.max_datagram_size(), channel.rtt_ms());
 
-        // Snapshot the live screen + read echo-ack timing under the session lock. The snapshot clones
+        // Snapshot the live state + read echo-ack timing under the session lock. The snapshot clones
         // the whole vt100 grid + title/icon/clipboard, so the core gates it: take it only when the
-        // screen may have changed or the echo-ack advanced (S-03).
+        // state may have changed or the echo-ack advanced (S-03).
         let (echo_wait, child_alive) = {
             let mut s = handle.session.lock().await;
-            let echo_changed = s.emu.set_echo_ack(now);
+            let echo_changed = s.host.set_echo_ack(now);
             let snapshot = session
                 .needs_snapshot(echo_changed)
-                .then(|| s.emu.snapshot());
+                .then(|| s.host.snapshot());
             session.install_snapshot(snapshot);
-            (s.emu.echo_ack_wait_time(now), s.child_alive)
+            (s.host.echo_ack_wait_time(now), s.host.alive())
         };
         let sleep_ms = session.wait_ms(now, echo_wait);
 
@@ -287,25 +292,16 @@ pub async fn run_attached(
                         // the lock (which also guards `application_cursor`).
                         if session.recv(now, &bytes) == RecvOutcome::NewState {
                             let mut s = handle.session.lock().await;
-                            let app_cursor = s.emu.application_cursor();
+                            let app_cursor = s.host.application_cursor();
                             if let Some(input) = session.drain_input(app_cursor) {
                                 if !input.keys.is_empty() {
-                                    if let Err(e) = s.pty.write_input(&input.keys) {
-                                        warn!(error = %e, "pty write failed");
-                                    }
+                                    s.host.input(&input.keys);
                                 }
                                 let resized = input.resize.is_some();
                                 if let Some((rows, cols)) = input.resize {
-                                    if let Err(e) = s.pty.resize(rows, cols) {
-                                        // A failed TIOCSWINSZ silently diverges the kernel winsize
-                                        // from the vt100 grid (full-screen-app corruption with no
-                                        // breadcrumb today); warn, but still resize the emulator so
-                                        // the screen geometry keeps tracking the client.
-                                        warn!(error = %e, rows, cols, "pty resize failed");
-                                    }
-                                    s.emu.resize(rows, cols);
+                                    s.host.resize(client, rows, cols);
                                 }
-                                s.emu.register_input_frame(input.frame, now);
+                                s.host.register_input_frame(input.frame, now);
                                 drop(s);
                                 // Only a resize mutates the emulator grid directly (a change not
                                 // signaled through `changed`), so re-snapshot next pass only then.
@@ -340,7 +336,7 @@ pub async fn run_attached(
     }
 }
 
-/// Convenience: run a **standalone** (non-detachable) session for one connection.
+/// Convenience: run a **standalone** (non-detachable) PTY session for one connection.
 ///
 /// Spawns a shell, serves it, and kills it when the connection ends. Used by integration tests and
 /// any caller that doesn't need reattach. The binary uses the [`session`] store + [`run_attached`].
@@ -350,8 +346,20 @@ pub async fn run_session(
     scrollback: usize,
 ) -> anyhow::Result<()> {
     let handle = session::spawn_session(command, scrollback)?;
-    let _ = run_attached(conn, handle.clone()).await?;
-    let _ = handle.session.lock().await.pty.kill();
+    run_session_with(conn, handle).await
+}
+
+/// Run a **standalone** (non-detachable) session over any host for one connection: serve it,
+/// then [`SessionHost::kill`] it when the connection ends (KH-01).
+pub async fn run_session_with<H: SessionHost>(
+    conn: iroh::endpoint::Connection,
+    handle: SharedSession<H>,
+) -> anyhow::Result<()> {
+    let client = ClientId::next();
+    let _ = run_attached(conn, handle.clone(), client).await?;
+    let mut s = handle.session.lock().await;
+    s.host.client_detached(client);
+    s.host.kill();
     Ok(())
 }
 
@@ -359,6 +367,7 @@ pub async fn run_session(
 mod tests {
     use super::{coalesce_drained_input, CursorKeyNormalizer, ServerSession};
     use crate::input::{UserInput, WireEvent};
+    use crate::ssp::testkit::GridState;
     use crate::ssp::{RecvOutcome, Transport};
     use crate::terminal::TerminalScreen;
 
@@ -438,10 +447,11 @@ mod tests {
 
     #[test]
     fn server_session_snapshot_gating() {
-        // The S-03 dirty/echo-ack snapshot decision, isolated from the lock + the real emulator.
-        let mut s = ServerSession::new(0, 1200);
+        // The S-03 dirty/echo-ack snapshot decision, isolated from the lock + the real emulator —
+        // over a non-terminal state (KH-01): the core is state-agnostic.
+        let mut s = ServerSession::<GridState>::new(0, 1200);
         assert!(s.needs_snapshot(false), "the first pass always snapshots");
-        s.install_snapshot(Some(TerminalScreen::default()));
+        s.install_snapshot(Some(GridState::default()));
         assert!(!s.needs_snapshot(false), "clean after a snapshot");
         assert!(
             s.needs_snapshot(true),
@@ -456,8 +466,9 @@ mod tests {
 
     #[test]
     fn server_session_shutdown_handshake_progresses() {
-        // The shutdown-sentinel handshake progression, without a PTY or a peer.
-        let mut s = ServerSession::new(0, 1200);
+        // The shutdown-sentinel handshake progression, without a PTY or a peer (KH-01: over a
+        // non-terminal state).
+        let mut s = ServerSession::<GridState>::new(0, 1200);
         let _ = s.tick(0, true); // child alive -> no shutdown started
         assert!(!s.shutdown_complete(0));
         let _ = s.tick(10, false); // child exited -> begin the shutdown handshake
@@ -488,7 +499,7 @@ mod tests {
             "the client transmits its queued input"
         );
 
-        let mut server = ServerSession::new(0, 1200);
+        let mut server = ServerSession::<TerminalScreen>::new(0, 1200);
         let mut drained = None;
         for dg in &datagrams {
             if server.recv(1000, dg) == RecvOutcome::NewState {
@@ -504,6 +515,78 @@ mod tests {
             input.resize,
             Some((30, 40)),
             "KOH-05: only the final resize survives (clamped)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_session_over_a_scripted_host_delivers_frames_and_clamped_resizes() {
+        // KH-01: the generic loop feeds a non-PTY host — `register_input_frame` gets the frame
+        // number the client sent, `resize` gets the clamped geometry with this connection's id,
+        // `input` gets the keys.
+        use crate::server::session::test_host::{HostCall, ScriptedHost};
+        use crate::server::session::SessionHandle;
+        use crate::transport_iroh::{
+            bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, MonoClock, ALPN,
+        };
+        let server_ep = bind_endpoint_local(generate_secret_key(), true)
+            .await
+            .expect("bind");
+        let addr = loopback_addr(&server_ep);
+        let handle = SessionHandle::new(ScriptedHost::new());
+        let h2 = handle.clone();
+        let accept = tokio::spawn(async move {
+            if let Some(incoming) = server_ep.accept().await {
+                if let Ok(conn) = incoming.await {
+                    let _ = super::run_session_with(conn, h2).await;
+                }
+            }
+        });
+        let client_ep = bind_endpoint_local(generate_secret_key(), false)
+            .await
+            .expect("bind client");
+        let chan = IrohChannel::new(client_ep.connect(addr, ALPN).await.expect("connect"));
+        let clock = MonoClock::new();
+        let mut t = Transport::<UserInput, GridState>::new(clock.now_ms(), 1200);
+        t.set_connected(true);
+        t.observe_rtt(10.0);
+        t.current_mut().push_resize(65000, 1);
+        t.current_mut().push_bytes(b"xy");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            for dg in t.tick(clock.now_ms()) {
+                chan.send(&dg);
+            }
+            tokio::select! {
+                r = chan.recv() => { if let Ok(b) = r { t.recv(clock.now_ms(), &b); } }
+                () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+            }
+            if t.remote_state().contents().contains("xy") {
+                break;
+            }
+        }
+        assert!(
+            t.remote_state().contents().contains("xy"),
+            "input reached the host"
+        );
+        chan.close(0, b"done");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), accept).await;
+        let s = handle.session.lock().await;
+        let calls = &s.host.calls;
+        assert!(
+            calls.iter().any(|c| matches!(c, HostCall::Resize(_, r, cc) if (*r, *cc) == crate::terminal::clamp_dims(65000, 1))),
+            "resize arrives clamped: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| matches!(c, HostCall::Frame(1, _))),
+            "frame 1 is registered: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| matches!(c, HostCall::Detached(_))),
+            "the connection's detach reaches the host: {calls:?}"
+        );
+        assert!(
+            calls.contains(&HostCall::Kill),
+            "run_session_with kills the host at the end"
         );
     }
 }

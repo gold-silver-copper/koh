@@ -24,7 +24,7 @@ use iroh::endpoint::Endpoint;
 use iroh::EndpointAddr;
 use koh::input::UserInput;
 use koh::server::session::{self, SessionStore};
-use koh::server::{run_attached, SessionExit};
+use koh::server::{run_attached, ClientId, SessionExit};
 use koh::ssp::Transport;
 use koh::terminal::TerminalScreen;
 use koh::transport_iroh::{
@@ -60,7 +60,7 @@ async fn start_server() -> RunningServer {
                 else {
                     return;
                 };
-                match run_attached(conn, handle).await {
+                match run_attached(conn, handle, ClientId::next()).await {
                     Ok(SessionExit::Detached) | Err(_) => session::detach(&store, peer).await,
                     Ok(SessionExit::ShellExited) => session::reap(&store, peer).await,
                 }

@@ -3,7 +3,8 @@
 //! Binds an iroh endpoint with a persistent identity, authorizes incoming clients against a
 //! node-id allowlist, and for each accepted connection runs a PTY-backed shell whose screen is
 //! kept in sync with the client via the SSP over QUIC datagrams (`Transport<TerminalScreen,
-//! UserInput>`).
+//! UserInput>`). [`serve_with`] generalizes this to any [`SessionHost`] behind a [`HostProvider`],
+//! one per ALPN (KH-01, KH-02).
 //!
 //! Auth model (deliberately *not* iroh-ssh's "anyone with the endpoint id gets a shell"):
 //! a connection is only served if the client's endpoint id is on the `--allow` list. There is no
@@ -22,10 +23,12 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
 use crate::server::audit::{auth_event, Outcome};
+use crate::server::session::{ClientId, HostProvider, PtyHosts, SessionHost};
 use crate::server::{run_attached, session, SessionExit};
 use crate::transport_iroh::{
-    bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
-    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, ALPN,
+    bind_endpoint_alpns, bind_endpoint_local_alpns, bind_endpoint_with_relay_alpns,
+    format_endpoint_id, load_or_create_secret_key, parse_endpoint_id, parse_relay_url,
+    TERMINAL_ALPN,
 };
 use tracing::{error, info, warn};
 
@@ -184,10 +187,12 @@ fn connect_qr(data: &str) -> Option<String> {
 /// The program hosted is [`ServeConfig::command`] (any argv, not only a shell). Accepts a
 /// [`ServeConfig`] or anything convertible into one ([`ServeArgs`] under the `cli` feature).
 ///
-/// Installs a global `tracing` subscriber writing to stderr; call it once per process.
+/// Installs a global `tracing` subscriber writing to stderr if none is installed yet. This is
+/// [`serve_with`] over a [`PtyHosts`] provider on [`TERMINAL_ALPN`].
 pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     let args: ServeConfig = config.into();
-    tracing_subscriber::fmt()
+    // `try_init`, not `init`: an embedding binary may already own a subscriber (KH-01).
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 // The crate is `koh`; there is no `koh_server` target (single-crate layout), so a
@@ -196,7 +201,214 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "koh=info".into()),
         )
         .with_writer(std::io::stderr)
-        .init();
+        .try_init();
+    // The CLI enforces this range in clap; a library caller bypasses that, so re-check here.
+    anyhow::ensure!(
+        args.scrollback <= MAX_SCROLLBACK,
+        "scrollback {} exceeds the maximum of {MAX_SCROLLBACK}",
+        args.scrollback
+    );
+    anyhow::ensure!(args.max_sessions >= 1, "max_sessions must be at least 1");
+    // Cast the validated u64 (range 0..=MAX_SCROLLBACK) down to the usize the emulator wants.
+    let provider = PtyHosts::new(
+        args.command.clone(),
+        args.scrollback as usize,
+        args.max_sessions as usize,
+    );
+    serve_with(args, Hosts::new().with(TERMINAL_ALPN, provider)).await
+}
+
+/// One ALPN-keyed provider with its host type erased (KH-02).
+///
+/// Lets [`Hosts`] hold providers for several state types in one list.
+trait ErasedProvider: Send + Sync {
+    /// Attach `peer`'s admitted connection to a session, drive it, and release it afterwards.
+    fn serve_conn(
+        &self,
+        conn: iroh::endpoint::Connection,
+        peer: EndpointId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+
+    /// Start this provider's TTL reaper.
+    fn spawn_reaper(
+        &self,
+        ttl: Duration,
+        interval: Duration,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()>;
+}
+
+struct Typed<H, P> {
+    provider: P,
+    _host: std::marker::PhantomData<fn() -> H>,
+}
+
+impl<H: SessionHost, P: HostProvider<H>> ErasedProvider for Typed<H, P> {
+    fn serve_conn(
+        &self,
+        conn: iroh::endpoint::Connection,
+        peer: EndpointId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            // Attach to (or create) this client's detachable session, then serve the connection.
+            let (handle, attach_kind) = match self.provider.attach(peer).await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    // At the live-session cap (L-3): refuse a brand-new peer rather than spawn
+                    // an unbounded shell. A reconnecting peer would have matched an existing
+                    // session above, so this only ever rejects a genuinely new one.
+                    warn!(peer = %format_endpoint_id(&peer), "refusing session: at max-sessions capacity");
+                    conn.close(1u32.into(), b"server at session capacity");
+                    return;
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to start session");
+                    conn.close(1u32.into(), b"session error");
+                    return;
+                }
+            };
+            match attach_kind {
+                session::AttachKind::Created => {
+                    info!(peer = %format_endpoint_id(&peer), "started a new session");
+                }
+                session::AttachKind::Reattached { detached_for } => {
+                    // mosh-server's "you have a detached session" notice, server-side: this peer is
+                    // resuming its running session rather than starting a fresh one.
+                    info!(
+                        peer = %format_endpoint_id(&peer),
+                        detached_secs = detached_for.map(|d| d.as_secs()),
+                        "reattaching to this peer's existing session"
+                    );
+                }
+            }
+            let client = ClientId::next();
+            // Arm a RAII safety net BEFORE serving: if `run_attached` unwinds (panics), the guard's
+            // Drop still releases this connection's session attach so it can't leak (K-16). On a
+            // normal return we disarm and run the precise detach/reap below ourselves.
+            let attach_guard = session::AttachGuard::new(self.provider.store(), peer);
+            let outcome = run_attached(conn, handle.clone(), client).await;
+            attach_guard.disarm();
+            handle.session.lock().await.host.client_detached(client);
+            match outcome {
+                Ok(SessionExit::Detached) => {
+                    // Keep the host running for reattach.
+                    self.provider.detach(peer).await;
+                    info!(peer = %format_endpoint_id(&peer), "client detached (session retained)");
+                }
+                Ok(SessionExit::ShellExited) => {
+                    self.provider.reap(peer).await;
+                    info!(peer = %format_endpoint_id(&peer), "shell exited; session reaped");
+                }
+                Err(e) => {
+                    error!(error = %e, "session loop error");
+                    self.provider.detach(peer).await;
+                }
+            }
+        })
+    }
+
+    fn spawn_reaper(
+        &self,
+        ttl: Duration,
+        interval: Duration,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(session::run_reaper(
+            self.provider.store(),
+            ttl,
+            interval,
+            shutdown,
+        ))
+    }
+}
+
+/// The set of state types a server offers, one [`HostProvider`] per ALPN (KH-02).
+///
+/// `Hosts::new().with(TERMINAL_ALPN, PtyHosts::new(..)).with(b"my/state/1", SharedHost::new(..))`
+/// serves both on one endpoint; the accepted connection's negotiated ALPN selects the provider.
+#[derive(Default)]
+pub struct Hosts {
+    entries: Vec<(Vec<u8>, Arc<dyn ErasedProvider>)>,
+}
+
+impl Hosts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Serve `provider`'s state type to connections negotiating `alpn`.
+    #[must_use]
+    pub fn with<H: SessionHost, P: HostProvider<H>>(mut self, alpn: &[u8], provider: P) -> Self {
+        self.entries.push((
+            alpn.to_vec(),
+            Arc::new(Typed::<H, P> {
+                provider,
+                _host: std::marker::PhantomData,
+            }),
+        ));
+        self
+    }
+
+    /// The ALPNs to bind the endpoint with.
+    pub fn alpns(&self) -> Vec<Vec<u8>> {
+        self.entries.iter().map(|(a, _)| a.clone()).collect()
+    }
+
+    fn for_alpn(&self, alpn: &[u8]) -> Option<Arc<dyn ErasedProvider>> {
+        self.entries
+            .iter()
+            .find(|(a, _)| a == alpn)
+            .map(|(_, p)| p.clone())
+    }
+
+    /// Serve one already-authorized connection: pick the provider for its negotiated ALPN, send
+    /// the admission ack, attach, drive, release. For embedding servers (and tests) that own
+    /// their accept loop and allowlist; [`serve_with`] calls this after its admission gauntlet.
+    pub async fn serve_connection(&self, conn: iroh::endpoint::Connection) {
+        let peer = conn.remote_id();
+        // The negotiated ALPN picks the state type (KH-02). iroh only completes the handshake
+        // for an ALPN in the bound list, so a miss here is a programming error, not a peer one.
+        let Some(provider) = self.for_alpn(conn.alpn()) else {
+            error!(alpn = %String::from_utf8_lossy(conn.alpn()), "no host provider for negotiated alpn");
+            conn.close(1u32.into(), b"no host for alpn");
+            return;
+        };
+        // Authorized: send the 1-byte admission ack so the client can distinguish "admitted"
+        // from a deliberate reject (without it a rejected client would re-dial forever). Bounded
+        // by a short timeout so a client that never accepts the stream can't pin the slot.
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            crate::transport_iroh::admission::admit(&conn),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(error = %e, "admission ack failed");
+                return;
+            }
+            Err(_) => {
+                warn!("admission ack timed out");
+                return;
+            }
+        }
+        auth_event(Outcome::Accepted, &peer, "authorized; attaching session");
+        provider.serve_conn(conn, peer).await;
+    }
+}
+
+/// Serve any set of hosts (KH-01, KH-02).
+///
+/// Binds the endpoint on the ALPNs in `hosts`, authorizes peers against `config.allow`, and for
+/// each admitted connection attaches it to the provider for its negotiated ALPN. `config.command`,
+/// `scrollback` and `max_sessions` are not read here (they belong to the [`PtyHosts`] provider);
+/// the caller owns tracing.
+pub async fn serve_with(config: impl Into<ServeConfig>, hosts: Hosts) -> anyhow::Result<()> {
+    let args: ServeConfig = config.into();
+    anyhow::ensure!(
+        !hosts.entries.is_empty(),
+        "serve_with needs at least one host"
+    );
 
     // Build the node-id allowlist — the sole authorization gate. Every authorized peer gets the
     // same access. At least one entry is required: koh never serves an unlisted peer.
@@ -212,15 +424,9 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     }
     // The CLI enforces these ranges in clap; a library caller bypasses that, so re-check here.
     anyhow::ensure!(
-        args.scrollback <= MAX_SCROLLBACK,
-        "scrollback {} exceeds the maximum of {MAX_SCROLLBACK}",
-        args.scrollback
-    );
-    anyhow::ensure!(
         args.max_connections >= 1,
         "max_connections must be at least 1"
     );
-    anyhow::ensure!(args.max_sessions >= 1, "max_sessions must be at least 1");
 
     let key_file = match args.key_file.clone() {
         Some(p) => p,
@@ -234,17 +440,18 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     })?;
 
     // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
+    let alpns = hosts.alpns();
     let endpoint = if let Some(url) = &args.relay_url {
         let relay = parse_relay_url(url)?;
-        bind_endpoint_with_relay(secret, true, relay)
+        bind_endpoint_with_relay_alpns(secret, alpns, relay)
             .await
             .context("binding endpoint")?
     } else if args.local {
-        bind_endpoint_local(secret, true)
+        bind_endpoint_local_alpns(secret, alpns)
             .await
             .context("binding endpoint")?
     } else {
-        bind_endpoint(secret, true)
+        bind_endpoint_alpns(secret, alpns)
             .await
             .context("binding endpoint")?
     };
@@ -268,7 +475,15 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     eprintln!("┌─ koh server ready ──────────────────────────────────────");
     eprintln!("│ endpoint id : {id_str}");
     eprintln!("│ key file    : {}", key_file.display());
-    eprintln!("│ alpn        : {}", String::from_utf8_lossy(ALPN));
+    eprintln!(
+        "│ alpn        : {}",
+        hosts
+            .entries
+            .iter()
+            .map(|(a, _)| String::from_utf8_lossy(a).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
@@ -294,23 +509,19 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
         "transport crypto posture"
     );
 
-    let command = std::sync::Arc::new(args.command.clone());
-    // Cast the validated u64 (range 0..=MAX_SCROLLBACK) down to the usize the emulator wants.
-    let scrollback = args.scrollback as usize;
     let allow = std::sync::Arc::new(allow);
+    let hosts = Arc::new(hosts);
 
-    // Detachable session store: one shell per authorized client, surviving disconnects so a
-    // reconnecting client lands back in the same session at the current screen. The reaper
-    // collects sessions whose shell exited or that have been detached past the TTL.
-    let store = session::SessionStore::default();
+    // Detachable session stores: one per provider, surviving disconnects so a reconnecting client
+    // lands back in the same session at the current state. Each reaper collects sessions whose
+    // program exited or that have been detached past the TTL.
     let session_ttl = Duration::from_secs(args.session_ttl_secs);
     let reaper_shutdown = tokio_util::sync::CancellationToken::new();
-    let reaper = tokio::spawn(session::run_reaper(
-        store.clone(),
-        session_ttl,
-        session::REAP_INTERVAL,
-        reaper_shutdown.clone(),
-    ));
+    let reapers: Vec<_> = hosts
+        .entries
+        .iter()
+        .map(|(_, p)| p.spawn_reaper(session_ttl, session::REAP_INTERVAL, reaper_shutdown.clone()))
+        .collect();
 
     // Graceful shutdown: a SIGTERM/SIGINT drains the accept loop cleanly (close the endpoint after
     // the reaper stops) instead of hard-killing the process.
@@ -328,7 +539,6 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     // refused cheaply (pre-handshake) like the connection cap.
     let pending_cap = (args.max_connections as usize).div_ceil(4).max(4);
     let handshake_limit = Arc::new(tokio::sync::Semaphore::new(pending_cap));
-    let max_sessions = args.max_sessions as usize;
 
     loop {
         let incoming = tokio::select! {
@@ -366,8 +576,7 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
             continue;
         };
         let allow = allow.clone();
-        let command = command.clone();
-        let store = store.clone();
+        let hosts = hosts.clone();
         tokio::spawn(async move {
             // Held for the whole task: releases the connection-cap permit on every exit path.
             let _permit = permit;
@@ -395,98 +604,22 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
                 conn.close(1u32.into(), b"not authorized");
                 return;
             }
-            // Authorized: send the 1-byte admission ack so the client can distinguish "admitted"
-            // from a deliberate reject (without it a rejected client would re-dial forever). Bounded
-            // by a short timeout so a client that never accepts the stream can't pin the slot.
-            match tokio::time::timeout(
-                Duration::from_secs(3),
-                crate::transport_iroh::admission::admit(&conn),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(error = %e, "admission ack failed");
-                    return;
-                }
-                Err(_) => {
-                    warn!("admission ack timed out");
-                    return;
-                }
-            }
-            // Admitted: free the pending-handshake slot so it isn't held for the (potentially
-            // long-lived) session that follows (KOH-08). The connection-cap permit is still held.
+            // Authenticated + authorized: free the pending-handshake slot so it isn't held for the
+            // (potentially long-lived) session that follows (KOH-08). The connection-cap permit is
+            // still held. The admission ack + attach happen in `serve_connection`.
             drop(pending_permit);
-            auth_event(Outcome::Accepted, &peer, "authorized; attaching session");
-            // Attach to (or create) this client's detachable session, then serve the connection.
-            let (handle, attach_kind) = match session::attach(
-                &store,
-                peer,
-                &command,
-                scrollback,
-                max_sessions,
-            )
-            .await
-            {
-                Ok(Some(pair)) => pair,
-                Ok(None) => {
-                    // At the live-session cap (L-3): refuse a brand-new peer rather than spawn
-                    // an unbounded shell. A reconnecting peer would have matched an existing
-                    // session above, so this only ever rejects a genuinely new one.
-                    warn!(peer = %format_endpoint_id(&peer), "refusing session: at max-sessions capacity");
-                    conn.close(1u32.into(), b"server at session capacity");
-                    return;
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to start session");
-                    conn.close(1u32.into(), b"session error");
-                    return;
-                }
-            };
-            match attach_kind {
-                session::AttachKind::Created => {
-                    info!(peer = %format_endpoint_id(&peer), "started a new session");
-                }
-                session::AttachKind::Reattached { detached_for } => {
-                    // mosh-server's "you have a detached session" notice, server-side: this peer is
-                    // resuming its running session rather than starting a fresh one.
-                    info!(
-                        peer = %format_endpoint_id(&peer),
-                        detached_secs = detached_for.map(|d| d.as_secs()),
-                        "reattaching to this peer's existing session"
-                    );
-                }
-            }
-            // Arm a RAII safety net BEFORE serving: if `run_attached` unwinds (panics), the guard's
-            // Drop still releases this connection's session attach so it can't leak (K-16). On a
-            // normal return we disarm and run the precise detach/reap below ourselves.
-            let attach_guard = session::AttachGuard::new(store.clone(), peer);
-            let outcome = run_attached(conn, handle).await;
-            attach_guard.disarm();
-            match outcome {
-                Ok(SessionExit::Detached) => {
-                    // Keep the shell running for reattach.
-                    session::detach(&store, peer).await;
-                    info!(peer = %format_endpoint_id(&peer), "client detached (session retained)");
-                }
-                Ok(SessionExit::ShellExited) => {
-                    session::reap(&store, peer).await;
-                    info!(peer = %format_endpoint_id(&peer), "shell exited; session reaped");
-                }
-                Err(e) => {
-                    error!(error = %e, "session loop error");
-                    session::detach(&store, peer).await;
-                }
-            }
+            hosts.serve_connection(conn).await;
         });
     }
 
-    // The accept loop ended (endpoint closed or a shutdown signal): stop the reaper cleanly and wait
-    // for it to finish its current sweep before tearing down the endpoint.
+    // The accept loop ended (endpoint closed or a shutdown signal): stop the reapers cleanly and
+    // wait for them to finish their current sweep before tearing down the endpoint.
     info!("draining: stopping reaper and closing endpoint");
     shutdown.cancel();
     reaper_shutdown.cancel();
-    let _ = reaper.await;
+    for r in reapers {
+        let _ = r.await;
+    }
     endpoint.close().await;
     Ok(())
 }

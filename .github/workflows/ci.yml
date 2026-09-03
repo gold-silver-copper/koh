@@ -53,6 +53,12 @@ jobs:
             echo "::error::server/client must not 'use crate::wire' directly — reach the wire through ssp::Transport"
             exit 1
           fi
+          # The generic host/client seam (0.11) must not leak back down: the protocol core stays
+          # ignorant of the terminal and the server.
+          if grep -rnE '^[[:space:]]*use crate::(terminal|server|client)' src/ssp; then
+            echo "::error::ssp must not import from terminal/server/client — the transport is generic over SyncState"
+            exit 1
+          fi
           echo "layering edges OK"
       - name: test
         run: cargo test --locked
@@ -82,6 +88,10 @@ jobs:
       # `cli` feature, so this fails if clap leaks back into the library surface.
       - name: clippy (library without cli, warnings are errors)
         run: cargo clippy --lib --locked --no-default-features --features backend-termina -- -D warnings
+      # The library-plus-tests tree without `cli`: the generic host/client seams and their tests
+      # must build for an embedding crate that never enables clap.
+      - name: clippy (all targets without cli, warnings are errors)
+        run: cargo clippy --all-targets --locked --no-default-features --features backend-termina -- -D warnings
       - name: no clap in the library-only tree
         run: |
           if cargo tree --locked --no-default-features --features backend-termina -e normal | grep -q '^.* clap '; then
@@ -129,3 +139,4 @@ jobs:
         run: |
           cargo +nightly fuzz run screen_apply -- -max_total_time=45 -rss_limit_mb=4096
           cargo +nightly fuzz run wire_decode  -- -max_total_time=45 -rss_limit_mb=4096
+          cargo +nightly fuzz run server_process -- -max_total_time=45 -rss_limit_mb=4096

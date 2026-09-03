@@ -54,8 +54,17 @@ fn koh_transport_config() -> QuicTransportConfig {
         .build()
 }
 
-/// The ALPN that identifies the koh protocol on the wire.
-pub const ALPN: &[u8] = b"koh/iroh/1";
+/// The ALPN that identifies the koh protocol on the wire: SSP carrying a
+/// [`TerminalScreen`](crate::terminal::TerminalScreen). Alias of [`TERMINAL_ALPN`].
+pub const ALPN: &[u8] = TERMINAL_ALPN;
+
+/// The ALPN for the terminal-screen state (KH-02).
+///
+/// The synced state type a connection carries is selected by ALPN, not by a tag in the SSP
+/// envelope: an embedding server hosting another [`SyncState`](crate::ssp::SyncState) registers its
+/// own ALPN, and a client dialing an ALPN the server does not serve fails the TLS handshake before
+/// any SSP bytes flow.
+pub const TERMINAL_ALPN: &[u8] = b"koh/iroh/1";
 
 /// Errors from endpoint/identity setup.
 #[derive(Debug, thiserror::Error)]
@@ -495,19 +504,36 @@ fn discovery_dns_resolver() -> Option<iroh::dns::DnsResolver> {
     }
 }
 
+/// The ALPN list the `accept: bool` binders register: the terminal ALPN, or none.
+fn accept_alpns(accept: bool) -> Vec<Vec<u8>> {
+    if accept {
+        vec![TERMINAL_ALPN.to_vec()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Build an iroh [`Endpoint`] with the `presets::N0` profile (relay + DNS discovery, so a
 /// bare endpoint id is dialable).
 ///
 /// `accept` registers our ALPN so the endpoint can accept incoming connections (server side).
 pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
+    bind_endpoint_alpns(secret, accept_alpns(accept)).await
+}
+
+/// [`bind_endpoint`] accepting the given ALPNs (empty = client-only, no accept) — KH-02.
+pub async fn bind_endpoint_alpns(
+    secret: SecretKey,
+    alpns: Vec<Vec<u8>>,
+) -> Result<Endpoint, SetupError> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
         .transport_config(koh_transport_config());
     if let Some(resolver) = discovery_dns_resolver() {
         builder = builder.dns_resolver(resolver);
     }
-    if accept {
-        builder = builder.alpns(vec![ALPN.to_vec()]);
+    if !alpns.is_empty() {
+        builder = builder.alpns(alpns);
     }
     let ep = builder
         .bind()
@@ -522,6 +548,14 @@ pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, 
 /// [`EndpointAddr`] (id + direct socket address), e.g. via [`loopback_addr`]. It avoids any
 /// dependency on n0's public relay/DNS, so it is fully hermetic.
 pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
+    bind_endpoint_local_alpns(secret, accept_alpns(accept)).await
+}
+
+/// [`bind_endpoint_local`] accepting the given ALPNs (empty = client-only) — KH-02.
+pub async fn bind_endpoint_local_alpns(
+    secret: SecretKey,
+    alpns: Vec<Vec<u8>>,
+) -> Result<Endpoint, SetupError> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .transport_config(koh_transport_config());
@@ -530,8 +564,8 @@ pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endp
     if let Some(resolver) = discovery_dns_resolver() {
         builder = builder.dns_resolver(resolver);
     }
-    if accept {
-        builder = builder.alpns(vec![ALPN.to_vec()]);
+    if !alpns.is_empty() {
+        builder = builder.alpns(alpns);
     }
     let ep = builder
         .bind()
@@ -576,6 +610,15 @@ pub async fn bind_endpoint_with_relay(
     accept: bool,
     relay: RelayUrl,
 ) -> Result<Endpoint, SetupError> {
+    bind_endpoint_with_relay_alpns(secret, accept_alpns(accept), relay).await
+}
+
+/// [`bind_endpoint_with_relay`] accepting the given ALPNs (empty = client-only) — KH-02.
+pub async fn bind_endpoint_with_relay_alpns(
+    secret: SecretKey,
+    alpns: Vec<Vec<u8>>,
+    relay: RelayUrl,
+) -> Result<Endpoint, SetupError> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .relay_mode(RelayMode::custom([relay]))
@@ -585,8 +628,8 @@ pub async fn bind_endpoint_with_relay(
     if let Some(resolver) = discovery_dns_resolver() {
         builder = builder.dns_resolver(resolver);
     }
-    if accept {
-        builder = builder.alpns(vec![ALPN.to_vec()]);
+    if !alpns.is_empty() {
+        builder = builder.alpns(alpns);
     }
     let ep = builder
         .bind()
@@ -1029,5 +1072,14 @@ mod tests {
 
         chan.close(0, b"done");
         let _ = srv.await;
+    }
+
+    #[test]
+    fn terminal_alpn_is_the_legacy_alpn_and_the_default_accept_list() {
+        // KH-02: the terminal state keeps the wire ALPN every existing peer speaks.
+        assert_eq!(TERMINAL_ALPN, ALPN);
+        assert_eq!(TERMINAL_ALPN, b"koh/iroh/1");
+        assert_eq!(accept_alpns(true), vec![TERMINAL_ALPN.to_vec()]);
+        assert!(accept_alpns(false).is_empty());
     }
 }

@@ -37,6 +37,7 @@ Useful flags:
 
 ```sh
 --clipboard               # opt in to OSC-52 clipboard writes
+--on-bell <cmd>           # run a shell command whenever the remote bell rings
 --shell <program>         # host a program instead of the login shell (repeat to pass args)
 --key-file <path>         # use a custom identity-key path
 --session-ttl-secs <n>    # keep detached sessions around longer/shorter
@@ -70,6 +71,16 @@ If DNS resolution is broken on your Android device, try setting an explicit reso
 KOH_DNS=1.1.1.1 koh connect <server-id>
 ```
 
+To get a phone notification when the remote shell rings the bell (a finished build, an agent
+waiting for input), hook `termux-notification`:
+
+```sh
+koh connect <server-id> --on-bell 'termux-notification -t "koh bell"'
+```
+
+The hook runs detached from the terminal at most once per second; `KOH_BELL_COUNT` and
+`KOH_TITLE` are set in its environment.
+
 ## As a library
 
 koh's server and client are callable from another binary. Depend on it without the `cli` feature
@@ -77,7 +88,7 @@ koh's server and client are callable from another binary. Depend on it without t
 
 ```toml
 [dependencies]
-koh = { version = "0.10", default-features = false, features = ["backend-termina"] }
+koh = { version = "0.11", default-features = false, features = ["backend-termina"] }
 ```
 
 The stable surface is the four config types and their entry points: `koh::server::{serve,
@@ -97,6 +108,50 @@ serve(ServeConfig {
 ```
 
 The `koh` binary is the same code behind clap; `cargo install koh` is unaffected.
+
+### Syncing a state of your own
+
+Since 0.11 the server hosts any `SyncState` producer and the client renders any `ClientState`, so
+a program can use koh's transport (SSP over iroh: loss-tolerant, reconnecting, detachable) for
+something other than a terminal screen. The state type a connection carries is selected by its
+ALPN, so old koh peers are never confused. A twenty-line sketch: a shared `String` that every
+authorized peer appends to.
+
+```rust
+use koh::server::{serve_with, cli::Hosts, ClientId, SessionHost, SharedHost, ServeConfig};
+use koh::ssp::SyncState;
+
+#[derive(Clone, Default, PartialEq)]
+struct Log(String);
+impl SyncState for Log {
+    type Diff = String; // the whole log; a real state diffs against `base`
+    const RECV_DECODE_LIMIT: usize = 1 << 20;
+    const RECEIVE_BUDGET_UNITS: usize = 1 << 24;
+    fn resource_units(&self) -> usize { self.0.len() }
+    fn diff_from(&self, _base: &Self) -> String { self.0.clone() }
+    fn apply(&mut self, d: &String) { self.0 = d.clone(); }
+}
+
+struct LogHost(Log);
+impl SessionHost for LogHost {
+    type State = Log;
+    fn snapshot(&mut self) -> Log { self.0.clone() }
+    fn input(&mut self, b: &[u8]) { self.0 .0.push_str(&String::from_utf8_lossy(b)); }
+    fn resize(&mut self, _: ClientId, _: u16, _: u16) {}
+    fn register_input_frame(&mut self, _: u64, _: u64) {}
+    fn set_echo_ack(&mut self, _: u64) -> bool { false }
+    fn echo_ack_wait_time(&self, _: u64) -> u64 { koh::ssp::NEVER }
+    fn alive(&self) -> bool { true }
+}
+
+let hosts = Hosts::new().with(b"example/log/1", SharedHost::new(|| Ok(LogHost(Log::default()))));
+serve_with(ServeConfig { allow, ..Default::default() }, hosts).await?;
+```
+
+On the client side, implement `koh::client::ClientState` for `Log` (title, exit code, echo-ack)
+and a `ClientTerminal<Log>` that prints it, then `connect_with(config, b"example/log/1", || Ok(term),
+input_rx, resize_rx)`. `tests/e2e_generic_host.rs` is the complete, runnable version of this over a
+real loopback connection.
 
 ## Highlights
 

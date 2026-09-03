@@ -1,6 +1,6 @@
 [package]
 name = "koh"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 # The effective floor is dictated by the `=`-pinned iroh 1.0.0 (edition 2024 + rust-version 1.91),
 # not by koh's own 2021 edition. Declaring it turns "cargo install on an old toolchain" into a clear
@@ -200,3 +200,8 @@ duration_suboptimal_units = "allow"     # `from_secs(3600)` is clearer than a co
 # `const fn` on every getter is high-churn for debatable benefit (and `const` is part of the
 # public API surface — making it implicit everywhere is not obviously desirable); not enforced.
 missing_const_for_fn = "allow"
+# The client session futures own a terminal backend (`impl KohBackend`, deliberately not `Send`)
+# and a caller-supplied `make_term` closure, and are driven on the caller's own task — never sent
+# across threads. Requiring `Send` on those seams would force every backend and embedder to be
+# `Send` for no benefit. (0.11: the generic `connect_with`/`run_client_with` made this concrete.)
+future_not_send = "allow"

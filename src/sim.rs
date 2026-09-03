@@ -7,7 +7,7 @@
 
 use crate::input::{UserInput, WireEvent};
 use crate::predict::{DisplayPreference, PredictionEngine};
-use crate::ssp::testkit::{LinkParams, SimHarness};
+use crate::ssp::testkit::{GridState, LinkParams, SimHarness};
 use crate::terminal::{ServerTerminal, TerminalScreen};
 
 /// The outcome of one driven client↔server session over the chaotic link.
@@ -121,4 +121,76 @@ pub fn run_predictor_reconciliation() -> anyhow::Result<()> {
         anyhow::bail!("confirmed prediction should be cleared");
     }
     Ok(())
+}
+
+/// The outcome of one driven session over a **non-terminal** state (KH-01).
+///
+/// A scripted producer mutates [`GridState`] cells on the server side while the client types; both
+/// directions must converge over the chaotic link exactly as the terminal session does.
+pub struct GenericSessionResult {
+    pub converge_steps: usize,
+    pub sim_ms: u64,
+    pub client_view: GridState,
+    pub server_view_of_input: usize,
+    pub expected_input: usize,
+}
+
+impl GenericSessionResult {
+    pub fn assert_ok(&self, expected: &GridState) -> anyhow::Result<()> {
+        if self.client_view != *expected {
+            anyhow::bail!(
+                "client replica diverged from the server state: {} cells vs {}",
+                self.client_view.cells.len(),
+                expected.cells.len()
+            );
+        }
+        if self.server_view_of_input != self.expected_input {
+            anyhow::bail!(
+                "server saw {} input events, expected {}",
+                self.server_view_of_input,
+                self.expected_input
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Drive a client↔server session whose synced state is a [`GridState`] over the lossy link (KH-01).
+///
+/// A stand-in for a multiplexer's per-pane grids: `rounds` rounds of random cell mutations (some
+/// larger than one datagram) interleaved with client keystrokes, then convergence. Returns the
+/// result and the final server state to compare against.
+pub fn run_generic_session(loss: f64, seed: u64, rounds: u32) -> (GenericSessionResult, GridState) {
+    let params = LinkParams {
+        loss,
+        min_delay_ms: 10,
+        max_delay_ms: 60,
+        dup: 0.02,
+    };
+    let mut h = SimHarness::<UserInput, GridState>::new(params, seed, 1200);
+    let mut rng = crate::ssp::testkit::Rng::new(seed ^ 0xA5A5);
+    let mut typed = 0usize;
+    for round in 0..rounds {
+        let k = (rng.next_u64() % 12) as u32;
+        let len = rng.range(1, 2500) as usize;
+        h.b_mut().cells.insert(k, vec![round as u8; len]);
+        if (rng.next_u64()).is_multiple_of(3) {
+            h.b_mut().cells.remove(&((rng.next_u64() % 12) as u32));
+        }
+        h.a_mut().push_bytes(b"k");
+        typed += 1;
+        h.run_steps(5);
+    }
+    let target = h.b.current().clone();
+    let converge_steps = h.run_until(60_000, |h| {
+        *h.a.remote_state() == target && h.b.remote_state().events().len() >= typed
+    });
+    let result = GenericSessionResult {
+        converge_steps,
+        sim_ms: h.now(),
+        client_view: h.a.remote_state().clone(),
+        server_view_of_input: h.b.remote_state().events().len(),
+        expected_input: typed,
+    };
+    (result, target)
 }

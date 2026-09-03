@@ -15,6 +15,49 @@ internal and unstable (see `src/lib.rs`).
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
 > 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.9.1.
 
+## [0.11.0] — 2026-09-03
+
+### Changed
+- **The server hosts any `SyncState` producer, not only a PTY** (KH-01). `session::Session`,
+  `SessionHandle`, `SessionStore`, `attach_with`, `detach`, `reap`, `run_reaper`, `ServerSession`,
+  `run_attached` (now also taking a `ClientId`) and `run_session_with` are generic over a
+  `SessionHost`; `PtyHost` is the previous PTY + emulator code behind that trait. `serve` is
+  unchanged in behaviour and is `serve_with(config, Hosts::new().with(TERMINAL_ALPN, PtyHosts))`
+  underneath. `serve` installs its tracing subscriber with `try_init`, so an embedding binary that
+  already owns one no longer panics.
+- **The client renders any `ClientState`** (KC-01). `ClientSession<S>`, `run_client`,
+  `ClientTerminal<S>::render(state, overlay, status)` (the window state now comes from
+  `ClientState::window`), and the input-mode mirroring go through `client::InputModes` (byte-identical
+  to vt100's sequences). `connect` is unchanged and is `connect_with(config, TERMINAL_ALPN, …)`.
+- **`predict` reads screens through `predict::ScreenView`** instead of `&vt100::Screen` directly
+  (implemented for `vt100::Screen`; still no `crate::` imports).
+- `ssp::NEVER`, `ssp::testkit` and `Transport::current` are public (the latter two `#[doc(hidden)]`).
+
+### Added
+- **`SessionHost`, `HostProvider`, `PtyHosts`, `SharedHost`, `serve_with`, `cli::Hosts`,
+  `ClientId`** — the server seam, including shared sessions (KS-01): every authorized peer attaches
+  to one host with its own connection loop and `ClientId`; the reaper collects it only once every
+  viewer has left.
+- **`ClientState`, `ClientTerminal<S>`, `connect_with`, `run_client_with`, `InputModes`** — the
+  client seam.
+- **The synced state type is selected by ALPN** (KH-02): `transport_iroh::TERMINAL_ALPN`
+  (`koh/iroh/1`, the existing ALPN) for `TerminalScreen`; `bind_endpoint*_alpns` bind several;
+  `IrohConnector::with_alpn` dials one. A client dialing an ALPN the server does not bind fails the
+  TLS handshake before any SSP bytes flow, with an error naming the ALPN.
+- **`ServerTerminal::progress()` and `take_unhandled_oscs()`** (KO-01): OSC 9;4 progress reports
+  and a bounded ring (16 × 256 bytes) of unhandled OSC payloads, host-side only.
+- **`--on-bell <CMD>` / `ConnectConfig::bell_command` / `client::BellHook`** (KB-01): run a shell
+  command when the remote bell rings; detached, `KOH_*`-scrubbed except `KOH_BELL_COUNT` and
+  `KOH_TITLE`, at most one spawn per second.
+- Test infrastructure: `ssp::testkit::GridState`, `sim::run_generic_session`, three new
+  integration targets (`e2e_generic_host`, `shared_session`, `bell_hook`), a `server_process`
+  fuzz target, and a KS-01 proptest over shared-session refcounting.
+
+### Unchanged
+- Wire protocol, `PROTOCOL_VERSION` (3), the terminal ALPN, `TerminalScreen`/`ScreenDiff` on the
+  wire, the `koh-key-v1` key format, and every CLI flag and default. `cargo install koh` builds
+  the same binary behaviour, plus `--on-bell`.
+
 ## [0.10.0] — 2026-09-03
 
 ### Changed

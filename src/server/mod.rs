@@ -772,7 +772,8 @@ mod tests {
                 r = chan.recv() => { if let Ok(b) = r { t.recv(clock.now_ms(), &b); } }
                 () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
             }
-            if t.remote_state().contents().contains("xy") {
+            // Wait for the input AND its echo-ack (the ack ships after the 50 ms debounce).
+            if t.remote_state().contents().contains("xy") && t.remote_state().echo_ack >= 1 {
                 break;
             }
         }

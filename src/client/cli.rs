@@ -42,7 +42,8 @@ pub struct ConnectConfig {
     pub clipboard: bool,
     /// A shell command to run (via `sh -c`) whenever the remote bell count climbs (KB-01), e.g.
     /// `termux-notification -t "koh bell"`. Detached from the terminal, rate-limited to one spawn
-    /// per second. `None` = no hook.
+    /// per second; bells that rang before this client attached do not fire it, bells during a
+    /// reconnect do. `None` = no hook.
     pub bell_command: Option<String>,
 }
 
@@ -65,13 +66,20 @@ impl ConnectConfig {
 /// The decision (`observe`) is pure and rate-limited so it is unit-testable; the spawn is
 /// detached — stdin/stdout/stderr on `/dev/null`, since the TUI owns the terminal — with
 /// `KOH_BELL_COUNT` and `KOH_TITLE` in the environment and every other `KOH_*` variable scrubbed
-/// (the `$KOH_KEY_PASSPHRASE` guard from `pty.rs`). The child is reaped on a background task and
-/// never awaited by the session loop.
+/// (the same `$KOH_KEY_PASSPHRASE` guard as `pty.rs`, KB-02). The child is reaped on a background
+/// task and never awaited by the session loop.
+///
+/// The remote bell count is cumulative for the life of the server session, so the hook is
+/// [`prime`](Self::prime)d with the count of the first synced frame: bells that rang before you
+/// attached do not fire it. The hook outlives a reconnect (it is not re-primed), so bells that
+/// rang during an outage do.
 #[derive(Debug, Clone)]
 pub struct BellHook {
     command: String,
     last_count: u64,
     last_spawn_ms: Option<u64>,
+    /// Whether a count has been seen (by `prime` or `observe`); `prime` is a no-op afterwards.
+    primed: bool,
 }
 
 /// Minimum spacing between two hook spawns; a burst of bells inside it coalesces into one.
@@ -83,6 +91,17 @@ impl BellHook {
             command: command.into(),
             last_count: 0,
             last_spawn_ms: None,
+            primed: false,
+        }
+    }
+
+    /// Seed the hook with the bell count of the first synced frame, without spawning: bells that
+    /// rang before this client attached are not "new". A no-op once any count has been seen, so a
+    /// reconnect keeps counting from where it was and bells during the outage still fire.
+    pub fn prime(&mut self, count: u64) {
+        if !self.primed {
+            self.last_count = count;
+            self.primed = true;
         }
     }
 
@@ -92,6 +111,7 @@ impl BellHook {
     pub fn observe(&mut self, count: u64, now_ms: u64) -> bool {
         let rose = count > self.last_count;
         self.last_count = count;
+        self.primed = true;
         if !rose {
             return false;
         }
@@ -111,14 +131,20 @@ impl BellHook {
         }
     }
 
-    /// Spawn the command detached (never blocks the session loop; the child is reaped by a
-    /// background task).
-    pub fn fire(&self, count: u64, title: &str) {
+    /// Build the detached command: `sh -c CMD` with `parent_env` minus every `KOH_*` key, plus
+    /// `KOH_BELL_COUNT` / `KOH_TITLE`, and all three fds on `/dev/null`. Pure given `parent_env`,
+    /// so the scrub is testable with a synthetic environment (KB-02).
+    pub(crate) fn command(
+        &self,
+        count: u64,
+        title: &str,
+        parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    ) -> std::process::Command {
         let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(&self.command);
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("KOH_") {
-                cmd.env_remove(k);
+        cmd.arg("-c").arg(&self.command).env_clear();
+        for (k, v) in parent_env {
+            if !crate::pty::is_koh_env_key(&k) {
+                cmd.env(k, v);
             }
         }
         cmd.env("KOH_BELL_COUNT", count.to_string())
@@ -126,7 +152,13 @@ impl BellHook {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        match cmd.spawn() {
+        cmd
+    }
+
+    /// Spawn the command detached (never blocks the session loop; the child is reaped by a
+    /// background task).
+    pub fn fire(&self, count: u64, title: &str) {
+        match self.command(count, title, std::env::vars_os()).spawn() {
             Ok(mut child) => {
                 // Reap off the async loop; a stuck hook can't wedge the session.
                 std::thread::Builder::new()
@@ -175,7 +207,8 @@ pub struct ConnectArgs {
 
     /// Run this shell command whenever the remote bell rings (e.g. on Termux:
     /// `--on-bell 'termux-notification -t "koh bell"'`). Detached from the terminal; at most one
-    /// spawn per second. KOH_BELL_COUNT and KOH_TITLE are set in its environment.
+    /// spawn per second. KOH_BELL_COUNT and KOH_TITLE are set in its environment. Bells that rang
+    /// before you attached do not fire it; bells during a reconnect do.
     #[arg(long, value_name = "CMD")]
     on_bell: Option<String>,
 }
@@ -517,34 +550,67 @@ mod tests {
     }
 
     #[test]
-    fn bell_hook_spawns_detached_with_koh_env_scrubbed() {
-        // KB-01: the hook sees KOH_BELL_COUNT / KOH_TITLE but NOT the parent's other KOH_* vars
-        // (the passphrase guard from pty.rs), and it runs with the TUI's fds detached.
-        let out = std::env::temp_dir().join(format!("koh-bell-env-{}", std::process::id()));
-        let _ = std::fs::remove_file(&out);
-        // SAFETY-equivalent: `set_var` is the documented way to seed the parent env in a test;
-        // the crate forbids `unsafe`, so use a subshell-visible variable via the command instead.
-        let hook = BellHook::new(format!(
-            "KOH_KEY_PASSPHRASE=secret env > '{}'",
-            out.display()
+    fn bell_hook_command_scrubs_parent_koh_vars_and_exports_its_own() {
+        // KB-02: given a parent environment holding the identity-key passphrase and another
+        // KOH_* var, the hook's child sees neither, keeps the rest (PATH, HOME), and gets
+        // KOH_BELL_COUNT / KOH_TITLE. The command builder takes the parent env explicitly, so
+        // this needs no process-global `set_var`.
+        use std::ffi::OsString;
+        let dir = std::env::temp_dir().join(format!(
+            "koh-bell-env-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
         ));
-        // The hook's own `sh -c` sets the var *inside*; what we assert is that the parent's
-        // scrub ran and the two koh vars are exported. Use a second hook with the parent var
-        // scrubbed by construction: here the parent has no KOH_* set, so assert the exports.
-        hook.fire(42, "a title");
-        let mut content = String::new();
-        for _ in 0..100 {
-            if let Ok(c) = std::fs::read_to_string(&out) {
-                if c.contains("KOH_BELL_COUNT") {
-                    content = c;
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("env.txt");
+        let hook = BellHook::new(format!("env > '{}'", out.display()));
+        let parent_env = [
+            ("KOH_KEY_PASSPHRASE", "secret"),
+            ("KOH_LOG", "/tmp/x"),
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/nonexistent"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let status = hook
+            .command(42, "a title", parent_env)
+            .status()
+            .expect("spawn env");
+        let content = std::fs::read_to_string(&out).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "{content}");
         assert!(content.contains("KOH_BELL_COUNT=42"), "{content}");
         assert!(content.contains("KOH_TITLE=a title"), "{content}");
-        let _ = std::fs::remove_file(&out);
+        assert!(content.contains("PATH=/usr/bin:/bin"), "{content}");
+        assert!(
+            !content.contains("KOH_KEY_PASSPHRASE"),
+            "the passphrase leaked into the hook's env: {content}"
+        );
+        assert!(!content.contains("KOH_LOG"), "{content}");
+    }
+
+    #[test]
+    fn bell_hook_prime_swallows_the_count_it_is_seeded_with_but_not_later_rises() {
+        // KB-02: the first synced frame's cumulative count is not a new bell; a later rise is.
+        // Priming again is a no-op (a reconnect keeps counting from where it was).
+        let mut h = BellHook::new("true");
+        h.prime(5);
+        assert!(!h.observe(5, 0), "the primed count is not a rise");
+        assert!(h.observe(6, 0), "a rise past the primed count fires");
+        h.prime(100);
+        assert!(
+            h.observe(7, 5_000),
+            "a second prime is ignored once a count was seen"
+        );
+        // observe() alone also primes: a hook that never saw prime() keeps today's behaviour.
+        let mut g = BellHook::new("true");
+        assert!(
+            g.observe(3, 0),
+            "with no prime, the first rise from 0 fires"
+        );
+        g.prime(50);
+        assert!(g.observe(4, 5_000), "prime after observe is a no-op");
     }
 
     #[test]

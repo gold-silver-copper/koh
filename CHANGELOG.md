@@ -54,7 +54,8 @@ internal and unstable (see `src/lib.rs`).
   and a bounded ring (16 × 256 bytes) of unhandled OSC payloads, host-side only.
 - **`--on-bell <CMD>` / `ConnectConfig::bell_command` / `client::BellHook`** (KB-01): run a shell
   command when the remote bell rings; detached, `KOH_*`-scrubbed except `KOH_BELL_COUNT` and
-  `KOH_TITLE`, at most one spawn per second.
+  `KOH_TITLE`, at most one spawn per second. Bells from before the attach do not fire it; bells
+  during a reconnect do (KB-02).
 - Test infrastructure: `ssp::testkit::GridState`, `sim::run_generic_session`, three new
   integration targets (`e2e_generic_host`, `shared_session`, `bell_hook`), a `server_process`
   fuzz target, and a KS-01 proptest over shared-session refcounting.

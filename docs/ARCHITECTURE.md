@@ -196,6 +196,12 @@ the same SSP-over-iroh machinery, with detachable sessions, reconnect and predic
   the remote bell count climbs: detached (fds on `/dev/null`), `KOH_*` scrubbed except
   `KOH_BELL_COUNT` / `KOH_TITLE`, rate-limited to one spawn per second with bursts coalesced, the
   child reaped off the session loop. The decision is a pure `BellHook::observe`.
+- **KB-02 — the hook's environment and its first frame.** `BellHook::command(count, title,
+  parent_env)` builds the child from an explicit parent environment (`env_clear`, then everything
+  but `KOH_*`, sharing `pty::is_koh_env_key` with the PTY spawn), so the scrub is tested with a
+  synthetic environment rather than assumed. The bell count is cumulative per server session, so
+  the first synced frame `prime`s the hook: bells from before this attach do not fire it. The hook
+  outlives a reconnect and is not re-primed, so bells during an outage do.
 
 Test doubles for all of this live in-tree: `ssp::testkit::GridState` (a non-terminal state with
 multi-datagram diffs), `server::session::test_host::ScriptedHost` (unit tests), and the `EchoHost`

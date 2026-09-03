@@ -79,7 +79,8 @@ koh connect <server-id> --on-bell 'termux-notification -t "koh bell"'
 ```
 
 The hook runs detached from the terminal at most once per second; `KOH_BELL_COUNT` and
-`KOH_TITLE` are set in its environment.
+`KOH_TITLE` are set in its environment, and every other `KOH_*` variable is scrubbed. Bells that
+rang before you attached do not fire it; bells during a reconnect do.
 
 ## As a library
 

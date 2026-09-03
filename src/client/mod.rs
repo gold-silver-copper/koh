@@ -605,6 +605,12 @@ impl<S: ClientState> ClientSession<S> {
         self.transport.remote_state()
     }
 
+    /// Whether at least one server frame has been applied, i.e. [`state`](Self::state) is the
+    /// server's and not the default a fresh session starts from.
+    pub fn synced(&self) -> bool {
+        self.transport.remote_num() > 0
+    }
+
     /// The current prediction overlay to draw over [`state`](Self::state) (empty when the state
     /// has no predict target).
     pub fn overlay(&self) -> Overlay {
@@ -837,9 +843,14 @@ async fn drive_connection<S: ClientState, T: ClientTerminal<S>>(
             session.status_was_shown = status_now;
             session.dirty = false;
             // KB-01: run the bell hook when the remote bell count climbs (rate-limited inside).
+            // Only once a server frame has arrived: the first paint is the default state, and the
+            // first synced frame primes the hook so bells from before this attach don't fire (KB-02).
             if let Some(hook) = bell.as_deref_mut() {
-                let win = session.window_state();
-                hook.observe_and_fire(win.bell_count, win.title, now);
+                if session.synced() {
+                    let win = session.window_state();
+                    hook.prime(win.bell_count);
+                    hook.observe_and_fire(win.bell_count, win.title, now);
+                }
             }
         }
 

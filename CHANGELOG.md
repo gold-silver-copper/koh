@@ -26,7 +26,8 @@ internal and unstable (see `src/lib.rs`).
   implements `stamp_echo_ack`, and `ServerTerminal::snapshot` leaves `echo_ack` at 0 for the loop
   to stamp (`TerminalScreen::set_echo_ack`). `SessionHandle::changed` is a `ChangeSignal` (a `watch`
   version counter) rather than a `Notify`, so one pulse wakes every attached viewer (KS-03);
-  `SessionHost::attach_notify` receives it. `serve` is
+  `SessionHost::attach_notify` receives it. The K-16 unwind guard releases a connection's attach through
+  its `HostProvider`, so a shared host is never pinned by a panicking connection task (KS-04). `serve` is
   unchanged in behaviour and is `serve_with(config, Hosts::new().with(TERMINAL_ALPN, PtyHosts))`
   underneath. `serve` installs its tracing subscriber with `try_init`, so an embedding binary that
   already owns one no longer panics.

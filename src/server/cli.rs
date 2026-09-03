@@ -239,7 +239,7 @@ trait ErasedProvider: Send + Sync {
 }
 
 struct Typed<H, P> {
-    provider: P,
+    provider: Arc<P>,
     _host: std::marker::PhantomData<fn() -> H>,
 }
 
@@ -283,9 +283,10 @@ impl<H: SessionHost, P: HostProvider<H>> ErasedProvider for Typed<H, P> {
             }
             let client = ClientId::next();
             // Arm a RAII safety net BEFORE serving: if `run_attached` unwinds (panics), the guard's
-            // Drop still releases this connection's session attach so it can't leak (K-16). On a
-            // normal return we disarm and run the precise detach/reap below ourselves.
-            let attach_guard = session::AttachGuard::new(self.provider.store(), peer);
+            // Drop still releases this connection's session attach through the provider so it
+            // can't leak, shared hosts included (K-16, KS-04). On a normal return we disarm and
+            // run the precise detach/reap below ourselves.
+            let attach_guard = session::AttachGuard::new(self.provider.clone(), peer);
             let outcome = run_attached(conn, handle.clone(), client).await;
             attach_guard.disarm();
             handle.session.lock().await.host.client_detached(client);
@@ -342,7 +343,7 @@ impl Hosts {
         self.entries.push((
             alpn.to_vec(),
             Arc::new(Typed::<H, P> {
-                provider,
+                provider: Arc::new(provider),
                 _host: std::marker::PhantomData,
             }),
         ));

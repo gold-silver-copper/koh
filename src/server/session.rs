@@ -537,24 +537,30 @@ impl<H: SessionHost> HostProvider<H> for SharedHost<H> {
 /// reaper (keyed on `!alive || detached_expired`) never collects: a zombie shell + PTY pinned for the
 /// server's lifetime.
 ///
+/// The release goes through the **provider's** `detach`, not a store lookup by peer id (KS-04): a
+/// [`SharedHost`] stores every peer under one fixed key, so a lookup by `peer` would miss and the
+/// shared host would never be reaped after a panicking connection task.
+///
 /// A standard RAII Drop-cleans-up-on-unwind discipline. On the normal return paths the task
 /// [`disarm`](Self::disarm)s the guard and does the precise cleanup (detach **vs** reap) itself; the
 /// guard only fires on an unexpected unwind. `Drop` can't `await`, so it spawns the async detach onto
 /// the current runtime (best-effort: a no-op if no runtime is in scope).
 #[must_use = "hold the guard for the connection's lifetime, then disarm() on a normal return"]
-pub(crate) struct AttachGuard<H: SessionHost> {
-    store: SessionStore<H>,
+pub(crate) struct AttachGuard<H: SessionHost, P: HostProvider<H>> {
+    provider: Arc<P>,
     peer: EndpointId,
     armed: bool,
+    _host: std::marker::PhantomData<fn() -> H>,
 }
 
-impl<H: SessionHost> AttachGuard<H> {
+impl<H: SessionHost, P: HostProvider<H>> AttachGuard<H, P> {
     /// Arm a guard for a freshly-attached `peer` connection. Hold it across the connection loop.
-    pub(crate) fn new(store: SessionStore<H>, peer: EndpointId) -> Self {
+    pub(crate) fn new(provider: Arc<P>, peer: EndpointId) -> Self {
         Self {
-            store,
+            provider,
             peer,
             armed: true,
+            _host: std::marker::PhantomData,
         }
     }
 
@@ -565,7 +571,7 @@ impl<H: SessionHost> AttachGuard<H> {
     }
 }
 
-impl<H: SessionHost> Drop for AttachGuard<H> {
+impl<H: SessionHost, P: HostProvider<H>> Drop for AttachGuard<H, P> {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -579,11 +585,11 @@ impl<H: SessionHost> Drop for AttachGuard<H> {
         // shell exits (the reaper also reaps on `!alive`), so it is not pinned for the server's
         // lifetime. Do NOT "fix" this with per-connection JoinSet panic-observation — that would
         // complicate the accept loop's deliberate spawn-and-forget shape for a moot window.
-        let store = self.store.clone();
+        let provider = self.provider.clone();
         let peer = self.peer;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                detach(&store, peer).await;
+                provider.detach(peer).await;
                 tracing::warn!(
                     %peer,
                     "connection task unwound; released its session attach via the drop guard"
@@ -891,9 +897,10 @@ mod tests {
         // K-16: an armed guard dropped without disarm (the panic-unwind case) must release the
         // attach — decrement `attached` to 0 and arm the detach timer — so the reaper can collect
         // the session instead of it leaking with attached>0/last_detach=None forever.
-        let store = SessionStore::default();
+        let provider = Arc::new(PtyHosts::new(vec!["sh".to_owned()], 0, 64));
         let peer = generate_secret_key().public();
-        let (h, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
+        let (h, _) = provider
+            .attach(peer)
             .await
             .expect("attach")
             .expect("under cap");
@@ -901,7 +908,7 @@ mod tests {
 
         // Simulate a connection task that unwinds before its explicit cleanup: the guard drops armed.
         {
-            let _g = AttachGuard::new(store.clone(), peer);
+            let _g = AttachGuard::new(provider.clone(), peer);
         }
         // Drop spawns the async detach; give the runtime a few turns to run it.
         let mut released = false;
@@ -926,15 +933,16 @@ mod tests {
     async fn attach_guard_is_a_noop_once_disarmed() {
         // The normal return path disarms the guard and does its own detach/reap; a disarmed guard
         // must NOT also fire (which would double-decrement the refcount).
-        let store = SessionStore::default();
+        let provider = Arc::new(PtyHosts::new(vec!["sh".to_owned()], 0, 64));
         let peer = generate_secret_key().public();
-        let (h, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
+        let (h, _) = provider
+            .attach(peer)
             .await
             .expect("attach")
             .expect("under cap");
         assert_eq!(h.session.lock().await.attached, 1);
 
-        AttachGuard::new(store.clone(), peer).disarm();
+        AttachGuard::new(provider.clone(), peer).disarm();
         // Let any erroneously-spawned detach run; the count must be unchanged by the disarmed guard.
         tokio::time::sleep(Duration::from_millis(20)).await;
         let s = h.session.lock().await;
@@ -948,6 +956,39 @@ mod tests {
         );
         drop(s);
         let _ = h.session.lock().await.host.pty.kill();
+    }
+
+    #[tokio::test]
+    async fn attach_guard_releases_a_shared_host_attach_under_the_shared_key() {
+        // KS-04: a SharedHost stores every peer under one fixed key. An armed guard dropping for
+        // a peer must still release that shared entry (attached -> 0, detach timer armed); a
+        // store lookup by the peer's own id would miss it and pin the host forever.
+        let provider = Arc::new(SharedHost::new(|| Ok(ScriptedHost::new())));
+        let peer = generate_secret_key().public();
+        let (h, _) = provider
+            .attach(peer)
+            .await
+            .expect("attach")
+            .expect("under cap");
+        assert_eq!(h.session.lock().await.attached, 1);
+        {
+            let _g = AttachGuard::new(provider.clone(), peer);
+        }
+        let mut released = false;
+        for _ in 0..100 {
+            {
+                let s = h.session.lock().await;
+                if s.attached == 0 && s.last_detach.is_some() {
+                    released = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            released,
+            "the guard must release the shared entry, not look the peer up by its own id"
+        );
     }
 
     #[tokio::test]
@@ -1199,16 +1240,17 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
 
-        /// KS-01: arbitrary attach/detach/reap/sweep sequences over a shared host never drive
-        /// `attached` negative (saturating), never reap while a viewer is attached, and always reap
-        /// once `attached == 0` and the TTL has elapsed.
+        /// KS-01 / KS-04: arbitrary attach/detach/reap/sweep/unwind sequences over a shared host
+        /// never drive `attached` negative (saturating), never reap while a viewer is attached,
+        /// always reap once `attached == 0` and the TTL has elapsed, and an unwinding connection
+        /// task (an armed guard dropping) behaves exactly like a detach.
         #[test]
         fn shared_host_refcount_and_reaping_invariants(
-            ops in proptest::collection::vec(0u8..4, 1..40),
+            ops in proptest::collection::vec(0u8..5, 1..40),
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async {
-                let provider = SharedHost::new(|| Ok(ScriptedHost::new()));
+                let provider = Arc::new(SharedHost::new(|| Ok(ScriptedHost::new())));
                 let peers: Vec<EndpointId> = (0..3).map(|_| generate_secret_key().public()).collect();
                 let mut attached: u32 = 0;
                 let mut alive_entry = false;
@@ -1228,6 +1270,15 @@ mod tests {
                             provider.reap(peer).await;
                             attached = 0;
                             alive_entry = false;
+                        }
+                        4 => {
+                            // A connection task unwinds: its armed guard drops and spawns the
+                            // balancing detach; yield so the current-thread runtime runs it.
+                            drop(AttachGuard::new(provider.clone(), peer));
+                            for _ in 0..4 {
+                                tokio::task::yield_now().await;
+                            }
+                            attached = attached.saturating_sub(1);
                         }
                         _ => {
                             // One reaper sweep with an expired TTL: collects iff nobody is attached.

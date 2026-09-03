@@ -178,6 +178,10 @@ the same SSP-over-iroh machinery, with detachable sessions, reconnect and predic
   it last saw, a pulse landing between a loop's snapshot and its wait is never lost. The previous
   `Notify::notify_one` released a single waiter, so a second viewer lagged by up to the 1 s timer
   cap.
+- **KS-04 — the unwind guard releases through the provider.** `AttachGuard` (K-16) holds the
+  `HostProvider` and calls its `detach(peer)` on an unwind, rather than looking the peer up in the
+  store. A `SharedHost` keys every peer under one fixed id, so a lookup by peer missed and a
+  panicking connection task left the shared host with `attached > 0` forever.
 - **KC-01 — `ClientState` / `ClientTerminal<S>` / `ScreenView`.** The client session is generic
   over the remote state: `ClientState` supplies the out-of-band window state, the exit code, the
   echo-ack, the input modes to mirror (`InputModes`, byte-identical to vt100's own sequences), and

@@ -23,7 +23,46 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use unicode_width::UnicodeWidthStr;
-use vt100::{Color, Screen};
+use vt100::Color;
+
+/// One cell as the predictor sees it: the glyph (empty for a blank or a wide-glyph continuation)
+/// and its colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellView<'a> {
+    pub contents: &'a str,
+    pub fg: Color,
+    pub bg: Color,
+}
+
+/// The read-only view of an authoritative screen the predictor reconciles against (KC-01).
+///
+/// `vt100::Screen` implements it; so can any grid a different front-end syncs (a multiplexer's
+/// pane), which is why the engine takes `&dyn ScreenView` rather than a concrete emulator type.
+/// `predict` still imports nothing from `crate::` — this trait lives here for that reason.
+pub trait ScreenView {
+    /// `(rows, cols)`.
+    fn size(&self) -> (u16, u16);
+    /// The cursor as `(row, col)`, 0-indexed.
+    fn cursor_position(&self) -> (u16, u16);
+    /// The cell at `(row, col)`, or `None` when out of bounds.
+    fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>>;
+}
+
+impl ScreenView for vt100::Screen {
+    fn size(&self) -> (u16, u16) {
+        Self::size(self)
+    }
+    fn cursor_position(&self) -> (u16, u16) {
+        Self::cursor_position(self)
+    }
+    fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>> {
+        Self::cell(self, row, col).map(|c| CellView {
+            contents: if c.has_contents() { c.contents() } else { "" },
+            fg: c.fgcolor(),
+            bg: c.bgcolor(),
+        })
+    }
+}
 
 /// Tunable engagement / flagging / glitch thresholds for the predictor (mosh `terminaloverlay.h`
 /// values).
@@ -233,7 +272,7 @@ impl PredictionEngine {
     /// row-shift copies from. Prefers an active prediction over the authoritative screen.
     fn pred_or_real_glyph(
         &self,
-        screen: &Screen,
+        screen: &dyn ScreenView,
         row: u16,
         col: u16,
     ) -> (String, Color, Color, bool) {
@@ -262,7 +301,7 @@ impl PredictionEngine {
     )]
     fn place_cell(
         &mut self,
-        screen: &Screen,
+        screen: &dyn ScreenView,
         row: u16,
         col: u16,
         glyph: String,
@@ -322,7 +361,7 @@ impl PredictionEngine {
     }
 
     /// Ensure a cursor prediction exists in the current epoch, seeded from the real cursor.
-    fn init_cursor(&mut self, screen: &Screen) {
+    fn init_cursor(&mut self, screen: &dyn ScreenView) {
         let (crow, ccol) = screen.cursor_position();
         let need_new = match &self.cursor {
             None => true,
@@ -362,7 +401,7 @@ impl PredictionEngine {
         self.cursor.as_mut().unwrap()
     }
 
-    fn newline_cr(&mut self, screen: &Screen) {
+    fn newline_cr(&mut self, screen: &dyn ScreenView) {
         let (rows, _) = screen.size();
         self.init_cursor(screen);
         if let Some(c) = self.cursor.as_mut() {
@@ -378,7 +417,7 @@ impl PredictionEngine {
     /// row. Cursor-only prediction in the current epoch, confirmed via `cursor_validity`; like
     /// a typed char it does not open a new epoch. Vertical arrows are not predicted (the caller
     /// `become_tentative`s them).
-    fn predict_arrow(&mut self, screen: &Screen, dir: i32) {
+    fn predict_arrow(&mut self, screen: &dyn ScreenView, dir: i32) {
         self.init_cursor(screen);
         let exp = self.local_frame_sent + 1;
         let (_, cols) = screen.size();
@@ -401,7 +440,7 @@ impl PredictionEngine {
     /// (combining) graphemes and ones that would land on the wrap-ambiguous right edge fall back
     /// to a tentative epoch. Overwrite-only (no insert-mode tail shift for wide chars — that
     /// rarer case is left to the server's real echo).
-    fn predict_wide(&mut self, now: u64, g: &str, screen: &Screen) {
+    fn predict_wide(&mut self, now: u64, g: &str, screen: &dyn ScreenView) {
         let w = g.width();
         if w == 0 {
             self.become_tentative(); // combining / zero-width: can't place safely
@@ -432,7 +471,7 @@ impl PredictionEngine {
 
     /// Record a typed byte and speculate its on-screen effect against `screen` (the latest
     /// authoritative frame). Validates existing predictions first (`cull`).
-    pub fn new_user_byte(&mut self, now: u64, byte: u8, screen: &Screen) {
+    pub fn new_user_byte(&mut self, now: u64, byte: u8, screen: &dyn ScreenView) {
         if self.pref == DisplayPreference::Never {
             return;
         }
@@ -627,7 +666,7 @@ impl PredictionEngine {
     /// keeps the escalation timely (mirrors mosh's `OverlayManager::wait_time`-driven update). It
     /// delegates to `cull`, which is idempotent on an unchanged screen (correct predictions were
     /// already confirmed/removed by the prior datagram), so the only effect here is re-timing.
-    pub fn tick(&mut self, now: u64, screen: &Screen) -> bool {
+    pub fn tick(&mut self, now: u64, screen: &dyn ScreenView) -> bool {
         if self.pref == DisplayPreference::Never || self.cells.is_empty() {
             return false;
         }
@@ -636,7 +675,7 @@ impl PredictionEngine {
         before != (self.flagging, self.glitch_trigger)
     }
 
-    pub fn cull(&mut self, now: u64, screen: &Screen) {
+    pub fn cull(&mut self, now: u64, screen: &dyn ScreenView) {
         if self.pref == DisplayPreference::Never {
             return;
         }
@@ -718,9 +757,7 @@ impl PredictionEngine {
                     // this ports the color/attr-flicker fix to the extent the cell model allows.
                     let (afg, abg) = screen
                         .cell(row, col)
-                        .map_or((Color::Default, Color::Default), |c| {
-                            (c.fgcolor(), c.bgcolor())
-                        });
+                        .map_or((Color::Default, Color::Default), |c| (c.fg, c.bg));
                     rendition_runs.push((row, col, afg, abg));
                     to_remove.push((row, col));
                 }
@@ -792,7 +829,7 @@ impl PredictionEngine {
 
     /// Build the render overlay for the current frame, honoring the display policy and epoch
     /// gating. Empty when nothing should be shown.
-    pub fn overlay(&self, screen: &Screen) -> Overlay {
+    pub fn overlay(&self, screen: &dyn ScreenView) -> Overlay {
         let show = match self.pref {
             DisplayPreference::Never => false,
             DisplayPreference::Always => true,
@@ -863,20 +900,20 @@ impl PredictionEngine {
     }
 }
 
-fn cell_glyph(screen: &Screen, row: u16, col: u16) -> String {
+fn cell_glyph(screen: &dyn ScreenView, row: u16, col: u16) -> String {
     screen
         .cell(row, col)
-        .filter(|c| c.has_contents())
-        .map(|c| c.contents().to_string())
+        .filter(|c| !c.contents.is_empty())
+        .map(|c| c.contents.to_string())
         .unwrap_or_default()
 }
 
-fn glyph_style(screen: &Screen, row: u16, col: u16) -> (Color, Color) {
+fn glyph_style(screen: &dyn ScreenView, row: u16, col: u16) -> (Color, Color) {
     // Copy the style of the neighbor to the left if it has content; else terminal default.
     if col > 0 {
         if let Some(c) = screen.cell(row, col - 1) {
-            if c.has_contents() {
-                return (c.fgcolor(), c.bgcolor());
+            if !c.contents.is_empty() {
+                return (c.fg, c.bg);
             }
         }
     }
@@ -889,7 +926,7 @@ fn is_blank(s: &str) -> bool {
 
 fn cell_validity(
     cell: &PredCell,
-    screen: &Screen,
+    screen: &dyn ScreenView,
     row: u16,
     col: u16,
     rows: u16,
@@ -921,7 +958,7 @@ fn cell_validity(
     }
 }
 
-fn cursor_validity(cur: &PredCursor, screen: &Screen, late_acked: u64) -> Validity {
+fn cursor_validity(cur: &PredCursor, screen: &dyn ScreenView, late_acked: u64) -> Validity {
     let (rows, cols) = screen.size();
     if cur.row >= rows || cur.col >= cols {
         return Validity::IncorrectOrExpired;
@@ -942,10 +979,74 @@ fn cursor_validity(cur: &PredCursor, screen: &Screen, late_acked: u64) -> Validi
 mod tests {
     use super::*;
 
+    use vt100::Screen;
+
     fn screen_of(bytes: &[u8]) -> Screen {
         let mut p = vt100::Parser::new(24, 80, 0);
         p.process(bytes);
         p.screen().clone()
+    }
+
+    /// A screen that is NOT vt100: a plain char grid with a cursor (KC-01).
+    struct FakeView {
+        rows: Vec<Vec<char>>,
+        cursor: (u16, u16),
+    }
+
+    impl ScreenView for FakeView {
+        fn size(&self) -> (u16, u16) {
+            (self.rows.len() as u16, self.rows[0].len() as u16)
+        }
+        fn cursor_position(&self) -> (u16, u16) {
+            self.cursor
+        }
+        fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>> {
+            // Leak-free static strs for the tiny alphabet the test uses.
+            let ch = *self.rows.get(row as usize)?.get(col as usize)?;
+            let contents: &'static str = match ch {
+                ' ' => "",
+                'x' => "x",
+                'y' => "y",
+                _ => "?",
+            };
+            Some(CellView {
+                contents,
+                fg: Color::Default,
+                bg: Color::Default,
+            })
+        }
+    }
+
+    #[test]
+    fn predictor_runs_over_a_non_vt100_screen_view() {
+        // KC-01: the exact flow of `confirm_first_keystroke`, but over a 5×10 fake grid that is
+        // not vt100: the first keystroke is hidden, the server's echo confirms the epoch, and the
+        // next keystroke is visible at the right column. Proves the engine has no vt100 dependency.
+        let blank = FakeView {
+            rows: vec![vec![' '; 10]; 5],
+            cursor: (0, 0),
+        };
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.set_srtt(250.0);
+        e.set_local_frame_sent(0);
+        e.new_user_byte(100, b'x', &blank);
+        assert!(e.overlay(&blank).is_empty(), "hidden until confirmed");
+        let mut echoed = FakeView {
+            rows: vec![vec![' '; 10]; 5],
+            cursor: (0, 1),
+        };
+        echoed.rows[0][0] = 'x';
+        e.set_local_frame_late_acked(1);
+        e.cull(200, &echoed);
+        assert_eq!(e.confirmed_epoch(), 1, "the echoed 'x' confirms the epoch");
+        e.set_local_frame_sent(1);
+        e.new_user_byte(300, b'y', &echoed);
+        let ov = e.overlay(&echoed);
+        assert_eq!(
+            ov.cell(0, 1).map(|c| c.glyph.as_str()),
+            Some("y"),
+            "typing after confirmation is visible over the fake view"
+        );
     }
 
     #[test]
@@ -1020,6 +1121,13 @@ mod tests {
         fn prop_new_user_byte_is_panic_free_and_utf8_bounded(
             bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
         ) {
+            let fake = FakeView { rows: vec![vec![' '; 80]; 24], cursor: (0, 0) };
+            let mut pf = PredictionEngine::new(DisplayPreference::Always);
+            pf.set_local_frame_sent(0);
+            for &b in &bytes {
+                pf.new_user_byte(0, b, &fake);
+                proptest::prop_assert!(pf.utf8_buf.len() <= 4, "utf8 accumulator over the fake view");
+            }
             let mut pe = PredictionEngine::new(DisplayPreference::Always);
             pe.set_local_frame_sent(0);
             let screen = screen_of(b"ready prompt $ ");

@@ -163,10 +163,9 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         &mut self.current_state
     }
 
-    /// Read the live local state. Test-only: production mutates via [`current_mut`](Self::current_mut)
-    /// and reads the peer's stream via [`remote_state`](Self::remote_state); it never reads the live
-    /// local state back.
-    #[cfg(test)]
+    /// Read the live local state. Production mutates via [`current_mut`](Self::current_mut) and
+    /// reads the peer's stream via [`remote_state`](Self::remote_state); it never reads the live
+    /// local state back — this is for tests and the sim harness.
     pub const fn current(&self) -> &Local {
         &self.current_state
     }

@@ -58,10 +58,16 @@ fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> Comma
 /// it is unit-testable without allocating a real PTY.
 fn scrub_koh_env(cmd: &mut CommandBuilder) {
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("KOH_") {
+        if is_koh_env_key(&key) {
             cmd.env_remove(&key);
         }
     }
+}
+
+/// Whether `key` is one of koh's own environment variables (`KOH_*`) — the ones scrubbed from
+/// every child koh spawns, here and in the client's bell hook (L-4, KB-02).
+pub(crate) fn is_koh_env_key(key: &std::ffi::OsStr) -> bool {
+    key.to_string_lossy().starts_with("KOH_")
 }
 
 fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {

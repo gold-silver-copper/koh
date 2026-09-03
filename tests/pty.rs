@@ -249,3 +249,39 @@ async fn argv_tail_reaches_the_child() {
         "the `-c \"exit 7\"` tail must have reached sh"
     );
 }
+
+#[tokio::test]
+async fn osc_progress_from_a_real_child_reaches_the_pty_host() {
+    // KO-01: a real program's OSC 9;4 report lands on `ServerTerminal::progress()` through the
+    // PTY host's drain.
+    use koh::server::session::spawn_session;
+    let handle = spawn_session(
+        &[
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf '\\033]9;4;1;42\\033\\\\'; printf PROGRESS_DONE; sleep 1".to_owned(),
+        ],
+        0,
+    )
+    .expect("spawn");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        {
+            let s = handle.session.lock().await;
+            if s.host.emu.progress()
+                == Some(koh::terminal::Progress {
+                    state: 1,
+                    percent: 42,
+                })
+            {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the OSC 9;4 report"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = handle.session.lock().await.host.pty.kill();
+}

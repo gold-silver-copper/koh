@@ -24,6 +24,7 @@ use std::time::Duration;
 use koh::client::{run_client, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::run_session;
+use koh::terminal::TerminalScreen;
 use koh::transport_iroh::{
     bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, ALPN,
 };
@@ -35,15 +36,14 @@ struct MockTerminal {
     latest: Arc<Mutex<String>>,
 }
 
-impl ClientTerminal for MockTerminal {
+impl ClientTerminal<TerminalScreen> for MockTerminal {
     fn render(
         &mut self,
-        screen: &vt100::Screen,
+        state: &TerminalScreen,
         _overlay: &Overlay,
         _status: Option<&str>,
-        _win: koh::client::WindowState<'_>,
     ) -> std::io::Result<()> {
-        *self.latest.lock().unwrap() = screen.contents();
+        *self.latest.lock().unwrap() = state.screen().contents();
         Ok(())
     }
 

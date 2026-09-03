@@ -139,6 +139,75 @@ rides out silently on the existing connection.
 > The relay/discovery path (a bare endpoint id) re-dials by node id and reconnects across address
 > changes — use it (or a fixed port) when you need reconnection to survive a server restart.
 
+## Generic hosts and clients (0.11)
+
+The protocol was always generic — `Transport<Local, Remote>` takes any `SyncState` — but the
+server loop knew it drove a PTY and the client loop knew it painted a `vt100::Screen`. 0.11 lifts
+both into traits so an embedding binary (the `fux` multiplexer) can sync a state of its own through
+the same SSP-over-iroh machinery, with detachable sessions, reconnect and prediction intact.
+
+- **KH-01 — `SessionHost`.** The exact contract `run_attached` needs from the classic PTY +
+  emulator pair: `snapshot`, `input`, `resize(client, …)`, `stamp_echo_ack`, `application_cursor`,
+  `alive`, plus `attach_notify` / `client_detached` / `kill` / `shutdown`. `PtyHost` is today's code moved, not rewritten; `Session<H>`, the store,
+  `attach_with`, `detach`, `reap` and the reaper are generic. A `HostProvider` maps admitted peers
+  to sessions: `PtyHosts` (one detachable session per peer, the 0.10 behaviour) or `SharedHost`
+  (one host for every peer). `serve` is `serve_with` over a `PtyHosts` on the terminal ALPN. Each
+  connection gets a `ClientId` so a shared host can key per-viewer state.
+- **KH-02 — the state type rides on the ALPN.** The SSP envelope's `diff` is opaque bytes, so two
+  state types on one wire format would be indistinguishable. Rather than tag the envelope (an
+  encoding change, hence a `PROTOCOL_VERSION` bump), each state type has its own ALPN:
+  `TERMINAL_ALPN` (`koh/iroh/1`, unchanged) for `TerminalScreen`; `Hosts::new().with(alpn,
+  provider)` registers more. iroh negotiates ALPN in the TLS handshake, so a client dialing an ALPN
+  the server does not bind never completes the handshake — no SSP bytes flow, no decode of foreign
+  state. The accepted connection's negotiated ALPN selects the provider.
+- **KS-01 — shared sessions.** `SharedHost` stores one session under a fixed key; every peer
+  attaches to it with its own connection loop, `Transport` and `ClientId` (`AttachKind::Joined`
+  while other viewers are on, `Reattached` when the last viewer left and one returns). `attached` is a
+  refcount across viewers; the TTL reaper collects only at zero, or when the host reports
+  `!alive()`. Resize policy is last-writer-wins for v1 (`coalesce_drained_input` keeps the last
+  resize per connection; the host sees each with its `ClientId`).
+- **KS-02 — echo-ack is per connection; a host never sees frame numbers.** SSP frame numbers are
+  per transport, so the input history and the S-03 debounce live in the per-connection
+  `ServerSession` (`server::EchoAck`), not in the emulator. The loop takes the host's snapshot,
+  then calls `SessionHost::stamp_echo_ack(&mut state, ack)` with *its* client's ack before
+  installing it. With a host-global ack, the second viewer of a shared host was handed the first
+  viewer's frame number and its predictor treated every keystroke as already acked.
+- **KS-03 — a change wakes every viewer.** `SessionHandle::changed` is a `ChangeSignal`, a
+  `tokio::sync::watch` version counter: the host (or the PTY drain task) `pulse`s it, and each
+  attached loop holds its own receiver and `select!`s on `changed()`. Every viewer wakes on one
+  pulse; a burst coalesces into one wake per viewer; and because a receiver remembers the version
+  it last saw, a pulse landing between a loop's snapshot and its wait is never lost. The previous
+  `Notify::notify_one` released a single waiter, so a second viewer lagged by up to the 1 s timer
+  cap.
+- **KS-04 — the unwind guard releases through the provider.** `AttachGuard` (K-16) holds the
+  `HostProvider` and calls its `detach(peer)` on an unwind, rather than looking the peer up in the
+  store. A `SharedHost` keys every peer under one fixed id, so a lookup by peer missed and a
+  panicking connection task left the shared host with `attached > 0` forever.
+- **KC-01 — `ClientState` / `ClientTerminal<S>` / `ScreenView`.** The client session is generic
+  over the remote state: `ClientState` supplies the out-of-band window state, the exit code, the
+  echo-ack, the input modes to mirror (`InputModes`, byte-identical to vt100's own sequences), and
+  an optional `predict_target`. The predictor reads through `predict::ScreenView` (implemented for
+  `vt100::Screen`; the trait lives in `predict.rs` so the layering guard still holds). `connect`
+  is `connect_with` over `TERMINAL_ALPN`, the real terminal, raw stdin and SIGWINCH.
+- **KO-01 — OSC 9;4 progress, host-side.** `ServerTerminal` parses ConEmu/Windows Terminal
+  progress reports (`Progress { state, percent }`) and keeps a bounded ring of unhandled OSC
+  payloads for an embedding host's own detection. Neither is on the wire: adding a field to
+  `ScreenDiff` would change its postcard encoding.
+- **KB-01 — the bell hook.** `--on-bell <cmd>` / `ConnectConfig::bell_command` runs `sh -c` when
+  the remote bell count climbs: detached (fds on `/dev/null`), `KOH_*` scrubbed except
+  `KOH_BELL_COUNT` / `KOH_TITLE`, rate-limited to one spawn per second with bursts coalesced, the
+  child reaped off the session loop. The decision is a pure `BellHook::observe`.
+- **KB-02 — the hook's environment and its first frame.** `BellHook::command(count, title,
+  parent_env)` builds the child from an explicit parent environment (`env_clear`, then everything
+  but `KOH_*`, sharing `pty::is_koh_env_key` with the PTY spawn), so the scrub is tested with a
+  synthetic environment rather than assumed. The bell count is cumulative per server session, so
+  the first synced frame `prime`s the hook: bells from before this attach do not fire it. The hook
+  outlives a reconnect and is not re-primed, so bells during an outage do.
+
+Test doubles for all of this live in-tree: `ssp::testkit::GridState` (a non-terminal state with
+multi-datagram diffs), `server::session::test_host::ScriptedHost` (unit tests), and the `EchoHost`
+in `tests/e2e_generic_host.rs`.
+
 ## Security internals
 
 The full picture is in the [threat model](THREAT_MODEL.md). In brief, the relevant boundaries:

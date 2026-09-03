@@ -29,3 +29,10 @@ path = "fuzz_targets/wire_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "server_process"
+path = "fuzz_targets/server_process.rs"
+test = false
+doc = false
+bench = false

@@ -19,7 +19,117 @@
     reason = "deterministic test harness: a failed invariant must panic the offending test"
 )]
 
+use std::collections::BTreeMap;
+
 use crate::ssp::{SyncState, Transport, NEVER};
+use serde::{Deserialize, Serialize};
+
+/// A multi-cell grid state for exercising the generic host/client seams (KH-01).
+///
+/// A state that is *not* a terminal: a map of numbered cells to byte payloads, plus the scalars a
+/// client needs (`echo_ack`, `exit_code`, geometry). Diffs carry only the changed cells, so a diff
+/// can span several datagrams when many cells move — the shape of a multiplexer's per-pane grids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GridState {
+    pub cells: BTreeMap<u32, Vec<u8>>,
+    pub echo_ack: u64,
+    pub exit_code: Option<u32>,
+    pub rows: u16,
+    pub cols: u16,
+    /// A bell counter so the client-side out-of-band path can be exercised too.
+    pub bell_count: u64,
+}
+
+impl Default for GridState {
+    fn default() -> Self {
+        Self {
+            cells: BTreeMap::new(),
+            echo_ack: 0,
+            exit_code: None,
+            rows: 24,
+            cols: 80,
+            bell_count: 0,
+        }
+    }
+}
+
+impl GridState {
+    /// Every cell's bytes concatenated in cell order, lossily decoded — the "screen contents" a
+    /// test asserts markers against.
+    pub fn contents(&self) -> String {
+        let mut out = String::new();
+        for v in self.cells.values() {
+            out.push_str(&String::from_utf8_lossy(v));
+        }
+        out
+    }
+}
+
+/// The delta between two [`GridState`]s: changed/added cells (`None` = removed) plus the scalars.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridDiff {
+    pub cells: Vec<(u32, Option<Vec<u8>>)>,
+    pub echo_ack: u64,
+    pub exit_code: Option<u32>,
+    pub rows: u16,
+    pub cols: u16,
+    pub bell_count: u64,
+}
+
+impl SyncState for GridState {
+    type Diff = GridDiff;
+    /// A test state: keep the global ceilings, declared explicitly (AR-05).
+    const RECV_DECODE_LIMIT: usize = crate::wire::MAX_DECOMPRESSED;
+    const RECEIVE_BUDGET_UNITS: usize = 64 * 1024 * 1024;
+
+    fn resource_units(&self) -> usize {
+        self.cells
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+            .saturating_add(self.cells.len())
+    }
+
+    fn diff_from(&self, base: &Self) -> Self::Diff {
+        let mut cells = Vec::new();
+        for (k, v) in &self.cells {
+            if base.cells.get(k) != Some(v) {
+                cells.push((*k, Some(v.clone())));
+            }
+        }
+        for k in base.cells.keys() {
+            if !self.cells.contains_key(k) {
+                cells.push((*k, None));
+            }
+        }
+        GridDiff {
+            cells,
+            echo_ack: self.echo_ack,
+            exit_code: self.exit_code,
+            rows: self.rows,
+            cols: self.cols,
+            bell_count: self.bell_count,
+        }
+    }
+
+    fn apply(&mut self, diff: &Self::Diff) {
+        for (k, v) in &diff.cells {
+            match v {
+                Some(bytes) => {
+                    self.cells.insert(*k, bytes.clone());
+                }
+                None => {
+                    self.cells.remove(k);
+                }
+            }
+        }
+        self.echo_ack = diff.echo_ack;
+        self.exit_code = diff.exit_code;
+        self.rows = diff.rows;
+        self.cols = diff.cols;
+        self.bell_count = diff.bell_count;
+    }
+}
 
 /// A small, dependency-free, reproducible PRNG (SplitMix64).
 #[derive(Debug, Clone)]
@@ -273,7 +383,6 @@ impl<L: SyncState, R: SyncState> SimHarness<L, R> {
     }
 
     /// Step a fixed number of times (e.g. to let an injected change propagate).
-    #[cfg(test)]
     pub fn run_steps(&mut self, steps: usize) {
         for _ in 0..steps {
             if !self.step() {
@@ -364,5 +473,38 @@ mod tests {
         }
         let final_len = h.a.current().0.len();
         h.run_until(20_000, move |h| h.b_view_of_a().0.len() == final_len);
+    }
+
+    #[test]
+    fn grid_state_diff_apply_roundtrip_with_adds_changes_and_removes() {
+        // KH-01: the round-trip law for the generic test state, including a removed cell.
+        let mut base = GridState::default();
+        base.cells.insert(1, b"one".to_vec());
+        base.cells.insert(2, b"two".to_vec());
+        let mut target = base.clone();
+        target.cells.insert(2, b"TWO".to_vec());
+        target.cells.remove(&1);
+        target.cells.insert(9, vec![0u8; 5000]); // bigger than one datagram
+        target.echo_ack = 7;
+        target.exit_code = Some(3);
+        let diff = target.diff_from(&base);
+        let mut c = base;
+        c.apply(&diff);
+        assert_eq!(c, target);
+    }
+
+    #[test]
+    fn grid_state_converges_under_chaos() {
+        // KH-01: the transport syncs a non-terminal state with multi-datagram diffs over loss.
+        let mut h = SimHarness::<GridState, LogState>::new(LinkParams::lossy(), 11, 1200);
+        let mut rng = Rng::new(5);
+        for round in 0..40u32 {
+            let k = (rng.next_u64() % 8) as u32;
+            let len = rng.range(1, 3000) as usize;
+            h.a_mut().cells.insert(k, vec![round as u8; len]);
+            h.run_steps(6);
+        }
+        let target = h.a.current().clone();
+        h.run_until(40_000, move |h| *h.b_view_of_a() == target);
     }
 }

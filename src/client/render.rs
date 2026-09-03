@@ -153,13 +153,107 @@ fn is_base64_payload(s: &str) -> bool {
 /// The out-of-band window state for one frame.
 ///
 /// What the client mirrors onto the real terminal alongside the cell grid (window title, icon
-/// name, clipboard, bell). All sourced from the synced [`crate::terminal::TerminalScreen`].
+/// name, clipboard, bell). Sourced from the synced state via
+/// [`ClientState::window`](crate::client::ClientState::window).
 #[derive(Clone, Copy)]
 pub struct WindowState<'a> {
     pub title: &'a str,
     pub icon: &'a str,
     pub clipboard: &'a str,
     pub bell_count: u64,
+}
+
+/// The input modes the remote app has set, which the real terminal must mirror (KC-01).
+///
+/// Application keypad / cursor keys, bracketed paste, and xterm mouse reporting: a
+/// state-type-agnostic copy of what `vt100::Screen` tracks. The escape sequences emitted are
+/// byte-identical to vt100's `input_mode_formatted` / `input_mode_diff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InputModes {
+    pub application_keypad: bool,
+    pub application_cursor: bool,
+    pub bracketed_paste: bool,
+    pub mouse_mode: vt100::MouseProtocolMode,
+    pub mouse_encoding: vt100::MouseProtocolEncoding,
+}
+
+impl From<&Screen> for InputModes {
+    fn from(s: &Screen) -> Self {
+        Self {
+            application_keypad: s.application_keypad(),
+            application_cursor: s.application_cursor(),
+            bracketed_paste: s.bracketed_paste(),
+            mouse_mode: s.mouse_protocol_mode(),
+            mouse_encoding: s.mouse_protocol_encoding(),
+        }
+    }
+}
+
+impl InputModes {
+    /// Escape sequences setting every mode explicitly (the first frame / after a resume).
+    pub fn formatted(self) -> Vec<u8> {
+        self.write(&mut Vec::new(), None)
+    }
+
+    /// Escape sequences taking a terminal at `prev` to these modes (only the changes).
+    pub fn diff(self, prev: Self) -> Vec<u8> {
+        self.write(&mut Vec::new(), Some(prev))
+    }
+
+    fn write(self, buf: &mut Vec<u8>, prev: Option<Self>) -> Vec<u8> {
+        use vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+        let changed = |get: fn(&Self) -> bool| prev.is_none_or(|p| get(&p) != get(&self));
+        if changed(|m| m.application_keypad) {
+            buf.extend_from_slice(if self.application_keypad {
+                b"\x1b="
+            } else {
+                b"\x1b>"
+            });
+        }
+        if changed(|m| m.application_cursor) {
+            buf.extend_from_slice(if self.application_cursor {
+                b"\x1b[?1h"
+            } else {
+                b"\x1b[?1l"
+            });
+        }
+        if changed(|m| m.bracketed_paste) {
+            buf.extend_from_slice(if self.bracketed_paste {
+                b"\x1b[?2004h"
+            } else {
+                b"\x1b[?2004l"
+            });
+        }
+        let prev_mode = prev.map_or(Mode::None, |p| p.mouse_mode);
+        if self.mouse_mode != prev_mode {
+            match self.mouse_mode {
+                Mode::None => buf.extend_from_slice(match prev_mode {
+                    Mode::None => b"",
+                    Mode::Press => b"\x1b[?9l",
+                    Mode::PressRelease => b"\x1b[?1000l",
+                    Mode::ButtonMotion => b"\x1b[?1002l",
+                    Mode::AnyMotion => b"\x1b[?1003l",
+                }),
+                Mode::Press => buf.extend_from_slice(b"\x1b[?9h"),
+                Mode::PressRelease => buf.extend_from_slice(b"\x1b[?1000h"),
+                Mode::ButtonMotion => buf.extend_from_slice(b"\x1b[?1002h"),
+                Mode::AnyMotion => buf.extend_from_slice(b"\x1b[?1003h"),
+            }
+        }
+        let prev_enc = prev.map_or(Enc::Default, |p| p.mouse_encoding);
+        if self.mouse_encoding != prev_enc {
+            match self.mouse_encoding {
+                Enc::Default => buf.extend_from_slice(match prev_enc {
+                    Enc::Default => b"",
+                    Enc::Utf8 => b"\x1b[?1005l",
+                    Enc::Sgr => b"\x1b[?1006l",
+                }),
+                Enc::Utf8 => buf.extend_from_slice(b"\x1b[?1005h"),
+                Enc::Sgr => buf.extend_from_slice(b"\x1b[?1006h"),
+            }
+        }
+        std::mem::take(buf)
+    }
 }
 
 /// Tracks the *out-of-band* terminal state the client mirrors onto the real terminal — window
@@ -188,8 +282,8 @@ pub(super) struct OutOfBand {
     last_icon: String,
     last_clipboard: String,
     last_bell: u64,
-    /// Previous frame's screen, kept only to diff its input modes against the current frame.
-    prev_screen: Option<Screen>,
+    /// Previous frame's input modes, to diff against the current frame.
+    prev_modes: Option<InputModes>,
 }
 
 impl OutOfBand {
@@ -225,7 +319,7 @@ impl OutOfBand {
     pub(super) fn emit(
         &mut self,
         backend: &mut impl KohBackend,
-        screen: &Screen,
+        modes: InputModes,
         win: WindowState<'_>,
     ) -> io::Result<()> {
         self.emit_window_title(backend, win.title, win.icon)?;
@@ -248,14 +342,14 @@ impl OutOfBand {
             self.last_bell = win.bell_count;
         }
         // Input modes: re-assert bracketed-paste / mouse / cursor-key (diff vs the previous frame).
-        let mode_bytes = match &self.prev_screen {
-            Some(prev) => screen.input_mode_diff(prev),
-            None => screen.input_mode_formatted(),
+        let mode_bytes = match self.prev_modes {
+            Some(prev) => modes.diff(prev),
+            None => modes.formatted(),
         };
         if !mode_bytes.is_empty() {
             backend.write_input_modes(&mode_bytes)?;
         }
-        self.prev_screen = Some(screen.clone());
+        self.prev_modes = Some(modes);
         Ok(())
     }
 
@@ -349,7 +443,8 @@ mod tests {
     /// Run one `OutOfBand::emit` into a fresh capture backend and return the emitted bytes.
     fn oob_emit(oob: &mut OutOfBand, screen: &Screen, win: WindowState<'_>) -> Vec<u8> {
         let mut backend = CaptureBackend::default();
-        oob.emit(&mut backend, screen, win).unwrap();
+        oob.emit(&mut backend, InputModes::from(screen), win)
+            .unwrap();
         backend.bytes
     }
 
@@ -544,5 +639,34 @@ mod tests {
 
         let s = render_to_string(&echoed, &overlay, None);
         assert!(s.contains('Z'), "predicted glyph not rendered");
+    }
+
+    // --- KC-01: InputModes reproduces vt100's input-mode bytes exactly ---
+
+    #[test]
+    fn input_modes_formatted_and_diff_match_vt100_byte_for_byte() {
+        let seqs: [&[u8]; 6] = [
+            b"",
+            b"\x1b[?2004h",
+            b"\x1b[?1000h\x1b[?1006h",
+            b"\x1b[?1003h\x1b[?1005h\x1b[?1h\x1b=",
+            b"\x1b[?1002h\x1b[?2004h",
+            b"\x1b[?9h",
+        ];
+        let screens: Vec<Screen> = seqs.iter().map(|s| screen_of(s)).collect();
+        for cur in &screens {
+            assert_eq!(
+                InputModes::from(cur).formatted(),
+                cur.input_mode_formatted(),
+                "formatted parity"
+            );
+            for prev in &screens {
+                assert_eq!(
+                    InputModes::from(cur).diff(InputModes::from(prev)),
+                    cur.input_mode_diff(prev),
+                    "diff parity"
+                );
+            }
+        }
     }
 }

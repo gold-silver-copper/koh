@@ -27,7 +27,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 mod rtt;
-pub(crate) mod testkit;
+#[doc(hidden)]
+pub mod testkit;
 mod transport;
 
 pub(crate) use rtt::RttEstimator;
@@ -35,7 +36,7 @@ pub use transport::{RecvOutcome, Transport};
 
 /// `u64::MAX` doubles as both the "never" deadline and the shutdown state sentinel,
 /// exactly as mosh uses `uint64_t(-1)`.
-pub(crate) const NEVER: u64 = u64::MAX;
+pub const NEVER: u64 = u64::MAX;
 /// The state number that signals a clean shutdown (`uint64_t(-1)` in mosh).
 pub const SHUTDOWN_SENTINEL: u64 = u64::MAX;
 

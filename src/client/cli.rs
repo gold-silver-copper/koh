@@ -431,6 +431,12 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
 /// wrong-ALPN error surfaces before the terminal is put into raw mode. `input_rx` carries typed
 /// bytes; `resize_rx` carries resize ticks (keep its sender alive). Installs SIGTERM/SIGINT/SIGHUP
 /// handlers that end the session cleanly. The caller owns tracing.
+#[expect(
+    clippy::future_not_send,
+    reason = "the future owns a terminal backend (`impl KohBackend`, deliberately not `Send`) and \
+              is driven on the caller's own task, never sent across threads; requiring `Send` \
+              would force every backend and embedder to be `Send` for no benefit"
+)]
 pub async fn connect_with<S: ClientState, T: ClientTerminal<S>>(
     config: ConnectConfig,
     alpn: &'static [u8],

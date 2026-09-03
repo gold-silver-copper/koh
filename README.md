@@ -119,7 +119,7 @@ ALPN, so old koh peers are never confused. A twenty-line sketch: a shared `Strin
 authorized peer appends to.
 
 ```rust
-use koh::server::{serve_with, cli::Hosts, ClientId, SessionHost, SharedHost, ServeConfig};
+use koh::server::{serve_with, ClientId, Hosts, SessionHost, SharedHost, ServeConfig};
 use koh::ssp::SyncState;
 
 #[derive(Clone, Default, PartialEq)]

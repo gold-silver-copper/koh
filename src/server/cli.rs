@@ -280,6 +280,13 @@ impl<H: SessionHost, P: HostProvider<H>> ErasedProvider for Typed<H, P> {
                         "reattaching to this peer's existing session"
                     );
                 }
+                session::AttachKind::Joined { viewers } => {
+                    info!(
+                        peer = %format_endpoint_id(&peer),
+                        viewers,
+                        "joined the shared session"
+                    );
+                }
             }
             let client = ClientId::next();
             // Arm a RAII safety net BEFORE serving: if `run_attached` unwinds (panics), the guard's

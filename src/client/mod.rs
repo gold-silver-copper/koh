@@ -666,6 +666,12 @@ impl ClientSession<TerminalScreen> {
               input/resize channels, the terminal, and the shutdown token — each a distinct \
               collaborator; bundling them into a struct would only move the list, not shorten it"
 )]
+#[expect(
+    clippy::future_not_send,
+    reason = "the future owns a terminal backend (`impl KohBackend`, deliberately not `Send`) and \
+              is driven on the caller's own task, never sent across threads; requiring `Send` \
+              would force every backend and embedder to be `Send` for no benefit"
+)]
 pub async fn run_client<S: ClientState, T: ClientTerminal<S>>(
     initial: IrohChannel,
     connector: IrohConnector,
@@ -695,6 +701,7 @@ pub async fn run_client<S: ClientState, T: ClientTerminal<S>>(
     clippy::too_many_arguments,
     reason = "see run_client; one more collaborator, the bell hook"
 )]
+#[expect(clippy::future_not_send, reason = "see run_client")]
 pub async fn run_client_with<S: ClientState, T: ClientTerminal<S>>(
     initial: IrohChannel,
     connector: IrohConnector,
@@ -947,6 +954,7 @@ enum ReconnectOutcome {
 /// `Ctrl-^ .` to give up. A single dial is bounded by [`RECONNECT_CONNECT_TIMEOUT`] and is *not*
 /// cancelled by banner repaints or non-quit keystrokes — it is pinned and polled in place — so a
 /// slow dial still completes.
+#[expect(clippy::future_not_send, reason = "see run_client")]
 async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
     connector: &IrohConnector,
     term: &mut T,

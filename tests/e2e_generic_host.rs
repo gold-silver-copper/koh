@@ -22,10 +22,8 @@ use std::time::Duration;
 
 use koh::client::{run_client, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
-use koh::server::cli::Hosts;
 use koh::server::session::{SessionHost, SharedHost};
-use koh::server::ChangeSignal;
-use koh::server::{ClientId, PtyHosts};
+use koh::server::{ChangeSignal, ClientId, Hosts, PtyHosts};
 use koh::ssp::testkit::GridState;
 use koh::transport_iroh::{
     bind_endpoint_local, bind_endpoint_local_alpns, generate_secret_key, loopback_addr,

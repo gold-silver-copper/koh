@@ -160,8 +160,9 @@ the same SSP-over-iroh machinery, with detachable sessions, reconnect and predic
   provider)` registers more. iroh negotiates ALPN in the TLS handshake, so a client dialing an ALPN
   the server does not bind never completes the handshake — no SSP bytes flow, no decode of foreign
   state. The accepted connection's negotiated ALPN selects the provider.
-- **KS-01 — shared sessions.** `SharedHost` stores one session under a fixed key; every peer's
-  attach is a reattach with its own connection loop, `Transport` and `ClientId`. `attached` is a
+- **KS-01 — shared sessions.** `SharedHost` stores one session under a fixed key; every peer
+  attaches to it with its own connection loop, `Transport` and `ClientId` (`AttachKind::Joined`
+  while other viewers are on, `Reattached` when the last viewer left and one returns). `attached` is a
   refcount across viewers; the TTL reaper collects only at zero, or when the host reports
   `!alive()`. Resize policy is last-writer-wins for v1 (`coalesce_drained_input` keeps the last
   resize per connection; the host sees each with its `ClientId`).

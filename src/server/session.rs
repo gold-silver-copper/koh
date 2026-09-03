@@ -337,6 +337,9 @@ pub enum AttachKind {
     /// Reattached to an existing session. `detached_for` is how long it had been detached
     /// (`None` if it wasn't marked detached, e.g. a second overlapping connection).
     Reattached { detached_for: Option<Duration> },
+    /// Joined a [`SharedHost`] that other viewers are attached to; `viewers` counts this one.
+    /// Never returned by [`PtyHosts`].
+    Joined { viewers: u32 },
 }
 
 /// Get-or-create the detachable PTY session for `peer` (see [`attach_with`]).
@@ -512,7 +515,19 @@ impl<H: SessionHost> HostProvider<H> for SharedHost<H> {
         _peer: EndpointId,
     ) -> anyhow::Result<Option<(SharedSession<H>, AttachKind)>> {
         let make = self.make.clone();
-        attach_with(&self.store, Self::key(), 1, || make()).await
+        let Some((handle, kind)) = attach_with(&self.store, Self::key(), 1, || make()).await?
+        else {
+            return Ok(None);
+        };
+        // An attach while other viewers are on is a join, not a resume of a detached session.
+        let kind = match kind {
+            AttachKind::Reattached { detached_for: None } => {
+                let viewers = handle.session.lock().await.attached;
+                AttachKind::Joined { viewers }
+            }
+            other => other,
+        };
+        Ok(Some((handle, kind)))
     }
 
     async fn detach(&self, _peer: EndpointId) {
@@ -1151,7 +1166,11 @@ mod tests {
         let (h1, k1) = provider.attach(p1).await.expect("attach p1").expect("cap");
         let (h2, k2) = provider.attach(p2).await.expect("attach p2").expect("cap");
         assert_eq!(k1, AttachKind::Created);
-        assert!(matches!(k2, AttachKind::Reattached { detached_for: None }));
+        assert_eq!(
+            k2,
+            AttachKind::Joined { viewers: 2 },
+            "a second viewer joins, it does not 'reattach'"
+        );
         assert!(Arc::ptr_eq(&h1, &h2), "both peers share one session");
         assert_eq!(h1.session.lock().await.attached, 2);
         assert_eq!(built.load(Ordering::Relaxed), 1, "the host is built once");

@@ -14,7 +14,7 @@ pub mod session;
 
 #[cfg(feature = "cli")]
 pub use cli::ServeArgs;
-pub use cli::{serve, serve_with, ServeConfig};
+pub use cli::{serve, serve_with, Hosts, ServeConfig};
 pub use session::{
     ChangeSignal, ClientId, HostProvider, PtyHost, PtyHosts, SessionHost, SharedHost, SharedSession,
 };

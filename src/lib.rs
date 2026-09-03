@@ -47,7 +47,7 @@
 //! - [`keycmd::run`] with [`keycmd::KeyConfig`],
 //! - the [`SyncState`](ssp::SyncState) / [`Transport`](ssp::Transport) protocol core in [`ssp`],
 //! - since 0.11, the generic seams: [`server::SessionHost`], [`server::HostProvider`]
-//!   ([`server::PtyHosts`], [`server::SharedHost`]), [`server::serve_with`] with [`server::cli::Hosts`],
+//!   ([`server::PtyHosts`], [`server::SharedHost`]), [`server::serve_with`] with [`server::Hosts`],
 //!   [`server::ClientId`]; [`client::ClientState`], [`client::ClientTerminal`],
 //!   [`client::connect_with`], [`client::run_client`], [`client::BellHook`]; [`predict::ScreenView`];
 //!   [`transport_iroh::TERMINAL_ALPN`]; and [`terminal::ServerTerminal`]'s `progress` /
@@ -56,13 +56,15 @@
 //! **The synced state type a connection carries is selected by its ALPN** (KH-02):
 //! [`transport_iroh::TERMINAL_ALPN`] (`koh/iroh/1`) is the [`terminal::TerminalScreen`] every koh
 //! release speaks; an embedding server registers its own ALPN per state via
-//! [`server::cli::Hosts`], and a client dials the ALPN of the state it renders. `TerminalScreen` on
+//! [`server::Hosts`], and a client dials the ALPN of the state it renders. `TerminalScreen` on
 //! the wire is unchanged and `PROTOCOL_VERSION` stays 3.
 //!
 //! The config types have public fields and no clap dependency. Everything else is `pub` only so the
 //! in-tree integration tests and the `chaos` example can drive it as a downstream dependency; treat
 //! it as **internal and unstable** — it may change in any release without a semver-major bump. Do
-//! not build external code against it.
+//! not build external code against it. That includes [`ssp::testkit`] (the sim harness, `Rng`,
+//! `LogState`, `GridState`) and the `ClientState` impl for `GridState`: `#[doc(hidden)]` test
+//! infrastructure that the integration tests need to reach from outside the crate.
 //!
 //! ## Features
 //!

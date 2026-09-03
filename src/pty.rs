@@ -81,7 +81,7 @@ fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
 /// `transport-iroh::SetupError` pattern so callers can match on the failure stage).
 ///
 /// `portable-pty` surfaces its failures as `anyhow::Error`; we fold those into `io::Error`
-/// (via [`io::Error::other`](std::io::Error::other)) so every variant carries one concrete payload. Only the reader
+/// (via `io::Error::other`) so every variant carries one concrete payload. Only the reader
 /// thread's `Builder::spawn` is natively an `io::Error`, so it is the single `#[from]` source.
 /// Binaries keep `anyhow` internally — their `?`/`.context()` absorb `PtyError` via anyhow's
 /// blanket `From<E: Error + Send + Sync>`.

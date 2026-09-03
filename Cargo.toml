@@ -1,12 +1,12 @@
 [package]
 name = "koh"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 # The effective floor is dictated by the `=`-pinned iroh 1.0.0 (edition 2024 + rust-version 1.91),
 # not by koh's own 2021 edition. Declaring it turns "cargo install on an old toolchain" into a clear
 # "requires rustc 1.91" instead of a confusing mid-compile error. Keep in sync with iroh on each bump.
 rust-version = "1.91"
-license = "GPL-3.0-or-later"
+license = "MIT"
 authors = ["Stephen Korzen <stephen.korzen@gmail.com>"]
 repository = "https://github.com/gold-silver-copper/koh"
 homepage = "https://github.com/gold-silver-copper/koh"
@@ -34,6 +34,18 @@ exclude = [
 [[bin]]
 name = "koh"
 path = "src/main.rs"
+required-features = ["cli"]
+
+# `chaos` parses its own flags with clap, and the pty-binary e2e test drives the `koh` binary
+# through `CARGO_BIN_EXE_koh`, which only exists when the bin is built. Both follow the `cli` gate so
+# a `--no-default-features --all-targets` build (the library-only tree fux uses) stays clap-free.
+[[example]]
+name = "chaos"
+required-features = ["cli"]
+
+[[test]]
+name = "e2e_pty_binary"
+required-features = ["cli"]
 
 [dependencies]
 # transport (pinned: iroh API churns; see README). iroh 1.0 brings its own QUIC backend (noq, a
@@ -87,7 +99,9 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive", "env"] }
+# Optional: only the `koh` binary and the `*Args` adapters need it (the `cli` feature). The
+# library surface (`ServeConfig` & co.) is clap-free so an embedding binary can bring its own parser.
+clap = { version = "4", features = ["derive", "env"], optional = true }
 rand = "0.8"
 data-encoding = "2"
 
@@ -97,7 +111,10 @@ data-encoding = "2"
 # the client fails to compile if none is. `backend-termina` is the default, so `cargo install koh`
 # and CI build the same tree as before; `backend-crossterm` is an off-by-default alternate that
 # exercises the `KohBackend` seam (build it with `--no-default-features --features backend-crossterm`).
-default = ["backend-termina"]
+# `cli` owns clap and gates the `koh` binary, the `*Args` adapter structs, the `chaos` example and
+# the pty-binary e2e test. Library users (`default-features = false`) pick a backend and skip it.
+default = ["backend-termina", "cli"]
+cli = ["dep:clap"]
 backend-termina = ["dep:termina"]
 backend-crossterm = ["dep:crossterm"]
 backend-qwertty = ["dep:qwertty"]

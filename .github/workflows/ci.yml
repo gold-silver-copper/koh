@@ -78,6 +78,16 @@ jobs:
         run: cargo clippy --all-targets --locked --no-default-features --features backend-crossterm -- -D warnings
       - name: clippy (qwertty backend, warnings are errors)
         run: cargo clippy --all-targets --locked --no-default-features --features backend-qwertty -- -D warnings
+      # The exact configuration an embedding binary builds (see "As a library" in the README): no
+      # `cli` feature, so this fails if clap leaks back into the library surface.
+      - name: clippy (library without cli, warnings are errors)
+        run: cargo clippy --lib --locked --no-default-features --features backend-termina -- -D warnings
+      - name: no clap in the library-only tree
+        run: |
+          if cargo tree --locked --no-default-features --features backend-termina -e normal | grep -q '^.* clap '; then
+            echo "::error::clap is in the library-only dependency tree; gate it behind the cli feature"
+            exit 1
+          fi
 
   # Verify the declared MSRV (`rust-version = "1.91"`) actually builds — otherwise the declaration is
   # a false promise to `cargo install` users on an older toolchain. Check, not test (the `=`-pinned

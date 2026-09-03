@@ -24,7 +24,8 @@ use koh::pty::Pty;
 )]
 async fn spawns_and_streams_output() {
     // Run a one-shot command in the PTY and confirm we receive its output + reap it.
-    let (mut pty, mut rx) = Pty::spawn(24, 80, Some("echo"), "xterm-256color").expect("spawn echo");
+    let (mut pty, mut rx) =
+        Pty::spawn(24, 80, &["echo".to_owned()], "xterm-256color").expect("spawn echo");
     // `echo` with no args prints just a newline; assert we get *something* and EOF.
     let mut collected = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -62,7 +63,7 @@ async fn spawns_and_streams_output() {
 )]
 async fn interactive_shell_echoes_input() {
     // Spawn the default shell, send a command, and verify the echoed output comes back.
-    let (mut pty, mut rx) = Pty::spawn(24, 80, None, "xterm-256color").expect("spawn shell");
+    let (mut pty, mut rx) = Pty::spawn(24, 80, &[], "xterm-256color").expect("spawn shell");
     // Give the shell a moment to start, then type a command that prints a marker.
     tokio::time::sleep(Duration::from_millis(300)).await;
     pty.write_input(b"printf KOH_MARKER_OK\n").expect("write");
@@ -100,7 +101,7 @@ async fn write_input_takes_shared_ref_and_preserves_order() {
     // `pty` is bound WITHOUT `mut`, proving write_input takes `&self`. Two separate enqueues must
     // reach the child in FIFO order: the concatenated marker only appears if the second chunk did
     // not overtake the first.
-    let (pty, mut rx) = Pty::spawn(24, 80, None, "xterm-256color").expect("spawn shell");
+    let (pty, mut rx) = Pty::spawn(24, 80, &[], "xterm-256color").expect("spawn shell");
     tokio::time::sleep(Duration::from_millis(300)).await;
     pty.write_input(b"printf ORDER_").expect("first enqueue");
     pty.write_input(b"AB_CD\n").expect("second enqueue");
@@ -138,7 +139,8 @@ async fn dropping_pty_eofs_child_and_stops_writer() {
     // then finishes and drops the PTY write handle, on which portable-pty sends EOT — so the child
     // sees EOF, exits, the slave closes, and the output channel ends. If the writer thread were
     // stuck (or never dropped its handle), the channel would never close.
-    let (pty, mut rx) = Pty::spawn(24, 80, Some("cat"), "xterm-256color").expect("spawn cat");
+    let (pty, mut rx) =
+        Pty::spawn(24, 80, &["cat".to_owned()], "xterm-256color").expect("spawn cat");
     tokio::time::sleep(Duration::from_millis(200)).await;
     drop(pty); // no kill(): EOF must come purely from the writer handle being dropped
 
@@ -157,7 +159,8 @@ async fn shutdown_joins_both_io_threads_without_deadlock() {
     // Graceful teardown: shutdown() kills the child (so the reader's blocking read returns EOF) and
     // drops the writer sender (so the writer's recv returns), then joins BOTH pump threads. It must
     // return promptly — a hang would mean a thread never unblocked.
-    let (pty, mut rx) = Pty::spawn(24, 80, Some("sh"), "xterm-256color").expect("spawn shell");
+    let (pty, mut rx) =
+        Pty::spawn(24, 80, &["sh".to_owned()], "xterm-256color").expect("spawn shell");
     // Keep the output channel drained so the reader thread never blocks on a full channel.
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -182,7 +185,8 @@ async fn reaped_child_is_not_signaled_again() {
     // no-op so it can't signal a recycled PID. We can't force PID reuse in a test, but we exercise
     // the reaped-gate: a one-shot `echo` exits and is reaped, after which kill()/kill_hard()/
     // shutdown() must be safe no-ops (no error, no panic).
-    let (mut pty, mut rx) = Pty::spawn(24, 80, Some("echo"), "xterm-256color").expect("spawn echo");
+    let (mut pty, mut rx) =
+        Pty::spawn(24, 80, &["echo".to_owned()], "xterm-256color").expect("spawn echo");
     // Drain output to EOF so the child has exited.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -207,4 +211,41 @@ async fn reaped_child_is_not_signaled_again() {
     assert!(pty.kill().is_ok(), "kill() after reap is a gated no-op");
     pty.kill_hard(); // must not signal a (possibly recycled) PID, must not panic
     pty.shutdown(); // consumes; Drop is reaped-gated; must not panic
+}
+
+#[tokio::test]
+#[allow(
+    clippy::match_wild_err_arm,
+    reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"
+)]
+async fn argv_tail_reaches_the_child() {
+    // The argument tail must reach the program verbatim: `sh -c "exit 7"` exits 7 only if both
+    // `-c` and the script arrived as separate argv entries.
+    let argv: Vec<String> = ["sh", "-c", "exit 7"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let (mut pty, mut rx) = Pty::spawn(24, 80, &argv, "xterm-256color").expect("spawn sh -c");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => panic!("timed out waiting for the child to exit"),
+        }
+    }
+    let mut status = None;
+    for _ in 0..200 {
+        if let Ok(Some(s)) = pty.try_wait() {
+            status = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let status = status.expect("the child must exit and be reaped");
+    assert_eq!(
+        status.exit_code(),
+        7,
+        "the `-c \"exit 7\"` tail must have reached sh"
+    );
 }

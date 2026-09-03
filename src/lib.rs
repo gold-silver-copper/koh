@@ -36,12 +36,30 @@
 //!
 //! ## Public API stability
 //!
-//! koh ships **binary-first**. The *supported* library surface is [`server::serve`],
-//! [`client::connect`], [`client::run_id`], [`keycmd::run`], and the [`SyncState`](ssp::SyncState) /
-//! [`Transport`](ssp::Transport) protocol core in [`ssp`]. Everything else is `pub` only so the in-tree
-//! integration tests and the `chaos` example can drive it as a downstream dependency; treat it as
-//! **internal and unstable** — it may change in any release without a semver-major bump. Do not build
-//! external code against it.
+//! koh ships **binary-first**, but the entry points are designed to be embedded. The *supported*
+//! library surface is:
+//!
+//! - [`server::serve`] with [`server::ServeConfig`],
+//! - [`client::connect`] with [`client::ConnectConfig`],
+//! - [`client::run_id`] with [`client::IdConfig`],
+//! - [`keycmd::run`] with [`keycmd::KeyConfig`],
+//! - the [`SyncState`](ssp::SyncState) / [`Transport`](ssp::Transport) protocol core in [`ssp`].
+//!
+//! The config types have public fields and no clap dependency. Everything else is `pub` only so the
+//! in-tree integration tests and the `chaos` example can drive it as a downstream dependency; treat
+//! it as **internal and unstable** — it may change in any release without a semver-major bump. Do
+//! not build external code against it.
+//!
+//! ## Features
+//!
+//! - `cli` (default): pulls in clap and enables the `koh` binary plus the `*Args` adapter structs
+//!   (`ServeArgs`, `ConnectArgs`, `IdArgs`, `KeyArgs`), each `Into` its config type. Those adapters
+//!   are *not* part of the stable surface.
+//! - `backend-termina` (default) / `backend-crossterm` / `backend-qwertty`: the client's terminal
+//!   backend; exactly one must be enabled.
+//!
+//! Embedding koh: `koh = { version = "0.10", default-features = false, features =
+//! ["backend-termina"] }`, then e.g. `server::serve(ServeConfig { allow, command, ..Default::default() })`.
 
 pub mod client;
 pub mod input;

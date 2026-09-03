@@ -13,6 +13,7 @@ use crate::transport_iroh::{
     load_or_create_secret_key, parse_endpoint_id, parse_relay_url, relay_addr,
 };
 use anyhow::Context;
+#[cfg(feature = "cli")]
 use clap::Args;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
@@ -20,7 +21,46 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{run_client, BackendTerminal, ClientTerminal, DefaultBackend, IrohConnector};
 
-/// Arguments for `koh connect <server-id>`.
+/// Configuration for [`connect`] — the clap-free, library-facing form of `koh connect`'s
+/// arguments. No `Default`: `server` is required.
+#[derive(Debug, Clone)]
+pub struct ConnectConfig {
+    /// Server endpoint id to connect to.
+    pub server: String,
+    /// Path to the client's persistent secret key (its endpoint id must be on the server's
+    /// allowlist). `None` = the platform default client key path.
+    pub key_file: Option<PathBuf>,
+    /// Dial the server at a direct socket address (LAN / loopback; no relay or discovery).
+    /// Takes precedence over `relay_url` if both are set.
+    pub direct: Option<SocketAddr>,
+    /// Dial the server via a self-hosted relay URL instead of n0's public relays.
+    pub relay_url: Option<String>,
+    /// Honor remote OSC-52 clipboard writes. Off by default in the CLI; see [`ConnectArgs`].
+    pub clipboard: bool,
+}
+
+impl ConnectConfig {
+    /// A config for dialing `server` with every other option at the CLI default.
+    pub fn new(server: impl Into<String>) -> Self {
+        Self {
+            server: server.into(),
+            key_file: None,
+            direct: None,
+            relay_url: None,
+            clipboard: false,
+        }
+    }
+}
+
+/// Configuration for [`run_id`] — the clap-free form of `koh id`'s arguments.
+#[derive(Debug, Clone, Default)]
+pub struct IdConfig {
+    /// Path to the client's persistent secret key. `None` = the platform default client key path.
+    pub key_file: Option<PathBuf>,
+}
+
+/// Arguments for `koh connect <server-id>` (the clap adapter over [`ConnectConfig`]; `cli` only).
+#[cfg(feature = "cli")]
 #[derive(Args, Debug)]
 pub struct ConnectArgs {
     /// Server endpoint id to connect to.
@@ -45,12 +85,35 @@ pub struct ConnectArgs {
     clipboard: bool,
 }
 
-/// Arguments for `koh id`.
+#[cfg(feature = "cli")]
+impl From<ConnectArgs> for ConnectConfig {
+    fn from(a: ConnectArgs) -> Self {
+        Self {
+            server: a.server,
+            key_file: a.key_file,
+            direct: a.direct,
+            relay_url: a.relay_url,
+            clipboard: a.clipboard,
+        }
+    }
+}
+
+/// Arguments for `koh id` (the clap adapter over [`IdConfig`]; `cli` only).
+#[cfg(feature = "cli")]
 #[derive(Args, Debug)]
 pub struct IdArgs {
     /// Path to the client's persistent secret key.
     #[arg(long)]
     key_file: Option<PathBuf>,
+}
+
+#[cfg(feature = "cli")]
+impl From<IdArgs> for IdConfig {
+    fn from(a: IdArgs) -> Self {
+        Self {
+            key_file: a.key_file,
+        }
+    }
 }
 
 /// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so
@@ -92,7 +155,9 @@ fn warn_if_locale_not_utf8() {
 }
 
 /// `koh id` — print this machine's koh id (to add to a server's `--allow` list) and exit.
-pub fn run_id(args: IdArgs) -> anyhow::Result<()> {
+/// Accepts an [`IdConfig`] or anything convertible into one ([`IdArgs`] under `cli`).
+pub fn run_id(config: impl Into<IdConfig>) -> anyhow::Result<()> {
+    let args: IdConfig = config.into();
     let key_file = match args.key_file {
         Some(p) => p,
         None => crate::transport_iroh::default_key_path("client")?,
@@ -108,8 +173,14 @@ pub fn run_id(args: IdArgs) -> anyhow::Result<()> {
 }
 
 /// `koh connect <server-id>` — connect to a koh server and run the (auto-reconnecting) session.
+///
 /// Returns the remote shell's exit code if the session ended because the shell exited.
-pub async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
+/// Accepts a [`ConnectConfig`] or anything convertible into one ([`ConnectArgs`] under `cli`).
+///
+/// Takes over the calling process's terminal (raw mode, alternate screen) and its stdin for the
+/// session's lifetime, and installs signal handlers; call it from a binary's main path.
+pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<u32>> {
+    let args: ConnectConfig = config.into();
     // The TUI owns the terminal, so logs go to a file (set $KOH_LOG) to avoid corrupting it.
     if let Ok(path) = std::env::var("KOH_LOG") {
         // Create the log owner-only (0600): debug logs can carry sensitive material, and unlike the

@@ -48,7 +48,7 @@ async fn real_client_binary_renders_over_pty() {
                 // The real client binary awaits an admission ack after connect; mirror the server
                 // side so its accept_bi() completes, like `koh serve`.
                 if koh::transport_iroh::admission::admit(&conn).await.is_ok() {
-                    let _ = run_session(conn, Some("sh".into()), 0).await;
+                    let _ = run_session(conn, &["sh".to_owned()], 0).await;
                 }
             }
         }

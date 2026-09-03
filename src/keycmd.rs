@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
+#[cfg(feature = "cli")]
 use clap::{Args, Subcommand};
 
 use crate::transport_iroh::{
@@ -15,7 +16,28 @@ use crate::transport_iroh::{
     write_identity_key,
 };
 
-/// Arguments for `koh key`.
+/// What [`run`] should do to the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOp {
+    /// Change the passphrase encrypting the identity key (like `ssh-keygen -p`). The key stays
+    /// encrypted — there is no way to store it in plaintext.
+    Passwd,
+    /// Print the key's encryption status and endpoint id (never the secret).
+    Info,
+}
+
+/// Configuration for [`run`] — the clap-free, library-facing form of `koh key`'s arguments.
+#[derive(Debug, Clone)]
+pub struct KeyConfig {
+    /// The operation to perform.
+    pub op: KeyOp,
+    /// Which identity key to operate on. `None` = the client key path (as `koh id` uses); pass a
+    /// server key explicitly to manage it.
+    pub key_file: Option<PathBuf>,
+}
+
+/// Arguments for `koh key` (the clap adapter over [`KeyConfig`]; `cli` feature only).
+#[cfg(feature = "cli")]
 #[derive(Args, Debug)]
 pub struct KeyArgs {
     #[command(subcommand)]
@@ -26,6 +48,7 @@ pub struct KeyArgs {
     key_file: Option<PathBuf>,
 }
 
+#[cfg(feature = "cli")]
 #[derive(Subcommand, Debug)]
 enum KeyCmd {
     /// Change the passphrase encrypting the identity key (like `ssh-keygen -p`). The key stays
@@ -35,8 +58,23 @@ enum KeyCmd {
     Info,
 }
 
-/// Run `koh key`.
-pub fn run(args: KeyArgs) -> anyhow::Result<()> {
+#[cfg(feature = "cli")]
+impl From<KeyArgs> for KeyConfig {
+    fn from(a: KeyArgs) -> Self {
+        Self {
+            op: match a.cmd {
+                KeyCmd::Passwd => KeyOp::Passwd,
+                KeyCmd::Info => KeyOp::Info,
+            },
+            key_file: a.key_file,
+        }
+    }
+}
+
+/// Run `koh key`. Accepts a [`KeyConfig`] or anything convertible into one ([`KeyArgs`] under
+/// the `cli` feature). `Passwd` prompts on the terminal unless `$KOH_KEY_NEW_PASSPHRASE` is set.
+pub fn run(config: impl Into<KeyConfig>) -> anyhow::Result<()> {
+    let args: KeyConfig = config.into();
     let key_file = match args.key_file {
         Some(p) => p,
         None => default_key_path("client")?,
@@ -52,13 +90,13 @@ pub fn run(args: KeyArgs) -> anyhow::Result<()> {
     let secret = load_or_create_secret_key(&key_file)
         .with_context(|| format!("loading identity key from {}", key_file.display()))?;
 
-    match args.cmd {
-        KeyCmd::Info => {
+    match args.op {
+        KeyOp::Info => {
             println!("key file    : {}", key_file.display());
             println!("encryption  : koh-key-v1 (Argon2id + AES-256-GCM)");
             println!("endpoint id : {}", format_endpoint_id(&secret.public()));
         }
-        KeyCmd::Passwd => {
+        KeyOp::Passwd => {
             // The NEW passphrase: `$KOH_KEY_NEW_PASSPHRASE` (automation/CI) or a confirmed prompt.
             // It must be non-empty — encryption is mandatory. The CURRENT passphrase was supplied to
             // the load above via `$KOH_KEY_PASSPHRASE` or its prompt.

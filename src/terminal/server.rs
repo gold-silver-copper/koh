@@ -259,6 +259,24 @@ impl ServerTerminal {
         self.parser.screen().application_cursor()
     }
 
+    /// Temporarily selects a bounded scrollback viewport and exposes it without cloning the
+    /// terminal's complete history. The prior viewport is restored before returning.
+    pub fn with_scrollback_screen<R>(
+        &mut self,
+        rows: usize,
+        read: impl FnOnce(&vt100::Screen) -> R,
+    ) -> R {
+        let previous = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(rows);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(self.parser.screen())));
+        self.parser.screen_mut().set_scrollback(previous);
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     /// Produce the SSP snapshot the transport will diff and ship. `echo_ack` is 0: the connection
     /// loop stamps its own (see [`SessionHost::stamp_echo_ack`](crate::server::SessionHost::stamp_echo_ack)).
     pub fn snapshot(&self) -> TerminalScreen {

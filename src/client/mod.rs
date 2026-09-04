@@ -307,7 +307,7 @@ pub trait ClientTerminal<S: ClientState> {
 /// The production [`ClientTerminal`], generic over a pluggable [`KohBackend`].
 ///
 /// Puts the backend into raw mode + the alternate screen on [`enter`](Self::enter), restored on
-/// drop. It owns the backend-independent out-of-band ledger ([`render::OutOfBand`]) and paints the
+/// drop. It owns the backend-independent out-of-band ledger (`render::OutOfBand`) and paints the
 /// synced grid + prediction overlay by driving the backend.
 ///
 /// One implementation of the enter / render / suspend / teardown logic runs against `termina`

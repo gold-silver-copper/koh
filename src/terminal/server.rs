@@ -187,7 +187,7 @@ impl ServerTerminal {
 
     /// Feed a chunk of the child shell's output into the screen model.
     ///
-    /// Routed through [`process_contained`](crate::terminal::process_contained): a `vt100` panic on
+    /// Routed through `process_contained`: a `vt100` panic on
     /// shell output (an emulator bug, not wire-controlled — but `vt100` is outside koh's no-panic
     /// coverage) is CONTAINED so it can't unwind out of the drain task and poison the session mutex.
     /// On a contained panic the chunk is dropped and the parser keeps its prior state; subsequent

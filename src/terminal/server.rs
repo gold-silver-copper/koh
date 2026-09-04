@@ -237,7 +237,7 @@ impl ControlStringFilter {
 fn control_string_introducer(byte: u8) -> Option<ControlStringKind> {
     match byte {
         b']' => Some(ControlStringKind::Osc),
-        b'P' | b'_' | b'^' => Some(ControlStringKind::Other),
+        b'P' | b'X' | b'_' | b'^' => Some(ControlStringKind::Other),
         _ => None,
     }
 }
@@ -245,7 +245,7 @@ fn control_string_introducer(byte: u8) -> Option<ControlStringKind> {
 fn c1_control_string_introducer(byte: u8) -> Option<ControlStringKind> {
     match byte {
         0x9d => Some(ControlStringKind::Osc),
-        0x90 | 0x9e | 0x9f => Some(ControlStringKind::Other),
+        0x90 | 0x98 | 0x9e | 0x9f => Some(ControlStringKind::Other),
         _ => None,
     }
 }
@@ -509,6 +509,22 @@ mod tests {
         }
         assert_eq!(terminal.title(), "split title");
         assert!(terminal.snapshot().screen().contents().contains("ok"));
+    }
+
+    #[test]
+    fn seven_bit_and_c1_sos_strings_share_the_control_string_bound() {
+        for introducer in [&b"\x1bX"[..], &b"\x98"[..]] {
+            let mut terminal = ServerTerminal::new(24, 80, 0);
+            terminal.process(introducer);
+            for _ in 0..5 {
+                terminal.process(&vec![b'x'; MAX_CONTROL_STRING_BYTES / 4]);
+            }
+            assert!(terminal.control_filter.dropping);
+            assert!(terminal.control_filter.buffered.len() <= MAX_CONTROL_STRING_BYTES);
+            terminal.process(b"\x1b\\ok");
+            assert!(!terminal.control_filter.dropping);
+            assert!(terminal.snapshot().screen().contents().contains("ok"));
+        }
     }
 
     // --- KO-01: OSC 9;4 progress and the unhandled-OSC ring ---

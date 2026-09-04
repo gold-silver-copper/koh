@@ -9,6 +9,7 @@
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::time::Duration;
 
 use portable_pty::{
     native_pty_system, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize,
@@ -344,6 +345,24 @@ impl Pty {
             .map_err(std::io::Error::other);
         }
         Ok(())
+    }
+
+    /// Gracefully tears down the process group while retaining ownership of its numeric id.
+    ///
+    /// The child is deliberately not reaped between SIGHUP and SIGKILL: its zombie reserves the
+    /// leader PID, so the process-group id cannot be recycled while descendants receive the hard
+    /// stop. This closes descendants that ignore SIGHUP without signaling an unrelated group.
+    pub fn shutdown_process_group(&mut self, grace: Duration) -> std::io::Result<()> {
+        if self.reaped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.terminate_process_group(false)?;
+        std::thread::sleep(grace);
+        match self.terminate_process_group(true) {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Force-kill the child with SIGKILL (which cannot be trapped). portable-pty's cloned killer

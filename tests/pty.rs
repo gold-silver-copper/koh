@@ -252,6 +252,30 @@ async fn process_group_teardown_closes_descendant_held_pty() {
 }
 
 #[tokio::test]
+async fn graceful_group_shutdown_kills_hup_immune_descendant_after_leader_exits() {
+    let (mut pty, mut rx) = Pty::spawn(
+        24,
+        80,
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "(trap '' HUP; while :; do sleep 1; done) & wait".into(),
+        ],
+        "xterm-256color",
+    )
+    .expect("spawn descendant");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    pty.shutdown_process_group(Duration::from_millis(50))
+        .expect("owned group teardown");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await
+    .expect("HUP-immune descendant must release PTY");
+    pty.shutdown();
+}
+
+#[tokio::test]
 #[allow(
     clippy::match_wild_err_arm,
     reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"

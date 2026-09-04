@@ -298,12 +298,27 @@ async fn drain(handle: SharedSession, mut pty_rx: mpsc::Receiver<Vec<u8>>) {
     loop {
         let Some(chunk) = pty_rx.recv().await else {
             // Shell exited: reader hit EOF. Reap the real exit code (the child is already a
-            // zombie, so try_wait returns it) and stamp it onto the emulator so the next
-            // snapshot — and thus the shutdown frame — carries it to the client.
+            // zombie, though its status can become waitable a moment after EOF) and stamp it onto
+            // the emulator so the next snapshot — and thus the shutdown frame — carries it to the
+            // client. Never hold the shared session lock across the bounded retry sleep.
+            let exit_code = wait_for_exit_code(
+                || async {
+                    handle
+                        .session
+                        .lock()
+                        .await
+                        .host
+                        .pty
+                        .try_wait()
+                        .map(|status| status.map(|status| status.exit_code()))
+                },
+                Duration::from_secs(1),
+            )
+            .await;
             let mut s = handle.session.lock().await;
             s.host.child_alive = false;
-            if let Ok(Some(status)) = s.host.pty.try_wait() {
-                s.host.emu.set_exit_code(status.exit_code());
+            if let Some(exit_code) = exit_code {
+                s.host.emu.set_exit_code(exit_code);
             }
             drop(s);
             handle.changed.pulse();
@@ -322,6 +337,27 @@ async fn drain(handle: SharedSession, mut pty_rx: mpsc::Receiver<Vec<u8>>) {
         }
         drop(s);
         handle.changed.pulse();
+    }
+}
+
+async fn wait_for_exit_code<F, Fut>(mut poll: F, timeout: Duration) -> Option<u32>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<Option<u32>>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match poll().await {
+            Ok(Some(exit_code)) => return Some(exit_code),
+            Ok(None) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(%error, "waiting for PTY child status after EOF failed");
+                return None;
+            }
+        }
     }
 }
 
@@ -788,6 +824,62 @@ mod tests {
     use super::test_host::{HostCall, ScriptedHost};
     use super::*;
     use crate::transport_iroh::generate_secret_key;
+
+    #[tokio::test]
+    async fn exit_status_polling_retries_but_remains_bounded() {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let outcomes = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            Ok(None),
+            Ok(None),
+            Ok(Some(3)),
+        ])));
+        let scripted = Arc::clone(&outcomes);
+        let exit = wait_for_exit_code(
+            move || {
+                let outcome = scripted
+                    .lock()
+                    .expect("scripted exit polls")
+                    .pop_front()
+                    .expect("unexpected extra exit poll");
+                async move { outcome }
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(exit, Some(3), "transient None polls must be retried");
+        assert!(
+            outcomes.lock().expect("scripted exit polls").is_empty(),
+            "the successful poll must end the retry loop"
+        );
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&polls);
+        assert_eq!(
+            wait_for_exit_code(
+                move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(None) }
+                },
+                Duration::ZERO,
+            )
+            .await,
+            None,
+            "the timeout path terminates without inventing a status"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "zero timeout polls once");
+
+        assert_eq!(
+            wait_for_exit_code(
+                || async { Err(std::io::Error::other("scripted wait failure")) },
+                Duration::from_secs(1),
+            )
+            .await,
+            None,
+            "a wait error terminates without inventing a status"
+        );
+    }
 
     #[tokio::test]
     async fn a_pulse_wakes_every_subscribed_viewer_not_just_one() {

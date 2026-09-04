@@ -390,8 +390,16 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
         channels.resize_rx,
     )
     .await;
-    tasks.shutdown().await?;
-    result
+    let cleanup = tasks.shutdown().await;
+    match (result, cleanup) {
+        (Err(primary), Err(cleanup)) => {
+            tracing::warn!(error = ?cleanup, "client I/O cleanup also failed");
+            Err(primary)
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Ok(value), Ok(())) => Ok(value),
+    }
 }
 
 /// Connect to a server over `alpn` and run the reconnecting session against a caller-supplied

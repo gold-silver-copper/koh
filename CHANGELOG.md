@@ -24,6 +24,8 @@ internal and unstable (see `src/lib.rs`).
 
 ### Fixed
 - Embedded client teardown now cancels producers blocked by full input or resize channels.
+- Terminal parsing bounds OSC, DCS, SOS, PM, and APC control strings at 64 KiB, discarding an
+  oversized string through its terminator before resuming normal input.
 
 ## [0.11.0] — 2026-09-03
 

@@ -25,6 +25,23 @@ const OUTPUT_CHANNEL_DEPTH: usize = 512;
 /// reading (flow-controlled or hung), which [`Pty::write_input`] surfaces rather than blocking on.
 const WRITE_CHANNEL_DEPTH: usize = 1024;
 
+/// Exit information returned by owned process-group teardown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupExitStatus {
+    code: u32,
+    signal: Option<String>,
+}
+
+impl GroupExitStatus {
+    pub fn exit_code(&self) -> u32 {
+        self.code
+    }
+
+    pub fn signal(&self) -> Option<&str> {
+        self.signal.as_deref()
+    }
+}
+
 /// Resolve the session shell when the caller didn't pass `--shell`. Prefers `$SHELL`; otherwise a
 /// platform default. portable-pty's `new_default_prog` falls back to `/bin/sh`, which does **not**
 /// exist on Android (it's `/system/bin/sh`) — so a `koh serve` with no `--shell` would fail to spawn
@@ -305,6 +322,9 @@ impl Pty {
     /// Non-blocking check for child exit. On a `Some` result the child has been reaped, so the PID
     /// may now be recycled — the kill paths must not signal it afterward (KR-02).
     pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if self.reaped.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         let r = self.child.try_wait();
         if matches!(r, Ok(Some(_))) {
             self.reaped.store(true, Ordering::SeqCst);
@@ -355,16 +375,18 @@ impl Pty {
     pub fn shutdown_process_group(
         &mut self,
         grace: Duration,
-    ) -> std::io::Result<Option<ExitStatus>> {
+    ) -> std::io::Result<Option<GroupExitStatus>> {
         if self.reaped.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        let direct = self.killer.kill();
-        let group = self.terminate_process_group(false);
-        let hup_error = match (direct, group) {
-            (Err(error), Err(_)) => Some(error),
-            _ => None,
-        };
+        // Use exactly one termination mechanism. On Unix the process-group signal is both
+        // sufficient for the leader and required for descendants; racing it with
+        // portable-pty's platform killer can make the leader report a clean exit instead of the
+        // SIGHUP-derived status.
+        #[cfg(unix)]
+        let hup_error = self.terminate_process_group(false).err();
+        #[cfg(not(unix))]
+        let hup_error = self.killer.kill().err();
         std::thread::sleep(grace);
         let force_error = match self.terminate_process_group(true) {
             Ok(()) => None,
@@ -373,8 +395,36 @@ impl Pty {
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
+            #[cfg(unix)]
+            if let Some(pid) = self.process_id().and_then(|pid| i32::try_from(pid).ok()) {
+                use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+                use nix::unistd::Pid;
+                match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG))
+                    .map_err(std::io::Error::other)?
+                {
+                    WaitStatus::Exited(_, code) => {
+                        self.reaped.store(true, Ordering::SeqCst);
+                        return Ok(Some(GroupExitStatus {
+                            code: u32::try_from(code).unwrap_or(u32::MAX),
+                            signal: None,
+                        }));
+                    }
+                    WaitStatus::Signaled(_, signal, _) => {
+                        self.reaped.store(true, Ordering::SeqCst);
+                        return Ok(Some(GroupExitStatus {
+                            code: 128 + signal as u32,
+                            signal: Some(format!("{signal:?}")),
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            #[cfg(not(unix))]
             if let Some(status) = self.try_wait()? {
-                return Ok(Some(status));
+                return Ok(Some(GroupExitStatus {
+                    code: status.exit_code(),
+                    signal: status.signal().map(str::to_owned),
+                }));
             }
             if std::time::Instant::now() >= deadline {
                 return match force_error.or(hup_error) {

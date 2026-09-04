@@ -276,6 +276,37 @@ async fn graceful_group_shutdown_kills_hup_immune_descendant_after_leader_exits(
 }
 
 #[tokio::test]
+async fn graceful_group_shutdown_preserves_the_leaders_shell_status() {
+    let (mut pty, mut rx) = Pty::spawn(
+        24,
+        80,
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf READY; while :; do sleep 1; done".into(),
+        ],
+        "xterm-256color",
+    )
+    .expect("spawn HUP-aware leader");
+    let mut output = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !output.windows(5).any(|bytes| bytes == b"READY") {
+            output.extend(rx.recv().await.expect("leader output before readiness"));
+        }
+    })
+    .await
+    .expect("leader readiness deadline");
+
+    let status = pty
+        .shutdown_process_group(Duration::from_millis(50))
+        .expect("owned group teardown")
+        .expect("leader status");
+    assert_eq!(status.exit_code(), 129, "SIGHUP must use shell convention");
+    assert_eq!(status.signal(), Some("SIGHUP"));
+    pty.shutdown();
+}
+
+#[tokio::test]
 #[allow(
     clippy::match_wild_err_arm,
     reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"

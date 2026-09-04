@@ -100,16 +100,7 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
         // in a group-writable dir where a co-tenant could swap `id.key` for a symlink *between* the
         // checks. `read_key_file_secure` opens with `O_NOFOLLOW` (a symlinked key is refused at
         // open) and operates only on the held fd, so there is no second path resolution to race.
-        let mut text = read_key_file_secure(path)?;
-        // The identity key is ALWAYS the `koh-key-v1` encrypted format (koh has no plaintext key
-        // path). Decrypt under the resolved passphrase; secret material stays in `Zeroizing` and the
-        // raw file text is wiped before returning.
-        let pass = resolve_key_passphrase(path)?;
-        let secret = keyfile::decrypt_key(&text, pass.expose_secret())
-            .map_err(|e| SetupError::Keyfile(e.to_string()))?;
-        let sk = SecretKey::from_bytes(&secret);
-        text.zeroize();
-        Ok(sk)
+        load_secret_key(path)
     } else {
         let sk = generate_secret_key();
         if let Some(parent) = path.parent() {
@@ -121,9 +112,32 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
         // (`koh-key-v1`) — encryption is mandatory, so a fresh key requires a passphrase up front
         // (a no-echo confirmed TTY prompt, or `$KOH_KEY_NEW_PASSPHRASE` when headless).
         let pass = resolve_new_key_passphrase(path)?;
-        write_identity_key(path, &sk, pass.expose_secret())?;
-        Ok(sk)
+        if create_identity_key(path, &sk, pass.expose_secret())? {
+            Ok(sk)
+        } else {
+            // Another same-user process won the atomic create race. Its key is now the one stable
+            // identity. Reuse the already-resolved creation passphrase: a headless first-create
+            // flow is documented to require only KOH_KEY_NEW_PASSPHRASE.
+            load_secret_key_with_passphrase(path, pass.expose_secret())
+        }
     }
+}
+
+fn load_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
+    let pass = resolve_key_passphrase(path)?;
+    load_secret_key_with_passphrase(path, pass.expose_secret())
+}
+
+fn load_secret_key_with_passphrase(
+    path: &Path,
+    passphrase: &str,
+) -> Result<SecretKey, SetupError> {
+    let mut text = read_key_file_secure(path)?;
+    let secret = keyfile::decrypt_key(&text, passphrase)
+        .map_err(|e| SetupError::Keyfile(e.to_string()))?;
+    let key = SecretKey::from_bytes(&secret);
+    text.zeroize();
+    Ok(key)
 }
 
 /// Resolve the passphrase for an encrypted identity key: `$KOH_KEY_PASSPHRASE` if set (non-empty),
@@ -220,6 +234,63 @@ pub(crate) fn write_identity_key(
         .map_err(|e| SetupError::Keyfile(e.to_string()))?;
     write_secret_file(path, text.as_bytes())?;
     Ok(())
+}
+
+/// Publish a newly-generated identity without replacing a winner from another process.
+fn create_identity_key(path: &Path, key: &SecretKey, passphrase: &str) -> Result<bool, SetupError> {
+    let secret = Zeroizing::new(key.to_bytes());
+    let text = keyfile::encrypt_key(&secret, passphrase)
+        .map_err(|error| SetupError::Keyfile(error.to_string()))?;
+    create_secret_file(path, text.as_bytes()).map_err(SetupError::Io)
+}
+
+fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let tmp = path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        let result = (|| {
+            file.write_all(contents)?;
+            file.sync_all()?;
+            drop(file);
+            match std::fs::hard_link(&tmp, path) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(error) => Err(error),
+            }
+        })();
+        let _ = std::fs::remove_file(tmp);
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write as _;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                file.write_all(contents)?;
+                file.sync_all()?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// Create `dir` (recursively) restricted to the owner (mode 0700 on unix) so a freshly-created
@@ -825,6 +896,41 @@ mod tests {
         assert_eq!(parse_endpoint_id(&s).unwrap(), id);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_first_key_creation_publishes_exactly_one_identity() {
+        let dir = std::env::temp_dir().join(format!("koh-key-create-race-{}", std::process::id()));
+        let path = dir.join("id.key");
+        let _ = std::fs::remove_dir_all(&dir);
+        create_dir_private(&dir).expect("private directory");
+        let keys = [generate_secret_key(), generate_secret_key()];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for key in keys {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                let created =
+                    create_identity_key(&path, &key, "race-passphrase").expect("atomic key create");
+                (created, key.to_bytes())
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("creator thread"))
+            .collect();
+        assert_eq!(outcomes.iter().filter(|(created, _)| *created).count(), 1);
+        let published = std::fs::read_to_string(&path).expect("published key");
+        let decrypted = keyfile::decrypt_key(&published, "race-passphrase").expect("decrypt key");
+        let winner = outcomes
+            .iter()
+            .find_map(|(created, bytes)| created.then_some(bytes))
+            .expect("one winner");
+        assert_eq!(&*decrypted, winner);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]

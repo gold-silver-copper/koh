@@ -13,12 +13,14 @@
 
 pub mod backend;
 pub mod cli;
+mod io;
 mod render;
 
 pub use backend::{DefaultBackend, KohBackend};
 pub use cli::{connect, connect_with, run_id, BellHook, ConnectConfig, IdConfig};
 #[cfg(feature = "cli")]
 pub use cli::{ConnectArgs, IdArgs};
+pub use io::{spawn_client_io, ClientIoChannels, ClientIoTasks};
 pub use render::{InputModes, WindowState};
 
 use std::time::Duration;

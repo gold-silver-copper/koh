@@ -130,7 +130,7 @@ pub trait KohBackend {
         self.flush()
     }
 
-    /// Reset the forwarded input modes ([`RESET_FORWARDED_MODES`]), show the cursor, and leave the
+    /// Reset the forwarded input modes (`RESET_FORWARDED_MODES`), show the cursor, and leave the
     /// alternate screen, then flush. This is the teardown that restores the user's terminal on drop
     /// and on suspend — kept here (not in the caller) so it runs identically for every backend.
     fn leave_alt_screen(&mut self) -> io::Result<()> {

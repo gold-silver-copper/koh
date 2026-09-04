@@ -17,6 +17,19 @@ use std::time::Duration;
 
 use koh::pty::Pty;
 
+#[test]
+fn spawned_child_exposes_a_real_process_id() {
+    let (pty, _rx) = Pty::spawn(
+        24,
+        80,
+        &["/bin/sh".into(), "-c".into(), "sleep 1".into()],
+        "xterm-256color",
+    )
+    .expect("spawn child");
+    assert!(pty.process_id().is_some_and(|pid| pid > 0));
+    pty.shutdown();
+}
+
 #[tokio::test]
 #[allow(
     clippy::match_wild_err_arm,
@@ -209,8 +222,57 @@ async fn reaped_child_is_not_signaled_again() {
     // After reaping, every kill path is gated and must be a safe no-op (never signaling a PID we no
     // longer own).
     assert!(pty.kill().is_ok(), "kill() after reap is a gated no-op");
+    assert!(pty.terminate_process_group(false).is_ok());
+    assert!(pty.terminate_process_group(true).is_ok());
     pty.kill_hard(); // must not signal a (possibly recycled) PID, must not panic
     pty.shutdown(); // consumes; Drop is reaped-gated; must not panic
+}
+
+#[tokio::test]
+async fn process_group_teardown_closes_descendant_held_pty() {
+    let (pty, mut rx) = Pty::spawn(
+        24,
+        80,
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' HUP; sleep 60 & wait".into(),
+        ],
+        "xterm-256color",
+    )
+    .expect("spawn descendants");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    pty.terminate_process_group(true).expect("kill group");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await
+    .expect("descendant-held PTY must reach EOF");
+    pty.shutdown();
+}
+
+#[tokio::test]
+async fn graceful_group_shutdown_kills_hup_immune_descendant_after_leader_exits() {
+    let (mut pty, mut rx) = Pty::spawn(
+        24,
+        80,
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "(trap '' HUP; while :; do sleep 1; done) & wait".into(),
+        ],
+        "xterm-256color",
+    )
+    .expect("spawn descendant");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    pty.shutdown_process_group(Duration::from_millis(50))
+        .expect("owned group teardown");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await
+    .expect("HUP-immune descendant must release PTY");
+    pty.shutdown();
 }
 
 #[tokio::test]

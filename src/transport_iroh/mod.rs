@@ -411,7 +411,7 @@ fn config_dir_from(
 
 /// The default persistent key path for `role` (`"client"`/`"server"`) when `--key-file` isn't given.
 ///
-/// `<config-dir>/<role>.key` under `~/.config/koh` (see [`config_dir_from`]). The dir is created 0700
+/// `<config-dir>/<role>.key` under `~/.config/koh` (see `config_dir_from`). The dir is created 0700
 /// when the key is first written (`load_or_create_secret_key`). Errors (rather than scattering a key
 /// into the CWD/tmp) when `~/.config` can't be located — pass `--key-file` in that case.
 pub fn default_key_path(role: &str) -> Result<std::path::PathBuf, SetupError> {

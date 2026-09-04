@@ -344,7 +344,7 @@ impl<S: SyncState> ServerSession<S> {
 
 /// Drive a client connection against an existing (shared, detachable) [`session::Session`].
 ///
-/// The thin async/I/O shell around [`ServerSession`] (the pure protocol core): it locks the session,
+/// The thin async/I/O shell around `ServerSession` (the pure protocol core): it locks the session,
 /// does the iroh + host I/O, and delegates every protocol decision to the core. Uses a **fresh**
 /// core per attach, so the first tick diffs the live state against the default base and re-syncs the
 /// (re)connecting client to the current state. Crucially, it does **not** kill the host on

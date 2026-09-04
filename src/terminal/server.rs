@@ -166,8 +166,93 @@ impl vt100::Callbacks for Callbacks {
 /// The echo-ack is **not** tracked here (KS-02): SSP frame numbers are per connection, so the
 /// per-connection `ServerSession` owns the input history and stamps its own ack onto each snapshot
 /// it takes. Snapshots leave `echo_ack` at 0 for that reason.
+const MAX_CONTROL_STRING_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlStringKind {
+    Osc,
+    Other,
+}
+
+#[derive(Default)]
+struct ControlStringFilter {
+    pending_escape: bool,
+    string: Option<ControlStringKind>,
+    string_escape: bool,
+    dropping: bool,
+    buffered: Vec<u8>,
+}
+
+impl ControlStringFilter {
+    fn process(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(input.len().min(MAX_CONTROL_STRING_BYTES));
+        for &byte in input {
+            if let Some(kind) = self.string {
+                let terminated = byte == 0x9c
+                    || (kind == ControlStringKind::Osc && byte == 0x07)
+                    || (self.string_escape && byte == b'\\');
+                if !self.dropping {
+                    if self.buffered.len() < MAX_CONTROL_STRING_BYTES {
+                        self.buffered.push(byte);
+                    } else {
+                        self.buffered.clear();
+                        self.dropping = true;
+                    }
+                }
+                self.string_escape = byte == 0x1b;
+                if terminated || matches!(byte, 0x18 | 0x1a) {
+                    if !self.dropping {
+                        output.append(&mut self.buffered);
+                    }
+                    self.buffered.clear();
+                    self.string = None;
+                    self.string_escape = false;
+                    self.dropping = false;
+                }
+                continue;
+            }
+
+            if self.pending_escape {
+                self.pending_escape = false;
+                if let Some(kind) = control_string_introducer(byte) {
+                    self.string = Some(kind);
+                    self.buffered.extend_from_slice(&[0x1b, byte]);
+                    continue;
+                }
+                output.push(0x1b);
+            }
+            if byte == 0x1b {
+                self.pending_escape = true;
+            } else if let Some(kind) = c1_control_string_introducer(byte) {
+                self.string = Some(kind);
+                self.buffered.push(byte);
+            } else {
+                output.push(byte);
+            }
+        }
+        output
+    }
+}
+
+fn control_string_introducer(byte: u8) -> Option<ControlStringKind> {
+    match byte {
+        b']' => Some(ControlStringKind::Osc),
+        b'P' | b'X' | b'_' | b'^' => Some(ControlStringKind::Other),
+        _ => None,
+    }
+}
+
+fn c1_control_string_introducer(byte: u8) -> Option<ControlStringKind> {
+    match byte {
+        0x9d => Some(ControlStringKind::Osc),
+        0x90 | 0x98 | 0x9e | 0x9f => Some(ControlStringKind::Other),
+        _ => None,
+    }
+}
+
 pub struct ServerTerminal {
     parser: vt100::Parser<Callbacks>,
+    control_filter: ControlStringFilter,
     /// The shell's exit code once it has exited (propagated to the client on shutdown).
     exit_code: Option<u32>,
 }
@@ -176,6 +261,7 @@ impl ServerTerminal {
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         Self {
             parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback, Callbacks::default()),
+            control_filter: ControlStringFilter::default(),
             exit_code: None,
         }
     }
@@ -187,13 +273,14 @@ impl ServerTerminal {
 
     /// Feed a chunk of the child shell's output into the screen model.
     ///
-    /// Routed through [`process_contained`](crate::terminal::process_contained): a `vt100` panic on
+    /// Routed through `process_contained`: a `vt100` panic on
     /// shell output (an emulator bug, not wire-controlled — but `vt100` is outside koh's no-panic
     /// coverage) is CONTAINED so it can't unwind out of the drain task and poison the session mutex.
     /// On a contained panic the chunk is dropped and the parser keeps its prior state; subsequent
     /// output repaints. The default hook still logs the backtrace to `$KOH_LOG` for an upstream report.
     pub fn process(&mut self, bytes: &[u8]) {
-        if !crate::terminal::process_contained(&mut self.parser, bytes) {
+        let filtered = self.control_filter.process(bytes);
+        if !crate::terminal::process_contained(&mut self.parser, &filtered) {
             tracing::error!(
                 "vt100 panicked on shell output; dropped the chunk (backtrace in logs)"
             );
@@ -257,6 +344,24 @@ impl ServerTerminal {
     /// client's arrow-key bytes (SS3 vs CSI) before they reach the PTY.
     pub fn application_cursor(&self) -> bool {
         self.parser.screen().application_cursor()
+    }
+
+    /// Temporarily selects a bounded scrollback viewport and exposes it without cloning the
+    /// terminal's complete history. The prior viewport is restored before returning.
+    pub fn with_scrollback_screen<R>(
+        &mut self,
+        rows: usize,
+        read: impl FnOnce(&vt100::Screen) -> R,
+    ) -> R {
+        let previous = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(rows);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(self.parser.screen())));
+        self.parser.screen_mut().set_scrollback(previous);
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Produce the SSP snapshot the transport will diff and ship. `echo_ack` is 0: the connection
@@ -369,6 +474,57 @@ mod tests {
         // A title within the cap is untouched.
         t.process(b"\x1b]2;short\x07");
         assert_eq!(t.title(), "short");
+    }
+
+    #[test]
+    fn unterminated_control_strings_are_bounded_and_reset_after_termination() {
+        let mut terminal = ServerTerminal::new(24, 80, 0);
+        terminal.process(b"before\x1b]");
+        for _ in 0..32 {
+            terminal.process(&vec![b'x'; MAX_CONTROL_STRING_BYTES / 4]);
+            assert!(terminal.control_filter.buffered.len() <= MAX_CONTROL_STRING_BYTES);
+        }
+        assert!(terminal.control_filter.dropping);
+        terminal.process(b"\x1b\\after");
+        assert!(!terminal.control_filter.dropping);
+        assert!(terminal.control_filter.buffered.is_empty());
+        assert!(terminal
+            .snapshot()
+            .screen()
+            .contents()
+            .contains("beforeafter"));
+    }
+
+    #[test]
+    fn bounded_filter_preserves_split_osc_and_csi_semantics() {
+        let mut terminal = ServerTerminal::new(24, 80, 0);
+        for chunk in [
+            &b"\x1b"[..],
+            &b"]2;split"[..],
+            &b" title\x1b"[..],
+            &b"\\\x1b"[..],
+            &b"[5;3Hok"[..],
+        ] {
+            terminal.process(chunk);
+        }
+        assert_eq!(terminal.title(), "split title");
+        assert!(terminal.snapshot().screen().contents().contains("ok"));
+    }
+
+    #[test]
+    fn seven_bit_and_c1_sos_strings_share_the_control_string_bound() {
+        for introducer in [&b"\x1bX"[..], &b"\x98"[..]] {
+            let mut terminal = ServerTerminal::new(24, 80, 0);
+            terminal.process(introducer);
+            for _ in 0..5 {
+                terminal.process(&vec![b'x'; MAX_CONTROL_STRING_BYTES / 4]);
+            }
+            assert!(terminal.control_filter.dropping);
+            assert!(terminal.control_filter.buffered.len() <= MAX_CONTROL_STRING_BYTES);
+            terminal.process(b"\x1b\\ok");
+            assert!(!terminal.control_filter.dropping);
+            assert!(terminal.snapshot().screen().contents().contains("ok"));
+        }
     }
 
     // --- KO-01: OSC 9;4 progress and the unhandled-OSC ring ---

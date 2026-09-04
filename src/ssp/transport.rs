@@ -40,7 +40,7 @@ pub enum RecvOutcome {
     /// The diff's base (`old_num`) is not in our `received_states`; dropped (replay guard).
     MissingBase,
     /// Refused by the anti-accumulation bound: the received-state count ceiling
-    /// ([`RECEIVED_STATES_CAP`]) or the per-direction resource budget
+    /// (`RECEIVED_STATES_CAP`) or the per-direction resource budget
     /// ([`SyncState::RECEIVE_BUDGET_UNITS`]) would be exceeded.
     Quenched,
 }

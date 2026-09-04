@@ -657,7 +657,7 @@ async fn teardown<H: SessionHost>(handle: SharedSession<H>) {
 /// Background sweeper: reap sessions whose hosted program has exited, or that have been detached
 /// longer than `ttl`, every `interval`.
 ///
-/// Runs until the store is dropped. `interval` is injectable (the binary passes [`REAP_INTERVAL`])
+/// Runs until the store is dropped. `interval` is injectable (the binary passes `REAP_INTERVAL`)
 /// so tests can drive a sweep without a real multi-second wait. `shutdown` lets the caller stop the
 /// reaper cleanly: the loop `select!`s the token against the sleep and returns when cancelled
 /// (rather than being `abort()`ed mid-sweep).

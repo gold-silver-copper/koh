@@ -13,12 +13,14 @@
 
 pub mod backend;
 pub mod cli;
+mod io;
 mod render;
 
 pub use backend::{DefaultBackend, KohBackend};
 pub use cli::{connect, connect_with, run_id, BellHook, ConnectConfig, IdConfig};
 #[cfg(feature = "cli")]
 pub use cli::{ConnectArgs, IdArgs};
+pub use io::{spawn_client_io, ClientIoChannels, ClientIoTasks};
 pub use render::{InputModes, WindowState};
 
 use std::time::Duration;
@@ -305,7 +307,7 @@ pub trait ClientTerminal<S: ClientState> {
 /// The production [`ClientTerminal`], generic over a pluggable [`KohBackend`].
 ///
 /// Puts the backend into raw mode + the alternate screen on [`enter`](Self::enter), restored on
-/// drop. It owns the backend-independent out-of-band ledger ([`render::OutOfBand`]) and paints the
+/// drop. It owns the backend-independent out-of-band ledger (`render::OutOfBand`) and paints the
 /// synced grid + prediction overlay by driving the backend.
 ///
 /// One implementation of the enter / render / suspend / teardown logic runs against `termina`

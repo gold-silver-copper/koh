@@ -3,7 +3,6 @@
 //! Dial a server by id and run the reconnecting client session against the real terminal. The
 //! session loop itself lives in [`crate::client::run_client`]; this just wires up the real terminal I/O.
 
-use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -374,41 +373,10 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
     // diagnosable rather than mysterious.
     warn_if_locale_not_utf8();
 
-    // Raw stdin reader (byte-perfect passthrough) on a dedicated blocking thread.
-    let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(64);
-    std::thread::Builder::new()
-        .name("koh-stdin".into())
-        .spawn(move || {
-            let mut stdin = std::io::stdin();
-            let mut buf = [0u8; 1024];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let chunk = buf.get(..n).unwrap_or(&buf).to_vec();
-                        if input_tx.blocking_send(chunk).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        })
-        .context("spawning stdin reader")?;
-
-    // SIGWINCH -> resize ticks (run_client re-reads term.size() on each). Sender kept alive.
-    let (resize_tx, resize_rx) = mpsc::channel::<()>(8);
-    let mut sigwinch =
-        signal(SignalKind::window_change()).context("installing SIGWINCH handler")?;
-    tokio::spawn(async move {
-        while sigwinch.recv().await.is_some() {
-            if resize_tx.send(()).await.is_err() {
-                break;
-            }
-        }
-    });
+    let (channels, tasks) = super::spawn_client_io()?;
 
     let clipboard_enabled = args.clipboard;
-    connect_with(
+    let result = connect_with(
         args,
         TERMINAL_ALPN,
         move || {
@@ -418,10 +386,20 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
             BackendTerminal::enter(backend, clipboard_enabled)
                 .context("entering raw mode / alt screen")
         },
-        input_rx,
-        resize_rx,
+        channels.input_rx,
+        channels.resize_rx,
     )
-    .await
+    .await;
+    let cleanup = tasks.shutdown().await;
+    match (result, cleanup) {
+        (Err(primary), Err(cleanup)) => {
+            tracing::warn!(error = ?cleanup, "client I/O cleanup also failed");
+            Err(primary)
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Ok(value), Ok(())) => Ok(value),
+    }
 }
 
 /// Connect to a server over `alpn` and run the reconnecting session against a caller-supplied

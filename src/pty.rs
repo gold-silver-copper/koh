@@ -361,22 +361,26 @@ impl Pty {
         }
         let direct = self.killer.kill();
         let group = self.terminate_process_group(false);
-        if let (Err(error), Err(_)) = (direct, group) {
-            return Err(error);
-        }
+        let hup_error = match (direct, group) {
+            (Err(error), Err(_)) => Some(error),
+            _ => None,
+        };
         std::thread::sleep(grace);
-        match self.terminate_process_group(true) {
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => {}
-            Err(error) => return Err(error),
-        }
+        let force_error = match self.terminate_process_group(true) {
+            Ok(()) => None,
+            Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => None,
+            Err(error) => Some(error),
+        };
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
             if let Some(status) = self.try_wait()? {
                 return Ok(Some(status));
             }
             if std::time::Instant::now() >= deadline {
-                return Ok(None);
+                return match force_error.or(hup_error) {
+                    Some(error) => Err(error),
+                    None => Ok(None),
+                };
             }
             std::thread::sleep(Duration::from_millis(5));
         }

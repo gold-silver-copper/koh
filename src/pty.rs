@@ -11,9 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::time::Duration;
 
-use portable_pty::{
-    native_pty_system, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize,
-};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc;
 
 /// Size of each output chunk read from the PTY master.
@@ -33,6 +31,10 @@ pub struct GroupExitStatus {
 }
 
 impl GroupExitStatus {
+    pub fn success(&self) -> bool {
+        self.signal.is_none() && self.code == 0
+    }
+
     pub fn exit_code(&self) -> u32 {
         self.code
     }
@@ -321,11 +323,38 @@ impl Pty {
 
     /// Non-blocking check for child exit. On a `Some` result the child has been reaped, so the PID
     /// may now be recycled — the kill paths must not signal it afterward (KR-02).
-    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+    pub fn try_wait(&mut self) -> std::io::Result<Option<GroupExitStatus>> {
         if self.reaped.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        let r = self.child.try_wait();
+        #[cfg(unix)]
+        let r = self
+            .process_id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .map_or(Ok(None), |pid| {
+                use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+                use nix::unistd::Pid;
+                match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG))
+                    .map_err(std::io::Error::other)?
+                {
+                    WaitStatus::Exited(_, code) => Ok(Some(GroupExitStatus {
+                        code: u32::try_from(code).unwrap_or(u32::MAX),
+                        signal: None,
+                    })),
+                    WaitStatus::Signaled(_, signal, _) => Ok(Some(GroupExitStatus {
+                        code: 128 + signal as u32,
+                        signal: Some(format!("{signal:?}")),
+                    })),
+                    _ => Ok(None),
+                }
+            });
+        #[cfg(not(unix))]
+        let r = self.child.try_wait().map(|status| {
+            status.map(|status| GroupExitStatus {
+                code: status.exit_code(),
+                signal: status.signal().map(str::to_owned),
+            })
+        });
         if matches!(r, Ok(Some(_))) {
             self.reaped.store(true, Ordering::SeqCst);
         }

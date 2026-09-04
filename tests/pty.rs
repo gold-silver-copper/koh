@@ -15,6 +15,40 @@
 
 use std::time::Duration;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn external_signal_retains_shell_style_exit_status() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    let (mut pty, _rx) = Pty::spawn(
+        24,
+        80,
+        &[
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "while :; do sleep 1; done".to_owned(),
+        ],
+        "xterm-256color",
+    )
+    .expect("spawn signal fixture");
+    let pid = i32::try_from(pty.process_id().expect("child pid")).expect("pid range");
+    kill(Pid::from_raw(pid), Signal::SIGKILL).expect("signal child");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = pty.try_wait().expect("wait child") {
+            assert_eq!(status.exit_code(), 137);
+            assert_eq!(status.signal(), Some("SIGKILL"));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "signal status deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 use koh::pty::Pty;
 
 #[test]

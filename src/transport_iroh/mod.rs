@@ -124,17 +124,21 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
 }
 
 fn load_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
+    // Validate and open the path before resolving credentials. Besides preserving the security
+    // error, this prevents a symlink from triggering an irrelevant interactive prompt.
+    let text = read_key_file_secure(path)?;
     let pass = resolve_key_passphrase(path)?;
-    load_secret_key_with_passphrase(path, pass.expose_secret())
+    decrypt_secret_key(text, pass.expose_secret())
 }
 
-fn load_secret_key_with_passphrase(
-    path: &Path,
-    passphrase: &str,
-) -> Result<SecretKey, SetupError> {
-    let mut text = read_key_file_secure(path)?;
-    let secret = keyfile::decrypt_key(&text, passphrase)
-        .map_err(|e| SetupError::Keyfile(e.to_string()))?;
+fn load_secret_key_with_passphrase(path: &Path, passphrase: &str) -> Result<SecretKey, SetupError> {
+    let text = read_key_file_secure(path)?;
+    decrypt_secret_key(text, passphrase)
+}
+
+fn decrypt_secret_key(mut text: String, passphrase: &str) -> Result<SecretKey, SetupError> {
+    let secret =
+        keyfile::decrypt_key(&text, passphrase).map_err(|e| SetupError::Keyfile(e.to_string()))?;
     let key = SecretKey::from_bytes(&secret);
     text.zeroize();
     Ok(key)
@@ -247,20 +251,26 @@ fn create_identity_key(path: &Path, key: &SecretKey, passphrase: &str) -> Result
 fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
+        use rand::RngCore as _;
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let tmp = path.with_extension(format!(
-            "tmp.{}.{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let (tmp, mut file) = loop {
+            let tmp = path.with_extension(format!(
+                "tmp.{}.{:016x}",
+                std::process::id(),
+                rand::rngs::OsRng.next_u64()
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+            {
+                Ok(file) => break (tmp, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        };
         let result = (|| {
             file.write_all(contents)?;
             file.sync_all()?;
@@ -930,6 +940,27 @@ mod tests {
             .find_map(|(created, bytes)| created.then_some(bytes))
             .expect("one winner");
         assert_eq!(&*decrypted, winner);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preplanted_predictable_temporary_name_cannot_block_key_creation() {
+        let dir = std::env::temp_dir().join(format!("koh-key-preplant-{}", std::process::id()));
+        let path = dir.join("id.key");
+        let _ = std::fs::remove_dir_all(&dir);
+        create_dir_private(&dir).expect("private directory");
+        let predictable = path.with_extension(format!("tmp.{}.1", std::process::id()));
+        std::fs::write(&predictable, b"attacker-owned").expect("preplant old temporary name");
+        let key = generate_secret_key();
+        assert!(
+            create_identity_key(&path, &key, "race-passphrase").expect("create identity"),
+            "the identity is published despite the preplanted predictable name"
+        );
+        assert_eq!(
+            std::fs::read(&predictable).expect("preplant remains untouched"),
+            b"attacker-owned"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

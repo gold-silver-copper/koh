@@ -15,6 +15,15 @@ internal and unstable (see `src/lib.rs`).
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
 > 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.9.1.
 
+## [0.12.0] — 2026-09-03
+
+### Added
+- Public cancellation-aware terminal input and resize producers for embedded clients.
+- A documented `Pty::process_id` accessor for lifecycle coordination by generic hosts.
+
+### Fixed
+- Embedded client teardown now cancels producers blocked by full input or resize channels.
+
 ## [0.11.0] — 2026-09-03
 
 ### Changed

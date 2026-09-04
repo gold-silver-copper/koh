@@ -83,7 +83,11 @@ pub fn spawn_client_io() -> anyhow::Result<(ClientIoChannels, ClientIoTasks)> {
             tokio::select! {
                 () = resize_cancel.cancelled() => break,
                 received = sigwinch.recv() => {
-                    if received.is_none() || resize_tx.send(()).await.is_err() { break; }
+                    if received.is_none()
+                        || !send_resize(&resize_tx, &resize_cancel).await
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -99,6 +103,14 @@ pub fn spawn_client_io() -> anyhow::Result<(ClientIoChannels, ClientIoTasks)> {
             resize: Some(resize),
         },
     ))
+}
+
+async fn send_resize(sender: &mpsc::Sender<()>, cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => false,
+        result = sender.send(()) => result.is_ok(),
+    }
 }
 
 fn read_input<R: Read + AsFd>(
@@ -270,5 +282,26 @@ mod tests {
             .expect("shutdown failed");
         assert_eq!(receiver.recv().await, Some(vec![0]));
         assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_resize_blocked_by_a_full_channel() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.try_send(()).expect("fill resize channel");
+        let cancel = CancellationToken::new();
+        let resize_cancel = cancel.clone();
+        let resize = tokio::spawn(async move {
+            assert!(!send_resize(&sender, &resize_cancel).await);
+        });
+        let tasks = ClientIoTasks {
+            cancel,
+            input: None,
+            resize: Some(resize),
+        };
+
+        timeout(Duration::from_secs(1), tasks.shutdown())
+            .await
+            .expect("shutdown stalled on the full resize channel")
+            .expect("shutdown failed");
     }
 }

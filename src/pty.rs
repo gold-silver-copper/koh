@@ -359,7 +359,11 @@ impl Pty {
         if self.reaped.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        self.terminate_process_group(false)?;
+        let direct = self.killer.kill();
+        let group = self.terminate_process_group(false);
+        if let (Err(error), Err(_)) = (direct, group) {
+            return Err(error);
+        }
         std::thread::sleep(grace);
         match self.terminate_process_group(true) {
             Ok(()) => {}

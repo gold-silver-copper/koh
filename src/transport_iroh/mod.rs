@@ -86,7 +86,15 @@ pub enum SetupError {
 /// The key is always stored in the passphrase-encrypted `koh-key-v1` format (there is no plaintext
 /// format). A stable key gives the server a stable [`EndpointId`], mirroring iroh-ssh's `--persist`.
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
-    if path.exists() {
+    // `Path::exists` follows links and therefore reports a dangling symlink as absent. Inspect the
+    // directory entry itself so every existing node, including a dangling link, reaches the secure
+    // open/validation path before any key-creation credential is resolved.
+    let entry_exists = match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if entry_exists {
         // Refuse a dangerous containing dir FIRST (KOH-06/KR-06): the load below tightens the key's
         // perms and reads it, and in a dir where another user can unlink/replace entries they could
         // swap `id.key` for their own. (v0.4.2 narrowed this to a non-sticky *other*-writable dir so
@@ -1099,6 +1107,23 @@ mod tests {
         assert!(
             matches!(result, Err(SetupError::BadKeyFile)),
             "a symlinked key path must be refused, got {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_a_dangling_symlink_before_resolving_creation_credentials() {
+        let dir = std::env::temp_dir().join(format!("koh-dangling-keylink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_dir_private(&dir).unwrap();
+        let link = dir.join("server.key");
+        std::os::unix::fs::symlink(dir.join("missing"), &link).unwrap();
+
+        let result = load_or_create_secret_key(&link);
+        assert!(
+            matches!(result, Err(SetupError::BadKeyFile)),
+            "a dangling symlink must be rejected before key creation, got {result:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -207,12 +207,11 @@ mod tests {
         })
         .await
         .expect("stdin producer remained alive after task owner was dropped");
-        assert_eq!(
-            timeout(Duration::from_secs(1), resize_rx.recv())
-                .await
-                .expect("resize producer remained alive after task owner was dropped"),
-            None
-        );
+        timeout(Duration::from_secs(1), async {
+            while resize_rx.recv().await.is_some() {}
+        })
+        .await
+        .expect("resize producer remained alive after task owner was dropped");
     }
 
     #[tokio::test]

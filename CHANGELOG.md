@@ -15,6 +15,12 @@ internal and unstable (see `src/lib.rs`).
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
 > 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.9.1.
 
+## [0.12.1] — 2026-09-04
+
+### Fixed
+- Concurrent first-time identity creation now atomically elects one persistent key, and every
+  contender loads that key using the documented new-key passphrase in headless environments.
+
 ## [0.12.0] — 2026-09-03
 
 ### Added

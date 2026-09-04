@@ -352,16 +352,29 @@ impl Pty {
     /// The child is deliberately not reaped between SIGHUP and SIGKILL: its zombie reserves the
     /// leader PID, so the process-group id cannot be recycled while descendants receive the hard
     /// stop. This closes descendants that ignore SIGHUP without signaling an unrelated group.
-    pub fn shutdown_process_group(&mut self, grace: Duration) -> std::io::Result<()> {
+    pub fn shutdown_process_group(
+        &mut self,
+        grace: Duration,
+    ) -> std::io::Result<Option<ExitStatus>> {
         if self.reaped.load(Ordering::SeqCst) {
-            return Ok(());
+            return Ok(None);
         }
         self.terminate_process_group(false)?;
         std::thread::sleep(grace);
         match self.terminate_process_group(true) {
-            Ok(()) => Ok(()),
-            Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => Ok(()),
-            Err(error) => Err(error),
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => {}
+            Err(error) => return Err(error),
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(Some(status));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 

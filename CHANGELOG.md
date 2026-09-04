@@ -19,7 +19,8 @@ internal and unstable (see `src/lib.rs`).
 
 ### Added
 - Public cancellation-aware terminal input and resize producers for embedded clients.
-- A documented `Pty::process_id` accessor for lifecycle coordination by generic hosts.
+- Documented `Pty::process_id` inspection and reaped-safe process-group teardown for lifecycle
+  coordination by generic hosts.
 
 ### Fixed
 - Embedded client teardown now cancels producers blocked by full input or resize channels.

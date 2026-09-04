@@ -320,6 +320,32 @@ impl Pty {
         self.killer.kill()
     }
 
+    /// Signals the entire process group rooted at the spawned child.
+    ///
+    /// `force = false` sends SIGHUP for graceful wrapper/descendant teardown; `force = true`
+    /// sends SIGKILL. Once the child has been reaped this is a no-op, preventing a recycled pid
+    /// from being interpreted as a process-group id.
+    pub fn terminate_process_group(&self, force: bool) -> std::io::Result<()> {
+        if self.reaped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        if let Some(pid) = self.process_id().and_then(|pid| i32::try_from(pid).ok()) {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+            return kill(
+                Pid::from_raw(-pid),
+                if force {
+                    Signal::SIGKILL
+                } else {
+                    Signal::SIGHUP
+                },
+            )
+            .map_err(std::io::Error::other);
+        }
+        Ok(())
+    }
+
     /// Force-kill the child with SIGKILL (which cannot be trapped). portable-pty's cloned killer
     /// only sends SIGHUP, so a child that ignores SIGHUP (e.g. `trap '' HUP`) would otherwise keep
     /// the PTY slave fd open and wedge the reader thread on a blocking `read()` forever — leaking a

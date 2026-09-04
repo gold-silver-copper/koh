@@ -344,8 +344,12 @@ impl Pty {
         }
     }
 
-    /// The child's process id, if known.
-    fn process_id(&self) -> Option<u32> {
+    /// Returns the spawned child's operating-system process id, when the backend exposes one.
+    ///
+    /// The value is informational and may remain present after the child exits; callers must not
+    /// use it for signaling because a reaped pid can be recycled. Use [`Self::kill`] instead.
+    #[must_use]
+    pub fn process_id(&self) -> Option<u32> {
         self.child.process_id()
     }
 }

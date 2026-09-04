@@ -17,6 +17,19 @@ use std::time::Duration;
 
 use koh::pty::Pty;
 
+#[test]
+fn spawned_child_exposes_a_real_process_id() {
+    let (pty, _rx) = Pty::spawn(
+        24,
+        80,
+        &["/bin/sh".into(), "-c".into(), "sleep 1".into()],
+        "xterm-256color",
+    )
+    .expect("spawn child");
+    assert!(pty.process_id().is_some_and(|pid| pid > 0));
+    pty.shutdown();
+}
+
 #[tokio::test]
 #[allow(
     clippy::match_wild_err_arm,

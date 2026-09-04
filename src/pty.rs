@@ -328,26 +328,36 @@ impl Pty {
             return Ok(None);
         }
         #[cfg(unix)]
-        let r = self
-            .process_id()
-            .and_then(|pid| i32::try_from(pid).ok())
-            .map_or(Ok(None), |pid| {
-                use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-                use nix::unistd::Pid;
-                match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG))
-                    .map_err(std::io::Error::other)?
-                {
-                    WaitStatus::Exited(_, code) => Ok(Some(GroupExitStatus {
-                        code: u32::try_from(code).unwrap_or(u32::MAX),
-                        signal: None,
-                    })),
-                    WaitStatus::Signaled(_, signal, _) => Ok(Some(GroupExitStatus {
-                        code: 128 + signal as u32,
-                        signal: Some(format!("{signal:?}")),
-                    })),
-                    _ => Ok(None),
-                }
-            });
+        let child: &mut dyn portable_pty::Child = self.child.as_mut();
+        let r = if let Some(child) = child.downcast_mut::<std::process::Child>() {
+            use std::os::unix::process::ExitStatusExt;
+            child.try_wait().map(|status| {
+                status.map(|status| {
+                    let signal = status.signal();
+                    GroupExitStatus {
+                        code: signal.map_or_else(
+                            || u32::try_from(status.code().unwrap_or_default()).unwrap_or(u32::MAX),
+                            |signal| {
+                                128_u32.saturating_add(u32::try_from(signal).unwrap_or(u32::MAX))
+                            },
+                        ),
+                        signal: signal.map(|signal| {
+                            nix::sys::signal::Signal::try_from(signal).map_or_else(
+                                |_| format!("SIG{signal}"),
+                                |signal| format!("{signal:?}"),
+                            )
+                        }),
+                    }
+                })
+            })
+        } else {
+            self.child.try_wait().map(|status| {
+                status.map(|status| GroupExitStatus {
+                    code: status.exit_code(),
+                    signal: status.signal().map(str::to_owned),
+                })
+            })
+        };
         #[cfg(not(unix))]
         let r = self.child.try_wait().map(|status| {
             status.map(|status| GroupExitStatus {

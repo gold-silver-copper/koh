@@ -229,6 +229,8 @@ struct ServerSession<S: SyncState> {
     echo: EchoAck,
     /// Whether the screen may have changed since the last grid snapshot (S-03).
     dirty: bool,
+    /// Whether this connection has installed the terminal host's final snapshot.
+    terminal_snapshot_taken: bool,
 }
 
 impl<S: SyncState> ServerSession<S> {
@@ -240,6 +242,7 @@ impl<S: SyncState> ServerSession<S> {
             cursor_keys: CursorKeyNormalizer::default(),
             echo: EchoAck::default(),
             dirty: true, // snapshot on the first pass
+            terminal_snapshot_taken: false,
         }
     }
 
@@ -271,19 +274,23 @@ impl<S: SyncState> ServerSession<S> {
         }
     }
 
-    /// Whether a fresh grid snapshot must be installed this wake: the screen is dirty OR the echo-ack
-    /// advanced (which must ship even with no grid change, else prediction-confirmation timing
-    /// breaks). The shell takes the (expensive) snapshot under the session lock only when this is true.
-    const fn needs_snapshot(&self, echo_changed: bool) -> bool {
-        self.dirty || echo_changed
+    /// Whether a fresh grid snapshot must be installed this wake: the screen is dirty, the echo-ack
+    /// advanced, or the host is terminal. The final case is intentionally per connection: a shared
+    /// host cannot know which independent transports have consumed its final state, so every clean
+    /// viewer takes one authoritative snapshot before beginning its shutdown handshake.
+    const fn needs_snapshot(&self, echo_changed: bool, child_alive: bool) -> bool {
+        self.dirty || echo_changed || (!child_alive && !self.terminal_snapshot_taken)
     }
 
     /// Install the freshly-taken screen snapshot (present iff [`needs_snapshot`](Self::needs_snapshot)
     /// said so) and clear the dirty flag. A skipped snapshot leaves `current_state` equal to the
     /// still-current screen, so the next `tick` correctly emits acks-only with no missed update.
-    fn install_snapshot(&mut self, snapshot: Option<S>) {
+    fn install_snapshot(&mut self, snapshot: Option<S>, child_alive: bool) {
         if let Some(state) = snapshot {
             *self.transport.current_mut() = state;
+            if !child_alive {
+                self.terminal_snapshot_taken = true;
+            }
         }
         self.dirty = false;
     }
@@ -377,8 +384,8 @@ pub async fn run_attached<H: SessionHost>(
         // or the echo-ack advanced (S-03). The ack is stamped onto the snapshot outside the lock.
         let echo_changed = session.set_echo_ack(now);
         let child_alive = {
-            let take = session.needs_snapshot(echo_changed);
-            if take {
+            let initially_dirty = session.needs_snapshot(echo_changed, true);
+            if initially_dirty {
                 // Mark the change signal seen BEFORE snapshotting: a pulse that lands after this
                 // point (from a change this snapshot may or may not include) re-fires `changed()`
                 // below and costs at most one redundant snapshot. Marking it after the snapshot
@@ -386,13 +393,21 @@ pub async fn run_attached<H: SessionHost>(
                 let _ = changed.borrow_and_update();
             }
             let mut s = handle.session.lock().await;
+            let alive_before_snapshot = s.host.alive();
+            let take = session.needs_snapshot(echo_changed, alive_before_snapshot);
+            if take && !initially_dirty {
+                // A terminal host forces a final snapshot even for a connection that did not yet
+                // observe the shared change pulse. Mark that pulse seen for this receiver before
+                // taking the state, matching the normal dirty-snapshot ordering above.
+                let _ = changed.borrow_and_update();
+            }
             let mut snapshot = take.then(|| s.host.snapshot());
             let alive = s.host.alive();
             drop(s);
             if let Some(state) = snapshot.as_mut() {
                 H::stamp_echo_ack(state, session.echo_ack());
             }
-            session.install_snapshot(snapshot);
+            session.install_snapshot(snapshot, alive);
             alive
         };
         let sleep_ms = session.wait_ms(now, session.echo_ack_wait_time(now));
@@ -662,16 +677,31 @@ mod tests {
         // The S-03 dirty/echo-ack snapshot decision, isolated from the lock + the real emulator —
         // over a non-terminal state (KH-01): the core is state-agnostic.
         let mut s = ServerSession::<GridState>::new(0, 1200);
-        assert!(s.needs_snapshot(false), "the first pass always snapshots");
-        s.install_snapshot(Some(GridState::default()));
-        assert!(!s.needs_snapshot(false), "clean after a snapshot");
         assert!(
-            s.needs_snapshot(true),
+            s.needs_snapshot(false, true),
+            "the first pass always snapshots"
+        );
+        s.install_snapshot(Some(GridState::default()), true);
+        assert!(
+            !s.needs_snapshot(false, true),
+            "clean live host skips a snapshot"
+        );
+        assert!(
+            s.needs_snapshot(true, true),
             "an echo-ack advance forces a snapshot even when clean (else confirmations stall)"
+        );
+        assert!(
+            s.needs_snapshot(false, false),
+            "every clean connection snapshots terminal host state before shutdown"
+        );
+        s.install_snapshot(Some(GridState::default()), false);
+        assert!(
+            !s.needs_snapshot(false, false),
+            "a connection does not repeatedly clone terminal state during shutdown retries"
         );
         s.mark_dirty();
         assert!(
-            s.needs_snapshot(false),
+            s.needs_snapshot(false, true),
             "a changed-pulse / applied resize re-arms the snapshot"
         );
     }

@@ -17,7 +17,7 @@ mod io;
 mod render;
 
 pub use backend::{DefaultBackend, KohBackend};
-pub use cli::{connect, connect_with, run_id, BellHook, ConnectConfig, IdConfig};
+pub use cli::{connect, run_id, BellHook, ConnectConfig, IdConfig};
 #[cfg(feature = "cli")]
 pub use cli::{ConnectArgs, IdArgs};
 pub use io::{spawn_client_io, ClientIoChannels, ClientIoTasks};
@@ -440,6 +440,7 @@ pub struct ClientSession<S: ClientState = TerminalScreen> {
     predictor: PredictionEngine,
     /// True after we've seen the lone escape prefix and are waiting for the next byte.
     pending_escape: bool,
+    escape_keys: bool,
     /// Set whenever the rendered output may have changed; cleared once the caller repaints.
     dirty: bool,
     /// Whether the "link down" banner was painted last frame, so we force one more repaint to
@@ -467,6 +468,7 @@ impl<S: ClientState> ClientSession<S> {
             transport,
             predictor,
             pending_escape: false,
+            escape_keys: true,
             dirty: true,
             status_was_shown: false,
         }
@@ -480,7 +482,7 @@ impl<S: ClientState> ClientSession<S> {
         let mut suspend = false;
         let mut fwd: Vec<u8> = Vec::with_capacity(bytes.len());
         for &b in bytes {
-            if self.pending_escape {
+            if self.escape_keys && self.pending_escape {
                 self.pending_escape = false;
                 if b == b'.' {
                     quit = true;
@@ -492,7 +494,7 @@ impl<S: ClientState> ClientSession<S> {
                 }
                 fwd.push(ESCAPE_PREFIX);
                 fwd.push(b);
-            } else if b == ESCAPE_PREFIX {
+            } else if self.escape_keys && b == ESCAPE_PREFIX {
                 self.pending_escape = true;
             } else {
                 fwd.push(b);
@@ -709,11 +711,43 @@ pub async fn run_client_with<S: ClientState, T: ClientTerminal<S>>(
     connector: IrohConnector,
     pref: DisplayPreference,
     initial_size: (u16, u16),
+    input_rx: mpsc::Receiver<Vec<u8>>,
+    resize_rx: mpsc::Receiver<()>,
+    term: T,
+    shutdown: CancellationToken,
+    bell: Option<BellHook>,
+) -> anyhow::Result<Option<u32>> {
+    run_client_configured(
+        initial,
+        connector,
+        pref,
+        initial_size,
+        input_rx,
+        resize_rx,
+        term,
+        shutdown,
+        bell,
+        true,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the application chooses its input policy in addition to run_client collaborators"
+)]
+#[expect(clippy::future_not_send, reason = "see run_client")]
+pub(crate) async fn run_client_configured<S: ClientState, T: ClientTerminal<S>>(
+    initial: IrohChannel,
+    connector: IrohConnector,
+    pref: DisplayPreference,
+    initial_size: (u16, u16),
     mut input_rx: mpsc::Receiver<Vec<u8>>,
     mut resize_rx: mpsc::Receiver<()>,
     mut term: T,
     shutdown: CancellationToken,
     mut bell: Option<BellHook>,
+    escape_keys: bool,
 ) -> anyhow::Result<Option<u32>> {
     let clock = MonoClock::new();
     let mut channel = initial;
@@ -732,6 +766,7 @@ pub async fn run_client_with<S: ClientState, T: ClientTerminal<S>>(
             rows,
             cols,
         );
+        session.escape_keys = escape_keys;
 
         let conn_started = clock.now_ms();
         match drive_connection(
@@ -968,6 +1003,11 @@ async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
 ) -> ReconnectOutcome {
     let started = clock.now_ms();
     let mut pending_escape = false;
+    let quit_hint = if last.escape_keys {
+        " (Ctrl-^ . to quit)"
+    } else {
+        ""
+    };
     'attempt: loop {
         // Back off BEFORE dialing whenever we've already failed a dial or the previous connection
         // dropped too fast (`*attempt > 0`). The caller seeds `*attempt` from the just-dropped
@@ -979,15 +1019,14 @@ async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
             let wait_until = clock.now_ms().saturating_add(backoff_ms(*attempt));
             while clock.now_ms() < wait_until {
                 let secs = clock.now_ms().saturating_sub(started) / 1000;
-                let banner =
-                    format!("[koh] disconnected — reconnecting… {secs}s (Ctrl-^ . to quit)");
+                let banner = format!("[koh] disconnected — reconnecting… {secs}s{quit_hint}");
                 let _ = term.render(last.state(), &Overlay::empty(), Some(banner.as_str()));
                 let remaining = wait_until.saturating_sub(clock.now_ms());
                 tokio::select! {
                     biased;
                     maybe = input_rx.recv() => match maybe {
                         Some(chunk) => {
-                            if escape_quit(&chunk, &mut pending_escape) {
+                            if last.escape_keys && escape_quit(&chunk, &mut pending_escape) {
                                 return ReconnectOutcome::Quit;
                             }
                         }
@@ -1002,7 +1041,7 @@ async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
         tokio::pin!(dial);
         loop {
             let secs = clock.now_ms().saturating_sub(started) / 1000;
-            let banner = format!("[koh] disconnected — reconnecting… {secs}s (Ctrl-^ . to quit)");
+            let banner = format!("[koh] disconnected — reconnecting… {secs}s{quit_hint}");
             let _ = term.render(last.state(), &Overlay::empty(), Some(banner.as_str()));
 
             tokio::select! {
@@ -1011,7 +1050,7 @@ async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
                 maybe = input_rx.recv() => {
                     match maybe {
                         Some(chunk) => {
-                            if escape_quit(&chunk, &mut pending_escape) {
+                            if last.escape_keys && escape_quit(&chunk, &mut pending_escape) {
                                 return ReconnectOutcome::Quit;
                             }
                         }

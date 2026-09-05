@@ -27,13 +27,15 @@
 //!   over iroh, plus `koh serve` and the generic [`server::serve_with`].
 //! - [`client`] — input + `Transport<Input, State>` + predictor + a backend-agnostic renderer
 //!   (the [`client::backend`] seam: `termina` by default; `crossterm` / `qwertty` optional), plus
-//!   `koh connect` and the generic [`client::connect_with`] over any [`client::ClientState`].
+//!   `koh connect` and the generic [`embed::Connection`] over any [`client::ClientState`].
+//! - [`identity`] — opaque unlocked identities, private credential storage/prompting and reset leases.
+//! - [`embed`] — transport-independent authenticated connections and hosted application sessions.
 //! - [`keycmd`] — `koh key`: change the identity key's encryption passphrase (`ssh-keygen -p`-style).
 //!
 //! Dependency direction is strict: `wire ← ssp ← {terminal, input}`, with `predict` over
 //! `{terminal, input}`, `transport_iroh` over `wire`, and `server`/`client` on top. The entire
 //! protocol (`ssp`, `terminal`, `input`, `predict`, `wire`) is transport-agnostic — only
-//! `transport_iroh`, `server`, and `client` touch iroh. (A CI check enforces the load-bearing edges:
+//! `transport_iroh`, `identity`, `embed`, `server`, and `client` touch iroh. (A CI check enforces the load-bearing edges:
 //! `predict` imports nothing from `crate::`, and `server`/`client` never `use crate::wire` directly.)
 //!
 //! ## Public API stability
@@ -49,7 +51,7 @@
 //! - since 0.11, the generic seams: [`server::SessionHost`], [`server::HostProvider`]
 //!   ([`server::PtyHosts`], [`server::SharedHost`]), [`server::serve_with`] with [`server::Hosts`],
 //!   [`server::ClientId`]; [`client::ClientState`], [`client::ClientTerminal`],
-//!   [`client::connect_with`], [`client::run_client`], [`client::BellHook`]; [`predict::ScreenView`];
+//!   [`embed::Connection`], [`client::run_client`], [`client::BellHook`]; [`predict::ScreenView`];
 //!   [`transport_iroh::TERMINAL_ALPN`]; and [`terminal::ServerTerminal`]'s `progress` /
 //!   `take_unhandled_oscs` accessors.
 //!
@@ -80,6 +82,8 @@
 //! to sync a state of your own.
 
 pub mod client;
+pub mod embed;
+pub mod identity;
 pub mod input;
 pub mod keycmd;
 pub mod predict;

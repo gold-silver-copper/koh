@@ -45,3 +45,45 @@ fn concurrent_public_first_create_uses_the_new_passphrase_for_the_loser() {
     assert!(key.is_file(), "one identity key was published");
     std::fs::remove_dir_all(dir).expect("remove test state directory");
 }
+
+#[test]
+fn reset_accepts_a_relative_key_path_only_after_explicit_confirmation() {
+    use std::os::unix::fs::PermissionsExt as _;
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory = Directory(std::env::temp_dir().join(format!(
+        "koh-relative-reset-{}",
+        koh::identity::Identity::generate().endpoint_id()
+    )));
+    std::fs::create_dir(&directory.0).expect("private directory");
+    std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700))
+        .expect("private mode");
+    let path = directory.0.join("identity.key");
+    std::fs::write(&path, b"disposable corrupt key").expect("disposable identity");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("key mode");
+    let run = |confirmed: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_koh"));
+        command
+            .current_dir(&directory.0)
+            .env_clear()
+            .args(["key", "reset", "--key-file", "identity.key"])
+            .stdin(Stdio::null());
+        if confirmed {
+            command.arg("--yes");
+        }
+        command.output().expect("reset command")
+    };
+    assert!(!run(false).status.success());
+    assert!(path.exists(), "unconfirmed reset removed key");
+    let output = run(true);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!path.exists(), "confirmed reset retained key");
+}

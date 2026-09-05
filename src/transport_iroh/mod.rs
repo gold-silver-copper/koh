@@ -313,7 +313,7 @@ fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<bool> {
 
 /// Create `dir` (recursively) restricted to the owner (mode 0700 on unix) so a freshly-created
 /// state dir doesn't expose its contents. Off-unix this is a plain recursive create.
-fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -437,7 +437,7 @@ fn tighten_key_perms_via_fd(file: &std::fs::File, path: &Path, meta: &std::fs::M
 /// group/other-**readable** (but not writable) dir only grants traverse, so it
 /// just warns — `create_dir_private` already makes koh-created dirs 0700, so this only fires on a
 /// pre-existing loosened dir or a shared fallback location. No-op off-unix / for the CWD.
-fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
+pub(crate) fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

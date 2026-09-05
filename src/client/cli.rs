@@ -6,21 +6,13 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::predict::DisplayPreference;
-use crate::transport_iroh::{
-    bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, format_endpoint_id,
-    load_or_create_secret_key, parse_endpoint_id, parse_relay_url, relay_addr,
-};
 use anyhow::Context;
 #[cfg(feature = "cli")]
 use clap::Args;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{
-    run_client_with, BackendTerminal, ClientState, ClientTerminal, DefaultBackend, IrohConnector,
-};
+use crate::client::{BackendTerminal, DefaultBackend};
 use crate::transport_iroh::TERMINAL_ALPN;
 
 /// Configuration for [`connect`] — the clap-free, library-facing form of `koh connect`'s
@@ -290,13 +282,8 @@ pub fn run_id(config: impl Into<IdConfig>) -> anyhow::Result<()> {
         Some(p) => p,
         None => crate::transport_iroh::default_key_path("client")?,
     };
-    let secret = load_or_create_secret_key(&key_file).with_context(|| {
-        format!(
-            "loading client key from {} (pass --key-file to use a writable path)",
-            key_file.display()
-        )
-    })?;
-    println!("{}", format_endpoint_id(&secret.public()));
+    let identity = crate::identity::load(&key_file)?;
+    println!("{}", identity.endpoint_id());
     Ok(())
 }
 
@@ -307,7 +294,7 @@ pub fn run_id(config: impl Into<IdConfig>) -> anyhow::Result<()> {
 ///
 /// Takes over the calling process's terminal (raw mode, alternate screen) and its stdin for the
 /// session's lifetime, and installs signal handlers; call it from a binary's main path. This is
-/// [`connect_with`] over [`TERMINAL_ALPN`], the real terminal, a raw-stdin reader and SIGWINCH.
+/// [`crate::embed::Connection`] over [`TERMINAL_ALPN`], the real terminal, a raw-stdin reader and SIGWINCH.
 pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<u32>> {
     let args: ConnectConfig = config.into();
     // The TUI owns the terminal, so logs go to a file (set $KOH_LOG) to avoid corrupting it.
@@ -373,22 +360,26 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
     // diagnosable rather than mysterious.
     warn_if_locale_not_utf8();
 
+    let identity = crate::identity::load_client(args.key_file.as_deref())?;
+    let connection = crate::embed::Connection::connect(&args, TERMINAL_ALPN, &identity).await?;
+    let shutdown = CancellationToken::new();
+    spawn_signal_shutdown(shutdown.clone())?;
     let (channels, tasks) = super::spawn_client_io()?;
-
-    let clipboard_enabled = args.clipboard;
-    let result = connect_with(
-        args,
-        TERMINAL_ALPN,
-        move || {
-            // --- real terminal I/O wiring: raw mode + alt screen via the build-selected KohBackend
-            // (termina by default), restored on drop ---
-            let backend = DefaultBackend::new().context("acquiring the terminal")?;
-            BackendTerminal::enter(backend, clipboard_enabled)
-                .context("entering raw mode / alt screen")
-        },
-        channels.input_rx,
-        channels.resize_rx,
-    )
+    let result = async {
+        let backend = DefaultBackend::new().context("acquiring the terminal")?;
+        let terminal = BackendTerminal::enter(backend, args.clipboard)
+            .context("entering raw mode / alt screen")?;
+        connection
+            .with_koh_escape_keys()
+            .run(
+                terminal,
+                channels.input_rx,
+                channels.resize_rx,
+                shutdown,
+                args.bell_command.map(BellHook::new),
+            )
+            .await
+    }
     .await;
     let cleanup = tasks.shutdown().await;
     match (result, cleanup) {
@@ -400,116 +391,6 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
         (Ok(_), Err(cleanup)) => Err(cleanup),
         (Ok(value), Ok(())) => Ok(value),
     }
-}
-
-/// Connect to a server over `alpn` and run the reconnecting session against a caller-supplied
-/// terminal (KC-01, KH-02): the generic form of [`connect`].
-///
-/// `make_term` is called only after the first dial succeeded, so a bad-id / not-on-allowlist /
-/// wrong-ALPN error surfaces before the terminal is put into raw mode. `input_rx` carries typed
-/// bytes; `resize_rx` carries resize ticks (keep its sender alive). Installs SIGTERM/SIGINT/SIGHUP
-/// handlers that end the session cleanly. The caller owns tracing.
-#[expect(
-    clippy::future_not_send,
-    reason = "the future owns a terminal backend (`impl KohBackend`, deliberately not `Send`) and \
-              is driven on the caller's own task, never sent across threads; requiring `Send` \
-              would force every backend and embedder to be `Send` for no benefit"
-)]
-pub async fn connect_with<S: ClientState, T: ClientTerminal<S>>(
-    config: ConnectConfig,
-    alpn: &'static [u8],
-    make_term: impl FnOnce() -> anyhow::Result<T>,
-    input_rx: mpsc::Receiver<Vec<u8>>,
-    resize_rx: mpsc::Receiver<()>,
-) -> anyhow::Result<Option<u32>> {
-    let args = config;
-    let key_file = match args.key_file {
-        Some(p) => p,
-        None => crate::transport_iroh::default_key_path("client")?,
-    };
-    let secret = load_or_create_secret_key(&key_file).with_context(|| {
-        format!(
-            "loading client key from {} (pass --key-file to use a writable path)",
-            key_file.display()
-        )
-    })?;
-    let my_id = secret.public();
-    let server_id = parse_endpoint_id(&args.server).context("parsing server endpoint id")?;
-
-    eprintln!("koh id: {}", format_endpoint_id(&my_id));
-    eprintln!("  (add this to the server with --allow if it isn't already)");
-    eprintln!("connecting to {} …", format_endpoint_id(&server_id));
-
-    // Pick the dial strategy: a direct LAN/loopback address, a self-hosted relay, or the
-    // default n0 relay+discovery (bare endpoint id).
-    let (endpoint, target) = if let Some(addr) = args.direct {
-        let ep = bind_endpoint_local(secret, false)
-            .await
-            .context("binding endpoint")?;
-        (ep, direct_addr(server_id, addr))
-    } else if let Some(url) = &args.relay_url {
-        let relay = parse_relay_url(url)?;
-        let ep = bind_endpoint_with_relay(secret, false, relay.clone())
-            .await
-            .context("binding endpoint")?;
-        (ep, relay_addr(server_id, relay))
-    } else {
-        let ep = bind_endpoint(secret, false)
-            .await
-            .context("binding endpoint")?;
-        (ep, server_id.into())
-    };
-    // One connector dials the server for the initial connection and for every transparent reconnect.
-    // The first dial happens here — before raw mode — so a bad-id / not-on-allowlist error prints
-    // cleanly; later drops are re-dialed from inside run_client.
-    let connector = IrohConnector::with_alpn(endpoint.clone(), target, alpn);
-    // Bound the initial dial (KR-04): `connect()` does the QUIC handshake then awaits the server's
-    // admission ack, so a malicious/typo'd server that never admits could otherwise hang it at
-    // "connecting…" until iroh's 300s idle timeout. Use the same cap as the transparent-reconnect path.
-    let channel =
-        match tokio::time::timeout(super::RECONNECT_CONNECT_TIMEOUT, connector.connect()).await {
-            Ok(r) => r?,
-            Err(_) => anyhow::bail!(
-                "timed out connecting to {} (the server may be unreachable or not responding)",
-                format_endpoint_id(&server_id)
-            ),
-        };
-    eprintln!("connected. (Ctrl-^ then . to disconnect)");
-
-    // Arm graceful shutdown BEFORE entering raw mode, so there's no window where a fatal signal —
-    // SIGTERM (`kill`), SIGINT (`kill -INT`; in raw mode Ctrl-C is a forwarded byte, not a signal),
-    // or SIGHUP (the controlling terminal closed) — kills us at default disposition with the TTY
-    // already raw. Cancelling the token makes run_client return, which drops `term` and restores the
-    // terminal; if a signal lands during setup below, the first loop iteration returns immediately.
-    let shutdown = CancellationToken::new();
-    spawn_signal_shutdown(shutdown.clone())?;
-
-    let term = make_term()?;
-    let (rows, cols) = term.size().unwrap_or((24, 80));
-
-    let result = run_client_with(
-        channel,
-        connector,
-        // Local-echo prediction is always on: keystrokes show immediately, with the engine's
-        // epoch gate still suppressing them at non-echoing (password) prompts. There is no
-        // user-facing toggle — the adaptive/never policies were removed.
-        DisplayPreference::Always,
-        (rows, cols),
-        input_rx,
-        resize_rx,
-        term,
-        shutdown,
-        args.bell_command.map(BellHook::new),
-    )
-    .await;
-    // `term` is moved into run_client and dropped there, restoring the terminal.
-
-    // Close gracefully so the server can detach our session promptly — but cap the wait. On a dead
-    // link (e.g. the network died while the phone was suspended) iroh's graceful close blocks until
-    // the connection idle-times out (minutes), which would freeze the parent shell with no prompt
-    // until koh finally exits. After the cap we just drop the endpoint and exit immediately.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.close()).await;
-    result
 }
 
 #[cfg(test)]

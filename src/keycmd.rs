@@ -12,8 +12,7 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use crate::transport_iroh::{
-    default_key_path, enforce_passphrase_strength, format_endpoint_id, load_or_create_secret_key,
-    write_identity_key,
+    default_key_path, enforce_passphrase_strength, format_endpoint_id, write_identity_key,
 };
 
 /// What [`run`] should do to the key.
@@ -24,6 +23,8 @@ pub enum KeyOp {
     Passwd,
     /// Print the key's encryption status and endpoint id (never the secret).
     Info,
+    /// Remove an unused identity after acknowledging endpoint-ID and allowlist changes.
+    Reset { confirmed: bool },
 }
 
 /// Configuration for [`run`] — the clap-free, library-facing form of `koh key`'s arguments.
@@ -56,6 +57,12 @@ enum KeyCmd {
     Passwd,
     /// Print the key's encryption status and endpoint id (never the secret).
     Info,
+    /// Delete an unused identity; the next use creates a new endpoint ID.
+    Reset {
+        /// Acknowledge permanent identity loss and required allowlist updates.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[cfg(feature = "cli")]
@@ -65,6 +72,7 @@ impl From<KeyArgs> for KeyConfig {
             op: match a.cmd {
                 KeyCmd::Passwd => KeyOp::Passwd,
                 KeyCmd::Info => KeyOp::Info,
+                KeyCmd::Reset { yes } => KeyOp::Reset { confirmed: yes },
             },
             key_file: a.key_file,
         }
@@ -79,6 +87,15 @@ pub fn run(config: impl Into<KeyConfig>) -> anyhow::Result<()> {
         Some(p) => p,
         None => default_key_path("client")?,
     };
+    if let KeyOp::Reset { confirmed } = args.op {
+        anyhow::ensure!(confirmed, "reset permanently deletes {}; the next use changes the endpoint ID and requires allowlist updates. Stop active users, then repeat with --yes", key_file.display());
+        crate::identity::reset(&key_file)?;
+        println!(
+            "Removed {}. The next use creates a new endpoint ID; update remote allowlists.",
+            key_file.display()
+        );
+        return Ok(());
+    }
     anyhow::ensure!(
         key_file.exists(),
         "no identity key at {} — run `koh id` (or `koh connect`/`koh serve`) to create one first, \
@@ -87,8 +104,8 @@ pub fn run(config: impl Into<KeyConfig>) -> anyhow::Result<()> {
     );
     // Loading prompts for the CURRENT passphrase ($KOH_KEY_PASSPHRASE or a TTY prompt) and yields the
     // secret key, whose bytes we then re-persist unchanged — preserving the endpoint id.
-    let secret = load_or_create_secret_key(&key_file)
-        .with_context(|| format!("loading identity key from {}", key_file.display()))?;
+    let identity = crate::identity::load(&key_file)?;
+    let secret = &identity.secret;
 
     match args.op {
         KeyOp::Info => {
@@ -96,7 +113,9 @@ pub fn run(config: impl Into<KeyConfig>) -> anyhow::Result<()> {
             println!("encryption  : koh-key-v1 (Argon2id + AES-256-GCM)");
             println!("endpoint id : {}", format_endpoint_id(&secret.public()));
         }
+        KeyOp::Reset { .. } => anyhow::bail!("reset was not dispatched"),
         KeyOp::Passwd => {
+            let _prompt = crate::identity::PromptTerminal::protect()?;
             // The NEW passphrase: `$KOH_KEY_NEW_PASSPHRASE` (automation/CI) or a confirmed prompt.
             // It must be non-empty — encryption is mandatory. The CURRENT passphrase was supplied to
             // the load above via `$KOH_KEY_PASSPHRASE` or its prompt.
@@ -119,7 +138,7 @@ pub fn run(config: impl Into<KeyConfig>) -> anyhow::Result<()> {
                 p1
             };
             enforce_passphrase_strength(&new)?;
-            write_identity_key(&key_file, &secret, &new)?;
+            write_identity_key(&key_file, secret, &new)?;
             eprintln!(
                 "koh: identity key re-encrypted at {} (koh-key-v1). Set $KOH_KEY_PASSPHRASE for \
                  unattended `koh serve`.",

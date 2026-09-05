@@ -27,8 +27,7 @@ use crate::server::session::{ClientId, HostProvider, PtyHosts, SessionHost};
 use crate::server::{run_attached, session, SessionExit};
 use crate::transport_iroh::{
     bind_endpoint_alpns, bind_endpoint_local_alpns, bind_endpoint_with_relay_alpns,
-    format_endpoint_id, load_or_create_secret_key, parse_endpoint_id, parse_relay_url,
-    TERMINAL_ALPN,
+    format_endpoint_id, parse_endpoint_id, parse_relay_url, TERMINAL_ALPN,
 };
 use tracing::{error, info, warn};
 
@@ -440,12 +439,8 @@ pub async fn serve_with(config: impl Into<ServeConfig>, hosts: Hosts) -> anyhow:
         Some(p) => p,
         None => crate::transport_iroh::default_key_path("server")?,
     };
-    let secret = load_or_create_secret_key(&key_file).with_context(|| {
-        format!(
-            "loading server key from {} (pass --key-file to use a writable path)",
-            key_file.display()
-        )
-    })?;
+    let identity = crate::identity::load(&key_file)?;
+    let secret = identity.secret.clone();
 
     // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
     let alpns = hosts.alpns();

@@ -110,47 +110,55 @@ serve(ServeConfig {
 
 The `koh` binary is the same code behind clap; `cargo install koh` is unaffected.
 
-### Syncing a state of your own
+### Embedding a stateful application
 
-Since 0.11 the server hosts any `SyncState` producer and the client renders any `ClientState`, so
-a program can use koh's transport (SSP over iroh: loss-tolerant, reconnecting, detachable) for
-something other than a terminal screen. The state type a connection carries is selected by its
-ALPN, so old koh peers are never confused. A twenty-line sketch: a shared `String` that every
-authorized peer appends to.
+Use `koh::identity::Identity` and `koh::embed::{Connection, Server}` for application embedding.
+Applications do not need iroh types or networking internals. Implement `server::SessionHost` for
+application state/input and `client::{ClientState, ClientTerminal}` for rendering. Choose a distinct
+static protocol identifier for your state schema; koh's standalone shell uses its own protocol.
 
-```rust
-use koh::server::{serve_with, ClientId, Hosts, SessionHost, SharedHost, ServeConfig};
-use koh::ssp::SyncState;
+Load credentials before starting terminal readers:
 
-#[derive(Clone, Default, PartialEq)]
-struct Log(String);
-impl SyncState for Log {
-    type Diff = String; // the whole log; a real state diffs against `base`
-    const RECV_DECODE_LIMIT: usize = 1 << 20;
-    const RECEIVE_BUDGET_UNITS: usize = 1 << 24;
-    fn resource_units(&self) -> usize { self.0.len() }
-    fn diff_from(&self, _base: &Self) -> String { self.0.clone() }
-    fn apply(&mut self, d: &String) { self.0 = d.clone(); }
-}
-
-struct LogHost(Log);
-impl SessionHost for LogHost {
-    type State = Log;
-    fn snapshot(&mut self) -> Log { self.0.clone() }
-    fn input(&mut self, b: &[u8]) { self.0 .0.push_str(&String::from_utf8_lossy(b)); }
-    fn resize(&mut self, _: ClientId, _: u16, _: u16) {}
-    fn stamp_echo_ack(_: &mut Log, _: u64) {} // a real state carries it for the predictor
-    fn alive(&self) -> bool { true }
-}
-
-let hosts = Hosts::new().with(b"example/log/1", SharedHost::new(|| Ok(LogHost(Log::default()))));
-serve_with(ServeConfig { allow, ..Default::default() }, hosts).await?;
+```rust,no_run
+# async fn example<S: koh::client::ClientState, T: koh::client::ClientTerminal<S>>(
+# config: koh::client::ConnectConfig, term: T,
+# input_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+# resize_rx: tokio::sync::mpsc::Receiver<()>,
+# shutdown: tokio_util::sync::CancellationToken,
+# ) -> anyhow::Result<()> {
+let identity = koh::identity::load_client(config.key_file.as_deref())?;
+let connection = koh::embed::Connection::connect(&config, b"example/app/1", &identity).await?;
+// In a real application, create `term` and input producers only after the two steps above.
+connection.run(term, input_rx, resize_rx, shutdown, None).await?;
+# Ok(())
+# }
 ```
 
-On the client side, implement `koh::client::ClientState` for `Log` (title, exit code, echo-ack)
-and a `ClientTerminal<Log>` that prints it, then `connect_with(config, b"example/log/1", || Ok(term),
-input_rx, resize_rx)`. `tests/e2e_generic_host.rs` is the complete, runnable version of this over a
-real loopback connection.
+Keep the identity for the invocation and reuse it for later connections; reconnects already retain
+it internally. `IdentityStore` can cache path-based loads within an invocation. Encrypted key
+loading, prompting, private-path checks, and reset leases belong to koh. `Identity::transfer` and
+`receive` carry an unlocked identity across an application's private startup IPC; transferred
+bytes are secret material and must never enter arguments, logs, or public sockets. Receivers wipe
+the supplied buffer, including malformed input.
+
+`Server::bind` accepts a server identity, an allowlist of endpoint ID strings, the protocol ID,
+a `NetworkProfile`, a connection limit, and a factory for a shared `SessionHost`. koh authenticates
+and admits peers, limits connections, owns accept/reconnect tasks, and calls the host's session
+hooks. The application decides whether its workspace persists after a viewer disconnects.
+Networking shutdown does not replace application process/PTY cleanup.
+
+`Connection::connect` starts no terminal readers or signal handlers. Embedded input is byte-exact;
+`run` does not interpret koh CLI escape keys. The standalone client explicitly opts into
+`with_koh_escape_keys()`. Applications implement their own shortcuts and cancel the supplied token. The application owns those
+resources and must stop/join its producers after the connection finishes. Cancelling the supplied
+token ends `run`; normal completion waits at most two seconds for endpoint close. Dropping `run`
+releases its terminal and connection handles without waiting for asynchronous network shutdown.
+Call `Connection::close` to discard an admitted connection before running it. `Server::close`
+stops admissions and connections and joins its worker with a bounded shutdown wait. Applications
+should then complete their own workspace shutdown in their chosen lifecycle order.
+
+The standalone `koh connect` and `koh serve` remain independently useful. fux is an embedding
+consumer; koh does not depend on it or on zor.
 
 ## Highlights
 

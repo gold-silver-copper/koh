@@ -11,13 +11,13 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Receivers passed directly to [`super::connect_with`].
+/// Receivers passed directly to [`crate::embed::Connection`].
 pub struct ClientIoChannels {
     pub input_rx: mpsc::Receiver<Vec<u8>>,
     pub resize_rx: mpsc::Receiver<()>,
 }
 
-/// Owned producer tasks. Call [`shutdown`](Self::shutdown) after `connect_with` returns.
+/// Owned producer tasks. Call [`shutdown`](Self::shutdown) after the embedded connection returns.
 pub struct ClientIoTasks {
     cancel: CancellationToken,
     input: Option<JoinHandle<()>>,
@@ -63,7 +63,7 @@ impl Drop for ClientIoTasks {
     }
 }
 
-/// Starts byte-exact stdin and SIGWINCH producers for an embedded `connect_with` client.
+/// Starts byte-exact stdin and SIGWINCH producers for an embedded client that explicitly owns their lifecycle.
 pub fn spawn_client_io() -> anyhow::Result<(ClientIoChannels, ClientIoTasks)> {
     let runtime = tokio::runtime::Handle::try_current()
         .context("starting client I/O requires a Tokio runtime")?;

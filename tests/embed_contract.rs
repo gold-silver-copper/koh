@@ -206,3 +206,23 @@ async fn embedded_input_does_not_interpret_standalone_escape_keys() -> anyhow::R
     server.close();
     Ok(())
 }
+
+#[tokio::test]
+async fn protocol_mismatch_does_not_prevent_a_subsequent_valid_connection() -> anyhow::Result<()> {
+    let identity = Identity::generate();
+    let mut server = Server::bind(
+        Identity::generate(),
+        &BTreeSet::from([identity.endpoint_id()]),
+        PROTOCOL,
+        NetworkProfile::Local,
+        1,
+        || Ok(Host(None)),
+    )
+    .await?;
+    let rejected = Connection::connect(&config(&server), b"incompatible/1", &identity).await;
+    assert!(rejected.is_err());
+    let connection = connect(&server, &identity).await?;
+    connection.close().await;
+    server.close();
+    Ok(())
+}

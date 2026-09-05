@@ -48,6 +48,8 @@ name = "e2e_pty_binary"
 required-features = ["cli"]
 
 [dependencies]
+# Structured gateway CLI readiness records.
+serde_json = { version = "1", optional = true }
 # transport (pinned: iroh API churns; see README). iroh 1.0 brings its own QUIC backend (noq, a
 # quinn fork); we never depend on quinn directly.
 iroh = "=1.0.0"
@@ -116,7 +118,7 @@ data-encoding = "2"
 # `cli` owns clap and gates the `koh` binary, the `*Args` adapter structs, the `chaos` example and
 # the pty-binary e2e test. Library users (`default-features = false`) pick a backend and skip it.
 default = ["backend-termina", "cli"]
-cli = ["dep:clap"]
+cli = ["dep:serde_json", "dep:clap"]
 backend-termina = ["dep:termina"]
 backend-crossterm = ["dep:crossterm"]
 backend-qwertty = ["dep:qwertty"]

@@ -34,11 +34,18 @@ impl Connection {
             (bind_endpoint(secret, false).await?, server.into())
         };
         let connector = IrohConnector::with_alpn(endpoint.clone(), target, protocol);
-        let channel = tokio::time::timeout(std::time::Duration::from_secs(15), connector.connect())
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), connector.connect())
             .await
-            .context(
-                "timed out connecting to workspace (server unreachable or not responding)",
-            )??;
+            .context("timed out connecting to workspace (server unreachable or not responding)")
+            .and_then(std::convert::identity);
+        let channel = match result {
+            Ok(channel) => channel,
+            Err(error) => {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.close()).await;
+                return Err(error);
+            }
+        };
         Ok(Self {
             escape_keys: false,
             _identity: identity.clone(),

@@ -33,6 +33,8 @@ struct Cli {
 enum Cmd {
     /// Host a PTY shell for authorized clients.
     Serve(ServeArgs),
+    /// Authenticated access to an independently owned local Unix service.
+    Gateway(koh::gateway::cli::GatewayArgs),
     /// Connect to a koh server by its endpoint id.
     Connect(ConnectArgs),
     /// Print this machine's koh id (add it to a server's --allow list).
@@ -57,6 +59,7 @@ async fn main() -> std::process::ExitCode {
 
 async fn dispatch(cli: Cli) -> anyhow::Result<Option<u32>> {
     match cli.cmd {
+        Cmd::Gateway(args) => koh::gateway::cli::run(args).await.map(|()| None),
         Cmd::Serve(args) => koh::server::serve(args).await.map(|()| None),
         Cmd::Connect(args) => koh::client::connect(args).await,
         Cmd::Id(args) => koh::client::run_id(args).map(|()| None),

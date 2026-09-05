@@ -99,3 +99,5 @@ pub mod wire;
 /// `chaos` example; hidden from the public docs.
 #[doc(hidden)]
 pub mod sim;
+
+pub mod gateway;

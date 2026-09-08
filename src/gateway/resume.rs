@@ -89,9 +89,10 @@ enum Event {
     Broken(io::Error),
 }
 
-pub(super) struct Session {
-    local_read: tokio::net::unix::OwnedReadHalf,
-    local_write: tokio::net::unix::OwnedWriteHalf,
+pub(super) struct Session<R = tokio::net::unix::OwnedReadHalf, W = tokio::net::unix::OwnedWriteHalf>
+{
+    local_read: R,
+    local_write: W,
     received: VecDeque<Frame>,
     write_offset: usize,
     write_deadline: Option<tokio::time::Instant>,
@@ -105,6 +106,12 @@ pub(super) struct Session {
 impl Session {
     pub(super) fn new(local: UnixStream) -> Self {
         let (local_read, local_write) = local.into_split();
+        Self::from_parts(local_read, local_write)
+    }
+}
+impl<LocalRead: AsyncRead + Unpin, LocalWrite: AsyncWrite + Unpin> Session<LocalRead, LocalWrite> {
+    // Production Unix halves and deterministic bounded streams use the same session machine.
+    fn from_parts(local_read: LocalRead, local_write: LocalWrite) -> Self {
         Self {
             local_read,
             local_write,
@@ -341,6 +348,153 @@ impl Session {
 )]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn deterministic_window_and_framing_costs_are_bounded() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        #[derive(Default)]
+        struct PartialSink {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+        impl AsyncWrite for PartialSink {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let count = bytes.len().min(7);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                self.writes += 1;
+                Poll::Ready(Ok(count))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let (local, _app) = tokio::io::duplex(1);
+        let (read, write) = tokio::io::split(local);
+        let mut session = Session::from_parts(read, write);
+        for sequence in 0..WINDOW {
+            session
+                .receive(Frame::Data(sequence as u64, vec![42; CHUNK]))
+                .expect("within receive window");
+        }
+        let buffered: usize = session
+            .received
+            .iter()
+            .map(|frame| match frame {
+                Frame::Data(_, bytes) => bytes.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(buffered, WINDOW * CHUNK);
+        assert!(session
+            .receive(Frame::Data(WINDOW as u64, vec![42; CHUNK]))
+            .is_err());
+        assert_eq!(session.received.len(), WINDOW);
+        assert_eq!(
+            session.committed(),
+            0,
+            "buffering alone cannot acknowledge input"
+        );
+        let frame = session.received.front().expect("queued input");
+        let mut sink = PartialSink::default();
+        write_frame(&mut sink, frame).await.expect("partial writer");
+        assert_eq!(sink.bytes.len(), CHUNK + 11);
+        assert_eq!(
+            read_frame(&mut std::io::Cursor::new(&sink.bytes))
+                .await
+                .expect("round trip"),
+            *frame
+        );
+        let data_writes = sink.writes;
+        let before_ack = sink.bytes.len();
+        write_frame(&mut sink, &Frame::Ack(0))
+            .await
+            .expect("ack frame");
+        assert_eq!(sink.bytes.len() - before_ack, 9);
+        println!("deterministic cost: receive_bytes={buffered} receive_items={WINDOW} data_wire_bytes={} ack_wire_bytes=9 partial_write_calls={data_writes}", CHUNK + 11);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_application_pressure_preserves_partial_progress_until_deadline() {
+        let (local, mut app) = tokio::io::duplex(2);
+        let (read, write) = tokio::io::split(local);
+        let mut session = Session::from_parts(read, write);
+        session
+            .receive(Frame::Data(0, b"abcdef".to_vec()))
+            .expect("input frame");
+        let (wire, _peer) = tokio::io::duplex(64);
+        let (read, write) = tokio::io::split(wire);
+        let began = tokio::time::Instant::now();
+        let result = session.exchange(read, write).await;
+        assert!(
+            matches!(result, Err(Failure::Session(ref error)) if error.kind() == io::ErrorKind::TimedOut)
+        );
+        assert_eq!(began.elapsed(), DEADLINE);
+        assert_eq!(
+            session.committed(),
+            0,
+            "partial input cannot be acknowledged"
+        );
+        assert_eq!(session.write_offset, 2);
+        assert_eq!(session.received.len(), 1);
+        let mut prefix = [0; 2];
+        app.read_exact(&mut prefix).await.expect("written prefix");
+        assert_eq!(&prefix, b"ab");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_wire_frame_has_absolute_deadline_without_wall_clock_wait() {
+        let (mut wire, mut peer) = tokio::io::duplex(8);
+        peer.write_u8(0).await.expect("data frame tag without body");
+        let began = tokio::time::Instant::now();
+        assert!(read_frame(&mut wire).await.is_err());
+        assert_eq!(began.elapsed(), DEADLINE);
+    }
+
+    #[tokio::test]
+    async fn cancelling_exchange_releases_both_owned_streams() {
+        let (local, mut app) = tokio::io::duplex(8);
+        let (wire, mut peer) = tokio::io::duplex(64);
+        let task = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(local);
+            let mut session = Session::from_parts(read, write);
+            let (read, write) = tokio::io::split(wire);
+            session.exchange(read, write).await
+        });
+        assert_eq!(
+            read_frame(&mut peer)
+                .await
+                .expect("initial acknowledgement"),
+            Frame::Ack(0)
+        );
+        task.abort();
+        assert!(task.await.expect_err("cancelled owner").is_cancelled());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), app.read_u8())
+                .await
+                .expect("application closed")
+                .expect_err("EOF")
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), peer.read_u8())
+                .await
+                .expect("wire closed")
+                .expect_err("EOF")
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
 
     #[tokio::test]
     async fn lost_ack_reconnect_replays_no_application_bytes() {

@@ -125,6 +125,8 @@ backend-qwertty = ["dep:qwertty"]
 
 [dev-dependencies]
 proptest = "1"
+# Deterministic deadline tests; no network endpoint or wall-clock wait.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 opt-level = 3

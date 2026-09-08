@@ -177,7 +177,7 @@ async fn frame(stream: &mut tokio::net::UnixStream) -> anyhow::Result<serde_json
 async fn hello(stream: &mut tokio::net::UnixStream) -> anyhow::Result<()> {
     message(
         stream,
-        serde_json::json!({"type":"hello","version":2,"rows":24,"columns":80}),
+        serde_json::json!({"type":"hello","version":6,"rows":24,"columns":80}),
     )
     .await?;
     let value = tokio::time::timeout(Duration::from_secs(15), frame(stream)).await??;
@@ -185,7 +185,8 @@ async fn hello(stream: &mut tokio::net::UnixStream) -> anyhow::Result<()> {
         value
             .pointer("/hello/version")
             .and_then(serde_json::Value::as_u64),
-        Some(2)
+        Some(6),
+        "{value}"
     );
     Ok(())
 }
@@ -235,5 +236,134 @@ impl Drop for ChildGuard {
         }
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// An attachment allowlist is not a control allowlist, even for the same local user.
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn attachment_peer_cannot_use_separately_authorized_real_zor_control() -> anyhow::Result<()> {
+    let (Some(fux), Some(zor)) = (std::env::var_os("FUX_BIN"), std::env::var_os("ZOR_BIN")) else {
+        anyhow::ensure!(
+            std::env::var_os("KOH_REQUIRE_ZOR_BIN").is_none(),
+            "FUX_BIN and ZOR_BIN are required for separate-service authorization"
+        );
+        return Ok(());
+    };
+    let root = std::path::PathBuf::from(format!("/tmp/kg-control-{}", std::process::id()));
+    std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let cleanup = OwnedDirectory(root.clone());
+    let spawn = |binary: std::ffi::OsString| -> anyhow::Result<ChildGuard> {
+        Ok(ChildGuard(
+            std::process::Command::new(binary)
+                .arg("serve")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("HOME", &root)
+                .env("XDG_RUNTIME_DIR", &root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .env("SHELL", "/bin/sh")
+                .env("TERM", "xterm-256color")
+                .current_dir(&root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?,
+        ))
+    };
+    let mut multiplexer = spawn(fux)?;
+    let mut controller = spawn(zor)?;
+    let attachment_socket = root.join("fux/default.attach.sock");
+    let control_socket = root.join("zor/control.sock");
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while !attachment_socket.exists() || !control_socket.exists() {
+            anyhow::ensure!(
+                multiplexer.0.try_wait()?.is_none(),
+                "fux exited during startup"
+            );
+            anyhow::ensure!(
+                controller.0.try_wait()?.is_none(),
+                "zor exited during startup"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+    let viewer_identity = Identity::generate();
+    let controller_identity = Identity::generate();
+    let mut attachment = gateway::serve(
+        Identity::generate(),
+        BTreeSet::from([viewer_identity.endpoint_id()]),
+        NetworkProfile::Local,
+        attachment_socket,
+    )
+    .await?;
+    let mut control = gateway::serve(
+        Identity::generate(),
+        BTreeSet::from([controller_identity.endpoint_id()]),
+        NetworkProfile::Local,
+        control_socket,
+    )
+    .await?;
+    assert_ne!(attachment.endpoint_id(), control.endpoint_id());
+    let config = |service: &gateway::Service, name: &str| gateway::ConnectConfig {
+        server: service.endpoint_id(),
+        direct: service.direct_addr(),
+        relay_url: None,
+        socket: root.join(name),
+    };
+    let mut viewer =
+        gateway::connect(viewer_identity.clone(), config(&attachment, "viewer.sock")).await?;
+    let mut terminal = tokio::net::UnixStream::connect(root.join("viewer.sock")).await?;
+    hello(&mut terminal).await?;
+    let mut denied = gateway::connect(viewer_identity, config(&control, "denied.sock")).await?;
+    let mut forbidden = tokio::net::UnixStream::connect(root.join("denied.sock")).await?;
+    forbidden
+        .write_all(b"{\"v\":1,\"id\":1,\"op\":\"ping\"}\n")
+        .await?;
+    let mut byte = [0];
+    let response = tokio::time::timeout(Duration::from_secs(15), forbidden.read(&mut byte)).await?;
+    assert!(
+        response.is_err() || matches!(response, Ok(0)),
+        "attachment-only peer received control bytes"
+    );
+    let mut allowed =
+        gateway::connect(controller_identity, config(&control, "allowed.sock")).await?;
+    let mut stream = tokio::net::UnixStream::connect(root.join("allowed.sock")).await?;
+    stream
+        .write_all(b"{\"v\":1,\"id\":2,\"op\":\"ping\"}\n")
+        .await?;
+    let mut reader = tokio::io::BufReader::new(stream.take(4096));
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+    )
+    .await??;
+    let reply: serde_json::Value = serde_json::from_str(&line)?;
+    assert_eq!(reply["status"], "completed");
+    assert_eq!(reply["id"], 2);
+    assert!(reply["service_instance"].as_str().is_some());
+    allowed.close().await;
+    denied.close().await;
+    viewer.close().await;
+    control.close().await;
+    attachment.close().await;
+    assert!(multiplexer.0.try_wait()?.is_none());
+    assert!(controller.0.try_wait()?.is_none());
+    drop(controller);
+    drop(multiplexer);
+    drop(cleanup);
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+struct OwnedDirectory(std::path::PathBuf);
+#[cfg(feature = "cli")]
+impl Drop for OwnedDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

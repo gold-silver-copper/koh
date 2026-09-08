@@ -7,6 +7,16 @@ use tokio::sync::mpsc;
 #[tokio::test]
 async fn real_fux_keeps_its_pane_and_applies_input_once_across_five_quic_losses(
 ) -> anyhow::Result<()> {
+    real_fux_reconnect(false).await
+}
+
+#[tokio::test]
+async fn real_fux_rejects_resume_after_actual_retention_and_allows_fresh_attachment(
+) -> anyhow::Result<()> {
+    real_fux_reconnect(true).await
+}
+
+async fn real_fux_reconnect(expire: bool) -> anyhow::Result<()> {
     let Some(binary) = std::env::var_os("FUX_BIN") else {
         anyhow::ensure!(
             std::env::var_os("KOH_REQUIRE_FUX_BIN").is_none(),
@@ -14,8 +24,9 @@ async fn real_fux_keeps_its_pane_and_applies_input_once_across_five_quic_losses(
         );
         return Ok(());
     };
-    let root = std::path::PathBuf::from(format!("/tmp/krf-{}", std::process::id()));
+    let root = std::path::PathBuf::from(format!("/tmp/krf-{}-{expire}", std::process::id()));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let _directory = OwnedDirectory(root.clone());
     let fux = ChildGuard(
         std::process::Command::new(binary)
             .arg("serve")
@@ -68,8 +79,10 @@ async fn real_fux_keeps_its_pane_and_applies_input_once_across_five_quic_losses(
     let target = crate::transport_iroh::loopback_addr(&server);
     let acceptor = server.clone();
     let (links, mut connections) = mpsc::channel(1);
+    let registry = Arc::new(Registry::default());
+    let server_registry = Arc::clone(&registry);
     let server_task = tokio::spawn(async move {
-        let registry = Arc::new(Registry::default());
+        let registry = server_registry;
         let mut workers = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -94,8 +107,8 @@ async fn real_fux_keeps_its_pane_and_applies_input_once_across_five_quic_losses(
     });
     let (local, mut viewer) = UnixStream::pair()?;
     let client_endpoint = client.clone();
-    let mut client_task = tokio::spawn(run_client(local, client_endpoint, target));
-    let result = tokio::time::timeout(Duration::from_secs(15), async {
+    let mut client_task = tokio::spawn(run_client(local, client_endpoint, target.clone()));
+    let result = tokio::time::timeout(Duration::from_secs(if expire { 75 } else { 15 }), async {
             let mut connection = connections
                 .recv()
                 .await
@@ -120,6 +133,45 @@ async fn real_fux_keeps_its_pane_and_applies_input_once_across_five_quic_losses(
                 }
             }
             anyhow::ensure!(std::fs::read(root.join("effects"))? == b"xxxxxx", "input effects were replayed or lost");
+            if expire {
+                // Stop automatic redial so the authenticated session actually remains detached
+                // beyond the production retention window. Do not alter registry timestamps.
+                client_task.abort();
+                let _ = (&mut client_task).await;
+                client_task = tokio::spawn(async { Ok(()) });
+                connection.close(77_u32.into(), b"outage beyond retention");
+                let key = *registry.entries().keys().next().ok_or_else(|| anyhow::anyhow!("retained session key"))?;
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let released = registry.entries().get(&key)
+                            .is_some_and(|entry| entry.try_lock().is_ok());
+                        if released { break; }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await?;
+                tokio::time::sleep(RETENTION + Duration::from_secs(1)).await;
+                let expired = client.connect(target.clone(), ALPN).await?;
+                crate::transport_iroh::admission::await_admission(&expired).await?;
+                let (mut send, mut recv) = expired.open_bi().await?;
+                send.write_u8(1).await?;
+                send.write_all(&key.1).await?;
+                send.finish()?;
+                anyhow::ensure!(recv.read_u8().await? == REJECTED, "expired token was accepted");
+                expired.close(0_u32.into(), b"expired resume checked");
+                let _ = connections.recv().await.ok_or_else(|| anyhow::anyhow!("expired connection"))?;
+                anyhow::ensure!(accepts.load(Ordering::Acquire) == 1, "expired resume reopened application");
+                anyhow::ensure!(std::fs::read(root.join("effects"))? == b"xxxxxx", "expired resume replayed input");
+                let (local, replacement) = UnixStream::pair()?;
+                viewer = replacement;
+                client_task = tokio::spawn(run_client(local, client.clone(), target.clone()));
+                let _ = connections.recv().await.ok_or_else(|| anyhow::anyhow!("fresh connection"))?;
+                hello(&mut viewer).await?;
+                let command = format!("n=$(( ${{n:-0}} + 1 )); printf x >> {}/effects; printf '%s' \"$$\" > {}/pane-pid; printf 'RESUMED_%s\\n' \"$n\"\n", root.display(), root.display());
+                message(&mut viewer, serde_json::json!({"type":"input", "bytes":command.as_bytes()})).await?;
+                wait_text(&mut viewer, "RESUMED_7").await?;
+                anyhow::ensure!(Some(std::fs::read_to_string(root.join("pane-pid"))?) == pane_pid, "expiry killed or replaced local pane");
+                anyhow::ensure!(std::fs::read(root.join("effects"))? == b"xxxxxxx", "fresh attachment replayed or lost input");
+            }
             message(&mut viewer, serde_json::json!({"type":"detach"})).await?;
             viewer.shutdown().await?;
             let mut tail = Vec::new();
@@ -144,8 +196,8 @@ async fn real_fux_keeps_its_pane_and_applies_input_once_across_five_quic_losses(
     result??;
     client_result???;
     anyhow::ensure!(
-        accepts.load(Ordering::Acquire) == 1,
-        "reconnect reopened the local application"
+        accepts.load(Ordering::Acquire) == if expire { 2 } else { 1 },
+        "unexpected local application connection count"
     );
     Ok(())
 }
@@ -171,7 +223,7 @@ async fn frame(stream: &mut tokio::net::UnixStream) -> anyhow::Result<serde_json
 async fn hello(stream: &mut tokio::net::UnixStream) -> anyhow::Result<()> {
     message(
         stream,
-        serde_json::json!({"type":"hello","version":2,"rows":24,"columns":80}),
+        serde_json::json!({"type":"hello","version":6,"rows":24,"columns":80}),
     )
     .await?;
     let value = tokio::time::timeout(Duration::from_secs(15), frame(stream)).await??;
@@ -179,7 +231,8 @@ async fn hello(stream: &mut tokio::net::UnixStream) -> anyhow::Result<()> {
         value
             .pointer("/hello/version")
             .and_then(serde_json::Value::as_u64),
-        Some(2)
+        Some(6),
+        "{value}"
     );
     Ok(())
 }
@@ -229,5 +282,12 @@ impl Drop for ChildGuard {
         }
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+struct OwnedDirectory(std::path::PathBuf);
+impl Drop for OwnedDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

@@ -177,17 +177,11 @@ async fn frame(stream: &mut tokio::net::UnixStream) -> anyhow::Result<serde_json
 async fn hello(stream: &mut tokio::net::UnixStream) -> anyhow::Result<()> {
     message(
         stream,
-        serde_json::json!({"type":"hello","version":6,"rows":24,"columns":80}),
+        serde_json::json!({"type":"hello","rows":24,"columns":80}),
     )
     .await?;
     let value = tokio::time::timeout(Duration::from_secs(15), frame(stream)).await??;
-    assert_eq!(
-        value
-            .pointer("/hello/version")
-            .and_then(serde_json::Value::as_u64),
-        Some(6),
-        "{value}"
-    );
+    assert_eq!(value, serde_json::json!({"hello":{}}));
     Ok(())
 }
 #[cfg(feature = "cli")]

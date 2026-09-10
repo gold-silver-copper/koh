@@ -91,11 +91,11 @@ jobs:
         env:
           KOH_REQUIRE_FUX_BIN: "1"
           KOH_REQUIRE_ZOR_BIN: "1"
-        run: cargo test --locked --test gateway
+        run: "cargo test --locked --test gateway"
       - name: Gateway reconnect and retention against the exact fux binary
         env:
           KOH_REQUIRE_FUX_BIN: "1"
-        run: cargo test --locked --lib gateway::
+        run: "cargo test --locked --lib gateway::"
 
   # The optional alternate terminal backend is OFF by default, so the main `gate` never compiles it.
   # Lint + type-check it on its own so the `client::backend::KohBackend` seam can't silently bitrot

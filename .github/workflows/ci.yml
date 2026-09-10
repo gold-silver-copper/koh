@@ -68,6 +68,35 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
 
+  # Real-fux integration against a pinned fux checkout, so this coverage no longer depends on the
+  # fux repository carrying a koh patch. Pinned to the fux commit that merged the workspace
+  # layout (no fux release tag exists yet); move the pin to a `v*` tag once one is published.
+  real-fux:
+    runs-on: ubuntu-latest
+    env:
+      FUX_REPOSITORY: https://github.com/gold-silver-copper/fux
+      FUX_COMMIT: 6c30960d8b44ac9c02028486faf349f4ad4f07e4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build fux and zor at the pinned commit
+        run: |
+          git clone --quiet "$FUX_REPOSITORY" "$RUNNER_TEMP/fux"
+          git -C "$RUNNER_TEMP/fux" checkout --quiet "$FUX_COMMIT"
+          cargo build --locked --manifest-path "$RUNNER_TEMP/fux/Cargo.toml" --bin fux --bin zor
+          echo "FUX_BIN=$RUNNER_TEMP/fux/target/debug/fux" >> "$GITHUB_ENV"
+          echo "ZOR_BIN=$RUNNER_TEMP/fux/target/debug/zor" >> "$GITHUB_ENV"
+      - name: Gateway integration against the exact fux and zor binaries
+        env:
+          KOH_REQUIRE_FUX_BIN: "1"
+          KOH_REQUIRE_ZOR_BIN: "1"
+        run: cargo test --locked --test gateway
+      - name: Gateway reconnect and retention against the exact fux binary
+        env:
+          KOH_REQUIRE_FUX_BIN: "1"
+        run: cargo test --locked --lib gateway::
+
   # The optional alternate terminal backend is OFF by default, so the main `gate` never compiles it.
   # Lint + type-check it on its own so the `client::backend::KohBackend` seam can't silently bitrot
   # (see src/client/backend/). `--all-targets` type-checks but doesn't run — the default `gate` job

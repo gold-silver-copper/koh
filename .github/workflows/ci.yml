@@ -69,13 +69,13 @@ jobs:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
 
   # Real-fux integration against a pinned fux checkout, so this coverage no longer depends on the
-  # fux repository carrying a koh patch. Pinned to the fux commit that merged the workspace
-  # layout (no fux release tag exists yet); move the pin to a `v*` tag once one is published.
+  # fux repository carrying a koh patch. Pinned to the fux release tag that koh is verified
+  # against; move it deliberately when a new fux release changes the local protocols.
   real-fux:
     runs-on: ubuntu-latest
     env:
       FUX_REPOSITORY: https://github.com/gold-silver-copper/fux
-      FUX_COMMIT: 6c30960d8b44ac9c02028486faf349f4ad4f07e4
+      FUX_COMMIT: v0.7.0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

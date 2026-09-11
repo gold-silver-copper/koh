@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FUX_REPOSITORY: https://github.com/gold-silver-copper/fux
-      FUX_COMMIT: v0.8.0
+      FUX_COMMIT: v0.10.0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

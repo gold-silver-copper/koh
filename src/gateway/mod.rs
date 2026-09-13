@@ -2,8 +2,8 @@
 //! No multiplexer or observer dependency is required by this transport boundary.
 mod resume;
 mod sessions;
-use crate::embed::NetworkProfile;
 use crate::identity::Identity;
+use crate::transport_iroh::NetworkProfile;
 use crate::transport_iroh::{
     bind_endpoint_alpns, bind_endpoint_local_alpns, bind_endpoint_with_relay_alpns,
     parse_endpoint_id, parse_relay_url,

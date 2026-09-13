@@ -157,8 +157,27 @@ Call `Connection::close` to discard an admitted connection before running it. `S
 stops admissions and connections and joins its worker with a bounded shutdown wait. Applications
 should then complete their own workspace shutdown in their chosen lifecycle order.
 
-The standalone `koh connect` and `koh serve` remain independently useful. fux is an embedding
-consumer; koh does not depend on it or on zor.
+The standalone `koh connect` and `koh serve` remain independently useful. Current fux
+integration uses koh's opaque gateway over process sockets; fux does not embed koh's
+shell, terminal model or predictor. Koh does not depend on fux or zor. Gateway forwarding
+provides byte transport and reconnect state, not predictive rendering or application restart.
+
+### Gateway-only build
+
+```sh
+cargo build --locked --no-default-features --features cli,gateway --bin koh
+```
+
+This build offers `gateway`, `id` and `key` without PTY allocation, terminal emulation,
+prediction or terminal backends. `NetworkProfile` lives in `koh::transport_iroh` so
+service authorization/connectivity does not depend on shell embedding. Library users can
+select `default-features = false, features = ["gateway"]`.
+
+The default build retains the standalone shell and gateway. A terminal backend feature
+(`backend-termina`, `backend-crossterm` or `backend-qwertty`) explicitly enables `shell`.
+For example, `--no-default-features --features cli,backend-termina` builds the shell CLI.
+Shell scenarios require `shell`; gateway and generic transport contracts run separately
+without it. Both configurations must be verified when changing the shared transport.
 
 ## Highlights
 

@@ -14,6 +14,14 @@
 //! never put the steady flow on a reliable stream — that would reintroduce the
 //! head-of-line blocking mosh exists to avoid.
 
+/// Connection routing policy, independent of shell hosting and terminal state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NetworkProfile {
+    Default,
+    Local,
+    Relay(String),
+}
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -55,7 +63,7 @@ fn koh_transport_config() -> QuicTransportConfig {
 }
 
 /// The ALPN that identifies the koh protocol on the wire: SSP carrying a
-/// [`TerminalScreen`](crate::terminal::TerminalScreen). Alias of [`TERMINAL_ALPN`].
+/// `TerminalScreen` (with the `shell` feature). Alias of [`TERMINAL_ALPN`].
 pub const ALPN: &[u8] = TERMINAL_ALPN;
 
 /// The ALPN for the terminal-screen state (KH-02).

@@ -47,11 +47,11 @@ pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
             let key = key_file.map_or_else(|| crate::identity::default_path("gateway"), Ok)?;
             let identity = crate::identity::load(&key)?;
             let profile = if local {
-                crate::embed::NetworkProfile::Local
+                crate::transport_iroh::NetworkProfile::Local
             } else if let Some(url) = relay_url {
-                crate::embed::NetworkProfile::Relay(url)
+                crate::transport_iroh::NetworkProfile::Relay(url)
             } else {
-                crate::embed::NetworkProfile::Default
+                crate::transport_iroh::NetworkProfile::Default
             };
             let service =
                 super::serve(identity, allow.into_iter().collect(), profile, socket).await?;

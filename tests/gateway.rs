@@ -3,7 +3,7 @@
     reason = "integration assertions report contract failures"
 )]
 #![allow(clippy::expect_used, reason = "test failures retain operation context")]
-use koh::{embed::NetworkProfile, gateway, identity::Identity};
+use koh::{gateway, identity::Identity, transport_iroh::NetworkProfile};
 use std::collections::BTreeSet;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::{

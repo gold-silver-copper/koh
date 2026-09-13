@@ -1,21 +1,12 @@
-//! # koh
-//!
-//! A resilient peer-to-peer remote shell — mosh (the mobile shell), reimplemented in Rust over
-//! [iroh](https://iroh.computer) p2p QUIC. One binary with four subcommands:
-//!
-//! - `koh serve`   — host a PTY shell for authorized clients (the server side).
-//! - `koh connect` — connect to a server by its endpoint id and run the session (the client side).
-//! - `koh id`      — print this machine's koh id (to add to a server's `--allow` list).
-//! - `koh key`     — change the identity key's encryption passphrase (keys are always encrypted).
-//!
-//! Each subcommand delegates to a library entry point (`koh::server::serve`, `koh::client::connect`,
-//! `koh::client::run_id`, `koh::keycmd::run`) via the clap `*Args` adapters, which convert into the
-//! clap-free `*Config` types those functions take; this binary is just argument parsing + dispatch.
-//! It exists only under the `cli` feature (on by default).
+//! Koh CLI dispatch. The gateway and shell command sets follow their product features.
+//! Identity display and key management do not require shell PTYs or rendering.
 
 use clap::{Parser, Subcommand};
-use koh::client::{ConnectArgs, IdArgs};
+#[cfg(feature = "shell")]
+use koh::client::ConnectArgs;
+use koh::idcmd::IdArgs;
 use koh::keycmd::KeyArgs;
+#[cfg(feature = "shell")]
 use koh::server::ServeArgs;
 
 #[derive(Parser, Debug)]
@@ -32,10 +23,13 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Host a PTY shell for authorized clients.
+    #[cfg(feature = "shell")]
     Serve(ServeArgs),
     /// Authenticated access to an independently owned local Unix service.
+    #[cfg(feature = "gateway")]
     Gateway(koh::gateway::cli::GatewayArgs),
     /// Connect to a koh server by its endpoint id.
+    #[cfg(feature = "shell")]
     Connect(ConnectArgs),
     /// Print this machine's koh id (add it to a server's --allow list).
     Id(IdArgs),
@@ -59,10 +53,13 @@ async fn main() -> std::process::ExitCode {
 
 async fn dispatch(cli: Cli) -> anyhow::Result<Option<u32>> {
     match cli.cmd {
+        #[cfg(feature = "gateway")]
         Cmd::Gateway(args) => koh::gateway::cli::run(args).await.map(|()| None),
+        #[cfg(feature = "shell")]
         Cmd::Serve(args) => koh::server::serve(args).await.map(|()| None),
+        #[cfg(feature = "shell")]
         Cmd::Connect(args) => koh::client::connect(args).await,
-        Cmd::Id(args) => koh::client::run_id(args).map(|()| None),
+        Cmd::Id(args) => koh::idcmd::run_id(args).map(|()| None),
         Cmd::Key(args) => koh::keycmd::run(args).map(|()| None),
     }
 }

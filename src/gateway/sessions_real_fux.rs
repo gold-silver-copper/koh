@@ -1,6 +1,6 @@
 //! Real application coverage for the resumable gateway; enabled only with the koh CLI JSON feature.
 use super::*;
-use crate::{embed::NetworkProfile, identity::Identity};
+use crate::{identity::Identity, transport_iroh::NetworkProfile};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;

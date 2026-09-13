@@ -227,7 +227,7 @@ pub(super) async fn run_client(
 #[allow(clippy::expect_used, reason = "test failures retain operation context")]
 mod tests {
     use super::*;
-    use crate::{embed::NetworkProfile, identity::Identity};
+    use crate::{identity::Identity, transport_iroh::NetworkProfile};
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;

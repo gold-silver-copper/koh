@@ -2,5 +2,6 @@
 //! lifetime. koh owns prepared identities, authenticated connections and bounded network tasks.
 mod client;
 mod server;
+pub use crate::transport_iroh::NetworkProfile;
 pub use client::Connection;
-pub use server::{NetworkProfile, Server};
+pub use server::Server;

@@ -16,10 +16,13 @@ pub mod cli;
 mod io;
 mod render;
 
-pub use backend::{DefaultBackend, KohBackend};
-pub use cli::{connect, run_id, BellHook, ConnectConfig, IdConfig};
 #[cfg(feature = "cli")]
-pub use cli::{ConnectArgs, IdArgs};
+pub use crate::idcmd::IdArgs;
+pub use crate::idcmd::{run_id, IdConfig};
+pub use backend::{DefaultBackend, KohBackend};
+#[cfg(feature = "cli")]
+pub use cli::ConnectArgs;
+pub use cli::{connect, BellHook, ConnectConfig};
 pub use io::{spawn_client_io, ClientIoChannels, ClientIoTasks};
 pub use render::{InputModes, WindowState};
 

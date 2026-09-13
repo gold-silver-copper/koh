@@ -67,8 +67,8 @@ pub(crate) const RECEIVED_STATES_CAP: usize = 1024;
 
 /// A synchronizable object: the unit the protocol keeps in sync.
 ///
-/// Implementors are the screen ([`terminal`](crate::terminal)) and the user-input stream
-/// ([`input`](crate::input)). The contract mirrors mosh's `MyState`/`RemoteState`:
+/// Implementors are the screen (`terminal` (with the `shell` feature)) and the user-input stream
+/// (`input` (with the `shell` feature)). The contract mirrors mosh's `MyState`/`RemoteState`:
 ///
 /// - [`diff_from`](SyncState::diff_from): produce the delta that transforms `base` into `self`.
 /// - [`apply`](SyncState::apply): mutate `self` by applying a delta.
@@ -124,7 +124,7 @@ pub trait SyncState: Clone + Default + PartialEq {
 
     /// Collapse storage by dropping the `prefix` already known to the peer.
     ///
-    /// Default is a no-op (correct but unbounded). [`crate::input::UserInput`] overrides
+    /// Default is a no-op (correct but unbounded). `crate::input::UserInput` (with `shell`) overrides
     /// this to pop acked keystrokes; the screen state leaves it as the no-op.
     fn subtract_prefix(&mut self, _prefix: &Self) {}
 }

@@ -79,7 +79,7 @@ impl From<KeyArgs> for KeyConfig {
     }
 }
 
-/// Run `koh key`. Accepts a [`KeyConfig`] or anything convertible into one ([`KeyArgs`] under
+/// Run `koh key`. Accepts a [`KeyConfig`] or anything convertible into one (`KeyArgs` under
 /// the `cli` feature). `Passwd` prompts on the terminal unless `$KOH_KEY_NEW_PASSPHRASE` is set.
 pub fn run(config: impl Into<KeyConfig>) -> anyhow::Result<()> {
     let args: KeyConfig = config.into();

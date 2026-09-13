@@ -12,12 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 const ENDPOINT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NetworkProfile {
-    Default,
-    Local,
-    Relay(String),
-}
+use crate::transport_iroh::NetworkProfile;
 
 pub struct Server {
     _endpoint: iroh::Endpoint,

@@ -15,6 +15,13 @@ internal and unstable (see `src/lib.rs`).
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
 > 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.9.1.
 
+## [Unreleased]
+
+### Changed
+- **Breaking (hidden API):** the `#[doc(hidden)]` test harnesses `koh::ssp::testkit` and
+  `koh::sim` are now behind the new `test-support` feature, together with `GridState`'s
+  `ClientState` impl. They panic by design and no longer ship in normal builds.
+
 ## [0.12.1] — 2026-09-04
 
 ### Fixed

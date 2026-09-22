@@ -58,10 +58,10 @@ pub mod transport_iroh;
 pub mod wire;
 
 /// In-process integration + chaos driver (wires client/server transports through the
-/// deterministic chaotic link in [`ssp::testkit`]). Used by `tests/integration.rs` and the
+/// deterministic chaotic link in `ssp::testkit`). Used by `tests/integration.rs` and the
 /// `chaos` example; hidden from the public docs.
 #[doc(hidden)]
-#[cfg(feature = "shell")]
+#[cfg(all(feature = "shell", any(test, feature = "test-support")))]
 pub mod sim;
 
 #[cfg(feature = "gateway")]

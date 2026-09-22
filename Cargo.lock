@@ -1875,6 +1875,7 @@ dependencies = [
  "crossterm",
  "data-encoding",
  "iroh",
+ "koh",
  "miniz_oxide",
  "nix",
  "portable-pty",

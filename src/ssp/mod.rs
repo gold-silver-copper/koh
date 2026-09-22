@@ -14,7 +14,7 @@
 //! The caller (the iroh driver, or a test harness) supplies the current time in
 //! milliseconds and the path RTT, calls [`Transport::tick`] to get datagrams to send,
 //! and feeds inbound datagrams to [`Transport::recv`]. This makes the whole protocol
-//! deterministically testable under simulated loss/latency/reordering — see [`testkit`].
+//! deterministically testable under simulated loss/latency/reordering — see `testkit` (behind the `test-support` feature).
 //!
 //! ## The transport-layer division of labor (vs. mosh)
 //!
@@ -28,6 +28,7 @@ use serde::Serialize;
 
 mod rtt;
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod testkit;
 mod transport;
 

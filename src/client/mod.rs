@@ -263,6 +263,7 @@ impl ClientState for TerminalScreen {
 }
 
 /// The generic test state renders too: no prediction, bell/exit from its scalars (KC-01).
+#[cfg(any(test, feature = "test-support"))]
 impl ClientState for crate::ssp::testkit::GridState {
     fn window(&self) -> render::WindowState<'_> {
         render::WindowState {

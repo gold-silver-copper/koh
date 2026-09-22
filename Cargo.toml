@@ -183,8 +183,15 @@ cli = ["dep:serde_json", "dep:clap"]
 backend-termina = ["shell", "dep:termina"]
 backend-crossterm = ["shell", "dep:crossterm"]
 backend-qwertty = ["shell", "dep:qwertty"]
+# Deterministic test harnesses (`ssp::testkit`, `sim`). They panic by design, so they are kept out
+# of normal builds, where the panic lints are `forbid`den (see `src/lib.rs`). Tests and examples get
+# them through the self dev-dependency below; nothing else should enable this.
+test-support = []
 
 [dev-dependencies]
+# Self dependency: turns on `test-support` for the lib only when dev-dependencies are built (tests,
+# examples, `--all-targets`). Cargo drops path-only dev-dependencies from the published crate.
+koh = { path = ".", default-features = false, features = ["test-support"] }
 proptest = "1"
 # Deterministic deadline tests; no network endpoint or wall-clock wait.
 tokio = { version = "1", features = ["test-util"] }

@@ -1486,6 +1486,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(via_trait.backend.bytes, direct.bytes);
-        assert!(!via_trait.backend.bytes.is_empty());
+        assert_ne!(via_trait.backend.bytes, b"");
     }
 }

@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(ServeConfig::from(cli.serve).command, ["/bin/zsh"]);
         // No `--shell` = login shell.
         let cli = Cli::parse_from(["koh", "--allow", "abc"]);
-        assert!(ServeConfig::from(cli.serve).command.is_empty());
+        assert_eq!(ServeConfig::from(cli.serve).command, Vec::<String>::new());
     }
 
     #[test]

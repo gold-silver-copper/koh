@@ -719,7 +719,7 @@ mod tests {
         let frags = f.fragment(&instr, 1200).unwrap();
         assert_eq!(frags.len(), 1);
         assert!(frags[0].final_);
-        assert!(instr.diff.is_empty());
+        assert_eq!(instr.diff, b"");
 
         let mut asm = FragmentAssembly::with_limit(MAX_DECOMPRESSED);
         assert_eq!(asm.add(frags[0].clone()).unwrap().unwrap(), instr);

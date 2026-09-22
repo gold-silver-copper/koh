@@ -1250,6 +1250,6 @@ mod tests {
         assert_eq!(TERMINAL_ALPN, ALPN);
         assert_eq!(TERMINAL_ALPN, b"koh/iroh/1");
         assert_eq!(accept_alpns(true), vec![TERMINAL_ALPN.to_vec()]);
-        assert!(accept_alpns(false).is_empty());
+        assert_eq!(accept_alpns(false), Vec::<Vec<u8>>::new());
     }
 }

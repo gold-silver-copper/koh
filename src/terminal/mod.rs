@@ -447,7 +447,7 @@ mod tests {
         let a = screen_from(24, 80, b"line one\r\nline two");
         let b = screen_from(24, 80, b"line one\r\nline two\r\nline three\x1b[1;1Hedited");
         let diff = b.diff_from(&a);
-        assert!(!diff.vt.is_empty());
+        assert_ne!(diff.vt, b"");
         assert!(diff.resize.is_none());
         let mut c = a;
         c.apply(&diff);
@@ -613,7 +613,7 @@ mod tests {
         let a = screen_from(24, 80, b"identical");
         let b = screen_from(24, 80, b"identical");
         assert_eq!(a, b);
-        assert!(a.diff_from(&b).vt.is_empty());
+        assert_eq!(a.diff_from(&b).vt, b"");
     }
 
     #[test]
@@ -680,7 +680,7 @@ mod tests {
                 "no resize -> incremental (persistent) path"
             );
             client.apply(&diff); // same object, repeated apply (no clone between frames)
-            base = target.clone();
+            base = target;
             assert_eq!(
                 client, base,
                 "client must track server after incremental diff {i}"

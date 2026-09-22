@@ -391,7 +391,7 @@ mod tests {
         t.process(b"\x1b[6n"); // DSR: report cursor position
         assert_eq!(t.take_host_replies(), b"\x1b[5;3R"); // 1-indexed report
                                                          // Drained: a second take is empty.
-        assert!(t.take_host_replies().is_empty());
+        assert_eq!(t.take_host_replies(), b"");
     }
 
     #[test]
@@ -487,7 +487,7 @@ mod tests {
         assert!(terminal.control_filter.dropping);
         terminal.process(b"\x1b\\after");
         assert!(!terminal.control_filter.dropping);
-        assert!(terminal.control_filter.buffered.is_empty());
+        assert_eq!(terminal.control_filter.buffered, b"");
         assert!(terminal
             .snapshot()
             .screen()
@@ -590,7 +590,7 @@ mod tests {
         assert!(t.take_unhandled_oscs().is_empty(), "take drains");
         // Handled OSCs (title) do not land in the ring.
         t.process(b"\x1b]2;a title\x1b\\");
-        assert!(t.take_unhandled_oscs().is_empty());
+        assert_eq!(t.take_unhandled_oscs(), Vec::<Vec<u8>>::new());
         assert_eq!(t.title(), "a title");
     }
 }

@@ -2,13 +2,12 @@
 //! remote state in. A direct port of mosh's `TransportSender` + `Transport::recv`,
 //! restructured as a pure, clock-injected state machine (no I/O, no async).
 
-use std::collections::VecDeque;
-
 use crate::wire::{Fragment, FragmentAssembly, Fragmenter, Instruction, PROTOCOL_VERSION};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tracing::trace;
 
+use crate::ssp::nonempty::NonEmpty;
 use crate::ssp::{
     RttEstimator, SyncState, ACK_DELAY, ACK_INTERVAL, ACTIVE_RETRY_TIMEOUT, NEVER,
     RECEIVED_STATES_CAP, SEND_MINDELAY, SENT_STATES_CAP, SHUTDOWN_RETRIES, SHUTDOWN_SENTINEL,
@@ -17,8 +16,7 @@ use crate::ssp::{
 /// A state snapshot tagged with its sequence number and the wall-clock ms it was created.
 ///
 /// Internal SSP machinery: `mod transport` is private and the `ssp` re-export was dropped, so this
-/// is crate-only and not part of the public API (the never-empty-deque invariant is upheld inside
-/// [`Transport`]).
+/// is crate-only and not part of the public API.
 #[derive(Debug, Clone)]
 struct TimestampedState<S> {
     timestamp: u64,
@@ -53,8 +51,8 @@ pub struct Transport<Local: SyncState, Remote: SyncState> {
     // ---- sender side (our authoritative local state) ----
     current_state: Local,
     /// Front = most-recent state known-acked by the peer (the diff base). Back = last
-    /// transmitted. Never empty.
-    sent_states: VecDeque<TimestampedState<Local>>,
+    /// transmitted.
+    sent_states: NonEmpty<TimestampedState<Local>>,
     /// `num` of the newest sent state we believe the peer already has.
     assumed_receiver_num: u64,
     fragmenter: Fragmenter,
@@ -71,7 +69,7 @@ pub struct Transport<Local: SyncState, Remote: SyncState> {
     shutdown_tries: u32,
     shutdown_start: u64,
     // ---- receiver side (peer's remote state) ----
-    received_states: Vec<TimestampedState<Remote>>,
+    received_states: NonEmpty<TimestampedState<Remote>>,
     assembly: FragmentAssembly,
     /// Snapshot of the remote state the app last consumed via [`get_remote_diff`](Transport::get_remote_diff).
     last_delivered_remote: Remote,
@@ -85,17 +83,16 @@ pub struct Transport<Local: SyncState, Remote: SyncState> {
 impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
     /// Create a transport at time `now` (ms). `mtu` is the datagram payload budget.
     pub fn new(now: u64, mtu: usize) -> Self {
-        let mut sent_states = VecDeque::new();
-        sent_states.push_back(TimestampedState {
+        let sent_states = NonEmpty::new(TimestampedState {
             timestamp: now,
             num: 0,
             state: Local::default(),
         });
-        let received_states = vec![TimestampedState {
+        let received_states = NonEmpty::new(TimestampedState {
             timestamp: now,
             num: 0,
             state: Remote::default(),
-        }];
+        });
         Self {
             current_state: Local::default(),
             sent_states,
@@ -122,38 +119,24 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         }
     }
 
-    // ----- never-empty-deque invariant -----
+    // ----- list ends -----
     //
-    // `sent_states` and `received_states` are seeded with one element in `new()` and every
-    // mutation keeps at least one (the front/last is never the element removed). These helpers are
-    // the ONLY place that invariant is unwrapped, so the panic surface is a handful of audited
-    // one-liners and any *new* stray `.unwrap()` elsewhere in the impl is still caught by clippy.
+    // Both lists are `NonEmpty`, so the acked base (front) and newest state (back) always exist.
 
-    #[expect(clippy::unwrap_used, reason = "sent_states is never empty (invariant)")]
-    fn sent_front(&self) -> &TimestampedState<Local> {
-        self.sent_states.front().unwrap()
+    const fn sent_front(&self) -> &TimestampedState<Local> {
+        self.sent_states.first()
     }
-    #[expect(clippy::unwrap_used, reason = "sent_states is never empty (invariant)")]
     fn sent_back(&self) -> &TimestampedState<Local> {
-        self.sent_states.back().unwrap()
+        self.sent_states.last()
     }
-    #[expect(clippy::unwrap_used, reason = "sent_states is never empty (invariant)")]
     fn sent_back_mut(&mut self) -> &mut TimestampedState<Local> {
-        self.sent_states.back_mut().unwrap()
+        self.sent_states.last_mut()
     }
-    #[expect(
-        clippy::unwrap_used,
-        reason = "received_states is never empty (invariant)"
-    )]
-    fn received_first(&self) -> &TimestampedState<Remote> {
-        self.received_states.first().unwrap()
+    const fn received_first(&self) -> &TimestampedState<Remote> {
+        self.received_states.first()
     }
-    #[expect(
-        clippy::unwrap_used,
-        reason = "received_states is never empty (invariant)"
-    )]
     fn received_last(&self) -> &TimestampedState<Remote> {
-        self.received_states.last().unwrap()
+        self.received_states.last()
     }
 
     // ----- accessors / driver hooks -----
@@ -192,7 +175,7 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         let diff = newest.diff_from(&self.last_delivered_remote);
         // Rationalize the received list against its oldest element (mirror of the send side).
         let oldest = self.received_first().state.clone();
-        for s in &mut self.received_states {
+        for s in self.received_states.iter_mut() {
             s.state.subtract_prefix(&oldest);
         }
         self.last_delivered_remote = self.received_last().state.clone();
@@ -287,7 +270,7 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         let recently_heard = self.last_heard + ACTIVE_RETRY_TIMEOUT > now;
 
         let current_eq_back = self.current_state == self.sent_back().state;
-        let current_eq_assumed = self.current_state == *self.assumed_state();
+        let current_eq_assumed = self.current_state == self.assumed_sent().state;
         let current_eq_front = self.current_state == self.sent_front().state;
 
         if !current_eq_back {
@@ -335,24 +318,17 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
     fn rationalize_states(&mut self) {
         let known = self.sent_front().state.clone();
         self.current_state.subtract_prefix(&known);
-        for s in &mut self.sent_states {
+        for s in self.sent_states.iter_mut() {
             s.state.subtract_prefix(&known);
         }
     }
 
-    fn assumed_idx(&self) -> usize {
+    /// The sent state the peer is assumed to hold, falling back to the acked base.
+    fn assumed_sent(&self) -> &TimestampedState<Local> {
         self.sent_states
             .iter()
-            .position(|s| s.num == self.assumed_receiver_num)
-            .unwrap_or(0)
-    }
-
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "assumed_idx() returns a valid in-bounds position (or 0, and sent_states is non-empty)"
-    )]
-    fn assumed_state(&self) -> &Local {
-        &self.sent_states[self.assumed_idx()].state
+            .find(|s| s.num == self.assumed_receiver_num)
+            .unwrap_or_else(|| self.sent_front())
     }
 
     /// Milliseconds until the next send/ack is due, or [`NEVER`] when idle/disconnected.
@@ -373,10 +349,6 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
 
     /// Decide whether to send this tick and return the datagrams (encoded [`Fragment`]s) to
     /// transmit. Empty when nothing is due. Mirrors mosh `TransportSender::tick`.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "assumed_idx() and chosen_idx (0 or assumed_idx) are valid in-bounds positions"
-    )]
     pub fn tick(&mut self, now: u64) -> Vec<Vec<u8>> {
         self.calculate_timers(now);
         if !self.connected {
@@ -388,35 +360,38 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
 
         // Compute the diff against the assumed receiver state, then maybe retarget to the
         // acked base if that is cheaper / self-healing (prospective resend optimization).
-        let assumed_idx = self.assumed_idx();
-        let mut chosen_idx = assumed_idx;
+        let assumed = self.assumed_sent();
+        let mut chosen = assumed;
         // Only the serialized bytes are transmitted; don't hold the typed diff (a repaint can be a
         // few MiB) alive past serialization.
-        let mut diff_bytes = encode_diff(
-            &self
-                .current_state
-                .diff_from(&self.sent_states[assumed_idx].state),
-        );
+        let Some(mut diff_bytes) = encode_diff(&self.current_state.diff_from(&assumed.state))
+        else {
+            return Vec::new();
+        };
 
-        if self.assumed_receiver_num != self.sent_front().num {
-            let resend_bytes = encode_diff(&self.current_state.diff_from(&self.sent_front().state));
+        let front = self.sent_front();
+        if self.assumed_receiver_num != front.num {
+            let Some(resend_bytes) = encode_diff(&self.current_state.diff_from(&front.state))
+            else {
+                return Vec::new();
+            };
             let shorter = resend_bytes.len() <= diff_bytes.len();
             let modestly_longer = resend_bytes.len() < 1000
                 && resend_bytes.len().saturating_sub(diff_bytes.len()) < 100;
             if shorter || modestly_longer {
                 trace!(
-                    from_num = self.sent_states[assumed_idx].num,
-                    to_num = self.sent_front().num,
+                    from_num = assumed.num,
+                    to_num = front.num,
                     "retargeting diff to the acked base (prospective resend)"
                 );
-                chosen_idx = 0;
+                chosen = front;
                 diff_bytes = resend_bytes;
             }
         }
 
-        let chosen_base_num = self.sent_states[chosen_idx].num;
+        let chosen_base_num = chosen.num;
         // The diff is empty exactly when the live state equals the chosen base state.
-        let is_empty = self.current_state == self.sent_states[chosen_idx].state;
+        let is_empty = self.current_state == chosen.state;
 
         if is_empty {
             let mut out = Vec::new();
@@ -524,7 +499,7 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
     }
 
     fn add_sent_state(&mut self, now: u64, num: u64, state: Local) {
-        self.sent_states.push_back(TimestampedState {
+        self.sent_states.push(TimestampedState {
             timestamp: now,
             num,
             state,
@@ -532,15 +507,17 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         if self.sent_states.len() > SENT_STATES_CAP {
             // Drop the 16th-from-end: keeps the acked base (front) and the recent tail.
             let idx = self.sent_states.len() - 16;
-            self.sent_states.remove(idx);
+            let _ = self.sent_states.remove(idx);
         }
     }
 
     /// Drop every sent state below `ack` (peer confirmed it holds `ack`). No-op for a stale
-    /// ack naming a state we already culled.
+    /// ack naming a state we already culled. Sent nums strictly increase front to back, so the
+    /// states below `ack` are exactly the ones before it.
     fn process_acknowledgment_through(&mut self, ack: u64) {
-        if self.sent_states.iter().any(|s| s.num == ack) {
-            self.sent_states.retain(|s| s.num >= ack);
+        let acked = self.sent_states.iter().position(|s| s.num == ack);
+        if let Some(pos) = acked {
+            self.sent_states.drop_front(pos);
             trace!(
                 ack,
                 sent_states = self.sent_states.len(),
@@ -553,11 +530,6 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
 
     /// Feed one inbound datagram (an encoded [`Fragment`]). Returns the outcome; on
     /// [`RecvOutcome::NewState`] the app should consume [`remote_state`](Self::remote_state).
-    #[expect(
-        clippy::unwrap_used,
-        clippy::indexing_slicing,
-        reason = "ref_idx comes from .position() (valid); last() follows a push (non-empty)"
-    )]
     pub fn recv(&mut self, now: u64, datagram: &[u8]) -> RecvOutcome {
         let frag = match Fragment::decode(datagram) {
             Ok(f) => f,
@@ -589,10 +561,10 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             return RecvOutcome::Duplicate;
         }
         // Must hold the diff base, else drop (out-of-order / replay defense).
-        let Some(ref_idx) = self
+        let Some(base) = self
             .received_states
             .iter()
-            .position(|s| s.num == instr.old_num)
+            .find(|s| s.num == instr.old_num)
         else {
             tracing::trace!(
                 old_num = instr.old_num,
@@ -605,7 +577,7 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         // base when `throwaway_num > old_num`. Re-resolving the base after the GC and
         // `.expect()`-ing it is a peer-triggerable panic (remote DoS of a pure state machine).
         // Owning the clone makes the GC harmless.
-        let mut new_state = self.received_states[ref_idx].state.clone();
+        let mut new_state = base.state.clone();
 
         self.process_throwaway_until(instr.throwaway_num);
 
@@ -671,14 +643,15 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         };
 
         // Insert sorted by num (handles reordering).
-        if let Some(pos) = self.received_states.iter().position(|s| s.num > ts.num) {
+        let newer = self.received_states.iter().position(|s| s.num > ts.num);
+        if let Some(pos) = newer {
             self.received_states.insert(pos, ts);
             RecvOutcome::OutOfOrder
         } else {
             self.received_states.push(ts);
             // Newest in-order state: advance our ack, owe a fast ack. (`last_heard` was
             // already refreshed for this datagram above, on any decoded inbound.)
-            self.ack_num = self.received_states.last().unwrap().num;
+            self.ack_num = self.received_states.last().num;
             if !instr.diff.is_empty() {
                 self.pending_data_ack = true;
             }
@@ -696,20 +669,20 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             .iter()
             .position(|s| s.num >= throwaway_num)
             .unwrap_or(0);
-        if keep_from > 0 {
-            self.received_states.drain(0..keep_from);
-        }
+        self.received_states.drop_front(keep_from);
     }
 }
 
 /// Serialize a typed diff for the wire. A no-change diff still serializes to a few bytes,
 /// which is why emptiness is decided by state equality, not by this length.
-#[expect(
-    clippy::expect_used,
-    reason = "postcard serialization of our own Serialize types into a Vec is infallible"
-)]
-fn encode_diff<D: Serialize>(diff: &D) -> Vec<u8> {
-    postcard::to_allocvec(diff).expect("diff serialization is infallible for our types")
+///
+/// postcard only fails for a `Serialize` impl it cannot represent (e.g. a sequence of unknown
+/// length), which our diff types never produce; if one ever did, the tick is skipped rather than
+/// sending a corrupt instruction.
+fn encode_diff<D: Serialize>(diff: &D) -> Option<Vec<u8>> {
+    postcard::to_allocvec(diff)
+        .inspect_err(|e| tracing::error!(error = %e, "diff serialization failed"))
+        .ok()
 }
 
 fn decode_diff<D: DeserializeOwned>(bytes: &[u8]) -> Result<D, postcard::Error> {
@@ -1093,10 +1066,6 @@ mod tests {
                     diff: postcard::to_allocvec(&GrowDiff(val)).unwrap(),
                 });
                 let _ = t.recv(now, &dg); // must never panic on any envelope
-                proptest::prop_assert!(
-                    !t.received_states.is_empty(),
-                    "received_states must never be empty (the never-empty invariant)"
-                );
                 proptest::prop_assert!(
                     t.received_states.len() <= RECEIVED_STATES_CAP,
                     "received_states {} exceeded the {} cap",

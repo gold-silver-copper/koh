@@ -37,25 +37,61 @@
 //! Public APIs outside the documented product entry points and configuration types are
 //! internal and may change without a semver-major release.
 
-#[cfg(feature = "shell")]
-pub mod client;
-#[cfg(feature = "shell")]
-pub mod embed;
-pub mod identity;
-#[cfg(feature = "shell")]
-pub mod input;
-pub mod keycmd;
-#[cfg(feature = "shell")]
-pub mod predict;
-#[cfg(feature = "shell")]
-pub mod pty;
-#[cfg(feature = "shell")]
-pub mod server;
-pub mod ssp;
-#[cfg(feature = "shell")]
-pub mod terminal;
-pub mod transport_iroh;
-pub mod wire;
+/// Declares modules whose production code is panic-free by construction.
+///
+/// The panic lints are `forbid` here, not just Cargo.toml's `deny`, so no local
+/// `#[expect]`/`#[allow]` can carve out an exception. They are applied per module rather than in
+/// `[lints]` or at the crate root because two things must stay outside: tests and the
+/// `test-support` harnesses, which panic on purpose (see clippy.toml), and the clap derives in
+/// [`args`], which emit `#[allow(clippy::restriction)]` and so cannot compile under a `forbid`.
+macro_rules! panic_free {
+    ($($item:item)*) => {$(
+        #[cfg_attr(
+            not(any(test, feature = "test-support")),
+            forbid(
+                clippy::unwrap_used,
+                clippy::expect_used,
+                clippy::panic,
+                clippy::unreachable,
+                clippy::todo,
+                clippy::unimplemented,
+                clippy::get_unwrap,
+                clippy::unwrap_in_result,
+                clippy::panic_in_result_fn,
+                clippy::exit,
+                clippy::indexing_slicing,
+                clippy::string_slice,
+                clippy::expect_fun_call
+            )
+        )]
+        $item
+    )*};
+}
+
+panic_free! {
+    #[cfg(feature = "shell")]
+    pub mod client;
+    #[cfg(feature = "shell")]
+    pub mod embed;
+    pub mod identity;
+    #[cfg(feature = "shell")]
+    pub mod input;
+    pub mod keycmd;
+    #[cfg(feature = "shell")]
+    pub mod predict;
+    #[cfg(feature = "shell")]
+    pub mod pty;
+    #[cfg(feature = "shell")]
+    pub mod server;
+    pub mod ssp;
+    #[cfg(feature = "shell")]
+    pub mod terminal;
+    pub mod transport_iroh;
+    pub mod wire;
+    #[cfg(feature = "gateway")]
+    pub mod gateway;
+    pub mod idcmd;
+}
 
 /// In-process integration + chaos driver (wires client/server transports through the
 /// deterministic chaotic link in `ssp::testkit`). Used by `tests/integration.rs` and the
@@ -64,6 +100,5 @@ pub mod wire;
 #[cfg(all(feature = "shell", any(test, feature = "test-support")))]
 pub mod sim;
 
-#[cfg(feature = "gateway")]
-pub mod gateway;
-pub mod idcmd;
+#[cfg(feature = "cli")]
+mod args;

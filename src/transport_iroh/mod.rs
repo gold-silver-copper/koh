@@ -45,20 +45,13 @@ mod keyfile;
 /// Longer outages are handled above this layer: the client transparently re-dials and reattaches
 /// to the detachable server session (see `crate::client::run_client`), so we don't need to hold a
 /// dead connection open indefinitely here.
-#[expect(
-    clippy::expect_used,
-    reason = "300s is far below IdleTimeout's varint ceiling; the conversion is statically infallible"
-)]
-#[allow(
-    clippy::duration_suboptimal_units,
-    reason = "`from_secs(300)` is the intended, readable idle timeout"
-)]
 fn koh_transport_config() -> QuicTransportConfig {
+    // `IdleTimeout` is a QUIC varint of milliseconds; building it from a `u32` is infallible,
+    // unlike `IdleTimeout::try_from(Duration)`.
+    const IDLE_TIMEOUT_MS: u32 = 300_000;
     QuicTransportConfig::builder()
         .keep_alive_interval(Duration::from_secs(5))
-        .max_idle_timeout(Some(
-            IdleTimeout::try_from(Duration::from_secs(300)).expect("300s fits in IdleTimeout"),
-        ))
+        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))))
         .build()
 }
 

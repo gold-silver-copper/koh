@@ -26,6 +26,7 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+mod nonempty;
 mod rtt;
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]

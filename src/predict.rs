@@ -360,45 +360,28 @@ impl PredictionEngine {
         self.cursor.is_some() || !self.cells.is_empty()
     }
 
-    /// Ensure a cursor prediction exists in the current epoch, seeded from the real cursor.
-    fn init_cursor(&mut self, screen: &dyn ScreenView) {
-        let (crow, ccol) = screen.cursor_position();
-        let need_new = match &self.cursor {
-            None => true,
-            Some(c) => c.tentative_epoch != self.prediction_epoch,
-        };
-        if need_new {
-            let (row, col) = self
-                .cursor
-                .as_ref()
-                .map_or((crow, ccol), |c| (c.row, c.col));
-            self.cursor = Some(PredCursor {
-                expiration_frame: self.local_frame_sent + 1,
-                tentative_epoch: self.prediction_epoch,
-                row,
-                col,
-            });
+    /// Ensure a cursor prediction exists in the current epoch, seeded from the real cursor, and
+    /// return it.
+    fn init_cursor(&mut self, screen: &dyn ScreenView) -> &mut PredCursor {
+        let epoch = self.prediction_epoch;
+        let expiration_frame = self.local_frame_sent + 1;
+        let (row, col) = screen.cursor_position();
+        let cursor = self.cursor.get_or_insert(PredCursor {
+            expiration_frame,
+            tentative_epoch: epoch,
+            row,
+            col,
+        });
+        if cursor.tentative_epoch != epoch {
+            // A new epoch keeps the predicted position but restarts confirmation.
+            *cursor = PredCursor {
+                expiration_frame,
+                tentative_epoch: epoch,
+                row: cursor.row,
+                col: cursor.col,
+            };
         }
-    }
-
-    /// The predicted cursor, which [`init_cursor`](Self::init_cursor) has just guaranteed is
-    /// present. Only call immediately after `init_cursor`.
-    #[expect(
-        clippy::unwrap_used,
-        reason = "init_cursor just set self.cursor to Some"
-    )]
-    fn cursor_after_init(&self) -> &PredCursor {
-        self.cursor.as_ref().unwrap()
-    }
-
-    /// The predicted cursor (mutable), which [`init_cursor`](Self::init_cursor) has just
-    /// guaranteed is present. Only call immediately after `init_cursor`.
-    #[expect(
-        clippy::unwrap_used,
-        reason = "init_cursor just set self.cursor to Some"
-    )]
-    fn cursor_after_init_mut(&mut self) -> &mut PredCursor {
-        self.cursor.as_mut().unwrap()
+        cursor
     }
 
     fn newline_cr(&mut self, screen: &dyn ScreenView) {
@@ -447,9 +430,8 @@ impl PredictionEngine {
             return;
         }
         let (_, cols) = screen.size();
-        self.init_cursor(screen);
         let (row, col) = {
-            let c = self.cursor_after_init();
+            let c = self.init_cursor(screen);
             (c.row, c.col)
         };
         // Need the whole glyph to fit strictly before the last column (the edge is wrap-ambiguous).
@@ -563,16 +545,14 @@ impl PredictionEngine {
         match byte {
             0x20..=0x7e => {
                 // Ordinary printable ASCII.
-                self.init_cursor(screen);
-                let col = self.cursor_after_init().col;
+                let col = self.init_cursor(screen).col;
                 // `col >= cols - 1`, saturating so a peer-controlled `cols == 0` can't overflow `+ 1`.
                 if col >= cols.saturating_sub(1) {
                     // Last column is ambiguous (wrap vs. overwrite); hide until confirmed.
                     self.become_tentative();
-                    self.init_cursor(screen);
                 }
                 let (row, col) = {
-                    let c = self.cursor_after_init();
+                    let c = self.init_cursor(screen);
                     (c.row, c.col)
                 };
                 // Insert mode (the only mode koh predicts): shift the row right (cols-1 down to
@@ -610,10 +590,9 @@ impl PredictionEngine {
             }
             0x7f | 0x08 => {
                 // Backspace: step the cursor back one column.
-                self.init_cursor(screen);
                 let exp = self.local_frame_sent + 1;
                 let (row, col, do_pred) = {
-                    let c = self.cursor_after_init_mut();
+                    let c = self.init_cursor(screen);
                     if c.col > 0 {
                         c.col -= 1;
                         c.expiration_frame = exp;

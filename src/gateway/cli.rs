@@ -1,40 +1,7 @@
-use clap::{Args, Subcommand};
-use std::path::PathBuf;
+pub use crate::args::GatewayArgs;
+use crate::args::GatewayAction as Action;
 use tokio::signal::unix::{signal, SignalKind};
 
-#[derive(Debug, Args)]
-pub struct GatewayArgs {
-    #[command(subcommand)]
-    action: Action,
-}
-#[derive(Debug, Subcommand)]
-enum Action {
-    /// Expose one local Unix service to explicitly authorized remote peers.
-    Serve {
-        #[arg(long)]
-        socket: PathBuf,
-        #[arg(long)]
-        key_file: Option<PathBuf>,
-        #[arg(long, required = true)]
-        allow: Vec<String>,
-        #[arg(long, conflicts_with = "relay_url")]
-        local: bool,
-        #[arg(long)]
-        relay_url: Option<String>,
-    },
-    /// Expose an authenticated remote service through a private local Unix socket.
-    Connect {
-        server: String,
-        #[arg(long)]
-        socket: PathBuf,
-        #[arg(long)]
-        key_file: Option<PathBuf>,
-        #[arg(long, conflicts_with = "relay_url")]
-        direct: Option<std::net::SocketAddr>,
-        #[arg(long)]
-        relay_url: Option<String>,
-    },
-}
 pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
     let mut service = match args.action {
         Action::Serve {

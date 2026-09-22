@@ -8,12 +8,13 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-#[cfg(feature = "cli")]
-use clap::{Args, Subcommand};
 
 use crate::transport_iroh::{
     default_key_path, enforce_passphrase_strength, format_endpoint_id, write_identity_key,
 };
+
+#[cfg(feature = "cli")]
+pub use crate::args::KeyArgs;
 
 /// What [`run`] should do to the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,47 +38,6 @@ pub struct KeyConfig {
     pub key_file: Option<PathBuf>,
 }
 
-/// Arguments for `koh key` (the clap adapter over [`KeyConfig`]; `cli` feature only).
-#[cfg(feature = "cli")]
-#[derive(Args, Debug)]
-pub struct KeyArgs {
-    #[command(subcommand)]
-    cmd: KeyCmd,
-    /// Which identity key to operate on. Defaults to the client key path (as `koh id` uses); pass a
-    /// server key explicitly to manage it.
-    #[arg(long, global = true)]
-    key_file: Option<PathBuf>,
-}
-
-#[cfg(feature = "cli")]
-#[derive(Subcommand, Debug)]
-enum KeyCmd {
-    /// Change the passphrase encrypting the identity key (like `ssh-keygen -p`). The key stays
-    /// encrypted — there is no way to store it in plaintext.
-    Passwd,
-    /// Print the key's encryption status and endpoint id (never the secret).
-    Info,
-    /// Delete an unused identity; the next use creates a new endpoint ID.
-    Reset {
-        /// Acknowledge permanent identity loss and required allowlist updates.
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
-#[cfg(feature = "cli")]
-impl From<KeyArgs> for KeyConfig {
-    fn from(a: KeyArgs) -> Self {
-        Self {
-            op: match a.cmd {
-                KeyCmd::Passwd => KeyOp::Passwd,
-                KeyCmd::Info => KeyOp::Info,
-                KeyCmd::Reset { yes } => KeyOp::Reset { confirmed: yes },
-            },
-            key_file: a.key_file,
-        }
-    }
-}
 
 /// Run `koh key`. Accepts a [`KeyConfig`] or anything convertible into one (`KeyArgs` under
 /// the `cli` feature). `Passwd` prompts on the terminal unless `$KOH_KEY_NEW_PASSPHRASE` is set.

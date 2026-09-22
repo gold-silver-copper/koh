@@ -16,12 +16,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-#[cfg(feature = "cli")]
-use clap::Args as ClapArgs;
 use iroh::EndpointId;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "cli")]
+pub use crate::args::ServeArgs;
 use crate::server::audit::{auth_event, Outcome};
 use crate::server::session::{ClientId, HostProvider, PtyHosts, SessionHost};
 use crate::server::{run_attached, session, SessionExit};
@@ -97,73 +97,6 @@ impl Default for ServeConfig {
     }
 }
 
-/// Arguments for `koh serve` (the clap adapter over [`ServeConfig`]; `cli` feature only).
-#[cfg(feature = "cli")]
-#[derive(ClapArgs, Debug)]
-pub struct ServeArgs {
-    /// Path to the persistent secret-key file (gives a stable endpoint id across restarts).
-    #[arg(long)]
-    key_file: Option<PathBuf>,
-
-    /// Authorize a client endpoint id (repeatable). At least one is required — koh only serves
-    /// peers whose node-id is on this list.
-    #[arg(long = "allow", value_name = "ENDPOINT_ID")]
-    allow: Vec<String>,
-
-    /// Program to run in the session (defaults to the user's login shell). Repeat to pass
-    /// arguments: `--shell zellij --shell attach --shell -c --shell main` runs
-    /// `zellij attach -c main`. The value is never split on whitespace.
-    #[arg(long, value_name = "PROGRAM_OR_ARG")]
-    shell: Vec<String>,
-
-    /// Scrollback lines retained by the server-side emulator (per session). Bounded like the other
-    /// resource knobs (`--max-connections`/`--max-sessions`): vt100 allocates the grid eagerly, so an
-    /// unbounded value × `--max-sessions` is a memory footgun. 0 = no scrollback.
-    #[arg(long, default_value_t = DEFAULT_SCROLLBACK, value_parser = clap::value_parser!(u64).range(0..=MAX_SCROLLBACK))]
-    scrollback: u64,
-
-    /// Keep a detached session's shell alive this long (seconds) for the client to reconnect.
-    /// Default 24h (mosh-style "close the laptop, reopen later").
-    #[arg(long, default_value_t = DEFAULT_SESSION_TTL_SECS)]
-    session_ttl_secs: u64,
-
-    /// Host via a self-hosted relay URL instead of n0's public relays.
-    #[arg(long, value_name = "URL")]
-    relay_url: Option<String>,
-
-    /// Bind without any relay/discovery (LAN / loopback). Clients dial with --direct <ip:port>.
-    #[arg(long, conflicts_with = "relay_url")]
-    local: bool,
-
-    /// Maximum number of connections being handled concurrently (each holds a permit for its whole
-    /// lifetime; excess incoming connections are refused cheaply, before the crypto handshake). This
-    /// bounds the work a flood of dials can pin on the server before the allowlist check rejects them.
-    #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS, value_parser = clap::value_parser!(u32).range(1..))]
-    max_connections: u32,
-
-    /// Maximum number of distinct live sessions (one per authorized peer). A new peer is refused
-    /// once this many sessions exist; reconnecting to an existing session is always allowed. Bounds
-    /// the number of real shells a flood of authorized keys can spawn.
-    #[arg(long, default_value_t = DEFAULT_MAX_SESSIONS, value_parser = clap::value_parser!(u32).range(1..))]
-    max_sessions: u32,
-}
-
-#[cfg(feature = "cli")]
-impl From<ServeArgs> for ServeConfig {
-    fn from(a: ServeArgs) -> Self {
-        Self {
-            key_file: a.key_file,
-            allow: a.allow,
-            command: a.shell,
-            scrollback: a.scrollback,
-            session_ttl_secs: a.session_ttl_secs,
-            relay_url: a.relay_url,
-            local: a.local,
-            max_connections: a.max_connections,
-            max_sessions: a.max_sessions,
-        }
-    }
-}
 
 /// Render `data` as a QR code for a **dark-background** terminal, or `None` if it is too large to
 /// encode. The polarity follows the `qrcode` crate's documented terminal recipe — QR-dark modules

@@ -7,11 +7,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Context;
-#[cfg(feature = "cli")]
-use clap::Args;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "cli")]
+pub use crate::args::ConnectArgs;
 use crate::client::{BackendTerminal, DefaultBackend};
 use crate::transport_iroh::TERMINAL_ALPN;
 
@@ -164,52 +164,6 @@ impl BellHook {
     }
 }
 
-/// Arguments for `koh connect <server-id>` (the clap adapter over [`ConnectConfig`]; `cli` only).
-#[cfg(feature = "cli")]
-#[derive(Args, Debug)]
-pub struct ConnectArgs {
-    /// Server endpoint id to connect to.
-    server: String,
-
-    /// Path to the client's persistent secret key (its endpoint id must be on the server's allowlist).
-    #[arg(long)]
-    key_file: Option<PathBuf>,
-
-    /// Dial the server at a direct socket address (LAN / loopback; no relay or discovery).
-    #[arg(long, value_name = "IP:PORT", conflicts_with = "relay_url")]
-    direct: Option<SocketAddr>,
-
-    /// Dial the server via a self-hosted relay URL instead of n0's public relays.
-    #[arg(long, value_name = "URL")]
-    relay_url: Option<String>,
-
-    /// Honor remote OSC-52 clipboard writes (let the remote app set your system clipboard).
-    /// OFF by default: a malicious/compromised server could otherwise silently overwrite your
-    /// clipboard (e.g. swap a copied command for `curl evil|sh`). A deliberate per-session opt-in.
-    #[arg(long)]
-    clipboard: bool,
-
-    /// Run this shell command whenever the remote bell rings (e.g. on Termux:
-    /// `--on-bell 'termux-notification -t "koh bell"'`). Detached from the terminal; at most one
-    /// spawn per second. KOH_BELL_COUNT and KOH_TITLE are set in its environment. Bells that rang
-    /// before you attached do not fire it; bells during a reconnect do.
-    #[arg(long, value_name = "CMD")]
-    on_bell: Option<String>,
-}
-
-#[cfg(feature = "cli")]
-impl From<ConnectArgs> for ConnectConfig {
-    fn from(a: ConnectArgs) -> Self {
-        Self {
-            server: a.server,
-            key_file: a.key_file,
-            direct: a.direct,
-            relay_url: a.relay_url,
-            clipboard: a.clipboard,
-            bell_command: a.on_bell,
-        }
-    }
-}
 
 /// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so
 /// the client unwinds cleanly and restores the terminal. Called before raw mode is entered (so the

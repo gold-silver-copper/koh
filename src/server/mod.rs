@@ -3,10 +3,9 @@
 //! Reused by the binary and by integration tests (so the full PTY⇄emulator⇄transport path can be
 //! exercised over a real iroh connection without the CLI/accept scaffolding).
 //!
-//! Sessions are **detachable**: the long-lived host (a PTY+emulator by default, any
-//! [`session::SessionHost`] in general — KH-01) lives in [`session::Session`] and survives client
-//! disconnects; a per-connection [`run_attached`] loop drives a *fresh* `Transport` against it, so
-//! a reconnecting client re-syncs to the current state.
+//! Sessions are **detachable**: the long-lived PTY + emulator lives in [`session::Session`] and
+//! survives client disconnects; a per-connection [`run_attached`] loop drives a *fresh* `Transport`
+//! against it, so a reconnecting client re-syncs to the current screen.
 
 mod audit;
 pub mod cli;
@@ -14,15 +13,14 @@ pub mod session;
 
 #[cfg(feature = "cli")]
 pub use cli::ServeArgs;
-pub use cli::{serve, serve_with, Hosts, ServeConfig};
-pub use session::{
-    ChangeSignal, ClientId, HostProvider, PtyHost, PtyHosts, SessionHost, SharedHost, SharedSession,
-};
+pub use cli::{serve, ServeConfig};
+pub use session::{ChangeSignal, PtyHost, SharedSession};
 
 use std::time::Duration;
 
 use crate::input::{UserInput, WireEvent};
-use crate::ssp::{RecvOutcome, SyncState, Transport};
+use crate::ssp::{RecvOutcome, Transport};
+use crate::terminal::TerminalScreen;
 use crate::transport_iroh::{IrohChannel, MonoClock};
 use tracing::info;
 
@@ -132,8 +130,8 @@ pub(crate) const ECHO_TIMEOUT_MS: u64 = 50;
 /// hosted program has had time to reflect. Mosh `Complete::set_echo_ack` / `wait_time`.
 ///
 /// SSP frame numbers are per transport, so this lives in [`ServerSession`] — one per attached
-/// connection — never in the host. A shared host with two viewers would otherwise conflate their
-/// frame sequences and hand the second viewer an ack for frames it never sent.
+/// connection — never in the host. Two connections on one session would otherwise conflate their
+/// frame sequences and hand one an ack for frames it never sent.
 #[derive(Debug)]
 pub(crate) struct EchoAck {
     /// The newest input frame number whose effects are considered on-screen.
@@ -221,9 +219,9 @@ impl EchoAck {
 /// in the session `Mutex` (shared with the host's own tasks), so the shell snapshots it under the
 /// lock and hands the snapshot in — the core can't own the host. That makes the split weaker than
 /// the client's, but still lifts every protocol decision out of the async loop where it can be
-/// tested. Generic over the synced state `S` (KH-01): nothing here knows it is a terminal.
-struct ServerSession<S: SyncState> {
-    transport: Transport<S, UserInput>,
+/// tested.
+struct ServerSession {
+    transport: Transport<TerminalScreen, UserInput>,
     cursor_keys: CursorKeyNormalizer,
     /// This connection's echo-ack tracker (KS-02).
     echo: EchoAck,
@@ -233,9 +231,9 @@ struct ServerSession<S: SyncState> {
     terminal_snapshot_taken: bool,
 }
 
-impl<S: SyncState> ServerSession<S> {
+impl ServerSession {
     fn new(now: u64, mtu: usize) -> Self {
-        let mut transport = Transport::<S, UserInput>::new(now, mtu);
+        let mut transport = Transport::<TerminalScreen, UserInput>::new(now, mtu);
         transport.set_connected(true);
         Self {
             transport,
@@ -275,9 +273,9 @@ impl<S: SyncState> ServerSession<S> {
     }
 
     /// Whether a fresh grid snapshot must be installed this wake: the screen is dirty, the echo-ack
-    /// advanced, or the host is terminal. The final case is intentionally per connection: a shared
-    /// host cannot know which independent transports have consumed its final state, so every clean
-    /// viewer takes one authoritative snapshot before beginning its shutdown handshake.
+    /// advanced, or the shell has exited. The final case is intentionally per connection: the
+    /// session cannot know which of its connections' transports have consumed the final screen, so
+    /// every clean connection takes one authoritative snapshot before its shutdown handshake.
     const fn needs_snapshot(&self, echo_changed: bool, child_alive: bool) -> bool {
         self.dirty || echo_changed || (!child_alive && !self.terminal_snapshot_taken)
     }
@@ -285,7 +283,7 @@ impl<S: SyncState> ServerSession<S> {
     /// Install the freshly-taken screen snapshot (present iff [`needs_snapshot`](Self::needs_snapshot)
     /// said so) and clear the dirty flag. A skipped snapshot leaves `current_state` equal to the
     /// still-current screen, so the next `tick` correctly emits acks-only with no missed update.
-    fn install_snapshot(&mut self, snapshot: Option<S>, child_alive: bool) {
+    fn install_snapshot(&mut self, snapshot: Option<TerminalScreen>, child_alive: bool) {
         if let Some(state) = snapshot {
             *self.transport.current_mut() = state;
             if !child_alive {
@@ -356,20 +354,18 @@ impl<S: SyncState> ServerSession<S> {
 /// core per attach, so the first tick diffs the live state against the default base and re-syncs the
 /// (re)connecting client to the current state. Crucially, it does **not** kill the host on
 /// disconnect — it returns [`SessionExit::Detached`] and leaves it running for the next reattach.
-/// `client` identifies this connection to the host (KH-01, KS-01).
 ///
 /// Returns `anyhow::Result` for signature stability, but in practice only ever returns `Ok`: a
 /// dropped connection is `Ok(Detached)`, a completed shutdown is `Ok(ShellExited)`, and the internal
 /// failure paths (PTY write/resize) are logged-and-continued inside the host. The `Err` arm at call
 /// sites is dead today; it is kept so a future fallible step needn't change the signature.
-pub async fn run_attached<H: SessionHost>(
+pub async fn run_attached(
     conn: iroh::endpoint::Connection,
-    handle: SharedSession<H>,
-    client: ClientId,
+    handle: SharedSession,
 ) -> anyhow::Result<SessionExit> {
     let channel = IrohChannel::new(conn);
     let clock = MonoClock::new();
-    let mut session = ServerSession::<H::State>::new(clock.now_ms(), channel.max_datagram_size());
+    let mut session = ServerSession::new(clock.now_ms(), channel.max_datagram_size());
     // This connection's view of the host's change signal (KS-03). Every attached loop has its
     // own receiver, so one pulse wakes all of them.
     let mut changed = handle.changed.subscribe();
@@ -392,12 +388,12 @@ pub async fn run_attached<H: SessionHost>(
                 // could swallow a pulse for a change the snapshot missed.
                 let _ = changed.borrow_and_update();
             }
-            let mut s = handle.session.lock().await;
+            let s = handle.session.lock().await;
             let alive_before_snapshot = s.host.alive();
             let take = session.needs_snapshot(echo_changed, alive_before_snapshot);
             if take && !initially_dirty {
-                // A terminal host forces a final snapshot even for a connection that did not yet
-                // observe the shared change pulse. Mark that pulse seen for this receiver before
+                // An exited shell forces a final snapshot even for a connection that did not yet
+                // observe the change pulse. Mark that pulse seen for this receiver before
                 // taking the state, matching the normal dirty-snapshot ordering above.
                 let _ = changed.borrow_and_update();
             }
@@ -405,7 +401,7 @@ pub async fn run_attached<H: SessionHost>(
             let alive = s.host.alive();
             drop(s);
             if let Some(state) = snapshot.as_mut() {
-                H::stamp_echo_ack(state, session.echo_ack());
+                state.set_echo_ack(session.echo_ack());
             }
             session.install_snapshot(snapshot, alive);
             alive
@@ -439,7 +435,7 @@ pub async fn run_attached<H: SessionHost>(
                                 }
                                 let resized = input.resize.is_some();
                                 if let Some((rows, cols)) = input.resize {
-                                    s.host.resize(client, rows, cols);
+                                    s.host.resize(rows, cols);
                                 }
                                 drop(s);
                                 session.register_input_frame(input.frame, now);
@@ -486,20 +482,8 @@ pub async fn run_session(
     scrollback: usize,
 ) -> anyhow::Result<()> {
     let handle = session::spawn_session(command, scrollback)?;
-    run_session_with(conn, handle).await
-}
-
-/// Run a **standalone** (non-detachable) session over any host for one connection: serve it,
-/// then [`SessionHost::kill`] it when the connection ends (KH-01).
-pub async fn run_session_with<H: SessionHost>(
-    conn: iroh::endpoint::Connection,
-    handle: SharedSession<H>,
-) -> anyhow::Result<()> {
-    let client = ClientId::next();
-    let _ = run_attached(conn, handle.clone(), client).await?;
-    let mut s = handle.session.lock().await;
-    s.host.client_detached(client);
-    s.host.kill();
+    let _ = run_attached(conn, handle.clone()).await?;
+    handle.session.lock().await.host.kill();
     Ok(())
 }
 
@@ -507,7 +491,6 @@ pub async fn run_session_with<H: SessionHost>(
 mod tests {
     use super::{coalesce_drained_input, CursorKeyNormalizer, EchoAck, ServerSession};
     use crate::input::{UserInput, WireEvent};
-    use crate::ssp::testkit::GridState;
     use crate::ssp::{RecvOutcome, Transport};
     use crate::terminal::TerminalScreen;
 
@@ -674,14 +657,13 @@ mod tests {
 
     #[test]
     fn server_session_snapshot_gating() {
-        // The S-03 dirty/echo-ack snapshot decision, isolated from the lock + the real emulator —
-        // over a non-terminal state (KH-01): the core is state-agnostic.
-        let mut s = ServerSession::<GridState>::new(0, 1200);
+        // The S-03 dirty/echo-ack snapshot decision, isolated from the lock + the real emulator.
+        let mut s = ServerSession::new(0, 1200);
         assert!(
             s.needs_snapshot(false, true),
             "the first pass always snapshots"
         );
-        s.install_snapshot(Some(GridState::default()), true);
+        s.install_snapshot(Some(TerminalScreen::default()), true);
         assert!(
             !s.needs_snapshot(false, true),
             "clean live host skips a snapshot"
@@ -694,7 +676,7 @@ mod tests {
             s.needs_snapshot(false, false),
             "every clean connection snapshots terminal host state before shutdown"
         );
-        s.install_snapshot(Some(GridState::default()), false);
+        s.install_snapshot(Some(TerminalScreen::default()), false);
         assert!(
             !s.needs_snapshot(false, false),
             "a connection does not repeatedly clone terminal state during shutdown retries"
@@ -708,9 +690,8 @@ mod tests {
 
     #[test]
     fn server_session_shutdown_handshake_progresses() {
-        // The shutdown-sentinel handshake progression, without a PTY or a peer (KH-01: over a
-        // non-terminal state).
-        let mut s = ServerSession::<GridState>::new(0, 1200);
+        // The shutdown-sentinel handshake progression, without a PTY or a peer.
+        let mut s = ServerSession::new(0, 1200);
         let _ = s.tick(0, true); // child alive -> no shutdown started
         assert!(!s.shutdown_complete(0));
         let _ = s.tick(10, false); // child exited -> begin the shutdown handshake
@@ -741,7 +722,7 @@ mod tests {
             "the client transmits its queued input"
         );
 
-        let mut server = ServerSession::<TerminalScreen>::new(0, 1200);
+        let mut server = ServerSession::new(0, 1200);
         let mut drained = None;
         for dg in &datagrams {
             if server.recv(1000, dg) == RecvOutcome::NewState {
@@ -761,12 +742,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_session_over_a_scripted_host_delivers_frames_and_clamped_resizes() {
-        // KH-01: the generic loop feeds a non-PTY host — `resize` gets the clamped geometry with
-        // this connection's id, `input` gets the keys, and the client's frame 1 comes back as
-        // the echo-ack the loop stamped (KS-02).
-        use crate::server::session::test_host::{HostCall, ScriptedHost};
-        use crate::server::session::SessionHandle;
+    async fn run_session_delivers_keys_and_clamped_resizes_then_kills_the_shell() {
+        // The loop hands the PTY the clamped geometry and the keys, stamps this connection's
+        // echo-ack for frame 1 onto the screen it ships (KS-02), and `run_session` returns once
+        // the connection ends and the shell is killed.
         use crate::transport_iroh::{
             bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, MonoClock, ALPN,
         };
@@ -774,25 +753,22 @@ mod tests {
             .await
             .expect("bind");
         let addr = loopback_addr(&server_ep);
-        let handle = SessionHandle::new(ScriptedHost::new());
-        let h2 = handle.clone();
         let accept = tokio::spawn(async move {
-            if let Some(incoming) = server_ep.accept().await {
-                if let Ok(conn) = incoming.await {
-                    let _ = super::run_session_with(conn, h2).await;
-                }
-            }
+            let incoming = server_ep.accept().await.expect("incoming");
+            let conn = incoming.await.expect("handshake");
+            super::run_session(conn, &["cat".to_owned()], 0).await
         });
         let client_ep = bind_endpoint_local(generate_secret_key(), false)
             .await
             .expect("bind client");
         let chan = IrohChannel::new(client_ep.connect(addr, ALPN).await.expect("connect"));
         let clock = MonoClock::new();
-        let mut t = Transport::<UserInput, GridState>::new(clock.now_ms(), 1200);
+        let mut t = Transport::<UserInput, TerminalScreen>::new(clock.now_ms(), 1200);
         t.set_connected(true);
         t.observe_rtt(10.0);
         t.current_mut().push_resize(65000, 1);
         t.current_mut().push_bytes(b"xy");
+        let clamped = crate::terminal::clamp_dims(65000, 1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             for dg in t.tick(clock.now_ms()) {
@@ -802,49 +778,44 @@ mod tests {
                 r = chan.recv() => { if let Ok(b) = r { t.recv(clock.now_ms(), &b); } }
                 () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
             }
-            // Wait for the input AND its echo-ack (the ack ships after the 50 ms debounce).
-            if t.remote_state().contents().contains("xy") && t.remote_state().echo_ack >= 1 {
+            // Wait for the echoed input AND its echo-ack (the ack ships after the 50 ms debounce).
+            let screen = t.remote_state();
+            if screen.screen().contents().contains("xy")
+                && screen.echo_ack() >= 1
+                && screen.screen().size() == clamped
+            {
                 break;
             }
         }
+        let screen = t.remote_state();
         assert!(
-            t.remote_state().contents().contains("xy"),
-            "input reached the host"
+            screen.screen().contents().contains("xy"),
+            "input reached the shell"
         );
-        chan.close(0, b"done");
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), accept).await;
-        let s = handle.session.lock().await;
-        let calls = &s.host.calls;
-        assert!(
-            calls.iter().any(|c| matches!(c, HostCall::Resize(_, r, cc) if (*r, *cc) == crate::terminal::clamp_dims(65000, 1))),
-            "resize arrives clamped: {calls:?}"
-        );
+        assert_eq!(screen.screen().size(), clamped, "resize arrives clamped");
         assert_eq!(
-            t.remote_state().echo_ack,
+            screen.echo_ack(),
             1,
             "the loop's own echo-ack for frame 1 is stamped onto the snapshot (KS-02)"
         );
-        assert!(
-            calls.iter().any(|c| matches!(c, HostCall::Detached(_))),
-            "the connection's detach reaches the host: {calls:?}"
-        );
-        assert!(
-            calls.contains(&HostCall::Kill),
-            "run_session_with kills the host at the end"
-        );
+        chan.close(0, b"done");
+        tokio::time::timeout(std::time::Duration::from_secs(5), accept)
+            .await
+            .expect("run_session returns after the connection ends")
+            .expect("accept task")
+            .expect("run_session");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[expect(
         clippy::items_after_statements,
-        reason = "the pump helper reads best next to the viewers it drives"
+        reason = "the pump helper reads best next to the connections it drives"
     )]
-    async fn echo_ack_is_tracked_per_connection_so_a_second_viewer_sees_only_its_own_frames() {
-        // KS-02: two clients on ONE shared ScriptedHost. A sends many frames, B sends one. B's
-        // snapshots must carry B's own ack (never A's much larger frame number), and A's must
-        // carry A's — the bug this pins was a host-global echo-ack that handed B `echo_ack = 40`.
-        use crate::server::session::test_host::ScriptedHost;
-        use crate::server::session::{ClientId, SessionHandle};
+    async fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_frames() {
+        // KS-02: two connections on ONE session (a peer's reconnect racing its old connection). A
+        // sends many frames, B sends one. B's snapshots must carry B's own ack (never A's much
+        // larger frame number), and A's must carry A's.
+        use crate::server::session::spawn_session;
         use crate::transport_iroh::{
             bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, MonoClock, ALPN,
         };
@@ -852,14 +823,14 @@ mod tests {
             .await
             .expect("bind");
         let addr = loopback_addr(&server_ep);
-        let handle = SessionHandle::new(ScriptedHost::new());
+        let handle = spawn_session(&["cat".to_owned()], 0).expect("spawn");
         let h2 = handle.clone();
         let accept = tokio::spawn(async move {
             while let Some(incoming) = server_ep.accept().await {
                 let h = h2.clone();
                 tokio::spawn(async move {
                     if let Ok(conn) = incoming.await {
-                        let _ = super::run_attached(conn, h, ClientId::next()).await;
+                        let _ = super::run_attached(conn, h).await;
                     }
                 });
             }
@@ -871,14 +842,14 @@ mod tests {
                 .await
                 .expect("bind client");
             let chan = IrohChannel::new(ep.connect(addr.clone(), ALPN).await.expect("connect"));
-            let mut t = Transport::<UserInput, GridState>::new(clock.now_ms(), 1200);
+            let mut t = Transport::<UserInput, TerminalScreen>::new(clock.now_ms(), 1200);
             t.set_connected(true);
             t.observe_rtt(10.0);
             viewers.push((chan, t, ep));
         }
-        // Pump both viewers for `ms`, asserting the per-connection invariant on every frame.
+        // Pump both connections for `ms`, asserting the per-connection invariant on every frame.
         async fn pump(
-            viewers: &mut [(IrohChannel, Transport<UserInput, GridState>, iroh::Endpoint)],
+            viewers: &mut [(IrohChannel, Transport<UserInput, TerminalScreen>, iroh::Endpoint)],
             clock: &MonoClock,
             ms: u64,
         ) {
@@ -894,9 +865,9 @@ mod tests {
                         t.recv(clock.now_ms(), &b);
                     }
                     assert!(
-                        t.remote_state().echo_ack <= t.newest_sent_num(),
-                        "a viewer was acked for a frame it never sent: ack {} > sent {}",
-                        t.remote_state().echo_ack,
+                        t.remote_state().echo_ack() <= t.newest_sent_num(),
+                        "a connection was acked for a frame it never sent: ack {} > sent {}",
+                        t.remote_state().echo_ack(),
                         t.newest_sent_num()
                     );
                 }
@@ -912,18 +883,18 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             pump(&mut viewers, &clock, 50).await;
-            let b_done = viewers[1].1.remote_state().echo_ack >= 1;
-            let a_done = viewers[0].1.remote_state().echo_ack >= 30;
+            let b_done = viewers[1].1.remote_state().echo_ack() >= 1;
+            let a_done = viewers[0].1.remote_state().echo_ack() >= 30;
             if a_done && b_done {
                 break;
             }
         }
         let (a_ack, a_sent) = (
-            viewers[0].1.remote_state().echo_ack,
+            viewers[0].1.remote_state().echo_ack(),
             viewers[0].1.newest_sent_num(),
         );
         let (b_ack, b_sent) = (
-            viewers[1].1.remote_state().echo_ack,
+            viewers[1].1.remote_state().echo_ack(),
             viewers[1].1.newest_sent_num(),
         );
         assert!(
@@ -942,5 +913,6 @@ mod tests {
             chan.close(0, b"done");
         }
         accept.abort();
+        handle.session.lock().await.host.kill();
     }
 }

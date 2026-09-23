@@ -153,8 +153,7 @@ fn is_base64_payload(s: &str) -> bool {
 /// The out-of-band window state for one frame.
 ///
 /// What the client mirrors onto the real terminal alongside the cell grid (window title, icon
-/// name, clipboard, bell). Sourced from the synced state via
-/// [`ClientState::window`](crate::client::ClientState::window).
+/// name, clipboard, bell), taken from the synced [`TerminalScreen`](crate::terminal::TerminalScreen).
 #[derive(Clone, Copy)]
 pub struct WindowState<'a> {
     pub title: &'a str,

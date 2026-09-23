@@ -46,7 +46,7 @@ impl GroupExitStatus {
 /// Resolve the session shell when the caller didn't pass `--shell`. Prefers `$SHELL`; otherwise a
 /// platform default. portable-pty's `new_default_prog` falls back to `/bin/sh`, which does **not**
 /// exist on Android (it's `/system/bin/sh`) — so a `koh serve` with no `--shell` would fail to spawn
-/// a session there (and the Bevy Android app, which has no `$SHELL`, would hit the same). The logic
+/// a session there. The logic
 /// lives in the pure [`resolve_shell`] so it is unit-testable without touching the process env.
 fn default_shell() -> String {
     resolve_shell(std::env::var_os("SHELL"))
@@ -56,8 +56,8 @@ fn default_shell() -> String {
 /// arguments. An empty `command` means "the session shell", resolved by `fallback` (the login
 /// shell in production; injected so this stays unit-testable without touching the process env).
 ///
-/// Deliberately no whitespace splitting or quote parsing: a library caller that wants to host
-/// `zellij attach -c main` passes four elements, and a program whose path contains a space still
+/// Deliberately no whitespace splitting or quote parsing: hosting `zellij attach -c main` takes
+/// four elements (`--shell` repeated four times), and a program whose path contains a space still
 /// works. Splitting a single `--shell` string is a CLI-layer choice, not a PTY concern.
 fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> CommandBuilder {
     match command.split_first() {

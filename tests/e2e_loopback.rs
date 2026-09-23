@@ -32,7 +32,7 @@ struct MockTerminal {
     latest: Arc<Mutex<String>>,
 }
 
-impl ClientTerminal<TerminalScreen> for MockTerminal {
+impl ClientTerminal for MockTerminal {
     fn render(
         &mut self,
         state: &TerminalScreen,

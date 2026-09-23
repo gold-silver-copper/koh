@@ -16,7 +16,7 @@ use koh::client::{run_client, BellHook, ClientTerminal, IrohConnector};
 use koh::input::UserInput;
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::session::spawn_session;
-use koh::server::{run_attached, run_session, ClientId, SessionExit};
+use koh::server::{run_attached, run_session, SessionExit};
 use koh::ssp::Transport;
 use koh::terminal::TerminalScreen;
 use koh::transport_iroh::{
@@ -29,7 +29,7 @@ struct MockTerminal {
     latest: Arc<Mutex<String>>,
 }
 
-impl ClientTerminal<TerminalScreen> for MockTerminal {
+impl ClientTerminal for MockTerminal {
     fn render(
         &mut self,
         state: &TerminalScreen,
@@ -177,7 +177,7 @@ async fn stale_bells_before_attach_do_not_fire_but_bells_after_reconnect_do() {
             if koh::transport_iroh::admission::admit(&conn).await.is_err() {
                 continue;
             }
-            match run_attached(conn, handle.clone(), ClientId::next()).await {
+            match run_attached(conn, handle.clone()).await {
                 Ok(SessionExit::Detached) => {}
                 _ => break,
             }

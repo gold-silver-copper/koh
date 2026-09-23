@@ -29,10 +29,10 @@ pub use render::{InputModes, WindowState};
 use std::time::Duration;
 
 use crate::input::UserInput;
-use crate::predict::{DisplayPreference, Overlay, PredictionEngine, ScreenView};
-use crate::ssp::{RecvOutcome, SyncState, Transport, SHUTDOWN_SENTINEL};
+use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
+use crate::ssp::{RecvOutcome, Transport, SHUTDOWN_SENTINEL};
 use crate::terminal::TerminalScreen;
-use crate::transport_iroh::{IrohChannel, MonoClock, TERMINAL_ALPN};
+use crate::transport_iroh::{IrohChannel, MonoClock, ALPN};
 use anyhow::Context;
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
@@ -109,23 +109,12 @@ fn looks_like_resume_from_freeze(wall_gap: Duration) -> bool {
 pub struct IrohConnector {
     endpoint: Endpoint,
     target: EndpointAddr,
-    /// The ALPN to dial: selects the synced state type the server must serve (KH-02).
-    alpn: &'static [u8],
 }
 
 impl IrohConnector {
-    /// A connector for the terminal-screen state ([`TERMINAL_ALPN`]).
-    pub fn new(endpoint: Endpoint, target: EndpointAddr) -> Self {
-        Self::with_alpn(endpoint, target, TERMINAL_ALPN)
-    }
-
-    /// A connector dialing `alpn` — the ALPN of the state type this client renders (KH-02).
-    pub fn with_alpn(endpoint: Endpoint, target: EndpointAddr, alpn: &'static [u8]) -> Self {
-        Self {
-            endpoint,
-            target,
-            alpn,
-        }
+    /// A connector dialing `target` from `endpoint`.
+    pub const fn new(endpoint: Endpoint, target: EndpointAddr) -> Self {
+        Self { endpoint, target }
     }
 
     /// Connect to the server and await its admission ack. A server that rejects us (our node-id is
@@ -135,15 +124,9 @@ impl IrohConnector {
     pub async fn connect(&self) -> anyhow::Result<IrohChannel> {
         let conn = self
             .endpoint
-            .connect(self.target.clone(), self.alpn)
+            .connect(self.target.clone(), ALPN)
             .await
-            .with_context(|| {
-                format!(
-                    "connecting to server (is your id on its allowlist, and does it serve the \
-                     `{}` state?)",
-                    String::from_utf8_lossy(self.alpn)
-                )
-            })?;
+            .context("connecting to server (is your id on its allowlist?)")?;
         if let Err(e) = crate::transport_iroh::admission::await_admission(&conn).await {
             // The server rejects with a specific application reason — "not authorized" / "server at
             // session capacity" — each pointing at a different operator fix. Surface that real reason
@@ -215,83 +198,30 @@ fn escape_quit(chunk: &[u8], pending: &mut bool) -> bool {
     false
 }
 
-/// What the client needs from any synced state to run a session over it (KC-01).
-///
-/// The out-of-band window state to mirror, the remote exit code once the server announces
-/// shutdown, the input modes the real terminal must match, and (optionally) the screen the
-/// predictor overlays. [`TerminalScreen`] implements it; an embedding client implements it for its
-/// own state and renders that state through its own [`ClientTerminal`].
-pub trait ClientState: SyncState + Send + 'static {
-    /// Title / icon / clipboard / bell to mirror onto the real terminal.
-    fn window(&self) -> render::WindowState<'_>;
-    /// The remote program's exit code, carried on the shutdown frame.
-    fn exit_code(&self) -> Option<u32>;
-    /// The server's echo-ack: the newest input frame reflected in the state (drives prediction
-    /// confirmation timing, S-03).
-    fn echo_ack(&self) -> u64;
-    /// Input modes the real terminal must mirror (default: none set).
-    fn input_modes(&self) -> render::InputModes {
-        render::InputModes::default()
-    }
-    /// The grid local-echo prediction reconciles against; `None` disables prediction.
-    fn predict_target(&self) -> Option<&dyn ScreenView> {
-        None
+/// The out-of-band window state (title / icon / clipboard / bell) to mirror onto the real terminal.
+fn window_state(screen: &TerminalScreen) -> WindowState<'_> {
+    WindowState {
+        title: screen.title(),
+        icon: screen.icon(),
+        clipboard: screen.clipboard(),
+        bell_count: screen.bell_count(),
     }
 }
 
-impl ClientState for TerminalScreen {
-    fn window(&self) -> render::WindowState<'_> {
-        render::WindowState {
-            title: self.title(),
-            icon: self.icon(),
-            clipboard: self.clipboard(),
-            bell_count: self.bell_count(),
-        }
-    }
-    fn exit_code(&self) -> Option<u32> {
-        Self::exit_code(self)
-    }
-    fn echo_ack(&self) -> u64 {
-        Self::echo_ack(self)
-    }
-    fn input_modes(&self) -> render::InputModes {
-        render::InputModes::from(self.screen())
-    }
-    fn predict_target(&self) -> Option<&dyn ScreenView> {
-        Some(self.screen())
-    }
-}
-
-/// The generic test state renders too: no prediction, bell/exit from its scalars (KC-01).
-#[cfg(any(test, feature = "test-support"))]
-impl ClientState for crate::ssp::testkit::GridState {
-    fn window(&self) -> render::WindowState<'_> {
-        render::WindowState {
-            title: "",
-            icon: "",
-            clipboard: "",
-            bell_count: self.bell_count,
-        }
-    }
-    fn exit_code(&self) -> Option<u32> {
-        self.exit_code
-    }
-    fn echo_ack(&self) -> u64 {
-        self.echo_ack
-    }
-}
-
-/// Where the client paints frames and reads the window size (KC-01).
+/// Where the client paints frames and reads the window size.
 ///
 /// The real binary draws to the terminal via a [`KohBackend`] ([`BackendTerminal`]); a test
-/// captures cells/text as data. Generic over the synced state it renders.
-pub trait ClientTerminal<S: ClientState> {
-    /// Paint one frame. `state` is the authoritative synced state (its
-    /// [`window`](ClientState::window) and [`input_modes`](ClientState::input_modes) are what the
-    /// real terminal must mirror); `overlay` is the prediction overlay; `status` is the optional
-    /// status line.
-    fn render(&mut self, state: &S, overlay: &Overlay, status: Option<&str>)
-        -> std::io::Result<()>;
+/// captures cells/text as data.
+pub trait ClientTerminal {
+    /// Paint one frame. `state` is the authoritative synced screen (its window state and input
+    /// modes are what the real terminal must mirror); `overlay` is the prediction overlay;
+    /// `status` is the optional status line.
+    fn render(
+        &mut self,
+        state: &TerminalScreen,
+        overlay: &Overlay,
+        status: Option<&str>,
+    ) -> std::io::Result<()>;
 
     /// The current window size as `(rows, cols)`.
     fn size(&self) -> std::io::Result<(u16, u16)>;
@@ -302,7 +232,7 @@ pub trait ClientTerminal<S: ClientState> {
     /// force a repaint. Blocks for the whole suspended duration (the entire process is stopped).
     ///
     /// Default: a no-op, so a scripted test terminal can never actually stop the test process; only
-    /// the real [`TerminaTerminal`] performs the suspend.
+    /// the real [`BackendTerminal`] performs the suspend.
     fn suspend_resume(&mut self) -> std::io::Result<()> {
         Ok(())
     }
@@ -343,7 +273,7 @@ impl<B: KohBackend> BackendTerminal<B> {
     }
 }
 
-impl<B: KohBackend> ClientTerminal<TerminalScreen> for BackendTerminal<B> {
+impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
     fn render(
         &mut self,
         state: &TerminalScreen,
@@ -353,7 +283,11 @@ impl<B: KohBackend> ClientTerminal<TerminalScreen> for BackendTerminal<B> {
         // Mirror the out-of-band terminal state (title/icon/clipboard/bell/modes) onto the real
         // terminal, then paint the cell grid.
         self.oob
-            .emit(&mut self.backend, state.input_modes(), state.window())?;
+            .emit(
+                &mut self.backend,
+                InputModes::from(state.screen()),
+                window_state(state),
+            )?;
         render::render(&mut self.backend, state.screen(), overlay, status)
     }
 
@@ -393,13 +327,6 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
     }
 }
 
-/// The production terminal on the default `termina` backend.
-///
-/// Kept as a named alias for callers that referenced the pre-abstraction type; new code should
-/// prefer [`BackendTerminal`] over [`DefaultBackend`] (or another [`KohBackend`]).
-#[cfg(feature = "backend-termina")]
-pub type TerminaTerminal = BackendTerminal<backend::TerminaBackend>;
-
 /// What [`ClientSession::on_input`] decided about a chunk of typed bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputOutcome {
@@ -432,15 +359,13 @@ pub struct TickResult {
 /// It owns the SSP [`Transport`], the [`PredictionEngine`], and the small render/escape state, and
 /// exposes pure step methods (`on_input`/`on_datagram`/`on_resize`/`on_tick`) that take the
 /// current time and return what to do — never touching tokio, iroh, or a real terminal. That makes
-/// the whole client protocol deterministically unit-testable (see this module's tests), and lets a
-/// future front-end (e.g. the planned Bevy app) drive it without `run_client`'s I/O scaffolding.
+/// the whole client protocol deterministically unit-testable (see this module's tests).
 ///
 /// The state is **derived** from the transport, never stored: [`state`](Self::state) and
 /// [`overlay`](Self::overlay) borrow it, so `run_client` renders through those borrows with no
-/// extra clone. Generic over the synced state `S` (KC-01); prediction runs only when the state
-/// offers a [`ClientState::predict_target`].
-pub struct ClientSession<S: ClientState = TerminalScreen> {
-    transport: Transport<UserInput, S>,
+/// extra clone.
+pub struct ClientSession {
+    transport: Transport<UserInput, TerminalScreen>,
     predictor: PredictionEngine,
     /// True after we've seen the lone escape prefix and are waiting for the next byte.
     pending_escape: bool,
@@ -451,7 +376,7 @@ pub struct ClientSession<S: ClientState = TerminalScreen> {
     status_was_shown: bool,
 }
 
-impl<S: ClientState> ClientSession<S> {
+impl ClientSession {
     /// Create a session at time `now` (ms) with datagram budget `mtu`, seeding the first resize
     /// the server should see. Marked connected and dirty (so the first frame paints).
     pub fn new(
@@ -461,7 +386,7 @@ impl<S: ClientState> ClientSession<S> {
         initial_rows: u16,
         initial_cols: u16,
     ) -> Self {
-        let mut transport = Transport::<UserInput, S>::new(now, mtu);
+        let mut transport = Transport::<UserInput, TerminalScreen>::new(now, mtu);
         transport.set_connected(true);
         transport
             .current_mut()
@@ -514,12 +439,10 @@ impl<S: ClientState> ClientSession<S> {
                 .set_srtt(self.transport.send_interval() as f64);
             // Seed predictions against the current remote screen. The screen borrows `transport`
             // immutably while `predictor` is borrowed mutably — disjoint fields, so no clone is
-            // needed; the borrow ends before `current_mut()` below. A state with no predict
-            // target skips prediction entirely.
-            if let Some(screen) = self.transport.remote_state().predict_target() {
-                for &b in &fwd {
-                    self.predictor.new_user_byte(now, b, screen);
-                }
+            // needed; the borrow ends before `current_mut()` below.
+            let screen = self.transport.remote_state().screen();
+            for &b in &fwd {
+                self.predictor.new_user_byte(now, b, screen);
             }
             self.transport.current_mut().push_bytes(&fwd);
             self.dirty = true;
@@ -538,9 +461,8 @@ impl<S: ClientState> ClientSession<S> {
             self.predictor.set_local_frame_late_acked(echo_ack);
             self.predictor
                 .set_srtt(self.transport.send_interval() as f64);
-            if let Some(screen) = self.transport.remote_state().predict_target() {
-                self.predictor.cull(now, screen);
-            }
+            self.predictor
+                .cull(now, self.transport.remote_state().screen());
             self.dirty = true;
         }
     }
@@ -564,10 +486,11 @@ impl<S: ClientState> ClientSession<S> {
         }
         // Escalate a long-pending prediction to the glitch underline on time, even on a silent
         // link (no datagram/keystroke to drive cull). Repaint if the flagging changed.
-        if let Some(screen) = self.transport.remote_state().predict_target() {
-            if self.predictor.tick(now, screen) {
-                self.dirty = true;
-            }
+        if self
+            .predictor
+            .tick(now, self.transport.remote_state().screen())
+        {
+            self.dirty = true;
         }
         let outgoing = self.transport.tick(now);
 
@@ -610,7 +533,7 @@ impl<S: ClientState> ClientSession<S> {
     }
 
     /// The authoritative remote state, borrowed (derived from the transport, never stored).
-    pub fn state(&self) -> &S {
+    pub fn state(&self) -> &TerminalScreen {
         self.transport.remote_state()
     }
 
@@ -620,24 +543,19 @@ impl<S: ClientState> ClientSession<S> {
         self.transport.remote_num() > 0
     }
 
-    /// The current prediction overlay to draw over [`state`](Self::state) (empty when the state
-    /// has no predict target).
+    /// The current prediction overlay to draw over [`state`](Self::state).
     pub fn overlay(&self) -> Overlay {
-        self.transport
-            .remote_state()
-            .predict_target()
-            .map_or_else(Overlay::empty, |screen| self.predictor.overlay(screen))
+        self.predictor
+            .overlay(self.transport.remote_state().screen())
     }
 
     /// The out-of-band window state (title / icon / clipboard / bell) for the client to mirror
     /// onto the real terminal alongside the cell grid.
     pub fn window_state(&self) -> render::WindowState<'_> {
-        self.transport.remote_state().window()
+        window_state(self.transport.remote_state())
     }
-}
 
-impl ClientSession<TerminalScreen> {
-    /// The authoritative remote screen (the terminal-state session's [`state`](Self::state) grid).
+    /// The authoritative remote screen (the [`state`](Self::state)'s grid).
     pub fn screen(&self) -> &vt100::Screen {
         self.transport.remote_state().screen()
     }
@@ -676,13 +594,7 @@ impl ClientSession<TerminalScreen> {
               input/resize channels, the terminal, the shutdown token and the bell hook — each a distinct \
               collaborator; bundling them into a struct would only move the list, not shorten it"
 )]
-#[expect(
-    clippy::future_not_send,
-    reason = "the future owns a terminal backend (`impl KohBackend`, deliberately not `Send`) and \
-              is driven on the caller's own task, never sent across threads; requiring `Send` \
-              would force every backend to be `Send` for no benefit"
-)]
-pub async fn run_client<S: ClientState, T: ClientTerminal<S>>(
+pub async fn run_client<T: ClientTerminal>(
     initial: IrohChannel,
     connector: IrohConnector,
     pref: DisplayPreference,
@@ -703,7 +615,7 @@ pub async fn run_client<S: ClientState, T: ClientTerminal<S>>(
         // A fresh session per (re)connection mirrors the server's fresh-transport-per-attach, which
         // full-repaints the live screen; re-seed the size from the terminal each time.
         let (rows, cols) = term.size().unwrap_or(initial_size);
-        let mut session = ClientSession::<S>::new(
+        let mut session = ClientSession::new(
             clock.now_ms(),
             channel.max_datagram_size(),
             pref,
@@ -775,9 +687,9 @@ enum Disposition {
     clippy::too_many_arguments,
     reason = "the I/O shell's collaborators, plus the optional bell hook"
 )]
-async fn drive_connection<S: ClientState, T: ClientTerminal<S>>(
+async fn drive_connection<T: ClientTerminal>(
     channel: &IrohChannel,
-    session: &mut ClientSession<S>,
+    session: &mut ClientSession,
     term: &mut T,
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
     resize_rx: &mut mpsc::Receiver<()>,
@@ -934,12 +846,11 @@ enum ReconnectOutcome {
 /// `Ctrl-^ .` to give up. A single dial is bounded by [`RECONNECT_CONNECT_TIMEOUT`] and is *not*
 /// cancelled by banner repaints or non-quit keystrokes — it is pinned and polled in place — so a
 /// slow dial still completes.
-#[expect(clippy::future_not_send, reason = "see run_client")]
-async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
+async fn reconnect<T: ClientTerminal>(
     connector: &IrohConnector,
     term: &mut T,
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
-    last: &ClientSession<S>,
+    last: &ClientSession,
     clock: &MonoClock,
     shutdown: &CancellationToken,
     attempt: &mut u32,
@@ -1037,7 +948,7 @@ mod tests {
     }
 
     fn new_session() -> ClientSession {
-        ClientSession::<TerminalScreen>::new(0, 1200, DisplayPreference::Always, 24, 80)
+        ClientSession::new(0, 1200, DisplayPreference::Always, 24, 80)
     }
 
     #[test]
@@ -1339,21 +1250,15 @@ mod tests {
         assert!(s.dirty, "a resize requires a repaint");
     }
 
-    // --- KC-01: the generic client over a non-terminal state, and the terminal path unchanged ---
-
     #[test]
-    fn client_session_over_grid_state_applies_diffs_and_reports_exit() {
-        use crate::ssp::testkit::GridState;
-        let mut s = ClientSession::<GridState>::new(0, 1200, DisplayPreference::Always, 24, 80);
-        // Typing seeds nothing (no predict target) but still forwards.
-        assert_eq!(s.on_input(0, b"hi"), InputOutcome::Forwarded);
-        assert!(s.overlay().is_empty(), "no predict target: no overlay");
-
-        let mut server = Transport::<GridState, UserInput>::new(0, 1200);
+    fn client_session_applies_remote_frames_and_reports_the_exit_code() {
+        let mut s = new_session();
+        let mut emu = crate::terminal::ServerTerminal::new(24, 80, 0);
+        emu.process(b"cell three\x07\x07");
+        let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
         server.set_connected(true);
         server.observe_rtt(20.0);
-        server.current_mut().cells.insert(3, b"cell three".to_vec());
-        server.current_mut().bell_count = 2;
+        *server.current_mut() = emu.snapshot();
         let mut now = 0;
         let out = loop {
             now += 25;
@@ -1367,15 +1272,16 @@ mod tests {
             s.on_datagram(now, &dg);
         }
         assert!(s.dirty, "a new remote state marks the client dirty");
-        assert_eq!(s.state().contents(), "cell three");
+        assert!(s.screen().contents().contains("cell three"));
         assert_eq!(
             s.window_state().bell_count,
             2,
-            "window state comes from the state"
+            "window state comes from the screen"
         );
 
         // Shutdown with an exit code.
-        server.current_mut().exit_code = Some(5);
+        emu.set_exit_code(5);
+        *server.current_mut() = emu.snapshot();
         server.start_shutdown(now);
         let out = loop {
             now += 25;
@@ -1393,7 +1299,7 @@ mod tests {
 
     #[test]
     fn backend_terminal_render_through_the_trait_matches_render_directly() {
-        // KC-01: `ClientTerminal<TerminalScreen>` for `BackendTerminal` is a pure delegation —
+        // `ClientTerminal` for `BackendTerminal` is a pure delegation —
         // the bytes are identical to calling the out-of-band ledger and `render::render` by hand.
         use crate::client::backend::CaptureBackend;
         let screen = TerminalScreen::from_bytes(
@@ -1412,8 +1318,12 @@ mod tests {
         // By hand.
         let mut direct = CaptureBackend::default();
         let mut oob = render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string());
-        oob.emit(&mut direct, screen.input_modes(), screen.window())
-            .unwrap();
+        oob.emit(
+            &mut direct,
+            InputModes::from(screen.screen()),
+            window_state(&screen),
+        )
+        .unwrap();
         render::render(
             &mut direct,
             screen.screen(),

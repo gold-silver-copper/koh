@@ -36,9 +36,8 @@ pub struct CellView<'a> {
 
 /// The read-only view of an authoritative screen the predictor reconciles against (KC-01).
 ///
-/// `vt100::Screen` implements it; so can any grid a different front-end syncs (a multiplexer's
-/// pane), which is why the engine takes `&dyn ScreenView` rather than a concrete emulator type.
-/// `predict` still imports nothing from `crate::` — this trait lives here for that reason.
+/// `vt100::Screen` implements it, and the tests implement it for a plain char grid. It keeps
+/// `predict` free of any `crate::` import (the CI layering guard enforces that).
 pub trait ScreenView {
     /// `(rows, cols)`.
     fn size(&self) -> (u16, u16);

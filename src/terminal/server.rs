@@ -268,7 +268,7 @@ impl ServerTerminal {
     }
 
     /// Produce the SSP snapshot the transport will diff and ship. `echo_ack` is 0: the connection
-    /// loop stamps its own (see [`SessionHost::stamp_echo_ack`](crate::server::SessionHost::stamp_echo_ack)).
+    /// loop stamps its own (KS-02).
     pub fn snapshot(&self) -> TerminalScreen {
         TerminalScreen {
             screen: self.parser.screen().clone(),

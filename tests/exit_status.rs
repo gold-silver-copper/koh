@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use koh::input::UserInput;
 use koh::server::session::{self, SessionStore};
-use koh::server::{run_attached, ClientId, SessionExit};
+use koh::server::{run_attached, SessionExit};
 use koh::ssp::{Transport, SHUTDOWN_SENTINEL};
 use koh::terminal::TerminalScreen;
 use koh::transport_iroh::{
@@ -71,7 +71,7 @@ async fn remote_shell_exit_status_reaches_client() {
                 else {
                     return;
                 };
-                match run_attached(conn, handle, ClientId::next()).await {
+                match run_attached(conn, handle).await {
                     Ok(SessionExit::Detached) | Err(_) => session::detach(&store, peer).await,
                     Ok(SessionExit::ShellExited) => session::reap(&store, peer).await,
                 }

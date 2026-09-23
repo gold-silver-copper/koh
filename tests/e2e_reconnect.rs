@@ -23,7 +23,7 @@ use std::time::Duration;
 use koh::client::{run_client, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::session::spawn_session;
-use koh::server::{run_attached, ClientId, SessionExit};
+use koh::server::{run_attached, SessionExit};
 use koh::terminal::TerminalScreen;
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel};
 use tokio::sync::{mpsc, oneshot};
@@ -33,7 +33,7 @@ struct MockTerminal {
     latest: Arc<Mutex<String>>,
 }
 
-impl ClientTerminal<TerminalScreen> for MockTerminal {
+impl ClientTerminal for MockTerminal {
     fn render(
         &mut self,
         state: &TerminalScreen,
@@ -101,7 +101,7 @@ async fn client_reconnects_and_reattaches_after_a_forced_drop() {
             if koh::transport_iroh::admission::admit(&conn).await.is_err() {
                 continue;
             }
-            match run_attached(conn, handle.clone(), ClientId::next()).await {
+            match run_attached(conn, handle.clone()).await {
                 Ok(SessionExit::Detached) => {} // reattach on the next accept
                 _ => break,                     // shell exited (or error)
             }

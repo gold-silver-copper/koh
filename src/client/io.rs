@@ -237,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_input_poll_cancels_and_joins_without_waiting_for_a_byte() {
-        // KC-IO-01: embedded client teardown owns and joins every producer.
+        // KC-IO-01: client teardown owns and joins every producer.
         let (reader, _writer) = UnixStream::pair().expect("socket pair");
         let (sender, mut receiver) = mpsc::channel(1);
         let cancel = CancellationToken::new();

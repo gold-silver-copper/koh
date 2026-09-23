@@ -4,7 +4,7 @@
 //! states converge end-to-end under loss, and that the predictor confirms/suppresses against real
 //! frames. The driver lives in `koh::sim`; the manual `--loss` explorer is `examples/chaos.rs`.
 
-use koh::sim::{run_generic_session, run_predictor_reconciliation, run_session};
+use koh::sim::{run_predictor_reconciliation, run_session};
 
 #[test]
 fn integration_converges_clean_link() {
@@ -23,15 +23,4 @@ fn integration_converges_lossy_link() {
 #[test]
 fn predictor_reconciles_against_real_screen() {
     run_predictor_reconciliation().unwrap();
-}
-
-#[test]
-fn integration_converges_generic_state_lossy() {
-    // KH-01: a non-terminal state with multi-datagram diffs converges under 30% loss, with the
-    // client's keystrokes reaching the server, for several seeds.
-    for seed in 1..6 {
-        let (r, expected) = run_generic_session(0.3, seed, 40);
-        r.assert_ok(&expected)
-            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
-    }
 }

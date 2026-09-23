@@ -105,8 +105,7 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Optional: only the `koh` binary and the `*Args` adapters need it (the `cli` feature). The
-# library surface (`ServeConfig` & co.) is clap-free so an embedding binary can bring its own parser.
+# Optional: only the `koh` binary and the `*Args` adapters need it (the `cli` feature).
 clap = { version = "4", features = ["derive", "env"], optional = true }
 rand = "0.8"
 data-encoding = "2"
@@ -118,7 +117,7 @@ data-encoding = "2"
 # and CI build the same tree as before; `backend-crossterm` is an off-by-default alternate that
 # exercises the `KohBackend` seam (build it with `--no-default-features --features backend-crossterm`).
 # `cli` owns clap and gates the `koh` binary, the `*Args` adapter structs, the `chaos` example and
-# the pty-binary e2e test. Library users (`default-features = false`) pick a backend and skip it.
+# the pty-binary e2e test.
 default = ["backend-termina", "cli"]
 cli = ["dep:clap"]
 backend-termina = ["dep:termina"]

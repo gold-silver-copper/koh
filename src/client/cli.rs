@@ -364,11 +364,8 @@ mod tests {
 
     #[tokio::test]
     async fn redial_reuses_the_loaded_identity_without_touching_the_key_file() -> anyhow::Result<()> {
-        use crate::transport_iroh::{
-            admission, bind_endpoint_local_alpns, generate_secret_key, TERMINAL_ALPN,
-        };
-        let server =
-            bind_endpoint_local_alpns(generate_secret_key(), vec![TERMINAL_ALPN.to_vec()]).await?;
+        use crate::transport_iroh::{admission, bind_endpoint_local, generate_secret_key};
+        let server = bind_endpoint_local(generate_secret_key(), true).await?;
         let identity = crate::identity::Identity::generate();
         let expected = identity.secret.public();
         let socket = server

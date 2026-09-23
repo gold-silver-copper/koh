@@ -21,11 +21,11 @@ use std::collections::BTreeMap;
 use crate::ssp::{SyncState, Transport, NEVER};
 use serde::{Deserialize, Serialize};
 
-/// A multi-cell grid state for exercising the generic host/client seams (KH-01).
+/// A multi-cell grid state for exercising the SSP with a state that is not a terminal.
 ///
-/// A state that is *not* a terminal: a map of numbered cells to byte payloads, plus the scalars a
-/// client needs (`echo_ack`, `exit_code`, geometry). Diffs carry only the changed cells, so a diff
-/// can span several datagrams when many cells move — the shape of a multiplexer's per-pane grids.
+/// A map of numbered cells to byte payloads, plus a few scalars (`echo_ack`, `exit_code`,
+/// geometry). Diffs carry only the changed cells, so a diff can span several datagrams when many
+/// cells move, which stresses fragmentation and reassembly under loss.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GridState {
     pub cells: BTreeMap<u32, Vec<u8>>,
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn grid_state_diff_apply_roundtrip_with_adds_changes_and_removes() {
-        // KH-01: the round-trip law for the generic test state, including a removed cell.
+        // The round-trip law for the grid test state, including a removed cell.
         let mut base = GridState::default();
         base.cells.insert(1, b"one".to_vec());
         base.cells.insert(2, b"two".to_vec());
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn grid_state_converges_under_chaos() {
-        // KH-01: the transport syncs a non-terminal state with multi-datagram diffs over loss.
+        // The transport syncs a non-terminal state with multi-datagram diffs over loss.
         let mut h = SimHarness::<GridState, LogState>::new(LinkParams::lossy(), 11, 1200);
         let mut rng = Rng::new(5);
         for round in 0..40u32 {

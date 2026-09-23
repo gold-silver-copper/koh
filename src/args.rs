@@ -84,8 +84,8 @@ pub struct ServeArgs {
     shell: Vec<String>,
 
     /// Scrollback lines retained by the server-side emulator (per session). Bounded like the other
-    /// resource knobs (`--max-connections`/`--max-sessions`): vt100 allocates the grid eagerly, so an
-    /// unbounded value × `--max-sessions` is a memory footgun. 0 = no scrollback.
+    /// resource knobs (`--max-connections`/`--max-sessions`) and by the emulator's per-buffer cell
+    /// limit at the largest screen. 0 = no scrollback.
     #[arg(long, default_value_t = crate::server::cli::DEFAULT_SCROLLBACK, value_parser = clap::value_parser!(u64).range(0..=crate::server::cli::MAX_SCROLLBACK))]
     scrollback: u64,
 

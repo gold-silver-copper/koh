@@ -93,9 +93,9 @@ impl CursorKeyNormalizer {
 /// Coalesce a batch of drained client input before it touches the PTY (KOH-05).
 ///
 /// A single datagram set can pack a huge number of events; applying each synchronously — an
-/// `ioctl(TIOCSWINSZ)` + SIGWINCH and a `vt100` grid realloc per resize — is a CPU/syscall DoS.
+/// `ioctl(TIOCSWINSZ)` + SIGWINCH and an emulator grid realloc per resize — is a CPU/syscall DoS.
 /// Intermediate resizes have no observable effect, so only the LAST geometry is kept (clamped to
-/// `[MIN_DIM, MAX_DIM]` before the PTY/vt100 ever see it, H-1 / M-2); keystrokes concatenate in
+/// `[MIN_DIM, MAX_DIM]` before the PTY/emulator ever see it, H-1 / M-2); keystrokes concatenate in
 /// order through the DECCKM normalizer. Pure (given the normalizer + `app_cursor`) so the
 /// security-relevant collapse is unit-testable without a real PTY/transport.
 fn coalesce_drained_input(
@@ -375,7 +375,7 @@ pub async fn run_attached(
         session.observe_link(channel.max_datagram_size(), channel.rtt_ms());
 
         // Promote this connection's echo-ack (KS-02: per connection, not per host), then snapshot
-        // the live state under the session lock. The snapshot clones the whole vt100 grid +
+        // the live state under the session lock. The snapshot copies the whole live grid +
         // title/icon/clipboard, so the core gates it: take it only when the state may have changed
         // or the echo-ack advanced (S-03). The ack is stamped onto the snapshot outside the lock.
         let echo_changed = session.set_echo_ack(now);

@@ -3,7 +3,7 @@
 //! Two iroh endpoints on loopback (no relay, no second machine), a real PTY-hosted shell on
 //! the server, and the real client session loop driven through a mock terminal — exercising
 //! the entire path: scripted keystroke → client → iroh datagram → server → PTY → shell echo →
-//! vt100 → iroh datagram → client render. This is the slice the in-process `SimHarness` tests
+//! fux-vt → iroh datagram → client render. This is the slice the in-process `SimHarness` tests
 //! (Tier 0) deliberately cannot cover: that the genuine iroh accept/connect/datagram API
 //! actually carries our protocol.
 

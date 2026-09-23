@@ -23,7 +23,7 @@
 
 use std::io;
 
-use vt100::Color;
+use fux_vt::Color;
 
 #[cfg(feature = "backend-termina")]
 mod termina;
@@ -78,7 +78,7 @@ pub(crate) const RESET_FORWARDED_MODES: &[u8] =
 
 /// A compact, backend-neutral style fingerprint for one cell.
 ///
-/// Carries only what koh renders (fg/bg plus the boolean attributes vt100 exposes); `Copy` +
+/// Carries only what koh renders (fg/bg plus the boolean cell attributes); `Copy` +
 /// `PartialEq` so the render loop can diff it against the previous cell and re-emit SGR only when it
 /// actually changes.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -227,7 +227,7 @@ pub trait KohBackend {
     }
 
     /// Re-assert the remote app's input modes (bracketed paste / mouse reporting / application
-    /// cursor keys) on the local terminal. `bytes` are the DEC-private-mode set/reset escapes vt100
+    /// cursor keys) on the local terminal. `bytes` are the DEC-private-mode set/reset escapes
     /// produced by diffing the screen's mode state, forwarded verbatim so the local terminal reports
     /// input exactly as the remote app expects.
     fn write_input_modes(&mut self, bytes: &[u8]) -> io::Result<()> {

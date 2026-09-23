@@ -1,8 +1,10 @@
-//! The server-side live terminal emulator: a long-lived `vt100::Parser` fed by the PTY,
-//! plus the terminal queries it answers on the host's behalf. The echo-ack debounce that tells the
-//! client which of its keystrokes are now visible lives per connection in `server` (KS-02).
+//! The server-side live terminal emulator: a long-lived `fux_vt::Parser` fed by the PTY, plus
+//! the title / icon / bell / clipboard it observes and the query replies it produces. The
+//! echo-ack debounce that tells the client which of its keystrokes are now visible lives per
+//! connection in `server` (KS-02).
 
-use crate::terminal::{clamp_dims, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN};
+use crate::terminal::{clamp_dims, Grid, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN};
+use fux_vt::{Event, Options, Parser, Sink};
 
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
 fn title_from(bytes: &[u8]) -> String {
@@ -12,11 +14,10 @@ fn title_from(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Captures window title / icon / bell from `vt100`'s callback stream (none are stored on
-/// `Screen` itself), and synthesizes the host-bound replies to terminal queries (DSR / device
-/// attributes / DECRQM) that `vt100` does not answer on its own.
+/// What the emulator reports beside the grid: fux-vt [`Event`]s (title, icon, bell, OSC 52) and
+/// the replies to terminal queries (DSR / DECXCPR / device attributes / DECRQM).
 #[derive(Default)]
-struct Callbacks {
+struct Observed {
     title: String,
     icon: String,
     /// The remote-set clipboard payload (OSC 52, base64), capped at [`MAXIMUM_CLIPBOARD_SIZE`].
@@ -27,182 +28,55 @@ struct Callbacks {
     host_replies: Vec<u8>,
 }
 
-impl vt100::Callbacks for Callbacks {
-    fn set_window_title(&mut self, _: &mut vt100::Screen, t: &[u8]) {
-        self.title = title_from(t);
+impl Sink for Observed {
+    fn reply(&mut self, bytes: &[u8]) {
+        self.host_replies.extend_from_slice(bytes);
     }
-    fn set_window_icon_name(&mut self, _: &mut vt100::Screen, n: &[u8]) {
-        self.icon = title_from(n);
-    }
-    fn audible_bell(&mut self, _: &mut vt100::Screen) {
-        self.bell_count += 1;
-    }
-    /// OSC 52: the app set the system clipboard. `data` is already base64 (vt100). Forward the `c`
-    /// (clipboard) selection, capped; oversized sets are ignored.
-    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
-        if data.len() <= MAXIMUM_CLIPBOARD_SIZE {
-            self.clipboard = String::from_utf8_lossy(data).into_owned();
-        }
-    }
-
-    /// Answer the terminal queries interactive apps (vim/htop/fzf/…) block on. vt100 routes
-    /// these unrecognized CSIs here; we generate the reply the real terminal would send.
-    fn unhandled_csi(
-        &mut self,
-        screen: &mut vt100::Screen,
-        i1: Option<u8>,
-        i2: Option<u8>,
-        params: &[&[u16]],
-        c: char,
-    ) {
-        // First parameter (empty/`ESC[c` => 0; explicit `ESC[0c` => 0; `ESC[6n` => 6).
-        let p0 = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
-        match (i1, i2, c) {
-            // Device Status Report. cursor_position() is 0-indexed; the report is 1-indexed.
-            (None, _, 'n') => match p0 {
-                6 => {
-                    let (row, col) = screen.cursor_position();
-                    self.host_replies
-                        .extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
-                }
-                5 => self.host_replies.extend_from_slice(b"\x1b[0n"), // "terminal OK"
-                _ => {}
-            },
-            // DECDSR (cursor position bracketed by `?`), used by some apps.
-            (Some(b'?'), _, 'n') if p0 == 6 => {
-                let (row, col) = screen.cursor_position();
-                self.host_replies
-                    .extend_from_slice(format!("\x1b[?{};{}R", row + 1, col + 1).as_bytes());
-            }
-            // Primary Device Attributes (`ESC[c` / `ESC[0c`): answer as a VT220 (matches mosh).
-            (None, _, 'c') => self.host_replies.extend_from_slice(b"\x1b[?62;1;6c"),
-            // Secondary Device Attributes (`ESC[>c`).
-            (Some(b'>'), _, 'c') => self.host_replies.extend_from_slice(b"\x1b[>1;10;0c"),
-            // DECRQM mode request (`ESC[?<n>$p`): report bracketed-paste accurately, others as
-            // "not recognized" (0) — an honest answer is safer than lying about a mode.
-            (Some(b'?'), Some(b'$'), 'p') => {
-                let status = match p0 {
-                    2004 => {
-                        if screen.bracketed_paste() {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    _ => 0u16,
-                };
-                self.host_replies
-                    .extend_from_slice(format!("\x1b[?{p0};{status}$y").as_bytes());
+    fn event(&mut self, event: Event<'_>) {
+        match event {
+            Event::Title(t) => self.title = title_from(t),
+            Event::IconName(n) => self.icon = title_from(n),
+            Event::Bell => self.bell_count = self.bell_count.saturating_add(1),
+            // OSC 52: the app set a clipboard selection; `data` is already base64. Forward it,
+            // capped; an oversized set is ignored.
+            Event::Clipboard { data, .. } if data.len() <= MAXIMUM_CLIPBOARD_SIZE => {
+                self.clipboard = String::from_utf8_lossy(data).into_owned();
             }
             _ => {}
         }
     }
 }
 
-/// The server's authoritative terminal. Owns the live parser (which is not `Clone`) and
-/// produces a [`TerminalScreen`] snapshot for the SSP transport each tick.
+/// The server's authoritative terminal. Owns the live parser and produces a [`TerminalScreen`]
+/// snapshot for the SSP transport each tick.
 ///
 /// The echo-ack is **not** tracked here (KS-02): SSP frame numbers are per connection, so the
 /// per-connection `ServerSession` owns the input history and stamps its own ack onto each snapshot
 /// it takes. Snapshots leave `echo_ack` at 0 for that reason.
-const MAX_CONTROL_STRING_BYTES: usize = 64 * 1024;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ControlStringKind {
-    Osc,
-    Other,
-}
-
-#[derive(Default)]
-struct ControlStringFilter {
-    pending_escape: bool,
-    string: Option<ControlStringKind>,
-    string_escape: bool,
-    dropping: bool,
-    buffered: Vec<u8>,
-}
-
-impl ControlStringFilter {
-    fn process(&mut self, input: &[u8]) -> Vec<u8> {
-        let mut output = Vec::with_capacity(input.len().min(MAX_CONTROL_STRING_BYTES));
-        for &byte in input {
-            if let Some(kind) = self.string {
-                let terminated = byte == 0x9c
-                    || (kind == ControlStringKind::Osc && byte == 0x07)
-                    || (self.string_escape && byte == b'\\');
-                if !self.dropping {
-                    if self.buffered.len() < MAX_CONTROL_STRING_BYTES {
-                        self.buffered.push(byte);
-                    } else {
-                        self.buffered.clear();
-                        self.dropping = true;
-                    }
-                }
-                self.string_escape = byte == 0x1b;
-                if terminated || matches!(byte, 0x18 | 0x1a) {
-                    if !self.dropping {
-                        output.append(&mut self.buffered);
-                    }
-                    self.buffered.clear();
-                    self.string = None;
-                    self.string_escape = false;
-                    self.dropping = false;
-                }
-                continue;
-            }
-
-            if self.pending_escape {
-                self.pending_escape = false;
-                if let Some(kind) = control_string_introducer(byte) {
-                    self.string = Some(kind);
-                    self.buffered.extend_from_slice(&[0x1b, byte]);
-                    continue;
-                }
-                output.push(0x1b);
-            }
-            if byte == 0x1b {
-                self.pending_escape = true;
-            } else if let Some(kind) = c1_control_string_introducer(byte) {
-                self.string = Some(kind);
-                self.buffered.push(byte);
-            } else {
-                output.push(byte);
-            }
-        }
-        output
-    }
-}
-
-fn control_string_introducer(byte: u8) -> Option<ControlStringKind> {
-    match byte {
-        b']' => Some(ControlStringKind::Osc),
-        b'P' | b'X' | b'_' | b'^' => Some(ControlStringKind::Other),
-        _ => None,
-    }
-}
-
-fn c1_control_string_introducer(byte: u8) -> Option<ControlStringKind> {
-    match byte {
-        0x9d => Some(ControlStringKind::Osc),
-        0x90 | 0x98 | 0x9e | 0x9f => Some(ControlStringKind::Other),
-        _ => None,
-    }
-}
-
+///
+/// fux-vt is panic-free by construction and bounded: it retains no OSC/DCS/APC/PM/SOS payload
+/// except the OSC strings it reports as events, which it caps at `fux_vt::OSC_PAYLOAD_LIMIT`.
 pub struct ServerTerminal {
-    parser: vt100::Parser<Callbacks>,
-    control_filter: ControlStringFilter,
+    parser: Parser,
+    observed: Observed,
     /// The shell's exit code once it has exited (propagated to the client on shutdown).
     exit_code: Option<u32>,
 }
 
 impl ServerTerminal {
-    pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
-        Self {
-            parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback, Callbacks::default()),
-            control_filter: ControlStringFilter::default(),
+    /// An emulator of the given (clamped) size retaining `scrollback` history lines. Fails only
+    /// if fux-vt refuses the allocation (see [`MAX_SCROLLBACK`](crate::server::cli::MAX_SCROLLBACK)).
+    pub fn new(rows: u16, cols: u16, scrollback: usize) -> Result<Self, fux_vt::Error> {
+        let (rows, cols) = clamp_dims(rows, cols);
+        let options = Options {
+            events: true,
+            extended_replies: true,
+        };
+        Ok(Self {
+            parser: Parser::with_options(rows, cols, scrollback, options)?,
+            observed: Observed::default(),
             exit_code: None,
-        }
+        })
     }
 
     /// Record the shell's exit code; the next snapshot carries it to the client.
@@ -210,19 +84,12 @@ impl ServerTerminal {
         self.exit_code = Some(code);
     }
 
-    /// Feed a chunk of the child shell's output into the screen model.
-    ///
-    /// Routed through `process_contained`: a `vt100` panic on
-    /// shell output (an emulator bug, not wire-controlled — but `vt100` is outside koh's no-panic
-    /// coverage) is CONTAINED so it can't unwind out of the drain task and poison the session mutex.
-    /// On a contained panic the chunk is dropped and the parser keeps its prior state; subsequent
-    /// output repaints. The default hook still logs the backtrace to `$KOH_LOG` for an upstream report.
+    /// Feed a chunk of the child shell's output into the screen model. fux-vt fails only on
+    /// allocation or identity exhaustion, keeping whatever prefix it already applied; that is
+    /// logged and the next output continues from the terminal as it stands.
     pub fn process(&mut self, bytes: &[u8]) {
-        let filtered = self.control_filter.process(bytes);
-        if !crate::terminal::process_contained(&mut self.parser, &filtered) {
-            tracing::error!(
-                "vt100 panicked on shell output; dropped the chunk (backtrace in logs)"
-            );
+        if let Err(e) = self.parser.process_with(bytes, &mut self.observed) {
+            tracing::warn!(error = %e, "terminal emulator refused shell output");
         }
     }
 
@@ -230,16 +97,19 @@ impl ServerTerminal {
     /// PTY output. The caller MUST write these back to the PTY input so the querying app sees
     /// them; they are never part of the synced screen.
     pub fn take_host_replies(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.parser.callbacks_mut().host_replies)
+        std::mem::take(&mut self.observed.host_replies)
     }
 
     /// Resize the emulated screen (after applying a client resize to the PTY). The dimensions are
-    /// peer-controlled, so they are clamped to `[MIN_DIM, MAX_DIM]` here — vt100 allocates the grid
-    /// eagerly, so an unbounded resize OOM-aborts the (cross-tenant) server and a zero dimension
-    /// panics it (H-1 / M-2). Defense in depth: the call site clamps too, this is the chokepoint.
+    /// peer-controlled, so they are clamped to `[MIN_DIM, MAX_DIM]` here — the grid is allocated
+    /// eagerly, so an unbounded resize would OOM the (cross-tenant) server (H-1). Defense in
+    /// depth: the call site clamps too, this is the chokepoint. A refused resize (allocation
+    /// limit) keeps the previous size and is logged.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let (rows, cols) = clamp_dims(rows, cols);
-        self.parser.screen_mut().set_size(rows, cols);
+        if let Err(e) = self.parser.resize(rows, cols) {
+            tracing::warn!(error = %e, rows, cols, "terminal emulator refused a resize");
+        }
     }
 
     /// `(rows, cols)`. Test-only: production reads geometry from the snapshot, not the live emulator.
@@ -252,13 +122,13 @@ impl ServerTerminal {
     /// [`snapshot`](Self::snapshot)'s [`TerminalScreen`].
     #[cfg(test)]
     pub fn title(&self) -> &str {
-        &self.parser.callbacks().title
+        &self.observed.title
     }
 
     /// Number of audible bells seen so far. Test-only (see [`title`](Self::title)).
     #[cfg(test)]
     pub fn bell_count(&self) -> u64 {
-        self.parser.callbacks().bell_count
+        self.observed.bell_count
     }
 
     /// Whether the emulated app has DECCKM (application cursor keys) on — used to normalize the
@@ -271,14 +141,13 @@ impl ServerTerminal {
     /// loop stamps its own (KS-02).
     pub fn snapshot(&self) -> TerminalScreen {
         TerminalScreen {
-            screen: self.parser.screen().clone(),
+            grid: Grid::of(self.parser.screen()),
             echo_ack: 0,
-            title: self.parser.callbacks().title.clone(),
-            icon: self.parser.callbacks().icon.clone(),
-            clipboard: self.parser.callbacks().clipboard.clone(),
-            bell_count: self.parser.callbacks().bell_count,
+            title: self.observed.title.clone(),
+            icon: self.observed.icon.clone(),
+            clipboard: self.observed.clipboard.clone(),
+            bell_count: self.observed.bell_count,
             exit_code: self.exit_code,
-            parser: None,
         }
     }
 }
@@ -289,7 +158,7 @@ mod tests {
 
     #[test]
     fn answers_cursor_position_report() {
-        let mut t = ServerTerminal::new(24, 80, 0);
+        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
         t.process(b"\x1b[5;3H"); // move cursor to row 5, col 3 (1-indexed input)
         t.process(b"\x1b[6n"); // DSR: report cursor position
         assert_eq!(t.take_host_replies(), b"\x1b[5;3R"); // 1-indexed report
@@ -299,16 +168,28 @@ mod tests {
 
     #[test]
     fn answers_device_attributes() {
-        let mut t = ServerTerminal::new(24, 80, 0);
-        t.process(b"\x1b[c"); // primary DA
-        assert_eq!(t.take_host_replies(), b"\x1b[?62;1;6c");
+        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
+        t.process(b"\x1b[c"); // primary DA: fux-vt answers as a VT100 with advanced video
+        assert_eq!(t.take_host_replies(), b"\x1b[?1;2c");
         t.process(b"\x1b[>c"); // secondary DA
         assert_eq!(t.take_host_replies(), b"\x1b[>1;10;0c");
     }
 
     #[test]
+    fn answers_decxcpr_and_decrqm() {
+        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
+        t.process(b"\x1b[5;3H\x1b[?6n");
+        assert_eq!(t.take_host_replies(), b"\x1b[?5;3R");
+        t.process(b"\x1b[?2004$p\x1b[?2004h\x1b[?2004$p\x1b[?4242$p");
+        assert_eq!(
+            t.take_host_replies(),
+            b"\x1b[?2004;2$y\x1b[?2004;1$y\x1b[?4242;0$y"
+        );
+    }
+
+    #[test]
     fn title_icon_bell_clipboard_captured() {
-        let mut t = ServerTerminal::new(24, 80, 0);
+        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
         t.process(b"\x1b]2;my-title\x07\x07\x1b]1;my-icon\x07\x1b]52;c;aGVsbG8=\x07");
         assert_eq!(t.title(), "my-title");
         assert_eq!(t.bell_count(), 1);
@@ -326,9 +207,9 @@ mod tests {
     #[test]
     fn server_resize_clamps_oom_and_zero() {
         use crate::terminal::{MAX_DIM, MIN_DIM};
-        // The server emulator must clamp a peer-controlled resize before vt100 allocates the grid:
-        // a giant resize would OOM-abort the (cross-tenant) server, a zero dimension would panic it.
-        let mut t = ServerTerminal::new(24, 80, 0);
+        // The server emulator must clamp a peer-controlled resize before the grid is allocated:
+        // a giant resize would OOM-abort the (cross-tenant) server.
+        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
         t.resize(65000, 65000); // must not OOM
         assert_eq!(
             t.size(),
@@ -341,9 +222,7 @@ mod tests {
             (MIN_DIM, MIN_DIM),
             "zero resize clamped to MIN_DIM"
         );
-        // Critically: feeding wrappy/wide shell output into the clamped grid must NOT panic vt100
-        // (a 1×1 grid underflows its wrap math — MIN_DIM=2 is the smallest size it tolerates). This
-        // is the in-process guard for the M-2 regression the emulator surfaced.
+        // Wrappy/wide shell output into the smallest clamped grid is fine.
         t.process("AAAA日本🦀\r\nBBBB\r\n".repeat(8).as_bytes());
         let _ = t.snapshot();
         // A normal resize is untouched, and a snapshot after a clamped resize is still coherent.
@@ -353,9 +232,21 @@ mod tests {
     }
 
     #[test]
+    fn max_scrollback_fits_the_largest_screen() {
+        // `MAX_SCROLLBACK` must leave room for a MAX_DIM×MAX_DIM screen in fux-vt's per-buffer
+        // cell limit, or `koh serve --scrollback <max>` would fail to start or refuse a resize.
+        use crate::terminal::MAX_DIM;
+        let history = usize::try_from(crate::server::cli::MAX_SCROLLBACK).expect("fits usize");
+        let mut t = ServerTerminal::new(24, 80, history).expect("default size at max scrollback");
+        t.resize(MAX_DIM, MAX_DIM);
+        assert_eq!(t.size(), (MAX_DIM, MAX_DIM), "largest resize accepted");
+        assert!(ServerTerminal::new(MAX_DIM, MAX_DIM, history).is_ok());
+    }
+
+    #[test]
     fn oversized_clipboard_is_dropped() {
         // A clipboard set above the cap must not be synced (anti-amplification).
-        let mut t = ServerTerminal::new(24, 80, 0);
+        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
         let big = "A".repeat(MAXIMUM_CLIPBOARD_SIZE + 1);
         t.process(format!("\x1b]52;c;{big}\x07").as_bytes());
         assert_eq!(t.snapshot().clipboard(), "", "oversized clipboard dropped");
@@ -365,7 +256,7 @@ mod tests {
     fn oversized_title_is_clamped() {
         // A runaway/hostile OSC title is clamped to MAX_TITLE_LEN chars (mosh's parse-time cap),
         // not stored unbounded.
-        let mut t = ServerTerminal::new(24, 80, 0);
+        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
         let huge = "x".repeat(MAX_TITLE_LEN + 500);
         t.process(format!("\x1b]2;{huge}\x07").as_bytes());
         assert_eq!(
@@ -379,27 +270,26 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_control_strings_are_bounded_and_reset_after_termination() {
-        let mut terminal = ServerTerminal::new(24, 80, 0);
-        terminal.process(b"before\x1b]");
-        for _ in 0..32 {
-            terminal.process(&vec![b'x'; MAX_CONTROL_STRING_BYTES.div_euclid(4)]);
-            assert!(terminal.control_filter.buffered.len() <= MAX_CONTROL_STRING_BYTES);
+    fn unterminated_control_strings_are_bounded_and_recover() {
+        // fux-vt retains no DCS/APC/PM/SOS payload and caps a pending OSC at its payload limit, so
+        // a runaway string can't grow memory; terminating it resumes normal output.
+        let mut terminal = ServerTerminal::new(24, 80, 0).expect("emulator");
+        for introducer in [&b"\x1b]2;"[..], b"\x1bP", b"\x1bX", b"\x1b_", b"\x1b^"] {
+            terminal.process(b"before");
+            terminal.process(introducer);
+            for _ in 0..32 {
+                terminal.process(&[b'x'; 16 * 1024]);
+            }
+            terminal.process(b"\x1b\\after\r\n");
         }
-        assert!(terminal.control_filter.dropping);
-        terminal.process(b"\x1b\\after");
-        assert!(!terminal.control_filter.dropping);
-        assert_eq!(terminal.control_filter.buffered, b"");
-        assert!(terminal
-            .snapshot()
-            .screen()
-            .contents()
-            .contains("beforeafter"));
+        let contents = terminal.snapshot().screen().contents();
+        assert_eq!(contents.matches("beforeafter").count(), 5, "{contents:?}");
+        assert_eq!(terminal.title(), "", "an over-limit title is dropped, not truncated");
     }
 
     #[test]
-    fn bounded_filter_preserves_split_osc_and_csi_semantics() {
-        let mut terminal = ServerTerminal::new(24, 80, 0);
+    fn split_osc_and_csi_keep_their_meaning() {
+        let mut terminal = ServerTerminal::new(24, 80, 0).expect("emulator");
         for chunk in [
             &b"\x1b"[..],
             &b"]2;split"[..],
@@ -411,21 +301,5 @@ mod tests {
         }
         assert_eq!(terminal.title(), "split title");
         assert!(terminal.snapshot().screen().contents().contains("ok"));
-    }
-
-    #[test]
-    fn seven_bit_and_c1_sos_strings_share_the_control_string_bound() {
-        for introducer in [&b"\x1bX"[..], &b"\x98"[..]] {
-            let mut terminal = ServerTerminal::new(24, 80, 0);
-            terminal.process(introducer);
-            for _ in 0..5 {
-                terminal.process(&vec![b'x'; MAX_CONTROL_STRING_BYTES.div_euclid(4)]);
-            }
-            assert!(terminal.control_filter.dropping);
-            assert!(terminal.control_filter.buffered.len() <= MAX_CONTROL_STRING_BYTES);
-            terminal.process(b"\x1b\\ok");
-            assert!(!terminal.control_filter.dropping);
-            assert!(terminal.snapshot().screen().contents().contains("ok"));
-        }
     }
 }

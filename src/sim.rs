@@ -53,7 +53,11 @@ pub fn run_session(loss: f64, seed: u64) -> SessionResult {
     let mut h = SimHarness::<UserInput, TerminalScreen>::new(params, seed, 1200);
 
     // The server's authoritative emulator with an initial prompt.
-    let mut emu = ServerTerminal::new(24, 80, 0);
+    #[expect(
+        clippy::expect_used,
+        reason = "a 24x80 screen without history is always within fux-vt's allocation limits"
+    )]
+    let mut emu = ServerTerminal::new(24, 80, 0).expect("24x80 emulator");
     emu.process(b"$ ");
     *h.b_mut() = emu.snapshot();
 

@@ -39,7 +39,7 @@ pub const DEFAULT_MAX_DATAGRAM: usize = 1200;
 /// The ALPN only proves both ends speak *some* koh; this catches diff-encoding skew between
 /// koh builds that share an ALPN. (Unrelated to upstream mosh's `MOSH_PROTOCOL_VERSION` —
 /// koh never interoperates with mosh.)
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Exact serialized overhead of a [`Fragment`] header.
 ///

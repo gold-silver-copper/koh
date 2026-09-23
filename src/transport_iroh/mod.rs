@@ -47,9 +47,13 @@ fn koh_transport_config() -> QuicTransportConfig {
         .build()
 }
 
-/// The ALPN that identifies the koh protocol on the wire: SSP carrying `UserInput` up and a
-/// `TerminalScreen` down. A peer speaking anything else fails the TLS handshake.
-pub const ALPN: &[u8] = b"koh/iroh/1";
+/// The ALPN that identifies the koh protocol on the wire.
+///
+/// SSP carrying `UserInput` up and a `TerminalScreen` down; a peer speaking anything else fails the
+/// TLS handshake. Changed together with [`PROTOCOL_VERSION`](crate::wire::PROTOCOL_VERSION) for an
+/// incompatible diff encoding, so mismatched peers fail at the handshake with a clear error rather
+/// than mid-session.
+pub const ALPN: &[u8] = b"koh/iroh/2";
 
 /// Errors from endpoint/identity setup.
 #[derive(Debug, thiserror::Error)]
@@ -1166,7 +1170,10 @@ mod tests {
     }
 
     #[test]
-    fn the_alpn_stays_the_one_every_released_peer_speaks() {
-        assert_eq!(ALPN, b"koh/iroh/1");
+    fn the_alpn_names_the_structured_screen_protocol() {
+        // `koh/iroh/2` carries protocol 4's structured screen diff; a `koh/iroh/1` peer (vt100
+        // escape-patch diffs) fails the TLS handshake instead of misparsing.
+        assert_eq!(ALPN, b"koh/iroh/2");
+        assert_eq!(crate::wire::PROTOCOL_VERSION, 4);
     }
 }

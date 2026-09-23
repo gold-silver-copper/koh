@@ -556,7 +556,7 @@ impl ClientSession {
     }
 
     /// The authoritative remote screen (the [`state`](Self::state)'s grid).
-    pub fn screen(&self) -> &vt100::Screen {
+    pub fn screen(&self) -> &crate::terminal::Grid {
         self.transport.remote_state().screen()
     }
 }
@@ -1119,7 +1119,7 @@ mod tests {
         );
 
         // A real server frame that echoes 'x' and acks input frame 1 (past the echo debounce).
-        let mut emu = ServerTerminal::new(24, 80, 0);
+        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
         emu.process(b"x");
         let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
         server.set_connected(true);
@@ -1170,7 +1170,7 @@ mod tests {
         assert!(first.wait_ms <= 50, "wait is capped at 50ms");
 
         // Craft a real server shutdown frame carrying exit code 7 and deliver it.
-        let mut emu = ServerTerminal::new(24, 80, 0);
+        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
         emu.set_exit_code(7);
         let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
         server.set_connected(true);
@@ -1197,7 +1197,7 @@ mod tests {
         // is absorbed while a genuine stall still surfaces.
         let mut s = new_session();
         // Stamp last_heard with a real decoded server frame at t = 1000.
-        let mut emu = ServerTerminal::new(24, 80, 0);
+        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
         emu.process(b"ready prompt $ ");
         let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
         server.set_connected(true);
@@ -1253,7 +1253,7 @@ mod tests {
     #[test]
     fn client_session_applies_remote_frames_and_reports_the_exit_code() {
         let mut s = new_session();
-        let mut emu = crate::terminal::ServerTerminal::new(24, 80, 0);
+        let mut emu = crate::terminal::ServerTerminal::new(24, 80, 0).expect("emulator");
         emu.process(b"cell three\x07\x07");
         let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
         server.set_connected(true);

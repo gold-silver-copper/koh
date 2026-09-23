@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use unicode_width::UnicodeWidthStr;
-use vt100::Color;
+use fux_vt::Color;
 
 /// One cell as the predictor sees it: the glyph (empty for a blank or a wide-glyph continuation)
 /// and its colours.
@@ -36,8 +36,9 @@ pub struct CellView<'a> {
 
 /// The read-only view of an authoritative screen the predictor reconciles against (KC-01).
 ///
-/// `vt100::Screen` implements it, and the tests implement it for a plain char grid. It keeps
-/// `predict` free of any `crate::` import (the CI layering guard enforces that).
+/// koh's client grid (`terminal::Grid`) and `fux_vt::Screen` implement it, and the tests implement
+/// it for a plain char grid. It keeps `predict` free of any `crate::` import (the CI layering guard
+/// enforces that).
 pub trait ScreenView {
     /// `(rows, cols)`.
     fn size(&self) -> (u16, u16);
@@ -47,7 +48,7 @@ pub trait ScreenView {
     fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>>;
 }
 
-impl ScreenView for vt100::Screen {
+impl ScreenView for fux_vt::Screen {
     fn size(&self) -> (u16, u16) {
         Self::size(self)
     }
@@ -418,7 +419,7 @@ impl PredictionEngine {
 
     /// Predict a full UTF-8 grapheme `g` (already decoded from accumulated bytes). Places the
     /// glyph at the cursor and advances by its display width — two cells for CJK/emoji, whose
-    /// continuation cell vt100 leaves empty (so we predict nothing there). Zero-width
+    /// continuation cell the emulator leaves empty (so we predict nothing there). Zero-width
     /// (combining) graphemes and ones that would land on the wrap-ambiguous right edge fall back
     /// to a tentative epoch. Overwrite-only (no insert-mode tail shift for wide chars — that
     /// rarer case is left to the server's real echo).
@@ -957,15 +958,15 @@ fn cursor_validity(cur: &PredCursor, screen: &dyn ScreenView, late_acked: u64) -
 mod tests {
     use super::*;
 
-    use vt100::Screen;
+    use fux_vt::Screen;
 
     fn screen_of(bytes: &[u8]) -> Screen {
-        let mut p = vt100::Parser::new(24, 80, 0);
-        p.process(bytes);
+        let mut p = fux_vt::Parser::new(24, 80, 0).expect("24x80 parser");
+        p.process(bytes).expect("process");
         p.screen().clone()
     }
 
-    /// A screen that is NOT vt100: a plain char grid with a cursor (KC-01).
+    /// A screen that is NOT an emulator: a plain char grid with a cursor (KC-01).
     struct FakeView {
         rows: Vec<Vec<char>>,
         cursor: (u16, u16),
@@ -996,10 +997,10 @@ mod tests {
     }
 
     #[test]
-    fn predictor_runs_over_a_non_vt100_screen_view() {
+    fn predictor_runs_over_a_plain_screen_view() {
         // KC-01: the exact flow of `confirm_first_keystroke`, but over a 5×10 fake grid that is
-        // not vt100: the first keystroke is hidden, the server's echo confirms the epoch, and the
-        // next keystroke is visible at the right column. Proves the engine has no vt100 dependency.
+        // not an emulator: the first keystroke is hidden, the server's echo confirms the epoch, and the
+        // next keystroke is visible at the right column. Proves the engine needs no emulator.
         let blank = FakeView {
             rows: vec![vec![' '; 10]; 5],
             cursor: (0, 0),
@@ -1357,7 +1358,7 @@ mod tests {
         // Regression: the unknown-column guard must be overflow-safe on a peer-controlled width.
         // At cols == u16::MAX the left-shift loop reaches i = 65534, where a naive `i + 2` overflows
         // u16 (panics under debug overflow-checks). The `i < cols - 2` form must not.
-        let p = vt100::Parser::new(1, u16::MAX, 0);
+        let p = fux_vt::Parser::new(1, u16::MAX, 0).expect("1-row parser");
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         // Predicted cursor near the right edge so the backspace runs its left-shift loop out to the

@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 /// drive it without a real 5s wait).
 pub(crate) const REAP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The hosted program: a PTY-spawned process behind a `vt100` emulator, producing
+/// The hosted program: a PTY-spawned process behind a `fux-vt` emulator, producing
 /// [`TerminalScreen`] snapshots. Every method is called under the session lock.
 pub struct PtyHost {
     pub emu: ServerTerminal,
@@ -49,7 +49,7 @@ impl PtyHost {
         scrollback: usize,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let (rows, cols) = (DEFAULT_ROWS, DEFAULT_COLS);
-        let emu = ServerTerminal::new(rows, cols, scrollback);
+        let emu = ServerTerminal::new(rows, cols, scrollback).context("creating the terminal emulator")?;
         let (pty, pty_rx) = crate::pty::Pty::spawn(rows, cols, command, "xterm-256color")
             .context("spawning shell")?;
         Ok((
@@ -79,7 +79,7 @@ impl PtyHost {
     /// The client's terminal is now `rows × cols` (already clamped to `[MIN_DIM, MAX_DIM]`).
     pub fn resize(&mut self, rows: u16, cols: u16) {
         if let Err(e) = self.pty.resize(rows, cols) {
-            // A failed TIOCSWINSZ silently diverges the kernel winsize from the vt100 grid
+            // A failed TIOCSWINSZ silently diverges the kernel winsize from the emulator grid
             // (full-screen-app corruption with no breadcrumb today); warn, but still resize the
             // emulator so the screen geometry keeps tracking the client.
             tracing::warn!(error = %e, rows, cols, "pty resize failed");

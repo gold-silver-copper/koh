@@ -1,41 +1,40 @@
 #![no_main]
-//! Fuzz the untrusted SERVER->CLIENT screen-apply path — the highest-value attacker surface, since
-//! `vt100` (which parses the server-controlled escape stream) is a dependency outside koh's
-//! `forbid(unsafe)` + denied-panic-lint coverage.
+//! Fuzz the untrusted SERVER->CLIENT screen-apply path — the highest-value attacker surface: a
+//! server (or anyone who compromised one) controls every `ScreenDiff` the client applies.
 //!
-//! `TerminalScreen::apply` CONTAINS vt100 panics (`process_contained` wraps the parser in
-//! `catch_unwind`), so this target asserts the containment HOLDS: `apply` must NEVER panic on ANY
-//! input, and must leave the screen within the dimension clamp. A crash here means the containment
-//! failed (a koh bug); a contained vt100 panic underneath is invisible to the fuzzer (by design).
-//! The body mirrors the in-tree `apply_is_panic_free_and_holds_invariants` proptest, extended to
-//! coverage-guided fuzzing of the real vt100 escape grammar.
+//! Arbitrary bytes are decoded as a `ScreenDiff` exactly as the transport does (postcard), then
+//! applied to a blank screen and to one with content. `apply` validates rows, runs and cells and
+//! drops a malformed frame whole, so it must NEVER panic, and must always leave a grid within the
+//! dimension clamp whose rows are exactly as wide as the screen, with the cursor in range. The body
+//! mirrors the in-tree `apply_is_panic_free_and_holds_invariants` proptest, extended to
+//! coverage-guided fuzzing of the encoding.
 
 use koh::ssp::SyncState;
-use koh::terminal::{ScreenDiff, TerminalScreen};
+use koh::terminal::{ScreenDiff, TerminalScreen, MAX_DIM, MIN_DIM};
 use libfuzzer_sys::fuzz_target;
 
+fn check(screen: &TerminalScreen) {
+    let (rows, cols) = screen.size();
+    assert!((MIN_DIM..=MAX_DIM).contains(&rows) && (MIN_DIM..=MAX_DIM).contains(&cols));
+    for row in 0..rows {
+        assert_eq!(
+            screen.screen().row(row).map(<[_]>::len),
+            Some(usize::from(cols))
+        );
+    }
+    let (crow, ccol) = screen.screen().cursor_position();
+    assert!(crow < rows && ccol <= cols);
+}
+
 fuzz_target!(|data: &[u8]| {
-    // First 4 bytes (if present) optionally drive a resize (exercising the repaint-rebuild branch);
-    // the remainder is the vt100 escape stream (exercising the incremental branch). Both reach vt100.
-    let (head, vt) = data.split_at(data.len().min(4));
-    let resize = if head.len() == 4 {
-        Some((
-            u16::from_le_bytes([head[0], head[1]]),
-            u16::from_le_bytes([head[2], head[3]]),
-        ))
-    } else {
-        None
+    let Ok(diff) = postcard::from_bytes::<ScreenDiff>(data) else {
+        return;
     };
-    let diff = ScreenDiff {
-        resize,
-        echo_ack: 0,
-        title: None,
-        icon: None,
-        clipboard: None,
-        bell_count: 0,
-        exit_code: None,
-        vt: vt.to_vec(),
-    };
-    let mut screen = TerminalScreen::default();
-    screen.apply(&diff); // must never panic — the libFuzzer assertion
+    for mut screen in [
+        TerminalScreen::default(),
+        TerminalScreen::from_bytes(24, 80, "prior 日本 \x1b[31mscreen\x1b[m".as_bytes()),
+    ] {
+        screen.apply(&diff); // must never panic — the libFuzzer assertion
+        check(&screen);
+    }
 });

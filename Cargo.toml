@@ -2,10 +2,11 @@
 name = "koh"
 version = "0.12.1"
 edition = "2021"
-# The effective floor is dictated by the `=`-pinned iroh 1.0.0 (edition 2024 + rust-version 1.91),
-# not by koh's own 2021 edition. Declaring it turns "cargo install on an old toolchain" into a clear
-# "requires rustc 1.91" instead of a confusing mid-compile error. Keep in sync with iroh on each bump.
-rust-version = "1.91"
+# The effective floor is dictated by dependencies, not by koh's own 2021 edition: fux-vt declares
+# 1.95 (edition 2024), above the `=`-pinned iroh 1.0.0's 1.91. Declaring it turns "cargo install on
+# an old toolchain" into a clear "requires rustc 1.95" instead of a confusing mid-compile error. Keep
+# in sync with fux-vt and iroh on each bump.
+rust-version = "1.95"
 license = "MIT"
 authors = ["Stephen Korzen <stephen.korzen@gmail.com>"]
 repository = "https://github.com/gold-silver-copper/koh"
@@ -55,8 +56,9 @@ required-features = ["cli"]
 # transport (pinned: iroh API churns; see README). iroh 1.0 brings its own QUIC backend (noq, a
 # quinn fork); we never depend on quinn directly.
 iroh = "=1.0.0"
-# terminal / pty / tui
-vt100 = "=0.16.2"
+# terminal / pty / tui. fux-vt is the server's emulator and supplies the cell type the client grid
+# stores. During development it comes from the fux branch that adds what koh needs.
+fux-vt = { path = "../fux/fux-vt" }
 portable-pty = "=0.9.0"
 unicode-width = "0.2"
 # Terminal backends behind the `client::backend::KohBackend` seam. `termina` is the default and the
@@ -143,7 +145,7 @@ lto = "thin"
 # engine), so the per-op cost is negligible, and it makes a wrap-on-overflow of any peer-derived
 # arithmetic a loud panic in release too — not a silent miscompute. (`cast_*` lints are allowed, so
 # this is the backstop for a future raw `a + b` on a wire `u64`/`u16`.) NOTE: panic stays `unwind`,
-# never `abort` — the vt100 containment (`process_contained`) relies on `catch_unwind`.
+# never `abort` — the session unwind guard (K-16, `AttachGuard`) relies on unwinding.
 overflow-checks = true
 
 # ---------------------------------------------------------------------------

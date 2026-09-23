@@ -77,7 +77,11 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 64;
 /// The CLI's default for `--max-sessions`.
 pub const DEFAULT_MAX_SESSIONS: u32 = 64;
 /// Upper bound on `scrollback` (the CLI's `value_parser` range; re-checked in [`serve`]).
-pub const MAX_SCROLLBACK: u64 = 1_000_000;
+///
+/// fux-vt caps each buffer at 64 Mi cells (history plus live rows, times the width), so the
+/// history must leave room for a `MAX_DIM × MAX_DIM` screen or a wide resize would be refused:
+/// `(65_000 + 1000) × 1000 < 64 Mi`. Pinned by a `terminal::server` test.
+pub const MAX_SCROLLBACK: u64 = 65_000;
 
 impl Default for ServeConfig {
     fn default() -> Self {

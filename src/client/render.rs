@@ -1,9 +1,8 @@
-//! Painting the synchronized `vt100` screen (plus prediction overlays and a status line)
+//! Painting the synchronized screen grid (plus prediction overlays and a status line)
 //! onto the local terminal through the pluggable [`KohBackend`] seam.
 //!
-//! We render cell-by-cell — rather than just blitting `screen.contents_formatted()` — because
-//! the predictor needs to draw speculative cells (underlined) *on top of* the authoritative
-//! grid. Style changes are diffed against the previous cell so we emit minimal SGR. Each frame
+//! We render cell-by-cell because the predictor needs to draw speculative cells (underlined)
+//! *on top of* the authoritative grid. Style changes are diffed against the previous cell so we emit minimal SGR. Each frame
 //! is wrapped in synchronized output (DEC mode 2026) so the terminal shows it atomically
 //! (no tearing/flicker on full repaints or resizes).
 //!
@@ -16,14 +15,14 @@ use std::io;
 
 use super::backend::{CellStyle, KohBackend};
 use crate::predict::Overlay;
-use crate::terminal::MAXIMUM_CLIPBOARD_SIZE;
-use vt100::{Color, Screen};
+use crate::terminal::{Grid, MAXIMUM_CLIPBOARD_SIZE};
+use fux_vt::{Color, MouseProtocolEncoding, MouseProtocolMode};
 
 /// Render the authoritative `screen` with prediction `overlay` and an optional `status` line
 /// (drawn reverse-video on the last row) to `backend`, wrapped in one synchronized-output frame.
 pub fn render(
     backend: &mut impl KohBackend,
-    screen: &Screen,
+    screen: &Grid,
     overlay: &Overlay,
     status: Option<&str>,
 ) -> io::Result<()> {
@@ -164,26 +163,27 @@ pub struct WindowState<'a> {
 
 /// The input modes the remote app has set, which the real terminal must mirror (KC-01).
 ///
-/// Application keypad / cursor keys, bracketed paste, and xterm mouse reporting: a
-/// state-type-agnostic copy of what `vt100::Screen` tracks. The escape sequences emitted are
-/// byte-identical to vt100's `input_mode_formatted` / `input_mode_diff`.
+/// Application keypad / cursor keys, bracketed paste, and xterm mouse reporting. The escape
+/// sequences emitted are byte-identical to what koh emitted through vt100 0.16's
+/// `input_mode_formatted` / `input_mode_diff` (pinned by a test).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InputModes {
     pub application_keypad: bool,
     pub application_cursor: bool,
     pub bracketed_paste: bool,
-    pub mouse_mode: vt100::MouseProtocolMode,
-    pub mouse_encoding: vt100::MouseProtocolEncoding,
+    pub mouse_mode: MouseProtocolMode,
+    pub mouse_encoding: MouseProtocolEncoding,
 }
 
-impl From<&Screen> for InputModes {
-    fn from(s: &Screen) -> Self {
+impl From<&Grid> for InputModes {
+    fn from(s: &Grid) -> Self {
+        let m = s.modes();
         Self {
-            application_keypad: s.application_keypad(),
-            application_cursor: s.application_cursor(),
-            bracketed_paste: s.bracketed_paste(),
-            mouse_mode: s.mouse_protocol_mode(),
-            mouse_encoding: s.mouse_protocol_encoding(),
+            application_keypad: m.application_keypad,
+            application_cursor: m.application_cursor,
+            bracketed_paste: m.bracketed_paste,
+            mouse_mode: m.mouse_mode,
+            mouse_encoding: m.mouse_encoding,
         }
     }
 }
@@ -200,7 +200,8 @@ impl InputModes {
     }
 
     fn write(self, buf: &mut Vec<u8>, prev: Option<Self>) -> Vec<u8> {
-        use vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+        use MouseProtocolEncoding as Enc;
+        use MouseProtocolMode as Mode;
         let changed = |get: fn(&Self) -> bool| prev.is_none_or(|p| get(&p) != get(&self));
         if changed(|m| m.application_keypad) {
             buf.extend_from_slice(if self.application_keypad {
@@ -396,14 +397,14 @@ mod tests {
     use crate::client::backend::CaptureBackend;
     use crate::predict::{DisplayPreference, PredictionEngine};
 
-    fn screen_of(bytes: &[u8]) -> Screen {
-        let mut p = vt100::Parser::new(24, 80, 0);
-        p.process(bytes);
-        p.screen().clone()
+    fn screen_of(bytes: &[u8]) -> Grid {
+        crate::terminal::TerminalScreen::from_bytes(24, 80, bytes)
+            .screen()
+            .clone()
     }
 
     /// Render into a capture backend and return the emitted bytes as a lossy string.
-    fn render_to_string(screen: &Screen, overlay: &Overlay, status: Option<&str>) -> String {
+    fn render_to_string(screen: &Grid, overlay: &Overlay, status: Option<&str>) -> String {
         let mut backend = CaptureBackend::default();
         render(&mut backend, screen, overlay, status).unwrap();
         String::from_utf8_lossy(&backend.bytes).into_owned()
@@ -440,7 +441,7 @@ mod tests {
     }
 
     /// Run one `OutOfBand::emit` into a fresh capture backend and return the emitted bytes.
-    fn oob_emit(oob: &mut OutOfBand, screen: &Screen, win: WindowState<'_>) -> Vec<u8> {
+    fn oob_emit(oob: &mut OutOfBand, screen: &Grid, win: WindowState<'_>) -> Vec<u8> {
         let mut backend = CaptureBackend::default();
         oob.emit(&mut backend, InputModes::from(screen), win)
             .unwrap();
@@ -604,11 +605,9 @@ mod tests {
         use crate::terminal::{MAX_DIM, MIN_DIM};
         let status = "[koh] link down — resuming… 5s";
         for cols in MIN_DIM..=MAX_DIM {
-            let screen = {
-                let mut p = vt100::Parser::new(MIN_DIM, cols, 0);
-                p.process(b"x");
-                p.screen().clone()
-            };
+            let screen = crate::terminal::TerminalScreen::from_bytes(MIN_DIM, cols, b"x")
+                .screen()
+                .clone();
             let mut backend = CaptureBackend::default();
             render(&mut backend, &screen, &Overlay::empty(), Some(status))
                 .expect("render must not error or panic at any width");
@@ -640,10 +639,12 @@ mod tests {
         assert!(s.contains('Z'), "predicted glyph not rendered");
     }
 
-    // --- KC-01: InputModes reproduces vt100's input-mode bytes exactly ---
+    // --- KC-01: InputModes reproduces koh's pre-migration (vt100 0.16) input-mode bytes ---
 
     #[test]
-    fn input_modes_formatted_and_diff_match_vt100_byte_for_byte() {
+    fn input_modes_formatted_and_diff_match_the_vt100_oracle() {
+        // Captured from vt100 0.16.2's `input_mode_formatted` / `input_mode_diff` before it was
+        // removed, so the bytes the local terminal sees are unchanged by the fux-vt migration.
         let seqs: [&[u8]; 6] = [
             b"",
             b"\x1b[?2004h",
@@ -652,19 +653,69 @@ mod tests {
             b"\x1b[?1002h\x1b[?2004h",
             b"\x1b[?9h",
         ];
-        let screens: Vec<Screen> = seqs.iter().map(|s| screen_of(s)).collect();
-        for cur in &screens {
-            assert_eq!(
-                InputModes::from(cur).formatted(),
-                cur.input_mode_formatted(),
-                "formatted parity"
-            );
-            for prev in &screens {
-                assert_eq!(
-                    InputModes::from(cur).diff(InputModes::from(prev)),
-                    cur.input_mode_diff(prev),
-                    "diff parity"
-                );
+        let formatted: [&str; 6] = [
+            "\x1b>\x1b[?1l\x1b[?2004l",
+            "\x1b>\x1b[?1l\x1b[?2004h",
+            "\x1b>\x1b[?1l\x1b[?2004l\x1b[?1000h\x1b[?1006h",
+            "\x1b=\x1b[?1h\x1b[?2004l\x1b[?1003h\x1b[?1005h",
+            "\x1b>\x1b[?1l\x1b[?2004h\x1b[?1002h",
+            "\x1b>\x1b[?1l\x1b[?2004l\x1b[?9h",
+        ];
+        let diff: [[&str; 6]; 6] = [
+            [
+                "",
+                "\x1b[?2004l",
+                "\x1b[?1000l\x1b[?1006l",
+                "\x1b>\x1b[?1l\x1b[?1003l\x1b[?1005l",
+                "\x1b[?2004l\x1b[?1002l",
+                "\x1b[?9l",
+            ],
+            [
+                "\x1b[?2004h",
+                "",
+                "\x1b[?2004h\x1b[?1000l\x1b[?1006l",
+                "\x1b>\x1b[?1l\x1b[?2004h\x1b[?1003l\x1b[?1005l",
+                "\x1b[?1002l",
+                "\x1b[?2004h\x1b[?9l",
+            ],
+            [
+                "\x1b[?1000h\x1b[?1006h",
+                "\x1b[?2004l\x1b[?1000h\x1b[?1006h",
+                "",
+                "\x1b>\x1b[?1l\x1b[?1000h\x1b[?1006h",
+                "\x1b[?2004l\x1b[?1000h\x1b[?1006h",
+                "\x1b[?1000h\x1b[?1006h",
+            ],
+            [
+                "\x1b=\x1b[?1h\x1b[?1003h\x1b[?1005h",
+                "\x1b=\x1b[?1h\x1b[?2004l\x1b[?1003h\x1b[?1005h",
+                "\x1b=\x1b[?1h\x1b[?1003h\x1b[?1005h",
+                "",
+                "\x1b=\x1b[?1h\x1b[?2004l\x1b[?1003h\x1b[?1005h",
+                "\x1b=\x1b[?1h\x1b[?1003h\x1b[?1005h",
+            ],
+            [
+                "\x1b[?2004h\x1b[?1002h",
+                "\x1b[?1002h",
+                "\x1b[?2004h\x1b[?1002h\x1b[?1006l",
+                "\x1b>\x1b[?1l\x1b[?2004h\x1b[?1002h\x1b[?1005l",
+                "",
+                "\x1b[?2004h\x1b[?1002h",
+            ],
+            [
+                "\x1b[?9h",
+                "\x1b[?2004l\x1b[?9h",
+                "\x1b[?9h\x1b[?1006l",
+                "\x1b>\x1b[?1l\x1b[?9h\x1b[?1005l",
+                "\x1b[?2004l\x1b[?9h",
+                "",
+            ],
+        ];
+        let modes: Vec<InputModes> = seqs.iter().map(|s| InputModes::from(&screen_of(s))).collect();
+        for (i, cur) in modes.iter().enumerate() {
+            assert_eq!(cur.formatted(), formatted[i].as_bytes(), "formatted {i}");
+            for (j, prev) in modes.iter().enumerate() {
+                assert_eq!(cur.diff(*prev), diff[i][j].as_bytes(), "diff {i} from {j}");
             }
         }
     }

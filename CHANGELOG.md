@@ -26,6 +26,8 @@ commands, flags and defaults, the wire protocol (`PROTOCOL_VERSION` 3, ALPN `koh
 - Updated `rustls` 0.23.40 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with it) for
   RUSTSEC-2026-0285: rustls accepted TLS 1.3 handshake messages sent at the wrong encryption
   level. koh reaches rustls through iroh's DNS resolver (hickory).
+- Replaced three yanked transitive crates with their patch releases: `chacha20` 0.10.0 → 0.10.2,
+  `der` 0.8.0 → 0.8.2 and `spin` 0.10.0 → 0.10.1.
 
 ### Fixed
 - A short-lived hosted program could lose **all** of its output on macOS (about 3 in 1000 spawns

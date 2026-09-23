@@ -5,12 +5,6 @@
 //! them: it runs the actual SSP send/recv loop across genuine QUIC datagrams (loopback, no
 //! relay), asserting the receiver converges to the sender's state.
 
-// Integration test: every `unwrap`/`expect`/panic here IS the test's assertion of success.
-#![expect(
-    clippy::indexing_slicing,
-    reason = "integration test code; a failed unwrap/expect is the test failing"
-)]
-
 use std::time::Duration;
 
 use koh::ssp::{SyncState, Transport};
@@ -36,7 +30,7 @@ impl SyncState for Log {
     }
     fn diff_from(&self, base: &Self) -> LogDiff {
         let n = base.0.len().min(self.0.len());
-        LogDiff(self.0[n..].to_vec())
+        LogDiff(self.0.iter().skip(n).copied().collect())
     }
     fn apply(&mut self, d: &LogDiff) {
         self.0.extend_from_slice(&d.0);

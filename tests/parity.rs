@@ -8,13 +8,6 @@
 //! `sh`), exactly like the real client's loop, so the full input → PTY → emulator → diff → client
 //! path is exercised without a TTY or a second machine.
 
-// Integration test: a failed unwrap/expect/assert IS the test failing.
-#![expect(
-    clippy::expect_used,
-    clippy::items_after_statements,
-    clippy::default_trait_access,
-    reason = "integration test code; panics are assertion failures"
-)]
 use std::time::Duration;
 
 use iroh::endpoint::Endpoint;
@@ -38,12 +31,10 @@ type RunningServer = (
 
 /// Start a loopback server with a session store and an accept loop that attaches each connection
 /// to its peer's detachable session (mirrors the real `koh-server` accept loop).
-async fn start_server() -> RunningServer {
-    let server_ep = bind_endpoint_local(generate_secret_key(), true)
-        .await
-        .expect("bind server");
+async fn start_server() -> anyhow::Result<RunningServer> {
+    let server_ep = bind_endpoint_local(generate_secret_key(), true).await?;
     let server_addr = loopback_addr(&server_ep);
-    let store: SessionStore = Default::default();
+    let store = SessionStore::default();
     let accept_ep = server_ep.clone();
     let accept_store = store.clone();
     let accept = tokio::spawn(async move {
@@ -64,7 +55,7 @@ async fn start_server() -> RunningServer {
             });
         }
     });
-    (server_ep, server_addr, store, accept)
+    Ok((server_ep, server_addr, store, accept))
 }
 
 /// One scripted client action: an optional resize to `(rows, cols)`, plus input bytes to send.
@@ -113,7 +104,7 @@ async fn xon_xoff_cycle_does_not_wedge_session() {
     // select+read race), so it is structurally immune to that specific deadlock; this guards the
     // observable contract — a ^S (XOFF) / ^Q (XON) cycle in the input stream must not break the
     // session, and output after it must still flow.
-    let (_server, addr, _store, accept) = start_server().await;
+    let (_server, addr, _store, accept) = start_server().await.expect("start server");
     let client_ep = bind_endpoint_local(generate_secret_key(), false)
         .await
         .expect("bind client");
@@ -144,12 +135,12 @@ async fn session_lifecycle_stress() {
     // mosh repeat.test: run a session many times in succession; a leak or teardown race shows up
     // as a hang or failure on some iteration. Here: reconnect the SAME client (so it reattaches
     // its detachable session) many times, each time round-tripping a fresh marker.
-    let (_server, addr, _store, accept) = start_server().await;
+    const ITERS: usize = 20;
+    let (_server, addr, _store, accept) = start_server().await.expect("start server");
     let client_ep = bind_endpoint_local(generate_secret_key(), false)
         .await
         .expect("bind client");
 
-    const ITERS: usize = 20;
     for i in 0..ITERS {
         let chan = IrohChannel::new(
             client_ep
@@ -178,12 +169,12 @@ async fn session_lifecycle_stress_with_input() {
     // mosh repeat-with-input.test: like repeat, but constantly send input — exercises the race
     // where input arriving as/after a connection tears down used to crash the server. Each
     // iteration sends a burst of CRs, confirms a marker, then drops the connection abruptly.
-    let (_server, addr, _store, accept) = start_server().await;
+    const ITERS: usize = 15;
+    let (_server, addr, _store, accept) = start_server().await.expect("start server");
     let client_ep = bind_endpoint_local(generate_secret_key(), false)
         .await
         .expect("bind client");
 
-    const ITERS: usize = 15;
     for i in 0..ITERS {
         let chan = IrohChannel::new(
             client_ep
@@ -219,7 +210,7 @@ async fn window_resize_propagates_to_shell() {
     // mosh window-resize.test: a window-size change must reach the shell (SIGWINCH + new winsize),
     // so a full-screen app redraws. Here: resize the session to 30x100 via the input stream, then
     // run `stty size` — the shell must report the new geometry.
-    let (_server, addr, _store, accept) = start_server().await;
+    let (_server, addr, _store, accept) = start_server().await.expect("start server");
     let client_ep = bind_endpoint_local(generate_secret_key(), false)
         .await
         .expect("bind client");

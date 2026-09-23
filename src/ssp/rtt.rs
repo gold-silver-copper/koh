@@ -95,10 +95,6 @@ impl RttEstimator {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::float_cmp,
-    reason = "these tests assert EXACT float values on purpose (e.g. the EWMA must not drift)"
-)]
 mod tests {
     use super::*;
 
@@ -153,7 +149,8 @@ mod tests {
         e.sample(40.0); // first sample seeds
         let before = e.srtt_ms();
         e.sample(9000.0); // ignored
-        assert_eq!(e.srtt_ms(), before);
+        // Bit-for-bit: the outlier must not move the estimate at all.
+        assert_eq!(e.srtt_ms().to_bits(), before.to_bits());
     }
 
     #[test]
@@ -167,9 +164,10 @@ mod tests {
         for _ in 0..100 {
             e.sample(20.0);
         }
+        // Compared bit-for-bit, not approximately: the EWMA must not drift at all.
         assert_eq!(
-            e.srtt_ms(),
-            srtt,
+            e.srtt_ms().to_bits(),
+            srtt.to_bits(),
             "srtt must not drift on a repeated identical sample"
         );
         assert_eq!(
@@ -180,8 +178,8 @@ mod tests {
         // A genuinely different sample is still incorporated.
         e.sample(21.0);
         assert_ne!(
-            e.srtt_ms(),
-            srtt,
+            e.srtt_ms().to_bits(),
+            srtt.to_bits(),
             "a changed sample still updates the estimate"
         );
     }

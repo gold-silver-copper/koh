@@ -2,13 +2,6 @@
 //! (over the `run_client` wiring) runs the hook command, a burst of bells is
 //! rate-limited, bells from before the attach do not fire, and bells during a reconnect do.
 
-// Integration test: a failed unwrap/expect/assert IS the test failing.
-#![expect(
-    clippy::unwrap_used,
-    clippy::unwrap_in_result,
-    reason = "integration test code; panics are assertion failures"
-)]
-
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +29,10 @@ impl ClientTerminal for MockTerminal {
         _overlay: &Overlay,
         _status: Option<&str>,
     ) -> std::io::Result<()> {
-        *self.latest.lock().unwrap() = state.screen().contents();
+        *self
+            .latest
+            .lock()
+            .map_err(|e| std::io::Error::other(e.to_string()))? = state.screen().contents();
         Ok(())
     }
 

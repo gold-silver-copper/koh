@@ -10,13 +10,6 @@
 //! reconnect (proving the same shell, not a freshly-spawned one) while a second command, typed
 //! only after the drop, also runs.
 
-// Integration test: a failed unwrap/expect/assert IS the test failing.
-#![expect(
-    clippy::unwrap_used,
-    clippy::unwrap_in_result,
-    reason = "integration test code; panics are assertion failures"
-)]
-
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,7 +33,10 @@ impl ClientTerminal for MockTerminal {
         _overlay: &Overlay,
         _status: Option<&str>,
     ) -> std::io::Result<()> {
-        *self.latest.lock().unwrap() = state.screen().contents();
+        *self
+            .latest
+            .lock()
+            .map_err(|e| std::io::Error::other(e.to_string()))? = state.screen().contents();
         Ok(())
     }
 
@@ -52,7 +48,7 @@ impl ClientTerminal for MockTerminal {
 /// Poll `latest` until it contains `needle`, up to `tries` × 100ms. Returns whether it appeared.
 async fn wait_for(latest: &Arc<Mutex<String>>, needle: &str, tries: u32) -> bool {
     for _ in 0..tries {
-        if latest.lock().unwrap().contains(needle) {
+        if latest.lock().is_ok_and(|screen| screen.contains(needle)) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

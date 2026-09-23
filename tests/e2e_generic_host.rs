@@ -200,6 +200,7 @@ async fn generic_state_round_trips_over_loopback_and_carries_the_exit_code() {
         resize_rx,
         term,
         shutdown,
+        None,
     ));
 
     input_tx

@@ -14,14 +14,6 @@
 //! never put the steady flow on a reliable stream — that would reintroduce the
 //! head-of-line blocking mosh exists to avoid.
 
-/// Connection routing policy, independent of shell hosting and terminal state.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NetworkProfile {
-    Default,
-    Local,
-    Relay(String),
-}
-
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;

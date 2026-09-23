@@ -96,6 +96,7 @@ async fn full_session_over_loopback_pty() {
             resize_rx,
             term,
             tokio_util::sync::CancellationToken::new(),
+            None,
         )
         .await;
     });

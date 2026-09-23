@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context;
 use tokio::signal::unix::{signal, SignalKind};
@@ -12,8 +13,12 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "cli")]
 pub use crate::args::ConnectArgs;
-use crate::client::{BackendTerminal, DefaultBackend};
-use crate::transport_iroh::TERMINAL_ALPN;
+use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
+use crate::predict::DisplayPreference;
+use crate::transport_iroh::{
+    bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, parse_endpoint_id,
+    parse_relay_url, relay_addr, IrohChannel,
+};
 
 /// Configuration for [`connect`] — the clap-free, library-facing form of `koh connect`'s
 /// arguments. No `Default`: `server` is required.
@@ -167,6 +172,42 @@ impl BellHook {
 }
 
 
+/// Bind an endpoint for `config`'s dial mode and make the first, admitted connection. The returned
+/// connector redials the same target with the same identity after a link loss.
+async fn dial(
+    config: &ConnectConfig,
+    identity: &crate::identity::Identity,
+) -> anyhow::Result<(iroh::Endpoint, IrohConnector, IrohChannel)> {
+    let secret = identity.secret.clone();
+    let server = parse_endpoint_id(&config.server).context("parsing server endpoint id")?;
+    let (endpoint, target) = if let Some(addr) = config.direct {
+        (bind_endpoint_local(secret, false).await?, direct_addr(server, addr))
+    } else if let Some(url) = &config.relay_url {
+        let relay = parse_relay_url(url)?;
+        let endpoint = bind_endpoint_with_relay(secret, false, relay.clone()).await?;
+        (endpoint, relay_addr(server, relay))
+    } else {
+        (bind_endpoint(secret, false).await?, server.into())
+    };
+    let connector = IrohConnector::new(endpoint.clone(), target);
+    let first = tokio::time::timeout(Duration::from_secs(15), connector.connect())
+        .await
+        .context("timed out connecting (server unreachable or not responding)")
+        .and_then(std::convert::identity);
+    match first {
+        Ok(channel) => Ok((endpoint, connector, channel)),
+        Err(error) => {
+            close_endpoint(&endpoint).await;
+            Err(error)
+        }
+    }
+}
+
+/// Close `endpoint`, waiting at most two seconds for the peer to see it.
+async fn close_endpoint(endpoint: &iroh::Endpoint) {
+    let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.close()).await;
+}
+
 /// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so
 /// the client unwinds cleanly and restores the terminal. Called before raw mode is entered (so the
 /// handlers are armed for the entire raw window); an install error surfaces while still cooked.
@@ -211,8 +252,7 @@ fn warn_if_locale_not_utf8() {
 /// Accepts a [`ConnectConfig`] or anything convertible into one ([`ConnectArgs`] under `cli`).
 ///
 /// Takes over the calling process's terminal (raw mode, alternate screen) and its stdin for the
-/// session's lifetime, and installs signal handlers; call it from a binary's main path. This is
-/// [`crate::embed::Connection`] over [`TERMINAL_ALPN`], the real terminal, a raw-stdin reader and SIGWINCH.
+/// session's lifetime, and installs signal handlers; call it from a binary's main path.
 pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<u32>> {
     let args: ConnectConfig = config.into();
     // The TUI owns the terminal, so logs go to a file (set $KOH_LOG) to avoid corrupting it.
@@ -278,8 +318,10 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
     // diagnosable rather than mysterious.
     warn_if_locale_not_utf8();
 
+    // Held for the whole session: the identity's lease keeps `koh key reset` from deleting the key
+    // while this client may still redial with it.
     let identity = crate::identity::load_client(args.key_file.as_deref())?;
-    let connection = crate::embed::Connection::connect(&args, TERMINAL_ALPN, &identity).await?;
+    let (endpoint, connector, channel) = dial(&args, &identity).await?;
     let shutdown = CancellationToken::new();
     spawn_signal_shutdown(shutdown.clone())?;
     let (channels, tasks) = super::spawn_client_io()?;
@@ -287,18 +329,23 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
         let backend = DefaultBackend::new().context("acquiring the terminal")?;
         let terminal = BackendTerminal::enter(backend, args.clipboard)
             .context("entering raw mode / alt screen")?;
-        connection
-            .with_koh_escape_keys()
-            .run(
-                terminal,
-                channels.input_rx,
-                channels.resize_rx,
-                shutdown,
-                args.bell_command.map(BellHook::new),
-            )
-            .await
+        let size = terminal.size().unwrap_or((24, 80));
+        crate::client::run_client(
+            channel,
+            connector,
+            DisplayPreference::Always,
+            size,
+            channels.input_rx,
+            channels.resize_rx,
+            terminal,
+            shutdown,
+            args.bell_command.map(BellHook::new),
+        )
+        .await
     }
     .await;
+    close_endpoint(&endpoint).await;
+    drop(identity);
     let cleanup = tasks.shutdown().await;
     match (result, cleanup) {
         (Err(primary), Err(cleanup)) => {
@@ -314,6 +361,60 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn redial_reuses_the_loaded_identity_without_touching_the_key_file() -> anyhow::Result<()> {
+        use crate::transport_iroh::{
+            admission, bind_endpoint_local_alpns, generate_secret_key, TERMINAL_ALPN,
+        };
+        let server =
+            bind_endpoint_local_alpns(generate_secret_key(), vec![TERMINAL_ALPN.to_vec()]).await?;
+        let identity = crate::identity::Identity::generate();
+        let expected = identity.secret.public();
+        let socket = server
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .context("server IPv4 socket")?;
+        let config = ConnectConfig {
+            server: server.id().to_string(),
+            // Any attempt to reload instead of reusing `identity` would fail here.
+            key_file: Some("/nonexistent/koh-redial-test.key".into()),
+            direct: Some(([127, 0, 0, 1], socket.port()).into()),
+            relay_url: None,
+            clipboard: false,
+            bell_command: None,
+        };
+        let peer = server.clone();
+        let accept = async move {
+            for _ in 0..2 {
+                let connection = peer.accept().await.context("accept connection")?.await?;
+                anyhow::ensure!(
+                    connection.remote_id() == expected,
+                    "client identity changed"
+                );
+                admission::admit(&connection).await?;
+                connection.closed().await;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let client = async {
+            let (endpoint, connector, channel) = dial(&config, &identity).await?;
+            channel.close(0, b"test reconnect");
+            // The same connector `run_client` redials with after a link loss.
+            let channel = connector.connect().await?;
+            channel.close(0, b"test done");
+            endpoint.close().await;
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            Box::pin(async { tokio::try_join!(accept, client) }),
+        )
+        .await??;
+        server.close().await;
+        Ok(())
+    }
 
     #[test]
     fn bell_hook_fires_on_a_rise_and_rate_limits_a_burst() {

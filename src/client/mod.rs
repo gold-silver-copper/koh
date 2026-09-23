@@ -23,7 +23,7 @@ pub use backend::{DefaultBackend, KohBackend};
 #[cfg(feature = "cli")]
 pub use cli::ConnectArgs;
 pub use cli::{connect, BellHook, ConnectConfig};
-pub use io::{spawn_client_io, ClientIoChannels, ClientIoTasks};
+pub(crate) use io::spawn_client_io;
 pub use render::{InputModes, WindowState};
 
 use std::time::Duration;
@@ -444,7 +444,6 @@ pub struct ClientSession<S: ClientState = TerminalScreen> {
     predictor: PredictionEngine,
     /// True after we've seen the lone escape prefix and are waiting for the next byte.
     pending_escape: bool,
-    escape_keys: bool,
     /// Set whenever the rendered output may have changed; cleared once the caller repaints.
     dirty: bool,
     /// Whether the "link down" banner was painted last frame, so we force one more repaint to
@@ -472,7 +471,6 @@ impl<S: ClientState> ClientSession<S> {
             transport,
             predictor,
             pending_escape: false,
-            escape_keys: true,
             dirty: true,
             status_was_shown: false,
         }
@@ -486,7 +484,7 @@ impl<S: ClientState> ClientSession<S> {
         let mut suspend = false;
         let mut fwd: Vec<u8> = Vec::with_capacity(bytes.len());
         for &b in bytes {
-            if self.escape_keys && self.pending_escape {
+            if self.pending_escape {
                 self.pending_escape = false;
                 if b == b'.' {
                     quit = true;
@@ -498,7 +496,7 @@ impl<S: ClientState> ClientSession<S> {
                 }
                 fwd.push(ESCAPE_PREFIX);
                 fwd.push(b);
-            } else if self.escape_keys && b == ESCAPE_PREFIX {
+            } else if b == ESCAPE_PREFIX {
                 self.pending_escape = true;
             } else {
                 fwd.push(b);
@@ -671,80 +669,20 @@ impl ClientSession<TerminalScreen> {
 /// `shutdown` is a [`CancellationToken`] the caller cancels on a fatal signal (SIGTERM/SIGINT/
 /// SIGHUP): the loop then returns as if the user quit, so `term` is dropped and the terminal is
 /// restored — rather than the process dying at default signal disposition with the TTY left raw.
+/// `bell`, if set, runs on every remote bell (KB-01).
 #[expect(
     clippy::too_many_arguments,
     reason = "the I/O shell wires up the channel, connector, prediction policy, size, the two \
-              input/resize channels, the terminal, and the shutdown token — each a distinct \
+              input/resize channels, the terminal, the shutdown token and the bell hook — each a distinct \
               collaborator; bundling them into a struct would only move the list, not shorten it"
 )]
 #[expect(
     clippy::future_not_send,
     reason = "the future owns a terminal backend (`impl KohBackend`, deliberately not `Send`) and \
               is driven on the caller's own task, never sent across threads; requiring `Send` \
-              would force every backend and embedder to be `Send` for no benefit"
+              would force every backend to be `Send` for no benefit"
 )]
 pub async fn run_client<S: ClientState, T: ClientTerminal<S>>(
-    initial: IrohChannel,
-    connector: IrohConnector,
-    pref: DisplayPreference,
-    initial_size: (u16, u16),
-    input_rx: mpsc::Receiver<Vec<u8>>,
-    resize_rx: mpsc::Receiver<()>,
-    term: T,
-    shutdown: CancellationToken,
-) -> anyhow::Result<Option<u32>> {
-    run_client_with(
-        initial,
-        connector,
-        pref,
-        initial_size,
-        input_rx,
-        resize_rx,
-        term,
-        shutdown,
-        None,
-    )
-    .await
-}
-
-/// [`run_client`] with an optional [`BellHook`] run on every remote bell (KB-01).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "see run_client; one more collaborator, the bell hook"
-)]
-#[expect(clippy::future_not_send, reason = "see run_client")]
-pub async fn run_client_with<S: ClientState, T: ClientTerminal<S>>(
-    initial: IrohChannel,
-    connector: IrohConnector,
-    pref: DisplayPreference,
-    initial_size: (u16, u16),
-    input_rx: mpsc::Receiver<Vec<u8>>,
-    resize_rx: mpsc::Receiver<()>,
-    term: T,
-    shutdown: CancellationToken,
-    bell: Option<BellHook>,
-) -> anyhow::Result<Option<u32>> {
-    run_client_configured(
-        initial,
-        connector,
-        pref,
-        initial_size,
-        input_rx,
-        resize_rx,
-        term,
-        shutdown,
-        bell,
-        true,
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the application chooses its input policy in addition to run_client collaborators"
-)]
-#[expect(clippy::future_not_send, reason = "see run_client")]
-pub(crate) async fn run_client_configured<S: ClientState, T: ClientTerminal<S>>(
     initial: IrohChannel,
     connector: IrohConnector,
     pref: DisplayPreference,
@@ -754,7 +692,6 @@ pub(crate) async fn run_client_configured<S: ClientState, T: ClientTerminal<S>>(
     mut term: T,
     shutdown: CancellationToken,
     mut bell: Option<BellHook>,
-    escape_keys: bool,
 ) -> anyhow::Result<Option<u32>> {
     let clock = MonoClock::new();
     let mut channel = initial;
@@ -773,7 +710,6 @@ pub(crate) async fn run_client_configured<S: ClientState, T: ClientTerminal<S>>(
             rows,
             cols,
         );
-        session.escape_keys = escape_keys;
 
         let conn_started = clock.now_ms();
         match drive_connection(
@@ -1010,11 +946,7 @@ async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
 ) -> ReconnectOutcome {
     let started = clock.now_ms();
     let mut pending_escape = false;
-    let quit_hint = if last.escape_keys {
-        " (Ctrl-^ . to quit)"
-    } else {
-        ""
-    };
+    let quit_hint = " (Ctrl-^ . to quit)";
     'attempt: loop {
         // Back off BEFORE dialing whenever we've already failed a dial or the previous connection
         // dropped too fast (`*attempt > 0`). The caller seeds `*attempt` from the just-dropped
@@ -1033,7 +965,7 @@ async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
                     biased;
                     maybe = input_rx.recv() => match maybe {
                         Some(chunk) => {
-                            if last.escape_keys && escape_quit(&chunk, &mut pending_escape) {
+                            if escape_quit(&chunk, &mut pending_escape) {
                                 return ReconnectOutcome::Quit;
                             }
                         }
@@ -1057,7 +989,7 @@ async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
                 maybe = input_rx.recv() => {
                     match maybe {
                         Some(chunk) => {
-                            if last.escape_keys && escape_quit(&chunk, &mut pending_escape) {
+                            if escape_quit(&chunk, &mut pending_escape) {
                                 return ReconnectOutcome::Quit;
                             }
                         }

@@ -70,7 +70,6 @@ macro_rules! panic_free {
 
 panic_free! {
     pub mod client;
-    pub mod embed;
     pub mod identity;
     pub mod input;
     pub mod keycmd;

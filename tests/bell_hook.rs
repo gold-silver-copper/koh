@@ -1,5 +1,5 @@
 //! The client bell hook end to end (KB-01, KB-02): a real PTY shell rings the bell, the client
-//! (over the generic `run_client_with` wiring) runs the hook command, a burst of bells is
+//! (over the `run_client` wiring) runs the hook command, a burst of bells is
 //! rate-limited, bells from before the attach do not fire, and bells during a reconnect do.
 
 // Integration test: a failed unwrap/expect/assert IS the test failing.
@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use koh::client::{run_client_with, BellHook, ClientTerminal, IrohConnector};
+use koh::client::{run_client, BellHook, ClientTerminal, IrohConnector};
 use koh::input::UserInput;
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::session::spawn_session;
@@ -81,7 +81,7 @@ async fn remote_bell_runs_the_hook_once_per_second_at_most() {
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(8);
     let (_resize_tx, resize_rx) = mpsc::channel::<()>(1);
     let shutdown = CancellationToken::new();
-    let client = tokio::spawn(run_client_with(
+    let client = tokio::spawn(run_client(
         channel,
         connector,
         DisplayPreference::Always,
@@ -237,7 +237,7 @@ async fn stale_bells_before_attach_do_not_fire_but_bells_after_reconnect_do() {
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(8);
     let (_resize_tx, resize_rx) = mpsc::channel::<()>(1);
     let shutdown = CancellationToken::new();
-    let client = tokio::spawn(run_client_with(
+    let client = tokio::spawn(run_client(
         channel,
         connector,
         DisplayPreference::Always,

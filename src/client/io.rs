@@ -1,4 +1,4 @@
-//! Cancellation-aware terminal input and resize producers for embedded clients.
+//! The client's stdin and SIGWINCH producers, cancellable so teardown never blocks on input.
 
 use anyhow::Context;
 use nix::poll::{poll, PollFd, PollFlags};
@@ -11,13 +11,13 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Receivers passed directly to [`crate::embed::Connection`].
+/// The receiving ends that `connect` hands to [`run_client`](super::run_client).
 pub struct ClientIoChannels {
     pub input_rx: mpsc::Receiver<Vec<u8>>,
     pub resize_rx: mpsc::Receiver<()>,
 }
 
-/// Owned producer tasks. Call [`shutdown`](Self::shutdown) after the embedded connection returns.
+/// The producer tasks. Call [`shutdown`](Self::shutdown) after the session returns.
 pub struct ClientIoTasks {
     cancel: CancellationToken,
     input: Option<JoinHandle<()>>,
@@ -72,7 +72,7 @@ impl Drop for ClientIoTasks {
     }
 }
 
-/// Starts byte-exact stdin and SIGWINCH producers for an embedded client that explicitly owns their lifecycle.
+/// Start the byte-exact stdin and SIGWINCH producers.
 pub fn spawn_client_io() -> anyhow::Result<(ClientIoChannels, ClientIoTasks)> {
     let runtime = tokio::runtime::Handle::try_current()
         .context("starting client I/O requires a Tokio runtime")?;

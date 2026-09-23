@@ -82,102 +82,11 @@ The hook runs detached from the terminal at most once per second; `KOH_BELL_COUN
 `KOH_TITLE` are set in its environment, and every other `KOH_*` variable is scrubbed. Bells that
 rang before you attached do not fire it; bells during a reconnect do.
 
-## As a library
+## Library
 
-koh's server and client are callable from another binary. Depend on it without the `cli` feature
-(clap stays out of your tree) and pick exactly one `backend-*` terminal feature:
-
-```toml
-[dependencies]
-koh = { version = "0.11", default-features = false, features = ["backend-termina"] }
-```
-
-The stable surface is the four config types and their entry points: `koh::server::{serve,
-ServeConfig}`, `koh::client::{connect, ConnectConfig, run_id, IdConfig}` and
-`koh::keycmd::{run, KeyConfig}`. `ServeConfig::command` is an argv, so any program can be hosted,
-not only a shell:
-
-```rust
-use koh::server::{serve, ServeConfig};
-
-serve(ServeConfig {
-    allow: vec![client_id],
-    command: vec!["zellij".into(), "attach".into(), "-c".into(), "main".into()],
-    ..Default::default()
-})
-.await?;
-```
-
-The `koh` binary is the same code behind clap; `cargo install koh` is unaffected.
-
-### Embedding a stateful application
-
-Use `koh::identity::Identity` and `koh::embed::{Connection, Server}` for application embedding.
-Applications do not need iroh types or networking internals. Implement `server::SessionHost` for
-application state/input and `client::{ClientState, ClientTerminal}` for rendering. Choose a distinct
-static protocol identifier for your state schema; koh's standalone shell uses its own protocol.
-
-Load credentials before starting terminal readers:
-
-```rust,no_run
-# async fn example<S: koh::client::ClientState, T: koh::client::ClientTerminal<S>>(
-# config: koh::client::ConnectConfig, term: T,
-# input_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-# resize_rx: tokio::sync::mpsc::Receiver<()>,
-# shutdown: tokio_util::sync::CancellationToken,
-# ) -> anyhow::Result<()> {
-let identity = koh::identity::load_client(config.key_file.as_deref())?;
-let connection = koh::embed::Connection::connect(&config, b"example/app/1", &identity).await?;
-// In a real application, create `term` and input producers only after the two steps above.
-connection.run(term, input_rx, resize_rx, shutdown, None).await?;
-# Ok(())
-# }
-```
-
-Keep the identity for the invocation and reuse it for later connections; reconnects already retain
-it internally. `IdentityStore` can cache path-based loads within an invocation. Encrypted key
-loading, prompting, private-path checks, and reset leases belong to koh. `Identity::transfer` and
-`receive` carry an unlocked identity across an application's private startup IPC; transferred
-bytes are secret material and must never enter arguments, logs, or public sockets. Receivers wipe
-the supplied buffer, including malformed input.
-
-`Server::bind` accepts a server identity, an allowlist of endpoint ID strings, the protocol ID,
-a `NetworkProfile`, a connection limit, and a factory for a shared `SessionHost`. koh authenticates
-and admits peers, limits connections, owns accept/reconnect tasks, and calls the host's session
-hooks. The application decides whether its workspace persists after a viewer disconnects.
-Networking shutdown does not replace application process/PTY cleanup.
-
-`Connection::connect` starts no terminal readers or signal handlers. Embedded input is byte-exact;
-`run` does not interpret koh CLI escape keys. The standalone client explicitly opts into
-`with_koh_escape_keys()`. Applications implement their own shortcuts and cancel the supplied token. The application owns those
-resources and must stop/join its producers after the connection finishes. Cancelling the supplied
-token ends `run`; normal completion waits at most two seconds for endpoint close. Dropping `run`
-releases its terminal and connection handles without waiting for asynchronous network shutdown.
-Call `Connection::close` to discard an admitted connection before running it. `Server::close`
-stops admissions and connections and joins its worker with a bounded shutdown wait. Applications
-should then complete their own workspace shutdown in their chosen lifecycle order.
-
-The standalone `koh connect` and `koh serve` remain independently useful. Current fux
-integration uses koh's opaque gateway over process sockets; fux does not embed koh's
-shell, terminal model or predictor. Koh does not depend on fux or zor. Gateway forwarding
-provides byte transport and reconnect state, not predictive rendering or application restart.
-
-### Gateway-only build
-
-```sh
-cargo build --locked --no-default-features --features cli,gateway --bin koh
-```
-
-This build offers `gateway`, `id` and `key` without PTY allocation, terminal emulation,
-prediction or terminal backends. `NetworkProfile` lives in `koh::transport_iroh` so
-service authorization/connectivity does not depend on shell embedding. Library users can
-select `default-features = false, features = ["gateway"]`.
-
-The default build retains the standalone shell and gateway. A terminal backend feature
-(`backend-termina`, `backend-crossterm` or `backend-qwertty`) explicitly enables `shell`.
-For example, `--no-default-features --features cli,backend-termina` builds the shell CLI.
-Shell scenarios require `shell`; gateway and generic transport contracts run separately
-without it. Both configurations must be verified when changing the shared transport.
+The `koh` crate also builds as a library, but only so the binary, its tests and the fuzz targets
+can share code. Its modules are internal and may change in any release; depend on the `koh`
+binary, not the library.
 
 ## Highlights
 

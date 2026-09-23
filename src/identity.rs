@@ -1,19 +1,16 @@
-//! Opaque prepared identities and credential operations for applications embedding koh.
+//! Unlocked identities and the credential operations behind `koh serve`, `connect`, `id` and `key`.
 //!
-//! Credentials are resolved before an application starts input readers. Network consumers receive
-//! an `Identity`, never a transport-specific secret key. Transfer buffers are only for private,
-//! same-user IPC; they are not an on-disk format and must never be logged or persisted.
+//! Loading an identity holds a shared lease (an `flock` beside the key file) for as long as any
+//! clone of it lives, so `koh key reset` refuses to delete a key a running koh is still using.
 use anyhow::{ensure, Context as _};
-use std::collections::BTreeMap;
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub struct Identity {
     pub(crate) secret: iroh::SecretKey,
-    lease: Option<Arc<IdentityLease>>,
+    /// Held, never read: dropping the last clone releases the key's shared lock.
+    _lease: Option<Arc<IdentityLease>>,
 }
 
 impl Identity {
@@ -21,85 +18,13 @@ impl Identity {
     pub fn generate() -> Self {
         Self {
             secret: crate::transport_iroh::generate_secret_key(),
-            lease: None,
+            _lease: None,
         }
     }
 
     #[must_use]
     pub fn endpoint_id(&self) -> String {
         crate::transport_iroh::format_endpoint_id(&self.secret.public())
-    }
-
-    /// Export only to a private, authenticated local IPC channel. Never log or persist this buffer.
-    #[must_use]
-    pub fn transfer(&self) -> Zeroizing<Vec<u8>> {
-        let path = self
-            .lease
-            .as_ref()
-            .map_or(&[][..], |lease| lease.path.as_os_str().as_bytes());
-        let mut bytes = Zeroizing::new(Vec::with_capacity(10 + path.len() + 32));
-        bytes.extend_from_slice(b"KOHID1");
-        bytes.extend_from_slice(&u32::try_from(path.len()).unwrap_or(u32::MAX).to_be_bytes());
-        bytes.extend_from_slice(path);
-        bytes.extend_from_slice(&self.secret.to_bytes());
-        bytes
-    }
-
-    /// Consume a private IPC payload, clearing it on both success and failure.
-    pub fn receive(bytes: &mut [u8]) -> anyhow::Result<Self> {
-        let owned = Zeroizing::new(bytes.to_vec());
-        bytes.fill(0);
-        ensure!(
-            owned.get(..6) == Some(b"KOHID1"),
-            "invalid koh identity transfer version"
-        );
-        let length = u32::from_be_bytes(
-            owned
-                .get(6..10)
-                .context("truncated identity transfer")?
-                .try_into()?,
-        ) as usize;
-        ensure!(
-            length <= 4096 && owned.len() == 10 + length + 32,
-            "invalid koh identity transfer length"
-        );
-        let lease = if length == 0 {
-            None
-        } else {
-            let path = PathBuf::from(std::ffi::OsString::from_vec(
-                owned
-                    .get(10..10 + length)
-                    .context("truncated identity path")?
-                    .to_vec(),
-            ));
-            Some(Arc::new(IdentityLease::acquire(&path, false)?))
-        };
-        let raw = Zeroizing::new(<[u8; 32]>::try_from(
-            owned
-                .get(10 + length..)
-                .context("truncated identity secret")?,
-        )?);
-        Ok(Self {
-            secret: iroh::SecretKey::from_bytes(&raw),
-            lease,
-        })
-    }
-}
-
-/// Invocation-scoped cache. Neither passphrases nor prepared identities are cached process-wide.
-#[derive(Default)]
-pub struct IdentityStore {
-    loaded: BTreeMap<PathBuf, Identity>,
-}
-
-impl IdentityStore {
-    pub fn load(&mut self, path: &Path) -> anyhow::Result<Identity> {
-        if let Some(identity) = self.loaded.get(path) {
-            return Ok(identity.clone());
-        }
-        let identity = load(path)?;
-        self.loaded.insert(path.to_owned(), identity.clone());
-        Ok(identity)
     }
 }
 
@@ -114,7 +39,7 @@ pub fn load(path: &Path) -> anyhow::Result<Identity> {
         .with_context(|| format!("unlocking identity at {}", path.display()))?;
     Ok(Identity {
         secret,
-        lease: Some(lease),
+        _lease: Some(lease),
     })
 }
 
@@ -125,8 +50,8 @@ pub fn load_client(path: Option<&Path>) -> anyhow::Result<Identity> {
     }
 }
 
-/// Reset an identity only after the application has excluded active users and concurrent startup.
-/// Applications retain ownership of their workspace lifetime; koh owns path validation/removal.
+/// Delete an identity key. Fails while any koh process still holds its lease, and refuses unsafe
+/// paths (symlinks, foreign owners, non-private directories).
 pub fn reset(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let _lease = IdentityLease::acquire(path, true)?;
@@ -150,46 +75,7 @@ pub fn reset(path: &Path) -> anyhow::Result<()> {
     std::fs::remove_file(path).with_context(|| format!("removing identity at {}", path.display()))
 }
 
-/// Transfer a startup identity pair without exposing key sizes or encoding to the application.
-#[must_use]
-pub fn transfer_pair(client: &Identity, server: &Identity) -> Zeroizing<Vec<u8>> {
-    let client = client.transfer();
-    let server = server.transfer();
-    let mut bytes = Zeroizing::new(Vec::with_capacity(4 + client.len() + server.len()));
-    bytes.extend_from_slice(
-        &u32::try_from(client.len())
-            .unwrap_or(u32::MAX)
-            .to_be_bytes(),
-    );
-    bytes.extend_from_slice(&client);
-    bytes.extend_from_slice(&server);
-    bytes
-}
-
-pub fn receive_pair(bytes: &mut [u8]) -> anyhow::Result<(Identity, Identity)> {
-    let mut owned = Zeroizing::new(bytes.to_vec());
-    bytes.fill(0);
-    let length = u32::from_be_bytes(
-        owned
-            .get(..4)
-            .context("truncated koh identity bundle")?
-            .try_into()?,
-    ) as usize;
-    ensure!(
-        length <= 8192 && owned.len() >= 4 + length,
-        "invalid koh identity bundle length"
-    );
-    let (client, server) = owned
-        .get_mut(4..)
-        .context("truncated identity bundle")?
-        .split_at_mut(length);
-    let client = Identity::receive(client);
-    let server = Identity::receive(server);
-    Ok((client?, server?))
-}
-
 struct IdentityLease {
-    path: PathBuf,
     _lock: nix::fcntl::Flock<std::fs::File>,
 }
 
@@ -236,7 +122,7 @@ impl IdentityLease {
                 path.display()
             )
         })?;
-        Ok(Self { path, _lock: lock })
+        Ok(Self { _lock: lock })
     }
 }
 
@@ -296,36 +182,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
-    fn transfers_preserve_identity_and_clear_input_on_every_decode_path() -> anyhow::Result<()> {
-        let identity = Identity::generate();
-        let original = identity.transfer();
-        let mut valid = original.to_vec();
-        assert_eq!(
-            Identity::receive(&mut valid)?.endpoint_id(),
-            identity.endpoint_id()
-        );
-        assert!(valid.iter().all(|byte| *byte == 0));
-        for length in 0..original.len() {
-            let mut truncated = original.get(..length).context("prefix")?.to_vec();
-            assert!(Identity::receive(&mut truncated).is_err());
-            assert!(truncated.iter().all(|byte| *byte == 0));
-        }
-        let other = Identity::generate();
-        let mut bundle = transfer_pair(&identity, &other);
-        let (client, server) = receive_pair(&mut bundle)?;
-        assert_eq!(client.endpoint_id(), identity.endpoint_id());
-        assert_eq!(server.endpoint_id(), other.endpoint_id());
-        assert!(bundle.iter().all(|byte| *byte == 0));
-        let mut malformed = transfer_pair(&identity, &other);
-        *malformed.last_mut().context("bundle tail")? = 7;
-        malformed.push(1); // trailing data invalidates the second identity
-        assert!(receive_pair(&mut malformed).is_err());
-        assert!(malformed.iter().all(|byte| *byte == 0));
-        Ok(())
-    }
-
-    #[test]
-    fn transferred_and_cloned_leases_block_reset_until_the_last_owner_drops() -> anyhow::Result<()>
+    fn cloned_leases_block_reset_until_the_last_owner_drops() -> anyhow::Result<()>
     {
         struct TestDirectory(PathBuf);
         impl Drop for TestDirectory {
@@ -343,16 +200,14 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let identity = Identity {
             secret: crate::transport_iroh::generate_secret_key(),
-            lease: Some(Arc::new(IdentityLease::acquire(&path, false)?)),
+            _lease: Some(Arc::new(IdentityLease::acquire(&path, false)?)),
         };
         let clone = identity.clone();
-        let transferred = Identity::receive(&mut identity.transfer())?;
         assert!(reset(&path).is_err());
         drop(identity);
-        drop(clone);
         assert!(reset(&path).is_err());
         assert!(path.exists());
-        drop(transferred);
+        drop(clone);
         reset(&path)?;
         assert!(!path.exists());
         Ok(())

@@ -22,6 +22,11 @@ other programs: everything that existed only for embedders or for fux is gone. T
 commands, flags and defaults, the wire protocol (`PROTOCOL_VERSION` 3, ALPN `koh/iroh/1`) and the
 `koh-key-v1` key format are unchanged, so 0.12 clients and servers interoperate with this release.
 
+### Security
+- Updated `rustls` 0.23.40 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with it) for
+  RUSTSEC-2026-0285: rustls accepted TLS 1.3 handshake messages sent at the wrong encryption
+  level. koh reaches rustls through iroh's DNS resolver (hickory).
+
 ### Removed
 - **The local-service gateway**: `koh gateway serve|connect`, the `koh::gateway` module and the
   `gateway` feature. It forwarded fux's attach socket, and fux no longer uses koh.

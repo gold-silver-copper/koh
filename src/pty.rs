@@ -166,32 +166,29 @@ impl Pty {
         command: &[String],
         term: &str,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
+        // libc `openpty` is not thread-safe on macOS (it goes through `ptsname`'s static buffer), so
+        // concurrent spawns in one process intermittently failed with a bogus errno. Allocation is
+        // quick; serialize it. A poisoned lock only means another spawn panicked mid-allocation,
+        // which leaves nothing to protect, so it is recovered rather than propagated.
+        static OPENPTY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let pair = {
+            let _serialized = OPENPTY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            native_pty_system().openpty(PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
+        }
+        .map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
 
-        let mut cmd = build_command(command, default_shell);
-        // A real terminal type so curses apps behave; the env is otherwise inherited.
-        cmd.env("TERM", term);
-        // Scrub koh's operational env from the child (L-4). Most important: `$KOH_KEY_PASSPHRASE` —
-        // the identity-key secret — must NOT reach the spawned shell, or any authorized user could
-        // `echo $KOH_KEY_PASSPHRASE` to recover it.
-        scrub_koh_env(&mut cmd);
-
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| PtyError::Spawn(io::Error::other(e)))?;
-        let killer = child.clone_killer();
-        // The slave fd is now owned by the child; drop our handle so EOF propagates correctly.
-        drop(pair.slave);
-
+        // Start reading the master BEFORE the child exists. If a short-lived child writes and exits
+        // (closing the last slave fd) while nothing is reading the master, macOS discards the
+        // queued output and the next master read reports EOF: a quick command's entire output was
+        // lost about 3 times in 1000 under load. With the reader already blocked in `read`, every
+        // byte is consumed as it is written.
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -245,6 +242,22 @@ impl Pty {
                 }
                 // `writer` drops here -> portable-pty sends EOT -> child sees EOF on stdin.
             })?;
+
+        let mut cmd = build_command(command, default_shell);
+        // A real terminal type so curses apps behave; the env is otherwise inherited.
+        cmd.env("TERM", term);
+        // Scrub koh's operational env from the child (L-4). Most important: `$KOH_KEY_PASSPHRASE` —
+        // the identity-key secret — must NOT reach the spawned shell, or any authorized user could
+        // `echo $KOH_KEY_PASSPHRASE` to recover it.
+        scrub_koh_env(&mut cmd);
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| PtyError::Spawn(io::Error::other(e)))?;
+        let killer = child.clone_killer();
+        // The slave fd is now owned by the child; drop our handle so EOF propagates correctly.
+        drop(pair.slave);
 
         Ok((
             Self {

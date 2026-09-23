@@ -291,3 +291,55 @@ async fn argv_tail_reaches_the_child() {
         "the `-c \"exit 7\"` tail must have reached sh"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn short_lived_children_never_lose_their_output() {
+    // A child that writes and exits before anything reads the master used to lose ALL of its
+    // output on macOS (the reader thread started only after the spawn, and a closed slave with
+    // nobody reading discards the queue) — about 3 in 1000 under load. Spawning many at once is
+    // the load; every one must deliver its marker.
+    // 16 at a time stays well under macOS's PTY cap (`kern.tty.ptmx_max`, 511) even when several
+    // PTY tests run at once; 128 rounds reproduced the loss on every run of the old code.
+    const CHILDREN: usize = 16;
+    const ROUNDS: usize = 128;
+    for round in 0..ROUNDS {
+        // Spawn every child before awaiting any, so they all run concurrently.
+        let mut runs = Vec::with_capacity(CHILDREN);
+        for i in 0..CHILDREN {
+            runs.push(tokio::spawn(async move {
+                let marker = format!("koh_short_{round}_{i}");
+                let (mut pty, mut rx) = Pty::spawn(
+                    24,
+                    80,
+                    &["/bin/echo".to_owned(), marker.clone()],
+                    "xterm-256color",
+                )
+                .expect("spawn short-lived child");
+                let mut out = Vec::new();
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    while let Some(chunk) = rx.recv().await {
+                        out.extend_from_slice(&chunk);
+                    }
+                })
+                .await
+                .expect("output EOF deadline");
+                // Reap the child (as the session drain task does in production), so thousands of
+                // runs don't pile up zombies and exhaust the process table.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while pty.try_wait().expect("wait child").is_none() {
+                    assert!(tokio::time::Instant::now() < deadline, "reap deadline");
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                pty.shutdown();
+                (marker, out)
+            }));
+        }
+        for run in runs {
+            let (marker, out) = run.await.expect("child task");
+            assert!(
+                String::from_utf8_lossy(&out).contains(&marker),
+                "a short-lived child's output was lost: expected {marker}, got {out:?}"
+            );
+        }
+    }
+}

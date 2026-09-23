@@ -27,6 +27,14 @@ commands, flags and defaults, the wire protocol (`PROTOCOL_VERSION` 3, ALPN `koh
   RUSTSEC-2026-0285: rustls accepted TLS 1.3 handshake messages sent at the wrong encryption
   level. koh reaches rustls through iroh's DNS resolver (hickory).
 
+### Fixed
+- A short-lived hosted program could lose **all** of its output on macOS (about 3 in 1000 spawns
+  under load): the PTY reader started only after the child was spawned, and when a child wrote and
+  exited before anything read the master, the queued output was discarded. The reader now runs
+  before the child is spawned.
+- Concurrent PTY spawns in one process intermittently failed in `openpty` on macOS, whose libc
+  `openpty` is not thread-safe. PTY allocation is now serialized.
+
 ### Removed
 - **The local-service gateway**: `koh gateway serve|connect`, the `koh::gateway` module and the
   `gateway` feature. It forwarded fux's attach socket, and fux no longer uses koh.

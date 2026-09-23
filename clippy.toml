@@ -1,8 +1,8 @@
 # Test code is allowed to panic: a failed `unwrap`/`expect`/`assert` in a test
 # IS the test failing. These keys relax the panic-prevention restriction lints
-# (denied workspace-wide in Cargo.toml) for `#[cfg(test)]` modules, `#[test]`
-# functions, and the `tests/` integration targets — keeping the strict
-# panic-free guarantee on library/binary code only.
+# (denied crate-wide in Cargo.toml, forbidden in production code by `panic_free!`)
+# for `#[cfg(test)]` modules, `#[test]` functions, and the `tests/` integration
+# targets — keeping the strict panic-free guarantee on library/binary code only.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true

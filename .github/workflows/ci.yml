@@ -41,6 +41,11 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy (warnings are errors)
         run: cargo clippy --all-targets --locked -- -D warnings
+      # Tests and examples enable `test-support` (via the self dev-dependency), which lifts the
+      # production `forbid` on panic lints. Check the shipped lib and binary without it, so the
+      # forbid is what actually gates them.
+      - name: clippy (production build, panic lints forbidden)
+        run: cargo clippy --lib --bins --locked -- -D warnings
       - name: layering guard
         # Enforce the two load-bearing dependency edges the architecture relies on (AR-02). Greps
         # the `use crate::` import form only, so doc-comment rustdoc links can't false-positive.

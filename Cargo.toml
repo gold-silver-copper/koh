@@ -207,11 +207,11 @@ lto = "thin"
 overflow-checks = true
 
 # ---------------------------------------------------------------------------
-# Lints. Goal: the library is PANIC-FREE by construction, enforced by clippy. The
-# panic-introducing lints below are denied; any genuinely-infallible site (a
-# poisoned-mutex check, a structurally-non-empty container, statically-valid
-# params) is justified with a local `#[expect(clippy::…, reason = "…")]`. Test
-# code keeps `unwrap`/`expect`/`panic`/`indexing` via the keys in `clippy.toml`.
+# Lints. Goal: the library and binary are PANIC-FREE by construction, enforced by
+# clippy. The panic-introducing lints below are denied crate-wide, and production
+# code additionally `forbid`s them (`panic_free!` in src/lib.rs and src/main.rs),
+# so no local `#[expect]` can carve out an exception there. Test code keeps
+# `unwrap`/`expect`/`panic`/`indexing` via the keys in `clippy.toml`.
 # ---------------------------------------------------------------------------
 [lints.rust]
 # A bare `unsafe` block must justify itself; this codebase is 100% safe today.

@@ -1089,6 +1089,7 @@ dependencies = [
 [[package]]
 name = "fux-vt"
 version = "0.1.1"
+source = "git+https://github.com/gold-silver-copper/fux?branch=feat%2Ffux-vt-for-koh#02fe47176ba50302df6ed3357d16bf17ccd5ccad"
 dependencies = [
  "unicode-width",
 ]

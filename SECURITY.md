@@ -26,15 +26,15 @@ credit reporters who want it.
 - The connection accept gauntlet / node-id allowlist authorization (`src/server/cli.rs`) and the
   admission barrier (`src/transport_iroh/admission.rs`).
 - The untrusted wire decoders (`src/wire.rs`) and the SSP state machine (`src/ssp/`).
-- The terminal apply path (`src/terminal/`), including the **contained** `vt100` parser surface.
+- The terminal apply path (`src/terminal/`): decoding and validating the structured screen diff.
 - On-disk identity-key handling and local-attacker hardening (`src/transport_iroh/`).
 
 **Out of scope — report upstream** (dependencies koh does not author):
 
 - Transport crypto / QUIC / TLS: **iroh** and its QUIC backend, **rustls**, **ring**.
-- The terminal emulator **`vt100`** (koh *contains* its panics on the client — see `process_contained`
-  — but a vt100 logic/parse bug should be reported to the `vt100` project) and the PTY layer
-  **`portable-pty`**.
+- The server's terminal emulator **`fux-vt`** (a parse/logic bug belongs to the
+  [fux](https://github.com/gold-silver-copper/fux) project; the client never runs it on server
+  bytes) and the PTY layer **`portable-pty`**.
 - Known advisories in the dependency tree are tracked via `cargo deny check advisories` (CI) +
   [`deny.toml`](deny.toml).
 

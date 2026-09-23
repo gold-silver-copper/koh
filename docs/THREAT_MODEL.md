@@ -39,10 +39,15 @@ service.
   checkpoint; its outcomes are logged structured under the `koh::auth` target.
 - **Untrusted data plane:** the SSP core (`src/ssp/`, `src/wire.rs`) is a pure, panic-free-by-
   construction state machine with per-direction decode/inflate ceilings, a fragment replay gate, a
-  reassembly byte cap, an accumulation budget, and dimension clamps before any vt100 allocation. The
-  `vt100` escape parser (a dependency outside koh's no-panic coverage) is wrapped in `catch_unwind`
-  on **both** sides — the client (so a crafted server repaint drops a frame instead of crashing the
-  session) and, as defense-in-depth, the server emulator processing shell output.
+  reassembly byte cap, an accumulation budget, and dimension clamps before any grid allocation.
+  **The client runs no terminal parser on server bytes:** a screen update is a structured diff of
+  whole rows of run-length-encoded cells, which `TerminalScreen::apply` validates completely (row
+  indices, runs covering exactly the width, known cell kinds and style bits, cell text within the
+  emulator's per-cell cap, known modes) before committing; a malformed frame is dropped whole. The
+  server's emulator is `fux-vt`, which is panic-free by construction (its own `forbid` lints) and
+  bounded: it retains no DCS/APC/PM/SOS payload and caps an OSC string at 64 KiB, so a runaway
+  control string from the shell can't grow memory. koh therefore no longer wraps the emulator in
+  `catch_unwind` or pre-filters control strings.
 - **Process / local:** `forbid(unsafe)` crate-wide; identity key written `0600` (born-private atomic
   write, `O_NOFOLLOW` read, fd-based perm-tighten) and **always encrypted at rest** (Argon2id +
   AES-256-GCM, `koh-key-v1`; no plaintext format, and a minimum passphrase length is enforced so an

@@ -17,10 +17,42 @@ internal and unstable (see `src/lib.rs`).
 
 ## [Unreleased]
 
-This is a breaking library release (0.13.0). koh is a remote shell again, not a transport for
-other programs: everything that existed only for embedders or for fux is gone. The binary's
-commands, flags and defaults, the wire protocol (`PROTOCOL_VERSION` 3, ALPN `koh/iroh/1`) and the
-`koh-key-v1` key format are unchanged, so 0.12 clients and servers interoperate with this release.
+koh is a remote shell again, not a transport for other programs: everything that existed only
+for embedders or for fux is gone. The terminal emulator moved from `vt100` to `fux-vt`, which
+**changes the wire protocol**: `PROTOCOL_VERSION` 4 and ALPN `koh/iroh/2`. A 0.12 client and a
+0.13 server (or the reverse) refuse each other at the TLS handshake with a clear error; upgrade
+both ends. The `koh-key-v1` key format is unchanged, so endpoint ids and allowlists carry over.
+
+> **Before release:** koh currently depends on `fux-vt` through a git dependency on the fux
+> branch `feat/fux-vt-for-koh`, which adds what koh needs to fux-vt. That must become a crates.io
+> version (fux-vt ≥ 0.1.1) before koh is published.
+
+### Changed
+- **Terminal emulation is `fux-vt`, and the client runs no parser.** The server's emulator is
+  `fux_vt::Parser`, a bounded, panic-free emulator; `vt100` is no longer a dependency. The screen
+  diff is now structured: every changed row whole, as run-length-encoded cells, plus the cursor and
+  modes. It replaces vt100's escape-sequence patch, which the client used to replay through its
+  own vt100 parser. The client validates every row and cell and drops a malformed frame whole, so
+  server bytes never reach a terminal parser on the client. The `catch_unwind` containment and the
+  64 KiB control-string pre-filter are gone: fux-vt cannot panic, retains no DCS/APC/PM/SOS payload
+  and caps OSC strings at 64 KiB.
+- **Wire protocol 4 / ALPN `koh/iroh/2`** (see above).
+- Emulation follows fux-vt's documented sequence contract, which is vt100 0.16's plus two
+  corrections: DECAWM (`CSI ? 7 l`, autowrap off) now works, and insert/delete-line outside the
+  scroll region is ignored. Terminal replies: primary device attributes now answer as a VT100
+  with advanced video (`CSI ? 1 ; 2 c`) instead of claiming VT220, and DECRQM reports the real
+  state of every mode the emulator tracks (it used to know only bracketed paste).
+- `--scrollback` is limited to 65,000 lines (was 1,000,000): fux-vt caps each buffer at 64 Mi
+  cells, and the history must leave room for a 1000×1000 screen. Scrollback stays server-side.
+- The minimum Rust version is 1.95 (was 1.91), from fux-vt.
+- **Breaking (hidden API):** the `#[doc(hidden)]` test harnesses `koh::ssp::testkit` and
+  `koh::sim` are now behind the new `test-support` feature. They panic by design and no longer
+  ship in normal builds.
+- The client's `Ctrl-^` escape keys are always on (only embedders could turn them off), and
+  `run_client` takes the bell hook directly.
+- Production code is now panic-free under `forbid`, not only `deny`. The SSP transport keeps its
+  sent and received state lists in a structurally non-empty type, and the `koh` binary builds its
+  Tokio runtime explicitly.
 
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with it) for
@@ -55,16 +87,6 @@ commands, flags and defaults, the wire protocol (`PROTOCOL_VERSION` 3, ALPN `koh
   and `ServerTerminal::with_scrollback_screen`.
 - **The `shell` feature.** The shell is always compiled; only the `backend-*` choice and `cli`
   remain optional.
-
-### Changed
-- **Breaking (hidden API):** the `#[doc(hidden)]` test harnesses `koh::ssp::testkit` and
-  `koh::sim` are now behind the new `test-support` feature. They panic by design and no longer
-  ship in normal builds.
-- The client's `Ctrl-^` escape keys are always on (only embedders could turn them off), and
-  `run_client` takes the bell hook directly.
-- Production code is now panic-free under `forbid`, not only `deny`. The SSP transport keeps its
-  sent and received state lists in a structurally non-empty type, and the `koh` binary builds its
-  Tokio runtime explicitly.
 
 ## [0.12.1] — 2026-09-04
 

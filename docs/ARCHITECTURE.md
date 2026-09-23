@@ -25,7 +25,7 @@ src/
 ├── wire.rs          SSP instruction envelope, postcard codec, fragmenter/reassembler
 ├── ssp/             SyncState trait + generic Transport<Local,Remote> + send scheduler
 │                      + a deterministic lossy/reordering chaos sim harness (testkit)
-├── terminal/        TerminalScreen state (vt100-backed) + ServerTerminal live emulator
+├── terminal/        TerminalScreen state (a cell grid + structured diff) + ServerTerminal (fux-vt)
 ├── input.rs         UserInput state: keystrokes + resize as an append-only synced log
 ├── predict.rs       local-echo prediction engine (overlays, epochs, adaptive engage)
 ├── transport_iroh/  iroh endpoint setup, encrypted identity, datagram channel, RTT, admission
@@ -51,11 +51,15 @@ library.
 
 ## The two synchronized states
 
-- **`TerminalScreen`** (server → client) wraps a `vt100` screen grid. Its diff is the `vt100`
-  `state_diff` escape-sequence patch, plus a side-band `resize` (full repaint on size change, since
-  vt100 does not reflow) and the server's `echo_ack`. `vt100::Parser` is not `Clone`, so the state
-  holds an owned `vt100::Screen` snapshot; the client reconstructs a throwaway parser to replay each
-  diff.
+- **`TerminalScreen`** (server → client) is a plain `Grid` of `fux_vt::Cell`s (with a cursor,
+  per-row soft-wrap flags and the input modes the client mirrors) plus the side channels: title,
+  icon, OSC 52 clipboard, bell count, exit code and the server's `echo_ack`. The server's live
+  emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's opt-in events (title, icon, bell,
+  clipboard) and extended replies (DECRQM, DECXCPR, secondary DA) turned on; each snapshot copies
+  its live rows. The diff (`ScreenDiff`, protocol 4, ALPN `koh/iroh/2`) carries every changed row
+  whole as run-length-encoded cells, the cursor and the modes; after a resize the client starts
+  from a blank grid and receives every non-blank row. The client validates and copies cells and
+  never runs a terminal parser, so server bytes never reach one.
 - **`UserInput`** (client → server) is the keystroke + resize stream, stored per-byte (so an acked
   prefix is a clean prefix) and coalesced into compact `Keys` blobs on the wire.
 
@@ -174,7 +178,8 @@ per-connection state never lives in the session:
 
 The client renders through `client::ClientTerminal`, so tests can capture frames instead of
 driving a real terminal, and the predictor reads screens through `predict::ScreenView`
-(implemented for `vt100::Screen`), which keeps `predict.rs` free of `crate::` imports.
+(implemented for the client `Grid` and for `fux_vt::Screen`), which keeps `predict.rs` free of
+`crate::` imports.
 `ssp::testkit::GridState` is a non-terminal state with multi-datagram diffs that exercises the SSP
 on its own.
 
@@ -186,10 +191,10 @@ The full picture is in the [threat model](THREAT_MODEL.md). In brief, the releva
   authenticated by iroh's QUIC + TLS 1.3 handshake *by construction* (no TOFU window — the client
   pins the id it dialed). There is no "accept any peer" mode and no passphrase/PAKE second factor.
 - **The data plane treats every authorized peer as untrusted**: a resize is clamped to `[2, 1000]`
-  before any vt100 allocation; instruction inflation, fragment replay, reassembly bytes, and
+  before any grid allocation; instruction inflation, fragment replay, reassembly bytes, and
   received-state accumulation are each explicitly bounded; the QUIC handshake and the 1-byte
-  admission ack are deadline-bounded; and `vt100` (a dependency outside koh's no-panic coverage) is
-  wrapped in `catch_unwind` on both sides so a crafted repaint drops a frame instead of crashing.
+  admission ack are deadline-bounded; and a screen diff is fully validated before it is applied,
+  with no terminal parser on the client (the server's fux-vt emulator is panic-free and bounded).
 - **The identity key is always encrypted at rest** (`koh-key-v1`: Argon2id 64 MiB / 4 passes +
   AES-256-GCM, modeled on `openssh-key-v1`), with an enforced ≥12-char passphrase floor, written
   0600 via a born-private atomic write + `O_NOFOLLOW` read, and zeroized in memory. koh keeps every
@@ -216,7 +221,8 @@ The SSP, diff/apply, and predictor are network- and TTY-free, so they're tested 
   predict→no-echo→suppress, real-shell streaming, fragment supersede/reassemble.
 - **Property tests** on the attacker-reachable parsers — `Transport::recv` over arbitrary envelopes,
   `FragmentAssembly::add` over adversarial sequences, `decrypt_key` over arbitrary payloads — assert
-  never-panic and bounded. Plus coverage-guided fuzz targets (`screen_apply`, `wire_decode`).
+  never-panic and bounded. Plus coverage-guided fuzz targets (`screen_apply` over the structured diff,
+  `server_process`, `wire_decode`).
 - **Whole-stack chaos** — input + screen + transport + collapse + echo-ack over the simulated link:
   `cargo run --example chaos -- chaos --loss 0.5` (or `cargo test --test integration`).
 
@@ -228,7 +234,7 @@ just an allocated PTY. Both are real and hermetic.
 - **`transport_iroh` module tests** — two real iroh endpoints connect over loopback (relay-less,
   `bind_endpoint_local`) and exchange datagrams.
 - **`tests/e2e_loopback.rs`** — the *entire* loop in one process: scripted keystroke → client → iroh
-  datagram → server → PTY-hosted `sh` → vt100 → iroh → client render. Asserts the typed command's
+  datagram → server → PTY-hosted `sh` → fux-vt → iroh → client render. Asserts the typed command's
   output round-trips.
 - **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** attached to an allocated PTY (so
   `isatty()` is true and raw-mode + termina run for real), driven by scripted keystrokes with

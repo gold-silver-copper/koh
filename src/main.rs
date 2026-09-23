@@ -26,8 +26,6 @@ enum Cmd {
     #[cfg(feature = "shell")]
     Serve(ServeArgs),
     /// Authenticated access to an independently owned local Unix service.
-    #[cfg(feature = "gateway")]
-    Gateway(koh::gateway::cli::GatewayArgs),
     /// Connect to a koh server by its endpoint id.
     #[cfg(feature = "shell")]
     Connect(ConnectArgs),
@@ -87,8 +85,6 @@ panic_free! {
 
     async fn dispatch(cli: Cli) -> anyhow::Result<Option<u32>> {
         match cli.cmd {
-            #[cfg(feature = "gateway")]
-            Cmd::Gateway(args) => koh::gateway::cli::run(args).await.map(|()| None),
             #[cfg(feature = "shell")]
             Cmd::Serve(args) => koh::server::serve(args).await.map(|()| None),
             #[cfg(feature = "shell")]

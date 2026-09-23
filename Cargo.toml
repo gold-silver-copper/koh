@@ -98,16 +98,10 @@ name = "transport_fault_matrix"
 required-features = ["shell"]
 
 [[test]]
-name = "gateway"
-required-features = ["gateway"]
-
-[[test]]
 name = "key_creation_race"
 required-features = ["cli"]
 
 [dependencies]
-# Structured gateway CLI readiness records.
-serde_json = { version = "1", optional = true }
 # transport (pinned: iroh API churns; see README). iroh 1.0 brings its own QUIC backend (noq, a
 # quinn fork); we never depend on quinn directly.
 iroh = "=1.0.0"
@@ -175,11 +169,9 @@ data-encoding = "2"
 # exercises the `KohBackend` seam (build it with `--no-default-features --features backend-crossterm`).
 # `cli` owns clap and gates the `koh` binary, the `*Args` adapter structs, the `chaos` example and
 # the pty-binary e2e test. Library users (`default-features = false`) pick a backend and skip it.
-default = ["backend-termina", "gateway", "cli"]
-# The gateway carries opaque bytes and has no shell/emulator/render dependency.
-gateway = []
+default = ["backend-termina", "cli"]
 shell = ["dep:portable-pty", "dep:vt100", "dep:unicode-width"]
-cli = ["dep:serde_json", "dep:clap"]
+cli = ["dep:clap"]
 backend-termina = ["shell", "dep:termina"]
 backend-crossterm = ["shell", "dep:crossterm"]
 backend-qwertty = ["shell", "dep:qwertty"]

@@ -88,8 +88,6 @@ panic_free! {
     pub mod terminal;
     pub mod transport_iroh;
     pub mod wire;
-    #[cfg(feature = "gateway")]
-    pub mod gateway;
     pub mod idcmd;
 }
 

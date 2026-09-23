@@ -152,12 +152,14 @@ impl BellHook {
         match self.command(count, title, std::env::vars_os()).spawn() {
             Ok(mut child) => {
                 // Reap off the async loop; a stuck hook can't wedge the session.
-                std::thread::Builder::new()
+                let reaper = std::thread::Builder::new()
                     .name("koh-bell-hook".into())
                     .spawn(move || {
                         let _ = child.wait();
-                    })
-                    .ok();
+                    });
+                if let Err(e) = reaper {
+                    tracing::warn!(error = %e, "bell hook reaper thread spawn failed");
+                }
             }
             Err(e) => tracing::warn!(error = %e, "bell hook spawn failed"),
         }

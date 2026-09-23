@@ -1,5 +1,9 @@
 //! Consumer contract tests: no transport-specific types, input readers, or personal keys.
-#![allow(clippy::panic_in_result_fn, clippy::expect_used)]
+#![expect(
+    clippy::panic_in_result_fn,
+    clippy::expect_used,
+    reason = "test assertions: a failed expectation is the test failing"
+)]
 
 use koh::client::{ClientTerminal, ConnectConfig};
 use koh::embed::{Connection, NetworkProfile, Server};
@@ -97,7 +101,7 @@ impl ClientTerminal<GridState> for Terminal {
         let sender = self
             .rendered
             .lock()
-            .map_err(|_| std::io::Error::other("render notification poisoned"))?
+            .map_err(|e| std::io::Error::other(format!("render notification poisoned: {e}")))?
             .take();
         if let Some(sender) = sender {
             let _ = sender.send(());

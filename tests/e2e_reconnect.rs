@@ -11,12 +11,8 @@
 //! only after the drop, also runs.
 
 // Integration test: a failed unwrap/expect/assert IS the test failing.
-#![allow(
+#![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::string_slice,
     clippy::unwrap_in_result,
     reason = "integration test code; panics are assertion failures"
 )]

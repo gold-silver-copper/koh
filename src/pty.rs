@@ -610,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::items_after_statements,
         reason = "`_assert_typed` is a deliberate compile-time signature assertion kept beside the runtime checks it documents"
     )]

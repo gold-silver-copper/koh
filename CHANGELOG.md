@@ -21,6 +21,11 @@ internal and unstable (see `src/lib.rs`).
 - **Breaking (hidden API):** the `#[doc(hidden)]` test harnesses `koh::ssp::testkit` and
   `koh::sim` are now behind the new `test-support` feature, together with `GridState`'s
   `ClientState` impl. They panic by design and no longer ship in normal builds.
+- `embed::Server::bind` now reports an invalid allowlist entry and an invalid relay URL as separate
+  errors that include the parse failure, instead of one generic message.
+- Production code is now panic-free under `forbid`, not only `deny`. The SSP transport keeps its
+  sent and received state lists in a structurally non-empty type, and the `koh` binary builds its
+  Tokio runtime explicitly.
 
 ## [0.12.1] — 2026-09-04
 

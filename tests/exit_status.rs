@@ -4,12 +4,7 @@
 //! until the shutdown sentinel and then reads the exit code off the synced state.
 
 // Integration test: a failed unwrap/expect/assert IS the test failing.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::items_after_statements,
+#![expect(
     clippy::default_trait_access,
     reason = "integration test code; panics are assertion failures"
 )]

@@ -3,12 +3,6 @@
 //! `await_admission` return an error, so a rejected client fails fast instead of re-dialing forever.
 //! Hermetic loopback iroh connections.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    reason = "integration test code; panics are assertion failures"
-)]
 use std::time::Duration;
 
 use koh::transport_iroh::admission::{admit, await_admission};

@@ -582,7 +582,10 @@ impl<S: ClientState> ClientSession<S> {
             && !self.transport.link_up_within(now, LINK_DOWN_GRACE_MS)
         {
             let since = now.saturating_sub(self.transport.last_heard());
-            Some(format!("[koh] link down — resuming… {}s", since / 1000))
+            Some(format!(
+                "[koh] link down — resuming… {}s",
+                Duration::from_millis(since).as_secs()
+            ))
         } else {
             None
         };
@@ -1022,7 +1025,7 @@ async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
         if *attempt > 0 {
             let wait_until = clock.now_ms().saturating_add(backoff_ms(*attempt));
             while clock.now_ms() < wait_until {
-                let secs = clock.now_ms().saturating_sub(started) / 1000;
+                let secs = Duration::from_millis(clock.now_ms().saturating_sub(started)).as_secs();
                 let banner = format!("[koh] disconnected — reconnecting… {secs}s{quit_hint}");
                 let _ = term.render(last.state(), &Overlay::empty(), Some(banner.as_str()));
                 let remaining = wait_until.saturating_sub(clock.now_ms());
@@ -1044,7 +1047,7 @@ async fn reconnect<S: ClientState, T: ClientTerminal<S>>(
         let dial = tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect());
         tokio::pin!(dial);
         loop {
-            let secs = clock.now_ms().saturating_sub(started) / 1000;
+            let secs = Duration::from_millis(clock.now_ms().saturating_sub(started)).as_secs();
             let banner = format!("[koh] disconnected — reconnecting… {secs}s{quit_hint}");
             let _ = term.render(last.state(), &Overlay::empty(), Some(banner.as_str()));
 

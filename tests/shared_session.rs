@@ -2,17 +2,6 @@
 //! ONE PTY host see each other's output; a resize from either client reaches the host with its own
 //! `ClientId`; the host is reaped only after the last viewer leaves and the TTL elapses.
 
-// Integration test: a failed unwrap/expect/assert IS the test failing.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::items_after_statements,
-    clippy::default_trait_access,
-    reason = "integration test code; panics are assertion failures"
-)]
-
 use std::sync::Arc;
 use std::time::Duration;
 

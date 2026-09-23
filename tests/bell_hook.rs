@@ -3,13 +3,8 @@
 //! rate-limited, bells from before the attach do not fire, and bells during a reconnect do.
 
 // Integration test: a failed unwrap/expect/assert IS the test failing.
-#![allow(
+#![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::items_after_statements,
-    clippy::default_trait_access,
     clippy::unwrap_in_result,
     reason = "integration test code; panics are assertion failures"
 )]

@@ -1,8 +1,7 @@
-#![allow(
+#![expect(
     clippy::panic_in_result_fn,
     reason = "integration assertions report contract failures"
 )]
-#![allow(clippy::expect_used, reason = "test failures retain operation context")]
 use koh::{gateway, identity::Identity, transport_iroh::NetworkProfile};
 use std::collections::BTreeSet;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -33,7 +32,10 @@ async fn gateway_authenticates_before_touching_the_local_service_and_copies_byte
                 let _ = writer.shutdown().await;
             });
         }
-        #[allow(unreachable_code)]
+        #[expect(
+            unreachable_code,
+            reason = "the accept loop never breaks; this only names the task's error type"
+        )]
         Ok::<(), std::io::Error>(())
     });
     let allowed = Identity::generate();

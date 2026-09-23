@@ -250,6 +250,21 @@ lossy_float_literal = "deny"
 float_cmp_const = "deny"
 rc_buffer = "deny"
 rest_pat_in_fully_bound_structs = "deny"
+# `Instant - Duration` panics on underflow; use `checked_sub`/`saturating_duration_since`.
+unchecked_time_subtraction = "deny"
+# `.map_err(|_| ...)` silently drops the source error. Where hiding it is deliberate (secret or
+# attacker-controlled input), say so with a local `#[expect]`.
+map_err_ignore = "deny"
+# `result.ok();` as a statement discards an error while looking like it handles it.
+unused_result_ok = "deny"
+# Integer division truncates silently; make the rounding intent explicit at each site.
+integer_division = "deny"
+
+# --- suppression hygiene (deny) ---
+# Suppress with `#[expect]`, never `#[allow]`: an expectation that stops firing is itself a warning,
+# so stale suppressions get cleaned up instead of silently accumulating.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
 
 # --- pedantic lints that are noisy or fight this codebase's deliberate style ---
 module_name_repetitions = "allow"

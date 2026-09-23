@@ -4,13 +4,6 @@
 //! states converge end-to-end under loss, and that the predictor confirms/suppresses against real
 //! frames. The driver lives in `koh::sim`; the manual `--loss` explorer is `examples/chaos.rs`.
 
-// Integration test: a failed unwrap/expect/assert IS the test failing.
-#![allow(
-    clippy::unwrap_used,
-    clippy::panic,
-    reason = "integration test code; panics are assertion failures"
-)]
-
 use koh::sim::{run_generic_session, run_predictor_reconciliation, run_session};
 
 #[test]

@@ -224,7 +224,6 @@ pub(super) async fn run_client(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, reason = "test failures retain operation context")]
 mod tests {
     use super::*;
     use crate::{identity::Identity, transport_iroh::NetworkProfile};
@@ -311,7 +310,10 @@ mod tests {
                     Some(_) = workers.join_next(), if !workers.is_empty() => {},
                 }
             }
-            #[allow(unreachable_code)]
+            #[expect(
+                unreachable_code,
+                reason = "the accept loop never breaks; this only names the task's error type"
+            )]
             Ok::<(), anyhow::Error>(())
         });
         let server = super::super::bind(&Identity::generate(), NetworkProfile::Local, true).await?;
@@ -400,9 +402,4 @@ mod tests {
 
 #[cfg(all(test, feature = "cli"))]
 #[path = "sessions_real_fux.rs"]
-#[allow(
-    clippy::expect_used,
-    clippy::panic_in_result_fn,
-    reason = "integration assertions retain failure context"
-)]
 mod real_fux_tests;

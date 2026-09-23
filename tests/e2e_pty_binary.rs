@@ -10,13 +10,8 @@
 //! lifecycle, the termina renderer, and stdin passthrough — the real terminal path.
 
 // Integration test: a failed unwrap/expect/assert IS the test failing.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
+#![expect(
     clippy::string_slice,
-    clippy::unwrap_in_result,
     reason = "integration test code; panics are assertion failures"
 )]
 
@@ -106,7 +101,7 @@ async fn real_client_binary_renders_over_pty() {
     writer
         .write_all(b"echo koh_pty_marker\r")
         .expect("write keystrokes");
-    writer.flush().ok();
+    writer.flush().expect("flush keystrokes");
 
     let contains_marker = |b: &Arc<Mutex<Vec<u8>>>| {
         String::from_utf8_lossy(&b.lock().unwrap()).contains("koh_pty_marker")

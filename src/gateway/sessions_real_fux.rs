@@ -69,7 +69,10 @@ async fn real_fux_reconnect(expire: bool) -> anyhow::Result<()> {
                 Some(_) = workers.join_next(), if !workers.is_empty() => {},
             }
         }
-        #[allow(unreachable_code)]
+        #[expect(
+            unreachable_code,
+            reason = "the accept loop never breaks; this only names the task's error type"
+        )]
         Ok::<(), anyhow::Error>(())
     });
     let server = super::super::bind(&Identity::generate(), NetworkProfile::Local, true).await?;

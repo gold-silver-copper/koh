@@ -205,7 +205,7 @@ fn authorize_peer(stream: &UnixStream) -> anyhow::Result<()> {
     );
     Ok(())
 }
-#[allow(
+#[expect(
     clippy::verbose_bit_mask,
     reason = "Unix permission masks are clearer in octal"
 )]
@@ -219,7 +219,7 @@ fn validate_directory(path: &Path) -> anyhow::Result<()> {
     );
     Ok(())
 }
-#[allow(
+#[expect(
     clippy::verbose_bit_mask,
     reason = "Unix permission masks are clearer in octal"
 )]

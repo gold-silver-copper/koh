@@ -1,3 +1,4 @@
+use anyhow::Context;
 use crate::server::{Hosts, SessionHost, SharedHost};
 use crate::transport_iroh::{
     bind_endpoint_alpns, bind_endpoint_local_alpns, bind_endpoint_with_relay_alpns,
@@ -65,8 +66,7 @@ impl Server {
         let mut allowed = HashSet::new();
         for value in allow {
             allowed.insert(
-                parse_endpoint_id(value)
-                    .map_err(|_| anyhow::anyhow!("invalid endpoint ID or relay URL"))?,
+                parse_endpoint_id(value).context("invalid endpoint ID in the allowlist")?,
             );
         }
         if allowed.is_empty() {
@@ -80,8 +80,7 @@ impl Server {
             NetworkProfile::Default => bind_endpoint_alpns(secret, alpns).await,
             NetworkProfile::Local => bind_endpoint_local_alpns(secret, alpns).await,
             NetworkProfile::Relay(url) => {
-                let relay = parse_relay_url(&url)
-                    .map_err(|_| anyhow::anyhow!("invalid endpoint ID or relay URL"))?;
+                let relay = parse_relay_url(&url).context("invalid relay URL")?;
                 bind_endpoint_with_relay_alpns(secret, alpns, relay).await
             }
         }

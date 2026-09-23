@@ -1,5 +1,4 @@
 // Transport fault verification belongs to koh, the remote transport owner.
-#![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 
 #[test]
 fn deterministic_transport_fault_matrix_converges_and_preserves_divergent_input() {

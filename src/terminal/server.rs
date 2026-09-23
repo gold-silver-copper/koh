@@ -481,7 +481,7 @@ mod tests {
         let mut terminal = ServerTerminal::new(24, 80, 0);
         terminal.process(b"before\x1b]");
         for _ in 0..32 {
-            terminal.process(&vec![b'x'; MAX_CONTROL_STRING_BYTES / 4]);
+            terminal.process(&vec![b'x'; MAX_CONTROL_STRING_BYTES.div_euclid(4)]);
             assert!(terminal.control_filter.buffered.len() <= MAX_CONTROL_STRING_BYTES);
         }
         assert!(terminal.control_filter.dropping);
@@ -517,7 +517,7 @@ mod tests {
             let mut terminal = ServerTerminal::new(24, 80, 0);
             terminal.process(introducer);
             for _ in 0..5 {
-                terminal.process(&vec![b'x'; MAX_CONTROL_STRING_BYTES / 4]);
+                terminal.process(&vec![b'x'; MAX_CONTROL_STRING_BYTES.div_euclid(4)]);
             }
             assert!(terminal.control_filter.dropping);
             assert!(terminal.control_filter.buffered.len() <= MAX_CONTROL_STRING_BYTES);

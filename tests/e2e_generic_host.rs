@@ -4,13 +4,8 @@
 //! and the ALPN routing / rejection cases.
 
 // Integration test: a failed unwrap/expect/assert IS the test failing.
-#![allow(
+#![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::items_after_statements,
-    clippy::default_trait_access,
     clippy::unwrap_in_result,
     clippy::significant_drop_in_scrutinee,
     clippy::match_wild_err_arm,

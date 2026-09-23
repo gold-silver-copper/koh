@@ -76,6 +76,12 @@ pub enum KeyfileError {
 
 /// Derive the 32-byte AES key from a passphrase + salt + Argon2 params (params come from the file on
 /// decrypt, from constants on encrypt). Wrapped in `Zeroizing` so it's wiped on drop.
+#[expect(
+    clippy::map_err_ignore,
+    reason = "`KeyfileError` is a closed set of unit variants on purpose: aes-gcm and argon2 errors \
+              are opaque, and key-file errors must not echo key material or distinguish failure \
+              modes beyond these variants"
+)]
 fn derive_aes_key(
     passphrase: &str,
     salt: &[u8],
@@ -98,6 +104,12 @@ fn derive_aes_key(
 
 /// Encrypt a 32-byte identity secret under `passphrase`, returning the `koh-key-v1` file text
 /// (a header line + base64 payload). Fresh random salt + nonce per call.
+#[expect(
+    clippy::map_err_ignore,
+    reason = "`KeyfileError` is a closed set of unit variants on purpose: aes-gcm and argon2 errors \
+              are opaque, and key-file errors must not echo key material or distinguish failure \
+              modes beyond these variants"
+)]
 pub fn encrypt_key(secret: &[u8; 32], passphrase: &str) -> Result<String, KeyfileError> {
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
@@ -137,6 +149,12 @@ pub fn encrypt_key(secret: &[u8; 32], passphrase: &str) -> Result<String, Keyfil
 
 /// Decrypt a `koh-key-v1` file's text under `passphrase`, returning the 32-byte secret (zeroized on
 /// drop). A wrong passphrase or any tampering fails the AEAD tag → [`KeyfileError::WrongPassphrase`].
+#[expect(
+    clippy::map_err_ignore,
+    reason = "`KeyfileError` is a closed set of unit variants on purpose: aes-gcm and argon2 errors \
+              are opaque, and key-file errors must not echo key material or distinguish failure \
+              modes beyond these variants"
+)]
 pub fn decrypt_key(text: &str, passphrase: &str) -> Result<Zeroizing<[u8; 32]>, KeyfileError> {
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     if lines.next() != Some(HEADER) {

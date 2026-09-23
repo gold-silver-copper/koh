@@ -11,11 +11,8 @@
 
 // This is a test harness: a violated invariant or an exceeded step budget SHOULD panic loudly
 // (it means a test is wrong), so the panic-prevention restrictions are relaxed here.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
+#![expect(
     clippy::panic,
-    clippy::indexing_slicing,
     reason = "deterministic test harness: a failed invariant must panic the offending test"
 )]
 

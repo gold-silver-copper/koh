@@ -4,11 +4,7 @@
 //! endpoint (so the peer id — the session key — is stable across reconnects).
 
 // Integration test: a failed unwrap/expect/assert IS the test failing.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
+#![expect(
     clippy::items_after_statements,
     clippy::default_trait_access,
     reason = "integration test code; panics are assertion failures"

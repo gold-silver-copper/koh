@@ -61,7 +61,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -> io
         writer.write_u64(frame.sequence()).await?;
         if let Frame::Data(_, bytes) = frame {
             let length =
-                u16::try_from(bytes.len()).map_err(|_| invalid("invalid gateway chunk"))?;
+                u16::try_from(bytes.len()).map_err(|e| invalid(&format!("invalid gateway chunk: {e}")))?;
             writer.write_u16(length).await?;
             writer.write_all(bytes).await?;
         }
@@ -163,7 +163,8 @@ impl<LocalRead: AsyncRead + Unpin, LocalWrite: AsyncWrite + Unpin> Session<Local
         let expected = self
             .next_receive
             .checked_add(
-                u64::try_from(self.received.len()).map_err(|_| invalid("sequence exhausted"))?,
+                u64::try_from(self.received.len())
+                    .map_err(|e| invalid(&format!("sequence exhausted: {e}")))?,
             )
             .ok_or_else(|| invalid("sequence exhausted"))?;
         if frame.sequence() < expected {
@@ -259,7 +260,7 @@ impl<LocalRead: AsyncRead + Unpin, LocalWrite: AsyncWrite + Unpin> Session<Local
                     }
                 }
                 permit = outgoing.reserve(), if next.is_some() => {
-                    let permit = permit.map_err(|_| Failure::Link(io::Error::other("gateway writer ended")))?;
+                    let permit = permit.map_err(|e| Failure::Link(io::Error::other(format!("gateway writer ended: {e}"))))?;
                     if let Some(frame) = next {
                         if let Frame::Ack(ack) = frame { ack_queued = Some(ack); }
                         else { cursor = frame.sequence().checked_add(1).ok_or_else(|| invalid("sequence exhausted"))?; }
@@ -342,10 +343,6 @@ impl<LocalRead: AsyncRead + Unpin, LocalWrite: AsyncWrite + Unpin> Session<Local
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    reason = "test assertions retain operation context"
-)]
 mod tests {
     use super::*;
 

@@ -6,10 +6,7 @@
 //! relay), asserting the receiver converges to the sender's state.
 
 // Integration test: every `unwrap`/`expect`/panic here IS the test's assertion of success.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
+#![expect(
     clippy::indexing_slicing,
     reason = "integration test code; a failed unwrap/expect is the test failing"
 )]

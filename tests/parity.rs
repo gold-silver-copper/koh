@@ -9,11 +9,8 @@
 //! path is exercised without a TTY or a second machine.
 
 // Integration test: a failed unwrap/expect/assert IS the test failing.
-#![allow(
-    clippy::unwrap_used,
+#![expect(
     clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
     clippy::items_after_statements,
     clippy::default_trait_access,
     reason = "integration test code; panics are assertion failures"

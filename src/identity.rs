@@ -287,7 +287,10 @@ impl Drop for PromptTerminal {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic_in_result_fn)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "`?`-returning tests assert with panicking macros; a failed assert is the test failing"
+)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;

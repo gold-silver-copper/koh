@@ -140,6 +140,11 @@ impl Instruction {
     /// `max_decompressed` is the caller's per-direction cap (the keystroke direction is far tighter
     /// than the screen direction), so one small datagram set can't be inflated into a huge resident
     /// payload (KOH-02).
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "miniz's error carries the partial, attacker-controlled inflate output; \
+                  `WireError::Decompress` deliberately reports only corrupt-or-oversized"
+    )]
     pub fn decode_with_limit(bytes: &[u8], max_decompressed: usize) -> Result<Self, WireError> {
         let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, max_decompressed)
             .map_err(|_| WireError::Decompress)?;

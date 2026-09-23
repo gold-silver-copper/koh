@@ -24,6 +24,15 @@ pub struct ClientIoTasks {
     resize: Option<TokioJoinHandle<()>>,
 }
 
+/// The message of a `panic!` payload, which is a `&str` or `String` unless a custom payload was used.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
 impl ClientIoTasks {
     /// Cancels both producers and joins them. The input poll checks cancellation at least every
     /// 100 ms, so teardown never waits for another byte on stdin.
@@ -38,7 +47,7 @@ impl ClientIoTasks {
             if let Some(input) = input {
                 input
                     .join()
-                    .map_err(|_| anyhow::anyhow!("stdin producer panicked"))?;
+                    .map_err(|payload| anyhow::anyhow!("stdin producer panicked: {}", panic_message(&*payload)))?;
             }
             Ok::<_, anyhow::Error>(())
         })

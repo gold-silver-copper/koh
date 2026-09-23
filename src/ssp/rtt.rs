@@ -8,7 +8,7 @@
 // Deliberately NOT using `f64::mul_add` here: a fused multiply-add rounds differently from the
 // separate `*` and `+`, which would diverge from mosh's exact EWMA/RTO arithmetic (the whole point
 // of this module is byte-for-byte timer parity with upstream).
-#![allow(
+#![expect(
     clippy::suboptimal_flops,
     reason = "preserve mosh's exact non-FMA timer arithmetic"
 )]
@@ -95,7 +95,7 @@ impl RttEstimator {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::float_cmp,
     reason = "these tests assert EXACT float values on purpose (e.g. the EWMA must not drift)"
 )]

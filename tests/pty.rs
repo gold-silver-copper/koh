@@ -5,14 +5,6 @@
 //! unit/property tests in one massively-parallel binary starved the PTY reader thread under load
 //! (a flaky timeout). A dedicated binary runs only these few in parallel, so they stay reliable.
 
-// Integration test: a failed unwrap/expect/assert/timeout IS the test failing.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    reason = "integration test code; panics are assertion failures"
-)]
-
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -65,7 +57,7 @@ fn spawned_child_exposes_a_real_process_id() {
 }
 
 #[tokio::test]
-#[allow(
+#[expect(
     clippy::match_wild_err_arm,
     reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"
 )]
@@ -104,7 +96,7 @@ async fn spawns_and_streams_output() {
 }
 
 #[tokio::test]
-#[allow(
+#[expect(
     clippy::match_same_arms,
     reason = "channel-close (`Ok(None)`) and deadline (`Err(_)`) are conceptually distinct outcomes kept as separate arms for readability, even though both set `found = false`"
 )]
@@ -140,7 +132,7 @@ async fn interactive_shell_echoes_input() {
 }
 
 #[tokio::test]
-#[allow(
+#[expect(
     clippy::match_same_arms,
     reason = "channel-close (`Ok(None)`) and deadline (`Err(_)`) are conceptually distinct outcomes kept as separate arms for readability, even though both set `in_order = false`"
 )]
@@ -176,7 +168,7 @@ async fn write_input_takes_shared_ref_and_preserves_order() {
 }
 
 #[tokio::test]
-#[allow(
+#[expect(
     clippy::needless_continue,
     clippy::match_wild_err_arm,
     reason = "the explicit `continue` documents the drain-and-keep-reading intent; the `Err(_)` deadline arm panics because a timeout here IS the test failing"
@@ -223,7 +215,7 @@ async fn shutdown_joins_both_io_threads_without_deadlock() {
 }
 
 #[tokio::test]
-#[allow(
+#[expect(
     clippy::match_wild_err_arm,
     reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"
 )]
@@ -341,7 +333,7 @@ async fn graceful_group_shutdown_preserves_the_leaders_shell_status() {
 }
 
 #[tokio::test]
-#[allow(
+#[expect(
     clippy::match_wild_err_arm,
     reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"
 )]

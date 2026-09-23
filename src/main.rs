@@ -1,5 +1,4 @@
-//! Koh CLI dispatch. The gateway and shell command sets follow their product features.
-//! Identity display and key management do not require shell PTYs or rendering.
+//! The `koh` binary: `serve` / `connect` / `id` / `key` dispatch.
 
 use clap::{Parser, Subcommand};
 use koh::client::ConnectArgs;

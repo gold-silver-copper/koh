@@ -2,7 +2,7 @@
 //! Fuzz the host-side emulator input path: arbitrary bytes (the hosted program's output — not
 //! wire-controlled, but a hostile or buggy app can emit anything) -> `ServerTerminal::process`,
 //! then the snapshot and host replies the server reads. Must never panic out of `process` (vt100
-//! panics are contained, KO-01).
+//! panics are contained).
 
 use koh::terminal::ServerTerminal;
 use libfuzzer_sys::fuzz_target;

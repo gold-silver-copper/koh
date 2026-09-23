@@ -17,12 +17,36 @@ internal and unstable (see `src/lib.rs`).
 
 ## [Unreleased]
 
+This is a breaking library release (0.13.0). koh is a remote shell again, not a transport for
+other programs: everything that existed only for embedders or for fux is gone. The binary's
+commands, flags and defaults, the wire protocol (`PROTOCOL_VERSION` 3, ALPN `koh/iroh/1`) and the
+`koh-key-v1` key format are unchanged, so 0.12 clients and servers interoperate with this release.
+
+### Removed
+- **The local-service gateway**: `koh gateway serve|connect`, the `koh::gateway` module and the
+  `gateway` feature. It forwarded fux's attach socket, and fux no longer uses koh.
+- **The embedding API**: `koh::embed` (`Connection`, `Server`, `NetworkProfile`),
+  `Identity::transfer`/`receive`, `identity::transfer_pair`/`receive_pair` and `IdentityStore`.
+  `koh connect`'s own dial-and-run path is now private to the client.
+- **The generic session host and client state (0.11)**: `SessionHost`, `HostProvider`, `PtyHosts`,
+  `SharedHost`, `Hosts`, `serve_with`, `ClientId`, `AttachKind::Joined`, `ClientState`,
+  `run_client_with`, `IrohConnector::with_alpn`, `TERMINAL_ALPN`, the `*_alpns` endpoint binders
+  and the `TerminaTerminal` alias. The server hosts a PTY per peer; the client renders a
+  `TerminalScreen`; `ClientTerminal` is no longer generic. The SSP (`SyncState`, `Transport`)
+  stays generic.
+- **Host-side hooks only fux read**: `Pty::process_id` (now private),
+  `Pty::terminate_process_group`/`shutdown_process_group`, `ServerTerminal::progress` and the
+  OSC 9;4 `Progress` parser, the unhandled-OSC ring (`take_unhandled_oscs`, `UNHANDLED_OSC_*`)
+  and `ServerTerminal::with_scrollback_screen`.
+- **The `shell` feature.** The shell is always compiled; only the `backend-*` choice and `cli`
+  remain optional.
+
 ### Changed
 - **Breaking (hidden API):** the `#[doc(hidden)]` test harnesses `koh::ssp::testkit` and
-  `koh::sim` are now behind the new `test-support` feature, together with `GridState`'s
-  `ClientState` impl. They panic by design and no longer ship in normal builds.
-- `embed::Server::bind` now reports an invalid allowlist entry and an invalid relay URL as separate
-  errors that include the parse failure, instead of one generic message.
+  `koh::sim` are now behind the new `test-support` feature. They panic by design and no longer
+  ship in normal builds.
+- The client's `Ctrl-^` escape keys are always on (only embedders could turn them off), and
+  `run_client` takes the bell hook directly.
 - Production code is now panic-free under `forbid`, not only `deny`. The SSP transport keeps its
   sent and received state lists in a structurally non-empty type, and the `koh` binary builds its
   Tokio runtime explicitly.

@@ -5,7 +5,6 @@
 //! crate `forbid`s (see `src/lib.rs`), so this module is kept outside that forbid. Cargo.toml's
 //! crate-wide `deny` still applies here, so keep it to plain field-moving conversions.
 
-#[cfg(feature = "shell")]
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -67,7 +66,6 @@ impl From<KeyArgs> for crate::keycmd::KeyConfig {
 }
 
 /// Arguments for `koh serve` (the clap adapter over [`ServeConfig`](crate::server::ServeConfig)).
-#[cfg(feature = "shell")]
 #[derive(Args, Debug)]
 pub struct ServeArgs {
     /// Path to the persistent secret-key file (gives a stable endpoint id across restarts).
@@ -117,7 +115,6 @@ pub struct ServeArgs {
     max_sessions: u32,
 }
 
-#[cfg(feature = "shell")]
 impl From<ServeArgs> for crate::server::ServeConfig {
     fn from(a: ServeArgs) -> Self {
         Self {
@@ -135,7 +132,6 @@ impl From<ServeArgs> for crate::server::ServeConfig {
 }
 
 /// Arguments for `koh connect <server-id>` (the clap adapter over [`ConnectConfig`](crate::client::ConnectConfig)).
-#[cfg(feature = "shell")]
 #[derive(Args, Debug)]
 pub struct ConnectArgs {
     /// Server endpoint id to connect to.
@@ -167,7 +163,6 @@ pub struct ConnectArgs {
     on_bell: Option<String>,
 }
 
-#[cfg(feature = "shell")]
 impl From<ConnectArgs> for crate::client::ConnectConfig {
     fn from(a: ConnectArgs) -> Self {
         Self {

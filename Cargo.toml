@@ -38,64 +38,14 @@ required-features = ["cli"]
 
 # `chaos` parses its own flags with clap, and the pty-binary e2e test drives the `koh` binary
 # through `CARGO_BIN_EXE_koh`, which only exists when the bin is built. Both follow the `cli` gate so
-# a `--no-default-features --all-targets` build (the library-only tree fux uses) stays clap-free.
+# a build without `cli` stays clap-free.
 [[example]]
 name = "chaos"
-required-features = ["cli", "shell"]
+required-features = ["cli"]
 
 [[test]]
 name = "e2e_pty_binary"
-required-features = ["cli", "shell"]
-
-# Shell scenarios require the shell product; gateway and generic transport tests remain
-# available in the gateway-only build. Both matrices are verified independently.
-[[test]]
-name = "bell_hook"
-required-features = ["shell"]
-
-[[test]]
-name = "e2e_generic_host"
-required-features = ["shell"]
-
-[[test]]
-name = "e2e_loopback"
-required-features = ["shell"]
-
-[[test]]
-name = "e2e_reconnect"
-required-features = ["shell"]
-
-[[test]]
-name = "embed_contract"
-required-features = ["shell"]
-
-[[test]]
-name = "exit_status"
-required-features = ["shell"]
-
-[[test]]
-name = "integration"
-required-features = ["shell"]
-
-[[test]]
-name = "parity"
-required-features = ["shell"]
-
-[[test]]
-name = "pty"
-required-features = ["shell"]
-
-[[test]]
-name = "reattach"
-required-features = ["shell"]
-
-[[test]]
-name = "shared_session"
-required-features = ["shell"]
-
-[[test]]
-name = "transport_fault_matrix"
-required-features = ["shell"]
+required-features = ["cli"]
 
 [[test]]
 name = "key_creation_race"
@@ -106,9 +56,9 @@ required-features = ["cli"]
 # quinn fork); we never depend on quinn directly.
 iroh = "=1.0.0"
 # terminal / pty / tui
-vt100 = { version = "=0.16.2", optional = true }
-portable-pty = { version = "=0.9.0", optional = true }
-unicode-width = { version = "0.2", optional = true }
+vt100 = "=0.16.2"
+portable-pty = "=0.9.0"
+unicode-width = "0.2"
 # Terminal backends behind the `client::backend::KohBackend` seam. `termina` is the default and the
 # only one compiled by `cargo install koh` (see `[features]`); `crossterm` is an optional, off-by-
 # default alternate proving the abstraction. Both are gated so the published .crate's default build
@@ -170,11 +120,10 @@ data-encoding = "2"
 # `cli` owns clap and gates the `koh` binary, the `*Args` adapter structs, the `chaos` example and
 # the pty-binary e2e test. Library users (`default-features = false`) pick a backend and skip it.
 default = ["backend-termina", "cli"]
-shell = ["dep:portable-pty", "dep:vt100", "dep:unicode-width"]
 cli = ["dep:clap"]
-backend-termina = ["shell", "dep:termina"]
-backend-crossterm = ["shell", "dep:crossterm"]
-backend-qwertty = ["shell", "dep:qwertty"]
+backend-termina = ["dep:termina"]
+backend-crossterm = ["dep:crossterm"]
+backend-qwertty = ["dep:qwertty"]
 # Deterministic test harnesses (`ssp::testkit`, `sim`). They panic by design, so they are kept out
 # of normal builds, where the panic lints are `forbid`den (see `src/lib.rs`). Tests and examples get
 # them through the self dev-dependency below; nothing else should enable this.

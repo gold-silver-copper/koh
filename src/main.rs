@@ -2,11 +2,9 @@
 //! Identity display and key management do not require shell PTYs or rendering.
 
 use clap::{Parser, Subcommand};
-#[cfg(feature = "shell")]
 use koh::client::ConnectArgs;
 use koh::idcmd::IdArgs;
 use koh::keycmd::KeyArgs;
-#[cfg(feature = "shell")]
 use koh::server::ServeArgs;
 
 #[derive(Parser, Debug)]
@@ -23,11 +21,9 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Host a PTY shell for authorized clients.
-    #[cfg(feature = "shell")]
     Serve(ServeArgs),
     /// Authenticated access to an independently owned local Unix service.
     /// Connect to a koh server by its endpoint id.
-    #[cfg(feature = "shell")]
     Connect(ConnectArgs),
     /// Print this machine's koh id (add it to a server's --allow list).
     Id(IdArgs),
@@ -85,9 +81,7 @@ panic_free! {
 
     async fn dispatch(cli: Cli) -> anyhow::Result<Option<u32>> {
         match cli.cmd {
-            #[cfg(feature = "shell")]
             Cmd::Serve(args) => koh::server::serve(args).await.map(|()| None),
-            #[cfg(feature = "shell")]
             Cmd::Connect(args) => koh::client::connect(args).await,
             Cmd::Id(args) => koh::idcmd::run_id(args).map(|()| None),
             Cmd::Key(args) => koh::keycmd::run(args).map(|()| None),

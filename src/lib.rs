@@ -69,22 +69,15 @@ macro_rules! panic_free {
 }
 
 panic_free! {
-    #[cfg(feature = "shell")]
     pub mod client;
-    #[cfg(feature = "shell")]
     pub mod embed;
     pub mod identity;
-    #[cfg(feature = "shell")]
     pub mod input;
     pub mod keycmd;
-    #[cfg(feature = "shell")]
     pub mod predict;
-    #[cfg(feature = "shell")]
     pub mod pty;
-    #[cfg(feature = "shell")]
     pub mod server;
     pub mod ssp;
-    #[cfg(feature = "shell")]
     pub mod terminal;
     pub mod transport_iroh;
     pub mod wire;
@@ -95,7 +88,7 @@ panic_free! {
 /// deterministic chaotic link in `ssp::testkit`). Used by `tests/integration.rs` and the
 /// `chaos` example; hidden from the public docs.
 #[doc(hidden)]
-#[cfg(all(feature = "shell", any(test, feature = "test-support")))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod sim;
 
 #[cfg(feature = "cli")]

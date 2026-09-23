@@ -89,12 +89,10 @@ jobs:
         run: cargo clippy --all-targets --locked --no-default-features --features backend-crossterm -- -D warnings
       - name: clippy (qwertty backend, warnings are errors)
         run: cargo clippy --all-targets --locked --no-default-features --features backend-qwertty -- -D warnings
-      # The exact configuration an embedding binary builds (see "As a library" in the README): no
-      # `cli` feature, so this fails if clap leaks back into the library surface.
+      # No `cli` feature: clap stays confined to the binary and its argument adapters.
       - name: clippy (library without cli, warnings are errors)
         run: cargo clippy --lib --locked --no-default-features --features backend-termina -- -D warnings
-      # The library-plus-tests tree without `cli`: the generic host/client seams and their tests
-      # must build for an embedding crate that never enables clap.
+      # The library-plus-tests tree without `cli` must still build.
       - name: clippy (all targets without cli, warnings are errors)
         run: cargo clippy --all-targets --locked --no-default-features --features backend-termina -- -D warnings
       - name: no clap in the library-only tree

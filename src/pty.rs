@@ -9,7 +9,6 @@
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::time::Duration;
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc;
@@ -380,101 +379,6 @@ impl Pty {
         self.killer.kill()
     }
 
-    /// Signals the entire process group rooted at the spawned child.
-    ///
-    /// `force = false` sends SIGHUP for graceful wrapper/descendant teardown; `force = true`
-    /// sends SIGKILL. Once the child has been reaped this is a no-op, preventing a recycled pid
-    /// from being interpreted as a process-group id.
-    pub fn terminate_process_group(&self, force: bool) -> std::io::Result<()> {
-        if self.reaped.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        #[cfg(unix)]
-        if let Some(pid) = self.process_id().and_then(|pid| i32::try_from(pid).ok()) {
-            use nix::sys::signal::{kill, Signal};
-            use nix::unistd::Pid;
-            return kill(
-                Pid::from_raw(-pid),
-                if force {
-                    Signal::SIGKILL
-                } else {
-                    Signal::SIGHUP
-                },
-            )
-            .map_err(std::io::Error::other);
-        }
-        Ok(())
-    }
-
-    /// Gracefully tears down the process group while retaining ownership of its numeric id.
-    ///
-    /// The child is deliberately not reaped between SIGHUP and SIGKILL: its zombie reserves the
-    /// leader PID, so the process-group id cannot be recycled while descendants receive the hard
-    /// stop. This closes descendants that ignore SIGHUP without signaling an unrelated group.
-    pub fn shutdown_process_group(
-        &mut self,
-        grace: Duration,
-    ) -> std::io::Result<Option<GroupExitStatus>> {
-        if self.reaped.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-        // Use exactly one termination mechanism. On Unix the process-group signal is both
-        // sufficient for the leader and required for descendants; racing it with
-        // portable-pty's platform killer can make the leader report a clean exit instead of the
-        // SIGHUP-derived status.
-        #[cfg(unix)]
-        let hup_error = self.terminate_process_group(false).err();
-        #[cfg(not(unix))]
-        let hup_error = self.killer.kill().err();
-        std::thread::sleep(grace);
-        let force_error = match self.terminate_process_group(true) {
-            Ok(()) => None,
-            Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => None,
-            Err(error) => Some(error),
-        };
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        loop {
-            #[cfg(unix)]
-            if let Some(pid) = self.process_id().and_then(|pid| i32::try_from(pid).ok()) {
-                use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-                use nix::unistd::Pid;
-                match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG))
-                    .map_err(std::io::Error::other)?
-                {
-                    WaitStatus::Exited(_, code) => {
-                        self.reaped.store(true, Ordering::SeqCst);
-                        return Ok(Some(GroupExitStatus {
-                            code: u32::try_from(code).unwrap_or(u32::MAX),
-                            signal: None,
-                        }));
-                    }
-                    WaitStatus::Signaled(_, signal, _) => {
-                        self.reaped.store(true, Ordering::SeqCst);
-                        return Ok(Some(GroupExitStatus {
-                            code: 128 + signal as u32,
-                            signal: Some(format!("{signal:?}")),
-                        }));
-                    }
-                    _ => {}
-                }
-            }
-            #[cfg(not(unix))]
-            if let Some(status) = self.try_wait()? {
-                return Ok(Some(GroupExitStatus {
-                    code: status.exit_code(),
-                    signal: status.signal().map(str::to_owned),
-                }));
-            }
-            if std::time::Instant::now() >= deadline {
-                return match force_error.or(hup_error) {
-                    Some(error) => Err(error),
-                    None => Ok(None),
-                };
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
     /// Force-kill the child with SIGKILL (which cannot be trapped). portable-pty's cloned killer
     /// only sends SIGHUP, so a child that ignores SIGHUP (e.g. `trap '' HUP`) would otherwise keep
     /// the PTY slave fd open and wedge the reader thread on a blocking `read()` forever — leaking a
@@ -499,12 +403,9 @@ impl Pty {
         }
     }
 
-    /// Returns the spawned child's operating-system process id, when the backend exposes one.
-    ///
-    /// The value is informational and may remain present after the child exits; callers must not
-    /// use it for signaling because a reaped pid can be recycled. Use [`Self::kill`] instead.
-    #[must_use]
-    pub fn process_id(&self) -> Option<u32> {
+    /// The child's pid. It stays present after the child exits, and a reaped pid can be recycled,
+    /// so only signal it while `reaped` is still false.
+    fn process_id(&self) -> Option<u32> {
         self.child.process_id()
     }
 }

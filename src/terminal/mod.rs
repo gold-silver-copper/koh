@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 mod server;
 
-pub use server::{Progress, ServerTerminal, UNHANDLED_OSC_MAX_LEN, UNHANDLED_OSC_RING};
+pub use server::ServerTerminal;
 
 /// Default screen geometry, used for the initial (num 0) state both ends agree on.
 pub const DEFAULT_ROWS: u16 = 24;

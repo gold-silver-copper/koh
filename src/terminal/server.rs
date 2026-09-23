@@ -4,46 +4,6 @@
 
 use crate::terminal::{clamp_dims, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN};
 
-/// A ConEmu / Windows Terminal progress report from the hosted app (KO-01).
-///
-/// `OSC 9;4;<state>;<percent> ST`: `state` is 0 = clear, 1 = normal, 2 = error, 3 = indeterminate,
-/// 4 = warning; `percent` is 0..=100. Host-side only — it never rides the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Progress {
-    pub state: u8,
-    pub percent: u8,
-}
-
-/// How many unhandled OSC payloads [`ServerTerminal::take_unhandled_oscs`] retains between drains,
-/// and the byte cap on each (dropped, never grown, so a hostile app can't pin memory here).
-pub const UNHANDLED_OSC_RING: usize = 16;
-pub const UNHANDLED_OSC_MAX_LEN: usize = 256;
-
-/// Parse the parameters of an `OSC 9;4;…` progress report. `params` is vt100's split payload
-/// (`["9", "4", state, percent]`); anything malformed or out of range is `None`.
-fn parse_progress(params: &[&[u8]]) -> Option<Progress> {
-    if params.len() < 3 || params.first().copied() != Some(b"9".as_slice()) {
-        return None;
-    }
-    if params.get(1).copied() != Some(b"4".as_slice()) {
-        return None;
-    }
-    let num = |i: usize| -> Option<u8> {
-        let p = params.get(i).copied()?;
-        let s = std::str::from_utf8(p).ok()?;
-        s.parse::<u8>().ok()
-    };
-    let state = num(2)?;
-    if state > 4 {
-        return None;
-    }
-    let percent = if state == 0 { 0 } else { num(3)? };
-    if percent > 100 {
-        return None;
-    }
-    Some(Progress { state, percent })
-}
-
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
 fn title_from(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
@@ -65,11 +25,6 @@ struct Callbacks {
     /// Bytes the emulator must send back to the application (query answers). Drained into the
     /// PTY input by the caller — never echoed onto the synced screen.
     host_replies: Vec<u8>,
-    /// The latest OSC 9;4 progress report; `None` once cleared (state 0) or never set (KO-01).
-    progress: Option<Progress>,
-    /// The last [`UNHANDLED_OSC_RING`] OSC payloads vt100 did not handle, each truncated to
-    /// [`UNHANDLED_OSC_MAX_LEN`] bytes, oldest first (KO-01).
-    unhandled_oscs: std::collections::VecDeque<Vec<u8>>,
 }
 
 impl vt100::Callbacks for Callbacks {
@@ -88,22 +43,6 @@ impl vt100::Callbacks for Callbacks {
         if data.len() <= MAXIMUM_CLIPBOARD_SIZE {
             self.clipboard = String::from_utf8_lossy(data).into_owned();
         }
-    }
-
-    /// OSC sequences vt100 has no handler for: parse progress (OSC 9;4) and keep a bounded ring of
-    /// raw payloads for an embedding host's own detection (KO-01).
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
-        match parse_progress(params) {
-            Some(p) if p.state == 0 => self.progress = None,
-            Some(p) => self.progress = Some(p),
-            None => {}
-        }
-        let mut raw = params.join(&b';');
-        raw.truncate(UNHANDLED_OSC_MAX_LEN);
-        if self.unhandled_oscs.len() >= UNHANDLED_OSC_RING {
-            self.unhandled_oscs.pop_front();
-        }
-        self.unhandled_oscs.push_back(raw);
     }
 
     /// Answer the terminal queries interactive apps (vim/htop/fzf/…) block on. vt100 routes
@@ -294,18 +233,6 @@ impl ServerTerminal {
         std::mem::take(&mut self.parser.callbacks_mut().host_replies)
     }
 
-    /// The hosted app's latest OSC 9;4 progress report, if one is active (KO-01). Host-side
-    /// information for an embedding server; not part of the synced screen.
-    pub fn progress(&self) -> Option<Progress> {
-        self.parser.callbacks().progress
-    }
-
-    /// Drain the ring of OSC payloads vt100 did not handle (at most [`UNHANDLED_OSC_RING`], each
-    /// at most [`UNHANDLED_OSC_MAX_LEN`] bytes), oldest first (KO-01).
-    pub fn take_unhandled_oscs(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.parser.callbacks_mut().unhandled_oscs).into()
-    }
-
     /// Resize the emulated screen (after applying a client resize to the PTY). The dimensions are
     /// peer-controlled, so they are clamped to `[MIN_DIM, MAX_DIM]` here — vt100 allocates the grid
     /// eagerly, so an unbounded resize OOM-aborts the (cross-tenant) server and a zero dimension
@@ -328,12 +255,6 @@ impl ServerTerminal {
         &self.parser.callbacks().title
     }
 
-    /// Window icon name set by the shell (OSC 1), if any. Test-only (see [`title`](Self::title)).
-    #[cfg(test)]
-    pub fn icon_name(&self) -> &str {
-        &self.parser.callbacks().icon
-    }
-
     /// Number of audible bells seen so far. Test-only (see [`title`](Self::title)).
     #[cfg(test)]
     pub fn bell_count(&self) -> u64 {
@@ -344,24 +265,6 @@ impl ServerTerminal {
     /// client's arrow-key bytes (SS3 vs CSI) before they reach the PTY.
     pub fn application_cursor(&self) -> bool {
         self.parser.screen().application_cursor()
-    }
-
-    /// Temporarily selects a bounded scrollback viewport and exposes it without cloning the
-    /// terminal's complete history. The prior viewport is restored before returning.
-    pub fn with_scrollback_screen<R>(
-        &mut self,
-        rows: usize,
-        read: impl FnOnce(&vt100::Screen) -> R,
-    ) -> R {
-        let previous = self.parser.screen().scrollback();
-        self.parser.screen_mut().set_scrollback(rows);
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(self.parser.screen())));
-        self.parser.screen_mut().set_scrollback(previous);
-        match result {
-            Ok(result) => result,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
     }
 
     /// Produce the SSP snapshot the transport will diff and ship. `echo_ack` is 0: the connection
@@ -408,7 +311,6 @@ mod tests {
         let mut t = ServerTerminal::new(24, 80, 0);
         t.process(b"\x1b]2;my-title\x07\x07\x1b]1;my-icon\x07\x1b]52;c;aGVsbG8=\x07");
         assert_eq!(t.title(), "my-title");
-        assert_eq!(t.icon_name(), "my-icon");
         assert_eq!(t.bell_count(), 1);
         let snap = t.snapshot();
         assert_eq!(snap.title(), "my-title");
@@ -525,72 +427,5 @@ mod tests {
             assert!(!terminal.control_filter.dropping);
             assert!(terminal.snapshot().screen().contents().contains("ok"));
         }
-    }
-
-    // --- KO-01: OSC 9;4 progress and the unhandled-OSC ring ---
-
-    #[test]
-    fn osc_9_4_progress_is_parsed_and_cleared() {
-        let mut t = ServerTerminal::new(24, 80, 0);
-        t.process(b"\x1b]9;4;1;50\x1b\\");
-        assert_eq!(
-            t.progress(),
-            Some(Progress {
-                state: 1,
-                percent: 50
-            })
-        );
-        t.process(b"\x1b]9;4;3;0\x07"); // BEL-terminated, indeterminate
-        assert_eq!(
-            t.progress(),
-            Some(Progress {
-                state: 3,
-                percent: 0
-            })
-        );
-        t.process(b"\x1b]9;4;0\x1b\\"); // state 0 clears, no percent needed
-        assert_eq!(t.progress(), None);
-    }
-
-    #[test]
-    fn malformed_osc_9_4_yields_none_and_never_panics() {
-        for bad in [
-            &b"\x1b]9;4;1;150\x1b\\"[..], // percent out of range
-            b"\x1b]9;4;x\x1b\\",          // non-numeric state
-            b"\x1b]9;4\x1b\\",            // missing state
-            b"\x1b]9;4;7;10\x1b\\",       // unknown state
-            b"\x1b]\x1b\\",               // empty param list
-        ] {
-            let mut t = ServerTerminal::new(24, 80, 0);
-            t.process(bad);
-            assert_eq!(t.progress(), None, "{bad:?}");
-        }
-        // A 4 KiB payload is truncated into the ring, not stored whole.
-        let mut t = ServerTerminal::new(24, 80, 0);
-        let mut big = b"\x1b]9;4;1;".to_vec();
-        big.extend(std::iter::repeat_n(b'9', 4096));
-        big.extend_from_slice(b"\x1b\\");
-        t.process(&big);
-        assert_eq!(t.progress(), None);
-        let ring = t.take_unhandled_oscs();
-        assert_eq!(ring.len(), 1);
-        assert!(ring[0].len() <= UNHANDLED_OSC_MAX_LEN);
-    }
-
-    #[test]
-    fn unhandled_osc_ring_keeps_the_last_sixteen_and_drains() {
-        let mut t = ServerTerminal::new(24, 80, 0);
-        for i in 0..20u8 {
-            t.process(format!("\x1b]777;item{i}\x1b\\").as_bytes());
-        }
-        let ring = t.take_unhandled_oscs();
-        assert_eq!(ring.len(), UNHANDLED_OSC_RING);
-        assert_eq!(ring[0], b"777;item4".to_vec(), "oldest retained is the 5th");
-        assert_eq!(ring[15], b"777;item19".to_vec());
-        assert!(t.take_unhandled_oscs().is_empty(), "take drains");
-        // Handled OSCs (title) do not land in the ring.
-        t.process(b"\x1b]2;a title\x1b\\");
-        assert_eq!(t.take_unhandled_oscs(), Vec::<Vec<u8>>::new());
-        assert_eq!(t.title(), "a title");
     }
 }

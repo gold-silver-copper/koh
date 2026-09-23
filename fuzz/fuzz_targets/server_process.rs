@@ -1,9 +1,8 @@
 #![no_main]
 //! Fuzz the host-side emulator input path: arbitrary bytes (the hosted program's output — not
 //! wire-controlled, but a hostile or buggy app can emit anything) -> `ServerTerminal::process`,
-//! then the accessors an embedding host reads (`snapshot`, `progress`, `take_unhandled_oscs`,
-//! `take_host_replies`). Must never panic out of `process` (vt100 panics are contained, KO-01)
-//! and the OSC ring / progress parse must never grow or misparse into a panic.
+//! then the snapshot and host replies the server reads. Must never panic out of `process` (vt100
+//! panics are contained, KO-01).
 
 use koh::terminal::ServerTerminal;
 use libfuzzer_sys::fuzz_target;
@@ -18,8 +17,4 @@ fuzz_target!(|data: &[u8]| {
     }
     let snap = t.snapshot();
     let _ = snap.screen().contents();
-    let _ = t.progress();
-    let ring = t.take_unhandled_oscs();
-    assert!(ring.len() <= koh::terminal::UNHANDLED_OSC_RING);
-    assert!(ring.iter().all(|p| p.len() <= koh::terminal::UNHANDLED_OSC_MAX_LEN));
 });

@@ -13,18 +13,34 @@ async fn external_signal_retains_shell_style_exit_status() {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
 
-    let (mut pty, _rx) = Pty::spawn(
+    // The shell prints its own pid, so the test can signal it from outside like any other process.
+    let (mut pty, mut rx) = Pty::spawn(
         24,
         80,
         &[
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            "while :; do sleep 1; done".to_owned(),
+            "echo PID=$$; while :; do sleep 1; done".to_owned(),
         ],
         "xterm-256color",
     )
     .expect("spawn signal fixture");
-    let pid = i32::try_from(pty.process_id().expect("child pid")).expect("pid range");
+    let mut output = String::new();
+    let pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let chunk = rx.recv().await.expect("output before the pid line");
+            output.push_str(&String::from_utf8_lossy(&chunk));
+            let pid = output
+                .split_once("PID=")
+                .and_then(|(_, rest)| rest.split_once(['\r', '\n']))
+                .and_then(|(digits, _)| digits.parse::<i32>().ok());
+            if let Some(pid) = pid {
+                break pid;
+            }
+        }
+    })
+    .await
+    .expect("pid line deadline");
     kill(Pid::from_raw(pid), Signal::SIGKILL).expect("signal child");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -42,19 +58,6 @@ async fn external_signal_retains_shell_style_exit_status() {
 }
 
 use koh::pty::Pty;
-
-#[test]
-fn spawned_child_exposes_a_real_process_id() {
-    let (pty, _rx) = Pty::spawn(
-        24,
-        80,
-        &["/bin/sh".into(), "-c".into(), "sleep 1".into()],
-        "xterm-256color",
-    )
-    .expect("spawn child");
-    assert!(pty.process_id().is_some_and(|pid| pid > 0));
-    pty.shutdown();
-}
 
 #[tokio::test]
 #[expect(
@@ -248,88 +251,8 @@ async fn reaped_child_is_not_signaled_again() {
     // After reaping, every kill path is gated and must be a safe no-op (never signaling a PID we no
     // longer own).
     assert!(pty.kill().is_ok(), "kill() after reap is a gated no-op");
-    assert!(pty.terminate_process_group(false).is_ok());
-    assert!(pty.terminate_process_group(true).is_ok());
     pty.kill_hard(); // must not signal a (possibly recycled) PID, must not panic
     pty.shutdown(); // consumes; Drop is reaped-gated; must not panic
-}
-
-#[tokio::test]
-async fn process_group_teardown_closes_descendant_held_pty() {
-    let (pty, mut rx) = Pty::spawn(
-        24,
-        80,
-        &[
-            "/bin/sh".into(),
-            "-c".into(),
-            "trap '' HUP; sleep 60 & wait".into(),
-        ],
-        "xterm-256color",
-    )
-    .expect("spawn descendants");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    pty.terminate_process_group(true).expect("kill group");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while rx.recv().await.is_some() {}
-    })
-    .await
-    .expect("descendant-held PTY must reach EOF");
-    pty.shutdown();
-}
-
-#[tokio::test]
-async fn graceful_group_shutdown_kills_hup_immune_descendant_after_leader_exits() {
-    let (mut pty, mut rx) = Pty::spawn(
-        24,
-        80,
-        &[
-            "/bin/sh".into(),
-            "-c".into(),
-            "(trap '' HUP; while :; do sleep 1; done) & wait".into(),
-        ],
-        "xterm-256color",
-    )
-    .expect("spawn descendant");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    pty.shutdown_process_group(Duration::from_millis(50))
-        .expect("owned group teardown");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while rx.recv().await.is_some() {}
-    })
-    .await
-    .expect("HUP-immune descendant must release PTY");
-    pty.shutdown();
-}
-
-#[tokio::test]
-async fn graceful_group_shutdown_preserves_the_leaders_shell_status() {
-    let (mut pty, mut rx) = Pty::spawn(
-        24,
-        80,
-        &[
-            "/bin/sh".into(),
-            "-c".into(),
-            "printf READY; while :; do sleep 1; done".into(),
-        ],
-        "xterm-256color",
-    )
-    .expect("spawn HUP-aware leader");
-    let mut output = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !output.windows(5).any(|bytes| bytes == b"READY") {
-            output.extend(rx.recv().await.expect("leader output before readiness"));
-        }
-    })
-    .await
-    .expect("leader readiness deadline");
-
-    let status = pty
-        .shutdown_process_group(Duration::from_millis(50))
-        .expect("owned group teardown")
-        .expect("leader status");
-    assert_eq!(status.exit_code(), 129, "SIGHUP must use shell convention");
-    assert_eq!(status.signal(), Some("SIGHUP"));
-    pty.shutdown();
 }
 
 #[tokio::test]
@@ -367,40 +290,4 @@ async fn argv_tail_reaches_the_child() {
         7,
         "the `-c \"exit 7\"` tail must have reached sh"
     );
-}
-
-#[tokio::test]
-async fn osc_progress_from_a_real_child_reaches_the_pty_host() {
-    // KO-01: a real program's OSC 9;4 report lands on `ServerTerminal::progress()` through the
-    // PTY host's drain.
-    use koh::server::session::spawn_session;
-    let handle = spawn_session(
-        &[
-            "sh".to_owned(),
-            "-c".to_owned(),
-            "printf '\\033]9;4;1;42\\033\\\\'; printf PROGRESS_DONE; sleep 1".to_owned(),
-        ],
-        0,
-    )
-    .expect("spawn");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        {
-            let s = handle.session.lock().await;
-            if s.host.emu.progress()
-                == Some(koh::terminal::Progress {
-                    state: 1,
-                    percent: 42,
-                })
-            {
-                break;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for the OSC 9;4 report"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let _ = handle.session.lock().await.host.pty.kill();
 }

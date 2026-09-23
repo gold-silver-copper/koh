@@ -51,7 +51,7 @@ jobs:
         # the `use crate::` import form only, so doc-comment rustdoc links can't false-positive.
         run: |
           if grep -rnE '^[[:space:]]*use crate::' src/predict.rs; then
-            echo "::error::predict.rs must import nothing from crate:: — keep it a standalone vt100-only library"
+            echo "::error::predict.rs must import nothing from crate:: — keep it a standalone library"
             exit 1
           fi
           if grep -rnE '^[[:space:]]*use crate::wire' src/server src/client; then
@@ -102,14 +102,14 @@ jobs:
             exit 1
           fi
 
-  # Verify the declared MSRV (`rust-version = "1.91"`) actually builds — otherwise the declaration is
+  # Verify the declared MSRV (`rust-version = "1.95"`) actually builds — otherwise the declaration is
   # a false promise to `cargo install` users on an older toolchain. Check, not test (the `=`-pinned
   # lockfile makes it cheap and deterministic). Bump `rust-version` if this ever fails.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.91
+      - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
       - name: cargo check on the declared MSRV
         run: cargo check --locked --all-targets
@@ -126,7 +126,7 @@ jobs:
 
   # Coverage-guided fuzzing of the untrusted-input decode surfaces (the OpenSSH/OSS-Fuzz doctrine:
   # one harness per attacker-reachable parser). Builds the harnesses, then a short smoke run that
-  # MUST stay crash-free — `screen_apply` proves the vt100 panic containment holds, `wire_decode`
+  # MUST stay crash-free — `screen_apply` proves the structured-diff apply never panics, `wire_decode`
   # proves the wire decoders only Err (never panic) on arbitrary bytes.
   fuzz:
     runs-on: ubuntu-latest

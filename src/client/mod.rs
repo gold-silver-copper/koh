@@ -33,7 +33,6 @@ use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::ssp::{RecvOutcome, Transport, SHUTDOWN_SENTINEL};
 use crate::terminal::TerminalScreen;
 use crate::transport_iroh::{IrohChannel, MonoClock, ALPN};
-use anyhow::Context;
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -122,11 +121,20 @@ impl IrohConnector {
     /// surfaces as an `Err` (the binary reports it before entering raw mode), so a rejected client
     /// fails fast rather than re-dialing forever.
     pub async fn connect(&self) -> anyhow::Result<IrohChannel> {
-        let conn = self
-            .endpoint
-            .connect(self.target.clone(), ALPN)
-            .await
-            .context("connecting to server (is your id on its allowlist?)")?;
+        let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
+            Ok(conn) => conn,
+            Err(e) if refused_our_alpn(&e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "the server does not speak this koh protocol ({}); upgrade koh on both ends",
+                    String::from_utf8_lossy(ALPN)
+                )));
+            }
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context("connecting to server (is your id on its allowlist?)")
+                );
+            }
+        };
         if let Err(e) = crate::transport_iroh::admission::await_admission(&conn).await {
             // The server rejects with a specific application reason — "not authorized" / "server at
             // session capacity" — each pointing at a different operator fix. Surface that real reason
@@ -140,6 +148,26 @@ impl IrohConnector {
         }
         Ok(IrohChannel::new(conn))
     }
+}
+
+/// Whether a dial failed because the server does not serve [`ALPN`]: the TLS handshake ended with
+/// alert 120 (`no_application_protocol`), which QUIC reports as crypto error `0x178`. A server on
+/// another koh protocol version refuses us this way, and pointing at the allowlist would mislead.
+fn refused_our_alpn(error: &(dyn std::error::Error + 'static)) -> bool {
+    use iroh::endpoint::{ConnectionError, TransportErrorCode};
+    let no_alpn = TransportErrorCode::crypto(120);
+    let mut next = Some(error);
+    while let Some(e) = next {
+        match e.downcast_ref::<ConnectionError>() {
+            Some(ConnectionError::ConnectionClosed(close)) if close.error_code == no_alpn => {
+                return true;
+            }
+            Some(ConnectionError::TransportError(t)) if t.code == no_alpn => return true,
+            _ => {}
+        }
+        next = e.source();
+    }
+    false
 }
 
 /// The server's application close reason, if it rejected us with one. The reason is peer-controlled,
@@ -933,6 +961,39 @@ mod tests {
     use super::*;
     use crate::input::InputEvent;
     use crate::terminal::ServerTerminal;
+
+    #[tokio::test]
+    async fn a_server_on_another_protocol_is_reported_as_such() {
+        // A server that only speaks the previous protocol's ALPN refuses the TLS handshake. The
+        // error must say so, not blame the allowlist.
+        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(generate_secret_key())
+            .alpns(vec![b"koh/iroh/1".to_vec()])
+            .bind()
+            .await
+            .expect("bind old-protocol server");
+        let addr = loopback_addr(&server);
+        let accept = tokio::spawn(async move {
+            if let Some(incoming) = server.accept().await {
+                let _ = incoming.await;
+            }
+            server
+        });
+        let client = bind_endpoint_local(generate_secret_key(), false)
+            .await
+            .expect("bind client");
+        let error = match IrohConnector::new(client, addr).connect().await {
+            Ok(_) => panic!("an old-protocol server must refuse the handshake"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            error.contains("does not speak this koh protocol (koh/iroh/2)"),
+            "{error}"
+        );
+        assert!(!error.contains("allowlist"), "{error}");
+        let _ = accept.await;
+    }
 
     /// Drive a server-side transport until it emits at least one datagram, returning them. Used to
     /// synthesize *real* server frames for the client session to consume — no iroh, no tokio.

@@ -873,41 +873,42 @@ mod tests {
                 }
             }
         }
-        // A types 30 separate frames.
+        // A types 30 times. Keystrokes pushed within one send interval may share a frame, so
+        // track the frame A's LAST keystroke went out in: it is newer than every frame A had sent
+        // before that push.
+        let mut a_last_before = 0;
         for _ in 0..30 {
+            a_last_before = viewers[0].1.newest_sent_num();
             viewers[0].1.current_mut().push_bytes(b"a");
             pump(&mut viewers, &clock, 40).await;
         }
+        // B has sent no input yet, so no frame of B's can be acked. A leaked ack would show here.
+        assert_eq!(
+            viewers[1].1.remote_state().echo_ack(),
+            0,
+            "B was handed A's echo-ack before typing anything"
+        );
         // B types once.
+        let b_before = viewers[1].1.newest_sent_num();
         viewers[1].1.current_mut().push_bytes(b"b");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             pump(&mut viewers, &clock, 50).await;
-            let b_done = viewers[1].1.remote_state().echo_ack() >= 1;
-            let a_done = viewers[0].1.remote_state().echo_ack() >= 30;
+            let a_done = viewers[0].1.remote_state().echo_ack() > a_last_before;
+            let b_done = viewers[1].1.remote_state().echo_ack() > b_before;
             if a_done && b_done {
                 break;
             }
         }
-        let (a_ack, a_sent) = (
-            viewers[0].1.remote_state().echo_ack(),
-            viewers[0].1.newest_sent_num(),
-        );
-        let (b_ack, b_sent) = (
-            viewers[1].1.remote_state().echo_ack(),
-            viewers[1].1.newest_sent_num(),
+        let a_ack = viewers[0].1.remote_state().echo_ack();
+        let b_ack = viewers[1].1.remote_state().echo_ack();
+        assert!(
+            a_ack > a_last_before,
+            "A's ack reaches the frame with its last keystroke: ack {a_ack}, last keystroke after frame {a_last_before}"
         );
         assert!(
-            a_ack >= 30 && a_ack <= a_sent,
-            "A's ack covers A's 30 frames: ack {a_ack}, sent {a_sent}"
-        );
-        assert!(
-            b_ack >= 1 && b_ack <= b_sent,
-            "B's ack covers B's one frame: ack {b_ack}, sent {b_sent}"
-        );
-        assert!(
-            b_ack < 30,
-            "B was handed A's ack ({b_ack}): the echo-ack leaked across connections"
+            b_ack > b_before,
+            "B's ack reaches the frame with its keystroke: ack {b_ack}, keystroke after frame {b_before}"
         );
         for (chan, _, _) in &viewers {
             chan.close(0, b"done");

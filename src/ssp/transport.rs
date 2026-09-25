@@ -9,7 +9,7 @@ use tracing::trace;
 
 use crate::ssp::nonempty::NonEmpty;
 use crate::ssp::{
-    RttEstimator, SyncState, ACK_DELAY, ACK_INTERVAL, ACTIVE_RETRY_TIMEOUT, NEVER,
+    later, RttEstimator, SyncState, ACK_DELAY, ACK_INTERVAL, ACTIVE_RETRY_TIMEOUT, NEVER,
     RECEIVED_STATES_CAP, SEND_MINDELAY, SENT_STATES_CAP, SHUTDOWN_RETRIES, SHUTDOWN_SENTINEL,
 };
 
@@ -260,14 +260,14 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         self.update_assumed_receiver_state(now);
         self.rationalize_states();
 
-        if self.pending_data_ack && self.next_ack_time > now + ACK_DELAY {
-            self.next_ack_time = now + ACK_DELAY;
+        if self.pending_data_ack && self.next_ack_time > later(now, ACK_DELAY) {
+            self.next_ack_time = later(now, ACK_DELAY);
         }
 
         let back_ts = self.sent_back().timestamp;
         let interval = self.rtt.send_interval();
         let rto = self.rtt.timeout();
-        let recently_heard = self.last_heard + ACTIVE_RETRY_TIMEOUT > now;
+        let recently_heard = later(self.last_heard, ACTIVE_RETRY_TIMEOUT) > now;
 
         let current_eq_back = self.current_state == self.sent_back().state;
         let current_eq_assumed = self.current_state == self.assumed_sent().state;
@@ -278,30 +278,33 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             if self.mindelay_clock == NEVER {
                 self.mindelay_clock = now;
             }
-            self.next_send_time = (self.mindelay_clock + SEND_MINDELAY).max(back_ts + interval);
+            self.next_send_time =
+                later(self.mindelay_clock, SEND_MINDELAY).max(later(back_ts, interval));
         } else if !current_eq_assumed && recently_heard {
             // (B) nothing new, but the peer may lack our latest — retransmit at frame rate.
-            self.next_send_time = back_ts + interval;
+            self.next_send_time = later(back_ts, interval);
             if self.mindelay_clock != NEVER {
-                self.next_send_time = self.next_send_time.max(self.mindelay_clock + SEND_MINDELAY);
+                self.next_send_time = self
+                    .next_send_time
+                    .max(later(self.mindelay_clock, SEND_MINDELAY));
             }
         } else if !current_eq_front && recently_heard {
             // (C) peer assumed-current but hasn't acked our base — slow retransmit.
-            self.next_send_time = back_ts + rto + ACK_DELAY;
+            self.next_send_time = later(later(back_ts, rto), ACK_DELAY);
         } else {
             // (D) fully in sync (or peer silent > 10s).
             self.next_send_time = NEVER;
         }
 
         if self.shutdown_in_progress || self.ack_num == SHUTDOWN_SENTINEL {
-            self.next_ack_time = back_ts + interval;
+            self.next_ack_time = later(back_ts, interval);
         }
     }
 
     /// `assumed_receiver_num` = newest state we believe the peer holds: the acked base plus
     /// any state sent within `RTO + ACK_DELAY` of now ("benefit of the doubt").
     fn update_assumed_receiver_state(&mut self, now: u64) {
-        let horizon = self.rtt.timeout() + ACK_DELAY;
+        let horizon = later(self.rtt.timeout(), ACK_DELAY);
         let mut assumed = self.sent_front().num;
         for s in self.sent_states.iter().skip(1) {
             if now.saturating_sub(s.timestamp) < horizon {
@@ -435,7 +438,7 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
 
         let out = self.send_in_fragments(old_num, new_num, diff);
         self.assumed_receiver_num = self.sent_back().num;
-        self.next_ack_time = now + ACK_INTERVAL;
+        self.next_ack_time = later(now, ACK_INTERVAL);
         self.next_send_time = NEVER;
         self.pending_data_ack = false;
         out
@@ -465,7 +468,7 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
         // re-emit an empty ack every ~ACK_DELAY ms forever instead of settling onto the much slower
         // ACK_INTERVAL idle cadence (~10x the idle datagram rate — mobile battery/radio cost).
         self.pending_data_ack = false;
-        self.next_ack_time = now + ACK_INTERVAL;
+        self.next_ack_time = later(now, ACK_INTERVAL);
         self.next_send_time = NEVER;
         out
     }
@@ -480,7 +483,8 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             diff,
         };
         if new_num == SHUTDOWN_SENTINEL {
-            self.shutdown_tries += 1;
+            // Only ever compared with `>= SHUTDOWN_RETRIES`, which a saturated count still meets.
+            self.shutdown_tries = self.shutdown_tries.saturating_add(1);
         }
         trace!(
             old_num,
@@ -505,9 +509,11 @@ impl<Local: SyncState, Remote: SyncState> Transport<Local, Remote> {
             state,
         });
         if self.sent_states.len() > SENT_STATES_CAP {
-            // Drop the 16th-from-end: keeps the acked base (front) and the recent tail.
-            let idx = self.sent_states.len() - 16;
-            let _ = self.sent_states.remove(idx);
+            // Drop the 16th-from-end: keeps the acked base (front) and the recent tail. Over the
+            // cap the list is longer than 16 (asserted with the cap), so the index always exists.
+            if let Some(idx) = self.sent_states.len().checked_sub(16) {
+                let _ = self.sent_states.remove(idx);
+            }
         }
     }
 

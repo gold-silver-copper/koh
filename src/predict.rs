@@ -313,7 +313,7 @@ impl PredictionEngine {
         self.cells.insert(
             (row, col),
             PredCell {
-                expiration_frame: self.local_frame_sent + 1,
+                expiration_frame: self.next_frame(),
                 tentative_epoch: self.prediction_epoch,
                 prediction_time: now,
                 glyph,
@@ -348,8 +348,17 @@ impl PredictionEngine {
         self.srtt_ms = ms;
     }
 
+    /// The frame a prediction made now expires at: the next input frame after the newest sent.
+    /// Frame numbers count sent states and cannot reach `u64::MAX` in practice. Were one to, the
+    /// expiry saturates there, the last frame there is, instead of wrapping to an expired 0.
+    fn next_frame(&self) -> u64 {
+        self.local_frame_sent.saturating_add(1)
+    }
+
     fn become_tentative(&mut self) {
-        self.prediction_epoch += 1;
+        // One epoch per tentative event, so `u64::MAX` is out of reach. Saturating keeps the epoch
+        // from wrapping below `confirmed_epoch`, which would show unconfirmed predictions.
+        self.prediction_epoch = self.prediction_epoch.saturating_add(1);
     }
 
     fn tentative(&self, epoch: u64) -> bool {
@@ -364,7 +373,7 @@ impl PredictionEngine {
     /// return it.
     fn init_cursor(&mut self, screen: &dyn ScreenView) -> &mut PredCursor {
         let epoch = self.prediction_epoch;
-        let expiration_frame = self.local_frame_sent + 1;
+        let expiration_frame = self.next_frame();
         let (row, col) = screen.cursor_position();
         let cursor = self.cursor.get_or_insert(PredCursor {
             expiration_frame,
@@ -389,8 +398,8 @@ impl PredictionEngine {
         self.init_cursor(screen);
         if let Some(c) = self.cursor.as_mut() {
             c.col = 0;
-            if c.row + 1 < rows {
-                c.row += 1;
+            if let Some(next) = c.row.checked_add(1).filter(|&next| next < rows) {
+                c.row = next;
             }
             // On the last row we do NOT predict a scroll (mosh deliberately avoids it).
         }
@@ -402,16 +411,18 @@ impl PredictionEngine {
     /// `become_tentative`s them).
     fn predict_arrow(&mut self, screen: &dyn ScreenView, dir: i32) {
         self.init_cursor(screen);
-        let exp = self.local_frame_sent + 1;
+        let exp = self.next_frame();
         let (_, cols) = screen.size();
         if let Some(c) = self.cursor.as_mut() {
-            // `c.col < cols - 1`, written saturating so a peer-controlled `cols == 0`/`c.col` near
-            // u16::MAX can't overflow the `+ 1` (matches the hardened predict_wide / backspace sites).
-            if dir > 0 && c.col < cols.saturating_sub(1) {
-                c.col += 1;
-                c.expiration_frame = exp;
-            } else if dir < 0 && c.col > 0 {
-                c.col -= 1;
+            // Right stops before the last column, left at column 0. The width is peer-controlled,
+            // so the step is checked: at `u16::MAX` or with `cols == 0` the cursor just stays.
+            let moved = match dir.cmp(&0) {
+                std::cmp::Ordering::Greater => c.col.checked_add(1).filter(|&next| next < cols),
+                std::cmp::Ordering::Less => c.col.checked_sub(1),
+                std::cmp::Ordering::Equal => None,
+            };
+            if let Some(col) = moved {
+                c.col = col;
                 c.expiration_frame = exp;
             }
         }
@@ -437,19 +448,18 @@ impl PredictionEngine {
             (c.row, c.col)
         };
         // Need the whole glyph to fit strictly before the last column (the edge is wrap-ambiguous).
-        // Written as `w >= cols - col` (saturating) to avoid a latent `col + w` u16 overflow, matching
-        // the hardened backspace path; in production `col, w` are clamped well below u16::MAX anyway.
-        if w >= cols.saturating_sub(col) {
+        // `col + w` is checked: the width is peer-controlled, and an overflow cannot fit either.
+        let Some(next_col) = col.checked_add(w).filter(|&next| next < cols) else {
             self.become_tentative();
             self.init_cursor(screen);
             return;
-        }
-        let exp = self.local_frame_sent + 1;
+        };
+        let exp = self.next_frame();
         let (fg, bg) = glyph_style(screen, row, col);
         self.place_cell(screen, row, col, g.to_string(), fg, bg, false, now);
         if let Some(c) = self.cursor.as_mut() {
             c.expiration_frame = exp;
-            c.col += w;
+            c.col = next_col;
         }
     }
 
@@ -561,10 +571,11 @@ impl PredictionEngine {
                 // col+1) so the tail moves over to make room — matching what a readline-style line
                 // editor renders. Iterate right-to-left so each cell reads its left neighbor's
                 // pre-shift content.
-                for i in ((col + 1)..cols).rev() {
-                    let (g, fg, bg, src_unknown) = self.pred_or_real_glyph(screen, row, i - 1);
+                // Each `(left, i)` is a column and its left neighbor, from `(col, col + 1)` up.
+                for (left, i) in (col..cols).zip((col..cols).skip(1)).rev() {
+                    let (g, fg, bg, src_unknown) = self.pred_or_real_glyph(screen, row, left);
                     // The rightmost cell takes content pushed off-screen -> unknown.
-                    let unknown = i == cols - 1 || src_unknown;
+                    let unknown = i.checked_add(1) == Some(cols) || src_unknown;
                     let glyph = if unknown { String::new() } else { g };
                     self.place_cell(screen, row, i, glyph, fg, bg, unknown, now);
                 }
@@ -579,11 +590,12 @@ impl PredictionEngine {
                     false,
                     now,
                 );
+                let exp = self.next_frame();
                 if let Some(c) = self.cursor.as_mut() {
-                    c.expiration_frame = self.local_frame_sent + 1;
-                    // `c.col < cols - 1`, saturating to match the hardened sites (no `+ 1` overflow).
-                    if c.col < cols.saturating_sub(1) {
-                        c.col += 1;
+                    c.expiration_frame = exp;
+                    // Advance unless on the last column (checked: `cols` is peer-controlled).
+                    if let Some(next) = c.col.checked_add(1).filter(|&next| next < cols) {
+                        c.col = next;
                     } else {
                         self.become_tentative();
                         self.newline_cr(screen);
@@ -592,11 +604,11 @@ impl PredictionEngine {
             }
             0x7f | 0x08 => {
                 // Backspace: step the cursor back one column.
-                let exp = self.local_frame_sent + 1;
+                let exp = self.next_frame();
                 let (row, col, do_pred) = {
                     let c = self.init_cursor(screen);
-                    if c.col > 0 {
-                        c.col -= 1;
+                    if let Some(prev) = c.col.checked_sub(1) {
+                        c.col = prev;
                         c.expiration_frame = exp;
                         (c.row, c.col, true)
                     } else {
@@ -613,12 +625,12 @@ impl PredictionEngine {
                     for i in col..cols {
                         // `i < cols - 2` is mosh's `i + 2 < width`, written to never overflow u16
                         // (the screen width is peer-controlled; `i + 2` would wrap/panic at
-                        // cols == u16::MAX). The true branch then has `i + 1 < cols`, so the `i + 1`
-                        // read below is in bounds.
-                        let (g, fg, bg, unknown) = if i < cols.saturating_sub(2) {
-                            self.pred_or_real_glyph(screen, row, i + 1)
-                        } else {
-                            (String::new(), Color::Default, Color::Default, true)
+                        // cols == u16::MAX). It implies `i + 1 < cols`, so the right neighbor
+                        // exists and the checked `i + 1` succeeds.
+                        let right = i.checked_add(1).filter(|_| i < cols.saturating_sub(2));
+                        let (g, fg, bg, unknown) = match right {
+                            Some(right) => self.pred_or_real_glyph(screen, row, right),
+                            None => (String::new(), Color::Default, Color::Default, true),
                         };
                         let glyph = if unknown { String::new() } else { g };
                         self.place_cell(screen, row, i, glyph, fg, bg, unknown, now);
@@ -726,12 +738,13 @@ impl PredictionEngine {
                     }
                     // Reward fast confirmations: cure the glitch trigger gradually.
                     if now.saturating_sub(cell.prediction_time) < self.config.glitch_threshold_ms
-                        && new_glitch > 0
                         && now.saturating_sub(self.config.glitch_repair_min_interval_ms)
                             >= last_quick
                     {
-                        new_glitch -= 1;
-                        last_quick = now;
+                        if let Some(cured) = new_glitch.checked_sub(1) {
+                            new_glitch = cured;
+                            last_quick = now;
+                        }
                     }
                     // Re-color the rest of this row's pending predictions to the actual confirmed
                     // renditions (mosh terminaloverlay.cc): koh's `PredCell` carries only fg/bg, so
@@ -786,7 +799,7 @@ impl PredictionEngine {
             // the authoritative cursor shows through in the meantime.
             let (crow, ccol) = screen.cursor_position();
             self.cursor = Some(PredCursor {
-                expiration_frame: self.local_frame_sent + 1,
+                expiration_frame: self.next_frame(),
                 tentative_epoch: self.prediction_epoch,
                 row: crow,
                 col: ccol,
@@ -891,8 +904,8 @@ fn cell_glyph(screen: &dyn ScreenView, row: u16, col: u16) -> String {
 
 fn glyph_style(screen: &dyn ScreenView, row: u16, col: u16) -> (Color, Color) {
     // Copy the style of the neighbor to the left if it has content; else terminal default.
-    if col > 0 {
-        if let Some(c) = screen.cell(row, col - 1) {
+    if let Some(left) = col.checked_sub(1) {
+        if let Some(c) = screen.cell(row, left) {
             if !c.contents.is_empty() {
                 return (c.fg, c.bg);
             }

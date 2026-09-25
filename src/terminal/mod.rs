@@ -75,12 +75,8 @@ fn capped_bytes(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    // Walk back to the nearest char boundary at or below `max`.
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.get(..end).unwrap_or("").to_string()
+    // The nearest char boundary at or below `max`.
+    s.get(..s.floor_char_boundary(max)).unwrap_or("").to_string()
 }
 
 /// The synchronized screen state: the cell grid plus the out-of-band channels.
@@ -291,6 +287,20 @@ pub struct Run {
     pub cell: WireCell,
 }
 
+impl Run {
+    /// Add one more cell. `false` if the run already holds `u16::MAX` cells, the most `count`
+    /// can say; the caller then starts a new run.
+    fn extend(&mut self) -> bool {
+        match self.count.checked_add(1) {
+            Some(count) => {
+                self.count = count;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// One whole row: its runs cover exactly the screen width.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowDiff {
@@ -304,12 +314,12 @@ impl RowDiff {
         let mut runs: Vec<Run> = Vec::new();
         let mut previous: Option<&Cell> = None;
         for cell in cells {
-            match (previous, runs.last_mut()) {
-                (Some(p), Some(run)) if p == cell && run.count < u16::MAX => run.count += 1,
-                _ => runs.push(Run {
+            let extended = previous == Some(cell) && runs.last_mut().is_some_and(Run::extend);
+            if !extended {
+                runs.push(Run {
                     count: 1,
                     cell: WireCell::of(cell),
-                }),
+                });
             }
             previous = Some(cell);
         }
@@ -321,7 +331,8 @@ impl RowDiff {
     fn cells(&self, cols: u16) -> Option<Vec<Cell>> {
         let mut out = Vec::with_capacity(usize::from(cols));
         for run in &self.runs {
-            if run.count == 0 || out.len() + usize::from(run.count) > usize::from(cols) {
+            let end = out.len().checked_add(usize::from(run.count));
+            if run.count == 0 || end.is_none_or(|end| end > usize::from(cols)) {
                 return None;
             }
             let cell = run.cell.cell()?;
@@ -435,7 +446,9 @@ impl SyncState for TerminalScreen {
         // MAX_TITLE_LEN / MAXIMUM_CLIPBOARD_SIZE, but a hostile server can still ship a distinct
         // max-size clipboard per state). Fold their lengths into the unit count (K-05) so
         // RECEIVE_BUDGET_UNITS bounds total retained memory.
-        (usize::from(rows) * usize::from(cols))
+        // A budget count: saturating only ever over-counts, which makes the budget stricter.
+        usize::from(rows)
+            .saturating_mul(usize::from(cols))
             .saturating_add(self.title.len())
             .saturating_add(self.icon.len())
             .saturating_add(self.clipboard.len())

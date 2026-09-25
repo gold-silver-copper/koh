@@ -154,7 +154,9 @@ impl PromptTerminal {
             .spawn(move || {
                 if let Some(signal) = signals.forever().next() {
                     let _ = tcsetattr(&tty, SetArg::TCSANOW, &saved);
-                    std::process::exit(128 + signal);
+                    // The shell's `128 + n` status. `signal` is SIGINT, SIGTERM or SIGHUP, so the
+                    // sum is exact and the saturation never happens.
+                    std::process::exit(128_i32.saturating_add(signal));
                 }
             })?;
         Ok(Self {

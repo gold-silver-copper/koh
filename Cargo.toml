@@ -143,10 +143,11 @@ tokio = { version = "1", features = ["test-util"] }
 opt-level = 3
 lto = "thin"
 # Keep release as strict as debug on integer overflow: koh is an interactive tool (not a throughput
-# engine), so the per-op cost is negligible, and it makes a wrap-on-overflow of any peer-derived
-# arithmetic a loud panic in release too — not a silent miscompute. (Overflow checks never see an
-# `as` cast; `panic_free!` forbids the lossy ones in production code.) NOTE: panic stays `unwind`,
-# never `abort` — the session unwind guard (K-16, `AttachGuard`) relies on unwinding.
+# engine), so the per-op cost is negligible. Production code has no unchecked arithmetic
+# (`panic_free!` forbids `arithmetic_side_effects` and the lossy `as` casts, which overflow checks
+# never see), so this is the second line of defence there, and the only one in tests and
+# `test-support`: a wrap-on-overflow is a loud panic, not a silent miscompute. NOTE: panic stays
+# `unwind`, never `abort` — the session unwind guard (K-16, `AttachGuard`) relies on unwinding.
 overflow-checks = true
 
 # ---------------------------------------------------------------------------

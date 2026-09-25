@@ -246,13 +246,14 @@ fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool)
     match color {
         Color::Default => out.write_bytes(if fg { b"\x1b[39m" } else { b"\x1b[49m" }),
         Color::Idx(i) if i < 8 => {
-            let base: u16 = if fg { 30 } else { 40 };
-            out.write_bytes(format!("\x1b[{}m", base + u16::from(i)).as_bytes())
+            // 0..=7 → 30..=37 (fg) / 40..=47 (bg): the lead digit, then the index.
+            let lead = if fg { 3 } else { 4 };
+            out.write_bytes(format!("\x1b[{lead}{i}m").as_bytes())
         }
         Color::Idx(i) if i < 16 => {
-            // 8..=15 → 90..=97 (fg) / 100..=107 (bg): base is 8 below the first bright code.
-            let base: u16 = if fg { 82 } else { 92 };
-            out.write_bytes(format!("\x1b[{}m", base + u16::from(i)).as_bytes())
+            // 8..=15 → 90..=97 (fg) / 100..=107 (bg): the lead, then the index less 8 (`i & 7`).
+            let lead = if fg { 9 } else { 10 };
+            out.write_bytes(format!("\x1b[{lead}{}m", i & 7).as_bytes())
         }
         Color::Idx(i) => {
             let lead = if fg { 38 } else { 48 };
@@ -304,6 +305,20 @@ mod tests {
         let mut b = CaptureBackend::default();
         f(&mut b).expect("capture backend never errors");
         b.bytes
+    }
+
+    #[test]
+    fn sgr_codes_for_the_16_palette_colors_are_exactly_30_37_90_97_and_40_47_100_107() {
+        for i in 0..16u8 {
+            for (fg, low, high) in [(true, 30, 90), (false, 40, 100)] {
+                let code = if i < 8 { low + i } else { high + i - 8 };
+                assert_eq!(
+                    emit(|b| write_sgr_color(b, Color::Idx(i), fg)),
+                    format!("\x1b[{code}m").into_bytes(),
+                    "index {i}, fg {fg}"
+                );
+            }
+        }
     }
 
     #[test]

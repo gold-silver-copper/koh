@@ -52,7 +52,8 @@ impl Grid {
         Self {
             rows,
             cols,
-            cells: vec![Cell::default(); usize::from(rows) * usize::from(cols)],
+            // `repeat` sizes the buffer as exactly `rows × cols` cells.
+            cells: vec![Cell::default(); usize::from(cols)].repeat(usize::from(rows)),
             wrapped: vec![false; usize::from(rows)],
             cursor: (0, 0),
             modes: Modes::default(),
@@ -92,19 +93,22 @@ impl Grid {
 
     /// One row's cells, or `None` out of bounds.
     pub fn row(&self, row: u16) -> Option<&[Cell]> {
-        if row >= self.rows {
-            return None;
-        }
-        let start = usize::from(row) * usize::from(self.cols);
-        self.cells.get(start..start + usize::from(self.cols))
+        let start = self.row_start(row)?;
+        self.cells.get(start..)?.get(..usize::from(self.cols))
     }
 
     pub(super) fn row_mut(&mut self, row: u16) -> Option<&mut [Cell]> {
+        let start = self.row_start(row)?;
+        self.cells.get_mut(start..)?.get_mut(..usize::from(self.cols))
+    }
+
+    /// Index of `row`'s first cell, or `None` out of bounds. `row < rows`, so the product is at
+    /// most `rows × cols`, the length of `cells`, and cannot overflow.
+    fn row_start(&self, row: u16) -> Option<usize> {
         if row >= self.rows {
             return None;
         }
-        let start = usize::from(row) * usize::from(self.cols);
-        self.cells.get_mut(start..start + usize::from(self.cols))
+        usize::from(row).checked_mul(usize::from(self.cols))
     }
 
     /// Whether `row` soft-wraps into the next one.

@@ -34,12 +34,10 @@ pub fn render(
     let mut cur_style: Option<CellStyle> = None;
     for row in 0..rows {
         backend.move_to(row, 0)?;
-        let mut col = 0u16;
-        while col < cols {
+        for col in 0..cols {
             let cell = screen.cell(row, col);
             if let Some(c) = cell {
                 if c.is_wide_continuation() {
-                    col += 1;
                     continue;
                 }
             }
@@ -98,7 +96,6 @@ pub fn render(
                 " "
             };
             backend.print(if glyph.is_empty() { " " } else { glyph })?;
-            col += 1;
         }
     }
 
@@ -111,11 +108,7 @@ pub fn render(
             // Truncate on a UTF-8 char boundary, never mid-scalar. `cols` is the peer-controlled
             // (clamped) screen width, and the status strings contain multi-byte glyphs (em-dash,
             // ellipsis), so a raw `String::truncate(max)` would panic and crash the client (KOH-04).
-            let mut end = max;
-            while end > 0 && !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            line.truncate(end);
+            line.truncate(line.floor_char_boundary(max));
         }
         backend.move_to(rows.saturating_sub(1), 0)?;
         backend.set_reverse()?;

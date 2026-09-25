@@ -56,7 +56,8 @@ impl CursorKeyNormalizer {
     /// Normalize `input` for an app whose application-cursor-keys mode is `app_cursor`, returning
     /// the bytes to feed the PTY.
     fn normalize(&mut self, input: &[u8], app_cursor: bool) -> Vec<u8> {
-        let mut out = Vec::with_capacity(input.len() + 1);
+        // A capacity hint: one spare byte for a held escape; saturating cannot matter.
+        let mut out = Vec::with_capacity(input.len().saturating_add(1));
         for &b in input {
             match self.state {
                 Ss3State::Ground => {
@@ -198,7 +199,7 @@ impl EchoAck {
         let Some(&(_, arrived)) = self.input_history.get(1) else {
             return crate::ssp::NEVER;
         };
-        let fire_at = arrived + self.echo_timeout_ms;
+        let fire_at = crate::ssp::later(arrived, self.echo_timeout_ms);
         fire_at.saturating_sub(now)
     }
 

@@ -183,11 +183,12 @@ impl Fragment {
     /// Exactly `FRAGMENT_HEADER_OVERHEAD + payload.len()` bytes.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
         let combined: u16 = (u16::from(self.final_) << 15) | (self.index & MAX_FRAGMENT_INDEX);
-        let mut out = Vec::with_capacity(FRAGMENT_HEADER_OVERHEAD + self.payload.len());
-        out.extend_from_slice(&self.id.to_be_bytes());
-        out.extend_from_slice(&combined.to_be_bytes());
-        out.extend_from_slice(&self.payload);
-        Ok(out)
+        Ok([
+            self.id.to_be_bytes().as_slice(),
+            &combined.to_be_bytes(),
+            &self.payload,
+        ]
+        .concat())
     }
 
     /// Parse the fixed 10-byte header (inverse of [`encode`](Fragment::encode)).
@@ -248,12 +249,16 @@ impl Fragmenter {
         instr: &Instruction,
         mtu: usize,
     ) -> Result<Vec<Fragment>, WireError> {
-        if mtu <= FRAGMENT_HEADER_OVERHEAD {
+        // Payload bytes per fragment: what the MTU leaves after the header, which must be some.
+        let Some(chunk) = mtu
+            .checked_sub(FRAGMENT_HEADER_OVERHEAD)
+            .filter(|&chunk| chunk > 0)
+        else {
             return Err(WireError::MtuTooSmall {
                 mtu,
                 min: FRAGMENT_HEADER_OVERHEAD,
             });
-        }
+        };
         let serialized = instr.encode()?;
 
         // Bump the id only when the content (or MTU) changed, so identical retransmits reuse it.
@@ -268,7 +273,6 @@ impl Fragmenter {
         }
         let id = self.next_id;
 
-        let chunk = mtu - FRAGMENT_HEADER_OVERHEAD;
         let mut fragments = Vec::new();
         if serialized.is_empty() {
             trace!(
@@ -311,7 +315,7 @@ impl Fragmenter {
             fragments.push(Fragment {
                 id,
                 index,
-                final_: i + 1 == total,
+                final_: i.checked_add(1) == Some(total),
                 payload: piece.to_vec(),
             });
         }

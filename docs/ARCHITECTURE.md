@@ -200,8 +200,9 @@ The full picture is in the [threat model](THREAT_MODEL.md). In brief, the releva
   0600 via a born-private atomic write + `O_NOFOLLOW` read, and zeroized in memory. koh keeps every
   file it owns under `~/.config/koh` and nowhere else.
 - The crate is `forbid(unsafe)` and forbids the panic lint family (`unwrap`/`expect`/`panic`/
-  indexing/slicing) in production code, with `overflow-checks` on in release too — so the
-  panic-free-by-construction property holds against adversarial input.
+  indexing/slicing), unchecked arithmetic (`arithmetic_side_effects`) and lossy `as` casts in
+  production code, with `overflow-checks` on in release too — so the panic-free-by-construction
+  property holds against adversarial input.
 
 ## Testing tiers
 

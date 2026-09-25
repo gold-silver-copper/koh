@@ -263,11 +263,12 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::io::Result<Option<u32>>>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
+    // An unrepresentable deadline (a timeout of centuries) means no deadline.
+    let deadline = tokio::time::Instant::now().checked_add(timeout);
     loop {
         match poll().await {
             Ok(Some(exit_code)) => return Some(exit_code),
-            Ok(None) if tokio::time::Instant::now() < deadline => {
+            Ok(None) if deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline) => {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             Ok(None) => return None,

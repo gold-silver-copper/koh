@@ -42,6 +42,17 @@ pub const NEVER: u64 = u64::MAX;
 /// The state number that signals a clean shutdown (`uint64_t(-1)` in mosh).
 pub const SHUTDOWN_SENTINEL: u64 = u64::MAX;
 
+/// `ms` milliseconds after `t`, for the SSP clock's times and delays; saturates at [`NEVER`].
+///
+/// Times are milliseconds since the transport's clock started (`MonoClock::now_ms`), so a real
+/// deadline stays below `u64::MAX` for 584 million years; only a synthetic clock can reach the
+/// saturation. There a deadline past the end of the clock lands on `NEVER`, which every
+/// scheduler check already reads as "not scheduled", and a comparison such as `later(t, d) > now`
+/// keeps its exact result for every `now` short of `NEVER` itself.
+pub(crate) const fn later(t: u64, ms: u64) -> u64 {
+    t.saturating_add(ms)
+}
+
 // --- scheduler constants (mosh `transportsender.h`, milliseconds) ---
 // `pub(crate)`: internal SSP tuning knobs, referenced only within `src/ssp`; not public API.
 /// Floor on the inter-frame interval.
@@ -60,6 +71,8 @@ pub(crate) const ACTIVE_RETRY_TIMEOUT: u64 = 10_000;
 pub(crate) const SHUTDOWN_RETRIES: u32 = 16;
 /// `sent_states` queue cap; the 16th-from-end is dropped when exceeded.
 pub(crate) const SENT_STATES_CAP: usize = 32;
+// Over the cap, the list is longer than 16, so the 16th-from-end exists and is not the front.
+const _: () = assert!(SENT_STATES_CAP >= 16);
 /// Hard ceiling on the number of retained `received_states` (anti-accumulation).
 ///
 /// Inbound states beyond this are refused outright (not merely rate-limited), so a hostile peer

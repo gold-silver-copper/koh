@@ -171,7 +171,8 @@ pub fn decrypt_key(text: &str, passphrase: &str) -> Result<Zeroizing<[u8; 32]>, 
     // Fixed-offset field reads via `get` (the crate forbids indexing/slicing).
     let field = |start: usize, len: usize| {
         payload
-            .get(start..start + len)
+            .get(start..)
+            .and_then(|rest| rest.get(..len))
             .ok_or(KeyfileError::BadFormat)
     };
     let u8at = |i: usize| payload.get(i).copied().ok_or(KeyfileError::BadFormat);

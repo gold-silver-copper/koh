@@ -76,7 +76,11 @@ macro_rules! panic_free {
                 // happens when the value does not fit.
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
-                clippy::cast_possible_wrap
+                clippy::cast_possible_wrap,
+                // Every `+`, `-`, `*` states its overflow behaviour (`checked_*`, `saturating_*`
+                // or a construction that cannot overflow): release builds keep overflow checks,
+                // so an unchecked operator is a potential panic.
+                clippy::arithmetic_side_effects
             )
         )]
         $item

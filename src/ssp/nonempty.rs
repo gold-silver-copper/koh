@@ -21,7 +21,9 @@ impl<T> NonEmpty<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.tail.len() + 1
+        // Only a zero-sized `T` lets `tail` hold `usize::MAX` elements; the count then saturates
+        // there, the nearest value a `usize` can report.
+        self.tail.len().saturating_add(1)
     }
 
     pub const fn first(&self) -> &T {

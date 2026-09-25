@@ -14,11 +14,8 @@ use iroh::endpoint::{
     presets, Connection, IdleTimeout, PathId, QuicTransportConfig, VarInt,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
-use secrecy::{ExposeSecret, SecretString};
-use zeroize::{Zeroize, Zeroizing};
 
 pub mod admission;
-mod keyfile;
 
 /// Keepalive + connection idle-timeout tuned so a phone screen-off doesn't drop the connection.
 /// iroh's defaults already PING every 5s and drop a *path* after 15s, but the *connection* idle
@@ -57,22 +54,29 @@ pub enum SetupError {
     Io(#[from] std::io::Error),
     #[error("secret key file is invalid, a symlink, or not a regular file")]
     BadKeyFile,
+    #[error(
+        "{0} is not a koh identity key (expected exactly {KEY_LEN} bytes); remove it with \
+         `koh key reset --key-file {0} --yes`, which creates a new identity on next use"
+    )]
+    NotAKey(String),
     #[error("could not parse endpoint id: {0}")]
     BadEndpointId(String),
-    #[error("encrypted identity key: {0}")]
-    Keyfile(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 
+/// The length of a key file: an iroh secret key's raw bytes, and nothing else.
+pub const KEY_LEN: usize = 32;
+
 /// Load a persistent [`SecretKey`] from `path`, or generate + persist one if absent.
 ///
-/// The key is always stored in the passphrase-encrypted `koh-key-v1` format (there is no plaintext
-/// format). A stable key gives the server a stable [`EndpointId`], mirroring iroh-ssh's `--persist`.
+/// The file holds the key's raw bytes, protected by its permissions (owner-only, 0600) like an SSH
+/// host key: anyone who can read it is that identity. A stable key gives the server a stable
+/// [`EndpointId`].
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
     // `Path::exists` follows links and therefore reports a dangling symlink as absent. Inspect the
     // directory entry itself so every existing node, including a dangling link, reaches the secure
-    // open/validation path before any key-creation credential is resolved.
+    // open/validation path.
     let entry_exists = match std::fs::symlink_metadata(path) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -81,17 +85,10 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
     if entry_exists {
         // Refuse a dangerous containing dir FIRST (KOH-06/KR-06): the load below tightens the key's
         // perms and reads it, and in a dir where another user can unlink/replace entries they could
-        // swap `id.key` for their own. (v0.4.2 narrowed this to a non-sticky *other*-writable dir so
-        // Android's group-writable /data/local/tmp still works — see `ensure_state_dir_secure`.)
+        // swap `id.key` for their own.
         if let Some(parent) = path.parent() {
             ensure_state_dir_secure(parent)?;
         }
-        // Open the key ONCE and do every subsequent step (fstat, perm-tighten, read) on that file
-        // descriptor (K-01). The previous flow was check-then-act — `symlink_metadata`, then a path
-        // `chmod`, then a path `read` — each re-resolving the path string, leaving a TOCTOU window
-        // in a group-writable dir where a co-tenant could swap `id.key` for a symlink *between* the
-        // checks. `read_key_file_secure` opens with `O_NOFOLLOW` (a symlinked key is refused at
-        // open) and operates only on the held fd, so there is no second path resolution to race.
         load_secret_key(path)
     } else {
         let sk = generate_secret_key();
@@ -100,146 +97,27 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
             // Reject a world-writable state dir before writing the identity key into it (KOH-06).
             ensure_state_dir_secure(parent)?;
         }
-        // The key is the node identity (M-1): write it owner-only (0600) AND encrypted at rest
-        // (`koh-key-v1`) — encryption is mandatory, so a fresh key requires a passphrase up front
-        // (a no-echo confirmed TTY prompt, or `$KOH_KEY_NEW_PASSPHRASE` when headless).
-        let pass = resolve_new_key_passphrase(path)?;
-        if create_identity_key(path, &sk, pass.expose_secret())? {
+        if create_secret_file(path, &sk.to_bytes())? {
             Ok(sk)
         } else {
-            // Another same-user process won the atomic create race. Its key is now the one stable
-            // identity. Reuse the already-resolved creation passphrase: a headless first-create
-            // flow is documented to require only KOH_KEY_NEW_PASSPHRASE.
-            load_secret_key_with_passphrase(path, pass.expose_secret())
+            // Another same-user process won the atomic create race; its key is the one identity.
+            load_secret_key(path)
         }
     }
 }
 
+/// Read a key file: exactly [`KEY_LEN`] bytes, opened and checked on one file descriptor.
 fn load_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
-    // Validate and open the path before resolving credentials. Besides preserving the security
-    // error, this prevents a symlink from triggering an irrelevant interactive prompt.
-    let text = read_key_file_secure(path)?;
-    let pass = resolve_key_passphrase(path)?;
-    decrypt_secret_key(text, pass.expose_secret())
+    let bytes = read_key_file_secure(path)?;
+    let Ok(raw) = <[u8; KEY_LEN]>::try_from(bytes.as_slice()) else {
+        return Err(SetupError::NotAKey(path.display().to_string()));
+    };
+    Ok(SecretKey::from_bytes(&raw))
 }
 
-fn load_secret_key_with_passphrase(path: &Path, passphrase: &str) -> Result<SecretKey, SetupError> {
-    let text = read_key_file_secure(path)?;
-    decrypt_secret_key(text, passphrase)
-}
-
-fn decrypt_secret_key(mut text: String, passphrase: &str) -> Result<SecretKey, SetupError> {
-    let secret =
-        keyfile::decrypt_key(&text, passphrase).map_err(|e| SetupError::Keyfile(e.to_string()))?;
-    let key = SecretKey::from_bytes(&secret);
-    text.zeroize();
-    Ok(key)
-}
-
-/// Resolve the passphrase for an encrypted identity key: `$KOH_KEY_PASSPHRASE` if set (non-empty),
-/// else a no-echo TTY prompt, else a clear error (so an unattended `koh serve` with an encrypted key
-/// fails loudly with the fix rather than hanging).
-fn resolve_key_passphrase(path: &Path) -> Result<SecretString, SetupError> {
-    use std::io::IsTerminal as _;
-    if let Ok(p) = std::env::var("KOH_KEY_PASSPHRASE") {
-        if !p.is_empty() {
-            return Ok(SecretString::from(p));
-        }
-    }
-    if std::io::stdin().is_terminal() {
-        let p = rpassword::prompt_password(format!("Passphrase for {}: ", path.display()))
-            .map_err(SetupError::Io)?;
-        return Ok(SecretString::from(p));
-    }
-    Err(SetupError::Other(anyhow::anyhow!(
-        "identity key {} is encrypted; set $KOH_KEY_PASSPHRASE (no TTY available for a prompt)",
-        path.display()
-    )))
-}
-
-/// Resolve a passphrase to encrypt a freshly-created identity key: `$KOH_KEY_NEW_PASSPHRASE` if set,
-/// else a confirmed no-echo TTY prompt, else a clear error. An empty passphrase is rejected —
-/// encryption is mandatory, so there is no plaintext fallback.
-fn resolve_new_key_passphrase(path: &Path) -> Result<SecretString, SetupError> {
-    use std::io::IsTerminal as _;
-    if let Ok(p) = std::env::var("KOH_KEY_NEW_PASSPHRASE") {
-        if p.is_empty() {
-            return Err(SetupError::Other(anyhow::anyhow!(
-                "$KOH_KEY_NEW_PASSPHRASE is empty; identity keys are always encrypted (set a non-empty passphrase)"
-            )));
-        }
-        enforce_passphrase_strength(&p)?;
-        return Ok(SecretString::from(p));
-    }
-    if std::io::stdin().is_terminal() {
-        let p1 = rpassword::prompt_password(format!(
-            "Set a passphrase to encrypt the new identity key {}: ",
-            path.display()
-        ))
-        .map_err(SetupError::Io)?;
-        if p1.is_empty() {
-            return Err(SetupError::Other(anyhow::anyhow!(
-                "an empty passphrase is not allowed; identity keys are always encrypted"
-            )));
-        }
-        let p2 = rpassword::prompt_password("Confirm passphrase: ").map_err(SetupError::Io)?;
-        if p1 != p2 {
-            return Err(SetupError::Other(anyhow::anyhow!(
-                "passphrases did not match"
-            )));
-        }
-        enforce_passphrase_strength(&p1)?;
-        return Ok(SecretString::from(p1));
-    }
-    Err(SetupError::Other(anyhow::anyhow!(
-        "no identity key at {} and no TTY to prompt; set $KOH_KEY_NEW_PASSPHRASE to create an encrypted key",
-        path.display()
-    )))
-}
-
-/// The minimum identity-key passphrase length koh accepts. A passphrase shorter than this would make
-/// the at-rest encryption (Argon2id + AES-256-GCM) effectively defeatable by an offline attacker who
-/// already holds the key file — i.e. an *effectively unencrypted* key. koh has no plaintext key
-/// format and, by the same logic, no weak-passphrase escape from real encryption.
-const MIN_PASSPHRASE_CHARS: usize = 12;
-
-/// Reject an identity-key passphrase weaker than [`MIN_PASSPHRASE_CHARS`]. Enforced as a HARD floor
-/// (not an advisory) on every key-creation / re-encryption path — the TTY prompt AND
-/// `$KOH_KEY_NEW_PASSPHRASE` alike — so there is no way to land an effectively-unencrypted key on
-/// disk. Shared by key creation and `koh key`.
-pub(crate) fn enforce_passphrase_strength(passphrase: &str) -> Result<(), SetupError> {
-    if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
-        return Err(SetupError::Other(anyhow::anyhow!(
-            "identity-key passphrase is too short (< {MIN_PASSPHRASE_CHARS} chars); identity keys are \
-             always strongly encrypted — choose a longer, higher-entropy passphrase"
-        )));
-    }
-    Ok(())
-}
-
-/// Persist `sk` to `path` atomically (born-private 0600) in the `koh-key-v1` encrypted format. The
-/// shared key-write path for `koh key`. The owned secret bytes are zeroized after use. `passphrase`
-/// must be non-empty — koh has no plaintext key format.
-pub(crate) fn write_identity_key(
-    path: &Path,
-    sk: &SecretKey,
-    passphrase: &str,
-) -> Result<(), SetupError> {
-    let secret = Zeroizing::new(sk.to_bytes());
-    let text = keyfile::encrypt_key(&secret, passphrase)
-        .map_err(|e| SetupError::Keyfile(e.to_string()))?;
-    write_secret_file(path, text.as_bytes())?;
-    Ok(())
-}
-
-/// Publish a newly-generated identity without replacing a winner from another process.
-fn create_identity_key(path: &Path, key: &SecretKey, passphrase: &str) -> Result<bool, SetupError> {
-    let secret = Zeroizing::new(key.to_bytes());
-    let text = keyfile::encrypt_key(&secret, passphrase)
-        .map_err(|error| SetupError::Keyfile(error.to_string()))?;
-    create_secret_file(path, text.as_bytes()).map_err(SetupError::Io)
-}
-
+/// Publish `contents` at `path` without replacing a file another process published first: write a
+/// born-private (0600) temporary file, then hard-link it into place. Returns whether this call
+/// published it.
 fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
@@ -314,38 +192,8 @@ pub(crate) fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Write `contents` to `path` as an owner-only (0600) file, atomically and without ever exposing a
-/// world-readable window. On unix: create a sibling temp file with `create_new` + mode 0600, write,
-/// fsync, then rename over `path`. Off-unix: a plain write (the platform's default ACLs apply).
-fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        // Clean up any stale temp from a previous crashed run so `create_new` can succeed.
-        let _ = std::fs::remove_file(&tmp);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(contents)?;
-        f.sync_all()?;
-        drop(f);
-        // Atomic publish; if the rename fails, don't leave the temp behind.
-        std::fs::rename(&tmp, path).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
-    }
-}
-
-/// Read the hex key text from `path`, doing every step on a single opened file descriptor so there
-/// is no path-based recheck window (K-01).
+/// Read the key file at `path`, doing every step on a single opened file descriptor so there is no
+/// path-based recheck window (K-01).
 ///
 /// On unix: open with `O_NOFOLLOW` (a symlinked final component is refused at open — `ELOOP`),
 /// confirm via the fd that it is a regular file, tighten group/other-accessible perms to 0600 via
@@ -353,14 +201,14 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// co-tenant who swaps `id.key` for a symlink can therefore neither redirect the `chmod`/read to
 /// another file nor race a gap between a check and an act — there is only the one open. On other
 /// platforms, fall back to a plain read (the platform's own ACLs apply, matching the key-write path).
-fn read_key_file_secure(path: &Path) -> Result<String, SetupError> {
+fn read_key_file_secure(path: &Path) -> Result<Vec<u8>, SetupError> {
     #[cfg(unix)]
     {
         use std::io::Read as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         // `O_NOFOLLOW`: refuse to follow a symlink planted as the key path — otherwise the load
         // could be turned into a chmod/read oracle on an arbitrary file koh can reach.
-        let mut file = match std::fs::OpenOptions::new()
+        let file = match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(nix::libc::O_NOFOLLOW)
             .open(path)
@@ -378,13 +226,17 @@ fn read_key_file_secure(path: &Path) -> Result<String, SetupError> {
             return Err(SetupError::BadKeyFile);
         }
         tighten_key_perms_via_fd(&file, path, &meta);
-        let mut text = String::new();
-        file.read_to_string(&mut text).map_err(SetupError::Io)?;
-        Ok(text)
+        // Read one byte past a key, so an oversized file is detected without reading all of it.
+        let mut bytes = Vec::with_capacity(KEY_LEN.saturating_add(1));
+        let limit = u64::try_from(KEY_LEN.saturating_add(1)).unwrap_or(u64::MAX);
+        file.take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(SetupError::Io)?;
+        Ok(bytes)
     }
     #[cfg(not(unix))]
     {
-        Ok(std::fs::read_to_string(path)?)
+        Ok(std::fs::read(path)?)
     }
 }
 
@@ -719,31 +571,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn passphrase_floor_rejects_weak_accepts_strong() {
-        // The "no effectively-unencrypted key" guard: a passphrase below the minimum is a hard error
-        // on every creation path, so a weak passphrase can't stand in for real encryption.
-        assert!(
-            enforce_passphrase_strength("").is_err(),
-            "empty is rejected"
-        );
-        assert!(
-            enforce_passphrase_strength(&"a".repeat(MIN_PASSPHRASE_CHARS - 1)).is_err(),
-            "one below the floor is rejected"
-        );
-        assert!(
-            enforce_passphrase_strength(&"a".repeat(MIN_PASSPHRASE_CHARS)).is_ok(),
-            "exactly the {MIN_PASSPHRASE_CHARS}-char minimum is accepted"
-        );
-        assert!(enforce_passphrase_strength("correct horse battery staple").is_ok());
-        // Counts characters, not bytes: (floor-1) two-byte chars is still below the floor.
-        assert!(
-            enforce_passphrase_strength(&"é".repeat(MIN_PASSPHRASE_CHARS - 1)).is_err(),
-            "the floor counts chars, not bytes"
-        );
-        assert!(enforce_passphrase_strength(&"é".repeat(MIN_PASSPHRASE_CHARS)).is_ok());
-    }
-
-    #[test]
     fn config_dir_is_xdg_then_home_and_never_elsewhere() {
         use std::ffi::OsString;
         use std::path::PathBuf;
@@ -773,19 +600,15 @@ mod tests {
     }
 
     #[test]
-    fn secret_key_roundtrips_through_disk() {
-        // Write an encrypted key and read it back through the keyfile codec. Avoids the env/TTY
-        // passphrase resolution of `load_or_create_secret_key` (which would need a racy env var).
+    fn a_created_key_is_its_raw_bytes_and_loads_back_to_the_same_identity() {
         let dir = std::env::temp_dir().join(format!("koh-key-test-{}", std::process::id()));
         let path = dir.join("id.key");
         let _ = std::fs::remove_dir_all(&dir);
         create_dir_private(&dir).unwrap();
 
-        let sk1 = generate_secret_key();
-        write_identity_key(&path, &sk1, "test-pass").expect("write encrypted key");
-        let text = std::fs::read_to_string(&path).unwrap();
-        let bytes = keyfile::decrypt_key(&text, "test-pass").expect("decrypts back");
-        let sk2 = SecretKey::from_bytes(&bytes);
+        let sk1 = load_or_create_secret_key(&path).expect("create a key");
+        assert_eq!(std::fs::read(&path).unwrap(), sk1.to_bytes(), "the file is the raw key");
+        let sk2 = load_or_create_secret_key(&path).expect("load it back");
         assert_eq!(sk1.to_bytes(), sk2.to_bytes(), "round-trips through disk");
 
         // The endpoint id is stable and round-trips through its string form.
@@ -810,8 +633,7 @@ mod tests {
             let barrier = std::sync::Arc::clone(&barrier);
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                let created =
-                    create_identity_key(&path, &key, "race-passphrase").expect("atomic key create");
+                let created = create_secret_file(&path, &key.to_bytes()).expect("atomic key create");
                 (created, key.to_bytes())
             }));
         }
@@ -821,13 +643,12 @@ mod tests {
             .map(|thread| thread.join().expect("creator thread"))
             .collect();
         assert_eq!(outcomes.iter().filter(|(created, _)| *created).count(), 1);
-        let published = std::fs::read_to_string(&path).expect("published key");
-        let decrypted = keyfile::decrypt_key(&published, "race-passphrase").expect("decrypt key");
+        let published = std::fs::read(&path).expect("published key");
         let winner = outcomes
             .iter()
             .find_map(|(created, bytes)| created.then_some(bytes))
             .expect("one winner");
-        assert_eq!(&*decrypted, winner);
+        assert_eq!(published.as_slice(), winner.as_slice());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -842,7 +663,7 @@ mod tests {
         std::fs::write(&predictable, b"attacker-owned").expect("preplant old temporary name");
         let key = generate_secret_key();
         assert!(
-            create_identity_key(&path, &key, "race-passphrase").expect("create identity"),
+            create_secret_file(&path, &key.to_bytes()).expect("create identity"),
             "the identity is published despite the preplanted predictable name"
         );
         assert_eq!(
@@ -864,8 +685,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         create_dir_private(&dir).unwrap();
 
-        write_identity_key(&path, &generate_secret_key(), "test-pass")
-            .expect("write encrypted key");
+        load_or_create_secret_key(&path).expect("create a key");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(
             mode & 0o077,
@@ -963,7 +783,7 @@ mod tests {
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let text = read_key_file_secure(&key).expect("a loose real key still reads");
-        assert_eq!(text.trim(), "deadbeef", "contents read back through the fd");
+        assert_eq!(text, b"deadbeef\n", "contents read back through the fd");
         let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "a loose key is tightened to 0600 via the fd");
         let _ = std::fs::remove_dir_all(&dir);
@@ -993,7 +813,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn load_refuses_a_dangling_symlink_before_resolving_creation_credentials() {
+    fn load_refuses_a_dangling_symlink_instead_of_creating_a_key() {
         let dir = std::env::temp_dir().join(format!("koh-dangling-keylink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         create_dir_private(&dir).unwrap();
@@ -1008,29 +828,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn write_identity_key_encrypted_roundtrips_and_rejects_wrong_passphrase() {
-        // The koh-key-v1 write path: storing with a passphrase produces an encrypted file that the
-        // keyfile codec decrypts back to the SAME secret (endpoint id preserved), and a wrong
-        // passphrase is rejected — end-to-end of the flagship without the env/TTY resolution layer.
-        let dir = std::env::temp_dir().join(format!("koh-enc-{}", std::process::id()));
+    fn a_file_that_is_not_exactly_a_key_is_refused_with_the_reset_hint() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("koh-notakey-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         create_dir_private(&dir).unwrap();
-        let key = dir.join("id.key");
-        let sk = generate_secret_key();
-        write_identity_key(&key, &sk, "correct horse").expect("write encrypted");
-
-        let text = std::fs::read_to_string(&key).unwrap();
-        assert!(
-            text.starts_with("koh-key-v1"),
-            "stored in the encrypted format"
-        );
-        let got = keyfile::decrypt_key(&text, "correct horse").expect("decrypts");
-        assert_eq!(*got, sk.to_bytes(), "round-trips to the same secret");
-        assert!(
-            keyfile::decrypt_key(&text, "wrong").is_err(),
-            "a wrong passphrase is rejected"
-        );
+        let path = dir.join("id.key");
+        let old_format = format!("koh-key-v1\n{}\n", "A".repeat(120));
+        for contents in [
+            Vec::new(),
+            vec![7u8; KEY_LEN - 1],
+            vec![7u8; KEY_LEN + 1],
+            old_format.into_bytes(),
+        ] {
+            std::fs::write(&path, &contents).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let error = load_or_create_secret_key(&path).expect_err("refused");
+            assert!(matches!(error, SetupError::NotAKey(_)), "{error:?}");
+            let message = error.to_string();
+            assert!(message.contains("koh key reset"), "{message}");
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(!message.contains("koh-key-v1"), "the old format is not named: {message}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

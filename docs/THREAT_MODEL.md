@@ -27,16 +27,16 @@ service.
    session to a specific server, so node-ids should be verified out-of-band.
 3. **Network / MITM** — QUIC + TLS 1.3 (via iroh) give transport encryption and node-id
    authentication by construction (no TOFU window). Considered: replay, and connection-level tamper.
-4. **Local attacker** — another uid on the same host. Targets: the (encrypted) identity key file and
-   its passphrase, the state dir, signals to a recycled pid, temp files.
+4. **Local attacker** — another uid on the same host. Targets: the identity key file, the state dir,
+   signals to a recycled pid, temp files.
 
 ## Trust boundaries & key defenses
 
 - **Peer identity:** both ends are authenticated by Ed25519 node-id *by construction* (no TOFU
   window). Authorization is an explicit **allowlist** (off-list peers refused); at least one entry is
   required, so there is no "accept any peer" mode. This is the **single** authentication factor —
-  there is no passphrase/PAKE second factor (the residual leaked-key risk is handled by mandatory
-  at-rest key encryption, below). The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
+  there is no passphrase/PAKE second factor. A leaked key file is a leaked identity: protect it
+  like an SSH private key, and remove a lost machine's id from every `--allow` list. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
   checkpoint; its outcomes are logged structured under the `koh::auth` target.
 - **Untrusted data plane:** the protocol (`src/proto.rs`) and the connection cores
   (`src/server/mod.rs`, `src/client/session.rs`) are pure and panic-free by construction. Client
@@ -52,12 +52,10 @@ service.
   bounded: it retains no DCS/APC/PM/SOS payload and caps an OSC string at 64 KiB, so a runaway
   control string from the shell can't grow memory. koh therefore no longer wraps the emulator in
   `catch_unwind` or pre-filters control strings.
-- **Process / local:** `forbid(unsafe)` crate-wide; identity key written `0600` (born-private atomic
-  write, `O_NOFOLLOW` read, fd-based perm-tighten) and **always encrypted at rest** (Argon2id +
-  AES-256-GCM, `koh-key-v1`; no plaintext format, and a minimum passphrase length is enforced so an
-  *effectively* unencrypted key can't be created); its passphrase carried as a redacted/zeroized
-  `SecretString`; `KOH_*` env scrubbed before exec'ing the shell; PTY kill gated against pid reuse.
-  Note at-rest encryption only protects a stolen key if `$KOH_KEY_PASSPHRASE` is not stored beside it.
+- **Process / local:** `forbid(unsafe)` crate-wide; the identity key is the raw secret, protected
+  by its permissions like an SSH host key: written `0600` (born-private atomic write), read with
+  `O_NOFOLLOW`, and re-tightened to 0600 through the open descriptor; a state dir another user can
+  write is refused; `KOH_*` env scrubbed before exec'ing the shell; PTY kill gated against pid reuse.
 
 The detailed finding history (security audit + the K-/AR-/CR- review series) lives in the git log and
 the inline `KOH-`/`KR-`/`K-`/`AR-` rationale tags.
@@ -67,8 +65,8 @@ the inline `KOH-`/`KR-`/`K-`/`AR-` rationale tags.
 - **No privilege separation / multi-user model:** the shell runs as the uid that ran `koh serve`;
   there is no per-user mapping, PAM, chroot, or `ForceCommand`-class policy. The only access control
   is the node-id allowlist; access is uniform across allowed peers.
-- **No hardware-backed / certificate / agent identity:** the node-id key lives on disk (always
-  passphrase-encrypted, but not in an HSM / FIDO2 token / agent).
+- **No hardware-backed / certificate / agent identity, and no at-rest encryption:** the node-id key
+  lives on disk, protected by file permissions only (not in an HSM / FIDO2 token / agent).
 - **No post-quantum key exchange yet:** transport crypto is inherited from iroh; koh is a policy-taker.
 - **Transport crypto is not koh's:** QUIC/TLS/KEX correctness is iroh/rustls/ring's responsibility.
 - **Not a substitute for ssh** where independent audit, compliance, or a multi-user/jail model is

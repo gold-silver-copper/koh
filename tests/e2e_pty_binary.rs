@@ -71,10 +71,7 @@ async fn real_client_binary_renders_over_pty() {
     cmd.arg("--key-file");
     cmd.arg(&key_path);
     cmd.env("TERM", "xterm-256color");
-    // The client creates its identity key on first run; keys are always encrypted, so supply the
-    // passphrase non-interactively (child-process env, so no race with the test process).
-    cmd.env("KOH_KEY_NEW_PASSPHRASE", "test-pass-1234");
-    cmd.env("KOH_KEY_PASSPHRASE", "test-pass-1234");
+    // The client creates its identity key on first run, without a prompt.
 
     let mut child = pair.slave.spawn_command(cmd).expect("spawn client binary");
     drop(pair.slave);

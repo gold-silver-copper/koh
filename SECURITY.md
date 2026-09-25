@@ -22,7 +22,8 @@ credit reporters who want it.
 
 **In scope** (code koh authors):
 
-- The at-rest identity-key format (`src/transport_iroh/keyfile.rs`) — always-encrypted `koh-key-v1`.
+- On-disk identity-key handling (`src/transport_iroh/`, `src/identity.rs`): the key file is the
+  raw 32-byte secret, protected by its permissions (0600) like an SSH host key.
 - The connection accept gauntlet / node-id allowlist authorization (`src/server/cli.rs`) and the
   admission barrier (`src/transport_iroh/admission.rs`).
 - The untrusted wire decoders (`src/proto.rs`) and the connection cores (`src/server/mod.rs`,

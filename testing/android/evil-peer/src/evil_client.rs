@@ -7,7 +7,7 @@
 //!
 //! Usage: evil-client <server-id> <ip:port> <attack> [args...]
 //!   The malicious client must be on the server's `--allow` list to reach the data plane, so the
-//!   harness pre-creates its key and sets `$EVIL_KEY_FILE` (+ `$KOH_KEY_PASSPHRASE` to open it).
+//!   harness pre-creates its key and sets `$EVIL_KEY_FILE`.
 //!
 //! Attacks (defense each probes):
 //!   resize <rows> <cols>     oversized/zero terminal geometry            (clamp_dims)

@@ -33,10 +33,9 @@ pub fn default_path(role: &str) -> anyhow::Result<PathBuf> {
 }
 
 pub fn load(path: &Path) -> anyhow::Result<Identity> {
-    let _terminal = PromptTerminal::protect()?;
     let lease = Arc::new(IdentityLease::acquire(path, false)?);
     let secret = crate::transport_iroh::load_or_create_secret_key(path)
-        .with_context(|| format!("unlocking identity at {}", path.display()))?;
+        .with_context(|| format!("loading identity at {}", path.display()))?;
     Ok(Identity {
         secret,
         _lease: Some(lease),
@@ -126,54 +125,6 @@ impl IdentityLease {
     }
 }
 
-/// Restore terminal settings when a credential prompt is interrupted.
-///
-/// The synchronous password reader cannot unwind on a fatal signal. During a prompt, a signal
-/// watcher restores the controlling terminal before exiting. No daemon child or input producer
-/// may be started in this scope. Normal return closes and joins the watcher before continuing.
-pub struct PromptTerminal {
-    watcher: Option<(signal_hook::iterator::Handle, std::thread::JoinHandle<()>)>,
-}
-
-impl PromptTerminal {
-    pub fn protect() -> anyhow::Result<Self> {
-        use nix::sys::termios::{tcgetattr, tcsetattr, SetArg};
-        use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
-        let Ok(tty) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-        else {
-            return Ok(Self { watcher: None });
-        };
-        let saved = tcgetattr(&tty)?;
-        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
-        let handle = signals.handle();
-        let watcher = std::thread::Builder::new()
-            .name("koh-prompt-signals".into())
-            .spawn(move || {
-                if let Some(signal) = signals.forever().next() {
-                    let _ = tcsetattr(&tty, SetArg::TCSANOW, &saved);
-                    // The shell's `128 + n` status. `signal` is SIGINT, SIGTERM or SIGHUP, so the
-                    // sum is exact and the saturation never happens.
-                    std::process::exit(128_i32.saturating_add(signal));
-                }
-            })?;
-        Ok(Self {
-            watcher: Some((handle, watcher)),
-        })
-    }
-}
-
-impl Drop for PromptTerminal {
-    fn drop(&mut self) {
-        if let Some((handle, watcher)) = self.watcher.take() {
-            handle.close();
-            let _ = watcher.join();
-        }
-    }
-}
-
 #[cfg(test)]
 #[expect(
     clippy::panic_in_result_fn,
@@ -197,7 +148,7 @@ mod tests {
         );
         crate::transport_iroh::create_dir_private(&directory.0)?;
         let path = directory.0.join("identity.key");
-        // Reset must also support unreadable/corrupt encrypted content without unlocking it.
+        // Reset must also work on a file that is not a valid key, without loading it.
         std::fs::write(&path, b"corrupt disposable key")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let identity = Identity {

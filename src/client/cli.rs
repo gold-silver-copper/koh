@@ -62,7 +62,7 @@ impl ConnectConfig {
 /// The decision (`observe`) is pure and rate-limited so it is unit-testable; the spawn is
 /// detached — stdin/stdout/stderr on `/dev/null`, since the TUI owns the terminal — with
 /// `KOH_BELL_COUNT` and `KOH_TITLE` in the environment and every other `KOH_*` variable scrubbed
-/// (the same `$KOH_KEY_PASSPHRASE` guard as `pty.rs`, KB-02). The child is reaped on a background
+/// (the same guard as `pty.rs`, KB-02). The child is reaped on a background
 /// task and never awaited by the session loop.
 ///
 /// The remote bell count is cumulative for the life of the server session, so the hook is
@@ -438,8 +438,7 @@ mod tests {
 
     #[test]
     fn bell_hook_command_scrubs_parent_koh_vars_and_exports_its_own() {
-        // KB-02: given a parent environment holding the identity-key passphrase and another
-        // KOH_* var, the hook's child sees neither, keeps the rest (PATH, HOME), and gets
+        // KB-02: given a parent environment holding KOH_* vars, the hook's child sees none of them, keeps the rest (PATH, HOME), and gets
         // KOH_BELL_COUNT / KOH_TITLE. The command builder takes the parent env explicitly, so
         // this needs no process-global `set_var`.
         use std::ffi::OsString;
@@ -453,7 +452,7 @@ mod tests {
         let out = dir.join("env.txt");
         let hook = BellHook::new(format!("env > '{}'", out.display()));
         let parent_env = [
-            ("KOH_KEY_PASSPHRASE", "secret"),
+            ("KOH_DNS", "1.1.1.1"),
             ("KOH_LOG", "/tmp/x"),
             ("PATH", "/usr/bin:/bin"),
             ("HOME", "/nonexistent"),
@@ -471,8 +470,8 @@ mod tests {
         assert!(content.contains("KOH_TITLE=a title"), "{content}");
         assert!(content.contains("PATH=/usr/bin:/bin"), "{content}");
         assert!(
-            !content.contains("KOH_KEY_PASSPHRASE"),
-            "the passphrase leaked into the hook's env: {content}"
+            !content.contains("KOH_DNS"),
+            "a parent KOH_* var leaked into the hook's env: {content}"
         );
         assert!(!content.contains("KOH_LOG"), "{content}");
     }

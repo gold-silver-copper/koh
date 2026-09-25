@@ -5,12 +5,12 @@
 //!
 //! ## Modules
 //!
-//! [`transport_iroh`] owns endpoint setup, the encrypted identity key file and connection
-//! admission. [`identity`] loads identities and holds their reset leases; [`idcmd`] and
-//! [`keycmd`] implement `koh id` and `koh key`. [`proto`] is the wire protocol: input messages
-//! on one stream, screen frames on their own. [`terminal`], [`predict`] and [`pty`] implement the
-//! remote-shell payload; [`server`] hosts detachable sessions and [`client`] renders them through
-//! a terminal backend chosen by a `backend-*` feature. The `cli` feature adds clap and the binary.
+//! [`transport_iroh`] owns endpoint setup, the identity key file and connection admission.
+//! [`identity`] loads identities and holds their reset leases; [`idcmd`] and [`keycmd`] implement
+//! `koh id` and `koh key`. [`proto`] is the wire protocol: input messages on one stream, screen
+//! frames on their own. [`terminal`], [`predict`] and [`pty`] implement the remote-shell payload;
+//! [`server`] hosts detachable sessions and [`client`] renders them on the tty. The `cli` feature
+//! adds clap and the binary.
 //!
 //! The library exists so the binary, its tests and the fuzz targets share code. Everything in it
 //! is internal and may change in any release.

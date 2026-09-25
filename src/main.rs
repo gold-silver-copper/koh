@@ -26,8 +26,7 @@ enum Cmd {
     Connect(ConnectArgs),
     /// Print this machine's koh id (add it to a server's --allow list).
     Id(IdArgs),
-    /// Change the identity key's encryption passphrase (like `ssh-keygen -p`; keys are always
-    /// encrypted).
+    /// Show or reset this machine's identity key.
     Key(KeyArgs),
 }
 

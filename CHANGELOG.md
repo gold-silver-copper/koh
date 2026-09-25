@@ -3,7 +3,7 @@
 All notable changes to koh are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and koh aims to follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) for the **binary's CLI, the on-disk
-`koh-key-v1` key format, and the wire `PROTOCOL_VERSION`/ALPN**. From 0.10.0 the library's config
+key format, and the wire protocol (its ALPN)**. From 0.10.0 the library's config
 types and entry points (`ServeConfig`/`serve`, `ConnectConfig`/`connect`, `IdConfig`/`run_id`,
 `KeyConfig`/`keycmd::run`, and the `ssp` core) are covered too; everything else in the library is
 internal and unstable (see `src/lib.rs`).
@@ -24,6 +24,14 @@ client and a 0.13 server (or the reverse) refuse each other at the TLS handshake
 error; upgrade both ends.
 
 ### Changed
+- **Breaking: identity keys are no longer encrypted at rest.** A key file is the key's 32 raw
+  bytes, protected by its permissions (0600) like an SSH host key: anyone who can read it is that
+  identity. koh never prompts for a passphrase; `koh key passwd`, `$KOH_KEY_PASSPHRASE` and
+  `$KOH_KEY_NEW_PASSPHRASE` are gone. **Existing key files are rejected**: run
+  `koh key reset --yes` (with `--key-file` for a non-default path) on each machine. A new client
+  key must then be added to the servers' `--allow` lists, and a new server key changes the id
+  clients dial. `argon2`, `aes-gcm` (as a direct dependency), `rpassword`, `secrecy`, `signal-hook`
+  and `zeroize` are no longer dependencies.
 - **Terminal emulation is `fux-vt`, and the client runs no parser.** The server's emulator is
   `fux_vt::Parser`, a bounded, panic-free emulator; `vt100` is no longer a dependency. The screen
   diff is now structured: every changed row whole, as run-length-encoded cells, plus the cursor and

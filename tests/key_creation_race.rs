@@ -3,7 +3,7 @@
 use std::process::{Command, Stdio};
 
 #[test]
-fn concurrent_public_first_create_uses_the_new_passphrase_for_the_loser() {
+fn concurrent_first_uses_publish_one_key_and_one_endpoint_id() {
     let dir = std::env::temp_dir().join(format!(
         "koh-public-key-race-{}-{}",
         std::process::id(),
@@ -21,7 +21,6 @@ fn concurrent_public_first_create_uses_the_new_passphrase_for_the_loser() {
                 .args(["id", "--key-file"])
                 .arg(&key)
                 .env_clear()
-                .env("KOH_KEY_NEW_PASSPHRASE", "concurrent-test-passphrase")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -47,7 +46,7 @@ fn concurrent_public_first_create_uses_the_new_passphrase_for_the_loser() {
 }
 
 #[test]
-fn reset_accepts_a_relative_key_path_only_after_explicit_confirmation() {
+fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirmation() {
     use std::os::unix::fs::PermissionsExt as _;
     struct Directory(std::path::PathBuf);
     impl Drop for Directory {
@@ -63,7 +62,12 @@ fn reset_accepts_a_relative_key_path_only_after_explicit_confirmation() {
     std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700))
         .expect("private mode");
     let path = directory.0.join("identity.key");
-    std::fs::write(&path, b"disposable corrupt key").expect("disposable identity");
+    // An identity in the old encrypted format: not a key koh reads, but reset must remove it.
+    std::fs::write(
+        &path,
+        b"koh-key-v1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+    )
+    .expect("disposable identity");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("key mode");
     let run = |confirmed: bool| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_koh"));
@@ -79,6 +83,17 @@ fn reset_accepts_a_relative_key_path_only_after_explicit_confirmation() {
     };
     assert!(!run(false).status.success());
     assert!(path.exists(), "unconfirmed reset removed key");
+    // `koh id` refuses the old file and points at the reset.
+    let id = Command::new(env!("CARGO_BIN_EXE_koh"))
+        .current_dir(&directory.0)
+        .env_clear()
+        .args(["id", "--key-file", "identity.key"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("id command");
+    assert!(!id.status.success());
+    let stderr = String::from_utf8_lossy(&id.stderr);
+    assert!(stderr.contains("koh key reset"), "{stderr}");
     let output = run(true);
     assert!(
         output.status.success(),

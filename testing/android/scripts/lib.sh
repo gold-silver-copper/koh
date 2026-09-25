@@ -15,14 +15,12 @@ HOST_BIN="${KOH_HOST_BIN:-$REPO_ROOT/target/$ANDROID_TARGET/release/koh}"
 DEVICE_BIN="${KOH_DEVICE_BIN:-/data/local/tmp/koh}"
 ADB_TIMEOUT="${KOH_ADB_TIMEOUT:-30}"        # cap on a single non-blocking adb shell call (seconds)
 
-# koh identity keys are ALWAYS encrypted at rest (an >= 8-char passphrase is enforced — there is no
-# plaintext key path and no weak-passphrase escape). Give every device-side koh invocation a fixed
-# test passphrase so it can create/open its key without a TTY prompt. `$KENV` is prefixed onto every
-# remote koh command (run_remote / run_remote_blocking inject it; raw `adb shell` callers prepend it).
-KOH_TEST_PASS="${KOH_TEST_PASS:-koh-emulator-test-pass}"
-KENV="KOH_KEY_PASSPHRASE=$KOH_TEST_PASS KOH_KEY_NEW_PASSPHRASE=$KOH_TEST_PASS"
+# Environment prefixed onto every device-side koh command (run_remote / run_remote_blocking inject
+# it; raw `adb shell` callers prepend it). Empty today: koh creates and opens its key files without
+# any prompt or credential. Override to pass e.g. RUST_LOG to every invocation.
+KENV="${KOH_DEVICE_ENV:-}"
 
-# Print the 64-hex koh node-id for <key-file> (creating the encrypted key if absent). koh has no
+# Print the 64-hex koh node-id for <key-file> (creating the key if absent). koh has no
 # "accept any" mode, so the server's --allow list is built from these ids.
 koh_id_of() {  # koh_id_of <key-file>
   adb $ADB_SERIAL shell "$KENV $DEVICE_BIN id --key-file $1" 2>/dev/null \

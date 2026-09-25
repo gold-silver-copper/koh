@@ -26,7 +26,7 @@ src/
 ├── proto.rs         the koh/3 wire protocol: client messages, screen frames, caps, pacing
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
 ├── predict.rs       local-echo prediction engine (overlays, epochs, adaptive engage)
-├── transport_iroh/  iroh endpoint setup, encrypted identity, connection handle, admission
+├── transport_iroh/  iroh endpoint setup, the identity key file, connection handle, admission
 ├── pty.rs           PTY allocation, shell spawn, SIGWINCH, child reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
 ├── client/          the connection loop + ClientSession core + predictor + render + `connect`
@@ -34,7 +34,7 @@ src/
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
 ├── args.rs          the clap argument structs (`cli` feature only)
 ├── idcmd.rs         `koh id` — print this machine's endpoint id
-└── keycmd.rs        `koh key` — change the passphrase, show info, reset the identity
+└── keycmd.rs        `koh key` — show the identity, or reset it
 tests/net/           koh over a fault-injecting link between real iroh endpoints
 tests/               PTY, PTY-binary, loopback e2e, admission and key tests
 ```
@@ -195,12 +195,13 @@ The full picture is in the [threat model](THREAT_MODEL.md). In brief, the releva
 - **The data plane treats every authorized peer as untrusted**: a resize is clamped to `[2, 1000]`
   before any grid allocation; client messages and frames are size-capped and frames inflate under a
   limit; each end keeps a fixed window of screens; QUIC stream limits and flow control bound what is
-  in flight; the QUIC handshake and the 1-byte admission ack are deadline-bounded; and a screen diff is fully validated before it is applied,
-  with no terminal parser on the client (the server's fux-vt emulator is panic-free and bounded).
-- **The identity key is always encrypted at rest** (`koh-key-v1`: Argon2id 64 MiB / 4 passes +
-  AES-256-GCM, modeled on `openssh-key-v1`), with an enforced ≥12-char passphrase floor, written
-  0600 via a born-private atomic write + `O_NOFOLLOW` read, and zeroized in memory. koh keeps every
-  file it owns under `~/.config/koh` and nowhere else.
+  in flight; the QUIC handshake and the 1-byte admission ack are deadline-bounded; and a screen
+  diff is fully validated before it is applied, with no terminal parser on the client (the
+  server's fux-vt emulator is panic-free and bounded).
+- **The identity key is protected by its file permissions**, like an SSH host key: the file is the
+  raw 32-byte secret, created 0600 by a born-private atomic write, read with `O_NOFOLLOW` and
+  re-tightened to 0600 through the open descriptor. Anyone who can read the file is that identity.
+  koh keeps every file it owns under `~/.config/koh` and nowhere else.
 - The crate is `forbid(unsafe)` and forbids the panic lint family (`unwrap`/`expect`/`panic`/
   indexing/slicing), unchecked arithmetic (`arithmetic_side_effects`) and lossy `as` casts in
   production code, with `overflow-checks` on in release too — so the panic-free-by-construction

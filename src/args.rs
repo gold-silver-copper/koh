@@ -39,10 +39,7 @@ pub struct KeyArgs {
 
 #[derive(Subcommand, Debug)]
 enum KeyCmd {
-    /// Change the passphrase encrypting the identity key (like `ssh-keygen -p`). The key stays
-    /// encrypted — there is no way to store it in plaintext.
-    Passwd,
-    /// Print the key's encryption status and endpoint id (never the secret).
+    /// Print the key file and its endpoint id (never the secret).
     Info,
     /// Delete an unused identity; the next use creates a new endpoint ID.
     Reset {
@@ -56,7 +53,6 @@ impl From<KeyArgs> for crate::keycmd::KeyConfig {
     fn from(a: KeyArgs) -> Self {
         Self {
             op: match a.cmd {
-                KeyCmd::Passwd => crate::keycmd::KeyOp::Passwd,
                 KeyCmd::Info => crate::keycmd::KeyOp::Info,
                 KeyCmd::Reset { yes } => crate::keycmd::KeyOp::Reset { confirmed: yes },
             },

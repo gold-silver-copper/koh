@@ -29,8 +29,8 @@ Useful commands:
 koh id                    # print this machine's endpoint id
 koh serve --allow <id>    # host a shell for an allowed client
 koh connect <id>          # connect to a server id
-koh key passwd            # change the identity-key passphrase
-koh key info              # show identity-key information
+koh key info              # show the identity key file and its endpoint id
+koh key reset --yes       # delete the identity key; the next use creates a new endpoint id
 ```
 
 Useful flags:

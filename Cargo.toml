@@ -72,21 +72,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # raise(SIGTSTP) for the Ctrl-^ Ctrl-Z client suspend without `unsafe` (nix wraps the libc call
 # internally; our crate stays `forbid(unsafe)`). `poll` makes the stdin producer cancellable while
 # idle; no default features. Already present transitively, so this pins no new major version.
-nix = { version = "0.28", default-features = false, features = ["fs", "poll", "process", "signal", "term", "user"] }
-# Argon2id — the password KDF for the encrypted-at-rest identity key (`koh-key-v1`). RustCrypto,
-# used through its safe, `Result`-returning API.
-argon2 = "0.5"
-zeroize = "1"
-secrecy = "0.10"
-# At-rest encryption of the on-disk identity key (the `koh-key-v1` format, modeled on OpenSSH's
-# openssh-key-v1): a vetted AEAD over the 32-byte secret, keyed by Argon2id. Already in the lockfile
-# transitively via iroh's QUIC backend, so promoting it to a direct dep adds no new compiled crate —
-# it makes koh own/audit the version. NOT home-grown crypto.
-aes-gcm = "0.10"
-# No-echo passphrase prompt for the encrypted identity key (the `ssh-keygen -p` / login analogue).
-rpassword = "7"
-# Restores the terminal if a signal interrupts the identity passphrase prompt.
-signal-hook = "0.3"
+nix = { version = "0.28", default-features = false, features = ["fs", "poll", "process", "signal", "user"] }
 # render the endpoint id as a terminal QR on `koh serve` (always printed); default-features = false drops the
 # heavy image/svg/pic renderers (we only use the built-in unicode half-block renderer).
 qrcode = { version = "=0.14.1", default-features = false }

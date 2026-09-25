@@ -6,13 +6,14 @@ internals. Pair it with the [threat model](THREAT_MODEL.md) and the porting-rese
 
 ## The one idea
 
-koh is **not a tunnel**. It does not ship a byte stream. It is a *state-synchronization* system
-whose payload happens to be a terminal. Each side holds an authoritative object and the protocol's
-only job is to bring the peer to the **latest** version of it — intermediate states are collapsed
-and discarded. If the screen changed 100 times in 40 ms, only the final state is sent. This is the
-source of every property users love: instant re-sync after a drop (never replay a backlog),
-responsiveness on lossy links, and no head-of-line blocking. It is a faithful port of mosh's SSP
-(State Synchronization Protocol), retargeted from UDP/OCB onto iroh's QUIC.
+koh keeps a **copy of the server's screen** on the client, not a byte stream from the shell. The
+server runs the terminal emulator; the client only ever receives screens, as diffs against a screen
+it already holds, and a newer screen replaces an older one. If the screen changed 100 times in
+40 ms, the client gets the latest, not 100 updates. That gives instant re-sync after a drop (never a
+backlog), responsiveness on lossy links, and no head-of-line blocking of the screen behind stale
+output. Keystrokes are the opposite: every byte matters and order matters, so they travel on one
+reliable, ordered stream. QUIC (through iroh) provides both, plus encryption, authentication, loss
+recovery, congestion control, RTT estimates, roaming and NAT traversal.
 
 ## Module layout
 
@@ -49,59 +50,69 @@ on top. Only `transport_iroh`, `server`, and `client` touch iroh — the entire 
 `predict` imports nothing from `crate::`, so it is a standalone, reusable terminal-prediction
 library.
 
-## The two synchronized states
+## The protocol (koh/3)
 
-- **`TerminalScreen`** (server → client) is a plain `Grid` of `fux_vt::Cell`s (with a cursor,
-  per-row soft-wrap flags and the input modes the client mirrors) plus the side channels: title,
-  icon, OSC 52 clipboard, bell count, exit code and the server's `echo_ack`. The server's live
-  emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's opt-in events (title, icon, bell,
-  clipboard) and extended replies (DECRQM, DECXCPR, secondary DA) turned on; each snapshot copies
-  its live rows. The diff (`ScreenDiff`, protocol 4, ALPN `koh/iroh/2`) carries every changed row
-  whole as run-length-encoded cells, the cursor and the modes; after a resize the client starts
-  from a blank grid and receives every non-blank row. The client validates and copies cells and
-  never runs a terminal parser, so server bytes never reach one.
-- **`UserInput`** (client → server) is the keystroke + resize stream, stored per-byte (so an acked
-  prefix is a clean prefix) and coalesced into compact `Keys` blobs on the wire.
+The ALPN `koh/3` is the version check: a peer on another version fails the TLS handshake with a
+clear error. After the handshake the server checks the allowlist and opens a bi-stream carrying one
+ADMIT byte, so a rejected client can tell "not authorized" from a network error. Then
+(`src/proto.rs`):
 
-## The Transport
+- **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Input { seq,
+  bytes }` (at most 64 KiB; a paste is split), `Resize`, `Ack { frame }` after applying a frame, and
+  `Resync` when a frame's base is unknown. `seq` numbers each input on the connection.
+- **Server to client: one uni stream per `Frame`**, DEFLATE-compressed and inflated with a 16 MiB
+  limit. A frame carries `num`, `base`, `echo_ack` and a `ScreenDiff` from frame `base` to frame
+  `num`. Frame 0 is the blank default screen, which both ends always hold; real frames count from 1.
+- **Bases are acknowledged frames.** The server diffs against the newest frame the client has
+  acknowledged, so a lost frame only delays the screen until the next one. When the server sends a
+  frame it resets the streams of older unacknowledged frames, so QUIC never retransmits a screen a
+  newer one has replaced.
+- **Pacing:** a frame goes out when the screen or the echo-ack changed, at most once per frame
+  interval (`clamp(rtt / 2, 20 ms, 250 ms)`), and a heartbeat frame at least every 3 s so the
+  client can tell a quiet session from a dead link.
+- **Retries without QUIC's backoff:** on a lossy, jittery path QUIC's probe timeout is several
+  round trips and doubles on each loss. So an unacknowledged newest frame is resent, as a new frame
+  that supersedes it, after a round trip plus a frame interval; and input the echo-ack has not
+  confirmed after the same wait makes the client send a repeated `Ack`, a later packet that lets
+  QUIC detect the loss and retransmit at once.
+- **Bounded state:** each end keeps at most `FRAME_WINDOW` (16) recent screens — the client its
+  last applied frames, the server the frames sent since the last acknowledged one. That constant,
+  plus QUIC flow control and the stream limits (the server accepts one client stream; the client a
+  handful of frame streams), is the whole memory bound; a peer cannot make either end accumulate.
+- **Backpressure:** PTY input goes through a bounded writer queue. While it is full the server
+  stops reading the client's stream, QUIC flow control stops the client's writes, and the client
+  keeps at most 1 MiB of typing before dropping it with an "input paused" status line. The keyboard
+  loop never waits on the network, so `Ctrl-^ .` always works.
+- **Shutdown:** when the shell exits, the server sends the final frame (carrying the exit code),
+  waits up to 1 s for its ack, then closes the connection with code 0 and reason `session ended`.
 
-One `Transport<Local, Remote>` per peer — a faithful port of mosh's `TransportSender` + receive
-path, restructured as a **pure, clock-injected state machine** (no sockets, no async). It keeps the
-`sent_states`/`received_states` collapse logic, the `tick()` send scheduler with mosh's exact timers
-(`SEND_INTERVAL_MIN/MAX`, `ACK_INTERVAL`, `ACK_DELAY`, `SEND_MINDELAY`, `ACTIVE_RETRY_TIMEOUT`), the
-seq/ack/throwaway envelope, the prospective-resend optimization, and the shutdown handshake. Because
-it is pure, the whole protocol is deterministically testable under simulated
-loss/latency/reordering/duplication.
+`TerminalScreen` is a plain `Grid` of `fux_vt::Cell`s (with a cursor, per-row soft-wrap flags and
+the input modes the client mirrors) plus the side channels: title, icon, OSC 52 clipboard, bell count
+and exit code. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's
+opt-in events (title, icon, bell, clipboard) and extended replies (DECRQM, DECXCPR, secondary DA)
+turned on. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
+cursor and the modes; after a resize the client starts from a blank grid and receives every
+non-blank row. The client validates and copies cells and never runs a terminal parser, so server
+bytes never reach one.
 
 ## Headless drivers (the protocol is I/O-free; the shells are thin)
 
-The client session loop is split the same way the `Transport` is: a synchronous, I/O-free
-**`ClientSession`** owns the transport, predictor, and escape/render state and exposes pure step
-methods — `on_input` (the `Ctrl-^`-prefix machine + prediction seeding), `on_datagram`, `on_resize`,
-and `on_tick` (which returns the datagrams to send, the next wait, the link-down banner, and the
-remote exit code) — none of which touch tokio, iroh, or a real terminal. The screen is *derived*
-from the transport, so the renderer draws through borrows with no extra clone. `run_client` is then
-a thin shell: the `tokio::select!` (kept `biased` for input priority), the channels/sleeps, and
-`term.render()`, delegating every protocol decision to the session. This makes the whole client
-deterministically unit-testable.
+Both ends split into a synchronous, I/O-free core and a thin async shell. The client's
+**`ClientSession`** (`client/session.rs`) holds the recent screens, the predictor and the
+escape/render state, and exposes pure steps: `on_input` (the `Ctrl-^`-prefix machine, prediction
+seeding, input queueing), `on_frame`, `on_resize` and `on_tick` (the link-down and input-paused
+banners), with the outgoing messages taken from a queue. The server's **`ServerConn`**
+(`server/mod.rs`) decodes the client's stream, tracks the echo-ack, and decides which frame to
+send against which base. None of it touches tokio, iroh or a terminal, and time is an argument, so
+both are deterministically unit-testable. The shells own the `tokio::select!` (the client's kept
+`biased` for input priority), a writer task for the client's stream, a task per frame stream, and
+the rendering.
 
 On the server side, **PTY writes are non-blocking**: a dedicated `koh-pty-writer` thread owns the
 blocking write handle and drains a bounded channel, so forwarding a keystroke (or a synthesized
 DSR/DA reply) only enqueues and never blocks a tokio worker on a slow child. Both producers share
 one sender and enqueue under the session lock, so byte order is preserved (a query reply can't
 overtake the keystroke that triggered it).
-
-## Fragmentation (how oversized state crosses the wire)
-
-**koh ships the SSP over QUIC *unreliable datagrams*, never a reliable stream for the steady flow**
-— a reliable ordered stream would reintroduce head-of-line blocking and defeat the "drop superseded
-state" property. We use mosh's own approach: a **fragmenter**. A serialized instruction larger than
-the path MTU is split into datagram-sized `Fragment`s that share an id; the reassembler keeps only
-the highest id it has seen, so a newer instruction's fragments supersede and discard any stale
-partial — the drop-superseded property extends down to the framing layer. Identical retransmits
-reuse fragment ids so a partially received instruction can complete across retransmissions. The
-datagram budget is taken from `Connection::max_datagram_size()` (re-queried, since it tracks the
-path MTU). Even a full repaint goes through the fragmenter; there is no reliable-stream fallback.
 
 ## The predictor
 
@@ -151,11 +162,11 @@ A session is one PTY + emulator per authorized peer (`server::session`). Two con
 same peer can briefly share it, when a reconnect races the old connection's teardown, so the
 per-connection state never lives in the session:
 
-- **KS-02 — echo-ack is per connection.** SSP frame numbers are per transport, so the input
-  history and the S-03 debounce live in the per-connection `ServerSession` (`server::EchoAck`),
-  not in the emulator. The loop snapshots the screen, then stamps *its* connection's ack before
-  installing it. A session-global ack would hand one connection another's frame numbers, and its
-  predictor would treat every keystroke as already acked.
+- **KS-02 — echo-ack is per connection.** Input sequence numbers are per connection, so the input
+  history and the 50 ms debounce live in the per-connection `ServerConn` (`server::EchoAck`), not
+  in the emulator, and each frame carries its connection's own echo-ack. A session-global ack would
+  hand one connection another's numbers, and its predictor would treat every keystroke as already
+  acked.
 - **KS-03 — a change wakes every connection.** `SessionHandle::changed` is a `ChangeSignal`, a
   `tokio::sync::watch` version counter: the PTY drain task `pulse`s it, and each attached loop holds
   its own receiver and `select!`s on `changed()`. Every loop wakes on one pulse; a burst coalesces
@@ -278,10 +289,10 @@ prove correctness; only a real two-device run over a real radio proves *feel* an
 | Property | How koh delivers it |
 |---|---|
 | Keystrokes appear instantly on every link | predictor (always on; underlined on high-RTT links, then confirmed) |
-| Survives suspend/resume + IP change, re-syncs to current screen | QUIC connection migration + SSP re-sync to latest (no backlog) |
-| A burst of superseded output never delays the current screen | datagram transport + state collapse; proven by the chaos monotonicity guard |
+| Survives suspend/resume + IP change, re-syncs to current screen | QUIC connection migration + a fresh frame against an acknowledged base (no backlog) |
+| A burst of superseded output never delays the current screen | one stream per frame, older frames reset; only the latest screen is sent |
 | Password prompts show no predicted echo | emergent no-echo suppression in the predictor |
-| Reconnect lands you where the screen is *now* | SSP always diffs toward the latest state |
+| Reconnect lands you where the screen is *now* | a new connection starts from the blank screen and gets the current one |
 | Detach and reattach later, shell still running | server-side detachable sessions keyed by client id (reattach test) |
 | Interactive apps (vim/htop/fzf) that probe the terminal work | server synthesizes DSR/DA/DECRQM replies |
-| Client exits with the remote shell's status | exit code rides the shutdown frame (exit_status test) |
+| Client exits with the remote shell's status | exit code rides the final frame (`tests/net` session test) |

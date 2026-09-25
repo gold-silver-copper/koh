@@ -76,6 +76,8 @@ pub struct BellHook {
     last_spawn_ms: Option<u64>,
     /// Whether a count has been seen (by `prime` or `observe`); `prime` is a no-op afterwards.
     primed: bool,
+    /// The instant `observe`'s millisecond clock counts from.
+    created: std::time::Instant,
 }
 
 /// Minimum spacing between two hook spawns; a burst of bells inside it coalesces into one.
@@ -88,6 +90,7 @@ impl BellHook {
             last_count: 0,
             last_spawn_ms: None,
             primed: false,
+            created: std::time::Instant::now(),
         }
     }
 
@@ -120,8 +123,11 @@ impl BellHook {
         spaced
     }
 
-    /// [`observe`](Self::observe) and, if due, [`fire`](Self::fire).
-    pub fn observe_and_fire(&mut self, count: u64, title: &str, now_ms: u64) {
+    /// [`observe`](Self::observe) at `now` and, if due, [`fire`](Self::fire).
+    pub fn observe_and_fire(&mut self, count: u64, title: &str, now: std::time::Instant) {
+        // Milliseconds since the hook was made, saturating after 584 million years.
+        let now_ms = u64::try_from(now.saturating_duration_since(self.created).as_millis())
+            .unwrap_or(u64::MAX);
         if self.observe(count, now_ms) {
             self.fire(count, title);
         }

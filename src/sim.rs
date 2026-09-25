@@ -78,7 +78,9 @@ pub fn run_session(loss: f64, seed: u64) -> SessionResult {
     let arrival = h.now();
     // The per-connection echo-ack tracker the server loop owns (KS-02).
     let mut echo = crate::server::EchoAck::default();
-    echo.register_input_frame(frame, arrival);
+    let base = std::time::Instant::now();
+    let at = |ms: u64| base + std::time::Duration::from_millis(ms);
+    echo.register(crate::proto::InputSeq(frame), at(arrival));
     for w in h.b.get_remote_diff() {
         if let WireEvent::Keys(bytes) = w {
             for b in bytes {
@@ -92,9 +94,9 @@ pub fn run_session(loss: f64, seed: u64) -> SessionResult {
     }
     // Past the echo-ack debounce: the input is now reflected on screen. Stamp the ack the way the
     // connection loop does, after taking the snapshot.
-    echo.set_echo_ack(arrival + 1_000);
+    echo.promote(at(arrival + 1_000));
     let mut snap = emu.snapshot();
-    snap.set_echo_ack(echo.echo_ack());
+    snap.set_echo_ack(echo.echo_ack().0);
     *h.b_mut() = snap.clone();
 
     let target = snap;

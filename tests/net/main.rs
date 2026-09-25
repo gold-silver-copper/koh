@@ -4,5 +4,7 @@
 //! One test binary, so every test shares the harness.
 
 mod baseline;
+mod bell;
 mod harness;
 mod link;
+mod session;

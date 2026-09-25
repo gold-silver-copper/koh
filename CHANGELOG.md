@@ -18,10 +18,10 @@ internal and unstable (see `src/lib.rs`).
 ## [Unreleased]
 
 koh is a remote shell again, not a transport for other programs: everything that existed only
-for embedders or for fux is gone. The terminal emulator moved from `vt100` to `fux-vt`, which
-**changes the wire protocol**: `PROTOCOL_VERSION` 4 and ALPN `koh/iroh/2`. A 0.12 client and a
-0.13 server (or the reverse) refuse each other at the TLS handshake with a clear error; upgrade
-both ends. The `koh-key-v1` key format is unchanged, so endpoint ids and allowlists carry over.
+for embedders or for fux is gone. **The wire protocol is new**: koh no longer runs mosh's State
+Synchronization Protocol over QUIC datagrams, but its own stream protocol, ALPN `koh/3`. A 0.12
+client and a 0.13 server (or the reverse) refuse each other at the TLS handshake with a clear
+error; upgrade both ends.
 
 ### Changed
 - **Terminal emulation is `fux-vt`, and the client runs no parser.** The server's emulator is
@@ -32,7 +32,15 @@ both ends. The `koh-key-v1` key format is unchanged, so endpoint ids and allowli
   server bytes never reach a terminal parser on the client. The `catch_unwind` containment and the
   64 KiB control-string pre-filter are gone: fux-vt cannot panic, retains no DCS/APC/PM/SOS payload
   and caps OSC strings at 64 KiB.
-- **Wire protocol 4 / ALPN `koh/iroh/2`** (see above).
+- **Breaking: the koh/3 stream protocol replaces SSP over datagrams.** Keystrokes travel on one
+  reliable QUIC stream; each screen update is a frame on its own stream, diffed against a frame the
+  client acknowledged, and the server resets a frame's stream once a newer one supersedes it. QUIC
+  does the loss recovery, retransmission and RTT estimation SSP did by hand, and each end keeps a
+  fixed window of 16 recent screens instead of budgeting received states. An unacknowledged frame
+  is resent after a round trip plus a frame interval, so heavy loss does not wait out QUIC's
+  backed-off probe timeout, and the link recovers from an outage within a round trip. A program that stops
+  reading its input now pushes back on the client: typing beyond 1 MiB queued is dropped with an
+  "input paused" status line instead of piling up, and `Ctrl-^ .` still quits at once.
 - Emulation follows fux-vt's documented sequence contract, which is vt100 0.16's plus two
   corrections: DECAWM (`CSI ? 7 l`, autowrap off) now works, and insert/delete-line outside the
   scroll region is ignored. Terminal replies: primary device attributes now answer as a VT100

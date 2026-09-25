@@ -7,7 +7,7 @@ look; pair it with [`SECURITY.md`](../SECURITY.md).
 ## What koh is
 
 A mosh-like remote shell over [iroh](https://iroh.computer) (peer-to-peer QUIC). The **server** spawns
-a real shell in a PTY and streams terminal state to a **client** via a mosh-style state-sync protocol.
+a real shell in a PTY and sends its screen to a **client** as frames over QUIC streams.
 There is **no listening port**: a server is reachable only via its non-enumerable Ed25519 **node-id**
 (through relays + NAT hole-punching), and only peers on its **allowlist** are admitted. It is a
 **single-operator** tool for connecting a small set of machines you control — not a multi-user network
@@ -16,7 +16,8 @@ service.
 ## Attacker models
 
 1. **Malicious / compromised client** — a peer that dials the server. If it is on the allowlist it
-   reaches the SSP data plane and sends arbitrary UserInput / Resize / fragmented instructions.
+   reaches the koh/3 data plane: it sends arbitrary input, resize, ack and resync messages and opens
+   streams.
    **Goal it must be denied:** crash / OOM / hang the server, bypass a cap, or escape the admission
    gauntlet. The server is the high-value target (it runs a shell).
 2. **Malicious / compromised server** — a server a client dials (a wrong/typo'd node-id, or a popped
@@ -37,9 +38,12 @@ service.
   there is no passphrase/PAKE second factor (the residual leaked-key risk is handled by mandatory
   at-rest key encryption, below). The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
   checkpoint; its outcomes are logged structured under the `koh::auth` target.
-- **Untrusted data plane:** the SSP core (`src/ssp/`, `src/wire.rs`) is a pure, panic-free-by-
-  construction state machine with per-direction decode/inflate ceilings, a fragment replay gate, a
-  reassembly byte cap, an accumulation budget, and dimension clamps before any grid allocation.
+- **Untrusted data plane:** the protocol (`src/proto.rs`) and the connection cores
+  (`src/server/mod.rs`, `src/client/session.rs`) are pure and panic-free by construction. Client
+  messages are length-capped (64 KiB of input each) and a frame is read and inflated with a 16 MiB
+  limit; each end keeps a fixed window of 16 screens, whatever the peer sends or withholds; QUIC
+  stream limits and flow control bound what a peer can have in flight; and resize dimensions are
+  clamped before any grid allocation.
   **The client runs no terminal parser on server bytes:** a screen update is a structured diff of
   whole rows of run-length-encoded cells, which `TerminalScreen::apply` validates completely (row
   indices, runs covering exactly the width, known cell kinds and style bits, cell text within the

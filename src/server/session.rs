@@ -69,10 +69,18 @@ impl PtyHost {
         self.emu.snapshot()
     }
 
-    /// Client keystrokes (already DECCKM-normalized and coalesced, KOH-05).
-    pub fn input(&mut self, bytes: &[u8]) {
-        if let Err(e) = self.pty.write_input(bytes) {
-            tracing::warn!(error = %e, "pty write failed");
+    /// Queue client keystrokes (already DECCKM-normalized) for the PTY. Returns `false` if the
+    /// writer queue is full because the program is not reading its input; the caller keeps the
+    /// bytes and retries.
+    pub fn input(&mut self, bytes: &[u8]) -> bool {
+        match self.pty.write_input(bytes) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => {
+                // The program is gone; there is no one to deliver the bytes to.
+                tracing::warn!(error = %e, "pty write failed");
+                true
+            }
         }
     }
 

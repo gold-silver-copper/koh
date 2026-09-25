@@ -70,8 +70,8 @@ struct Metrics {
 const KEYSTROKES: usize = 200;
 
 /// Run one session over `profile`, black-holing the link for 5 s at the end if `outage`.
-async fn measure(profile: Profile, outage: bool) -> anyhow::Result<Metrics> {
-    let net = FaultNet::new(profile, 7);
+async fn measure(profile: Profile, outage: bool, seed: u64) -> anyhow::Result<Metrics> {
+    let net = FaultNet::new(profile, seed);
     let (server, mut client) = session(&net, &["sh"]).await?;
     let long = Duration::from_secs(120);
     client
@@ -163,11 +163,23 @@ async fn baseline() {
         ),
         ("5 s outage", Profile::default(), true),
     ];
+    // `KOH_BASELINE_PROFILE` picks one profile by index; `KOH_BASELINE_SEED` changes the link's
+    // RNG seed (default 7).
+    let only: Option<usize> = std::env::var("KOH_BASELINE_PROFILE")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let seed: u64 = std::env::var("KOH_BASELINE_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
     let mut report = String::new();
-    for (name, profile, outage) in profiles {
-        let m = measure(profile, outage).await.expect(name);
+    for (i, (name, profile, outage)) in profiles.into_iter().enumerate() {
+        if only.is_some_and(|only| only != i) {
+            continue;
+        }
+        let m = measure(profile, outage, seed).await.expect(name);
         let line = format!(
-            "{name:<38} echo p50 {:>7.1} ms  p95 {:>7.1} ms  burst {:>8.1} ms  recovery {:>8}  \
+            "seed {seed:<3} {name:<38} echo p50 {:>7.1} ms  p95 {:>7.1} ms  burst {:>8.1} ms  recovery {:>8}  \
              to server {:>9} B / {:>6} pkts  to client {:>10} B / {:>6} pkts\n",
             ms(m.echo_median),
             ms(m.echo_p95),

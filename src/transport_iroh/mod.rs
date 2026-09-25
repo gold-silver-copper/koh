@@ -1,18 +1,10 @@
 //! # koh-transport-iroh
 //!
 //! The iroh glue: endpoint setup, a persistent node identity, dial-by-endpoint-id, and a
-//! thin [`IrohChannel`] over a `Connection` that the SSP driver uses to ship datagrams and
-//! read the path RTT. Everything QUIC-shaped (encryption, key exchange, NAT traversal,
-//! relay fallback, roaming/migration, RTT measurement) is iroh's job; this module just
-//! exposes the few primitives the protocol above it needs.
-//!
-//! ## Datagrams, not streams
-//!
-//! The steady SSP flow rides QUIC **unreliable datagrams** ([`IrohChannel::send`] /
-//! [`IrohChannel::recv`]). Oversized instructions are handled upstream by the
-//! [`wire`](crate::wire) fragmenter (each fragment fits [`IrohChannel::max_datagram_size`]), so we
-//! never put the steady flow on a reliable stream — that would reintroduce the
-//! head-of-line blocking mosh exists to avoid.
+//! thin [`IrohChannel`] over a `Connection` that gives the connection loops its streams and the
+//! path RTT. Everything QUIC-shaped (encryption, key exchange, NAT traversal, relay fallback,
+//! roaming/migration, loss recovery, RTT measurement) is iroh's job; this module just exposes
+//! the few primitives the protocol above it ([`crate::proto`]) needs.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -37,23 +29,28 @@ mod keyfile;
 /// Longer outages are handled above this layer: the client transparently re-dials and reattaches
 /// to the detachable server session (see `crate::client::run_client`), so we don't need to hold a
 /// dead connection open indefinitely here.
-fn koh_transport_config() -> QuicTransportConfig {
+///
+/// Stream limits differ by role. The server accepts only the client's one message stream. The
+/// client accepts the admission bi-stream and a few concurrent frame streams; the server resets a
+/// frame's stream once a newer frame supersedes it, so only a handful are ever open.
+fn koh_transport_config(accept: bool) -> QuicTransportConfig {
     // `IdleTimeout` is a QUIC varint of milliseconds; building it from a `u32` is infallible,
     // unlike `IdleTimeout::try_from(Duration)`.
     const IDLE_TIMEOUT_MS: u32 = 300_000;
+    let (uni, bidi) = if accept { (1, 0) } else { (8, 1) };
     QuicTransportConfig::builder()
         .keep_alive_interval(Duration::from_secs(5))
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))))
+        .max_concurrent_uni_streams(VarInt::from_u32(uni))
+        .max_concurrent_bidi_streams(VarInt::from_u32(bidi))
         .build()
 }
 
 /// The ALPN that identifies the koh protocol on the wire.
 ///
-/// SSP carrying `UserInput` up and a `TerminalScreen` down; a peer speaking anything else fails the
-/// TLS handshake. Changed together with [`PROTOCOL_VERSION`](crate::wire::PROTOCOL_VERSION) for an
-/// incompatible diff encoding, so mismatched peers fail at the handshake with a clear error rather
-/// than mid-session.
-pub const ALPN: &[u8] = b"koh/iroh/2";
+/// The ALPN is the protocol version: the stream protocol in [`crate::proto`]. A peer speaking
+/// anything else fails the TLS handshake with a clear error rather than misparsing mid-session.
+pub const ALPN: &[u8] = b"koh/3";
 
 /// Errors from endpoint/identity setup.
 #[derive(Debug, thiserror::Error)]
@@ -606,7 +603,7 @@ pub fn configure(
 ) -> iroh::endpoint::Builder {
     let mut builder = builder
         .secret_key(secret)
-        .transport_config(koh_transport_config());
+        .transport_config(koh_transport_config(accept));
     // Even with no discovery, iroh constructs a default `DnsResolver` at bind time, which panics
     // on a bare-CLI Android build; pin an explicit resolver there. See `discovery_dns_resolver`.
     if let Some(resolver) = discovery_dns_resolver() {
@@ -682,20 +679,10 @@ pub fn parse_relay_url(s: &str) -> Result<RelayUrl, SetupError> {
         .map_err(|e| SetupError::Other(anyhow::anyhow!("bad relay url: {e}")))
 }
 
-/// A datagram channel over a single iroh [`Connection`].
+/// One iroh [`Connection`], as the connection loops use it: its streams, its path RTT, closing.
 ///
-/// Oversized state is split by the [`wire`](crate::wire) fragmenter across datagrams — never a reliable
-/// stream (which would reintroduce the head-of-line blocking the protocol exists to avoid).
-///
-/// Architectural note (AR-04): the driver loops (`server::run_attached`, `client::drive_connection`)
-/// take `&IrohChannel` **concretely**, not behind a `DatagramChannel` trait. This is deliberate: koh
-/// is architected around exactly one real transport (iroh subsumes crypto/NAT/roaming/RTT/MTU), and
-/// the pure `ssp::Transport` state machine — which `SimHarness` drives directly — already carries the
-/// transport-agnostic protocol logic. A trait here would buy only a deterministic *loop* test double
-/// (the loops are otherwise covered by real-iroh loopback e2e); it would also have to preserve the
-/// typed close-reason path (`client::server_close_reason`) and could not type-enforce the
-/// `read_datagram` cancel-safety the loops rely on. Extract the trait only if a second transport or
-/// that loop double genuinely earns its keep — until then the concrete type is the right call.
+/// The loops take it concretely, not behind a trait: koh has one transport, and its protocol
+/// logic already lives in the I/O-free cores the tests drive directly.
 #[derive(Clone)]
 pub struct IrohChannel {
     conn: Connection,
@@ -704,6 +691,22 @@ pub struct IrohChannel {
 impl IrohChannel {
     pub fn new(conn: Connection) -> Self {
         Self { conn }
+    }
+
+    /// The connection, for its streams.
+    pub const fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// The smoothed round-trip time of the selected path, or `None` before any path exists.
+    pub fn rtt(&self) -> Option<Duration> {
+        let paths = self.conn.paths();
+        paths
+            .iter()
+            .find(iroh::endpoint::Path::is_selected)
+            .or_else(|| paths.iter().next())
+            .map(|p| p.rtt())
+            .or_else(|| self.conn.rtt(PathId::ZERO))
     }
 
     /// Send one datagram. Failures (peer congestion, too-large, unsupported) are *dropped* on
@@ -1186,10 +1189,9 @@ mod tests {
     }
 
     #[test]
-    fn the_alpn_names_the_structured_screen_protocol() {
-        // `koh/iroh/2` carries protocol 4's structured screen diff; a `koh/iroh/1` peer (vt100
-        // escape-patch diffs) fails the TLS handshake instead of misparsing.
-        assert_eq!(ALPN, b"koh/iroh/2");
-        assert_eq!(crate::wire::PROTOCOL_VERSION, 4);
+    fn the_alpn_names_the_stream_protocol() {
+        // `koh/3` is the stream protocol; a `koh/iroh/2` peer (SSP over datagrams) fails the TLS
+        // handshake instead of misparsing.
+        assert_eq!(ALPN, b"koh/3");
     }
 }

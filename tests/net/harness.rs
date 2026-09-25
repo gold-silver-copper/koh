@@ -4,10 +4,12 @@
 //! reconnecting loop ([`run_client`]) with a terminal that records every painted screen. Tests
 //! type through the client and watch what it paints.
 
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use iroh::{EndpointId, SecretKey};
-use koh::client::{run_client, ClientTerminal, IrohConnector};
+use iroh::endpoint::Connection;
+use iroh::{Endpoint, EndpointId, SecretKey};
+use koh::client::{run_client, BellHook, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::terminal::TerminalScreen;
@@ -18,9 +20,6 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::link::FaultNet;
-
-/// The client terminal's size.
-const SIZE: (u16, u16) = (24, 80);
 
 /// A running `koh serve` on the fault link.
 pub struct Server {
@@ -57,16 +56,19 @@ impl Server {
     }
 }
 
-/// What the client has painted: the latest screen text and when it last changed.
+/// What the client has painted: the latest screen text, its status line, and when either last
+/// changed.
 #[derive(Clone, Debug)]
 pub struct Painted {
     pub text: String,
+    pub status: Option<String>,
     pub at: Instant,
 }
 
-/// The client's terminal: records each painted screen.
+/// The client's terminal: records each painted screen, at a size the test can change.
 struct Recorder {
     painted: watch::Sender<Painted>,
+    size: Arc<Mutex<(u16, u16)>>,
 }
 
 impl ClientTerminal for Recorder {
@@ -74,15 +76,17 @@ impl ClientTerminal for Recorder {
         &mut self,
         state: &TerminalScreen,
         _overlay: &Overlay,
-        _status: Option<&str>,
+        status: Option<&str>,
     ) -> std::io::Result<()> {
         let text = state.screen().contents();
+        let status = status.map(str::to_owned);
         self.painted.send_if_modified(|painted| {
-            if painted.text == text {
+            if painted.text == text && painted.status == status {
                 return false;
             }
             *painted = Painted {
                 text,
+                status,
                 at: Instant::now(),
             };
             true
@@ -91,7 +95,7 @@ impl ClientTerminal for Recorder {
     }
 
     fn size(&self) -> std::io::Result<(u16, u16)> {
-        Ok(SIZE)
+        Ok(*self.size.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
@@ -100,32 +104,44 @@ pub struct Client {
     pub id: EndpointId,
     input: mpsc::Sender<Vec<u8>>,
     resize: mpsc::Sender<()>,
+    size: Arc<Mutex<(u16, u16)>>,
     painted: watch::Receiver<Painted>,
+    /// The first connection, so a test can cut it and watch the client reconnect.
+    first: Connection,
     task: JoinHandle<anyhow::Result<Option<u32>>>,
 }
 
 impl Client {
-    /// A fresh client identity, to put on a server's allowlist before [`Client::connect`].
-    pub fn identity() -> SecretKey {
-        generate_secret_key()
-    }
-
-    /// Dial `server` as `secret` and run the client loop.
+    /// Dial `server` as `secret` from a fresh endpoint and run the client loop.
     pub async fn connect(
         net: &FaultNet,
         secret: SecretKey,
         server: EndpointId,
     ) -> anyhow::Result<Self> {
-        let id = secret.public();
         let endpoint = net.endpoint(secret, false).await?;
+        Self::connect_on(endpoint, server, None).await
+    }
+
+    /// Dial `server` from `endpoint` (so several connections share one client identity), with an
+    /// optional bell hook, and run the client loop.
+    pub async fn connect_on(
+        endpoint: Endpoint,
+        server: EndpointId,
+        bell: Option<BellHook>,
+    ) -> anyhow::Result<Self> {
+        let id = endpoint.id();
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server));
         let channel = connector.connect().await?;
+        let first = channel.connection().clone();
+        let size = Arc::new(Mutex::new((24, 80)));
         let (painted_tx, painted) = watch::channel(Painted {
             text: String::new(),
+            status: None,
             at: Instant::now(),
         });
         let term = Recorder {
             painted: painted_tx,
+            size: size.clone(),
         };
         let (input, input_rx) = mpsc::channel(1024);
         let (resize, resize_rx) = mpsc::channel(8);
@@ -133,18 +149,20 @@ impl Client {
             channel,
             connector,
             DisplayPreference::Never,
-            SIZE,
+            (24, 80),
             input_rx,
             resize_rx,
             term,
             CancellationToken::new(),
-            None,
+            bell,
         ));
         Ok(Self {
             id,
             input,
             resize,
+            size,
             painted,
+            first,
             task,
         })
     }
@@ -152,6 +170,17 @@ impl Client {
     /// Type `bytes`.
     pub async fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
         Ok(self.input.send(bytes.to_vec()).await?)
+    }
+
+    /// Resize the client's terminal to `rows × cols`.
+    pub async fn resize_to(&self, rows: u16, cols: u16) -> anyhow::Result<()> {
+        *self.size.lock().unwrap_or_else(PoisonError::into_inner) = (rows, cols);
+        Ok(self.resize.send(()).await?)
+    }
+
+    /// Cut the first connection the way an idle timeout would; the client should reconnect.
+    pub fn drop_first_connection(&self) {
+        self.first.close(0u32.into(), b"simulated idle timeout");
     }
 
     /// The screen the client painted last.
@@ -164,13 +193,22 @@ impl Client {
     pub async fn wait_until(
         &mut self,
         timeout: Duration,
-        done: impl Fn(&str) -> bool,
+        done: impl Fn(&str) -> bool + Sync,
+    ) -> Option<Painted> {
+        self.wait_for(timeout, |painted| done(&painted.text)).await
+    }
+
+    /// Wait until what was painted, status line included, satisfies `done`, up to `timeout`.
+    pub async fn wait_for(
+        &mut self,
+        timeout: Duration,
+        done: impl Fn(&Painted) -> bool + Send,
     ) -> Option<Painted> {
         let deadline = Instant::now() + timeout;
         loop {
             {
                 let painted = self.painted.borrow_and_update();
-                if done(&painted.text) {
+                if done(&painted) {
                     return Some(painted.clone());
                 }
             }
@@ -192,11 +230,32 @@ impl Client {
             .ok()
             .and_then(Result::ok)
     }
+
+    /// Stop the client without a goodbye: its connection is dropped, not closed.
+    pub fn abort(self) {
+        self.task.abort();
+    }
+
+    /// Wait up to `timeout` for the client loop to return on its own (the shell exited).
+    pub async fn exit(self, timeout: Duration) -> Option<anyhow::Result<Option<u32>>> {
+        let Self { input, task, .. } = self;
+        let result = tokio::time::timeout(timeout, task)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        drop(input);
+        result
+    }
+}
+
+/// A fresh client identity, to put on a server's allowlist before connecting.
+pub fn identity() -> SecretKey {
+    generate_secret_key()
 }
 
 /// A session: one server hosting `command` for one connected client.
 pub async fn session(net: &FaultNet, command: &[&str]) -> anyhow::Result<(Server, Client)> {
-    let secret = Client::identity();
+    let secret = identity();
     let server = Server::start(net, &[secret.public()], command).await?;
     let client = Client::connect(net, secret, server.id).await?;
     Ok((server, client))

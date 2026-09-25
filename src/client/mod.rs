@@ -15,6 +15,7 @@ pub mod backend;
 pub mod cli;
 mod io;
 mod render;
+mod session;
 
 #[cfg(feature = "cli")]
 pub use crate::idcmd::IdArgs;
@@ -25,14 +26,15 @@ pub use cli::ConnectArgs;
 pub use cli::{connect, BellHook, ConnectConfig};
 pub(crate) use io::spawn_client_io;
 pub use render::{InputModes, WindowState};
+pub use session::{ClientSession, InputOutcome, TickResult};
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::input::UserInput;
-use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
-use crate::ssp::{RecvOutcome, Transport, SHUTDOWN_SENTINEL};
+use crate::predict::{DisplayPreference, Overlay};
+use crate::proto::{decode_frame, encode_client, Frame, MAX_FRAME, SESSION_ENDED};
 use crate::terminal::TerminalScreen;
 use crate::transport_iroh::{IrohChannel, MonoClock, ALPN};
+use iroh::endpoint::{Connection, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -61,19 +63,6 @@ const RECONNECT_BACKOFF_MAX_MS: u64 = 8_000;
 /// climbing and the next redial backs off, so such a server can't drive a tight reconnect/repaint
 /// churn loop (K-03). A genuine mid-session drop after this dwell reconnects promptly.
 const MIN_CONNECTION_DWELL_MS: u64 = 5_000;
-
-/// How long the link must be silent before the in-session "link down — resuming…" banner appears.
-///
-/// An idle, still-connected peer sends a keepalive every `crate::ssp::ACK_INTERVAL` (3 s), and
-/// the transport's `last_heard` refreshes on every decoded inbound (including duplicate keepalives)
-/// — so on a healthy link the gap between contacts never exceeds one interval. The trouble
-/// is on a *lossy* link: a single dropped or jittered keepalive pushes the gap just past one
-/// interval, so a threshold near `ACK_INTERVAL` flashes the banner on routine packet loss (the gap
-/// recovers the instant the next keepalive lands). Gate the banner at several keepalive intervals so
-/// a couple of missed keepalives are absorbed silently and the banner only surfaces on a genuine
-/// stall — at the cost of a few extra seconds before a real outage is announced (the user can always
-/// `Ctrl-^ .` to quit immediately).
-const LINK_DOWN_GRACE_MS: u64 = crate::ssp::ACK_INTERVAL * 3;
 
 /// Wall-clock gap between two steady-loop iterations above which we assume the process was
 /// **suspended** (Android deep-sleep / screen-off freezes the process) rather than merely busy.
@@ -355,240 +344,6 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
     }
 }
 
-/// What [`ClientSession::on_input`] decided about a chunk of typed bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputOutcome {
-    /// The user typed the escape prefix followed by `.` — disconnect.
-    Quit,
-    /// The user typed the escape prefix followed by `Ctrl-Z` — suspend to the background. Any bytes
-    /// before the escape in the same chunk were already forwarded; the caller drives the suspend.
-    Suspend,
-    /// The bytes were consumed (forwarded to the server and/or seeded into the predictor).
-    Forwarded,
-}
-
-/// What one [`ClientSession::on_tick`] produced for the I/O loop to act on.
-#[derive(Debug, Default)]
-pub struct TickResult {
-    /// Datagrams to ship to the server this tick (the caller sends them; the session does no I/O).
-    pub outgoing: Vec<Vec<u8>>,
-    /// How long the caller should wait before the next tick if nothing else wakes it (ms).
-    pub wait_ms: u64,
-    /// The "link down — resuming…" banner text, if the peer has gone quiet (else `None`).
-    pub status: Option<String>,
-    /// `Some(exit_code)` once the server has announced a clean shutdown (the inner `Option` is
-    /// the remote shell's exit code, which may be unknown). The caller renders a final frame and
-    /// returns this code.
-    pub ended: Option<Option<u32>>,
-}
-
-/// The terminal-agnostic, **synchronous, I/O-free** core of the client session loop.
-///
-/// It owns the SSP [`Transport`], the [`PredictionEngine`], and the small render/escape state, and
-/// exposes pure step methods (`on_input`/`on_datagram`/`on_resize`/`on_tick`) that take the
-/// current time and return what to do — never touching tokio, iroh, or a real terminal. That makes
-/// the whole client protocol deterministically unit-testable (see this module's tests).
-///
-/// The state is **derived** from the transport, never stored: [`state`](Self::state) and
-/// [`overlay`](Self::overlay) borrow it, so `run_client` renders through those borrows with no
-/// extra clone.
-pub struct ClientSession {
-    transport: Transport<UserInput, TerminalScreen>,
-    predictor: PredictionEngine,
-    /// True after we've seen the lone escape prefix and are waiting for the next byte.
-    pending_escape: bool,
-    /// Set whenever the rendered output may have changed; cleared once the caller repaints.
-    dirty: bool,
-    /// Whether the "link down" banner was painted last frame, so we force one more repaint to
-    /// clear it the moment the peer reappears (recovery may arrive as a Duplicate, not NewState).
-    status_was_shown: bool,
-}
-
-impl ClientSession {
-    /// Create a session at time `now` (ms) with datagram budget `mtu`, seeding the first resize
-    /// the server should see. Marked connected and dirty (so the first frame paints).
-    pub fn new(
-        now: u64,
-        mtu: usize,
-        pref: DisplayPreference,
-        initial_rows: u16,
-        initial_cols: u16,
-    ) -> Self {
-        let mut transport = Transport::<UserInput, TerminalScreen>::new(now, mtu);
-        transport.set_connected(true);
-        transport
-            .current_mut()
-            .push_resize(initial_rows, initial_cols);
-        let predictor = PredictionEngine::new(pref);
-        Self {
-            transport,
-            predictor,
-            pending_escape: false,
-            dirty: true,
-            status_was_shown: false,
-        }
-    }
-
-    /// Feed a chunk of locally-typed bytes. Runs the escape-prefix machine (`0x1e` then `.` quits;
-    /// `0x1e` then anything else forwards both bytes literally), seeds the predictor against the
-    /// current remote screen, and appends the surviving bytes to the outgoing input stream.
-    pub fn on_input(&mut self, now: u64, bytes: &[u8]) -> InputOutcome {
-        let mut quit = false;
-        let mut suspend = false;
-        let mut fwd: Vec<u8> = Vec::with_capacity(bytes.len());
-        for &b in bytes {
-            if self.pending_escape {
-                self.pending_escape = false;
-                if b == b'.' {
-                    quit = true;
-                    break;
-                }
-                if b == SUSPEND_KEY {
-                    suspend = true;
-                    break;
-                }
-                fwd.push(ESCAPE_PREFIX);
-                fwd.push(b);
-            } else if b == ESCAPE_PREFIX {
-                self.pending_escape = true;
-            } else {
-                fwd.push(b);
-            }
-        }
-        if quit {
-            return InputOutcome::Quit;
-        }
-        // Forward any bytes that preceded the escape before suspending, so nothing typed ahead of
-        // `Ctrl-^ Ctrl-Z` is dropped.
-        if !fwd.is_empty() {
-            self.predictor
-                .set_local_frame_sent(self.transport.newest_sent_num());
-            self.predictor
-                .set_srtt(self.transport.send_interval() as f64);
-            // Seed predictions against the current remote screen. The screen borrows `transport`
-            // immutably while `predictor` is borrowed mutably — disjoint fields, so no clone is
-            // needed; the borrow ends before `current_mut()` below.
-            let screen = self.transport.remote_state().screen();
-            for &b in &fwd {
-                self.predictor.new_user_byte(now, b, screen);
-            }
-            self.transport.current_mut().push_bytes(&fwd);
-            self.dirty = true;
-        }
-        if suspend {
-            return InputOutcome::Suspend;
-        }
-        InputOutcome::Forwarded
-    }
-
-    /// Feed one inbound datagram. On a newest-in-order state it reconciles the predictor against
-    /// the fresh authoritative screen (culling confirmed/incorrect predictions) and marks dirty.
-    pub fn on_datagram(&mut self, now: u64, bytes: &[u8]) {
-        if self.transport.recv(now, bytes) == RecvOutcome::NewState {
-            let echo_ack = self.transport.remote_state().echo_ack();
-            self.predictor.set_local_frame_late_acked(echo_ack);
-            self.predictor
-                .set_srtt(self.transport.send_interval() as f64);
-            self.predictor
-                .cull(now, self.transport.remote_state().screen());
-            self.dirty = true;
-        }
-    }
-
-    /// Note a new window size: propagate it to the server and reset the predictor (a resize
-    /// invalidates in-flight predictions).
-    pub fn on_resize(&mut self, rows: u16, cols: u16) {
-        self.transport.current_mut().push_resize(rows, cols);
-        self.predictor.reset();
-        self.dirty = true;
-    }
-
-    /// Advance the steady-state at time `now` with the latest `mtu`/`rtt_ms`, returning the
-    /// datagrams to send, the next idle wait, the link-down banner, and — once the server has
-    /// announced shutdown — the remote exit code. Does no I/O: it returns datagrams instead of
-    /// sending them.
-    pub fn on_tick(&mut self, now: u64, mtu: usize, rtt_ms: Option<f64>) -> TickResult {
-        self.transport.set_mtu(mtu);
-        if let Some(rtt) = rtt_ms {
-            self.transport.observe_rtt(rtt);
-        }
-        // Escalate a long-pending prediction to the glitch underline on time, even on a silent
-        // link (no datagram/keystroke to drive cull). Repaint if the flagging changed.
-        if self
-            .predictor
-            .tick(now, self.transport.remote_state().screen())
-        {
-            self.dirty = true;
-        }
-        let outgoing = self.transport.tick(now);
-
-        // Link-down is driven by transport liveness, which refreshes on ANY decoded inbound
-        // (including duplicate keepalives) — so a quiet-but-alive session never falsely trips the
-        // banner. The grace is several keepalive intervals (LINK_DOWN_GRACE_MS), so a dropped/jittered
-        // keepalive on a lossy link doesn't flash the banner the moment one packet is late. No banner
-        // before first contact (last_heard == 0 -> still connecting).
-        let status = if self.transport.last_heard() > 0
-            && !self.transport.link_up_within(now, LINK_DOWN_GRACE_MS)
-        {
-            let since = now.saturating_sub(self.transport.last_heard());
-            Some(format!(
-                "[koh] link down — resuming… {}s",
-                Duration::from_millis(since).as_secs()
-            ))
-        } else {
-            None
-        };
-
-        // K-04 (trust boundary, documented by design): both `remote_num()` and the carried
-        // `exit_code` are peer-controlled, so a malicious/typo'd server can announce a shutdown with
-        // any exit code, which becomes koh's process exit status (`code as u8`). This is the same
-        // contract as ssh/mosh — the remote shell's exit code is *meant* to propagate — so we keep
-        // it rather than masking a useful signal. A wrapper that must distinguish "the remote shell
-        // exited N" from "the transport failed" should key off koh's own failure paths (a dropped
-        // connection returns via `LinkLost`/reconnect, never this clean-shutdown arm), not trust the
-        // peer-announced code as authoritative. The connection is already QUIC-authenticated to the
-        // dialed node id; an attacker who can send this frame can already disrupt the session.
-        let ended = (self.transport.remote_num() == SHUTDOWN_SENTINEL)
-            .then(|| self.transport.remote_state().exit_code());
-
-        let wait_ms = self.transport.wait_time(now).min(50);
-        TickResult {
-            outgoing,
-            wait_ms,
-            status,
-            ended,
-        }
-    }
-
-    /// The authoritative remote state, borrowed (derived from the transport, never stored).
-    pub fn state(&self) -> &TerminalScreen {
-        self.transport.remote_state()
-    }
-
-    /// Whether at least one server frame has been applied, i.e. [`state`](Self::state) is the
-    /// server's and not the default a fresh session starts from.
-    pub fn synced(&self) -> bool {
-        self.transport.remote_num() > 0
-    }
-
-    /// The current prediction overlay to draw over [`state`](Self::state).
-    pub fn overlay(&self) -> Overlay {
-        self.predictor
-            .overlay(self.transport.remote_state().screen())
-    }
-
-    /// The out-of-band window state (title / icon / clipboard / bell) for the client to mirror
-    /// onto the real terminal alongside the cell grid.
-    pub fn window_state(&self) -> render::WindowState<'_> {
-        window_state(self.transport.remote_state())
-    }
-
-    /// The authoritative remote screen (the [`state`](Self::state)'s grid).
-    pub fn screen(&self) -> &crate::terminal::Grid {
-        self.transport.remote_state().screen()
-    }
-}
-
 /// Run a client session, **transparently reconnecting** after the link drops.
 ///
 /// Drives the session against `initial` (the already-established first connection); when that
@@ -643,13 +398,7 @@ pub async fn run_client<T: ClientTerminal>(
         // A fresh session per (re)connection mirrors the server's fresh-transport-per-attach, which
         // full-repaints the live screen; re-seed the size from the terminal each time.
         let (rows, cols) = term.size().unwrap_or(initial_size);
-        let mut session = ClientSession::new(
-            clock.now_ms(),
-            channel.max_datagram_size(),
-            pref,
-            rows,
-            cols,
-        );
+        let mut session = ClientSession::new(Instant::now(), pref, rows, cols);
 
         let conn_started = clock.now_ms();
         match drive_connection(
@@ -658,7 +407,6 @@ pub async fn run_client<T: ClientTerminal>(
             &mut term,
             &mut input_rx,
             &mut resize_rx,
-            &clock,
             &shutdown,
             bell.as_mut(),
         )
@@ -711,29 +459,37 @@ enum Disposition {
 
 /// Drive one connection: the steady send/render/select loop, returning a [`Disposition`] instead
 /// of breaking — so the caller can reconnect on [`Disposition::LinkLost`] rather than exiting.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the I/O shell's collaborators, plus the optional bell hook"
-)]
+///
+/// The client's stream is written by its own task behind a bounded queue, and frames are read by
+/// their own tasks, so nothing here ever waits on the network: the keyboard, and with it the quit
+/// escape, stays live even when the server stops reading.
 async fn drive_connection<T: ClientTerminal>(
     channel: &IrohChannel,
     session: &mut ClientSession,
     term: &mut T,
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
     resize_rx: &mut mpsc::Receiver<()>,
-    clock: &MonoClock,
     shutdown: &CancellationToken,
     mut bell: Option<&mut BellHook>,
 ) -> anyhow::Result<Disposition> {
-    // Wall-clock checkpoint for freeze detection. `MonoClock` (and iroh's idle timer) are monotonic
+    let conn = channel.connection();
+    let Ok(send) = conn.open_uni().await else {
+        return Ok(Disposition::LinkLost);
+    };
+    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
+    let _writer = AbortOnDrop(tokio::spawn(write_client_stream(send, writer_rx)));
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(FRAME_QUEUE);
+    let _reader = AbortOnDrop(tokio::spawn(read_frames(conn.clone(), frame_tx)));
+
+    // Wall-clock checkpoint for freeze detection. `Instant` (and iroh's idle timer) are monotonic
     // and PAUSE across a system suspend, so they can't tell a long screen-off from a momentary
     // stall; `SystemTime` keeps real time across suspend. A large gap between two (≤50ms-cadence)
     // iterations therefore fingerprints a resume-from-freeze (see `STALE_AFTER_FREEZE`).
     let mut last_wall = std::time::SystemTime::now();
     // Last RTT we emitted a debug log for, so an operator with `RUST_LOG=koh=debug` can see whether a
-    // sluggish session is the link (RTT climbing) or the server — without spamming a line per tick
-    // (O-07). Only a meaningful change (>= 30 ms) is logged.
-    let mut last_logged_rtt: Option<f64> = None;
+    // sluggish session is the link (RTT climbing) or the server — without spamming a line per tick.
+    // Only a meaningful change (>= 30 ms) is logged.
+    let mut last_logged_rtt: Option<Duration> = None;
     loop {
         // If real time jumped far ahead of our ≤50ms polling cadence, the process was suspended
         // (phone screen-off). The connection is almost certainly dead, so proactively drop it and
@@ -750,28 +506,25 @@ async fn drive_connection<T: ClientTerminal>(
             return Ok(Disposition::LinkLost);
         }
 
-        let now = clock.now_ms();
-        let rtt = channel.rtt_ms();
-        if let Some(ms) = rtt {
-            if last_logged_rtt.is_none_or(|prev| (prev - ms).abs() >= 30.0) {
-                tracing::debug!(rtt_ms = ms, "link rtt");
-                last_logged_rtt = Some(ms);
+        let now = Instant::now();
+        let rtt = channel.rtt();
+        if let Some(rtt) = rtt {
+            if last_logged_rtt.is_none_or(|prev| prev.abs_diff(rtt) >= Duration::from_millis(30)) {
+                tracing::debug!(rtt_ms = rtt.as_millis(), "link rtt");
+                last_logged_rtt = Some(rtt);
             }
         }
-        let tick = session.on_tick(now, channel.max_datagram_size(), rtt);
-        for datagram in &tick.outgoing {
-            channel.send(datagram);
-        }
+        let tick = session.on_tick(now, rtt);
 
-        // Repaint on new content, while the banner is up, or once more to clear a stale banner.
+        // Repaint on new content, while a banner is up, or once more to clear a stale banner.
         let status_now = tick.status.is_some();
         if session.dirty || status_now || session.status_was_shown {
             term.render(session.state(), &session.overlay(), tick.status.as_deref())?;
             session.status_was_shown = status_now;
             session.dirty = false;
-            // KB-01: run the bell hook when the remote bell count climbs (rate-limited inside).
-            // Only once a server frame has arrived: the first paint is the default state, and the
-            // first synced frame primes the hook so bells from before this attach don't fire (KB-02).
+            // Run the bell hook when the remote bell count climbs (rate-limited inside). Only once
+            // a server frame has arrived: the first paint is the blank default, and the first
+            // synced frame primes the hook so bells from before this attach don't fire.
             if let Some(hook) = bell.as_deref_mut() {
                 if session.synced() {
                     let win = session.window_state();
@@ -781,31 +534,19 @@ async fn drive_connection<T: ClientTerminal>(
             }
         }
 
-        if let Some(code) = tick.ended {
-            let _ = term.render(
-                session.state(),
-                &Overlay::empty(),
-                Some("[koh] session ended"),
-            );
-            // Brief dwell so the "session ended" banner is seen — but stay responsive to a
-            // SIGTERM/SIGINT/SIGHUP (this was the one await not inside the select!), so an impatient
-            // signal right after the shell exits restores the TTY now instead of after 400ms.
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_millis(400)) => {}
-                () = shutdown.cancelled() => {}
-            }
-            return Ok(Disposition::Ended(code));
+        if session.exited() {
+            let code = session.state().exit_code();
+            return Ok(end_session(term, session, shutdown, code).await);
         }
 
         tokio::select! {
-            // Input-priority: a queued screen update must never starve local keystrokes (mosh
-            // keeps typing responsive even when the screen is busy). The server loop is the mirror
-            // image and is deliberately NOT biased (see `crate::server::run_attached`).
+            // Input-priority: a queued screen update must never starve local keystrokes. The
+            // server loop is the mirror image and is deliberately NOT biased.
             biased;
 
             maybe = input_rx.recv() => {
                 match maybe {
-                    Some(chunk) => match session.on_input(clock.now_ms(), &chunk) {
+                    Some(chunk) => match session.on_input(Instant::now(), &chunk) {
                         InputOutcome::Quit => return Ok(Disposition::Quit),
                         InputOutcome::Suspend => {
                             // Ctrl-^ Ctrl-Z: hand the terminal back to the shell, stop, and on
@@ -815,8 +556,7 @@ async fn drive_connection<T: ClientTerminal>(
                             session.dirty = true;
                             // The process was parked for the whole foreground-suspend (possibly
                             // minutes); reset the freeze checkpoint so that deliberate suspend isn't
-                            // misread as a screen-off freeze and forced into a needless reconnect
-                            // (KR-05). Real screen-off/deep-sleep doesn't go through this arm.
+                            // misread as a screen-off freeze and forced into a needless reconnect.
                             last_wall = std::time::SystemTime::now();
                         }
                         InputOutcome::Forwarded => {}
@@ -824,26 +564,34 @@ async fn drive_connection<T: ClientTerminal>(
                     None => return Ok(Disposition::Quit), // input source closed
                 }
             }
-
             // Graceful shutdown: a SIGTERM/SIGINT/SIGHUP (delivered via this token) returns Quit so
             // `run_client` unwinds and drops the terminal — restoring cooked mode + the main screen
             // — instead of the process dying at default disposition with the TTY left in raw mode.
-            _ = shutdown.cancelled() => return Ok(Disposition::Quit),
-
-            // Cancel-safety: if a higher-priority arm fires first, this in-flight `read_datagram`
-            // future is dropped. That is only sound because the pinned `iroh = "1.0.0"`'s
-            // `read_datagram` is cancel-safe (a dropped future loses no buffered datagram); any
-            // iroh version bump must re-verify this before relying on the drop here.
-            dg = channel.recv() => {
-                match dg {
-                    Ok(bytes) => session.on_datagram(clock.now_ms(), &bytes),
-                    Err(e) => {
-                        tracing::info!(reason = %e, "link lost; will reconnect");
-                        return Ok(Disposition::LinkLost);
+            () = shutdown.cancelled() => return Ok(Disposition::Quit),
+            permit = writer_tx.reserve(), if session.has_outgoing() => {
+                let Ok(permit) = permit else {
+                    // The writer ended: the stream, and so the connection, is gone.
+                    return Ok(closed_disposition(conn, session));
+                };
+                if let Some(msg) = session.pop_outgoing() {
+                    match encode_client(&msg) {
+                        Ok(bytes) => permit.send(bytes),
+                        Err(e) => tracing::warn!(error = %e, "dropping an unencodable message"),
                     }
                 }
             }
-
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else {
+                    // The frame reader ended because the connection closed.
+                    let disposition = closed_disposition(conn, session);
+                    if let Disposition::Ended(code) = disposition {
+                        return Ok(end_session(term, session, shutdown, code).await);
+                    }
+                    tracing::info!(reason = ?conn.close_reason(), "link lost; will reconnect");
+                    return Ok(disposition);
+                };
+                session.on_frame(Instant::now(), &frame);
+            }
             maybe = resize_rx.recv() => {
                 // A resize tick: read the fresh size from the terminal and propagate it. A closed
                 // resize channel is fine; keep its sender alive to avoid spinning.
@@ -853,10 +601,88 @@ async fn drive_connection<T: ClientTerminal>(
                     }
                 }
             }
-
-            _ = tokio::time::sleep(Duration::from_millis(tick.wait_ms)) => {}
+            () = tokio::time::sleep(tick.wait) => {}
         }
     }
+}
+
+/// How many encoded messages may wait for the client's stream writer.
+const WRITER_QUEUE: usize = 64;
+/// How many decoded frames may wait for the connection loop.
+const FRAME_QUEUE: usize = 16;
+
+/// Aborts a task when dropped, so a connection's helper tasks end with it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Write queued messages to the client's stream until the queue or the stream closes.
+async fn write_client_stream(mut send: SendStream, mut queue: mpsc::Receiver<Vec<u8>>) {
+    while let Some(bytes) = queue.recv().await {
+        if send.write_all(&bytes).await.is_err() {
+            return;
+        }
+    }
+    let _ = send.finish();
+}
+
+/// Accept the server's frame streams, each read on its own task so a stalled or reset stream never
+/// holds up a newer frame. Ends when the connection closes.
+async fn read_frames(conn: Connection, frames: mpsc::Sender<Frame>) {
+    while let Ok(mut recv) = conn.accept_uni().await {
+        let frames = frames.clone();
+        tokio::spawn(async move {
+            // A reset (superseded) or malformed frame is simply not delivered.
+            let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+                return;
+            };
+            match decode_frame(&bytes) {
+                Ok(frame) => {
+                    let _ = frames.send(frame).await;
+                }
+                Err(e) => tracing::debug!(error = %e, "dropping an undecodable frame"),
+            }
+        });
+    }
+}
+
+/// What a closed connection means: the server ended the session (its shell exited), or the link was
+/// lost and the client should reconnect.
+fn closed_disposition(conn: &Connection, session: &ClientSession) -> Disposition {
+    use iroh::endpoint::{ApplicationClose, ConnectionError};
+    match conn.close_reason() {
+        Some(ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason }))
+            if error_code.into_inner() == 0 && reason.as_ref() == SESSION_ENDED =>
+        {
+            Disposition::Ended(session.state().exit_code())
+        }
+        _ => Disposition::LinkLost,
+    }
+}
+
+/// Paint the "session ended" banner, linger briefly so it is seen, and report the exit code.
+async fn end_session<T: ClientTerminal>(
+    term: &mut T,
+    session: &ClientSession,
+    shutdown: &CancellationToken,
+    code: Option<u32>,
+) -> Disposition {
+    let _ = term.render(
+        session.state(),
+        &Overlay::empty(),
+        Some("[koh] session ended"),
+    );
+    // Stay responsive to a SIGTERM/SIGINT/SIGHUP right after the shell exits, so an impatient
+    // signal restores the TTY now instead of after the dwell.
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_millis(400)) => {}
+        () = shutdown.cancelled() => {}
+    }
+    Disposition::Ended(code)
 }
 
 /// The result of a [`reconnect`] loop.
@@ -959,8 +785,6 @@ async fn reconnect<T: ClientTerminal>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::InputEvent;
-    use crate::terminal::ServerTerminal;
 
     #[tokio::test]
     async fn a_server_on_another_protocol_is_reported_as_such() {
@@ -969,7 +793,7 @@ mod tests {
         use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
         let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(generate_secret_key())
-            .alpns(vec![b"koh/iroh/1".to_vec()])
+            .alpns(vec![b"koh/iroh/2".to_vec()])
             .bind()
             .await
             .expect("bind old-protocol server");
@@ -988,88 +812,11 @@ mod tests {
             Err(e) => format!("{e:#}"),
         };
         assert!(
-            error.contains("does not speak this koh protocol (koh/iroh/2)"),
+            error.contains("does not speak this koh protocol (koh/3)"),
             "{error}"
         );
         assert!(!error.contains("allowlist"), "{error}");
         let _ = accept.await;
-    }
-
-    /// Drive a server-side transport until it emits at least one datagram, returning them. Used to
-    /// synthesize *real* server frames for the client session to consume — no iroh, no tokio.
-    fn drive_until_nonempty(t: &mut Transport<TerminalScreen, UserInput>) -> Vec<Vec<u8>> {
-        let mut now = 0u64;
-        loop {
-            now += 25;
-            let out = t.tick(now);
-            if !out.is_empty() || now > 5_000 {
-                return out;
-            }
-        }
-    }
-
-    fn new_session() -> ClientSession {
-        ClientSession::new(0, 1200, DisplayPreference::Always, 24, 80)
-    }
-
-    #[test]
-    fn escape_prefix_dot_quits_and_plain_bytes_forward() {
-        let mut s = new_session();
-        // Plain bytes are forwarded and appended to the outgoing UserInput stream.
-        assert_eq!(s.on_input(0, b"ls\r"), InputOutcome::Forwarded);
-        let typed: Vec<u8> = s
-            .transport
-            .current()
-            .events()
-            .iter()
-            .filter_map(|e| match e {
-                InputEvent::Byte(b) => Some(*b),
-                InputEvent::Resize { .. } => None,
-            })
-            .collect();
-        assert_eq!(
-            typed, b"ls\r",
-            "forwarded bytes land in transport.current()"
-        );
-        // The escape prefix (0x1e) followed by '.' disconnects.
-        assert_eq!(s.on_input(0, &[ESCAPE_PREFIX, b'.']), InputOutcome::Quit);
-    }
-
-    #[test]
-    fn escape_prefix_ctrl_z_suspends() {
-        let mut s = new_session();
-        // 0x1e then Ctrl-Z (0x1a) requests a background suspend.
-        assert_eq!(
-            s.on_input(0, &[ESCAPE_PREFIX, SUSPEND_KEY]),
-            InputOutcome::Suspend
-        );
-        // The suffix also works split across chunks (the pending-escape state carries over).
-        assert_eq!(s.on_input(0, &[ESCAPE_PREFIX]), InputOutcome::Forwarded);
-        assert_eq!(s.on_input(0, &[SUSPEND_KEY]), InputOutcome::Suspend);
-    }
-
-    #[test]
-    fn bytes_before_suspend_escape_are_forwarded_first() {
-        let mut s = new_session();
-        // Typing "hi" then Ctrl-^ Ctrl-Z in one chunk: "hi" must reach the server before we suspend.
-        assert_eq!(
-            s.on_input(0, &[b'h', b'i', ESCAPE_PREFIX, SUSPEND_KEY]),
-            InputOutcome::Suspend
-        );
-        let typed: Vec<u8> = s
-            .transport
-            .current()
-            .events()
-            .iter()
-            .filter_map(|e| match e {
-                InputEvent::Byte(b) => Some(*b),
-                InputEvent::Resize { .. } => None,
-            })
-            .collect();
-        assert_eq!(
-            typed, b"hi",
-            "pre-escape bytes are forwarded before suspending"
-        );
     }
 
     #[test]
@@ -1138,224 +885,6 @@ mod tests {
         // ...but a multi-second-to-minutes suspend (phone screen-off) forces a proactive reconnect.
         assert!(looks_like_resume_from_freeze(STALE_AFTER_FREEZE));
         assert!(looks_like_resume_from_freeze(Duration::from_secs(300)));
-    }
-
-    #[test]
-    fn lone_escape_prefix_then_other_byte_forwards_both() {
-        let mut s = new_session();
-        // 0x1e then a non-'.' byte forwards the prefix AND the byte literally (escape pass-through).
-        assert_eq!(s.on_input(0, &[ESCAPE_PREFIX]), InputOutcome::Forwarded);
-        assert_eq!(s.on_input(0, b"x"), InputOutcome::Forwarded);
-        let typed: Vec<u8> = s
-            .transport
-            .current()
-            .events()
-            .iter()
-            .filter_map(|e| match e {
-                InputEvent::Byte(b) => Some(*b),
-                InputEvent::Resize { .. } => None,
-            })
-            .collect();
-        assert_eq!(
-            typed,
-            [ESCAPE_PREFIX, b'x'],
-            "escaped non-dot byte passes through literally"
-        );
-    }
-
-    #[test]
-    fn on_datagram_new_state_marks_dirty_and_culls_predictor() {
-        let mut s = new_session();
-        // Type 'x': a prediction is seeded but hidden (epoch-gated) until the server confirms echo.
-        s.on_input(0, b"x");
-        s.dirty = false; // clear so we can observe on_datagram re-dirtying
-        assert!(
-            s.overlay().is_empty(),
-            "the first keystroke stays hidden until confirmed"
-        );
-        assert_eq!(
-            s.predictor.confirmed_epoch(),
-            0,
-            "nothing is confirmed before the server frame arrives"
-        );
-
-        // A real server frame that echoes 'x' and acks input frame 1 (past the echo debounce).
-        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
-        emu.process(b"x");
-        let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
-        server.set_connected(true);
-        server.observe_rtt(20.0);
-        // The connection loop stamps its own ack onto the snapshot (KS-02).
-        let mut snap = emu.snapshot();
-        snap.set_echo_ack(1);
-        *server.current_mut() = snap;
-        for dg in drive_until_nonempty(&mut server) {
-            s.on_datagram(100, &dg);
-        }
-        assert!(
-            s.dirty,
-            "a new remote state must mark the client dirty (needs repaint)"
-        );
-        assert!(
-            s.screen().contents().contains('x'),
-            "the new state is applied to the screen"
-        );
-        // Pin the cull effect to on_datagram ITSELF: the epoch must advance here, before any
-        // further keystroke (an `on_input` would also call cull, which is why asserting only on a
-        // later keystroke's visibility wouldn't isolate this call).
-        assert_eq!(
-            s.predictor.confirmed_epoch(),
-            1,
-            "on_datagram's cull must grade the echoed 'x' Correct and advance the confirmed epoch"
-        );
-
-        // And the downstream consequence holds: a subsequent keystroke is now VISIBLE.
-        s.on_input(110, b"y");
-        assert_eq!(
-            s.overlay().cell(0, 1).map(|c| c.glyph.as_str()),
-            Some("y"),
-            "typing after the confirmed echo is visible (the prior prediction was culled)"
-        );
-    }
-
-    #[test]
-    fn on_tick_emits_outgoing_and_reports_shutdown_exit_code() {
-        let mut s = new_session();
-        // First tick: the initial resize is pending, so a datagram goes out and there's no end yet.
-        let first = s.on_tick(0, 1200, Some(20.0));
-        assert!(
-            !first.outgoing.is_empty(),
-            "the pending initial resize must be sent"
-        );
-        assert!(first.ended.is_none(), "no shutdown announced yet");
-        assert!(first.wait_ms <= 50, "wait is capped at 50ms");
-
-        // Craft a real server shutdown frame carrying exit code 7 and deliver it.
-        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
-        emu.set_exit_code(7);
-        let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
-        server.set_connected(true);
-        server.observe_rtt(20.0);
-        *server.current_mut() = emu.snapshot();
-        server.start_shutdown(0);
-        for dg in drive_until_nonempty(&mut server) {
-            s.on_datagram(10, &dg);
-        }
-        let tick = s.on_tick(10, 1200, Some(20.0));
-        assert_eq!(
-            tick.ended,
-            Some(Some(7)),
-            "a SHUTDOWN_SENTINEL remote state reports the remote shell's exit code"
-        );
-    }
-
-    #[test]
-    fn link_down_banner_absorbs_a_missed_keepalive_but_shows_on_a_real_stall() {
-        // Regression: the "link down — resuming…" banner used a 3 s grace — exactly the keepalive
-        // interval (ssp::ACK_INTERVAL) — so a single dropped/jittered keepalive on a lossy link
-        // pushed the silence gap just past the grace and flashed the banner, then cleared the moment
-        // the next keepalive landed. The grace is now several keepalive intervals, so transient loss
-        // is absorbed while a genuine stall still surfaces.
-        let mut s = new_session();
-        // Stamp last_heard with a real decoded server frame at t = 1000.
-        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
-        emu.process(b"ready prompt $ ");
-        let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
-        server.set_connected(true);
-        server.observe_rtt(20.0);
-        *server.current_mut() = emu.snapshot();
-        for dg in drive_until_nonempty(&mut server) {
-            s.on_datagram(1000, &dg);
-        }
-
-        // One missed keepalive ≈ two intervals of silence — still inside the grace, so no banner.
-        let absorbed = s.on_tick(1000 + 2 * crate::ssp::ACK_INTERVAL, 1200, Some(20.0));
-        assert!(
-            absorbed.status.is_none(),
-            "a single missed keepalive must not flash the link-down banner"
-        );
-        // Right at the grace boundary: still no banner (the gate is strictly past the grace).
-        let boundary = s.on_tick(1000 + LINK_DOWN_GRACE_MS, 1200, Some(20.0));
-        assert!(
-            boundary.status.is_none(),
-            "the banner must not show until the silence exceeds the grace"
-        );
-        // A sustained silence well past the grace is a real stall — the banner shows.
-        let stalled = s.on_tick(1000 + LINK_DOWN_GRACE_MS + 2_000, 1200, Some(20.0));
-        assert!(
-            stalled.status.is_some(),
-            "a silence past the grace shows the link-down banner"
-        );
-    }
-
-    #[test]
-    fn on_resize_resets_predictor_and_propagates() {
-        let mut s = new_session();
-        s.on_resize(40, 120);
-        // The resize is appended to the outgoing input stream.
-        let last_resize = s
-            .transport
-            .current()
-            .events()
-            .iter()
-            .rev()
-            .find_map(|e| match e {
-                InputEvent::Resize { rows, cols } => Some((*rows, *cols)),
-                InputEvent::Byte(_) => None,
-            });
-        assert_eq!(
-            last_resize,
-            Some((40, 120)),
-            "resize propagates to the server"
-        );
-        assert!(s.dirty, "a resize requires a repaint");
-    }
-
-    #[test]
-    fn client_session_applies_remote_frames_and_reports_the_exit_code() {
-        let mut s = new_session();
-        let mut emu = crate::terminal::ServerTerminal::new(24, 80, 0).expect("emulator");
-        emu.process(b"cell three\x07\x07");
-        let mut server = Transport::<TerminalScreen, UserInput>::new(0, 1200);
-        server.set_connected(true);
-        server.observe_rtt(20.0);
-        *server.current_mut() = emu.snapshot();
-        let mut now = 0;
-        let out = loop {
-            now += 25;
-            let out = server.tick(now);
-            if !out.is_empty() || now > 5_000 {
-                break out;
-            }
-        };
-        s.dirty = false;
-        for dg in out {
-            s.on_datagram(now, &dg);
-        }
-        assert!(s.dirty, "a new remote state marks the client dirty");
-        assert!(s.screen().contents().contains("cell three"));
-        assert_eq!(
-            s.window_state().bell_count,
-            2,
-            "window state comes from the screen"
-        );
-
-        // Shutdown with an exit code.
-        emu.set_exit_code(5);
-        *server.current_mut() = emu.snapshot();
-        server.start_shutdown(now);
-        let out = loop {
-            now += 25;
-            let out = server.tick(now);
-            if !out.is_empty() || now > 10_000 {
-                break out;
-            }
-        };
-        for dg in out {
-            s.on_datagram(now, &dg);
-        }
-        let tick = s.on_tick(now, 1200, Some(20.0));
-        assert_eq!(tick.ended, Some(Some(5)));
     }
 
     #[test]

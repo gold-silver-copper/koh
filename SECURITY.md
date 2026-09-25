@@ -25,7 +25,8 @@ credit reporters who want it.
 - The at-rest identity-key format (`src/transport_iroh/keyfile.rs`) — always-encrypted `koh-key-v1`.
 - The connection accept gauntlet / node-id allowlist authorization (`src/server/cli.rs`) and the
   admission barrier (`src/transport_iroh/admission.rs`).
-- The untrusted wire decoders (`src/wire.rs`) and the SSP state machine (`src/ssp/`).
+- The untrusted wire decoders (`src/proto.rs`) and the connection cores (`src/server/mod.rs`,
+  `src/client/session.rs`).
 - The terminal apply path (`src/terminal/`): decoding and validating the structured screen diff.
 - On-disk identity-key handling and local-attacker hardening (`src/transport_iroh/`).
 

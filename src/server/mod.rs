@@ -16,12 +16,18 @@ pub use cli::ServeArgs;
 pub use cli::{serve, ServeConfig};
 pub use session::{ChangeSignal, PtyHost, SharedSession};
 
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
-use crate::input::{UserInput, WireEvent};
-use crate::ssp::{RecvOutcome, Transport};
+use crate::proto::{
+    encode_frame, frame_interval, retry_after, ClientDecoder, ClientMsg, Frame, FrameNum, InputSeq,
+    ProtoError, FRAME_WINDOW, HEARTBEAT, SESSION_ENDED,
+};
+use crate::ssp::SyncState as _;
 use crate::terminal::TerminalScreen;
-use crate::transport_iroh::{IrohChannel, MonoClock};
+use crate::transport_iroh::IrohChannel;
+use iroh::endpoint::RecvStream;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 /// Why an attached connection loop returned.
@@ -91,385 +97,483 @@ impl CursorKeyNormalizer {
     }
 }
 
-/// Coalesce a batch of drained client input before it touches the PTY (KOH-05).
+/// Server-side debounce before received input is considered "echoed": how long the hosted
+/// program gets to reflect a keystroke on screen before the client's prediction is confirmed.
+pub(crate) const ECHO_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// How often a connection retries PTY input the writer queue could not take.
+const INPUT_RETRY: Duration = Duration::from_millis(10);
+
+/// How long the server waits for the client to acknowledge the final frame before closing.
+const FINAL_ACK_WAIT: Duration = Duration::from_secs(1);
+
+/// Which of one client's inputs the hosted program has had time to reflect.
 ///
-/// A single datagram set can pack a huge number of events; applying each synchronously — an
-/// `ioctl(TIOCSWINSZ)` + SIGWINCH and an emulator grid realloc per resize — is a CPU/syscall DoS.
-/// Intermediate resizes have no observable effect, so only the LAST geometry is kept (clamped to
-/// `[MIN_DIM, MAX_DIM]` before the PTY/emulator ever see it, H-1 / M-2); keystrokes concatenate in
-/// order through the DECCKM normalizer. Pure (given the normalizer + `app_cursor`) so the
-/// security-relevant collapse is unit-testable without a real PTY/transport.
-fn coalesce_drained_input(
-    input_diff: &[WireEvent],
-    cursor_keys: &mut CursorKeyNormalizer,
-    app_cursor: bool,
-) -> (Vec<u8>, Option<(u16, u16)>) {
-    let mut keys = Vec::new();
-    let mut last_resize: Option<(u16, u16)> = None;
-    for w in input_diff {
-        match w {
-            WireEvent::Keys(b) => keys.extend(cursor_keys.normalize(b, app_cursor)),
-            WireEvent::Resize { rows, cols } => {
-                last_resize = Some(crate::terminal::clamp_dims(*rows, *cols));
-            }
-        }
-    }
-    (keys, last_resize)
-}
-
-/// The coalesced client input one `NewState` datagram drained, ready to apply to the PTY/emulator.
-struct DrainedInput {
-    keys: Vec<u8>,
-    resize: Option<(u16, u16)>,
-    frame: u64,
-}
-
-/// Server-side debounce before a received input frame is considered "echoed" (mosh `ECHO_TIMEOUT`).
-pub(crate) const ECHO_TIMEOUT_MS: u64 = 50;
-
-/// The per-connection echo-ack tracker (S-03, KS-02): which of *this* client's input frames the
-/// hosted program has had time to reflect. Mosh `Complete::set_echo_ack` / `wait_time`.
-///
-/// SSP frame numbers are per transport, so this lives in [`ServerSession`] — one per attached
-/// connection — never in the host. Two connections on one session would otherwise conflate their
-/// frame sequences and hand one an ack for frames it never sent.
+/// Input sequence numbers are per connection, so each connection has its own tracker; two
+/// connections on one session never see each other's numbers.
 #[derive(Debug)]
 pub(crate) struct EchoAck {
-    /// The newest input frame number whose effects are considered on-screen.
-    acked: u64,
-    /// Pending `(input_frame_num, arrival_timestamp_ms)`, oldest first.
-    input_history: Vec<(u64, u64)>,
-    /// Echo debounce (ms): how long after an input frame arrives before it counts as echoed.
-    /// Defaults to [`ECHO_TIMEOUT_MS`]; injectable so timing is testable without the wall clock.
-    echo_timeout_ms: u64,
+    /// The newest input considered reflected on screen.
+    acked: InputSeq,
+    /// Inputs not yet promoted, with when they arrived, oldest first.
+    pending: VecDeque<(InputSeq, Instant)>,
+    timeout: Duration,
 }
 
 impl Default for EchoAck {
     fn default() -> Self {
-        Self {
-            acked: 0,
-            input_history: Vec::new(),
-            echo_timeout_ms: ECHO_TIMEOUT_MS,
-        }
+        Self::with_timeout(ECHO_TIMEOUT)
     }
 }
 
 impl EchoAck {
-    /// A tracker with a custom debounce (ms); tests inject a small value to exercise the promotion
-    /// timing deterministically.
-    #[cfg(test)]
-    pub(crate) fn with_timeout_ms(echo_timeout_ms: u64) -> Self {
+    /// A tracker with a custom debounce; tests use a small one.
+    pub(crate) const fn with_timeout(timeout: Duration) -> Self {
         Self {
-            echo_timeout_ms,
-            ..Self::default()
+            acked: InputSeq(0),
+            pending: VecDeque::new(),
+            timeout,
         }
     }
 
-    /// Record that user-input frame `n` arrived at `now` (ms). The screen has had no time to
-    /// reflect it yet; [`set_echo_ack`](Self::set_echo_ack) promotes it after the debounce.
-    pub(crate) fn register_input_frame(&mut self, n: u64, now: u64) {
-        // Frame numbers only advance; ignore stale/duplicate registrations.
-        if self.input_history.last().is_none_or(|(f, _)| n > *f) {
-            self.input_history.push((n, now));
+    /// Input `seq` arrived at `now`. Sequence numbers only advance; a stale one is ignored.
+    pub(crate) fn register(&mut self, seq: InputSeq, now: Instant) {
+        let newest = self.pending.back().map_or(self.acked, |(s, _)| *s);
+        if seq > newest {
+            self.pending.push_back((seq, now));
         }
     }
 
-    /// Promote `echo_ack` to the newest input frame that arrived at least `echo_timeout_ms`
-    /// ago (so the program has had time to echo it). Returns whether it changed.
-    pub(crate) fn set_echo_ack(&mut self, now: u64) -> bool {
-        let cutoff = now.saturating_sub(self.echo_timeout_ms);
-        let mut newest = self.acked;
-        for &(frame, ts) in &self.input_history {
-            if ts <= cutoff {
-                newest = newest.max(frame);
+    /// Promote every input that arrived at least the debounce before `now`. Returns whether the
+    /// echo-ack advanced.
+    pub(crate) fn promote(&mut self, now: Instant) -> bool {
+        let before = self.acked;
+        while let Some(&(seq, arrived)) = self.pending.front() {
+            if now.saturating_duration_since(arrived) < self.timeout {
+                break;
             }
+            self.acked = seq;
+            self.pending.pop_front();
         }
-        // Drop history entries strictly older than the new echo_ack (keep it and newer).
-        self.input_history.retain(|&(frame, _)| frame >= newest);
-        let changed = self.acked != newest;
-        self.acked = newest;
-        changed
+        self.acked != before
     }
 
-    /// Milliseconds until [`set_echo_ack`](Self::set_echo_ack) could next advance, or
-    /// [`NEVER`](crate::ssp::NEVER) if nothing pends.
-    pub(crate) fn wait_time(&self, now: u64) -> u64 {
-        // The second-oldest pending frame is the next one whose debounce can fire; if there are
-        // fewer than two, nothing is waiting. `.get(1)` keeps this panic-free without an index.
-        let Some(&(_, arrived)) = self.input_history.get(1) else {
-            return crate::ssp::NEVER;
-        };
-        let fire_at = crate::ssp::later(arrived, self.echo_timeout_ms);
-        fire_at.saturating_sub(now)
+    /// When [`promote`](Self::promote) could next advance, or `None` if nothing is pending.
+    pub(crate) fn next_promotion(&self) -> Option<Instant> {
+        let (_, arrived) = self.pending.front()?;
+        arrived.checked_add(self.timeout)
     }
 
-    /// The current echo-ack value.
-    pub(crate) const fn echo_ack(&self) -> u64 {
+    /// The current echo-ack.
+    pub(crate) const fn echo_ack(&self) -> InputSeq {
         self.acked
     }
 }
 
-/// The server's pure, I/O-free SSP core for one attached connection — the analogue of the client's
-/// [`ClientSession`](crate::client). It owns the `Transport`, the DECCKM arrow-key normalizer, and
-/// the dirty-snapshot flag, and exposes synchronous step methods (each taking `now: u64`) so the
-/// protocol bookkeeping — the echo-ack-gated snapshot decision (S-03), the KOH-05 coalescing handoff,
-/// and the shutdown-sentinel handshake — is unit-testable WITHOUT iroh, tokio, or a real PTY.
-/// [`run_attached`] is the thin async shell that locks the session, does the I/O, and calls these.
-///
-/// Unlike `ClientSession`, this core is deliberately **lock-coupled**: the authoritative state lives
-/// in the session `Mutex` (shared with the host's own tasks), so the shell snapshots it under the
-/// lock and hands the snapshot in — the core can't own the host. That makes the split weaker than
-/// the client's, but still lifts every protocol decision out of the async loop where it can be
-/// tested.
-struct ServerSession {
-    transport: Transport<TerminalScreen, UserInput>,
-    cursor_keys: CursorKeyNormalizer,
-    /// This connection's echo-ack tracker (KS-02).
-    echo: EchoAck,
-    /// Whether the screen may have changed since the last grid snapshot (S-03).
-    dirty: bool,
-    /// Whether this connection has installed the terminal host's final snapshot.
-    terminal_snapshot_taken: bool,
+/// The client input one read made ready for the PTY.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Drained {
+    /// Keystrokes, DECCKM-normalized, in order.
+    keys: Vec<u8>,
+    /// The last resize among the messages, clamped to `[MIN_DIM, MAX_DIM]`. Earlier ones in the same
+    /// read have no observable effect, so they are dropped rather than each costing a
+    /// `TIOCSWINSZ`, a `SIGWINCH` and an emulator reallocation.
+    resize: Option<(u16, u16)>,
 }
 
-impl ServerSession {
-    fn new(now: u64, mtu: usize) -> Self {
-        let mut transport = Transport::<TerminalScreen, UserInput>::new(now, mtu);
-        transport.set_connected(true);
+/// The server side of one connection: the I/O-free protocol core.
+///
+/// It decodes the client's stream, tracks the echo-ack, and decides when to send which frame
+/// against which base. The connection loop in [`run_attached`] does the I/O and holds the session
+/// lock only to take snapshots and apply input.
+pub(crate) struct ServerConn {
+    decoder: ClientDecoder,
+    cursor_keys: CursorKeyNormalizer,
+    echo: EchoAck,
+    /// The newest snapshot of the session's screen.
+    screen: TerminalScreen,
+    /// The screen may have changed since `screen` was taken.
+    dirty: bool,
+    /// `screen` differs from what was last sent, or the base must be rebuilt.
+    unsent_change: bool,
+    /// `screen` was taken after the hosted program exited.
+    final_snapshot: bool,
+    /// The newest frame the client acknowledged, and its screen. Starts as the blank frame 0.
+    acked: (FrameNum, TerminalScreen),
+    /// Frames sent since, oldest first, at most `FRAME_WINDOW`.
+    sent: VecDeque<(FrameNum, TerminalScreen)>,
+    last_num: FrameNum,
+    last_sent_at: Option<Instant>,
+    last_sent_echo: InputSeq,
+    /// The first frame sent after the program exited, and when.
+    final_frame: Option<(FrameNum, Instant)>,
+    /// Keystrokes the PTY writer queue could not take yet. While this is non-empty the loop stops
+    /// reading the client's stream, so QUIC flow control pushes back on the client.
+    pending_keys: Vec<u8>,
+}
+
+impl Default for ServerConn {
+    fn default() -> Self {
+        Self::with_echo(EchoAck::default())
+    }
+}
+
+impl ServerConn {
+    fn with_echo(echo: EchoAck) -> Self {
         Self {
-            transport,
+            decoder: ClientDecoder::default(),
             cursor_keys: CursorKeyNormalizer::default(),
-            echo: EchoAck::default(),
-            dirty: true, // snapshot on the first pass
-            terminal_snapshot_taken: false,
+            echo,
+            screen: TerminalScreen::default(),
+            dirty: true,
+            unsent_change: true,
+            final_snapshot: false,
+            acked: (FrameNum::BLANK, TerminalScreen::default()),
+            sent: VecDeque::new(),
+            last_num: FrameNum::BLANK,
+            last_sent_at: None,
+            last_sent_echo: InputSeq(0),
+            final_frame: None,
+            pending_keys: Vec::new(),
         }
     }
 
-    /// Promote this connection's echo-ack at `now`; returns whether it advanced (S-03, KS-02).
-    fn set_echo_ack(&mut self, now: u64) -> bool {
-        self.echo.set_echo_ack(now)
+    /// Whether a new snapshot is needed: the screen may have changed, or the program exited and
+    /// the final screen (with its exit code) has not been taken yet.
+    const fn needs_snapshot(&self, alive: bool) -> bool {
+        self.dirty || (!alive && !self.final_snapshot)
     }
 
-    /// This connection's current echo-ack, to stamp onto the snapshot it ships.
-    const fn echo_ack(&self) -> u64 {
-        self.echo.echo_ack()
-    }
-
-    /// Milliseconds until the echo-ack could next advance.
-    fn echo_ack_wait_time(&self, now: u64) -> u64 {
-        self.echo.wait_time(now)
-    }
-
-    /// Record that this client's input frame `frame` arrived at `now`.
-    fn register_input_frame(&mut self, frame: u64, now: u64) {
-        self.echo.register_input_frame(frame, now);
-    }
-
-    /// Refresh the transport's MTU + RTT from the live channel at the top of each wake.
-    fn observe_link(&mut self, mtu: usize, rtt_ms: Option<f64>) {
-        self.transport.set_mtu(mtu);
-        if let Some(rtt) = rtt_ms {
-            self.transport.observe_rtt(rtt);
+    /// Install a snapshot taken while the program was `alive`.
+    fn install_snapshot(&mut self, screen: TerminalScreen, alive: bool) {
+        let last_sent = self.sent.back().map_or(&self.acked.1, |(_, s)| s);
+        if screen != *last_sent {
+            self.unsent_change = true;
         }
-    }
-
-    /// Whether a fresh grid snapshot must be installed this wake: the screen is dirty, the echo-ack
-    /// advanced, or the shell has exited. The final case is intentionally per connection: the
-    /// session cannot know which of its connections' transports have consumed the final screen, so
-    /// every clean connection takes one authoritative snapshot before its shutdown handshake.
-    const fn needs_snapshot(&self, echo_changed: bool, child_alive: bool) -> bool {
-        self.dirty || echo_changed || (!child_alive && !self.terminal_snapshot_taken)
-    }
-
-    /// Install the freshly-taken screen snapshot (present iff [`needs_snapshot`](Self::needs_snapshot)
-    /// said so) and clear the dirty flag. A skipped snapshot leaves `current_state` equal to the
-    /// still-current screen, so the next `tick` correctly emits acks-only with no missed update.
-    fn install_snapshot(&mut self, snapshot: Option<TerminalScreen>, child_alive: bool) {
-        if let Some(state) = snapshot {
-            *self.transport.current_mut() = state;
-            if !child_alive {
-                self.terminal_snapshot_taken = true;
-            }
-        }
+        self.screen = screen;
         self.dirty = false;
+        if !alive {
+            self.final_snapshot = true;
+        }
     }
 
-    /// The next wake deadline (ms): the transport's own send/ack timer, the echo-ack debounce, 1s cap.
-    fn wait_ms(&mut self, now: u64, echo_wait: u64) -> u64 {
-        self.transport.wait_time(now).min(echo_wait).min(1000)
-    }
-
-    /// Mark the screen possibly-changed — a `changed` pulse, or applied input that resized the
-    /// emulator directly (a grid change not signaled through `changed`).
     fn mark_dirty(&mut self) {
         self.dirty = true;
     }
 
-    /// Feed one inbound datagram into the transport; returns whether it produced a new in-order state.
-    /// Pure transport work — the shell calls this OUTSIDE the session lock.
-    fn recv(&mut self, now: u64, bytes: &[u8]) -> RecvOutcome {
-        self.transport.recv(now, bytes)
+    /// Append bytes read from the client's stream.
+    fn push_client_bytes(&mut self, bytes: &[u8]) {
+        self.decoder.push(bytes);
     }
 
-    /// Drain the newly-received client input (after a `recv` returning `NewState`) and coalesce it for
-    /// the PTY (KOH-05). Always calls `get_remote_diff` — whose collapse of `received_states` is a
-    /// required side effect on every new state — then returns the bytes/resize to apply, or `None`
-    /// when the new state carried no input. `app_cursor` is read under the lock by the shell (it is
-    /// driven by the shell's DECCKM output, so it can't change from client input mid-drain).
-    fn drain_input(&mut self, app_cursor: bool) -> Option<DrainedInput> {
-        let diff = self.transport.get_remote_diff();
-        if diff.is_empty() {
+    /// Decode every complete message read so far at `now`: acks and resyncs update the frame
+    /// state, inputs register with the echo-ack and come back normalized for the PTY.
+    fn drain_client(&mut self, now: Instant, app_cursor: bool) -> Result<Drained, ProtoError> {
+        let mut drained = Drained::default();
+        while let Some(msg) = self.decoder.next_msg()? {
+            match msg {
+                ClientMsg::Input { seq, bytes } => {
+                    self.echo.register(seq, now);
+                    drained
+                        .keys
+                        .extend(self.cursor_keys.normalize(&bytes, app_cursor));
+                }
+                ClientMsg::Resize { rows, cols } => {
+                    drained.resize = Some(crate::terminal::clamp_dims(rows, cols));
+                }
+                ClientMsg::Ack { frame } => self.ack(frame),
+                ClientMsg::Resync => self.resync(),
+            }
+        }
+        Ok(drained)
+    }
+
+    /// The client's stream ended: fine between messages, a protocol error inside one.
+    fn finish_client(&self) -> Result<(), ProtoError> {
+        self.decoder.finish()
+    }
+
+    /// The client applied `num`. Frames sent before it are no longer needed as bases. An ack for a
+    /// frame this connection no longer holds (or never sent) is ignored.
+    fn ack(&mut self, num: FrameNum) {
+        if num <= self.acked.0 {
+            return;
+        }
+        let Some(pos) = self.sent.iter().position(|(n, _)| *n == num) else {
+            return;
+        };
+        let mut rest = self.sent.split_off(pos);
+        if let Some(acked) = rest.pop_front() {
+            self.acked = acked;
+        }
+        self.sent = rest;
+    }
+
+    /// The client does not hold the base of what it was sent; diff against the blank screen, which
+    /// it always holds, until it acknowledges a newer frame.
+    fn resync(&mut self) {
+        self.acked = (FrameNum::BLANK, TerminalScreen::default());
+        self.unsent_change = true;
+    }
+
+    /// Promote the echo-ack at `now`.
+    fn promote_echo(&mut self, now: Instant) {
+        self.echo.promote(now);
+    }
+
+    /// The frame to send at `now` on a path with round-trip time `rtt`, if one is due: the screen
+    /// or the echo-ack changed and a frame interval has passed, the newest frame went unacknowledged
+    /// for a retry interval (it is resent as a new frame, which supersedes the old one), or nothing
+    /// was sent for a heartbeat.
+    fn poll_frame(&mut self, now: Instant, rtt: Option<Duration>) -> Option<Frame> {
+        let changed = self.unsent_change || self.echo.echo_ack() != self.last_sent_echo;
+        let since = self
+            .last_sent_at
+            .map(|at| now.saturating_duration_since(at));
+        let interval_passed = since.is_none_or(|since| since >= frame_interval(rtt));
+        let unacked = self.last_num > self.acked.0;
+        let retry_due = unacked && since.is_some_and(|since| since >= retry_after(rtt));
+        let heartbeat_due = since.is_none_or(|since| since >= HEARTBEAT);
+        let due = (changed && interval_passed) || retry_due || heartbeat_due;
+        if !due {
             return None;
         }
-        let frame = self.transport.remote_num();
-        let (keys, resize) = coalesce_drained_input(&diff, &mut self.cursor_keys, app_cursor);
-        Some(DrainedInput {
-            keys,
-            resize,
-            frame,
+        let num = self.last_num.next();
+        let frame = Frame {
+            num,
+            base: self.acked.0,
+            echo_ack: self.echo.echo_ack(),
+            diff: self.screen.diff_from(&self.acked.1),
+        };
+        self.sent.push_back((num, self.screen.clone()));
+        while self.sent.len() > FRAME_WINDOW {
+            self.sent.pop_front();
+        }
+        self.last_num = num;
+        self.last_sent_at = Some(now);
+        self.last_sent_echo = frame.echo_ack;
+        self.unsent_change = false;
+        if self.final_snapshot && self.final_frame.is_none() {
+            self.final_frame = Some((num, now));
+        }
+        Some(frame)
+    }
+
+    /// The newest frame the client has acknowledged.
+    const fn acked(&self) -> FrameNum {
+        self.acked.0
+    }
+
+    /// Whether the connection is done: the program exited and the client acknowledged the final
+    /// frame, or did not within [`FINAL_ACK_WAIT`].
+    fn finished(&self, now: Instant) -> bool {
+        self.final_frame.is_some_and(|(num, at)| {
+            self.acked.0 >= num || now.saturating_duration_since(at) >= FINAL_ACK_WAIT
         })
     }
 
-    /// Advance the shutdown handshake (begin it once the shell has exited) + timers, and produce this
-    /// wake's outgoing datagrams.
-    fn tick(&mut self, now: u64, child_alive: bool) -> Vec<Vec<u8>> {
-        if !child_alive && !self.transport.shutdown_in_progress() {
-            self.transport.start_shutdown(now);
+    /// When the loop must wake at the latest, with nothing else happening.
+    fn next_wake(&self, now: Instant, rtt: Option<Duration>) -> Instant {
+        let mut wake = self
+            .last_sent_at
+            .map_or(now, |at| at.checked_add(HEARTBEAT).unwrap_or(now));
+        let changed = self.unsent_change || self.echo.echo_ack() != self.last_sent_echo;
+        if changed {
+            let interval = self
+                .last_sent_at
+                .map_or(now, |at| at.checked_add(frame_interval(rtt)).unwrap_or(now));
+            wake = wake.min(interval);
         }
-        self.transport.tick(now)
-    }
-
-    /// Whether the shutdown handshake has completed (peer acked the sentinel, or it timed out) so the
-    /// session may be reaped.
-    fn shutdown_complete(&self, now: u64) -> bool {
-        self.transport.shutdown_in_progress()
-            && (self.transport.shutdown_acknowledged()
-                || self.transport.shutdown_ack_timed_out(now))
+        if self.last_num > self.acked.0 {
+            let retry = self
+                .last_sent_at
+                .map_or(now, |at| at.checked_add(retry_after(rtt)).unwrap_or(now));
+            wake = wake.min(retry);
+        }
+        if let Some(promotion) = self.echo.next_promotion() {
+            wake = wake.min(promotion);
+        }
+        if let Some((_, at)) = self.final_frame {
+            wake = wake.min(at.checked_add(FINAL_ACK_WAIT).unwrap_or(now));
+        }
+        if !self.pending_keys.is_empty() {
+            wake = wake.min(now.checked_add(INPUT_RETRY).unwrap_or(now));
+        }
+        wake.max(now)
     }
 }
 
 /// Drive a client connection against an existing (shared, detachable) [`session::Session`].
 ///
-/// The thin async/I/O shell around `ServerSession` (the pure protocol core): it locks the session,
-/// does the iroh + host I/O, and delegates every protocol decision to the core. Uses a **fresh**
-/// core per attach, so the first tick diffs the live state against the default base and re-syncs the
-/// (re)connecting client to the current state. Crucially, it does **not** kill the host on
-/// disconnect — it returns [`SessionExit::Detached`] and leaves it running for the next reattach.
-///
-/// Returns `anyhow::Result` for signature stability, but in practice only ever returns `Ok`: a
-/// dropped connection is `Ok(Detached)`, a completed shutdown is `Ok(ShellExited)`, and the internal
-/// failure paths (PTY write/resize) are logged-and-continued inside the host. The `Err` arm at call
-/// sites is dead today; it is kept so a future fallible step needn't change the signature.
+/// The async shell around the `ServerConn` core: it snapshots the session when it changes, applies the
+/// client's input to the PTY, sends each frame on its own stream, and resets the stream of a frame
+/// a newer one supersedes. A fresh core per attach starts from the blank screen, so the first frame
+/// repaints the live screen onto a (re)connecting client. It does **not** kill the host on
+/// disconnect: it returns [`SessionExit::Detached`] and leaves it running for the next reattach.
 pub async fn run_attached(
     conn: iroh::endpoint::Connection,
     handle: SharedSession,
 ) -> anyhow::Result<SessionExit> {
-    let channel = IrohChannel::new(conn);
-    let clock = MonoClock::new();
-    let mut session = ServerSession::new(clock.now_ms(), channel.max_datagram_size());
-    // This connection's view of the host's change signal (KS-03). Every attached loop has its
-    // own receiver, so one pulse wakes all of them.
+    let channel = IrohChannel::new(conn.clone());
+    let mut core = ServerConn::default();
     let mut changed = handle.changed.subscribe();
-
-    loop {
-        let now = clock.now_ms();
-        session.observe_link(channel.max_datagram_size(), channel.rtt_ms());
-
-        // Promote this connection's echo-ack (KS-02: per connection, not per host), then snapshot
-        // the live state under the session lock. The snapshot copies the whole live grid +
-        // title/icon/clipboard, so the core gates it: take it only when the state may have changed
-        // or the echo-ack advanced (S-03). The ack is stamped onto the snapshot outside the lock.
-        let echo_changed = session.set_echo_ack(now);
-        let child_alive = {
-            let initially_dirty = session.needs_snapshot(echo_changed, true);
-            if initially_dirty {
-                // Mark the change signal seen BEFORE snapshotting: a pulse that lands after this
-                // point (from a change this snapshot may or may not include) re-fires `changed()`
-                // below and costs at most one redundant snapshot. Marking it after the snapshot
-                // could swallow a pulse for a change the snapshot missed.
-                let _ = changed.borrow_and_update();
-            }
+    let mut client: Option<RecvStream> = None;
+    let mut read_buf = vec![0u8; 16 * 1024];
+    let mut in_flight: VecDeque<(FrameNum, CancellationToken)> = VecDeque::new();
+    let result = loop {
+        let now = Instant::now();
+        core.promote_echo(now);
+        // Snapshot under the session lock, only when something may have changed. Mark the change
+        // signal seen BEFORE snapshotting: a pulse after this point re-fires `changed()` below and
+        // costs at most one redundant snapshot, while marking it after could swallow a pulse for a
+        // change the snapshot missed.
+        {
             let s = handle.session.lock().await;
-            let alive_before_snapshot = s.host.alive();
-            let take = session.needs_snapshot(echo_changed, alive_before_snapshot);
-            if take && !initially_dirty {
-                // An exited shell forces a final snapshot even for a connection that did not yet
-                // observe the change pulse. Mark that pulse seen for this receiver before
-                // taking the state, matching the normal dirty-snapshot ordering above.
-                let _ = changed.borrow_and_update();
-            }
-            let mut snapshot = take.then(|| s.host.snapshot());
             let alive = s.host.alive();
-            drop(s);
-            if let Some(state) = snapshot.as_mut() {
-                state.set_echo_ack(session.echo_ack());
+            if core.needs_snapshot(alive) {
+                let _ = changed.borrow_and_update();
+                let snapshot = s.host.snapshot();
+                drop(s);
+                core.install_snapshot(snapshot, alive);
             }
-            session.install_snapshot(snapshot, alive);
-            alive
-        };
-        let sleep_ms = session.wait_ms(now, session.echo_ack_wait_time(now));
-
-        tokio::select! {
-            // NOT biased: `changed` may already be pending (a pulse since the last snapshot), which
-            // under `biased` would starve client input. A fair select interleaves rendering and
-            // input. `watch` remembers the last seen version per receiver, so a pulse that landed
-            // between the snapshot above and this wait resolves immediately — never lost (KS-03).
-            _ = changed.changed() => session.mark_dirty(),
-
-            // Cancel-safety: when `changed` (or the timer) fires first, this in-flight `recv()`
-            // future is dropped — sound only because the pinned `iroh = "1.0.0"`'s `read_datagram`
-            // is cancel-safe (a dropped future loses no buffered datagram). This loop drops it far
-            // more often than the client (on every screen change, not just a timer tick), so any
-            // iroh bump must re-verify cancel-safety here too (see `client::drive_connection`).
-            dg = channel.recv() => {
-                match dg {
-                    Ok(bytes) => {
-                        let now = clock.now_ms();
-                        // recv() is pure transport — outside the lock. Drain + PTY apply happen under
-                        // the lock (which also guards `application_cursor`).
-                        if session.recv(now, &bytes) == RecvOutcome::NewState {
-                            let mut s = handle.session.lock().await;
-                            let app_cursor = s.host.application_cursor();
-                            if let Some(input) = session.drain_input(app_cursor) {
-                                if !input.keys.is_empty() {
-                                    s.host.input(&input.keys);
-                                }
-                                let resized = input.resize.is_some();
-                                if let Some((rows, cols)) = input.resize {
-                                    s.host.resize(rows, cols);
-                                }
-                                drop(s);
-                                session.register_input_frame(input.frame, now);
-                                // Only a resize mutates the emulator grid directly (a change not
-                                // signaled through `changed`), so re-snapshot next pass only then.
-                                // Keystroke-driven changes arrive via the drain task's `changed` pulse
-                                // (which sets `dirty` through the select arm above), so an input frame
-                                // that didn't resize needs no forced snapshot.
-                                if resized {
-                                    session.mark_dirty();
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        info!(reason = %e, "connection closed by peer (detaching)");
-                        channel.close(0, b"client detached");
-                        return Ok(SessionExit::Detached);
-                    }
+        }
+        // Keystrokes the PTY queue could not take last time.
+        if !core.pending_keys.is_empty() {
+            let mut s = handle.session.lock().await;
+            if s.host.input(&core.pending_keys) {
+                core.pending_keys.clear();
+            }
+        }
+        let rtt = channel.rtt();
+        if let Some(frame) = core.poll_frame(now, rtt) {
+            // Every older frame the client has not acknowledged is superseded.
+            let acked = core.acked();
+            for (num, cancel) in std::mem::take(&mut in_flight) {
+                if num > acked {
+                    cancel.cancel();
                 }
             }
+            match encode_frame(&frame) {
+                Ok(bytes) => {
+                    let cancel = CancellationToken::new();
+                    tokio::spawn(send_frame(conn.clone(), bytes, cancel.clone()));
+                    in_flight.push_back((frame.num, cancel));
+                }
+                Err(e) => tracing::error!(error = %e, "encoding a frame failed"),
+            }
+        }
+        if core.finished(now) {
+            conn.close(0u32.into(), SESSION_ENDED);
+            break Ok(SessionExit::ShellExited);
+        }
+        let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
+        let reading = client.is_some() && core.pending_keys.is_empty();
+        tokio::select! {
+            // NOT biased: `changed` may already be pending, which under `biased` would starve
+            // client input. `watch` remembers the last version each receiver saw, so a pulse that
+            // landed between the snapshot above and this wait resolves immediately.
+            _ = changed.changed() => core.mark_dirty(),
+            stream = conn.accept_uni() => match stream {
+                Ok(stream) if client.is_none() => client = Some(stream),
+                Ok(_) => {
+                    conn.close(PROTOCOL_ERROR.into(), b"a second client stream");
+                    break Ok(SessionExit::Detached);
+                }
+                Err(e) => {
+                    info!(reason = %e, "connection closed by peer (detaching)");
+                    break Ok(SessionExit::Detached);
+                }
+            },
+            read = read_client(client.as_mut(), &mut read_buf), if reading => match read {
+                Ok(Some(n)) => {
+                    core.push_client_bytes(read_buf.get(..n).unwrap_or_default());
+                    let mut s = handle.session.lock().await;
+                    match core.drain_client(Instant::now(), s.host.application_cursor()) {
+                        Ok(drained) => {
+                            if !drained.keys.is_empty() && !s.host.input(&drained.keys) {
+                                core.pending_keys = drained.keys;
+                            }
+                            if let Some((rows, cols)) = drained.resize {
+                                s.host.resize(rows, cols);
+                                // A resize changes the emulator grid directly, with no pulse.
+                                core.mark_dirty();
+                            }
+                        }
+                        Err(e) => {
+                            drop(s);
+                            tracing::warn!(error = %e, "client broke the protocol; closing");
+                            conn.close(PROTOCOL_ERROR.into(), b"protocol error");
+                            break Ok(SessionExit::Detached);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // The client finished its stream; a clean end only between messages.
+                    if core.finish_client().is_err() {
+                        conn.close(PROTOCOL_ERROR.into(), b"protocol error");
+                        break Ok(SessionExit::Detached);
+                    }
+                    client = None;
+                }
+                Err(e) => {
+                    info!(reason = %e, "client stream failed (detaching)");
+                    break Ok(SessionExit::Detached);
+                }
+            },
+            () = tokio::time::sleep_until(wake) => {}
+        }
+    };
+    for (_, cancel) in in_flight {
+        cancel.cancel();
+    }
+    result
+}
 
-            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
-        }
+/// The close code for a client that broke the protocol.
+const PROTOCOL_ERROR: u32 = 2;
 
-        let now = clock.now_ms();
-        for datagram in session.tick(now, child_alive) {
-            channel.send(&datagram);
+/// Read from the client's stream; `None` when there is no stream is never polled (the caller
+/// guards the branch).
+async fn read_client(
+    stream: Option<&mut RecvStream>,
+    buf: &mut [u8],
+) -> Result<Option<usize>, iroh::endpoint::ReadError> {
+    match stream {
+        Some(stream) => stream.read(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Send one frame on its own stream. Cancelling resets the stream, so QUIC stops retransmitting a
+/// frame a newer one has superseded.
+async fn send_frame(conn: iroh::endpoint::Connection, bytes: Vec<u8>, cancel: CancellationToken) {
+    let mut send = tokio::select! {
+        stream = conn.open_uni() => match stream {
+            Ok(stream) => stream,
+            Err(_) => return,
+        },
+        () = cancel.cancelled() => return,
+    };
+    let cancelled = tokio::select! {
+        written = async {
+            send.write_all(&bytes).await.ok()?;
+            send.finish().ok()
+        } => {
+            if written.is_none() {
+                return;
+            }
+            false
         }
-        if session.shutdown_complete(now) {
-            channel.close(0, b"session ended");
-            return Ok(SessionExit::ShellExited);
-        }
+        () = cancel.cancelled() => true,
+    };
+    // Written: wait until the client has it all, or until it is superseded.
+    let cancelled = cancelled
+        || tokio::select! {
+            _ = send.stopped() => false,
+            () = cancel.cancelled() => true,
+        };
+    if cancelled {
+        let _ = send.reset(0u32.into());
     }
 }
 
@@ -490,9 +594,14 @@ pub async fn run_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{coalesce_drained_input, CursorKeyNormalizer, EchoAck, ServerSession};
-    use crate::input::{UserInput, WireEvent};
-    use crate::ssp::{RecvOutcome, Transport};
+    use std::time::{Duration, Instant};
+
+    use super::{CursorKeyNormalizer, Drained, EchoAck, ServerConn, FINAL_ACK_WAIT};
+    use crate::proto::{
+        decode_frame, encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
+        FRAME_WINDOW, HEARTBEAT, MAX_FRAME,
+    };
+    use crate::ssp::SyncState as _;
     use crate::terminal::TerminalScreen;
 
     /// Feed `chunks` through one normalizer at the given app-cursor mode, return the PTY bytes.
@@ -532,224 +641,365 @@ mod tests {
         assert_eq!(norm(&[b"\x1b", b"[", b"A"], false), b"\x1b[A");
     }
 
+    fn stream(msgs: &[ClientMsg]) -> Vec<u8> {
+        msgs.iter().flat_map(|m| encode_client(m).unwrap()).collect()
+    }
+
     #[test]
-    fn coalesce_keeps_only_the_last_resize_and_concatenates_keys() {
-        // KOH-05: a batch with several resizes collapses to ONLY the last geometry (clamped), while
-        // keystrokes concatenate in order — the CPU/syscall-DoS mitigation, now unit-testable.
-        let mut norm = CursorKeyNormalizer::default();
-        let diff = vec![
-            WireEvent::Keys(b"ab".to_vec()),
-            WireEvent::Resize { rows: 10, cols: 20 },
-            WireEvent::Keys(b"cd".to_vec()),
-            WireEvent::Resize { rows: 30, cols: 40 },
-            WireEvent::Resize {
-                rows: 65000,
-                cols: 1,
-            }, // only this one survives, and it is clamped
-            WireEvent::Keys(b"ef".to_vec()),
-        ];
-        let (keys, last_resize) = coalesce_drained_input(&diff, &mut norm, false);
-        assert_eq!(keys, b"abcdef", "keystrokes concatenate in order");
+    fn a_read_keeps_only_the_last_resize_and_concatenates_keys() {
+        // Several resizes in one read collapse to the last (clamped); keys stay in order.
+        let mut conn = ServerConn::default();
+        conn.push_client_bytes(&stream(&[
+            ClientMsg::Input { seq: InputSeq(1), bytes: b"ab".to_vec() },
+            ClientMsg::Resize { rows: 10, cols: 20 },
+            ClientMsg::Input { seq: InputSeq(2), bytes: b"\x1bOA".to_vec() },
+            ClientMsg::Resize { rows: 30, cols: 40 },
+            ClientMsg::Resize { rows: 65000, cols: 1 },
+            ClientMsg::Input { seq: InputSeq(3), bytes: b"ef".to_vec() },
+        ]));
+        let drained = conn.drain_client(Instant::now(), false).unwrap();
         assert_eq!(
-            last_resize,
-            Some(crate::terminal::clamp_dims(65000, 1)),
-            "only the final resize survives, clamped to [MIN_DIM, MAX_DIM]"
+            drained,
+            Drained {
+                keys: b"ab\x1b[Aef".to_vec(),
+                resize: Some(crate::terminal::clamp_dims(65000, 1)),
+            }
         );
+        conn.push_client_bytes(&stream(&[ClientMsg::Input { seq: InputSeq(4), bytes: b"x".to_vec() }]));
+        assert_eq!(conn.drain_client(Instant::now(), false).unwrap().resize, None);
     }
 
     #[test]
-    fn coalesce_with_no_resize_returns_none() {
-        let mut norm = CursorKeyNormalizer::default();
-        let diff = vec![WireEvent::Keys(b"x".to_vec())];
-        let (keys, last_resize) = coalesce_drained_input(&diff, &mut norm, false);
-        assert_eq!(keys, b"x");
-        assert!(last_resize.is_none(), "no resize event -> None");
+    fn a_partial_message_waits_and_a_truncated_stream_is_an_error() {
+        let mut conn = ServerConn::default();
+        let bytes = stream(&[ClientMsg::Input { seq: InputSeq(1), bytes: b"hello".to_vec() }]);
+        let (first, rest) = bytes.split_at(3);
+        conn.push_client_bytes(first);
+        assert!(conn.drain_client(Instant::now(), false).unwrap().keys.is_empty());
+        assert!(conn.finish_client().is_err(), "the stream ended inside a message");
+        conn.push_client_bytes(rest);
+        assert_eq!(conn.drain_client(Instant::now(), false).unwrap().keys, b"hello");
+        assert!(conn.finish_client().is_ok());
     }
 
-    // --- EchoAck (S-03, KS-02): the per-connection echo-ack debounce, moved here from the emulator.
+    // --- EchoAck: the per-connection echo-ack debounce.
 
     #[test]
     fn echo_ack_debounces() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
         let mut t = EchoAck::default();
-        t.register_input_frame(5, 1000);
-        // Too soon: nothing within the debounce window.
-        assert!(!t.set_echo_ack(1010));
-        assert_eq!(t.echo_ack(), 0);
-        // After 50ms the frame is considered echoed.
-        assert!(t.set_echo_ack(1050));
-        assert_eq!(t.echo_ack(), 5);
+        t.register(InputSeq(5), t0);
+        assert!(!t.promote(ms(10)), "too soon");
+        assert_eq!(t.echo_ack(), InputSeq(0));
+        assert!(t.promote(ms(50)), "after the 50 ms debounce the input counts as echoed");
+        assert_eq!(t.echo_ack(), InputSeq(5));
     }
 
     #[test]
-    fn echo_ack_honors_injected_timeout() {
-        // With a 10ms debounce (not the 50ms default), a frame is echoed after 10ms, not 50 — a
-        // deterministic timing assertion only possible because the timeout is injectable.
-        let mut t = EchoAck::with_timeout_ms(10);
-        t.register_input_frame(5, 1000);
-        assert!(
-            !t.set_echo_ack(1005),
-            "still inside the injected 10ms window"
-        );
-        assert_eq!(t.echo_ack(), 0);
-        assert!(t.set_echo_ack(1011), "past the injected 10ms window");
-        assert_eq!(t.echo_ack(), 5);
-        // The default (50ms) would not have promoted at 1011.
+    fn echo_ack_honors_an_injected_timeout() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut t = EchoAck::with_timeout(Duration::from_millis(10));
+        t.register(InputSeq(5), t0);
+        assert!(!t.promote(ms(5)));
+        assert!(t.promote(ms(11)));
         let mut d = EchoAck::default();
-        d.register_input_frame(5, 1000);
-        assert!(
-            !d.set_echo_ack(1011),
-            "the 50ms default has not elapsed yet"
-        );
+        d.register(InputSeq(5), t0);
+        assert!(!d.promote(ms(11)), "the 50 ms default has not elapsed");
     }
 
     #[test]
-    fn echo_ack_is_monotonic_and_takes_newest() {
+    fn echo_ack_is_monotonic_takes_the_newest_and_says_when_it_next_moves() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
         let mut t = EchoAck::default();
-        t.register_input_frame(3, 1000);
-        t.register_input_frame(7, 1005);
-        t.set_echo_ack(1100); // both older than 50ms -> newest = 7
-        assert_eq!(t.echo_ack(), 7);
-    }
-
-    #[test]
-    fn echo_ack_wait_time_points_at_the_second_pending_frame() {
-        let mut t = EchoAck::default();
-        assert_eq!(t.wait_time(0), crate::ssp::NEVER, "nothing pending");
-        t.register_input_frame(1, 1000);
-        assert_eq!(
-            t.wait_time(1000),
-            crate::ssp::NEVER,
-            "one frame: nothing waits behind it"
-        );
-        t.register_input_frame(2, 1020);
-        assert_eq!(t.wait_time(1030), 40, "the second frame fires at 1070");
+        assert_eq!(t.next_promotion(), None, "nothing pending");
+        t.register(InputSeq(3), t0);
+        t.register(InputSeq(7), ms(20));
+        t.register(InputSeq(6), ms(25)); // stale: ignored
+        assert_eq!(t.next_promotion(), Some(ms(50)));
+        t.promote(ms(55));
+        assert_eq!(t.echo_ack(), InputSeq(3));
+        assert_eq!(t.next_promotion(), Some(ms(70)));
+        t.promote(ms(100));
+        assert_eq!(t.echo_ack(), InputSeq(7));
+        assert_eq!(t.next_promotion(), None);
     }
 
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
 
-        /// KS-02: two connections' trackers fed interleaved frame sequences never influence each
-        /// other — each ack is bounded by the frames *that* connection registered.
+        /// Two connections' trackers fed interleaved inputs never influence each other: each ack
+        /// is bounded by the inputs *that* connection registered.
         #[test]
         fn echo_ack_trackers_are_independent_per_connection(
             ops in proptest::collection::vec((proptest::prelude::any::<bool>(), 1u64..1000, 0u64..10_000), 1..64),
         ) {
-            let mut a = EchoAck::with_timeout_ms(10);
-            let mut b = EchoAck::with_timeout_ms(10);
+            let t0 = Instant::now();
+            let at = |n: u64| t0 + Duration::from_millis(n);
+            let mut a = EchoAck::with_timeout(Duration::from_millis(10));
+            let mut b = EchoAck::with_timeout(Duration::from_millis(10));
             let (mut max_a, mut max_b) = (0u64, 0u64);
-            for (to_a, frame, now) in ops {
+            for (to_a, seq, now) in ops {
                 if to_a {
-                    a.register_input_frame(frame, now);
-                    max_a = max_a.max(frame);
+                    a.register(InputSeq(seq), at(now));
+                    max_a = max_a.max(seq);
                 } else {
-                    b.register_input_frame(frame, now);
-                    max_b = max_b.max(frame);
+                    b.register(InputSeq(seq), at(now));
+                    max_b = max_b.max(seq);
                 }
-                a.set_echo_ack(now.saturating_add(100));
-                b.set_echo_ack(now.saturating_add(100));
-                proptest::prop_assert!(a.echo_ack() <= max_a, "A acked a frame it never saw");
-                proptest::prop_assert!(b.echo_ack() <= max_b, "B acked a frame it never saw");
+                a.promote(at(now + 100));
+                b.promote(at(now + 100));
+                proptest::prop_assert!(a.echo_ack().0 <= max_a, "A acked input it never saw");
+                proptest::prop_assert!(b.echo_ack().0 <= max_b, "B acked input it never saw");
             }
         }
     }
 
-    // --- ServerSession pure-core tests (AR-01): the server's protocol bookkeeping, exercised with no
-    //     iroh / tokio / PTY — the deterministic-unit-test bar the client's ClientSession already had.
+    // --- ServerConn: frame pacing, bases, acknowledgements and shutdown, with no I/O.
 
-    #[test]
-    fn server_session_snapshot_gating() {
-        // The S-03 dirty/echo-ack snapshot decision, isolated from the lock + the real emulator.
-        let mut s = ServerSession::new(0, 1200);
-        assert!(
-            s.needs_snapshot(false, true),
-            "the first pass always snapshots"
-        );
-        s.install_snapshot(Some(TerminalScreen::default()), true);
-        assert!(
-            !s.needs_snapshot(false, true),
-            "clean live host skips a snapshot"
-        );
-        assert!(
-            s.needs_snapshot(true, true),
-            "an echo-ack advance forces a snapshot even when clean (else confirmations stall)"
-        );
-        assert!(
-            s.needs_snapshot(false, false),
-            "every clean connection snapshots terminal host state before shutdown"
-        );
-        s.install_snapshot(Some(TerminalScreen::default()), false);
-        assert!(
-            !s.needs_snapshot(false, false),
-            "a connection does not repeatedly clone terminal state during shutdown retries"
-        );
-        s.mark_dirty();
-        assert!(
-            s.needs_snapshot(false, true),
-            "a changed-pulse / applied resize re-arms the snapshot"
-        );
+    fn screen(bytes: &[u8]) -> TerminalScreen {
+        TerminalScreen::from_bytes(24, 80, bytes)
+    }
+
+    /// Apply `frame` to `base`, as a client holding that base would.
+    fn applied(base: &TerminalScreen, frame: &Frame) -> TerminalScreen {
+        let mut s = base.clone();
+        s.apply(&frame.diff);
+        s
     }
 
     #[test]
-    fn server_session_shutdown_handshake_progresses() {
-        // The shutdown-sentinel handshake progression, without a PTY or a peer.
-        let mut s = ServerSession::new(0, 1200);
-        let _ = s.tick(0, true); // child alive -> no shutdown started
-        assert!(!s.shutdown_complete(0));
-        let _ = s.tick(10, false); // child exited -> begin the shutdown handshake
-        assert!(
-            !s.shutdown_complete(10),
-            "shutdown just started: neither acked nor timed out yet"
-        );
-        assert!(
-            s.shutdown_complete(10_000_000),
-            "far in the future the unacked shutdown times out -> reapable"
-        );
+    fn snapshots_are_taken_when_dirty_and_once_after_exit() {
+        let mut c = ServerConn::default();
+        assert!(c.needs_snapshot(true), "the first pass snapshots");
+        c.install_snapshot(screen(b"a"), true);
+        assert!(!c.needs_snapshot(true), "a clean live host skips it");
+        assert!(c.needs_snapshot(false), "the exit screen is always taken");
+        c.install_snapshot(screen(b"a"), false);
+        assert!(!c.needs_snapshot(false), "but only once");
+        c.mark_dirty();
+        assert!(c.needs_snapshot(false));
     }
 
     #[test]
-    fn server_session_drains_coalesced_input_from_a_real_datagram() {
-        // Exercise recv + drain_input over a genuine wire datagram authored by a client-side
-        // Transport — the KOH-05 coalescing handoff, with no iroh/PTY. The client logs keys then two
-        // resizes; the server must drain the concatenated keys and ONLY the last (clamped) resize.
-        let mut client = Transport::<UserInput, TerminalScreen>::new(0, 1200);
-        client.set_connected(true);
-        client.current_mut().push_bytes(b"ls\r");
-        client.current_mut().push_resize(10, 20);
-        client.current_mut().push_resize(30, 40);
-        // Tick well past the send mindelay so the queued input is actually transmitted.
-        let datagrams = client.tick(1000);
-        assert!(
-            !datagrams.is_empty(),
-            "the client transmits its queued input"
-        );
+    fn the_first_frame_goes_out_at_once_and_later_ones_are_paced() {
+        let t0 = Instant::now();
+        let rtt = Some(Duration::from_millis(100)); // a 50 ms frame interval
+        let mut c = ServerConn::default();
+        c.install_snapshot(screen(b"hello"), true);
+        let first = c.poll_frame(t0, rtt).expect("the first frame is due at once");
+        assert_eq!((first.num, first.base), (FrameNum(1), FrameNum::BLANK));
+        assert!(applied(&TerminalScreen::default(), &first).screen().contents().contains("hello"));
+        assert!(c.poll_frame(t0, rtt).is_none(), "nothing changed");
+        c.install_snapshot(screen(b"hello world"), true);
+        assert!(c.poll_frame(t0 + Duration::from_millis(10), rtt).is_none(), "inside the interval");
+        assert_eq!(c.next_wake(t0 + Duration::from_millis(10), rtt), t0 + Duration::from_millis(50));
+        let second = c.poll_frame(t0 + Duration::from_millis(50), rtt).expect("interval passed");
+        assert_eq!(second.num, FrameNum(2));
+        assert_eq!(second.base, FrameNum::BLANK, "nothing was acknowledged yet");
+    }
 
-        let mut server = ServerSession::new(0, 1200);
-        let mut drained = None;
-        for dg in &datagrams {
-            if server.recv(1000, dg) == RecvOutcome::NewState {
-                drained = server.drain_input(false);
+    #[test]
+    fn a_quiet_connection_still_gets_a_heartbeat() {
+        let t0 = Instant::now();
+        let mut c = ServerConn::default();
+        c.install_snapshot(screen(b"idle"), true);
+        c.poll_frame(t0, None).expect("first frame");
+        // Acknowledged, so no retry is due; only the heartbeat is.
+        c.ack(FrameNum(1));
+        let just_before = (t0 + HEARTBEAT).checked_sub(Duration::from_millis(1)).unwrap();
+        assert!(c.poll_frame(just_before, None).is_none());
+        assert_eq!(c.next_wake(t0, None), t0 + HEARTBEAT);
+        let beat = c.poll_frame(t0 + HEARTBEAT, None).expect("heartbeat");
+        assert_eq!(beat.num, FrameNum(2));
+    }
+
+    #[test]
+    fn an_unacknowledged_frame_is_resent_as_a_new_one_after_a_retry_interval() {
+        let t0 = Instant::now();
+        let rtt = Some(Duration::from_millis(200));
+        let retry = retry_after(rtt);
+        let mut c = ServerConn::default();
+        c.install_snapshot(screen(b"lost?"), true);
+        let first = c.poll_frame(t0, rtt).unwrap();
+        let just_before = (t0 + retry).checked_sub(Duration::from_millis(1)).unwrap();
+        assert!(c.poll_frame(just_before, rtt).is_none());
+        assert_eq!(c.next_wake(t0, rtt), t0 + retry);
+        let again = c.poll_frame(t0 + retry, rtt).expect("resent");
+        assert_eq!((again.num, again.base), (FrameNum(2), FrameNum::BLANK));
+        assert_eq!(again.diff, first.diff, "the same screen, as a frame that supersedes");
+        // Once acknowledged, nothing more is resent until something changes.
+        c.ack(FrameNum(2));
+        assert!(c.poll_frame(t0 + retry * 3, rtt).is_none());
+    }
+
+    #[test]
+    fn frames_diff_against_the_newest_acknowledged_frame() {
+        let t0 = Instant::now();
+        let later = |n| t0 + Duration::from_secs(n);
+        let mut c = ServerConn::default();
+        c.install_snapshot(screen(b"one"), true);
+        let one = c.poll_frame(t0, None).unwrap();
+        c.install_snapshot(screen(b"one two"), true);
+        let two = c.poll_frame(later(1), None).unwrap();
+        c.ack(FrameNum(1));
+        c.install_snapshot(screen(b"one two three"), true);
+        let three = c.poll_frame(later(2), None).unwrap();
+        assert_eq!(three.base, FrameNum(1));
+        let client_one = applied(&TerminalScreen::default(), &one);
+        assert_eq!(applied(&client_one, &three), screen(b"one two three"));
+        // An ack for a frame older than the acknowledged one changes nothing.
+        c.ack(FrameNum(2));
+        c.ack(FrameNum(1));
+        c.install_snapshot(screen(b"four"), true);
+        assert_eq!(c.poll_frame(later(3), None).unwrap().base, FrameNum(2));
+        let _ = two;
+    }
+
+    #[test]
+    fn a_resync_diffs_against_the_blank_screen_until_a_newer_ack() {
+        let t0 = Instant::now();
+        let later = |n| t0 + Duration::from_secs(n);
+        let mut c = ServerConn::default();
+        c.install_snapshot(screen(b"a"), true);
+        c.poll_frame(t0, None).unwrap();
+        c.ack(FrameNum(1));
+        c.push_client_bytes(&stream(&[ClientMsg::Resync]));
+        c.drain_client(later(1), false).unwrap();
+        let rebuilt = c.poll_frame(later(1), None).expect("a resync forces a frame");
+        assert_eq!(rebuilt.base, FrameNum::BLANK);
+        assert_eq!(applied(&TerminalScreen::default(), &rebuilt), screen(b"a"));
+    }
+
+    #[test]
+    fn only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored() {
+        let t0 = Instant::now();
+        let mut c = ServerConn::default();
+        for n in 0..=u64::try_from(FRAME_WINDOW).unwrap() {
+            c.install_snapshot(screen(format!("frame {n}").as_bytes()), true);
+            c.poll_frame(t0 + Duration::from_secs(n), None).unwrap();
+        }
+        assert_eq!(c.sent.len(), FRAME_WINDOW);
+        c.ack(FrameNum(1)); // dropped from the window
+        assert_eq!(c.acked(), FrameNum::BLANK);
+        c.ack(FrameNum(3));
+        assert_eq!(c.acked(), FrameNum(3));
+    }
+
+    #[test]
+    fn the_connection_finishes_once_the_final_frame_is_acked_or_after_a_second() {
+        let t0 = Instant::now();
+        let sent = t0 + Duration::from_secs(1);
+        // A connection that has just sent the final frame (with the exit code) at `sent`.
+        let exited = || {
+            let mut c = ServerConn::default();
+            c.install_snapshot(screen(b"$ "), true);
+            c.poll_frame(t0, None).unwrap();
+            assert!(!c.finished(t0));
+            let mut emu = crate::terminal::ServerTerminal::new(24, 80, 0).unwrap();
+            emu.set_exit_code(3);
+            c.install_snapshot(emu.snapshot(), false);
+            let last = c.poll_frame(sent, None).expect("the final frame");
+            assert!(!c.finished(sent));
+            (c, last)
+        };
+        let (mut acked, last) = exited();
+        acked.ack(last.num);
+        assert!(acked.finished(sent), "acked: done at once");
+        let (unacked, _) = exited();
+        let just_before = (sent + FINAL_ACK_WAIT).checked_sub(Duration::from_millis(1)).unwrap();
+        assert!(!unacked.finished(just_before));
+        assert!(unacked.finished(sent + FINAL_ACK_WAIT), "unacked: done after the wait");
+    }
+
+    // --- run_session / run_attached over real iroh, with a minimal koh/3 client.
+
+    /// A bare koh/3 client: writes messages, applies frames whose base it holds, and acks them.
+    struct RawClient {
+        conn: iroh::endpoint::Connection,
+        send: iroh::endpoint::SendStream,
+        frames: tokio::sync::mpsc::Receiver<Frame>,
+        screens: std::collections::HashMap<FrameNum, TerminalScreen>,
+        newest: FrameNum,
+        echo_ack: InputSeq,
+        last_seq: InputSeq,
+        _endpoint: iroh::Endpoint,
+    }
+
+    impl RawClient {
+        async fn connect(addr: iroh::EndpointAddr) -> Self {
+            use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, ALPN};
+            let endpoint = bind_endpoint_local(generate_secret_key(), false)
+                .await
+                .expect("bind client");
+            let conn = endpoint.connect(addr, ALPN).await.expect("connect");
+            let send = conn.open_uni().await.expect("open the client stream");
+            let (tx, frames) = tokio::sync::mpsc::channel(64);
+            let reader = conn.clone();
+            tokio::spawn(async move {
+                while let Ok(mut recv) = reader.accept_uni().await {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(bytes) = recv.read_to_end(MAX_FRAME).await {
+                            if let Ok(frame) = decode_frame(&bytes) {
+                                let _ = tx.send(frame).await;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                conn,
+                send,
+                frames,
+                screens: std::collections::HashMap::from([(FrameNum::BLANK, TerminalScreen::default())]),
+                newest: FrameNum::BLANK,
+                echo_ack: InputSeq(0),
+                last_seq: InputSeq(0),
+                _endpoint: endpoint,
             }
         }
-        let input = drained.expect("the server drained the client's input");
-        assert_eq!(
-            input.keys, b"ls\r",
-            "keystrokes concatenate in order through the normalizer"
-        );
-        assert_eq!(
-            input.resize,
-            Some((30, 40)),
-            "KOH-05: only the final resize survives (clamped)"
-        );
+
+        async fn write(&mut self, msg: &ClientMsg) {
+            self.send
+                .write_all(&encode_client(msg).unwrap())
+                .await
+                .expect("write the client stream");
+        }
+
+        async fn type_bytes(&mut self, bytes: &[u8]) {
+            self.last_seq = self.last_seq.next();
+            let msg = ClientMsg::Input { seq: self.last_seq, bytes: bytes.to_vec() };
+            self.write(&msg).await;
+        }
+
+        /// Apply and ack frames for `ms`.
+        async fn pump(&mut self, ms: u64) {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+            while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, self.frames.recv()).await {
+                if frame.num <= self.newest {
+                    continue;
+                }
+                let Some(base) = self.screens.get(&frame.base) else { continue };
+                let mut next = base.clone();
+                next.apply(&frame.diff);
+                self.screens.insert(frame.num, next);
+                self.newest = frame.num;
+                self.echo_ack = self.echo_ack.max(frame.echo_ack);
+                self.write(&ClientMsg::Ack { frame: frame.num }).await;
+            }
+        }
+
+        fn screen(&self) -> &TerminalScreen {
+            &self.screens[&self.newest]
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_session_delivers_keys_and_clamped_resizes_then_kills_the_shell() {
-        // The loop hands the PTY the clamped geometry and the keys, stamps this connection's
-        // echo-ack for frame 1 onto the screen it ships (KS-02), and `run_session` returns once
-        // the connection ends and the shell is killed.
-        use crate::transport_iroh::{
-            bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, MonoClock, ALPN,
-        };
+        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
         let server_ep = bind_endpoint_local(generate_secret_key(), true)
             .await
             .expect("bind");
@@ -759,48 +1009,22 @@ mod tests {
             let conn = incoming.await.expect("handshake");
             super::run_session(conn, &["cat".to_owned()], 0).await
         });
-        let client_ep = bind_endpoint_local(generate_secret_key(), false)
-            .await
-            .expect("bind client");
-        let chan = IrohChannel::new(client_ep.connect(addr, ALPN).await.expect("connect"));
-        let clock = MonoClock::new();
-        let mut t = Transport::<UserInput, TerminalScreen>::new(clock.now_ms(), 1200);
-        t.set_connected(true);
-        t.observe_rtt(10.0);
-        t.current_mut().push_resize(65000, 1);
-        t.current_mut().push_bytes(b"xy");
+        let mut client = RawClient::connect(addr).await;
+        client.write(&ClientMsg::Resize { rows: 65000, cols: 1 }).await;
+        client.type_bytes(b"xy").await;
         let clamped = crate::terminal::clamp_dims(65000, 1);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            for dg in t.tick(clock.now_ms()) {
-                chan.send(&dg);
-            }
-            tokio::select! {
-                r = chan.recv() => { if let Ok(b) = r { t.recv(clock.now_ms(), &b); } }
-                () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
-            }
-            // Wait for the echoed input AND its echo-ack (the ack ships after the 50 ms debounce).
-            let screen = t.remote_state();
-            if screen.screen().contents().contains("xy")
-                && screen.echo_ack() >= 1
-                && screen.screen().size() == clamped
-            {
+        for _ in 0..100 {
+            client.pump(100).await;
+            let s = client.screen();
+            if s.screen().contents().contains("xy") && s.size() == clamped && client.echo_ack >= InputSeq(1) {
                 break;
             }
         }
-        let screen = t.remote_state();
-        assert!(
-            screen.screen().contents().contains("xy"),
-            "input reached the shell"
-        );
-        assert_eq!(screen.screen().size(), clamped, "resize arrives clamped");
-        assert_eq!(
-            screen.echo_ack(),
-            1,
-            "the loop's own echo-ack for frame 1 is stamped onto the snapshot (KS-02)"
-        );
-        chan.close(0, b"done");
-        tokio::time::timeout(std::time::Duration::from_secs(5), accept)
+        assert!(client.screen().screen().contents().contains("xy"), "input reached the program");
+        assert_eq!(client.screen().size(), clamped, "the resize arrives clamped");
+        assert_eq!(client.echo_ack, InputSeq(1), "the input is acknowledged as echoed");
+        client.conn.close(0u32.into(), b"done");
+        tokio::time::timeout(Duration::from_secs(5), accept)
             .await
             .expect("run_session returns after the connection ends")
             .expect("accept task")
@@ -808,18 +1032,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[expect(
-        clippy::items_after_statements,
-        reason = "the pump helper reads best next to the connections it drives"
-    )]
-    async fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_frames() {
-        // KS-02: two connections on ONE session (a peer's reconnect racing its old connection). A
-        // sends many frames, B sends one. B's snapshots must carry B's own ack (never A's much
-        // larger frame number), and A's must carry A's.
+    async fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_input() {
+        // Two connections on ONE session (a peer's reconnect racing its old connection). A types
+        // many times, B once. Each must only ever be acked for input it sent.
         use crate::server::session::spawn_session;
-        use crate::transport_iroh::{
-            bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, MonoClock, ALPN,
-        };
+        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
         let server_ep = bind_endpoint_local(generate_secret_key(), true)
             .await
             .expect("bind");
@@ -836,85 +1053,25 @@ mod tests {
                 });
             }
         });
-        let clock = MonoClock::new();
-        let mut viewers = Vec::new();
-        for _ in 0..2 {
-            let ep = bind_endpoint_local(generate_secret_key(), false)
-                .await
-                .expect("bind client");
-            let chan = IrohChannel::new(ep.connect(addr.clone(), ALPN).await.expect("connect"));
-            let mut t = Transport::<UserInput, TerminalScreen>::new(clock.now_ms(), 1200);
-            t.set_connected(true);
-            t.observe_rtt(10.0);
-            viewers.push((chan, t, ep));
-        }
-        // Pump both connections for `ms`, asserting the per-connection invariant on every frame.
-        async fn pump(
-            viewers: &mut [(IrohChannel, Transport<UserInput, TerminalScreen>, iroh::Endpoint)],
-            clock: &MonoClock,
-            ms: u64,
-        ) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-            while std::time::Instant::now() < deadline {
-                for (chan, t, _) in viewers.iter_mut() {
-                    for dg in t.tick(clock.now_ms()) {
-                        chan.send(&dg);
-                    }
-                    if let Ok(Ok(b)) =
-                        tokio::time::timeout(std::time::Duration::from_millis(2), chan.recv()).await
-                    {
-                        t.recv(clock.now_ms(), &b);
-                    }
-                    assert!(
-                        t.remote_state().echo_ack() <= t.newest_sent_num(),
-                        "a connection was acked for a frame it never sent: ack {} > sent {}",
-                        t.remote_state().echo_ack(),
-                        t.newest_sent_num()
-                    );
-                }
-            }
-        }
-        // A types 30 times. Keystrokes pushed within one send interval may share a frame, so
-        // track the frame A's LAST keystroke went out in: it is newer than every frame A had sent
-        // before that push.
-        let mut a_last_before = 0;
+        let mut a = RawClient::connect(addr.clone()).await;
+        let mut b = RawClient::connect(addr).await;
         for _ in 0..30 {
-            a_last_before = viewers[0].1.newest_sent_num();
-            viewers[0].1.current_mut().push_bytes(b"a");
-            pump(&mut viewers, &clock, 40).await;
+            a.type_bytes(b"a").await;
+            a.pump(20).await;
+            b.pump(20).await;
+            assert!(a.echo_ack <= a.last_seq, "A was acked for input it never sent");
+            assert_eq!(b.echo_ack, InputSeq(0), "B was handed A's echo-ack");
         }
-        // B has sent no input yet, so no frame of B's can be acked. A leaked ack would show here.
-        assert_eq!(
-            viewers[1].1.remote_state().echo_ack(),
-            0,
-            "B was handed A's echo-ack before typing anything"
-        );
-        // B types once.
-        let b_before = viewers[1].1.newest_sent_num();
-        viewers[1].1.current_mut().push_bytes(b"b");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            pump(&mut viewers, &clock, 50).await;
-            let a_done = viewers[0].1.remote_state().echo_ack() > a_last_before;
-            let b_done = viewers[1].1.remote_state().echo_ack() > b_before;
-            if a_done && b_done {
+        b.type_bytes(b"b").await;
+        for _ in 0..50 {
+            a.pump(20).await;
+            b.pump(20).await;
+            if b.echo_ack == InputSeq(1) && a.echo_ack == a.last_seq {
                 break;
             }
         }
-        let a_ack = viewers[0].1.remote_state().echo_ack();
-        let b_ack = viewers[1].1.remote_state().echo_ack();
-        assert!(
-            a_ack > a_last_before,
-            "A's ack reaches the frame with its last keystroke: ack {a_ack}, last keystroke after frame {a_last_before}"
-        );
-        assert!(
-            b_ack > b_before,
-            "B's ack reaches the frame with its keystroke: ack {b_ack}, keystroke after frame {b_before}"
-        );
-        for (chan, _, _) in &viewers {
-            chan.close(0, b"done");
-        }
+        assert_eq!(b.echo_ack, InputSeq(1), "B is acked for its own one input");
+        assert_eq!(a.echo_ack, a.last_seq, "A is acked up to its own last input");
         accept.abort();
-        handle.session.lock().await.host.kill();
     }
 }

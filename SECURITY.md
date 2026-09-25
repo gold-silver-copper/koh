@@ -22,14 +22,15 @@ credit reporters who want it.
 
 **In scope** (code koh authors):
 
-- On-disk identity-key handling (`src/transport_iroh/`, `src/identity.rs`): the key file is the
-  raw 32-byte secret, protected by its permissions (0600) like an SSH host key.
-- The connection accept gauntlet / node-id allowlist authorization (`src/server/cli.rs`) and the
-  admission barrier (`src/transport_iroh/admission.rs`).
-- The untrusted wire decoders (`src/proto.rs`) and the connection cores (`src/server/mod.rs`,
-  `src/client/session.rs`).
-- The terminal apply path (`src/terminal/`): decoding and validating the structured screen diff.
-- On-disk identity-key handling and local-attacker hardening (`src/transport_iroh/`).
+- On-disk identity-key handling and local-attacker hardening (`koh-core/src/transport_iroh/`,
+  `koh-core/src/identity.rs`): the key file is the raw 32-byte secret, protected by its
+  permissions (0600) like an SSH host key.
+- The connection accept gauntlet / node-id allowlist authorization
+  (`koh-core/src/server/cli.rs`) and the admission barrier
+  (`koh-core/src/transport_iroh/admission.rs`).
+- The untrusted wire decoders (`koh-core/src/proto.rs`) and the connection cores
+  (`koh-core/src/server/mod.rs`, `koh-core/src/client/session.rs`).
+- The terminal apply path (`koh-core/src/terminal/`): decoding and validating the structured screen diff.
 
 **Out of scope — report upstream** (dependencies koh does not author):
 

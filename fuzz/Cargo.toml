@@ -1,5 +1,5 @@
 # Coverage-guided fuzzing of koh's untrusted-input decode paths (run with `cargo +nightly fuzz run
-# <target>`; needs `cargo install cargo-fuzz`). Standalone package — NOT a workspace member of koh, so
+# <target>`; needs `cargo install cargo-fuzz`). Standalone package — NOT a member of koh's workspace, so
 # `cargo build`/`cargo test` in the parent never touch it, and it is excluded from the published
 # .crate. One harness per attacker-reachable parser (the OpenSSH / OSS-Fuzz one-harness-per-parser
 # doctrine): server->client screen apply (the structured diff), the server emulator and the
@@ -14,7 +14,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-koh = { path = ".." }
+koh-core = { path = "../koh-core" }
 libfuzzer-sys = "0.4"
 # Decodes fuzz input as a `ScreenDiff` exactly as koh's transport does; same pin as koh.
 postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }

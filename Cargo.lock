@@ -1814,8 +1814,18 @@ name = "koh"
 version = "0.12.1"
 dependencies = [
  "anyhow",
- "bytes",
  "clap",
+ "koh-core",
+ "portable-pty",
+ "tokio",
+]
+
+[[package]]
+name = "koh-core"
+version = "0.12.1"
+dependencies = [
+ "anyhow",
+ "bytes",
  "data-encoding",
  "fux-vt",
  "iroh",

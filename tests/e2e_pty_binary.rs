@@ -19,8 +19,8 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use koh::server::run_session;
-use koh::transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
+use koh_core::server::run_session;
+use koh_core::transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -42,7 +42,10 @@ async fn real_client_binary_renders_over_pty() {
             if let Ok(conn) = incoming.await {
                 // The real client binary awaits an admission ack after connect; mirror the server
                 // side so its accept_bi() completes, like `koh serve`.
-                if koh::transport_iroh::admission::admit(&conn).await.is_ok() {
+                if koh_core::transport_iroh::admission::admit(&conn)
+                    .await
+                    .is_ok()
+                {
                     let _ = run_session(conn, &["sh".to_owned()], 0).await;
                 }
             }

@@ -36,10 +36,10 @@ service.
   window). Authorization is an explicit **allowlist** (off-list peers refused); at least one entry is
   required, so there is no "accept any peer" mode. This is the **single** authentication factor —
   there is no passphrase/PAKE second factor. A leaked key file is a leaked identity: protect it
-  like an SSH private key, and remove a lost machine's id from every `--allow` list. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
+  like an SSH private key, and remove a lost machine's id from every `--allow` list. The accept gauntlet (`koh-core/src/server/cli.rs`) is the trust-boundary
   checkpoint; its outcomes are logged structured under the `koh::auth` target.
-- **Untrusted data plane:** the protocol (`src/proto.rs`) and the connection cores
-  (`src/server/mod.rs`, `src/client/session.rs`) are pure and panic-free by construction. Client
+- **Untrusted data plane:** the protocol (`koh-core/src/proto.rs`) and the connection cores
+  (`koh-core/src/server/mod.rs`, `koh-core/src/client/session.rs`) are pure and panic-free by construction. Client
   messages are length-capped (64 KiB of input each) and a frame is read and inflated with a 16 MiB
   limit; each end keeps a fixed window of 16 screens, whatever the peer sends or withholds; QUIC
   stream limits and flow control bound what a peer can have in flight; and resize dimensions are

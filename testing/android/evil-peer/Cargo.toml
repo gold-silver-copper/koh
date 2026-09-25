@@ -19,7 +19,7 @@ name = "evil-server"
 path = "src/evil_server.rs"
 
 [dependencies]
-koh = { path = "../../.." }
+koh-core = { path = "../../../koh-core" }
 # The malicious client opens streams and builds close codes directly, so it names iroh's stream
 # types. Already in the lockfile through koh.
 iroh = "=1.0.0"

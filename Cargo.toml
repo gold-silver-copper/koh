@@ -1,5 +1,9 @@
-[package]
-name = "koh"
+[workspace]
+members = ["koh-core"]
+# Standalone packages with their own lockfiles, built only on demand.
+exclude = ["fuzz", "testing/android/evil-peer"]
+
+[workspace.package]
 version = "0.12.1"
 edition = "2021"
 # The effective floor is dictated by dependencies, not by koh's own 2021 edition: fux-vt declares
@@ -11,19 +15,31 @@ license = "MIT"
 authors = ["Stephen Korzen <stephen.korzen@gmail.com>"]
 repository = "https://github.com/gold-silver-copper/koh"
 homepage = "https://github.com/gold-silver-copper/koh"
+
+[package]
+name = "koh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 documentation = "https://docs.rs/koh"
 description = "koh — a resilient peer-to-peer remote shell over iroh, with predictive local echo"
 readme = "README.md"
 keywords = ["mosh", "shell", "terminal", "iroh", "p2p"]
 categories = ["command-line-utilities", "network-programming"]
 # Keep the published .crate lean: the porting-research notes, the test infra, the integration tests,
-# and the dev/CI tooling aren't needed to build or USE koh (the lib's own unit
-# tests live in `src/`). COPYING (the license) and CHANGELOG.md DO ship.
+# and the dev/CI tooling aren't needed to build or use koh. COPYING (the license) and CHANGELOG.md
+# DO ship.
 exclude = [
     "docs/",
     "testing/",
     "tests/",
     "fuzz/",
+    # the library is its own crate
+    "koh-core/",
     ".github/",
     "clippy.toml",
     "deny.toml",
@@ -31,115 +47,50 @@ exclude = [
     "koh-presentation.html",
 ]
 
-[[bin]]
-name = "koh"
-path = "src/main.rs"
-required-features = ["cli"]
-
-# The pty-binary e2e test drives the `koh` binary through `CARGO_BIN_EXE_koh`, which only exists
-# when the bin is built, so it follows the `cli` gate and a build without `cli` stays clap-free.
-[[test]]
-name = "e2e_pty_binary"
-required-features = ["cli"]
-
-[[test]]
-name = "key_creation_race"
-required-features = ["cli"]
-
 [dependencies]
-# transport (pinned: iroh API churns; see README). iroh 1.0 brings its own QUIC backend (noq, a
-# quinn fork); we never depend on quinn directly.
-iroh = "=1.0.0"
-# terminal / pty / tui. fux-vt is the server's emulator and supplies the cell type the client grid
-# stores. 0.1.1 is the first release with what koh needs (opt-in events, extended replies, keypad
-# state, cell constructors).
-fux-vt = "0.1.1"
-portable-pty = "=0.9.0"
-unicode-width = "0.2"
-# The client's terminal: raw mode and the window size through safe termios calls. koh writes its own
-# ANSI and reads raw stdin itself, so it needs nothing more. Was already locked (through termina).
-rustix = { version = "1.1", default-features = false, features = ["std", "termios"] }
-# serialization. default-features = false drops postcard's `heapless-cas` default, whose
-# `atomic-polyfill` transitive dep is unmaintained (RUSTSEC-2023-0089); we only need `use-std`
-# (which pulls `alloc`) for `to_allocvec`/`from_bytes`. See KOH-17.
-postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
-serde = { version = "=1.0.228", features = ["derive"] }
-# DEFLATE compression of screen frames (pure-Rust, no unsafe).
-miniz_oxide = "0.8"
-# async / runtime
+# Path and version: the published `koh` depends on the published `koh-core` of the same version.
+koh-core = { path = "koh-core", version = "=0.12.1" }
+clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-# raise(SIGTSTP) for the Ctrl-^ Ctrl-Z client suspend without `unsafe` (nix wraps the libc call
-# internally; our crate stays `forbid(unsafe)`). `poll` makes the stdin producer cancellable while
-# idle; no default features. Already present transitively, so this pins no new major version.
-nix = { version = "0.28", default-features = false, features = ["fs", "poll", "process", "signal", "user"] }
-# render the endpoint id as a terminal QR on `koh serve` (always printed); default-features = false drops the
-# heavy image/svg/pic renderers (we only use the built-in unicode half-block renderer).
-qrcode = { version = "=0.14.1", default-features = false }
-# utility
 anyhow = "1"
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Optional: only the `koh` binary and the `*Args` adapters need it (the `cli` feature).
-clap = { version = "4", features = ["derive", "env"], optional = true }
-rand = "0.8"
-data-encoding = "2"
-
-[features]
-# `cli` owns clap and gates the `koh` binary, the `*Args` adapter structs and the pty-binary e2e
-# test.
-default = ["cli"]
-cli = ["dep:clap"]
 
 [dev-dependencies]
-proptest = "1"
-# The fault-injecting test transport (`tests/net/link.rs`): iroh's custom-transport API and the
-# crates its trait signatures name. Dev-only, so release builds keep iroh's default features; all
-# are already in the lockfile through iroh.
-bytes = "1"
-iroh = { version = "=1.0.0", features = ["unstable-custom-transports"] }
-iroh-base = "=1.0.0"
-n0-watcher = "=1.0.0"
-noq-udp = { version = "=1.0.0", default-features = false }
-# Deterministic deadline tests; no network endpoint or wall-clock wait.
-tokio = { version = "1", features = ["test-util"] }
+# The pty-binary e2e test drives the real binary on an allocated PTY.
+portable-pty = "=0.9.0"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 # Keep release as strict as debug on integer overflow: koh is an interactive tool (not a throughput
 # engine), so the per-op cost is negligible. Production code has no unchecked arithmetic
-# (`panic_free!` forbids `arithmetic_side_effects` and the lossy `as` casts, which overflow checks
+# (`koh-core` forbids `arithmetic_side_effects` and the lossy `as` casts, which overflow checks
 # never see), so this is the second line of defence there, and the only one in tests: a
 # wrap-on-overflow is a loud panic, not a silent miscompute. NOTE: panic stays `unwind`, never
 # `abort` — a panicking connection task must unwind and detach cleanly, not abort the server.
 overflow-checks = true
 
 # ---------------------------------------------------------------------------
-# Lints. Goal: the library and binary are PANIC-FREE by construction, enforced by
-# clippy. The panic-introducing lints below are denied crate-wide, and production
-# code additionally `forbid`s them (`panic_free!` in src/lib.rs and src/main.rs),
-# so no local `#[expect]` can carve out an exception there. Test code keeps
-# `unwrap`/`expect`/`panic`/`indexing` via the keys in `clippy.toml`.
+# Lints. The same set as `koh-core/Cargo.toml`, at `deny` instead of `forbid`: clap's derives emit
+# `#[allow(...)]` for some of these lints, which a `forbid` rejects (E0453). CI's `-D warnings`
+# still fails on any violation.
 # ---------------------------------------------------------------------------
 [lints.rust]
-# A bare `unsafe` block must justify itself; this codebase is 100% safe today.
+# A bare `unsafe` block must justify itself; this codebase is 100% safe.
 unsafe_code = "forbid"
-# Dead code is a hard compile error. `deny` (not `forbid`) because clap's derive macros
-# (`Args`/`Subcommand`/`ValueEnum`) emit an internal `#[allow(dead_code)]` that `forbid` rejects
-# outright (E0453) — `deny` is the strictest level compatible with the derives while still failing the
-# build on any genuine dead code we write. Combined with the minimal-surface discipline (test-only
-# helpers are `#[cfg(test)]`-gated, not left `pub`), this keeps the crate from accreting unused items;
-# it also covers the integration-test crates, so every helper there must be used too.
+# Dead code is a hard error; every test helper must be used too.
 dead_code = "deny"
+# Results that must be used, and recursion that cannot terminate.
+unused_must_use = "deny"
+unconditional_recursion = "deny"
 
 [lints.clippy]
 # Lint-group toggles (priority = -1 so individual lints below can override).
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
 
-# --- panic prevention (deny): no explicit panics in non-test code ---
+# --- the panic-free set: explicit panics, lossy casts, unchecked arithmetic, silent failures ---
+# Tests may still unwrap, expect, panic and index (the keys in `clippy.toml`).
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
@@ -150,42 +101,44 @@ get_unwrap = "deny"
 unwrap_in_result = "deny"
 panic_in_result_fn = "deny"
 exit = "deny"
-indexing_slicing = "deny"        # `a[i]` panics on out-of-bounds — use `.get()`
-string_slice = "deny"            # `s[a..b]` panics on a non-char-boundary
+indexing_slicing = "deny"
+string_slice = "deny"
 expect_fun_call = "deny"
-
-# --- additional correctness / footgun restrictions (deny) ---
+infinite_loop = "deny"
+large_stack_frames = "deny"
+large_stack_arrays = "deny"
+read_zero_byte_vec = "deny"
+debug_assert_with_mut_call = "deny"
+significant_drop_in_scrutinee = "deny"
+cast_lossless = "deny"
+unchecked_time_subtraction = "deny"
+unused_result_ok = "deny"
 mem_forget = "deny"
+integer_division = "deny"
+allow_attributes_without_reason = "deny"
+wildcard_enum_match_arm = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+arithmetic_side_effects = "deny"
+
+# --- further correctness restrictions (deny) ---
 lossy_float_literal = "deny"
 float_cmp_const = "deny"
 rc_buffer = "deny"
 rest_pat_in_fully_bound_structs = "deny"
-# `Instant - Duration` panics on underflow; use `checked_sub`/`saturating_duration_since`.
-unchecked_time_subtraction = "deny"
 # `.map_err(|_| ...)` silently drops the source error. Where hiding it is deliberate (secret or
 # attacker-controlled input), say so with a local `#[expect]`.
 map_err_ignore = "deny"
-# `result.ok();` as a statement discards an error while looking like it handles it.
-unused_result_ok = "deny"
-# Integer division truncates silently; make the rounding intent explicit at each site.
-integer_division = "deny"
-
-# --- suppression hygiene (deny) ---
-# Suppress with `#[expect]`, never `#[allow]`: an expectation that stops firing is itself a warning,
-# so stale suppressions get cleaned up instead of silently accumulating.
+# Suppress with `#[expect]`, never `#[allow]`: an expectation that stops firing is itself a
+# warning, so stale suppressions get cleaned up instead of silently accumulating.
 allow_attributes = "deny"
-allow_attributes_without_reason = "deny"
 
-# --- pedantic lints that are noisy or fight this codebase's deliberate style ---
+# --- pedantic / nursery lints that are noisy or fight this codebase's deliberate style ---
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
-# The three lossy-cast lints are `forbid`den in production code by `panic_free!` (src/lib.rs,
-# src/main.rs), which overrides this level; `allow` here only relaxes tests.
-cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
-cast_possible_wrap = "allow"
 cast_precision_loss = "allow"
 similar_names = "allow"
 struct_excessive_bools = "allow"
@@ -198,6 +151,5 @@ cognitive_complexity = "allow"
 option_if_let_else = "allow"
 significant_drop_tightening = "allow"   # false-positives on single-statement lock guards
 duration_suboptimal_units = "allow"     # `from_secs(3600)` is clearer than a contrived larger unit
-# `const fn` on every getter is high-churn for debatable benefit (and `const` is part of the
-# public API surface — making it implicit everywhere is not obviously desirable); not enforced.
+# `const fn` on every getter is high-churn for debatable benefit; not enforced.
 missing_const_for_fn = "allow"

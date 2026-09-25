@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use koh::transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
+use koh_core::transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
 
 #[tokio::main]
 async fn main() -> Result<()> {

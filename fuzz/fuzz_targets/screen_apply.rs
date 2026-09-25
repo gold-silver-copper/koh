@@ -9,7 +9,7 @@
 //! mirrors the in-tree `apply_is_panic_free_and_holds_invariants` proptest, extended to
 //! coverage-guided fuzzing of the encoding.
 
-use koh::terminal::{ScreenDiff, TerminalScreen, MAX_DIM, MIN_DIM};
+use koh_core::terminal::{ScreenDiff, TerminalScreen, MAX_DIM, MIN_DIM};
 use libfuzzer_sys::fuzz_target;
 
 fn check(screen: &TerminalScreen) {

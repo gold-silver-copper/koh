@@ -17,12 +17,18 @@ recovery, congestion control, RTT estimates, roaming and NAT traversal.
 
 ## Module layout
 
-A single crate, organized into small, independently-tested modules:
+A workspace of two crates. `koh-core` is the library, with everything except the command line;
+it has no clap, so its `Cargo.toml` forbids the panic lints outright. `koh` is the binary: the clap
+definitions and the mapping from arguments to `koh-core`'s config structs. Its lints are the same
+set at `deny`, because clap's derives `allow` some of them.
 
 ```
-src/
+src/                 the `koh` binary
+├── main.rs          serve / connect / id / key subcommand dispatch
+└── args.rs          the clap argument structs and their conversions into koh-core's configs
+tests/               the binary on a PTY, key creation races, the Android suites (opt-in)
+koh-core/src/
 ├── lib.rs           crate root: module declarations + the architecture overview
-├── main.rs          the `koh` binary: serve / connect / id / key subcommand dispatch
 ├── proto.rs         the koh/3 wire protocol: client messages, screen frames, caps, pacing
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
 ├── predict.rs       local-echo prediction engine (overlays, epochs, adaptive engage)
@@ -32,14 +38,13 @@ src/
 ├── client/          the connection loop + ClientSession core + predictor + render + `connect`
 │   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through rustix::termios)
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
-├── args.rs          the clap argument structs (`cli` feature only)
 ├── idcmd.rs         `koh id` — print this machine's endpoint id
 └── keycmd.rs        `koh key` — show the identity, or reset it
-tests/net/           koh over a fault-injecting link between real iroh endpoints
-tests/               PTY, PTY-binary, loopback e2e, admission and key tests
+koh-core/tests/net/  koh over a fault-injecting link between real iroh endpoints
+koh-core/tests/      PTY, loopback e2e and admission tests
 ```
 
-Dependency direction is strict: `proto` sits on `terminal`; `server` and `client` (+ the `main`
+Dependency direction is strict: `proto` sits on `terminal`; `server` and `client` (+ the `koh`
 binary) build on both. The protocol cores (`proto`, `terminal`, `predict`, `server::ServerConn`,
 `client::ClientSession`) do no I/O and are tested with no network at all. `predict` imports nothing
 from `crate::` (CI checks it), so it is a standalone terminal-prediction library.
@@ -49,7 +54,7 @@ from `crate::` (CI checks it), so it is a standalone terminal-prediction library
 The ALPN `koh/3` is the version check: a peer on another version fails the TLS handshake with a
 clear error. After the handshake the server checks the allowlist and opens a bi-stream carrying one
 ADMIT byte, so a rejected client can tell "not authorized" from a network error. Then
-(`src/proto.rs`):
+(`koh-core/src/proto.rs`):
 
 - **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Input { seq,
   bytes }` (at most 64 KiB; a paste is split), `Resize`, `Ack { frame }` after applying a frame, and
@@ -212,7 +217,7 @@ The full picture is in the [threat model](THREAT_MODEL.md). In brief, the releva
 You never need a second *machine* to develop koh — you need a second *process* and occasionally a
 second *container*. The verification is layered cheapest-first; everything but Tier 3 is headless.
 
-### Tier 0 — pure logic, no infra (`cargo test`)
+### Tier 0 — pure logic, no infra (`cargo test --workspace`)
 
 The protocol, diff/apply, predictor and session registry need no network or TTY, so they're tested
 deterministically:
@@ -228,18 +233,18 @@ deterministically:
   Coverage-guided fuzz targets: `screen_apply` (the structured diff), `server_process` and
   `proto_decode` (both directions of the wire).
 
-### Tier 1 — real iroh endpoints on one machine (`cargo test`)
+### Tier 1 — real iroh endpoints on one machine (`cargo test --workspace`)
 
 A second host is just a second endpoint, and a TTY is just an allocated PTY.
 
-- **`tests/net/`** — a real `koh serve` accept loop and a real `koh connect` client loop on iroh
-  endpoints whose only path is an in-process fault-injecting link (`tests/net/link.rs`, an iroh
+- **`koh-core/tests/net/`** — a real `koh serve` accept loop and a real `koh connect` client loop on iroh
+  endpoints whose only path is an in-process fault-injecting link (`koh-core/tests/net/link.rs`, an iroh
   custom transport): loss, delay, jitter, duplication, reordering and outages under real QUIC. It
   covers screen convergence (and that a stale screen is never shown), exactly-once ordered input,
   reattach, a forced mid-session drop, exit status, resize, XON/XOFF, input backpressure, the bell
   hook, prediction and the no-echo property, and hostile clients and servers. An `#[ignore]`d
   baseline measures echo latency, output bursts, bytes and outage recovery per network profile.
-- **`tests/e2e_loopback.rs`** — the whole loop over loopback: scripted keystroke → client → iroh →
+- **`koh-core/tests/e2e_loopback.rs`** — the whole loop over loopback: scripted keystroke → client → iroh →
   server → PTY-hosted `sh` → fux-vt → iroh → client render.
 - **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** attached to an allocated PTY (so
   `isatty()` is true and raw mode runs for real), driven by scripted keystrokes with rendered

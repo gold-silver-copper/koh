@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "cli"))]
+#![cfg(unix)]
 
 use std::process::{Command, Stdio};
 
@@ -56,7 +56,7 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
     }
     let directory = Directory(std::env::temp_dir().join(format!(
         "koh-relative-reset-{}",
-        koh::identity::Identity::generate().endpoint_id()
+        koh_core::identity::Identity::generate().endpoint_id()
     )));
     std::fs::create_dir(&directory.0).expect("private directory");
     std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700))

@@ -40,54 +40,49 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy (warnings are errors)
-        run: cargo clippy --all-targets --locked -- -D warnings
-      # `--all-targets` also builds the library as its own unit-test crate, where the production
-      # `forbid`s are off. Check the shipped lib and binary on their own, so the forbid is what
-      # actually gates them.
-      - name: clippy (production build, panic lints forbidden)
-        run: cargo clippy --lib --bins --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # `--all-targets` builds the library under `cfg(test)`, where clippy.toml lets tests panic.
+      # Check the shipped library and binary as they are built for release, too.
+      - name: clippy (production build)
+        run: cargo clippy --workspace --lib --bins --locked -- -D warnings
       - name: layering guard
         # Enforce the load-bearing dependency edges the architecture relies on (AR-02). Greps
         # the `use crate::` import form only, so doc-comment rustdoc links can't false-positive.
         run: |
-          if grep -rnE '^[[:space:]]*use crate::' src/predict.rs; then
+          if grep -rnE '^[[:space:]]*use crate::' koh-core/src/predict.rs; then
             echo "::error::predict.rs must import nothing from crate:: — keep it a standalone library"
             exit 1
           fi
           # The wire protocol sits below both ends: it may use the screen types, never a client or server.
-          if grep -rnE '^[[:space:]]*use crate::(server|client)' src/proto.rs; then
+          if grep -rnE '^[[:space:]]*use crate::(server|client)' koh-core/src/proto.rs; then
             echo "::error::proto.rs must not import from server/client — both ends build on it"
             exit 1
           fi
           echo "layering edges OK"
       - name: test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
       - name: docs (deny broken intra-doc links)
-        # Catches workspace-era / renamed intra-doc links before they ship a broken docs.rs build.
-        run: cargo doc --no-deps --locked
+        # Catches renamed intra-doc links before they ship a broken docs.rs build.
+        run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
 
-  # The library without the `cli` feature: clap stays confined to the binary and its argument
-  # adapters, and the library-plus-tests tree still builds.
-  no-cli:
+  # Both crates stay publishable at the same version, so `cargo install koh` keeps working, and the
+  # library stays clap-free: its lints are `forbid`, which clap's derives cannot compile under.
+  publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: clippy (library without cli, warnings are errors)
-        run: cargo clippy --lib --locked --no-default-features -- -D warnings
-      - name: clippy (all targets without cli, warnings are errors)
-        run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
-      - name: no clap in the library-only tree
+      - name: no clap in koh-core
         run: |
-          if cargo tree --locked --no-default-features -e normal | grep -q '^.* clap '; then
-            echo "::error::clap is in the library-only dependency tree; gate it behind the cli feature"
+          if cargo tree --locked -p koh-core -e normal | grep -q '^.* clap '; then
+            echo "::error::clap is in koh-core's dependency tree; the command line belongs in koh"
             exit 1
           fi
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --workspace --locked
 
   # Verify the declared MSRV (`rust-version = "1.95"`) actually builds — otherwise the declaration is
   # a false promise to `cargo install` users on an older toolchain. Check, not test (the `=`-pinned
@@ -99,7 +94,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
       - name: cargo check on the declared MSRV
-        run: cargo check --locked --all-targets
+        run: cargo check --workspace --locked --all-targets
 
   # Supply-chain tripwire: the `=` pins buy reproducibility, so this is what keeps them from
   # silently aging into a CVE. Advisory ignores (and the rationale) live in deny.toml.

@@ -3,10 +3,8 @@
 All notable changes to koh are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and koh aims to follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) for the **binary's CLI, the on-disk
-key format, and the wire protocol (its ALPN)**. From 0.10.0 the library's config
-types and entry points (`ServeConfig`/`serve`, `ConnectConfig`/`connect`, `IdConfig`/`run_id`,
-`KeyConfig`/`keycmd::run`, and the `ssp` core) are covered too; everything else in the library is
-internal and unstable (see `src/lib.rs`).
+key format, and the wire protocol (its ALPN)**. The `koh-core` library is internal: it exists so
+the binary, its tests and the fuzz targets share code, and any release may change it.
 
 > **A note on versions.** [crates.io](https://crates.io/crates/koh) is the source of truth for what
 > was actually released. Two git-tag-only gaps exist from koh's early, fast-moving security-review
@@ -99,7 +97,9 @@ error; upgrade both ends.
   `Pty::terminate_process_group`/`shutdown_process_group`, `ServerTerminal::progress` and the
   OSC 9;4 `Progress` parser, the unhandled-OSC ring (`take_unhandled_oscs`, `UNHANDLED_OSC_*`)
   and `ServerTerminal::with_scrollback_screen`.
-- **The `shell` feature.** The shell is always compiled; only `cli` remains optional.
+- **The `shell` and `cli` features.** The library is now its own crate, `koh-core`, with no
+  command line and no clap; the `koh` crate is the binary on top of it. `cargo install koh` is
+  unchanged. Code that used the `koh` library depends on `koh-core` instead.
 - **The SSP transport and its test harnesses**: `koh::ssp` (`SyncState`, `Transport`, `testkit`),
   `koh::wire` (`Instruction`, the fragmenter and reassembler, `PROTOCOL_VERSION`), `koh::input`,
   `koh::sim`, the `chaos` example, the `test-support` feature and `MonoClock`. koh/3 replaces them.

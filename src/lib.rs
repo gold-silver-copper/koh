@@ -18,11 +18,13 @@
 
 /// Declares modules whose production code is panic-free by construction.
 ///
-/// The panic lints are `forbid` here, not just Cargo.toml's `deny`, so no local
-/// `#[expect]`/`#[allow]` can carve out an exception. They are applied per module rather than in
-/// `[lints]` or at the crate root because two things must stay outside: tests and the
-/// `test-support` harnesses, which panic on purpose (see clippy.toml), and the clap derives in
-/// [`args`], which emit `#[allow(clippy::restriction)]` and so cannot compile under a `forbid`.
+/// The panic lints, and the lints for other silent failures (unused results, runaway recursion,
+/// oversized stack frames, lossy time and integer operations), are `forbid` here, not just
+/// Cargo.toml's `deny`, so no local `#[expect]`/`#[allow]` can carve out an exception. They are
+/// applied per module rather than in `[lints]` or at the crate root because two things must stay
+/// outside: tests and the `test-support` harnesses, which panic on purpose (see clippy.toml), and
+/// the clap derives in [`args`], which emit `#[allow(clippy::restriction)]` and so cannot compile
+/// under a `forbid`.
 macro_rules! panic_free {
     ($($item:item)*) => {$(
         #[cfg_attr(
@@ -40,7 +42,25 @@ macro_rules! panic_free {
                 clippy::exit,
                 clippy::indexing_slicing,
                 clippy::string_slice,
-                clippy::expect_fun_call
+                clippy::expect_fun_call,
+                // Not panics, but the same class of silent failure, and already at zero here:
+                // results that must be used, runaway recursion and loops, oversized stack frames,
+                // lock guards held across a match, and time/integer ops that panic or truncate.
+                unused_must_use,
+                unconditional_recursion,
+                clippy::suspicious,
+                clippy::infinite_loop,
+                clippy::large_stack_frames,
+                clippy::large_stack_arrays,
+                clippy::read_zero_byte_vec,
+                clippy::debug_assert_with_mut_call,
+                clippy::significant_drop_in_scrutinee,
+                clippy::cast_lossless,
+                clippy::unchecked_time_subtraction,
+                clippy::unused_result_ok,
+                clippy::mem_forget,
+                clippy::integer_division,
+                clippy::allow_attributes_without_reason
             )
         )]
         $item

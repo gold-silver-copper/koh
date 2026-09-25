@@ -41,27 +41,22 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy (warnings are errors)
         run: cargo clippy --all-targets --locked -- -D warnings
-      # Tests and examples enable `test-support` (via the self dev-dependency), which lifts the
-      # production `forbid` on panic lints. Check the shipped lib and binary without it, so the
-      # forbid is what actually gates them.
+      # `--all-targets` also builds the library as its own unit-test crate, where the production
+      # `forbid`s are off. Check the shipped lib and binary on their own, so the forbid is what
+      # actually gates them.
       - name: clippy (production build, panic lints forbidden)
         run: cargo clippy --lib --bins --locked -- -D warnings
       - name: layering guard
-        # Enforce the two load-bearing dependency edges the architecture relies on (AR-02). Greps
+        # Enforce the load-bearing dependency edges the architecture relies on (AR-02). Greps
         # the `use crate::` import form only, so doc-comment rustdoc links can't false-positive.
         run: |
           if grep -rnE '^[[:space:]]*use crate::' src/predict.rs; then
             echo "::error::predict.rs must import nothing from crate:: — keep it a standalone library"
             exit 1
           fi
-          if grep -rnE '^[[:space:]]*use crate::wire' src/server src/client; then
-            echo "::error::server/client must not 'use crate::wire' directly — reach the wire through ssp::Transport"
-            exit 1
-          fi
-          # The generic host/client seam (0.11) must not leak back down: the protocol core stays
-          # ignorant of the terminal and the server.
-          if grep -rnE '^[[:space:]]*use crate::(terminal|server|client)' src/ssp; then
-            echo "::error::ssp must not import from terminal/server/client — the transport is generic over SyncState"
+          # The wire protocol sits below both ends: it may use the screen types, never a client or server.
+          if grep -rnE '^[[:space:]]*use crate::(server|client)' src/proto.rs; then
+            echo "::error::proto.rs must not import from server/client — both ends build on it"
             exit 1
           fi
           echo "layering edges OK"
@@ -126,8 +121,8 @@ jobs:
 
   # Coverage-guided fuzzing of the untrusted-input decode surfaces (the OpenSSH/OSS-Fuzz doctrine:
   # one harness per attacker-reachable parser). Builds the harnesses, then a short smoke run that
-  # MUST stay crash-free — `screen_apply` proves the structured-diff apply never panics, `wire_decode`
-  # and `proto_decode` prove the wire decoders only Err (never panic) on arbitrary bytes.
+  # MUST stay crash-free — `screen_apply` proves the structured-diff apply never panics, and
+  # `proto_decode` proves the wire decoders only Err (never panic) on arbitrary bytes.
   fuzz:
     runs-on: ubuntu-latest
     steps:
@@ -141,6 +136,5 @@ jobs:
       - name: smoke (must stay crash-free)
         run: |
           cargo +nightly fuzz run screen_apply -- -max_total_time=45 -rss_limit_mb=4096
-          cargo +nightly fuzz run wire_decode  -- -max_total_time=45 -rss_limit_mb=4096
           cargo +nightly fuzz run proto_decode -- -max_total_time=45 -rss_limit_mb=4096
           cargo +nightly fuzz run server_process -- -max_total_time=45 -rss_limit_mb=4096

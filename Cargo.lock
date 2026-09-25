@@ -1886,7 +1886,6 @@ dependencies = [
  "fux-vt",
  "iroh",
  "iroh-base",
- "koh",
  "miniz_oxide",
  "n0-watcher",
  "nix",

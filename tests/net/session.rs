@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use crate::harness::{identity, session, Client, Server};
+use crate::harness::{identity, session, Client, Options, Server};
 use crate::link::{FaultNet, Profile};
 
 const WAIT: Duration = Duration::from_secs(15);
@@ -53,7 +53,7 @@ async fn many_connects_in_a_row_reattach_the_same_session() {
         .expect("start the server");
     let endpoint = net.endpoint(secret, false).await.expect("bind the client");
     for i in 0..20 {
-        let mut client = Client::connect_on(endpoint.clone(), server.id, None)
+        let mut client = Client::connect_on(endpoint.clone(), server.id, Options::default())
             .await
             .unwrap_or_else(|e| panic!("iteration {i}: connect failed: {e:#}"));
         let marker = format!("REPEAT_{i}");
@@ -85,7 +85,7 @@ async fn connections_dropped_with_input_in_flight_do_not_hurt_the_session() {
         .expect("start the server");
     let endpoint = net.endpoint(secret, false).await.expect("bind the client");
     for i in 0..15 {
-        let mut client = Client::connect_on(endpoint.clone(), server.id, None)
+        let mut client = Client::connect_on(endpoint.clone(), server.id, Options::default())
             .await
             .unwrap_or_else(|e| panic!("iteration {i}: connect failed: {e:#}"));
         client.send(b"\r\r\r\r\r").await.expect("type");
@@ -134,7 +134,7 @@ async fn a_detached_session_is_reattached_at_its_current_screen() {
         .await
         .expect("start the server");
     let endpoint = net.endpoint(secret, false).await.expect("bind the client");
-    let mut first = Client::connect_on(endpoint.clone(), server.id, None)
+    let mut first = Client::connect_on(endpoint.clone(), server.id, Options::default())
         .await
         .expect("connect #1");
     first.send(b"echo REATTACH''_MARKER\r").await.expect("type");
@@ -144,7 +144,7 @@ async fn a_detached_session_is_reattached_at_its_current_screen() {
         .is_some());
     let _ = first.finish().await;
     // No input this time: the new connection must repaint the same session's screen.
-    let mut second = Client::connect_on(endpoint, server.id, None)
+    let mut second = Client::connect_on(endpoint, server.id, Options::default())
         .await
         .expect("connect #2");
     assert!(

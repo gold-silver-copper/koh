@@ -10,10 +10,8 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::wire::DEFAULT_MAX_DATAGRAM;
-use bytes::Bytes;
 use iroh::endpoint::{
-    presets, Connection, ConnectionError, IdleTimeout, PathId, QuicTransportConfig, VarInt,
+    presets, Connection, IdleTimeout, PathId, QuicTransportConfig, VarInt,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use secrecy::{ExposeSecret, SecretString};
@@ -709,51 +707,6 @@ impl IrohChannel {
             .or_else(|| self.conn.rtt(PathId::ZERO))
     }
 
-    /// Send one datagram. Failures (peer congestion, too-large, unsupported) are *dropped* on
-    /// purpose: the SSP resends the current state on the next tick, so a lost datagram is a
-    /// non-event. Returns whether it was handed to the transport.
-    pub fn send(&self, datagram: &[u8]) -> bool {
-        match self.conn.send_datagram(Bytes::copy_from_slice(datagram)) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::trace!(error = %e, len = datagram.len(), "datagram send dropped");
-                false
-            }
-        }
-    }
-
-    /// Await the next inbound datagram.
-    pub async fn recv(&self) -> Result<Bytes, ConnectionError> {
-        self.conn.read_datagram().await
-    }
-
-    /// The current datagram payload budget (path-MTU dependent; can change over the
-    /// connection's life). Falls back to a conservative default if datagrams report no size.
-    pub fn max_datagram_size(&self) -> usize {
-        self.conn
-            .max_datagram_size()
-            .unwrap_or(DEFAULT_MAX_DATAGRAM)
-            .max(64)
-    }
-
-    /// The smoothed path RTT in milliseconds, preferring the currently-selected path. `None`
-    /// before any path is established (e.g. mid-holepunch).
-    pub fn rtt_ms(&self) -> Option<f64> {
-        let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
-        if let Some(p) = self
-            .conn
-            .paths()
-            .iter()
-            .find(iroh::endpoint::Path::is_selected)
-        {
-            return Some(to_ms(p.rtt()));
-        }
-        if let Some(p) = self.conn.paths().iter().next() {
-            return Some(to_ms(p.rtt()));
-        }
-        self.conn.rtt(PathId::ZERO).map(to_ms)
-    }
-
     /// Immediately close the connection with an application code + reason.
     pub fn close(&self, code: u32, reason: &[u8]) {
         self.conn.close(VarInt::from_u32(code), reason);
@@ -1151,11 +1104,10 @@ mod tests {
             iroh::dns::DnsResolver::with_nameserver(SocketAddr::from(([8, 8, 8, 8], 53)));
     }
 
-    /// Tier-1 foundation: two real iroh endpoints on loopback establish a connection and
-    /// exchange a datagram both ways over the genuine accept/connect/datagram API — no relay,
-    /// no second machine, fully hermetic.
+    /// Two real iroh endpoints on loopback connect and exchange a stream each way, under the
+    /// per-role stream limits: no relay, no second machine, fully hermetic.
     #[tokio::test]
-    async fn two_endpoints_exchange_datagram_over_loopback() {
+    async fn two_endpoints_exchange_streams_over_loopback() {
         let server = bind_endpoint_local(generate_secret_key(), true)
             .await
             .expect("bind server");
@@ -1167,8 +1119,11 @@ mod tests {
         let srv = tokio::spawn(async move {
             let incoming = server.accept().await.expect("accept");
             let conn = incoming.await.expect("handshake");
-            let dg = conn.read_datagram().await.expect("read datagram");
-            conn.send_datagram(dg).expect("echo datagram"); // echo it back
+            let mut recv = conn.accept_uni().await.expect("the client's stream");
+            let ping = recv.read_to_end(64).await.expect("read ping");
+            let mut send = conn.open_uni().await.expect("a server stream");
+            send.write_all(&ping).await.expect("echo");
+            send.finish().expect("finish");
             conn.closed().await;
         });
 
@@ -1176,15 +1131,14 @@ mod tests {
             .connect(server_addr, ALPN)
             .await
             .expect("connect over loopback");
-        let chan = IrohChannel::new(conn);
-        assert!(
-            chan.send(b"ping-over-real-iroh"),
-            "datagram send should succeed"
-        );
-        let echoed = chan.recv().await.expect("recv echo");
-        assert_eq!(&echoed[..], b"ping-over-real-iroh");
+        let mut send = conn.open_uni().await.expect("open a stream");
+        send.write_all(b"ping-over-real-iroh").await.expect("write");
+        send.finish().expect("finish");
+        let mut recv = conn.accept_uni().await.expect("the echo stream");
+        let echoed = recv.read_to_end(64).await.expect("read the echo");
+        assert_eq!(echoed, b"ping-over-real-iroh");
 
-        chan.close(0, b"done");
+        IrohChannel::new(conn).close(0, b"done");
         let _ = srv.await;
     }
 

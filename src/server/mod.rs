@@ -23,7 +23,6 @@ use crate::proto::{
     encode_frame, frame_interval, retry_after, ClientDecoder, ClientMsg, Frame, FrameNum, InputSeq,
     ProtoError, FRAME_WINDOW, HEARTBEAT, SESSION_ENDED,
 };
-use crate::ssp::SyncState as _;
 use crate::terminal::TerminalScreen;
 use crate::transport_iroh::IrohChannel;
 use iroh::endpoint::RecvStream;
@@ -418,6 +417,8 @@ pub async fn run_attached(
     let mut core = ServerConn::default();
     let mut changed = handle.changed.subscribe();
     let mut client: Option<RecvStream> = None;
+    // The client gets exactly one stream for the connection, even after it finishes that one.
+    let mut had_client_stream = false;
     let mut read_buf = vec![0u8; 16 * 1024];
     let mut in_flight: VecDeque<(FrameNum, CancellationToken)> = VecDeque::new();
     let result = loop {
@@ -474,7 +475,10 @@ pub async fn run_attached(
             // landed between the snapshot above and this wait resolves immediately.
             _ = changed.changed() => core.mark_dirty(),
             stream = conn.accept_uni() => match stream {
-                Ok(stream) if client.is_none() => client = Some(stream),
+                Ok(stream) if !had_client_stream => {
+                    had_client_stream = true;
+                    client = Some(stream);
+                }
                 Ok(_) => {
                     conn.close(PROTOCOL_ERROR.into(), b"a second client stream");
                     break Ok(SessionExit::Detached);
@@ -601,7 +605,6 @@ mod tests {
         decode_frame, encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
         FRAME_WINDOW, HEARTBEAT, MAX_FRAME,
     };
-    use crate::ssp::SyncState as _;
     use crate::terminal::TerminalScreen;
 
     /// Feed `chunks` through one normalizer at the given app-cursor mode, return the PTY bytes.

@@ -2,14 +2,13 @@
 //! Fuzz the untrusted SERVER->CLIENT screen-apply path — the highest-value attacker surface: a
 //! server (or anyone who compromised one) controls every `ScreenDiff` the client applies.
 //!
-//! Arbitrary bytes are decoded as a `ScreenDiff` exactly as the transport does (postcard), then
+//! Arbitrary bytes are decoded as a `ScreenDiff` exactly as a frame carries it (postcard), then
 //! applied to a blank screen and to one with content. `apply` validates rows, runs and cells and
 //! drops a malformed frame whole, so it must NEVER panic, and must always leave a grid within the
 //! dimension clamp whose rows are exactly as wide as the screen, with the cursor in range. The body
 //! mirrors the in-tree `apply_is_panic_free_and_holds_invariants` proptest, extended to
 //! coverage-guided fuzzing of the encoding.
 
-use koh::ssp::SyncState;
 use koh::terminal::{ScreenDiff, TerminalScreen, MAX_DIM, MIN_DIM};
 use libfuzzer_sys::fuzz_target;
 

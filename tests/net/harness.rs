@@ -56,41 +56,72 @@ impl Server {
     }
 }
 
-/// What the client has painted: the latest screen text, its status line, and when either last
-/// changed.
+/// What the client has painted: the screen text, the predicted glyphs drawn over it, its status
+/// line, and when any of them last changed.
 #[derive(Clone, Debug)]
 pub struct Painted {
     pub text: String,
+    pub predicted: String,
     pub status: Option<String>,
     pub at: Instant,
+}
+
+/// How a test client runs.
+#[derive(Default)]
+pub struct Options {
+    pub bell: Option<BellHook>,
+    /// Whether to predict; `None` is `DisplayPreference::Never`.
+    pub predict: Option<DisplayPreference>,
 }
 
 /// The client's terminal: records each painted screen, at a size the test can change.
 struct Recorder {
     painted: watch::Sender<Painted>,
+    history: Arc<Mutex<Vec<Painted>>>,
     size: Arc<Mutex<(u16, u16)>>,
+}
+
+/// The glyphs a prediction overlay draws, row by row.
+fn predicted_glyphs(overlay: &Overlay, (rows, cols): (u16, u16)) -> String {
+    let mut glyphs = String::new();
+    for row in 0..rows {
+        for col in 0..cols {
+            if let Some(cell) = overlay.cell(row, col) {
+                glyphs.push_str(&cell.glyph);
+            }
+        }
+    }
+    glyphs
 }
 
 impl ClientTerminal for Recorder {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        _overlay: &Overlay,
+        overlay: &Overlay,
         status: Option<&str>,
     ) -> std::io::Result<()> {
-        let text = state.screen().contents();
-        let status = status.map(str::to_owned);
-        self.painted.send_if_modified(|painted| {
-            if painted.text == text && painted.status == status {
+        let painted = Painted {
+            text: state.screen().contents(),
+            predicted: predicted_glyphs(overlay, state.size()),
+            status: status.map(str::to_owned),
+            at: Instant::now(),
+        };
+        let changed = self.painted.send_if_modified(|last| {
+            if (&last.text, &last.predicted, &last.status)
+                == (&painted.text, &painted.predicted, &painted.status)
+            {
                 return false;
             }
-            *painted = Painted {
-                text,
-                status,
-                at: Instant::now(),
-            };
+            *last = painted.clone();
             true
         });
+        if changed {
+            self.history
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(painted);
+        }
         Ok(())
     }
 
@@ -106,6 +137,7 @@ pub struct Client {
     resize: mpsc::Sender<()>,
     size: Arc<Mutex<(u16, u16)>>,
     painted: watch::Receiver<Painted>,
+    history: Arc<Mutex<Vec<Painted>>>,
     /// The first connection, so a test can cut it and watch the client reconnect.
     first: Connection,
     task: JoinHandle<anyhow::Result<Option<u32>>>,
@@ -119,15 +151,15 @@ impl Client {
         server: EndpointId,
     ) -> anyhow::Result<Self> {
         let endpoint = net.endpoint(secret, false).await?;
-        Self::connect_on(endpoint, server, None).await
+        Self::connect_on(endpoint, server, Options::default()).await
     }
 
-    /// Dial `server` from `endpoint` (so several connections share one client identity), with an
-    /// optional bell hook, and run the client loop.
+    /// Dial `server` from `endpoint` (so several connections share one client identity) and run
+    /// the client loop.
     pub async fn connect_on(
         endpoint: Endpoint,
         server: EndpointId,
-        bell: Option<BellHook>,
+        options: Options,
     ) -> anyhow::Result<Self> {
         let id = endpoint.id();
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server));
@@ -136,11 +168,14 @@ impl Client {
         let size = Arc::new(Mutex::new((24, 80)));
         let (painted_tx, painted) = watch::channel(Painted {
             text: String::new(),
+            predicted: String::new(),
             status: None,
             at: Instant::now(),
         });
+        let history = Arc::new(Mutex::new(Vec::new()));
         let term = Recorder {
             painted: painted_tx,
+            history: history.clone(),
             size: size.clone(),
         };
         let (input, input_rx) = mpsc::channel(1024);
@@ -148,13 +183,13 @@ impl Client {
         let task = tokio::spawn(run_client(
             channel,
             connector,
-            DisplayPreference::Never,
+            options.predict.unwrap_or(DisplayPreference::Never),
             (24, 80),
             input_rx,
             resize_rx,
             term,
             CancellationToken::new(),
-            bell,
+            options.bell,
         ));
         Ok(Self {
             id,
@@ -162,6 +197,7 @@ impl Client {
             resize,
             size,
             painted,
+            history,
             first,
             task,
         })
@@ -186,6 +222,14 @@ impl Client {
     /// The screen the client painted last.
     pub fn screen(&self) -> String {
         self.painted.borrow().text.clone()
+    }
+
+    /// Everything the client has painted, in order.
+    pub fn history(&self) -> Vec<Painted> {
+        self.history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Wait until a painted screen satisfies `done`, up to `timeout`, and return it with the time

@@ -243,7 +243,6 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame, ProtoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ssp::SyncState as _;
     use crate::terminal::TerminalScreen;
 
     fn frame() -> Frame {

@@ -1,20 +1,17 @@
-//! # koh-terminal — the `TerminalScreen` SSP state
+//! # koh-terminal — the screen the server sends
 //!
-//! The server→client half of the synchronized world: the terminal *screen*, not a byte
-//! stream. The server parses the shell's output with `fux-vt` ([`ServerTerminal`]) into a 2-D
-//! cell grid; the protocol's job is to bring the client to the server's *current* screen,
-//! collapsing any intermediate frames. A port of mosh's `Terminal::Complete`.
+//! The terminal *screen*, not a byte stream. The server parses the shell's output with `fux-vt`
+//! ([`ServerTerminal`]) into a 2-D cell grid; frames bring the client to the server's *current*
+//! screen, skipping any intermediate ones.
 //!
 //! ## A structured diff, no parser on the client
 //!
-//! [`TerminalScreen`] holds a plain [`Grid`] of `fux_vt::Cell`s plus the out-of-band channels
-//! (mosh's `HostMessage`): the `echo_ack` (which the client's predictor consumes as the
-//! authoritative "your input up to frame N is now on screen"), the window `title`/`icon`, the
-//! `clipboard` and `bell` out-of-band events and the shell's `exit_code`. A [`ScreenDiff`]
-//! carries the changed rows as run-length-encoded cells, the cursor and the modes. The client
-//! validates and copies cells; it never runs a terminal parser on server-controlled bytes.
+//! [`TerminalScreen`] holds a plain [`Grid`] of `fux_vt::Cell`s plus the out-of-band channels: the
+//! window `title`/`icon`, the `clipboard` and `bell` events and the shell's `exit_code`. A
+//! [`ScreenDiff`] carries the changed rows as run-length-encoded cells, the cursor and the modes.
+//! The client validates and copies cells; it never runs a terminal parser on server-controlled
+//! bytes.
 
-use crate::ssp::SyncState;
 use fux_vt::{Attributes, Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
 use serde::{Deserialize, Serialize};
 
@@ -79,12 +76,10 @@ fn capped_bytes(s: &str, max: usize) -> String {
     s.get(..s.floor_char_boundary(max)).unwrap_or("").to_string()
 }
 
-/// The synchronized screen state: the cell grid plus the out-of-band channels.
+/// The screen: the cell grid plus the out-of-band channels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalScreen {
     grid: Grid,
-    /// Newest user-input frame number the server has echoed (drives the client predictor).
-    echo_ack: u64,
     /// Window title (OSC 2), propagated so the client can mirror it.
     title: String,
     /// Window icon name (OSC 1), propagated alongside the title (mosh emits `]1;`/`]2;` when the
@@ -111,7 +106,6 @@ impl TerminalScreen {
     const fn with_grid(grid: Grid) -> Self {
         Self {
             grid,
-            echo_ack: 0,
             title: String::new(),
             icon: String::new(),
             clipboard: String::new(),
@@ -145,17 +139,6 @@ impl TerminalScreen {
     /// `(rows, cols)`.
     pub const fn size(&self) -> (u16, u16) {
         self.grid.size()
-    }
-
-    /// The server's echo-ack: the newest input frame number reflected on this screen.
-    pub const fn echo_ack(&self) -> u64 {
-        self.echo_ack
-    }
-
-    /// Stamp the echo-ack the connection loop computed for its client (KS-02). The emulator's
-    /// snapshot leaves it at 0; the per-connection loop writes it here.
-    pub fn set_echo_ack(&mut self, ack: u64) {
-        self.echo_ack = ack;
     }
 
     /// The window title, if the server has set one.
@@ -407,8 +390,6 @@ pub struct ScreenDiff {
     /// New `(rows, cols)` if the screen was resized; the client starts from a blank grid of that
     /// size, and `rows` then carries every row that isn't blank.
     pub resize: Option<(u16, u16)>,
-    /// The server's echo-ack at the target state.
-    pub echo_ack: u64,
     /// New window title if it changed.
     pub title: Option<String>,
     /// New window icon name if it changed.
@@ -428,33 +409,9 @@ pub struct ScreenDiff {
     pub rows: Vec<RowDiff>,
 }
 
-impl SyncState for TerminalScreen {
-    type Diff = ScreenDiff;
-
-    // A full repaint of a 1000×1000 screen with varied styles can be several MiB, so the screen
-    // direction keeps the 16 MiB inflate ceiling.
-    const RECV_DECODE_LIMIT: usize = crate::wire::MAX_DECOMPRESSED;
-
-    // Each retained snapshot costs `rows × cols` cells (≤ MAX_DIM², dimension-bounded by `clamp_dims`);
-    // the budget caps total retained screens at ~8 full-size ones, so a hostile server that prevents
-    // collapse can't pin tens of GB on the client (KOH-01).
-    const RECEIVE_BUDGET_UNITS: usize = 8 * (MAX_DIM as usize) * (MAX_DIM as usize);
-
-    fn resource_units(&self) -> usize {
-        let (rows, cols) = self.size();
-        // Each retained snapshot also owns title/icon/clipboard byte buffers (capped upstream at
-        // MAX_TITLE_LEN / MAXIMUM_CLIPBOARD_SIZE, but a hostile server can still ship a distinct
-        // max-size clipboard per state). Fold their lengths into the unit count (K-05) so
-        // RECEIVE_BUDGET_UNITS bounds total retained memory.
-        // A budget count: saturating only ever over-counts, which makes the budget stricter.
-        usize::from(rows)
-            .saturating_mul(usize::from(cols))
-            .saturating_add(self.title.len())
-            .saturating_add(self.icon.len())
-            .saturating_add(self.clipboard.len())
-    }
-
-    fn diff_from(&self, base: &Self) -> Self::Diff {
+impl TerminalScreen {
+    /// The diff that turns `base` into `self`.
+    pub fn diff_from(&self, base: &Self) -> ScreenDiff {
         let resized = self.size() != base.size();
         let (rows, cols) = self.size();
         let blank = vec![Cell::default(); usize::from(cols)];
@@ -470,7 +427,6 @@ impl SyncState for TerminalScreen {
         });
         ScreenDiff {
             resize: resized.then(|| self.size()),
-            echo_ack: self.echo_ack,
             title: (self.title != base.title).then(|| self.title.clone()),
             icon: (self.icon != base.icon).then(|| self.icon.clone()),
             clipboard: (self.clipboard != base.clipboard).then(|| self.clipboard.clone()),
@@ -482,15 +438,14 @@ impl SyncState for TerminalScreen {
         }
     }
 
-    fn apply(&mut self, diff: &Self::Diff) {
+    /// Apply `diff`, a diff against this screen. A malformed diff changes nothing.
+    pub fn apply(&mut self, diff: &ScreenDiff) {
         // Everything below is server-controlled. Validate the whole grid part first and commit
         // only if all of it is well-formed: a malformed frame is dropped and the prior screen
         // kept, never half-applied.
         //
-        // K-13 — LOAD-BEARING: `apply()` runs in the SSP receive path BEFORE the per-direction
-        // `RECEIVE_BUDGET_UNITS` check (the budget bounds *accumulation* across retained states,
-        // not the cost of building one state), so this `clamp_dims` is the SOLE bound on a single
-        // resize's grid allocation. The mirror clamp on the server lives in `terminal/server.rs`.
+        // K-13 — LOAD-BEARING: this `clamp_dims` is the only bound on a single resize's grid
+        // allocation. The mirror clamp on the server lives in `terminal/server.rs`.
         let (rows, cols) = diff
             .resize
             .map_or_else(|| self.size(), |(r, c)| clamp_dims(r, c));
@@ -524,7 +479,6 @@ impl SyncState for TerminalScreen {
             .set_cursor((crow.min(rows.saturating_sub(1)), ccol.min(cols)));
         self.grid.set_modes(modes);
 
-        self.echo_ack = self.echo_ack.max(diff.echo_ack);
         // Monotonic: never regress on a reordered/older diff (the SSP guarantees no state
         // regression, but `max` is the defensive, obviously-correct choice).
         self.bell_count = self.bell_count.max(diff.bell_count);
@@ -544,15 +498,11 @@ impl SyncState for TerminalScreen {
             self.exit_code = diff.exit_code;
         }
     }
-
-    // subtract_prefix: screen state is absolute, so the default no-op is correct (mosh's
-    // `Complete::subtract` is likewise a no-op).
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ssp::testkit::{LinkParams, SimHarness};
 
     fn screen_from(rows: u16, cols: u16, bytes: &[u8]) -> TerminalScreen {
         TerminalScreen::from_bytes(rows, cols, bytes)
@@ -616,7 +566,6 @@ mod tests {
     fn resize_only(resize: (u16, u16)) -> ScreenDiff {
         ScreenDiff {
             resize: Some(resize),
-            echo_ack: 0,
             title: None,
             icon: None,
             clipboard: None,
@@ -675,7 +624,6 @@ mod tests {
             title in proptest::option::of(".{0,512}"),
             icon in proptest::option::of(".{0,512}"),
             clipboard in proptest::option::of(".{0,40000}"),
-            echo_ack in proptest::prelude::any::<u64>(),
             bell_count in proptest::prelude::any::<u64>(),
             exit_code in proptest::option::of(proptest::prelude::any::<u32>()),
         ) {
@@ -688,7 +636,7 @@ mod tests {
                 mouse_encoding: modes.5,
             };
             let diff = ScreenDiff {
-                resize, echo_ack, title, icon, clipboard, bell_count, exit_code, cursor, modes, rows,
+                resize, title, icon, clipboard, bell_count, exit_code, cursor, modes, rows,
             };
             let mut screen = TerminalScreen::default();
             screen.apply(&diff); // must not panic on adversarial input
@@ -886,21 +834,6 @@ mod tests {
         let mut c = base;
         c.apply(&diff);
         assert_eq!(c, target);
-    }
-
-    #[test]
-    fn converges_over_lossy_link() {
-        // Server (A) evolves its screen; client (B) must converge to the latest frame.
-        let mut h =
-            SimHarness::<TerminalScreen, TerminalScreen>::new(LinkParams::lossy(), 77, 1200);
-        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
-        for i in 0..30u32 {
-            emu.process(format!("\r\nframe {i} of output").as_bytes());
-            *h.a_mut() = emu.snapshot();
-            h.run_steps(5);
-        }
-        let final_snap = emu.snapshot();
-        h.run_until(20_000, move |h| *h.b_view_of_a() == final_snap);
     }
 
     #[test]

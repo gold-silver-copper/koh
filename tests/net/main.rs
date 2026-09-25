@@ -5,6 +5,9 @@
 
 mod baseline;
 mod bell;
+mod convergence;
 mod harness;
+mod hostile_peer;
 mod link;
+mod predict;
 mod session;

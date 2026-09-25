@@ -50,12 +50,11 @@ impl Sink for Observed {
     }
 }
 
-/// The server's authoritative terminal. Owns the live parser and produces a [`TerminalScreen`]
-/// snapshot for the SSP transport each tick.
+/// The server's authoritative terminal. Owns the live parser and produces the [`TerminalScreen`]
+/// snapshots the connections diff and send.
 ///
-/// The echo-ack is **not** tracked here (KS-02): SSP frame numbers are per connection, so the
-/// per-connection `ServerSession` owns the input history and stamps its own ack onto each snapshot
-/// it takes. Snapshots leave `echo_ack` at 0 for that reason.
+/// The echo-ack is **not** tracked here (KS-02): input sequence numbers are per connection, so each
+/// connection's `ServerConn` tracks its own and puts it on its frames.
 ///
 /// fux-vt is panic-free by construction and bounded: it retains no OSC/DCS/APC/PM/SOS payload
 /// except the OSC strings it reports as events, which it caps at `fux_vt::OSC_PAYLOAD_LIMIT`.
@@ -140,12 +139,10 @@ impl ServerTerminal {
         self.parser.screen().application_cursor()
     }
 
-    /// Produce the SSP snapshot the transport will diff and ship. `echo_ack` is 0: the connection
-    /// loop stamps its own (KS-02).
+    /// A snapshot of the current screen.
     pub fn snapshot(&self) -> TerminalScreen {
         TerminalScreen {
             grid: Grid::of(self.parser.screen()),
-            echo_ack: 0,
             title: self.observed.title.clone(),
             icon: self.observed.icon.clone(),
             clipboard: self.observed.clipboard.clone(),

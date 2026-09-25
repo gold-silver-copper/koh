@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use koh::client::BellHook;
 
-use crate::harness::{identity, Client, Server};
+use crate::harness::{identity, Client, Options, Server};
 use crate::link::{FaultNet, Profile};
 
 const WAIT: Duration = Duration::from_secs(15);
@@ -45,9 +45,16 @@ async fn a_remote_bell_runs_the_hook_at_most_once_a_second() {
         .expect("start the server");
     let (dir, log, hook) = hook("bell-hook").expect("scratch dir");
     let endpoint = net.endpoint(secret, false).await.expect("bind");
-    let mut client = Client::connect_on(endpoint, server.id, Some(hook))
-        .await
-        .expect("connect");
+    let mut client = Client::connect_on(
+        endpoint,
+        server.id,
+        Options {
+            bell: Some(hook),
+            ..Options::default()
+        },
+    )
+    .await
+    .expect("connect");
     assert!(client
         .wait_until(WAIT, |t| !t.trim().is_empty())
         .await
@@ -104,7 +111,7 @@ async fn stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do() 
     let endpoint = net.endpoint(secret, false).await.expect("bind");
 
     // Connection #1, without a hook, rings the bell once and leaves.
-    let mut first = Client::connect_on(endpoint.clone(), server.id, None)
+    let mut first = Client::connect_on(endpoint.clone(), server.id, Options::default())
         .await
         .expect("connect #1");
     first
@@ -119,9 +126,16 @@ async fn stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do() 
 
     // Connection #2 carries the hook and attaches to a session whose count is already 1.
     let (dir, log, hook) = hook("bell-stale").expect("scratch dir");
-    let mut client = Client::connect_on(endpoint, server.id, Some(hook))
-        .await
-        .expect("connect #2");
+    let mut client = Client::connect_on(
+        endpoint,
+        server.id,
+        Options {
+            bell: Some(hook),
+            ..Options::default()
+        },
+    )
+    .await
+    .expect("connect #2");
     assert!(client
         .wait_until(WAIT, |t| t.contains("STALE_BELL"))
         .await

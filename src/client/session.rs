@@ -13,7 +13,6 @@ use crate::proto::{
     frame_interval, retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_WINDOW, HEARTBEAT,
     MAX_INPUT_BYTES,
 };
-use crate::ssp::SyncState as _;
 use crate::terminal::{Grid, TerminalScreen};
 
 use super::render::WindowState;

@@ -1,42 +1,44 @@
-//! A deliberately-MALICIOUS koh CLIENT. It authenticates (or deliberately fails to) like a real
-//! client, then sends crafted protocol traffic a stock peer never would, to exercise koh's
-//! server-side defenses on the emulator. Every attack reuses koh's PUBLIC wire/transport code, so
-//! the malicious client allocates almost nothing — the SERVER is the one that must stay bounded.
+//! A deliberately-MALICIOUS koh CLIENT for the emulator suite. It authenticates (or deliberately
+//! fails to) like a real client, then sends crafted koh/3 traffic a stock peer never would, to
+//! exercise koh's server-side defenses. Every attack reuses koh's PUBLIC `proto`/`transport_iroh`
+//! code, so the malicious client allocates almost nothing — the SERVER is the one that must stay
+//! bounded. The equivalent CI tests live in `tests/net/hostile_peer.rs`; this is the on-device
+//! probe.
 //!
 //! Usage: evil-client <server-id> <ip:port> <attack> [args...]
 //!   The malicious client must be on the server's `--allow` list to reach the data plane, so the
-//!   harness pre-creates its key and sets `$EVIL_KEY_FILE` (+ `$KOH_KEY_PASSPHRASE` to open it);
-//!   without it a fresh ephemeral key is used (only the pre-admission attacks then apply).
+//!   harness pre-creates its key and sets `$EVIL_KEY_FILE` (+ `$KOH_KEY_PASSPHRASE` to open it).
 //!
 //! Attacks (defense each probes):
-//!   resize <rows> <cols>     oversized/zero terminal geometry            (H-1 / M-2 clamp_dims)
-//!   bomb <mib>               decompression bomb: tiny wire, huge inflate (KOH-02 per-dir decode cap)
-//!   empty-frags <n>          flood of empty non-final fragments          (KR-08 empty-frag drop)
-//!   partial-frags <n>        never-completing payload fragments          (KOH-07 reassembly byte cap)
-//!   accumulate <n> [bytes]   distinct states off the num-0 base          (KOH-01 received-states budget)
-//!   resize-flood <n>         one diff packed with n resize events        (KOH-05 resize coalescing)
-//!   keys-flood <mib>         one diff of mib MiB of keystrokes (under cap) (bounded PTY write/budget)
-//!   garbage <n>              n random/short datagrams                    (Fragment::decode robustness)
-//!   bad-version              an Instruction with a bogus protocol ver    (PROTOCOL_VERSION reject)
-//!   stall-admission          connect but never accept the admission ack  (KOH-08 3s admission timeout)
+//!   resize <rows> <cols>     oversized/zero terminal geometry            (clamp_dims)
+//!   bomb                     a length prefix over the message cap        (per-message size cap)
+//!   oversized                one message body over the input cap         (input size cap)
+//!   accumulate <n>           a flood of input messages                   (fixed frame window)
+//!   resize-flood <n>         one read packed with n resize messages      (resize coalescing)
+//!   keys-flood <mib>         a mib-MiB paste, split into capped messages  (PTY backpressure)
+//!   garbage <n>              n random byte blobs on the stream           (decoder robustness)
+//!   second-stream            open a second client stream                 (one-stream limit)
+//!   bad-alpn                 connect with the wrong ALPN                  (handshake rejects)
+//!   stall-admission          connect but never accept the admission ack  (3s admission timeout)
+//!
+//! `empty-frags`, `partial-frags` and `bad-version` are accepted as aliases of `garbage` /
+//! `bad-alpn`: koh/3 has no fragments and the ALPN is the version, so the old SSP-specific probes
+//! map onto their nearest koh/3 equivalent, keeping the Android scripts working.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use koh::input::WireEvent;
+use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE, MAX_INPUT_BYTES};
 use koh::transport_iroh::{
     admission, bind_endpoint_local, direct_addr, generate_secret_key, load_or_create_secret_key,
     parse_endpoint_id, IrohChannel, ALPN,
 };
-use koh::wire::{Fragment, Fragmenter, Instruction, PROTOCOL_VERSION};
+use iroh::endpoint::{Connection, SendStream};
 
 const MIB: usize = 1024 * 1024;
 
-/// The evil client's identity: a persistent key from `$EVIL_KEY_FILE` (so the harness can put its
-/// node-id on the server's `--allow` list), or a fresh ephemeral key when unset. Macro (not a fn) so
-/// it needn't name the non-re-exported `SecretKey` type — evil-peer depends on koh only, not iroh.
 macro_rules! evil_secret {
     () => {
         match std::env::var_os("EVIL_KEY_FILE") {
@@ -54,215 +56,191 @@ async fn main() -> Result<()> {
     let id = args.get(1).ok_or_else(|| anyhow!(usage))?;
     let addr = args.get(2).ok_or_else(|| anyhow!(usage))?;
     let attack = args.get(3).map(String::as_str).ok_or_else(|| anyhow!(usage))?;
-    let num = |i: usize| -> Result<u64> {
-        args.get(i)
-            .ok_or_else(|| anyhow!("attack '{attack}' needs a numeric arg #{}", i - 3))?
-            .parse::<u64>()
-            .map_err(Into::into)
+    let num = |i: usize, default: u64| -> u64 {
+        args.get(i).and_then(|a| a.parse().ok()).unwrap_or(default)
     };
 
     let server_id = parse_endpoint_id(id)?;
     let saddr: SocketAddr = addr.parse()?;
 
-    // The admission-stall attack does NOT complete admission — it connects and then deliberately
-    // never accepts the server's admission ack, so the server's 3s admission timeout must fire.
+    // Attacks that do NOT complete admission: they exercise the handshake/admission bounds.
     if attack == "stall-admission" {
-        return admission_stall(id, addr).await;
+        return admission_stall(server_id, saddr).await;
+    }
+    if attack == "bad-alpn" || attack == "bad-version" {
+        let ep = bind_endpoint_local(evil_secret!(), false).await?;
+        eprintln!("evil-client: connecting with a bad ALPN (the handshake must reject us)");
+        let bad = ep.connect(direct_addr(server_id, saddr), b"koh/iroh/2").await;
+        eprintln!("evil-client: bad-ALPN connect returned {:?}", bad.map(|_| ()));
+        return Ok(());
     }
 
-    // Everything else gets admitted first (the evil client must be on the server's allowlist; see
-    // $EVIL_KEY_FILE), then injects crafted datagrams on the established connection.
+    // Everything else gets admitted first, then opens the one client stream and writes crafted
+    // messages on it.
     let ep = bind_endpoint_local(evil_secret!(), false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
     admission::await_admission(&conn).await?;
     eprintln!("evil-client: admitted; running attack '{attack}'");
-    let ch = IrohChannel::new(conn);
 
     match attack {
-        "resize" => resize(&ch, num(4)? as u16, num(5)? as u16).await,
-        "bomb" => bomb(&ch, num(4).unwrap_or(12) as usize).await,
-        "empty-frags" => empty_frags(&ch, num(4).unwrap_or(20000) as u16).await,
-        "partial-frags" => partial_frags(&ch, num(4).unwrap_or(20000) as u16).await,
-        "accumulate" => {
-            accumulate(&ch, num(4).unwrap_or(3000), num(5).unwrap_or(4096) as usize).await;
+        "second-stream" => second_stream(&conn).await?,
+        _ => {
+            let mut send = conn.open_uni().await?;
+            match attack {
+                "resize" => {
+                    let (r, c) = (num(4, 65000) as u16, num(5, 1) as u16);
+                    resize(&mut send, r, c).await?;
+                }
+                "bomb" => bomb(&mut send).await?,
+                "oversized" => oversized(&mut send).await?,
+                "accumulate" => accumulate(&mut send, num(4, 3000)).await?,
+                "resize-flood" => resize_flood(&mut send, num(4, 500_000) as usize).await?,
+                "keys-flood" => keys_flood(&mut send, num(4, 6) as usize).await?,
+                "garbage" | "empty-frags" | "partial-frags" => {
+                    garbage(&mut send, num(4, 30000) as usize).await?;
+                }
+                other => return Err(anyhow!("unknown attack '{other}'\n{usage}")),
+            }
+            let _ = send.finish();
         }
-        "resize-flood" => resize_flood(&ch, num(4).unwrap_or(500_000) as usize).await,
-        "keys-flood" => keys_flood(&ch, num(4).unwrap_or(6) as usize).await,
-        "garbage" => garbage(&ch, num(4).unwrap_or(20000) as usize).await,
-        "bad-version" => bad_version(&ch).await,
-        other => return Err(anyhow!("unknown attack '{other}'\n{usage}")),
     }
 
-    // Hold the connection open briefly so the unreliable datagrams flush before we drop it.
     tokio::time::sleep(Duration::from_millis(800)).await;
     eprintln!("evil-client: attack '{attack}' done");
+    let _ = IrohChannel::new(conn);
     drop(ep);
     Ok(())
 }
 
-// --- crafting helpers --------------------------------------------------------------------------
-
-/// A `UserInput` diff (the client→server direction) as the opaque bytes koh puts in `Instruction.diff`.
-fn ui_diff(events: &[WireEvent]) -> Vec<u8> {
-    postcard::to_allocvec(events).unwrap_or_default()
+/// Write one length-prefixed client message.
+async fn write_msg(send: &mut SendStream, msg: &ClientMsg) -> Result<()> {
+    send.write_all(&encode_client(msg)?).await?;
+    Ok(())
 }
 
-fn instr(old: u64, new: u64, throwaway: u64, version: u32, diff: Vec<u8>) -> Instruction {
-    Instruction {
-        protocol_version: version,
-        old_num: old,
-        new_num: new,
-        ack_num: 0,
-        throwaway_num: throwaway,
-        diff,
-    }
-}
-
-/// Fragment `instr` and fire every fragment as a datagram, `times` times (retransmits raise the
-/// odds of delivery over the unreliable datagram channel; the server dedups by fragment id).
-fn blast(ch: &IrohChannel, f: &mut Fragmenter, instr: &Instruction, times: usize) {
-    let mtu = ch.max_datagram_size();
-    for _ in 0..times {
-        if let Ok(frags) = f.fragment(instr, mtu) {
-            for fr in &frags {
-                if let Ok(dg) = fr.encode() {
-                    ch.send(&dg);
-                }
-            }
-        }
-    }
-}
-
-// --- attacks -----------------------------------------------------------------------------------
-
-/// H-1 / M-2: an oversized or zero terminal geometry. The clamp must keep the server from
-/// allocating a giant (or panicking on a degenerate) vt100 grid.
-async fn resize(ch: &IrohChannel, rows: u16, cols: u16) {
-    let i = instr(0, 1, 0, PROTOCOL_VERSION, ui_diff(&[WireEvent::Resize { rows, cols }]));
-    let mut f = Fragmenter::new();
+/// clamp_dims: an oversized or zero terminal geometry, sent many times.
+async fn resize(send: &mut SendStream, rows: u16, cols: u16) -> Result<()> {
     eprintln!("evil-client: injecting resize({rows}, {cols})");
     for _ in 0..30 {
-        blast(ch, &mut f, &i, 1);
+        write_msg(send, &ClientMsg::Resize { rows, cols }).await?;
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
+    Ok(())
 }
 
-/// KOH-02: a decompression bomb — a few-KB wire payload that inflates past the server's per-direction
-/// decode cap. The server must reject it at inflate time, never allocating the full payload.
-async fn bomb(ch: &IrohChannel, mib: usize) {
-    let i = instr(0, 1, 0, PROTOCOL_VERSION, vec![0u8; mib * MIB]); // compresses to ~KB
-    let mut f = Fragmenter::new();
-    eprintln!("evil-client: bomb inflating to ~{mib} MiB (server must reject at the cap)");
-    blast(ch, &mut f, &i, 6);
+/// A length prefix claiming more than the message cap: the server must reject it on the header.
+async fn bomb(send: &mut SendStream) -> Result<()> {
+    eprintln!("evil-client: a length prefix over the {MAX_CLIENT_MESSAGE}-byte cap");
+    let len = u32::try_from(MAX_CLIENT_MESSAGE + 1).unwrap_or(u32::MAX);
+    send.write_all(&len.to_be_bytes()).await?;
+    send.write_all(&[0u8; 64]).await?;
+    Ok(())
 }
 
-/// KR-08: a flood of empty-payload non-final fragments. They add 0 to the byte cap, so the server's
-/// up-front empty-fragment drop is what keeps `parts` from accumulating one slot per index.
-async fn empty_frags(ch: &IrohChannel, n: u16) {
-    eprintln!("evil-client: flooding {n} empty non-final fragments");
-    for index in 0..n {
-        let fr = Fragment { id: 7, index, final_: false, payload: Vec::new() };
-        if let Ok(dg) = fr.encode() {
-            ch.send(&dg);
+/// A single well-framed message whose input body is over the per-input cap.
+async fn oversized(send: &mut SendStream) -> Result<()> {
+    eprintln!("evil-client: one input message over the {MAX_INPUT_BYTES}-byte cap");
+    let msg = ClientMsg::Input {
+        seq: InputSeq(1),
+        bytes: vec![b'a'; MAX_INPUT_BYTES + 4096],
+    };
+    // Encode by hand: `encode_client` refuses to build an over-cap message, which is the point.
+    let body = postcard::to_allocvec(&msg)?;
+    let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+    send.write_all(&len.to_be_bytes()).await?;
+    send.write_all(&body).await?;
+    Ok(())
+}
+
+/// A flood of input messages: the server applies them and keeps only its fixed frame window.
+async fn accumulate(send: &mut SendStream, n: u64) -> Result<()> {
+    eprintln!("evil-client: {n} input messages (the server's frame window must stay bounded)");
+    for seq in 1..=n {
+        write_msg(
+            send,
+            &ClientMsg::Input {
+                seq: InputSeq(seq),
+                bytes: b"a".to_vec(),
+            },
+        )
+        .await?;
+        if seq % 256 == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
+    Ok(())
 }
 
-/// KOH-07: non-completing payload fragments under one id. The reassembly byte cap must bound the
-/// buffered scratch and reset, never growing unbounded.
-async fn partial_frags(ch: &IrohChannel, n: u16) {
-    eprintln!("evil-client: flooding {n} non-completing 1 KB fragments");
-    for index in 0..n {
-        let fr = Fragment { id: 9, index, final_: false, payload: vec![0u8; 1000] };
-        if let Ok(dg) = fr.encode() {
-            ch.send(&dg);
-        }
+/// Many resize messages in one burst: the server coalesces to the last per read.
+async fn resize_flood(send: &mut SendStream, n: usize) -> Result<()> {
+    eprintln!("evil-client: {n} resize messages (the server must coalesce)");
+    for k in 0..n {
+        let (rows, cols) = if k % 2 == 0 { (1000, 1000) } else { (2, 2) };
+        write_msg(send, &ClientMsg::Resize { rows, cols }).await?;
     }
+    Ok(())
 }
 
-/// KOH-01: many distinct states all based on the never-collapsing num-0 base (old=0, throwaway=0).
-/// The received-states count cap + per-direction byte budget must bound resident memory.
-async fn accumulate(ch: &IrohChannel, n: u64, bytes: usize) {
-    eprintln!("evil-client: accumulating {n} states of ~{bytes} B (server budget must cap)");
-    let diff = ui_diff(&[WireEvent::Keys(vec![b'a'; bytes])]);
-    let mut f = Fragmenter::new();
-    for new in 1..=n {
-        let i = instr(0, new, 0, PROTOCOL_VERSION, diff.clone());
-        blast(ch, &mut f, &i, 1);
-        if new % 256 == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await; // let the channel drain
-        }
+/// A big paste, split into capped input messages: the PTY write queue and QUIC flow control bound it.
+async fn keys_flood(send: &mut SendStream, mib: usize) -> Result<()> {
+    eprintln!("evil-client: a {mib} MiB paste in capped messages");
+    let chunk = vec![b'x'; MAX_INPUT_BYTES];
+    let count = mib * MIB / MAX_INPUT_BYTES;
+    for seq in 1..=count as u64 {
+        write_msg(
+            send,
+            &ClientMsg::Input {
+                seq: InputSeq(seq),
+                bytes: chunk.clone(),
+            },
+        )
+        .await?;
     }
+    Ok(())
 }
 
-/// KOH-05: one diff packed with `n` alternating-dimension resize events. The server must coalesce to
-/// the final resize (one ioctl + grid realloc), not run one synchronous op per event under the lock.
-async fn resize_flood(ch: &IrohChannel, n: usize) {
-    eprintln!("evil-client: one diff with {n} resize events (server must coalesce)");
-    let events: Vec<WireEvent> = (0..n)
-        .map(|k| {
-            if k % 2 == 0 {
-                WireEvent::Resize { rows: 1000, cols: 1000 }
-            } else {
-                WireEvent::Resize { rows: 2, cols: 2 }
-            }
-        })
-        .collect();
-    let i = instr(0, 1, 0, PROTOCOL_VERSION, ui_diff(&events));
-    let mut f = Fragmenter::new();
-    blast(ch, &mut f, &i, 3);
-}
-
-/// One diff of `mib` MiB of keystrokes (kept UNDER the decode cap, so it decodes and applies) —
-/// exercises the server's bounded PTY write + per-state budget. The decode cap itself is covered by
-/// the `bomb` attack; for a single Keys blob the byte cap and the event budget coincide at ~8 MiB,
-/// so this probe deliberately stays below both.
-async fn keys_flood(ch: &IrohChannel, mib: usize) {
-    eprintln!("evil-client: one diff of {mib} MiB of keystrokes");
-    let i = instr(0, 1, 0, PROTOCOL_VERSION, ui_diff(&[WireEvent::Keys(vec![b'x'; mib * MIB])]));
-    let mut f = Fragmenter::new();
-    blast(ch, &mut f, &i, 3);
-}
-
-/// Random/short datagrams that aren't valid fragments — `Fragment::decode` must reject them without
-/// panicking or consuming resources.
-async fn garbage(ch: &IrohChannel, n: usize) {
-    eprintln!("evil-client: {n} garbage datagrams");
+/// Random byte blobs on the stream: the decoder must reject them and the server close the connection.
+async fn garbage(send: &mut SendStream, n: usize) -> Result<()> {
+    eprintln!("evil-client: {n} garbage byte blobs");
     let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
     for _ in 0..n {
         seed = seed
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        let len = (seed % 40) as usize; // mostly shorter than a fragment header -> ShortFragment
+        let len = (seed % 40) as usize;
         let buf: Vec<u8> = (0..len).map(|k| (seed >> (k % 8)) as u8).collect();
-        ch.send(&buf);
+        if send.write_all(&buf).await.is_err() {
+            break; // the server closed on the malformed stream, as it should
+        }
     }
+    Ok(())
 }
 
-/// An Instruction carrying a bogus protocol version — must be rejected at decode, before any state
-/// is touched.
-async fn bad_version(ch: &IrohChannel) {
-    let bad = PROTOCOL_VERSION + 99;
-    eprintln!("evil-client: Instruction with protocol_version = {bad}");
-    let i = instr(0, 1, 0, bad, ui_diff(&[WireEvent::Keys(b"x".to_vec())]));
-    let mut f = Fragmenter::new();
-    blast(ch, &mut f, &i, 4);
+/// Open a second client stream: the server permits one, so this must not be grantable.
+async fn second_stream(conn: &Connection) -> Result<()> {
+    let mut first = conn.open_uni().await?;
+    write_msg(
+        &mut first,
+        &ClientMsg::Input {
+            seq: InputSeq(1),
+            bytes: b"echo hi\r".to_vec(),
+        },
+    )
+    .await?;
+    eprintln!("evil-client: trying a second client stream (the one-stream limit must block it)");
+    match tokio::time::timeout(Duration::from_secs(3), conn.open_uni()).await {
+        Err(_) => eprintln!("evil-client: second stream blocked by the limit, as expected"),
+        Ok(_) => eprintln!("evil-client: WARNING second stream opened — limit not enforced"),
+    }
+    let _ = first.finish();
+    Ok(())
 }
 
-// --- admission-direction attack ----------------------------------------------------------------
-
-/// `stall-admission`: connect (the evil client must be allowlisted) but then deliberately never
-/// accept the server's admission ack — just hold the connection. The server's bounded admission
-/// step (`koh serve`'s 3s deadline / KOH-08 pending-handshake cap) must fire and release the slot
-/// rather than letting a stalled admittee pin a permit. Crafts no raw auth bytes — there is no
-/// passphrase handshake anymore; admission is a single ADMIT byte the server writes.
-async fn admission_stall(id_str: &str, addr_str: &str) -> Result<()> {
-    let server_id = parse_endpoint_id(id_str)?;
-    let saddr: SocketAddr = addr_str.parse()?;
+/// Connect but never accept the admission ack: the server's 3s admission timeout must fire.
+async fn admission_stall(server_id: iroh::EndpointId, saddr: SocketAddr) -> Result<()> {
     let ep = bind_endpoint_local(evil_secret!(), false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
     eprintln!("evil-client: connected; NOT accepting the admission ack (server timeout must fire)");
-    // Hold the connection open, never calling await_admission, longer than the server's 3s bound.
     tokio::time::sleep(Duration::from_secs(8)).await;
     drop(conn);
     drop(ep);

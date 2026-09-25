@@ -57,22 +57,23 @@ run_client_attack() {
 
 ACC="$(scaled 2000 8000)" # accumulation count scales with intensity
 
-# bomb (KOH-02): the decisive proof is the server LOG, not RSS — with the inflate cap, the bomb
-# aborts mid-inflate and `recv` logs "unreassemblable"; WITHOUT the cap the 14 MiB inflates (and the
-# now-empty diff decodes), so that line never appears. We diff the count around just this attack.
-echo "  -- client attack: decompression bomb (KOH-02)"
-BOMB0="$(cat_dev "$SRV_LOG" | grep -c unreassemblable || true)"
-adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR bomb 14" >/dev/null 2>&1 || true
+# bomb (KOH-02): a length prefix over the per-message cap. The decisive proof is the server LOG, not
+# RSS: the server refuses the message from its prefix alone, before buffering the body, and logs the
+# size-cap rejection. We diff the count around just this attack.
+echo "  -- client attack: oversized message prefix (KOH-02)"
+BOMB_LINE='message of [0-9]* bytes exceeds the'
+BOMB0="$(cat_dev "$SRV_LOG" | grep -c "$BOMB_LINE" || true)"
+adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR bomb" >/dev/null 2>&1 || true
 sleep 3
-BOMB1="$(cat_dev "$SRV_LOG" | grep -c unreassemblable || true)"
+BOMB1="$(cat_dev "$SRV_LOG" | grep -c "$BOMB_LINE" || true)"
 if [ -z "$(proc_state "$SPID")" ]; then
   bad "[bomb] server was KILLED by the decompression bomb"
 else
   _rss="$(rss_kb "$SPID")"
   [ "$_rss" -le "$RSS_LIMIT" ] && ok "[bomb] server RSS bounded (${_rss}kB)" || bad "[bomb] RSS ${_rss}kB > ${RSS_LIMIT}kB"
   [ "$BOMB1" -gt "$BOMB0" ] \
-    && ok "[bomb] server rejected the bomb at the inflate cap (logged 'unreassemblable')" \
-    || bad "[bomb] no inflate-cap rejection logged — the per-direction decode cap may be gone"
+    && ok "[bomb] server rejected the message at the size cap (logged the rejection)" \
+    || bad "[bomb] no size-cap rejection logged — the per-message cap may be gone"
 fi
 
 run_client_attack "empty-fragment flood"   empty-frags 30000

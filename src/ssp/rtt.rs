@@ -83,15 +83,37 @@ impl RttEstimator {
 
     /// Retransmission timeout (RTO), `clamp(ceil(SRTT + 4·RTTVAR), 50, 1000)` ms.
     pub fn timeout(&self) -> u64 {
-        let rto = (self.srtt + 4.0 * self.rttvar).ceil() as i64;
-        rto.clamp(50, 1000) as u64
+        ceil_clamp(self.srtt + 4.0 * self.rttvar, 50, 1000)
     }
 
     /// Inter-frame send interval, `clamp(ceil(SRTT / 2), 20, 250)` ms ("two frames per RTT").
     pub fn send_interval(&self) -> u64 {
-        let si = (self.srtt / 2.0).ceil() as i64;
-        si.clamp(SEND_INTERVAL_MIN as i64, SEND_INTERVAL_MAX as i64) as u64
+        ceil_clamp(self.srtt / 2.0, SEND_INTERVAL_MIN, SEND_INTERVAL_MAX)
     }
+}
+
+/// `clamp(ceil(x), lo, hi)` for `lo < hi`, computed without a float-to-int `as` cast. It returns
+/// exactly what mosh's `(x.ceil() as i64).clamp(lo, hi)` does, including for non-finite `x`: the
+/// cast saturates infinities and maps NaN to 0, which the clamp then raises to `lo`.
+fn ceil_clamp(x: f64, lo: u32, hi: u32) -> u64 {
+    if x.is_nan() || x <= f64::from(lo) {
+        return lo.into();
+    }
+    if x >= f64::from(hi) {
+        return hi.into();
+    }
+    // Now `lo < x < hi`, so `ceil(x)` is the smallest integer in `lo + 1..=hi` that is `>= x`.
+    // Bisect for it; every `u32` is exact as an `f64`, so each comparison is exact.
+    let (mut below, mut at_or_above) = (lo, hi);
+    while below.abs_diff(at_or_above) > 1 {
+        let mid = below.midpoint(at_or_above);
+        if f64::from(mid) >= x {
+            at_or_above = mid;
+        } else {
+            below = mid;
+        }
+    }
+    at_or_above.into()
 }
 
 #[cfg(test)]
@@ -124,12 +146,12 @@ mod tests {
         for _ in 0..200 {
             fast.sample(2.0);
         }
-        assert_eq!(fast.send_interval(), SEND_INTERVAL_MIN);
+        assert_eq!(fast.send_interval(), u64::from(SEND_INTERVAL_MIN));
         let mut slow = RttEstimator::new();
         for _ in 0..200 {
             slow.sample(1000.0);
         }
-        assert_eq!(slow.send_interval(), SEND_INTERVAL_MAX);
+        assert_eq!(slow.send_interval(), u64::from(SEND_INTERVAL_MAX));
     }
 
     #[test]
@@ -182,5 +204,61 @@ mod tests {
             srtt.to_bits(),
             "a changed sample still updates the estimate"
         );
+    }
+
+    /// The old `as`-cast formula, kept as the reference `ceil_clamp` must match bit for bit.
+    fn ceil_clamp_by_cast(x: f64, lo: u32, hi: u32) -> u64 {
+        (x.ceil() as i64).clamp(i64::from(lo), i64::from(hi)) as u64
+    }
+
+    #[test]
+    fn ceil_clamp_matches_the_cast_formula_at_the_edges() {
+        for (lo, hi) in [(50, 1000), (SEND_INTERVAL_MIN, SEND_INTERVAL_MAX)] {
+            let (l, h) = (f64::from(lo), f64::from(hi));
+            for x in [
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::MAX,
+                f64::MIN,
+                -0.0,
+                0.0,
+                l - 1.0,
+                l - 0.5,
+                l,
+                l + f64::EPSILON * l,
+                l + 0.5,
+                l + 1.0,
+                h - 1.0,
+                h - 0.5,
+                h - 1e-9,
+                h,
+                h + 0.5,
+                h + 1.0,
+            ] {
+                assert_eq!(ceil_clamp(x, lo, hi), ceil_clamp_by_cast(x, lo, hi), "x = {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn ceil_clamp_matches_the_cast_formula_across_the_range() {
+        // Every multiple of 1/64 from -64 to 1088 (exact in binary), around both clamp windows.
+        for i in -4096..=69_632 {
+            let x = f64::from(i) / 64.0;
+            for (lo, hi) in [(50, 1000), (SEND_INTERVAL_MIN, SEND_INTERVAL_MAX)] {
+                assert_eq!(ceil_clamp(x, lo, hi), ceil_clamp_by_cast(x, lo, hi), "x = {x}");
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn ceil_clamp_matches_the_cast_formula(x in proptest::num::f64::ANY, wide in -2000.0f64..3000.0) {
+            for (lo, hi) in [(50, 1000), (SEND_INTERVAL_MIN, SEND_INTERVAL_MAX)] {
+                proptest::prop_assert_eq!(ceil_clamp(x, lo, hi), ceil_clamp_by_cast(x, lo, hi));
+                proptest::prop_assert_eq!(ceil_clamp(wide, lo, hi), ceil_clamp_by_cast(wide, lo, hi));
+            }
+        }
     }
 }

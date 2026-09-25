@@ -64,6 +64,9 @@ both ends. The `koh-key-v1` key format is unchanged, so endpoint ids and allowli
   before the child is spawned.
 - Concurrent PTY spawns in one process intermittently failed in `openpty` on macOS, whose libc
   `openpty` is not thread-safe. PTY allocation is now serialized.
+- `koh connect` truncated the remote exit status to 8 bits, so a server reporting 256 (or any
+  multiple of 256) made the client exit 0, reporting a failed session as a success. A status that
+  does not fit in 8 bits now exits 255.
 
 ### Removed
 - **The local-service gateway**: `koh gateway serve|connect`, the `koh::gateway` module and the

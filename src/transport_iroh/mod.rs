@@ -761,9 +761,10 @@ impl MonoClock {
         }
     }
 
-    /// Milliseconds since this clock was created.
+    /// Milliseconds since this clock was created. Saturates at `u64::MAX` (after 584 million
+    /// years) rather than wrapping, so the clock never runs backwards.
     pub fn now_ms(&self) -> u64 {
-        self.base.elapsed().as_millis() as u64
+        u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 }
 

@@ -301,9 +301,16 @@ impl Fragmenter {
             "fragmented instruction"
         );
         for (i, piece) in serialized.chunks(chunk).enumerate() {
+            // `total` was checked against `MAX_FRAGMENT_INDEX` above, so every index fits.
+            let Ok(index) = u16::try_from(i) else {
+                return Err(WireError::TooManyFragments {
+                    count: total,
+                    max: MAX_FRAGMENT_INDEX as usize + 1,
+                });
+            };
             fragments.push(Fragment {
                 id,
-                index: i as u16,
+                index,
                 final_: i + 1 == total,
                 payload: piece.to_vec(),
             });

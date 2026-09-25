@@ -424,7 +424,9 @@ impl PredictionEngine {
     /// to a tentative epoch. Overwrite-only (no insert-mode tail shift for wide chars — that
     /// rarer case is left to the server's real echo).
     fn predict_wide(&mut self, now: u64, g: &str, screen: &dyn ScreenView) {
-        let w = g.width();
+        // `g` is one decoded char, so its width is at most 2. Clamping keeps a wider one on the
+        // "does not fit" path below instead of truncating it into a small width.
+        let w = u16::try_from(g.width()).unwrap_or(u16::MAX);
         if w == 0 {
             self.become_tentative(); // combining / zero-width: can't place safely
             return;
@@ -437,7 +439,7 @@ impl PredictionEngine {
         // Need the whole glyph to fit strictly before the last column (the edge is wrap-ambiguous).
         // Written as `w >= cols - col` (saturating) to avoid a latent `col + w` u16 overflow, matching
         // the hardened backspace path; in production `col, w` are clamped well below u16::MAX anyway.
-        if w as u16 >= cols.saturating_sub(col) {
+        if w >= cols.saturating_sub(col) {
             self.become_tentative();
             self.init_cursor(screen);
             return;
@@ -447,7 +449,7 @@ impl PredictionEngine {
         self.place_cell(screen, row, col, g.to_string(), fg, bg, false, now);
         if let Some(c) = self.cursor.as_mut() {
             c.expiration_frame = exp;
-            c.col += w as u16;
+            c.col += w;
         }
     }
 

@@ -63,7 +63,12 @@ macro_rules! panic_free {
                 clippy::allow_attributes_without_reason,
                 // Every match names the variants it handles, so a new variant is a compile error
                 // at each match instead of silently taking a wildcard arm.
-                clippy::wildcard_enum_match_arm
+                clippy::wildcard_enum_match_arm,
+                // No silent truncation or sign change: convert with `From`/`TryFrom` and say what
+                // happens when the value does not fit.
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_possible_wrap
             )
         )]
         $item

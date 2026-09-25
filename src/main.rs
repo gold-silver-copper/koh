@@ -71,7 +71,12 @@ macro_rules! panic_free {
                 clippy::allow_attributes_without_reason,
                 // Every match names the variants it handles, so a new variant is a compile error
                 // at each match instead of silently taking a wildcard arm.
-                clippy::wildcard_enum_match_arm
+                clippy::wildcard_enum_match_arm,
+                // No silent truncation or sign change: convert with `From`/`TryFrom` and say what
+                // happens when the value does not fit.
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_possible_wrap
             )
         )]
         $item
@@ -89,8 +94,7 @@ panic_free! {
             .map_err(anyhow::Error::from)
             .and_then(|runtime| runtime.block_on(dispatch(cli)));
         match result {
-            // Exit with the remote shell's status (a POSIX wait status is 8-bit).
-            Ok(Some(code)) => std::process::ExitCode::from(code as u8),
+            Ok(Some(code)) => std::process::ExitCode::from(exit_status(code)),
             Ok(None) => std::process::ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("koh: {e:#}");
@@ -105,6 +109,33 @@ panic_free! {
             Cmd::Connect(args) => koh::client::connect(args).await,
             Cmd::Id(args) => koh::idcmd::run_id(args).map(|()| None),
             Cmd::Key(args) => koh::keycmd::run(args).map(|()| None),
+        }
+    }
+
+    /// The client's exit status for the remote shell's `code`. A POSIX exit status is 8-bit, but
+    /// the wire carries a `u32`. A code that does not fit (only a broken or hostile server sends
+    /// one) becomes 255: truncating it could give 0 and report a failed session as a success.
+    fn exit_status(code: u32) -> u8 {
+        u8::try_from(code).unwrap_or(u8::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exit_status;
+
+    #[test]
+    fn exit_status_passes_8_bit_codes_through() {
+        for code in [0, 1, 42, 127, 128, 255] {
+            assert_eq!(u32::from(exit_status(code)), code);
+        }
+    }
+
+    #[test]
+    fn exit_status_never_turns_an_out_of_range_code_into_success() {
+        // `code as u8` made 256 and 512 exit 0 and 257 exit 1.
+        for code in [256, 257, 512, 65_536, u32::MAX] {
+            assert_eq!(exit_status(code), u8::MAX, "code {code}");
         }
     }
 }

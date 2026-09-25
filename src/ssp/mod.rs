@@ -45,9 +45,9 @@ pub const SHUTDOWN_SENTINEL: u64 = u64::MAX;
 // --- scheduler constants (mosh `transportsender.h`, milliseconds) ---
 // `pub(crate)`: internal SSP tuning knobs, referenced only within `src/ssp`; not public API.
 /// Floor on the inter-frame interval.
-pub(crate) const SEND_INTERVAL_MIN: u64 = 20;
+pub(crate) const SEND_INTERVAL_MIN: u32 = 20;
 /// Ceiling on the inter-frame interval.
-pub(crate) const SEND_INTERVAL_MAX: u64 = 250;
+pub(crate) const SEND_INTERVAL_MAX: u32 = 250;
 /// Interval between empty keep-alive acks when otherwise idle.
 pub(crate) const ACK_INTERVAL: u64 = 3000;
 /// Delay before a coalesced data-ack is flushed.

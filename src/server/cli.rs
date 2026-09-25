@@ -229,12 +229,14 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     );
 
     let allow = std::sync::Arc::new(allow);
-    // Cast the validated u64 (range 0..=MAX_SCROLLBACK) down to the usize the emulator wants.
+    // Both were validated above (scrollback <= MAX_SCROLLBACK), so the conversions to the usize
+    // the emulator and the store want cannot fail on any supported target.
     let sessions = Arc::new(SessionPool {
         store: SessionStore::default(),
         command: args.command.clone().into(),
-        scrollback: args.scrollback as usize,
-        max_sessions: args.max_sessions as usize,
+        scrollback: usize::try_from(args.scrollback).context("scrollback does not fit in usize")?,
+        max_sessions: usize::try_from(args.max_sessions)
+            .context("max_sessions does not fit in usize")?,
     });
 
     // The detachable session store survives disconnects, so a reconnecting client lands back in

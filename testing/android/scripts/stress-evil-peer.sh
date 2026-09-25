@@ -5,7 +5,7 @@
 #      BOUNDED memory and NO panic, a benign witness session intact (no cross-tenant impact), and a
 #      fresh legit client must still connect afterward.
 #   B) admission-stall attack: an admitted-but-stalling client must be timed out by the server's
-#      bounded admission step (KOH-08), and the server must survive.
+#      bounded admission step, and the server must survive.
 #   C) malicious SERVER (admission direction): a real koh client must REFUSE a server that sends a
 #      bad admission byte or never admits it (never reach "connected.") — fail-closed on-device.
 #
@@ -28,7 +28,7 @@ echo "Stress: malicious-peer harness — crafted client + admission attacks (lev
 EVIL_KEY=/data/local/tmp/koh-evilcli.key
 EVIL_ENV="EVIL_KEY_FILE=$EVIL_KEY $KENV"
 
-# ---- Part A: malicious-CLIENT datagram attacks ---------------------------------------------------
+# ---- Part A: malicious-CLIENT stream attacks -----------------------------------------------------
 allow_client_key "$EVIL_KEY"
 allow_client_key /data/local/tmp/koh-evil-witness.key
 allow_client_key /data/local/tmp/koh-evil-fresh.key
@@ -57,7 +57,7 @@ run_client_attack() {
 
 ACC="$(scaled 2000 8000)" # accumulation count scales with intensity
 
-# bomb (KOH-02): a length prefix over the per-message cap. The decisive proof is the server LOG, not
+# bomb: a length prefix over the per-message cap. The decisive proof is the server LOG, not
 # RSS: the server refuses the message from its prefix alone, before buffering the body, and logs the
 # size-cap rejection. We diff the count around just this attack.
 echo "  -- client attack: oversized message prefix (KOH-02)"
@@ -80,7 +80,7 @@ run_client_attack "empty-fragment flood"   empty-frags 30000
 run_client_attack "partial-fragment flood" partial-frags 30000
 run_client_attack "state accumulation"     accumulate "$ACC" 4096
 
-# resize-flood (KOH-05): the server must COALESCE to one resize, not run one ioctl(TIOCSWINSZ) +
+# resize-flood: the server must COALESCE to one resize, not run one ioctl(TIOCSWINSZ) +
 # SIGWINCH + grid-realloc per event. A per-event regression is a CPU/syscall storm (minutes of CPU
 # for 400k events), not an RSS blowup — so we gate on CPU jiffies burned, not memory.
 echo "  -- client attack: resize flood (KOH-05 coalescing)"

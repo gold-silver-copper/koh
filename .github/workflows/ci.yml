@@ -46,7 +46,7 @@ jobs:
       - name: clippy (production build)
         run: cargo clippy --workspace --lib --bins --locked -- -D warnings
       - name: layering guard
-        # Enforce the load-bearing dependency edges the architecture relies on (AR-02). Greps
+        # Enforce the load-bearing dependency edges the architecture relies on. Greps
         # the `use crate::` import form only, so doc-comment rustdoc links can't false-positive.
         run: |
           if grep -rnE '^[[:space:]]*use crate::' koh-core/src/predict.rs; then

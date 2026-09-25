@@ -81,7 +81,7 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
         Err(error) => return Err(error.into()),
     };
     if entry_exists {
-        // Refuse a dangerous containing dir FIRST (KOH-06/KR-06): the load below tightens the key's
+        // Refuse a dangerous containing dir FIRST: the load below tightens the key's
         // perms and reads it, and in a dir where another user can unlink/replace entries they could
         // swap `id.key` for their own.
         if let Some(parent) = path.parent() {
@@ -92,7 +92,7 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
         let sk = generate_secret_key();
         if let Some(parent) = path.parent() {
             create_dir_private(parent)?;
-            // Reject a world-writable state dir before writing the identity key into it (KOH-06).
+            // Reject a world-writable state dir before writing the identity key into it.
             ensure_state_dir_secure(parent)?;
         }
         if create_secret_file(path, &sk.to_bytes())? {
@@ -191,7 +191,7 @@ pub(crate) fn create_dir_private(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Read the key file at `path`, doing every step on a single opened file descriptor so there is no
-/// path-based recheck window (K-01).
+/// path-based recheck window.
 ///
 /// On unix: open with `O_NOFOLLOW` (a symlinked final component is refused at open — `ELOOP`),
 /// confirm via the fd that it is a regular file, tighten group/other-accessible perms to 0600 via
@@ -240,7 +240,7 @@ fn read_key_file_secure(path: &Path) -> Result<Vec<u8>, SetupError> {
 
 /// On unix, tighten an existing group/other-accessible key file to 0600 — operating on the held
 /// **fd** (`File::set_permissions` is `fchmod`), so it can't be redirected to a different inode by a
-/// path swap (K-01). The key IS the node identity (KOH-16), so a loose key is a local-impersonation
+/// path swap. The key IS the node identity, so a loose key is a local-impersonation
 /// risk; a key file whose perms were loosened out-of-band (manual `chmod`, a restore from a
 /// permissive backup/umask) is re-tightened here on load.
 #[cfg(unix)]
@@ -264,7 +264,7 @@ fn tighten_key_perms_via_fd(file: &std::fs::File, path: &Path, meta: &std::fs::M
     }
 }
 
-/// Refuse a state dir a co-tenant could tamper with, and flag a merely-loose one (KOH-06 / KOH-12).
+/// Refuse a state dir a co-tenant could tamper with, and flag a merely-loose one.
 ///
 /// On unix: a group/other-**writable** dir lets another user unlink/replace the secret key even
 /// though the key file itself is 0600, so this hard-errors (pointing at `--key-file`). A
@@ -280,7 +280,7 @@ pub(crate) fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
         }
         if let Ok(meta) = std::fs::metadata(dir) {
             let mode = meta.permissions().mode();
-            // The real threat (KOH-06) is a dir where *another user* can unlink/replace the key.
+            // The real threat is a dir where *another user* can unlink/replace the key.
             // That is precisely an **other-writable, non-sticky** dir: the sticky bit (e.g. /tmp's
             // 1777) restricts unlink to file owners, and an other-writable bit is what lets an
             // unrelated uid write. We must NOT hard-refuse merely group-writable dirs: Android's
@@ -678,7 +678,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn created_key_file_is_owner_only() {
-        // M-1: a written secret key must be 0600 (no group/other bits) and its parent dir must not
+        // A written secret key must be 0600 (no group/other bits) and its parent dir must not
         // be group/other-writable — the key is the node identity, so a world-readable key is a
         // local-impersonation risk.
         use std::os::unix::fs::PermissionsExt;
@@ -707,7 +707,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ensure_state_dir_secure_refuses_only_nonsticky_world_writable() {
-        // KOH-06/KR-06: only a dir where ANOTHER user can replace the key must be refused — that is
+        // Only a dir where ANOTHER user can replace the key must be refused — that is
         // a non-sticky *other*-writable dir. A merely group-writable dir (Android's /data/local/tmp
         // is 0771, NOT other-writable) and a sticky world-writable dir (Linux /tmp is 1777; sticky
         // restricts unlink to file owners) must be ALLOWED, else koh can't start in those standard
@@ -745,7 +745,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fd_key_read_does_not_follow_a_symlinked_key() {
-        // K-01 / KR-06: the fd-based load (`O_NOFOLLOW`) must refuse a symlinked key path and never
+        // The fd-based load (`O_NOFOLLOW`) must refuse a symlinked key path and never
         // chmod or read its target — so an attacker-planted symlink to a victim file is inert (the
         // target's perms and the load both reflect a refusal, not a follow).
         use std::os::unix::fs::PermissionsExt;
@@ -774,7 +774,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fd_key_read_tightens_a_loose_real_key_via_the_fd() {
-        // K-01: a loose (group/other-accessible) real key is tightened to 0600 through the fd, and
+        // A loose (group/other-accessible) real key is tightened to 0600 through the fd, and
         // its contents still read back. Proves the fd path both fstats and fchmods the same inode.
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("koh-loose-{}", std::process::id()));
@@ -794,8 +794,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn load_refuses_a_symlinked_key() {
-        // KR-06: a symlinked key path must be refused before `read_to_string` (which would follow it
-        // as a read-oracle on the target). The parent dir is 0700 so the dir check passes and we
+        // A symlinked key path must be refused before the key is read (following it would make
+        // the load a read-oracle on the target). The parent dir is 0700 so the dir check passes and we
         // reach the symlink guard.
         let dir = std::env::temp_dir().join(format!("koh-keylink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -947,8 +947,8 @@ mod tests {
 
     #[test]
     fn the_alpn_names_the_stream_protocol() {
-        // `koh/3` is the stream protocol; a `koh/iroh/2` peer (SSP over datagrams) fails the TLS
-        // handshake instead of misparsing.
+        // `koh/3` is the stream protocol; a peer on another version (e.g. `koh/iroh/2`) fails the
+        // TLS handshake instead of misparsing.
         assert_eq!(ALPN, b"koh/3");
     }
 }

@@ -55,13 +55,13 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(8);
 /// connection that drops sooner than this — e.g. a malicious or compromised server that completes
 /// the handshake then immediately closes — is treated like a failed dial: the attempt counter keeps
 /// climbing and the next redial backs off, so such a server can't drive a tight reconnect/repaint
-/// churn loop (K-03). A genuine mid-session drop after this dwell reconnects promptly.
+/// churn loop. A genuine mid-session drop after this dwell reconnects promptly.
 const MIN_CONNECTION_DWELL: Duration = Duration::from_secs(5);
 
 /// Wall-clock gap between two steady-loop iterations above which we assume the process was
 /// **suspended** (Android deep-sleep / screen-off freezes the process) rather than merely busy.
 ///
-/// The loop polls at least every ~50ms (`TickResult::wait_ms` is capped at 50), so a gap this large
+/// The loop polls at least every ~50ms (`TickResult::wait` is 50ms), so a gap this large
 /// can only mean the task was parked, unscheduled, for that whole span. On a phone that almost
 /// always means the QUIC connection is now stale — the NAT mapping has likely expired and the
 /// *server's* real-time idle timer has advanced — yet iroh's idle timer is driven by the **monotonic**
@@ -183,8 +183,8 @@ fn backoff(attempt: u32) -> Duration {
 /// A connection that lasted at least [`MIN_CONNECTION_DWELL`] proved itself, so the backoff resets
 /// to 0 (a genuine mid-session drop reconnects promptly). A shorter-lived one — e.g. a server that
 /// accepts then immediately closes — is treated like a failed dial: the counter increments
-/// (saturating) so the next redial backs off, preventing a tight reconnect/repaint churn loop
-/// (K-03). Pure so the branch logic is unit-testable without driving a real connection.
+/// (saturating) so the next redial backs off, preventing a tight reconnect/repaint churn loop.
+/// Pure so the branch logic is unit-testable without driving a real connection.
 const fn next_attempt_after_drop(attempt: u32, dwell: Duration) -> u32 {
     if dwell.as_millis() >= MIN_CONNECTION_DWELL.as_millis() {
         0
@@ -265,7 +265,7 @@ pub struct BackendTerminal<B: KohBackend> {
 
 impl<B: KohBackend> BackendTerminal<B> {
     /// Take ownership of `backend`, enter raw mode + the alternate screen, and hide the cursor.
-    /// `clipboard_enabled` gates honoring remote OSC-52 clipboard writes (default off; L-1).
+    /// `clipboard_enabled` gates honoring remote OSC-52 clipboard writes (default off).
     pub fn enter(mut backend: B, clipboard_enabled: bool) -> std::io::Result<Self> {
         backend.enter_raw_mode()?;
         // Build the struct, then enter the alternate screen via the backend — the enter/leave escape
@@ -345,7 +345,7 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
 /// (`Ctrl-^ .`) still works.
 ///
 /// This is the thin I/O shell around [`ClientSession`]: it owns the `tokio::select!`, channels,
-/// sleeps, datagram send/recv/close, and `term.size()`/`render()`, delegating every protocol
+/// sleeps, stream reads and writes, and `term.size()`/`render()`, delegating every protocol
 /// decision to the session's step methods.
 ///
 /// `input_rx` carries raw typed bytes (the caller must keep its sender alive for the session;
@@ -360,7 +360,7 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
 /// `shutdown` is a [`CancellationToken`] the caller cancels on a fatal signal (SIGTERM/SIGINT/
 /// SIGHUP): the loop then returns as if the user quit, so `term` is dropped and the terminal is
 /// restored — rather than the process dying at default signal disposition with the TTY left raw.
-/// `bell`, if set, runs on every remote bell (KB-01).
+/// `bell`, if set, runs on every remote bell.
 #[expect(
     clippy::too_many_arguments,
     reason = "the I/O shell wires up the channel, connector, prediction policy, size, the two \
@@ -381,7 +381,7 @@ pub async fn run_client<T: ClientTerminal>(
     let mut channel = initial;
     // Persists ACROSS reconnect cycles (not reset per connection) so a server that keeps dropping us
     // fast can't escape the backoff by completing each handshake — only a connection that proves
-    // itself (stays up past `MIN_CONNECTION_DWELL_MS`) resets it (K-03).
+    // itself (stays up past `MIN_CONNECTION_DWELL`) resets it.
     let mut attempt: u32 = 0;
     loop {
         // A fresh session per (re)connection mirrors the server's fresh-transport-per-attach, which
@@ -414,7 +414,7 @@ pub async fn run_client<T: ClientTerminal>(
                 // Did this connection prove itself? A drop after a real session resets the backoff
                 // (prompt reattach); a drop sooner than `MIN_CONNECTION_DWELL` is treated like a
                 // failed dial — bump the attempt so `reconnect` backs off before redialing, so an
-                // accept-then-instantly-close server can't spin us in a tight loop (K-03).
+                // accept-then-instantly-close server can't spin us in a tight loop.
                 let dwell = conn_started.elapsed();
                 attempt = next_attempt_after_drop(attempt, dwell);
                 match reconnect(
@@ -703,9 +703,8 @@ async fn reconnect<T: ClientTerminal>(
         // Back off BEFORE dialing whenever we've already failed a dial or the previous connection
         // dropped too fast (`*attempt > 0`). The caller seeds `*attempt` from the just-dropped
         // connection's dwell, so a server that completes the handshake then immediately closes is
-        // backed off here rather than redialed instantly — closing the tight-loop hole (K-03). On a
-        // proven-then-dropped connection `*attempt == 0`, so a normal reconnect dials at once. The
-        // wait stays responsive to the quit escape / shutdown and keeps the banner clock ticking.
+        // backed off here rather than redialed instantly. On a proven-then-dropped connection
+        // `*attempt == 0`, so a normal reconnect dials at once. The wait stays responsive to the quit escape / shutdown and keeps the banner clock ticking.
         if *attempt > 0 {
             let wait_until = Instant::now()
                 .checked_add(backoff(*attempt))
@@ -851,7 +850,7 @@ mod tests {
 
     #[test]
     fn dwell_gate_resets_on_proven_connection_and_climbs_on_flap() {
-        // K-03: a connection that lasted >= the dwell threshold proved itself -> backoff resets to 0
+        // A connection that lasted >= the dwell threshold proved itself -> backoff resets to 0
         // (prompt reattach), regardless of the prior attempt count.
         assert_eq!(next_attempt_after_drop(0, MIN_CONNECTION_DWELL), 0);
         assert_eq!(next_attempt_after_drop(5, MIN_CONNECTION_DWELL), 0);

@@ -236,7 +236,7 @@ fn shutdown_joins_both_io_threads_without_deadlock() {
 )]
 fn reaped_child_is_not_signaled_again() {
     current_thread().expect("tokio runtime").block_on(async {
-        // KR-02: once the child is reaped (try_wait/wait returned Some), every kill path must be a
+        // Once the child is reaped (try_wait/wait returned Some), every kill path must be a
         // no-op so it can't signal a recycled PID. We can't force PID reuse in a test, but we exercise
         // the reaped-gate: a one-shot `echo` exits and is reaped, after which kill()/kill_hard()/
         // shutdown() must be safe no-ops (no error, no panic).
@@ -311,12 +311,12 @@ fn argv_tail_reaches_the_child() {
 #[test]
 fn short_lived_children_never_lose_their_output() {
     multi_thread().expect("tokio runtime").block_on(async {
-        // A child that writes and exits before anything reads the master used to lose ALL of its
-        // output on macOS (the reader thread started only after the spawn, and a closed slave with
-        // nobody reading discards the queue) — about 3 in 1000 under load. Spawning many at once is
-        // the load; every one must deliver its marker.
+        // A child that writes and exits before anything reads the master loses ALL of its output
+        // on macOS (a closed slave with nobody reading discards the queue), so the reader must be
+        // running before the spawn. A reader started late loses about 3 outputs in 1000 under
+        // load; spawning many at once is the load, and every one must deliver its marker.
         // 16 at a time stays well under macOS's PTY cap (`kern.tty.ptmx_max`, 511) even when several
-        // PTY tests run at once; 128 rounds reproduced the loss on every run of the old code.
+        // PTY tests run at once; 128 rounds reproduce a late reader on every run.
         const CHILDREN: usize = 16;
         const ROUNDS: usize = 128;
         for round in 0..ROUNDS {

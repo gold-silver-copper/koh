@@ -88,8 +88,9 @@ fn connections_dropped_with_input_in_flight_do_not_hurt_the_session() {
     crate::harness::runtime()
         .expect("tokio runtime")
         .block_on(async {
-            // Input arriving as or after a connection tears down used to be able to crash a server. Each
-            // iteration sends a burst of CRs, confirms a marker, then drops the connection without a close.
+            // Input arriving as or after a connection tears down must not crash the server. Each
+            // iteration sends a burst of CRs, confirms a marker, then drops the connection without
+            // a close.
             let net = clean();
             let secret = identity();
             let server = Server::start(&net, &[secret.public()], &["sh"])
@@ -254,7 +255,7 @@ fn a_forced_mid_session_drop_reconnects_to_the_same_shell() {
     crate::harness::runtime()
         .expect("tokio runtime")
         .block_on(async {
-            // The phone-screen-off regression: the connection dies mid-session while the shell keeps
+            // A phone screen turning off: the connection dies mid-session while the shell keeps
             // running. The client must transparently reconnect and land back on the same shell, with the
             // earlier output still on screen.
             let net = clean();

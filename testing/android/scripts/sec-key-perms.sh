@@ -1,7 +1,7 @@
 #!/bin/sh
-# SECURITY (M-1): the persistent secret identity key is written world-readable (default umask, ~0644)
-# instead of 0600. The key IS the node's whole cryptographic identity → local impersonation. Asserts
-# the SECURE behavior (mode 600) — fails against unpatched koh (644), passes once hardened.
+# SECURITY: the persistent secret identity key must be written 0600, never with the default umask
+# (~0644). The key IS the node's whole cryptographic identity, so a readable key allows local
+# impersonation. Asserts mode 600.
 set -eu
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 . "$HERE/stress-lib.sh"

@@ -188,8 +188,7 @@ pub trait KohBackend {
 
 /// Emit one SGR color parameter for `color` on the foreground (`fg == true`) or background layer.
 ///
-/// Mirrors `termina`'s encoding exactly so the abstraction is byte-for-byte compatible with the
-/// pre-refactor output: palette indices 0–7 map to the classic 30–37 / 40–47 codes and 8–15 to the
+/// Palette indices 0–7 map to the classic 30–37 / 40–47 codes and 8–15 to the
 /// bright 90–97 / 100–107 codes (both **theme-aware** — the terminal's palette, not the fixed
 /// 256-color slots), 16–255 to `38;5;n` / `48;5;n`, true color to `38;2;r;g;b` / `48;2;r;g;b`, and
 /// the default color to `39` / `49`.
@@ -275,8 +274,7 @@ mod tests {
     #[test]
     fn sgr_colors_match_the_classic_theme_aware_codes() {
         // Low palette indices use the theme-aware 30–37 / 90–97 codes (not the fixed 256-palette
-        // 38;5;n form), so a user's terminal theme still recolors them — this is the property the
-        // pre-abstraction termina path had, preserved exactly.
+        // 38;5;n form), so a user's terminal theme still recolors them.
         assert_eq!(
             emit(|b| write_sgr_color(b, Color::Idx(1), true)),
             b"\x1b[31m"

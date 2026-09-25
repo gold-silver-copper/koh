@@ -21,7 +21,7 @@ mod server;
 pub use grid::{Grid, Modes};
 pub use server::ServerTerminal;
 
-/// Default screen geometry, used for the initial (num 0) state both ends agree on.
+/// Default screen geometry, used for the blank screen both ends start from.
 pub const DEFAULT_ROWS: u16 = 24;
 pub const DEFAULT_COLS: u16 = 80;
 /// Bounds on a peer-controlled terminal geometry.
@@ -51,7 +51,7 @@ pub const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
 /// Clamp a peer-supplied `(rows, cols)` into `[MIN_DIM, MAX_DIM]`.
 ///
 /// The single chokepoint both the server and the client funnel a resize through before building a
-/// grid, so the two paths can never disagree. Closes the resize OOM (H-1).
+/// grid, so the two paths can never disagree and no resize can allocate an unbounded grid.
 #[must_use]
 pub fn clamp_dims(rows: u16, cols: u16) -> (u16, u16) {
     (rows.clamp(MIN_DIM, MAX_DIM), cols.clamp(MIN_DIM, MAX_DIM))
@@ -117,7 +117,7 @@ impl TerminalScreen {
     }
 
     /// Construct a screen by feeding `bytes` of terminal output into a fresh emulator of the
-    /// given (clamped) size. For tests and the in-process simulator.
+    /// given (clamped) size. For tests.
     pub fn from_bytes(rows: u16, cols: u16, bytes: &[u8]) -> Self {
         ServerTerminal::new(rows, cols, 0).map_or_else(
             |_| Self::default(),
@@ -451,7 +451,7 @@ impl TerminalScreen {
         // only if all of it is well-formed: a malformed frame is dropped and the prior screen
         // kept, never half-applied.
         //
-        // K-13 — LOAD-BEARING: this `clamp_dims` is the only bound on a single resize's grid
+        // LOAD-BEARING: this `clamp_dims` is the only bound on a single resize's grid
         // allocation. The mirror clamp on the server lives in `terminal/server.rs`.
         let (rows, cols) = diff
             .resize
@@ -486,12 +486,12 @@ impl TerminalScreen {
             .set_cursor((crow.min(rows.saturating_sub(1)), ccol.min(cols)));
         self.grid.set_modes(modes);
 
-        // Monotonic: never regress on a reordered/older diff (the SSP guarantees no state
-        // regression, but `max` is the defensive, obviously-correct choice).
+        // Monotonic: never regress on a reordered/older diff (the client applies only newer
+        // frames, but `max` is the defensive, obviously-correct choice).
         self.bell_count = self.bell_count.max(diff.bell_count);
         // Title / icon / clipboard arrive from the wire. The server emulator caps them, but the
         // client must NOT trust that — a malicious server could ship an oversized payload to bloat
-        // the client or stuff its terminal. Re-apply the same caps here before storing (L-2).
+        // the client or stuff its terminal. Re-apply the same caps here before storing.
         if let Some(title) = &diff.title {
             self.title = capped_chars(title, MAX_TITLE_LEN);
         }
@@ -624,7 +624,7 @@ mod tests {
         /// The untrusted server->client `apply` path must NEVER panic on an arbitrary structured
         /// `ScreenDiff` (any rows, runs, cells, cursor, modes, dimensions, strings) and must always
         /// leave the screen within the dimension clamp, a consistent grid, a cursor in range, and
-        /// the title/clipboard caps (KOH-02/07, K-13, H-1).
+        /// the title/clipboard caps.
         #[test]
         fn apply_is_panic_free_and_holds_invariants(
             rows in proptest::collection::vec(row_diff(), 0..6),
@@ -676,7 +676,7 @@ mod tests {
             }
         }
 
-        /// The SSP law over real emulator output: for any two screens produced by the server
+        /// The round-trip law over real emulator output: for any two screens produced by the server
         /// emulator (any bytes, any sizes), applying `target.diff_from(base)` to `base` yields
         /// exactly `target`, including after a resize.
         #[test]
@@ -892,8 +892,8 @@ mod tests {
         );
     }
 
-    // --- Ported mosh terminal-emulation / unicode regression tests, recast as SSP round-trip
-    // tests: feed the byte sequence from the corresponding mosh test to the server emulator, ship
+    // --- Ported mosh terminal-emulation / unicode regression tests, recast as diff/apply
+    // round-trip tests: feed the byte sequence from the corresponding mosh test to the server emulator, ship
     // the snapshot through diff/apply onto a fresh client, and assert the client reconstructs the
     // screen EXACTLY (koh's verification guarantee) plus the semantic outcome mosh checked.
     // mosh source: src/tests/emulation-*.test, unicode-*.test. ---

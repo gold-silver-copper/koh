@@ -1,7 +1,7 @@
 //! The server-side live terminal emulator: a long-lived `fux_vt::Parser` fed by the PTY, plus
 //! the title / icon / bell / clipboard it observes and the query replies it produces. The
-//! echo-ack debounce that tells the client which of its keystrokes are now visible lives per
-//! connection in `server` (KS-02).
+//! echo-ack debounce that tells the client which of its keystrokes are visible lives per
+//! connection in `server`.
 
 use crate::terminal::{clamp_dims, Grid, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN};
 use fux_vt::{Event, Options, Parser, Sink};
@@ -53,7 +53,7 @@ impl Sink for Observed {
 /// The server's authoritative terminal. Owns the live parser and produces the [`TerminalScreen`]
 /// snapshots the connections diff and send.
 ///
-/// The echo-ack is **not** tracked here (KS-02): input sequence numbers are per connection, so each
+/// The echo-ack is **not** tracked here: input sequence numbers are per connection, so each
 /// connection's `ServerConn` tracks its own and puts it on its frames.
 ///
 /// fux-vt is panic-free by construction and bounded: it retains no OSC/DCS/APC/PM/SOS payload
@@ -104,7 +104,7 @@ impl ServerTerminal {
 
     /// Resize the emulated screen (after applying a client resize to the PTY). The dimensions are
     /// peer-controlled, so they are clamped to `[MIN_DIM, MAX_DIM]` here — the grid is allocated
-    /// eagerly, so an unbounded resize would OOM the (cross-tenant) server (H-1). Defense in
+    /// eagerly, so an unbounded resize would OOM the (cross-tenant) server. Defense in
     /// depth: the call site clamps too, this is the chokepoint. A refused resize (allocation
     /// limit) keeps the previous size and is logged.
     pub fn resize(&mut self, rows: u16, cols: u16) {

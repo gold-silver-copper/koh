@@ -2,8 +2,7 @@
 //!
 //! Binds an iroh endpoint with a persistent identity, authorizes incoming clients against a
 //! node-id allowlist, and for each accepted connection runs a PTY-backed shell whose screen is
-//! kept in sync with the client via the SSP over QUIC datagrams (`Transport<TerminalScreen,
-//! UserInput>`).
+//! kept in sync with the client over koh/3 (see [`crate::proto`]).
 //!
 //! Auth model (deliberately *not* iroh-ssh's "anyone with the endpoint id gets a shell"):
 //! a connection is only served if the client's endpoint id is on the `--allow` list. There is no
@@ -29,7 +28,7 @@ use crate::transport_iroh::{
 use tracing::{error, info, warn};
 
 /// Deadline on the QUIC crypto handshake (`Incoming::await`) before a stalled dial is dropped and
-/// its connection + pending-handshake permits released (KR-01). A legitimate 1-RTT QUIC handshake
+/// its connection + pending-handshake permits released. A legitimate 1-RTT QUIC handshake
 /// finishes in well under this even on a slow mobile link; the cap exists so a peer can't pin a
 /// pending slot for the 300s idle timeout koh configures (`koh_transport_config`).
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -124,9 +123,8 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                // The crate is `koh`; there is no `koh_server` target (single-crate layout), so a
-                // `koh_server=` directive matches nothing. `koh=info` covers every module; use
-                // e.g. `koh::server=info` via RUST_LOG for real per-module control.
+                // Targets match by prefix, so `koh` covers the binary, `koh_core` and the
+                // `koh::auth` audit target; RUST_LOG=koh_core::server=debug narrows to a module.
                 .unwrap_or_else(|_| "koh=info".into()),
         )
         .with_writer(std::io::stderr)
@@ -205,7 +203,7 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     );
 
     // Graceful shutdown: a SIGTERM/SIGINT drains the accept loop cleanly (close the endpoint after
-    // the reaper stops) instead of hard-killing the process.
+    // the registry stops) instead of hard-killing the process.
     let shutdown = CancellationToken::new();
     spawn_signal_drain(shutdown.clone())?;
     serve_endpoint(endpoint, hosting, shutdown).await
@@ -284,10 +282,10 @@ pub async fn serve_endpoint(
     });
 
     // Bound concurrent connection-handling tasks: each accepted connection holds a permit for its
-    // whole lifetime, so a flood can't spawn unbounded tasks (L-3). Excess dials are refused cheaply
+    // whole lifetime, so a flood can't spawn unbounded tasks. Excess dials are refused cheaply
     // (before the crypto handshake) via `Incoming::refuse`.
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(hosting.max_connections));
-    // Separate, smaller cap on *un-admitted, in-flight* handshakes (KOH-08): a slowloris that opens
+    // Separate, smaller cap on *un-admitted, in-flight* handshakes: a slowloris that opens
     // connections but stalls the QUIC handshake (or never accepts the admission stream) would
     // otherwise pin every connection permit for the whole handshake-timeout window. A pending permit
     // is released the moment admission completes (the `drop(pending_permit)` in the accept task), so
@@ -305,14 +303,14 @@ pub async fn serve_endpoint(
                 None => break, // endpoint closed
             },
         };
-        // Connection cap (L-3): grab a permit before doing any work for this connection. If the
+        // Connection cap: grab a permit before doing any work for this connection. If the
         // server is at capacity, refuse the incoming dial cheaply — `refuse()` rejects it without
         // the (expensive) crypto handshake, so a flood can't pin unbounded resources.
-        // --- Trust-boundary admission pipeline (AR-06) ---
+        // --- Trust-boundary admission pipeline ---
         // An accepted connection runs an ORDERED gauntlet before it gets a session, deliberately
         // inlined so each control is a single local edit and the order reads as one sequence:
-        //   (1) connection-cap permit, (2) pending-handshake permit (KOH-08), then in the task:
-        //   (3) QUIC-handshake timeout (KR-01), (4) node-id allowlist, (5) a 1-byte admission ack so
+        //   (1) connection-cap permit, (2) pending-handshake permit, then in the task:
+        //   (3) QUIC-handshake timeout, (4) node-id allowlist, (5) a 1-byte admission ack so
         //   the client can tell "admitted" from a deliberate reject, then attach. Authorization is the
         //   allowlist — the peer's node-id is already cryptographically authenticated by the QUIC/TLS
         //   handshake, so there is no passphrase/second-factor step. The pure controls (allowlist /
@@ -323,7 +321,7 @@ pub async fn serve_endpoint(
             incoming.refuse();
             continue;
         };
-        // Pending-handshake cap (KOH-08): refuse if too many un-authenticated handshakes are
+        // Pending-handshake cap: refuse if too many un-authenticated handshakes are
         // already in flight, so stalls can't consume the whole connection budget. (`permit` above
         // is released on this `continue`.)
         let Ok(pending_permit) = handshake_limit.clone().try_acquire_owned() else {
@@ -339,7 +337,7 @@ pub async fn serve_endpoint(
             // Held only until auth completes (dropped explicitly on success, or on any early
             // return below), so an established session doesn't occupy a pending-handshake slot.
             let pending_permit = pending_permit;
-            // Bound the QUIC handshake itself (KR-01): `incoming.await` has no internal deadline
+            // Bound the QUIC handshake itself: `incoming.await` has no internal deadline
             // short of iroh's 300s idle timeout, so a peer that yields an `Incoming` then stalls
             // would otherwise pin this conn + pending permit for ~5 min — and ~`pending_cap` such
             // stalls would deny all new connections. The timeout releases both permits promptly.
@@ -361,7 +359,7 @@ pub async fn serve_endpoint(
                 return;
             }
             // Authenticated + authorized: free the pending-handshake slot so it isn't held for the
-            // (potentially long-lived) session that follows (KOH-08). The connection-cap permit is
+            // (potentially long-lived) session that follows. The connection-cap permit is
             // still held. The admission ack + attach happen in `serve_connection`.
             drop(pending_permit);
             serve_connection(conn, &sessions).await;
@@ -404,7 +402,7 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
 
     // Attach to (or create) this client's detachable session, then serve the connection.
     let Some((client, attach_kind)) = registry.attach(peer).await else {
-        // At the live-session cap (L-3): refuse a brand-new peer rather than spawn an unbounded
+        // At the live-session cap: refuse a brand-new peer rather than spawn an unbounded
         // shell. A reconnecting peer would have matched its existing session, so this only ever
         // rejects a genuinely new one.
         warn!(peer = %format_endpoint_id(&peer), "refusing session: at max-sessions capacity");

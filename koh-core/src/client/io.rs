@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn idle_input_poll_cancels_and_joins_without_waiting_for_a_byte() {
         crate::test_runtime::current_thread().block_on(async {
-            // KC-IO-01: client teardown owns and joins every producer.
+            // Client teardown owns and joins every producer.
             let (reader, _writer) = UnixStream::pair().expect("socket pair");
             let (sender, mut receiver) = mpsc::channel(1);
             let cancel = CancellationToken::new();
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn input_producer_forwards_bytes_exactly() {
         crate::test_runtime::current_thread().block_on(async {
-            // KC-IO-02: producer framing does not transform terminal input.
+            // Producer framing does not transform terminal input.
             let (reader, mut writer) = UnixStream::pair().expect("socket pair");
             let (sender, mut receiver) = mpsc::channel(1);
             let cancel = CancellationToken::new();

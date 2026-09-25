@@ -62,7 +62,7 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
     std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700))
         .expect("private mode");
     let path = directory.0.join("identity.key");
-    // An identity in the old encrypted format: not a key koh reads, but reset must remove it.
+    // A `koh-key-v1` (passphrase-encrypted) file: not a key koh reads, but reset must remove it.
     std::fs::write(
         &path,
         b"koh-key-v1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
@@ -83,7 +83,7 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
     };
     assert!(!run(false).status.success());
     assert!(path.exists(), "unconfirmed reset removed key");
-    // `koh id` refuses the old file and points at the reset.
+    // `koh id` refuses the file and points at the reset.
     let id = Command::new(env!("CARGO_BIN_EXE_koh"))
         .current_dir(&directory.0)
         .env_clear()

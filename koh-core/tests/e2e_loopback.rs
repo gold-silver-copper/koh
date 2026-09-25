@@ -2,10 +2,9 @@
 //!
 //! Two iroh endpoints on loopback (no relay, no second machine), a real PTY-hosted shell on
 //! the server, and the real client session loop driven through a mock terminal — exercising
-//! the entire path: scripted keystroke → client → iroh datagram → server → PTY → shell echo →
-//! fux-vt → iroh datagram → client render. This is the slice the in-process `SimHarness` tests
-//! (Tier 0) deliberately cannot cover: that the genuine iroh accept/connect/datagram API
-//! actually carries our protocol.
+//! the entire path: scripted keystroke → client → input stream → server → PTY → shell echo →
+//! fux-vt → frame stream → client render, on the plain loopback path with no fault link in
+//! between (the `net` tests add one).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

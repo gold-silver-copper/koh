@@ -71,7 +71,7 @@ fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> Comma
 }
 
 /// Remove koh's own env vars (`KOH_*`, such as `KOH_LOG` and `KOH_DNS`) from a command's
-/// environment before it spawns the session shell (L-4 / KOH-15): they configure koh, not the
+/// environment before it spawns the session shell: they configure koh, not the
 /// hosted program, and are not the remote user's to read. `CommandBuilder::new`
 /// seeds the full parent environment, so we strip *every* inherited `KOH_*` key by prefix (rather
 /// than a hand-maintained list that silently misses future vars). Pulled out of [`Pty::spawn`] so
@@ -85,7 +85,7 @@ fn scrub_koh_env(cmd: &mut CommandBuilder) {
 }
 
 /// Whether `key` is one of koh's own environment variables (`KOH_*`) — the ones scrubbed from
-/// every child koh spawns, here and in the client's bell hook (L-4, KB-02).
+/// every child koh spawns, here and in the client's bell hook.
 pub(crate) fn is_koh_env_key(key: &std::ffi::OsStr) -> bool {
     key.to_string_lossy().starts_with("KOH_")
 }
@@ -143,7 +143,7 @@ pub struct Pty {
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Set once we have *reaped* the child (a `try_wait`/`wait` returned `Some`). After a reap the
     /// kernel may recycle the PID, so signaling the stored PID could hit an unrelated process —
-    /// every kill path checks this and skips when set (KR-02). An un-reaped exited child is still a
+    /// every kill path checks this and skips when set. An un-reaped exited child is still a
     /// zombie that reserves its PID, so signaling *that* is harmless; only a reaped PID is unsafe.
     reaped: AtomicBool,
     /// Join handles for the reader/writer pump threads, kept so a graceful [`Pty::shutdown`] can
@@ -247,7 +247,7 @@ impl Pty {
         let mut cmd = build_command(command, default_shell);
         // A real terminal type so curses apps behave; the env is otherwise inherited.
         cmd.env("TERM", term);
-        // Scrub koh's own env from the child (L-4): it configures koh, not the hosted program.
+        // Scrub koh's own env from the child: it configures koh, not the hosted program.
         scrub_koh_env(&mut cmd);
 
         let child = pair
@@ -280,8 +280,8 @@ impl Pty {
         // A failed kill is logged, not ignored: if the child somehow survives it keeps the slave
         // fd open, the reader stays blocked on read(), and the join below would hang — so a warning
         // is the breadcrumb for that (otherwise impossible-looking) stall. Skip the kill entirely
-        // once the child is reaped: it is already dead (reader saw EOF) and its PID may be recycled
-        // (KR-02). The `drop(self)` below still runs `Drop`, which is likewise reaped-gated.
+        // once the child is reaped: it is already dead (reader saw EOF) and its PID may be recycled.
+        // The `drop(self)` below still runs `Drop`, which is likewise reaped-gated.
         if !self.reaped.load(Ordering::SeqCst) {
             if let Err(e) = self.killer.kill() {
                 tracing::warn!(error = %e, "pty kill on shutdown failed; reader join may stall");
@@ -333,7 +333,7 @@ impl Pty {
     }
 
     /// Non-blocking check for child exit. On a `Some` result the child has been reaped, so the PID
-    /// may now be recycled — the kill paths must not signal it afterward (KR-02).
+    /// may be recycled — the kill paths must not signal it afterward.
     pub fn try_wait(&mut self) -> std::io::Result<Option<GroupExitStatus>> {
         if self.reaped.load(Ordering::SeqCst) {
             return Ok(None);
@@ -383,7 +383,7 @@ impl Pty {
     }
 
     /// Terminate the child (SIGHUP via the portable-pty killer). No-op once the child is reaped, so
-    /// we never SIGHUP a recycled PID (KR-02).
+    /// we never SIGHUP a recycled PID.
     pub fn kill(&mut self) -> std::io::Result<()> {
         if self.reaped.load(Ordering::SeqCst) {
             return Ok(());
@@ -394,11 +394,11 @@ impl Pty {
     /// Force-kill the child with SIGKILL (which cannot be trapped). portable-pty's cloned killer
     /// only sends SIGHUP, so a child that ignores SIGHUP (e.g. `trap '' HUP`) would otherwise keep
     /// the PTY slave fd open and wedge the reader thread on a blocking `read()` forever — leaking a
-    /// thread + fds per session and defeating the reaper (KOH-10).
+    /// thread + fds per session.
     ///
     /// Skips signaling once the child has been **reaped**: `process_id()` keeps returning the
     /// original PID after reaping, but the kernel may have recycled it, so SIGKILL could hit an
-    /// unrelated same-uid process (KR-02). A reaped child is already dead (its fds closed, so the
+    /// unrelated same-uid process. A reaped child is already dead (its fds closed, so the
     /// reader already saw EOF), so there is nothing to kill; an un-reaped zombie still reserves its
     /// PID, so the SIGKILL below targets only a PID we still own. Off-unix this is a no-op.
     pub fn kill_hard(&self) {
@@ -424,16 +424,16 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        // A `Pty` dropped without an explicit [`Pty::shutdown`] (e.g. the Err path in
-        // `session::teardown`, or any future caller) must still guarantee the child dies, so the
-        // detached reader thread can't block forever on a still-open slave fd (KOH-10). SIGHUP
+        // A `Pty` dropped without an explicit [`Pty::shutdown`] (an error path, a panicking
+        // session task) must still guarantee the child dies, so the
+        // detached reader thread can't block forever on a still-open slave fd. SIGHUP
         // first (a well-behaved shell exits cleanly), then SIGKILL so a SIGHUP-immune child also
         // dies → the reader hits EOF and the pump threads exit. `writer_tx` drops with the struct,
         // EOFing the child's stdin. We deliberately do NOT join the threads here (that could block
         // the dropping thread, possibly a tokio worker); SIGKILL makes them exit promptly on their
         // own, and `shutdown` remains the path that joins.
         //
-        // Skip signaling once the child is reaped (KR-02): a reaped child is already dead and its
+        // Skip signaling once the child is reaped: a reaped child is already dead and its
         // PID may have been recycled, so SIGHUP/SIGKILL here could hit an unrelated process.
         if self.reaped.load(Ordering::SeqCst) {
             return;
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn scrub_removes_inherited_koh_vars() {
-        // L-4: KOH_* vars set in the server's environment must not reach the spawned shell.
+        // KOH_* vars set in the server's environment must not reach the spawned shell.
         // CommandBuilder::new seeds the full parent env, so this proves env_remove strips an
         // *inherited* var.
         std::env::set_var("KOH_SCRUB_TEST", "topsecret-unit");
@@ -545,7 +545,7 @@ mod tests {
         // typed error stays internal to the lib but composes with anyhow at the edges.
         let absorbed: anyhow::Error = PtyError::OpenPty(mk()).into();
         assert!(absorbed.to_string().contains("opening pty"));
-        // The public spawn signature now carries the typed error.
+        // The public spawn signature carries the typed error.
         fn _assert_typed(r: Result<(), PtyError>) -> Result<(), PtyError> {
             r
         }

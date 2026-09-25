@@ -34,7 +34,7 @@ pub struct ConnectConfig {
     pub relay_url: Option<String>,
     /// Honor remote OSC-52 clipboard writes. Off by default in the CLI (`--clipboard`).
     pub clipboard: bool,
-    /// A shell command to run (via `sh -c`) whenever the remote bell count climbs (KB-01), e.g.
+    /// A shell command to run (via `sh -c`) whenever the remote bell count climbs, e.g.
     /// `termux-notification -t "koh bell"`. Detached from the terminal, rate-limited to one spawn
     /// per second; bells that rang before this client attached do not fire it, bells during a
     /// reconnect do. `None` = no hook.
@@ -55,13 +55,13 @@ impl ConnectConfig {
     }
 }
 
-/// Runs a user command whenever the remote bell rings (KB-01): `--on-bell` / [`ConnectConfig::bell_command`].
+/// Runs a user command whenever the remote bell rings: `--on-bell` / [`ConnectConfig::bell_command`].
 ///
 /// The decision (`observe`) is pure and rate-limited so it is unit-testable; the spawn is
 /// detached — stdin/stdout/stderr on `/dev/null`, since the TUI owns the terminal — with
 /// `KOH_BELL_COUNT` and `KOH_TITLE` in the environment and every other `KOH_*` variable scrubbed
-/// (the same guard as `pty.rs`, KB-02). The child is reaped on a background
-/// task and never awaited by the session loop.
+/// (the same guard as `pty.rs`). The child is reaped on a background task and never awaited by
+/// the session loop.
 ///
 /// The remote bell count is cumulative for the life of the server session, so the hook is
 /// [`prime`](Self::prime)d with the count of the first synced frame: bells that rang before you
@@ -133,7 +133,7 @@ impl BellHook {
 
     /// Build the detached command: `sh -c CMD` with `parent_env` minus every `KOH_*` key, plus
     /// `KOH_BELL_COUNT` / `KOH_TITLE`, and all three fds on `/dev/null`. Pure given `parent_env`,
-    /// so the scrub is testable with a synthetic environment (KB-02).
+    /// so the scrub is testable with a synthetic environment.
     pub(crate) fn command(
         &self,
         count: u64,
@@ -263,8 +263,7 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
     let args: ConnectConfig = config.into();
     // The TUI owns the terminal, so logs go to a file (set $KOH_LOG) to avoid corrupting it.
     if let Ok(path) = std::env::var("KOH_LOG") {
-        // Create the log owner-only (0600): debug logs can carry sensitive material, and unlike the
-        // key file this was previously world-readable per umask (KOH-14).
+        // Create the log owner-only (0600): debug logs can carry sensitive material.
         let created = {
             #[cfg(unix)]
             {
@@ -282,7 +281,7 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
             }
         };
         if let Ok(file) = created {
-            // Tighten to 0600 unconditionally via the fd (KR-07): the `mode` above only applies when
+            // Tighten to 0600 unconditionally via the fd: the `mode` above only applies when
             // the file is *created*, so a pre-existing looser `$KOH_LOG` (or one a co-tenant planted)
             // would otherwise be reused/truncated with its loose bits intact. `File::set_permissions`
             // fchmods the open fd, so it also avoids re-resolving the path through a symlink. If we
@@ -423,7 +422,7 @@ mod tests {
 
     #[test]
     fn bell_hook_fires_on_a_rise_and_rate_limits_a_burst() {
-        // KB-01: counts [0,1,1,2,3] at times [0,0,10,20,1500] spawn at index 1 and 4 only — the
+        // Counts [0,1,1,2,3] at times [0,0,10,20,1500] spawn at index 1 and 4 only — the
         // first rise fires, the rises inside the 1 s window coalesce, the one past it fires.
         let mut h = BellHook::new("true");
         let counts = [0u64, 1, 1, 2, 3];
@@ -440,8 +439,8 @@ mod tests {
 
     #[test]
     fn bell_hook_command_scrubs_parent_koh_vars_and_exports_its_own() {
-        // KB-02: given a parent environment holding KOH_* vars, the hook's child sees none of them, keeps the rest (PATH, HOME), and gets
-        // KOH_BELL_COUNT / KOH_TITLE. The command builder takes the parent env explicitly, so
+        // Given a parent environment holding KOH_* vars, the hook's child sees none of them,
+        // keeps the rest (PATH, HOME), and gets KOH_BELL_COUNT / KOH_TITLE. The command builder takes the parent env explicitly, so
         // this needs no process-global `set_var`.
         use std::ffi::OsString;
         let dir = std::env::temp_dir().join(format!(
@@ -480,7 +479,7 @@ mod tests {
 
     #[test]
     fn bell_hook_prime_swallows_the_count_it_is_seeded_with_but_not_later_rises() {
-        // KB-02: the first synced frame's cumulative count is not a new bell; a later rise is.
+        // The first synced frame's cumulative count is not a new bell; a later rise is.
         // Priming again is a no-op (a reconnect keeps counting from where it was).
         let mut h = BellHook::new("true");
         h.prime(5);

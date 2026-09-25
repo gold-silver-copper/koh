@@ -6,7 +6,7 @@
 //! `watch` channel — whether or not a client is attached, so a reconnecting client re-syncs to the
 //! live screen ("close the laptop, reopen, it's right where you left off"). A connection talks to
 //! its session only through a [`SessionClient`]: it watches the screen and sends input, and
-//! dropping it detaches. No shared locks, no reference count, no separate reaper.
+//! dropping it detaches. Session state is owned by its task, never shared behind a lock.
 
 use std::collections::HashMap;
 use std::sync::Arc;

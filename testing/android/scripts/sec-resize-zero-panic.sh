@@ -1,7 +1,7 @@
 #!/bin/sh
-# SECURITY (M-2): a malicious client's (0, 0) resize triggers a panic/abort in the vt100 emulator
-# (it computes rows-1 unchecked → overflow panic / OOB index), crashing the session. Asserts the
-# SECURE behavior (server survives, no panic) — fails against unpatched koh, passes once clamped.
+# SECURITY: a malicious client's (0, 0) resize must not panic the server's emulator (an unchecked
+# rows-1 would overflow or index out of bounds). Asserts the server survives with no panic: geometry
+# is clamped to at least MIN_DIM.
 set -eu
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 . "$HERE/stress-lib.sh"

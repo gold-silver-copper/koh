@@ -1,5 +1,5 @@
 #!/bin/sh
-# SECURITY (L-4): koh's own environment (KOH_*) configures koh, not the hosted program, and must NOT
+# SECURITY: koh's own environment (KOH_*) configures koh, not the hosted program, and must NOT
 # be inherited by the spawned login shell. koh scrubs KOH_* from the child env before exec; this
 # starts the server with a KOH_* canary, records the spawned shell's KOH_* env, and asserts the
 # canary is absent.

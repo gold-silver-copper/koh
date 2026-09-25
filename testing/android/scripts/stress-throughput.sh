@@ -1,7 +1,7 @@
 #!/bin/sh
 # Stress: throughput / large output. The server's session shell is a flood script that emits tens of
 # thousands of lines the moment a client attaches, pushing a large volume through the full path:
-# PTY -> server emulator (vt100 parse) -> SSP diff + DEFLATE + framing -> wire -> client. (Driving
+# PTY -> server emulator (fux-vt parse) -> screen diff + DEFLATE + framing -> wire -> client. (Driving
 # the flood from the SERVER side avoids having to forward typed input over adb's PTY, which is
 # unreliable.) A sentinel written as the script's last line proves the whole flood was processed.
 # Asserts: a client attaches, the flood completes, neither side panics, and server memory stays

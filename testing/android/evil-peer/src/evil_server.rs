@@ -1,7 +1,7 @@
 //! A deliberately-MALICIOUS koh SERVER. It impersonates a `koh serve` to attack a real
-//! `koh connect` on the **admission** direction (koh no longer has an over-the-wire passphrase
-//! second factor — that PAKE handshake was removed in 0.7.0; the node-id is authenticated by the
-//! QUIC/TLS handshake and admission is a single ADMIT byte the server writes). It prints its
+//! `koh connect` on the **admission** direction (there is no over-the-wire second factor: the
+//! node-id is authenticated by the QUIC/TLS handshake and admission is a single ADMIT byte the
+//! server writes). It prints its
 //! endpoint id + port (machine-readable) so the harness can point a koh client at it, accepts one
 //! connection, and then misbehaves on the admission step.
 //!

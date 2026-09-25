@@ -23,10 +23,6 @@ for embedders or for fux is gone. The terminal emulator moved from `vt100` to `f
 0.13 server (or the reverse) refuse each other at the TLS handshake with a clear error; upgrade
 both ends. The `koh-key-v1` key format is unchanged, so endpoint ids and allowlists carry over.
 
-> **Before release:** koh currently depends on `fux-vt` through a git dependency on the fux
-> branch `feat/fux-vt-for-koh`, which adds what koh needs to fux-vt. That must become a crates.io
-> version (fux-vt ≥ 0.1.1) before koh is published.
-
 ### Changed
 - **Terminal emulation is `fux-vt`, and the client runs no parser.** The server's emulator is
   `fux_vt::Parser`, a bounded, panic-free emulator; `vt100` is no longer a dependency. The screen

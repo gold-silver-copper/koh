@@ -57,10 +57,9 @@ required-features = ["cli"]
 # quinn fork); we never depend on quinn directly.
 iroh = "=1.0.0"
 # terminal / pty / tui. fux-vt is the server's emulator and supplies the cell type the client grid
-# stores. TEMPORARY: a git dependency on the fux branch that adds what koh needs (opt-in events,
-# extended replies, keypad state, cell constructors). Switch to the crates.io release (>= 0.1.1)
-# before publishing koh; `cargo publish` rejects git dependencies.
-fux-vt = { git = "https://github.com/gold-silver-copper/fux", branch = "feat/fux-vt-for-koh" }
+# stores. 0.1.1 is the first release with what koh needs (opt-in events, extended replies, keypad
+# state, cell constructors).
+fux-vt = "0.1.1"
 portable-pty = "=0.9.0"
 unicode-width = "0.2"
 # Terminal backends behind the `client::backend::KohBackend` seam. `termina` is the default and the

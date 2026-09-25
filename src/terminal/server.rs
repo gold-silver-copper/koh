@@ -42,7 +42,10 @@ impl Sink for Observed {
             Event::Clipboard { data, .. } if data.len() <= MAXIMUM_CLIPBOARD_SIZE => {
                 self.clipboard = String::from_utf8_lossy(data).into_owned();
             }
-            _ => {}
+            // An oversized clipboard set is dropped. `Event` is `#[non_exhaustive]`, so the trailing
+            // `_` is required; it only covers events added by a later fux-vt, which koh ignores
+            // until it handles them here.
+            Event::Clipboard { .. } | _ => {}
         }
     }
 }

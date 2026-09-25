@@ -799,7 +799,7 @@ impl PredictionEngine {
                     self.reset();
                 }
                 Validity::Pending => {}
-                _ => {
+                Validity::Correct | Validity::CorrectNoCredit => {
                     self.cursor = None; // resolved
                 }
             }

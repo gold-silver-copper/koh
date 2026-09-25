@@ -60,7 +60,10 @@ macro_rules! panic_free {
                 clippy::unused_result_ok,
                 clippy::mem_forget,
                 clippy::integer_division,
-                clippy::allow_attributes_without_reason
+                clippy::allow_attributes_without_reason,
+                // Every match names the variants it handles, so a new variant is a compile error
+                // at each match instead of silently taking a wildcard arm.
+                clippy::wildcard_enum_match_arm
             )
         )]
         $item

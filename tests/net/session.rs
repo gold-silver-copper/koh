@@ -218,3 +218,50 @@ async fn a_program_that_stops_reading_input_never_freezes_the_client() {
     assert!(quit_at.elapsed() < Duration::from_secs(2));
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forced_mid_session_drop_reconnects_to_the_same_shell() {
+    // The phone-screen-off regression: the connection dies mid-session while the shell keeps
+    // running. The client must transparently reconnect and land back on the same shell, with the
+    // earlier output still on screen.
+    let net = clean();
+    let secret = identity();
+    let server = Server::start(&net, &[secret.public()], &["sh"])
+        .await
+        .expect("start the server");
+    let endpoint = net.endpoint(secret, false).await.expect("bind the client");
+    let mut client = Client::connect_on(endpoint, server.id, Options::default())
+        .await
+        .expect("connect");
+    client.send(b"echo MARK_O''NE\r").await.expect("type");
+    assert!(client
+        .wait_until(WAIT, |t| t.contains("MARK_ONE"))
+        .await
+        .is_some());
+    // Kill the connection without closing the session; the client should re-dial.
+    client.drop_first_connection();
+    // Retype until the reattached session runs it (input during the reconnect is dropped).
+    let mut ran = false;
+    for _ in 0..150 {
+        let _ = client.send(b"echo MARK_T''WO\r").await;
+        if client
+            .wait_until(Duration::from_millis(200), |t| t.contains("MARK_TWO"))
+            .await
+            .is_some()
+        {
+            ran = true;
+            break;
+        }
+    }
+    let screen = client.screen();
+    assert!(
+        ran,
+        "the second command never ran after reconnect; screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("MARK_ONE"),
+        "the reconnect must reattach the SAME shell (MARK_ONE preserved); screen:\n{screen}"
+    );
+    let _ = client.finish().await;
+    server.stop().await;
+}

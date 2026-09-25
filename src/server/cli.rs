@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "cli")]
 pub use crate::args::ServeArgs;
 use crate::server::audit::{auth_event, Outcome};
-use crate::server::session::{self, SessionStore};
+use crate::server::session::{AttachKind, Registry, SessionSpec};
 use crate::server::{run_attached, SessionExit};
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
@@ -274,23 +274,14 @@ pub async fn serve_endpoint(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let allow = Arc::new(hosting.allow);
-    let sessions = Arc::new(SessionPool {
-        store: SessionStore::default(),
+    // The registry task owns the live sessions: it creates, reattaches, caps and reaps them, so a
+    // reconnecting client lands back in the same session at the current screen.
+    let registry = Registry::spawn(SessionSpec {
         command: hosting.command,
         scrollback: hosting.scrollback,
         max_sessions: hosting.max_sessions,
+        ttl: hosting.session_ttl,
     });
-
-    // The detachable session store survives disconnects, so a reconnecting client lands back in
-    // the same session at the current screen. The reaper collects sessions whose program exited
-    // or that have been detached past the TTL.
-    let reaper_shutdown = tokio_util::sync::CancellationToken::new();
-    let reaper = tokio::spawn(session::run_reaper(
-        sessions.store.clone(),
-        hosting.session_ttl,
-        session::REAP_INTERVAL,
-        reaper_shutdown.clone(),
-    ));
 
     // Bound concurrent connection-handling tasks: each accepted connection holds a permit for its
     // whole lifetime, so a flood can't spawn unbounded tasks (L-3). Excess dials are refused cheaply
@@ -341,7 +332,7 @@ pub async fn serve_endpoint(
             continue;
         };
         let allow = allow.clone();
-        let sessions = sessions.clone();
+        let sessions = registry.clone();
         tokio::spawn(async move {
             // Held for the whole task: releases the connection-cap permit on every exit path.
             let _permit = permit;
@@ -377,27 +368,18 @@ pub async fn serve_endpoint(
         });
     }
 
-    // The accept loop ended (endpoint closed or a shutdown signal): stop the reaper cleanly and
-    // wait for it to finish its current sweep before tearing down the endpoint.
-    info!("draining: stopping reaper and closing endpoint");
+    // The accept loop ended (endpoint closed or a shutdown signal): stop the registry (which tears
+    // down every session) before closing the endpoint.
+    info!("draining: stopping the registry and closing endpoint");
     shutdown.cancel();
-    reaper_shutdown.cancel();
-    let _ = reaper.await;
+    registry.shutdown().await;
     endpoint.close().await;
     Ok(())
 }
 
-/// The server's session store and what it spawns for a new peer.
-struct SessionPool {
-    store: SessionStore,
-    command: Arc<[String]>,
-    scrollback: usize,
-    max_sessions: usize,
-}
-
 /// Serve one authenticated, allowlisted connection: send the admission ack, attach the peer's
-/// session, drive it, and release it afterwards.
-async fn serve_connection(conn: iroh::endpoint::Connection, sessions: &SessionPool) {
+/// session, and drive it. Dropping the session client on return detaches.
+async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry) {
     let peer = conn.remote_id();
     // Authorized: send the 1-byte admission ack so the client can distinguish "admitted" from a
     // deliberate reject (without it a rejected client would re-dial forever). Bounded by a short
@@ -421,37 +403,19 @@ async fn serve_connection(conn: iroh::endpoint::Connection, sessions: &SessionPo
     auth_event(Outcome::Accepted, &peer, "authorized; attaching session");
 
     // Attach to (or create) this client's detachable session, then serve the connection.
-    let attached = session::attach(
-        &sessions.store,
-        peer,
-        &sessions.command,
-        sessions.scrollback,
-        sessions.max_sessions,
-    )
-    .await;
-    let (handle, attach_kind) = match attached {
-        Ok(Some(pair)) => pair,
-        Ok(None) => {
-            // At the live-session cap (L-3): refuse a brand-new peer rather than spawn an
-            // unbounded shell. A reconnecting peer would have matched its existing session, so
-            // this only ever rejects a genuinely new one.
-            warn!(peer = %format_endpoint_id(&peer), "refusing session: at max-sessions capacity");
-            conn.close(1u32.into(), b"server at session capacity");
-            return;
-        }
-        Err(e) => {
-            error!(error = %e, "failed to start session");
-            conn.close(1u32.into(), b"session error");
-            return;
-        }
+    let Some((client, attach_kind)) = registry.attach(peer).await else {
+        // At the live-session cap (L-3): refuse a brand-new peer rather than spawn an unbounded
+        // shell. A reconnecting peer would have matched its existing session, so this only ever
+        // rejects a genuinely new one.
+        warn!(peer = %format_endpoint_id(&peer), "refusing session: at max-sessions capacity");
+        conn.close(1u32.into(), b"server at session capacity");
+        return;
     };
     match attach_kind {
-        session::AttachKind::Created => {
+        AttachKind::Created => {
             info!(peer = %format_endpoint_id(&peer), "started a new session");
         }
-        session::AttachKind::Reattached { detached_for } => {
-            // mosh-server's "you have a detached session" notice, server-side: this peer is
-            // resuming its running session rather than starting a fresh one.
+        AttachKind::Reattached { detached_for } => {
             info!(
                 peer = %format_endpoint_id(&peer),
                 detached_secs = detached_for.map(|d| d.as_secs()),
@@ -459,26 +423,15 @@ async fn serve_connection(conn: iroh::endpoint::Connection, sessions: &SessionPo
             );
         }
     }
-    // Arm a RAII safety net BEFORE serving: if `run_attached` unwinds (panics), the guard's Drop
-    // still releases this connection's session attach so it can't leak (K-16). On a normal return
-    // we disarm and run the precise detach/reap below ourselves.
-    let attach_guard = session::AttachGuard::new(sessions.store.clone(), peer);
-    let outcome = run_attached(conn, handle).await;
-    attach_guard.disarm();
-    match outcome {
+    // Dropping `client` on return (or panic) detaches; the session keeps running for reattach.
+    match run_attached(conn, client).await {
         Ok(SessionExit::Detached) => {
-            // Keep the shell running for reattach.
-            session::detach(&sessions.store, peer).await;
             info!(peer = %format_endpoint_id(&peer), "client detached (session retained)");
         }
         Ok(SessionExit::ShellExited) => {
-            session::reap(&sessions.store, peer).await;
-            info!(peer = %format_endpoint_id(&peer), "shell exited; session reaped");
+            info!(peer = %format_endpoint_id(&peer), "shell exited");
         }
-        Err(e) => {
-            error!(error = %e, "session loop error");
-            session::detach(&sessions.store, peer).await;
-        }
+        Err(e) => error!(error = %e, "session loop error"),
     }
 }
 

@@ -164,18 +164,17 @@ per-connection state never lives in the session:
 
 - **KS-02 — echo-ack is per connection.** Input sequence numbers are per connection, so the input
   history and the 50 ms debounce live in the per-connection `ServerConn` (`server::EchoAck`), not
-  in the emulator, and each frame carries its connection's own echo-ack. A session-global ack would
+  in the session, and each frame carries its connection's own echo-ack. A session-global ack would
   hand one connection another's numbers, and its predictor would treat every keystroke as already
   acked.
-- **KS-03 — a change wakes every connection.** `SessionHandle::changed` is a `ChangeSignal`, a
-  `tokio::sync::watch` version counter: the PTY drain task `pulse`s it, and each attached loop holds
-  its own receiver and `select!`s on `changed()`. Every loop wakes on one pulse; a burst coalesces
-  into one wake per loop; and because a receiver remembers the version it last saw, a pulse landing
-  between a loop's snapshot and its wait is never lost.
-- **K-16 — the unwind guard.** `AttachGuard` holds the session store and the peer id and runs the
-  balancing `detach` if a connection task unwinds before its explicit detach/reap, so a panicking
-  task can't pin a session with `attached > 0` forever. `attached` is a refcount across the peer's
-  connections; the TTL reaper collects a session only at zero, or once its shell has exited.
+- **KS-03 — a change wakes every connection.** The session task publishes each new screen on a
+  `tokio::sync::watch`; each connection holds a receiver and `select!`s on it. Every connection
+  wakes on one change; a burst coalesces into the latest screen; and a change landing between a
+  connection's read and its wait is never lost, because the receiver keeps the latest value.
+- **K-16 — detach on drop.** A connection holds a `SessionClient`; dropping it (on return **or**
+  panic) sends the session task a detach, so a panicking connection can't pin a session. The
+  session task counts attached clients and starts the TTL only when the last one leaves; it tears
+  itself down at the TTL or once its shell exits, and tells the registry to forget it.
 - **KB-01 — the bell hook.** `--on-bell <cmd>` / `ConnectConfig::bell_command` runs `sh -c` when
   the remote bell count climbs: detached (fds on `/dev/null`), `KOH_*` scrubbed except
   `KOH_BELL_COUNT` / `KOH_TITLE`, rate-limited to one spawn per second with bursts coalesced, the
@@ -191,8 +190,6 @@ The client renders through `client::ClientTerminal`, so tests can capture frames
 driving a real terminal, and the predictor reads screens through `predict::ScreenView`
 (implemented for the client `Grid` and for `fux_vt::Screen`), which keeps `predict.rs` free of
 `crate::` imports.
-`ssp::testkit::GridState` is a non-terminal state with multi-datagram diffs that exercises the SSP
-on its own.
 
 ## Security internals
 

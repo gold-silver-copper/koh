@@ -3,9 +3,9 @@
 //! Reused by the binary and by integration tests (so the full PTY⇄emulator⇄transport path can be
 //! exercised over a real iroh connection without the CLI/accept scaffolding).
 //!
-//! Sessions are **detachable**: the long-lived PTY + emulator lives in [`session::Session`] and
-//! survives client disconnects; a per-connection [`run_attached`] loop drives a *fresh* `Transport`
-//! against it, so a reconnecting client re-syncs to the current screen.
+//! Sessions are **detachable**: the long-lived PTY + emulator lives in a [`session`] task and
+//! survives client disconnects; a per-connection [`run_attached`] loop drives a *fresh* protocol
+//! core against it, so a reconnecting client re-syncs to the current screen.
 
 mod audit;
 pub mod cli;
@@ -14,7 +14,7 @@ pub mod session;
 #[cfg(feature = "cli")]
 pub use cli::ServeArgs;
 pub use cli::{serve, ServeConfig};
-pub use session::{ChangeSignal, PtyHost, SharedSession};
+pub use session::{PtyHost, Registry, SessionSpec};
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -99,9 +99,6 @@ impl CursorKeyNormalizer {
 /// Server-side debounce before received input is considered "echoed": how long the hosted
 /// program gets to reflect a keystroke on screen before the client's prediction is confirmed.
 pub(crate) const ECHO_TIMEOUT: Duration = Duration::from_millis(50);
-
-/// How often a connection retries PTY input the writer queue could not take.
-const INPUT_RETRY: Duration = Duration::from_millis(10);
 
 /// How long the server waits for the client to acknowledge the final frame before closing.
 const FINAL_ACK_WAIT: Duration = Duration::from_secs(1);
@@ -191,8 +188,6 @@ pub(crate) struct ServerConn {
     echo: EchoAck,
     /// The newest snapshot of the session's screen.
     screen: TerminalScreen,
-    /// The screen may have changed since `screen` was taken.
-    dirty: bool,
     /// `screen` differs from what was last sent, or the base must be rebuilt.
     unsent_change: bool,
     /// `screen` was taken after the hosted program exited.
@@ -206,9 +201,6 @@ pub(crate) struct ServerConn {
     last_sent_echo: InputSeq,
     /// The first frame sent after the program exited, and when.
     final_frame: Option<(FrameNum, Instant)>,
-    /// Keystrokes the PTY writer queue could not take yet. While this is non-empty the loop stops
-    /// reading the client's stream, so QUIC flow control pushes back on the client.
-    pending_keys: Vec<u8>,
 }
 
 impl Default for ServerConn {
@@ -224,7 +216,6 @@ impl ServerConn {
             cursor_keys: CursorKeyNormalizer::default(),
             echo,
             screen: TerminalScreen::default(),
-            dirty: true,
             unsent_change: true,
             final_snapshot: false,
             acked: (FrameNum::BLANK, TerminalScreen::default()),
@@ -233,31 +224,19 @@ impl ServerConn {
             last_sent_at: None,
             last_sent_echo: InputSeq(0),
             final_frame: None,
-            pending_keys: Vec::new(),
         }
     }
 
-    /// Whether a new snapshot is needed: the screen may have changed, or the program exited and
-    /// the final screen (with its exit code) has not been taken yet.
-    const fn needs_snapshot(&self, alive: bool) -> bool {
-        self.dirty || (!alive && !self.final_snapshot)
-    }
-
-    /// Install a snapshot taken while the program was `alive`.
+    /// Install the session's latest screen (taken while the program was `alive`).
     fn install_snapshot(&mut self, screen: TerminalScreen, alive: bool) {
         let last_sent = self.sent.back().map_or(&self.acked.1, |(_, s)| s);
         if screen != *last_sent {
             self.unsent_change = true;
         }
         self.screen = screen;
-        self.dirty = false;
         if !alive {
             self.final_snapshot = true;
         }
-    }
-
-    fn mark_dirty(&mut self) {
-        self.dirty = true;
     }
 
     /// Append bytes read from the client's stream.
@@ -363,6 +342,11 @@ impl ServerConn {
         self.acked.0
     }
 
+    /// Whether the latest snapshot has application-cursor-keys mode on, for the arrow normalizer.
+    fn app_cursor(&self) -> bool {
+        self.screen.application_cursor()
+    }
+
     /// Whether the connection is done: the program exited and the client acknowledged the final
     /// frame, or did not within [`FINAL_ACK_WAIT`].
     fn finished(&self, now: Instant) -> bool {
@@ -395,27 +379,24 @@ impl ServerConn {
         if let Some((_, at)) = self.final_frame {
             wake = wake.min(at.checked_add(FINAL_ACK_WAIT).unwrap_or(now));
         }
-        if !self.pending_keys.is_empty() {
-            wake = wake.min(now.checked_add(INPUT_RETRY).unwrap_or(now));
-        }
         wake.max(now)
     }
 }
 
-/// Drive a client connection against an existing (shared, detachable) [`session::Session`].
+/// Drive one client connection against its session, through a [`session::SessionClient`].
 ///
-/// The async shell around the `ServerConn` core: it snapshots the session when it changes, applies the
-/// client's input to the PTY, sends each frame on its own stream, and resets the stream of a frame
-/// a newer one supersedes. A fresh core per attach starts from the blank screen, so the first frame
-/// repaints the live screen onto a (re)connecting client. It does **not** kill the host on
-/// disconnect: it returns [`SessionExit::Detached`] and leaves it running for the next reattach.
+/// The async shell around the `ServerConn` core: it watches the session's screen, forwards the
+/// client's input, sends each frame on its own stream, and resets the stream of a frame a newer one
+/// supersedes. A fresh core per attach repaints the live screen onto a (re)connecting client.
+/// Dropping the `SessionClient` (on return or panic) detaches; the session keeps running.
 pub async fn run_attached(
     conn: iroh::endpoint::Connection,
-    handle: SharedSession,
+    mut session: session::SessionClient,
 ) -> anyhow::Result<SessionExit> {
     let channel = IrohChannel::new(conn.clone());
     let mut core = ServerConn::default();
-    let mut changed = handle.changed.subscribe();
+    // Seed the core with the live screen so the first frame repaints it onto this connection.
+    core.install_snapshot((*session.screen()).clone(), true);
     let mut client: Option<RecvStream> = None;
     // The client gets exactly one stream for the connection, even after it finishes that one.
     let mut had_client_stream = false;
@@ -424,27 +405,6 @@ pub async fn run_attached(
     let result = loop {
         let now = Instant::now();
         core.promote_echo(now);
-        // Snapshot under the session lock, only when something may have changed. Mark the change
-        // signal seen BEFORE snapshotting: a pulse after this point re-fires `changed()` below and
-        // costs at most one redundant snapshot, while marking it after could swallow a pulse for a
-        // change the snapshot missed.
-        {
-            let s = handle.session.lock().await;
-            let alive = s.host.alive();
-            if core.needs_snapshot(alive) {
-                let _ = changed.borrow_and_update();
-                let snapshot = s.host.snapshot();
-                drop(s);
-                core.install_snapshot(snapshot, alive);
-            }
-        }
-        // Keystrokes the PTY queue could not take last time.
-        if !core.pending_keys.is_empty() {
-            let mut s = handle.session.lock().await;
-            if s.host.input(&core.pending_keys) {
-                core.pending_keys.clear();
-            }
-        }
         let rtt = channel.rtt();
         if let Some(frame) = core.poll_frame(now, rtt) {
             // Every older frame the client has not acknowledged is superseded.
@@ -468,12 +428,18 @@ pub async fn run_attached(
             break Ok(SessionExit::ShellExited);
         }
         let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
-        let reading = client.is_some() && core.pending_keys.is_empty();
+        let reading = client.is_some();
         tokio::select! {
-            // NOT biased: `changed` may already be pending, which under `biased` would starve
-            // client input. `watch` remembers the last version each receiver saw, so a pulse that
-            // landed between the snapshot above and this wait resolves immediately.
-            _ = changed.changed() => core.mark_dirty(),
+            // NOT biased: a screen change may already be pending, which under `biased` would starve
+            // client input.
+            screen = session.next_screen() => match screen {
+                Some(screen) => {
+                    let alive = screen.exit_code().is_none();
+                    core.install_snapshot((*screen).clone(), alive);
+                }
+                // The session task ended without a final screen (server shutting down): detach.
+                None => break Ok(SessionExit::Detached),
+            },
             stream = conn.accept_uni() => match stream {
                 Ok(stream) if !had_client_stream => {
                     had_client_stream = true;
@@ -491,20 +457,23 @@ pub async fn run_attached(
             read = read_client(client.as_mut(), &mut read_buf), if reading => match read {
                 Ok(Some(n)) => {
                     core.push_client_bytes(read_buf.get(..n).unwrap_or_default());
-                    let mut s = handle.session.lock().await;
-                    match core.drain_client(Instant::now(), s.host.application_cursor()) {
+                    let app_cursor = core.app_cursor();
+                    match core.drain_client(Instant::now(), app_cursor) {
                         Ok(drained) => {
-                            if !drained.keys.is_empty() && !s.host.input(&drained.keys) {
-                                core.pending_keys = drained.keys;
+                            // Await the session's bounded input queue: a full queue (a program not
+                            // reading its input) stops this read branch, so QUIC flow control
+                            // pushes the pressure back to the client.
+                            if !drained.keys.is_empty() {
+                                session.send_keys(drained.keys).await;
                             }
                             if let Some((rows, cols)) = drained.resize {
-                                s.host.resize(rows, cols);
-                                // A resize changes the emulator grid directly, with no pulse.
-                                core.mark_dirty();
+                                session.send_resize(rows, cols).await;
+                            }
+                            if !session.can_send() {
+                                break Ok(SessionExit::Detached); // the session ended
                             }
                         }
                         Err(e) => {
-                            drop(s);
                             tracing::warn!(error = %e, "client broke the protocol; closing");
                             conn.close(PROTOCOL_ERROR.into(), b"protocol error");
                             break Ok(SessionExit::Detached);
@@ -581,18 +550,26 @@ async fn send_frame(conn: iroh::endpoint::Connection, bytes: Vec<u8>, cancel: Ca
     }
 }
 
-/// Convenience: run a **standalone** (non-detachable) PTY session for one connection.
+/// Convenience: run a one-session, one-connection server for `conn`.
 ///
-/// Spawns a shell, serves it, and kills it when the connection ends. Used by integration tests and
-/// any caller that doesn't need reattach. The binary uses the [`session`] store + [`run_attached`].
+/// Spawns a registry that hosts a single session, attaches this connection, serves it, and tears
+/// the session down afterwards. Used by tests and callers that don't need the full accept loop.
 pub async fn run_session(
     conn: iroh::endpoint::Connection,
     command: &[String],
     scrollback: usize,
 ) -> anyhow::Result<()> {
-    let handle = session::spawn_session(command, scrollback)?;
-    let _ = run_attached(conn, handle.clone()).await?;
-    handle.session.lock().await.host.kill();
+    let registry = Registry::spawn(SessionSpec {
+        command: command.to_vec().into(),
+        scrollback,
+        max_sessions: 1,
+        ttl: Duration::from_secs(1),
+    });
+    let peer = conn.remote_id();
+    if let Some((client, _)) = registry.attach(peer).await {
+        let _ = run_attached(conn, client).await?;
+    }
+    registry.shutdown().await;
     Ok(())
 }
 
@@ -774,16 +751,18 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_are_taken_when_dirty_and_once_after_exit() {
+    fn a_changed_snapshot_marks_an_unsent_change_and_the_exit_screen_is_final() {
+        let t0 = Instant::now();
         let mut c = ServerConn::default();
-        assert!(c.needs_snapshot(true), "the first pass snapshots");
         c.install_snapshot(screen(b"a"), true);
-        assert!(!c.needs_snapshot(true), "a clean live host skips it");
-        assert!(c.needs_snapshot(false), "the exit screen is always taken");
+        assert!(c.poll_frame(t0, None).is_some(), "the changed screen is sent");
+        // Re-installing the same screen is not a change, so nothing new is due.
+        c.install_snapshot(screen(b"a"), true);
+        assert!(c.poll_frame(t0, None).is_none());
+        // The exit screen marks the connection final.
         c.install_snapshot(screen(b"a"), false);
-        assert!(!c.needs_snapshot(false), "but only once");
-        c.mark_dirty();
-        assert!(c.needs_snapshot(false));
+        let last = c.poll_frame(t0 + Duration::from_secs(1), None);
+        assert!(last.is_some() || c.finished(t0 + Duration::from_secs(1) + FINAL_ACK_WAIT));
     }
 
     #[test]
@@ -933,8 +912,12 @@ mod tests {
 
     impl RawClient {
         async fn connect(addr: iroh::EndpointAddr) -> Self {
-            use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, ALPN};
-            let endpoint = bind_endpoint_local(generate_secret_key(), false)
+            Self::connect_as(addr, crate::transport_iroh::generate_secret_key()).await
+        }
+
+        async fn connect_as(addr: iroh::EndpointAddr, secret: iroh::SecretKey) -> Self {
+            use crate::transport_iroh::{bind_endpoint_local, ALPN};
+            let endpoint = bind_endpoint_local(secret, false)
                 .await
                 .expect("bind client");
             let conn = endpoint.connect(addr, ALPN).await.expect("connect");
@@ -1038,26 +1021,34 @@ mod tests {
     async fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_input() {
         // Two connections on ONE session (a peer's reconnect racing its old connection). A types
         // many times, B once. Each must only ever be acked for input it sent.
-        use crate::server::session::spawn_session;
+        use crate::server::{Registry, SessionSpec};
         use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
         let server_ep = bind_endpoint_local(generate_secret_key(), true)
             .await
             .expect("bind");
         let addr = loopback_addr(&server_ep);
-        let handle = spawn_session(&["cat".to_owned()], 0).expect("spawn");
-        let h2 = handle.clone();
+        let registry = Registry::spawn(SessionSpec {
+            command: vec!["cat".to_owned()].into(),
+            scrollback: 0,
+            max_sessions: 4,
+            ttl: Duration::from_secs(30),
+        });
         let accept = tokio::spawn(async move {
             while let Some(incoming) = server_ep.accept().await {
-                let h = h2.clone();
+                let registry = registry.clone();
                 tokio::spawn(async move {
                     if let Ok(conn) = incoming.await {
-                        let _ = super::run_attached(conn, h).await;
+                        if let Some((client, _)) = registry.attach(conn.remote_id()).await {
+                            let _ = super::run_attached(conn, client).await;
+                        }
                     }
                 });
             }
         });
-        let mut a = RawClient::connect(addr.clone()).await;
-        let mut b = RawClient::connect(addr).await;
+        // Both connections share one client identity, so they land on ONE session.
+        let secret = generate_secret_key();
+        let mut a = RawClient::connect_as(addr.clone(), secret.clone()).await;
+        let mut b = RawClient::connect_as(addr, secret).await;
         for _ in 0..30 {
             a.type_bytes(b"a").await;
             a.pump(20).await;

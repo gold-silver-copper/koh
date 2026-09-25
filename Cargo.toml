@@ -140,8 +140,8 @@ lto = "thin"
 # engine), so the per-op cost is negligible. Production code has no unchecked arithmetic
 # (`panic_free!` forbids `arithmetic_side_effects` and the lossy `as` casts, which overflow checks
 # never see), so this is the second line of defence there, and the only one in tests: a
-# wrap-on-overflow is a loud panic, not a silent miscompute. NOTE: panic stays
-# `unwind`, never `abort` — the session unwind guard (K-16, `AttachGuard`) relies on unwinding.
+# wrap-on-overflow is a loud panic, not a silent miscompute. NOTE: panic stays `unwind`, never
+# `abort` — a panicking connection task must unwind and detach cleanly, not abort the server.
 overflow-checks = true
 
 # ---------------------------------------------------------------------------

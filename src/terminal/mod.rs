@@ -141,6 +141,11 @@ impl TerminalScreen {
         self.grid.size()
     }
 
+    /// Whether the app has application-cursor-keys (DECCKM) on, for the arrow-key normalizer.
+    pub fn application_cursor(&self) -> bool {
+        self.grid.modes().application_cursor
+    }
+
     /// The window title, if the server has set one.
     pub fn title(&self) -> &str {
         &self.title

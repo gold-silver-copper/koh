@@ -1,85 +1,67 @@
-//! Detachable, reattachable PTY sessions.
+//! Detachable, reattachable PTY sessions, as tasks.
 //!
-//! A [`Session`] (a PTY + emulator, [`PtyHost`]) outlives any single client connection. A
-//! per-session **drain task** owns the PTY output stream and keeps the emulator current *whether
-//! or not a client is attached*, so a reconnecting client always re-syncs to the live screen. The
-//! store is keyed by the client's endpoint id: one detachable session per authorized client,
-//! matching the allowlist model. This is what gives mosh's "close the laptop, reopen, your session
-//! is right where you left it" behavior.
-//!
-//! Concurrency: the drain task and the attached connection loops all lock the session briefly
-//! (the drain to `process` output, a loop to snapshot / apply input). A peer can have two
-//! connections on one session for a moment (a reconnect racing the old connection's teardown), so
-//! the drain pulses a [`ChangeSignal`] after each change and every attached loop re-renders
-//! promptly (KS-03): it is a `watch` version counter, so a burst of output coalesces into a single
-//! wake per loop (mosh-style collapse) and a pulse can never be lost, because each receiver
-//! remembers the version it last saw. Lock order is always store → session, so there is no
-//! deadlock (the connection loop only ever locks the session).
+//! A [`Registry`] task owns the set of live sessions, one per authorized peer, and creates,
+//! reattaches, caps and reaps them. Each session is its own task that owns its
+//! [`PtyHost`], drains its PTY output into the emulator, and publishes each new screen on a
+//! `watch` channel — whether or not a client is attached, so a reconnecting client re-syncs to the
+//! live screen ("close the laptop, reopen, it's right where you left off"). A connection talks to
+//! its session only through a [`SessionClient`]: it watches the screen and sends input, and
+//! dropping it detaches. No shared locks, no reference count, no separate reaper.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::terminal::{ServerTerminal, TerminalScreen, DEFAULT_COLS, DEFAULT_ROWS};
 use anyhow::Context;
 use iroh::EndpointId;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
-/// Default cadence the reaper sweeps for dead/expired sessions (injectable per call so tests can
-/// drive it without a real 5s wait).
+/// How often the registry sweeps for sessions past their detach TTL. Injectable so tests need no
+/// real multi-second wait.
 pub(crate) const REAP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The hosted program: a PTY-spawned process behind a `fux-vt` emulator, producing
-/// [`TerminalScreen`] snapshots. Every method is called under the session lock.
+/// How much input may wait for a session's PTY before a connection must stop reading its stream.
+const INPUT_QUEUE: usize = 256;
+
+/// The hosted program: a PTY-spawned process behind a `fux-vt` emulator. Owned by one session task.
 pub struct PtyHost {
     pub emu: ServerTerminal,
     pub pty: crate::pty::Pty,
-    /// False once the child process has exited (the drain task hit EOF).
-    pub child_alive: bool,
 }
 
 impl PtyHost {
-    /// Spawn the program and its emulator at the default geometry. Returns the host and the PTY
-    /// output receiver the drain task consumes.
-    ///
-    /// `command` is the argv to host (`command[0]` the program); empty means the login shell.
+    /// Spawn the program and its emulator at the default geometry, returning the host and the PTY
+    /// output receiver the session task drains. `command[0]` is the program; empty means the login
+    /// shell.
     pub fn spawn(
         command: &[String],
         scrollback: usize,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let (rows, cols) = (DEFAULT_ROWS, DEFAULT_COLS);
-        let emu = ServerTerminal::new(rows, cols, scrollback).context("creating the terminal emulator")?;
+        let emu = ServerTerminal::new(rows, cols, scrollback)
+            .context("creating the terminal emulator")?;
         let (pty, pty_rx) = crate::pty::Pty::spawn(rows, cols, command, "xterm-256color")
             .context("spawning shell")?;
-        Ok((
-            Self {
-                emu,
-                pty,
-                child_alive: true,
-            },
-            pty_rx,
-        ))
+        Ok((Self { emu, pty }, pty_rx))
     }
-}
 
-impl PtyHost {
-    /// The screen to ship. `echo_ack` is 0: the connection loop stamps its own (KS-02).
+    /// A snapshot of the current screen.
     pub fn snapshot(&self) -> TerminalScreen {
         self.emu.snapshot()
     }
 
-    /// Queue client keystrokes (already DECCKM-normalized) for the PTY. Returns `false` if the
-    /// writer queue is full because the program is not reading its input; the caller keeps the
-    /// bytes and retries.
+    /// Queue client keystrokes (already DECCKM-normalized) for the PTY. `false` if the writer queue
+    /// is full because the program is not reading its input; the caller keeps the bytes and retries.
     pub fn input(&mut self, bytes: &[u8]) -> bool {
         match self.pty.write_input(bytes) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
             Err(e) => {
-                // The program is gone; there is no one to deliver the bytes to.
                 tracing::warn!(error = %e, "pty write failed");
-                true
+                true // the program is gone; there is no one to deliver to
             }
         }
     }
@@ -87,31 +69,13 @@ impl PtyHost {
     /// The client's terminal is now `rows × cols` (already clamped to `[MIN_DIM, MAX_DIM]`).
     pub fn resize(&mut self, rows: u16, cols: u16) {
         if let Err(e) = self.pty.resize(rows, cols) {
-            // A failed TIOCSWINSZ silently diverges the kernel winsize from the emulator grid
-            // (full-screen-app corruption with no breadcrumb today); warn, but still resize the
-            // emulator so the screen geometry keeps tracking the client.
             tracing::warn!(error = %e, rows, cols, "pty resize failed");
         }
         self.emu.resize(rows, cols);
     }
 
-    /// Whether the app has DECCKM (application cursor keys) on, for the arrow-key normalizer.
-    pub fn application_cursor(&self) -> bool {
-        self.emu.application_cursor()
-    }
-
-    /// Whether the hosted program is still running. Once `false` the connection loop starts the
-    /// shutdown handshake and the reaper collects the session.
-    pub const fn alive(&self) -> bool {
-        self.child_alive
-    }
-
-    /// Best-effort stop of the program while other holders may still reference the session
-    /// (teardown with an attached connection, KOH-10).
+    /// Stop the program while a pump thread may still reference it, without joining (best-effort).
     pub fn kill(&mut self) {
-        // Log a failed SIGHUP, then force SIGKILL so a SIGHUP-immune child can't keep the reader
-        // thread + fds wedged and stop the last `Arc` (hence the `Pty` Drop) from ever running
-        // (KOH-10).
         if let Err(e) = self.pty.kill() {
             tracing::warn!(error = %e, "pty kill during teardown failed");
         }
@@ -120,163 +84,219 @@ impl PtyHost {
 
     /// Final, sole-owner teardown. Blocks joining the pump threads, so run it on `spawn_blocking`.
     pub fn shutdown(self) {
-        // Kills the child and joins both I/O pump threads, so they don't linger as detached threads.
         self.pty.shutdown();
     }
 }
 
-/// A long-lived session that survives client disconnects.
-pub struct Session {
-    pub host: PtyHost,
-    /// When the last client detached (`None` while any client is attached); drives TTL reaping.
-    /// Only stamped once [`attached`](Self::attached) falls to 0, so an overlapping connection
-    /// detaching can't mark a session the other connection is still using as reapable.
-    pub last_detach: Option<Instant>,
-    /// How many client connections are currently attached to this session: normally 0 or 1, but
-    /// two concurrent connections from the same endpoint id share the handle. The detach timer is
-    /// reference-counted rather than set on the first detach.
-    pub attached: u32,
+/// What a connection sends its session.
+enum ClientInput {
+    Keys(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
 }
 
-/// The "state changed" broadcast the drain task pulses and every attached connection loop watches
-/// (KS-03).
-///
-/// A `tokio::sync::watch` version counter rather than a `Notify`: `Notify::notify_one` releases
-/// exactly one waiter, so with two connections on one session the second only re-rendered on its
-/// timer cap. `watch` wakes every subscriber, and because each receiver remembers the version it
-/// last saw, a pulse that lands between a loop's snapshot and its wait is still observed — the
-/// property the stored `Notify` permit used to provide, now for any number of connections. Bursts
-/// still coalesce: many pulses before a loop looks are one wake.
-#[derive(Clone, Debug)]
-pub struct ChangeSignal(watch::Sender<u64>);
+/// Whether [`Registry::attach`] created a fresh session or reattached to a running one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachKind {
+    /// A brand-new session was spawned for this peer.
+    Created,
+    /// Reattached to an existing session; `detached_for` is how long it had been detached (`None`
+    /// if a client was still attached).
+    Reattached { detached_for: Option<Duration> },
+}
 
-impl ChangeSignal {
-    fn new() -> Self {
-        Self(watch::Sender::new(0))
-    }
+/// A connection's handle to its session: watch the screen, send input, and detach on drop.
+pub struct SessionClient {
+    screens: watch::Receiver<Arc<TerminalScreen>>,
+    input: mpsc::Sender<ClientInput>,
+    /// Detaches the session when this client is dropped (including on a panic).
+    control: mpsc::Sender<SessionMsg>,
+}
 
-    /// Announce that the state changed; every subscribed loop wakes once.
-    pub fn pulse(&self) {
-        self.0.send_modify(|v| *v = v.wrapping_add(1));
-    }
-
-    /// A receiver for one connection loop; [`watch::Receiver::changed`] resolves after any pulse
-    /// newer than the version the receiver last saw.
-    pub fn subscribe(&self) -> watch::Receiver<u64> {
-        self.0.subscribe()
+impl Drop for SessionClient {
+    fn drop(&mut self) {
+        // Best-effort: the session task decrements its attach count and, at zero, starts the TTL.
+        let _ = self.control.try_send(SessionMsg::Detach);
     }
 }
 
-impl Default for ChangeSignal {
-    fn default() -> Self {
-        Self::new()
+impl SessionClient {
+    /// Wait for the next screen the session publishes, or `None` once the session ends.
+    pub async fn next_screen(&mut self) -> Option<Arc<TerminalScreen>> {
+        self.screens.changed().await.ok()?;
+        Some(self.screens.borrow_and_update().clone())
+    }
+
+    /// The current screen.
+    pub fn screen(&self) -> Arc<TerminalScreen> {
+        self.screens.borrow().clone()
+    }
+
+    /// Reserve a slot to send input; `None` if the session ended. Awaiting the returned permit-free
+    /// send never blocks the caller's loop indefinitely (the queue is bounded, so a full queue is
+    /// itself the backpressure).
+    pub fn can_send(&self) -> bool {
+        !self.input.is_closed()
+    }
+
+    /// Send keystrokes to the PTY, waiting for queue room (bounded, so it applies backpressure).
+    pub async fn send_keys(&self, keys: Vec<u8>) {
+        let _ = self.input.send(ClientInput::Keys(keys)).await;
+    }
+
+    /// Send a resize to the PTY.
+    pub async fn send_resize(&self, rows: u16, cols: u16) {
+        let _ = self.input.send(ClientInput::Resize { rows, cols }).await;
     }
 }
 
-/// Shared session plus the signal the drain task pulses whenever the screen changes.
-pub struct SessionHandle {
-    pub session: Mutex<Session>,
-    pub changed: ChangeSignal,
+// --- the session task -------------------------------------------------------------------------
+
+/// Control messages to a session task.
+enum SessionMsg {
+    /// A connection attaches; the reply carries a client handle and how long it was detached. The
+    /// `control` sender is handed back inside the client so its drop detaches.
+    Attach {
+        control: mpsc::Sender<Self>,
+        reply: oneshot::Sender<(SessionClient, Option<Duration>)>,
+    },
+    /// A connection detached (its [`SessionClient`] dropped).
+    Detach,
 }
 
-impl SessionHandle {
-    /// Wrap a host in a handle with a fresh change signal, not attached to any client.
-    fn new(host: PtyHost) -> SharedSession {
-        let changed = ChangeSignal::new();
-        Arc::new(Self {
-            session: Mutex::new(Session {
-                host,
-                last_detach: None,
-                attached: 0,
-            }),
-            changed,
-        })
-    }
+/// A registry's handle to one session task.
+struct SessionHandle {
+    control: mpsc::Sender<SessionMsg>,
 }
 
-pub type SharedSession = Arc<SessionHandle>;
-pub type SessionStore = Arc<Mutex<HashMap<EndpointId, SharedSession>>>;
+/// Run one session: own the PTY host, drain its output into the emulator, publish each screen,
+/// apply attached connections' input, and end when the shell exits or the detach TTL expires.
+async fn session_task(
+    peer: EndpointId,
+    mut host: PtyHost,
+    mut pty_rx: mpsc::Receiver<Vec<u8>>,
+    mut control: mpsc::Receiver<SessionMsg>,
+    ttl: Duration,
+    ended: mpsc::Sender<EndpointId>,
+) {
+    let (screens_tx, _screens_rx) = watch::channel(Arc::new(host.snapshot()));
+    let (input_tx, mut input_rx) = mpsc::channel::<ClientInput>(INPUT_QUEUE);
+    let input_tx = Arc::new(input_tx);
+    let mut attached: usize = 0;
+    let mut last_detach: Option<Instant> = None;
+    let mut pending_keys: Vec<u8> = Vec::new();
+    // Once the shell exits we publish a final screen (with its exit code) and keep the task alive,
+    // still serving that screen, until the attached client has seen it and detached (or the TTL).
+    let mut exited = false;
 
-/// Spawn a standalone PTY session: a shell + emulator + a background drain task that keeps the
-/// emulator current from the PTY output even with no client attached. Not placed in any store.
-///
-/// `command` is the argv to host (`command[0]` the program); empty means the login shell.
-pub fn spawn_session(command: &[String], scrollback: usize) -> anyhow::Result<SharedSession> {
-    let (host, pty_rx) = PtyHost::spawn(command, scrollback)?;
-    let handle = SessionHandle::new(host);
-    // The drain task is the one long-lived task with no *named* owner (AR-11): it holds an `Arc`
-    // clone and ends when its `pty_rx` closes — i.e. once the `Pty` (hence its reader thread) is gone,
-    // which happens when the last `SessionHandle` `Arc` drops (after `detach`/`reap` + the connection
-    // task exits) or when `teardown` SIGKILLs the child and the reader hits EOF. So it self-terminates
-    // on every teardown path without an explicit join; the only thing NOT done is joining the pump
-    // threads on a TTL-reap-while-a-connection-still-holds-the-Arc, where `Pty::Drop` reaps them when
-    // that last holder finally drops. Giving it a `CancellationToken`/`JoinHandle` is deferred: the
-    // cancel must fire ONLY at teardown (never on detach — the drain must keep the emulator current
-    // while detached, which is the close-laptop-reopen feature), and that edit is the most dangerous
-    // in this subsystem, so it is not worth it while both paths are already leak-free.
-    tokio::spawn(drain(handle.clone(), pty_rx));
-    Ok(handle)
-}
+    // Check the detach TTL at most every `REAP_INTERVAL`, but sooner for a short TTL (tests).
+    let tick_period = ttl.min(REAP_INTERVAL).max(Duration::from_millis(1));
+    let mut ttl_tick = tokio::time::interval(tick_period);
+    ttl_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-/// Drain PTY output into the emulator for the whole life of the session, pulsing `changed`.
-/// Owns `pty_rx` exclusively (it is not `Clone`), so the screen stays current while detached.
-async fn drain(handle: SharedSession, mut pty_rx: mpsc::Receiver<Vec<u8>>) {
     loop {
-        let Some(chunk) = pty_rx.recv().await else {
-            // Shell exited: reader hit EOF. Reap the real exit code (the child is already a
-            // zombie, though its status can become waitable a moment after EOF) and stamp it onto
-            // the emulator so the next snapshot — and thus the shutdown frame — carries it to the
-            // client. Never hold the shared session lock across the bounded retry sleep.
-            let exit_code = wait_for_exit_code(
-                || async {
-                    handle
-                        .session
-                        .lock()
-                        .await
-                        .host
-                        .pty
-                        .try_wait()
-                        .map(|status| status.map(|status| status.exit_code()))
-                },
-                Duration::from_secs(1),
-            )
-            .await;
-            let mut s = handle.session.lock().await;
-            s.host.child_alive = false;
-            if let Some(exit_code) = exit_code {
-                s.host.emu.set_exit_code(exit_code);
-            }
-            drop(s);
-            handle.changed.pulse();
-            break;
-        };
-        let mut s = handle.session.lock().await;
-        s.host.emu.process(&chunk);
-        // Answer any terminal queries the shell/app emitted (DSR/DA/DECRQM) by writing the
-        // replies straight back to the PTY — they are host I/O, not screen content.
-        let replies = s.host.emu.take_host_replies();
-        if !replies.is_empty() {
-            if let Err(e) = s.host.pty.write_input(&replies) {
-                // debug, not warn: a just-exited child makes a failed reply write expected and noisy.
-                tracing::debug!(error = %e, "pty host-reply write failed");
+        // Retry keystrokes the PTY writer queue could not take last pass.
+        if !pending_keys.is_empty() && host.input(&pending_keys) {
+            pending_keys.clear();
+        }
+        let can_read_input = pending_keys.is_empty();
+
+        tokio::select! {
+            chunk = pty_rx.recv(), if !exited => {
+                if let Some(chunk) = chunk {
+                    host.emu.process(&chunk);
+                    let replies = host.emu.take_host_replies();
+                    if !replies.is_empty() {
+                        // Query answers (DSR/DA/DECRQM) are host I/O, not screen content.
+                        let _ = host.input(&replies);
+                    }
+                } else {
+                    // The shell exited: reap its status and publish a final screen carrying it. The
+                    // task stays alive so the attached connection can deliver that frame and be
+                    // acknowledged before we tear down.
+                    if let Some(code) = reap_exit_code(&mut host).await {
+                        host.emu.set_exit_code(code);
+                    }
+                    exited = true;
+                }
+                screens_tx.send_replace(Arc::new(host.snapshot()));
+            },
+            input = input_rx.recv(), if can_read_input => {
+                // `input_tx` is held below, so this only ends with the task.
+                if let Some(input) = input {
+                    match input {
+                        ClientInput::Keys(keys) => {
+                            if !host.input(&keys) {
+                                pending_keys = keys;
+                            }
+                        }
+                        ClientInput::Resize { rows, cols } => {
+                            host.resize(rows, cols);
+                            screens_tx.send_replace(Arc::new(host.snapshot()));
+                        }
+                    }
+                }
+            },
+            msg = control.recv() => match msg {
+                Some(SessionMsg::Attach { control, reply }) => {
+                    let detached_for = last_detach.take().map(|t| t.elapsed());
+                    attached = attached.saturating_add(1);
+                    let client = SessionClient {
+                        screens: screens_tx.subscribe(),
+                        input: (*input_tx).clone(),
+                        control,
+                    };
+                    // If the connection is already gone, treat it as an immediate detach.
+                    if reply.send((client, detached_for)).is_err() {
+                        attached = attached.saturating_sub(1);
+                        if attached == 0 {
+                            last_detach = Some(Instant::now());
+                        }
+                    }
+                }
+                Some(SessionMsg::Detach) => {
+                    attached = attached.saturating_sub(1);
+                    if attached == 0 {
+                        if exited {
+                            break; // the client saw the exit and left; tear down now
+                        }
+                        last_detach = Some(Instant::now());
+                    }
+                }
+                None => break, // the registry dropped: the whole server is shutting down
+            },
+            _ = pending_input_retry(!pending_keys.is_empty()) => {}
+            _ = ttl_tick.tick() => {
+                let idle_expired = last_detach.is_some_and(|t| t.elapsed() >= ttl);
+                if attached == 0 && (exited || idle_expired) {
+                    break;
+                }
             }
         }
-        drop(s);
-        handle.changed.pulse();
+    }
+
+    let _ = ended.send(peer).await;
+    tokio::task::spawn_blocking(move || host.shutdown());
+}
+
+/// A short delay used to re-poll the PTY writer queue while keystrokes are pending; a never-ready
+/// future when nothing is pending.
+async fn pending_input_retry(pending: bool) {
+    if pending {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    } else {
+        std::future::pending::<()>().await;
     }
 }
 
-async fn wait_for_exit_code<F, Fut>(mut poll: F, timeout: Duration) -> Option<u32>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<Option<u32>>>,
-{
+/// Poll for the exited child's status for up to a second (the zombie becomes waitable a moment
+/// after EOF).
+async fn reap_exit_code(host: &mut PtyHost) -> Option<u32> {
     // An unrepresentable deadline (a timeout of centuries) means no deadline.
-    let deadline = tokio::time::Instant::now().checked_add(timeout);
+    let deadline = Instant::now().checked_add(Duration::from_secs(1));
     loop {
-        match poll().await {
-            Ok(Some(exit_code)) => return Some(exit_code),
-            Ok(None) if deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline) => {
+        match host.pty.try_wait() {
+            Ok(Some(status)) => return Some(status.exit_code()),
+            Ok(None) if deadline.is_none_or(|d| Instant::now() < d) => {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             Ok(None) => return None,
@@ -288,681 +308,253 @@ where
     }
 }
 
-/// Whether [`attach`] spawned a fresh session or reattached to an existing one.
-///
-/// Lets the server tell the peer it's resuming a running session (mosh-server's `warn_unattached`,
-/// mapped to koh's one-detachable-session-per-peer model: there is never a duplicate to warn about,
-/// only a resume).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttachKind {
-    /// A brand-new session was spawned for this peer.
-    Created,
-    /// Reattached to an existing session. `detached_for` is how long it had been detached
-    /// (`None` if it wasn't marked detached, e.g. a second overlapping connection).
-    Reattached { detached_for: Option<Duration> },
+// --- the registry -----------------------------------------------------------------------------
+
+/// What the registry accepts.
+enum RegMsg {
+    Attach {
+        peer: EndpointId,
+        reply: oneshot::Sender<Option<(SessionClient, AttachKind)>>,
+    },
+    /// A session task ended and removed itself.
+    Ended(EndpointId),
 }
 
-/// Get-or-create the detachable PTY session for `peer`.
-///
-/// On reattach, clears the detach timer so the reaper won't collect it while the client is back,
-/// and reports how long it had been detached. `max_sessions` caps the number of distinct live
-/// sessions (L-3): reattaching to `peer`'s existing session is always allowed, but creating a NEW
-/// session when the store already holds `max_sessions` is refused (returns `Ok(None)`), so a flood
-/// of distinct keys can't spawn unbounded shells.
-pub async fn attach(
-    store: &SessionStore,
-    peer: EndpointId,
-    command: &[String],
-    scrollback: usize,
-    max_sessions: usize,
-) -> anyhow::Result<Option<(SharedSession, AttachKind)>> {
-    let mut map = store.lock().await;
-    if let Some(h) = map.get(&peer) {
-        let mut s = h.session.lock().await;
-        let detached_for = s.last_detach.map(|t| t.elapsed());
-        s.last_detach = None;
-        s.attached = s.attached.saturating_add(1);
-        drop(s);
-        return Ok(Some((h.clone(), AttachKind::Reattached { detached_for })));
-    }
-    // New peer: enforce the live-session cap before spawning a shell.
-    if map.len() >= max_sessions {
-        return Ok(None);
-    }
-    let handle = spawn_session(command, scrollback)?;
-    handle.session.lock().await.attached = 1;
-    map.insert(peer, handle.clone());
-    Ok(Some((handle, AttachKind::Created)))
+/// A handle to the registry task: cheap to clone, one per accept loop.
+#[derive(Clone)]
+pub struct Registry {
+    tx: mpsc::Sender<RegMsg>,
+    shutdown: CancellationToken,
 }
 
-/// Detach one client from `peer`'s session (the host keeps running for reattach).
-///
-/// The detach timer is stamped only when the *last* attached client leaves, so a concurrent
-/// connection detaching can't mark a session the other is still using as reapable.
-pub async fn detach(store: &SessionStore, peer: EndpointId) {
-    if let Some(h) = store.lock().await.get(&peer) {
-        let mut s = h.session.lock().await;
-        s.attached = s.attached.saturating_sub(1);
-        if s.attached == 0 {
-            s.last_detach = Some(Instant::now());
-        }
+/// What the registry hosts, and the session TTL.
+pub struct SessionSpec {
+    pub command: Arc<[String]>,
+    pub scrollback: usize,
+    pub max_sessions: usize,
+    pub ttl: Duration,
+}
+
+impl Registry {
+    /// Spawn the registry task.
+    pub fn spawn(spec: SessionSpec) -> Self {
+        let (tx, rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+        tokio::spawn(registry_task(spec, rx, tx.clone(), shutdown.clone()));
+        Self { tx, shutdown }
+    }
+
+    /// Attach `peer` to its session, creating one if needed. `None` if the server is at its
+    /// session cap and `peer` has no existing session.
+    pub async fn attach(&self, peer: EndpointId) -> Option<(SessionClient, AttachKind)> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(RegMsg::Attach { peer, reply }).await.ok()?;
+        rx.await.ok().flatten()
+    }
+
+    /// Stop the registry and every session, and wait for them to tear down.
+    pub async fn shutdown(self) {
+        self.shutdown.cancel();
+        // Dropping the last sender ends the registry task, which drops every session's control
+        // sender, ending each session task.
+        self.tx.closed().await;
     }
 }
 
-/// RAII safety net that releases an attached connection's session if its task unwinds (K-16).
-///
-/// If the per-connection task **panics** before it can run its explicit [`detach`] / [`reap`],
-/// this guard's `Drop` still releases the attach — decrementing `attached`
-/// and arming the detach timer — so a panicking task can't leak the session forever. Without it a
-/// panic skips the post-`await` cleanup, leaving `attached > 0` and `last_detach == None`, which the
-/// reaper (keyed on `!alive || detached_expired`) never collects: a zombie shell + PTY pinned for the
-/// server's lifetime.
-///
-/// A standard RAII Drop-cleans-up-on-unwind discipline. On the normal return paths the task
-/// [`disarm`](Self::disarm)s the guard and does the precise cleanup (detach **vs** reap) itself; the
-/// guard only fires on an unexpected unwind. `Drop` can't `await`, so it spawns the async detach onto
-/// the current runtime (best-effort: a no-op if no runtime is in scope).
-#[must_use = "hold the guard for the connection's lifetime, then disarm() on a normal return"]
-pub(crate) struct AttachGuard {
-    store: SessionStore,
-    peer: EndpointId,
-    armed: bool,
-}
-
-impl AttachGuard {
-    /// Arm a guard for a freshly-attached `peer` connection. Hold it across the connection loop.
-    pub(crate) const fn new(store: SessionStore, peer: EndpointId) -> Self {
-        Self {
-            store,
-            peer,
-            armed: true,
-        }
-    }
-
-    /// Disable the safety net once the connection returned normally and the caller will run the
-    /// precise detach/reap itself. Consumes the guard so its `Drop` becomes a no-op.
-    pub(crate) fn disarm(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for AttachGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Only reached on an unwind (the normal paths disarm first). `detach` locks an async Mutex
-        // and `Drop` can't `.await`, so we spawn the balancing detach onto the current runtime — the
-        // one fire-and-forget recovery in an otherwise tightly-owned system (AR-12). Accepted
-        // residual: if no runtime is in scope (the server is tearing its runtime down) the spawn is
-        // a no-op and the attach isn't decremented — but a server abandoning its runtime is
-        // abandoning all sessions anyway, and even a leaked attach is collected once the orphaned
-        // shell exits (the reaper also reaps on `!alive`), so it is not pinned for the server's
-        // lifetime. Do NOT "fix" this with per-connection JoinSet panic-observation — that would
-        // complicate the accept loop's deliberate spawn-and-forget shape for a moot window.
-        let store = self.store.clone();
-        let peer = self.peer;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                detach(&store, peer).await;
-                tracing::warn!(
-                    %peer,
-                    "connection task unwound; released its session attach via the drop guard"
-                );
-            });
-        } else {
-            // No runtime in scope (the server is tearing its runtime down): the balancing detach
-            // can't be spawned, so this attach is not decremented here. It is NOT a permanent leak —
-            // the reaper also collects on `!alive`, so the session is reclaimed once the
-            // orphaned shell exits — but make the silent degrade an operator breadcrumb rather than
-            // an invisible one.
-            tracing::warn!(
-                %peer,
-                "connection task unwound with no tokio runtime in scope; session attach not \
-                 decremented now (reaped later when the shell exits)"
-            );
-        }
-    }
-}
-
-/// Remove + tear down `peer`'s session (e.g. once its shutdown handshake has completed).
-pub async fn reap(store: &SessionStore, peer: EndpointId) {
-    let removed = store.lock().await.remove(&peer);
-    if let Some(h) = removed {
-        teardown(h).await;
-    }
-}
-
-/// Tear down a session we have just removed from the store.
-///
-/// If we now hold the **only** reference (the drain task has already ended — typical once the
-/// shell has exited), gracefully shut the host down: [`PtyHost::shutdown`] kills the child and
-/// joins both I/O pump threads, so they don't linger as detached threads. The join blocks, so it
-/// runs on `spawn_blocking`, never on an async worker. Otherwise some other holder (an attached
-/// connection, or the drain task) still owns it, so we just [`PtyHost::kill`] the program and
-/// let the threads exit when the last reference drops — joining there would mean reaching into
-/// shared state we don't own.
-async fn teardown(handle: SharedSession) {
-    match Arc::try_unwrap(handle) {
-        Ok(h) => {
-            let Session { host, .. } = h.session.into_inner();
-            tokio::task::spawn_blocking(move || host.shutdown());
-        }
-        Err(h) => {
-            h.session.lock().await.host.kill();
-        }
-    }
-}
-
-/// Background sweeper: reap sessions whose hosted program has exited, or that have been detached
-/// longer than `ttl`, every `interval`.
-///
-/// Runs until the store is dropped. `interval` is injectable (the binary passes `REAP_INTERVAL`)
-/// so tests can drive a sweep without a real multi-second wait. `shutdown` lets the caller stop the
-/// reaper cleanly: the loop `select!`s the token against the sleep and returns when cancelled
-/// (rather than being `abort()`ed mid-sweep).
-pub async fn run_reaper(
-    store: SessionStore,
-    ttl: Duration,
-    interval: Duration,
+async fn registry_task(
+    spec: SessionSpec,
+    mut rx: mpsc::Receiver<RegMsg>,
+    self_tx: mpsc::Sender<RegMsg>,
     shutdown: CancellationToken,
 ) {
+    let mut sessions: HashMap<EndpointId, SessionHandle> = HashMap::new();
+    let ended_tx = ended_sender(&self_tx);
+    // Drop our own sender clone so the channel closes once the accept loop's `Registry` handles do.
+    drop(self_tx);
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
-            _ = shutdown.cancelled() => return,
+        let msg = tokio::select! {
+            () = shutdown.cancelled() => break,
+            msg = rx.recv() => match msg {
+                Some(msg) => msg,
+                None => break,
+            },
+        };
+        match msg {
+            RegMsg::Attach { peer, reply } => {
+                let result = attach_in(&mut sessions, &spec, &ended_tx, peer).await;
+                let _ = reply.send(result);
+            }
+            RegMsg::Ended(peer) => {
+                sessions.remove(&peer);
+            }
         }
-        sweep(&store, ttl).await;
     }
+    // Shutdown: dropping every control sender ends the session tasks.
+    sessions.clear();
 }
 
-/// One reaper pass: remove and tear down every session whose host has exited or whose detach
-/// timer has run past `ttl`. Public within the crate so tests can drive a sweep deterministically.
-pub(crate) async fn sweep(store: &SessionStore, ttl: Duration) {
-    let mut map = store.lock().await;
-    let mut dead = Vec::new();
-    for (peer, h) in map.iter() {
-        let s = h.session.lock().await;
-        let detached_expired = s.last_detach.is_some_and(|t| t.elapsed() >= ttl);
-        if !s.host.alive() || detached_expired {
-            dead.push(*peer);
+/// The registry's clone of a sender it can hand to session tasks so they announce their end.
+fn ended_sender(tx: &mpsc::Sender<RegMsg>) -> mpsc::Sender<EndpointId> {
+    let (etx, mut erx) = mpsc::channel::<EndpointId>(16);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        while let Some(peer) = erx.recv().await {
+            if tx.send(RegMsg::Ended(peer)).await.is_err() {
+                break;
+            }
         }
+    });
+    etx
+}
+
+async fn attach_in(
+    sessions: &mut HashMap<EndpointId, SessionHandle>,
+    spec: &SessionSpec,
+    ended: &mpsc::Sender<EndpointId>,
+    peer: EndpointId,
+) -> Option<(SessionClient, AttachKind)> {
+    if let Some(handle) = sessions.get(&peer) {
+        let control = handle.control.clone();
+        let (reply, rx) = oneshot::channel();
+        if control
+            .send(SessionMsg::Attach { control: control.clone(), reply })
+            .await
+            .is_ok()
+        {
+            if let Ok((client, detached_for)) = rx.await {
+                return Some((client, AttachKind::Reattached { detached_for }));
+            }
+        }
+        // The session task is gone; drop the stale handle and fall through to create a new one.
+        sessions.remove(&peer);
     }
-    let doomed: Vec<SharedSession> = dead.iter().filter_map(|peer| map.remove(peer)).collect();
-    drop(map); // release the store lock before tearing down (teardown may lock a session)
-    for h in doomed {
-        teardown(h).await;
+    if sessions.len() >= spec.max_sessions {
+        return None;
     }
+    let (host, pty_rx) = PtyHost::spawn(&spec.command, spec.scrollback)
+        .map_err(|e| tracing::error!(error = %e, "spawning a session failed"))
+        .ok()?;
+    let (control, control_rx) = mpsc::channel(16);
+    tokio::spawn(session_task(
+        peer,
+        host,
+        pty_rx,
+        control_rx,
+        spec.ttl,
+        ended.clone(),
+    ));
+    sessions.insert(peer, SessionHandle { control });
+    // Attach to the session we just created.
+    let control = sessions.get(&peer)?.control.clone();
+    let (reply, rx) = oneshot::channel();
+    control
+        .send(SessionMsg::Attach { control: control.clone(), reply })
+        .await
+        .ok()?;
+    let (client, _) = rx.await.ok()?;
+    Some((client, AttachKind::Created))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport_iroh::generate_secret_key;
 
-    #[tokio::test]
-    async fn exit_status_polling_retries_but_remains_bounded() {
-        use std::collections::VecDeque;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    fn registry(max_sessions: usize, ttl: Duration) -> Registry {
+        Registry::spawn(SessionSpec {
+            command: vec!["sleep".to_owned(), "30".to_owned()].into(),
+            scrollback: 0,
+            max_sessions,
+            ttl,
+        })
+    }
 
-        let outcomes = Arc::new(std::sync::Mutex::new(VecDeque::from([
-            Ok(None),
-            Ok(None),
-            Ok(Some(3)),
-        ])));
-        let scripted = Arc::clone(&outcomes);
-        let exit = wait_for_exit_code(
-            move || {
-                let outcome = scripted
-                    .lock()
-                    .expect("scripted exit polls")
-                    .pop_front()
-                    .expect("unexpected extra exit poll");
-                async move { outcome }
-            },
-            Duration::from_secs(1),
-        )
-        .await;
-        assert_eq!(exit, Some(3), "transient None polls must be retried");
+    /// Attach `peer`, retrying briefly (a just-reaped session may still be clearing).
+    async fn attach_kind(reg: &Registry, peer: EndpointId) -> Option<AttachKind> {
+        reg.attach(peer).await.map(|(_, kind)| kind)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_creates_then_reattaches_the_same_peer() {
+        let reg = registry(4, Duration::from_secs(30));
+        let peer = crate::transport_iroh::generate_secret_key().public();
+        let (client, kind) = reg.attach(peer).await.expect("first attach");
+        assert_eq!(kind, AttachKind::Created);
+        let (_c2, kind) = reg.attach(peer).await.expect("second attach");
+        assert!(matches!(kind, AttachKind::Reattached { .. }), "same peer reattaches");
+        drop(client);
+        reg.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() {
+        let reg = registry(1, Duration::from_secs(30));
+        let a = crate::transport_iroh::generate_secret_key().public();
+        let b = crate::transport_iroh::generate_secret_key().public();
+        let (a_client, _) = reg.attach(a).await.expect("A creates the one allowed session");
+        assert!(reg.attach(b).await.is_none(), "a second distinct peer is refused at the cap");
         assert!(
-            outcomes.lock().expect("scripted exit polls").is_empty(),
-            "the successful poll must end the retry loop"
+            matches!(attach_kind(&reg, a).await, Some(AttachKind::Reattached { .. })),
+            "the existing peer still reattaches at the cap"
         );
-
-        let polls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&polls);
-        assert_eq!(
-            wait_for_exit_code(
-                move || {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    async { Ok(None) }
-                },
-                Duration::ZERO,
-            )
-            .await,
-            None,
-            "the timeout path terminates without inventing a status"
-        );
-        assert_eq!(polls.load(Ordering::SeqCst), 1, "zero timeout polls once");
-
-        assert_eq!(
-            wait_for_exit_code(
-                || async { Err(std::io::Error::other("scripted wait failure")) },
-                Duration::from_secs(1),
-            )
-            .await,
-            None,
-            "a wait error terminates without inventing a status"
-        );
+        drop(a_client);
+        reg.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn a_pulse_wakes_every_subscribed_viewer_not_just_one() {
-        // KS-03: two connection loops subscribed to one signal both wake on a single pulse — the
-        // `notify_one` bug woke only the first.
-        let signal = ChangeSignal::new();
-        let mut a = signal.subscribe();
-        let mut b = signal.subscribe();
-        signal.pulse();
-        let both = async {
-            a.changed().await.expect("sender alive");
-            b.changed().await.expect("sender alive");
-        };
-        tokio::time::timeout(Duration::from_millis(100), both)
-            .await
-            .expect("both receivers wake within 100 ms");
-    }
-
-    #[tokio::test]
-    async fn a_pulse_between_snapshot_and_wait_is_not_lost() {
-        // KS-03: the loop marks the signal seen (`borrow_and_update`) before snapshotting; a pulse
-        // that lands after that mark must resolve the next `changed()` immediately, and a burst
-        // of pulses is one wake.
-        let signal = ChangeSignal::new();
-        let mut rx = signal.subscribe();
-        let _ = rx.borrow_and_update(); // "snapshot taken"
-        signal.pulse();
-        signal.pulse();
-        signal.pulse();
-        tokio::time::timeout(Duration::from_millis(100), rx.changed())
-            .await
-            .expect("the pulse after the mark wakes the loop")
-            .expect("sender alive");
-        let quiet = tokio::time::timeout(Duration::from_millis(50), rx.changed()).await;
-        assert!(quiet.is_err(), "the burst coalesced into one wake");
-    }
-
-    #[tokio::test]
-    async fn attach_reports_created_then_reattached() {
-        // First attach for a peer creates a session; a later attach (after detach) reattaches to
-        // the same session and reports how long it was detached — the data the server logs as the
-        // mosh-style "resuming your session" notice.
-        let store = SessionStore::default();
-        let peer = generate_secret_key().public();
-
-        let (h1, kind) = attach(&store, peer, &["sh".to_owned()], 0, 64)
-            .await
-            .expect("first attach")
-            .expect("not at capacity");
-        assert_eq!(kind, AttachKind::Created, "first attach creates a session");
-
-        detach(&store, peer).await;
-        let (h2, kind) = attach(&store, peer, &["sh".to_owned()], 0, 64)
-            .await
-            .expect("reattach")
-            .expect("not at capacity");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() {
+        let reg = registry(4, Duration::from_millis(150));
+        let peer = crate::transport_iroh::generate_secret_key().public();
+        let (a, _) = reg.attach(peer).await.expect("A");
+        let (b, _) = reg.attach(peer).await.expect("B (concurrent, same session)");
+        // Dropping ONE of two attached clients must not start the TTL.
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(
-            matches!(
-                kind,
-                AttachKind::Reattached {
-                    detached_for: Some(_)
-                }
-            ),
-            "reattach after a detach reports the detached duration, got {kind:?}"
+            matches!(attach_kind(&reg, peer).await, Some(AttachKind::Reattached { .. })),
+            "with one client still attached the session must survive past the TTL"
         );
-        assert!(
-            Arc::ptr_eq(&h1, &h2),
-            "reattach returns the very same session handle, not a new one"
-        );
-
-        // Tear the shell down so the drain task ends and nothing lingers.
-        let _ = h2.session.lock().await.host.pty.kill();
-    }
-
-    #[tokio::test]
-    async fn overlapping_detach_does_not_arm_reaper_until_last_client_leaves() {
-        // Two concurrent connections from the same peer share one session. The first detach must
-        // NOT stamp last_detach (the other client is still using the shell); only the last detach
-        // arms the TTL reaper. Otherwise the reaper could collect the session under an active client.
-        let store = SessionStore::default();
-        let peer = generate_secret_key().public();
-
-        let (h, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
-            .await
-            .expect("attach A")
-            .expect("not at capacity");
-        let (_, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
-            .await
-            .expect("attach B")
-            .expect("not at capacity");
+        // Now drop every client; after the TTL the session is reaped and a fresh attach creates one.
+        drop(b);
+        drop(reg.attach(peer).await.expect("reattach C").0);
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
-            h.session.lock().await.attached,
-            2,
-            "both connections counted"
+            attach_kind(&reg, peer).await,
+            Some(AttachKind::Created),
+            "after the last detach and the TTL the session is gone"
         );
-
-        detach(&store, peer).await; // A leaves; B still attached
-        {
-            let s = h.session.lock().await;
-            assert_eq!(s.attached, 1, "one client remains");
-            assert!(
-                s.last_detach.is_none(),
-                "detach timer must NOT be armed while a client is still attached"
-            );
-        }
-
-        detach(&store, peer).await; // B leaves; now truly detached
-        {
-            let s = h.session.lock().await;
-            assert_eq!(s.attached, 0);
-            assert!(
-                s.last_detach.is_some(),
-                "detach timer arms only once the last client leaves"
-            );
-        }
-
-        let _ = h.session.lock().await.host.pty.kill();
+        reg.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn attach_guard_releases_the_attach_when_dropped_armed() {
-        // K-16: an armed guard dropped without disarm (the panic-unwind case) must release the
-        // attach — decrement `attached` to 0 and arm the detach timer — so the reaper can collect
-        // the session instead of it leaking with attached>0/last_detach=None forever.
-        let store = SessionStore::default();
-        let peer = generate_secret_key().public();
-        let (h, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
-            .await
-            .expect("attach")
-            .expect("under cap");
-        assert_eq!(h.session.lock().await.attached, 1);
-
-        // Simulate a connection task that unwinds before its explicit cleanup: the guard drops armed.
-        {
-            let _g = AttachGuard::new(store.clone(), peer);
-        }
-        // Drop spawns the async detach; give the runtime a few turns to run it.
-        let mut released = false;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_whose_shell_exited_is_torn_down() {
+        let reg = Registry::spawn(SessionSpec {
+            command: vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()].into(),
+            scrollback: 0,
+            max_sessions: 4,
+            ttl: Duration::from_secs(30),
+        });
+        let peer = crate::transport_iroh::generate_secret_key().public();
+        let (mut client, kind) = reg.attach(peer).await.expect("attach");
+        assert_eq!(kind, AttachKind::Created);
+        // Wait for the final (exited) screen, then detach.
         for _ in 0..100 {
-            {
-                let s = h.session.lock().await;
-                if s.attached == 0 && s.last_detach.is_some() {
-                    released = true;
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(
-            released,
-            "an armed guard's Drop must detach the session (attached->0, detach timer armed)"
-        );
-        let _ = h.session.lock().await.host.pty.kill();
-    }
-
-    #[tokio::test]
-    async fn attach_guard_is_a_noop_once_disarmed() {
-        // The normal return path disarms the guard and does its own detach/reap; a disarmed guard
-        // must NOT also fire (which would double-decrement the refcount).
-        let store = SessionStore::default();
-        let peer = generate_secret_key().public();
-        let (h, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
-            .await
-            .expect("attach")
-            .expect("under cap");
-        assert_eq!(h.session.lock().await.attached, 1);
-
-        AttachGuard::new(store.clone(), peer).disarm();
-        // Let any erroneously-spawned detach run; the count must be unchanged by the disarmed guard.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let s = h.session.lock().await;
-        assert_eq!(
-            s.attached, 1,
-            "a disarmed guard must not release the attach"
-        );
-        assert!(
-            s.last_detach.is_none(),
-            "a disarmed guard must not arm the detach timer"
-        );
-        drop(s);
-        let _ = h.session.lock().await.host.pty.kill();
-    }
-
-    #[tokio::test]
-    async fn attach_enforces_session_cap_but_allows_reattach() {
-        // L-3: with a cap of 2, a third DISTINCT peer is refused (Ok(None)) — a flood of keys can't
-        // spawn unbounded shells — but an already-present peer can always reattach.
-        let store = SessionStore::default();
-        let p1 = generate_secret_key().public();
-        let p2 = generate_secret_key().public();
-        let p3 = generate_secret_key().public();
-
-        let (h1, _) = attach(&store, p1, &["sh".to_owned()], 0, 2)
-            .await
-            .expect("attach p1")
-            .expect("under cap");
-        let (h2, _) = attach(&store, p2, &["sh".to_owned()], 0, 2)
-            .await
-            .expect("attach p2")
-            .expect("under cap");
-
-        // Store is now full (2/2): a brand-new peer is refused.
-        let rejected = attach(&store, p3, &["sh".to_owned()], 0, 2)
-            .await
-            .expect("attach p3 ok-result");
-        assert!(
-            rejected.is_none(),
-            "a new peer beyond the cap must be refused"
-        );
-
-        // But an existing peer reattaches fine even at capacity.
-        detach(&store, p1).await;
-        let reattach = attach(&store, p1, &["sh".to_owned()], 0, 2)
-            .await
-            .expect("reattach p1")
-            .expect("reattach is allowed at capacity");
-        assert!(
-            matches!(reattach.1, AttachKind::Reattached { .. }),
-            "an existing peer reattaches at capacity, got {:?}",
-            reattach.1
-        );
-
-        for h in [h1, h2] {
-            let _ = h.session.lock().await.host.pty.kill();
-        }
-    }
-
-    #[tokio::test]
-    async fn reaper_collects_dead_session_at_injected_interval() {
-        // Inject a 10ms sweep interval instead of the 5s default, so the reaper's collection of a
-        // dead session is observable in a fast, deterministic test.
-        let store = SessionStore::default();
-        let peer = generate_secret_key().public();
-
-        // A real session whose shell we immediately mark as exited.
-        let handle = spawn_session(&["sh".to_owned()], 0).expect("spawn session");
-        handle.session.lock().await.host.child_alive = false;
-        store.lock().await.insert(peer, handle);
-        assert_eq!(
-            store.lock().await.len(),
-            1,
-            "session is present before the sweep"
-        );
-
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(run_reaper(
-            store.clone(),
-            Duration::from_secs(3600), // long TTL: collection is driven by child_alive, not TTL
-            Duration::from_millis(10),
-            shutdown.clone(),
-        ));
-
-        let mut reaped = false;
-        for _ in 0..200 {
-            if store.lock().await.is_empty() {
-                reaped = true;
+            if client.screen().exit_code().is_some() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = tokio::time::timeout(Duration::from_millis(50), client.next_screen()).await;
         }
-        // Graceful stop: cancel the token and the reaper future resolves on its own (no abort()).
-        shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("reaper must exit promptly after cancellation")
-            .expect("reaper task should not panic");
-        assert!(
-            reaped,
-            "the reaper must collect the dead session at the injected interval"
-        );
-    }
-
-    #[tokio::test]
-    async fn pty_host_snapshot_carries_output_and_the_exit_code() {
-        // Spawn a program with arguments, drain until its output is on the snapshot, then observe
-        // the exit code the drain stamped.
-        let handle = spawn_session(
-            &[
-                "sh".to_owned(),
-                "-c".to_owned(),
-                "printf HELLO; exit 3".to_owned(),
-            ],
-            0,
-        )
-        .expect("spawn");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let s = handle.session.lock().await;
-            let snap = s.host.snapshot();
-            if snap.screen().contents().contains("HELLO") && !s.host.alive() {
-                assert_eq!(snap.exit_code(), Some(3), "exit code rides on the snapshot");
+        assert!(client.screen().exit_code().is_some(), "the exit code reaches the screen");
+        drop(client);
+        // The session tears down once the client that saw the exit detaches; a fresh attach creates.
+        let mut created = false;
+        for _ in 0..100 {
+            if attach_kind(&reg, peer).await == Some(AttachKind::Created) {
+                created = true;
                 break;
             }
-            drop(s);
-            assert!(Instant::now() < deadline, "timed out waiting for the child");
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    #[tokio::test]
-    async fn reaper_keeps_an_attached_session_and_collects_it_after_the_last_detach() {
-        // With a 1 ms TTL and a 5 ms sweep, a session with a client attached survives many sweeps;
-        // once the last client detaches it is collected, and `kill` stops the shell because the
-        // test still holds an `Arc` to it.
-        let store = SessionStore::default();
-        let peer = generate_secret_key().public();
-        let (h, _) = attach(&store, peer, &["sh".to_owned()], 0, 64)
-            .await
-            .expect("attach")
-            .expect("under cap");
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(run_reaper(
-            store.clone(),
-            Duration::from_millis(1),
-            Duration::from_millis(5),
-            shutdown.clone(),
-        ));
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert_eq!(store.lock().await.len(), 1, "an attached session survives sweeps");
-        detach(&store, peer).await;
-        let mut reaped = false;
-        for _ in 0..200 {
-            if store.lock().await.is_empty() {
-                reaped = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        shutdown.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-        assert!(reaped, "the reaper collects the session once the last client left");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        // The drain task sees the killed shell's EOF and marks the host dead.
-        while h.session.lock().await.host.alive() {
-            assert!(
-                Instant::now() < deadline,
-                "teardown with a live Arc elsewhere must kill the shell"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    proptest::proptest! {
-        // Every attach may spawn a real shell, so keep the case count modest.
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
-
-        /// Arbitrary attach/detach/reap/sweep/unwind sequences over one peer's session never drive
-        /// `attached` negative (saturating), never reap while a client is attached, always reap
-        /// once `attached == 0` and the TTL has elapsed, and an unwinding connection task (an
-        /// armed guard dropping) behaves exactly like a detach.
-        #[test]
-        fn session_refcount_and_reaping_invariants(
-            ops in proptest::collection::vec(0u8..5, 1..24),
-        ) {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            rt.block_on(async {
-                let store = SessionStore::default();
-                let peer = generate_secret_key().public();
-                let command = ["sh".to_owned()];
-                let mut attached: u32 = 0;
-                let mut alive_entry = false;
-                for op in &ops {
-                    match op {
-                        0 => {
-                            attach(&store, peer, &command, 0, 64).await.unwrap().unwrap();
-                            attached += 1;
-                            alive_entry = true;
-                        }
-                        1 => {
-                            detach(&store, peer).await;
-                            attached = attached.saturating_sub(1);
-                        }
-                        2 => {
-                            reap(&store, peer).await;
-                            attached = 0;
-                            alive_entry = false;
-                        }
-                        4 => {
-                            // A connection task unwinds: its armed guard drops and spawns the
-                            // balancing detach; yield so the current-thread runtime runs it.
-                            drop(AttachGuard::new(store.clone(), peer));
-                            for _ in 0..4 {
-                                tokio::task::yield_now().await;
-                            }
-                            attached = attached.saturating_sub(1);
-                        }
-                        _ => {
-                            // One reaper sweep with an expired TTL: collects iff nobody is attached.
-                            sweep(&store, Duration::ZERO).await;
-                            if attached == 0 {
-                                alive_entry = false;
-                            }
-                        }
-                    }
-                    let map = store.lock().await;
-                    proptest::prop_assert_eq!(map.len(), usize::from(alive_entry), "entry presence");
-                    if let Some(h) = map.values().next() {
-                        let s = h.session.lock().await;
-                        proptest::prop_assert_eq!(s.attached, attached, "refcount");
-                        proptest::prop_assert!(
-                            s.attached > 0 || s.last_detach.is_some(),
-                            "a fully detached session always has the detach timer armed"
-                        );
-                    }
-                }
-                reap(&store, peer).await;
-                Ok(())
-            })?;
-        }
+        assert!(created, "an exited session is torn down and the next attach creates a new one");
+        reg.shutdown().await;
     }
 }

@@ -589,6 +589,21 @@ async fn bind(
     secret: SecretKey,
     accept: bool,
 ) -> Result<Endpoint, SetupError> {
+    configure(builder, secret, accept)
+        .bind()
+        .await
+        .map_err(|e| SetupError::Other(e.into()))
+}
+
+/// Apply koh's identity, transport config and (when `accept`ing) ALPN to an endpoint builder.
+///
+/// Every endpoint koh binds goes through this; tests use it to bind endpoints on their own
+/// transports.
+pub fn configure(
+    builder: iroh::endpoint::Builder,
+    secret: SecretKey,
+    accept: bool,
+) -> iroh::endpoint::Builder {
     let mut builder = builder
         .secret_key(secret)
         .transport_config(koh_transport_config());
@@ -600,7 +615,7 @@ async fn bind(
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
-    builder.bind().await.map_err(|e| SetupError::Other(e.into()))
+    builder
 }
 
 /// Build an iroh [`Endpoint`] with the `presets::N0` profile (relay + DNS discovery, so a

@@ -136,6 +136,13 @@ test-support = []
 # examples, `--all-targets`). Cargo drops path-only dev-dependencies from the published crate.
 koh = { path = ".", default-features = false, features = ["test-support"] }
 proptest = "1"
+# The fault-injecting test transport (`tests/net/link.rs`): iroh's custom-transport API and the
+# crates its trait signatures name. Dev-only, so release builds keep iroh's default features; all
+# are already in the lockfile through iroh.
+iroh = { version = "=1.0.0", features = ["unstable-custom-transports"] }
+iroh-base = "=1.0.0"
+n0-watcher = "=1.0.0"
+noq-udp = { version = "=1.0.0", default-features = false }
 # Deterministic deadline tests; no network endpoint or wall-clock wait.
 tokio = { version = "1", features = ["test-util"] }
 

@@ -134,31 +134,7 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .try_init();
-    // The CLI enforces this range in clap; a directly built `ServeConfig` bypasses that, so re-check here.
-    anyhow::ensure!(
-        args.scrollback <= MAX_SCROLLBACK,
-        "scrollback {} exceeds the maximum of {MAX_SCROLLBACK}",
-        args.scrollback
-    );
-    anyhow::ensure!(args.max_sessions >= 1, "max_sessions must be at least 1");
-
-    // Build the node-id allowlist — the sole authorization gate. Every authorized peer gets the
-    // same access. At least one entry is required: koh never serves an unlisted peer.
-    let mut allow: HashSet<EndpointId> = HashSet::new();
-    for s in &args.allow {
-        let id = parse_endpoint_id(s).with_context(|| format!("bad --allow id: {s}"))?;
-        allow.insert(id);
-    }
-    if allow.is_empty() {
-        anyhow::bail!(
-            "no clients authorized: pass --allow <endpoint-id> (repeatable; get one from `koh id`)"
-        );
-    }
-    // The CLI enforces these ranges in clap; a directly built `ServeConfig` bypasses that, so re-check here.
-    anyhow::ensure!(
-        args.max_connections >= 1,
-        "max_connections must be at least 1"
-    );
+    let hosting = Hosting::from_config(&args)?;
 
     let key_file = match args.key_file.clone() {
         Some(p) => p,
@@ -203,7 +179,7 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     eprintln!("│ endpoint id : {id_str}");
     eprintln!("│ key file    : {}", key_file.display());
     eprintln!("│ alpn        : {}", String::from_utf8_lossy(ALPN));
-    eprintln!("│ auth        : allowlist ({} client(s))", allow.len());
+    eprintln!("│ auth        : allowlist ({} client(s))", hosting.allow.len());
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
 
@@ -228,15 +204,81 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
         "transport crypto posture"
     );
 
-    let allow = std::sync::Arc::new(allow);
-    // Both were validated above (scrollback <= MAX_SCROLLBACK), so the conversions to the usize
-    // the emulator and the store want cannot fail on any supported target.
+    // Graceful shutdown: a SIGTERM/SIGINT drains the accept loop cleanly (close the endpoint after
+    // the reaper stops) instead of hard-killing the process.
+    let shutdown = CancellationToken::new();
+    spawn_signal_drain(shutdown.clone())?;
+    serve_endpoint(endpoint, hosting, shutdown).await
+}
+
+/// What `koh serve` hosts, validated from a [`ServeConfig`]: who may connect, the program each
+/// session runs, and the limits.
+pub struct Hosting {
+    allow: HashSet<EndpointId>,
+    command: Arc<[String]>,
+    scrollback: usize,
+    session_ttl: Duration,
+    max_connections: usize,
+    max_sessions: usize,
+}
+
+impl Hosting {
+    /// Validate the hosting part of `args`. The CLI enforces these ranges in clap; a directly built
+    /// `ServeConfig` bypasses that, so they are re-checked here.
+    pub fn from_config(args: &ServeConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            args.scrollback <= MAX_SCROLLBACK,
+            "scrollback {} exceeds the maximum of {MAX_SCROLLBACK}",
+            args.scrollback
+        );
+        anyhow::ensure!(args.max_sessions >= 1, "max_sessions must be at least 1");
+        // The node-id allowlist is the sole authorization gate. Every authorized peer gets the
+        // same access. At least one entry is required: koh never serves an unlisted peer.
+        let mut allow: HashSet<EndpointId> = HashSet::new();
+        for s in &args.allow {
+            let id = parse_endpoint_id(s).with_context(|| format!("bad --allow id: {s}"))?;
+            allow.insert(id);
+        }
+        if allow.is_empty() {
+            anyhow::bail!(
+                "no clients authorized: pass --allow <endpoint-id> (repeatable; get one from `koh id`)"
+            );
+        }
+        anyhow::ensure!(
+            args.max_connections >= 1,
+            "max_connections must be at least 1"
+        );
+        // Validated above (scrollback <= MAX_SCROLLBACK), so the conversions to the usize the
+        // emulator, the store and the semaphores want cannot fail on any supported target.
+        Ok(Self {
+            allow,
+            command: args.command.clone().into(),
+            scrollback: usize::try_from(args.scrollback)
+                .context("scrollback does not fit in usize")?,
+            session_ttl: Duration::from_secs(args.session_ttl_secs),
+            max_connections: usize::try_from(args.max_connections)
+                .context("max_connections does not fit in usize")?,
+            max_sessions: usize::try_from(args.max_sessions)
+                .context("max_sessions does not fit in usize")?,
+        })
+    }
+}
+
+/// Serve authorized clients on an already-bound `endpoint`.
+///
+/// Runs until `shutdown` is cancelled or the endpoint closes, then closes it. This is `koh serve`'s
+/// accept pipeline; tests run it on endpoints bound to their own transports.
+pub async fn serve_endpoint(
+    endpoint: iroh::Endpoint,
+    hosting: Hosting,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let allow = Arc::new(hosting.allow);
     let sessions = Arc::new(SessionPool {
         store: SessionStore::default(),
-        command: args.command.clone().into(),
-        scrollback: usize::try_from(args.scrollback).context("scrollback does not fit in usize")?,
-        max_sessions: usize::try_from(args.max_sessions)
-            .context("max_sessions does not fit in usize")?,
+        command: hosting.command,
+        scrollback: hosting.scrollback,
+        max_sessions: hosting.max_sessions,
     });
 
     // The detachable session store survives disconnects, so a reconnecting client lands back in
@@ -245,26 +287,22 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     let reaper_shutdown = tokio_util::sync::CancellationToken::new();
     let reaper = tokio::spawn(session::run_reaper(
         sessions.store.clone(),
-        Duration::from_secs(args.session_ttl_secs),
+        hosting.session_ttl,
         session::REAP_INTERVAL,
         reaper_shutdown.clone(),
     ));
 
-    // Graceful shutdown: a SIGTERM/SIGINT drains the accept loop cleanly (close the endpoint after
-    // the reaper stops) instead of hard-killing the process.
-    let shutdown = CancellationToken::new();
-    spawn_signal_drain(shutdown.clone())?;
     // Bound concurrent connection-handling tasks: each accepted connection holds a permit for its
     // whole lifetime, so a flood can't spawn unbounded tasks (L-3). Excess dials are refused cheaply
     // (before the crypto handshake) via `Incoming::refuse`.
-    let conn_limit = Arc::new(tokio::sync::Semaphore::new(args.max_connections as usize));
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(hosting.max_connections));
     // Separate, smaller cap on *un-admitted, in-flight* handshakes (KOH-08): a slowloris that opens
     // connections but stalls the QUIC handshake (or never accepts the admission stream) would
     // otherwise pin every connection permit for the whole handshake-timeout window. A pending permit
     // is released the moment admission completes (the `drop(pending_permit)` in the accept task), so
     // established sessions never count against this — only stalls do — and excess pending dials are
     // refused cheaply (pre-handshake) like the connection cap.
-    let pending_cap = (args.max_connections as usize).div_ceil(4).max(4);
+    let pending_cap = hosting.max_connections.div_ceil(4).max(4);
     let handshake_limit = Arc::new(tokio::sync::Semaphore::new(pending_cap));
 
     loop {

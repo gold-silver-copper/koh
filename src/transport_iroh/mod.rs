@@ -713,31 +713,6 @@ impl IrohChannel {
     }
 }
 
-/// A monotonic millisecond clock for driving the SSP scheduler, anchored at a base instant.
-#[derive(Debug, Clone, Copy)]
-pub struct MonoClock {
-    base: tokio::time::Instant,
-}
-
-impl Default for MonoClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MonoClock {
-    pub fn new() -> Self {
-        Self {
-            base: tokio::time::Instant::now(),
-        }
-    }
-
-    /// Milliseconds since this clock was created. Saturates at `u64::MAX` (after 584 million
-    /// years) rather than wrapping, so the clock never runs backwards.
-    pub fn now_ms(&self) -> u64 {
-        u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-}
 
 #[cfg(test)]
 mod tests {

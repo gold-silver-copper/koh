@@ -1,16 +1,15 @@
 //! # koh-predict — the local-echo prediction engine
 //!
 //! What makes typing feel instant on a laggy link. When the user types, the client *guesses*
-//! what each keystroke does to the screen and displays it immediately (underlined on high-RTT
-//! links), then confirms or corrects when the authoritative server frame arrives. A focused
-//! port of mosh's `Overlay::PredictionEngine`.
+//! what each keystroke does to the screen and displays it immediately, then confirms or corrects
+//! when the authoritative server frame arrives.
 //!
-//! ## Scope of this port
+//! ## What it does
 //!
-//! The headline behavior — instant echo of ordinary typing, with epoch-gated confirmation
-//! driven by the server's debounced **echo-ack** (not the raw network ack), adaptive
-//! engagement by SRTT, underline flagging, and emergent password/no-echo suppression — is
-//! faithful. It predicts ASCII printables, backspace, CR/LF, the left/right arrow keys, and
+//! Instant echo of ordinary typing, with epoch-gated confirmation driven by the server's debounced
+//! **echo-ack** (not the raw network ack), engagement by round-trip time, and emergent
+//! password/no-echo suppression. It predicts ASCII printables, backspace, CR/LF, the left/right
+//! arrow keys, and
 //! whole UTF-8 graphemes (including double-width CJK/emoji, whose cursor advances by two
 //! cells). Control/escape/CSI bytes it doesn't model (and ambiguous edge-of-row cases) open a
 //! fresh epoch but make no concrete prediction — they fall back to the server's real echo.
@@ -64,48 +63,6 @@ impl ScreenView for fux_vt::Screen {
     }
 }
 
-/// Tunable engagement / flagging / glitch thresholds for the predictor (mosh `terminaloverlay.h`
-/// values).
-///
-/// Lifted out of module constants so a front-end can tune responsiveness and tests can
-/// drive engagement deterministically. [`Default`] reproduces the historical hardcoded values, so
-/// `PredictionEngine::new` behaves exactly as before.
-#[derive(Debug, Clone, Copy)]
-pub struct PredictionConfig {
-    /// SRTT (ms) at/below which the engagement trigger releases (hysteresis with `srtt_trigger_high`).
-    pub srtt_trigger_low: f64,
-    /// SRTT (ms) above which predictions begin to show (Adaptive mode).
-    pub srtt_trigger_high: f64,
-    /// SRTT (ms) at/below which underline flagging stops.
-    pub flag_trigger_low: f64,
-    /// SRTT (ms) above which shown predictions are underline-flagged.
-    pub flag_trigger_high: f64,
-    /// A prediction pending at least this long (ms) escalates the glitch trigger.
-    pub glitch_threshold_ms: u64,
-    /// Glitch-repair counter target (how many fast confirmations cure a glitch).
-    pub glitch_repair_count: u32,
-    /// Minimum interval (ms) between successive glitch-repair decrements.
-    pub glitch_repair_min_interval_ms: u64,
-    /// A prediction pending at least this long (ms) forces maximal flagging.
-    pub glitch_flag_threshold_ms: u64,
-}
-
-impl Default for PredictionConfig {
-    fn default() -> Self {
-        // mosh terminaloverlay.h defaults.
-        Self {
-            srtt_trigger_low: 20.0,
-            srtt_trigger_high: 30.0,
-            flag_trigger_low: 50.0,
-            flag_trigger_high: 80.0,
-            glitch_threshold_ms: 250,
-            glitch_repair_count: 10,
-            glitch_repair_min_interval_ms: 150,
-            glitch_flag_threshold_ms: 5000,
-        }
-    }
-}
-
 /// When predictions are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayPreference {
@@ -113,9 +70,15 @@ pub enum DisplayPreference {
     Always,
     /// Never predict (the plain, non-speculative path).
     Never,
-    /// Render only when the link is slow enough to benefit (default).
+    /// Render only while the link is slow enough to benefit.
     Adaptive,
 }
+
+/// [`Adaptive`](DisplayPreference::Adaptive) starts showing predictions once the round-trip time
+/// rises above this, and stops once it falls below [`DISENGAGE_BELOW_MS`]. The gap is hysteresis,
+/// so a link hovering near the threshold does not flicker predictions on and off.
+const ENGAGE_ABOVE_MS: f64 = 60.0;
+const DISENGAGE_BELOW_MS: f64 = 40.0;
 
 /// A speculative cell for the renderer to draw on top of the authoritative grid.
 #[derive(Clone, Debug)]
@@ -125,7 +88,7 @@ pub struct PredictedCell {
     pub glyph: String,
     pub fg: Color,
     pub bg: Color,
-    /// Whether to underline it (mosh's "flagging" on high-latency links).
+    /// Whether to underline it. Always false now; kept because the renderer reads it.
     pub underline: bool,
     /// "Something changed here but we don't know what" (e.g. content shifted in from off-screen
     /// by an insert/backspace). Rendered as an underline-only hint, never a guessed glyph.
@@ -160,7 +123,6 @@ impl Overlay {
 struct PredCell {
     expiration_frame: u64,
     tentative_epoch: u64,
-    prediction_time: u64,
     glyph: String,
     fg: Color,
     bg: Color,
@@ -205,7 +167,7 @@ enum EscState {
 ///
 /// Drive it: [`set_local_frame_sent`](Self::set_local_frame_sent)
 /// before feeding typed bytes; [`new_user_byte`](Self::new_user_byte) per typed byte;
-/// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) + [`set_srtt`](Self::set_srtt)
+/// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) + [`set_rtt_ms`](Self::set_rtt_ms)
 /// + [`cull`](Self::cull) when a server frame arrives; [`overlay`](Self::overlay) to render.
 pub struct PredictionEngine {
     pref: DisplayPreference,
@@ -215,11 +177,10 @@ pub struct PredictionEngine {
     confirmed_epoch: u64,
     local_frame_sent: u64,
     late_acked: u64,
-    srtt_ms: f64,
-    srtt_trigger: bool,
-    glitch_trigger: u32,
-    flagging: bool,
-    last_quick_confirmation: u64,
+    /// The link round-trip time (ms) the client last reported, for adaptive engagement.
+    rtt_ms: f64,
+    /// Whether adaptive engagement is currently showing predictions (latched, with hysteresis).
+    engaged: bool,
     last_size: Option<(u16, u16)>,
     last_byte: u8,
     /// Escape-sequence parser state across raw input bytes (for arrow-key prediction).
@@ -228,18 +189,11 @@ pub struct PredictionEngine {
     /// the total byte length its leading byte announced. Empty/0 when not mid-grapheme.
     utf8_buf: Vec<u8>,
     utf8_need: usize,
-    /// Tunable engagement / flagging / glitch thresholds (mosh defaults via [`PredictionConfig`]).
-    config: PredictionConfig,
 }
 
 impl PredictionEngine {
-    /// A predictor with the default (mosh) engagement thresholds.
+    /// A predictor displaying per `pref`.
     pub fn new(pref: DisplayPreference) -> Self {
-        Self::with_config(pref, PredictionConfig::default())
-    }
-
-    /// A predictor with explicit engagement thresholds (for tuning / deterministic tests).
-    pub fn with_config(pref: DisplayPreference, config: PredictionConfig) -> Self {
         Self {
             pref,
             cells: BTreeMap::new(),
@@ -254,17 +208,13 @@ impl PredictionEngine {
             confirmed_epoch: 0,
             local_frame_sent: 0,
             late_acked: 0,
-            srtt_ms: 250.0,
-            srtt_trigger: false,
-            glitch_trigger: 0,
-            flagging: false,
-            last_quick_confirmation: 0,
+            rtt_ms: 0.0,
+            engaged: false,
             last_size: None,
             last_byte: 0,
             esc: EscState::Ground,
             utf8_buf: Vec::new(),
             utf8_need: 0,
-            config,
         }
     }
 
@@ -286,7 +236,7 @@ impl PredictionEngine {
 
     /// Insert a prediction cell at `(row, col)`, stamping the shared, load-bearing invariant: the
     /// expiration frame (`local_frame_sent + 1`), the current `prediction_epoch` (the security gate
-    /// that hides input until the server confirms it echoes), `now`, and a one-element
+    /// that hides input until the server confirms it echoes), and a one-element
     /// `original_contents` snapshot of the cell being overwritten (so a rewrite back to an earlier
     /// value grades "no credit"). Centralizes the identical invariant literals so a future edit can't
     /// drift one site's invariant on this security-sensitive path (S-07). The per-cell fields
@@ -308,14 +258,12 @@ impl PredictionEngine {
         fg: Color,
         bg: Color,
         unknown: bool,
-        now: u64,
     ) {
         self.cells.insert(
             (row, col),
             PredCell {
                 expiration_frame: self.next_frame(),
                 tentative_epoch: self.prediction_epoch,
-                prediction_time: now,
                 glyph,
                 fg,
                 bg,
@@ -343,9 +291,14 @@ impl PredictionEngine {
     pub fn set_local_frame_late_acked(&mut self, n: u64) {
         self.late_acked = n;
     }
-    /// The smoothed RTT (ms) used for adaptive engagement / flagging.
-    pub fn set_srtt(&mut self, ms: f64) {
-        self.srtt_ms = ms;
+    /// The link round-trip time (ms), for adaptive engagement (with hysteresis).
+    pub fn set_rtt_ms(&mut self, ms: f64) {
+        self.rtt_ms = ms;
+        if ms > ENGAGE_ABOVE_MS {
+            self.engaged = true;
+        } else if ms < DISENGAGE_BELOW_MS {
+            self.engaged = false;
+        }
     }
 
     /// The frame a prediction made now expires at: the next input frame after the newest sent.
@@ -363,10 +316,6 @@ impl PredictionEngine {
 
     fn tentative(&self, epoch: u64) -> bool {
         epoch > self.confirmed_epoch
-    }
-
-    fn active(&self) -> bool {
-        self.cursor.is_some() || !self.cells.is_empty()
     }
 
     /// Ensure a cursor prediction exists in the current epoch, seeded from the real cursor, and
@@ -434,7 +383,7 @@ impl PredictionEngine {
     /// (combining) graphemes and ones that would land on the wrap-ambiguous right edge fall back
     /// to a tentative epoch. Overwrite-only (no insert-mode tail shift for wide chars — that
     /// rarer case is left to the server's real echo).
-    fn predict_wide(&mut self, now: u64, g: &str, screen: &dyn ScreenView) {
+    fn predict_wide(&mut self, g: &str, screen: &dyn ScreenView) {
         // `g` is one decoded char, so its width is at most 2. Clamping keeps a wider one on the
         // "does not fit" path below instead of truncating it into a small width.
         let w = u16::try_from(g.width()).unwrap_or(u16::MAX);
@@ -456,7 +405,7 @@ impl PredictionEngine {
         };
         let exp = self.next_frame();
         let (fg, bg) = glyph_style(screen, row, col);
-        self.place_cell(screen, row, col, g.to_string(), fg, bg, false, now);
+        self.place_cell(screen, row, col, g.to_string(), fg, bg, false);
         if let Some(c) = self.cursor.as_mut() {
             c.expiration_frame = exp;
             c.col = next_col;
@@ -465,11 +414,11 @@ impl PredictionEngine {
 
     /// Record a typed byte and speculate its on-screen effect against `screen` (the latest
     /// authoritative frame). Validates existing predictions first (`cull`).
-    pub fn new_user_byte(&mut self, now: u64, byte: u8, screen: &dyn ScreenView) {
+    pub fn new_user_byte(&mut self, byte: u8, screen: &dyn ScreenView) {
         if self.pref == DisplayPreference::Never {
             return;
         }
-        self.cull(now, screen);
+        self.cull(screen);
 
         let mut byte = byte;
         if self.last_byte == 0x1b && byte == b'O' {
@@ -493,7 +442,7 @@ impl PredictionEngine {
                     self.utf8_buf.clear();
                     self.utf8_need = 0;
                     match decoded {
-                        Some(s) => self.predict_wide(now, &s, screen),
+                        Some(s) => self.predict_wide(&s, screen),
                         None => self.become_tentative(),
                     }
                 }
@@ -577,7 +526,7 @@ impl PredictionEngine {
                     // The rightmost cell takes content pushed off-screen -> unknown.
                     let unknown = i.checked_add(1) == Some(cols) || src_unknown;
                     let glyph = if unknown { String::new() } else { g };
-                    self.place_cell(screen, row, i, glyph, fg, bg, unknown, now);
+                    self.place_cell(screen, row, i, glyph, fg, bg, unknown);
                 }
                 let (fg, bg) = glyph_style(screen, row, col);
                 self.place_cell(
@@ -588,7 +537,6 @@ impl PredictionEngine {
                     fg,
                     bg,
                     false,
-                    now,
                 );
                 let exp = self.next_frame();
                 if let Some(c) = self.cursor.as_mut() {
@@ -633,7 +581,7 @@ impl PredictionEngine {
                             None => (String::new(), Color::Default, Color::Default, true),
                         };
                         let glyph = if unknown { String::new() } else { g };
-                        self.place_cell(screen, row, i, glyph, fg, bg, unknown, now);
+                        self.place_cell(screen, row, i, glyph, fg, bg, unknown);
                     }
                 }
             }
@@ -649,26 +597,7 @@ impl PredictionEngine {
         }
     }
 
-    /// Re-evaluate prediction visibility at `now` against the (unchanged) authoritative `screen`,
-    /// so a long-pending prediction escalates to the glitch underline on time even on a silent
-    /// link. Returns whether the displayed flagging changed (the caller repaints if so).
-    ///
-    /// The age-based escalation otherwise only runs inside [`cull`](Self::cull) (on a datagram) or
-    /// [`new_user_byte`](Self::new_user_byte) (on a keystroke); on a quiet slow link it would not
-    /// fire until the next such event. The client loop wakes at least every 50ms, so calling this
-    /// keeps the escalation timely (mirrors mosh's `OverlayManager::wait_time`-driven update). It
-    /// delegates to `cull`, which is idempotent on an unchanged screen (correct predictions were
-    /// already confirmed/removed by the prior datagram), so the only effect here is re-timing.
-    pub fn tick(&mut self, now: u64, screen: &dyn ScreenView) -> bool {
-        if self.pref == DisplayPreference::Never || self.cells.is_empty() {
-            return false;
-        }
-        let before = (self.flagging, self.glitch_trigger);
-        self.cull(now, screen);
-        before != (self.flagging, self.glitch_trigger)
-    }
-
-    pub fn cull(&mut self, now: u64, screen: &dyn ScreenView) {
+    pub fn cull(&mut self, screen: &dyn ScreenView) {
         if self.pref == DisplayPreference::Never {
             return;
         }
@@ -684,25 +613,6 @@ impl PredictionEngine {
         self.last_size = Some(size);
         let (rows, cols) = size;
 
-        // SRTT trigger (show predictions) with hysteresis.
-        if self.srtt_ms > self.config.srtt_trigger_high {
-            self.srtt_trigger = true;
-        } else if self.srtt_trigger
-            && self.srtt_ms <= self.config.srtt_trigger_low
-            && !self.active()
-        {
-            self.srtt_trigger = false;
-        }
-        // Flagging (underline) with hysteresis.
-        if self.srtt_ms > self.config.flag_trigger_high {
-            self.flagging = true;
-        } else if self.srtt_ms <= self.config.flag_trigger_low {
-            self.flagging = false;
-        }
-        if self.glitch_trigger > self.config.glitch_repair_count {
-            self.flagging = true;
-        }
-
         let late = self.late_acked;
         let confirmed = self.confirmed_epoch;
 
@@ -710,8 +620,6 @@ impl PredictionEngine {
         let mut kill_epochs: BTreeSet<u64> = BTreeSet::new();
         let mut kill_all = false;
         let mut max_confirm = confirmed;
-        let mut new_glitch = self.glitch_trigger;
-        let mut last_quick = self.last_quick_confirmation;
         // mosh's "match rest of row to the actual renditions": each `(row, from_col, fg, bg)` run
         // recolors the still-pending predicted cells from `from_col` to the row's end with a freshly
         // confirmed cell's *actual* colors, so they don't flash a guessed rendition before their own
@@ -721,30 +629,10 @@ impl PredictionEngine {
         for (&(row, col), cell) in &self.cells {
             let v = cell_validity(cell, screen, row, col, rows, cols, late);
             match v {
-                Validity::Pending => {
-                    // Long-pending predictions escalate visibility (glitch).
-                    let age = now.saturating_sub(cell.prediction_time);
-                    if age >= self.config.glitch_flag_threshold_ms {
-                        new_glitch = self.config.glitch_repair_count.saturating_mul(2);
-                    } else if age >= self.config.glitch_threshold_ms
-                        && new_glitch < self.config.glitch_repair_count
-                    {
-                        new_glitch = self.config.glitch_repair_count;
-                    }
-                }
+                Validity::Pending => {}
                 Validity::Correct => {
                     if cell.tentative_epoch > max_confirm {
                         max_confirm = cell.tentative_epoch;
-                    }
-                    // Reward fast confirmations: cure the glitch trigger gradually.
-                    if now.saturating_sub(cell.prediction_time) < self.config.glitch_threshold_ms
-                        && now.saturating_sub(self.config.glitch_repair_min_interval_ms)
-                            >= last_quick
-                    {
-                        if let Some(cured) = new_glitch.checked_sub(1) {
-                            new_glitch = cured;
-                            last_quick = now;
-                        }
                     }
                     // Re-color the rest of this row's pending predictions to the actual confirmed
                     // renditions (mosh terminaloverlay.cc): koh's `PredCell` carries only fg/bg, so
@@ -775,8 +663,6 @@ impl PredictionEngine {
         }
 
         self.confirmed_epoch = max_confirm;
-        self.glitch_trigger = new_glitch;
-        self.last_quick_confirmation = last_quick;
         for k in &to_remove {
             self.cells.remove(k);
         }
@@ -823,37 +709,23 @@ impl PredictionEngine {
 
     /// Build the render overlay for the current frame, honoring the display policy and epoch
     /// gating. Empty when nothing should be shown.
-    pub fn overlay(&self, screen: &dyn ScreenView) -> Overlay {
+    pub fn overlay(&self) -> Overlay {
         let show = match self.pref {
             DisplayPreference::Never => false,
             DisplayPreference::Always => true,
-            DisplayPreference::Adaptive => self.srtt_trigger || self.glitch_trigger > 0,
+            DisplayPreference::Adaptive => self.engaged,
         };
         if !show {
             return Overlay::empty();
         }
-        let (_, cols) = screen.size();
         let mut ov = Overlay::empty();
         for (&(row, col), cell) in &self.cells {
             if self.tentative(cell.tentative_epoch) {
                 continue; // hidden until its epoch is confirmed
             }
             if cell.unknown {
-                // "Something changed here, not sure what": only hint with an underline (and
-                // only when flagging, and not in the always-ambiguous last column). Never push
-                // a glyph — the renderer underlines the real cell instead of overwriting it.
-                if self.flagging && col != cols.saturating_sub(1) {
-                    ov.cells.insert(
-                        (row, col),
-                        PredictedCell {
-                            glyph: String::new(),
-                            fg: Color::Default,
-                            bg: Color::Default,
-                            underline: true,
-                            unknown: true,
-                        },
-                    );
-                }
+                // "Something changed here, not sure what": show nothing, so the real cell beneath
+                // stays visible rather than a guessed glyph.
                 continue;
             }
             ov.cells.insert(
@@ -862,7 +734,7 @@ impl PredictionEngine {
                     glyph: cell.glyph.clone(),
                     fg: cell.fg,
                     bg: cell.bg,
-                    underline: self.flagging,
+                    underline: false,
                     unknown: false,
                 },
             );
@@ -1021,21 +893,21 @@ mod tests {
             cursor: (0, 0),
         };
         let mut e = PredictionEngine::new(DisplayPreference::Always);
-        e.set_srtt(250.0);
+        e.set_rtt_ms(250.0);
         e.set_local_frame_sent(0);
-        e.new_user_byte(100, b'x', &blank);
-        assert!(e.overlay(&blank).is_empty(), "hidden until confirmed");
+        e.new_user_byte(b'x', &blank);
+        assert!(e.overlay().is_empty(), "hidden until confirmed");
         let mut echoed = FakeView {
             rows: vec![vec![' '; 10]; 5],
             cursor: (0, 1),
         };
         echoed.rows[0][0] = 'x';
         e.set_local_frame_late_acked(1);
-        e.cull(200, &echoed);
+        e.cull(&echoed);
         assert_eq!(e.confirmed_epoch(), 1, "the echoed 'x' confirms the epoch");
         e.set_local_frame_sent(1);
-        e.new_user_byte(300, b'y', &echoed);
-        let ov = e.overlay(&echoed);
+        e.new_user_byte(b'y', &echoed);
+        let ov = e.overlay();
         assert_eq!(
             ov.cell(0, 1).map(|c| c.glyph.as_str()),
             Some("y"),
@@ -1051,13 +923,13 @@ mod tests {
         let mut pe = PredictionEngine::new(DisplayPreference::Always);
         pe.set_local_frame_sent(0);
         let screen = screen_of(b"");
-        pe.new_user_byte(0, 0xE4, &screen); // lead byte of a 3-byte sequence
-        pe.new_user_byte(0, b'A', &screen); // not a continuation -> reset
+        pe.new_user_byte(0xE4, &screen); // lead byte of a 3-byte sequence
+        pe.new_user_byte(b'A', &screen); // not a continuation -> reset
         assert!(
             pe.utf8_buf.is_empty(),
             "the UTF-8 accumulator must reset after a malformed sequence"
         );
-        let _ = pe.overlay(&screen);
+        let _ = pe.overlay();
     }
 
     #[test]
@@ -1070,7 +942,7 @@ mod tests {
         pe.set_local_frame_sent(0);
         let screen = screen_of(b"");
         // Mid-grapheme: feed the lead byte of a 2-byte sequence, leaving a continuation outstanding.
-        pe.new_user_byte(0, 0xC3, &screen);
+        pe.new_user_byte(0xC3, &screen);
         assert_eq!(
             pe.utf8_buf,
             vec![0xC3],
@@ -1096,12 +968,12 @@ mod tests {
 
         // The next byte now decodes cleanly as ASCII, not as a stray continuation of the dropped
         // grapheme.
-        pe.new_user_byte(1, b'A', &screen);
+        pe.new_user_byte(b'A', &screen);
         assert!(
             pe.utf8_buf.is_empty(),
             "the post-reset byte decodes cleanly"
         );
-        let _ = pe.overlay(&screen);
+        let _ = pe.overlay();
     }
 
     proptest::proptest! {
@@ -1119,7 +991,7 @@ mod tests {
             let mut pf = PredictionEngine::new(DisplayPreference::Always);
             pf.set_local_frame_sent(0);
             for &b in &bytes {
-                pf.new_user_byte(0, b, &fake);
+                pf.new_user_byte(b, &fake);
                 proptest::prop_assert!(pf.utf8_buf.len() <= 4, "utf8 accumulator over the fake view");
             }
             let mut pe = PredictionEngine::new(DisplayPreference::Always);
@@ -1127,7 +999,7 @@ mod tests {
             let screen = screen_of(b"ready prompt $ ");
             let mut now = 0u64;
             for b in &bytes {
-                pe.new_user_byte(now, *b, &screen); // must not panic on any byte sequence
+                pe.new_user_byte(*b, &screen); // must not panic on any byte sequence
                 now = now.saturating_add(1);
                 proptest::prop_assert!(
                     pe.utf8_buf.len() <= 4,
@@ -1135,47 +1007,8 @@ mod tests {
                     pe.utf8_buf.len()
                 );
             }
-            let _ = pe.overlay(&screen); // must not panic on the accumulated prediction set
+            let _ = pe.overlay(); // must not panic on the accumulated prediction set
         }
-    }
-
-    #[test]
-    fn tick_escalates_a_long_pending_prediction_without_a_datagram() {
-        let mut pe = PredictionEngine::new(DisplayPreference::Always);
-        // A *fast* link, so SRTT-based flagging is off and we isolate the time-based glitch
-        // escalation (the thing tick() exists to drive on a silent link).
-        pe.set_srtt(0.0);
-        pe.set_local_frame_sent(0);
-        let blank = screen_of(b"");
-        pe.new_user_byte(0, b'a', &blank); // hidden (epoch 1)
-        let echoed = screen_of(b"a");
-        pe.set_local_frame_late_acked(1);
-        pe.cull(50, &echoed); // confirm epoch 1 -> later predictions are shown
-        pe.set_local_frame_sent(1);
-        pe.new_user_byte(100, b'Z', &echoed); // shown, still-unconfirmed prediction
-        assert!(!pe.flagging, "not flagged on a fast link before escalation");
-        let before_glitch = pe.glitch_trigger;
-
-        // The server goes silent (no new datagram); only the loop ticks against the same screen.
-        // Past the glitch-flag threshold the long-pending prediction escalates the glitch trigger;
-        // the trigger turns on flagging (the underline) on the following tick (cull computes
-        // flagging from the glitch value *before* re-escalating it — true of the original code too,
-        // so the escalation lands within ~2 ticks ≈ 100ms instead of waiting for a datagram).
-        let t1 = 100 + pe.config.glitch_flag_threshold_ms + 1;
-        let c1 = pe.tick(t1, &echoed);
-        assert!(
-            pe.glitch_trigger > before_glitch,
-            "glitch escalated by age on a silent tick: {before_glitch} -> {}",
-            pe.glitch_trigger
-        );
-        assert!(c1, "tick reports the glitch change so the loop repaints");
-
-        let c2 = pe.tick(t1 + 1, &echoed);
-        assert!(
-            pe.flagging,
-            "the escalated glitch turns on the underline on the next tick"
-        );
-        assert!(c2, "tick reports the flagging change so the loop repaints");
     }
 
     /// Drive a confirmation round: type `first` (hidden), have the server echo it on `echoed`
@@ -1183,17 +1016,17 @@ mod tests {
     /// subsequent typing to be *visible*.
     fn confirm_first_keystroke(pref: DisplayPreference, srtt: f64) -> (PredictionEngine, Screen) {
         let mut e = PredictionEngine::new(pref);
-        e.set_srtt(srtt);
+        e.set_rtt_ms(srtt);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        e.new_user_byte(100, b'x', &blank);
+        e.new_user_byte(b'x', &blank);
         assert!(
-            e.overlay(&blank).is_empty(),
+            e.overlay().is_empty(),
             "the very first keystroke must be hidden until the server confirms it echoes"
         );
         let echoed = screen_of(b"x");
         e.set_local_frame_late_acked(1);
-        e.cull(200, &echoed); // grades 'x' Correct -> confirmed_epoch = 1
+        e.cull(&echoed); // grades 'x' Correct -> confirmed_epoch = 1
         (e, echoed)
     }
 
@@ -1205,10 +1038,10 @@ mod tests {
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
         for &b in b"hunter2" {
-            e.new_user_byte(100, b, &blank);
+            e.new_user_byte(b, &blank);
         }
         assert!(
-            e.overlay(&blank).is_empty(),
+            e.overlay().is_empty(),
             "predictions must stay hidden until the server confirms it echoes"
         );
     }
@@ -1218,8 +1051,8 @@ mod tests {
         // After the server proves it echoes (one Correct), later typing in the confirmed epoch shows.
         let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
         e.set_local_frame_sent(1);
-        e.new_user_byte(300, b'y', &echoed); // cursor now at (0,1)
-        let ov = e.overlay(&echoed);
+        e.new_user_byte(b'y', &echoed); // cursor now at (0,1)
+        let ov = e.overlay();
         assert_eq!(
             ov.cell(0, 1).map(|c| c.glyph.as_str()),
             Some("y"),
@@ -1228,64 +1061,42 @@ mod tests {
     }
 
     #[test]
-    fn slow_link_flags_confirmed_predictions() {
+    fn a_slow_link_shows_confirmed_predictions() {
+        // Adaptive: an RTT above the engage threshold shows predictions (never underlined now).
         let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Adaptive, 120.0);
         e.set_local_frame_sent(1);
-        e.new_user_byte(300, b'y', &echoed);
-        let ov = e.overlay(&echoed);
+        e.new_user_byte(b'y', &echoed);
+        let ov = e.overlay();
         assert_eq!(ov.cell(0, 1).map(|c| c.glyph.as_str()), Some("y"));
-        assert!(
-            ov.cell(0, 1).unwrap().underline,
-            "slow link should flag predictions"
-        );
+        assert!(!ov.cell(0, 1).unwrap().underline, "predictions are not underlined");
     }
 
     #[test]
-    fn injected_srtt_threshold_gates_engagement_deterministically() {
-        // Adaptive mode shows predictions only when srtt_ms > config.srtt_trigger_high. With an
-        // injected threshold far above the link's SRTT, a confirmed keystroke stays hidden; with
-        // a threshold below it, the same keystroke engages. Only testable now that the trigger is
-        // injectable (it used to be a hardcoded const).
-        fn confirm_then_type_visible(cfg: PredictionConfig, srtt: f64) -> bool {
-            let mut e = PredictionEngine::with_config(DisplayPreference::Adaptive, cfg);
-            e.set_srtt(srtt);
-            e.set_local_frame_sent(0);
-            let blank = screen_of(b"");
-            e.new_user_byte(100, b'x', &blank);
-            let echoed = screen_of(b"x");
-            e.set_local_frame_late_acked(1);
-            e.cull(200, &echoed); // confirm epoch 1
-            e.set_local_frame_sent(1);
-            e.new_user_byte(300, b'y', &echoed);
-            !e.overlay(&echoed).is_empty()
-        }
-        let high = PredictionConfig {
-            srtt_trigger_high: 1_000.0,
-            srtt_trigger_low: 999.0,
-            ..Default::default()
-        };
-        assert!(
-            !confirm_then_type_visible(high, 120.0),
-            "srtt 120 below the injected 1000ms engage threshold -> predictions hidden"
-        );
-        let low = PredictionConfig {
-            srtt_trigger_high: 10.0,
-            srtt_trigger_low: 5.0,
-            ..Default::default()
-        };
-        assert!(
-            confirm_then_type_visible(low, 120.0),
-            "srtt 120 above the injected 10ms engage threshold -> predictions shown"
-        );
+    fn adaptive_engagement_has_hysteresis() {
+        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Adaptive, 120.0);
+        e.set_local_frame_sent(1);
+        e.new_user_byte(b'y', &echoed);
+        assert!(!e.overlay().is_empty(), "engaged above 60 ms");
+        // Between the thresholds the latch holds its state.
+        e.set_rtt_ms(50.0);
+        assert!(!e.overlay().is_empty(), "still engaged in the hysteresis band");
+        // Below the low threshold it disengages and the real echo wins.
+        e.set_rtt_ms(30.0);
+        assert!(e.overlay().is_empty(), "disengaged below 40 ms");
+        // And re-engages only above the high threshold, not within the band.
+        e.set_rtt_ms(50.0);
+        assert!(e.overlay().is_empty(), "45 ms does not re-engage");
+        e.set_rtt_ms(70.0);
+        assert!(!e.overlay().is_empty(), "re-engaged above 60 ms");
     }
 
     #[test]
     fn no_prediction_shown_on_fast_link() {
-        // Even after a confirmation, a fast link keeps the SRTT gate closed so the real echo wins.
+        // Even after a confirmation, a fast link keeps adaptive engagement off so the real echo wins.
         let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Adaptive, 5.0);
         e.set_local_frame_sent(1);
-        e.new_user_byte(300, b'y', &echoed);
-        assert!(e.overlay(&echoed).is_empty());
+        e.new_user_byte(b'y', &echoed);
+        assert!(e.overlay().is_empty());
     }
 
     #[test]
@@ -1294,17 +1105,17 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        e.new_user_byte(100, b's', &blank);
+        e.new_user_byte(b's', &blank);
         assert!(
-            e.overlay(&blank).is_empty(),
+            e.overlay().is_empty(),
             "non-echoed input is never shown"
         );
 
         let still_blank = screen_of(b"");
         e.set_local_frame_late_acked(1);
-        e.cull(200, &still_blank);
+        e.cull(&still_blank);
         assert!(
-            e.overlay(&still_blank).is_empty(),
+            e.overlay().is_empty(),
             "non-echoed input must not leave a predicted glyph"
         );
     }
@@ -1312,10 +1123,10 @@ mod tests {
     #[test]
     fn never_mode_predicts_nothing() {
         let mut e = PredictionEngine::new(DisplayPreference::Never);
-        e.set_srtt(500.0);
+        e.set_rtt_ms(500.0);
         let screen = screen_of(b"");
-        e.new_user_byte(100, b'x', &screen);
-        assert!(e.overlay(&screen).is_empty());
+        e.new_user_byte(b'x', &screen);
+        assert!(e.overlay().is_empty());
     }
 
     #[test]
@@ -1326,7 +1137,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of(b"ab\x1b[1;2H"); // cursor -> row1 col2 = (0,1)
-        e.new_user_byte(0, b'X', &screen);
+        e.new_user_byte(b'X', &screen);
         assert_eq!(
             e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
             Some("X"),
@@ -1347,7 +1158,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of(b"abc\x1b[1;3H"); // cursor -> (0,2)
-        e.new_user_byte(0, 0x7f, &screen); // backspace
+        e.new_user_byte(0x7f, &screen); // backspace
         let (_, cols) = screen.size();
         assert_eq!(
             e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
@@ -1384,7 +1195,7 @@ mod tests {
             row: 0,
             col: u16::MAX - 1,
         });
-        e.new_user_byte(0, 0x7f, p.screen()); // backspace — must not panic
+        e.new_user_byte(0x7f, p.screen()); // backspace — must not panic
                                               // The two right-edge columns are unknown (mosh's `i + 2 >= width`), with no `i + 1` read.
         assert!(
             e.cells.get(&(0, u16::MAX - 1)).is_some_and(|c| c.unknown),
@@ -1405,17 +1216,17 @@ mod tests {
         e.set_local_frame_sent(0);
         // Confirm an initial keystroke so later predictions are in a shown epoch.
         let blank = screen_of(b"");
-        e.new_user_byte(0, b'a', &blank);
+        e.new_user_byte(b'a', &blank);
         let echoed = screen_of(b"a");
         e.set_local_frame_late_acked(1);
-        e.cull(50, &echoed); // confirmed_epoch = 1
+        e.cull(&echoed); // confirmed_epoch = 1
 
         // Type "bc": 'b' on frame 2 (will be confirmed), 'c' on frame 3 (stays pending), so 'c'
         // survives the cull where 'b' confirms — and can be recolored.
         e.set_local_frame_sent(1);
-        e.new_user_byte(60, b'b', &echoed);
+        e.new_user_byte(b'b', &echoed);
         e.set_local_frame_sent(2);
-        e.new_user_byte(61, b'c', &echoed);
+        e.new_user_byte(b'c', &echoed);
         assert_eq!(
             e.cells.get(&(0, 2)).map(|c| c.fg),
             Some(Color::Default),
@@ -1427,7 +1238,7 @@ mod tests {
         // 'c' — with 'b''s actual red foreground.
         let colored = screen_of(b"a\x1b[31mb");
         e.set_local_frame_late_acked(2);
-        e.cull(70, &colored);
+        e.cull(&colored);
         assert_eq!(
             e.cells.get(&(0, 2)).map(|c| c.fg),
             Some(Color::Idx(1)),
@@ -1460,7 +1271,6 @@ mod tests {
             PredCell {
                 expiration_frame: 5,
                 tentative_epoch: 2,
-                prediction_time: 0,
                 glyph: "Q".to_string(),
                 fg: Color::Default,
                 bg: Color::Default,
@@ -1470,14 +1280,14 @@ mod tests {
         );
         let blank = screen_of(b"");
         assert_eq!(
-            e.overlay(&blank).cursor(),
+            e.overlay().cursor(),
             Some((0, 9)),
             "the stale confirmed cursor is drawn before the kill"
         );
         // The frame has no 'Q' at (0,3) -> epoch 2 is killed; the real cursor is at (0,0).
-        e.cull(10, &blank);
+        e.cull(&blank);
         assert!(
-            e.overlay(&blank).cursor().is_none(),
+            e.overlay().cursor().is_none(),
             "after kill_epoch the stale predicted cursor is displaced; the real cursor shows through"
         );
         let c = e
@@ -1492,41 +1302,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_cell_overlay_is_underline_hint_only() {
-        // An unknown cell, when flagging, renders as an underline-only hint: empty glyph (so the
-        // renderer underlines the real cell instead of overwriting it), unknown = true.
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
-        e.flagging = true;
-        e.confirmed_epoch = 5; // un-gate the cell below (tentative_epoch 1 <= 5)
-        e.cells.insert(
-            (0, 1),
-            PredCell {
-                expiration_frame: 0,
-                tentative_epoch: 1,
-                prediction_time: 0,
-                glyph: String::new(),
-                fg: Color::Default,
-                bg: Color::Default,
-                original_contents: None,
-                unknown: true,
-            },
-        );
-        let screen = screen_of(b"");
-        let ov = e.overlay(&screen);
-        let c = ov.cell(0, 1).expect("unknown hint should be present");
-        assert!(c.unknown && c.underline && c.glyph.is_empty());
-    }
-
-    #[test]
     fn left_arrow_predicts_cursor_and_leaves_no_glyph() {
         // After confirming a keystroke (cursor at (0,1)), a left arrow predicts the cursor one
         // column left and must NOT leave literal '[' / 'D' glyphs from the escape bytes.
         let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
         e.set_local_frame_sent(1);
         for &b in b"\x1b[D" {
-            e.new_user_byte(300, b, &echoed); // ESC [ D
+            e.new_user_byte(b, &echoed); // ESC [ D
         }
-        let ov = e.overlay(&echoed);
+        let ov = e.overlay();
         assert_eq!(
             ov.cursor(),
             Some((0, 0)),
@@ -1544,9 +1328,9 @@ mod tests {
         let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
         e.set_local_frame_sent(1);
         for &b in b"\x1bOD" {
-            e.new_user_byte(300, b, &echoed); // ESC O D
+            e.new_user_byte(b, &echoed); // ESC O D
         }
-        assert_eq!(e.overlay(&echoed).cursor(), Some((0, 0)));
+        assert_eq!(e.overlay().cursor(), Some((0, 0)));
     }
 
     #[test]
@@ -1557,9 +1341,9 @@ mod tests {
         let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
         e.set_local_frame_sent(1);
         for &b in "世".as_bytes() {
-            e.new_user_byte(300, b, &echoed); // cursor seeds from the real screen at (0,1)
+            e.new_user_byte(b, &echoed); // cursor seeds from the real screen at (0,1)
         }
-        let ov = e.overlay(&echoed);
+        let ov = e.overlay();
         assert_eq!(
             ov.cell(0, 1).map(|c| c.glyph.as_str()),
             Some("世"),
@@ -1588,9 +1372,9 @@ mod tests {
             let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
             e.set_local_frame_sent(1);
             for &b in word.as_bytes() {
-                e.new_user_byte(300, b, &echoed);
+                e.new_user_byte(b, &echoed);
             }
-            let ov = e.overlay(&echoed);
+            let ov = e.overlay();
             // The first typed char lands at col 1 (cursor seeded from the echoed "x"); the accent
             // is the 3rd char, so column 3.
             assert_eq!(

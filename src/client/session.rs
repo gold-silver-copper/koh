@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
-    frame_interval, retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_WINDOW, HEARTBEAT,
-    MAX_INPUT_BYTES,
+    retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_WINDOW, HEARTBEAT, MAX_INPUT_BYTES,
 };
 use crate::terminal::{Grid, TerminalScreen};
 
@@ -71,8 +70,6 @@ pub struct ClientSession {
     /// by the echo-ack.
     last_nudge: Option<Instant>,
     predictor: PredictionEngine,
-    /// The instant the predictor's millisecond clock counts from.
-    epoch: Instant,
     /// True after the lone escape prefix, while waiting for the next byte.
     pending_escape: bool,
     /// Set whenever the rendered output may have changed; cleared once the caller repaints.
@@ -82,8 +79,8 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
-    /// A session for a new connection at `now`, telling the server the window is `rows × cols`.
-    pub fn new(now: Instant, pref: DisplayPreference, rows: u16, cols: u16) -> Self {
+    /// A session for a new connection, telling the server the window is `rows × cols`.
+    pub fn new(pref: DisplayPreference, rows: u16, cols: u16) -> Self {
         Self {
             current: (FrameNum::BLANK, TerminalScreen::default()),
             older: VecDeque::new(),
@@ -96,17 +93,10 @@ impl ClientSession {
             last_heard: None,
             last_nudge: None,
             predictor: PredictionEngine::new(pref),
-            epoch: now,
             pending_escape: false,
             dirty: true,
             status_was_shown: false,
         }
-    }
-
-    /// The predictor's clock: milliseconds since the session started, saturating after 584
-    /// million years.
-    fn millis(&self, now: Instant) -> u64 {
-        u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Feed a chunk of typed bytes. Runs the escape machine (`0x1e` then `.` quits, then `Ctrl-Z`
@@ -167,10 +157,8 @@ impl ClientSession {
         };
         self.predictor
             .set_local_frame_sent(seq.0.saturating_sub(1));
-        let now_ms = self.millis(now);
         for &b in bytes {
-            self.predictor
-                .new_user_byte(now_ms, b, self.current.1.screen());
+            self.predictor.new_user_byte(b, self.current.1.screen());
         }
         let mut rest = bytes;
         while !rest.is_empty() {
@@ -251,8 +239,7 @@ impl ClientSession {
         self.acknowledge(frame.num);
         self.echo_ack = self.echo_ack.max(frame.echo_ack);
         self.predictor.set_local_frame_late_acked(self.echo_ack.0);
-        let now_ms = self.millis(now);
-        self.predictor.cull(now_ms, self.current.1.screen());
+        self.predictor.cull(self.current.1.screen());
         self.dirty = true;
     }
 
@@ -287,13 +274,9 @@ impl ClientSession {
                 });
             }
         }
-        // The predictor adapts to the frame interval, as it always has.
-        let interval_ms = frame_interval(rtt).as_secs_f64() * 1000.0;
-        self.predictor.set_srtt(interval_ms);
-        let now_ms = self.millis(now);
-        if self.predictor.tick(now_ms, self.current.1.screen()) {
-            self.dirty = true;
-        }
+        // The predictor engages adaptively on the link's round-trip time.
+        self.predictor
+            .set_rtt_ms(rtt.map_or(0.0, |rtt| rtt.as_secs_f64() * 1000.0));
         let silent = self
             .last_heard
             .map(|heard| now.saturating_duration_since(heard));
@@ -349,7 +332,7 @@ impl ClientSession {
 
     /// The prediction overlay to draw over [`state`](Self::state).
     pub fn overlay(&self) -> Overlay {
-        self.predictor.overlay(self.current.1.screen())
+        self.predictor.overlay()
     }
 
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
@@ -370,7 +353,7 @@ mod tests {
 
     fn start() -> (Instant, ClientSession) {
         let now = Instant::now();
-        (now, ClientSession::new(now, DisplayPreference::Always, 24, 80))
+        (now, ClientSession::new(DisplayPreference::Always, 24, 80))
     }
 
     fn screen(bytes: &[u8]) -> TerminalScreen {
@@ -448,7 +431,7 @@ mod tests {
     #[test]
     fn input_is_numbered_in_order_and_a_paste_is_split() {
         let now = Instant::now();
-        let mut s = ClientSession::new(now, DisplayPreference::Never, 24, 80);
+        let mut s = ClientSession::new(DisplayPreference::Never, 24, 80);
         let paste: Vec<u8> = (0..200_000u32).map(|i| b'a' + (i % 26) as u8).collect();
         s.on_input(now, b"first");
         s.on_input(now, &paste);
@@ -470,7 +453,7 @@ mod tests {
     fn typing_past_the_queue_limit_is_dropped_and_reported_until_it_drains() {
         // Queueing, not prediction, is under test; skip predicting a megabyte byte by byte.
         let now = Instant::now();
-        let mut s = ClientSession::new(now, DisplayPreference::Never, 24, 80);
+        let mut s = ClientSession::new(DisplayPreference::Never, 24, 80);
         let chunk = vec![b'z'; MAX_INPUT_BYTES];
         for _ in 0..MAX_QUEUED_INPUT.div_euclid(MAX_INPUT_BYTES) {
             s.on_input(now, &chunk);

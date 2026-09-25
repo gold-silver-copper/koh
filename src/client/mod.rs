@@ -398,7 +398,7 @@ pub async fn run_client<T: ClientTerminal>(
         // A fresh session per (re)connection mirrors the server's fresh-transport-per-attach, which
         // full-repaints the live screen; re-seed the size from the terminal each time.
         let (rows, cols) = term.size().unwrap_or(initial_size);
-        let mut session = ClientSession::new(Instant::now(), pref, rows, cols);
+        let mut session = ClientSession::new(pref, rows, cols);
 
         let conn_started = clock.now_ms();
         match drive_connection(

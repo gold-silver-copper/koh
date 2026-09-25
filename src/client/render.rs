@@ -615,14 +615,14 @@ mod tests {
         let mut pe = PredictionEngine::new(DisplayPreference::Always);
         pe.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        pe.new_user_byte(0, b'a', &blank); // hidden (epoch 1, unconfirmed)
+        pe.new_user_byte(b'a', &blank); // hidden (epoch 1, unconfirmed)
         let echoed = screen_of(b"a");
         pe.set_local_frame_late_acked(1);
-        pe.cull(50, &echoed); // confirms -> confirmed_epoch = 1
+        pe.cull(&echoed); // confirms -> confirmed_epoch = 1
 
         pe.set_local_frame_sent(1);
-        pe.new_user_byte(60, b'Z', &echoed); // now visible at (0,1)
-        let overlay = pe.overlay(&echoed);
+        pe.new_user_byte(b'Z', &echoed); // now visible at (0,1)
+        let overlay = pe.overlay();
         assert!(
             !overlay.is_empty(),
             "confirmed prediction should be visible"

@@ -1,70 +1,21 @@
-//! The pluggable terminal backend seam: [`KohBackend`] and its concrete implementations.
+//! The terminal the client paints on: [`KohBackend`] and its one implementation, [`Tty`].
 //!
 //! The client's render path (`super::render`) and its [`ClientTerminal`](super::ClientTerminal)
-//! adapter ([`BackendTerminal`](super::BackendTerminal)) speak **only** to [`KohBackend`] — never to
-//! `termina`, `crossterm`, or any other terminal crate directly. A backend supplies the handful of
-//! genuinely platform-specific operations (enter/leave raw mode, query the size, write bytes) and
-//! inherits every escape-sequence emission (the cell grid, the cursor, the out-of-band window state)
-//! as **provided methods** that write standard ANSI/DEC sequences. So adding a backend is small — a
-//! few lines wiring up its raw-mode + size ioctls — and the escape output is identical across all of
-//! them, byte-for-byte with the pre-abstraction `termina` path.
-//!
-//! The provided methods are what a backend *may* override: a backend that wants to own its escape
-//! encoding (e.g. to route through its own ordered-output/policy layer) can replace any of them, but
-//! none of the current backends need to — the ANSI koh emits is understood by every real terminal
-//! regardless of which crate put it into raw mode.
-//!
-//! ## Backend selection
-//!
-//! Exactly one backend is compiled into the `koh` binary, chosen by cargo feature: `backend-termina`
-//! (default), `backend-crossterm`, or `backend-qwertty`. [`DefaultBackend`] resolves to the enabled
-//! one; enabling several keeps the highest-precedence (`termina` first, a plain build is unchanged),
-//! and enabling none is a compile error rather than a client that cannot paint.
+//! adapter ([`BackendTerminal`](super::BackendTerminal)) speak only to [`KohBackend`]. Its required
+//! methods are the platform primitives (raw mode, the window size, writing bytes); every escape
+//! sequence — the cell grid, the cursor, the out-of-band window state — is a provided method that
+//! writes standard ANSI/DEC bytes. [`Tty`] supplies the primitives through `rustix::termios`; the
+//! tests' `CaptureBackend` records the bytes instead.
 
 use std::io;
 
 use fux_vt::Color;
 
-#[cfg(feature = "backend-termina")]
-mod termina;
-#[cfg(feature = "backend-termina")]
-pub use self::termina::TerminaBackend;
+mod tty;
+pub use self::tty::Tty;
 
-#[cfg(feature = "backend-crossterm")]
-mod crossterm;
-#[cfg(feature = "backend-crossterm")]
-pub use self::crossterm::CrosstermBackend;
-
-#[cfg(feature = "backend-qwertty")]
-mod qwertty;
-#[cfg(feature = "backend-qwertty")]
-pub use self::qwertty::QwerttyBackend;
-
-/// The backend the `koh` binary paints through, resolved at build time.
-///
-/// Precedence when several backend features are on: `backend-termina` (the default) beats
-/// `backend-crossterm` beats `backend-qwertty`, so enabling an alternate alongside the default does
-/// not change a default build. A build with *no* backend feature trips the `compile_error!` below
-/// instead of silently producing a client with no renderer.
-#[cfg(feature = "backend-termina")]
-pub type DefaultBackend = TerminaBackend;
-#[cfg(all(feature = "backend-crossterm", not(feature = "backend-termina")))]
-pub type DefaultBackend = CrosstermBackend;
-#[cfg(all(
-    feature = "backend-qwertty",
-    not(feature = "backend-termina"),
-    not(feature = "backend-crossterm")
-))]
-pub type DefaultBackend = QwerttyBackend;
-
-#[cfg(not(any(
-    feature = "backend-termina",
-    feature = "backend-crossterm",
-    feature = "backend-qwertty"
-)))]
-compile_error!(
-    "koh's client needs a terminal backend: enable `backend-termina` (default), `backend-crossterm`, or `backend-qwertty`"
-);
+/// The terminal the `koh` binary paints through.
+pub type DefaultBackend = Tty;
 
 /// The DEC private modes koh may have forwarded to the user's terminal (X10 `?9` + all mouse modes
 /// and encodings, bracketed paste `?2004`, application cursor keys `?1`) plus normal keypad

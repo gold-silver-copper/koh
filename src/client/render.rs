@@ -1,15 +1,13 @@
 //! Painting the synchronized screen grid (plus prediction overlays and a status line)
-//! onto the local terminal through the pluggable [`KohBackend`] seam.
+//! onto the local terminal through [`KohBackend`].
 //!
 //! We render cell-by-cell because the predictor needs to draw speculative cells (underlined)
 //! *on top of* the authoritative grid. Style changes are diffed against the previous cell so we emit minimal SGR. Each frame
 //! is wrapped in synchronized output (DEC mode 2026) so the terminal shows it atomically
 //! (no tearing/flicker on full repaints or resizes).
 //!
-//! Nothing here knows which terminal crate is in use: the engine calls [`KohBackend`] methods
-//! (`begin_frame` / `move_to` / `set_style` / `print` / …), whose default implementations emit the
-//! same standard ANSI koh always did — so this path no longer depends on `termina` (or any other
-//! backend) types.
+//! The engine calls [`KohBackend`] methods (`begin_frame` / `move_to` / `set_style` / `print` / …),
+//! whose provided implementations emit standard ANSI; the tests capture those bytes.
 
 use std::io;
 

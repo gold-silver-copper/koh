@@ -86,14 +86,19 @@ error; upgrade both ends.
   `SharedHost`, `Hosts`, `serve_with`, `ClientId`, `AttachKind::Joined`, `ClientState`,
   `run_client_with`, `IrohConnector::with_alpn`, `TERMINAL_ALPN`, the `*_alpns` endpoint binders
   and the `TerminaTerminal` alias. The server hosts a PTY per peer; the client renders a
-  `TerminalScreen`; `ClientTerminal` is no longer generic. The SSP (`SyncState`, `Transport`)
-  stays generic.
+  `TerminalScreen`; `ClientTerminal` is no longer generic.
 - **Host-side hooks only fux read**: `Pty::process_id` (now private),
   `Pty::terminate_process_group`/`shutdown_process_group`, `ServerTerminal::progress` and the
   OSC 9;4 `Progress` parser, the unhandled-OSC ring (`take_unhandled_oscs`, `UNHANDLED_OSC_*`)
   and `ServerTerminal::with_scrollback_screen`.
-- **The `shell` feature.** The shell is always compiled; only the `backend-*` choice and `cli`
-  remain optional.
+- **The `shell` feature.** The shell is always compiled; only `cli` remains optional.
+- **The SSP transport and its test harnesses**: `koh::ssp` (`SyncState`, `Transport`, `testkit`),
+  `koh::wire` (`Instruction`, the fragmenter and reassembler, `PROTOCOL_VERSION`), `koh::input`,
+  `koh::sim`, the `chaos` example, the `test-support` feature and `MonoClock`. koh/3 replaces them.
+- **The terminal backend features**: `backend-termina`, `backend-crossterm` and `backend-qwertty`,
+  with `TerminaBackend`, `CrosstermBackend` and `QwerttyBackend`. The client drives the tty itself
+  through `rustix::termios` (`client::backend::Tty`); its output is byte-for-byte unchanged.
+  `termina`, `crossterm` and `qwertty` are no longer dependencies.
 
 ## [0.12.1] — 2026-09-04
 

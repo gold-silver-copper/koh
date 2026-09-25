@@ -68,11 +68,9 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
 
-  # The optional alternate terminal backend is OFF by default, so the main `gate` never compiles it.
-  # Lint + type-check it on its own so the `client::backend::KohBackend` seam can't silently bitrot
-  # (see src/client/backend/). `--all-targets` type-checks but doesn't run — the default `gate` job
-  # already runs the real PTY/e2e suite against the shipped `termina` backend.
-  backends:
+  # The library without the `cli` feature: clap stays confined to the binary and its argument
+  # adapters, and the library-plus-tests tree still builds.
+  no-cli:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,19 +78,13 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: clippy (crossterm backend, warnings are errors)
-        run: cargo clippy --all-targets --locked --no-default-features --features backend-crossterm -- -D warnings
-      - name: clippy (qwertty backend, warnings are errors)
-        run: cargo clippy --all-targets --locked --no-default-features --features backend-qwertty -- -D warnings
-      # No `cli` feature: clap stays confined to the binary and its argument adapters.
       - name: clippy (library without cli, warnings are errors)
-        run: cargo clippy --lib --locked --no-default-features --features backend-termina -- -D warnings
-      # The library-plus-tests tree without `cli` must still build.
+        run: cargo clippy --lib --locked --no-default-features -- -D warnings
       - name: clippy (all targets without cli, warnings are errors)
-        run: cargo clippy --all-targets --locked --no-default-features --features backend-termina -- -D warnings
+        run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
       - name: no clap in the library-only tree
         run: |
-          if cargo tree --locked --no-default-features --features backend-termina -e normal | grep -q '^.* clap '; then
+          if cargo tree --locked --no-default-features -e normal | grep -q '^.* clap '; then
             echo "::error::clap is in the library-only dependency tree; gate it behind the cli feature"
             exit 1
           fi

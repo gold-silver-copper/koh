@@ -23,32 +23,26 @@ A single crate, organized into small, independently-tested modules:
 src/
 ├── lib.rs           crate root: module declarations + the architecture overview
 ├── main.rs          the `koh` binary: serve / connect / id / key subcommand dispatch
-├── wire.rs          SSP instruction envelope, postcard codec, fragmenter/reassembler
-├── ssp/             SyncState trait + generic Transport<Local,Remote> + send scheduler
-│                      + a deterministic lossy/reordering chaos sim harness (testkit)
-├── terminal/        TerminalScreen state (a cell grid + structured diff) + ServerTerminal (fux-vt)
-├── input.rs         UserInput state: keystrokes + resize as an append-only synced log
+├── proto.rs         the koh/3 wire protocol: client messages, screen frames, caps, pacing
+├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
 ├── predict.rs       local-echo prediction engine (overlays, epochs, adaptive engage)
-├── transport_iroh/  iroh endpoint setup, encrypted identity, datagram channel, RTT, admission
+├── transport_iroh/  iroh endpoint setup, encrypted identity, connection handle, admission
 ├── pty.rs           PTY allocation, shell spawn, SIGWINCH, child reaping
-├── server/          PTY + emulator + Transport<Screen,Input> over iroh + `serve`
-├── client/          input + Transport<Input,Screen> + predictor + backend-agnostic render + `connect`
-│   └── backend/     the KohBackend seam: termina (default) / crossterm / qwertty behind cargo features
+├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
+├── client/          the connection loop + ClientSession core + predictor + render + `connect`
+│   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through rustix::termios)
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
 ├── args.rs          the clap argument structs (`cli` feature only)
 ├── idcmd.rs         `koh id` — print this machine's endpoint id
-├── keycmd.rs        `koh key` — change the passphrase, show info, reset the identity
-└── sim.rs           in-process integration/chaos driver (used by tests + the chaos example)
-tests/               real-iroh e2e, reattach, auto-reconnect, PTY-binary, ported mosh regressions
-examples/chaos.rs    manual `cargo run --example chaos -- chaos --loss 0.5` driver
+└── keycmd.rs        `koh key` — change the passphrase, show info, reset the identity
+tests/net/           koh over a fault-injecting link between real iroh endpoints
+tests/               PTY, PTY-binary, loopback e2e, admission and key tests
 ```
 
-Dependency direction is strict and CI-enforced: `wire ← ssp ← {terminal, input}`, with `predict`
-over `{terminal, input}`, `transport_iroh` over `wire`, and `server`/`client` (+ the `main` binary)
-on top. Only `transport_iroh`, `server`, and `client` touch iroh — the entire protocol (`ssp`,
-`terminal`, `input`, `predict`, `wire`) is transport-agnostic and tested with no network at all.
-`predict` imports nothing from `crate::`, so it is a standalone, reusable terminal-prediction
-library.
+Dependency direction is strict: `proto` sits on `terminal`; `server` and `client` (+ the `main`
+binary) build on both. The protocol cores (`proto`, `terminal`, `predict`, `server::ServerConn`,
+`client::ClientSession`) do no I/O and are tested with no network at all. `predict` imports nothing
+from `crate::` (CI checks it), so it is a standalone terminal-prediction library.
 
 ## The protocol (koh/3)
 
@@ -199,9 +193,9 @@ The full picture is in the [threat model](THREAT_MODEL.md). In brief, the releva
   authenticated by iroh's QUIC + TLS 1.3 handshake *by construction* (no TOFU window — the client
   pins the id it dialed). There is no "accept any peer" mode and no passphrase/PAKE second factor.
 - **The data plane treats every authorized peer as untrusted**: a resize is clamped to `[2, 1000]`
-  before any grid allocation; instruction inflation, fragment replay, reassembly bytes, and
-  received-state accumulation are each explicitly bounded; the QUIC handshake and the 1-byte
-  admission ack are deadline-bounded; and a screen diff is fully validated before it is applied,
+  before any grid allocation; client messages and frames are size-capped and frames inflate under a
+  limit; each end keeps a fixed window of screens; QUIC stream limits and flow control bound what is
+  in flight; the QUIC handshake and the 1-byte admission ack are deadline-bounded; and a screen diff is fully validated before it is applied,
   with no terminal parser on the client (the server's fux-vt emulator is panic-free and bounded).
 - **The identity key is always encrypted at rest** (`koh-key-v1`: Argon2id 64 MiB / 4 passes +
   AES-256-GCM, modeled on `openssh-key-v1`), with an enforced ≥12-char passphrase floor, written
@@ -219,49 +213,40 @@ second *container*. The verification is layered cheapest-first; everything but T
 
 ### Tier 0 — pure logic, no infra (`cargo test`)
 
-The SSP, diff/apply, and predictor are network- and TTY-free, so they're tested deterministically:
+The protocol, diff/apply, predictor and session registry need no network or TTY, so they're tested
+deterministically:
 
 - **State round-trip** — `apply(diff(base→target))` over `base` equals `target`, for screens (incl.
-  wide chars / emoji / combining marks) and input.
-- **Transport under chaos** (`ssp::testkit`) — two transports through a seeded
-  lossy/latent/reordering/duplicating link; asserts convergence *and* that the newest applied state
-  number never regresses (the no-head-of-line-blocking guard).
-- **Terminal / predictor / PTY / fragmenter** — diff+resize, predict→confirm→clear,
-  predict→no-echo→suppress, real-shell streaming, fragment supersede/reassemble.
-- **Property tests** on the attacker-reachable parsers — `Transport::recv` over arbitrary envelopes,
-  `FragmentAssembly::add` over adversarial sequences, `decrypt_key` over arbitrary payloads — assert
-  never-panic and bounded. Plus coverage-guided fuzz targets (`screen_apply` over the structured diff,
-  `server_process`, `wire_decode`).
-- **Whole-stack chaos** — input + screen + transport + collapse + echo-ack over the simulated link:
-  `cargo run --example chaos -- chaos --loss 0.5` (or `cargo test --test integration`).
+  wide chars / emoji / combining marks).
+- **Protocol cores** — `ClientSession` and `ServerConn` driven with synthesized frames and
+  messages: bases, acknowledgements, resyncs, the frame window, pacing, retries, heartbeats,
+  backpressure and shutdown; `proto` round-trips, size caps, truncation and inflate bombs.
+- **Terminal / predictor / PTY / sessions** — diff+resize, predict→confirm→clear,
+  predict→no-echo→suppress, real-shell streaming, attach/reattach/cap/TTL/teardown.
+- **Property tests and fuzzing** on the attacker-reachable parsers — assert never-panic and bounded.
+  Coverage-guided fuzz targets: `screen_apply` (the structured diff), `server_process` and
+  `proto_decode` (both directions of the wire).
 
-### Tier 1 — two endpoints + a PTY on localhost, over *real* iroh (`cargo test`)
+### Tier 1 — real iroh endpoints on one machine (`cargo test`)
 
-The big unlock, with **zero infrastructure**: a second host is just a second endpoint, and a TTY is
-just an allocated PTY. Both are real and hermetic.
+A second host is just a second endpoint, and a TTY is just an allocated PTY.
 
-- **`transport_iroh` module tests** — two real iroh endpoints connect over loopback (relay-less,
-  `bind_endpoint_local`) and exchange datagrams.
-- **`tests/e2e_loopback.rs`** — the *entire* loop in one process: scripted keystroke → client → iroh
-  datagram → server → PTY-hosted `sh` → fux-vt → iroh → client render. Asserts the typed command's
-  output round-trips.
+- **`tests/net/`** — a real `koh serve` accept loop and a real `koh connect` client loop on iroh
+  endpoints whose only path is an in-process fault-injecting link (`tests/net/link.rs`, an iroh
+  custom transport): loss, delay, jitter, duplication, reordering and outages under real QUIC. It
+  covers screen convergence (and that a stale screen is never shown), exactly-once ordered input,
+  reattach, a forced mid-session drop, exit status, resize, XON/XOFF, input backpressure, the bell
+  hook, prediction and the no-echo property, and hostile clients and servers. An `#[ignore]`d
+  baseline measures echo latency, output bursts, bytes and outage recovery per network profile.
+- **`tests/e2e_loopback.rs`** — the whole loop over loopback: scripted keystroke → client → iroh →
+  server → PTY-hosted `sh` → fux-vt → iroh → client render.
 - **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** attached to an allocated PTY (so
-  `isatty()` is true and raw-mode + termina run for real), driven by scripted keystrokes with
-  rendered frames read back from the master, connected with `--direct` to an in-process server.
-- **`tests/reattach.rs`** — the detachable-session acceptance test: type a marker, disconnect,
-  reconnect from the *same* client endpoint, assert the session re-syncs to the persisted screen.
-- **`tests/e2e_reconnect.rs`** — the auto-reconnect regression test: mid-session the server
-  force-closes the connection while keeping the shell; asserts the client transparently re-dials,
-  reattaches to the *same* shell, and keeps working.
-- **`tests/exit_status.rs`** — a loopback session where `sh` runs `exit 42`; asserts the client
-  observes exit code `42` on the shutdown frame.
+  `isatty()` is true and raw mode runs for real), driven by scripted keystrokes with rendered
+  frames read back from the master, connected with `--direct` to an in-process server.
 
-The seam that makes this cheap: terminal I/O is abstracted behind `ClientTerminal`, so the same
-session loop runs against the real backend path (binary) or a captured-cells mock (fast test). One
-layer down, the *rendering* is abstracted again behind `client::backend::KohBackend` — the escape
-emission has no dependency on any specific terminal crate (its default methods write standard ANSI),
-so `termina` (default), `crossterm`, and `qwertty` are interchangeable at build time and a new backend
-only wires up raw-mode + size.
+Terminal I/O is behind `ClientTerminal`, so the same session loop runs against the real terminal
+(binary) or a capturing mock (tests). One layer down, `client::backend::KohBackend`'s provided
+methods emit all the ANSI, so the bytes are pinned by tests against a capturing backend.
 
 ### Tier 2 — Android emulator: runtime, network realism, resilience ([`testing/android/`](../testing/android/))
 

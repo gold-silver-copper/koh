@@ -2,8 +2,8 @@
 # <target>`; needs `cargo install cargo-fuzz`). Standalone package — NOT a workspace member of koh, so
 # `cargo build`/`cargo test` in the parent never touch it, and it is excluded from the published
 # .crate. One harness per attacker-reachable parser (the OpenSSH / OSS-Fuzz one-harness-per-parser
-# doctrine): server->client screen apply (the structured diff), the server emulator and the wire
-# instruction decoder.
+# doctrine): server->client screen apply (the structured diff), the server emulator, the wire
+# instruction decoder and the koh/3 message decoders.
 [package]
 name = "koh-fuzz"
 version = "0.0.0"
@@ -29,6 +29,13 @@ bench = false
 [[bin]]
 name = "wire_decode"
 path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_decode"
+path = "fuzz_targets/proto_decode.rs"
 test = false
 doc = false
 bench = false

@@ -127,7 +127,7 @@ jobs:
   # Coverage-guided fuzzing of the untrusted-input decode surfaces (the OpenSSH/OSS-Fuzz doctrine:
   # one harness per attacker-reachable parser). Builds the harnesses, then a short smoke run that
   # MUST stay crash-free — `screen_apply` proves the structured-diff apply never panics, `wire_decode`
-  # proves the wire decoders only Err (never panic) on arbitrary bytes.
+  # and `proto_decode` prove the wire decoders only Err (never panic) on arbitrary bytes.
   fuzz:
     runs-on: ubuntu-latest
     steps:
@@ -142,4 +142,5 @@ jobs:
         run: |
           cargo +nightly fuzz run screen_apply -- -max_total_time=45 -rss_limit_mb=4096
           cargo +nightly fuzz run wire_decode  -- -max_total_time=45 -rss_limit_mb=4096
+          cargo +nightly fuzz run proto_decode -- -max_total_time=45 -rss_limit_mb=4096
           cargo +nightly fuzz run server_process -- -max_total_time=45 -rss_limit_mb=4096

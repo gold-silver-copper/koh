@@ -85,6 +85,7 @@ panic_free! {
     pub mod input;
     pub mod keycmd;
     pub mod predict;
+    pub mod proto;
     pub mod pty;
     pub mod server;
     pub mod ssp;

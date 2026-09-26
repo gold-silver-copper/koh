@@ -92,6 +92,9 @@ error; upgrade both ends.
   largest size a client may ask for (1000×1000, about 32 MB a screen) that was about 680 MB, from
   one resize. Frames now share the screen they show, and the unacknowledged ones hold at most one
   screen of that size beyond the newest; the wire protocol is unchanged.
+- A session at a large size whose program wrote a lot at once could make `koh serve` briefly take
+  gigabytes of memory: the server took a whole new snapshot of the screen for every 8 KiB the
+  program wrote. It now takes one per burst of output (up to 64 reads).
 - **A session whose program stopped reading its input could keep `koh serve` from ever exiting**
   on Linux and Android. Input is written to the terminal from a dedicated thread; once the
   terminal's input queue was full that write blocked, and the kernel never woke it — not even once

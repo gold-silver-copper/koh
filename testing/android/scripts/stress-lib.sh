@@ -107,6 +107,12 @@ stop_all_koh() {
   while [ -n "$(koh_pids)" ] && [ "$_j" -lt 10 ]; do _j=$((_j + 1)); sleep 1; done
   if [ -n "$(koh_pids)" ]; then
     bad "koh did not exit within 10s of SIGTERM (pids: $(koh_pids))"
+    # What each is waiting on, for the report, before it is killed.
+    for _p in $(koh_pids); do
+      adb $ADB_SERIAL shell "echo \"    pid $_p: \$(tr '\\0' ' ' < /proc/$_p/cmdline | cut -c1-60)\";
+        for t in /proc/$_p/task/*; do echo \"      \$(cat \$t/comm) \$(cut -d' ' -f3 \$t/stat) \$(cat \$t/wchan)\"; done" 2>/dev/null || true
+    done
+    cat_dev "$SRV_LOG" | sed 's/\x1b\[[0-9;]*m//g' | grep -E 'INFO|WARN|ERROR' | tail -4 | sed 's/^/      log| /'
     adb $ADB_SERIAL shell "pkill -9 -f $DEVICE_BIN" >/dev/null 2>&1 || true
   fi
 }

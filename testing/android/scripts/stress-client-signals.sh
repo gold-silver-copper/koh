@@ -37,8 +37,13 @@ while [ "$w" -lt 16 ]; do
 done
 [ "$ran" = 1 ] && ok "Ctrl-^ Ctrl-Z ran the suspend path on-device (printed the suspend notice, handed back the TTY)" \
   || bad "the suspend path did not run on Ctrl-^ Ctrl-Z (no suspend notice)"
-# The client must not have crashed doing it (SIGTSTP discarded → it keeps running here).
-{ [ -n "$(other_pid "$SPID")" ] || grep -aq 'koh suspended' "$HLOG"; } && ok "client handled the suspend without crashing" || bad "client crashed during the suspend path"
+# The client must not have crashed doing it (SIGTSTP discarded → it keeps running here, until it
+# quits 8s after the suspend).
+if [ -n "$(other_pid "$SPID")" ] && assert_no_crash "$(cat "$HLOG")" >/dev/null; then
+  ok "client handled the suspend without crashing"
+else
+  bad "client crashed during the suspend path"
+fi
 
 wait "$SIGA_BG" 2>/dev/null || true
 rm -f "$HLOG"
@@ -53,6 +58,7 @@ pty_connect_host_bg /data/local/tmp/koh-sigb.key "$HLOGB" 30 ""
 w=0; C2=""
 while [ "$w" -lt 12 ]; do C2="$(other_pid "$SPID")"; [ -n "$C2" ] && break; w=$((w + 1)); sleep 1; done
 [ -n "$C2" ] || { bad "client (b) never attached"; rm -f "$HLOGB"; finish "stress-client-signals"; }
+wait_attached /data/local/tmp/koh-sigb.key 12 || { bad "client (b) never attached"; rm -f "$HLOGB"; finish "stress-client-signals"; }
 
 adb $ADB_SERIAL shell "kill -TERM $C2" >/dev/null 2>&1 || true
 gone=0; w=0

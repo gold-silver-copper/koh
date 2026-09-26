@@ -32,12 +32,7 @@ esac
 
 built() { for a in $ARTIFACTS; do [ -x "$a" ] || return 1; done; }
 
-# Already built? (callers may force a rebuild by deleting the artifact)
-if built && [ -z "${KOH_FORCE_BUILD:-}" ]; then
-  echo "Android build already present: $ARTIFACTS (set KOH_FORCE_BUILD=1 to rebuild)"
-  exit 0
-fi
-
+# Always run cargo: it rebuilds only what changed, so a run never tests a stale binary.
 rustup target add "$ANDROID_TARGET" >/dev/null 2>&1 || true
 cd "$DIR"
 

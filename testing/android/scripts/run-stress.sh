@@ -13,6 +13,9 @@ bootstrap_sdk_env
 require_device_or_skip
 echo "Device: ${ADB_SERIAL#-s }   level: ${KOH_STRESS_LEVEL:-quick}"
 wait_for_boot || { echo "ERROR: device never finished booting" >&2; exit 1; }
+# Rebuild what changed since the last run (a no-op when nothing did).
+sh "$HERE/build-android.sh"
+sh "$HERE/build-android.sh" evil
 push_binary
 echo
 

@@ -29,7 +29,7 @@ unicode-width = "0.2"
 # launcher (a new session with the PTY as its controlling terminal), the client's terminal (raw
 # mode, the window size), `poll` on stdin, signals and `O_NOFOLLOW`. koh writes its own ANSI and
 # reads raw stdin itself.
-fuxix = "0.1.1"
+fuxix = "0.1.2"
 # serialization. default-features = false drops postcard's `heapless-cas` default, whose
 # `atomic-polyfill` transitive dep is unmaintained (RUSTSEC-2023-0089); we only need `use-std`
 # (which pulls `alloc`) for `to_allocvec`/`from_bytes`.

@@ -990,9 +990,9 @@ dependencies = [
 
 [[package]]
 name = "fuxix"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af315c3816b751b1fe0916e08d6d8ba2a37394c423e30c7652a8b6e31b82d263"
+checksum = "c3bcb54e67ae7f3e99d96ca3237fd58261112348f8140b8d5da83c28fa9cb20c"
 dependencies = [
  "libc",
 ]

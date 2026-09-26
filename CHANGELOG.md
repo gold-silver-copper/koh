@@ -86,6 +86,11 @@ error; upgrade both ends.
   `der` 0.8.0 → 0.8.2 and `spin` 0.10.0 → 0.10.1.
 
 ### Fixed
+- On macOS, starting a session could fail with "Unknown error: -6", stall for up to about half a
+  second, or, rarely, hang for good, while PTYs were being allocated concurrently anywhere on the
+  machine. These are two races in the macOS kernel's PTY driver; fuxix 0.1.2 works around both
+  ([fux#64](https://github.com/gold-silver-copper/fux/pull/64), which also has a report for Apple),
+  and koh no longer serializes PTY allocation itself.
 - A short-lived hosted program could lose **all** of its output on macOS (about 3 in 1000 spawns
   under load): the PTY reader started only after the child was spawned, and when a child wrote and
   exited before anything read the master, the queued output was discarded. The reader now runs

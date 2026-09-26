@@ -301,19 +301,9 @@ impl Pty {
         term: &str,
         launcher: &Launcher,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
-        // Concurrent allocations on macOS intermittently fail inside `posix_openpt` with a bogus
-        // errno (-6 was seen under the short-lived-children test), although fuxix names the slave
-        // without `ptsname`'s shared buffer. Allocation is quick; serialize it. A poisoned lock
-        // only means another spawn panicked mid-allocation, which leaves nothing to protect, so it
-        // is recovered rather than propagated.
-        static OPEN_PTY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let (master, slave) = {
-            let _serialized = OPEN_PTY
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            fuxix::pty::open(rows, cols)
-        }
-        .map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
+        // fuxix serializes the allocation itself and works around macOS's PTY races.
+        let (master, slave) =
+            fuxix::pty::open(rows, cols).map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
 
         // Start reading the master BEFORE the child exists. If a short-lived child writes and exits
         // (closing the last slave fd) while nothing is reading the master, macOS discards the

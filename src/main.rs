@@ -31,6 +31,11 @@ enum Cmd {
 
 // An explicit runtime instead of `#[tokio::main]`, whose expansion `allow`s `clippy::expect_used`.
 fn main() -> std::process::ExitCode {
+    // `koh serve` starts each session's program through this binary (`koh __launch …`): a hidden
+    // subcommand, handled before the command line is parsed or any thread starts.
+    if let Some(argv) = koh_core::pty::launch_argv() {
+        return std::process::ExitCode::from(koh_core::pty::launched(&argv));
+    }
     let cli = Cli::parse();
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

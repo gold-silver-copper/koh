@@ -121,6 +121,7 @@ impl From<ServeArgs> for koh_core::server::ServeConfig {
             local: a.local,
             max_connections: a.max_connections,
             max_sessions: a.max_sessions,
+            launcher: koh_core::pty::Launcher::this_binary(),
         }
     }
 }

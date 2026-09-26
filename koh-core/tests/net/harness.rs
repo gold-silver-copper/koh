@@ -42,6 +42,7 @@ impl Server {
             allow: allow.iter().map(format_endpoint_id).collect(),
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
             scrollback: 0,
+            launcher: koh_core::pty::Launcher::new(env!("CARGO_BIN_EXE_koh-launch")),
             ..ServeConfig::default()
         };
         let hosting = Hosting::from_config(&config)?;

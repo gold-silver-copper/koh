@@ -60,7 +60,13 @@ fn full_session_over_loopback_pty() {
             let incoming = server_ep.accept().await.expect("server accept");
             let conn = incoming.await.expect("server handshake");
             // `sh` is portable and quiet; scrollback 0.
-            let _ = run_session(conn, &["sh".to_owned()], 0).await;
+            let _ = run_session(
+                conn,
+                &["sh".to_owned()],
+                0,
+                koh_core::pty::Launcher::new(env!("CARGO_BIN_EXE_koh-launch")),
+            )
+            .await;
         });
 
         // --- client: connect and run the real session loop against a mock terminal ---

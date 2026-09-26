@@ -9,11 +9,3 @@ pub fn current_thread() -> Runtime {
         .build()
         .expect("tokio runtime")
 }
-
-pub fn multi_thread(workers: usize) -> Runtime {
-    Builder::new_multi_thread()
-        .worker_threads(workers)
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-}

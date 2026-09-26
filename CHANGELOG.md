@@ -22,6 +22,12 @@ client and a 0.13 server (or the reverse) refuse each other at the TLS handshake
 error; upgrade both ends.
 
 ### Changed
+- **`koh serve` starts each session's program through `koh __launch`**, a hidden subcommand of
+  its own binary that makes the program a session leader with the PTY as its controlling
+  terminal, then becomes it. The program sees what it did before: argv verbatim, `TERM`, no
+  `KOH_*` variables, default signal handling, and no descriptor beyond stdio. `portable-pty` and
+  `nix` are no longer dependencies; fux's `fuxix` makes the system calls (Linux, Android and
+  macOS, as before).
 - **`RUST_LOG` takes `target=level` directives and bare levels only**, such as
   `RUST_LOG=koh_core::server=debug,iroh=warn` or `RUST_LOG=debug`. Span, field and regex filters
   are no longer understood; a `RUST_LOG` koh cannot read gives the default filter, as before. koh

@@ -33,17 +33,18 @@ pub struct PtyHost {
 }
 
 impl PtyHost {
-    /// Spawn the program and its emulator at the default geometry, returning the host and the PTY
-    /// output receiver the session task drains. `command[0]` is the program; empty means the login
-    /// shell.
+    /// Spawn the program through `launcher` and its emulator at the default geometry, returning the
+    /// host and the PTY output receiver the session task drains. `command[0]` is the program; empty
+    /// means the login shell.
     pub fn spawn(
         command: &[String],
         scrollback: usize,
+        launcher: &crate::pty::Launcher,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let (rows, cols) = (DEFAULT_ROWS, DEFAULT_COLS);
         let emu = ServerTerminal::new(rows, cols, scrollback)
             .context("creating the terminal emulator")?;
-        let (pty, pty_rx) = crate::pty::Pty::spawn(rows, cols, command, "xterm-256color")
+        let (pty, pty_rx) = crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", launcher)
             .context("spawning shell")?;
         Ok((Self { emu, pty }, pty_rx))
     }
@@ -333,6 +334,8 @@ pub struct SessionSpec {
     pub scrollback: usize,
     pub max_sessions: usize,
     pub ttl: Duration,
+    /// The binary each session's program is started through.
+    pub launcher: crate::pty::Launcher,
 }
 
 impl Registry {
@@ -434,7 +437,7 @@ async fn attach_in(
     if sessions.len() >= spec.max_sessions {
         return None;
     }
-    let (host, pty_rx) = PtyHost::spawn(&spec.command, spec.scrollback)
+    let (host, pty_rx) = PtyHost::spawn(&spec.command, spec.scrollback, &spec.launcher)
         .map_err(|e| tracing::error!(error = %e, "spawning a session failed"))
         .ok()?;
     let (control, control_rx) = mpsc::channel(16);
@@ -459,150 +462,4 @@ async fn attach_in(
         .ok()?;
     let (client, _) = rx.await.ok()?;
     Some((client, AttachKind::Created))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn registry(max_sessions: usize, ttl: Duration) -> Registry {
-        Registry::spawn(SessionSpec {
-            command: vec!["sleep".to_owned(), "30".to_owned()].into(),
-            scrollback: 0,
-            max_sessions,
-            ttl,
-        })
-    }
-
-    /// Attach `peer`, retrying briefly (a just-reaped session may still be clearing).
-    async fn attach_kind(reg: &Registry, peer: EndpointId) -> Option<AttachKind> {
-        reg.attach(peer).await.map(|(_, kind)| kind)
-    }
-
-    #[test]
-    fn attach_creates_then_reattaches_the_same_peer() {
-        crate::test_runtime::multi_thread(2).block_on(async {
-            let reg = registry(4, Duration::from_secs(30));
-            let peer = crate::transport_iroh::generate_secret_key()
-                .expect("OS randomness")
-                .public();
-            let (client, kind) = reg.attach(peer).await.expect("first attach");
-            assert_eq!(kind, AttachKind::Created);
-            let (_c2, kind) = reg.attach(peer).await.expect("second attach");
-            assert!(
-                matches!(kind, AttachKind::Reattached { .. }),
-                "same peer reattaches"
-            );
-            drop(client);
-            reg.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() {
-        crate::test_runtime::multi_thread(2).block_on(async {
-            let reg = registry(1, Duration::from_secs(30));
-            let a = crate::transport_iroh::generate_secret_key()
-                .expect("OS randomness")
-                .public();
-            let b = crate::transport_iroh::generate_secret_key()
-                .expect("OS randomness")
-                .public();
-            let (a_client, _) = reg
-                .attach(a)
-                .await
-                .expect("A creates the one allowed session");
-            assert!(
-                reg.attach(b).await.is_none(),
-                "a second distinct peer is refused at the cap"
-            );
-            assert!(
-                matches!(
-                    attach_kind(&reg, a).await,
-                    Some(AttachKind::Reattached { .. })
-                ),
-                "the existing peer still reattaches at the cap"
-            );
-            drop(a_client);
-            reg.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() {
-        crate::test_runtime::multi_thread(2).block_on(async {
-            let reg = registry(4, Duration::from_millis(150));
-            let peer = crate::transport_iroh::generate_secret_key()
-                .expect("OS randomness")
-                .public();
-            let (a, _) = reg.attach(peer).await.expect("A");
-            let (b, _) = reg
-                .attach(peer)
-                .await
-                .expect("B (concurrent, same session)");
-            // Dropping ONE of two attached clients must not start the TTL.
-            drop(a);
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            assert!(
-                matches!(
-                    attach_kind(&reg, peer).await,
-                    Some(AttachKind::Reattached { .. })
-                ),
-                "with one client still attached the session must survive past the TTL"
-            );
-            // Now drop every client; after the TTL the session is reaped and a fresh attach creates one.
-            drop(b);
-            drop(reg.attach(peer).await.expect("reattach C").0);
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            assert_eq!(
-                attach_kind(&reg, peer).await,
-                Some(AttachKind::Created),
-                "after the last detach and the TTL the session is gone"
-            );
-            reg.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn a_session_whose_shell_exited_is_torn_down() {
-        crate::test_runtime::multi_thread(2).block_on(async {
-            let reg = Registry::spawn(SessionSpec {
-                command: vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()].into(),
-                scrollback: 0,
-                max_sessions: 4,
-                ttl: Duration::from_secs(30),
-            });
-            let peer = crate::transport_iroh::generate_secret_key()
-                .expect("OS randomness")
-                .public();
-            let (mut client, kind) = reg.attach(peer).await.expect("attach");
-            assert_eq!(kind, AttachKind::Created);
-            // Wait for the final (exited) screen, then detach.
-            for _ in 0..100 {
-                if client.screen().exit_code().is_some() {
-                    break;
-                }
-                let _ = tokio::time::timeout(Duration::from_millis(50), client.next_screen()).await;
-            }
-            assert!(
-                client.screen().exit_code().is_some(),
-                "the exit code reaches the screen"
-            );
-            drop(client);
-            // The session tears down once the client that saw the exit detaches; a fresh attach creates.
-            let mut created = false;
-            for _ in 0..100 {
-                if attach_kind(&reg, peer).await == Some(AttachKind::Created) {
-                    created = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(
-                created,
-                "an exited session is torn down and the next attach creates a new one"
-            );
-            reg.shutdown().await;
-        });
-    }
 }

@@ -550,18 +550,21 @@ async fn send_frame(conn: iroh::endpoint::Connection, bytes: Vec<u8>, cancel: Ca
 
 /// Convenience: run a one-session, one-connection server for `conn`.
 ///
-/// Spawns a registry that hosts a single session, attaches this connection, serves it, and tears
-/// the session down afterwards. Used by tests and callers that don't need the full accept loop.
+/// Spawns a registry that hosts a single session, started through `launcher`, attaches this
+/// connection, serves it, and tears the session down afterwards. Used by tests and callers that
+/// don't need the full accept loop.
 pub async fn run_session(
     conn: iroh::endpoint::Connection,
     command: &[String],
     scrollback: usize,
+    launcher: crate::pty::Launcher,
 ) -> anyhow::Result<()> {
     let registry = Registry::spawn(SessionSpec {
         command: command.to_vec().into(),
         scrollback,
         max_sessions: 1,
         ttl: Duration::from_secs(1),
+        launcher,
     });
     let peer = conn.remote_id();
     if let Some((client, _)) = registry.attach(peer).await {
@@ -577,8 +580,7 @@ mod tests {
 
     use super::{CursorKeyNormalizer, Drained, EchoAck, ServerConn, FINAL_ACK_WAIT};
     use crate::proto::{
-        decode_frame, encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
-        FRAME_WINDOW, HEARTBEAT, MAX_FRAME,
+        encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_WINDOW, HEARTBEAT,
     };
     use crate::terminal::TerminalScreen;
 
@@ -956,224 +958,5 @@ mod tests {
             unacked.finished(sent + FINAL_ACK_WAIT),
             "unacked: done after the wait"
         );
-    }
-
-    // --- run_session / run_attached over real iroh, with a minimal koh/3 client.
-
-    /// A bare koh/3 client: writes messages, applies frames whose base it holds, and acks them.
-    struct RawClient {
-        conn: iroh::endpoint::Connection,
-        send: iroh::endpoint::SendStream,
-        frames: tokio::sync::mpsc::Receiver<Frame>,
-        screens: std::collections::HashMap<FrameNum, TerminalScreen>,
-        newest: FrameNum,
-        echo_ack: InputSeq,
-        last_seq: InputSeq,
-        _endpoint: iroh::Endpoint,
-    }
-
-    impl RawClient {
-        async fn connect(addr: iroh::EndpointAddr) -> Self {
-            Self::connect_as(
-                addr,
-                crate::transport_iroh::generate_secret_key().expect("OS randomness"),
-            )
-            .await
-        }
-
-        async fn connect_as(addr: iroh::EndpointAddr, secret: iroh::SecretKey) -> Self {
-            use crate::transport_iroh::{bind_endpoint_local, ALPN};
-            let endpoint = bind_endpoint_local(secret, false)
-                .await
-                .expect("bind client");
-            let conn = endpoint.connect(addr, ALPN).await.expect("connect");
-            let send = conn.open_uni().await.expect("open the client stream");
-            let (tx, frames) = tokio::sync::mpsc::channel(64);
-            let reader = conn.clone();
-            tokio::spawn(async move {
-                while let Ok(mut recv) = reader.accept_uni().await {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        if let Ok(bytes) = recv.read_to_end(MAX_FRAME).await {
-                            if let Ok(frame) = decode_frame(&bytes) {
-                                let _ = tx.send(frame).await;
-                            }
-                        }
-                    });
-                }
-            });
-            Self {
-                conn,
-                send,
-                frames,
-                screens: std::collections::HashMap::from([(
-                    FrameNum::BLANK,
-                    TerminalScreen::default(),
-                )]),
-                newest: FrameNum::BLANK,
-                echo_ack: InputSeq(0),
-                last_seq: InputSeq(0),
-                _endpoint: endpoint,
-            }
-        }
-
-        async fn write(&mut self, msg: &ClientMsg) {
-            self.send
-                .write_all(&encode_client(msg).unwrap())
-                .await
-                .expect("write the client stream");
-        }
-
-        async fn type_bytes(&mut self, bytes: &[u8]) {
-            self.last_seq = self.last_seq.next();
-            let msg = ClientMsg::Input {
-                seq: self.last_seq,
-                bytes: bytes.to_vec(),
-            };
-            self.write(&msg).await;
-        }
-
-        /// Apply and ack frames for `ms`.
-        async fn pump(&mut self, ms: u64) {
-            let deadline = tokio::time::Instant::now()
-                .checked_add(Duration::from_millis(ms))
-                .expect("deadline within range");
-            while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, self.frames.recv()).await
-            {
-                if frame.num <= self.newest {
-                    continue;
-                }
-                let Some(base) = self.screens.get(&frame.base) else {
-                    continue;
-                };
-                let mut next = base.clone();
-                next.apply(&frame.diff);
-                self.screens.insert(frame.num, next);
-                self.newest = frame.num;
-                self.echo_ack = self.echo_ack.max(frame.echo_ack);
-                self.write(&ClientMsg::Ack { frame: frame.num }).await;
-            }
-        }
-
-        fn screen(&self) -> &TerminalScreen {
-            &self.screens[&self.newest]
-        }
-    }
-
-    #[test]
-    fn run_session_delivers_keys_and_clamped_resizes_then_kills_the_shell() {
-        crate::test_runtime::multi_thread(2).block_on(async {
-            use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
-            let server_ep =
-                bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
-                    .await
-                    .expect("bind");
-            let addr = loopback_addr(&server_ep);
-            let accept = tokio::spawn(async move {
-                let incoming = server_ep.accept().await.expect("incoming");
-                let conn = incoming.await.expect("handshake");
-                super::run_session(conn, &["cat".to_owned()], 0).await
-            });
-            let mut client = RawClient::connect(addr).await;
-            client
-                .write(&ClientMsg::Resize {
-                    rows: 65000,
-                    cols: 1,
-                })
-                .await;
-            client.type_bytes(b"xy").await;
-            let clamped = crate::terminal::clamp_dims(65000, 1);
-            for _ in 0..100 {
-                client.pump(100).await;
-                let s = client.screen();
-                if s.screen().contents().contains("xy")
-                    && s.size() == clamped
-                    && client.echo_ack >= InputSeq(1)
-                {
-                    break;
-                }
-            }
-            assert!(
-                client.screen().screen().contents().contains("xy"),
-                "input reached the program"
-            );
-            assert_eq!(
-                client.screen().size(),
-                clamped,
-                "the resize arrives clamped"
-            );
-            assert_eq!(
-                client.echo_ack,
-                InputSeq(1),
-                "the input is acknowledged as echoed"
-            );
-            client.conn.close(0u32.into(), b"done");
-            tokio::time::timeout(Duration::from_secs(5), accept)
-                .await
-                .expect("run_session returns after the connection ends")
-                .expect("accept task")
-                .expect("run_session");
-        });
-    }
-
-    #[test]
-    fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_input() {
-        crate::test_runtime::multi_thread(2).block_on(async {
-            // Two connections on ONE session (a peer's reconnect racing its old connection). A types
-            // many times, B once. Each must only ever be acked for input it sent.
-            use crate::server::{Registry, SessionSpec};
-            use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
-            let server_ep =
-                bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
-                    .await
-                    .expect("bind");
-            let addr = loopback_addr(&server_ep);
-            let registry = Registry::spawn(SessionSpec {
-                command: vec!["cat".to_owned()].into(),
-                scrollback: 0,
-                max_sessions: 4,
-                ttl: Duration::from_secs(30),
-            });
-            let accept = tokio::spawn(async move {
-                while let Some(incoming) = server_ep.accept().await {
-                    let registry = registry.clone();
-                    tokio::spawn(async move {
-                        if let Ok(conn) = incoming.await {
-                            if let Some((client, _)) = registry.attach(conn.remote_id()).await {
-                                let _ = super::run_attached(conn, client).await;
-                            }
-                        }
-                    });
-                }
-            });
-            // Both connections share one client identity, so they land on ONE session.
-            let secret = generate_secret_key().expect("OS randomness");
-            let mut a = RawClient::connect_as(addr.clone(), secret.clone()).await;
-            let mut b = RawClient::connect_as(addr, secret).await;
-            for _ in 0..30 {
-                a.type_bytes(b"a").await;
-                a.pump(20).await;
-                b.pump(20).await;
-                assert!(
-                    a.echo_ack <= a.last_seq,
-                    "A was acked for input it never sent"
-                );
-                assert_eq!(b.echo_ack, InputSeq(0), "B was handed A's echo-ack");
-            }
-            b.type_bytes(b"b").await;
-            for _ in 0..50 {
-                a.pump(20).await;
-                b.pump(20).await;
-                if b.echo_ack == InputSeq(1) && a.echo_ack == a.last_seq {
-                    break;
-                }
-            }
-            assert_eq!(b.echo_ack, InputSeq(1), "B is acked for its own one input");
-            assert_eq!(
-                a.echo_ack, a.last_seq,
-                "A is acked up to its own last input"
-            );
-            accept.abort();
-        });
     }
 }

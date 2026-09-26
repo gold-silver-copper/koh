@@ -3,41 +3,35 @@
 //! This is the standard way to test a terminal program headlessly: open a pseudo-terminal,
 //! launch the client on the slave (so `isatty()` is true and raw mode runs for
 //! real), and drive the master side by writing scripted keystrokes and reading back the
-//! rendered frames. The server is an in-process loopback endpoint; the client connects with
+//! rendered frames. Every program here starts through `koh __launch`, as `koh serve`'s do. The server is an in-process loopback endpoint; the client connects with
 //! `--direct`, so the whole thing is hermetic — no relay, no second machine, no real TTY.
 //!
 //! Unlike the mock-terminal e2e, this exercises the actual binary: argument parsing, raw-mode
 //! lifecycle, the renderer, and stdin passthrough — the real terminal path.
 
-// Integration test: a failed unwrap/expect/assert IS the test failing.
-#![expect(
-    clippy::string_slice,
-    reason = "integration test code; panics are assertion failures"
-)]
-
-use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use koh_core::pty::{Launcher, Pty};
 use koh_core::server::run_session;
 use koh_core::transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_client_binary_renders_over_pty() {
-    // --- in-process loopback server with a real shell ---
-    let server_ep = bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
-        .await
-        .expect("bind server");
+/// The `koh` binary, as the launcher every program here starts through.
+fn launcher() -> Launcher {
+    Launcher::new(env!("CARGO_BIN_EXE_koh"))
+}
+
+/// A loopback server hosting `sh` for one connection: its id and IPv4 port, and its task.
+async fn loopback_server() -> anyhow::Result<(String, u16, tokio::task::JoinHandle<()>)> {
+    let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
     let server_id = format_endpoint_id(&server_ep.id());
     let server_port = server_ep
         .bound_sockets()
         .iter()
         .find(|s| s.is_ipv4())
         .map(std::net::SocketAddr::port)
-        .expect("server v4 port");
-
-    let server_task = tokio::spawn(async move {
+        .ok_or_else(|| anyhow::anyhow!("no IPv4 socket"))?;
+    let task = tokio::spawn(async move {
         if let Some(incoming) = server_ep.accept().await {
             if let Ok(conn) = incoming.await {
                 // The real client binary awaits an admission ack after connect; mirror the server
@@ -46,104 +40,22 @@ async fn real_client_binary_renders_over_pty() {
                     .await
                     .is_ok()
                 {
-                    let _ = run_session(conn, &["sh".to_owned()], 0).await;
+                    let _ = run_session(conn, &["sh".to_owned()], 0, launcher()).await;
                 }
             }
         }
     });
-
-    // --- launch the real client binary attached to a PTY slave ---
-    let key_path = std::env::temp_dir().join(format!("koh-pty-test-{}.key", std::process::id()));
-    let _ = std::fs::remove_file(&key_path);
-
-    let pty = native_pty_system();
-    let pair = pty
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty");
-
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_koh"));
-    cmd.arg("connect");
-    cmd.arg(&server_id);
-    cmd.arg("--direct");
-    cmd.arg(format!("127.0.0.1:{server_port}"));
-    cmd.arg("--key-file");
-    cmd.arg(&key_path);
-    cmd.env("TERM", "xterm-256color");
-    // The client creates its identity key on first run, without a prompt.
-
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn client binary");
-    drop(pair.slave);
-
-    // Read everything the client renders into a shared buffer.
-    let mut reader = pair.master.try_clone_reader().expect("clone reader");
-    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let buf_reader = buf.clone();
-    std::thread::spawn(move || {
-        let mut tmp = [0u8; 8192];
-        loop {
-            match reader.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf_reader.lock().unwrap().extend_from_slice(&tmp[..n]),
-            }
-        }
-    });
-    let mut writer = pair.master.take_writer().expect("take writer");
-
-    // Give the binary time to connect over loopback iroh and do the initial screen sync.
-    tokio::time::sleep(Duration::from_millis(2000)).await;
-
-    // Type a command with a distinctive marker; it round-trips to `sh` and back as a frame.
-    writer
-        .write_all(b"echo koh_pty_marker\r")
-        .expect("write keystrokes");
-    writer.flush().expect("flush keystrokes");
-
-    let contains_marker = |b: &Arc<Mutex<Vec<u8>>>| {
-        String::from_utf8_lossy(&b.lock().unwrap()).contains("koh_pty_marker")
-    };
-
-    let mut seen = false;
-    for _ in 0..150 {
-        if contains_marker(&buf) {
-            seen = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    // Disconnect via the escape sequence (Ctrl-^ then '.'), then ensure teardown.
-    let _ = writer.write_all(&[0x1e, b'.']);
-    let _ = writer.flush();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let _ = child.kill();
-    server_task.abort();
-    let _ = std::fs::remove_file(&key_path);
-
-    let rendered = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
-    assert!(
-        seen,
-        "real client binary never rendered the marker over the PTY; captured:\n{}",
-        // keep the failure message bounded
-        &rendered[rendered.len().saturating_sub(2000)..]
-    );
+    Ok((server_id, server_port, task))
 }
 
-/// Everything the PTY master has produced so far, read on a background thread.
-fn capture(mut reader: Box<dyn Read + Send>) -> Arc<Mutex<Vec<u8>>> {
+/// Everything `output` delivers, gathered by a background task.
+fn capture(mut output: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Arc<Mutex<Vec<u8>>> {
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = buf.clone();
-    std::thread::spawn(move || {
-        let mut tmp = [0u8; 8192];
-        while let Ok(n) = reader.read(&mut tmp) {
-            match (tmp.get(..n), sink.lock()) {
-                (Some(chunk), Ok(mut all)) if !chunk.is_empty() => all.extend_from_slice(chunk),
-                _ => break,
-            }
+    tokio::spawn(async move {
+        while let Some(chunk) = output.recv().await {
+            let Ok(mut all) = sink.lock() else { break };
+            all.extend_from_slice(&chunk);
         }
     });
     buf
@@ -176,58 +88,77 @@ async fn wait_for(
     ))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_client_binary_renders_over_pty() {
+    let (server_id, server_port, server_task) = loopback_server().await.expect("server");
+    let key_path = std::env::temp_dir().join(format!("koh-pty-test-{}.key", std::process::id()));
+    let _ = std::fs::remove_file(&key_path);
+
+    // The client creates its identity key on first run, without a prompt.
+    let (mut client, output) = Pty::spawn(
+        24,
+        80,
+        &[
+            env!("CARGO_BIN_EXE_koh").to_owned(),
+            "connect".to_owned(),
+            server_id,
+            "--direct".to_owned(),
+            format!("127.0.0.1:{server_port}"),
+            "--key-file".to_owned(),
+            key_path.display().to_string(),
+        ],
+        "xterm-256color",
+        &launcher(),
+    )
+    .expect("spawn client binary");
+    let buf = capture(output);
+
+    // Give the binary time to connect over loopback iroh and do the initial screen sync.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // Type a command with a distinctive marker; it round-trips to `sh` and back as a frame.
+    client
+        .write_input(b"echo koh_pty_marker\r")
+        .expect("write keystrokes");
+    let seen = wait_for(&buf, 0, "koh_pty_marker", 15).await;
+
+    // Disconnect via the escape sequence (Ctrl-^ then '.'), then ensure teardown.
+    let _ = client.write_input(&[0x1e, b'.']);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = client.kill();
+    server_task.abort();
+    let _ = std::fs::remove_file(&key_path);
+    seen.expect("real client binary rendered the marker over the PTY");
+}
+
 /// `Ctrl-^ Ctrl-Z` stops the client with SIGTSTP, as a terminal's suspend key would: the job
 /// control shell that ran it sees a job stopped by SIGTSTP (`$?` is 128 + SIGTSTP; SIGSTOP would
 /// make the shell report "Stopped (signal)"), and `fg` resumes the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
-    let server_ep = bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
-        .await
-        .expect("bind server");
-    let server_id = format_endpoint_id(&server_ep.id());
-    let server_port = server_ep
-        .bound_sockets()
-        .iter()
-        .find(|s| s.is_ipv4())
-        .map(std::net::SocketAddr::port)
-        .expect("server v4 port");
-    let server_task = tokio::spawn(async move {
-        if let Some(incoming) = server_ep.accept().await {
-            if let Ok(conn) = incoming.await {
-                if koh_core::transport_iroh::admission::admit(&conn)
-                    .await
-                    .is_ok()
-                {
-                    let _ = run_session(conn, &["sh".to_owned()], 0).await;
-                }
-            }
-        }
-    });
+    let (server_id, server_port, server_task) = loopback_server().await.expect("server");
     let key_path =
         std::env::temp_dir().join(format!("koh-suspend-test-{}.key", std::process::id()));
     let _ = std::fs::remove_file(&key_path);
 
     // An interactive bash with job control, as a user's login shell would be.
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty");
-    let mut cmd = CommandBuilder::new("bash");
-    cmd.args(["--norc", "--noprofile", "-i"]);
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("PS1", "job$ ");
-    let mut bash = pair.slave.spawn_command(cmd).expect("spawn bash");
-    drop(pair.slave);
-    let buf = capture(pair.master.try_clone_reader().expect("clone reader"));
-    let mut writer = pair.master.take_writer().expect("take writer");
-    let mut type_ = |bytes: &[u8]| {
-        writer.write_all(bytes).expect("type");
-        writer.flush().expect("flush");
-    };
+    let (mut bash, output) = Pty::spawn(
+        24,
+        80,
+        &[
+            "env".to_owned(),
+            "PS1=job$ ".to_owned(),
+            "bash".to_owned(),
+            "--norc".to_owned(),
+            "--noprofile".to_owned(),
+            "-i".to_owned(),
+        ],
+        "xterm-256color",
+        &launcher(),
+    )
+    .expect("spawn bash");
+    let buf = capture(output);
+    let type_ = |bytes: &[u8]| bash.write_input(bytes).expect("type");
 
     let mut at = wait_for(&buf, 0, "job$ ", 10)
         .await

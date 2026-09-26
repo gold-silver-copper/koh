@@ -24,25 +24,26 @@ set at `deny`, because clap's derives `allow` some of them.
 
 ```
 src/                 the `koh` binary
-├── main.rs          serve / connect / id / key subcommand dispatch
+├── main.rs          serve / connect / id / key dispatch, and the hidden `__launch`
 └── args.rs          the clap argument structs and their conversions into koh-core's configs
-tests/               the binary on a PTY, key creation races, the Android suites (opt-in)
+tests/               the binary on a PTY, upgrade in place, key creation races, Android (opt-in)
 koh-core/src/
 ├── lib.rs           crate root: module declarations + the architecture overview
 ├── proto.rs         the koh/3 wire protocol: client messages, screen frames, caps, pacing
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
 ├── predict.rs       local-echo prediction engine (overlays, epochs, adaptive engage)
 ├── transport_iroh/  iroh endpoint setup, the identity key file, connection handle, admission
-├── pty.rs           PTY allocation, shell spawn, SIGWINCH, child reaping
+├── pty.rs           PTYs over fuxix, the `__launch` launcher sessions start through, reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
 ├── client/          the connection loop + ClientSession core + predictor + render + `connect`
 │   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through fuxix::terminal)
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
 ├── log.rs           the `RUST_LOG` filter `serve` and `connect` install (`target=level` directives)
 ├── idcmd.rs         `koh id` — print this machine's endpoint id
-└── keycmd.rs        `koh key` — show the identity, or reset it
+├── keycmd.rs        `koh key` — show the identity, or reset it
+└── bin/koh-launch.rs the launcher koh-core's tests start sessions through (not published)
 koh-core/tests/net/  koh over a fault-injecting link between real iroh endpoints
-koh-core/tests/      PTY, loopback e2e and admission tests
+koh-core/tests/      PTYs, sessions, loopback e2e and admission tests
 ```
 
 Dependency direction is strict: `proto` sits on `terminal`; `server` and `client` (+ the `koh`
@@ -158,7 +159,14 @@ rides out silently on the existing connection.
 
 ## Sessions, connections and the bell hook
 
-A session is one PTY + emulator per authorized peer (`server::session`). Two connections from the
+A session is one PTY + emulator per authorized peer (`server::session`). Its program starts
+through the launcher, `koh __launch PROGRAM ARGS…`: making a program a session leader with the
+PTY as its controlling terminal needs code between `fork` and `exec`, which std allows only
+through `unsafe`, so the launcher does it as a program of its own. It marks every inherited
+descriptor close-on-exec, calls `setsid`, takes the PTY as its controlling terminal and `exec`s
+the program, reporting a failure (including a failed `exec`) on a pipe the `exec` closes. On
+Linux the launcher is `/proc/self/exe`, so a server whose binary was upgraded in place still
+launches sessions; `__launch`'s interface is fixed for the same reason. Two connections from the
 same peer can briefly share it, when a reconnect races the old connection's teardown, so the
 per-connection state never lives in the session:
 
@@ -228,8 +236,7 @@ deterministically:
 - **Protocol cores** — `ClientSession` and `ServerConn` driven with synthesized frames and
   messages: bases, acknowledgements, resyncs, the frame window, pacing, retries, heartbeats,
   backpressure and shutdown; `proto` round-trips, size caps, truncation and inflate bombs.
-- **Terminal / predictor / PTY / sessions** — diff+resize, predict→confirm→clear,
-  predict→no-echo→suppress, real-shell streaming, attach/reattach/cap/TTL/teardown.
+- **Terminal / predictor** — diff+resize, predict→confirm→clear, predict→no-echo→suppress.
 - **Property tests and fuzzing** on the attacker-reachable parsers — assert never-panic and bounded.
   Coverage-guided fuzz targets: `screen_apply` (the structured diff), `server_process` and
   `proto_decode` (both directions of the wire).
@@ -245,11 +252,19 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   reattach, a forced mid-session drop, exit status, resize, XON/XOFF, input backpressure, the bell
   hook, prediction and the no-echo property, and hostile clients and servers. An `#[ignore]`d
   baseline measures echo latency, output bursts, bytes and outage recovery per network profile.
+- **`koh-core/tests/pty.rs`** and **`koh-core/tests/sessions.rs`** — real programs on real PTYs,
+  started through the `koh-launch` binary: output streaming and teardown, exit statuses, the
+  reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its
+  terminal; the session registry's attach/reattach/cap/TTL/teardown; `run_session` and the
+  per-connection echo-ack over loopback iroh.
 - **`koh-core/tests/e2e_loopback.rs`** — the whole loop over loopback: scripted keystroke → client → iroh →
   server → PTY-hosted `sh` → fux-vt → iroh → client render.
 - **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** attached to an allocated PTY (so
   `isatty()` is true and raw mode runs for real), driven by scripted keystrokes with rendered
-  frames read back from the master, connected with `--direct` to an in-process server.
+  frames read back from the master, connected with `--direct` to an in-process server; and the
+  `Ctrl-^ Ctrl-Z` suspend under a job-control bash.
+- **`tests/upgrade_in_place.rs`** (Linux) — a running `koh serve` whose binary file is removed
+  still starts sessions, because it launches them from `/proc/self/exe`.
 
 Terminal I/O is behind `ClientTerminal`, so the same session loop runs against the real terminal
 (binary) or a capturing mock (tests). One layer down, `client::backend::KohBackend`'s provided

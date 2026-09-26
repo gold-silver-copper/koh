@@ -12,8 +12,9 @@ description = "The library behind koh, a peer-to-peer remote shell over iroh: pr
 readme = "../README.md"
 keywords = ["shell", "terminal", "iroh", "p2p"]
 categories = ["network-programming"]
-# The integration tests are not needed to build or use the library.
-exclude = ["tests/"]
+# The integration tests, and the `koh-launch` binary they start sessions through, are not needed
+# to build or use the library.
+exclude = ["tests/", "src/bin/"]
 
 [dependencies]
 # transport (pinned: iroh API churns; see README). iroh 1.0 brings its own QUIC backend (noq, a
@@ -23,11 +24,11 @@ iroh = "=1.0.0"
 # stores. 0.1.1 is the first release with what koh needs (opt-in events, extended replies, keypad
 # state, cell constructors).
 fux-vt = "0.1.1"
-portable-pty = "=0.9.0"
 unicode-width = "0.2"
-# The system calls koh makes beyond std, each safe to call: the client's terminal (raw mode, the
-# window size), `poll` on stdin, signals (the Ctrl-^ Ctrl-Z suspend's SIGTSTP, the PTY's SIGKILL)
-# and `O_NOFOLLOW`. koh writes its own ANSI and reads raw stdin itself.
+# The system calls koh makes beyond std, each safe to call: the server's PTYs and the session
+# launcher (a new session with the PTY as its controlling terminal), the client's terminal (raw
+# mode, the window size), `poll` on stdin, signals and `O_NOFOLLOW`. koh writes its own ANSI and
+# reads raw stdin itself.
 fuxix = "0.1.1"
 # serialization. default-features = false drops postcard's `heapless-cas` default, whose
 # `atomic-polyfill` transitive dep is unmaintained (RUSTSEC-2023-0089); we only need `use-std`

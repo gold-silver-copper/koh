@@ -23,6 +23,7 @@ fn external_signal_retains_shell_style_exit_status() {
                 "echo PID=$$; while :; do sleep 1; done".to_owned(),
             ],
             "xterm-256color",
+            &launcher(),
         )
         .expect("spawn signal fixture");
         let mut output = String::new();
@@ -70,7 +71,8 @@ fn spawns_and_streams_output() {
     current_thread().expect("tokio runtime").block_on(async {
         // Run a one-shot command in the PTY and confirm we receive its output + reap it.
         let (mut pty, mut rx) =
-            Pty::spawn(24, 80, &["echo".to_owned()], "xterm-256color").expect("spawn echo");
+            Pty::spawn(24, 80, &["echo".to_owned()], "xterm-256color", &launcher())
+                .expect("spawn echo");
         // `echo` with no args prints just a newline; assert we get *something* and EOF.
         let mut collected = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -110,7 +112,8 @@ fn spawns_and_streams_output() {
 fn interactive_shell_echoes_input() {
     current_thread().expect("tokio runtime").block_on(async {
         // Spawn the default shell, send a command, and verify the echoed output comes back.
-        let (mut pty, mut rx) = Pty::spawn(24, 80, &[], "xterm-256color").expect("spawn shell");
+        let (mut pty, mut rx) =
+            Pty::spawn(24, 80, &[], "xterm-256color", &launcher()).expect("spawn shell");
         // Give the shell a moment to start, then type a command that prints a marker.
         tokio::time::sleep(Duration::from_millis(300)).await;
         pty.write_input(b"printf KOH_MARKER_OK\n").expect("write");
@@ -150,7 +153,8 @@ fn write_input_takes_shared_ref_and_preserves_order() {
         // `pty` is bound WITHOUT `mut`, proving write_input takes `&self`. Two separate enqueues must
         // reach the child in FIFO order: the concatenated marker only appears if the second chunk did
         // not overtake the first.
-        let (pty, mut rx) = Pty::spawn(24, 80, &[], "xterm-256color").expect("spawn shell");
+        let (pty, mut rx) =
+            Pty::spawn(24, 80, &[], "xterm-256color", &launcher()).expect("spawn shell");
         tokio::time::sleep(Duration::from_millis(300)).await;
         pty.write_input(b"printf ORDER_").expect("first enqueue");
         pty.write_input(b"AB_CD\n").expect("second enqueue");
@@ -187,11 +191,11 @@ fn write_input_takes_shared_ref_and_preserves_order() {
 fn dropping_pty_eofs_child_and_stops_writer() {
     current_thread().expect("tokio runtime").block_on(async {
         // `cat` blocks reading stdin. Dropping the Pty drops the writer-thread sender; the writer thread
-        // then finishes and drops the PTY write handle, on which portable-pty sends EOT — so the child
-        // sees EOF, exits, the slave closes, and the output channel ends. If the writer thread were
-        // stuck (or never dropped its handle), the channel would never close.
-        let (pty, mut rx) =
-            Pty::spawn(24, 80, &["cat".to_owned()], "xterm-256color").expect("spawn cat");
+        // then writes EOT and finishes — so the child sees EOF, exits, the slave closes, and the
+        // output channel ends. If the writer thread were stuck (or never let go of its handle), the
+        // channel would never close.
+        let (pty, mut rx) = Pty::spawn(24, 80, &["cat".to_owned()], "xterm-256color", &launcher())
+            .expect("spawn cat");
         tokio::time::sleep(Duration::from_millis(200)).await;
         drop(pty); // no kill(): EOF must come purely from the writer handle being dropped
 
@@ -212,8 +216,8 @@ fn shutdown_joins_both_io_threads_without_deadlock() {
         // Graceful teardown: shutdown() kills the child (so the reader's blocking read returns EOF) and
         // drops the writer sender (so the writer's recv returns), then joins BOTH pump threads. It must
         // return promptly — a hang would mean a thread never unblocked.
-        let (pty, mut rx) =
-            Pty::spawn(24, 80, &["sh".to_owned()], "xterm-256color").expect("spawn shell");
+        let (pty, mut rx) = Pty::spawn(24, 80, &["sh".to_owned()], "xterm-256color", &launcher())
+            .expect("spawn shell");
         // Keep the output channel drained so the reader thread never blocks on a full channel.
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -241,7 +245,8 @@ fn reaped_child_is_not_signaled_again() {
         // the reaped-gate: a one-shot `echo` exits and is reaped, after which kill()/kill_hard()/
         // shutdown() must be safe no-ops (no error, no panic).
         let (mut pty, mut rx) =
-            Pty::spawn(24, 80, &["echo".to_owned()], "xterm-256color").expect("spawn echo");
+            Pty::spawn(24, 80, &["echo".to_owned()], "xterm-256color", &launcher())
+                .expect("spawn echo");
         // Drain output to EOF so the child has exited.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
@@ -282,7 +287,8 @@ fn argv_tail_reaches_the_child() {
             .into_iter()
             .map(String::from)
             .collect();
-        let (mut pty, mut rx) = Pty::spawn(24, 80, &argv, "xterm-256color").expect("spawn sh -c");
+        let (mut pty, mut rx) =
+            Pty::spawn(24, 80, &argv, "xterm-256color", &launcher()).expect("spawn sh -c");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -330,6 +336,7 @@ fn short_lived_children_never_lose_their_output() {
                         80,
                         &["/bin/echo".to_owned(), marker.clone()],
                         "xterm-256color",
+                        &launcher(),
                     )
                     .expect("spawn short-lived child");
                     let mut out = Vec::new();
@@ -375,4 +382,155 @@ fn multi_thread() -> std::io::Result<tokio::runtime::Runtime> {
         .worker_threads(4)
         .enable_all()
         .build()
+}
+
+/// Everything the program writes, until it exits and the PTY closes (or 20 s pass).
+async fn all_output(mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> String {
+    let mut collected = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(chunk) = rx.recv().await {
+            collected.extend_from_slice(&chunk);
+        }
+    })
+    .await;
+    String::from_utf8_lossy(&collected).into_owned()
+}
+
+#[test]
+fn a_program_that_cannot_start_fails_the_spawn_and_is_named() {
+    let missing = "/nonexistent/koh-no-such-program";
+    let result = Pty::spawn(24, 80, &[missing.to_owned()], "xterm-256color", &launcher());
+    let Err(error) = result else {
+        panic!("a missing program must fail the spawn, not yield a dead session");
+    };
+    assert!(
+        matches!(error, koh_core::pty::PtyError::Spawn(_)),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains(missing), "{error}");
+}
+
+#[test]
+fn a_descriptor_the_server_holds_without_close_on_exec_does_not_reach_the_shell() {
+    current_thread().expect("tokio runtime").block_on(async {
+        use std::os::fd::AsRawFd;
+        // Any descriptor koh serve inherited or opened without close-on-exec, standing in for one
+        // a racing thread had not yet marked.
+        let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let leaked = fuxix::io::duplicate_inheritable(&file).expect("an inheritable copy");
+        let fd = leaked.as_raw_fd();
+        let script = format!("if [ -e /dev/fd/{fd} ]; then echo HAS_FD; else echo NO_FD; fi");
+        let (_pty, rx) = Pty::spawn(
+            24,
+            80,
+            &["/bin/sh".to_owned(), "-c".to_owned(), script],
+            "xterm-256color",
+            &launcher(),
+        )
+        .expect("spawn sh");
+        let out = all_output(rx).await;
+        assert!(
+            out.contains("NO_FD"),
+            "descriptor {fd} reached the shell: {out:?}"
+        );
+        drop(leaked);
+    });
+}
+
+#[test]
+fn the_shell_leads_its_own_session_and_owns_its_terminal() {
+    current_thread().expect("tokio runtime").block_on(async {
+        // `ps` reports the shell's process group and its terminal's foreground group; the shell
+        // stays alive (`sleep`) so its session can be read from outside.
+        let (pty, rx) = Pty::spawn(
+            24,
+            80,
+            &[
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "echo GROUPS $$ $(ps -o pgid= -p $$) $(ps -o tpgid= -p $$) END; sleep 30"
+                    .to_owned(),
+            ],
+            "xterm-256color",
+            &launcher(),
+        )
+        .expect("spawn sh");
+        let mut rx = rx;
+        let mut out = String::new();
+        let _ = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(chunk) = rx.recv().await {
+                out.push_str(&String::from_utf8_lossy(&chunk));
+                if out.contains("END") {
+                    break;
+                }
+            }
+        })
+        .await;
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("GROUPS"))
+            .unwrap_or_else(|| panic!("no report: {out:?}"));
+        let ids: Vec<i32> = line
+            .split_whitespace()
+            .filter_map(|w| w.parse().ok())
+            .collect();
+        let [pid, pgid, tpgid] = ids[..] else {
+            panic!("unexpected report: {line:?}");
+        };
+        assert_eq!(pgid, pid, "the shell leads its own process group: {line}");
+        assert_eq!(
+            tpgid, pid,
+            "the shell's group is its terminal's foreground group: {line}"
+        );
+        let pid = fuxix::process::Pid::from_raw(pid).expect("a valid pid");
+        assert_eq!(
+            fuxix::process::session(pid),
+            Some(pid),
+            "the shell leads its own session"
+        );
+        pty.kill_hard();
+    });
+}
+
+#[test]
+fn a_child_that_ignores_sighup_dies_when_its_pty_is_dropped() {
+    current_thread().expect("tokio runtime").block_on(async {
+        // `sleep` inherits the ignored SIGHUP, so only the SIGKILL `Drop` follows up with ends it;
+        // until something does, it holds the slave open and the output channel never ends.
+        let (pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &[
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "trap '' HUP; echo READY; exec sleep 30".to_owned(),
+            ],
+            "xterm-256color",
+            &launcher(),
+        )
+        .expect("spawn sh");
+        let mut out = String::new();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !out.contains("READY") {
+                let Some(chunk) = rx.recv().await else { break };
+                out.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await
+        .expect("the child reports it is ready");
+        drop(pty);
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "a SIGHUP-immune child outlived its dropped PTY"
+        );
+    });
+}
+
+/// The launcher every PTY in these tests starts through.
+fn launcher() -> koh_core::pty::Launcher {
+    koh_core::pty::Launcher::new(env!("CARGO_BIN_EXE_koh-launch"))
 }

@@ -63,6 +63,9 @@ pub struct ServeConfig {
     pub max_connections: u32,
     /// Maximum number of distinct live sessions, one per authorized peer (minimum 1).
     pub max_sessions: u32,
+    /// The binary each session's program is started through. The default, the running binary,
+    /// is what `koh serve` uses: it dispatches `__launch` to [`crate::pty::launched`].
+    pub launcher: crate::pty::Launcher,
 }
 
 /// The CLI's default for `--scrollback`.
@@ -92,6 +95,7 @@ impl Default for ServeConfig {
             local: false,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            launcher: crate::pty::Launcher::this_binary(),
         }
     }
 }
@@ -217,6 +221,7 @@ pub struct Hosting {
     session_ttl: Duration,
     max_connections: usize,
     max_sessions: usize,
+    launcher: crate::pty::Launcher,
 }
 
 impl Hosting {
@@ -257,6 +262,7 @@ impl Hosting {
                 .context("max_connections does not fit in usize")?,
             max_sessions: usize::try_from(args.max_sessions)
                 .context("max_sessions does not fit in usize")?,
+            launcher: args.launcher.clone(),
         })
     }
 }
@@ -278,6 +284,7 @@ pub async fn serve_endpoint(
         scrollback: hosting.scrollback,
         max_sessions: hosting.max_sessions,
         ttl: hosting.session_ttl,
+        launcher: hosting.launcher,
     });
 
     // Bound concurrent connection-handling tasks: each accepted connection holds a permit for its

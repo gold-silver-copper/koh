@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use koh_core::client::BellHook;
+use koh::client::BellHook;
 
 use crate::harness::{identity, Client, Options, Server};
 use crate::link::{FaultNet, Profile};

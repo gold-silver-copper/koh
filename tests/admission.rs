@@ -5,8 +5,8 @@
 
 use std::time::Duration;
 
-use koh_core::transport_iroh::admission::{admit, await_admission};
-use koh_core::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
+use koh::transport_iroh::admission::{admit, await_admission};
+use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 
 #[test]
 fn admit_unblocks_await_admission() {
@@ -66,7 +66,7 @@ fn reject_surfaces_as_error() {
 }
 
 /// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh-core forbids, and a `forbid` rejects that `allow`.
+/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

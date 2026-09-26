@@ -9,7 +9,7 @@ on Android.
 iroh builds a `DnsResolver` for every endpoint it binds. Its default reads the host's system DNS
 through Android's app **JNI context** — which a plain CLI (no Android app) doesn't have, so the read
 used to panic with `ndk-context: android context was not initialized`. `koh` fixes this in
-`koh-core/src/transport_iroh/mod.rs` (`discovery_dns_resolver`) by pinning an explicit nameserver on Android
+`src/transport_iroh/mod.rs` (`discovery_dns_resolver`) by pinning an explicit nameserver on Android
 (`KOH_DNS=<ip[:port]>` overrides).
 
 Running the bare binary under `adb shell` reproduces the **exact** no-JNI-context condition — so it

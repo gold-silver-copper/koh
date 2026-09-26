@@ -9,11 +9,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use koh_core::client::{run_client, ClientTerminal, IrohConnector};
-use koh_core::predict::{DisplayPreference, Overlay};
-use koh_core::server::run_session;
-use koh_core::terminal::TerminalScreen;
-use koh_core::transport_iroh::{
+use koh::client::{run_client, ClientTerminal, IrohConnector};
+use koh::predict::{DisplayPreference, Overlay};
+use koh::server::run_session;
+use koh::terminal::TerminalScreen;
+use koh::transport_iroh::{
     bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, ALPN,
 };
 use tokio::sync::mpsc;
@@ -64,7 +64,7 @@ fn full_session_over_loopback_pty() {
                 conn,
                 &["sh".to_owned()],
                 0,
-                koh_core::pty::Launcher::new(env!("CARGO_BIN_EXE_koh-launch")),
+                koh::pty::Launcher::new(env!("CARGO_BIN_EXE_koh")),
             )
             .await;
         });
@@ -138,7 +138,7 @@ fn full_session_over_loopback_pty() {
 }
 
 /// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh-core forbids, and a `forbid` rejects that `allow`.
+/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

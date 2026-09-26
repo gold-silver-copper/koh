@@ -2,46 +2,24 @@
 
 mod args;
 
-use clap::{Parser, Subcommand};
-
-use crate::args::{ConnectArgs, IdArgs, KeyArgs, ServeArgs};
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "koh",
-    version,
-    about = "koh — a resilient peer-to-peer remote shell (mosh over iroh)"
-)]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-#[derive(Subcommand, Debug)]
-enum Cmd {
-    /// Host a PTY shell for authorized clients.
-    Serve(ServeArgs),
-    /// Connect to a koh server by its endpoint id.
-    Connect(ConnectArgs),
-    /// Print this machine's koh id (add it to a server's --allow list).
-    Id(IdArgs),
-    /// Show or reset this machine's identity key.
-    Key(KeyArgs),
-}
+use crate::args::Cmd;
 
 // An explicit runtime instead of `#[tokio::main]`, whose expansion `allow`s `clippy::expect_used`.
 fn main() -> std::process::ExitCode {
     // `koh serve` starts each session's program through this binary (`koh __launch …`): a hidden
     // subcommand, handled before the command line is parsed or any thread starts.
-    if let Some(argv) = koh_core::pty::launch_argv() {
-        return std::process::ExitCode::from(koh_core::pty::launched(&argv));
+    if let Some(argv) = koh::pty::launch_argv() {
+        return std::process::ExitCode::from(koh::pty::launched(&argv));
     }
-    let cli = Cli::parse();
+    let cmd = match args::parse(&args::command().get_matches()) {
+        Ok(cmd) => cmd,
+        Err(e) => e.exit(),
+    };
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(anyhow::Error::from)
-        .and_then(|runtime| runtime.block_on(dispatch(cli)));
+        .and_then(|runtime| runtime.block_on(dispatch(cmd)));
     match result {
         Ok(Some(code)) => std::process::ExitCode::from(exit_status(code)),
         Ok(None) => std::process::ExitCode::SUCCESS,
@@ -52,12 +30,12 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-async fn dispatch(cli: Cli) -> anyhow::Result<Option<u32>> {
-    match cli.cmd {
-        Cmd::Serve(args) => koh_core::server::serve(args).await.map(|()| None),
-        Cmd::Connect(args) => koh_core::client::connect(args).await,
-        Cmd::Id(args) => koh_core::idcmd::run_id(args).map(|()| None),
-        Cmd::Key(args) => koh_core::keycmd::run(args).map(|()| None),
+async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
+    match cmd {
+        Cmd::Serve(config) => koh::server::serve(config).await.map(|()| None),
+        Cmd::Connect(config) => koh::client::connect(config).await,
+        Cmd::Id(config) => koh::idcmd::run_id(config).map(|()| None),
+        Cmd::Key(config) => koh::keycmd::run(config).map(|()| None),
     }
 }
 

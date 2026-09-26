@@ -12,9 +12,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use koh_core::pty::{Launcher, Pty};
-use koh_core::server::run_session;
-use koh_core::transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
+use koh::pty::{Launcher, Pty};
+use koh::server::run_session;
+use koh::transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
 
 /// The `koh` binary, as the launcher every program here starts through.
 fn launcher() -> Launcher {
@@ -36,10 +36,7 @@ async fn loopback_server() -> anyhow::Result<(String, u16, tokio::task::JoinHand
             if let Ok(conn) = incoming.await {
                 // The real client binary awaits an admission ack after connect; mirror the server
                 // side so its accept_bi() completes, like `koh serve`.
-                if koh_core::transport_iroh::admission::admit(&conn)
-                    .await
-                    .is_ok()
-                {
+                if koh::transport_iroh::admission::admit(&conn).await.is_ok() {
                     let _ = run_session(conn, &["sh".to_owned()], 0, launcher()).await;
                 }
             }
@@ -88,120 +85,134 @@ async fn wait_for(
     ))
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_client_binary_renders_over_pty() {
-    let (server_id, server_port, server_task) = loopback_server().await.expect("server");
-    let key_path = std::env::temp_dir().join(format!("koh-pty-test-{}.key", std::process::id()));
-    let _ = std::fs::remove_file(&key_path);
+#[test]
+fn real_client_binary_renders_over_pty() {
+    runtime().expect("tokio runtime").block_on(async {
+        let (server_id, server_port, server_task) = loopback_server().await.expect("server");
+        let key_path =
+            std::env::temp_dir().join(format!("koh-pty-test-{}.key", std::process::id()));
+        let _ = std::fs::remove_file(&key_path);
 
-    // The client creates its identity key on first run, without a prompt.
-    let (mut client, output) = Pty::spawn(
-        24,
-        80,
-        &[
-            env!("CARGO_BIN_EXE_koh").to_owned(),
-            "connect".to_owned(),
-            server_id,
-            "--direct".to_owned(),
-            format!("127.0.0.1:{server_port}"),
-            "--key-file".to_owned(),
-            key_path.display().to_string(),
-        ],
-        "xterm-256color",
-        &launcher(),
-    )
-    .expect("spawn client binary");
-    let buf = capture(output);
+        // The client creates its identity key on first run, without a prompt.
+        let (mut client, output) = Pty::spawn(
+            24,
+            80,
+            &[
+                env!("CARGO_BIN_EXE_koh").to_owned(),
+                "connect".to_owned(),
+                server_id,
+                "--direct".to_owned(),
+                format!("127.0.0.1:{server_port}"),
+                "--key-file".to_owned(),
+                key_path.display().to_string(),
+            ],
+            "xterm-256color",
+            &launcher(),
+        )
+        .expect("spawn client binary");
+        let buf = capture(output);
 
-    // Give the binary time to connect over loopback iroh and do the initial screen sync.
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+        // Give the binary time to connect over loopback iroh and do the initial screen sync.
+        tokio::time::sleep(Duration::from_millis(2000)).await;
 
-    // Type a command with a distinctive marker; it round-trips to `sh` and back as a frame.
-    client
-        .write_input(b"echo koh_pty_marker\r")
-        .expect("write keystrokes");
-    let seen = wait_for(&buf, 0, "koh_pty_marker", 15).await;
+        // Type a command with a distinctive marker; it round-trips to `sh` and back as a frame.
+        client
+            .write_input(b"echo koh_pty_marker\r")
+            .expect("write keystrokes");
+        let seen = wait_for(&buf, 0, "koh_pty_marker", 15).await;
 
-    // Disconnect via the escape sequence (Ctrl-^ then '.'), then ensure teardown.
-    let _ = client.write_input(&[0x1e, b'.']);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let _ = client.kill();
-    server_task.abort();
-    let _ = std::fs::remove_file(&key_path);
-    seen.expect("real client binary rendered the marker over the PTY");
+        // Disconnect via the escape sequence (Ctrl-^ then '.'), then ensure teardown.
+        let _ = client.write_input(&[0x1e, b'.']);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = client.kill();
+        server_task.abort();
+        let _ = std::fs::remove_file(&key_path);
+        seen.expect("real client binary rendered the marker over the PTY");
+    });
 }
 
 /// `Ctrl-^ Ctrl-Z` stops the client with SIGTSTP, as a terminal's suspend key would: the job
 /// control shell that ran it sees a job stopped by SIGTSTP (`$?` is 128 + SIGTSTP; SIGSTOP would
 /// make the shell report "Stopped (signal)"), and `fg` resumes the session.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
-    let (server_id, server_port, server_task) = loopback_server().await.expect("server");
-    let key_path =
-        std::env::temp_dir().join(format!("koh-suspend-test-{}.key", std::process::id()));
-    let _ = std::fs::remove_file(&key_path);
+#[test]
+fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
+    runtime().expect("tokio runtime").block_on(async {
+        let (server_id, server_port, server_task) = loopback_server().await.expect("server");
+        let key_path =
+            std::env::temp_dir().join(format!("koh-suspend-test-{}.key", std::process::id()));
+        let _ = std::fs::remove_file(&key_path);
 
-    // An interactive bash with job control, as a user's login shell would be.
-    let (mut bash, output) = Pty::spawn(
-        24,
-        80,
-        &[
-            "env".to_owned(),
-            "PS1=job$ ".to_owned(),
-            "bash".to_owned(),
-            "--norc".to_owned(),
-            "--noprofile".to_owned(),
-            "-i".to_owned(),
-        ],
-        "xterm-256color",
-        &launcher(),
-    )
-    .expect("spawn bash");
-    let buf = capture(output);
-    let type_ = |bytes: &[u8]| bash.write_input(bytes).expect("type");
-
-    let mut at = wait_for(&buf, 0, "job$ ", 10)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-    type_(
-        format!(
-            "'{}' connect {server_id} --direct 127.0.0.1:{server_port} --key-file '{}'\r",
-            env!("CARGO_BIN_EXE_koh"),
-            key_path.display()
+        // An interactive bash with job control, as a user's login shell would be.
+        let (mut bash, output) = Pty::spawn(
+            24,
+            80,
+            &[
+                "env".to_owned(),
+                "PS1=job$ ".to_owned(),
+                "bash".to_owned(),
+                "--norc".to_owned(),
+                "--noprofile".to_owned(),
+                "-i".to_owned(),
+            ],
+            "xterm-256color",
+            &launcher(),
         )
-        .as_bytes(),
-    );
-    // Only the remote shell turns `$((6*7))` into 42, so this proves the session is up.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    type_(b"echo ready_$((6*7))\r");
-    at = wait_for(&buf, at, "ready_42", 20)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+        .expect("spawn bash");
+        let buf = capture(output);
+        let type_ = |bytes: &[u8]| bash.write_input(bytes).expect("type");
 
-    type_(&[0x1e, 0x1a]);
-    at = wait_for(&buf, at, "job$ ", 10)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-    type_(b"echo status=$?\r");
-    let expected = format!("status={}", 128 + fuxix::process::Signal::Tstp.raw());
-    at = wait_for(&buf, at, &expected, 10)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+        let mut at = wait_for(&buf, 0, "job$ ", 10)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        type_(
+            format!(
+                "'{}' connect {server_id} --direct 127.0.0.1:{server_port} --key-file '{}'\r",
+                env!("CARGO_BIN_EXE_koh"),
+                key_path.display()
+            )
+            .as_bytes(),
+        );
+        // Only the remote shell turns `$((6*7))` into 42, so this proves the session is up.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        type_(b"echo ready_$((6*7))\r");
+        at = wait_for(&buf, at, "ready_42", 20)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
 
-    type_(b"fg\r");
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    type_(b"echo back_$((6*7))\r");
-    at = wait_for(&buf, at, "back_42", 20)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+        type_(&[0x1e, 0x1a]);
+        at = wait_for(&buf, at, "job$ ", 10)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        type_(b"echo status=$?\r");
+        let expected = format!("status={}", 128 + fuxix::process::Signal::Tstp.raw());
+        at = wait_for(&buf, at, &expected, 10)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
 
-    type_(&[0x1e, b'.']);
-    wait_for(&buf, at, "job$ ", 10)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-    type_(b"exit\r");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let _ = bash.kill();
-    server_task.abort();
-    let _ = std::fs::remove_file(&key_path);
+        type_(b"fg\r");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        type_(b"echo back_$((6*7))\r");
+        at = wait_for(&buf, at, "back_42", 20)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        type_(&[0x1e, b'.']);
+        wait_for(&buf, at, "job$ ", 10)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        type_(b"exit\r");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = bash.kill();
+        server_task.abort();
+        let _ = std::fs::remove_file(&key_path);
+    });
+}
+
+/// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
+/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
 }

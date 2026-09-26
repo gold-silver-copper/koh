@@ -255,7 +255,7 @@ fn warn_if_locale_not_utf8() {
 /// `koh connect <server-id>` — connect to a koh server and run the (auto-reconnecting) session.
 ///
 /// Returns the remote shell's exit code if the session ended because the shell exited.
-/// Accepts a [`ConnectConfig`] or anything convertible into one (the `koh` binary's `ConnectArgs`).
+/// Accepts a [`ConnectConfig`] or anything convertible into one.
 ///
 /// Takes over the calling process's terminal (raw mode, alternate screen) and its stdin for the
 /// session's lifetime, and installs signal handlers; call it from a binary's main path.

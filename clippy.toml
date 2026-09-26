@@ -1,6 +1,6 @@
 # Test code is allowed to panic: a failed `unwrap`/`expect`/`assert` in a test
 # IS the test failing. These keys relax the panic-prevention restriction lints
-# (forbidden in koh-core/Cargo.toml, denied in the `koh` binary's Cargo.toml)
+# (forbidden in Cargo.toml)
 # inside `#[cfg(test)]` modules and `#[test]` functions. Anything else, including
 # helper functions in the integration tests, stays panic-free.
 allow-unwrap-in-tests = true

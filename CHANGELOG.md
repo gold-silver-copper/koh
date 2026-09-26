@@ -3,8 +3,8 @@
 All notable changes to koh are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and koh aims to follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) for the **binary's CLI, the on-disk
-key format, and the wire protocol (its ALPN)**. The `koh-core` library is internal: it exists so
-the binary, its tests and the fuzz targets share code, and any release may change it.
+key format, and the wire protocol (its ALPN)**. The `koh` library is internal: it exists so the
+binary, its tests and the fuzz targets share code, and any release may change it.
 
 > **A note on versions.** [crates.io](https://crates.io/crates/koh) is the source of truth for what
 > was actually released. Two git-tag-only gaps exist from koh's early, fast-moving security-review
@@ -29,7 +29,7 @@ error; upgrade both ends.
   `nix` are no longer dependencies; fux's `fuxix` makes the system calls (Linux, Android and
   macOS, as before).
 - **`RUST_LOG` takes `target=level` directives and bare levels only**, such as
-  `RUST_LOG=koh_core::server=debug,iroh=warn` or `RUST_LOG=debug`. Span, field and regex filters
+  `RUST_LOG=koh::server=debug,iroh=warn` or `RUST_LOG=debug`. Span, field and regex filters
   are no longer understood; a `RUST_LOG` koh cannot read gives the default filter, as before. koh
   no longer depends on `rand`, `data-encoding` or tracing-subscriber's `env-filter` (8 fewer
   crates in a build).
@@ -116,9 +116,11 @@ error; upgrade both ends.
   `Pty::terminate_process_group`/`shutdown_process_group`, `ServerTerminal::progress` and the
   OSC 9;4 `Progress` parser, the unhandled-OSC ring (`take_unhandled_oscs`, `UNHANDLED_OSC_*`)
   and `ServerTerminal::with_scrollback_screen`.
-- **The `shell` and `cli` features.** The library is now its own crate, `koh-core`, with no
-  command line and no clap; the `koh` crate is the binary on top of it. `cargo install koh` is
-  unchanged. Code that used the `koh` library depends on `koh-core` instead.
+- **The `shell` and `cli` features.** The library and the binary are one crate again, and the
+  binary always builds: its command line uses clap's builder API, so no feature is needed to keep
+  clap's derive out of the library. The `*Args` types are gone; build the `*Config` structs
+  (`ServeConfig`, `ConnectConfig`, `IdConfig`, `KeyConfig`) instead. `cargo install koh` and every
+  flag, help text and error message are unchanged.
 - **The SSP transport and its test harnesses**: `koh::ssp` (`SyncState`, `Transport`, `testkit`),
   `koh::wire` (`Instruction`, the fragmenter and reassembler, `PROTOCOL_VERSION`), `koh::input`,
   `koh::sim`, the `chaos` example, the `test-support` feature and `MonoClock`. koh/3 replaces them.

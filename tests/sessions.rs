@@ -1,35 +1,33 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
 //! loopback iroh with a minimal koh/3 client.
 //!
-//! Every session's program starts through the `koh-launch` binary, as `koh serve`'s start through
-//! `koh __launch`; unit tests cannot reach a binary, so these live here.
+//! Every session's program starts through the `koh` binary's `__launch`, as `koh serve`'s do; unit
+//! tests cannot reach a binary, so these live here.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use koh_core::proto::{
-    decode_frame, encode_client, ClientMsg, Frame, FrameNum, InputSeq, MAX_FRAME,
-};
-use koh_core::pty::Launcher;
-use koh_core::server::cli::{serve_endpoint, Hosting, ServeConfig};
-use koh_core::server::run_session;
-use koh_core::server::session::AttachKind;
-use koh_core::server::{Registry, SessionSpec};
-use koh_core::terminal::{clamp_dims, TerminalScreen};
-use koh_core::transport_iroh::admission::await_admission;
-use koh_core::transport_iroh::{
+use koh::proto::{decode_frame, encode_client, ClientMsg, Frame, FrameNum, InputSeq, MAX_FRAME};
+use koh::pty::Launcher;
+use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
+use koh::server::run_session;
+use koh::server::session::AttachKind;
+use koh::server::{Registry, SessionSpec};
+use koh::terminal::{clamp_dims, TerminalScreen};
+use koh::transport_iroh::admission::await_admission;
+use koh::transport_iroh::{
     bind_endpoint_local, format_endpoint_id, generate_secret_key, loopback_addr, ALPN,
 };
 use tokio_util::sync::CancellationToken;
 
 /// The launcher every session in these tests starts through.
 fn launcher() -> Launcher {
-    Launcher::new(env!("CARGO_BIN_EXE_koh-launch"))
+    Launcher::new(env!("CARGO_BIN_EXE_koh"))
 }
 
 /// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh-core forbids, and a `forbid` rejects that `allow`.
+/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

@@ -136,8 +136,8 @@ pub const LAUNCH: &str = "__launch";
 
 /// The binary [`Pty::spawn`] runs as the launcher.
 ///
-/// The default is the running binary, which must hand a [`LAUNCH`] invocation to [`launched`] (the
-/// `koh` binary does); koh-core's own tests name their `koh-launch` binary instead.
+/// The default is the running binary, which must hand a [`LAUNCH`] invocation to [`launched`], as
+/// the `koh` binary does. Tests run a test harness, so they name the `koh` binary explicitly.
 #[derive(Clone, Debug, Default)]
 pub struct Launcher(Option<PathBuf>);
 

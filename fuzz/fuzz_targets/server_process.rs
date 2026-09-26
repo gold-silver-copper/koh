@@ -4,7 +4,7 @@
 //! then the snapshot and host replies the server reads. Must never panic (fux-vt is panic-free by
 //! construction; this checks it stays that way under koh's options).
 
-use koh_core::terminal::ServerTerminal;
+use koh::terminal::ServerTerminal;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

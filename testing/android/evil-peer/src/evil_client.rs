@@ -30,8 +30,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use koh_core::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE, MAX_INPUT_BYTES};
-use koh_core::transport_iroh::{
+use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE, MAX_INPUT_BYTES};
+use koh::transport_iroh::{
     admission, bind_endpoint_local, direct_addr, generate_secret_key, load_or_create_secret_key,
     parse_endpoint_id, IrohChannel, ALPN,
 };

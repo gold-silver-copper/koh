@@ -4,7 +4,7 @@
 //! plus postcard). Both must only return errors on bad input, never panic, and never allocate past
 //! their caps.
 
-use koh_core::proto::{decode_frame, ClientDecoder};
+use koh::proto::{decode_frame, ClientDecoder};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

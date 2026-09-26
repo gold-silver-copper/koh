@@ -1,4 +1,4 @@
-//! Real-PTY / real-shell tests for [`koh_core::pty::Pty`].
+//! Real-PTY / real-shell tests for [`koh::pty::Pty`].
 //!
 //! These live in their own integration-test binary (rather than inline `#[cfg(test)]`) on purpose:
 //! each spawns a real child + PTY + two pump threads, and running them alongside the ~100 inline
@@ -60,7 +60,7 @@ fn external_signal_retains_shell_style_exit_status() {
     });
 }
 
-use koh_core::pty::Pty;
+use koh::pty::Pty;
 
 #[test]
 #[expect(
@@ -370,7 +370,7 @@ fn short_lived_children_never_lose_their_output() {
 }
 
 /// Runtimes for the tests. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh-core forbids, and a `forbid` rejects that `allow`.
+/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
 fn current_thread() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -403,10 +403,7 @@ fn a_program_that_cannot_start_fails_the_spawn_and_is_named() {
     let Err(error) = result else {
         panic!("a missing program must fail the spawn, not yield a dead session");
     };
-    assert!(
-        matches!(error, koh_core::pty::PtyError::Spawn(_)),
-        "{error:?}"
-    );
+    assert!(matches!(error, koh::pty::PtyError::Spawn(_)), "{error:?}");
     assert!(error.to_string().contains(missing), "{error}");
 }
 
@@ -531,6 +528,6 @@ fn a_child_that_ignores_sighup_dies_when_its_pty_is_dropped() {
 }
 
 /// The launcher every PTY in these tests starts through.
-fn launcher() -> koh_core::pty::Launcher {
-    koh_core::pty::Launcher::new(env!("CARGO_BIN_EXE_koh-launch"))
+fn launcher() -> koh::pty::Launcher {
+    koh::pty::Launcher::new(env!("CARGO_BIN_EXE_koh"))
 }

@@ -26,8 +26,7 @@ pub struct KeyConfig {
     pub key_file: Option<PathBuf>,
 }
 
-/// Run `koh key`. Accepts a [`KeyConfig`] or anything convertible into one (the `koh` binary's
-/// `KeyArgs`).
+/// Run `koh key`. Accepts a [`KeyConfig`] or anything convertible into one.
 pub fn run(config: impl Into<KeyConfig>) -> anyhow::Result<()> {
     let args: KeyConfig = config.into();
     let key_file = match args.key_file {

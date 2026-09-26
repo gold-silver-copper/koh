@@ -154,15 +154,11 @@ impl FaultNet {
             inbox: Mutex::new(Some(rx)),
         });
         Ok(
-            koh_core::transport_iroh::configure(
-                Endpoint::builder(presets::Minimal),
-                secret,
-                accept,
-            )
-            .clear_ip_transports()
-            .add_custom_transport(transport)
-            .bind()
-            .await?,
+            koh::transport_iroh::configure(Endpoint::builder(presets::Minimal), secret, accept)
+                .clear_ip_transports()
+                .add_custom_transport(transport)
+                .bind()
+                .await?,
         )
     }
 

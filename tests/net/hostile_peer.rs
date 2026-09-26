@@ -9,11 +9,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use iroh::endpoint::Connection;
 use iroh::{EndpointId, SecretKey};
-use koh_core::proto::{
-    encode_client, encode_frame, ClientMsg, Frame, FrameNum, InputSeq, MAX_FRAME,
-};
-use koh_core::terminal::{ServerTerminal, TerminalScreen};
-use koh_core::transport_iroh::{admission, generate_secret_key, ALPN};
+use koh::proto::{encode_client, encode_frame, ClientMsg, Frame, FrameNum, InputSeq, MAX_FRAME};
+use koh::terminal::{ServerTerminal, TerminalScreen};
+use koh::transport_iroh::{admission, generate_secret_key, ALPN};
 
 use crate::harness::{identity, Client, Options, Server};
 use crate::link::{FaultNet, Profile};

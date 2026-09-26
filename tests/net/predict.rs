@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use koh_core::predict::DisplayPreference;
+use koh::predict::DisplayPreference;
 
 use crate::harness::{identity, Client, Options, Server};
 use crate::link::{FaultNet, Profile};

@@ -22,15 +22,15 @@ credit reporters who want it.
 
 **In scope** (code koh authors):
 
-- On-disk identity-key handling and local-attacker hardening (`koh-core/src/transport_iroh/`,
-  `koh-core/src/identity.rs`): the key file is the raw 32-byte secret, protected by its
+- On-disk identity-key handling and local-attacker hardening (`src/transport_iroh/`,
+  `src/identity.rs`): the key file is the raw 32-byte secret, protected by its
   permissions (0600) like an SSH host key.
 - The connection accept gauntlet / node-id allowlist authorization
-  (`koh-core/src/server/cli.rs`) and the admission barrier
-  (`koh-core/src/transport_iroh/admission.rs`).
-- The untrusted wire decoders (`koh-core/src/proto.rs`) and the connection cores
-  (`koh-core/src/server/mod.rs`, `koh-core/src/client/session.rs`).
-- The terminal apply path (`koh-core/src/terminal/`): decoding and validating the structured screen diff.
+  (`src/server/cli.rs`) and the admission barrier
+  (`src/transport_iroh/admission.rs`).
+- The untrusted wire decoders (`src/proto.rs`) and the connection cores
+  (`src/server/mod.rs`, `src/client/session.rs`).
+- The terminal apply path (`src/terminal/`): decoding and validating the structured screen diff.
 
 **Out of scope — report upstream** (dependencies koh does not author):
 
@@ -45,9 +45,8 @@ credit reporters who want it.
 ## Audit trail
 
 The code's comments state invariants, not finding IDs. This index maps every finding ID from koh's
-security audits and reviews to what guards it today: a test (`file::name`; `src/` and `tests/`
-paths are in `koh-core/`, `testing/` and `.github/` at the repository root), or, where the mechanism
-is gone, what replaced it. The finding reports themselves live in [`docs/audits/`](docs/audits/)
+security audits and reviews to what guards it today: a test (`file::name`, from the repository
+root), or, where the mechanism is gone, what replaced it. The finding reports themselves live in [`docs/audits/`](docs/audits/)
 and the git log.
 
 **Security audit v0.3.1 fixes (H-, M-, L-).**
@@ -80,7 +79,7 @@ and the git log.
 | KOH-14 | CLI args holding a passphrase derive `Debug` | Removed: no passphrase or other secret is a CLI argument |
 | KOH-15 | The env scrub list misses variables | Scrubbed by prefix: `src/pty.rs::scrub_removes_inherited_koh_vars` |
 | KOH-16 | A loose existing key is never re-tightened | `src/transport_iroh/mod.rs::fd_key_read_tightens_a_loose_real_key_via_the_fd` |
-| KOH-17 | Unmaintained `atomic-polyfill` via postcard defaults | postcard's default features are off (`koh-core/Cargo.toml`); `cargo deny check advisories` in CI |
+| KOH-17 | Unmaintained `atomic-polyfill` via postcard defaults | postcard's default features are off (`Cargo.toml`); `cargo deny check advisories` in CI |
 | KOH-18 | Unmaintained `paste` via iroh | Accepted, advisory-only: the ignore in [`deny.toml`](deny.toml) |
 | KOH-19 | Pre-release `ed25519-dalek` / `curve25519-dalek` | Accepted: iroh 1.0.0 still depends on them; tracked with each iroh bump |
 

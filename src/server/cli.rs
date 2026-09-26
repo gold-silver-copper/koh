@@ -35,7 +35,7 @@ const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration for [`serve`] — the clap-free, library-facing form of `koh serve`'s arguments.
 ///
-/// The `koh` binary builds it from its `ServeArgs` via `From`; tests build it directly. [`Default`] gives the
+/// The `koh` binary builds it from the command line; tests build it directly. [`Default`] gives the
 /// same values as the CLI's defaults, with an empty `allow` list — which [`serve`] rejects, exactly
 /// as the CLI does, because an allowlist entry is the sole way in.
 #[derive(Debug, Clone)]
@@ -119,7 +119,7 @@ fn connect_qr(data: &str) -> Option<String> {
 /// `koh serve` — host a PTY shell for authorized clients over iroh.
 ///
 /// The program hosted is [`ServeConfig::command`] (any argv, not only a shell). Accepts a
-/// [`ServeConfig`] or anything convertible into one (the `koh` binary's `ServeArgs`).
+/// [`ServeConfig`] or anything convertible into one.
 ///
 /// Installs a global `tracing` subscriber writing to stderr if none is installed yet.
 pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {

@@ -9,7 +9,7 @@ pub struct IdConfig {
 }
 
 /// `koh id` — print this machine's koh id (to add to a server's `--allow` list) and exit.
-/// Accepts an [`IdConfig`] or anything convertible into one (the `koh` binary's `IdArgs`).
+/// Accepts an [`IdConfig`] or anything convertible into one.
 pub fn run_id(config: impl Into<IdConfig>) -> anyhow::Result<()> {
     let args: IdConfig = config.into();
     let key_file = match args.key_file {

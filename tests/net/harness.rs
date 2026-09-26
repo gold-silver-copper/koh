@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId, SecretKey};
-use koh_core::client::{run_client, BellHook, ClientTerminal, IrohConnector};
-use koh_core::predict::{DisplayPreference, Overlay};
-use koh_core::server::cli::{serve_endpoint, Hosting, ServeConfig};
-use koh_core::terminal::TerminalScreen;
-use koh_core::transport_iroh::{format_endpoint_id, generate_secret_key};
+use koh::client::{run_client, BellHook, ClientTerminal, IrohConnector};
+use koh::predict::{DisplayPreference, Overlay};
+use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
+use koh::terminal::TerminalScreen;
+use koh::transport_iroh::{format_endpoint_id, generate_secret_key};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -42,7 +42,7 @@ impl Server {
             allow: allow.iter().map(format_endpoint_id).collect(),
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
             scrollback: 0,
-            launcher: koh_core::pty::Launcher::new(env!("CARGO_BIN_EXE_koh-launch")),
+            launcher: koh::pty::Launcher::new(env!("CARGO_BIN_EXE_koh")),
             ..ServeConfig::default()
         };
         let hosting = Hosting::from_config(&config)?;
@@ -307,7 +307,7 @@ pub async fn session(net: &FaultNet, command: &[&str]) -> anyhow::Result<(Server
 }
 
 /// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh-core forbids, and a `forbid` rejects that `allow`.
+/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
 pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

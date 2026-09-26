@@ -22,6 +22,9 @@ client and a 0.13 server (or the reverse) refuse each other at the TLS handshake
 error; upgrade both ends.
 
 ### Changed
+- **Keys typed while `koh connect` starts are kept**, as with ssh and mosh: entering raw mode no
+  longer discards pending input, so a command typed before the connection is up reaches the remote
+  shell. The same holds when resuming after `Ctrl-^ Ctrl-Z`.
 - **Breaking: identity keys are no longer encrypted at rest.** A key file is the key's 32 raw
   bytes, protected by its permissions (0600) like an SSH host key: anyone who can read it is that
   identity. koh never prompts for a passphrase; `koh key passwd`, `$KOH_KEY_PASSPHRASE` and
@@ -105,8 +108,8 @@ error; upgrade both ends.
   `koh::sim`, the `chaos` example, the `test-support` feature and `MonoClock`. koh/3 replaces them.
 - **The terminal backend features**: `backend-termina`, `backend-crossterm` and `backend-qwertty`,
   with `TerminaBackend`, `CrosstermBackend` and `QwerttyBackend`. The client drives the tty itself
-  through `rustix::termios` (`client::backend::Tty`); its output is byte-for-byte unchanged.
-  `termina`, `crossterm` and `qwertty` are no longer dependencies.
+  through `fuxix::terminal` (`client::backend::Tty`); its output is byte-for-byte unchanged.
+  `termina`, `crossterm`, `qwertty` and `rustix` are no longer dependencies.
 
 ## [0.12.1] — 2026-09-04
 

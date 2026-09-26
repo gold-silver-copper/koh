@@ -1,13 +1,13 @@
-//! The terminal koh's client paints on: the controlling tty, driven through `rustix::termios`.
+//! The terminal koh's client paints on: the controlling tty, driven through `fuxix::terminal`.
 //!
 //! It supplies only the platform primitives — raw mode, the window size, and a byte sink. Every
 //! escape sequence comes from [`KohBackend`]'s provided methods.
 
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, IsTerminal, Write};
 use std::os::fd::AsFd;
 
-use rustix::termios::{self, OptionalActions, Termios};
+use fuxix::terminal::{self, Termios};
 
 use super::KohBackend;
 
@@ -25,7 +25,7 @@ impl Tty {
     /// Open the terminal and record its current mode. Does not enter raw mode.
     pub fn new() -> io::Result<Self> {
         let stdout = io::stdout();
-        let file = if termios::isatty(stdout.as_fd()) {
+        let file = if stdout.is_terminal() {
             File::from(stdout.as_fd().try_clone_to_owned()?)
         } else {
             std::fs::OpenOptions::new()
@@ -33,7 +33,7 @@ impl Tty {
                 .write(true)
                 .open("/dev/tty")?
         };
-        let original = termios::tcgetattr(&file)?;
+        let original = terminal::attributes(&file)?;
         Ok(Self {
             out: BufWriter::with_capacity(BUF_SIZE, file),
             original,
@@ -51,20 +51,21 @@ impl KohBackend for Tty {
     }
 
     fn enter_raw_mode(&mut self) -> io::Result<()> {
-        let mut raw = termios::tcgetattr(self.out.get_ref())?;
+        let mut raw = terminal::attributes(self.out.get_ref())?;
         raw.make_raw();
-        termios::tcsetattr(self.out.get_ref(), OptionalActions::Flush, &raw)?;
+        // Takes effect at once and keeps typed-ahead input, as ssh and mosh do: keys typed while
+        // koh connects reach the remote shell.
+        terminal::set_attributes(self.out.get_ref(), &raw)?;
         Ok(())
     }
 
     fn leave_raw_mode(&mut self) -> io::Result<()> {
-        termios::tcsetattr(self.out.get_ref(), OptionalActions::Now, &self.original)?;
+        terminal::set_attributes(self.out.get_ref(), &self.original)?;
         Ok(())
     }
 
     fn size(&self) -> io::Result<(u16, u16)> {
-        let size = termios::tcgetwinsize(self.out.get_ref())?;
-        let (mut rows, mut cols) = (size.ws_row, size.ws_col);
+        let (mut rows, mut cols) = terminal::window_size(self.out.get_ref())?;
         // Over a serial line the ioctl may report zero; fall back to LINES/COLUMNS, as vim does.
         let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u16>().ok());
         if rows == 0 {

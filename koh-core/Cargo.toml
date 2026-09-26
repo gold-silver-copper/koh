@@ -25,9 +25,9 @@ iroh = "=1.0.0"
 fux-vt = "0.1.1"
 portable-pty = "=0.9.0"
 unicode-width = "0.2"
-# The client's terminal: raw mode and the window size through safe termios calls. koh writes its own
-# ANSI and reads raw stdin itself, so it needs nothing more.
-rustix = { version = "1.1", default-features = false, features = ["std", "termios"] }
+# The client's terminal: raw mode and the window size, through fux's safe calls over libc. koh writes
+# its own ANSI and reads raw stdin itself, so it needs nothing more.
+fuxix = "0.1.0"
 # serialization. default-features = false drops postcard's `heapless-cas` default, whose
 # `atomic-polyfill` transitive dep is unmaintained (RUSTSEC-2023-0089); we only need `use-std`
 # (which pulls `alloc`) for `to_allocvec`/`from_bytes`.
@@ -54,7 +54,8 @@ rand = "0.8"
 data-encoding = "2"
 
 [dev-dependencies]
-proptest = "1"
+# No `fork` (and so no `timeout`): no test runs a case in a subprocess.
+proptest = { version = "1", default-features = false, features = ["std"] }
 # The fault-injecting test transport (`tests/net/link.rs`): iroh's custom-transport API and the
 # crates its trait signatures name. Dev-only, so release builds keep iroh's default features; all
 # are already in the lockfile through iroh.

@@ -4,7 +4,7 @@
 //! adapter ([`BackendTerminal`](super::BackendTerminal)) speak only to [`KohBackend`]. Its required
 //! methods are the platform primitives (raw mode, the window size, writing bytes); every escape
 //! sequence — the cell grid, the cursor, the out-of-band window state — is a provided method that
-//! writes standard ANSI/DEC bytes. [`Tty`] supplies the primitives through `rustix::termios`; the
+//! writes standard ANSI/DEC bytes. [`Tty`] supplies the primitives through `fuxix::terminal`; the
 //! tests' `CaptureBackend` records the bytes instead.
 
 use std::io;

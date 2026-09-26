@@ -36,7 +36,7 @@ koh-core/src/
 ├── pty.rs           PTY allocation, shell spawn, SIGWINCH, child reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
 ├── client/          the connection loop + ClientSession core + predictor + render + `connect`
-│   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through rustix::termios)
+│   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through fuxix::terminal)
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
 ├── idcmd.rs         `koh id` — print this machine's endpoint id
 └── keycmd.rs        `koh key` — show the identity, or reset it

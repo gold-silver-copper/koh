@@ -17,13 +17,13 @@ i=1
 while [ "$i" -le "$ROUNDS" ]; do
   if [ $((i % 2)) -eq 0 ]; then SIG=INT; else SIG=TERM; fi
   if ! start_server ""; then bad "round $i: server did not start"; break; fi
-  PID="$(server_pid)"
+  PID="$SERVER_PID"
   adb $ADB_SERIAL shell "kill -$SIG $PID" >/dev/null 2>&1 || true
 
-  # Wait for the process to actually exit (bounded).
+  # Wait for this server to actually exit (bounded).
   gone=0; j=0
   while [ "$j" -lt 8 ]; do
-    [ -z "$(koh_pids)" ] && { gone=1; break; }
+    [ -z "$(proc_state "$PID")" ] && { gone=1; break; }
     j=$((j + 1)); sleep 1
   done
   SRV="$(cat_dev "$SRV_LOG")"

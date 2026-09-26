@@ -43,9 +43,11 @@ max_koh_rss_kb() {
   for _p in $(koh_pids); do _r=$(rss_kb "$_p"); [ "$_r" -gt "$_m" ] && _m=$_r; done
   echo "$_m"
 }
-# The koh pid that ISN'T <server-pid> (i.e. the connected client). Empty if none.
+# The koh pid that ISN'T <server-pid> (i.e. the connected client). Empty if none; always succeeds,
+# so `CPID="$(other_pid …)"` polling before the client starts does not trip `set -e`.
 other_pid() {  # other_pid <server-pid>
-  for _p in $(koh_pids); do [ "$_p" != "$1" ] && { echo "$_p"; return; }; done
+  for _p in $(koh_pids); do [ "$_p" != "$1" ] && { echo "$_p"; return 0; }; done
+  return 0
 }
 # /proc/<pid>/stat state char (R run, S sleep, T stopped, Z zombie, …); empty if the pid is gone.
 proc_state() {
@@ -61,7 +63,8 @@ cpu_jiffies() {
 }
 
 # --- server lifecycle on device --------------------------------------------------------------------
-# start_server "<extra serve args>" — launch detached, wait for the banner, set SERVER_ID/SERVER_PORT.
+# start_server "<extra serve args>" — launch detached, wait for the banner, set SERVER_ID/SERVER_PORT
+# and SERVER_PID (the pid the device shell started, so no other koh process can be mistaken for it).
 # Adds the default Android session shell unless the caller already passes its own `--shell` (clap
 # rejects a duplicated `--shell`).
 start_server() {
@@ -70,7 +73,7 @@ start_server() {
   # Allowlist the shared client key (plus any registered via allow_client_key). koh requires at
   # least one --allow; there is no accept-any mode.
   _allow="--allow $(koh_id_of "$CLI_KEY")$ALLOW_IDS"
-  adb $ADB_SERIAL shell "rm -f $SRV_LOG; $KENV nohup $DEVICE_BIN serve $_allow --local $_shellarg --key-file $SRV_KEY $_extra >$SRV_LOG 2>&1 &" >/dev/null
+  SERVER_PID="$(adb $ADB_SERIAL shell "rm -f $SRV_LOG; $KENV nohup $DEVICE_BIN serve $_allow --local $_shellarg --key-file $SRV_KEY $_extra >$SRV_LOG 2>&1 & echo \$!" | tr -d '\r')"
   SERVER_ID=""; SERVER_PORT=""
   _i=0
   while [ "$_i" -lt 25 ]; do
@@ -84,8 +87,21 @@ start_server() {
   done
   return 1
 }
-server_pid() { adb $ADB_SERIAL shell "pidof koh 2>/dev/null | tr ' ' '\n' | head -1" 2>/dev/null | tr -d '\r'; }
-stop_all_koh() { kill_remote_koh; sleep 1; }
+# The last started server's pid while it runs; empty once it is gone.
+server_pid() { [ -n "${SERVER_PID:-}" ] && [ -n "$(proc_state "$SERVER_PID")" ] && echo "$SERVER_PID"; return 0; }
+# SIGTERM every koh (continuing any the test stopped, which would hold the signal) and wait for them
+# to go. A koh still running 10s later did not honour SIGTERM: that fails the test, and it is
+# SIGKILLed so the next one starts clean.
+stop_all_koh() {
+  kill_remote_koh
+  adb $ADB_SERIAL shell "pkill -CONT -f $DEVICE_BIN" >/dev/null 2>&1 || true
+  _j=0
+  while [ -n "$(koh_pids)" ] && [ "$_j" -lt 10 ]; do _j=$((_j + 1)); sleep 1; done
+  if [ -n "$(koh_pids)" ]; then
+    bad "koh did not exit within 10s of SIGTERM (pids: $(koh_pids))"
+    adb $ADB_SERIAL shell "pkill -9 -f $DEVICE_BIN" >/dev/null 2>&1 || true
+  fi
+}
 
 # --- client drivers --------------------------------------------------------------------------------
 # Non-TTY connect: is admitted, then errors at the terminal (no TTY) and exits. Sets OUT/RC.
@@ -192,9 +208,19 @@ push_evil() {
 
 # --- reporting -------------------------------------------------------------------------------------
 STRESS_FAIL=0
+FINISHED=0
 ok()   { echo "  ok: $1"; }
 bad()  { echo "  FAIL: $1"; STRESS_FAIL=1; }
 finish() {  # finish <test-name>
   stop_all_koh
+  FINISHED=1
   if [ "$STRESS_FAIL" = 0 ]; then echo "PASS: $1"; exit 0; else echo "FAIL: $1"; exit 1; fi
 }
+# A test that stops early (a command failing under `set -e`) must say so, not end silently.
+report_early_exit() {
+  _status=$?
+  if [ "$FINISHED" = 0 ] && [ "$_status" != 0 ]; then
+    echo "FAIL: $(basename "$0" .sh) stopped early (status $_status) before its checks finished"
+  fi
+}
+trap report_early_exit EXIT

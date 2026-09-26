@@ -24,7 +24,9 @@ for t in $TESTS; do
   total=$((total + 1))
   echo "════════════════════════ $t ════════════════════════"
   if sh "$HERE/$t.sh"; then :; else failed=$((failed + 1)); failed_names="$failed_names $t"; fi
-  adb $ADB_SERIAL shell "pkill -f $DEVICE_BIN" >/dev/null 2>&1 || true
+  # Nothing a test left behind may reach the next one. Each test's own teardown already checked that
+  # koh exits on SIGTERM; this only isolates the next test.
+  adb $ADB_SERIAL shell "pkill -9 -f $DEVICE_BIN" >/dev/null 2>&1 || true
   echo
 done
 

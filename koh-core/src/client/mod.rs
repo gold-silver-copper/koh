@@ -785,7 +785,7 @@ mod tests {
             // error must say so, not blame the allowlist.
             use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
             let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-                .secret_key(generate_secret_key())
+                .secret_key(generate_secret_key().expect("OS randomness"))
                 .alpns(vec![b"koh/iroh/2".to_vec()])
                 .bind()
                 .await
@@ -797,7 +797,7 @@ mod tests {
                 }
                 server
             });
-            let client = bind_endpoint_local(generate_secret_key(), false)
+            let client = bind_endpoint_local(generate_secret_key().expect("OS randomness"), false)
                 .await
                 .expect("bind client");
             let error = match IrohConnector::new(client, addr).connect().await {

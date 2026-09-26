@@ -89,7 +89,7 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
         }
         load_secret_key(path)
     } else {
-        let sk = generate_secret_key();
+        let sk = generate_secret_key()?;
         if let Some(parent) = path.parent() {
             create_dir_private(parent)?;
             // Reject a world-writable state dir before writing the identity key into it.
@@ -119,14 +119,13 @@ fn load_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
 fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
-        use rand::RngCore as _;
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let (tmp, mut file) = loop {
             let tmp = path.with_extension(format!(
                 "tmp.{}.{:016x}",
                 std::process::id(),
-                rand::rngs::OsRng.next_u64()
+                getrandom::u64()?
             ));
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -350,12 +349,12 @@ pub fn default_key_path(role: &str) -> Result<std::path::PathBuf, SetupError> {
     })
 }
 
-/// Generate a fresh random secret key (uses the OS RNG so it's independent of iroh's rand version).
-pub fn generate_secret_key() -> SecretKey {
-    use rand::RngCore;
+/// Generate a fresh secret key from the OS's randomness. Fails only if the OS has none to give;
+/// there is no fallback, because a predictable key is no key.
+pub fn generate_secret_key() -> std::io::Result<SecretKey> {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    SecretKey::from_bytes(&bytes)
+    getrandom::fill(&mut bytes)?;
+    Ok(SecretKey::from_bytes(&bytes))
 }
 
 /// Parse an [`EndpointId`] from its canonical (hex) string form, or the n0 base32 form.
@@ -626,7 +625,10 @@ mod tests {
         let path = dir.join("id.key");
         let _ = std::fs::remove_dir_all(&dir);
         create_dir_private(&dir).expect("private directory");
-        let keys = [generate_secret_key(), generate_secret_key()];
+        let keys = [
+            generate_secret_key().expect("OS randomness"),
+            generate_secret_key().expect("OS randomness"),
+        ];
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let mut threads = Vec::new();
         for key in keys {
@@ -663,7 +665,7 @@ mod tests {
         create_dir_private(&dir).expect("private directory");
         let predictable = path.with_extension(format!("tmp.{}.1", std::process::id()));
         std::fs::write(&predictable, b"attacker-owned").expect("preplant old temporary name");
-        let key = generate_secret_key();
+        let key = generate_secret_key().expect("OS randomness");
         assert!(
             create_secret_file(&path, &key.to_bytes()).expect("create identity"),
             "the identity is published despite the preplanted predictable name"
@@ -910,10 +912,10 @@ mod tests {
     #[test]
     fn two_endpoints_exchange_streams_over_loopback() {
         crate::test_runtime::current_thread().block_on(async {
-            let server = bind_endpoint_local(generate_secret_key(), true)
+            let server = bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
                 .await
                 .expect("bind server");
-            let client = bind_endpoint_local(generate_secret_key(), false)
+            let client = bind_endpoint_local(generate_secret_key().expect("OS randomness"), false)
                 .await
                 .expect("bind client");
             let server_addr = loopback_addr(&server);

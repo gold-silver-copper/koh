@@ -47,10 +47,10 @@ impl ClientTerminal for MockTerminal {
 fn full_session_over_loopback_pty() {
     runtime().expect("tokio runtime").block_on(async {
         // --- two real iroh endpoints on loopback ---
-        let server_ep = bind_endpoint_local(generate_secret_key(), true)
+        let server_ep = bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
             .await
             .expect("bind server endpoint");
-        let client_ep = bind_endpoint_local(generate_secret_key(), false)
+        let client_ep = bind_endpoint_local(generate_secret_key().expect("OS randomness"), false)
             .await
             .expect("bind client endpoint");
         let server_addr = loopback_addr(&server_ep);

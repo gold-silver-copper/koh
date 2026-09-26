@@ -43,7 +43,7 @@ macro_rules! evil_secret {
     () => {
         match std::env::var_os("EVIL_KEY_FILE") {
             Some(p) => load_or_create_secret_key(&PathBuf::from(p))?,
-            None => generate_secret_key(),
+            None => generate_secret_key()?,
         }
     };
 }

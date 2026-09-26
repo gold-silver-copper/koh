@@ -26,7 +26,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_client_binary_renders_over_pty() {
     // --- in-process loopback server with a real shell ---
-    let server_ep = bind_endpoint_local(generate_secret_key(), true)
+    let server_ep = bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
         .await
         .expect("bind server");
     let server_id = format_endpoint_id(&server_ep.id());

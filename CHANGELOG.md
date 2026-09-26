@@ -22,6 +22,11 @@ client and a 0.13 server (or the reverse) refuse each other at the TLS handshake
 error; upgrade both ends.
 
 ### Changed
+- **`RUST_LOG` takes `target=level` directives and bare levels only**, such as
+  `RUST_LOG=koh_core::server=debug,iroh=warn` or `RUST_LOG=debug`. Span, field and regex filters
+  are no longer understood; a `RUST_LOG` koh cannot read gives the default filter, as before. koh
+  no longer depends on `rand`, `data-encoding` or tracing-subscriber's `env-filter` (8 fewer
+  crates in a build).
 - **Keys typed while `koh connect` starts are kept**, as with ssh and mosh: entering raw mode no
   longer discards pending input, so a command typed before the connection is up reaches the remote
   shell. The same holds when resuming after `Ctrl-^ Ctrl-Z`.

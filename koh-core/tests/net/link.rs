@@ -18,8 +18,6 @@ use iroh::endpoint::transports::{
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use iroh_base::CustomAddr;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -63,9 +61,33 @@ struct Packet {
     data: Bytes,
 }
 
+/// SplitMix64: a small seeded generator, so a seed replays the same faults.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let z = self.0;
+        let z = (z ^ z.wrapping_shr(30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let z = (z ^ z.wrapping_shr(27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ z.wrapping_shr(31)
+    }
+
+    /// Uniform in `[0, 1)`, from the top 32 bits.
+    fn unit(&mut self) -> f64 {
+        let top = u32::try_from(self.next().wrapping_shr(32)).unwrap_or(u32::MAX);
+        f64::from(top) / 4_294_967_296.0
+    }
+
+    /// `true` with probability `p`.
+    fn chance(&mut self, p: f64) -> bool {
+        self.unit() < p
+    }
+}
+
 struct State {
     profile: Profile,
-    rng: StdRng,
+    rng: SplitMix64,
     /// Everything sent before this instant is dropped.
     outage_until: Option<Instant>,
     inboxes: HashMap<EndpointId, mpsc::UnboundedSender<Packet>>,
@@ -86,7 +108,7 @@ impl FaultNet {
         Self {
             state: Arc::new(Mutex::new(State {
                 profile,
-                rng: StdRng::seed_from_u64(seed),
+                rng: SplitMix64(seed),
                 outage_until: None,
                 inboxes: HashMap::new(),
                 sent: HashMap::new(),
@@ -159,23 +181,19 @@ impl FaultNet {
             return Ok(());
         }
         let profile = state.profile.clone();
-        if state.rng.gen_bool(profile.loss) {
+        if state.rng.chance(profile.loss) {
             return Ok(());
         }
-        let copies = if state.rng.gen_bool(profile.dup) {
-            2
-        } else {
-            1
-        };
+        let copies = if state.rng.chance(profile.dup) { 2 } else { 1 };
         let mut delays = Vec::with_capacity(copies);
         for _ in 0..copies {
-            let offset = profile.jitter.mul_f64(state.rng.gen_range(0.0..=1.0));
-            let mut delay = if state.rng.gen_bool(0.5) {
+            let offset = profile.jitter.mul_f64(state.rng.unit());
+            let mut delay = if state.rng.chance(0.5) {
                 profile.delay.saturating_sub(offset)
             } else {
                 profile.delay.saturating_add(offset)
             };
-            if state.rng.gen_bool(profile.reorder) {
+            if state.rng.chance(profile.reorder) {
                 delay = delay
                     .saturating_add(profile.delay)
                     .saturating_add(profile.jitter);

@@ -48,7 +48,7 @@ async fn raw_client_stream(conn: &Connection, bytes: &[u8]) -> anyhow::Result<()
 
 /// A server hosting `sh` for `evil` plus a well-behaved client, so the attack races real traffic.
 async fn server_under_attack(net: &FaultNet, evil: EndpointId) -> anyhow::Result<(Server, Client)> {
-    let good = identity();
+    let good = identity()?;
     let server = Server::start(net, &[evil, good.public()], &["sh"]).await?;
     let client = Client::connect(net, good, server.id).await?;
     Ok((server, client))
@@ -71,7 +71,7 @@ async fn assert_good_client_still_works(client: &mut Client) -> anyhow::Result<(
 fn an_oversized_client_message_closes_the_connection_only() -> anyhow::Result<()> {
     crate::harness::runtime()?.block_on(async {
         let net = net();
-        let evil = identity();
+        let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
         let conn = admitted(&net, evil, server.id).await?;
         // A length prefix claiming far more than the cap: rejected on the header.
@@ -91,7 +91,7 @@ fn an_oversized_client_message_closes_the_connection_only() -> anyhow::Result<()
 fn a_client_cannot_open_a_second_stream() -> anyhow::Result<()> {
     crate::harness::runtime()?.block_on(async {
         let net = net();
-        let evil = identity();
+        let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
         let conn = admitted(&net, evil, server.id).await?;
         raw_client_stream(
@@ -120,7 +120,7 @@ fn a_client_cannot_open_a_second_stream() -> anyhow::Result<()> {
 fn a_flood_of_connections_and_garbage_does_not_take_the_server_down() -> anyhow::Result<()> {
     crate::harness::runtime()?.block_on(async {
         let net = net();
-        let evil = identity();
+        let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
         for _ in 0..50 {
             let conn = admitted(&net, evil.clone(), server.id).await?;
@@ -143,7 +143,7 @@ async fn evil_server<F>(net: &FaultNet, allow: EndpointId, frames: F) -> anyhow:
 where
     F: FnOnce(Connection) -> tokio::task::JoinHandle<()> + Send + 'static,
 {
-    let secret = generate_secret_key();
+    let secret = generate_secret_key()?;
     let id = secret.public();
     let endpoint = net.endpoint(secret, true).await?;
     tokio::spawn(async move {
@@ -190,7 +190,7 @@ async fn client_survives(net: &FaultNet, good: SecretKey, evil: EndpointId) -> a
 fn an_oversized_or_bomb_frame_never_grows_the_client() -> anyhow::Result<()> {
     crate::harness::runtime()?.block_on(async {
         let net = net();
-        let good = identity();
+        let good = identity()?;
         let evil_id = evil_server(&net, good.public(), |conn| {
             tokio::spawn(async move {
                 // An inflate bomb: 64 MiB of zeros deflates tiny; the client's 16 MiB limit rejects it.
@@ -209,7 +209,7 @@ fn an_oversized_or_bomb_frame_never_grows_the_client() -> anyhow::Result<()> {
 fn frames_with_unknown_bases_never_grow_the_client() -> anyhow::Result<()> {
     crate::harness::runtime()?.block_on(async {
         let net = net();
-        let good = identity();
+        let good = identity()?;
         let evil_id = evil_server(&net, good.public(), |conn| {
             tokio::spawn(async move {
                 // 1000 frames, numbered far apart, each diffing from a base the client never holds.
@@ -245,9 +245,9 @@ fn frames_with_unknown_bases_never_grow_the_client() -> anyhow::Result<()> {
 fn a_bad_admission_byte_is_rejected_not_treated_as_admitted() -> anyhow::Result<()> {
     crate::harness::runtime()?.block_on(async {
         let net = net();
-        let good = identity();
+        let good = identity()?;
         // A server that opens the admission stream but writes the wrong byte.
-        let secret = generate_secret_key();
+        let secret = generate_secret_key()?;
         let evil_id = secret.public();
         let endpoint = net.endpoint(secret, true).await?;
         tokio::spawn(async move {

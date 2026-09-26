@@ -307,12 +307,11 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
                 }
             };
             if secured {
-                let _ = tracing_subscriber::fmt()
-                    .with_writer(std::sync::Mutex::new(file))
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| "koh=debug".into()),
-                    )
+                use tracing_subscriber::layer::SubscriberExt as _;
+                use tracing_subscriber::util::SubscriberInitExt as _;
+                let _ = tracing_subscriber::registry()
+                    .with(tracing_subscriber::fmt::layer().with_writer(std::sync::Mutex::new(file)))
+                    .with(crate::log::targets(tracing::Level::DEBUG))
                     .try_init();
             }
         }
@@ -371,8 +370,8 @@ mod tests {
     fn redial_reuses_the_loaded_identity_without_touching_the_key_file() -> anyhow::Result<()> {
         crate::test_runtime::current_thread().block_on(async {
             use crate::transport_iroh::{admission, bind_endpoint_local, generate_secret_key};
-            let server = bind_endpoint_local(generate_secret_key(), true).await?;
-            let identity = crate::identity::Identity::generate();
+            let server = bind_endpoint_local(generate_secret_key()?, true).await?;
+            let identity = crate::identity::Identity::generate()?;
             let expected = identity.secret.public();
             let socket = server
                 .bound_sockets()

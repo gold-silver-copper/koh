@@ -974,7 +974,11 @@ mod tests {
 
     impl RawClient {
         async fn connect(addr: iroh::EndpointAddr) -> Self {
-            Self::connect_as(addr, crate::transport_iroh::generate_secret_key()).await
+            Self::connect_as(
+                addr,
+                crate::transport_iroh::generate_secret_key().expect("OS randomness"),
+            )
+            .await
         }
 
         async fn connect_as(addr: iroh::EndpointAddr, secret: iroh::SecretKey) -> Self {
@@ -1060,9 +1064,10 @@ mod tests {
     fn run_session_delivers_keys_and_clamped_resizes_then_kills_the_shell() {
         crate::test_runtime::multi_thread(2).block_on(async {
             use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
-            let server_ep = bind_endpoint_local(generate_secret_key(), true)
-                .await
-                .expect("bind");
+            let server_ep =
+                bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
+                    .await
+                    .expect("bind");
             let addr = loopback_addr(&server_ep);
             let accept = tokio::spawn(async move {
                 let incoming = server_ep.accept().await.expect("incoming");
@@ -1118,9 +1123,10 @@ mod tests {
             // many times, B once. Each must only ever be acked for input it sent.
             use crate::server::{Registry, SessionSpec};
             use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
-            let server_ep = bind_endpoint_local(generate_secret_key(), true)
-                .await
-                .expect("bind");
+            let server_ep =
+                bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
+                    .await
+                    .expect("bind");
             let addr = loopback_addr(&server_ep);
             let registry = Registry::spawn(SessionSpec {
                 command: vec!["cat".to_owned()].into(),
@@ -1141,7 +1147,7 @@ mod tests {
                 }
             });
             // Both connections share one client identity, so they land on ONE session.
-            let secret = generate_secret_key();
+            let secret = generate_secret_key().expect("OS randomness");
             let mut a = RawClient::connect_as(addr.clone(), secret.clone()).await;
             let mut b = RawClient::connect_as(addr, secret).await;
             for _ in 0..30 {

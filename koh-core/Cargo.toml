@@ -49,9 +49,10 @@ qrcode = { version = "=0.14.1", default-features = false }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rand = "0.8"
-data-encoding = "2"
+# The log filter is `filter::Targets` (`target=level` directives), which needs no regex engine.
+tracing-subscriber = "0.3"
+# The OS's randomness, for new secret keys. Already in the tree through iroh.
+getrandom = { version = "0.4", features = ["std"] }
 
 [dev-dependencies]
 # No `fork` (and so no `timeout`): no test runs a case in a subprocess.

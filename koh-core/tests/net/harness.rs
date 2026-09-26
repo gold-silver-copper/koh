@@ -35,7 +35,7 @@ impl Server {
         allow: &[EndpointId],
         command: &[&str],
     ) -> anyhow::Result<Self> {
-        let secret = generate_secret_key();
+        let secret = generate_secret_key()?;
         let id = secret.public();
         let endpoint = net.endpoint(secret, true).await?;
         let config = ServeConfig {
@@ -293,13 +293,13 @@ impl Client {
 }
 
 /// A fresh client identity, to put on a server's allowlist before connecting.
-pub fn identity() -> SecretKey {
+pub fn identity() -> std::io::Result<SecretKey> {
     generate_secret_key()
 }
 
 /// A session: one server hosting `command` for one connected client.
 pub async fn session(net: &FaultNet, command: &[&str]) -> anyhow::Result<(Server, Client)> {
-    let secret = identity();
+    let secret = identity()?;
     let server = Server::start(net, &[secret.public()], command).await?;
     let client = Client::connect(net, secret, server.id).await?;
     Ok((server, client))

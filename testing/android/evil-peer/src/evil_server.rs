@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .ok_or_else(|| anyhow!("usage: evil-server <bad-admit|stall-admit>"))?;
 
-    let secret = generate_secret_key();
+    let secret = generate_secret_key()?;
     let id = secret.public();
     let ep = bind_endpoint_local(secret, true).await?;
     let port = ep

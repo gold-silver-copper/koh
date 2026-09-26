@@ -54,7 +54,7 @@ fn many_connects_in_a_row_reattach_the_same_session() {
         .block_on(async {
             // A leak or teardown race shows up as a hang or a failure on some iteration.
             let net = clean();
-            let secret = identity();
+            let secret = identity().expect("OS randomness");
             let server = Server::start(&net, &[secret.public()], &["sh"])
                 .await
                 .expect("start the server");
@@ -92,7 +92,7 @@ fn connections_dropped_with_input_in_flight_do_not_hurt_the_session() {
             // iteration sends a burst of CRs, confirms a marker, then drops the connection without
             // a close.
             let net = clean();
-            let secret = identity();
+            let secret = identity().expect("OS randomness");
             let server = Server::start(&net, &[secret.public()], &["sh"])
                 .await
                 .expect("start the server");
@@ -151,7 +151,7 @@ fn a_detached_session_is_reattached_at_its_current_screen() {
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
-            let secret = identity();
+            let secret = identity().expect("OS randomness");
             let server = Server::start(&net, &[secret.public()], &["sh"])
                 .await
                 .expect("start the server");
@@ -259,7 +259,7 @@ fn a_forced_mid_session_drop_reconnects_to_the_same_shell() {
             // running. The client must transparently reconnect and land back on the same shell, with the
             // earlier output still on screen.
             let net = clean();
-            let secret = identity();
+            let secret = identity().expect("OS randomness");
             let server = Server::start(&net, &[secret.public()], &["sh"])
                 .await
                 .expect("start the server");

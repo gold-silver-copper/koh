@@ -483,7 +483,9 @@ mod tests {
     fn attach_creates_then_reattaches_the_same_peer() {
         crate::test_runtime::multi_thread(2).block_on(async {
             let reg = registry(4, Duration::from_secs(30));
-            let peer = crate::transport_iroh::generate_secret_key().public();
+            let peer = crate::transport_iroh::generate_secret_key()
+                .expect("OS randomness")
+                .public();
             let (client, kind) = reg.attach(peer).await.expect("first attach");
             assert_eq!(kind, AttachKind::Created);
             let (_c2, kind) = reg.attach(peer).await.expect("second attach");
@@ -500,8 +502,12 @@ mod tests {
     fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() {
         crate::test_runtime::multi_thread(2).block_on(async {
             let reg = registry(1, Duration::from_secs(30));
-            let a = crate::transport_iroh::generate_secret_key().public();
-            let b = crate::transport_iroh::generate_secret_key().public();
+            let a = crate::transport_iroh::generate_secret_key()
+                .expect("OS randomness")
+                .public();
+            let b = crate::transport_iroh::generate_secret_key()
+                .expect("OS randomness")
+                .public();
             let (a_client, _) = reg
                 .attach(a)
                 .await
@@ -526,7 +532,9 @@ mod tests {
     fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() {
         crate::test_runtime::multi_thread(2).block_on(async {
             let reg = registry(4, Duration::from_millis(150));
-            let peer = crate::transport_iroh::generate_secret_key().public();
+            let peer = crate::transport_iroh::generate_secret_key()
+                .expect("OS randomness")
+                .public();
             let (a, _) = reg.attach(peer).await.expect("A");
             let (b, _) = reg
                 .attach(peer)
@@ -564,7 +572,9 @@ mod tests {
                 max_sessions: 4,
                 ttl: Duration::from_secs(30),
             });
-            let peer = crate::transport_iroh::generate_secret_key().public();
+            let peer = crate::transport_iroh::generate_secret_key()
+                .expect("OS randomness")
+                .public();
             let (mut client, kind) = reg.attach(peer).await.expect("attach");
             assert_eq!(kind, AttachKind::Created);
             // Wait for the final (exited) screen, then detach.

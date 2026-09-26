@@ -23,6 +23,7 @@ pub mod client;
 pub mod idcmd;
 pub mod identity;
 pub mod keycmd;
+pub mod log;
 pub mod predict;
 pub mod proto;
 pub mod pty;

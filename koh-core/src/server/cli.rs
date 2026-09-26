@@ -120,15 +120,14 @@ fn connect_qr(data: &str) -> Option<String> {
 /// Installs a global `tracing` subscriber writing to stderr if none is installed yet.
 pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     let args: ServeConfig = config.into();
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                // Targets match by prefix, so `koh` covers the binary, `koh_core` and the
-                // `koh::auth` audit target; RUST_LOG=koh_core::server=debug narrows to a module.
-                .unwrap_or_else(|_| "koh=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        let _ = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .with(crate::log::targets(tracing::Level::INFO))
+            .try_init();
+    }
     let hosting = Hosting::from_config(&args)?;
 
     let key_file = match args.key_file.clone() {

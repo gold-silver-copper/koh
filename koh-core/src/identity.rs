@@ -14,12 +14,12 @@ pub struct Identity {
 }
 
 impl Identity {
-    #[must_use]
-    pub fn generate() -> Self {
-        Self {
-            secret: crate::transport_iroh::generate_secret_key(),
+    /// A new identity with no key file behind it. Fails only if the OS has no randomness.
+    pub fn generate() -> std::io::Result<Self> {
+        Ok(Self {
+            secret: crate::transport_iroh::generate_secret_key()?,
             _lease: None,
-        }
+        })
     }
 
     #[must_use]
@@ -139,7 +139,7 @@ mod tests {
             }
         }
         let directory = TestDirectory(
-            std::env::temp_dir().join(format!("koh-lease-{}", Identity::generate().endpoint_id())),
+            std::env::temp_dir().join(format!("koh-lease-{}", Identity::generate()?.endpoint_id())),
         );
         crate::transport_iroh::create_dir_private(&directory.0)?;
         let path = directory.0.join("identity.key");
@@ -147,7 +147,7 @@ mod tests {
         std::fs::write(&path, b"corrupt disposable key")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let identity = Identity {
-            secret: crate::transport_iroh::generate_secret_key(),
+            secret: crate::transport_iroh::generate_secret_key()?,
             _lease: Some(Arc::new(IdentityLease::acquire(&path, false)?)),
         };
         let clone = identity.clone();

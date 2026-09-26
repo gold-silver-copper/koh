@@ -11,10 +11,10 @@ use koh_core::transport_iroh::{bind_endpoint_local, generate_secret_key, loopbac
 #[test]
 fn admit_unblocks_await_admission() {
     runtime().expect("tokio runtime").block_on(async {
-        let server = bind_endpoint_local(generate_secret_key(), true)
+        let server = bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
             .await
             .expect("bind server");
-        let client = bind_endpoint_local(generate_secret_key(), false)
+        let client = bind_endpoint_local(generate_secret_key().expect("OS randomness"), false)
             .await
             .expect("bind client");
         let addr = loopback_addr(&server);
@@ -39,10 +39,10 @@ fn admit_unblocks_await_admission() {
 #[test]
 fn reject_surfaces_as_error() {
     runtime().expect("tokio runtime").block_on(async {
-        let server = bind_endpoint_local(generate_secret_key(), true)
+        let server = bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
             .await
             .expect("bind server");
-        let client = bind_endpoint_local(generate_secret_key(), false)
+        let client = bind_endpoint_local(generate_secret_key().expect("OS randomness"), false)
             .await
             .expect("bind client");
         let addr = loopback_addr(&server);

@@ -42,7 +42,7 @@ fn a_remote_bell_runs_the_hook_at_most_once_a_second() {
         .expect("tokio runtime")
         .block_on(async {
             let net = FaultNet::new(Profile::default(), 1);
-            let secret = identity();
+            let secret = identity().expect("OS randomness");
             let server = Server::start(&net, &[secret.public()], &["sh"])
                 .await
                 .expect("start the server");
@@ -111,7 +111,7 @@ fn stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do() {
             // attaches must not fire the hook (the first synced frame primes it); a bell rung while the
             // client is reconnecting must (the hook is not re-primed).
             let net = FaultNet::new(Profile::default(), 1);
-            let secret = identity();
+            let secret = identity().expect("OS randomness");
             let server = Server::start(&net, &[secret.public()], &["sh"])
                 .await
                 .expect("start the server");

@@ -75,9 +75,13 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   confirmed after the same wait makes the client send a repeated `Ack`, a later packet that lets
   QUIC detect the loss and retransmit at once.
 - **Bounded state:** each end keeps at most `FRAME_WINDOW` (16) recent screens — the client its
-  last applied frames, the server the frames sent since the last acknowledged one. That constant,
-  plus QUIC flow control and the stream limits (the server accepts one client stream; the client a
-  handful of frame streams), is the whole memory bound; a peer cannot make either end accumulate.
+  last applied frames, the server the frames sent since the last acknowledged one. A count alone is
+  not a memory bound when a screen can be a million cells (about 32 MB at the 1000×1000 a client may
+  ask for), so the server's frames share the session's snapshot rather than copying it, hold at
+  most one screen of that size beyond the newest, and the session takes one snapshot per burst of
+  program output rather than per read. That, plus QUIC flow control and the stream limits (the
+  server accepts one client stream; the client a handful of frame streams), bounds memory; a peer
+  cannot make either end accumulate.
 - **Backpressure:** PTY input goes through a bounded writer queue. While it is full the server
   stops reading the client's stream, QUIC flow control stops the client's writes, and the client
   keeps at most 1 MiB of typing before dropping it with an "input paused" status line. The keyboard
@@ -107,9 +111,12 @@ both are deterministically unit-testable. The shells own the `tokio::select!` (t
 `biased` for input priority), a writer task for the client's stream, a task per frame stream, and
 the rendering.
 
-On the server side, **PTY writes are non-blocking**: a dedicated `koh-pty-writer` thread owns the
-blocking write handle and drains a bounded channel, so forwarding a keystroke (or a synthesized
-DSR/DA reply) only enqueues and never blocks a tokio worker on a slow child. Both producers share
+On the server side, **PTY writes are non-blocking**: a dedicated `koh-pty-writer` thread drains a
+bounded channel, so forwarding a keystroke (or a synthesized DSR/DA reply) only enqueues and never
+blocks a tokio worker on a slow child. The PTY master itself is non-blocking and both pump threads
+wait in `poll`: on Linux and Android a write blocked on a program's full input queue is never woken,
+not even once the program dies, so the writer gives up unread input as soon as the session is torn
+down instead of wedging the teardown. Both producers share
 one sender and enqueue under the session lock, so byte order is preserved (a query reply can't
 overtake the keystroke that triggered it).
 
@@ -278,7 +285,11 @@ conditions (connection churn, concurrent sessions, throughput + memory-longevity
 handling, a short screen-off freeze and a long one, reattach continuity, `tc netem`
 loss/jitter/reorder beneath real QUIC, a total-outage roaming analogue, and a bare-id connection over
 the public relay); and a **security** suite proves the data-plane and key defenses against a
-cross-compiled malicious-peer harness.
+cross-compiled malicious-peer harness. The memory checks are part of the point: an emulator has the
+RAM to survive what would get the server killed on a phone, so the suites bound the server's RSS
+under attack rather than only its survival. Every check first proves its precondition (the attack
+ran, the client was attached) from the server's log, so a result cannot pass vacuously. The netem
+tests root only `tc` (`su 0`, on a userdebug image), never the shell koh runs in.
 
 ### Tier 3 — real devices (manual)
 

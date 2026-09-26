@@ -110,7 +110,8 @@ about 3.5 minutes, evil-peer about 2):
 
 ### Known skips
 
-With the setup above nothing skips. A test skips, saying why, only when the machine cannot run it:
+With the setup above nothing skips. A skipped test is reported as skipped, not passed (`15/15
+passed, 0 skipped`). A test skips, saying why, only when the machine cannot run it:
 `stress-netem` and `stress-roaming` without `su` (a user build, such as a `google_apis_playstore`
 image); `stress-relay-discovery` without internet on the emulator, or when the bare-id connection
 over the public relay does not establish that run (the no-`ndk-context`-panic check still applies);

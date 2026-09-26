@@ -19,20 +19,23 @@ push_binary
 echo
 
 TESTS="sec-resize-oom-server sec-resize-zero-panic sec-key-perms sec-env-leak"
-total=0; failed=0; failed_names=""
+total=0; failed=0; failed_names=""; skipped=0; skipped_names=""
 for t in $TESTS; do
   total=$((total + 1))
   echo "════════════════════════ $t ════════════════════════"
-  if sh "$HERE/$t.sh"; then :; else failed=$((failed + 1)); failed_names="$failed_names $t"; fi
+  run_test "$HERE/$t.sh"
+  if [ "$TEST_RC" != 0 ]; then failed=$((failed + 1)); failed_names="$failed_names $t"
+  elif [ "$TEST_SKIPPED" = 1 ]; then skipped=$((skipped + 1)); skipped_names="$skipped_names $t"; fi
   # Nothing a test left behind may reach the next one. Each test's own teardown already checked that
   # koh exits on SIGTERM; this only isolates the next test.
   adb $ADB_SERIAL shell "pkill -9 -f $DEVICE_BIN" >/dev/null 2>&1 || true
   echo
 done
 
-passed=$((total - failed))
+passed=$((total - failed - skipped))
 echo "█████████████████████████████████████████████████████████"
-echo "koh security tests: $passed/$total assert the secure behavior"
+echo "koh security tests: $passed/$total assert the secure behavior, $skipped skipped"
+[ -n "$skipped_names" ] && echo "skipped (unverified):$skipped_names"
 [ -n "$failed_names" ] && echo "demonstrating-a-vuln (or failing):$failed_names"
 [ "$failed" = 0 ] || { echo "RESULT: FAIL (findings present or unverified)"; exit 1; }
 echo "RESULT: PASS (all findings closed)"

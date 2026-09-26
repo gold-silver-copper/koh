@@ -23,15 +23,19 @@ echo
 
 total=0
 failed=0
+skipped=0; skipped_names=""
 for t in test-dns-resolver test-dns-override test-loopback-e2e; do
   total=$((total + 1))
   echo "──────────────────────── $t ────────────────────────"
-  if sh "$HERE/$t.sh"; then :; else failed=$((failed + 1)); fi
+  run_test "$HERE/$t.sh"
+  if [ "$TEST_RC" != 0 ]; then failed=$((failed + 1))
+  elif [ "$TEST_SKIPPED" = 1 ]; then skipped=$((skipped + 1)); skipped_names="$skipped_names $t"; fi
   echo
 done
 
-passed=$((total - failed))
+passed=$((total - failed - skipped))
 echo "════════════════════════════════════════════════════════"
-echo "Android emulator tests: $passed/$total passed"
+echo "Android emulator tests: $passed/$total passed, $skipped skipped"
+[ -n "$skipped_names" ] && echo "skipped:$skipped_names"
 [ "$failed" = 0 ] || { echo "RESULT: FAIL"; exit 1; }
 echo "RESULT: PASS"

@@ -134,6 +134,18 @@ kill_remote_koh() {
   adb $ADB_SERIAL shell "pkill -f $DEVICE_BIN" >/dev/null 2>&1 || true
 }
 
+# --- running a test from an orchestrator ----------------------------------------------------------
+# run_test <script>: run one test, showing its output as it goes. Sets TEST_RC (its exit status) and
+# TEST_SKIPPED (1 if it printed a SKIP line): a skip exits 0, and must not be counted as a pass.
+run_test() {
+  _log="$(mktemp)"; _rcf="$(mktemp)"
+  { _r=0; sh "$1" || _r=$?; echo "$_r" > "$_rcf"; } 2>&1 | tee "$_log"
+  TEST_RC="$(cat "$_rcf")"
+  TEST_SKIPPED=0
+  if grep -q '^ *SKIP:' "$_log"; then TEST_SKIPPED=1; fi
+  rm -f "$_log" "$_rcf"
+}
+
 # --- assertions ------------------------------------------------------------------------------------
 contains()     { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 # koh's client prints nothing once it connects, so a connection is proven by the server's log: the

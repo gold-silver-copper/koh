@@ -40,19 +40,29 @@ wait_attached /data/local/tmp/koh-evil-witness.key 12 || bad "the benign witness
 echo "    server pid=$SPID; benign witness attached"
 ADDR="127.0.0.1:$SERVER_PORT"
 
-# <label> <attack-and-args...>: fire it, then require the server alive + bounded.
-run_client_attack() {
-  _label="$1"; shift
-  echo "  -- client attack: $_label"
-  adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR $*" >/dev/null 2>&1 || true
-  sleep 3
-  if [ -z "$(proc_state "$SPID")" ]; then bad "[$_label] server was KILLED"; return; fi
+# Require the server alive with bounded memory after <label>'s attack.
+require_server_bounded() {
+  if [ -z "$(proc_state "$SPID")" ]; then bad "[$1] server was KILLED"; return; fi
   _rss="$(rss_kb "$SPID")"
   if [ "$_rss" -le "$RSS_LIMIT" ]; then
-    ok "[$_label] server alive, RSS ${_rss}kB <= ${RSS_LIMIT}kB"
+    ok "[$1] server alive, RSS ${_rss}kB <= ${RSS_LIMIT}kB"
   else
-    bad "[$_label] server RSS ${_rss}kB exceeded ${RSS_LIMIT}kB (possible leak/OOM)"
+    bad "[$1] server RSS ${_rss}kB exceeded ${RSS_LIMIT}kB (possible leak/OOM)"
   fi
+}
+
+# <label> <attack> [args...]: fire it, require it ran to the end (the evil client says so only once
+# every crafted message is written, which QUIC's flow control makes the server's reading), then
+# require the server alive + bounded. Sets EVIL_OUT.
+run_client_attack() {
+  _label="$1"; shift
+  _atk="$1"
+  echo "  -- client attack: $_label"
+  EVIL_OUT="$(adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR $*" 2>&1 || true)"
+  contains "attack '$_atk' done" "$EVIL_OUT" \
+    || bad "[$_label] the attack never ran: $(printf '%s\n' "$EVIL_OUT" | tail -1)"
+  sleep 3
+  require_server_bounded "$_label"
 }
 
 ACC="$(scaled 2000 8000)" # accumulation count scales with intensity
@@ -63,7 +73,9 @@ ACC="$(scaled 2000 8000)" # accumulation count scales with intensity
 echo "  -- client attack: oversized message prefix (KOH-02)"
 BOMB_LINE='message of [0-9]* bytes exceeds the'
 BOMB0="$(cat_dev "$SRV_LOG" | grep -c "$BOMB_LINE" || true)"
-adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR bomb" >/dev/null 2>&1 || true
+BOMB_OUT="$(adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR bomb" 2>&1 || true)"
+contains "attack 'bomb' done" "$BOMB_OUT" \
+  || bad "[bomb] the attack never ran: $(printf '%s\n' "$BOMB_OUT" | tail -1)"
 sleep 3
 BOMB1="$(cat_dev "$SRV_LOG" | grep -c "$BOMB_LINE" || true)"
 if [ -z "$(proc_state "$SPID")" ]; then
@@ -80,25 +92,43 @@ run_client_attack "empty-fragment flood"   empty-frags 30000
 run_client_attack "partial-fragment flood" partial-frags 30000
 run_client_attack "state accumulation"     accumulate "$ACC" 4096
 
-# resize-flood: the server must COALESCE to one resize, not run one ioctl(TIOCSWINSZ) +
-# SIGWINCH + grid-realloc per event. A per-event regression is a CPU/syscall storm (minutes of CPU
-# for 400k events), not an RSS blowup — so we gate on CPU jiffies burned, not memory.
+# resize-flood: the server must COALESCE to one resize per read, not run one ioctl(TIOCSWINSZ) +
+# SIGWINCH + grid-realloc per event. A per-event regression is a CPU storm, not an RSS blowup, so
+# this gates on CPU ticks. The cap is far above what decoding 400k messages costs (20-600 ticks
+# measured across runs on the emulator, which accounts CPU coarsely) and far below a per-event
+# regression: the flood alternates 1000x1000 and 2x2, so every event would reallocate a million-cell
+# grid — minutes of CPU, not seconds. Exactly one resize per read is pinned off-device by
+# `a_read_keeps_only_the_last_resize_and_concatenates_keys`.
 echo "  -- client attack: resize flood (KOH-05 coalescing)"
 J0="$(cpu_jiffies "$SPID")"
-adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR resize-flood 400000" >/dev/null 2>&1 || true
+TICK_CAP="${KOH_EVIL_CPU_TICKS:-2000}"
+FLOOD_OUT="$(adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR resize-flood 400000" 2>&1 || true)"
 sleep 4
 DJ=$(( $(cpu_jiffies "$SPID") - J0 ))
+contains "attack 'resize-flood' done" "$FLOOD_OUT" \
+  || bad "[resize-flood] the attack never ran: $(printf '%s\n' "$FLOOD_OUT" | tail -1)"
 if [ -z "$(proc_state "$SPID")" ]; then
   bad "[resize-flood] server was KILLED"
-elif [ "$DJ" -le "${KOH_EVIL_CPU_TICKS:-500}" ]; then
-  ok "[resize-flood] server coalesced (burned ${DJ} CPU ticks <= 500; 400k per-event ops would burn thousands)"
+elif [ "$DJ" -le "$TICK_CAP" ]; then
+  ok "[resize-flood] server coalesced (burned ${DJ} CPU ticks <= ${TICK_CAP})"
 else
   bad "[resize-flood] server burned ${DJ} CPU ticks — a per-event resize regression?"
 fi
 
 run_client_attack "keys flood (PTY write/budget)" keys-flood 6
 run_client_attack "garbage datagrams"             garbage 30000
-run_client_attack "bad protocol version"          bad-version
+
+# bad-version: koh/3's ALPN *is* its version, so a wrong one must be refused by the TLS handshake —
+# the evil client never reaches the data plane at all.
+echo "  -- client attack: bad protocol version (the ALPN is the version)"
+BV_OUT="$(adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR bad-version" 2>&1 || true)"
+sleep 2
+if contains "connect returned Err" "$BV_OUT"; then
+  ok "[bad-version] the handshake refused the wrong ALPN"
+else
+  bad "[bad-version] the wrong ALPN was not refused: $(printf '%s\n' "$BV_OUT" | tail -1)"
+fi
+require_server_bounded "bad-version"
 
 SRV="$(cat_dev "$SRV_LOG")"
 [ -n "$(proc_state "$SPID")" ] && ok "server survived ALL client attacks" || bad "server died under the attacks"
@@ -124,17 +154,31 @@ fi
 rm -f "$WIT"
 stop_all_koh
 
-# ---- Part B: admission-stall attack — an admitted-but-stalling client must be timed out -----------
+# ---- Part B: admission-stall attack — a stalling client must hold nobody up -----------------------
+# The admission ack is one byte on a stream the server opens, and QUIC does not need the client to
+# accept it, so the server's 3s admission deadline need not fire for the server to be unharmed. What
+# must hold is that a client which never accepts the ack holds nobody up: every connection is served
+# in its own task, behind the connection and pending-handshake caps. So we keep one stalling and
+# require a legit client to be admitted while it does.
+STALL_KEY=/data/local/tmp/koh-evil-stall-fresh.key
+allow_client_key "$STALL_KEY"
 start_server "" || { bad "server failed to start for Part B"; finish "stress-evil-peer"; }
-echo "  -- admission-stall attack (the server's 3s admission timeout must fire; KOH-08)"
-adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT stall-admission" >/dev/null 2>&1 || true
-sleep 7
-SRV="$(cat_dev "$SRV_LOG")"
-if printf '%s\n' "$SRV" | grep -qE 'admission ack timed out|too many handshakes'; then
-  ok "the server bounded the stalled admission (timeout/cap fired)"
+echo "  -- admission-stall attack (a stalling client must hold nobody up; KOH-08)"
+( adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT stall-admission" >/dev/null 2>&1 || true ) &
+STALL_BG=$!
+sleep 2
+connect_once "$STALL_KEY"
+sleep 1
+if contains "$PAST_ADMISSION" "$OUT" \
+  && [ "$(attach_count "$(cat_dev "$SRV_LOG")" "$(koh_id_of "$STALL_KEY")")" -ge 1 ]; then
+  ok "a legit client was admitted while the stalling one was connected"
 else
-  echo "  note: no explicit admission-timeout line logged this run (still asserting survival below)"
+  bad "the stalling client held up a legit one (admission is not bounded per connection)"
 fi
+wait "$STALL_BG" 2>/dev/null || true
+SRV="$(cat_dev "$SRV_LOG")"
+printf '%s\n' "$SRV" | grep -qE 'admission ack timed out|too many handshakes' \
+  && echo "    note: the server also logged its admission timeout / handshake cap"
 [ -n "$(server_pid)" ] && ok "server survived the admission-stall attack" || bad "server died under the admission-stall attack"
 assert_no_crash "$SRV" >/dev/null && ok "no panic in the server log" || bad "server log shows a crash"
 stop_all_koh

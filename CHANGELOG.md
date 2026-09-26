@@ -86,6 +86,12 @@ error; upgrade both ends.
   `der` 0.8.0 → 0.8.2 and `spin` 0.10.0 → 0.10.1.
 
 ### Fixed
+- **A session whose program stopped reading its input could keep `koh serve` from ever exiting**
+  on Linux and Android. Input is written to the terminal from a dedicated thread; once the
+  terminal's input queue was full that write blocked, and the kernel never woke it — not even once
+  the program was dead — so tearing the session down waited on it for good. A large paste into a
+  program that reads nothing (`sleep`, a wedged shell) was enough. The thread now waits in `poll`
+  and gives up what the program never read as soon as the session is torn down.
 - **koh could not create a key on Android** (since 0.12.1): `koh serve`, `connect` and `id` failed
   with "Permission denied" whenever the key file did not exist yet. A new key was published with a
   hard link, which Android's SELinux policy denies to the shell and to apps. It is now renamed into

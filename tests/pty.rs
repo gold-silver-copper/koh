@@ -234,6 +234,44 @@ fn shutdown_joins_both_io_threads_without_deadlock() {
 }
 
 #[test]
+fn shutdown_returns_while_the_program_leaves_its_input_unread() {
+    multi_thread().expect("tokio runtime").block_on(async {
+        // `sleep` never reads its terminal, so a paste fills the PTY's input queue and the writer
+        // thread blocks in `write`. Shutdown kills the program; it must not then wait on that
+        // write forever, or `koh serve` could never exit after such a paste.
+        let (pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "stty raw -echo; sleep 60".to_owned(),
+            ],
+            "xterm-256color",
+            &launcher(),
+        )
+        .expect("spawn sleep");
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let chunk = vec![b'x'; 4096];
+        let mut queued = 0;
+        while queued < 256 && pty.write_input(&chunk).is_ok() {
+            queued += 1;
+        }
+        // Let the writer thread fill the terminal's input queue and block.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::task::spawn_blocking(move || pty.shutdown()),
+        )
+        .await
+        .expect("shutdown must not wait on a write the program will never read")
+        .expect("shutdown task panicked");
+        let _ = drain.await;
+    });
+}
+
+#[test]
 #[expect(
     clippy::match_wild_err_arm,
     reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"

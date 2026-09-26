@@ -25,7 +25,7 @@ start_server "--shell $FLOOD" || { bad "server failed to start"; finish "stress-
 SPID="$(server_pid)"
 
 pty_connect_bg /data/local/tmp/koh-long.key "$CLILOG" "$((DURATION + 6))" ""
-wait_file_contains "$CLILOG" "connected." 12 && ok "a client attached; flooding for ${DURATION}s" || bad "the client never attached"
+wait_attached /data/local/tmp/koh-long.key 12 && ok "a client attached; flooding for ${DURATION}s" || bad "the client never attached"
 
 samples=""; t=0
 while [ "$t" -lt "$DURATION" ]; do

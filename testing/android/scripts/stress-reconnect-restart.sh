@@ -20,6 +20,7 @@ echo "Stress: link-drop resilience — $ROUNDS round(s) of kill-server-under-a-l
 survived=0
 bannered=0
 allow_client_key /data/local/tmp/koh-rc.key   # the reconnecting client must be on the allowlist
+RC_ID="$(koh_id_of /data/local/tmp/koh-rc.key)"
 r=1
 while [ "$r" -le "$ROUNDS" ]; do
   echo "  round $r:"
@@ -32,7 +33,7 @@ while [ "$r" -le "$ROUNDS" ]; do
   attached=0; w=0
   while [ "$w" -lt 12 ]; do
     n="$(koh_count)"; [ "$n" -ge 2 ] && { attached=1; break; }
-    grep -q 'connected\.' "$HOSTLOG" 2>/dev/null && { attached=1; break; }
+    [ "$(attach_count "$(cat_dev "$SRV_LOG")" "$RC_ID")" -ge 1 ] && { attached=1; break; }
     w=$((w + 1)); sleep 1
   done
   [ "$attached" = 1 ] || { bad "round $r: client never attached"; stop_all_koh; break; }

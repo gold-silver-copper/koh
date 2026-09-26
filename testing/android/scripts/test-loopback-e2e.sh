@@ -3,9 +3,9 @@
 #
 # Starts `koh serve --local` detached on the device, scrapes its endpoint id + UDP port, then dials
 # it with `koh connect ... --direct 127.0.0.1:<port>`. BOTH sides bind their own iroh endpoint (so
-# both exercise the Android DnsResolver path), and the client must complete the handshake and print
-# "connected." over loopback QUIC. Because `adb shell` provides no TTY, the client then fails at
-# entering raw mode — that's expected and ignored; reaching "connected." proves the p2p path works.
+# both exercise the Android DnsResolver path), and the client must complete the handshake and be
+# admitted over loopback QUIC: the server logs the client's session. Because `adb shell` provides no
+# TTY, the client then fails at acquiring the terminal — expected, and proof it got that far.
 set -eu
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 . "$HERE/lib.sh"
@@ -42,16 +42,19 @@ fi
 if ! assert_no_crash "$SRV"; then kill_remote_koh; echo "FAIL: test-loopback-e2e (server crashed)"; exit 1; fi
 echo "  server up: id=${ID%??????????????????????????????????????????????????????????}… port=$PORT"
 
-# Dial over loopback. No TTY here, so the client prints "connected." then errors at raw mode — fine.
+# Dial over loopback. No TTY here, so once admitted the client errors at the terminal — fine.
 run_remote "$DEVICE_BIN connect $ID --direct 127.0.0.1:$PORT --key-file /data/local/tmp/koh-client.key"
-printf '%s\n' "$OUT" | grep -E 'connecting to|connected|ndk-context|panic|raw mode' | sed 's/^/    connect| /' | head -8
+printf '%s\n' "$OUT" | grep -E 'koh:|ndk-context|panic' | sed 's/^/    connect| /' | head -8
+sleep 1
+SRV="$(adb_ shell cat "$LOG" 2>/dev/null | tr -d '\r')"
 kill_remote_koh
 
-if contains "connected." "$OUT"; then
-  echo "  ok: client completed the handshake over loopback (p2p works on-device)"
+if [ "$(attach_count "$SRV" "$CLIENT_ID")" -ge 1 ] && contains "$PAST_ADMISSION" "$OUT"; then
+  echo "  ok: client completed the handshake over loopback and was admitted (p2p works on-device)"
 else
-  echo "  FAIL: client never reached \"connected.\" (loopback connect did not establish)"; fail=1
+  echo "  FAIL: the server never attached the client's session (loopback connect did not establish)"; fail=1
 fi
+if assert_no_crash "$SRV"; then :; else fail=1; fi
 if assert_no_crash "$OUT"; then
   echo "  ok: no ndk-context panic, no Rust panic on the client side either"
 else

@@ -16,6 +16,8 @@ echo "Stress: concurrent clients — $CLIENTS simultaneous connects, distinct pe
 # Each client uses its own key → its own node-id; all must be on the allowlist (no accept-any mode).
 i=1
 while [ "$i" -le "$CLIENTS" ]; do allow_client_key "/data/local/tmp/cc-$i.key"; i=$((i + 1)); done
+# Their ids, in order (the last $CLIENTS of ALLOW_IDS), to find each one's session in the server log.
+CC_IDS="$(printf '%s\n' $ALLOW_IDS | grep -E '^[0-9a-f]{64}$' | tail -n "$CLIENTS")"
 start_server "" || { bad "server failed to start"; finish "stress-concurrent-clients"; }
 SPID="$(server_pid)"
 RSS0="$(rss_kb "$SPID")"
@@ -31,12 +33,13 @@ while [ "$i" -le "$CLIENTS" ]; do
 done
 wait
 
+SRV="$(cat_dev "$SRV_LOG")"
 connected=0
+for id in $CC_IDS; do [ "$(attach_count "$SRV" "$id")" -ge 1 ] && connected=$((connected + 1)); done
 panics=0
 i=1
 while [ "$i" -le "$CLIENTS" ]; do
   L="$(cat_dev /data/local/tmp/cc-$i.log)"
-  contains "connected." "$L" && connected=$((connected + 1))
   { contains "$PANIC_NDK" "$L" || contains "$PANIC_RUST" "$L"; } && panics=$((panics + 1))
   i=$((i + 1))
 done

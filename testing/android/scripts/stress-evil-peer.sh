@@ -7,7 +7,7 @@
 #   B) admission-stall attack: an admitted-but-stalling client must be timed out by the server's
 #      bounded admission step, and the server must survive.
 #   C) malicious SERVER (admission direction): a real koh client must REFUSE a server that sends a
-#      bad admission byte or never admits it (never reach "connected.") — fail-closed on-device.
+#      bad admission byte or never admits it (exit with that refusal) — fail-closed on-device.
 #
 # Every malicious peer must be on the server's --allow list to reach the data plane (koh has no
 # accept-any mode), so the harness pre-registers their keys. Self-SKIPs cleanly if the evil-peer
@@ -24,7 +24,7 @@ RSS_LIMIT="${KOH_EVIL_RSS_LIMIT_KB:-262144}" # 256 MiB ceiling across the whole 
 echo "Stress: malicious-peer harness — crafted client + admission attacks (level=$STRESS_LEVEL)"
 
 # The evil client must be allowlisted to reach the data plane; it loads its (persistent, allowlisted)
-# identity from $EVIL_KEY via $EVIL_KEY_FILE. $KENV opens the always-encrypted key non-interactively.
+# identity from $EVIL_KEY via $EVIL_KEY_FILE (a raw key file, as koh's own).
 EVIL_KEY=/data/local/tmp/koh-evilcli.key
 EVIL_ENV="EVIL_KEY_FILE=$EVIL_KEY $KENV"
 
@@ -36,7 +36,7 @@ start_server "" || { bad "server failed to start"; finish "stress-evil-peer"; }
 SPID="$(server_pid)"
 WIT="/tmp/koh-evil-witness-$$.log"
 pty_connect_host_bg /data/local/tmp/koh-evil-witness.key "$WIT" 120 ""
-wait_file_contains_host "$WIT" "connected." 12 || true
+wait_attached /data/local/tmp/koh-evil-witness.key 12 || bad "the benign witness never attached"
 echo "    server pid=$SPID; benign witness attached"
 ADDR="127.0.0.1:$SERVER_PORT"
 
@@ -103,20 +103,23 @@ run_client_attack "bad protocol version"          bad-version
 SRV="$(cat_dev "$SRV_LOG")"
 [ -n "$(proc_state "$SPID")" ] && ok "server survived ALL client attacks" || bad "server died under the attacks"
 assert_no_crash "$SRV" >/dev/null && ok "no panic/abort in the server log" || bad "server log shows a crash"
-# The witness PTY capture records the reconnect banner IF its session was disrupted; its presence —
-# not the historical "connected." banner — is the real cross-tenant-impact signal.
+# The witness PTY capture records the reconnect banner IF its session was disrupted; its presence is
+# the cross-tenant-impact signal.
 if grep -aq 'reconnecting' "$WIT"; then
   bad "the benign witness session was disrupted (cross-tenant impact)"
 else
   ok "the benign witness stayed attached (no cross-tenant impact)"
 fi
-# A fresh legit client must still reach "connected." after the barrage — assert on ITS OWN captured
-# output (connect_once → run_remote sets $OUT), not the server's stale log.
+# A fresh legit client must still be admitted after the barrage: its own output shows it got past
+# admission, and the server attached its session.
 connect_once /data/local/tmp/koh-evil-fresh.key
-if printf '%s\n' "$OUT" | grep -q 'connected.'; then
+sleep 1
+if contains "$PAST_ADMISSION" "$OUT" \
+  && [ "$(attach_count "$(cat_dev "$SRV_LOG")" "$(koh_id_of /data/local/tmp/koh-evil-fresh.key)")" -ge 1 ]; then
   ok "a fresh legit client still connects after the barrage"
 else
-  echo "  note: fresh-client connect not confirmed (loopback flake; not a hard gate)"
+  bad "a fresh legit client was not admitted after the barrage"
+  printf '%s\n' "$OUT" | grep 'koh:' | sed 's/^/      /'
 fi
 rm -f "$WIT"
 stop_all_koh
@@ -150,14 +153,20 @@ if [ -x "$EVIL_SERVER_HOST" ]; then
       w=$((w + 1)); sleep 1
     done
     if [ -z "$EID" ] || [ -z "$EPORT" ]; then bad "[$atk] evil-server did not announce its id/port"; rm -f "$ESLOG"; continue; fi
-    # A koh client dials the malicious server; it must FAIL admission (never reach "connected.")
-    # because a non-ADMIT byte is rejected and a never-opened admission stream times out.
-    # run_remote injects $KENV so the client can open its own (always-encrypted) key.
+    # A koh client dials the malicious server; it must FAIL admission and exit with the refusal: a
+    # non-ADMIT byte is rejected, and a never-opened admission stream hits the 15s connect timeout.
+    case "$atk" in
+      bad-admit) refusal="server did not admit the connection" ;;
+      *) refusal="timed out connecting" ;;
+    esac
     run_remote "$DEVICE_BIN connect $EID --direct 127.0.0.1:$EPORT --key-file /data/local/tmp/koh-evilcli-$atk.key"
-    if printf '%s\n' "$OUT" | grep -q 'connected.'; then
+    if contains "$PAST_ADMISSION" "$OUT"; then
       bad "[$atk] the koh client was TRICKED into connecting to the malicious server!"
+    elif [ "$RC" != 0 ] && contains "$refusal" "$OUT"; then
+      ok "[$atk] the koh client refused the malicious server (exit $RC: $refusal)"
     else
-      ok "[$atk] the koh client refused the malicious server (never reached 'connected.')"
+      bad "[$atk] the koh client did not refuse with \"$refusal\" (exit $RC)"
+      printf '%s\n' "$OUT" | grep 'koh:' | sed 's/^/      /'
     fi
     rm -f "$ESLOG"
   done

@@ -73,7 +73,7 @@ if ! start_server "--shell $FLOOD"; then bad "server failed to start"; cleanup_t
 SPID="$(server_pid)"; RSS0="$(rss_kb "$SPID")"
 
 pty_connect_bg /data/local/tmp/koh-chaos.key "$CLILOG" $((SOAK + 30)) ""
-wait_file_contains "$CLILOG" "connected." 15 && ok "session connected (clean handshake); flooding" \
+wait_attached /data/local/tmp/koh-chaos.key 15 && ok "session connected (clean handshake); flooding" \
   || { bad "client never connected"; cleanup_tc; stop_all_koh; finish "stress-netem"; }
 CPID="$(other_pid "$SPID")"
 

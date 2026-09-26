@@ -88,7 +88,7 @@ server_pid() { adb $ADB_SERIAL shell "pidof koh 2>/dev/null | tr ' ' '\n' | head
 stop_all_koh() { kill_remote_koh; sleep 1; }
 
 # --- client drivers --------------------------------------------------------------------------------
-# Non-TTY connect: reaches "connected." then errors at raw mode (no TTY) and exits. Sets OUT/RC.
+# Non-TTY connect: is admitted, then errors at the terminal (no TTY) and exits. Sets OUT/RC.
 connect_once() {  # connect_once [key-file=$CLI_KEY] [extra args]  (run_remote injects $KENV)
   _kf="${1:-$CLI_KEY}"
   run_remote "$DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file $_kf ${2:-}"
@@ -135,6 +135,15 @@ push_flood_script() {  # push_flood_script <devpath> <body>
 
 # --- device file helpers ---------------------------------------------------------------------------
 cat_dev() { adb $ADB_SERIAL shell cat "$1" 2>/dev/null | tr -d '\r'; }
+# Wait until the server log shows <n> (default 1) attached connections of <key-file>'s client.
+wait_attached() {  # wait_attached <key-file> <secs> [n] -> 0 if seen
+  _id="$(koh_id_of "$1")"; _j=0
+  while [ "$_j" -lt "$2" ]; do
+    [ "$(attach_count "$(cat_dev "$SRV_LOG")" "$_id")" -ge "${3:-1}" ] && return 0
+    _j=$((_j + 1)); sleep 1
+  done
+  return 1
+}
 wait_file_contains() {  # <devfile> <substr> <secs> -> 0 if seen
   _j=0
   while [ "$_j" -lt "$3" ]; do

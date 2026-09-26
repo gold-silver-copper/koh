@@ -33,6 +33,14 @@ rss_kb() {
   adb $ADB_SERIAL shell "grep -m1 VmRSS /proc/$1/status 2>/dev/null" 2>/dev/null \
     | tr -d '\r' | awk '{print $2+0; found=1} END{if(!found) print 0}'
 }
+# Highest VmRSS (kB) of <pid> over <secs>, sampled on the device ten times a second: a transient
+# allocation burst that a single sample taken afterwards would miss is what an OOM kill sees.
+peak_rss_kb() {  # peak_rss_kb <pid> <secs>
+  adb $ADB_SERIAL shell "m=0; i=0; while [ \$i -lt $(($2 * 10)) ]; do
+      r=\$(grep -m1 VmRSS /proc/$1/status 2>/dev/null | awk '{print \$2}')
+      [ \"\${r:-0}\" -gt \$m ] && m=\$r; i=\$((i + 1)); sleep 0.1
+    done; echo \$m" 2>/dev/null | tr -d '\r' | awk '{print $1+0}'
+}
 # Open fd count of <pid>, 0 if gone.
 fd_count() {
   adb $ADB_SERIAL shell "ls /proc/$1/fd 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r' | awk '{print $1+0}'

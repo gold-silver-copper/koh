@@ -1,7 +1,7 @@
 //! The client's stdin and SIGWINCH producers, cancellable so teardown never blocks on input.
 
 use anyhow::Context;
-use nix::poll::{poll, PollFd, PollFlags};
+use fuxix::poll::{poll, Events, PollFd};
 use std::io::Read;
 use std::os::fd::AsFd;
 use std::thread::JoinHandle;
@@ -130,11 +130,16 @@ fn read_input<R: Read + AsFd>(
     let mut buffer = [0_u8; 1024];
     while !cancel.is_cancelled() {
         let ready = {
-            let mut descriptors = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
-            poll(&mut descriptors, 100_u16)
+            let fd = reader.as_fd();
+            let mut descriptors = [PollFd::new(&fd, Events::IN)];
+            poll(
+                &mut descriptors,
+                Some(std::time::Duration::from_millis(100)),
+            )
         };
         match ready {
-            Ok(0) | Err(nix::errno::Errno::EINTR) => {}
+            Ok(0) => {}
+            Err(errno) if errno == fuxix::Errno::INTR => {}
             Ok(_) => match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
@@ -174,7 +179,6 @@ fn send_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::sys::signal::{raise, Signal};
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
@@ -200,7 +204,8 @@ mod tests {
                 mut resize_rx,
             } = channels;
 
-            raise(Signal::SIGWINCH).expect("raise SIGWINCH");
+            let own = crate::client::own_pid().expect("own pid");
+            fuxix::process::kill(own, fuxix::process::Signal::Winch).expect("signal SIGWINCH");
             assert_eq!(
                 timeout(Duration::from_secs(1), resize_rx.recv())
                     .await

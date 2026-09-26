@@ -1019,9 +1019,9 @@ dependencies = [
 
 [[package]]
 name = "fuxix"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a67f7ec89fefb81b1c9dd0568af1c05e4958e6103424213e688161680b85ed"
+checksum = "af315c3816b751b1fe0916e08d6d8ba2a37394c423e30c7652a8b6e31b82d263"
 dependencies = [
  "libc",
 ]
@@ -1809,6 +1809,7 @@ version = "0.12.1"
 dependencies = [
  "anyhow",
  "clap",
+ "fuxix",
  "koh-core",
  "portable-pty",
  "tokio",
@@ -1827,7 +1828,6 @@ dependencies = [
  "iroh-base",
  "miniz_oxide",
  "n0-watcher",
- "nix",
  "noq-udp",
  "portable-pty",
  "postcard",

@@ -250,6 +250,14 @@ pub trait ClientTerminal {
     }
 }
 
+/// This process's pid, as the signal calls take it.
+fn own_pid() -> std::io::Result<fuxix::process::Pid> {
+    i32::try_from(std::process::id())
+        .ok()
+        .and_then(fuxix::process::Pid::from_raw)
+        .ok_or_else(|| std::io::Error::other("this process's pid is not a valid pid"))
+}
+
 /// The production [`ClientTerminal`], generic over a [`KohBackend`] (the binary's [`DefaultBackend`],
 /// or a byte-capturing one in tests).
 ///
@@ -311,10 +319,9 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
             .backend
             .write_bytes("\n[koh suspended — run `fg` to resume]\n".as_bytes());
         let _ = self.backend.flush();
-        // Stop ourselves. SIGTSTP halts the whole process; control returns here only once the user
-        // foregrounds the job (SIGCONT). `nix::raise` keeps the crate `forbid(unsafe)`.
-        nix::sys::signal::raise(nix::sys::signal::Signal::SIGTSTP)
-            .map_err(std::io::Error::other)?;
+        // Stop ourselves. SIGTSTP halts the whole process, and the shell reports the job as
+        // "Stopped"; control returns here only once the user foregrounds it (SIGCONT).
+        fuxix::process::kill(own_pid()?, fuxix::process::Signal::Tstp)?;
         // Foregrounded again: re-enter raw mode + the alternate screen and force the next frame to
         // re-assert the title / clipboard / input modes (the terminal was reset while we were away).
         self.backend.enter_raw_mode()?;

@@ -57,6 +57,8 @@ anyhow = "1"
 [dev-dependencies]
 # The pty-binary e2e test drives the real binary on an allocated PTY.
 portable-pty = "=0.9.0"
+# The signal numbers the e2e tests expect.
+fuxix = "0.1.1"
 
 [profile.release]
 opt-level = 3

@@ -11,8 +11,7 @@ use std::time::Duration;
 #[test]
 fn external_signal_retains_shell_style_exit_status() {
     current_thread().expect("tokio runtime").block_on(async {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
+        use fuxix::process::{kill, Pid, Signal};
 
         // The shell prints its own pid, so the test can signal it from outside like any other process.
         let (mut pty, mut rx) = Pty::spawn(
@@ -42,12 +41,13 @@ fn external_signal_retains_shell_style_exit_status() {
         })
         .await
         .expect("pid line deadline");
-        kill(Pid::from_raw(pid), Signal::SIGKILL).expect("signal child");
+        let pid = Pid::from_raw(pid).expect("a positive pid");
+        kill(pid, Signal::Kill).expect("signal child");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = pty.try_wait().expect("wait child") {
                 assert_eq!(status.exit_code(), 137);
-                assert_eq!(status.signal(), Some("SIGKILL"));
+                assert_eq!(status.signal(), Some(fuxix::process::Signal::Kill.raw()));
                 break;
             }
             assert!(

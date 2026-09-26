@@ -25,9 +25,10 @@ iroh = "=1.0.0"
 fux-vt = "0.1.1"
 portable-pty = "=0.9.0"
 unicode-width = "0.2"
-# The client's terminal: raw mode and the window size, through fux's safe calls over libc. koh writes
-# its own ANSI and reads raw stdin itself, so it needs nothing more.
-fuxix = "0.1.0"
+# The system calls koh makes beyond std, each safe to call: the client's terminal (raw mode, the
+# window size), `poll` on stdin, signals (the Ctrl-^ Ctrl-Z suspend's SIGTSTP, the PTY's SIGKILL)
+# and `O_NOFOLLOW`. koh writes its own ANSI and reads raw stdin itself.
+fuxix = "0.1.1"
 # serialization. default-features = false drops postcard's `heapless-cas` default, whose
 # `atomic-polyfill` transitive dep is unmaintained (RUSTSEC-2023-0089); we only need `use-std`
 # (which pulls `alloc`) for `to_allocvec`/`from_bytes`.
@@ -38,10 +39,6 @@ miniz_oxide = "0.8"
 # async / runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-# raise(SIGTSTP) for the Ctrl-^ Ctrl-Z client suspend without `unsafe` (nix wraps the libc call
-# internally; our crate stays `forbid(unsafe)`). `poll` makes the stdin producer cancellable while
-# idle; no default features. Already present transitively, so this pins no new major version.
-nix = { version = "0.28", default-features = false, features = ["fs", "poll", "process", "signal", "user"] }
 # render the endpoint id as a terminal QR on `koh serve` (always printed); default-features = false drops the
 # heavy image/svg/pic renderers (we only use the built-in unicode half-block renderer).
 qrcode = { version = "=0.14.1", default-features = false }

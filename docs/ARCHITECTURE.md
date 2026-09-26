@@ -277,7 +277,7 @@ prove correctness; only a real two-device run over a real radio proves *feel* an
 
 | Property | How koh delivers it |
 |---|---|
-| Keystrokes appear instantly on every link | predictor (always on; underlined on high-RTT links, then confirmed) |
+| Keystrokes appear instantly on every link | predictor (engages above 60 ms RTT once the server proves it echoes; confirmed by later frames) |
 | Survives suspend/resume + IP change, re-syncs to current screen | QUIC connection migration + a fresh frame against an acknowledged base (no backlog) |
 | A burst of superseded output never delays the current screen | one stream per frame, older frames reset; only the latest screen is sent |
 | Password prompts show no predicted echo | emergent no-echo suppression in the predictor |
@@ -285,3 +285,4 @@ prove correctness; only a real two-device run over a real radio proves *feel* an
 | Detach and reattach later, shell still running | server-side detachable sessions keyed by client id (reattach test) |
 | Interactive apps (vim/htop/fzf) that probe the terminal work | server synthesizes DSR/DA/DECRQM replies |
 | Client exits with the remote shell's status | exit code rides the final frame (`tests/net` session test) |
+| `Ctrl-^ Ctrl-Z` suspends like a terminal's suspend key | the client sends itself SIGTSTP, so the shell reports it "Stopped" and `fg` resumes (`tests/e2e_pty_binary.rs`) |

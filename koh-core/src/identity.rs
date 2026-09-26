@@ -74,13 +74,14 @@ pub fn reset(path: &Path) -> anyhow::Result<()> {
     std::fs::remove_file(path).with_context(|| format!("removing identity at {}", path.display()))
 }
 
+/// A `flock` on the identity's lock file, shared by users and exclusive for a reset; closing the
+/// file releases it.
 struct IdentityLease {
-    _lock: nix::fcntl::Flock<std::fs::File>,
+    _lock: std::fs::File,
 }
 
 impl IdentityLease {
     fn acquire(path: &Path, exclusive: bool) -> anyhow::Result<Self> {
-        use nix::fcntl::{Flock, FlockArg};
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
         let parent = path
             .parent()
@@ -101,21 +102,21 @@ impl IdentityLease {
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW)
+            .custom_flags(fuxix::file::NOFOLLOW)
             .open(path.with_file_name(lock_name))?;
         let meta = lock.metadata()?;
         ensure!(
             meta.is_file()
-                && meta.uid() == nix::unistd::geteuid().as_raw()
+                && meta.uid() == fuxix::process::geteuid()
                 && meta.permissions().mode().trailing_zeros() >= 6,
             "unsafe identity lease file"
         );
-        let kind = if exclusive {
-            FlockArg::LockExclusiveNonblock
+        let locked = if exclusive {
+            lock.try_lock()
         } else {
-            FlockArg::LockSharedNonblock
+            lock.try_lock_shared()
         };
-        let lock = Flock::lock(lock, kind).map_err(|(_, error)| {
+        locked.map_err(|error| {
             anyhow::anyhow!(
                 "identity {} is in use or being reset: {error}; stop its active users before reset",
                 path.display()

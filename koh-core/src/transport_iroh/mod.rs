@@ -207,11 +207,12 @@ fn read_key_file_secure(path: &Path) -> Result<Vec<u8>, SetupError> {
         // could be turned into a chmod/read oracle on an arbitrary file koh can reach.
         let file = match std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
+            .custom_flags(fuxix::file::NOFOLLOW)
             .open(path)
         {
             Ok(f) => f,
-            Err(e) if e.raw_os_error() == Some(nix::libc::ELOOP) => {
+            // The open refused a symlink (ELOOP); asking afterwards only names the refusal.
+            Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
                 tracing::warn!(path = %path.display(), "secret key path is a symlink; refusing to load it");
                 return Err(SetupError::BadKeyFile);
             }

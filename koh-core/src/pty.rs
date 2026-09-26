@@ -26,7 +26,7 @@ const WRITE_CHANNEL_DEPTH: usize = 1024;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GroupExitStatus {
     code: u32,
-    signal: Option<String>,
+    signal: Option<i32>,
 }
 
 impl GroupExitStatus {
@@ -38,8 +38,9 @@ impl GroupExitStatus {
         self.code
     }
 
-    pub fn signal(&self) -> Option<&str> {
-        self.signal.as_deref()
+    /// The number of the signal that ended the child, if one did.
+    pub fn signal(&self) -> Option<i32> {
+        self.signal
     }
 }
 
@@ -335,45 +336,25 @@ impl Pty {
     /// Non-blocking check for child exit. On a `Some` result the child has been reaped, so the PID
     /// may be recycled — the kill paths must not signal it afterward.
     pub fn try_wait(&mut self) -> std::io::Result<Option<GroupExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
         if self.reaped.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        #[cfg(unix)]
         let child: &mut dyn portable_pty::Child = self.child.as_mut();
-        let r = if let Some(child) = child.downcast_mut::<std::process::Child>() {
-            use std::os::unix::process::ExitStatusExt;
-            child.try_wait().map(|status| {
-                status.map(|status| {
-                    let signal = status.signal();
-                    GroupExitStatus {
-                        code: signal.map_or_else(
-                            || u32::try_from(status.code().unwrap_or_default()).unwrap_or(u32::MAX),
-                            |signal| {
-                                128_u32.saturating_add(u32::try_from(signal).unwrap_or(u32::MAX))
-                            },
-                        ),
-                        signal: signal.map(|signal| {
-                            nix::sys::signal::Signal::try_from(signal).map_or_else(
-                                |_| format!("SIG{signal}"),
-                                |signal| format!("{signal:?}"),
-                            )
-                        }),
-                    }
-                })
-            })
-        } else {
-            self.child.try_wait().map(|status| {
-                status.map(|status| GroupExitStatus {
-                    code: status.exit_code(),
-                    signal: status.signal().map(str::to_owned),
-                })
-            })
+        // portable-pty spawns a `std::process::Child` on unix, the only platform koh builds on.
+        let Some(child) = child.downcast_mut::<std::process::Child>() else {
+            return Err(io::Error::other("the PTY's child is not a std child"));
         };
-        #[cfg(not(unix))]
-        let r = self.child.try_wait().map(|status| {
-            status.map(|status| GroupExitStatus {
-                code: status.exit_code(),
-                signal: status.signal().map(str::to_owned),
+        let r = child.try_wait().map(|status| {
+            status.map(|status| {
+                let signal = status.signal();
+                GroupExitStatus {
+                    code: signal.map_or_else(
+                        || u32::try_from(status.code().unwrap_or_default()).unwrap_or(u32::MAX),
+                        |signal| 128_u32.saturating_add(u32::try_from(signal).unwrap_or(u32::MAX)),
+                    ),
+                    signal,
+                }
             })
         });
         if matches!(r, Ok(Some(_))) {
@@ -406,12 +387,12 @@ impl Pty {
             return;
         }
         #[cfg(unix)]
-        if let Some(pid) = self.process_id() {
-            use nix::sys::signal::{kill, Signal};
-            use nix::unistd::Pid;
-            if let Ok(pid) = i32::try_from(pid) {
-                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-            }
+        if let Some(pid) = self
+            .process_id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(fuxix::process::Pid::from_raw)
+        {
+            let _ = fuxix::process::kill(pid, fuxix::process::Signal::Kill);
         }
     }
 

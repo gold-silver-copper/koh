@@ -30,16 +30,18 @@ echo "Stress: bad-network CHAOS SOAK — ${SOAK}s of cycling adverse conditions 
 have_root_tc || { echo "SKIP: no root 'tc' on this image (needs 'su 0 tc': a userdebug/eng build)"; exit 0; }
 cleanup_tc() { as_root tc qdisc del dev lo root >/dev/null 2>&1 || true; }
 
-# The chaos profiles (cycled). netem args; empty = a clean recovery window.
+# The chaos profiles (cycled). netem args; empty = a clean recovery window. Jitter uses netem's
+# default (uniform) distribution: `distribution normal` needs tc's distribution tables, which the
+# emulator's images do not ship. Reordering needs a delay to reorder against.
 NPROFILES=6
 profile_args() {
   case "$1" in
-    0) echo "delay 120ms 60ms distribution normal loss 15% reorder 30% 50% duplicate 2%" ;;
+    0) echo "delay 120ms 60ms loss 15% reorder 30% 50% duplicate 2%" ;;
     1) echo "loss 40%" ;;
-    2) echo "loss 100%" ;;                                # TOTAL blackout (short phase, < idle timeout)
-    3) echo "delay 400ms 200ms distribution normal" ;;   # high latency + heavy jitter
-    4) echo "loss 25% duplicate 10% reorder 50% 50%" ;;  # dup + reorder storm
-    *) echo "" ;;                                         # recovery (clean)
+    2) echo "loss 100%" ;;                                     # TOTAL blackout (short phase, < idle timeout)
+    3) echo "delay 400ms 200ms" ;;                             # high latency + heavy jitter
+    4) echo "delay 10ms loss 25% duplicate 10% reorder 50% 50%" ;;  # dup + reorder storm
+    *) echo "" ;;                                              # recovery (clean)
   esac
 }
 profile_name() {
@@ -48,13 +50,13 @@ profile_name() {
     3) echo "high latency 400±200ms" ;; 4) echo "dup+reorder storm" ;; *) echo "recovery (clean)" ;;
   esac
 }
-# Apply a profile; if the image lacks reorder/dup (e.g. android-35), strip those and keep loss/delay.
+# Apply a profile, and confirm netem is in place: a phase whose conditions never applied would
+# report surviving something that did not happen.
 apply_profile() {
   cleanup_tc
   [ -z "$1" ] && return 0
-  as_root tc qdisc add dev lo root netem "$1" >/dev/null 2>&1 && return 0
-  _safe="$(printf '%s' "$1" | sed -E 's/reorder [0-9]+% [0-9]+%//; s/duplicate [0-9]+%//; s/  */ /g')"
-  as_root tc qdisc add dev lo root netem "$_safe" >/dev/null 2>&1 || return 1
+  as_root tc qdisc add dev lo root netem $1 >/dev/null 2>&1 || return 1
+  as_root tc qdisc show dev lo | grep -q netem
 }
 
 # A continuous, PACED flood so data keeps crossing the connection during the chaos — steady (~5k
@@ -80,7 +82,7 @@ phases=0; peak="$RSS0"; minrss="$RSS0"; broke=0; t=0; idx=0
 while [ "$t" -lt "$SOAK" ]; do
   args="$(profile_args "$idx")"
   printf '    [%3ss] phase %s: %s\n' "$t" "$phases" "$(profile_name "$idx")"
-  apply_profile "$args" || true   # if even the safe form fails, the phase is just clean — fine
+  apply_profile "$args" || bad "could not apply '$(profile_name "$idx")' ($args) — the phase would run clean"
   # Sample health a couple times during the phase.
   s=0
   while [ "$s" -lt "$PHASE" ]; do

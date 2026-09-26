@@ -86,6 +86,10 @@ error; upgrade both ends.
   `der` 0.8.0 → 0.8.2 and `spin` 0.10.0 → 0.10.1.
 
 ### Fixed
+- **koh could not create a key on Android** (since 0.12.1): `koh serve`, `connect` and `id` failed
+  with "Permission denied" whenever the key file did not exist yet. A new key was published with a
+  hard link, which Android's SELinux policy denies to the shell and to apps. It is now renamed into
+  place with the key's directory locked, which keeps two first runs racing to one identity.
 - On macOS, starting a session could fail with "Unknown error: -6", stall for up to about half a
   second, or, rarely, hang for good, while PTYs were being allocated concurrently anywhere on the
   machine. These are two races in the macOS kernel's PTY driver; fuxix 0.1.2 works around both

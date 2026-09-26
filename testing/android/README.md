@@ -122,7 +122,7 @@ KOH_ANDROID_EMULATOR=1 sh testing/android/scripts/stress-throughput.sh
 | `stress-relay-discovery` *(opt-in)* | bare-id connect over the public relay | real discovery **DNS resolution** works on Android (not just resolver construction) |
 
 The opt-in tests self-SKIP (exit 0) unless enabled: `KOH_STRESS_NETEM=1` (netem + roaming; needs
-`adb root` + `tc`) and `KOH_ANDROID_NET=1` (relay-discovery; needs the emulator to reach the internet).
+`su 0 tc`, i.e. a userdebug image) and `KOH_ANDROID_NET=1` (relay-discovery; needs the emulator to reach the internet).
 
 ### Migrated from the old `testing/tier2/` (Docker network-realism scaffolding)
 

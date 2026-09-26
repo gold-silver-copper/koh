@@ -26,10 +26,8 @@ fi
 OUTAGE="${KOH_STRESS_ROAM_OUTAGE_SECS:-6}"   # must stay < the 300s connection idle timeout
 echo "Stress: roaming — ${OUTAGE}s total loopback outage mid-session, then recover (level=$STRESS_LEVEL)"
 
-adb $ADB_SERIAL root >/dev/null 2>&1 || true
-adb $ADB_SERIAL wait-for-device >/dev/null 2>&1 || true
-adb $ADB_SERIAL shell 'command -v tc' >/dev/null 2>&1 || { echo "SKIP: 'tc' not present on this image"; exit 0; }
-cleanup_tc() { adb $ADB_SERIAL shell "tc qdisc del dev lo root" >/dev/null 2>&1 || true; }
+have_root_tc || { echo "SKIP: no root 'tc' on this image (needs 'su 0 tc': a userdebug/eng build)"; exit 0; }
+cleanup_tc() { as_root tc qdisc del dev lo root >/dev/null 2>&1 || true; }
 
 allow_client_key /data/local/tmp/koh-roam.key
 start_server "" || { bad "server failed to start"; finish "stress-roaming"; }
@@ -44,7 +42,7 @@ echo "    client attached (server=$SPID, client=$CPID)"
 
 # Total outage on the QUIC path.
 cleanup_tc
-if ! adb $ADB_SERIAL shell "tc qdisc add dev lo root netem loss 100%" >/dev/null 2>&1; then
+if ! as_root tc qdisc add dev lo root netem loss 100%; then
   echo "SKIP: couldn't apply a 100%-loss qdisc (no permission / no netem)"; rm -f "$CLILOG"; stop_all_koh; exit 0
 fi
 echo "    loopback blacked out (100% loss)"

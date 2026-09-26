@@ -133,6 +133,16 @@ push_flood_script() {  # push_flood_script <devpath> <body>
   rm -f "$_tmp"
 }
 
+# --- root on the device (the `tc` the netem tests need) ---------------------------------------------
+# Run a command as root WITHOUT rooting adbd: `adb root` restarts the shell as uid 0, and koh then
+# refuses the harness's shell-owned key files (a key file must belong to whoever opens it), so every
+# `koh` call in the suite fails. `su 0` keeps the shell as uid 2000 and roots only this command. It
+# exists on a userdebug/eng image (the emulator's `google_apis` one); on a user build there is no
+# root at all and the caller SKIPs.
+as_root() { adb $ADB_SERIAL shell "su 0 $*" 2>/dev/null; }
+# Whether root + tc + netem are actually usable on this image.
+have_root_tc() { as_root tc qdisc show dev lo >/dev/null 2>&1; }
+
 # --- device file helpers ---------------------------------------------------------------------------
 cat_dev() { adb $ADB_SERIAL shell cat "$1" 2>/dev/null | tr -d '\r'; }
 # Wait until the server log shows <n> (default 1) attached connections of <key-file>'s client.

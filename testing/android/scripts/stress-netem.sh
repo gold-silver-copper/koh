@@ -27,10 +27,8 @@ SOAK="${KOH_STRESS_NETEM_SOAK_SECS:-$(scaled 72 300)}"   # total chaos duration
 PHASE="${KOH_STRESS_NETEM_PHASE_SECS:-8}"                # seconds per condition (< the 300s idle timeout)
 echo "Stress: bad-network CHAOS SOAK — ${SOAK}s of cycling adverse conditions on lo (level=$STRESS_LEVEL)"
 
-adb $ADB_SERIAL root >/dev/null 2>&1 || true
-adb $ADB_SERIAL wait-for-device >/dev/null 2>&1 || true
-adb $ADB_SERIAL shell 'command -v tc' >/dev/null 2>&1 || { echo "SKIP: 'tc' (iproute2) not present on this system image"; exit 0; }
-cleanup_tc() { adb $ADB_SERIAL shell "tc qdisc del dev lo root" >/dev/null 2>&1 || true; }
+have_root_tc || { echo "SKIP: no root 'tc' on this image (needs 'su 0 tc': a userdebug/eng build)"; exit 0; }
+cleanup_tc() { as_root tc qdisc del dev lo root >/dev/null 2>&1 || true; }
 
 # The chaos profiles (cycled). netem args; empty = a clean recovery window.
 NPROFILES=6
@@ -54,9 +52,9 @@ profile_name() {
 apply_profile() {
   cleanup_tc
   [ -z "$1" ] && return 0
-  adb $ADB_SERIAL shell "tc qdisc add dev lo root netem $1" >/dev/null 2>&1 && return 0
+  as_root tc qdisc add dev lo root netem "$1" >/dev/null 2>&1 && return 0
   _safe="$(printf '%s' "$1" | sed -E 's/reorder [0-9]+% [0-9]+%//; s/duplicate [0-9]+%//; s/  */ /g')"
-  adb $ADB_SERIAL shell "tc qdisc add dev lo root netem $_safe" >/dev/null 2>&1 || return 1
+  as_root tc qdisc add dev lo root netem "$_safe" >/dev/null 2>&1 || return 1
 }
 
 # A continuous, PACED flood so data keeps crossing the connection during the chaos — steady (~5k

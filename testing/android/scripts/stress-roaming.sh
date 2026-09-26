@@ -46,8 +46,9 @@ echo "    client attached (server=$SPID, client=$CPID)"
 
 # Total outage on the QUIC path.
 cleanup_tc
+# Root tc works here (checked above), so failing to black the link out is a failure, not a skip.
 if ! as_root tc qdisc add dev lo root netem loss 100%; then
-  echo "SKIP: couldn't apply a 100%-loss qdisc (no permission / no netem)"; rm -f "$CLILOG"; stop_all_koh; exit 0
+  bad "couldn't apply a 100%-loss qdisc"; rm -f "$CLILOG"; finish "stress-roaming"
 fi
 echo "    loopback blacked out (100% loss)"
 

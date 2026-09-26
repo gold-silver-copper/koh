@@ -86,6 +86,12 @@ error; upgrade both ends.
   `der` 0.8.0 → 0.8.2 and `spin` 0.10.0 → 0.10.1.
 
 ### Fixed
+- **One client could make `koh serve` hold over half a gigabyte**, enough for Android to kill it
+  and every session in it. A client that never acknowledged a frame was resent the screen every
+  round trip, and the server kept a full copy of it for each of the 16 frames it remembers: at the
+  largest size a client may ask for (1000×1000, about 32 MB a screen) that was about 680 MB, from
+  one resize. Frames now share the screen they show, and the unacknowledged ones hold at most one
+  screen of that size beyond the newest; the wire protocol is unchanged.
 - **A session whose program stopped reading its input could keep `koh serve` from ever exiting**
   on Linux and Android. Input is written to the terminal from a dedicated thread; once the
   terminal's input queue was full that write blocked, and the kernel never woke it — not even once

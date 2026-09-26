@@ -159,8 +159,7 @@ EVIL_SERVER_DEV="${KOH_EVIL_SERVER_DEV:-/data/local/tmp/evil-server}"
 # Push the cross-compiled malicious peer (both binaries); SKIP the test cleanly if not built.
 push_evil() {
   if [ ! -x "$EVIL_HOST" ]; then
-    echo "SKIP: evil-peer not built. Build it first:"
-    echo "      (cd testing/android/evil-peer && CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=<ndk>/…/aarch64-linux-android24-clang cargo build --release --target aarch64-linux-android)"
+    echo "SKIP: evil-peer not built. Build it first: sh testing/android/scripts/build-android.sh evil"
     exit 0
   fi
   adb $ADB_SERIAL push "$EVIL_HOST" "$EVIL_DEV" >/dev/null

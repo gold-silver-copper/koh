@@ -57,6 +57,13 @@ Use an **arm64-v8a** image — it runs natively on Apple Silicon and matches `ko
 `aarch64-linux-android` target. The build uses `cargo-ndk` if installed, else the NDK clang linker
 directly (no committed `.cargo/config.toml`, so host builds are unaffected).
 
+The suites build koh themselves. The malicious-peer harness (`evil-peer/`, used by the security
+suite and `stress-evil-peer`) is built once, the same way:
+
+```sh
+sh testing/android/scripts/build-android.sh evil   # evil-client + evil-server
+```
+
 ## Run
 
 ```sh

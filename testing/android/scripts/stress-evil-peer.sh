@@ -79,7 +79,7 @@ contains "attack 'bomb' done" "$BOMB_OUT" \
 sleep 3
 BOMB1="$(cat_dev "$SRV_LOG" | grep -c "$BOMB_LINE" || true)"
 if [ -z "$(proc_state "$SPID")" ]; then
-  bad "[bomb] server was KILLED by the decompression bomb"
+  bad "[bomb] server was KILLED by the oversized message prefix"
 else
   _rss="$(rss_kb "$SPID")"
   [ "$_rss" -le "$RSS_LIMIT" ] && ok "[bomb] server RSS bounded (${_rss}kB)" || bad "[bomb] RSS ${_rss}kB > ${RSS_LIMIT}kB"
@@ -88,8 +88,24 @@ else
     || bad "[bomb] no size-cap rejection logged — the per-message cap may be gone"
 fi
 
-run_client_attack "empty-fragment flood"   empty-frags 30000
-run_client_attack "partial-fragment flood" partial-frags 30000
+# How many server log lines match <pattern> so far.
+log_count() { cat_dev "$SRV_LOG" | grep -c "$1" || true; }
+BROKE_LINE='client broke the protocol'
+
+# oversized: a well-framed input message whose body is over the input cap; the server must refuse
+# it and close that connection.
+B0="$(log_count "$BOMB_LINE")"
+run_client_attack "over-cap input message" oversized
+[ "$(log_count "$BOMB_LINE")" -gt "$B0" ] \
+  && ok "[oversized] server refused the over-cap message and closed the connection" \
+  || bad "[oversized] no size-cap rejection logged"
+
+# second-stream: the server grants one client stream; a second must never open.
+run_client_attack "second input stream" second-stream
+contains "second stream blocked by the limit" "$EVIL_OUT" \
+  && ok "[second-stream] the server's one-stream limit blocked a second stream" \
+  || bad "[second-stream] a second client stream opened: $(printf '%s\n' "$EVIL_OUT" | grep evil-client | tail -1)"
+
 run_client_attack "state accumulation"     accumulate "$ACC" 4096
 
 # resize-flood: the server must COALESCE to one resize per read, not run one ioctl(TIOCSWINSZ) +
@@ -116,7 +132,11 @@ else
 fi
 
 run_client_attack "keys flood (PTY write/budget)" keys-flood 6
-run_client_attack "garbage datagrams"             garbage 30000
+G0="$(log_count "$BROKE_LINE")"
+run_client_attack "garbage on the input stream"   garbage 30000
+[ "$(log_count "$BROKE_LINE")" -gt "$G0" ] \
+  && ok "[garbage] server rejected the malformed stream and closed the connection" \
+  || bad "[garbage] no protocol-error close logged for the garbage"
 
 # bad-version: koh/3's ALPN *is* its version, so a wrong one must be refused by the TLS handshake —
 # the evil client never reaches the data plane at all.

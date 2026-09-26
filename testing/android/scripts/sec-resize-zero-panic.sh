@@ -21,6 +21,9 @@ adb $ADB_SERIAL shell "EVIL_KEY_FILE=$EVIL_KEY $KENV $EVIL_DEV $SERVER_ID 127.0.
 sleep 5
 
 SRV="$(cat_dev "$SRV_LOG")"
+[ "$(attach_count "$SRV" "$(koh_id_of "$EVIL_KEY")")" -ge 1 ] \
+  && ok "the malicious client was admitted (its resizes reached the session)" \
+  || bad "the malicious client was never admitted — the attack did not run"
 [ -n "$(proc_state "$SPID")" ] && ok "server survived the zero-dimension resize (clamped to a valid minimum)" \
   || bad "server was CRASHED by a (0,0) resize (M-2 confirmed)"
 printf '%s\n' "$SRV" | grep -q 'panicked' && bad "server PANICKED on the zero-dimension resize (M-2 confirmed)" \

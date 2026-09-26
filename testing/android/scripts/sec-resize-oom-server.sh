@@ -35,6 +35,9 @@ adb $ADB_SERIAL shell "EVIL_KEY_FILE=$EVIL_KEY $KENV $EVIL_DEV $SERVER_ID 127.0.
 sleep 6
 
 SRV="$(cat_dev "$SRV_LOG")"
+[ "$(attach_count "$SRV" "$(koh_id_of "$EVIL_KEY")")" -ge 1 ] \
+  && ok "the malicious client was admitted (its resizes reached the session)" \
+  || bad "the malicious client was never admitted — the attack did not run"
 if [ -n "$(proc_state "$SPID")" ]; then
   ok "server survived the resize bomb (geometry clamped)"
 else

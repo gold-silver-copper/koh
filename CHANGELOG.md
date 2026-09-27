@@ -93,6 +93,12 @@ error; upgrade both ends.
   `der` 0.8.0 → 0.8.2 and `spin` 0.10.0 → 0.10.1.
 
 ### Fixed
+- **A server could make `koh connect` hold about half a gigabyte**, enough to get it killed on a
+  phone. The client keeps the screens of its last 16 frames as bases for the next ones, each a full
+  copy: a server on a 1000×1000 terminal (about 32 MB a screen), or a hostile one, sending full
+  repaints made it hold 16 of them. Screens now share their unchanged rows, and the older frames
+  hold at most one screen of that size beyond the current one; a frame whose base was dropped asks
+  for a resync, as before. The wire protocol is unchanged.
 - **One client could make `koh serve` hold over half a gigabyte**, enough for Android to kill it
   and every session in it. A client that never acknowledged a frame was resent the screen every
   round trip, and the server kept a full copy of it for each of the 16 frames it remembers: at the

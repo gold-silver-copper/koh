@@ -41,7 +41,8 @@ service.
 - **Untrusted data plane:** the protocol (`src/proto.rs`) and the connection cores
   (`src/server/mod.rs`, `src/client/session.rs`) are pure and panic-free by construction. Client
   messages are length-capped (64 KiB of input each) and a frame is read and inflated with a 16 MiB
-  limit; each end keeps a fixed window of 16 screens, whatever the peer sends or withholds; QUIC
+  limit; each end keeps at most 16 recent screens, holding at most one screen of the largest size
+  beyond the one it needs (a row several share counted once), whatever the peer sends or withholds; QUIC
   stream limits and flow control bound what a peer can have in flight; and resize dimensions are
   clamped before any grid allocation.
   **The client runs no terminal parser on server bytes:** a screen update is a structured diff of

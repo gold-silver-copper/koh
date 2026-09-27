@@ -19,21 +19,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::proto::{
-    encode_frame, frame_interval, retry_after, ClientDecoder, ClientMsg, Frame, FrameNum, InputSeq,
-    ProtoError, FRAME_WINDOW, HEARTBEAT, SESSION_ENDED,
+    encode_frame, frame_interval, retry_after, ClientDecoder, ClientMsg, Frame, FrameNum,
+    FrameScreen, InputSeq, ProtoError, FRAME_WINDOW, HEARTBEAT, SESSION_ENDED, WINDOW_CELLS,
 };
 use crate::terminal::TerminalScreen;
 use crate::transport_iroh::IrohChannel;
 use iroh::endpoint::RecvStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
-
-/// Most screen cells the frames awaiting acknowledgement may hold together, a row several frames
-/// share counted once: one screen of the largest size a client may ask for (`MAX_DIM`²). Past it
-/// the oldest are dropped, as past [`FRAME_WINDOW`], so a client that never acknowledges cannot make
-/// the server hold sixteen million-cell screens (half a gigabyte). The newest frame is always kept;
-/// a dropped frame is only a base the client can no longer have a frame diffed against.
-const SENT_CELLS: usize = 1_000_000;
 
 /// Why an attached connection loop returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,13 +164,6 @@ impl EchoAck {
     }
 }
 
-/// A frame's number and the screen it brings the client to.
-#[derive(Clone, Default)]
-struct FrameScreen {
-    num: FrameNum,
-    screen: Arc<TerminalScreen>,
-}
-
 /// The client input one read made ready for the PTY.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Drained {
@@ -207,8 +193,9 @@ pub(crate) struct ServerConn {
     final_snapshot: bool,
     /// The newest frame the client acknowledged, and its screen. Starts as the blank frame 0.
     acked: FrameScreen,
-    /// Frames sent since, oldest first: at most `FRAME_WINDOW`, holding at most [`SENT_CELLS`] cells
-    /// beyond the newest.
+    /// Frames sent since, oldest first: at most `FRAME_WINDOW`, holding at most [`WINDOW_CELLS`]
+    /// cells together unless the newest alone is more, so a client that never acknowledges cannot
+    /// make the server hold sixteen of the largest screens. The newest is always kept.
     sent: VecDeque<FrameScreen>,
     last_num: FrameNum,
     last_sent_at: Option<Instant>,
@@ -341,7 +328,7 @@ impl ServerConn {
             screen: Arc::clone(&self.screen),
         });
         while self.sent.len() > FRAME_WINDOW
-            || (self.sent.len() > 1 && distinct_cells(&self.sent) > SENT_CELLS)
+            || (self.sent.len() > 1 && distinct_cells(&self.sent) > WINDOW_CELLS)
         {
             self.sent.pop_front();
         }
@@ -606,10 +593,10 @@ mod tests {
 
     use super::{
         distinct_cells, CursorKeyNormalizer, Drained, EchoAck, ServerConn, FINAL_ACK_WAIT,
-        SENT_CELLS,
     };
     use crate::proto::{
         encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_WINDOW, HEARTBEAT,
+        WINDOW_CELLS,
     };
     use crate::terminal::TerminalScreen;
 
@@ -996,12 +983,6 @@ mod tests {
     }
 
     #[test]
-    fn the_window_budget_is_one_screen_of_the_largest_size() {
-        let max = usize::from(crate::terminal::MAX_DIM);
-        assert_eq!(SENT_CELLS, max * max);
-    }
-
-    #[test]
     fn frames_resent_to_a_client_that_never_acknowledges_share_their_screen() {
         // A client that acknowledges nothing is resent the unchanged screen at every heartbeat.
         // Each resend held its own copy: sixteen of a 1000x1000 screen were over 500 MB.
@@ -1019,7 +1000,7 @@ mod tests {
             "the window still holds every resend"
         );
         assert!(c.sent.iter().all(|sent| Arc::ptr_eq(&sent.screen, &big)));
-        assert_eq!(distinct_cells(&c.sent), SENT_CELLS);
+        assert_eq!(distinct_cells(&c.sent), WINDOW_CELLS);
     }
 
     #[test]
@@ -1050,7 +1031,7 @@ mod tests {
             c.install_snapshot(largest(&format!("screen {n}")), true);
             c.poll_frame(t0 + HEARTBEAT * n, None)
                 .expect("a frame is due");
-            assert!(distinct_cells(&c.sent) <= SENT_CELLS, "after frame {n}");
+            assert!(distinct_cells(&c.sent) <= WINDOW_CELLS, "after frame {n}");
         }
         // Only the newest is left, and it still diffs against the base the client holds.
         assert_eq!(c.sent.len(), 1);

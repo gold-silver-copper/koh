@@ -175,6 +175,12 @@ impl TerminalScreen {
     pub fn distinct_cells<'a>(screens: impl IntoIterator<Item = &'a Self>) -> usize {
         Grid::distinct_cells(screens.into_iter().map(|screen| &screen.grid))
     }
+
+    /// The cells `screens` hold in memory beyond what `base` holds: a row they share with `base`
+    /// costs nothing, and a row several of them share counts once.
+    pub fn cells_beyond<'a>(base: &Self, screens: impl IntoIterator<Item = &'a Self>) -> usize {
+        Grid::cells_beyond(&base.grid, screens.into_iter().map(|screen| &screen.grid))
+    }
 }
 
 /// A colour on the wire.

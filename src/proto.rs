@@ -9,11 +9,12 @@
 //! Everything here is pure: the connection loops move bytes, this module turns them into messages
 //! and rejects anything oversized or malformed.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::terminal::ScreenDiff;
+use crate::terminal::{ScreenDiff, TerminalScreen};
 
 /// A frame number. Frame 0 is the blank default screen both ends start from; it is never sent.
 /// Real frames count from 1 on each connection.
@@ -64,6 +65,23 @@ pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// The client keeps its last applied frames, the server the frames it sent since the newest one
 /// acknowledged. A constant, so neither end's memory grows with what the peer sends or withholds.
 pub const FRAME_WINDOW: usize = 16;
+
+/// Most cells the recent screens an end keeps may hold, a row several of them share counted once:
+/// one screen of the largest size a client may ask for (`MAX_DIM`²).
+///
+/// [`FRAME_WINDOW`] alone is no memory bound when one screen can be a million cells (about 32 MB):
+/// sixteen of them are half a gigabyte, which a hostile peer, or one on a huge terminal, could
+/// make the other end hold by resizing. Past this the oldest screens are dropped, as past the
+/// window; a dropped screen is only a base the peer can no longer have a frame diffed against.
+pub const WINDOW_CELLS: usize = 1_000_000;
+
+/// A frame's number and the screen it brings the client to. Screens are shared, not copied, by
+/// every frame that shows them.
+#[derive(Clone, Debug, Default)]
+pub struct FrameScreen {
+    pub num: FrameNum,
+    pub screen: Arc<TerminalScreen>,
+}
 
 /// The server sends a frame at least this often, even when nothing changed, so the client can tell
 /// a quiet session from a dead link.
@@ -489,6 +507,12 @@ mod tests {
         assert_eq!(retry_after(Some(ms(200))), ms(300));
         assert_eq!(retry_after(Some(ms(10))), ms(30));
         assert_eq!(retry_after(None), ms(333 + 250));
+    }
+
+    #[test]
+    fn the_window_budget_is_one_screen_of_the_largest_size() {
+        let max = usize::from(crate::terminal::MAX_DIM);
+        assert_eq!(WINDOW_CELLS, max * max);
     }
 
     #[test]

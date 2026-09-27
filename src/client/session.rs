@@ -6,11 +6,13 @@
 //! drive it directly.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
-    retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_WINDOW, HEARTBEAT, MAX_INPUT_BYTES,
+    retry_after, ClientMsg, Frame, FrameNum, FrameScreen, InputSeq, FRAME_WINDOW, HEARTBEAT,
+    MAX_INPUT_BYTES, WINDOW_CELLS,
 };
 use crate::terminal::{Grid, TerminalScreen};
 
@@ -46,19 +48,14 @@ pub struct TickResult {
     pub status: Option<String>,
 }
 
-/// A frame this session applied: its number and the screen it left.
-#[derive(Default)]
-struct Applied {
-    num: FrameNum,
-    screen: TerminalScreen,
-}
-
 /// The client side of one connection.
 pub struct ClientSession {
     /// The newest applied frame and its screen.
-    current: Applied,
-    /// The frames applied before it, oldest first, at most `FRAME_WINDOW - 1`.
-    older: VecDeque<Applied>,
+    current: FrameScreen,
+    /// The frames applied before it, oldest first: at most `FRAME_WINDOW - 1`, holding at most
+    /// [`WINDOW_CELLS`] cells beyond those `current` holds, so a server cannot make the client
+    /// keep fifteen of the largest screens.
+    older: VecDeque<FrameScreen>,
     /// A `Resync` was sent and no frame has applied since.
     resync_sent: bool,
     /// The newest input the server has reported reflected on screen.
@@ -89,7 +86,7 @@ impl ClientSession {
     /// A session for a new connection, telling the server the window is `rows × cols`.
     pub fn new(pref: DisplayPreference, rows: u16, cols: u16) -> Self {
         Self {
-            current: Applied::default(),
+            current: FrameScreen::default(),
             older: VecDeque::new(),
             resync_sent: false,
             echo_ack: InputSeq::default(),
@@ -219,15 +216,17 @@ impl ClientSession {
         if frame.num <= self.current.num {
             return;
         }
+        // The base is copied to apply the frame to, which shares every row with it; the frame
+        // replaces only the rows it carries.
         let base = if frame.base == FrameNum::BLANK {
             Some(TerminalScreen::default())
         } else if frame.base == self.current.num {
-            Some(self.current.screen.clone())
+            Some(TerminalScreen::clone(&self.current.screen))
         } else {
             self.older
                 .iter()
                 .find(|older| older.num == frame.base)
-                .map(|older| older.screen.clone())
+                .map(|older| TerminalScreen::clone(&older.screen))
         };
         let Some(mut screen) = base else {
             if !self.resync_sent {
@@ -239,13 +238,13 @@ impl ClientSession {
         screen.apply(&frame.diff);
         let previous = std::mem::replace(
             &mut self.current,
-            Applied {
+            FrameScreen {
                 num: frame.num,
-                screen,
+                screen: Arc::new(screen),
             },
         );
         self.older.push_back(previous);
-        while self.older.len() >= FRAME_WINDOW {
+        while self.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
             self.older.pop_front();
         }
         self.resync_sent = false;
@@ -254,6 +253,14 @@ impl ClientSession {
         self.predictor.set_local_frame_late_acked(self.echo_ack.0);
         self.predictor.cull(self.current.screen.screen());
         self.dirty = true;
+    }
+
+    /// The cells the older frames hold beyond the current one.
+    fn older_cells(&self) -> usize {
+        TerminalScreen::cells_beyond(
+            &self.current.screen,
+            self.older.iter().map(|older| &*older.screen),
+        )
     }
 
     fn acknowledge(&mut self, num: FrameNum) {
@@ -331,12 +338,12 @@ impl ClientSession {
     }
 
     /// Whether a frame reported that the shell exited (its code is on [`state`](Self::state)).
-    pub const fn exited(&self) -> bool {
+    pub fn exited(&self) -> bool {
         self.current.screen.exit_code().is_some()
     }
 
     /// The newest applied screen.
-    pub const fn state(&self) -> &TerminalScreen {
+    pub fn state(&self) -> &TerminalScreen {
         &self.current.screen
     }
 
@@ -357,7 +364,7 @@ impl ClientSession {
     }
 
     /// The newest applied screen's grid.
-    pub const fn screen(&self) -> &Grid {
+    pub fn screen(&self) -> &Grid {
         self.current.screen.screen()
     }
 }
@@ -574,6 +581,72 @@ mod tests {
             s.screen().contents().contains("target"),
             "a kept base applies"
         );
+    }
+
+    /// A screen of the largest size a server may send, with text on every row.
+    fn largest_full() -> TerminalScreen {
+        let max = crate::terminal::MAX_DIM;
+        let mut emu = ServerTerminal::new(max, max, 0).expect("emulator");
+        let rows: Vec<String> = (0..max).map(|row| format!("row {row}")).collect();
+        emu.process(rows.join("\r\n").as_bytes());
+        emu.snapshot()
+    }
+
+    #[test]
+    fn older_frames_hold_at_most_one_largest_screen_beyond_the_current_one() {
+        // A server that sends only full repaints of the largest screen, each from the blank base
+        // so no row is shared: fifteen older copies of it were about 480 MB.
+        let (now, mut s) = start();
+        let big = largest_full();
+        let repaint = big.diff_from(&TerminalScreen::default());
+        for n in 1..=20 {
+            s.on_frame(
+                now,
+                &Frame {
+                    num: FrameNum(n),
+                    base: FrameNum::BLANK,
+                    echo_ack: InputSeq(0),
+                    diff: repaint.clone(),
+                },
+            );
+            assert!(s.older_cells() <= WINDOW_CELLS, "after frame {n}");
+        }
+        assert_eq!(
+            s.older.len(),
+            1,
+            "one largest screen besides the current one"
+        );
+        assert_eq!(s.older_cells(), WINDOW_CELLS);
+        assert_eq!(s.state(), &big);
+        drain(&mut s);
+        // A frame on a dropped base still asks for a resync; one on the kept base applies.
+        s.on_frame(now, &frame(21, 5, 0, &big, &big));
+        assert_eq!(drain(&mut s), [ClientMsg::Resync]);
+        s.on_frame(now, &frame(22, 19, 0, &big, &big));
+        assert_eq!(
+            drain(&mut s),
+            [ClientMsg::Ack {
+                frame: FrameNum(22)
+            }]
+        );
+    }
+
+    #[test]
+    fn older_frames_share_the_rows_they_have_in_common() {
+        // Frames that each change a row keep the whole window: the rows the current screen still
+        // shows are shared with it, so the older frames cost nothing beyond it.
+        let (now, mut s) = start();
+        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
+        let mut prev = TerminalScreen::default();
+        for n in 1..=20 {
+            emu.process(format!("line {n}\r\n").as_bytes());
+            let next = emu.snapshot();
+            s.on_frame(now, &frame(n, n - 1, 0, &prev, &next));
+            prev = next;
+        }
+        assert_eq!(s.older.len(), FRAME_WINDOW - 1);
+        assert_eq!(s.older_cells(), 0);
+        assert_eq!(s.state(), &prev);
     }
 
     #[test]

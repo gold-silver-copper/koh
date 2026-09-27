@@ -77,11 +77,15 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
 - **Bounded state:** each end keeps at most `FRAME_WINDOW` (16) recent screens — the client its
   last applied frames, the server the frames sent since the last acknowledged one. A count alone is
   not a memory bound when a screen can be a million cells (about 32 MB at the 1000×1000 a client may
-  ask for), so the server's frames share the session's snapshot rather than copying it, hold at
-  most one screen of that size beyond the newest, and the session takes one snapshot per burst of
-  program output rather than per read. That, plus QUIC flow control and the stream limits (the
-  server accepts one client stream; the client a handful of frame streams), bounds memory; a peer
-  cannot make either end accumulate.
+  ask for, 32 bytes a cell), so both ends also bound the cells their window holds at
+  `WINDOW_CELLS`, one screen of that size, counting each row once however many screens share it:
+  the server's unacknowledged frames together, the client's older frames beyond the current one.
+  Past it the oldest are dropped, which only costs the peer a base (a frame on a dropped base makes
+  the client ask for a resync). Screens are shared, not copied — a resent frame holds the session's
+  own snapshot, a client screen shares every row a frame did not carry with its base — and the
+  session takes one snapshot per burst of program output rather than per read. That, plus QUIC flow
+  control and the stream limits (the server accepts one client stream; the client a handful of
+  frame streams), bounds memory; a peer cannot make either end accumulate.
 - **Backpressure:** PTY input goes through a bounded writer queue. While it is full the server
   stops reading the client's stream, QUIC flow control stops the client's writes, and the client
   keeps at most 1 MiB of typing before dropping it with an "input paused" status line. The keyboard

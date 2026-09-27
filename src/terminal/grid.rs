@@ -48,6 +48,11 @@ impl Row {
     fn shares(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.cells, &other.cells)
     }
+
+    /// The allocation this row's cells live in, which every row sharing them has too.
+    fn id(&self) -> *const Cell {
+        Arc::as_ptr(&self.cells).cast()
+    }
 }
 
 impl PartialEq for Row {
@@ -194,10 +199,25 @@ impl Grid {
     /// The cells the rows of `grids` hold, each allocation counted once however many rows and
     /// grids share it: what those grids cost in memory together.
     pub fn distinct_cells<'a>(grids: impl IntoIterator<Item = &'a Self>) -> usize {
-        let mut seen: HashSet<*const Cell> = HashSet::new();
+        Self::unseen_cells(&mut HashSet::new(), grids)
+    }
+
+    /// The cells the rows of `grids` hold beyond the rows of `base`, counted as
+    /// [`distinct_cells`](Self::distinct_cells) counts them: what keeping `grids` besides `base`
+    /// costs.
+    pub fn cells_beyond<'a>(base: &Self, grids: impl IntoIterator<Item = &'a Self>) -> usize {
+        let mut seen = base.lines.iter().map(Row::id).collect();
+        Self::unseen_cells(&mut seen, grids)
+    }
+
+    /// The cells of the rows of `grids` whose allocation is not in `seen`, adding each to it.
+    fn unseen_cells<'a>(
+        seen: &mut HashSet<*const Cell>,
+        grids: impl IntoIterator<Item = &'a Self>,
+    ) -> usize {
         let mut cells = 0_usize;
         for line in grids.into_iter().flat_map(|grid| &grid.lines) {
-            if seen.insert(Arc::as_ptr(&line.cells).cast::<Cell>()) {
+            if seen.insert(line.id()) {
                 cells = cells.saturating_add(line.cells.len());
             }
         }

@@ -178,17 +178,19 @@ impl From<&Grid> for InputModes {
 impl InputModes {
     /// Escape sequences setting every mode explicitly (the first frame / after a resume).
     pub fn formatted(self) -> Vec<u8> {
-        self.write(&mut Vec::new(), None)
+        self.sequences(None)
     }
 
     /// Escape sequences taking a terminal at `prev` to these modes (only the changes).
     pub fn diff(self, prev: Self) -> Vec<u8> {
-        self.write(&mut Vec::new(), Some(prev))
+        self.sequences(Some(prev))
     }
 
-    fn write(self, buf: &mut Vec<u8>, prev: Option<Self>) -> Vec<u8> {
+    /// The sequences taking a terminal at `prev` (unknown if `None`) to these modes.
+    fn sequences(self, prev: Option<Self>) -> Vec<u8> {
         use MouseProtocolEncoding as Enc;
         use MouseProtocolMode as Mode;
+        let mut buf = Vec::new();
         let changed = |get: fn(&Self) -> bool| prev.is_none_or(|p| get(&p) != get(&self));
         if changed(|m| m.application_keypad) {
             buf.extend_from_slice(if self.application_keypad {
@@ -239,7 +241,7 @@ impl InputModes {
                 Enc::Sgr => buf.extend_from_slice(b"\x1b[?1006h"),
             }
         }
-        std::mem::take(buf)
+        buf
     }
 }
 

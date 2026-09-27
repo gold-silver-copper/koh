@@ -106,6 +106,10 @@ error; upgrade both ends.
   moved, where that writes less: a third of the terminal output for `seq` at 80×24 and a scroll
   region at 200×50, a thirtieth for full-width lines at 200×50, with the client's paint taking about
   a thirtieth of the CPU there. What the terminal shows is unchanged.
+- Typed CJK and emoji are predicted as the server then shows them: a predicted wide glyph covers the
+  cell to its right instead of being cut by it, a typed character before a wide glyph moves it
+  whole, and a prediction over half of a wide glyph blanks the other half, as the terminal does.
+  Frames with predicted wide glyphs are no longer repainted whole, nor is the frame after them.
 - Updated `iroh` 1.0.0 → 1.2.0 (with its QUIC backend `noq` 1.0.0 → 1.3.0), which clears Cargo's
   warning that iroh 1.0.0 contains code a future Rust will reject. Also `serde` 1.0.228 → 1.0.229
   and `miniz_oxide` 0.8 → 0.9; every other dependency's minimum version is now the release koh is

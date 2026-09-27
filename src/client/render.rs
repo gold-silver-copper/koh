@@ -21,8 +21,8 @@ use unicode_width::UnicodeWidthChar as _;
 /// A frame is painted whole when the terminal may not show what was painted: the first frame, after
 /// [`invalidate`](Self::invalidate) (a resume, a window resize), when the screen's size changed,
 /// when the status line appears or goes, and while the terminal is smaller than the screen. So is
-/// it, and the next one, when a glyph does not fill exactly the cells the grid gives it (a
-/// predicted wide glyph over a narrow cell): the terminal then lays the row out its own way.
+/// it, and the next one, when a glyph does not fill exactly the cells it is given (a hostile
+/// server's wide glyph in the last column, say): the terminal then lays the row out its own way.
 #[derive(Default)]
 pub(super) struct Painter {
     last: Option<Painted>,
@@ -47,6 +47,8 @@ struct Mark<G> {
     glyph: G,
     fg: Color,
     bg: Color,
+    /// The right half of the predicted wide glyph to its left.
+    covered: bool,
 }
 
 impl Mark<String> {
@@ -57,6 +59,7 @@ impl Mark<String> {
             glyph: &self.glyph,
             fg: self.fg,
             bg: self.bg,
+            covered: self.covered,
         }
     }
 }
@@ -69,16 +72,36 @@ impl Mark<&str> {
             glyph: self.glyph.to_owned(),
             fg: self.fg,
             bg: self.bg,
+            covered: self.covered,
         }
     }
+}
+
+/// The mark of `marks` (in `(row, col)` order) at `(row, col)`.
+fn mark_at<'m, 'a>(marks: &'m [Mark<&'a str>], row: u16, col: u16) -> Option<&'m Mark<&'a str>> {
+    marks
+        .binary_search_by_key(&(row, col), |mark| (mark.row, mark.col))
+        .ok()
+        .and_then(|at| marks.get(at))
+}
+
+/// The style the prediction at `(row, col)` draws in: its own, or a covered cell's wide glyph's.
+fn mark_style(marks: &[Mark<&str>], row: u16, col: u16) -> Option<CellStyle> {
+    let mark = mark_at(marks, row, col)?;
+    let owner = if mark.covered {
+        mark_at(marks, row, col.checked_sub(1)?)?
+    } else {
+        mark
+    };
+    Some(plain(owner.fg, owner.bg))
 }
 
 /// Whether `a` and `b` (each the marks on one row) draw the same glyphs in the same columns.
 fn same_marks(a: &[Mark<&str>], b: &[Mark<&str>]) -> bool {
     a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(a, b)| (a.col, a.glyph, a.fg, a.bg) == (b.col, b.glyph, b.fg, b.bg))
+        && a.iter().zip(b).all(|(a, b)| {
+            (a.col, a.glyph, a.fg, a.bg, a.covered) == (b.col, b.glyph, b.fg, b.bg, b.covered)
+        })
 }
 
 /// A scroll of the terminal: the rows `top..bottom` scroll by `by` (negative is up) in a scroll
@@ -233,41 +256,71 @@ const fn plain(fg: Color, bg: Color) -> CellStyle {
 }
 
 /// What `grid` with the predictions `marks` draws at `(row, col)`.
+///
+/// A prediction wins on glyph and colours, and spans two cells when the overlay covers the next
+/// one. A glyph of the grid half hidden by a prediction cannot show: its other half is a blank in
+/// the prediction's style, as a terminal leaves a wide glyph one of whose halves is overwritten.
 fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Paint<'a> {
+    if let Some(mark) = mark_at(marks, row, col) {
+        if mark.covered {
+            return Paint::Covered;
+        }
+        let covers_next = col
+            .checked_add(1)
+            .and_then(|next| mark_at(marks, row, next))
+            .is_some_and(|next| next.covered);
+        return Paint::Glyph {
+            // An empty glyph is a blank.
+            glyph: if mark.glyph.is_empty() {
+                " "
+            } else {
+                mark.glyph
+            },
+            style: plain(mark.fg, mark.bg),
+            span: if covers_next { 2 } else { 1 },
+        };
+    }
     let cell = grid.cell(row, col);
-    if cell.is_some_and(Cell::is_wide_continuation) {
+    let other_half = if cell.is_some_and(Cell::is_wide_continuation) {
+        col.checked_sub(1)
+    } else if cell.is_some_and(Cell::is_wide) {
+        col.checked_add(1)
+    } else {
+        None
+    };
+    if let Some(style) = other_half.and_then(|other| mark_style(marks, row, other)) {
+        return Paint::Glyph {
+            glyph: " ",
+            style,
+            span: 1,
+        };
+    }
+    let Some(c) = cell else {
+        return Paint::Glyph {
+            glyph: " ",
+            style: plain(Color::Default, Color::Default),
+            span: 1,
+        };
+    };
+    if c.is_wide_continuation() {
         return Paint::Covered;
     }
-    let span = if cell.is_some_and(Cell::is_wide) {
-        2
-    } else {
-        1
-    };
-    // A prediction wins on glyph and colours; an empty glyph is a blank.
-    let mark = marks
-        .binary_search_by_key(&(row, col), |mark| (mark.row, mark.col))
-        .ok()
-        .and_then(|at| marks.get(at));
-    let (glyph, style) = match (mark, cell) {
-        (Some(mark), _) => (mark.glyph, plain(mark.fg, mark.bg)),
-        (None, Some(c)) => (
-            c.contents(),
-            CellStyle {
-                fg: c.fgcolor(),
-                bg: c.bgcolor(),
-                bold: c.bold(),
-                dim: c.dim(),
-                italic: c.italic(),
-                underline: c.underline(),
-                inverse: c.inverse(),
-            },
-        ),
-        (None, None) => ("", plain(Color::Default, Color::Default)),
-    };
     Paint::Glyph {
-        glyph: if glyph.is_empty() { " " } else { glyph },
-        style,
-        span,
+        glyph: if c.contents().is_empty() {
+            " "
+        } else {
+            c.contents()
+        },
+        style: CellStyle {
+            fg: c.fgcolor(),
+            bg: c.bgcolor(),
+            bold: c.bold(),
+            dim: c.dim(),
+            italic: c.italic(),
+            underline: c.underline(),
+            inverse: c.inverse(),
+        },
+        span: if c.is_wide() { 2 } else { 1 },
     }
 }
 
@@ -319,6 +372,7 @@ impl Painter {
                 glyph: p.glyph,
                 fg: p.fg,
                 bg: p.bg,
+                covered: p.covered,
             })
             .collect();
         // Only on a terminal holding the whole screen does a cell land where it is painted.
@@ -702,6 +756,7 @@ mod tests {
     use super::*;
     use crate::client::backend::CaptureBackend;
     use crate::predict::{DisplayPreference, PredictedCell, PredictionEngine};
+    use unicode_width::UnicodeWidthStr as _;
 
     fn screen_of(bytes: &[u8]) -> Grid {
         crate::terminal::TerminalScreen::from_bytes(24, 80, bytes)
@@ -1066,6 +1121,7 @@ mod tests {
                     glyph: "Z",
                     fg: Color::Default,
                     bg: Color::Default,
+                    covered: false,
                 },
             )],
             Some((0, 3)),
@@ -1082,34 +1138,212 @@ mod tests {
         );
     }
 
+    /// A predicted glyph at `(row, col)`, and when it is wide the cell it covers.
+    fn predicted(row: u16, col: u16, glyph: &str) -> Vec<((u16, u16), PredictedCell<'_>)> {
+        let cell = |glyph, covered| PredictedCell {
+            glyph,
+            fg: Color::Default,
+            bg: Color::Default,
+            covered,
+        };
+        let mut cells = vec![((row, col), cell(glyph, false))];
+        if glyph.width() == 2 {
+            cells.push(((row, col.saturating_add(1)), cell("", true)));
+        }
+        cells
+    }
+
     #[test]
-    fn a_glyph_wider_than_its_cell_repaints_everything_twice() {
-        // A predicted wide glyph over a narrow cell: the terminal lays the row out its own way, so
-        // that frame and the next are painted whole, as every frame used to be.
-        let screen = screen_of(b"ab");
-        let wide = Overlay::of(
-            [(
-                (0, 2),
-                PredictedCell {
-                    glyph: "世",
-                    fg: Color::Default,
-                    bg: Color::Default,
-                },
-            )],
-            None,
-        );
+    fn a_predicted_wide_glyph_paints_only_itself() {
+        // Over narrow cells, then gone: each frame paints only the cells that changed.
+        let screen = screen_of(b"abcd");
+        let wide = Overlay::of(predicted(0, 1, "世"), None);
         let mut painter = Painter::default();
         paint_frame(&mut painter, &screen, &Overlay::empty(), None);
         assert_eq!(
             paint_frame(&mut painter, &screen, &wide, None),
-            render_to_string(&screen, &wide, None)
+            framed(&format!("\x1b[1;2H{PLAIN}世\x1b[m"), "1;5")
         );
         assert_eq!(
             paint_frame(&mut painter, &screen, &Overlay::empty(), None),
-            render_to_string(&screen, &Overlay::empty(), None)
+            framed(&format!("\x1b[1;2H{PLAIN}bc\x1b[m"), "1;5")
+        );
+    }
+
+    #[test]
+    fn a_predicted_narrow_glyph_over_a_wide_cell_blanks_its_right_half() {
+        // What a terminal shows once the server echoes the same glyph there.
+        let screen = screen_of("本x".as_bytes());
+        let narrow = Overlay::of(predicted(0, 0, "a"), Some((0, 1)));
+        let mut painter = Painter::default();
+        paint_frame(&mut painter, &screen, &Overlay::empty(), None);
+        let painted = paint_frame(&mut painter, &screen, &narrow, None);
+        assert_eq!(painted, framed(&format!("\x1b[1;1H{PLAIN}a \x1b[m"), "1;2"));
+        let mut terminal = fux_vt::Parser::new(24, 80, 0).unwrap();
+        terminal
+            .process(render_to_string(&screen, &Overlay::empty(), None).as_bytes())
+            .unwrap();
+        terminal.process(painted.as_bytes()).unwrap();
+        let echo = render_to_string(
+            &screen_of("本x\x1b[1;1Ha".as_bytes()),
+            &Overlay::empty(),
+            None,
+        );
+        let mut echoed = fux_vt::Parser::new(24, 80, 0).unwrap();
+        echoed.process(echo.as_bytes()).unwrap();
+        assert_eq!(shown(&terminal), shown(&echoed));
+    }
+
+    /// Paint `grid` with `overlay` through `painter` into `terminal`, 6×20.
+    fn paint_into(
+        painter: &mut Painter,
+        terminal: &mut fux_vt::Parser,
+        grid: &Grid,
+        overlay: &Overlay<'_>,
+    ) {
+        let mut backend = CaptureBackend {
+            size: Size::new(6, 20),
+            ..CaptureBackend::default()
+        };
+        painter.render(&mut backend, grid, overlay, None).unwrap();
+        terminal.process(&backend.bytes).unwrap();
+    }
+
+    /// Type `typed` where the program shows `before` (once a first keystroke confirmed that it
+    /// echoes), and paint the predictions; then let the program echo it with `echo` and paint
+    /// that. The terminal showed with the predictions exactly what it shows with the echo, the
+    /// cursor included, and the echo confirms every prediction.
+    fn predicted_typing_shows_the_echo(before: &str, typed: &str, echo: &str) {
+        let mut emu = crate::terminal::ServerTerminal::new(6, 20, 0).unwrap();
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        engine.set_local_frame_sent(0);
+        engine.new_user_byte(b'>', emu.snapshot().screen());
+        emu.process(b">");
+        engine.set_local_frame_late_acked(1);
+        engine.cull(emu.snapshot().screen());
+        emu.process(before.as_bytes());
+        let screen = emu.snapshot();
+
+        let mut painter = Painter::default();
+        let mut terminal = fux_vt::Parser::new(6, 20, 0).unwrap();
+        paint_into(
+            &mut painter,
+            &mut terminal,
+            screen.screen(),
+            &Overlay::empty(),
+        );
+        engine.set_local_frame_sent(1);
+        for &byte in typed.as_bytes() {
+            engine.new_user_byte(byte, screen.screen());
+        }
+        let overlay = engine.overlay();
+        assert!(overlay.cells().count() > 0, "{typed:?} is predicted");
+        paint_into(&mut painter, &mut terminal, screen.screen(), &overlay);
+        let predicted = shown(&terminal);
+
+        emu.process(echo.as_bytes());
+        let echoed = emu.snapshot();
+        let confirmed = engine.confirmed_epoch();
+        engine.set_local_frame_late_acked(2);
+        engine.cull(echoed.screen());
+        assert!(
+            engine.overlay().is_empty(),
+            "{typed:?}: every prediction graded"
+        );
+        assert!(
+            engine.confirmed_epoch() >= confirmed,
+            "{typed:?}: nothing killed"
+        );
+        let mut whole = fux_vt::Parser::new(6, 20, 0).unwrap();
+        paint_into(
+            &mut Painter::default(),
+            &mut whole,
+            echoed.screen(),
+            &Overlay::empty(),
+        );
+        assert_eq!(predicted, shown(&whole), "{before:?} then {typed:?}");
+        // Painting the echo over the predictions changes nothing the terminal shows.
+        paint_into(
+            &mut painter,
+            &mut terminal,
+            echoed.screen(),
+            &engine.overlay(),
+        );
+        assert_eq!(shown(&terminal), shown(&whole), "{before:?} then {typed:?}");
+    }
+
+    #[test]
+    fn typing_wide_glyphs_shows_what_the_echo_shows() {
+        // A terminal echoes a typed glyph where the cursor is, over what was there.
+        for (before, typed) in [
+            // Over blank cells.
+            ("", "日本\u{1f980}"),
+            // Over narrow text.
+            ("abcdefgh\x1b[1;2H", "日"),
+            ("abcdef\x1b[1;4H", "\u{1f980}"),
+            // Over wide text, on its glyphs and across them.
+            ("本本本\x1b[1;2H", "日"),
+            ("本本本\x1b[1;3H", "日"),
+            ("a本本\x1b[1;2H", "日\u{1f980}"),
+        ] {
+            predicted_typing_shows_the_echo(before, typed, typed);
+        }
+    }
+
+    #[test]
+    fn typing_before_wide_glyphs_moves_them_whole() {
+        // A line editor inserts a typed glyph, moving the rest of the line right, wide glyphs and
+        // all: here as insert-character then the glyph.
+        predicted_typing_shows_the_echo("本本x\x1b[1;2H", "a", "\x1b[@a");
+        predicted_typing_shows_the_echo("ab本c\x1b[1;3H", "z", "\x1b[@z");
+    }
+
+    #[test]
+    fn a_malformed_grid_repaints_everything_twice() {
+        // A hostile server's wide glyph in the last column, which the terminal cannot show where
+        // the grid puts it: it lays the row out its own way, so that frame and the next are painted
+        // whole.
+        use crate::terminal::{CellKind, CellText, RowDiff, Run, TerminalScreen, WireCell};
+        use crate::terminal::{WireColor, WireStyle};
+        let blank = TerminalScreen::from_bytes(24, 80, b"ab");
+        let cell = |text, kind| WireCell {
+            text: CellText::new(text).unwrap(),
+            kind,
+            fg: WireColor::Default,
+            bg: WireColor::Default,
+            style: WireStyle::default(),
+        };
+        let mut diff = blank.diff_from(&blank);
+        diff.rows = vec![RowDiff {
+            row: 0,
+            wrapped: false,
+            runs: vec![
+                Run {
+                    count: std::num::NonZeroU16::new(79).unwrap(),
+                    cell: cell("", CellKind::Narrow),
+                },
+                Run {
+                    count: std::num::NonZeroU16::MIN,
+                    cell: cell("世", CellKind::Wide),
+                },
+            ],
+        }];
+        let mut malformed = blank.clone();
+        malformed.apply(&diff);
+        let malformed = malformed.screen().clone();
+        assert!(malformed.cell(0, 79).is_some_and(Cell::is_wide));
+        let mut painter = Painter::default();
+        paint_frame(&mut painter, blank.screen(), &Overlay::empty(), None);
+        assert_eq!(
+            paint_frame(&mut painter, &malformed, &Overlay::empty(), None),
+            render_to_string(&malformed, &Overlay::empty(), None)
         );
         assert_eq!(
-            paint_frame(&mut painter, &screen, &Overlay::empty(), None),
+            paint_frame(&mut painter, blank.screen(), &Overlay::empty(), None),
+            render_to_string(blank.screen(), &Overlay::empty(), None)
+        );
+        assert_eq!(
+            paint_frame(&mut painter, blank.screen(), &Overlay::empty(), None),
             framed("", "1;3")
         );
     }
@@ -1299,8 +1533,8 @@ mod tests {
         "\x1b[3;1H\x1b[L",
     ];
 
-    /// Predicted glyphs, one wider than a cell.
-    const GLYPHS: [&str; 4] = ["Z", "", "ü", "世"];
+    /// Predicted glyphs, two of them wide.
+    const GLYPHS: [&str; 5] = ["Z", "", "ü", "世", "\u{1f980}"];
 
     /// Status lines of several lengths.
     const STATUSES: [&str; 3] = [
@@ -1341,7 +1575,8 @@ mod tests {
                 (
                     proptest::collection::vec(0..PIECES.len(), 0..6),
                     proptest::option::of(0..STATUSES.len()),
-                    proptest::option::of((0u16..6, 0u16..20, 0..GLYPHS.len())),
+                    proptest::collection::vec((0u16..6, 0u16..20, 0..GLYPHS.len()), 0..4),
+                    proptest::prelude::any::<bool>(),
                 ),
                 1..12,
             ),
@@ -1353,18 +1588,26 @@ mod tests {
             let mut painter = Painter::default();
             let mut incremental = fux_vt::Parser::new(size.rows, size.cols, 0).unwrap();
             let mut whole = fux_vt::Parser::new(size.rows, size.cols, 0).unwrap();
-            for (pieces, status, prediction) in steps {
+            for (pieces, status, predictions, whole_glyphs) in steps {
                 for piece in pieces {
                     emu.process(PIECES[piece].as_bytes());
                 }
                 let screen = emu.snapshot();
+                // Wide glyphs cover the next cell, as the predictor makes them; or, now and then, not,
+                // which the terminal lays out its own way.
                 let overlay = Overlay::of(
-                    prediction.map(|(row, col, glyph)| {
-                        ((row, col), PredictedCell {
-                            glyph: GLYPHS[glyph],
+                    predictions.into_iter().flat_map(|(row, col, glyph)| {
+                        let glyph = GLYPHS[glyph];
+                        let cell = |glyph, covered| PredictedCell {
+                            glyph,
                             fg: Color::Idx(2),
                             bg: Color::Default,
-                        })
+                            covered,
+                        };
+                        let next = col.saturating_add(1);
+                        let covered = (whole_glyphs && glyph.width() == 2 && next < cols)
+                            .then(|| ((row, next), cell("", true)));
+                        std::iter::once(((row, col), cell(glyph, false))).chain(covered)
                     }),
                     None,
                 );

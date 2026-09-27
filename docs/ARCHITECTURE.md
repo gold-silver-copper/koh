@@ -171,9 +171,12 @@ whole terminal lines, and never the status line's row.
 A frame is painted whole, byte for byte as every frame was before, when the terminal may not show
 what was painted: the first frame, after a resume or a window resize, when the screen's size
 changes, when the status line appears or goes, and while the terminal is smaller than the screen.
-It is also painted whole, and the next one too, when a glyph does not fill exactly the cells the
-grid gives it (a predicted wide glyph over a narrow cell, say), because the terminal then lays the
-row out its own way. A property test feeds both ways of painting into a fux-vt terminal and checks
+It is also painted whole, and the next one too, when a glyph does not fill exactly the cells it is
+given (a hostile server's wide glyph in the last column, say), because the terminal then lays the
+row out its own way. Predictions never cause that: a predicted wide glyph comes with the cell it
+covers, which is skipped as a grid continuation is, and a glyph of the grid that a prediction half
+hides is drawn as a blank in the prediction's style, as a terminal leaves a wide glyph one of whose
+halves is overwritten. A property test feeds both ways of painting into a fux-vt terminal and checks
 it shows the same thing after every frame, scrolling included; there a printed space and an erased
 cell of the same attributes count as the same, since a whole repaint prints spaces where a scroll
 brings in erased cells.
@@ -192,10 +195,14 @@ and a cell it knows changed but not to what is not drawn at all, so the real cel
 The port faithfully implements epoch-gated confirmation, glitch escalation,
 and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
 backspace, CR/LF, the left/right arrow keys (CSI **and** SS3/application-cursor form), and whole
-UTF-8 graphemes including double-width CJK/emoji (cursor advances by two cells). Control/escape
-sequences it doesn't model open a fresh epoch but make no concrete guess (they fall back to the
-server's real echo). A wrong or unconfirmed guess is always reconciled away — it never corrupts the
-display.
+UTF-8 graphemes including double-width CJK/emoji (cursor advances by two cells). A wide glyph is
+predicted as two cells, the glyph and the cell it covers; the covered cell is right when the
+server shows a wide glyph's right half there, and never confirms an epoch. The insert-mode shift
+moves each wide glyph with its right half; one the shift splits (at the right edge, or typed
+inside) becomes unknown rather than half drawn. Backspace over a wide glyph, which a line editor
+takes back two cells, is not modelled. Control/escape sequences it doesn't model open a fresh epoch
+but make no concrete guess (they fall back to the server's real echo). A wrong or unconfirmed guess
+is always reconciled away — it never corrupts the display.
 
 ## Reconnect & detachable sessions
 

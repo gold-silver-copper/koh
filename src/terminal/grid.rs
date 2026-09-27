@@ -416,6 +416,8 @@ impl ScreenView for Grid {
             contents: if c.has_contents() { c.contents() } else { "" },
             fg: c.fgcolor(),
             bg: c.bgcolor(),
+            wide: c.is_wide(),
+            continuation: c.is_wide_continuation(),
         })
     }
 }

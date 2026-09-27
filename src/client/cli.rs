@@ -252,6 +252,33 @@ fn warn_if_locale_not_utf8() {
     }
 }
 
+/// With `$KOH_LOG` set, log to that file at debug level: the TUI owns the terminal. The file is
+/// made owner-only (0600) through its descriptor whether or not it existed, since debug logs can
+/// carry sensitive material; if that fails, nothing is logged to it.
+fn log_to_koh_log() {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let Ok(path) = std::env::var("KOH_LOG") else {
+        return;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+    else {
+        return;
+    };
+    if file
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .is_err()
+    {
+        eprintln!("koh: warning: could not set $KOH_LOG to 0600; file logging disabled");
+        return;
+    }
+    crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG);
+}
+
 /// `koh connect <server-id>` — connect to a koh server and run the (auto-reconnecting) session.
 ///
 /// Returns the remote shell's exit code if the session ended because the shell exited.
@@ -261,61 +288,7 @@ fn warn_if_locale_not_utf8() {
 /// session's lifetime, and installs signal handlers; call it from a binary's main path.
 pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<u32>> {
     let args: ConnectConfig = config.into();
-    // The TUI owns the terminal, so logs go to a file (set $KOH_LOG) to avoid corrupting it.
-    if let Ok(path) = std::env::var("KOH_LOG") {
-        // Create the log owner-only (0600): debug logs can carry sensitive material.
-        let created = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&path)
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::File::create(&path)
-            }
-        };
-        if let Ok(file) = created {
-            // Tighten to 0600 unconditionally via the fd: the `mode` above only applies when
-            // the file is *created*, so a pre-existing looser `$KOH_LOG` (or one a co-tenant planted)
-            // would otherwise be reused/truncated with its loose bits intact. `File::set_permissions`
-            // fchmods the open fd, so it also avoids re-resolving the path through a symlink. If we
-            // CAN'T secure it (e.g. `$KOH_LOG` points at a foreign-owned file → EPERM), don't write
-            // potentially-sensitive debug logs into a file we couldn't lock down — warn and skip.
-            let secured = {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let ok = file
-                        .set_permissions(std::fs::Permissions::from_mode(0o600))
-                        .is_ok();
-                    if !ok {
-                        eprintln!(
-                            "koh: warning: could not set $KOH_LOG to 0600; file logging disabled"
-                        );
-                    }
-                    ok
-                }
-                #[cfg(not(unix))]
-                {
-                    true
-                }
-            };
-            if secured {
-                use tracing_subscriber::layer::SubscriberExt as _;
-                use tracing_subscriber::util::SubscriberInitExt as _;
-                let _ = tracing_subscriber::registry()
-                    .with(tracing_subscriber::fmt::layer().with_writer(std::sync::Mutex::new(file)))
-                    .with(crate::log::targets(tracing::Level::DEBUG))
-                    .try_init();
-            }
-        }
-    }
+    log_to_koh_log();
 
     // koh assumes a UTF-8 terminal (the predictor reassembles UTF-8 graphemes; the renderer emits
     // UTF-8). Warn — but don't refuse, unlike mosh — if the locale looks non-UTF-8, so mojibake is

@@ -120,144 +120,102 @@ fn load_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
 /// Not a hard link, which would need no lock: Android's SELinux policy denies `link` to the shell
 /// and to apps.
 fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<bool> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        // Held until this returns: creators take turns, so only the first finds `path` free, and a
-        // reader sees no key or a whole one.
-        let directory = std::fs::File::open(parent)?;
-        directory.lock()?;
-        match std::fs::symlink_metadata(path) {
-            Ok(_) => return Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        let (tmp, mut file) = loop {
-            let tmp = path.with_extension(format!(
-                "tmp.{}.{:016x}",
-                std::process::id(),
-                getrandom::u64()?
-            ));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)
-            {
-                Ok(file) => break (tmp, file),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        };
-        let result = (|| {
-            file.write_all(contents)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&tmp, path)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(tmp);
-        }
-        result.map(|()| true)
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Held until this returns: creators take turns, so only the first finds `path` free, and a
+    // reader sees no key or a whole one.
+    let directory = std::fs::File::open(parent)?;
+    directory.lock()?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
-    #[cfg(not(unix))]
-    {
-        use std::io::Write as _;
+    let (tmp, mut file) = loop {
+        let tmp = path.with_extension(format!(
+            "tmp.{}.{:016x}",
+            std::process::id(),
+            getrandom::u64()?
+        ));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(path)
+            .mode(0o600)
+            .open(&tmp)
         {
-            Ok(mut file) => {
-                file.write_all(contents)?;
-                file.sync_all()?;
-                Ok(true)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(error) => Err(error),
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
+    };
+    let result = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
     }
+    result.map(|()| true)
 }
 
-/// Create `dir` (recursively) restricted to the owner (mode 0700 on unix) so a freshly-created
-/// state dir doesn't expose its contents. Off-unix this is a plain recursive create.
+/// Create `dir` (recursively) with mode 0700, so a freshly-created state dir doesn't expose its
+/// contents. The mode applies to the components it creates; an existing dir is left as it is.
 pub(crate) fn create_dir_private(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        // `recursive(true)` is idempotent if the dir already exists; the mode applies to the
-        // components it creates.
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(dir)
-    }
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
 }
 
 /// Read the key file at `path`, doing every step on a single opened file descriptor so there is no
 /// path-based recheck window.
 ///
-/// On unix: open with `O_NOFOLLOW` (a symlinked final component is refused at open — `ELOOP`),
-/// confirm via the fd that it is a regular file, tighten group/other-accessible perms to 0600 via
-/// the fd (`fchmod`, never a second path `chmod`), then read the contents from the same fd. A
-/// co-tenant who swaps `id.key` for a symlink can therefore neither redirect the `chmod`/read to
-/// another file nor race a gap between a check and an act — there is only the one open. On other
-/// platforms, fall back to a plain read (the platform's own ACLs apply, matching the key-write path).
+/// Open with `O_NOFOLLOW` (a symlinked final component is refused at open — `ELOOP`), confirm via
+/// the fd that it is a regular file, tighten group/other-accessible perms to 0600 via the fd
+/// (`fchmod`, never a second path `chmod`), then read the contents from the same fd. A co-tenant
+/// who swaps `id.key` for a symlink can therefore neither redirect the `chmod`/read to another file
+/// nor race a gap between a check and an act — there is only the one open.
 fn read_key_file_secure(path: &Path) -> Result<Vec<u8>, SetupError> {
-    #[cfg(unix)]
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(fuxix::file::NOFOLLOW)
+        .open(path)
     {
-        use std::io::Read as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        // `O_NOFOLLOW`: refuse to follow a symlink planted as the key path — otherwise the load
-        // could be turned into a chmod/read oracle on an arbitrary file koh can reach.
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(fuxix::file::NOFOLLOW)
-            .open(path)
-        {
-            Ok(f) => f,
-            // The open refused a symlink (ELOOP); asking afterwards only names the refusal.
-            Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
-                tracing::warn!(path = %path.display(), "secret key path is a symlink; refusing to load it");
-                return Err(SetupError::BadKeyFile);
-            }
-            Err(e) => return Err(SetupError::Io(e)),
-        };
-        let meta = file.metadata().map_err(SetupError::Io)?;
-        if !meta.file_type().is_file() {
-            tracing::warn!(path = %path.display(), "secret key path is not a regular file; refusing to load it");
+        Ok(f) => f,
+        // The open refused a symlink (ELOOP); asking afterwards only names the refusal.
+        Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
+            tracing::warn!(path = %path.display(), "secret key path is a symlink; refusing to load it");
             return Err(SetupError::BadKeyFile);
         }
-        tighten_key_perms_via_fd(&file, path, &meta);
-        // Read one byte past a key, so an oversized file is detected without reading all of it.
-        let mut bytes = Vec::with_capacity(KEY_LEN.saturating_add(1));
-        let limit = u64::try_from(KEY_LEN.saturating_add(1)).unwrap_or(u64::MAX);
-        file.take(limit)
-            .read_to_end(&mut bytes)
-            .map_err(SetupError::Io)?;
-        Ok(bytes)
+        Err(e) => return Err(SetupError::Io(e)),
+    };
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        tracing::warn!(path = %path.display(), "secret key path is not a regular file; refusing to load it");
+        return Err(SetupError::BadKeyFile);
     }
-    #[cfg(not(unix))]
-    {
-        Ok(std::fs::read(path)?)
-    }
+    tighten_key_perms_via_fd(&file, path, &meta);
+    // Read one byte past a key, so an oversized file is detected without reading all of it.
+    let mut bytes = Vec::with_capacity(KEY_LEN.saturating_add(1));
+    let limit = u64::try_from(KEY_LEN.saturating_add(1)).unwrap_or(u64::MAX);
+    file.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
-/// On unix, tighten an existing group/other-accessible key file to 0600 — operating on the held
+/// Tighten an existing group/other-accessible key file to 0600 — operating on the held
 /// **fd** (`File::set_permissions` is `fchmod`), so it can't be redirected to a different inode by a
 /// path swap. The key IS the node identity, so a loose key is a local-impersonation
 /// risk; a key file whose perms were loosened out-of-band (manual `chmod`, a restore from a
 /// permissive backup/umask) is re-tightened here on load.
-#[cfg(unix)]
 fn tighten_key_perms_via_fd(file: &std::fs::File, path: &Path, meta: &std::fs::Metadata) {
     use std::os::unix::fs::PermissionsExt as _;
     let mode = meta.permissions().mode();
@@ -280,52 +238,44 @@ fn tighten_key_perms_via_fd(file: &std::fs::File, path: &Path, meta: &std::fs::M
 
 /// Refuse a state dir a co-tenant could tamper with, and flag a merely-loose one.
 ///
-/// On unix: a group/other-**writable** dir lets another user unlink/replace the secret key even
-/// though the key file itself is 0600, so this hard-errors (pointing at `--key-file`). A
-/// group/other-**readable** (but not writable) dir only grants traverse, so it
-/// just warns — `create_dir_private` already makes koh-created dirs 0700, so this only fires on a
-/// pre-existing loosened dir or a shared fallback location. No-op off-unix / for the CWD.
+/// A dir another user can write lets them unlink/replace the secret key even though the key file
+/// itself is 0600, so this hard-errors (pointing at `--key-file`); a merely group/other-readable
+/// one only grants traverse, so it just warns. `create_dir_private` already makes koh-created dirs
+/// 0700, so this only fires on a pre-existing loosened dir. No-op for the CWD.
 pub(crate) fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if dir.as_os_str().is_empty() {
-            return Ok(()); // a relative "id.key" has an empty parent (the CWD); nothing to stat
-        }
-        if let Ok(meta) = std::fs::metadata(dir) {
-            let mode = meta.permissions().mode();
-            // The real threat is a dir where *another user* can unlink/replace the key.
-            // That is precisely an **other-writable, non-sticky** dir: the sticky bit (e.g. /tmp's
-            // 1777) restricts unlink to file owners, and an other-writable bit is what lets an
-            // unrelated uid write. We must NOT hard-refuse merely group-writable dirs: Android's
-            // standard scratch /data/local/tmp is 0771 (group `shell`, NOT other-writable), and a
-            // single-user device has no co-tenant — refusing it broke koh on Android. So refuse
-            // only a non-sticky other-writable dir; warn (don't refuse) on anything looser than 0700.
-            let other_writable = mode & 0o002 != 0;
-            let sticky = mode & 0o1000 != 0;
-            if other_writable && !sticky {
-                return Err(SetupError::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "state dir {} is world-writable without the sticky bit (mode {:o}); any user \
-                         could replace the secret key — chmod 700 it, add the sticky bit, or pass \
-                         --key-file pointing at a private path",
-                        dir.display(),
-                        mode & 0o7777
-                    ),
-                )));
-            }
-            if mode & 0o077 != 0 {
-                tracing::warn!(
-                    path = %dir.display(),
-                    mode = format!("{:o}", mode & 0o7777),
-                    "state dir is group/other-accessible; the key is still 0600, but prefer chmod 700"
-                );
-            }
-        }
+    use std::os::unix::fs::PermissionsExt;
+    if dir.as_os_str().is_empty() {
+        return Ok(()); // a relative "id.key" has an empty parent (the CWD); nothing to stat
     }
-    #[cfg(not(unix))]
-    let _ = dir;
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return Ok(());
+    };
+    let mode = meta.permissions().mode();
+    // The real threat is a dir where *another user* can unlink/replace the key: an
+    // **other-writable, non-sticky** dir. The sticky bit (e.g. /tmp's 1777) restricts unlink to file
+    // owners. A merely group-writable dir is allowed: Android's standard scratch /data/local/tmp is
+    // 0771 (group `shell`, NOT other-writable), and a single-user device has no co-tenant.
+    let other_writable = mode & 0o002 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if other_writable && !sticky {
+        return Err(SetupError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "state dir {} is world-writable without the sticky bit (mode {:o}); any user \
+                 could replace the secret key — chmod 700 it, add the sticky bit, or pass \
+                 --key-file pointing at a private path",
+                dir.display(),
+                mode & 0o7777
+            ),
+        )));
+    }
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            path = %dir.display(),
+            mode = format!("{:o}", mode & 0o7777),
+            "state dir is group/other-accessible; the key is still 0600, but prefer chmod 700"
+        );
+    }
     Ok(())
 }
 
@@ -684,7 +634,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn preplanted_predictable_temporary_name_cannot_block_key_creation() {
         let dir = std::env::temp_dir().join(format!("koh-key-preplant-{}", std::process::id()));
@@ -705,7 +654,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn created_key_file_is_owner_only() {
         // A written secret key must be 0600 (no group/other bits) and its parent dir must not
@@ -734,7 +682,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn ensure_state_dir_secure_refuses_only_nonsticky_world_writable() {
         // Only a dir where ANOTHER user can replace the key must be refused — that is
@@ -772,7 +719,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn fd_key_read_does_not_follow_a_symlinked_key() {
         // The fd-based load (`O_NOFOLLOW`) must refuse a symlinked key path and never
@@ -801,7 +747,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn fd_key_read_tightens_a_loose_real_key_via_the_fd() {
         // A loose (group/other-accessible) real key is tightened to 0600 through the fd, and
@@ -821,7 +766,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn load_refuses_a_symlinked_key() {
         // A symlinked key path must be refused before the key is read (following it would make
@@ -843,7 +787,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn load_refuses_a_dangling_symlink_instead_of_creating_a_key() {
         let dir = std::env::temp_dir().join(format!("koh-dangling-keylink-{}", std::process::id()));
@@ -860,7 +803,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_file_that_is_not_exactly_a_key_is_refused_with_the_reset_hint() {
         use std::os::unix::fs::PermissionsExt;

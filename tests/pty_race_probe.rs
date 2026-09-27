@@ -10,7 +10,7 @@ use std::time::Duration;
 #[test]
 #[ignore = "a CI probe, run explicitly"]
 fn pty_table_growth_race() {
-    if std::env::var_os("KOH_PROBE_GROW").is_some() {
+    if std::env::var("KOH_PROBE_GROW").is_ok_and(|grow| !grow.is_empty()) {
         let mut held = Vec::new();
         for _ in 0..256 {
             if let Ok(pty) = fuxix::pty::open(24, 80) {

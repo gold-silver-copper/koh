@@ -12,6 +12,8 @@
 //! The client validates and copies cells; it never runs a terminal parser on server-controlled
 //! bytes.
 
+use std::num::NonZeroU16;
+
 use fux_vt::{Attributes, Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -313,10 +315,10 @@ impl WireCell {
     }
 }
 
-/// `count` consecutive identical cells.
+/// `count` consecutive identical cells. A run is never empty: a zero count fails to decode.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
-    pub count: u16,
+    pub count: NonZeroU16,
     pub cell: WireCell,
 }
 
@@ -350,7 +352,7 @@ impl RowDiff {
             let extended = previous == Some(cell) && runs.last_mut().is_some_and(Run::extend);
             if !extended {
                 runs.push(Run {
-                    count: 1,
+                    count: NonZeroU16::MIN,
                     cell: WireCell::of(cell),
                 });
             }
@@ -360,16 +362,17 @@ impl RowDiff {
     }
 
     /// Decode into exactly `cols` cells, or `None` if the runs are malformed or don't cover the
-    /// row exactly. Work is bounded by `cols`: every run must be non-empty.
+    /// row exactly. Work is bounded by `cols`: every run is non-empty.
     fn cells(&self, cols: u16) -> Option<Vec<Cell>> {
         let mut out = Vec::with_capacity(usize::from(cols));
         for run in &self.runs {
-            let end = out.len().checked_add(usize::from(run.count));
-            if run.count == 0 || end.is_none_or(|end| end > usize::from(cols)) {
+            let count = usize::from(run.count.get());
+            let end = out.len().checked_add(count);
+            if end.is_none_or(|end| end > usize::from(cols)) {
                 return None;
             }
             let cell = run.cell.cell()?;
-            out.extend(std::iter::repeat_n(cell, usize::from(run.count)));
+            out.extend(std::iter::repeat_n(cell, count));
         }
         (out.len() == usize::from(cols)).then_some(out)
     }
@@ -696,7 +699,10 @@ mod tests {
             0u16..40,
             any::<bool>(),
             proptest::collection::vec(
-                (0u16..120, wire_cell()).prop_map(|(count, cell)| Run { count, cell }),
+                (1u16..120, wire_cell()).prop_map(|(count, cell)| Run {
+                    count: NonZeroU16::new(count).unwrap(),
+                    cell,
+                }),
                 0..8,
             ),
         )
@@ -848,17 +854,16 @@ mod tests {
         let base = screen_from(24, 80, b"keep me");
         let target = screen_from(24, 80, b"changed\r\nmore");
         let good = target.diff_from(&base);
-        let mutations: [fn(&mut ScreenDiff); 6] = [
-            |d| d.rows[0].row = 24,           // row out of range
-            |d| d.rows[0].runs[0].count += 1, // overruns the width
+        let mutations: [fn(&mut ScreenDiff); 5] = [
+            |d| d.rows[0].row = 24, // row out of range
             |d| {
-                if let Some(run) = d.rows[0].runs.last_mut() {
-                    run.count -= 1; // falls short of the width
-                }
+                let run = &mut d.rows[0].runs[0];
+                run.count = run.count.checked_add(1).unwrap(); // overruns the width
             },
             |d| {
-                let cell = d.rows[0].runs[0].cell.clone();
-                d.rows[0].runs.insert(0, Run { count: 0, cell }); // empty run
+                if let Some(run) = d.rows[0].runs.last_mut() {
+                    run.count = NonZeroU16::new(run.count.get() - 1).unwrap(); // falls short
+                }
             },
             |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CONTENTS_CAPACITY + 1),
             |d| d.rows[0].runs[0].cell.kind = CellKind::Continuation, // continuation with text
@@ -971,7 +976,8 @@ mod tests {
         screen.apply(&good);
         assert_eq!(screen.size(), (2, 2));
         assert_eq!(screen.screen().cell(0, 1).map(Cell::contents), Some("x"));
-        let mutations: [fn(&mut RawDiff); 4] = [
+        let mutations: [fn(&mut RawDiff); 5] = [
+            |d| d.rows[0].runs[0].count = 0,       // empty run
             |d| d.rows[0].runs[0].cell.kind = 3,   // unknown kind
             |d| d.rows[0].runs[0].cell.style = 32, // unknown style bit
             |d| d.modes.mouse_mode = 5,            // unknown mouse mode
@@ -997,7 +1003,7 @@ mod tests {
             3,
             "'a', 'b', then one run of 78 blanks"
         );
-        assert_eq!(diff.rows[0].runs[2].count, 78);
+        assert_eq!(diff.rows[0].runs[2].count.get(), 78);
     }
 
     #[test]

@@ -6,13 +6,15 @@
 //! drive it directly.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
-    retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_WINDOW, HEARTBEAT, MAX_INPUT_BYTES,
+    retry_after, ClientMsg, Frame, FrameNum, FrameScreen, InputSeq, FRAME_WINDOW, HEARTBEAT,
+    MAX_INPUT_BYTES, WINDOW_CELLS,
 };
-use crate::terminal::{Grid, TerminalScreen};
+use crate::terminal::{Grid, Size, TerminalScreen};
 
 use super::render::WindowState;
 use super::{window_state, ESCAPE_PREFIX, SUSPEND_KEY};
@@ -49,9 +51,11 @@ pub struct TickResult {
 /// The client side of one connection.
 pub struct ClientSession {
     /// The newest applied frame and its screen.
-    current: (FrameNum, TerminalScreen),
-    /// The frames applied before it, oldest first, at most `FRAME_WINDOW - 1`.
-    older: VecDeque<(FrameNum, TerminalScreen)>,
+    current: FrameScreen,
+    /// The frames applied before it, oldest first: at most `FRAME_WINDOW - 1`, holding at most
+    /// [`WINDOW_CELLS`] cells beyond those `current` holds, so a server cannot make the client
+    /// keep fifteen of the largest screens.
+    older: VecDeque<FrameScreen>,
     /// A `Resync` was sent and no frame has applied since.
     resync_sent: bool,
     /// The newest input the server has reported reflected on screen.
@@ -79,15 +83,15 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
-    /// A session for a new connection, telling the server the window is `rows × cols`.
-    pub fn new(pref: DisplayPreference, rows: u16, cols: u16) -> Self {
+    /// A session for a new connection, telling the server the window's `size`.
+    pub fn new(pref: DisplayPreference, size: Size) -> Self {
         Self {
-            current: (FrameNum::BLANK, TerminalScreen::default()),
+            current: FrameScreen::default(),
             older: VecDeque::new(),
             resync_sent: false,
             echo_ack: InputSeq::default(),
             last_seq: InputSeq::default(),
-            outgoing: VecDeque::from([ClientMsg::Resize { rows, cols }]),
+            outgoing: VecDeque::from([ClientMsg::Resize(size)]),
             queued_input: 0,
             input_paused: false,
             last_heard: None,
@@ -157,7 +161,8 @@ impl ClientSession {
         };
         self.predictor.set_local_frame_sent(seq.0.saturating_sub(1));
         for &b in bytes {
-            self.predictor.new_user_byte(b, self.current.1.screen());
+            self.predictor
+                .new_user_byte(b, self.current.screen.screen());
         }
         let mut rest = bytes;
         while !rest.is_empty() {
@@ -188,17 +193,12 @@ impl ClientSession {
 
     /// Note a new window size: queue it for the server and reset the predictor, whose
     /// predictions a resize invalidates.
-    pub fn on_resize(&mut self, rows: u16, cols: u16) {
+    pub fn on_resize(&mut self, size: Size) {
         // Only the last of several unsent resizes matters.
-        if let Some(ClientMsg::Resize {
-            rows: queued_rows,
-            cols: queued_cols,
-        }) = self.outgoing.back_mut()
-        {
-            *queued_rows = rows;
-            *queued_cols = cols;
+        if let Some(ClientMsg::Resize(queued)) = self.outgoing.back_mut() {
+            *queued = size;
         } else {
-            self.outgoing.push_back(ClientMsg::Resize { rows, cols });
+            self.outgoing.push_back(ClientMsg::Resize(size));
         }
         self.predictor.reset();
         self.dirty = true;
@@ -208,18 +208,20 @@ impl ClientSession {
     /// is one this session holds; otherwise it only proves the link is alive.
     pub fn on_frame(&mut self, now: Instant, frame: &Frame) {
         self.last_heard = Some(now);
-        if frame.num <= self.current.0 {
+        if frame.num <= self.current.num {
             return;
         }
+        // The base is copied to apply the frame to, which shares every row with it; the frame
+        // replaces only the rows it carries.
         let base = if frame.base == FrameNum::BLANK {
             Some(TerminalScreen::default())
-        } else if frame.base == self.current.0 {
-            Some(self.current.1.clone())
+        } else if frame.base == self.current.num {
+            Some(TerminalScreen::clone(&self.current.screen))
         } else {
             self.older
                 .iter()
-                .find(|(num, _)| *num == frame.base)
-                .map(|(_, screen)| screen.clone())
+                .find(|older| older.num == frame.base)
+                .map(|older| TerminalScreen::clone(&older.screen))
         };
         let Some(mut screen) = base else {
             if !self.resync_sent {
@@ -229,17 +231,31 @@ impl ClientSession {
             return;
         };
         screen.apply(&frame.diff);
-        let previous = std::mem::replace(&mut self.current, (frame.num, screen));
+        let previous = std::mem::replace(
+            &mut self.current,
+            FrameScreen {
+                num: frame.num,
+                screen: Arc::new(screen),
+            },
+        );
         self.older.push_back(previous);
-        while self.older.len() >= FRAME_WINDOW {
+        while self.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
             self.older.pop_front();
         }
         self.resync_sent = false;
         self.acknowledge(frame.num);
         self.echo_ack = self.echo_ack.max(frame.echo_ack);
         self.predictor.set_local_frame_late_acked(self.echo_ack.0);
-        self.predictor.cull(self.current.1.screen());
+        self.predictor.cull(self.current.screen.screen());
         self.dirty = true;
+    }
+
+    /// The cells the older frames hold beyond the current one.
+    fn older_cells(&self) -> usize {
+        TerminalScreen::cells_beyond(
+            &self.current.screen,
+            self.older.iter().map(|older| &*older.screen),
+        )
     }
 
     fn acknowledge(&mut self, num: FrameNum) {
@@ -273,7 +289,7 @@ impl ClientSession {
                 .any(|m| matches!(m, ClientMsg::Ack { .. }))
             {
                 self.outgoing.push_back(ClientMsg::Ack {
-                    frame: self.current.0,
+                    frame: self.current.num,
                 });
             }
         }
@@ -317,34 +333,34 @@ impl ClientSession {
     }
 
     /// Whether a frame reported that the shell exited (its code is on [`state`](Self::state)).
-    pub const fn exited(&self) -> bool {
-        self.current.1.exit_code().is_some()
+    pub fn exited(&self) -> bool {
+        self.current.screen.exit_code().is_some()
     }
 
     /// The newest applied screen.
-    pub const fn state(&self) -> &TerminalScreen {
-        &self.current.1
+    pub fn state(&self) -> &TerminalScreen {
+        &self.current.screen
     }
 
     /// Whether a server frame has been applied, i.e. [`state`](Self::state) is the server's and
     /// not the blank screen a session starts from.
     pub fn synced(&self) -> bool {
-        self.current.0 > FrameNum::BLANK
+        self.current.num > FrameNum::BLANK
     }
 
     /// The prediction overlay to draw over [`state`](Self::state).
-    pub fn overlay(&self) -> Overlay {
+    pub fn overlay(&self) -> Overlay<'_> {
         self.predictor.overlay()
     }
 
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
     pub fn window_state(&self) -> WindowState<'_> {
-        window_state(&self.current.1)
+        window_state(&self.current.screen)
     }
 
     /// The newest applied screen's grid.
-    pub const fn screen(&self) -> &Grid {
-        self.current.1.screen()
+    pub fn screen(&self) -> &Grid {
+        self.current.screen.screen()
     }
 }
 
@@ -355,7 +371,10 @@ mod tests {
 
     fn start() -> (Instant, ClientSession) {
         let now = Instant::now();
-        (now, ClientSession::new(DisplayPreference::Always, 24, 80))
+        (
+            now,
+            ClientSession::new(DisplayPreference::Always, Size::new(24, 80)),
+        )
     }
 
     fn screen(bytes: &[u8]) -> TerminalScreen {
@@ -385,7 +404,7 @@ mod tests {
         msgs.iter()
             .filter_map(|m| match m {
                 ClientMsg::Input { bytes, .. } => Some(bytes.as_slice()),
-                ClientMsg::Resize { .. } | ClientMsg::Ack { .. } | ClientMsg::Resync => None,
+                ClientMsg::Resize(_) | ClientMsg::Ack { .. } | ClientMsg::Resync => None,
             })
             .flatten()
             .copied()
@@ -395,7 +414,7 @@ mod tests {
     #[test]
     fn a_session_first_tells_the_server_its_window_size() {
         let (_, mut s) = start();
-        assert_eq!(drain(&mut s), [ClientMsg::Resize { rows: 24, cols: 80 }]);
+        assert_eq!(drain(&mut s), [ClientMsg::Resize(Size::new(24, 80))]);
     }
 
     #[test]
@@ -439,7 +458,7 @@ mod tests {
     #[test]
     fn input_is_numbered_in_order_and_a_paste_is_split() {
         let now = Instant::now();
-        let mut s = ClientSession::new(DisplayPreference::Never, 24, 80);
+        let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
         let paste: Vec<u8> = (0..200_000u32).map(|i| b'a' + (i % 26) as u8).collect();
         s.on_input(now, b"first");
         s.on_input(now, &paste);
@@ -448,7 +467,7 @@ mod tests {
             .iter()
             .filter_map(|m| match m {
                 ClientMsg::Input { seq, bytes } => Some((*seq, bytes.len())),
-                ClientMsg::Resize { .. } | ClientMsg::Ack { .. } | ClientMsg::Resync => None,
+                ClientMsg::Resize(_) | ClientMsg::Ack { .. } | ClientMsg::Resync => None,
             })
             .collect();
         assert!(inputs.iter().all(|&(_, len)| len <= MAX_INPUT_BYTES));
@@ -464,7 +483,7 @@ mod tests {
     fn typing_past_the_queue_limit_is_dropped_and_reported_until_it_drains() {
         // Queueing, not prediction, is under test; skip predicting a megabyte byte by byte.
         let now = Instant::now();
-        let mut s = ClientSession::new(DisplayPreference::Never, 24, 80);
+        let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
         let chunk = vec![b'z'; MAX_INPUT_BYTES];
         for _ in 0..MAX_QUEUED_INPUT.div_euclid(MAX_INPUT_BYTES) {
             s.on_input(now, &chunk);
@@ -562,6 +581,72 @@ mod tests {
         );
     }
 
+    /// A screen of the largest size a server may send, with text on every row.
+    fn largest_full() -> TerminalScreen {
+        let max = crate::terminal::MAX_DIM;
+        let mut emu = ServerTerminal::new(max, max, 0).expect("emulator");
+        let rows: Vec<String> = (0..max).map(|row| format!("row {row}")).collect();
+        emu.process(rows.join("\r\n").as_bytes());
+        emu.snapshot()
+    }
+
+    #[test]
+    fn older_frames_hold_at_most_one_largest_screen_beyond_the_current_one() {
+        // A server that sends only full repaints of the largest screen, each from the blank base
+        // so no row is shared: fifteen older copies of it were about 480 MB.
+        let (now, mut s) = start();
+        let big = largest_full();
+        let repaint = big.diff_from(&TerminalScreen::default());
+        for n in 1..=20 {
+            s.on_frame(
+                now,
+                &Frame {
+                    num: FrameNum(n),
+                    base: FrameNum::BLANK,
+                    echo_ack: InputSeq(0),
+                    diff: repaint.clone(),
+                },
+            );
+            assert!(s.older_cells() <= WINDOW_CELLS, "after frame {n}");
+        }
+        assert_eq!(
+            s.older.len(),
+            1,
+            "one largest screen besides the current one"
+        );
+        assert_eq!(s.older_cells(), WINDOW_CELLS);
+        assert_eq!(s.state(), &big);
+        drain(&mut s);
+        // A frame on a dropped base still asks for a resync; one on the kept base applies.
+        s.on_frame(now, &frame(21, 5, 0, &big, &big));
+        assert_eq!(drain(&mut s), [ClientMsg::Resync]);
+        s.on_frame(now, &frame(22, 19, 0, &big, &big));
+        assert_eq!(
+            drain(&mut s),
+            [ClientMsg::Ack {
+                frame: FrameNum(22)
+            }]
+        );
+    }
+
+    #[test]
+    fn older_frames_share_the_rows_they_have_in_common() {
+        // Frames that each change a row keep the whole window: the rows the current screen still
+        // shows are shared with it, so the older frames cost nothing beyond it.
+        let (now, mut s) = start();
+        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
+        let mut prev = TerminalScreen::default();
+        for n in 1..=20 {
+            emu.process(format!("line {n}\r\n").as_bytes());
+            let next = emu.snapshot();
+            s.on_frame(now, &frame(n, n - 1, 0, &prev, &next));
+            prev = next;
+        }
+        assert_eq!(s.older.len(), FRAME_WINDOW - 1);
+        assert_eq!(s.older_cells(), 0);
+        assert_eq!(s.state(), &prev);
+    }
+
     #[test]
     fn a_frame_confirms_echoed_predictions() {
         let (now, mut s) = start();
@@ -581,7 +666,7 @@ mod tests {
         );
         s.on_input(later, b"y");
         assert_eq!(
-            s.overlay().cell(0, 1).map(|c| c.glyph.as_str()),
+            s.overlay().cell(0, 1).map(|c| c.glyph),
             Some("y"),
             "typing after a confirmed echo is shown"
         );
@@ -653,25 +738,19 @@ mod tests {
     #[test]
     fn resizes_coalesce_and_reset_the_predictor() {
         let (now, mut s) = start();
-        s.on_resize(30, 100);
-        s.on_resize(40, 120);
+        s.on_resize(Size::new(30, 100));
+        s.on_resize(Size::new(40, 120));
         s.on_input(now, b"a");
-        s.on_resize(50, 132);
+        s.on_resize(Size::new(50, 132));
         assert_eq!(
             drain(&mut s),
             [
-                ClientMsg::Resize {
-                    rows: 40,
-                    cols: 120
-                },
+                ClientMsg::Resize(Size::new(40, 120)),
                 ClientMsg::Input {
                     seq: InputSeq(1),
                     bytes: b"a".to_vec()
                 },
-                ClientMsg::Resize {
-                    rows: 50,
-                    cols: 132
-                },
+                ClientMsg::Resize(Size::new(50, 132)),
             ]
         );
         assert!(s.overlay().is_empty(), "a resize drops predictions");

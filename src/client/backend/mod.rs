@@ -7,9 +7,12 @@
 //! writes standard ANSI/DEC bytes. [`Tty`] supplies the primitives through `fuxix::terminal`; the
 //! tests' `CaptureBackend` records the bytes instead.
 
+use std::fmt;
 use std::io;
 
 use fux_vt::Color;
+
+use crate::terminal::Size;
 
 mod tty;
 pub use self::tty::Tty;
@@ -69,10 +72,39 @@ pub trait KohBackend {
     /// Return the terminal to cooked mode. Must be safe to call even if raw mode was never entered.
     fn leave_raw_mode(&mut self) -> io::Result<()>;
 
-    /// The current terminal size as `(rows, cols)`.
-    fn size(&self) -> io::Result<(u16, u16)>;
+    /// The current terminal size.
+    fn size(&self) -> io::Result<Size>;
 
     // --- provided: standard ANSI/DEC emission (override only to use a different encoding) ---
+
+    /// Format `args` straight into the output buffer, piece by piece through
+    /// [`write_bytes`](Self::write_bytes), with no intermediate `String`. This is what `write!`
+    /// on a backend calls.
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
+        /// Forwards formatted pieces to the backend, keeping the first I/O error for the caller.
+        struct Pieces<'a, B: ?Sized> {
+            backend: &'a mut B,
+            error: io::Result<()>,
+        }
+        impl<B: KohBackend + ?Sized> fmt::Write for Pieces<'_, B> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                self.backend.write_bytes(s.as_bytes()).map_err(|e| {
+                    self.error = Err(e);
+                    fmt::Error
+                })
+            }
+        }
+        let mut pieces = Pieces {
+            backend: self,
+            error: Ok(()),
+        };
+        if fmt::write(&mut pieces, args).is_err() {
+            // A formatter fails only through `write_str`, which kept the I/O error.
+            pieces.error?;
+            return Err(io::Error::other("formatting failed"));
+        }
+        Ok(())
+    }
 
     /// Enter the alternate screen (clearing it) and hide the cursor, then flush. Paired with
     /// [`leave_alt_screen`](Self::leave_alt_screen). DEC 1049 + hide-cursor.
@@ -106,7 +138,7 @@ pub trait KohBackend {
         // u32 math so the `+ 1` can never overflow the u16 coordinate (overflow-checks are on in
         // release), and cols/rows are peer-controlled (though clamped) — never trust them not to be
         // at the type max.
-        self.write_bytes(format!("\x1b[{};{}H", u32::from(row) + 1, u32::from(col) + 1).as_bytes())
+        write!(self, "\x1b[{};{}H", u32::from(row) + 1, u32::from(col) + 1)
     }
 
     /// Apply a full cell style: SGR reset, then each set attribute, then fg and bg. Emitted only
@@ -157,19 +189,19 @@ pub trait KohBackend {
     /// Set the combined window title + icon name (`OSC 0`), used when the app's icon name equals its
     /// title. `title` is already sanitized/prefixed by the caller's ledger.
     fn set_window_title(&mut self, title: &str) -> io::Result<()> {
-        self.write_bytes(format!("\x1b]0;{title}\x07").as_bytes())
+        write!(self, "\x1b]0;{title}\x07")
     }
 
     /// Set a distinct icon name (`OSC 1`) and window title (`OSC 2`). Both are sanitized/prefixed by
     /// the caller's ledger.
     fn set_window_icon_and_title(&mut self, icon: &str, title: &str) -> io::Result<()> {
-        self.write_bytes(format!("\x1b]1;{icon}\x07\x1b]2;{title}\x07").as_bytes())
+        write!(self, "\x1b]1;{icon}\x07\x1b]2;{title}\x07")
     }
 
     /// Forward an OSC-52 clipboard write (`OSC 52`). The caller has already gated this on the
     /// `--clipboard` opt-in and validated `base64` as strict base64 within the size cap.
     fn set_clipboard(&mut self, base64: &str) -> io::Result<()> {
-        self.write_bytes(format!("\x1b]52;c;{base64}\x07").as_bytes())
+        write!(self, "\x1b]52;c;{base64}\x07")
     }
 
     /// Ring the terminal bell (BEL).
@@ -198,20 +230,20 @@ fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool)
         Color::Idx(i) if i < 8 => {
             // 0..=7 → 30..=37 (fg) / 40..=47 (bg): the lead digit, then the index.
             let lead = if fg { 3 } else { 4 };
-            out.write_bytes(format!("\x1b[{lead}{i}m").as_bytes())
+            write!(out, "\x1b[{lead}{i}m")
         }
         Color::Idx(i) if i < 16 => {
             // 8..=15 → 90..=97 (fg) / 100..=107 (bg): the lead, then the index less 8 (`i & 7`).
             let lead = if fg { 9 } else { 10 };
-            out.write_bytes(format!("\x1b[{lead}{}m", i & 7).as_bytes())
+            write!(out, "\x1b[{lead}{}m", i & 7)
         }
         Color::Idx(i) => {
             let lead = if fg { 38 } else { 48 };
-            out.write_bytes(format!("\x1b[{lead};5;{i}m").as_bytes())
+            write!(out, "\x1b[{lead};5;{i}m")
         }
         Color::Rgb(r, g, b) => {
             let lead = if fg { 38 } else { 48 };
-            out.write_bytes(format!("\x1b[{lead};2;{r};{g};{b}m").as_bytes())
+            write!(out, "\x1b[{lead};2;{r};{g};{b}m")
         }
     }
 }
@@ -219,11 +251,21 @@ fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool)
 /// An in-memory backend that captures every emitted byte, for unit-testing the render engine and
 /// out-of-band emission without a real TTY. All the platform primitives are inert; the escape
 /// output comes from the trait's provided methods, so tests observe exactly what a real terminal
-/// would receive.
+/// would receive. It reports `size`, 24×80 by default.
 #[cfg(test)]
-#[derive(Default)]
 pub(crate) struct CaptureBackend {
     pub bytes: Vec<u8>,
+    pub size: Size,
+}
+
+#[cfg(test)]
+impl Default for CaptureBackend {
+    fn default() -> Self {
+        Self {
+            bytes: Vec::new(),
+            size: Size::new(24, 80),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -241,8 +283,8 @@ impl KohBackend for CaptureBackend {
     fn leave_raw_mode(&mut self) -> io::Result<()> {
         Ok(())
     }
-    fn size(&self) -> io::Result<(u16, u16)> {
-        Ok((24, 80))
+    fn size(&self) -> io::Result<Size> {
+        Ok(self.size)
     }
 }
 

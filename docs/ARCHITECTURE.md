@@ -77,11 +77,15 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
 - **Bounded state:** each end keeps at most `FRAME_WINDOW` (16) recent screens — the client its
   last applied frames, the server the frames sent since the last acknowledged one. A count alone is
   not a memory bound when a screen can be a million cells (about 32 MB at the 1000×1000 a client may
-  ask for), so the server's frames share the session's snapshot rather than copying it, hold at
-  most one screen of that size beyond the newest, and the session takes one snapshot per burst of
-  program output rather than per read. That, plus QUIC flow control and the stream limits (the
-  server accepts one client stream; the client a handful of frame streams), bounds memory; a peer
-  cannot make either end accumulate.
+  ask for, 32 bytes a cell), so both ends also bound the cells their window holds at
+  `WINDOW_CELLS`, one screen of that size, counting each row once however many screens share it:
+  the server's unacknowledged frames together, the client's older frames beyond the current one.
+  Past it the oldest are dropped, which only costs the peer a base (a frame on a dropped base makes
+  the client ask for a resync). Screens are shared, not copied — a resent frame holds the session's
+  own snapshot, a client screen shares every row a frame did not carry with its base — and the
+  session takes one snapshot per burst of program output rather than per read. That, plus QUIC flow
+  control and the stream limits (the server accepts one client stream; the client a handful of
+  frame streams), bounds memory; a peer cannot make either end accumulate.
 - **Backpressure:** PTY input goes through a bounded writer queue. While it is full the server
   stops reading the client's stream, QUIC flow control stops the client's writes, and the client
   keeps at most 1 MiB of typing before dropping it with an "input paused" status line. The keyboard
@@ -91,12 +95,19 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
 
 `TerminalScreen` is a plain `Grid` of `fux_vt::Cell`s (with a cursor, per-row soft-wrap flags and
 the input modes the client mirrors) plus the side channels: title, icon, OSC 52 clipboard, bell count
-and exit code. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's
+and exit code. The grid stores each row as its own reference-counted slice of cells, shared by every
+screen that holds the row unchanged: a snapshot shares the rows the program left alone (found by
+fux-vt's row ids, so rows that scrolled are shared too) with the snapshot before it, and a client
+screen shares every row a diff did not carry with the base it was applied to. So a screen costs the
+rows that changed, two screens compare and diff by skipping the rows they share, and each end's
+memory for its recent screens is counted in distinct rows. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's
 opt-in events (title, icon, bell, clipboard) and extended replies (DECRQM, DECXCPR, secondary DA)
 turned on. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
 cursor and the modes; after a resize the client starts from a blank grid and receives every
 non-blank row. The client validates and copies cells and never runs a terminal parser, so server
-bytes never reach one.
+bytes never reach one. That includes the user's terminal, which the client prints a cell's text to
+as is: decoding refuses a cell whose text holds a control character, so no escape sequence can
+ride in one.
 
 ## Headless drivers (the protocol is I/O-free; the shells are thin)
 
@@ -120,20 +131,39 @@ down instead of wedging the teardown. Both producers share
 one sender and enqueue under the session lock, so byte order is preserved (a query reply can't
 overtake the keystroke that triggered it).
 
+## Rendering
+
+The client paints the synced grid, the predictions over it and an optional status line through
+`KohBackend`, whose provided methods write the ANSI; every frame is wrapped in synchronized output
+(DEC 2026), so the terminal shows it at once. `BackendTerminal` keeps what it last painted: the
+grid (whose rows are shared with the session's screen, so keeping it copies no cells), the
+predictions and whether a status line was up. A frame then paints only the cells that differ from
+it, skipping rows it shares without reading them, moving the cursor only to reach a changed cell,
+and repainting a wide glyph whole when either half changed. So a keystroke's echo writes a few
+bytes, and the banners, which repaint every 50 ms, write their own row.
+
+A frame is painted whole, byte for byte as every frame was before, when the terminal may not show
+what was painted: the first frame, after a resume or a window resize, when the screen's size
+changes, when the status line appears or goes, and while the terminal is smaller than the screen.
+It is also painted whole, and the next one too, when a glyph does not fill exactly the cells the
+grid gives it (a predicted wide glyph over a narrow cell, say), because the terminal then lays the
+row out its own way. A property test feeds both ways of painting into a fux-vt terminal and checks
+it shows the same thing after every frame.
+
 ## The predictor
 
-The client guesses what each keystroke does to the screen and shows it immediately (underlined on
-high-RTT links), then confirms or corrects when the authoritative server frame arrives. Confirmation
+The client guesses what each keystroke does to the screen and shows it immediately, then confirms
+or corrects when the authoritative server frame arrives. Confirmation
 is driven by the server's **echo-ack** (a 50 ms-debounced "your input up to frame N is now on
 screen"), not the raw network ack. Password prompts get no predicted echo — suppression is
 *emergent*: non-echoed input fails validation, kills its epoch, and keeps subsequent predictions
 hidden, with no explicit password heuristic. Prediction is **always on** in koh (`DisplayPreference::
 Always`), so keystrokes engage on every link; the engine also implements an adaptive-by-SRTT
-engagement mode that the client no longer selects. The underline *flagging* stays SRTT-gated
-(> 80 ms) with hysteresis.
+engagement mode that the client no longer selects. Predictions are drawn plain, not underlined,
+and a cell it knows changed but not to what is not drawn at all, so the real cell shows.
 
-The port faithfully implements epoch-gated confirmation, adaptive engagement, flagging, glitch
-escalation, and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
+The port faithfully implements epoch-gated confirmation, adaptive engagement, glitch escalation,
+and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
 backspace, CR/LF, the left/right arrow keys (CSI **and** SS3/application-cursor form), and whole
 UTF-8 graphemes including double-width CJK/emoji (cursor advances by two cells). Control/escape
 sequences it doesn't model open a fresh epoch but make no concrete guess (they fall back to the

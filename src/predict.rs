@@ -22,7 +22,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fux_vt::Color;
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
+
+/// A terminal's geometry: `rows` lines of `cols` cells each.
+///
+/// Defined here, at the bottom of the crate, so the predictor, which imports nothing from
+/// `crate::`, shares it with the rest; [`terminal`](crate::terminal) re-exports it. On the wire it
+/// is its two `u16`s, rows first, as the `(rows, cols)` pair it replaces was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Size {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl Size {
+    pub const fn new(rows: u16, cols: u16) -> Self {
+        Self { rows, cols }
+    }
+}
 
 /// One cell as the predictor sees it: the glyph (empty for a blank or a wide-glyph continuation)
 /// and its colours.
@@ -39,8 +57,7 @@ pub struct CellView<'a> {
 /// it for a plain char grid. It keeps `predict` free of any `crate::` import (the CI layering guard
 /// enforces that).
 pub trait ScreenView {
-    /// `(rows, cols)`.
-    fn size(&self) -> (u16, u16);
+    fn size(&self) -> Size;
     /// The cursor as `(row, col)`, 0-indexed.
     fn cursor_position(&self) -> (u16, u16);
     /// The cell at `(row, col)`, or `None` when out of bounds.
@@ -48,8 +65,9 @@ pub trait ScreenView {
 }
 
 impl ScreenView for fux_vt::Screen {
-    fn size(&self) -> (u16, u16) {
-        Self::size(self)
+    fn size(&self) -> Size {
+        let (rows, cols) = Self::size(self);
+        Size { rows, cols }
     }
     fn cursor_position(&self) -> (u16, u16) {
         Self::cursor_position(self)
@@ -80,35 +98,49 @@ pub enum DisplayPreference {
 const ENGAGE_ABOVE_MS: f64 = 60.0;
 const DISENGAGE_BELOW_MS: f64 = 40.0;
 
-/// A speculative cell for the renderer to draw on top of the authoritative grid.
-#[derive(Clone, Debug)]
-pub struct PredictedCell {
-    /// The predicted glyph. **Empty when [`unknown`](PredictedCell::unknown)** — the renderer
-    /// must then only hint (underline the existing real cell), never overwrite its content.
-    pub glyph: String,
+/// A speculative cell for the renderer to draw, as is, on top of the authoritative grid.
+///
+/// Only concrete guesses become one: a cell the predictor knows changed but not to what is left
+/// out of the [`Overlay`], so the real cell beneath shows.
+#[derive(Clone, Copy, Debug)]
+pub struct PredictedCell<'a> {
+    /// The predicted glyph, borrowed from the engine; empty for a blank shifted in by an insert or
+    /// a backspace.
+    pub glyph: &'a str,
     pub fg: Color,
     pub bg: Color,
-    /// Whether to underline it. Always false now; kept because the renderer reads it.
-    pub underline: bool,
-    /// "Something changed here but we don't know what" (e.g. content shifted in from off-screen
-    /// by an insert/backspace). Rendered as an underline-only hint, never a guessed glyph.
-    pub unknown: bool,
 }
 
-/// The render-facing snapshot of current predictions.
+/// The render-facing snapshot of current predictions, borrowing its glyphs from the
+/// [`PredictionEngine`] it came from.
 #[derive(Default, Debug)]
-pub struct Overlay {
-    cells: BTreeMap<(u16, u16), PredictedCell>,
+pub struct Overlay<'a> {
+    cells: BTreeMap<(u16, u16), PredictedCell<'a>>,
     cursor: Option<(u16, u16)>,
 }
 
-impl Overlay {
+impl<'a> Overlay<'a> {
     pub fn empty() -> Self {
         Self::default()
     }
     /// The predicted cell at `(row, col)`, if any.
-    pub fn cell(&self, row: u16, col: u16) -> Option<&PredictedCell> {
+    pub fn cell(&self, row: u16, col: u16) -> Option<&PredictedCell<'a>> {
         self.cells.get(&(row, col))
+    }
+    /// An overlay of exactly `cells` and `cursor`, for tests of what draws it.
+    #[cfg(test)]
+    pub(crate) fn of(
+        cells: impl IntoIterator<Item = ((u16, u16), PredictedCell<'a>)>,
+        cursor: Option<(u16, u16)>,
+    ) -> Self {
+        Self {
+            cells: cells.into_iter().collect(),
+            cursor,
+        }
+    }
+    /// Every predicted cell, in `(row, col)` order.
+    pub fn cells(&self) -> impl Iterator<Item = ((u16, u16), &PredictedCell<'a>)> + '_ {
+        self.cells.iter().map(|(&at, cell)| (at, cell))
     }
     /// The predicted cursor position `(row, col)`, if any.
     pub fn cursor(&self) -> Option<(u16, u16)> {
@@ -181,7 +213,7 @@ pub struct PredictionEngine {
     rtt_ms: f64,
     /// Whether adaptive engagement is currently showing predictions (latched, with hysteresis).
     engaged: bool,
-    last_size: Option<(u16, u16)>,
+    last_size: Option<Size>,
     last_byte: u8,
     /// Escape-sequence parser state across raw input bytes (for arrow-key prediction).
     esc: EscState,
@@ -343,7 +375,7 @@ impl PredictionEngine {
     }
 
     fn newline_cr(&mut self, screen: &dyn ScreenView) {
-        let (rows, _) = screen.size();
+        let rows = screen.size().rows;
         self.init_cursor(screen);
         if let Some(c) = self.cursor.as_mut() {
             c.col = 0;
@@ -361,7 +393,7 @@ impl PredictionEngine {
     fn predict_arrow(&mut self, screen: &dyn ScreenView, dir: i32) {
         self.init_cursor(screen);
         let exp = self.next_frame();
-        let (_, cols) = screen.size();
+        let cols = screen.size().cols;
         if let Some(c) = self.cursor.as_mut() {
             // Right stops before the last column, left at column 0. The width is peer-controlled,
             // so the step is checked: at `u16::MAX` or with `cols == 0` the cursor just stays.
@@ -391,7 +423,7 @@ impl PredictionEngine {
             self.become_tentative(); // combining / zero-width: can't place safely
             return;
         }
-        let (_, cols) = screen.size();
+        let cols = screen.size().cols;
         let (row, col) = {
             let c = self.init_cursor(screen);
             (c.row, c.col)
@@ -426,7 +458,7 @@ impl PredictionEngine {
         }
         self.last_byte = byte;
 
-        let (rows, cols) = screen.size();
+        let Size { rows, cols } = screen.size();
         if rows == 0 || cols == 0 {
             return;
         }
@@ -603,7 +635,7 @@ impl PredictionEngine {
             }
         }
         self.last_size = Some(size);
-        let (rows, cols) = size;
+        let Size { rows, cols } = size;
 
         let late = self.late_acked;
         let confirmed = self.confirmed_epoch;
@@ -701,7 +733,7 @@ impl PredictionEngine {
 
     /// Build the render overlay for the current frame, honoring the display policy and epoch
     /// gating. Empty when nothing should be shown.
-    pub fn overlay(&self) -> Overlay {
+    pub fn overlay(&self) -> Overlay<'_> {
         let show = match self.pref {
             DisplayPreference::Never => false,
             DisplayPreference::Always => true,
@@ -723,11 +755,9 @@ impl PredictionEngine {
             ov.cells.insert(
                 (row, col),
                 PredictedCell {
-                    glyph: cell.glyph.clone(),
+                    glyph: &cell.glyph,
                     fg: cell.fg,
                     bg: cell.bg,
-                    underline: false,
-                    unknown: false,
                 },
             );
         }
@@ -817,7 +847,7 @@ fn cell_validity(
 }
 
 fn cursor_validity(cur: &PredCursor, screen: &dyn ScreenView, late_acked: u64) -> Validity {
-    let (rows, cols) = screen.size();
+    let Size { rows, cols } = screen.size();
     if cur.row >= rows || cur.col >= cols {
         return Validity::IncorrectOrExpired;
     }
@@ -852,8 +882,8 @@ mod tests {
     }
 
     impl ScreenView for FakeView {
-        fn size(&self) -> (u16, u16) {
-            (
+        fn size(&self) -> Size {
+            Size::new(
                 u16::try_from(self.rows.len()).expect("rows fit u16"),
                 u16::try_from(self.rows[0].len()).expect("columns fit u16"),
             )
@@ -904,7 +934,7 @@ mod tests {
         e.new_user_byte(b'y', &echoed);
         let ov = e.overlay();
         assert_eq!(
-            ov.cell(0, 1).map(|c| c.glyph.as_str()),
+            ov.cell(0, 1).map(|c| c.glyph),
             Some("y"),
             "typing after confirmation is visible over the fake view"
         );
@@ -1049,7 +1079,7 @@ mod tests {
         e.new_user_byte(b'y', &echoed); // cursor now at (0,1)
         let ov = e.overlay();
         assert_eq!(
-            ov.cell(0, 1).map(|c| c.glyph.as_str()),
+            ov.cell(0, 1).map(|c| c.glyph),
             Some("y"),
             "typing after confirmation must be visible"
         );
@@ -1057,16 +1087,13 @@ mod tests {
 
     #[test]
     fn a_slow_link_shows_confirmed_predictions() {
-        // Adaptive: an RTT above the engage threshold shows predictions (never underlined now).
+        // Adaptive: an RTT above the engage threshold shows predictions (drawn plain; the render
+        // tests check they are not underlined).
         let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Adaptive, 120.0);
         e.set_local_frame_sent(1);
         e.new_user_byte(b'y', &echoed);
         let ov = e.overlay();
-        assert_eq!(ov.cell(0, 1).map(|c| c.glyph.as_str()), Some("y"));
-        assert!(
-            !ov.cell(0, 1).unwrap().underline,
-            "predictions are not underlined"
-        );
+        assert_eq!(ov.cell(0, 1).map(|c| c.glyph), Some("y"));
     }
 
     #[test]
@@ -1343,7 +1370,7 @@ mod tests {
         }
         let ov = e.overlay();
         assert_eq!(
-            ov.cell(0, 1).map(|c| c.glyph.as_str()),
+            ov.cell(0, 1).map(|c| c.glyph),
             Some("世"),
             "the wide grapheme is predicted at the cursor column"
         );
@@ -1376,7 +1403,7 @@ mod tests {
             // The first typed char lands at col 1 (cursor seeded from the echoed "x"); the accent
             // is the 3rd char, so column 3.
             assert_eq!(
-                ov.cell(0, 3).map(|c| c.glyph.as_str()),
+                ov.cell(0, 3).map(|c| c.glyph),
                 Some(accent),
                 "{word}: accented char must be predicted as the real grapheme"
             );

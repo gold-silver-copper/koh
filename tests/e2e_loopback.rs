@@ -12,7 +12,7 @@ use std::time::Duration;
 use koh::client::{run_client, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::run_session;
-use koh::terminal::TerminalScreen;
+use koh::terminal::{Size, TerminalScreen};
 use koh::transport_iroh::{
     bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, ALPN,
 };
@@ -28,7 +28,7 @@ impl ClientTerminal for MockTerminal {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        _overlay: &Overlay,
+        _overlay: &Overlay<'_>,
         _status: Option<&str>,
     ) -> std::io::Result<()> {
         *self
@@ -38,8 +38,8 @@ impl ClientTerminal for MockTerminal {
         Ok(())
     }
 
-    fn size(&self) -> std::io::Result<(u16, u16)> {
-        Ok((24, 80))
+    fn size(&self) -> std::io::Result<Size> {
+        Ok(Size::new(24, 80))
     }
 }
 
@@ -93,7 +93,7 @@ fn full_session_over_loopback_pty() {
                 channel,
                 connector,
                 DisplayPreference::Never, // predictions are overlay-only; assert on the real grid
-                (24, 80),
+                Size::new(24, 80),
                 input_rx,
                 resize_rx,
                 term,

@@ -8,14 +8,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
+use iroh::{EndpointId, RelayUrl};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
 use crate::predict::DisplayPreference;
 use crate::transport_iroh::{
-    bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, parse_endpoint_id,
-    parse_relay_url, relay_addr, IrohChannel,
+    bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, relay_addr,
+    IrohChannel,
 };
 
 /// Configuration for [`connect`] — the clap-free, library-facing form of `koh connect`'s
@@ -23,7 +24,7 @@ use crate::transport_iroh::{
 #[derive(Debug, Clone)]
 pub struct ConnectConfig {
     /// Server endpoint id to connect to.
-    pub server: String,
+    pub server: EndpointId,
     /// Path to the client's persistent secret key (its endpoint id must be on the server's
     /// allowlist). `None` = the platform default client key path.
     pub key_file: Option<PathBuf>,
@@ -31,7 +32,7 @@ pub struct ConnectConfig {
     /// Takes precedence over `relay_url` if both are set.
     pub direct: Option<SocketAddr>,
     /// Dial the server via a self-hosted relay URL instead of n0's public relays.
-    pub relay_url: Option<String>,
+    pub relay_url: Option<RelayUrl>,
     /// Honor remote OSC-52 clipboard writes. Off by default in the CLI (`--clipboard`).
     pub clipboard: bool,
     /// A shell command to run (via `sh -c`) whenever the remote bell count climbs, e.g.
@@ -43,9 +44,9 @@ pub struct ConnectConfig {
 
 impl ConnectConfig {
     /// A config for dialing `server` with every other option at the CLI default.
-    pub fn new(server: impl Into<String>) -> Self {
+    pub fn new(server: EndpointId) -> Self {
         Self {
-            server: server.into(),
+            server,
             key_file: None,
             direct: None,
             relay_url: None,
@@ -182,14 +183,13 @@ async fn dial(
     identity: &crate::identity::Identity,
 ) -> anyhow::Result<(iroh::Endpoint, IrohConnector, IrohChannel)> {
     let secret = identity.secret.clone();
-    let server = parse_endpoint_id(&config.server).context("parsing server endpoint id")?;
+    let server = config.server;
     let (endpoint, target) = if let Some(addr) = config.direct {
         (
             bind_endpoint_local(secret, false).await?,
             direct_addr(server, addr),
         )
-    } else if let Some(url) = &config.relay_url {
-        let relay = parse_relay_url(url)?;
+    } else if let Some(relay) = config.relay_url.clone() {
         let endpoint = bind_endpoint_with_relay(secret, false, relay.clone()).await?;
         (endpoint, relay_addr(server, relay))
     } else {
@@ -333,7 +333,7 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
         let backend = DefaultBackend::new().context("acquiring the terminal")?;
         let terminal = BackendTerminal::enter(backend, args.clipboard)
             .context("entering raw mode / alt screen")?;
-        let size = terminal.size().unwrap_or((24, 80));
+        let size = terminal.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
         crate::client::run_client(
             channel,
             connector,
@@ -379,7 +379,7 @@ mod tests {
                 .find(std::net::SocketAddr::is_ipv4)
                 .context("server IPv4 socket")?;
             let config = ConnectConfig {
-                server: server.id().to_string(),
+                server: server.id(),
                 // Any attempt to reload instead of reusing `identity` would fail here.
                 key_file: Some("/nonexistent/koh-redial-test.key".into()),
                 direct: Some(([127, 0, 0, 1], socket.port()).into()),
@@ -501,6 +501,9 @@ mod tests {
 
     #[test]
     fn connect_config_default_has_no_bell_hook() {
-        assert!(ConnectConfig::new("abc").bell_command.is_none());
+        let server = crate::transport_iroh::generate_secret_key()
+            .unwrap()
+            .public();
+        assert!(ConnectConfig::new(server).bell_command.is_none());
     }
 }

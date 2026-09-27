@@ -11,9 +11,18 @@ fn main() -> std::process::ExitCode {
     if let Some(argv) = koh::pty::launch_argv() {
         return std::process::ExitCode::from(koh::pty::launched(&argv));
     }
-    let cmd = match args::parse(&args::command().get_matches()) {
+    let cmd = match args::command()
+        .try_get_matches()
+        .and_then(|matches| args::parse(&matches))
+    {
         Ok(cmd) => cmd,
-        Err(e) => e.exit(),
+        Err(e) => match args::bad_value(&e) {
+            Some(bad) => {
+                eprintln!("koh: {bad}");
+                return std::process::ExitCode::FAILURE;
+            }
+            None => e.exit(),
+        },
     };
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -41,13 +41,16 @@ service.
 - **Untrusted data plane:** the protocol (`src/proto.rs`) and the connection cores
   (`src/server/mod.rs`, `src/client/session.rs`) are pure and panic-free by construction. Client
   messages are length-capped (64 KiB of input each) and a frame is read and inflated with a 16 MiB
-  limit; each end keeps a fixed window of 16 screens, whatever the peer sends or withholds; QUIC
+  limit; each end keeps at most 16 recent screens, holding at most one screen of the largest size
+  beyond the one it needs (a row several share counted once), whatever the peer sends or withholds; QUIC
   stream limits and flow control bound what a peer can have in flight; and resize dimensions are
   clamped before any grid allocation.
   **The client runs no terminal parser on server bytes:** a screen update is a structured diff of
-  whole rows of run-length-encoded cells, which `TerminalScreen::apply` validates completely (row
-  indices, runs covering exactly the width, known cell kinds and style bits, cell text within the
-  emulator's per-cell cap, known modes) before committing; a malformed frame is dropped whole. The
+  whole rows of run-length-encoded cells. Decoding it refuses unknown cell kinds, style bits and
+  modes, empty runs, and cell text over the emulator's per-cell cap or holding a control character
+  (the client prints a cell's text to the user's terminal as is, so it cannot carry an escape
+  sequence); `TerminalScreen::apply` then validates the rest (row indices, runs covering exactly the
+  width) before committing. A malformed frame is dropped whole. The
   server's emulator is `fux-vt`, which is panic-free by construction (its own `forbid` lints) and
   bounded: it retains no DCS/APC/PM/SOS payload and caps an OSC string at 64 KiB, so a runaway
   control string from the shell can't grow memory. koh therefore no longer wraps the emulator in

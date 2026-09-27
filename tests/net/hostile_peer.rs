@@ -217,10 +217,7 @@ fn frames_with_unknown_bases_never_grow_the_client() -> anyhow::Result<()> {
                         return;
                     };
                     emu.process(format!("frame {n}").as_bytes());
-                    let Ok(diff) = std::panic::catch_unwind(|| emu.snapshot().diff_from(&base))
-                    else {
-                        return;
-                    };
+                    let diff = emu.snapshot().diff_from(&base);
                     let frame = Frame {
                         num: FrameNum(n.wrapping_mul(1000)),
                         base: FrameNum(n.wrapping_mul(1000).wrapping_sub(1)),

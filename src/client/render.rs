@@ -1,9 +1,10 @@
 //! Painting the synchronized screen grid (plus prediction overlays and a status line)
 //! onto the local terminal through [`KohBackend`].
 //!
-//! We render cell-by-cell because the predictor needs to draw speculative cells (underlined)
-//! *on top of* the authoritative grid. Style changes are diffed against the previous cell so we emit minimal SGR. Each frame
-//! is wrapped in synchronized output (DEC mode 2026) so the terminal shows it atomically
+//! We render cell-by-cell because the predictor needs to draw speculative cells *on top of* the
+//! authoritative grid, and a frame paints only the cells that changed since the last one
+//! ([`Painter`]). Style changes are diffed against the previous cell so we emit minimal SGR. Each
+//! frame is wrapped in synchronized output (DEC mode 2026) so the terminal shows it atomically
 //! (no tearing/flicker on full repaints or resizes).
 //!
 //! The engine calls [`KohBackend`] methods (`begin_frame` / `move_to` / `set_style` / `print` / …),
@@ -13,117 +14,326 @@ use std::io;
 
 use super::backend::{CellStyle, KohBackend};
 use crate::predict::Overlay;
-use crate::terminal::{Grid, MAXIMUM_CLIPBOARD_SIZE};
-use fux_vt::{Color, MouseProtocolEncoding, MouseProtocolMode};
+use crate::terminal::{Grid, Size, MAXIMUM_CLIPBOARD_SIZE};
+use fux_vt::{Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
+use unicode_width::UnicodeWidthChar as _;
 
-/// Render the authoritative `screen` with prediction `overlay` and an optional `status` line
-/// (drawn reverse-video on the last row) to `backend`, wrapped in one synchronized-output frame.
-pub fn render(
-    backend: &mut impl KohBackend,
-    screen: &Grid,
-    overlay: &Overlay,
-    status: Option<&str>,
-) -> io::Result<()> {
-    let (rows, cols) = screen.size();
+/// What the terminal was last painted with, so the next frame paints only what changed.
+///
+/// A frame is painted whole, as every frame used to be, when there is nothing to compare it with or
+/// the terminal may not show what was painted: the first frame, after [`invalidate`](Self::invalidate)
+/// (a resume, a window resize), when the screen's size changed, when the status line appears or
+/// goes, and when the terminal is smaller than the screen. It is also painted whole, and the next
+/// frame too, when a glyph does not fill exactly the cells the grid gives it (a predicted wide glyph
+/// over a narrow cell, say): the terminal then lays the row out in its own way, which only a whole
+/// repaint reproduces. Otherwise only the cells that differ from the last frame are painted, the
+/// cursor moved only to reach them; the terminal then shows exactly what a whole repaint would.
+#[derive(Default)]
+pub(super) struct Painter {
+    last: Option<Painted>,
+}
 
-    // Begin Synchronized Update (atomic frame) and hide the cursor while we paint.
-    backend.begin_frame()?;
+/// A frame as it was painted.
+struct Painted {
+    /// The grid. Its rows are shared with the screen it came from, so keeping it copies no cells.
+    grid: Grid,
+    /// The predictions drawn over it, in `(row, col)` order.
+    predicted: Vec<Drawn>,
+    status: bool,
+    /// Whether the terminal may not show exactly this frame (see [`Painter`]).
+    irregular: bool,
+}
 
-    let mut cur_style: Option<CellStyle> = None;
-    for row in 0..rows {
-        backend.move_to(row, 0)?;
-        for col in 0..cols {
-            let cell = screen.cell(row, col);
-            if let Some(c) = cell {
-                if c.is_wide_continuation() {
-                    continue;
-                }
-            }
-            // A prediction wins on glyph/underline for this cell — EXCEPT an "unknown" cell,
-            // which only hints: it underlines the real cell rather than overwriting its glyph.
-            let pred = overlay.cell(row, col);
-            let concrete = pred.filter(|p| !p.unknown); // prediction carrying a real glyph
-            let hint_underline = pred.is_some_and(|p| p.unknown && p.underline);
+/// A prediction as it was drawn.
+struct Drawn {
+    row: u16,
+    col: u16,
+    glyph: String,
+    fg: Color,
+    bg: Color,
+}
 
-            let style = if let Some(p) = concrete {
-                CellStyle {
-                    fg: p.fg,
-                    bg: p.bg,
-                    bold: false,
-                    dim: false,
-                    italic: false,
-                    // mosh flags predictions with underline on high-latency links.
-                    underline: p.underline,
-                    inverse: false,
-                }
-            } else if let Some(c) = cell {
-                CellStyle {
-                    fg: c.fgcolor(),
-                    bg: c.bgcolor(),
-                    bold: c.bold(),
-                    dim: c.dim(),
-                    italic: c.italic(),
-                    underline: c.underline() || hint_underline,
-                    inverse: c.inverse(),
-                }
-            } else {
-                CellStyle {
-                    fg: Color::Default,
-                    bg: Color::Default,
-                    bold: false,
-                    dim: false,
-                    italic: false,
-                    underline: hint_underline,
-                    inverse: false,
-                }
-            };
-
-            if cur_style != Some(style) {
-                backend.set_style(style)?;
-                cur_style = Some(style);
-            }
-
-            // Borrow a &str per branch — no per-cell String allocation on the hot repaint path:
-            // `contents()` already returns &str and the predicted glyph is borrowed from the
-            // overlay, both outliving this write. An empty glyph renders as a blank cell.
-            let glyph: &str = if let Some(p) = concrete {
-                &p.glyph
-            } else if let Some(c) = cell.filter(|c| c.has_contents()) {
-                c.contents()
-            } else {
-                " "
-            };
-            backend.print(if glyph.is_empty() { " " } else { glyph })?;
+impl Drawn {
+    fn mark(&self) -> Mark<'_> {
+        Mark {
+            row: self.row,
+            col: self.col,
+            glyph: &self.glyph,
+            fg: self.fg,
+            bg: self.bg,
         }
     }
+}
 
-    backend.reset_sgr()?;
+/// A prediction drawn over a cell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Mark<'a> {
+    row: u16,
+    col: u16,
+    glyph: &'a str,
+    fg: Color,
+    bg: Color,
+}
 
-    if let Some(st) = status {
-        let mut line = format!(" {st} ");
-        let max = cols as usize;
-        if line.len() > max {
-            // Truncate on a UTF-8 char boundary, never mid-scalar. `cols` is the peer-controlled
-            // (clamped) screen width, and the status strings contain multi-byte glyphs (em-dash,
-            // ellipsis), so a raw `String::truncate(max)` would panic and crash the client.
-            line.truncate(line.floor_char_boundary(max));
+impl Mark<'_> {
+    fn drawn(self) -> Drawn {
+        Drawn {
+            row: self.row,
+            col: self.col,
+            glyph: self.glyph.to_owned(),
+            fg: self.fg,
+            bg: self.bg,
         }
-        backend.move_to(rows.saturating_sub(1), 0)?;
-        backend.set_reverse()?;
-        backend.print(&line)?;
-        backend.reset_sgr()?;
+    }
+}
+
+/// The marks of `marks` (in `(row, col)` order) on `row`.
+fn marks_on<'m, 'a>(marks: &'m [Mark<'a>], row: u16) -> &'m [Mark<'a>] {
+    let start = marks.partition_point(|mark| mark.row < row);
+    let end = marks.partition_point(|mark| mark.row <= row);
+    marks.get(start..end).unwrap_or_default()
+}
+
+/// What one cell of a frame draws.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Paint<'a> {
+    /// The right half of a wide glyph, which the glyph to its left covers.
+    Covered,
+    /// `glyph` in `style`, over `span` cells of the grid: 2 for a wide cell, else 1.
+    Glyph {
+        glyph: &'a str,
+        style: CellStyle,
+        span: u16,
+    },
+}
+
+/// The style of a cell drawn with no attribute but its colours.
+const fn plain(fg: Color, bg: Color) -> CellStyle {
+    CellStyle {
+        fg,
+        bg,
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        inverse: false,
+    }
+}
+
+/// What `grid` with the predictions `marks` draws at `(row, col)`.
+fn paint<'a>(grid: &'a Grid, marks: &[Mark<'a>], row: u16, col: u16) -> Paint<'a> {
+    let cell = grid.cell(row, col);
+    if cell.is_some_and(Cell::is_wide_continuation) {
+        return Paint::Covered;
+    }
+    let span = if cell.is_some_and(Cell::is_wide) {
+        2
+    } else {
+        1
+    };
+    // A prediction wins on glyph and colours for this cell. An empty glyph is a blank cell.
+    let mark = marks
+        .binary_search_by_key(&(row, col), |mark| (mark.row, mark.col))
+        .ok()
+        .and_then(|at| marks.get(at));
+    let (glyph, style) = match (mark, cell) {
+        (Some(mark), _) => (mark.glyph, plain(mark.fg, mark.bg)),
+        (None, Some(c)) => (
+            c.contents(),
+            CellStyle {
+                fg: c.fgcolor(),
+                bg: c.bgcolor(),
+                bold: c.bold(),
+                dim: c.dim(),
+                italic: c.italic(),
+                underline: c.underline(),
+                inverse: c.inverse(),
+            },
+        ),
+        (None, None) => ("", plain(Color::Default, Color::Default)),
+    };
+    Paint::Glyph {
+        glyph: if glyph.is_empty() { " " } else { glyph },
+        style,
+        span,
+    }
+}
+
+/// Whether every glyph `grid` and `marks` draw on `row` fills exactly the cells the grid gives it:
+/// one column for a narrow cell, two for a wide one followed by the half it covers.
+fn regular(grid: &Grid, marks: &[Mark<'_>], row: u16) -> bool {
+    let cols = grid.size().cols;
+    let mut col = 0;
+    while col < cols {
+        let Paint::Glyph { glyph, span, .. } = paint(grid, marks, row, col) else {
+            return false; // a half no glyph covers
+        };
+        let columns = glyph
+            .chars()
+            .fold(0_usize, |sum, c| sum.saturating_add(c.width().unwrap_or(0)));
+        let covers = span == 1
+            || col
+                .checked_add(1)
+                .is_some_and(|next| paint(grid, marks, row, next) == Paint::Covered);
+        if columns != usize::from(span) || !covers {
+            return false;
+        }
+        col = col.saturating_add(span);
+    }
+    true
+}
+
+impl Painter {
+    /// Forget what was painted: the terminal may no longer show it, so the next frame is painted
+    /// whole.
+    pub(super) fn invalidate(&mut self) {
+        self.last = None;
     }
 
-    // Place and show the cursor: the predicted cursor wins if present, else the real one.
-    let (crow, ccol) = overlay.cursor().unwrap_or_else(|| screen.cursor_position());
-    backend.move_to(crow, ccol)?;
-    if !screen.hide_cursor() {
-        backend.show_cursor()?;
-    }
+    /// Render the authoritative `screen` with prediction `overlay` and an optional `status` line
+    /// (drawn reverse-video on the last row) to `backend`, wrapped in one synchronized-output frame.
+    pub(super) fn render(
+        &mut self,
+        backend: &mut impl KohBackend,
+        screen: &Grid,
+        overlay: &Overlay<'_>,
+        status: Option<&str>,
+    ) -> io::Result<()> {
+        let Size { rows, cols } = screen.size();
+        let marks: Vec<Mark<'_>> = overlay
+            .cells()
+            .map(|((row, col), p)| Mark {
+                row,
+                col,
+                glyph: p.glyph,
+                fg: p.fg,
+                bg: p.bg,
+            })
+            .collect();
+        // The terminal must hold the whole screen for a cell to land where it is painted.
+        let fits = backend
+            .size()
+            .is_ok_and(|terminal| terminal.rows >= rows && terminal.cols >= cols);
+        let last = self.last.take().filter(|last| {
+            fits && !last.irregular
+                && last.grid.size() == screen.size()
+                && last.status == status.is_some()
+        });
+        let last_marks: Vec<Mark<'_>> = last
+            .iter()
+            .flat_map(|last| &last.predicted)
+            .map(Drawn::mark)
+            .collect();
+        let status_row = status.map(|_| rows.saturating_sub(1));
+        // The rows that differ from the last frame; the status line's row is repainted with it.
+        let changed = |row: u16| {
+            last.as_ref().is_none_or(|last| {
+                Some(row) == status_row
+                    || !last.grid.row_eq(screen, row)
+                    || marks_on(&last_marks, row) != marks_on(&marks, row)
+            })
+        };
+        let whole = last.is_none()
+            || (0..rows)
+                .filter(|&row| changed(row))
+                .any(|row| !regular(screen, &marks, row));
 
-    // End Synchronized Update: the terminal now reveals the whole frame at once.
-    backend.end_frame()?;
-    backend.flush()
+        // Begin Synchronized Update (atomic frame) and hide the cursor while we paint.
+        backend.begin_frame()?;
+
+        let mut cur_style: Option<CellStyle> = None;
+        let mut irregular = false;
+        if whole {
+            for row in 0..rows {
+                irregular = irregular || !regular(screen, &marks, row);
+                backend.move_to(row, 0)?;
+                for col in 0..cols {
+                    if let Paint::Glyph { glyph, style, .. } = paint(screen, &marks, row, col) {
+                        if cur_style != Some(style) {
+                            backend.set_style(style)?;
+                            cur_style = Some(style);
+                        }
+                        backend.print(glyph)?;
+                    }
+                }
+            }
+        } else if let Some(last) = &last {
+            // Where the terminal's cursor is after the last glyph painted, if that is known: past
+            // the screen's last column the terminal may be about to wrap.
+            let mut cursor: Option<(u16, u16)> = None;
+            for row in (0..rows).filter(|&row| changed(row)) {
+                let repaint_row = Some(row) == status_row;
+                let mut col = 0;
+                while col < cols {
+                    let now = paint(screen, &marks, row, col);
+                    let Paint::Glyph { glyph, style, span } = now else {
+                        col = col.saturating_add(1);
+                        continue;
+                    };
+                    let before = |col| paint(&last.grid, &last_marks, row, col);
+                    // A wide glyph is painted whole when either half of it changed.
+                    let differs = repaint_row
+                        || now != before(col)
+                        || (span == 2
+                            && col.checked_add(1).is_some_and(|next| {
+                                paint(screen, &marks, row, next) != before(next)
+                            }));
+                    if differs {
+                        if cursor != Some((row, col)) {
+                            backend.move_to(row, col)?;
+                        }
+                        if cur_style != Some(style) {
+                            backend.set_style(style)?;
+                            cur_style = Some(style);
+                        }
+                        backend.print(glyph)?;
+                        cursor = col
+                            .checked_add(span)
+                            .filter(|&next| next < cols)
+                            .map(|next| (row, next));
+                    }
+                    col = col.saturating_add(span);
+                }
+            }
+        }
+
+        if cur_style.is_some() {
+            backend.reset_sgr()?;
+        }
+
+        if let Some(st) = status {
+            let mut line = format!(" {st} ");
+            let max = usize::from(cols);
+            if line.len() > max {
+                // Truncate on a UTF-8 char boundary, never mid-scalar. `cols` is the peer-controlled
+                // (clamped) screen width, and the status strings contain multi-byte glyphs (em-dash,
+                // ellipsis), so a raw `String::truncate(max)` would panic and crash the client.
+                line.truncate(line.floor_char_boundary(max));
+            }
+            backend.move_to(rows.saturating_sub(1), 0)?;
+            backend.set_reverse()?;
+            backend.print(&line)?;
+            backend.reset_sgr()?;
+        }
+
+        // Place and show the cursor: the predicted cursor wins if present, else the real one.
+        let (crow, ccol) = overlay.cursor().unwrap_or_else(|| screen.cursor_position());
+        backend.move_to(crow, ccol)?;
+        if !screen.hide_cursor() {
+            backend.show_cursor()?;
+        }
+
+        // End Synchronized Update: the terminal now reveals the whole frame at once.
+        backend.end_frame()?;
+        let painted = Painted {
+            grid: screen.clone(),
+            predicted: marks.into_iter().map(Mark::drawn).collect(),
+            status: status.is_some(),
+            irregular: irregular || !fits,
+        };
+        self.last = Some(painted);
+        backend.flush()
+    }
 }
 
 /// Strip control chars from an OSC string payload so it can't break the sequence we wrap it in.
@@ -182,17 +392,19 @@ impl From<&Grid> for InputModes {
 impl InputModes {
     /// Escape sequences setting every mode explicitly (the first frame / after a resume).
     pub fn formatted(self) -> Vec<u8> {
-        self.write(&mut Vec::new(), None)
+        self.sequences(None)
     }
 
     /// Escape sequences taking a terminal at `prev` to these modes (only the changes).
     pub fn diff(self, prev: Self) -> Vec<u8> {
-        self.write(&mut Vec::new(), Some(prev))
+        self.sequences(Some(prev))
     }
 
-    fn write(self, buf: &mut Vec<u8>, prev: Option<Self>) -> Vec<u8> {
+    /// The sequences taking a terminal at `prev` (unknown if `None`) to these modes.
+    fn sequences(self, prev: Option<Self>) -> Vec<u8> {
         use MouseProtocolEncoding as Enc;
         use MouseProtocolMode as Mode;
+        let mut buf = Vec::new();
         let changed = |get: fn(&Self) -> bool| prev.is_none_or(|p| get(&p) != get(&self));
         if changed(|m| m.application_keypad) {
             buf.extend_from_slice(if self.application_keypad {
@@ -243,7 +455,7 @@ impl InputModes {
                 Enc::Sgr => buf.extend_from_slice(b"\x1b[?1006h"),
             }
         }
-        std::mem::take(buf)
+        buf
     }
 }
 
@@ -386,7 +598,7 @@ impl OutOfBand {
 mod tests {
     use super::*;
     use crate::client::backend::CaptureBackend;
-    use crate::predict::{DisplayPreference, PredictionEngine};
+    use crate::predict::{DisplayPreference, PredictedCell, PredictionEngine};
 
     fn screen_of(bytes: &[u8]) -> Grid {
         crate::terminal::TerminalScreen::from_bytes(24, 80, bytes)
@@ -394,10 +606,12 @@ mod tests {
             .clone()
     }
 
-    /// Render into a capture backend and return the emitted bytes as a lossy string.
-    fn render_to_string(screen: &Grid, overlay: &Overlay, status: Option<&str>) -> String {
+    /// Render a first frame into a capture backend and return the emitted bytes as a lossy string.
+    fn render_to_string(screen: &Grid, overlay: &Overlay<'_>, status: Option<&str>) -> String {
         let mut backend = CaptureBackend::default();
-        render(&mut backend, screen, overlay, status).unwrap();
+        Painter::default()
+            .render(&mut backend, screen, overlay, status)
+            .unwrap();
         String::from_utf8_lossy(&backend.bytes).into_owned()
     }
 
@@ -600,8 +814,300 @@ mod tests {
                 .screen()
                 .clone();
             let mut backend = CaptureBackend::default();
-            render(&mut backend, &screen, &Overlay::empty(), Some(status))
+            Painter::default()
+                .render(&mut backend, &screen, &Overlay::empty(), Some(status))
                 .expect("render must not error or panic at any width");
+        }
+    }
+
+    /// Paint one frame with `painter` and return the bytes, as a lossy string.
+    fn paint_frame(
+        painter: &mut Painter,
+        screen: &Grid,
+        overlay: &Overlay<'_>,
+        status: Option<&str>,
+    ) -> String {
+        let mut backend = CaptureBackend::default();
+        painter
+            .render(&mut backend, screen, overlay, status)
+            .unwrap();
+        String::from_utf8_lossy(&backend.bytes).into_owned()
+    }
+
+    /// The bytes around a frame's cells: open the synchronized frame, then after the cells place
+    /// the cursor at the 1-based `cursor`, show it, and close the frame.
+    fn framed(cells: &str, cursor: &str) -> String {
+        format!("\x1b[?2026h\x1b[?25l{cells}\x1b[{cursor}H\x1b[?25h\x1b[?2026l")
+    }
+
+    /// What `set_style` emits for the default style.
+    const PLAIN: &str = "\x1b[m\x1b[39m\x1b[49m";
+
+    #[test]
+    fn a_second_identical_frame_paints_no_cells() {
+        let screen = screen_of(b"hello");
+        let mut painter = Painter::default();
+        let first = paint_frame(&mut painter, &screen, &Overlay::empty(), None);
+        assert!(first.contains("hello"));
+        let second = paint_frame(&mut painter, &screen, &Overlay::empty(), None);
+        assert_eq!(second, framed("", "1;6"));
+    }
+
+    #[test]
+    fn one_changed_cell_paints_only_that_cell() {
+        let mut painter = Painter::default();
+        paint_frame(&mut painter, &screen_of(b"hello"), &Overlay::empty(), None);
+        let changed = paint_frame(&mut painter, &screen_of(b"hellO"), &Overlay::empty(), None);
+        assert_eq!(changed, framed(&format!("\x1b[1;5H{PLAIN}O\x1b[m"), "1;6"));
+    }
+
+    #[test]
+    fn the_cursor_moves_only_to_reach_a_changed_cell() {
+        // Two changed cells either side of an unchanged wide glyph: the second needs a move, and
+        // the glyph between them is not painted.
+        let mut painter = Painter::default();
+        paint_frame(
+            &mut painter,
+            &screen_of("a日b".as_bytes()),
+            &Overlay::empty(),
+            None,
+        );
+        let changed = paint_frame(
+            &mut painter,
+            &screen_of("c日d".as_bytes()),
+            &Overlay::empty(),
+            None,
+        );
+        assert_eq!(
+            changed,
+            framed(&format!("\x1b[1;1H{PLAIN}c\x1b[1;4Hd\x1b[m"), "1;5")
+        );
+        // A changed wide glyph is painted whole, and the cell after it follows without a move.
+        paint_frame(
+            &mut painter,
+            &screen_of("日本x".as_bytes()),
+            &Overlay::empty(),
+            None,
+        );
+        let changed = paint_frame(
+            &mut painter,
+            &screen_of("日字y".as_bytes()),
+            &Overlay::empty(),
+            None,
+        );
+        assert_eq!(
+            changed,
+            framed(&format!("\x1b[1;3H{PLAIN}字y\x1b[m"), "1;6")
+        );
+    }
+
+    #[test]
+    fn a_resize_a_resume_or_a_small_terminal_repaints_everything() {
+        let screen = screen_of(b"hello");
+        let whole = render_to_string(&screen, &Overlay::empty(), None);
+        let mut painter = Painter::default();
+        paint_frame(&mut painter, &screen, &Overlay::empty(), None);
+        // A resume (or a window resize) invalidates what was painted.
+        painter.invalidate();
+        assert_eq!(
+            paint_frame(&mut painter, &screen, &Overlay::empty(), None),
+            whole
+        );
+        // A screen of another size.
+        let small = crate::terminal::TerminalScreen::from_bytes(10, 40, b"hello")
+            .screen()
+            .clone();
+        assert_eq!(
+            paint_frame(&mut painter, &small, &Overlay::empty(), None),
+            render_to_string(&small, &Overlay::empty(), None)
+        );
+        // A screen larger than the terminal, where cells do not land where they are painted.
+        let large = crate::terminal::TerminalScreen::from_bytes(30, 100, b"hello")
+            .screen()
+            .clone();
+        let whole = render_to_string(&large, &Overlay::empty(), None);
+        for _ in 0..2 {
+            assert_eq!(
+                paint_frame(&mut painter, &large, &Overlay::empty(), None),
+                whole
+            );
+        }
+    }
+
+    #[test]
+    fn the_status_line_appearing_or_going_repaints_everything() {
+        let screen = screen_of(b"hello");
+        let mut painter = Painter::default();
+        paint_frame(&mut painter, &screen, &Overlay::empty(), None);
+        assert_eq!(
+            paint_frame(&mut painter, &screen, &Overlay::empty(), Some("down")),
+            render_to_string(&screen, &Overlay::empty(), Some("down"))
+        );
+        // While it stays, only its row is repainted, under the new text.
+        let again = paint_frame(&mut painter, &screen, &Overlay::empty(), Some("down 2s"));
+        assert!(again.contains("\x1b[24;1H") && again.contains(" down 2s "));
+        assert!(!again.contains("hello"), "{again:?}");
+        assert_eq!(
+            paint_frame(&mut painter, &screen, &Overlay::empty(), None),
+            render_to_string(&screen, &Overlay::empty(), None)
+        );
+    }
+
+    #[test]
+    fn a_prediction_is_painted_and_cleared_like_a_cell() {
+        let screen = screen_of(b"ab");
+        let predicted = Overlay::of(
+            [(
+                (0, 2),
+                PredictedCell {
+                    glyph: "Z",
+                    fg: Color::Default,
+                    bg: Color::Default,
+                },
+            )],
+            Some((0, 3)),
+        );
+        let mut painter = Painter::default();
+        paint_frame(&mut painter, &screen, &Overlay::empty(), None);
+        assert_eq!(
+            paint_frame(&mut painter, &screen, &predicted, None),
+            framed(&format!("\x1b[1;3H{PLAIN}Z\x1b[m"), "1;4")
+        );
+        assert_eq!(
+            paint_frame(&mut painter, &screen, &Overlay::empty(), None),
+            framed(&format!("\x1b[1;3H{PLAIN} \x1b[m"), "1;3")
+        );
+    }
+
+    #[test]
+    fn a_glyph_wider_than_its_cell_repaints_everything_twice() {
+        // A predicted wide glyph over a narrow cell: the terminal lays the row out its own way, so
+        // that frame and the next are painted whole, as every frame used to be.
+        let screen = screen_of(b"ab");
+        let wide = Overlay::of(
+            [(
+                (0, 2),
+                PredictedCell {
+                    glyph: "世",
+                    fg: Color::Default,
+                    bg: Color::Default,
+                },
+            )],
+            None,
+        );
+        let mut painter = Painter::default();
+        paint_frame(&mut painter, &screen, &Overlay::empty(), None);
+        assert_eq!(
+            paint_frame(&mut painter, &screen, &wide, None),
+            render_to_string(&screen, &wide, None)
+        );
+        assert_eq!(
+            paint_frame(&mut painter, &screen, &Overlay::empty(), None),
+            render_to_string(&screen, &Overlay::empty(), None)
+        );
+        assert_eq!(
+            paint_frame(&mut painter, &screen, &Overlay::empty(), None),
+            framed("", "1;3")
+        );
+    }
+
+    /// Output that exercises what a frame can change: text, wide glyphs, combining marks,
+    /// colours and attributes, cursor motion, erasing, scrolling and inserting lines, wrapping.
+    const PIECES: [&str; 22] = [
+        "a",
+        "xyz",
+        "日",
+        "本",
+        "é",
+        "e\u{301}",
+        "\u{1f980}",
+        "\r\n",
+        "\x1b[31m",
+        "\x1b[1;7m",
+        "\x1b[44m",
+        "\x1b[m",
+        "\x1b[H",
+        "\x1b[2J",
+        "\x1b[3;7H",
+        "\x1b[K",
+        "\x1b[2L",
+        "\x1b[M",
+        "\x1b[S",
+        "\x1b[19G",
+        "\x1b[?25l\x1b[?25h",
+        "a line that wraps past the edge",
+    ];
+
+    /// Predicted glyphs, one wider than a cell.
+    const GLYPHS: [&str; 4] = ["Z", "", "ü", "世"];
+
+    /// Status lines of several lengths.
+    const STATUSES: [&str; 3] = [
+        "[koh] link down \u{2014} 10s",
+        "[koh] link down \u{2014} 9s",
+        "x",
+    ];
+
+    /// The cells and cursor a terminal shows.
+    fn shown(terminal: &fux_vt::Parser) -> (Vec<Option<Cell>>, (u16, u16)) {
+        let screen = terminal.screen();
+        let (rows, cols) = screen.size();
+        let cells = (0..rows)
+            .flat_map(|row| (0..cols).map(move |col| (row, col)))
+            .map(|(row, col)| screen.cell(row, col).copied())
+            .collect();
+        (cells, screen.cursor_position())
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+
+        /// A terminal fed only what changed shows, after every frame, exactly what a terminal fed
+        /// every frame whole shows: on a terminal the screen's size and on a larger one.
+        #[test]
+        fn painting_what_changed_shows_what_painting_everything_shows(
+            steps in proptest::collection::vec(
+                (
+                    proptest::collection::vec(0..PIECES.len(), 0..6),
+                    proptest::option::of(0..STATUSES.len()),
+                    proptest::option::of((0u16..6, 0u16..20, 0..GLYPHS.len())),
+                ),
+                1..12,
+            ),
+            larger in proptest::prelude::any::<bool>(),
+        ) {
+            let (rows, cols) = (6, 20);
+            let size = if larger { Size::new(8, 30) } else { Size::new(rows, cols) };
+            let mut emu = crate::terminal::ServerTerminal::new(rows, cols, 0).unwrap();
+            let mut painter = Painter::default();
+            let mut incremental = fux_vt::Parser::new(size.rows, size.cols, 0).unwrap();
+            let mut whole = fux_vt::Parser::new(size.rows, size.cols, 0).unwrap();
+            for (pieces, status, prediction) in steps {
+                for piece in pieces {
+                    emu.process(PIECES[piece].as_bytes());
+                }
+                let screen = emu.snapshot();
+                let overlay = Overlay::of(
+                    prediction.map(|(row, col, glyph)| {
+                        ((row, col), PredictedCell {
+                            glyph: GLYPHS[glyph],
+                            fg: Color::Idx(2),
+                            bg: Color::Default,
+                        })
+                    }),
+                    None,
+                );
+                let status = status.map(|status| STATUSES[status]);
+                let mut changed = CaptureBackend { size, ..CaptureBackend::default() };
+                painter.render(&mut changed, screen.screen(), &overlay, status).unwrap();
+                let mut everything = CaptureBackend { size, ..CaptureBackend::default() };
+                Painter::default()
+                    .render(&mut everything, screen.screen(), &overlay, status)
+                    .unwrap();
+                incremental.process(&changed.bytes).unwrap();
+                whole.process(&everything.bytes).unwrap();
+                proptest::prop_assert_eq!(shown(&incremental), shown(&whole));
+            }
         }
     }
 
@@ -628,6 +1134,7 @@ mod tests {
 
         let s = render_to_string(&echoed, &overlay, None);
         assert!(s.contains('Z'), "predicted glyph not rendered");
+        assert!(!s.contains("\x1b[4m"), "predictions are not underlined");
     }
 
     // --- InputModes emits vt100 0.16's input-mode bytes ---

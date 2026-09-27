@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use crate::predict::{DisplayPreference, Overlay};
 use crate::proto::{decode_frame, encode_client, Frame, MAX_FRAME, SESSION_ENDED};
-use crate::terminal::TerminalScreen;
+use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::{IrohChannel, ALPN};
 use iroh::endpoint::{Connection, SendStream};
 use iroh::{Endpoint, EndpointAddr};
@@ -231,12 +231,16 @@ pub trait ClientTerminal {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay,
+        overlay: &Overlay<'_>,
         status: Option<&str>,
     ) -> std::io::Result<()>;
 
-    /// The current window size as `(rows, cols)`.
-    fn size(&self) -> std::io::Result<(u16, u16)>;
+    /// The current window size.
+    fn size(&self) -> std::io::Result<Size>;
+
+    /// The window was resized: whatever it showed may be gone, so the next [`render`](Self::render)
+    /// paints everything. Default: a no-op, for a terminal that paints everything every time.
+    fn window_resized(&mut self) {}
 
     /// Suspend the client to the background (the `Ctrl-^ Ctrl-Z` escape): restore the user's
     /// terminal to a usable cooked state, stop the process with `SIGTSTP`, and — once the user
@@ -269,6 +273,8 @@ pub struct BackendTerminal<B: KohBackend> {
     backend: B,
     /// Tracks the title / bell / input modes mirrored to the real terminal (see [`render::OutOfBand`]).
     oob: render::OutOfBand,
+    /// What the terminal was last painted with, so a frame paints only what changed.
+    painter: render::Painter,
 }
 
 impl<B: KohBackend> BackendTerminal<B> {
@@ -283,6 +289,7 @@ impl<B: KohBackend> BackendTerminal<B> {
             backend,
             oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string())
                 .with_clipboard(clipboard_enabled),
+            painter: render::Painter::default(),
         };
         this.backend.enter_alt_screen()?;
         Ok(this)
@@ -293,7 +300,7 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay,
+        overlay: &Overlay<'_>,
         status: Option<&str>,
     ) -> std::io::Result<()> {
         // Mirror the out-of-band terminal state (title/icon/clipboard/bell/modes) onto the real
@@ -303,11 +310,16 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
             InputModes::from(state.screen()),
             window_state(state),
         )?;
-        render::render(&mut self.backend, state.screen(), overlay, status)
+        self.painter
+            .render(&mut self.backend, state.screen(), overlay, status)
     }
 
-    fn size(&self) -> std::io::Result<(u16, u16)> {
+    fn size(&self) -> std::io::Result<Size> {
         self.backend.size()
+    }
+
+    fn window_resized(&mut self) {
+        self.painter.invalidate();
     }
 
     fn suspend_resume(&mut self) -> std::io::Result<()> {
@@ -323,10 +335,12 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
         // "Stopped"; control returns here only once the user foregrounds it (SIGCONT).
         fuxix::process::kill(own_pid()?, fuxix::process::Signal::Tstp)?;
         // Foregrounded again: re-enter raw mode + the alternate screen and force the next frame to
-        // re-assert the title / clipboard / input modes (the terminal was reset while we were away).
+        // re-assert the title / clipboard / input modes and repaint every cell (the terminal was
+        // reset while we were away).
         self.backend.enter_raw_mode()?;
         self.backend.enter_alt_screen()?;
         self.oob.invalidate();
+        self.painter.invalidate();
         Ok(())
     }
 }
@@ -358,8 +372,8 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
 /// `input_rx` carries raw typed bytes (the caller must keep its sender alive for the session;
 /// when it closes, the session ends). `resize_rx` carries resize *ticks* — each one prompts the
 /// loop to re-read the current size from `term`; keep its sender alive even if you never resize,
-/// so the loop doesn't spin on a closed channel. `initial_size` (`(rows, cols)`) seeds the size if
-/// `term.size()` is unavailable.
+/// so the loop doesn't spin on a closed channel. `initial_size` seeds the size if `term.size()` is
+/// unavailable.
 /// Returns the remote shell's exit code (`Some`) when the session ended because the shell exited,
 /// or `None` for a local quit (`Ctrl-^ .`, a closed input channel, or a cancelled `shutdown`) — so
 /// the binary can exit with the remote status.
@@ -378,7 +392,7 @@ pub async fn run_client<T: ClientTerminal>(
     initial: IrohChannel,
     connector: IrohConnector,
     pref: DisplayPreference,
-    initial_size: (u16, u16),
+    initial_size: Size,
     mut input_rx: mpsc::Receiver<Vec<u8>>,
     mut resize_rx: mpsc::Receiver<()>,
     mut term: T,
@@ -393,8 +407,8 @@ pub async fn run_client<T: ClientTerminal>(
     loop {
         // A fresh session per (re)connection mirrors the server's fresh-transport-per-attach, which
         // full-repaints the live screen; re-seed the size from the terminal each time.
-        let (rows, cols) = term.size().unwrap_or(initial_size);
-        let mut session = ClientSession::new(pref, rows, cols);
+        let size = term.size().unwrap_or(initial_size);
+        let mut session = ClientSession::new(pref, size);
 
         let conn_started = Instant::now();
         match drive_connection(
@@ -591,8 +605,9 @@ async fn drive_connection<T: ClientTerminal>(
                 // A resize tick: read the fresh size from the terminal and propagate it. A closed
                 // resize channel is fine; keep its sender alive to avoid spinning.
                 if maybe.is_some() {
-                    if let Ok((rows, cols)) = term.size() {
-                        session.on_resize(rows, cols);
+                    term.window_resized();
+                    if let Ok(size) = term.size() {
+                        session.on_resize(size);
                     }
                 }
             }
@@ -910,6 +925,7 @@ mod tests {
         let mut via_trait = BackendTerminal {
             backend: CaptureBackend::default(),
             oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string()),
+            painter: render::Painter::default(),
         };
         via_trait
             .render(&screen, &Overlay::empty(), Some("status"))
@@ -923,13 +939,14 @@ mod tests {
             window_state(&screen),
         )
         .unwrap();
-        render::render(
-            &mut direct,
-            screen.screen(),
-            &Overlay::empty(),
-            Some("status"),
-        )
-        .unwrap();
+        render::Painter::default()
+            .render(
+                &mut direct,
+                screen.screen(),
+                &Overlay::empty(),
+                Some("status"),
+            )
+            .unwrap();
         assert_eq!(via_trait.backend.bytes, direct.bytes);
         assert_ne!(via_trait.backend.bytes, b"");
     }

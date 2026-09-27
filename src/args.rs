@@ -2,12 +2,17 @@
 //!
 //! Built with the builder API rather than the derive, whose expansions `allow` lints this crate
 //! forbids. Help texts are single sentences without a final period, as clap prints them.
+//!
+//! Endpoint ids and relay URLs are parsed here, by clap, so the configs carry parsed values and an
+//! invalid one never gets past the command line.
 
+use std::error::Error as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::error::ErrorKind;
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command};
+use iroh::{EndpointId, RelayUrl};
 
 use koh::client::ConnectConfig;
 use koh::idcmd::IdConfig;
@@ -17,6 +22,40 @@ use koh::server::cli::{
     MAX_SCROLLBACK,
 };
 use koh::server::ServeConfig;
+use koh::transport_iroh::{parse_endpoint_id, parse_relay_url};
+
+/// A value clap could not parse, with the message koh reports for it (see [`bad_value`]).
+#[derive(Debug)]
+pub struct BadValue(String);
+
+impl std::fmt::Display for BadValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BadValue {}
+
+/// koh's message for `error` if it is a value one of koh's own parsers refused. koh prints it as it
+/// prints every error of its own, `koh: <message>`, rather than in clap's form.
+pub fn bad_value(error: &clap::Error) -> Option<&BadValue> {
+    error.source()?.downcast_ref()
+}
+
+/// A `--allow` endpoint id.
+fn allow_id(value: &str) -> Result<EndpointId, BadValue> {
+    parse_endpoint_id(value).map_err(|e| BadValue(format!("bad --allow id: {value}: {e}")))
+}
+
+/// The server endpoint id `koh connect` dials.
+fn server_id(value: &str) -> Result<EndpointId, BadValue> {
+    parse_endpoint_id(value).map_err(|e| BadValue(format!("parsing server endpoint id: {e}")))
+}
+
+/// A `--relay-url`.
+fn relay_url(value: &str) -> Result<RelayUrl, BadValue> {
+    parse_relay_url(value).map_err(|e| BadValue(e.to_string()))
+}
 
 /// What the command line asks for.
 #[derive(Debug)]
@@ -64,6 +103,7 @@ fn serve() -> Command {
             Arg::new("allow")
                 .long("allow")
                 .value_name("ENDPOINT_ID")
+                .value_parser(allow_id)
                 .action(ArgAction::Append)
                 .help("Authorize a client endpoint id (repeatable). At least one is required — koh only serves peers whose node-id is on this list"),
         )
@@ -94,6 +134,7 @@ fn serve() -> Command {
             Arg::new("relay_url")
                 .long("relay-url")
                 .value_name("URL")
+                .value_parser(relay_url)
                 .help("Host via a self-hosted relay URL instead of n0's public relays"),
         )
         .arg(
@@ -125,6 +166,7 @@ fn connect() -> Command {
         .arg(
             Arg::new("server")
                 .value_name("SERVER")
+                .value_parser(server_id)
                 .required(true)
                 .help("Server endpoint id to connect to"),
         )
@@ -144,6 +186,7 @@ fn connect() -> Command {
             Arg::new("relay_url")
                 .long("relay-url")
                 .value_name("URL")
+                .value_parser(relay_url)
                 .help("Dial the server via a self-hosted relay URL instead of n0's public relays"),
         )
         .arg(
@@ -193,11 +236,13 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
     match matches.subcommand() {
         Some(("serve", m)) => Ok(Cmd::Serve(ServeConfig {
             key_file: m.get_one::<PathBuf>("key_file").cloned(),
-            allow: strings(m, "allow"),
+            allow: m
+                .get_many::<EndpointId>("allow")
+                .map_or_else(Vec::new, |ids| ids.copied().collect()),
             command: strings(m, "shell"),
             scrollback: value(m, "scrollback")?,
             session_ttl_secs: value(m, "session_ttl_secs")?,
-            relay_url: m.get_one::<String>("relay_url").cloned(),
+            relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
             local: m.get_flag("local"),
             max_connections: value(m, "max_connections")?,
             max_sessions: value(m, "max_sessions")?,
@@ -205,12 +250,12 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
         })),
         Some(("connect", m)) => Ok(Cmd::Connect(ConnectConfig {
             server: m
-                .get_one::<String>("server")
-                .cloned()
+                .get_one::<EndpointId>("server")
+                .copied()
                 .ok_or_else(|| missing("server"))?,
             key_file: m.get_one::<PathBuf>("key_file").cloned(),
             direct: m.get_one::<SocketAddr>("direct").copied(),
-            relay_url: m.get_one::<String>("relay_url").cloned(),
+            relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
             clipboard: m.get_flag("clipboard"),
             bell_command: m.get_one::<String>("on_bell").cloned(),
         })),
@@ -259,9 +304,13 @@ fn missing(what: &str) -> clap::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{command, parse, Cmd};
+    use super::{bad_value, command, parse, Cmd};
+    use clap::error::ErrorKind;
     use koh::keycmd::KeyOp;
     use koh::server::ServeConfig;
+
+    /// A valid endpoint id.
+    const ID: &str = "d12841817cf7b0e8b357ae293f8a0c7d911d9661b06833a8365a1b3e7f83febf";
 
     fn parsed(argv: &[&str]) -> Cmd {
         let matches = command()
@@ -278,12 +327,12 @@ mod tests {
     #[test]
     fn serve_args_map_shell_to_command_argv_and_keep_defaults() {
         let Cmd::Serve(c) = parsed(&[
-            "koh", "serve", "--allow", "abc", "--shell", "zellij", "--shell", "attach",
+            "koh", "serve", "--allow", ID, "--shell", "zellij", "--shell", "attach",
         ]) else {
             panic!("serve");
         };
         assert_eq!(c.command, ["zellij", "attach"]);
-        assert_eq!(c.allow, ["abc"]);
+        assert_eq!(c.allow, [ID.parse().unwrap()]);
         // Everything not given on the command line must equal `ServeConfig::default()`.
         let d = ServeConfig::default();
         assert_eq!(c.scrollback, d.scrollback);
@@ -293,13 +342,12 @@ mod tests {
         assert!(!c.local && c.relay_url.is_none() && c.key_file.is_none());
 
         // A single `--shell` is just the program.
-        let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", "abc", "--shell", "/bin/zsh"])
-        else {
+        let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", ID, "--shell", "/bin/zsh"]) else {
             panic!("serve");
         };
         assert_eq!(c.command, ["/bin/zsh"]);
         // No `--shell` = login shell.
-        let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", "abc"]) else {
+        let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", ID]) else {
             panic!("serve");
         };
         assert_eq!(c.command, Vec::<String>::new());
@@ -307,14 +355,63 @@ mod tests {
 
     #[test]
     fn connect_args_map_on_bell_to_bell_command() {
-        let Cmd::Connect(c) =
-            parsed(&["koh", "connect", "abc", "--on-bell", "termux-notification"])
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--on-bell", "termux-notification"])
         else {
             panic!("connect");
         };
-        assert_eq!(c.server, "abc");
+        assert_eq!(c.server, ID.parse().unwrap());
         assert_eq!(c.bell_command.as_deref(), Some("termux-notification"));
         assert!(!c.clipboard && c.direct.is_none());
+    }
+
+    #[test]
+    fn ids_and_relay_urls_are_parsed_on_the_command_line() {
+        let Cmd::Serve(c) = parsed(&[
+            "koh",
+            "serve",
+            "--allow",
+            ID,
+            "--relay-url",
+            "https://relay.example",
+        ]) else {
+            panic!("serve");
+        };
+        assert_eq!(c.relay_url, Some("https://relay.example".parse().unwrap()));
+        // An invalid value is refused while parsing the command line, with the message koh gave
+        // when it parsed the value later.
+        let invalid = "could not parse endpoint id: invalid length";
+        for (argv, message) in [
+            (
+                &["koh", "serve", "--allow", "bad"][..],
+                format!("bad --allow id: bad: {invalid}"),
+            ),
+            (
+                &["koh", "serve", "--allow", ID, "--allow", "bad2"][..],
+                format!("bad --allow id: bad2: {invalid}"),
+            ),
+            (
+                &["koh", "connect", "bad"][..],
+                format!("parsing server endpoint id: {invalid}"),
+            ),
+            (
+                &["koh", "serve", "--allow", ID, "--relay-url", "bad"][..],
+                "bad relay url: Failed to parse relay URL".to_owned(),
+            ),
+            (
+                &["koh", "connect", ID, "--relay-url", "bad"][..],
+                "bad relay url: Failed to parse relay URL".to_owned(),
+            ),
+        ] {
+            let error = command()
+                .try_get_matches_from(argv)
+                .expect_err("an invalid value");
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{argv:?}");
+            assert_eq!(
+                bad_value(&error).map(ToString::to_string),
+                Some(message),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

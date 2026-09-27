@@ -14,11 +14,9 @@ use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::server::run_session;
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
-use koh::terminal::{clamp_dims, TerminalScreen};
+use koh::terminal::{clamp_dims, Size, TerminalScreen};
 use koh::transport_iroh::admission::await_admission;
-use koh::transport_iroh::{
-    bind_endpoint_local, format_endpoint_id, generate_secret_key, loopback_addr, ALPN,
-};
+use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 use tokio_util::sync::CancellationToken;
 
 /// The launcher every session in these tests starts through.
@@ -272,13 +270,10 @@ fn run_session_delivers_keys_and_clamped_resizes_then_kills_the_shell() -> anyho
         });
         let mut client = RawClient::connect(addr, generate_secret_key()?, false).await?;
         client
-            .write(&ClientMsg::Resize {
-                rows: 65000,
-                cols: 1,
-            })
+            .write(&ClientMsg::Resize(Size::new(65000, 1)))
             .await?;
         client.type_bytes(b"xy").await?;
-        let clamped = clamp_dims(65000, 1);
+        let clamped = clamp_dims(Size::new(65000, 1));
         let done = |c: &RawClient| {
             c.screen()
                 .is_some_and(|s| s.screen().contents().contains("xy") && s.size() == clamped)
@@ -319,7 +314,7 @@ fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_i
         let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
         let addr = loopback_addr(&server_ep);
         let config = ServeConfig {
-            allow: vec![format_endpoint_id(&secret.public())],
+            allow: vec![secret.public()],
             command: vec!["cat".to_owned()],
             scrollback: 0,
             launcher: launcher(),

@@ -9,11 +9,12 @@
 //! Everything here is pure: the connection loops move bytes, this module turns them into messages
 //! and rejects anything oversized or malformed.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::terminal::ScreenDiff;
+use crate::terminal::{ScreenDiff, Size, TerminalScreen};
 
 /// A frame number. Frame 0 is the blank default screen both ends start from; it is never sent.
 /// Real frames count from 1 on each connection.
@@ -65,6 +66,23 @@ pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// acknowledged. A constant, so neither end's memory grows with what the peer sends or withholds.
 pub const FRAME_WINDOW: usize = 16;
 
+/// Most cells the recent screens an end keeps may hold, a row several of them share counted once:
+/// one screen of the largest size a client may ask for (`MAX_DIM`²).
+///
+/// [`FRAME_WINDOW`] alone is no memory bound when one screen can be a million cells (about 32 MB):
+/// sixteen of them are half a gigabyte, which a hostile peer, or one on a huge terminal, could
+/// make the other end hold by resizing. Past this the oldest screens are dropped, as past the
+/// window; a dropped screen is only a base the peer can no longer have a frame diffed against.
+pub const WINDOW_CELLS: usize = 1_000_000;
+
+/// A frame's number and the screen it brings the client to. Screens are shared, not copied, by
+/// every frame that shows them.
+#[derive(Clone, Debug, Default)]
+pub struct FrameScreen {
+    pub num: FrameNum,
+    pub screen: Arc<TerminalScreen>,
+}
+
 /// The server sends a frame at least this often, even when nothing changed, so the client can tell
 /// a quiet session from a dead link.
 pub const HEARTBEAT: Duration = Duration::from_secs(3);
@@ -109,14 +127,51 @@ const COMPRESSION_LEVEL: u8 = 6;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// Typed bytes, at most [`MAX_INPUT_BYTES`].
-    Input { seq: InputSeq, bytes: Vec<u8> },
-    /// The client's window is now `rows × cols`.
-    Resize { rows: u16, cols: u16 },
+    Input {
+        seq: InputSeq,
+        #[serde(with = "byte_string")]
+        bytes: Vec<u8>,
+    },
+    /// The client's window is now this size.
+    Resize(Size),
     /// The client applied `frame`; later frames may diff against it.
     Ack { frame: FrameNum },
     /// The client got a frame whose base it does not hold; the next frame must diff against
     /// [`FrameNum::BLANK`].
     Resync,
+}
+
+/// [`ClientMsg::Input`]'s bytes as a byte string. postcard encodes that exactly as it encodes a
+/// `Vec<u8>` (a varint length, then the bytes), but decodes it with one copy rather than byte by
+/// byte.
+mod byte_string {
+    use serde::{de, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_byte_buf(Bytes)
+    }
+
+    struct Bytes;
+
+    impl de::Visitor<'_> for Bytes {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a byte string")
+        }
+
+        fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(bytes.to_vec())
+        }
+
+        fn visit_byte_buf<E: de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(bytes)
+        }
+    }
 }
 
 /// A screen update: the change from frame `base` to frame `num`.
@@ -146,28 +201,45 @@ pub enum ProtoError {
 
 /// Encode one client message with its length prefix.
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
-    if let ClientMsg::Input { bytes, .. } = msg {
-        if bytes.len() > MAX_INPUT_BYTES {
-            return Err(ProtoError::InputTooLarge {
-                len: bytes.len(),
-                max: MAX_INPUT_BYTES,
-            });
-        }
+    let input = match msg {
+        ClientMsg::Input { bytes, .. } => bytes.len(),
+        ClientMsg::Resize(_) | ClientMsg::Ack { .. } | ClientMsg::Resync => 0,
+    };
+    if input > MAX_INPUT_BYTES {
+        return Err(ProtoError::InputTooLarge {
+            len: input,
+            max: MAX_INPUT_BYTES,
+        });
     }
-    let body = postcard::to_allocvec(msg)?;
-    let Ok(len) = u32::try_from(body.len()) else {
+    // The body goes straight after a placeholder for its length, into one buffer sized for the
+    // typed bytes plus the envelope.
+    let mut out = Vec::with_capacity(input.saturating_add(ENVELOPE));
+    out.extend_from_slice(&[0; 4]);
+    let mut out = postcard::to_extend(msg, out)?;
+    let body = out.len().saturating_sub(4);
+    let Ok(len) = u32::try_from(body) else {
         return Err(ProtoError::TooLarge {
-            len: body.len(),
+            len: body,
             max: MAX_CLIENT_MESSAGE,
         });
     };
-    Ok([len.to_be_bytes().as_slice(), &body].concat())
+    if let Some(prefix) = out.first_chunk_mut::<4>() {
+        *prefix = len.to_be_bytes();
+    }
+    Ok(out)
 }
+
+/// Room for a client message beside its typed bytes: the length prefix, the variant and the
+/// varints of the sequence number and the byte count.
+const ENVELOPE: usize = 32;
 
 /// Splits the client's stream back into messages, however its bytes arrive.
 #[derive(Debug, Default)]
 pub struct ClientDecoder {
     buf: Vec<u8>,
+    /// How many bytes at the front of `buf` were already decoded. They are dropped in one move
+    /// once no complete message is left, not after every message: one read can hold thousands.
+    start: usize,
 }
 
 impl ClientDecoder {
@@ -176,10 +248,16 @@ impl ClientDecoder {
         self.buf.extend_from_slice(bytes);
     }
 
+    /// The bytes not decoded yet.
+    fn pending(&self) -> &[u8] {
+        self.buf.get(self.start..).unwrap_or_default()
+    }
+
     /// The next complete message, or `None` if more bytes are needed. An error means the peer
     /// broke the protocol; the caller closes the connection.
     pub fn next_msg(&mut self) -> Result<Option<ClientMsg>, ProtoError> {
-        let Some((len, rest)) = self.buf.split_first_chunk::<4>() else {
+        let Some((len, rest)) = self.pending().split_first_chunk::<4>() else {
+            self.compact();
             return Ok(None);
         };
         let len = usize::try_from(u32::from_be_bytes(*len)).unwrap_or(usize::MAX);
@@ -190,6 +268,7 @@ impl ClientDecoder {
             });
         }
         let Some(body) = rest.get(..len) else {
+            self.compact();
             return Ok(None);
         };
         let msg: ClientMsg = postcard::from_bytes(body)?;
@@ -201,15 +280,24 @@ impl ClientDecoder {
                 });
             }
         }
-        // The header and body were just read, so `4 + len` is within the buffer.
-        let consumed = len.saturating_add(4).min(self.buf.len());
-        self.buf.drain(..consumed);
+        // The header and body were just read, so `start + 4 + len` is within the buffer.
+        self.start = self
+            .start
+            .saturating_add(len)
+            .saturating_add(4)
+            .min(self.buf.len());
         Ok(Some(msg))
+    }
+
+    /// Drop the decoded bytes, moving what is left of a partial message to the front.
+    fn compact(&mut self) {
+        self.buf.drain(..self.start);
+        self.start = 0;
     }
 
     /// The stream ended: fine between messages, a protocol error inside one.
     pub fn finish(&self) -> Result<(), ProtoError> {
-        if self.buf.is_empty() {
+        if self.pending().is_empty() {
             Ok(())
         } else {
             Err(ProtoError::Truncated)
@@ -277,10 +365,7 @@ mod tests {
                 seq: InputSeq(1),
                 bytes: b"ls -la\r".to_vec(),
             },
-            ClientMsg::Resize {
-                rows: 50,
-                cols: 132,
-            },
+            ClientMsg::Resize(Size::new(50, 132)),
             ClientMsg::Ack { frame: FrameNum(9) },
             ClientMsg::Resync,
             ClientMsg::Input {
@@ -304,6 +389,36 @@ mod tests {
         }
         decoder.finish().unwrap();
         assert_eq!(out, msgs);
+    }
+
+    #[test]
+    fn a_read_of_many_tiny_messages_decodes_them_all_and_leaves_the_buffer_empty() {
+        let resize = encode_client(&ClientMsg::Resize(Size::new(1, 2))).unwrap();
+        let count = (16 * 1024_usize).div_euclid(resize.len());
+        let mut decoder = ClientDecoder::default();
+        decoder.push(&resize.repeat(count));
+        assert!(decoder.next_msg().unwrap().is_some());
+        assert_eq!(
+            decoder.buf.len(),
+            resize.len() * count,
+            "decoding a message does not move the rest of the read"
+        );
+        let mut decoded = 1;
+        while let Some(msg) = decoder.next_msg().unwrap() {
+            assert_eq!(msg, ClientMsg::Resize(Size::new(1, 2)));
+            decoded += 1;
+        }
+        assert_eq!(decoded, count);
+        assert!(decoder.buf.is_empty(), "{} bytes left", decoder.buf.len());
+        decoder.finish().unwrap();
+        // A partial message is kept, at the front, for the next read.
+        decoder.push(&resize[..3]);
+        assert!(decoder.next_msg().unwrap().is_none());
+        decoder.push(&resize[3..]);
+        assert_eq!(
+            decoder.next_msg().unwrap(),
+            Some(ClientMsg::Resize(Size::new(1, 2)))
+        );
     }
 
     #[test]
@@ -340,7 +455,7 @@ mod tests {
 
     #[test]
     fn truncated_and_garbage_client_streams_are_errors() {
-        let stream = encode_client(&ClientMsg::Resize { rows: 1, cols: 2 }).unwrap();
+        let stream = encode_client(&ClientMsg::Resize(Size::new(1, 2))).unwrap();
         for cut in 1..stream.len() {
             assert!(
                 matches!(decode_all(&stream[..cut]), Err(ProtoError::Truncated)),
@@ -389,6 +504,12 @@ mod tests {
         assert_eq!(retry_after(Some(ms(200))), ms(300));
         assert_eq!(retry_after(Some(ms(10))), ms(30));
         assert_eq!(retry_after(None), ms(333 + 250));
+    }
+
+    #[test]
+    fn the_window_budget_is_one_screen_of_the_largest_size() {
+        let max = usize::from(crate::terminal::MAX_DIM);
+        assert_eq!(WINDOW_CELLS, max * max);
     }
 
     #[test]

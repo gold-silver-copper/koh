@@ -4,9 +4,12 @@
 //! reconstructs one from [`ScreenDiff`](super::ScreenDiff) rows. No terminal parser runs on the
 //! client, so server-controlled bytes never reach one there.
 
-use fux_vt::{Cell, MouseProtocolEncoding, MouseProtocolMode};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::predict::{CellView, ScreenView};
+use fux_vt::{Cell, MouseProtocolEncoding, MouseProtocolMode, RowId};
+
+use crate::predict::{CellView, ScreenView, Size};
 
 /// The terminal modes the client mirrors onto the real terminal (or draws with).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -32,58 +35,117 @@ impl Modes {
     }
 }
 
+/// One row of a [`Grid`]: its cells, shared by every screen that holds the row unchanged, and
+/// whether it soft-wraps into the next.
+#[derive(Clone, Debug)]
+struct Row {
+    cells: Arc<[Cell]>,
+    wrapped: bool,
+}
+
+impl Row {
+    /// Whether `self` and `other` share one allocation of cells.
+    fn shares(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cells, &other.cells)
+    }
+
+    /// The allocation this row's cells live in, which every row sharing them has too.
+    fn id(&self) -> *const Cell {
+        Arc::as_ptr(&self.cells).cast()
+    }
+}
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        self.wrapped == other.wrapped && (self.shares(other) || self.cells == other.cells)
+    }
+}
+
+impl Eq for Row {}
+
+/// The rows of the last snapshot, by fux-vt row id: a row whose cells are unchanged is shared
+/// with the next snapshot, wherever it moved, instead of copied.
+pub(super) type RowCache = HashMap<RowId, Arc<[Cell]>>;
+
+/// `cells` as a row exactly `cols` wide. A live row is exactly that wide, and is copied once into
+/// its own allocation; anything longer is cut, anything shorter padded with blank cells.
+fn exactly(cells: &[Cell], cols: u16) -> Arc<[Cell]> {
+    let cols = usize::from(cols);
+    if let Some(row) = cells.get(..cols) {
+        return row.into();
+    }
+    let mut row = Vec::with_capacity(cols);
+    row.extend_from_slice(cells);
+    row.resize(cols, Cell::default());
+    row.into()
+}
+
 /// A fixed-size screen of `fux_vt::Cell`s with a cursor, per-row soft-wrap flags and modes.
 ///
-/// Row-major, always exactly `rows × cols` cells. The cursor column may equal `cols` while an
-/// autowrap is pending (fux-vt's parked cursor).
+/// Always exactly `rows` rows of exactly `cols` cells. A row's cells are shared, not copied,
+/// between screens that hold it unchanged: snapshots of the server's emulator, and a client
+/// screen and the base it was diffed from. The cursor column may equal `cols` while an autowrap
+/// is pending (fux-vt's parked cursor).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grid {
-    rows: u16,
-    cols: u16,
-    cells: Vec<Cell>,
-    wrapped: Vec<bool>,
+    size: Size,
+    lines: Vec<Row>,
     cursor: (u16, u16),
     modes: Modes,
 }
 
 impl Grid {
-    /// A blank grid (default cells, cursor home, default modes).
-    pub fn blank(rows: u16, cols: u16) -> Self {
+    /// A blank grid (default cells, cursor home, default modes). Every row shares one allocation.
+    pub fn blank(size: Size) -> Self {
+        let blank = Row {
+            cells: vec![Cell::default(); usize::from(size.cols)].into(),
+            wrapped: false,
+        };
         Self {
-            rows,
-            cols,
-            // `repeat` sizes the buffer as exactly `rows × cols` cells.
-            cells: vec![Cell::default(); usize::from(cols)].repeat(usize::from(rows)),
-            wrapped: vec![false; usize::from(rows)],
+            size,
+            lines: vec![blank; usize::from(size.rows)],
             cursor: (0, 0),
             modes: Modes::default(),
         }
     }
 
-    /// Copy the live (non-history) rows, cursor and modes out of a fux-vt screen.
-    pub fn of(screen: &fux_vt::Screen) -> Self {
+    /// Copy the live (non-history) rows, cursor and modes out of a fux-vt screen. A row `cache`
+    /// holds unchanged since the last snapshot is shared rather than copied; `cache` is left
+    /// holding this snapshot's rows.
+    pub(super) fn of(screen: &fux_vt::Screen, cache: &mut RowCache) -> Self {
         let (rows, cols) = screen.size();
-        let mut grid = Self::blank(rows, cols);
         let window = screen.window(0, rows, cols);
-        for row in 0..rows {
-            if let (Some(live), Some(dst)) = (window.row(row), grid.row_mut(row)) {
-                // Live rows are exactly `cols` wide; copy what exists and leave any shortfall blank.
-                for (d, s) in dst.iter_mut().zip(live.cells) {
-                    *d = *s;
+        let mut next = RowCache::with_capacity(usize::from(rows));
+        let lines = (0..rows)
+            .map(|row| {
+                let Some(live) = window.row(row) else {
+                    return Row {
+                        cells: exactly(&[], cols),
+                        wrapped: false,
+                    };
+                };
+                let cells = match cache.get(&live.id) {
+                    Some(cells) if **cells == *live.cells => Arc::clone(cells),
+                    _ => exactly(live.cells, cols),
+                };
+                next.insert(live.id, Arc::clone(&cells));
+                Row {
+                    cells,
+                    wrapped: live.wrapped,
                 }
-                if let Some(w) = grid.wrapped.get_mut(usize::from(row)) {
-                    *w = live.wrapped;
-                }
-            }
+            })
+            .collect();
+        *cache = next;
+        Self {
+            size: Size { rows, cols },
+            lines,
+            cursor: screen.cursor_position(),
+            modes: Modes::of(screen),
         }
-        grid.cursor = screen.cursor_position();
-        grid.modes = Modes::of(screen);
-        grid
     }
 
-    /// `(rows, cols)`.
-    pub const fn size(&self) -> (u16, u16) {
-        (self.rows, self.cols)
+    pub const fn size(&self) -> Size {
+        self.size
     }
 
     /// The cell at `(row, col)`, or `None` out of bounds.
@@ -93,35 +155,69 @@ impl Grid {
 
     /// One row's cells, or `None` out of bounds.
     pub fn row(&self, row: u16) -> Option<&[Cell]> {
-        let start = self.row_start(row)?;
-        self.cells.get(start..)?.get(..usize::from(self.cols))
-    }
-
-    pub(super) fn row_mut(&mut self, row: u16) -> Option<&mut [Cell]> {
-        let start = self.row_start(row)?;
-        self.cells
-            .get_mut(start..)?
-            .get_mut(..usize::from(self.cols))
-    }
-
-    /// Index of `row`'s first cell, or `None` out of bounds. `row < rows`, so the product is at
-    /// most `rows × cols`, the length of `cells`, and cannot overflow.
-    fn row_start(&self, row: u16) -> Option<usize> {
-        if row >= self.rows {
-            return None;
-        }
-        usize::from(row).checked_mul(usize::from(self.cols))
+        self.lines.get(usize::from(row)).map(|line| &*line.cells)
     }
 
     /// Whether `row` soft-wraps into the next one.
     pub fn row_wrapped(&self, row: u16) -> bool {
-        self.wrapped.get(usize::from(row)).copied().unwrap_or(false)
+        self.lines
+            .get(usize::from(row))
+            .is_some_and(|line| line.wrapped)
     }
 
-    pub(super) fn set_row_wrapped(&mut self, row: u16, wrapped: bool) {
-        if let Some(w) = self.wrapped.get_mut(usize::from(row)) {
-            *w = wrapped;
+    /// Whether `row` is the same in `self` and `other`: the same cells and wrap flag. Rows that
+    /// share their cells compare without reading them.
+    pub fn row_eq(&self, other: &Self, row: u16) -> bool {
+        let row = usize::from(row);
+        self.lines.get(row) == other.lines.get(row)
+    }
+
+    /// Whether `row` shares its cells with `other`'s, rather than holding a copy.
+    pub fn row_shared(&self, other: &Self, row: u16) -> bool {
+        let row = usize::from(row);
+        match (self.lines.get(row), other.lines.get(row)) {
+            (Some(line), Some(other)) => line.shares(other),
+            _ => false,
         }
+    }
+
+    /// Replace `row` with `cells`, which must be exactly `cols` long. Out of bounds or a wrong
+    /// length changes nothing.
+    pub(super) fn set_row(&mut self, row: u16, cells: Arc<[Cell]>, wrapped: bool) {
+        if cells.len() != usize::from(self.size.cols) {
+            return;
+        }
+        if let Some(line) = self.lines.get_mut(usize::from(row)) {
+            *line = Row { cells, wrapped };
+        }
+    }
+
+    /// The cells the rows of `grids` hold, each allocation counted once however many rows and
+    /// grids share it: what those grids cost in memory together.
+    pub fn distinct_cells<'a>(grids: impl IntoIterator<Item = &'a Self>) -> usize {
+        Self::unseen_cells(&mut HashSet::new(), grids)
+    }
+
+    /// The cells the rows of `grids` hold beyond the rows of `base`, counted as
+    /// [`distinct_cells`](Self::distinct_cells) counts them: what keeping `grids` besides `base`
+    /// costs.
+    pub fn cells_beyond<'a>(base: &Self, grids: impl IntoIterator<Item = &'a Self>) -> usize {
+        let mut seen = base.lines.iter().map(Row::id).collect();
+        Self::unseen_cells(&mut seen, grids)
+    }
+
+    /// The cells of the rows of `grids` whose allocation is not in `seen`, adding each to it.
+    fn unseen_cells<'a>(
+        seen: &mut HashSet<*const Cell>,
+        grids: impl IntoIterator<Item = &'a Self>,
+    ) -> usize {
+        let mut cells = 0_usize;
+        for line in grids.into_iter().flat_map(|grid| &grid.lines) {
+            if seen.insert(line.id()) {
+                cells = cells.saturating_add(line.cells.len());
+            }
+        }
+        cells
     }
 
     /// The cursor as `(row, col)`, 0-indexed; `col` may equal `cols` while a wrap is pending.
@@ -150,7 +246,7 @@ impl Grid {
     /// where a row soft-wraps into the next, trailing empty rows dropped.
     pub fn contents(&self) -> String {
         let mut out = String::new();
-        for row in 0..self.rows {
+        for row in 0..self.size.rows {
             let line: String = self
                 .row(row)
                 .unwrap_or_default()
@@ -172,7 +268,7 @@ impl Grid {
 }
 
 impl ScreenView for Grid {
-    fn size(&self) -> (u16, u16) {
+    fn size(&self) -> Size {
         Self::size(self)
     }
     fn cursor_position(&self) -> (u16, u16) {

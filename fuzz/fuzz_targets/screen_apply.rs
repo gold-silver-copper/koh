@@ -9,11 +9,11 @@
 //! mirrors the in-tree `apply_is_panic_free_and_holds_invariants` proptest, extended to
 //! coverage-guided fuzzing of the encoding.
 
-use koh::terminal::{ScreenDiff, TerminalScreen, MAX_DIM, MIN_DIM};
+use koh::terminal::{ScreenDiff, Size, TerminalScreen, MAX_DIM, MIN_DIM};
 use libfuzzer_sys::fuzz_target;
 
 fn check(screen: &TerminalScreen) {
-    let (rows, cols) = screen.size();
+    let Size { rows, cols } = screen.size();
     assert!((MIN_DIM..=MAX_DIM).contains(&rows) && (MIN_DIM..=MAX_DIM).contains(&cols));
     for row in 0..rows {
         assert_eq!(

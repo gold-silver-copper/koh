@@ -3,7 +3,10 @@
 //! echo-ack debounce that tells the client which of its keystrokes are visible lives per
 //! connection in `server`.
 
-use crate::terminal::{clamp_dims, Grid, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN};
+use crate::terminal::grid::RowCache;
+use crate::terminal::{
+    clamp_dims, Grid, Size, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
+};
 use fux_vt::{Event, Options, Parser, Sink};
 
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
@@ -63,13 +66,15 @@ pub struct ServerTerminal {
     observed: Observed,
     /// The shell's exit code once it has exited (propagated to the client on shutdown).
     exit_code: Option<u32>,
+    /// The last snapshot's rows, which the next one shares where they are unchanged.
+    rows: RowCache,
 }
 
 impl ServerTerminal {
     /// An emulator of the given (clamped) size retaining `scrollback` history lines. Fails only
     /// if fux-vt refuses the allocation (see [`MAX_SCROLLBACK`](crate::server::cli::MAX_SCROLLBACK)).
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Result<Self, fux_vt::Error> {
-        let (rows, cols) = clamp_dims(rows, cols);
+        let Size { rows, cols } = clamp_dims(Size { rows, cols });
         let options = Options {
             events: true,
             extended_replies: true,
@@ -78,6 +83,7 @@ impl ServerTerminal {
             parser: Parser::with_options(rows, cols, scrollback, options)?,
             observed: Observed::default(),
             exit_code: None,
+            rows: RowCache::default(),
         })
     }
 
@@ -107,17 +113,18 @@ impl ServerTerminal {
     /// eagerly, so an unbounded resize would OOM the (cross-tenant) server. Defense in
     /// depth: the call site clamps too, this is the chokepoint. A refused resize (allocation
     /// limit) keeps the previous size and is logged.
-    pub fn resize(&mut self, rows: u16, cols: u16) {
-        let (rows, cols) = clamp_dims(rows, cols);
+    pub fn resize(&mut self, size: Size) {
+        let Size { rows, cols } = clamp_dims(size);
         if let Err(e) = self.parser.resize(rows, cols) {
             tracing::warn!(error = %e, rows, cols, "terminal emulator refused a resize");
         }
     }
 
-    /// `(rows, cols)`. Test-only: production reads geometry from the snapshot, not the live emulator.
+    /// The size. Test-only: production reads geometry from the snapshot, not the live emulator.
     #[cfg(test)]
-    pub fn size(&self) -> (u16, u16) {
-        self.parser.screen().size()
+    pub fn size(&self) -> Size {
+        let (rows, cols) = self.parser.screen().size();
+        Size { rows, cols }
     }
 
     /// Window title set by the shell (OSC 2), if any. Test-only — production reads it via
@@ -139,10 +146,10 @@ impl ServerTerminal {
         self.parser.screen().application_cursor()
     }
 
-    /// A snapshot of the current screen.
-    pub fn snapshot(&self) -> TerminalScreen {
+    /// A snapshot of the current screen. Rows unchanged since the last snapshot share its cells.
+    pub fn snapshot(&mut self) -> TerminalScreen {
         TerminalScreen {
-            grid: Grid::of(self.parser.screen()),
+            grid: Grid::of(self.parser.screen(), &mut self.rows),
             title: self.observed.title.clone(),
             icon: self.observed.icon.clone(),
             clipboard: self.observed.clipboard.clone(),
@@ -210,24 +217,24 @@ mod tests {
         // The server emulator must clamp a peer-controlled resize before the grid is allocated:
         // a giant resize would OOM-abort the (cross-tenant) server.
         let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.resize(65000, 65000); // must not OOM
+        t.resize(Size::new(65000, 65000)); // must not OOM
         assert_eq!(
             t.size(),
-            (MAX_DIM, MAX_DIM),
+            Size::new(MAX_DIM, MAX_DIM),
             "giant resize clamped to MAX_DIM"
         );
-        t.resize(0, 0); // must not panic
+        t.resize(Size::new(0, 0)); // must not panic
         assert_eq!(
             t.size(),
-            (MIN_DIM, MIN_DIM),
+            Size::new(MIN_DIM, MIN_DIM),
             "zero resize clamped to MIN_DIM"
         );
         // Wrappy/wide shell output into the smallest clamped grid is fine.
         t.process("AAAA日本🦀\r\nBBBB\r\n".repeat(8).as_bytes());
         let _ = t.snapshot();
         // A normal resize is untouched, and a snapshot after a clamped resize is still coherent.
-        t.resize(40, 120);
-        assert_eq!(t.size(), (40, 120));
+        t.resize(Size::new(40, 120));
+        assert_eq!(t.size(), Size::new(40, 120));
         let _ = t.snapshot();
     }
 
@@ -238,8 +245,12 @@ mod tests {
         use crate::terminal::MAX_DIM;
         let history = usize::try_from(crate::server::cli::MAX_SCROLLBACK).expect("fits usize");
         let mut t = ServerTerminal::new(24, 80, history).expect("default size at max scrollback");
-        t.resize(MAX_DIM, MAX_DIM);
-        assert_eq!(t.size(), (MAX_DIM, MAX_DIM), "largest resize accepted");
+        t.resize(Size::new(MAX_DIM, MAX_DIM));
+        assert_eq!(
+            t.size(),
+            Size::new(MAX_DIM, MAX_DIM),
+            "largest resize accepted"
+        );
         assert!(ServerTerminal::new(MAX_DIM, MAX_DIM, history).is_ok());
     }
 

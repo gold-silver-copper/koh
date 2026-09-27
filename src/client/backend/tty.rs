@@ -10,6 +10,7 @@ use std::os::fd::AsFd;
 use fuxix::terminal::{self, Termios};
 
 use super::KohBackend;
+use crate::terminal::Size;
 
 /// Output is buffered and flushed once per frame.
 const BUF_SIZE: usize = 64 * 1024;
@@ -64,7 +65,7 @@ impl KohBackend for Tty {
         Ok(())
     }
 
-    fn size(&self) -> io::Result<(u16, u16)> {
+    fn size(&self) -> io::Result<Size> {
         let (mut rows, mut cols) = terminal::window_size(self.out.get_ref())?;
         // Over a serial line the ioctl may report zero; fall back to LINES/COLUMNS, as vim does.
         let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u16>().ok());
@@ -79,7 +80,7 @@ impl KohBackend for Tty {
                 "cannot read a non-zero terminal size from the ioctl or LINES/COLUMNS",
             ));
         }
-        Ok((rows, cols))
+        Ok(Size { rows, cols })
     }
 }
 

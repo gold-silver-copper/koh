@@ -48,8 +48,9 @@ error; upgrade both ends.
   `fux_vt::Parser`, a bounded, panic-free emulator; `vt100` is no longer a dependency. The screen
   diff is now structured: every changed row whole, as run-length-encoded cells, plus the cursor and
   modes. It replaces vt100's escape-sequence patch, which the client used to replay through its
-  own vt100 parser. The client validates every row and cell and drops a malformed frame whole, so
-  server bytes never reach a terminal parser on the client. The `catch_unwind` containment and the
+  own vt100 parser. The client validates every row and cell, a cell's text included (it may hold
+  no control character, so it cannot carry an escape sequence to the user's terminal), and drops a
+  malformed frame whole, so server bytes never reach a terminal parser on the client. The `catch_unwind` containment and the
   64 KiB control-string pre-filter are gone: fux-vt cannot panic, retains no DCS/APC/PM/SOS payload
   and caps OSC strings at 64 KiB.
 - **Breaking: the koh/3 stream protocol replaces SSP over datagrams.** Keystrokes travel on one
@@ -77,6 +78,17 @@ error; upgrade both ends.
 - Production code is now panic-free under `forbid`, not only `deny`. The SSP transport keeps its
   sent and received state lists in a structurally non-empty type, and the `koh` binary builds its
   Tokio runtime explicitly.
+- `koh serve` takes far less CPU to read a burst of small client messages, such as a flood of
+  resizes: it no longer moves the rest of a read after each message it decodes.
+- Both ends need much less memory and CPU for the recent screens they keep: screens share the rows
+  they have in common instead of each holding a full copy (about 32 MB at 1000×1000), so a new
+  screen costs only the rows that changed, including rows that scrolled.
+- Screen updates take less CPU at both ends: a frame's cell text is stored inline, so building and
+  decoding a frame no longer allocates once per run of cells.
+- `koh connect` writes far less to your terminal: a frame paints only the cells that changed, not
+  the whole screen, so a keystroke's echo is a few bytes and the link-down banner no longer repaints
+  every cell every 50 ms. What the terminal shows is unchanged; the whole screen is still repainted
+  on the first frame, after a resize or `Ctrl-^ Ctrl-Z`, and when the status line appears or goes.
 
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with it) for
@@ -86,6 +98,12 @@ error; upgrade both ends.
   `der` 0.8.0 → 0.8.2 and `spin` 0.10.0 → 0.10.1.
 
 ### Fixed
+- **A server could make `koh connect` hold about half a gigabyte**, enough to get it killed on a
+  phone. The client keeps the screens of its last 16 frames as bases for the next ones, each a full
+  copy: a server on a 1000×1000 terminal (about 32 MB a screen), or a hostile one, sending full
+  repaints made it hold 16 of them. Screens now share their unchanged rows, and the older frames
+  hold at most one screen of that size beyond the current one; a frame whose base was dropped asks
+  for a resync, as before. The wire protocol is unchanged.
 - **One client could make `koh serve` hold over half a gigabyte**, enough for Android to kill it
   and every session in it. A client that never acknowledged a frame was resent the screen every
   round trip, and the server kept a full copy of it for each of the 16 frames it remembers: at the

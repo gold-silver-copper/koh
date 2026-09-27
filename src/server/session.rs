@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::terminal::{ServerTerminal, TerminalScreen, DEFAULT_COLS, DEFAULT_ROWS};
+use crate::terminal::{ServerTerminal, Size, TerminalScreen, DEFAULT_SIZE};
 use anyhow::Context;
 use iroh::EndpointId;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -47,7 +47,7 @@ impl PtyHost {
         scrollback: usize,
         launcher: &crate::pty::Launcher,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
-        let (rows, cols) = (DEFAULT_ROWS, DEFAULT_COLS);
+        let Size { rows, cols } = DEFAULT_SIZE;
         let emu = ServerTerminal::new(rows, cols, scrollback)
             .context("creating the terminal emulator")?;
         let (pty, pty_rx) = crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", launcher)
@@ -56,7 +56,7 @@ impl PtyHost {
     }
 
     /// A snapshot of the current screen.
-    pub fn snapshot(&self) -> TerminalScreen {
+    pub fn snapshot(&mut self) -> TerminalScreen {
         self.emu.snapshot()
     }
 
@@ -73,12 +73,13 @@ impl PtyHost {
         }
     }
 
-    /// The client's terminal is now `rows × cols` (already clamped to `[MIN_DIM, MAX_DIM]`).
-    pub fn resize(&mut self, rows: u16, cols: u16) {
+    /// The client's terminal is now `size` (already clamped to `[MIN_DIM, MAX_DIM]`).
+    pub fn resize(&mut self, size: Size) {
+        let Size { rows, cols } = size;
         if let Err(e) = self.pty.resize(rows, cols) {
             tracing::warn!(error = %e, rows, cols, "pty resize failed");
         }
-        self.emu.resize(rows, cols);
+        self.emu.resize(size);
     }
 
     /// Stop the program while a pump thread may still reference it, without joining (best-effort).
@@ -98,7 +99,7 @@ impl PtyHost {
 /// What a connection sends its session.
 enum ClientInput {
     Keys(Vec<u8>),
-    Resize { rows: u16, cols: u16 },
+    Resize(Size),
 }
 
 /// Whether [`Registry::attach`] created a fresh session or reattached to a running one.
@@ -151,8 +152,8 @@ impl SessionClient {
     }
 
     /// Send a resize to the PTY.
-    pub async fn send_resize(&self, rows: u16, cols: u16) {
-        let _ = self.input.send(ClientInput::Resize { rows, cols }).await;
+    pub async fn send_resize(&self, size: Size) {
+        let _ = self.input.send(ClientInput::Resize(size)).await;
     }
 }
 
@@ -175,17 +176,15 @@ struct SessionHandle {
     control: mpsc::Sender<SessionMsg>,
 }
 
-/// Up to `limit` items `rx` already holds, without waiting. An end of the channel is left for the
-/// next `recv` to report.
-fn drain_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize) -> Vec<T> {
-    let mut ready = Vec::new();
-    while ready.len() < limit {
-        match rx.try_recv() {
-            Ok(item) => ready.push(item),
-            Err(_) => break,
-        }
+/// Hand `take` up to `limit` items `rx` already holds, without waiting, as they come off the
+/// channel. An end of the channel is left for the next `recv` to report.
+fn take_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize, mut take: impl FnMut(T)) {
+    for _ in 0..limit {
+        let Ok(item) = rx.try_recv() else {
+            break;
+        };
+        take(item);
     }
-    ready
 }
 
 /// Run one session: own the PTY host, drain its output into the emulator, publish each screen,
@@ -200,7 +199,6 @@ async fn session_task(
 ) {
     let (screens_tx, _screens_rx) = watch::channel(Arc::new(host.snapshot()));
     let (input_tx, mut input_rx) = mpsc::channel::<ClientInput>(INPUT_QUEUE);
-    let input_tx = Arc::new(input_tx);
     let mut attached: usize = 0;
     let mut last_detach: Option<Instant> = None;
     let mut pending_keys: Vec<u8> = Vec::new();
@@ -224,9 +222,9 @@ async fn session_task(
             chunk = pty_rx.recv(), if !exited => {
                 if let Some(chunk) = chunk {
                     host.emu.process(&chunk);
-                    for more in drain_ready(&mut pty_rx, OUTPUT_CHUNKS_PER_SNAPSHOT) {
+                    take_ready(&mut pty_rx, OUTPUT_CHUNKS_PER_SNAPSHOT, |more| {
                         host.emu.process(&more);
-                    }
+                    });
                     let replies = host.emu.take_host_replies();
                     if !replies.is_empty() {
                         // Query answers (DSR/DA/DECRQM) are host I/O, not screen content.
@@ -252,8 +250,8 @@ async fn session_task(
                                 pending_keys = keys;
                             }
                         }
-                        ClientInput::Resize { rows, cols } => {
-                            host.resize(rows, cols);
+                        ClientInput::Resize(size) => {
+                            host.resize(size);
                             screens_tx.send_replace(Arc::new(host.snapshot()));
                         }
                     }
@@ -265,7 +263,7 @@ async fn session_task(
                     attached = attached.saturating_add(1);
                     let client = SessionClient {
                         screens: screens_tx.subscribe(),
-                        input: (*input_tx).clone(),
+                        input: input_tx.clone(),
                         control,
                     };
                     // If the connection is already gone, treat it as an immediate detach.
@@ -488,7 +486,7 @@ async fn attach_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_ready, OUTPUT_CHUNKS_PER_SNAPSHOT};
+    use super::{take_ready, OUTPUT_CHUNKS_PER_SNAPSHOT};
     use tokio::sync::mpsc;
 
     #[test]
@@ -497,14 +495,23 @@ mod tests {
         for n in 0..100 {
             tx.try_send(n).unwrap();
         }
-        let first = drain_ready(&mut rx, OUTPUT_CHUNKS_PER_SNAPSHOT);
-        assert_eq!(first, (0..OUTPUT_CHUNKS_PER_SNAPSHOT).collect::<Vec<_>>());
+        let taken = |rx: &mut mpsc::Receiver<usize>| {
+            let mut taken = Vec::new();
+            take_ready(rx, OUTPUT_CHUNKS_PER_SNAPSHOT, |n| taken.push(n));
+            taken
+        };
+        assert_eq!(
+            taken(&mut rx),
+            (0..OUTPUT_CHUNKS_PER_SNAPSHOT).collect::<Vec<_>>()
+        );
         drop(tx);
-        let rest = drain_ready(&mut rx, OUTPUT_CHUNKS_PER_SNAPSHOT);
-        assert_eq!(rest, (OUTPUT_CHUNKS_PER_SNAPSHOT..100).collect::<Vec<_>>());
+        assert_eq!(
+            taken(&mut rx),
+            (OUTPUT_CHUNKS_PER_SNAPSHOT..100).collect::<Vec<_>>()
+        );
         // The channel's end is not swallowed: the session loop's `recv` still sees it and reaps
         // the program.
-        assert!(drain_ready(&mut rx, OUTPUT_CHUNKS_PER_SNAPSHOT).is_empty());
+        assert!(taken(&mut rx).is_empty());
         assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
     }
 }

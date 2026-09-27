@@ -12,24 +12,27 @@
 //! The client validates and copies cells; it never runs a terminal parser on server-controlled
 //! bytes.
 
+use std::num::NonZeroU16;
+use std::sync::Arc;
+
 use fux_vt::{Attributes, Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 mod grid;
 mod server;
 
+pub use crate::predict::Size;
 pub use grid::{Grid, Modes};
 pub use server::ServerTerminal;
 
 /// Default screen geometry, used for the blank screen both ends start from.
-pub const DEFAULT_ROWS: u16 = 24;
-pub const DEFAULT_COLS: u16 = 80;
+pub const DEFAULT_SIZE: Size = Size::new(24, 80);
 /// Bounds on a peer-controlled terminal geometry.
 ///
 /// A grid is allocated eagerly (`rows × cols` cells on the server's emulator and on the client),
-/// so an unclamped resize from a hostile peer is an out-of-memory bomb: `(65000, 65000)` is
-/// billions of cells. Every peer-influenced `(rows, cols)` MUST pass through [`clamp_dims`]
-/// before a grid is built, on both the server (a client's `Resize`) and the client (a server's
+/// so an unclamped resize from a hostile peer is an out-of-memory bomb: 65000×65000 is billions
+/// of cells. Every peer-influenced [`Size`] MUST pass through [`clamp_dims`] before a grid is
+/// built, on both the server (a client's `Resize`) and the client (a server's
 /// `ScreenDiff.resize`). `MAX_DIM` is generous versus any real terminal (1000×1000 already dwarfs
 /// any display); `MIN_DIM` keeps a degenerate 1-wide terminal out of the shell's way.
 pub const MIN_DIM: u16 = 2;
@@ -48,13 +51,16 @@ pub(crate) const MAX_TITLE_LEN: usize = 256;
 /// megabytes. Enforced server-side at capture *and* client-side at apply.
 pub const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
 
-/// Clamp a peer-supplied `(rows, cols)` into `[MIN_DIM, MAX_DIM]`.
+/// Clamp a peer-supplied size into `[MIN_DIM, MAX_DIM]` on both axes.
 ///
 /// The single chokepoint both the server and the client funnel a resize through before building a
 /// grid, so the two paths can never disagree and no resize can allocate an unbounded grid.
 #[must_use]
-pub fn clamp_dims(rows: u16, cols: u16) -> (u16, u16) {
-    (rows.clamp(MIN_DIM, MAX_DIM), cols.clamp(MIN_DIM, MAX_DIM))
+pub fn clamp_dims(size: Size) -> Size {
+    Size {
+        rows: size.rows.clamp(MIN_DIM, MAX_DIM),
+        cols: size.cols.clamp(MIN_DIM, MAX_DIM),
+    }
 }
 
 /// Truncate `s` to at most `max` characters (not bytes), preserving whole scalars.
@@ -100,7 +106,7 @@ pub struct TerminalScreen {
 
 impl Default for TerminalScreen {
     fn default() -> Self {
-        Self::with_grid(Grid::blank(DEFAULT_ROWS, DEFAULT_COLS))
+        Self::with_grid(Grid::blank(DEFAULT_SIZE))
     }
 }
 
@@ -138,8 +144,7 @@ impl TerminalScreen {
         self.exit_code
     }
 
-    /// `(rows, cols)`.
-    pub const fn size(&self) -> (u16, u16) {
+    pub const fn size(&self) -> Size {
         self.grid.size()
     }
 
@@ -166,6 +171,17 @@ impl TerminalScreen {
     /// Monotonic count of audible bells the server has seen (the client rings on an increase).
     pub const fn bell_count(&self) -> u64 {
         self.bell_count
+    }
+
+    /// The cells `screens` hold in memory together: a row several of them share counts once.
+    pub fn distinct_cells<'a>(screens: impl IntoIterator<Item = &'a Self>) -> usize {
+        Grid::distinct_cells(screens.into_iter().map(|screen| &screen.grid))
+    }
+
+    /// The cells `screens` hold in memory beyond what `base` holds: a row they share with `base`
+    /// costs nothing, and a row several of them share counts once.
+    pub fn cells_beyond<'a>(base: &Self, screens: impl IntoIterator<Item = &'a Self>) -> usize {
+        Grid::cells_beyond(&base.grid, screens.into_iter().map(|screen| &screen.grid))
     }
 }
 
@@ -197,83 +213,207 @@ impl From<WireColor> for Color {
     }
 }
 
-/// Cell `kind` on the wire.
-const KIND_NARROW: u8 = 0;
-const KIND_WIDE: u8 = 1;
-const KIND_CONTINUATION: u8 = 2;
+/// A cell's kind on the wire. The variant's index is its byte, so an unknown kind fails to decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CellKind {
+    Narrow,
+    Wide,
+    /// The right half of a wide glyph.
+    Continuation,
+}
 
-/// `style` bits on the wire.
-const STYLE_BOLD: u8 = 1;
-const STYLE_DIM: u8 = 2;
-const STYLE_ITALIC: u8 = 4;
-const STYLE_UNDERLINE: u8 = 8;
-const STYLE_INVERSE: u8 = 16;
-const STYLE_ALL: u8 = 31;
+/// A cell's style on the wire: one bit per attribute. Decoding rejects any bit outside the five
+/// defined, so every value holds only known bits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WireStyle(u8);
 
-/// One cell on the wire. `text` is at most `fux_vt::Cell::CONTENTS_CAPACITY` bytes; a
-/// continuation (the right half of a wide glyph) is empty with default colours and no style.
+impl WireStyle {
+    pub const BOLD: u8 = 1;
+    pub const DIM: u8 = 2;
+    pub const ITALIC: u8 = 4;
+    pub const UNDERLINE: u8 = 8;
+    pub const INVERSE: u8 = 16;
+    const ALL: u8 = 31;
+
+    /// The style with exactly `bits`, or `None` if any is not a defined bit.
+    pub const fn new(bits: u8) -> Option<Self> {
+        if bits & !Self::ALL == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    const fn has(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
+}
+
+impl Serialize for WireStyle {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireStyle {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bits = u8::deserialize(deserializer)?;
+        Self::new(bits).ok_or_else(|| {
+            de::Error::invalid_value(
+                de::Unexpected::Unsigned(u64::from(bits)),
+                &"style bits within 0b11111",
+            )
+        })
+    }
+}
+
+/// A cell's text on the wire: at most [`Cell::CONTENTS_CAPACITY`] bytes of UTF-8, and no control
+/// character.
+///
+/// Stored inline, as `fux_vt::Cell` stores it, so building or decoding a run allocates nothing.
+/// The client prints a cell's text to the user's terminal as is, so it must not be able to carry
+/// an escape sequence: fux-vt never puts a control character in a cell, and decoding refuses one,
+/// as it refuses text too long for a cell, which drops the frame. It encodes as a string.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct CellText {
+    len: u8,
+    bytes: [u8; Cell::CONTENTS_CAPACITY],
+}
+
+impl CellText {
+    /// `text`, or `None` if it is longer than [`Cell::CONTENTS_CAPACITY`] bytes or holds a
+    /// control character (C0, DEL or C1).
+    pub fn new(text: &str) -> Option<Self> {
+        if text.chars().any(char::is_control) {
+            return None;
+        }
+        let mut bytes = [0; Cell::CONTENTS_CAPACITY];
+        bytes
+            .get_mut(..text.len())?
+            .copy_from_slice(text.as_bytes());
+        Some(Self {
+            len: u8::try_from(text.len()).ok()?,
+            bytes,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Only ever a whole `&str`'s bytes, so the prefix is valid UTF-8.
+        self.bytes
+            .get(..usize::from(self.len))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::fmt::Debug for CellText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl Serialize for CellText {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CellText {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_str(CellTextVisitor)
+    }
+}
+
+/// Takes a borrowed or an owned string (serde hands both to `visit_str`) that fits a cell.
+struct CellTextVisitor;
+
+impl de::Visitor<'_> for CellTextVisitor {
+    type Value = CellText;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a string of at most {} bytes with no control character",
+            Cell::CONTENTS_CAPACITY
+        )
+    }
+
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<CellText, E> {
+        CellText::new(text).ok_or_else(|| E::invalid_value(de::Unexpected::Str(text), &self))
+    }
+}
+
+/// One cell on the wire. A continuation (the right half of a wide glyph) is empty with default
+/// colours and no style.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireCell {
-    pub text: String,
-    pub kind: u8,
+    pub text: CellText,
+    pub kind: CellKind,
     pub fg: WireColor,
     pub bg: WireColor,
-    pub style: u8,
+    pub style: WireStyle,
 }
 
 impl WireCell {
     fn of(cell: &Cell) -> Self {
         let a = cell.attributes();
         let bit = |on: bool, b: u8| if on { b } else { 0 };
+        let style = bit(a.bold(), WireStyle::BOLD)
+            | bit(a.dim(), WireStyle::DIM)
+            | bit(a.italic(), WireStyle::ITALIC)
+            | bit(a.underline(), WireStyle::UNDERLINE)
+            | bit(a.inverse(), WireStyle::INVERSE);
         Self {
-            text: cell.contents().to_owned(),
+            // A cell holds at most `CONTENTS_CAPACITY` bytes, as `CellText` does.
+            text: CellText::new(cell.contents()).unwrap_or_default(),
             kind: if cell.is_wide_continuation() {
-                KIND_CONTINUATION
+                CellKind::Continuation
             } else if cell.is_wide() {
-                KIND_WIDE
+                CellKind::Wide
             } else {
-                KIND_NARROW
+                CellKind::Narrow
             },
             fg: a.foreground.into(),
             bg: a.background.into(),
-            style: bit(a.bold(), STYLE_BOLD)
-                | bit(a.dim(), STYLE_DIM)
-                | bit(a.italic(), STYLE_ITALIC)
-                | bit(a.underline(), STYLE_UNDERLINE)
-                | bit(a.inverse(), STYLE_INVERSE),
+            // Only defined bits were set above.
+            style: WireStyle(style),
         }
     }
 
-    /// The cell this encodes, or `None` if the encoding is malformed (unknown kind or style
-    /// bits, oversized text, or a continuation carrying content).
+    /// The cell this encodes, or `None` if the encoding is malformed (a continuation carrying
+    /// content).
     fn cell(&self) -> Option<Cell> {
-        if self.style & !STYLE_ALL != 0 {
-            return None;
-        }
         match self.kind {
-            KIND_CONTINUATION => (self.text.is_empty()
+            CellKind::Continuation => (self.text.is_empty()
                 && self.fg == WireColor::Default
                 && self.bg == WireColor::Default
-                && self.style == 0)
-                .then(Cell::wide_continuation),
-            KIND_NARROW | KIND_WIDE => {
+                && self.style == WireStyle::default())
+            .then(Cell::wide_continuation),
+            CellKind::Narrow | CellKind::Wide => {
                 let attributes = Attributes::new(self.fg.into(), self.bg.into())
-                    .with_bold(self.style & STYLE_BOLD != 0)
-                    .with_dim(self.style & STYLE_DIM != 0)
-                    .with_italic(self.style & STYLE_ITALIC != 0)
-                    .with_underline(self.style & STYLE_UNDERLINE != 0)
-                    .with_inverse(self.style & STYLE_INVERSE != 0);
-                Cell::new(&self.text, self.kind == KIND_WIDE, attributes)
+                    .with_bold(self.style.has(WireStyle::BOLD))
+                    .with_dim(self.style.has(WireStyle::DIM))
+                    .with_italic(self.style.has(WireStyle::ITALIC))
+                    .with_underline(self.style.has(WireStyle::UNDERLINE))
+                    .with_inverse(self.style.has(WireStyle::INVERSE));
+                Cell::new(self.text.as_str(), self.kind == CellKind::Wide, attributes)
             }
-            _ => None,
         }
     }
 }
 
-/// `count` consecutive identical cells.
+/// `count` consecutive identical cells. A run is never empty: a zero count fails to decode.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
-    pub count: u16,
+    pub count: NonZeroU16,
     pub cell: WireCell,
 }
 
@@ -307,7 +447,7 @@ impl RowDiff {
             let extended = previous == Some(cell) && runs.last_mut().is_some_and(Run::extend);
             if !extended {
                 runs.push(Run {
-                    count: 1,
+                    count: NonZeroU16::MIN,
                     cell: WireCell::of(cell),
                 });
             }
@@ -316,19 +456,82 @@ impl RowDiff {
         Self { row, wrapped, runs }
     }
 
-    /// Decode into exactly `cols` cells, or `None` if the runs are malformed or don't cover the
-    /// row exactly. Work is bounded by `cols`: every run must be non-empty.
-    fn cells(&self, cols: u16) -> Option<Vec<Cell>> {
-        let mut out = Vec::with_capacity(usize::from(cols));
+    /// Append exactly `cols` decoded cells to `out`, or return `None` if the runs are malformed or
+    /// don't cover the row exactly (`out` then holds a partial row, which the caller discards).
+    /// Work is bounded by `cols`: every run is non-empty.
+    fn decode_into(&self, cols: u16, out: &mut Vec<Cell>) -> Option<()> {
+        let mut len = 0_usize;
         for run in &self.runs {
-            let end = out.len().checked_add(usize::from(run.count));
-            if run.count == 0 || end.is_none_or(|end| end > usize::from(cols)) {
-                return None;
-            }
+            let count = usize::from(run.count.get());
+            len = len
+                .checked_add(count)
+                .filter(|&len| len <= usize::from(cols))?;
             let cell = run.cell.cell()?;
-            out.extend(std::iter::repeat_n(cell, usize::from(run.count)));
+            out.extend(std::iter::repeat_n(cell, count));
         }
-        (out.len() == usize::from(cols)).then_some(out)
+        (len == usize::from(cols)).then_some(())
+    }
+}
+
+/// The mouse reporting mode on the wire. The variant's index is its byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireMouseMode {
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+impl From<MouseProtocolMode> for WireMouseMode {
+    fn from(mode: MouseProtocolMode) -> Self {
+        match mode {
+            MouseProtocolMode::None => Self::None,
+            MouseProtocolMode::Press => Self::Press,
+            MouseProtocolMode::PressRelease => Self::PressRelease,
+            MouseProtocolMode::ButtonMotion => Self::ButtonMotion,
+            MouseProtocolMode::AnyMotion => Self::AnyMotion,
+        }
+    }
+}
+
+impl From<WireMouseMode> for MouseProtocolMode {
+    fn from(mode: WireMouseMode) -> Self {
+        match mode {
+            WireMouseMode::None => Self::None,
+            WireMouseMode::Press => Self::Press,
+            WireMouseMode::PressRelease => Self::PressRelease,
+            WireMouseMode::ButtonMotion => Self::ButtonMotion,
+            WireMouseMode::AnyMotion => Self::AnyMotion,
+        }
+    }
+}
+
+/// The mouse report encoding on the wire. The variant's index is its byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireMouseEncoding {
+    Default,
+    Utf8,
+    Sgr,
+}
+
+impl From<MouseProtocolEncoding> for WireMouseEncoding {
+    fn from(encoding: MouseProtocolEncoding) -> Self {
+        match encoding {
+            MouseProtocolEncoding::Default => Self::Default,
+            MouseProtocolEncoding::Utf8 => Self::Utf8,
+            MouseProtocolEncoding::Sgr => Self::Sgr,
+        }
+    }
+}
+
+impl From<WireMouseEncoding> for MouseProtocolEncoding {
+    fn from(encoding: WireMouseEncoding) -> Self {
+        match encoding {
+            WireMouseEncoding::Default => Self::Default,
+            WireMouseEncoding::Utf8 => Self::Utf8,
+            WireMouseEncoding::Sgr => Self::Sgr,
+        }
     }
 }
 
@@ -339,8 +542,8 @@ pub struct WireModes {
     pub application_cursor: bool,
     pub application_keypad: bool,
     pub bracketed_paste: bool,
-    pub mouse_mode: u8,
-    pub mouse_encoding: u8,
+    pub mouse_mode: WireMouseMode,
+    pub mouse_encoding: WireMouseEncoding,
 }
 
 impl From<Modes> for WireModes {
@@ -350,53 +553,31 @@ impl From<Modes> for WireModes {
             application_cursor: m.application_cursor,
             application_keypad: m.application_keypad,
             bracketed_paste: m.bracketed_paste,
-            mouse_mode: match m.mouse_mode {
-                MouseProtocolMode::None => 0,
-                MouseProtocolMode::Press => 1,
-                MouseProtocolMode::PressRelease => 2,
-                MouseProtocolMode::ButtonMotion => 3,
-                MouseProtocolMode::AnyMotion => 4,
-            },
-            mouse_encoding: match m.mouse_encoding {
-                MouseProtocolEncoding::Default => 0,
-                MouseProtocolEncoding::Utf8 => 1,
-                MouseProtocolEncoding::Sgr => 2,
-            },
+            mouse_mode: m.mouse_mode.into(),
+            mouse_encoding: m.mouse_encoding.into(),
         }
     }
 }
 
-impl WireModes {
-    fn modes(self) -> Option<Modes> {
-        Some(Modes {
-            hide_cursor: self.hide_cursor,
-            application_cursor: self.application_cursor,
-            application_keypad: self.application_keypad,
-            bracketed_paste: self.bracketed_paste,
-            mouse_mode: match self.mouse_mode {
-                0 => MouseProtocolMode::None,
-                1 => MouseProtocolMode::Press,
-                2 => MouseProtocolMode::PressRelease,
-                3 => MouseProtocolMode::ButtonMotion,
-                4 => MouseProtocolMode::AnyMotion,
-                _ => return None,
-            },
-            mouse_encoding: match self.mouse_encoding {
-                0 => MouseProtocolEncoding::Default,
-                1 => MouseProtocolEncoding::Utf8,
-                2 => MouseProtocolEncoding::Sgr,
-                _ => return None,
-            },
-        })
+impl From<WireModes> for Modes {
+    fn from(m: WireModes) -> Self {
+        Self {
+            hide_cursor: m.hide_cursor,
+            application_cursor: m.application_cursor,
+            application_keypad: m.application_keypad,
+            bracketed_paste: m.bracketed_paste,
+            mouse_mode: m.mouse_mode.into(),
+            mouse_encoding: m.mouse_encoding.into(),
+        }
     }
 }
 
 /// The wire delta between two [`TerminalScreen`]s (mosh `HostMessage`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenDiff {
-    /// New `(rows, cols)` if the screen was resized; the client starts from a blank grid of that
-    /// size, and `rows` then carries every row that isn't blank.
-    pub resize: Option<(u16, u16)>,
+    /// The new size if the screen was resized; the client starts from a blank grid of that size,
+    /// and `rows` then carries every row that isn't blank.
+    pub resize: Option<Size>,
     /// New window title if it changed.
     pub title: Option<String>,
     /// New window icon name if it changed.
@@ -420,15 +601,15 @@ impl TerminalScreen {
     /// The diff that turns `base` into `self`.
     pub fn diff_from(&self, base: &Self) -> ScreenDiff {
         let resized = self.size() != base.size();
-        let (rows, cols) = self.size();
-        let blank = vec![Cell::default(); usize::from(cols)];
+        let rows = self.size().rows;
         let changed = (0..rows).filter_map(|r| {
             let cells = self.grid.row(r)?;
             let wrapped = self.grid.row_wrapped(r);
+            // A row shared with the base is the same without comparing its cells.
             let same = if resized {
-                cells == blank.as_slice() && !wrapped
+                !wrapped && cells.iter().all(|cell| *cell == Cell::default())
             } else {
-                base.grid.row(r) == Some(cells) && base.grid.row_wrapped(r) == wrapped
+                self.grid.row_eq(&base.grid, r)
             };
             (!same).then(|| RowDiff::of(r, cells, wrapped))
         });
@@ -453,38 +634,30 @@ impl TerminalScreen {
         //
         // LOAD-BEARING: this `clamp_dims` is the only bound on a single resize's grid
         // allocation. The mirror clamp on the server lives in `terminal/server.rs`.
-        let (rows, cols) = diff
-            .resize
-            .map_or_else(|| self.size(), |(r, c)| clamp_dims(r, c));
-        let Some(modes) = diff.modes.modes() else {
-            return;
-        };
+        let Size { rows, cols } = diff.resize.map_or_else(|| self.size(), clamp_dims);
         if diff.rows.len() > usize::from(rows) {
             return;
         }
-        let mut decoded = Vec::with_capacity(diff.rows.len());
+        // Every row decodes into one staging buffer, `cols` cells each, in the diff's order. At
+        // most `rows × cols` cells, which the clamp bounds.
+        let width = usize::from(cols);
+        let mut staged = Vec::with_capacity(diff.rows.len().saturating_mul(width));
         for row in &diff.rows {
-            if row.row >= rows {
+            if row.row >= rows || row.decode_into(cols, &mut staged).is_none() {
                 return;
             }
-            let Some(cells) = row.cells(cols) else {
-                return;
-            };
-            decoded.push((row.row, row.wrapped, cells));
         }
         if diff.resize.is_some() {
-            self.grid = Grid::blank(rows, cols);
+            self.grid = Grid::blank(Size { rows, cols });
         }
-        for (row, wrapped, cells) in decoded {
-            if let Some(dst) = self.grid.row_mut(row) {
-                dst.copy_from_slice(&cells);
-            }
-            self.grid.set_row_wrapped(row, wrapped);
+        // Only the rows the diff carries are replaced; the rest stay shared with the base.
+        for (row, cells) in diff.rows.iter().zip(staged.chunks(width.max(1))) {
+            self.grid.set_row(row.row, Arc::from(cells), row.wrapped);
         }
         let (crow, ccol) = diff.cursor;
         self.grid
             .set_cursor((crow.min(rows.saturating_sub(1)), ccol.min(cols)));
-        self.grid.set_modes(modes);
+        self.grid.set_modes(diff.modes.into());
 
         // Monotonic: never regress on a reordered/older diff (the client applies only newer
         // frames, but `max` is the defensive, obviously-correct choice).
@@ -546,31 +719,39 @@ mod tests {
             b"now a much wider and taller screen\r\nwith two lines",
         );
         let diff = b.diff_from(&a);
-        assert_eq!(diff.resize, Some((40, 120)));
+        assert_eq!(diff.resize, Some(Size::new(40, 120)));
         let mut c = a;
         c.apply(&diff);
         assert_eq!(c, b);
-        assert_eq!(c.size(), (40, 120));
+        assert_eq!(c.size(), Size::new(40, 120));
     }
 
     #[test]
     fn clamp_dims_bounds_both_extremes() {
         assert_eq!(
-            clamp_dims(65000, 65000),
-            (MAX_DIM, MAX_DIM),
+            clamp_dims(Size::new(65000, 65000)),
+            Size::new(MAX_DIM, MAX_DIM),
             "huge -> MAX_DIM"
         );
-        assert_eq!(clamp_dims(0, 0), (MIN_DIM, MIN_DIM), "zero -> MIN_DIM");
-        assert_eq!(clamp_dims(24, 80), (24, 80), "in-range passes through");
         assert_eq!(
-            clamp_dims(0, 5000),
-            (MIN_DIM, MAX_DIM),
+            clamp_dims(Size::new(0, 0)),
+            Size::new(MIN_DIM, MIN_DIM),
+            "zero -> MIN_DIM"
+        );
+        assert_eq!(
+            clamp_dims(Size::new(24, 80)),
+            Size::new(24, 80),
+            "in-range passes through"
+        );
+        assert_eq!(
+            clamp_dims(Size::new(0, 5000)),
+            Size::new(MIN_DIM, MAX_DIM),
             "mixed clamps each axis"
         );
     }
 
     /// A diff that changes nothing but `resize`, for the clamp tests.
-    fn resize_only(resize: (u16, u16)) -> ScreenDiff {
+    fn resize_only(resize: Size) -> ScreenDiff {
         ScreenDiff {
             resize: Some(resize),
             title: None,
@@ -594,15 +775,21 @@ mod tests {
                 .prop_map(|(r, g, b)| WireColor::Rgb(r, g, b))
                 .boxed(),
         ]);
-        (".{0,30}", 0u8..4, color.clone(), color, any::<u8>()).prop_map(
-            |(text, kind, fg, bg, style)| WireCell {
+        let kind = proptest::sample::select(vec![
+            CellKind::Narrow,
+            CellKind::Wide,
+            CellKind::Continuation,
+        ]);
+        let text = ".{0,22}".prop_filter_map("fits a cell", |text| CellText::new(&text));
+        (text, kind, color.clone(), color, 0u8..=31).prop_map(|(text, kind, fg, bg, style)| {
+            WireCell {
                 text,
                 kind,
                 fg,
                 bg,
-                style,
-            },
-        )
+                style: WireStyle::new(style).unwrap(),
+            }
+        })
     }
 
     fn row_diff() -> impl proptest::strategy::Strategy<Value = RowDiff> {
@@ -611,7 +798,10 @@ mod tests {
             0u16..40,
             any::<bool>(),
             proptest::collection::vec(
-                (0u16..120, wire_cell()).prop_map(|(count, cell)| Run { count, cell }),
+                (1u16..120, wire_cell()).prop_map(|(count, cell)| Run {
+                    count: NonZeroU16::new(count).unwrap(),
+                    cell,
+                }),
                 0..8,
             ),
         )
@@ -630,7 +820,19 @@ mod tests {
             rows in proptest::collection::vec(row_diff(), 0..6),
             resize in proptest::option::of((proptest::prelude::any::<u16>(), proptest::prelude::any::<u16>())),
             cursor in proptest::prelude::any::<(u16, u16)>(),
-            modes in proptest::prelude::any::<(bool, bool, bool, bool, u8, u8)>(),
+            modes in proptest::prelude::any::<(bool, bool, bool, bool)>(),
+            mouse_mode in proptest::sample::select(vec![
+                WireMouseMode::None,
+                WireMouseMode::Press,
+                WireMouseMode::PressRelease,
+                WireMouseMode::ButtonMotion,
+                WireMouseMode::AnyMotion,
+            ]),
+            mouse_encoding in proptest::sample::select(vec![
+                WireMouseEncoding::Default,
+                WireMouseEncoding::Utf8,
+                WireMouseEncoding::Sgr,
+            ]),
             title in proptest::option::of(".{0,512}"),
             icon in proptest::option::of(".{0,512}"),
             clipboard in proptest::option::of(".{0,40000}"),
@@ -642,15 +844,16 @@ mod tests {
                 application_cursor: modes.1,
                 application_keypad: modes.2,
                 bracketed_paste: modes.3,
-                mouse_mode: modes.4,
-                mouse_encoding: modes.5,
+                mouse_mode,
+                mouse_encoding,
             };
+            let resize = resize.map(|(rows, cols)| Size::new(rows, cols));
             let diff = ScreenDiff {
                 resize, title, icon, clipboard, bell_count, exit_code, cursor, modes, rows,
             };
             let mut screen = TerminalScreen::default();
             screen.apply(&diff); // must not panic on adversarial input
-            let (rows, cols) = screen.size();
+            let Size { rows, cols } = screen.size();
             proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&rows), "rows {rows} escaped the clamp");
             proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&cols), "cols {cols} escaped the clamp");
             for r in 0..rows {
@@ -671,7 +874,7 @@ mod tests {
             if let Ok(diff) = postcard::from_bytes::<ScreenDiff>(&bytes) {
                 let mut screen = TerminalScreen::default();
                 screen.apply(&diff);
-                let (rows, cols) = screen.size();
+                let Size { rows, cols } = screen.size();
                 proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&rows) && (MIN_DIM..=MAX_DIM).contains(&cols));
             }
         }
@@ -689,7 +892,7 @@ mod tests {
             emu.process(&first);
             let base = emu.snapshot();
             if let Some((rows, cols)) = resize {
-                emu.resize(rows, cols);
+                emu.resize(Size::new(rows, cols));
             }
             emu.process(&second);
             let target = emu.snapshot();
@@ -704,17 +907,21 @@ mod tests {
         // A malicious server ships a (65000, 65000) resize. The client must NOT build a giant
         // grid: apply clamps to MAX_DIM and reconstructs a bounded screen without OOM/panic.
         let mut c = TerminalScreen::default();
-        c.apply(&resize_only((65000, 65000))); // must not OOM/panic
-        assert_eq!(c.size(), (MAX_DIM, MAX_DIM), "client clamps a giant resize");
+        c.apply(&resize_only(Size::new(65000, 65000))); // must not OOM/panic
+        assert_eq!(
+            c.size(),
+            Size::new(MAX_DIM, MAX_DIM),
+            "client clamps a giant resize"
+        );
     }
 
     #[test]
     fn client_apply_clamps_zero_resize() {
         let mut c = TerminalScreen::default();
-        c.apply(&resize_only((0, 0))); // must not panic
+        c.apply(&resize_only(Size::new(0, 0))); // must not panic
         assert_eq!(
             c.size(),
-            (MIN_DIM, MIN_DIM),
+            Size::new(MIN_DIM, MIN_DIM),
             "client clamps a zero-dimension resize"
         );
     }
@@ -751,23 +958,18 @@ mod tests {
         let base = screen_from(24, 80, b"keep me");
         let target = screen_from(24, 80, b"changed\r\nmore");
         let good = target.diff_from(&base);
-        let mutations: [fn(&mut ScreenDiff); 9] = [
-            |d| d.rows[0].row = 24,           // row out of range
-            |d| d.rows[0].runs[0].count += 1, // overruns the width
+        let mutations: [fn(&mut ScreenDiff); 4] = [
+            |d| d.rows[0].row = 24, // row out of range
+            |d| {
+                let run = &mut d.rows[0].runs[0];
+                run.count = run.count.checked_add(1).unwrap(); // overruns the width
+            },
             |d| {
                 if let Some(run) = d.rows[0].runs.last_mut() {
-                    run.count -= 1; // falls short of the width
+                    run.count = NonZeroU16::new(run.count.get() - 1).unwrap(); // falls short
                 }
             },
-            |d| {
-                let cell = d.rows[0].runs[0].cell.clone();
-                d.rows[0].runs.insert(0, Run { count: 0, cell }); // empty run
-            },
-            |d| d.rows[0].runs[0].cell.kind = 3,   // unknown kind
-            |d| d.rows[0].runs[0].cell.style = 32, // unknown style bit
-            |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CONTENTS_CAPACITY + 1),
-            |d| d.rows[0].runs[0].cell.kind = KIND_CONTINUATION, // continuation with text
-            |d| d.modes.mouse_mode = 9,                          // unknown mouse mode
+            |d| d.rows[0].runs[0].cell.kind = CellKind::Continuation, // continuation with text
         ];
         for (i, mutate) in mutations.iter().enumerate() {
             let mut diff = good.clone();
@@ -783,6 +985,208 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_last_row_drops_the_rows_before_it_too() {
+        // Every row is validated before any is committed: rows that decoded fine before the
+        // malformed one are not applied either.
+        let base = screen_from(24, 80, b"keep\r\nkeep\r\nkeep");
+        let target = screen_from(24, 80, b"one\r\ntwo\r\nthree");
+        let good = target.diff_from(&base);
+        assert_eq!(good.rows.len(), 3);
+        let mutations: [fn(&mut ScreenDiff); 3] = [
+            |d| d.rows[2].row = 24,
+            |d| {
+                let run = &mut d.rows[2].runs[0];
+                run.count = run.count.checked_add(1).unwrap();
+            },
+            |d| d.rows[2].runs[0].cell.kind = CellKind::Continuation,
+        ];
+        for (i, mutate) in mutations.iter().enumerate() {
+            let mut diff = good.clone();
+            mutate(&mut diff);
+            let mut c = base.clone();
+            c.apply(&diff);
+            assert_eq!(c, base, "mutation {i} must drop the whole frame");
+        }
+    }
+
+    /// A [`ScreenDiff`] in the same wire shape with plain fields, to encode values the typed one
+    /// cannot hold.
+    #[derive(Clone, Serialize)]
+    struct RawDiff {
+        resize: Option<(u16, u16)>,
+        title: Option<String>,
+        icon: Option<String>,
+        clipboard: Option<String>,
+        bell_count: u64,
+        exit_code: Option<u32>,
+        cursor: (u16, u16),
+        modes: RawModes,
+        rows: Vec<RawRow>,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct RawModes {
+        hide_cursor: bool,
+        application_cursor: bool,
+        application_keypad: bool,
+        bracketed_paste: bool,
+        mouse_mode: u8,
+        mouse_encoding: u8,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct RawRow {
+        row: u16,
+        wrapped: bool,
+        runs: Vec<RawRun>,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct RawRun {
+        count: u16,
+        cell: RawCell,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct RawCell {
+        text: String,
+        kind: u8,
+        fg: WireColor,
+        bg: WireColor,
+        style: u8,
+    }
+
+    /// A resize to 2×2 whose first row reads `xx`.
+    fn raw_two_by_two() -> RawDiff {
+        RawDiff {
+            resize: Some((2, 2)),
+            title: None,
+            icon: None,
+            clipboard: None,
+            bell_count: 0,
+            exit_code: None,
+            cursor: (0, 0),
+            modes: RawModes {
+                hide_cursor: false,
+                application_cursor: false,
+                application_keypad: false,
+                bracketed_paste: false,
+                mouse_mode: 4,
+                mouse_encoding: 2,
+            },
+            rows: vec![RawRow {
+                row: 0,
+                wrapped: false,
+                runs: vec![RawRun {
+                    count: 2,
+                    cell: RawCell {
+                        text: "x".to_owned(),
+                        kind: 0,
+                        fg: WireColor::Default,
+                        bg: WireColor::Default,
+                        style: 31,
+                    },
+                }],
+            }],
+        }
+    }
+
+    fn decode_raw(raw: &RawDiff) -> postcard::Result<ScreenDiff> {
+        postcard::from_bytes(&postcard::to_allocvec(raw)?)
+    }
+
+    #[test]
+    fn malformed_cells_and_modes_fail_to_decode() {
+        // What the types cannot hold fails at decode, so the client drops the frame before any
+        // `apply`.
+        let good = decode_raw(&raw_two_by_two()).expect("a well-formed diff decodes");
+        let mut screen = TerminalScreen::default();
+        screen.apply(&good);
+        assert_eq!(screen.size(), Size::new(2, 2));
+        assert_eq!(screen.screen().cell(0, 1).map(Cell::contents), Some("x"));
+        let mutations: [fn(&mut RawDiff); 8] = [
+            |d| d.rows[0].runs[0].count = 0, // empty run
+            |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CONTENTS_CAPACITY + 1),
+            |d| d.rows[0].runs[0].cell.text = "\x1b".to_owned(), // an escape for the terminal
+            |d| d.rows[0].runs[0].cell.text = "\u{9b}".to_owned(), // a C1 control
+            |d| d.rows[0].runs[0].cell.kind = 3,                 // unknown kind
+            |d| d.rows[0].runs[0].cell.style = 32,               // unknown style bit
+            |d| d.modes.mouse_mode = 5,                          // unknown mouse mode
+            |d| d.modes.mouse_encoding = 3,                      // unknown mouse encoding
+        ];
+        for (i, mutate) in mutations.iter().enumerate() {
+            let mut raw = raw_two_by_two();
+            mutate(&mut raw);
+            assert!(
+                decode_raw(&raw).is_err(),
+                "mutation {i} must fail to decode"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshots_share_the_rows_they_hold_unchanged() {
+        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
+        emu.process(b"one\r\ntwo\r\n");
+        let before = emu.snapshot();
+        emu.process(b"three");
+        let after = emu.snapshot();
+        assert!(after.grid.row_shared(&before.grid, 0));
+        assert!(after.grid.row_shared(&before.grid, 1));
+        assert!(!after.grid.row_shared(&before.grid, 2), "the changed row");
+        assert_eq!(after.grid.row(2).map(<[Cell]>::len), Some(80));
+        // Scrolled rows are shared too, wherever they moved: one screen and one row in all.
+        for n in 0..30 {
+            emu.process(format!("\r\nline {n}").as_bytes());
+        }
+        let before = emu.snapshot();
+        emu.process(b"\r\nscrolled");
+        let after = emu.snapshot();
+        assert_eq!(
+            TerminalScreen::distinct_cells([&before, &after]),
+            (24 + 1) * 80
+        );
+        assert_eq!(after.screen().row(0), before.screen().row(1));
+    }
+
+    #[test]
+    fn apply_replaces_only_the_rows_the_diff_carries() {
+        let base = screen_from(24, 80, b"one\r\ntwo\r\nthree");
+        let target = screen_from(24, 80, b"one\r\nTWO\r\nthree");
+        let diff = target.diff_from(&base);
+        assert_eq!(diff.rows.len(), 1);
+        let mut client = base.clone();
+        client.apply(&diff);
+        assert_eq!(client, target);
+        for row in (0..24).filter(|&row| row != 1) {
+            assert!(client.grid.row_shared(&base.grid, row), "row {row}");
+        }
+        assert!(!client.grid.row_shared(&base.grid, 1));
+        assert_eq!(TerminalScreen::distinct_cells([&base, &client]), 25 * 80);
+    }
+
+    #[test]
+    fn cell_text_holds_what_a_cell_holds() {
+        let full = "é".repeat(Cell::CONTENTS_CAPACITY.div_euclid(2));
+        assert_eq!(
+            CellText::new(&full).map(|t| t.as_str().to_owned()),
+            Some(full)
+        );
+        assert!(CellText::new(&"x".repeat(Cell::CONTENTS_CAPACITY + 1)).is_none());
+        for control in ["\x1b[2J", "\x07", "\x7f", "\u{9d}", "a\nb"] {
+            assert!(CellText::new(control).is_none(), "{control:?}");
+        }
+        assert!(CellText::default().is_empty());
+        // The encoding is the string's, and a decoded string must fit.
+        let text = CellText::new("日本").unwrap();
+        let bytes = postcard::to_allocvec(&text).unwrap();
+        assert_eq!(bytes, postcard::to_allocvec("日本").unwrap());
+        assert_eq!(postcard::from_bytes::<CellText>(&bytes).unwrap(), text);
+        let long = postcard::to_allocvec(&"x".repeat(Cell::CONTENTS_CAPACITY + 1)).unwrap();
+        assert!(postcard::from_bytes::<CellText>(&long).is_err());
+    }
+
+    #[test]
     fn identical_cells_are_run_length_encoded() {
         let target = screen_from(24, 80, b"ab");
         let diff = target.diff_from(&TerminalScreen::default());
@@ -792,7 +1196,7 @@ mod tests {
             3,
             "'a', 'b', then one run of 78 blanks"
         );
-        assert_eq!(diff.rows[0].runs[2].count, 78);
+        assert_eq!(diff.rows[0].runs[2].count.get(), 78);
     }
 
     #[test]
@@ -917,7 +1321,7 @@ mod tests {
 
     /// Trimmed text of one screen row (blank cells as spaces), for line-level assertions.
     fn row_text(s: &Grid, row: u16) -> String {
-        let (_, cols) = s.size();
+        let cols = s.size().cols;
         (0..cols)
             .map(|c| match s.cell(row, c).map(Cell::contents) {
                 Some(g) if !g.is_empty() => g.to_string(),

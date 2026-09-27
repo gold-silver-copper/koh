@@ -19,21 +19,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::proto::{
-    encode_frame, frame_interval, retry_after, ClientDecoder, ClientMsg, Frame, FrameNum, InputSeq,
-    ProtoError, FRAME_WINDOW, HEARTBEAT, SESSION_ENDED,
+    encode_frame, frame_interval, retry_after, ClientDecoder, ClientMsg, Frame, FrameNum,
+    FrameScreen, InputSeq, ProtoError, FRAME_WINDOW, HEARTBEAT, SESSION_ENDED, WINDOW_CELLS,
 };
-use crate::terminal::TerminalScreen;
+use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::IrohChannel;
 use iroh::endpoint::RecvStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
-
-/// Most screen cells the frames awaiting acknowledgement may hold together, a screen several frames
-/// share counted once: one screen of the largest size a client may ask for (`MAX_DIM`²). Past it
-/// the oldest are dropped, as past [`FRAME_WINDOW`], so a client that never acknowledges cannot make
-/// the server hold sixteen million-cell screens (half a gigabyte). The newest frame is always kept;
-/// a dropped frame is only a base the client can no longer have a frame diffed against.
-const SENT_CELLS: usize = 1_000_000;
 
 /// Why an attached connection loop returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,11 +57,11 @@ struct CursorKeyNormalizer {
 }
 
 impl CursorKeyNormalizer {
-    /// Normalize `input` for an app whose application-cursor-keys mode is `app_cursor`, returning
-    /// the bytes to feed the PTY.
-    fn normalize(&mut self, input: &[u8], app_cursor: bool) -> Vec<u8> {
+    /// Normalize `input` for an app whose application-cursor-keys mode is `app_cursor`, appending
+    /// the bytes to feed the PTY to `out`.
+    fn normalize_into(&mut self, input: &[u8], app_cursor: bool, out: &mut Vec<u8>) {
         // A capacity hint: one spare byte for a held escape; saturating cannot matter.
-        let mut out = Vec::with_capacity(input.len().saturating_add(1));
+        out.reserve(input.len().saturating_add(1));
         for &b in input {
             match self.state {
                 Ss3State::Ground => {
@@ -98,7 +91,6 @@ impl CursorKeyNormalizer {
                 }
             }
         }
-        out
     }
 }
 
@@ -180,7 +172,7 @@ struct Drained {
     /// The last resize among the messages, clamped to `[MIN_DIM, MAX_DIM]`. Earlier ones in the same
     /// read have no observable effect, so they are dropped rather than each costing a
     /// `TIOCSWINSZ`, a `SIGWINCH` and an emulator reallocation.
-    resize: Option<(u16, u16)>,
+    resize: Option<Size>,
 }
 
 /// The server side of one connection: the I/O-free protocol core.
@@ -200,10 +192,11 @@ pub(crate) struct ServerConn {
     /// `screen` was taken after the hosted program exited.
     final_snapshot: bool,
     /// The newest frame the client acknowledged, and its screen. Starts as the blank frame 0.
-    acked: (FrameNum, Arc<TerminalScreen>),
-    /// Frames sent since, oldest first: at most `FRAME_WINDOW`, holding at most [`SENT_CELLS`] cells
-    /// beyond the newest.
-    sent: VecDeque<(FrameNum, Arc<TerminalScreen>)>,
+    acked: FrameScreen,
+    /// Frames sent since, oldest first: at most `FRAME_WINDOW`, holding at most [`WINDOW_CELLS`]
+    /// cells together unless the newest alone is more, so a client that never acknowledges cannot
+    /// make the server hold sixteen of the largest screens. The newest is always kept.
+    sent: VecDeque<FrameScreen>,
     last_num: FrameNum,
     last_sent_at: Option<Instant>,
     last_sent_echo: InputSeq,
@@ -226,7 +219,7 @@ impl ServerConn {
             screen: Arc::default(),
             unsent_change: true,
             final_snapshot: false,
-            acked: (FrameNum::BLANK, Arc::default()),
+            acked: FrameScreen::default(),
             sent: VecDeque::new(),
             last_num: FrameNum::BLANK,
             last_sent_at: None,
@@ -237,7 +230,7 @@ impl ServerConn {
 
     /// Install the session's latest screen (taken while the program was `alive`).
     fn install_snapshot(&mut self, screen: Arc<TerminalScreen>, alive: bool) {
-        let last_sent = self.sent.back().map_or(&self.acked.1, |(_, s)| s);
+        let last_sent = &self.sent.back().unwrap_or(&self.acked).screen;
         if screen != *last_sent {
             self.unsent_change = true;
         }
@@ -260,12 +253,11 @@ impl ServerConn {
             match msg {
                 ClientMsg::Input { seq, bytes } => {
                     self.echo.register(seq, now);
-                    drained
-                        .keys
-                        .extend(self.cursor_keys.normalize(&bytes, app_cursor));
+                    self.cursor_keys
+                        .normalize_into(&bytes, app_cursor, &mut drained.keys);
                 }
-                ClientMsg::Resize { rows, cols } => {
-                    drained.resize = Some(crate::terminal::clamp_dims(rows, cols));
+                ClientMsg::Resize(size) => {
+                    drained.resize = Some(crate::terminal::clamp_dims(size));
                 }
                 ClientMsg::Ack { frame } => self.ack(frame),
                 ClientMsg::Resync => self.resync(),
@@ -282,10 +274,10 @@ impl ServerConn {
     /// The client applied `num`. Frames sent before it are no longer needed as bases. An ack for a
     /// frame this connection no longer holds (or never sent) is ignored.
     fn ack(&mut self, num: FrameNum) {
-        if num <= self.acked.0 {
+        if num <= self.acked.num {
             return;
         }
-        let Some(pos) = self.sent.iter().position(|(n, _)| *n == num) else {
+        let Some(pos) = self.sent.iter().position(|sent| sent.num == num) else {
             return;
         };
         let mut rest = self.sent.split_off(pos);
@@ -298,7 +290,7 @@ impl ServerConn {
     /// The client does not hold the base of what it was sent; diff against the blank screen, which
     /// it always holds, until it acknowledges a newer frame.
     fn resync(&mut self) {
-        self.acked = (FrameNum::BLANK, Arc::default());
+        self.acked = FrameScreen::default();
         self.unsent_change = true;
     }
 
@@ -317,7 +309,7 @@ impl ServerConn {
             .last_sent_at
             .map(|at| now.saturating_duration_since(at));
         let interval_passed = since.is_none_or(|since| since >= frame_interval(rtt));
-        let unacked = self.last_num > self.acked.0;
+        let unacked = self.last_num > self.acked.num;
         let retry_due = unacked && since.is_some_and(|since| since >= retry_after(rtt));
         let heartbeat_due = since.is_none_or(|since| since >= HEARTBEAT);
         let due = (changed && interval_passed) || retry_due || heartbeat_due;
@@ -327,13 +319,16 @@ impl ServerConn {
         let num = self.last_num.next();
         let frame = Frame {
             num,
-            base: self.acked.0,
+            base: self.acked.num,
             echo_ack: self.echo.echo_ack(),
-            diff: self.screen.diff_from(&self.acked.1),
+            diff: self.screen.diff_from(&self.acked.screen),
         };
-        self.sent.push_back((num, Arc::clone(&self.screen)));
+        self.sent.push_back(FrameScreen {
+            num,
+            screen: Arc::clone(&self.screen),
+        });
         while self.sent.len() > FRAME_WINDOW
-            || (self.sent.len() > 1 && distinct_cells(&self.sent) > SENT_CELLS)
+            || (self.sent.len() > 1 && distinct_cells(&self.sent) > WINDOW_CELLS)
         {
             self.sent.pop_front();
         }
@@ -349,7 +344,7 @@ impl ServerConn {
 
     /// The newest frame the client has acknowledged.
     const fn acked(&self) -> FrameNum {
-        self.acked.0
+        self.acked.num
     }
 
     /// Whether the latest snapshot has application-cursor-keys mode on, for the arrow normalizer.
@@ -361,7 +356,7 @@ impl ServerConn {
     /// frame, or did not within [`FINAL_ACK_WAIT`].
     fn finished(&self, now: Instant) -> bool {
         self.final_frame.is_some_and(|(num, at)| {
-            self.acked.0 >= num || now.saturating_duration_since(at) >= FINAL_ACK_WAIT
+            self.acked.num >= num || now.saturating_duration_since(at) >= FINAL_ACK_WAIT
         })
     }
 
@@ -377,7 +372,7 @@ impl ServerConn {
                 .map_or(now, |at| at.checked_add(frame_interval(rtt)).unwrap_or(now));
             wake = wake.min(interval);
         }
-        if self.last_num > self.acked.0 {
+        if self.last_num > self.acked.num {
             let retry = self
                 .last_sent_at
                 .map_or(now, |at| at.checked_add(retry_after(rtt)).unwrap_or(now));
@@ -393,18 +388,9 @@ impl ServerConn {
     }
 }
 
-/// The cells of the screens `frames` hold, a screen shared by neighbouring frames counted once.
-fn distinct_cells(frames: &VecDeque<(FrameNum, Arc<TerminalScreen>)>) -> usize {
-    let mut previous: Option<&Arc<TerminalScreen>> = None;
-    let mut cells = 0_usize;
-    for (_, screen) in frames {
-        if !previous.is_some_and(|previous| Arc::ptr_eq(previous, screen)) {
-            let (rows, cols) = screen.size();
-            cells = cells.saturating_add(usize::from(rows).saturating_mul(usize::from(cols)));
-        }
-        previous = Some(screen);
-    }
-    cells
+/// The cells the screens of `frames` hold in memory, a row several of them share counted once.
+fn distinct_cells(frames: &VecDeque<FrameScreen>) -> usize {
+    TerminalScreen::distinct_cells(frames.iter().map(|frame| &*frame.screen))
 }
 
 /// Drive one client connection against its session, through a [`session::SessionClient`].
@@ -490,8 +476,8 @@ pub async fn run_attached(
                             if !drained.keys.is_empty() {
                                 session.send_keys(drained.keys).await;
                             }
-                            if let Some((rows, cols)) = drained.resize {
-                                session.send_resize(rows, cols).await;
+                            if let Some(size) = drained.resize {
+                                session.send_resize(size).await;
                             }
                             if !session.can_send() {
                                 break Ok(SessionExit::Detached); // the session ended
@@ -607,19 +593,19 @@ mod tests {
 
     use super::{
         distinct_cells, CursorKeyNormalizer, Drained, EchoAck, ServerConn, FINAL_ACK_WAIT,
-        SENT_CELLS,
     };
     use crate::proto::{
         encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_WINDOW, HEARTBEAT,
+        WINDOW_CELLS,
     };
-    use crate::terminal::TerminalScreen;
+    use crate::terminal::{Size, TerminalScreen};
 
     /// Feed `chunks` through one normalizer at the given app-cursor mode, return the PTY bytes.
     fn norm(chunks: &[&[u8]], app_cursor: bool) -> Vec<u8> {
         let mut n = CursorKeyNormalizer::default();
         let mut out = Vec::new();
         for c in chunks {
-            out.extend(n.normalize(c, app_cursor));
+            n.normalize_into(c, app_cursor, &mut out);
         }
         out
     }
@@ -666,16 +652,13 @@ mod tests {
                 seq: InputSeq(1),
                 bytes: b"ab".to_vec(),
             },
-            ClientMsg::Resize { rows: 10, cols: 20 },
+            ClientMsg::Resize(Size::new(10, 20)),
             ClientMsg::Input {
                 seq: InputSeq(2),
                 bytes: b"\x1bOA".to_vec(),
             },
-            ClientMsg::Resize { rows: 30, cols: 40 },
-            ClientMsg::Resize {
-                rows: 65000,
-                cols: 1,
-            },
+            ClientMsg::Resize(Size::new(30, 40)),
+            ClientMsg::Resize(Size::new(65000, 1)),
             ClientMsg::Input {
                 seq: InputSeq(3),
                 bytes: b"ef".to_vec(),
@@ -686,7 +669,7 @@ mod tests {
             drained,
             Drained {
                 keys: b"ab\x1b[Aef".to_vec(),
-                resize: Some(crate::terminal::clamp_dims(65000, 1)),
+                resize: Some(crate::terminal::clamp_dims(Size::new(65000, 1))),
             }
         );
         conn.push_client_bytes(&stream(&[ClientMsg::Input {
@@ -997,12 +980,6 @@ mod tests {
     }
 
     #[test]
-    fn the_window_budget_is_one_screen_of_the_largest_size() {
-        let max = usize::from(crate::terminal::MAX_DIM);
-        assert_eq!(SENT_CELLS, max * max);
-    }
-
-    #[test]
     fn frames_resent_to_a_client_that_never_acknowledges_share_their_screen() {
         // A client that acknowledges nothing is resent the unchanged screen at every heartbeat.
         // Each resend held its own copy: sixteen of a 1000x1000 screen were over 500 MB.
@@ -1019,8 +996,26 @@ mod tests {
             FRAME_WINDOW,
             "the window still holds every resend"
         );
-        assert!(c.sent.iter().all(|(_, s)| Arc::ptr_eq(s, &big)));
-        assert_eq!(distinct_cells(&c.sent), SENT_CELLS);
+        assert!(c.sent.iter().all(|sent| Arc::ptr_eq(&sent.screen, &big)));
+        assert_eq!(distinct_cells(&c.sent), WINDOW_CELLS);
+    }
+
+    #[test]
+    fn frames_that_differ_by_a_row_share_the_rest() {
+        // Each snapshot shares the rows the program left alone with the one before, so a window of
+        // frames that each changed one row holds one screen and those rows, not sixteen screens.
+        let mut c = ServerConn::default();
+        let mut emu = crate::terminal::ServerTerminal::new(24, 80, 0).unwrap();
+        let t0 = Instant::now();
+        for n in 0..20_u32 {
+            emu.process(format!("line {n}\r\n").as_bytes());
+            c.install_snapshot(Arc::new(emu.snapshot()), true);
+            c.poll_frame(t0 + HEARTBEAT * n, None)
+                .expect("a frame is due");
+        }
+        assert_eq!(c.sent.len(), FRAME_WINDOW);
+        let changed_rows = FRAME_WINDOW - 1;
+        assert_eq!(distinct_cells(&c.sent), (24 + changed_rows) * 80);
     }
 
     #[test]
@@ -1033,7 +1028,7 @@ mod tests {
             c.install_snapshot(largest(&format!("screen {n}")), true);
             c.poll_frame(t0 + HEARTBEAT * n, None)
                 .expect("a frame is due");
-            assert!(distinct_cells(&c.sent) <= SENT_CELLS, "after frame {n}");
+            assert!(distinct_cells(&c.sent) <= WINDOW_CELLS, "after frame {n}");
         }
         // Only the newest is left, and it still diffs against the base the client holds.
         assert_eq!(c.sent.len(), 1);

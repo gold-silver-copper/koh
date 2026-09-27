@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE, MAX_INPUT_BYTES};
+use koh::terminal::Size;
 use koh::transport_iroh::{
     admission, bind_endpoint_local, direct_addr, generate_secret_key, load_or_create_secret_key,
     parse_endpoint_id, IrohChannel, ALPN,
@@ -122,7 +123,7 @@ async fn write_msg(send: &mut SendStream, msg: &ClientMsg) -> Result<()> {
 async fn resize(send: &mut SendStream, rows: u16, cols: u16) -> Result<()> {
     eprintln!("evil-client: injecting resize({rows}, {cols})");
     for _ in 0..30 {
-        write_msg(send, &ClientMsg::Resize { rows, cols }).await?;
+        write_msg(send, &ClientMsg::Resize(Size::new(rows, cols))).await?;
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
     Ok(())
@@ -176,7 +177,7 @@ async fn resize_flood(send: &mut SendStream, n: usize) -> Result<()> {
     eprintln!("evil-client: {n} resize messages (the server must coalesce)");
     for k in 0..n {
         let (rows, cols) = if k % 2 == 0 { (1000, 1000) } else { (2, 2) };
-        write_msg(send, &ClientMsg::Resize { rows, cols }).await?;
+        write_msg(send, &ClientMsg::Resize(Size::new(rows, cols))).await?;
     }
     Ok(())
 }

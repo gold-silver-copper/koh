@@ -82,6 +82,8 @@ error; upgrade both ends.
 - Both ends need much less memory and CPU for the recent screens they keep: screens share the rows
   they have in common instead of each holding a full copy (about 32 MB at 1000×1000), so a new
   screen costs only the rows that changed, including rows that scrolled.
+- Screen updates take less CPU at both ends: a frame's cell text is stored inline, so building and
+  decoding a frame no longer allocates once per run of cells.
 
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with it) for

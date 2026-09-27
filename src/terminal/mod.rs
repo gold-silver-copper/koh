@@ -263,11 +263,80 @@ impl<'de> Deserialize<'de> for WireStyle {
     }
 }
 
-/// One cell on the wire. `text` is at most `fux_vt::Cell::CONTENTS_CAPACITY` bytes; a
-/// continuation (the right half of a wide glyph) is empty with default colours and no style.
+/// A cell's text on the wire: at most [`Cell::CONTENTS_CAPACITY`] bytes of UTF-8.
+///
+/// Stored inline, as `fux_vt::Cell` stores it, so building or decoding a run allocates nothing.
+/// It encodes as a string; decoding refuses a longer one, which drops the frame.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct CellText {
+    len: u8,
+    bytes: [u8; Cell::CONTENTS_CAPACITY],
+}
+
+impl CellText {
+    /// `text`, or `None` if it is longer than [`Cell::CONTENTS_CAPACITY`] bytes.
+    pub fn new(text: &str) -> Option<Self> {
+        let mut bytes = [0; Cell::CONTENTS_CAPACITY];
+        bytes
+            .get_mut(..text.len())?
+            .copy_from_slice(text.as_bytes());
+        Some(Self {
+            len: u8::try_from(text.len()).ok()?,
+            bytes,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Only ever a whole `&str`'s bytes, so the prefix is valid UTF-8.
+        self.bytes
+            .get(..usize::from(self.len))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::fmt::Debug for CellText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl Serialize for CellText {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CellText {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_str(CellTextVisitor)
+    }
+}
+
+/// Takes a borrowed or an owned string (serde hands both to `visit_str`) that fits a cell.
+struct CellTextVisitor;
+
+impl de::Visitor<'_> for CellTextVisitor {
+    type Value = CellText;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a string of at most {} bytes", Cell::CONTENTS_CAPACITY)
+    }
+
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<CellText, E> {
+        CellText::new(text).ok_or_else(|| E::invalid_length(text.len(), &self))
+    }
+}
+
+/// One cell on the wire. A continuation (the right half of a wide glyph) is empty with default
+/// colours and no style.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireCell {
-    pub text: String,
+    pub text: CellText,
     pub kind: CellKind,
     pub fg: WireColor,
     pub bg: WireColor,
@@ -284,7 +353,8 @@ impl WireCell {
             | bit(a.underline(), WireStyle::UNDERLINE)
             | bit(a.inverse(), WireStyle::INVERSE);
         Self {
-            text: cell.contents().to_owned(),
+            // A cell holds at most `CONTENTS_CAPACITY` bytes, as `CellText` does.
+            text: CellText::new(cell.contents()).unwrap_or_default(),
             kind: if cell.is_wide_continuation() {
                 CellKind::Continuation
             } else if cell.is_wide() {
@@ -299,8 +369,8 @@ impl WireCell {
         }
     }
 
-    /// The cell this encodes, or `None` if the encoding is malformed (oversized text, or a
-    /// continuation carrying content).
+    /// The cell this encodes, or `None` if the encoding is malformed (a continuation carrying
+    /// content).
     fn cell(&self) -> Option<Cell> {
         match self.kind {
             CellKind::Continuation => (self.text.is_empty()
@@ -315,7 +385,7 @@ impl WireCell {
                     .with_italic(self.style.has(WireStyle::ITALIC))
                     .with_underline(self.style.has(WireStyle::UNDERLINE))
                     .with_inverse(self.style.has(WireStyle::INVERSE));
-                Cell::new(&self.text, self.kind == CellKind::Wide, attributes)
+                Cell::new(self.text.as_str(), self.kind == CellKind::Wide, attributes)
             }
         }
     }
@@ -685,7 +755,8 @@ mod tests {
             CellKind::Wide,
             CellKind::Continuation,
         ]);
-        (".{0,30}", kind, color.clone(), color, 0u8..=31).prop_map(|(text, kind, fg, bg, style)| {
+        let text = ".{0,22}".prop_filter_map("fits a cell", |text| CellText::new(&text));
+        (text, kind, color.clone(), color, 0u8..=31).prop_map(|(text, kind, fg, bg, style)| {
             WireCell {
                 text,
                 kind,
@@ -857,7 +928,7 @@ mod tests {
         let base = screen_from(24, 80, b"keep me");
         let target = screen_from(24, 80, b"changed\r\nmore");
         let good = target.diff_from(&base);
-        let mutations: [fn(&mut ScreenDiff); 5] = [
+        let mutations: [fn(&mut ScreenDiff); 4] = [
             |d| d.rows[0].row = 24, // row out of range
             |d| {
                 let run = &mut d.rows[0].runs[0];
@@ -868,7 +939,6 @@ mod tests {
                     run.count = NonZeroU16::new(run.count.get() - 1).unwrap(); // falls short
                 }
             },
-            |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CONTENTS_CAPACITY + 1),
             |d| d.rows[0].runs[0].cell.kind = CellKind::Continuation, // continuation with text
         ];
         for (i, mutate) in mutations.iter().enumerate() {
@@ -1004,8 +1074,9 @@ mod tests {
         screen.apply(&good);
         assert_eq!(screen.size(), (2, 2));
         assert_eq!(screen.screen().cell(0, 1).map(Cell::contents), Some("x"));
-        let mutations: [fn(&mut RawDiff); 5] = [
-            |d| d.rows[0].runs[0].count = 0,       // empty run
+        let mutations: [fn(&mut RawDiff); 6] = [
+            |d| d.rows[0].runs[0].count = 0, // empty run
+            |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CONTENTS_CAPACITY + 1),
             |d| d.rows[0].runs[0].cell.kind = 3,   // unknown kind
             |d| d.rows[0].runs[0].cell.style = 32, // unknown style bit
             |d| d.modes.mouse_mode = 5,            // unknown mouse mode
@@ -1060,6 +1131,24 @@ mod tests {
         }
         assert!(!client.grid.row_shared(&base.grid, 1));
         assert_eq!(TerminalScreen::distinct_cells([&base, &client]), 25 * 80);
+    }
+
+    #[test]
+    fn cell_text_holds_what_a_cell_holds() {
+        let full = "é".repeat(Cell::CONTENTS_CAPACITY.div_euclid(2));
+        assert_eq!(
+            CellText::new(&full).map(|t| t.as_str().to_owned()),
+            Some(full)
+        );
+        assert!(CellText::new(&"x".repeat(Cell::CONTENTS_CAPACITY + 1)).is_none());
+        assert!(CellText::default().is_empty());
+        // The encoding is the string's, and a decoded string must fit.
+        let text = CellText::new("日本").unwrap();
+        let bytes = postcard::to_allocvec(&text).unwrap();
+        assert_eq!(bytes, postcard::to_allocvec("日本").unwrap());
+        assert_eq!(postcard::from_bytes::<CellText>(&bytes).unwrap(), text);
+        let long = postcard::to_allocvec(&"x".repeat(Cell::CONTENTS_CAPACITY + 1)).unwrap();
+        assert!(postcard::from_bytes::<CellText>(&long).is_err());
     }
 
     #[test]

@@ -163,11 +163,6 @@ enum SessionMsg {
     Detach,
 }
 
-/// A registry's handle to one session task.
-struct SessionHandle {
-    control: mpsc::Sender<SessionMsg>,
-}
-
 /// Hand `take` up to `limit` items `rx` already holds, without waiting, as they come off the
 /// channel. An end of the channel is left for the next `recv` to report.
 fn take_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize, mut take: impl FnMut(T)) {
@@ -382,7 +377,8 @@ async fn registry_task(
     self_tx: mpsc::Sender<RegMsg>,
     shutdown: CancellationToken,
 ) {
-    let mut sessions: HashMap<EndpointId, SessionHandle> = HashMap::new();
+    // Each live session's control sender, by peer.
+    let mut sessions: HashMap<EndpointId, mpsc::Sender<SessionMsg>> = HashMap::new();
     let ended_tx = ended_sender(&self_tx);
     // Drop our own sender clone so the channel closes once the accept loop's `Registry` handles do.
     drop(self_tx);
@@ -423,25 +419,14 @@ fn ended_sender(tx: &mpsc::Sender<RegMsg>) -> mpsc::Sender<EndpointId> {
 }
 
 async fn attach_in(
-    sessions: &mut HashMap<EndpointId, SessionHandle>,
+    sessions: &mut HashMap<EndpointId, mpsc::Sender<SessionMsg>>,
     spec: &SessionSpec,
     ended: &mpsc::Sender<EndpointId>,
     peer: EndpointId,
 ) -> Option<(SessionClient, AttachKind)> {
-    if let Some(handle) = sessions.get(&peer) {
-        let control = handle.control.clone();
-        let (reply, rx) = oneshot::channel();
-        if control
-            .send(SessionMsg::Attach {
-                control: control.clone(),
-                reply,
-            })
-            .await
-            .is_ok()
-        {
-            if let Ok((client, detached_for)) = rx.await {
-                return Some((client, AttachKind::Reattached { detached_for }));
-            }
+    if let Some(control) = sessions.get(&peer) {
+        if let Some((client, detached_for)) = attach_to(control).await {
+            return Some((client, AttachKind::Reattached { detached_for }));
         }
         // The session task is gone; drop the stale handle and fall through to create a new one.
         sessions.remove(&peer);
@@ -461,9 +446,16 @@ async fn attach_in(
         spec.ttl,
         ended.clone(),
     ));
-    sessions.insert(peer, SessionHandle { control });
-    // Attach to the session we just created.
-    let control = sessions.get(&peer)?.control.clone();
+    let (client, _) = attach_to(&control).await?;
+    sessions.insert(peer, control);
+    Some((client, AttachKind::Created))
+}
+
+/// Attach to the session `control` reaches: a client handle and how long it was detached, or `None`
+/// if its task is gone.
+async fn attach_to(
+    control: &mpsc::Sender<SessionMsg>,
+) -> Option<(SessionClient, Option<Duration>)> {
     let (reply, rx) = oneshot::channel();
     control
         .send(SessionMsg::Attach {
@@ -472,8 +464,7 @@ async fn attach_in(
         })
         .await
         .ok()?;
-    let (client, _) = rx.await.ok()?;
-    Some((client, AttachKind::Created))
+    rx.await.ok()
 }
 
 #[cfg(test)]

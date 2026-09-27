@@ -91,7 +91,12 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
 
 `TerminalScreen` is a plain `Grid` of `fux_vt::Cell`s (with a cursor, per-row soft-wrap flags and
 the input modes the client mirrors) plus the side channels: title, icon, OSC 52 clipboard, bell count
-and exit code. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's
+and exit code. The grid stores each row as its own reference-counted slice of cells, shared by every
+screen that holds the row unchanged: a snapshot shares the rows the program left alone (found by
+fux-vt's row ids, so rows that scrolled are shared too) with the snapshot before it, and a client
+screen shares every row a diff did not carry with the base it was applied to. So a screen costs the
+rows that changed, two screens compare and diff by skipping the rows they share, and each end's
+memory for its recent screens is counted in distinct rows. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's
 opt-in events (title, icon, bell, clipboard) and extended replies (DECRQM, DECXCPR, secondary DA)
 turned on. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
 cursor and the modes; after a resize the client starts from a blank grid and receives every

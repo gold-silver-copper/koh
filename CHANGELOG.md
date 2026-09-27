@@ -79,6 +79,9 @@ error; upgrade both ends.
   Tokio runtime explicitly.
 - `koh serve` takes far less CPU to read a burst of small client messages, such as a flood of
   resizes: it no longer moves the rest of a read after each message it decodes.
+- Both ends need much less memory and CPU for the recent screens they keep: screens share the rows
+  they have in common instead of each holding a full copy (about 32 MB at 1000×1000), so a new
+  screen costs only the rows that changed, including rows that scrolled.
 
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with it) for

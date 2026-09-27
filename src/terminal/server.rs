@@ -3,6 +3,7 @@
 //! echo-ack debounce that tells the client which of its keystrokes are visible lives per
 //! connection in `server`.
 
+use crate::terminal::grid::RowCache;
 use crate::terminal::{clamp_dims, Grid, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN};
 use fux_vt::{Event, Options, Parser, Sink};
 
@@ -63,6 +64,8 @@ pub struct ServerTerminal {
     observed: Observed,
     /// The shell's exit code once it has exited (propagated to the client on shutdown).
     exit_code: Option<u32>,
+    /// The last snapshot's rows, which the next one shares where they are unchanged.
+    rows: RowCache,
 }
 
 impl ServerTerminal {
@@ -78,6 +81,7 @@ impl ServerTerminal {
             parser: Parser::with_options(rows, cols, scrollback, options)?,
             observed: Observed::default(),
             exit_code: None,
+            rows: RowCache::default(),
         })
     }
 
@@ -139,10 +143,10 @@ impl ServerTerminal {
         self.parser.screen().application_cursor()
     }
 
-    /// A snapshot of the current screen.
-    pub fn snapshot(&self) -> TerminalScreen {
+    /// A snapshot of the current screen. Rows unchanged since the last snapshot share its cells.
+    pub fn snapshot(&mut self) -> TerminalScreen {
         TerminalScreen {
-            grid: Grid::of(self.parser.screen()),
+            grid: Grid::of(self.parser.screen(), &mut self.rows),
             title: self.observed.title.clone(),
             icon: self.observed.icon.clone(),
             clipboard: self.observed.clipboard.clone(),

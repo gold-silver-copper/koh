@@ -56,7 +56,7 @@ impl PtyHost {
     }
 
     /// A snapshot of the current screen.
-    pub fn snapshot(&self) -> TerminalScreen {
+    pub fn snapshot(&mut self) -> TerminalScreen {
         self.emu.snapshot()
     }
 

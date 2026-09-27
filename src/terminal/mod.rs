@@ -13,6 +13,7 @@
 //! bytes.
 
 use std::num::NonZeroU16;
+use std::sync::Arc;
 
 use fux_vt::{Attributes, Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -168,6 +169,11 @@ impl TerminalScreen {
     /// Monotonic count of audible bells the server has seen (the client rings on an increase).
     pub const fn bell_count(&self) -> u64 {
         self.bell_count
+    }
+
+    /// The cells `screens` hold in memory together: a row several of them share counts once.
+    pub fn distinct_cells<'a>(screens: impl IntoIterator<Item = &'a Self>) -> usize {
+        Grid::distinct_cells(screens.into_iter().map(|screen| &screen.grid))
     }
 }
 
@@ -511,10 +517,11 @@ impl TerminalScreen {
         let changed = (0..rows).filter_map(|r| {
             let cells = self.grid.row(r)?;
             let wrapped = self.grid.row_wrapped(r);
+            // A row shared with the base is the same without comparing its cells.
             let same = if resized {
                 cells == blank.as_slice() && !wrapped
             } else {
-                base.grid.row(r) == Some(cells) && base.grid.row_wrapped(r) == wrapped
+                self.grid.row_eq(&base.grid, r)
             };
             (!same).then(|| RowDiff::of(r, cells, wrapped))
         });
@@ -558,11 +565,9 @@ impl TerminalScreen {
         if diff.resize.is_some() {
             self.grid = Grid::blank(rows, cols);
         }
+        // Only the rows the diff carries are replaced; the rest stay shared with the base.
         for (row, wrapped, cells) in decoded {
-            if let Some(dst) = self.grid.row_mut(row) {
-                dst.copy_from_slice(&cells);
-            }
-            self.grid.set_row_wrapped(row, wrapped);
+            self.grid.set_row(row, Arc::from(cells), wrapped);
         }
         let (crow, ccol) = diff.cursor;
         self.grid
@@ -991,6 +996,47 @@ mod tests {
                 "mutation {i} must fail to decode"
             );
         }
+    }
+
+    #[test]
+    fn snapshots_share_the_rows_they_hold_unchanged() {
+        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
+        emu.process(b"one\r\ntwo\r\n");
+        let before = emu.snapshot();
+        emu.process(b"three");
+        let after = emu.snapshot();
+        assert!(after.grid.row_shared(&before.grid, 0));
+        assert!(after.grid.row_shared(&before.grid, 1));
+        assert!(!after.grid.row_shared(&before.grid, 2), "the changed row");
+        assert_eq!(after.grid.row(2).map(<[Cell]>::len), Some(80));
+        // Scrolled rows are shared too, wherever they moved: one screen and one row in all.
+        for n in 0..30 {
+            emu.process(format!("\r\nline {n}").as_bytes());
+        }
+        let before = emu.snapshot();
+        emu.process(b"\r\nscrolled");
+        let after = emu.snapshot();
+        assert_eq!(
+            TerminalScreen::distinct_cells([&before, &after]),
+            (24 + 1) * 80
+        );
+        assert_eq!(after.screen().row(0), before.screen().row(1));
+    }
+
+    #[test]
+    fn apply_replaces_only_the_rows_the_diff_carries() {
+        let base = screen_from(24, 80, b"one\r\ntwo\r\nthree");
+        let target = screen_from(24, 80, b"one\r\nTWO\r\nthree");
+        let diff = target.diff_from(&base);
+        assert_eq!(diff.rows.len(), 1);
+        let mut client = base.clone();
+        client.apply(&diff);
+        assert_eq!(client, target);
+        for row in (0..24).filter(|&row| row != 1) {
+            assert!(client.grid.row_shared(&base.grid, row), "row {row}");
+        }
+        assert!(!client.grid.row_shared(&base.grid, 1));
+        assert_eq!(TerminalScreen::distinct_cells([&base, &client]), 25 * 80);
     }
 
     #[test]

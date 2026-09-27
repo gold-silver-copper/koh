@@ -28,7 +28,7 @@ use iroh::endpoint::RecvStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-/// Most screen cells the frames awaiting acknowledgement may hold together, a screen several frames
+/// Most screen cells the frames awaiting acknowledgement may hold together, a row several frames
 /// share counted once: one screen of the largest size a client may ask for (`MAX_DIM`²). Past it
 /// the oldest are dropped, as past [`FRAME_WINDOW`], so a client that never acknowledges cannot make
 /// the server hold sixteen million-cell screens (half a gigabyte). The newest frame is always kept;
@@ -401,18 +401,9 @@ impl ServerConn {
     }
 }
 
-/// The cells of the screens `frames` hold, a screen shared by neighbouring frames counted once.
+/// The cells the screens of `frames` hold in memory, a row several of them share counted once.
 fn distinct_cells(frames: &VecDeque<FrameScreen>) -> usize {
-    let mut previous: Option<&Arc<TerminalScreen>> = None;
-    let mut cells = 0_usize;
-    for FrameScreen { screen, .. } in frames {
-        if !previous.is_some_and(|previous| Arc::ptr_eq(previous, screen)) {
-            let (rows, cols) = screen.size();
-            cells = cells.saturating_add(usize::from(rows).saturating_mul(usize::from(cols)));
-        }
-        previous = Some(screen);
-    }
-    cells
+    TerminalScreen::distinct_cells(frames.iter().map(|frame| &*frame.screen))
 }
 
 /// Drive one client connection against its session, through a [`session::SessionClient`].
@@ -1029,6 +1020,24 @@ mod tests {
         );
         assert!(c.sent.iter().all(|sent| Arc::ptr_eq(&sent.screen, &big)));
         assert_eq!(distinct_cells(&c.sent), SENT_CELLS);
+    }
+
+    #[test]
+    fn frames_that_differ_by_a_row_share_the_rest() {
+        // Each snapshot shares the rows the program left alone with the one before, so a window of
+        // frames that each changed one row holds one screen and those rows, not sixteen screens.
+        let mut c = ServerConn::default();
+        let mut emu = crate::terminal::ServerTerminal::new(24, 80, 0).unwrap();
+        let t0 = Instant::now();
+        for n in 0..20_u32 {
+            emu.process(format!("line {n}\r\n").as_bytes());
+            c.install_snapshot(Arc::new(emu.snapshot()), true);
+            c.poll_frame(t0 + HEARTBEAT * n, None)
+                .expect("a frame is due");
+        }
+        assert_eq!(c.sent.len(), FRAME_WINDOW);
+        let changed_rows = FRAME_WINDOW - 1;
+        assert_eq!(distinct_cells(&c.sent), (24 + changed_rows) * 80);
     }
 
     #[test]

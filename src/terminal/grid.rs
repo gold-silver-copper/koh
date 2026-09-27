@@ -1,8 +1,5 @@
-//! The synced cell grid: what the client renders and the predictor reads.
-//!
-//! The server builds a [`Grid`] from its live `fux_vt::Screen`; the client only ever
-//! reconstructs one from [`ScreenDiff`](super::ScreenDiff) rows. No terminal parser runs on the
-//! client, so server-controlled bytes never reach one there.
+//! The synced cell grid, which the client renders and the predictor reads: built from the live
+//! `fux_vt::Screen` on the server, from [`ScreenDiff`](super::ScreenDiff) rows on the client.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -80,12 +77,10 @@ fn exactly(cells: &[Cell], cols: u16) -> Arc<[Cell]> {
     row.into()
 }
 
-/// A fixed-size screen of `fux_vt::Cell`s with a cursor, per-row soft-wrap flags and modes.
+/// A screen of `fux_vt::Cell`s with a cursor, soft-wrap flags and modes.
 ///
-/// Always exactly `rows` rows of exactly `cols` cells. A row's cells are shared, not copied,
-/// between screens that hold it unchanged: snapshots of the server's emulator, and a client
-/// screen and the base it was diffed from. The cursor column may equal `cols` while an autowrap
-/// is pending (fux-vt's parked cursor).
+/// Always exactly `rows` rows of `cols` cells. Screens share the rows they hold unchanged. The cursor column may equal `cols`
+/// while an autowrap is pending.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grid {
     size: Size,
@@ -109,9 +104,8 @@ impl Grid {
         }
     }
 
-    /// Copy the live (non-history) rows, cursor and modes out of a fux-vt screen. A row `cache`
-    /// holds unchanged since the last snapshot is shared rather than copied; `cache` is left
-    /// holding this snapshot's rows.
+    /// The live rows, cursor and modes of a fux-vt screen, sharing the rows `cache` holds unchanged;
+    /// `cache` is left holding this snapshot's rows.
     pub(super) fn of(screen: &fux_vt::Screen, cache: &mut RowCache) -> Self {
         let (rows, cols) = screen.size();
         let window = screen.window(0, rows, cols);
@@ -173,7 +167,8 @@ impl Grid {
     }
 
     /// Whether `row` shares its cells with `other`'s, rather than holding a copy.
-    pub fn row_shared(&self, other: &Self, row: u16) -> bool {
+    #[cfg(test)]
+    pub(super) fn row_shared(&self, other: &Self, row: u16) -> bool {
         let row = usize::from(row);
         match (self.lines.get(row), other.lines.get(row)) {
             (Some(line), Some(other)) => line.shares(other),
@@ -192,15 +187,12 @@ impl Grid {
         }
     }
 
-    /// The cells the rows of `grids` hold, each allocation counted once however many rows and
-    /// grids share it: what those grids cost in memory together.
+    /// The cells the rows of `grids` hold, each shared row counted once: their memory together.
     pub fn distinct_cells<'a>(grids: impl IntoIterator<Item = &'a Self>) -> usize {
         Self::unseen_cells(&mut HashSet::new(), grids)
     }
 
-    /// The cells the rows of `grids` hold beyond the rows of `base`, counted as
-    /// [`distinct_cells`](Self::distinct_cells) counts them: what keeping `grids` besides `base`
-    /// costs.
+    /// The cells the rows of `grids` hold beyond `base`'s: what keeping them besides it costs.
     pub fn cells_beyond<'a>(base: &Self, grids: impl IntoIterator<Item = &'a Self>) -> usize {
         let mut seen = base.lines.iter().map(Row::id).collect();
         Self::unseen_cells(&mut seen, grids)

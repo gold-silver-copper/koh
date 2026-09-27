@@ -1,9 +1,5 @@
-//! The client's I/O-free core: frames in, messages out.
-//!
-//! [`ClientSession`] holds the screens of its last applied frames, turns typed bytes and resizes
-//! into [`ClientMsg`]s, applies [`Frame`]s whose base it holds, and runs the predictor. It never
-//! touches tokio, iroh or a terminal; the connection loop in [`super`] moves the bytes, and tests
-//! drive it directly.
+//! The client's core, without I/O: [`ClientSession`] turns typed bytes and resizes into
+//! [`ClientMsg`]s, applies [`Frame`]s whose base it holds, and runs the predictor.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -19,12 +15,12 @@ use crate::terminal::{Grid, Size, TerminalScreen};
 use super::render::WindowState;
 use super::{window_state, ESCAPE_PREFIX, SUSPEND_KEY};
 
-/// How long the server may go unheard before the "link down" banner appears: three missed
-/// heartbeats, so one late or lost frame on a lossy link does not flash it.
+/// How long the server may go unheard before the "link down" banner: three heartbeats, so one late
+/// frame does not flash it.
 pub const LINK_DOWN_GRACE: Duration = HEARTBEAT.saturating_mul(3);
 
-/// The most typed bytes the client holds while the server is not taking input. Past this, typing is
-/// dropped and the status line says so.
+/// The most typed bytes held while the server takes no input; past it, typing is dropped and the
+/// status line says so.
 const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 
 /// What [`ClientSession::on_input`] decided about a chunk of typed bytes.
@@ -32,10 +28,9 @@ const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 pub enum InputOutcome {
     /// The user typed the escape prefix followed by `.` — disconnect.
     Quit,
-    /// The user typed the escape prefix followed by `Ctrl-Z` — suspend to the background. Any bytes
-    /// before the escape in the same chunk were already queued; the caller drives the suspend.
+    /// The user typed the escape prefix and `Ctrl-Z`: suspend. Bytes before it were queued.
     Suspend,
-    /// The bytes were consumed (queued for the server and seeded into the predictor).
+    /// The bytes were queued and predicted.
     Forwarded,
 }
 
@@ -53,8 +48,7 @@ pub struct ClientSession {
     /// The newest applied frame and its screen.
     current: FrameScreen,
     /// The frames applied before it, oldest first: at most `FRAME_WINDOW - 1`, holding at most
-    /// [`WINDOW_CELLS`] cells beyond those `current` holds, so a server cannot make the client
-    /// keep fifteen of the largest screens.
+    /// [`WINDOW_CELLS`] cells beyond `current`'s.
     older: VecDeque<FrameScreen>,
     /// A `Resync` was sent and no frame has applied since.
     resync_sent: bool,
@@ -70,8 +64,7 @@ pub struct ClientSession {
     input_paused: bool,
     /// When the server was last heard from; `None` until the first frame.
     last_heard: Option<Instant>,
-    /// When input was last queued, or the last probe sent, while some input is not yet confirmed
-    /// by the echo-ack.
+    /// When input was last queued or probed for, while some is unconfirmed.
     last_nudge: Option<Instant>,
     predictor: PredictionEngine,
     /// True after the lone escape prefix, while waiting for the next byte.
@@ -103,8 +96,8 @@ impl ClientSession {
         }
     }
 
-    /// Feed a chunk of typed bytes. Runs the escape machine (`0x1e` then `.` quits, then `Ctrl-Z`
-    /// suspends, then anything else forwards both bytes), seeds the predictor, and queues the rest.
+    /// Take typed bytes: the escape prefix then `.` quits, then `Ctrl-Z` suspends, then anything
+    /// else forwards both; the rest is predicted and queued.
     pub fn on_input(&mut self, now: Instant, bytes: &[u8]) -> InputOutcome {
         let mut quit = false;
         let mut suspend = false;
@@ -191,8 +184,7 @@ impl ClientSession {
         self.dirty = true;
     }
 
-    /// Note a new window size: queue it for the server and reset the predictor, whose
-    /// predictions a resize invalidates.
+    /// Queue a new window size; it voids the predictions.
     pub fn on_resize(&mut self, size: Size) {
         // Only the last of several unsent resizes matters.
         if let Some(ClientMsg::Resize(queued)) = self.outgoing.back_mut() {
@@ -204,15 +196,13 @@ impl ClientSession {
         self.dirty = true;
     }
 
-    /// A frame arrived at `now`. It is applied if it is newer than the current screen and its base
-    /// is one this session holds; otherwise it only proves the link is alive.
+    /// A frame arrived: applied if newer and on a base held, else only proof the link lives.
     pub fn on_frame(&mut self, now: Instant, frame: &Frame) {
         self.last_heard = Some(now);
         if frame.num <= self.current.num {
             return;
         }
-        // The base is copied to apply the frame to, which shares every row with it; the frame
-        // replaces only the rows it carries.
+        // The copy shares every row with the base; the frame replaces only its own.
         let base = if frame.base == FrameNum::BLANK {
             Some(TerminalScreen::default())
         } else if frame.base == self.current.num {
@@ -270,13 +260,10 @@ impl ClientSession {
         self.outgoing.push_back(ClientMsg::Ack { frame: num });
     }
 
-    /// Advance to `now` with the connection's current `rtt`: expire stale predictions, probe for
-    /// input the server has not confirmed, and report the status banner.
+    /// Advance to `now`: probe for unconfirmed input, and report the status banner.
     pub fn on_tick(&mut self, now: Instant, rtt: Option<Duration>) -> TickResult {
-        // Input the echo-ack has not confirmed for a retry interval may be stuck behind a lost
-        // packet. Any later packet lets QUIC detect the loss and retransmit at once, where
-        // otherwise it waits out its probe timeout; a repeated acknowledgement is that packet, and
-        // the server ignores it.
+        // Unconfirmed input may be behind a lost packet: any later one (a repeated ack, which the
+        // server ignores) lets QUIC retransmit at once instead of after its probe timeout.
         if self.echo_ack < self.last_seq
             && self
                 .last_nudge
@@ -293,9 +280,6 @@ impl ClientSession {
                 });
             }
         }
-        // The predictor engages adaptively on the link's round-trip time.
-        self.predictor
-            .set_rtt_ms(rtt.map_or(0.0, |rtt| rtt.as_secs_f64() * 1000.0));
         let silent = self
             .last_heard
             .map(|heard| now.saturating_duration_since(heard));
@@ -342,8 +326,7 @@ impl ClientSession {
         &self.current.screen
     }
 
-    /// Whether a server frame has been applied, i.e. [`state`](Self::state) is the server's and
-    /// not the blank screen a session starts from.
+    /// Whether a frame has been applied, so [`state`](Self::state) is the server's.
     pub fn synced(&self) -> bool {
         self.current.num > FrameNum::BLANK
     }

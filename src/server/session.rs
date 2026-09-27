@@ -1,12 +1,9 @@
-//! Detachable, reattachable PTY sessions, as tasks.
+//! Detachable sessions, as tasks.
 //!
-//! A [`Registry`] task owns the set of live sessions, one per authorized peer, and creates,
-//! reattaches, caps and reaps them. Each session is its own task that owns its
-//! [`PtyHost`], drains its PTY output into the emulator, and publishes each new screen on a
-//! `watch` channel — whether or not a client is attached, so a reconnecting client re-syncs to the
-//! live screen ("close the laptop, reopen, it's right where you left off"). A connection talks to
-//! its session only through a [`SessionClient`]: it watches the screen and sends input, and
-//! dropping it detaches. Session state is owned by its task, never shared behind a lock.
+//! A [`Registry`] task creates, reattaches, caps and reaps them, one
+//! per peer. Each session task owns its [`PtyHost`] and publishes every screen on a `watch`
+//! channel, attached or not, so a client that reconnects finds the live screen. A connection talks
+//! to its session through a [`SessionClient`], whose drop detaches.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,29 +16,26 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
-/// How often the registry sweeps for sessions past their detach TTL. Injectable so tests need no
-/// real multi-second wait.
+/// How often a session checks its detach TTL (sooner for a shorter TTL).
 pub(crate) const REAP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How much input may wait for a session's PTY before a connection must stop reading its stream.
 const INPUT_QUEUE: usize = 256;
 
-/// Most output chunks taken into one snapshot beyond the one that woke the session. A snapshot is a
-/// whole screen, a million cells at the largest size a client may ask for, so one per 8 KiB read
-/// had a chatty program allocate (and the allocator hold on to) gigabytes a second. Bounded, so a
-/// program that never stops writing cannot starve input and resizes.
+/// Most output chunks taken into one snapshot beyond the first: one snapshot per 8 KiB read had a
+/// chatty program allocate gigabytes a second at the largest size. Bounded, so a program that never
+/// stops writing cannot starve input.
 const OUTPUT_CHUNKS_PER_SNAPSHOT: usize = 64;
 
-/// The hosted program: a PTY-spawned process behind a `fux-vt` emulator. Owned by one session task.
+/// The hosted program: a process on a PTY, and its emulator.
 pub struct PtyHost {
     pub emu: ServerTerminal,
     pub pty: crate::pty::Pty,
 }
 
 impl PtyHost {
-    /// Spawn the program through `launcher` and its emulator at the default geometry, returning the
-    /// host and the PTY output receiver the session task drains. `command[0]` is the program; empty
-    /// means the login shell.
+    /// Start `command` (empty for the login shell) through `launcher` at the default size; the host
+    /// and a receiver of its output.
     pub fn spawn(
         command: &[String],
         scrollback: usize,
@@ -60,8 +54,7 @@ impl PtyHost {
         self.emu.snapshot()
     }
 
-    /// Queue client keystrokes (already DECCKM-normalized) for the PTY. `false` if the writer queue
-    /// is full because the program is not reading its input; the caller keeps the bytes and retries.
+    /// Queue keystrokes for the program; `false` if its queue is full, and the caller retries.
     pub fn input(&mut self, bytes: &[u8]) -> bool {
         match self.pty.write_input(bytes) {
             Ok(()) => true,
@@ -73,7 +66,7 @@ impl PtyHost {
         }
     }
 
-    /// The client's terminal is now `size` (already clamped to `[MIN_DIM, MAX_DIM]`).
+    /// The client's window is now `size` (clamped).
     pub fn resize(&mut self, size: Size) {
         let Size { rows, cols } = size;
         if let Err(e) = self.pty.resize(rows, cols) {
@@ -82,15 +75,7 @@ impl PtyHost {
         self.emu.resize(size);
     }
 
-    /// Stop the program while a pump thread may still reference it, without joining (best-effort).
-    pub fn kill(&mut self) {
-        if let Err(e) = self.pty.kill() {
-            tracing::warn!(error = %e, "pty kill during teardown failed");
-        }
-        self.pty.kill_hard();
-    }
-
-    /// Final, sole-owner teardown. Blocks joining the pump threads, so run it on `spawn_blocking`.
+    /// Tear down; blocks joining the pump threads, so run it on `spawn_blocking`.
     pub fn shutdown(self) {
         self.pty.shutdown();
     }
@@ -107,8 +92,7 @@ enum ClientInput {
 pub enum AttachKind {
     /// A brand-new session was spawned for this peer.
     Created,
-    /// Reattached to an existing session; `detached_for` is how long it had been detached (`None`
-    /// if a client was still attached).
+    /// Reattached; `detached_for` is how long it had no client, `None` if it had one.
     Reattached { detached_for: Option<Duration> },
 }
 
@@ -122,7 +106,6 @@ pub struct SessionClient {
 
 impl Drop for SessionClient {
     fn drop(&mut self) {
-        // Best-effort: the session task decrements its attach count and, at zero, starts the TTL.
         let _ = self.control.try_send(SessionMsg::Detach);
     }
 }
@@ -139,14 +122,12 @@ impl SessionClient {
         self.screens.borrow().clone()
     }
 
-    /// Reserve a slot to send input; `None` if the session ended. Awaiting the returned permit-free
-    /// send never blocks the caller's loop indefinitely (the queue is bounded, so a full queue is
-    /// itself the backpressure).
+    /// Whether the session still takes input: `false` once it ended.
     pub fn can_send(&self) -> bool {
         !self.input.is_closed()
     }
 
-    /// Send keystrokes to the PTY, waiting for queue room (bounded, so it applies backpressure).
+    /// Send keystrokes, waiting for room in the bounded queue.
     pub async fn send_keys(&self, keys: Vec<u8>) {
         let _ = self.input.send(ClientInput::Keys(keys)).await;
     }
@@ -161,19 +142,13 @@ impl SessionClient {
 
 /// Control messages to a session task.
 enum SessionMsg {
-    /// A connection attaches; the reply carries a client handle and how long it was detached. The
-    /// `control` sender is handed back inside the client so its drop detaches.
+    /// A connection attaches; `control` goes into its client, whose drop detaches.
     Attach {
         control: mpsc::Sender<Self>,
         reply: oneshot::Sender<(SessionClient, Option<Duration>)>,
     },
     /// A connection detached (its [`SessionClient`] dropped).
     Detach,
-}
-
-/// A registry's handle to one session task.
-struct SessionHandle {
-    control: mpsc::Sender<SessionMsg>,
 }
 
 /// Hand `take` up to `limit` items `rx` already holds, without waiting, as they come off the
@@ -187,8 +162,7 @@ fn take_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize, mut take: impl FnMut(
     }
 }
 
-/// Run one session: own the PTY host, drain its output into the emulator, publish each screen,
-/// apply attached connections' input, and end when the shell exits or the detach TTL expires.
+/// Run one session until its program exits and its client leaves, or its detach TTL expires.
 async fn session_task(
     peer: EndpointId,
     mut host: PtyHost,
@@ -202,11 +176,9 @@ async fn session_task(
     let mut attached: usize = 0;
     let mut last_detach: Option<Instant> = None;
     let mut pending_keys: Vec<u8> = Vec::new();
-    // Once the shell exits we publish a final screen (with its exit code) and keep the task alive,
-    // still serving that screen, until the attached client has seen it and detached (or the TTL).
+    // After the program exits, its final screen is served until the client leaves.
     let mut exited = false;
 
-    // Check the detach TTL at most every `REAP_INTERVAL`, but sooner for a short TTL (tests).
     let tick_period = ttl.min(REAP_INTERVAL).max(Duration::from_millis(1));
     let mut ttl_tick = tokio::time::interval(tick_period);
     ttl_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -227,13 +199,11 @@ async fn session_task(
                     });
                     let replies = host.emu.take_host_replies();
                     if !replies.is_empty() {
-                        // Query answers (DSR/DA/DECRQM) are host I/O, not screen content.
+                        // Query answers go to the program, not the screen.
                         let _ = host.input(&replies);
                     }
                 } else {
-                    // The shell exited: reap its status and publish a final screen carrying it. The
-                    // task stays alive so the attached connection can deliver that frame and be
-                    // acknowledged before we tear down.
+                    // The program exited: publish a final screen carrying its status.
                     if let Some(code) = reap_exit_code(&mut host).await {
                         host.emu.set_exit_code(code);
                     }
@@ -299,8 +269,7 @@ async fn session_task(
     tokio::task::spawn_blocking(move || host.shutdown());
 }
 
-/// A short delay used to re-poll the PTY writer queue while keystrokes are pending; a never-ready
-/// future when nothing is pending.
+/// A short wait before retrying pending keystrokes; never, with none pending.
 async fn pending_input_retry(pending: bool) {
     if pending {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -309,14 +278,12 @@ async fn pending_input_retry(pending: bool) {
     }
 }
 
-/// Poll for the exited child's status for up to a second (the zombie becomes waitable a moment
-/// after EOF).
+/// The exited program's status, polled for up to a second: it is waitable a moment after EOF.
 async fn reap_exit_code(host: &mut PtyHost) -> Option<u32> {
-    // An unrepresentable deadline (a timeout of centuries) means no deadline.
     let deadline = Instant::now().checked_add(Duration::from_secs(1));
     loop {
         match host.pty.try_wait() {
-            Ok(Some(status)) => return Some(status.exit_code()),
+            Ok(Some(status)) => return Some(status.code),
             Ok(None) if deadline.is_none_or(|d| Instant::now() < d) => {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
@@ -378,8 +345,6 @@ impl Registry {
     /// Stop the registry and every session, and wait for them to tear down.
     pub async fn shutdown(self) {
         self.shutdown.cancel();
-        // Dropping the last sender ends the registry task, which drops every session's control
-        // sender, ending each session task.
         self.tx.closed().await;
     }
 }
@@ -390,9 +355,10 @@ async fn registry_task(
     self_tx: mpsc::Sender<RegMsg>,
     shutdown: CancellationToken,
 ) {
-    let mut sessions: HashMap<EndpointId, SessionHandle> = HashMap::new();
+    // Each live session's control sender, by peer.
+    let mut sessions: HashMap<EndpointId, mpsc::Sender<SessionMsg>> = HashMap::new();
     let ended_tx = ended_sender(&self_tx);
-    // Drop our own sender clone so the channel closes once the accept loop's `Registry` handles do.
+    // So the channel closes with the last `Registry`.
     drop(self_tx);
     loop {
         let msg = tokio::select! {
@@ -416,7 +382,8 @@ async fn registry_task(
     sessions.clear();
 }
 
-/// The registry's clone of a sender it can hand to session tasks so they announce their end.
+/// A sender session tasks announce their end on, forwarded to the registry. Not the registry's own
+/// sender, which would keep its channel open while any session lives.
 fn ended_sender(tx: &mpsc::Sender<RegMsg>) -> mpsc::Sender<EndpointId> {
     let (etx, mut erx) = mpsc::channel::<EndpointId>(16);
     let tx = tx.clone();
@@ -431,25 +398,14 @@ fn ended_sender(tx: &mpsc::Sender<RegMsg>) -> mpsc::Sender<EndpointId> {
 }
 
 async fn attach_in(
-    sessions: &mut HashMap<EndpointId, SessionHandle>,
+    sessions: &mut HashMap<EndpointId, mpsc::Sender<SessionMsg>>,
     spec: &SessionSpec,
     ended: &mpsc::Sender<EndpointId>,
     peer: EndpointId,
 ) -> Option<(SessionClient, AttachKind)> {
-    if let Some(handle) = sessions.get(&peer) {
-        let control = handle.control.clone();
-        let (reply, rx) = oneshot::channel();
-        if control
-            .send(SessionMsg::Attach {
-                control: control.clone(),
-                reply,
-            })
-            .await
-            .is_ok()
-        {
-            if let Ok((client, detached_for)) = rx.await {
-                return Some((client, AttachKind::Reattached { detached_for }));
-            }
+    if let Some(control) = sessions.get(&peer) {
+        if let Some((client, detached_for)) = attach_to(control).await {
+            return Some((client, AttachKind::Reattached { detached_for }));
         }
         // The session task is gone; drop the stale handle and fall through to create a new one.
         sessions.remove(&peer);
@@ -469,9 +425,16 @@ async fn attach_in(
         spec.ttl,
         ended.clone(),
     ));
-    sessions.insert(peer, SessionHandle { control });
-    // Attach to the session we just created.
-    let control = sessions.get(&peer)?.control.clone();
+    let (client, _) = attach_to(&control).await?;
+    sessions.insert(peer, control);
+    Some((client, AttachKind::Created))
+}
+
+/// Attach to the session `control` reaches: a client handle and how long it was detached, or `None`
+/// if its task is gone.
+async fn attach_to(
+    control: &mpsc::Sender<SessionMsg>,
+) -> Option<(SessionClient, Option<Duration>)> {
     let (reply, rx) = oneshot::channel();
     control
         .send(SessionMsg::Attach {
@@ -480,8 +443,7 @@ async fn attach_in(
         })
         .await
         .ok()?;
-    let (client, _) = rx.await.ok()?;
-    Some((client, AttachKind::Created))
+    rx.await.ok()
 }
 
 #[cfg(test)]

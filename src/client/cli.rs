@@ -1,7 +1,5 @@
-//! The `koh connect` / `koh id` command implementations.
-//!
-//! Dial a server by id and run the reconnecting client session against the real terminal. The
-//! session loop itself lives in [`crate::client::run_client`]; this just wires up the real terminal I/O.
+//! The `koh connect` command: dial the server and run [`crate::client::run_client`] on the real
+//! terminal.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -9,36 +7,29 @@ use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::SignalKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
 use crate::predict::DisplayPreference;
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, relay_addr,
-    IrohChannel,
 };
 
-/// Configuration for [`connect`] — the clap-free, library-facing form of `koh connect`'s
-/// arguments. No `Default`: `server` is required.
+/// The clap-free form of `koh connect`'s arguments.
 #[derive(Debug, Clone)]
 pub struct ConnectConfig {
     /// Server endpoint id to connect to.
     pub server: EndpointId,
-    /// Path to the client's persistent secret key (its endpoint id must be on the server's
-    /// allowlist). `None` = the platform default client key path.
+    /// The secret-key file; `None` for the default client key path.
     pub key_file: Option<PathBuf>,
-    /// Dial the server at a direct socket address (LAN / loopback; no relay or discovery).
-    /// Takes precedence over `relay_url` if both are set.
+    /// Dial this socket address directly, with no relay or discovery; wins over `relay_url`.
     pub direct: Option<SocketAddr>,
-    /// Dial the server via a self-hosted relay URL instead of n0's public relays.
+    /// Dial through a self-hosted relay instead of n0's.
     pub relay_url: Option<RelayUrl>,
-    /// Honor remote OSC-52 clipboard writes. Off by default in the CLI (`--clipboard`).
+    /// Let the server set the clipboard (OSC 52).
     pub clipboard: bool,
-    /// A shell command to run (via `sh -c`) whenever the remote bell count climbs, e.g.
-    /// `termux-notification -t "koh bell"`. Detached from the terminal, rate-limited to one spawn
-    /// per second; bells that rang before this client attached do not fire it, bells during a
-    /// reconnect do. `None` = no hook.
+    /// A shell command to run on the remote bell (see [`BellHook`]).
     pub bell_command: Option<String>,
 }
 
@@ -56,18 +47,12 @@ impl ConnectConfig {
     }
 }
 
-/// Runs a user command whenever the remote bell rings: `--on-bell` / [`ConnectConfig::bell_command`].
+/// Runs a command (`sh -c`) when the remote bell rings (`--on-bell`), at most once a second.
 ///
-/// The decision (`observe`) is pure and rate-limited so it is unit-testable; the spawn is
-/// detached — stdin/stdout/stderr on `/dev/null`, since the TUI owns the terminal — with
-/// `KOH_BELL_COUNT` and `KOH_TITLE` in the environment and every other `KOH_*` variable scrubbed
-/// (the same guard as `pty.rs`). The child is reaped on a background task and never awaited by
-/// the session loop.
-///
-/// The remote bell count is cumulative for the life of the server session, so the hook is
-/// [`prime`](Self::prime)d with the count of the first synced frame: bells that rang before you
-/// attached do not fire it. The hook outlives a reconnect (it is not re-primed), so bells that
-/// rang during an outage do.
+/// The command is detached, with its stdio on `/dev/null` (the TUI owns the terminal),
+/// `KOH_BELL_COUNT` and `KOH_TITLE` set and every other `KOH_*` variable scrubbed. The bell count
+/// is cumulative for the server session, so the first synced frame [`prime`](Self::prime)s it:
+/// bells from before the attach do not fire, bells during a reconnect do.
 #[derive(Debug, Clone)]
 pub struct BellHook {
     command: String,
@@ -93,9 +78,7 @@ impl BellHook {
         }
     }
 
-    /// Seed the hook with the bell count of the first synced frame, without spawning: bells that
-    /// rang before this client attached are not "new". A no-op once any count has been seen, so a
-    /// reconnect keeps counting from where it was and bells during the outage still fire.
+    /// Take `count` as seen, without firing, unless a count was seen already.
     pub fn prime(&mut self, count: u64) {
         if !self.primed {
             self.last_count = count;
@@ -103,9 +86,8 @@ impl BellHook {
         }
     }
 
-    /// Note the remote bell count at `now_ms`. Returns `true` when the hook should spawn now: the
-    /// count climbed since the last observation and at least [`BELL_HOOK_MIN_INTERVAL_MS`] passed
-    /// since the last spawn. A rise inside the window is coalesced (absorbed, not deferred).
+    /// Note the bell count at `now_ms`; whether to fire: it rose, and the last spawn was at least
+    /// [`BELL_HOOK_MIN_INTERVAL_MS`] ago. A rise within that is absorbed, not deferred.
     pub fn observe(&mut self, count: u64, now_ms: u64) -> bool {
         let rose = count > self.last_count;
         self.last_count = count;
@@ -132,9 +114,8 @@ impl BellHook {
         }
     }
 
-    /// Build the detached command: `sh -c CMD` with `parent_env` minus every `KOH_*` key, plus
-    /// `KOH_BELL_COUNT` / `KOH_TITLE`, and all three fds on `/dev/null`. Pure given `parent_env`,
-    /// so the scrub is testable with a synthetic environment.
+    /// The command to spawn, with `parent_env` scrubbed of `KOH_*` (given, so tests can pass their
+    /// own).
     pub(crate) fn command(
         &self,
         count: u64,
@@ -156,12 +137,10 @@ impl BellHook {
         cmd
     }
 
-    /// Spawn the command detached (never blocks the session loop; the child is reaped by a
-    /// background task).
+    /// Spawn the command, reaped on a thread of its own so it can never block the session.
     pub fn fire(&self, count: u64, title: &str) {
         match self.command(count, title, std::env::vars_os()).spawn() {
             Ok(mut child) => {
-                // Reap off the async loop; a stuck hook can't wedge the session.
                 let reaper = std::thread::Builder::new()
                     .name("koh-bell-hook".into())
                     .spawn(move || {
@@ -176,12 +155,12 @@ impl BellHook {
     }
 }
 
-/// Bind an endpoint for `config`'s dial mode and make the first, admitted connection. The returned
-/// connector redials the same target with the same identity after a link loss.
+/// Bind an endpoint for `config` and make the first connection; the connector redials the same
+/// target.
 async fn dial(
     config: &ConnectConfig,
     identity: &crate::identity::Identity,
-) -> anyhow::Result<(iroh::Endpoint, IrohConnector, IrohChannel)> {
+) -> anyhow::Result<(iroh::Endpoint, IrohConnector, iroh::endpoint::Connection)> {
     let secret = identity.secret.clone();
     let server = config.server;
     let (endpoint, target) = if let Some(addr) = config.direct {
@@ -214,28 +193,9 @@ async fn close_endpoint(endpoint: &iroh::Endpoint) {
     crate::transport_iroh::close_endpoint(endpoint).await;
 }
 
-/// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so
-/// the client unwinds cleanly and restores the terminal. Called before raw mode is entered (so the
-/// handlers are armed for the entire raw window); an install error surfaces while still cooked.
-fn spawn_signal_shutdown(shutdown: CancellationToken) -> anyhow::Result<()> {
-    let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
-    let mut intr = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
-    let mut hup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = intr.recv() => {}
-            _ = hup.recv() => {}
-        }
-        shutdown.cancel();
-    });
-    Ok(())
-}
-
-/// Warn (once, to stderr) if the locale doesn't look UTF-8. koh assumes UTF-8 end to end; on a
-/// legacy locale, output may be mojibake. We only warn — koh still runs — where mosh refuses.
+/// Warn if the locale does not look UTF-8, which koh assumes; mosh refuses to run instead.
 fn warn_if_locale_not_utf8() {
-    // `$LC_ALL` overrides `$LC_CTYPE`, which overrides `$LANG` (POSIX precedence).
+    // In POSIX's order of precedence.
     let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()));
@@ -252,82 +212,55 @@ fn warn_if_locale_not_utf8() {
     }
 }
 
-/// `koh connect <server-id>` — connect to a koh server and run the (auto-reconnecting) session.
-///
-/// Returns the remote shell's exit code if the session ended because the shell exited.
-/// Accepts a [`ConnectConfig`] or anything convertible into one.
-///
-/// Takes over the calling process's terminal (raw mode, alternate screen) and its stdin for the
-/// session's lifetime, and installs signal handlers; call it from a binary's main path.
-pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<u32>> {
-    let args: ConnectConfig = config.into();
-    // The TUI owns the terminal, so logs go to a file (set $KOH_LOG) to avoid corrupting it.
-    if let Ok(path) = std::env::var("KOH_LOG") {
-        // Create the log owner-only (0600): debug logs can carry sensitive material.
-        let created = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&path)
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::File::create(&path)
-            }
-        };
-        if let Ok(file) = created {
-            // Tighten to 0600 unconditionally via the fd: the `mode` above only applies when
-            // the file is *created*, so a pre-existing looser `$KOH_LOG` (or one a co-tenant planted)
-            // would otherwise be reused/truncated with its loose bits intact. `File::set_permissions`
-            // fchmods the open fd, so it also avoids re-resolving the path through a symlink. If we
-            // CAN'T secure it (e.g. `$KOH_LOG` points at a foreign-owned file → EPERM), don't write
-            // potentially-sensitive debug logs into a file we couldn't lock down — warn and skip.
-            let secured = {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let ok = file
-                        .set_permissions(std::fs::Permissions::from_mode(0o600))
-                        .is_ok();
-                    if !ok {
-                        eprintln!(
-                            "koh: warning: could not set $KOH_LOG to 0600; file logging disabled"
-                        );
-                    }
-                    ok
-                }
-                #[cfg(not(unix))]
-                {
-                    true
-                }
-            };
-            if secured {
-                use tracing_subscriber::layer::SubscriberExt as _;
-                use tracing_subscriber::util::SubscriberInitExt as _;
-                let _ = tracing_subscriber::registry()
-                    .with(tracing_subscriber::fmt::layer().with_writer(std::sync::Mutex::new(file)))
-                    .with(crate::log::targets(tracing::Level::DEBUG))
-                    .try_init();
-            }
-        }
+/// With `$KOH_LOG` set, log to that file at debug level (the TUI owns the terminal). It is made
+/// 0600 through its descriptor, existing or not, as debug logs can be sensitive; failing that,
+/// nothing is logged.
+fn log_to_koh_log() {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let Ok(path) = std::env::var("KOH_LOG") else {
+        return;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+    else {
+        return;
+    };
+    if file
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .is_err()
+    {
+        eprintln!("koh: warning: could not set $KOH_LOG to 0600; file logging disabled");
+        return;
     }
+    crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG);
+}
 
-    // koh assumes a UTF-8 terminal (the predictor reassembles UTF-8 graphemes; the renderer emits
-    // UTF-8). Warn — but don't refuse, unlike mosh — if the locale looks non-UTF-8, so mojibake is
-    // diagnosable rather than mysterious.
+/// `koh connect`: the remote shell's exit code if it exited. Takes the process's terminal, stdin
+/// and signal handlers for the session.
+pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
+    log_to_koh_log();
+
     warn_if_locale_not_utf8();
 
-    // Held for the whole session: the identity's lease keeps `koh key reset` from deleting the key
-    // while this client may still redial with it.
-    let identity = crate::identity::load_client(args.key_file.as_deref())?;
+    // Held for the session: its lease stops `koh key reset` while it may redial.
+    let identity =
+        crate::identity::load(&crate::identity::key_path(args.key_file.clone(), "client")?)?;
     let (endpoint, connector, channel) = dial(&args, &identity).await?;
     let shutdown = CancellationToken::new();
-    spawn_signal_shutdown(shutdown.clone())?;
+    // Armed before raw mode is entered, so an install error surfaces while the terminal is cooked.
+    crate::cancel_on_signals(
+        &shutdown,
+        &[
+            SignalKind::terminate(),
+            SignalKind::interrupt(),
+            SignalKind::hangup(),
+        ],
+    )
+    .context("installing the signal handlers")?;
     let (channels, tasks) = super::spawn_client_io()?;
     let result = async {
         let backend = DefaultBackend::new().context("acquiring the terminal")?;
@@ -350,16 +283,7 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
     .await;
     close_endpoint(&endpoint).await;
     drop(identity);
-    let cleanup = tasks.shutdown().await;
-    match (result, cleanup) {
-        (Err(primary), Err(cleanup)) => {
-            tracing::warn!(error = ?cleanup, "client I/O cleanup also failed");
-            Err(primary)
-        }
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup)) => Err(cleanup),
-        (Ok(value), Ok(())) => Ok(value),
-    }
+    super::io::first_error(result, tasks.shutdown().await)
 }
 
 #[cfg(test)]
@@ -402,10 +326,10 @@ mod tests {
             };
             let client = async {
                 let (endpoint, connector, channel) = dial(&config, &identity).await?;
-                channel.close(0, b"test reconnect");
+                channel.close(0u32.into(), b"test reconnect");
                 // The same connector `run_client` redials with after a link loss.
                 let channel = connector.connect().await?;
-                channel.close(0, b"test done");
+                channel.close(0u32.into(), b"test done");
                 endpoint.close().await;
                 Ok::<_, anyhow::Error>(())
             };

@@ -6,8 +6,7 @@ use crate::args::Cmd;
 
 // An explicit runtime instead of `#[tokio::main]`, whose expansion `allow`s `clippy::expect_used`.
 fn main() -> std::process::ExitCode {
-    // `koh serve` starts each session's program through this binary (`koh __launch …`): a hidden
-    // subcommand, handled before the command line is parsed or any thread starts.
+    // Sessions start through this binary (`koh __launch …`), before anything else runs.
     if let Some(argv) = koh::pty::launch_argv() {
         return std::process::ExitCode::from(koh::pty::launched(&argv));
     }
@@ -43,14 +42,12 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
     match cmd {
         Cmd::Serve(config) => koh::server::serve(config).await.map(|()| None),
         Cmd::Connect(config) => koh::client::connect(config).await,
-        Cmd::Id(config) => koh::idcmd::run_id(config).map(|()| None),
         Cmd::Key(config) => koh::keycmd::run(config).map(|()| None),
     }
 }
 
-/// The client's exit status for the remote shell's `code`. A POSIX exit status is 8-bit, but
-/// the wire carries a `u32`. A code that does not fit (only a broken or hostile server sends
-/// one) becomes 255: truncating it could give 0 and report a failed session as a success.
+/// The exit status for the remote `code`: 255 if it does not fit 8 bits, where truncating could
+/// turn a failure into 0.
 fn exit_status(code: u32) -> u8 {
     u8::try_from(code).unwrap_or(u8::MAX)
 }

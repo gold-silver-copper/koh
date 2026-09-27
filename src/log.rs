@@ -1,8 +1,23 @@
-//! The log filter `koh serve` and `koh connect` install: `RUST_LOG` as `target=level` directives
+//! The logging `koh serve` and `koh connect` install: `RUST_LOG` as `target=level` directives
 //! and bare levels, else koh's own targets at a default level.
 
 use tracing::Level;
 use tracing_subscriber::filter::Targets;
+use tracing_subscriber::fmt::MakeWriter;
+
+/// Install the global subscriber: formatted events to `writer`, filtered by [`targets`]. A no-op if
+/// one is installed already.
+pub fn init<W>(writer: W, default: Level)
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(writer))
+        .with(targets(default))
+        .try_init();
+}
 
 /// The filter `RUST_LOG` asks for, else `koh` at `default`.
 ///

@@ -1,11 +1,8 @@
-//! The koh server: the per-connection session loop.
+//! The koh server.
 //!
-//! Reused by the binary and by integration tests (so the full PTY⇄emulator⇄transport path can be
-//! exercised over a real iroh connection without the CLI/accept scaffolding).
-//!
-//! Sessions are **detachable**: the long-lived PTY + emulator lives in a [`session`] task and
-//! survives client disconnects; a per-connection [`run_attached`] loop drives a *fresh* protocol
-//! core against it, so a reconnecting client re-syncs to the current screen.
+//! A session's PTY and emulator live in a [`session`] task that outlives its
+//! connections; each connection runs [`run_attached`] with a fresh protocol core, so a client that
+//! reconnects gets the current screen.
 
 mod audit;
 pub mod cli;
@@ -23,7 +20,6 @@ use crate::proto::{
     FrameScreen, InputSeq, ProtoError, FRAME_WINDOW, HEARTBEAT, SESSION_ENDED, WINDOW_CELLS,
 };
 use crate::terminal::{Size, TerminalScreen};
-use crate::transport_iroh::IrohChannel;
 use iroh::endpoint::RecvStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -45,22 +41,19 @@ enum Ss3State {
     Ss3,
 }
 
-/// Rewrites the client's arrow keys to match the remote app's DECCKM mode before they reach the PTY.
-///
-/// SS3-form cursor keys (`ESC O A..D`) become CSI-form (`ESC [ A..D`) when the app is NOT in
-/// application-cursor mode, so arrows behave regardless of the local terminal's mode (a faithful
-/// port of mosh's `UserInput::input`). The `ESC` is emitted eagerly and the SS3 state carries
-/// across input chunks.
+/// Rewrites SS3 arrow keys (`ESC O A..D`) as CSI (`ESC [ A..D`) for a program not in application
+/// cursor mode, so arrows work whatever mode the local terminal is in (mosh's `UserInput::input`).
+/// The state carries across chunks.
 #[derive(Default)]
 struct CursorKeyNormalizer {
     state: Ss3State,
 }
 
 impl CursorKeyNormalizer {
-    /// Normalize `input` for an app whose application-cursor-keys mode is `app_cursor`, appending
-    /// the bytes to feed the PTY to `out`.
+    /// Append `input`, normalized for a program whose application cursor mode is `app_cursor`, to
+    /// `out`.
     fn normalize_into(&mut self, input: &[u8], app_cursor: bool, out: &mut Vec<u8>) {
-        // A capacity hint: one spare byte for a held escape; saturating cannot matter.
+        // One spare byte for a held escape.
         out.reserve(input.len().saturating_add(1));
         for &b in input {
             match self.state {
@@ -80,8 +73,7 @@ impl CursorKeyNormalizer {
                 }
                 Ss3State::Ss3 => {
                     self.state = Ss3State::Ground;
-                    // ESC was already emitted; complete the sequence, rewriting SS3 -> CSI when the
-                    // app isn't in application-cursor mode.
+                    // ESC went out already.
                     out.push(if !app_cursor && (b'A'..=b'D').contains(&b) {
                         b'['
                     } else {
@@ -94,17 +86,14 @@ impl CursorKeyNormalizer {
     }
 }
 
-/// Server-side debounce before received input is considered "echoed": how long the hosted
-/// program gets to reflect a keystroke on screen before the client's prediction is confirmed.
+/// How long the program gets to show a keystroke before it counts as echoed.
 pub(crate) const ECHO_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// How long the server waits for the client to acknowledge the final frame before closing.
 const FINAL_ACK_WAIT: Duration = Duration::from_secs(1);
 
-/// Which of one client's inputs the hosted program has had time to reflect.
-///
-/// Input sequence numbers are per connection, so each connection has its own tracker; two
-/// connections on one session never see each other's numbers.
+/// Which of one connection's inputs the program has had time to show. Per connection, as input
+/// sequence numbers are.
 #[derive(Debug)]
 pub(crate) struct EchoAck {
     /// The newest input considered reflected on screen.
@@ -138,8 +127,7 @@ impl EchoAck {
         }
     }
 
-    /// Promote every input that arrived at least the debounce before `now`. Returns whether the
-    /// echo-ack advanced.
+    /// Promote the inputs that arrived at least the debounce before `now`; whether the echo-ack moved.
     pub(crate) fn promote(&mut self, now: Instant) -> bool {
         let before = self.acked;
         while let Some(&(seq, arrived)) = self.pending.front() {
@@ -169,23 +157,17 @@ impl EchoAck {
 struct Drained {
     /// Keystrokes, DECCKM-normalized, in order.
     keys: Vec<u8>,
-    /// The last resize among the messages, clamped to `[MIN_DIM, MAX_DIM]`. Earlier ones in the same
-    /// read have no observable effect, so they are dropped rather than each costing a
-    /// `TIOCSWINSZ`, a `SIGWINCH` and an emulator reallocation.
+    /// The last resize, clamped. Earlier ones in a read would have no visible effect, only costs.
     resize: Option<Size>,
 }
 
-/// The server side of one connection: the I/O-free protocol core.
-///
-/// It decodes the client's stream, tracks the echo-ack, and decides when to send which frame
-/// against which base. The connection loop in [`run_attached`] does the I/O and holds the session
-/// lock only to take snapshots and apply input.
+/// The server side of one connection, without I/O: it decodes the client's stream, tracks the
+/// echo-ack, and decides when to send which frame against which base.
 pub(crate) struct ServerConn {
     decoder: ClientDecoder,
     cursor_keys: CursorKeyNormalizer,
     echo: EchoAck,
-    /// The newest snapshot of the session's screen. Screens are shared, not copied: every frame
-    /// resent while the screen is unchanged holds the session's own snapshot.
+    /// The session's newest screen, shared with every frame that shows it.
     screen: Arc<TerminalScreen>,
     /// `screen` differs from what was last sent, or the base must be rebuilt.
     unsent_change: bool,
@@ -245,8 +227,7 @@ impl ServerConn {
         self.decoder.push(bytes);
     }
 
-    /// Decode every complete message read so far at `now`: acks and resyncs update the frame
-    /// state, inputs register with the echo-ack and come back normalized for the PTY.
+    /// Decode the complete messages read so far, at `now`: the input and resize for the PTY.
     fn drain_client(&mut self, now: Instant, app_cursor: bool) -> Result<Drained, ProtoError> {
         let mut drained = Drained::default();
         while let Some(msg) = self.decoder.next_msg()? {
@@ -271,8 +252,8 @@ impl ServerConn {
         self.decoder.finish()
     }
 
-    /// The client applied `num`. Frames sent before it are no longer needed as bases. An ack for a
-    /// frame this connection no longer holds (or never sent) is ignored.
+    /// The client applied `num`, so older frames are no bases any more. An ack for a frame no longer
+    /// held is ignored.
     fn ack(&mut self, num: FrameNum) {
         if num <= self.acked.num {
             return;
@@ -287,8 +268,7 @@ impl ServerConn {
         self.sent = rest;
     }
 
-    /// The client does not hold the base of what it was sent; diff against the blank screen, which
-    /// it always holds, until it acknowledges a newer frame.
+    /// The client lacks a frame's base: diff against the blank screen until it acknowledges one.
     fn resync(&mut self) {
         self.acked = FrameScreen::default();
         self.unsent_change = true;
@@ -299,10 +279,9 @@ impl ServerConn {
         self.echo.promote(now);
     }
 
-    /// The frame to send at `now` on a path with round-trip time `rtt`, if one is due: the screen
-    /// or the echo-ack changed and a frame interval has passed, the newest frame went unacknowledged
-    /// for a retry interval (it is resent as a new frame, which supersedes the old one), or nothing
-    /// was sent for a heartbeat.
+    /// The frame due at `now`, if any: the screen or echo-ack changed and a frame interval passed,
+    /// the newest frame went unacknowledged for a retry interval (resent as a new frame), or a
+    /// heartbeat is due.
     fn poll_frame(&mut self, now: Instant, rtt: Option<Duration>) -> Option<Frame> {
         let changed = self.unsent_change || self.echo.echo_ack() != self.last_sent_echo;
         let since = self
@@ -347,7 +326,7 @@ impl ServerConn {
         self.acked.num
     }
 
-    /// Whether the latest snapshot has application-cursor-keys mode on, for the arrow normalizer.
+    /// Whether the program has application cursor keys on.
     fn app_cursor(&self) -> bool {
         self.screen.application_cursor()
     }
@@ -393,19 +372,16 @@ fn distinct_cells(frames: &VecDeque<FrameScreen>) -> usize {
     TerminalScreen::distinct_cells(frames.iter().map(|frame| &*frame.screen))
 }
 
-/// Drive one client connection against its session, through a [`session::SessionClient`].
+/// Drive one connection against its session: the I/O around a `ServerConn`.
 ///
-/// The async shell around the `ServerConn` core: it watches the session's screen, forwards the
-/// client's input, sends each frame on its own stream, and resets the stream of a frame a newer one
-/// supersedes. A fresh core per attach repaints the live screen onto a (re)connecting client.
-/// Dropping the `SessionClient` (on return or panic) detaches; the session keeps running.
+/// It forwards the
+/// client's input, sends each frame on its own stream and resets the streams of superseded ones.
+/// Returning (or panicking) detaches.
 pub async fn run_attached(
     conn: iroh::endpoint::Connection,
     mut session: session::SessionClient,
 ) -> anyhow::Result<SessionExit> {
-    let channel = IrohChannel::new(conn.clone());
     let mut core = ServerConn::default();
-    // Seed the core with the live screen so the first frame repaints it onto this connection.
     core.install_snapshot(session.screen(), true);
     let mut client: Option<RecvStream> = None;
     // The client gets exactly one stream for the connection, even after it finishes that one.
@@ -415,7 +391,7 @@ pub async fn run_attached(
     let result = loop {
         let now = Instant::now();
         core.promote_echo(now);
-        let rtt = channel.rtt();
+        let rtt = crate::transport_iroh::rtt(&conn);
         if let Some(frame) = core.poll_frame(now, rtt) {
             // Every older frame the client has not acknowledged is superseded.
             let acked = core.acked();
@@ -440,14 +416,13 @@ pub async fn run_attached(
         let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
         let reading = client.is_some();
         tokio::select! {
-            // NOT biased: a screen change may already be pending, which under `biased` would starve
-            // client input.
+            // Not biased: a pending screen change would starve client input.
             screen = session.next_screen() => match screen {
                 Some(screen) => {
                     let alive = screen.exit_code().is_none();
                     core.install_snapshot(screen, alive);
                 }
-                // The session task ended without a final screen (server shutting down): detach.
+                // The server is shutting down.
                 None => break Ok(SessionExit::Detached),
             },
             stream = conn.accept_uni() => match stream {
@@ -470,9 +445,7 @@ pub async fn run_attached(
                     let app_cursor = core.app_cursor();
                     match core.drain_client(Instant::now(), app_cursor) {
                         Ok(drained) => {
-                            // Await the session's bounded input queue: a full queue (a program not
-                            // reading its input) stops this read branch, so QUIC flow control
-                            // pushes the pressure back to the client.
+                            // A full input queue stops reading, so QUIC pushes back on the client.
                             if !drained.keys.is_empty() {
                                 session.send_keys(drained.keys).await;
                             }
@@ -515,8 +488,7 @@ pub async fn run_attached(
 /// The close code for a client that broke the protocol.
 const PROTOCOL_ERROR: u32 = 2;
 
-/// Read from the client's stream; `None` when there is no stream is never polled (the caller
-/// guards the branch).
+/// Read from the client's stream, if there is one.
 async fn read_client(
     stream: Option<&mut RecvStream>,
     buf: &mut [u8],
@@ -560,11 +532,8 @@ async fn send_frame(conn: iroh::endpoint::Connection, bytes: Vec<u8>, cancel: Ca
     }
 }
 
-/// Convenience: run a one-session, one-connection server for `conn`.
-///
-/// Spawns a registry that hosts a single session, started through `launcher`, attaches this
-/// connection, serves it, and tears the session down afterwards. Used by tests and callers that
-/// don't need the full accept loop.
+/// Serve `conn` one session of `command`, then tear it down: the server without its accept loop,
+/// for tests.
 pub async fn run_session(
     conn: iroh::endpoint::Connection,
     command: &[String],

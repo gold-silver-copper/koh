@@ -1,13 +1,8 @@
 //! The koh client: the session loop, abstracted over a [`ClientTerminal`].
 //!
-//! It runs either against the real terminal (the binary, via [`BackendTerminal`] over the
-//! [`KohBackend`] tty) or against a scripted mock (integration tests) — no real TTY required for the
-//! latter. The rendering path speaks only to [`KohBackend`] ([`backend`]).
-//!
-//! Terminal *input* (typed bytes) and *resize* ticks arrive as channels the caller wires up;
-//! terminal *output* and *size* go through [`ClientTerminal`]. The binary's `main` connects a
-//! [`KohBackend`] renderer + a raw-stdin reader + a `SIGWINCH` task; a test connects a capturing
-//! mock + a scripted input channel.
+//! Typed bytes and resize ticks arrive on channels; output and the window size go through
+//! [`ClientTerminal`]: the real tty ([`BackendTerminal`] over [`KohBackend`]) in the binary, a
+//! capturing mock in tests.
 
 pub mod backend;
 pub mod cli;
@@ -15,7 +10,6 @@ mod io;
 mod render;
 mod session;
 
-pub use crate::idcmd::{run_id, IdConfig};
 pub use backend::{DefaultBackend, KohBackend};
 pub use cli::{connect, BellHook, ConnectConfig};
 pub(crate) use io::spawn_client_io;
@@ -27,67 +21,44 @@ use std::time::{Duration, Instant};
 use crate::predict::{DisplayPreference, Overlay};
 use crate::proto::{decode_frame, encode_client, Frame, MAX_FRAME, SESSION_ENDED};
 use crate::terminal::{Size, TerminalScreen};
-use crate::transport_iroh::{IrohChannel, ALPN};
+use crate::transport_iroh::ALPN;
 use iroh::endpoint::{Connection, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// The window-title prefix mirrored onto the user's terminal so the OS title bar shows you're in a
-/// koh session (mosh's `[mosh] `).
+/// Prefixed to the mirrored window title, as mosh prefixes `[mosh] `.
 const KOH_TITLE_PREFIX: &str = "[koh] ";
 
 /// The escape prefix (Ctrl-^); followed by '.' it disconnects the session.
 pub(crate) const ESCAPE_PREFIX: u8 = 0x1e;
-/// The escape suffix that suspends the client to the background (`Ctrl-^` then `Ctrl-Z`).
-///
-/// Mirrors mosh. In raw mode `Ctrl-Z` is a literal byte (no SIGTSTP from the tty), so the suspend
-/// is driven through the escape machine instead.
+/// After the escape prefix, suspends the client (as mosh does): in raw mode `Ctrl-Z` is a plain
+/// byte, not SIGTSTP.
 pub(crate) const SUSPEND_KEY: u8 = 0x1a;
 
 /// How long a single reconnect dial may run before it is abandoned and retried.
 const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Reconnect backoff: `BASE << min(attempt, 4)`, capped at `MAX`. [`backoff`] is only called for
-/// `attempt > 0` (attempt 0 redials immediately), so the realized sequence is 1 → 2 → 4 → 8s.
+/// Reconnect backoff: `BASE << min(attempt, 4)`, capped at `MAX`; attempts from 1 wait 1, 2, 4, 8 s.
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(500);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(8);
-/// Minimum time a connection must stay up to count as "proven" and reset the reconnect backoff. A
-/// connection that drops sooner than this — e.g. a malicious or compromised server that completes
-/// the handshake then immediately closes — is treated like a failed dial: the attempt counter keeps
-/// climbing and the next redial backs off, so such a server can't drive a tight reconnect/repaint
-/// churn loop. A genuine mid-session drop after this dwell reconnects promptly.
+/// How long a connection must last to reset the reconnect backoff. One that drops sooner counts as
+/// a failed dial, so a server that accepts and at once closes cannot drive a tight redial loop.
 const MIN_CONNECTION_DWELL: Duration = Duration::from_secs(5);
 
-/// Wall-clock gap between two steady-loop iterations above which we assume the process was
-/// **suspended** (Android deep-sleep / screen-off freezes the process) rather than merely busy.
-///
-/// The loop polls at least every ~50ms (`TickResult::wait` is 50ms), so a gap this large
-/// can only mean the task was parked, unscheduled, for that whole span. On a phone that almost
-/// always means the QUIC connection is now stale — the NAT mapping has likely expired and the
-/// *server's* real-time idle timer has advanced — yet iroh's idle timer is driven by the **monotonic**
-/// clock, which pauses across suspend, so iroh won't notice and can hold the dead connection for up
-/// to its full ~5-minute idle timeout after wake. Detecting the freeze and reconnecting immediately
-/// (reattaching to the retained server session) turns that ~5-minute hang into a ~1–2s redial.
-///
-/// 20s is ~400× the loop cadence, so normal scheduling jitter never trips it; a sub-20s glance rides
-/// out on the existing connection (no visible reconnect). The cost of a false positive is only a
-/// brief "reconnecting…" banner and a repaint back into the same session, so we bias low.
+/// A wall-clock gap between two loop iterations (which run at least every 50 ms) this long means
+/// the process was frozen, as Android does at screen-off. The connection is then almost surely
+/// dead, but iroh's idle timer runs on the monotonic clock, which pauses too, so it would hold it
+/// for up to five minutes; reconnecting at once reattaches in a second or two. A false positive
+/// costs only a brief banner, so the threshold is low.
 const STALE_AFTER_FREEZE: Duration = Duration::from_secs(20);
 
-/// Whether a wall-clock gap between steady-loop iterations looks like a resume from a process
-/// freeze (suspend), i.e. is at least [`STALE_AFTER_FREEZE`]. Pulled out so the threshold is
-/// unit-testable without driving a whole session.
+/// Whether a wall-clock gap between loop iterations means the process was frozen.
 fn looks_like_resume_from_freeze(wall_gap: Duration) -> bool {
     wall_gap >= STALE_AFTER_FREEZE
 }
 
-/// Dials the server and awaits its admission ack, yielding a fresh [`IrohChannel`].
-///
-/// One instance is reused for the **initial** connection and for every **transparent reconnect**
-/// after the link drops (e.g. a phone screen-off long enough that the QUIC connection idle-times
-/// out). Re-dialing the same endpoint id reattaches to the detachable server session — the server
-/// keeps the shell running and full-repaints the live screen onto the fresh connection — so the
-/// user lands back exactly where they were instead of being dropped to a local shell.
+/// Dials the server and awaits its admission ack: the first connection and every reconnect, which
+/// reattaches to the same server session.
 pub struct IrohConnector {
     endpoint: Endpoint,
     target: EndpointAddr,
@@ -99,11 +70,9 @@ impl IrohConnector {
         Self { endpoint, target }
     }
 
-    /// Connect to the server and await its admission ack. A server that rejects us (our node-id is
-    /// not on its allowlist, or it's at capacity) closes the connection instead of admitting; that
-    /// surfaces as an `Err` (the binary reports it before entering raw mode), so a rejected client
-    /// fails fast rather than re-dialing forever.
-    pub async fn connect(&self) -> anyhow::Result<IrohChannel> {
+    /// Connect and await the admission ack. A server that rejects us closes the connection instead,
+    /// which is an error, so a rejected client fails fast rather than redialing forever.
+    pub async fn connect(&self) -> anyhow::Result<Connection> {
         let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
             Ok(conn) => conn,
             Err(e) if refused_our_alpn(&e) => {
@@ -118,9 +87,8 @@ impl IrohConnector {
             }
         };
         if let Err(e) = crate::transport_iroh::admission::await_admission(&conn).await {
-            // The server rejects with a specific application reason — "not authorized" / "server at
-            // session capacity" — each pointing at a different operator fix. Surface that real reason
-            // instead of a static guess. The reason is peer-controlled, so it is sanitized + capped.
+            // Surface the server's own reason ("not authorized", "at session capacity"): each
+            // points at a different fix.
             return Err(match server_close_reason(&conn) {
                 Some(reason) => anyhow::Error::new(e)
                     .context(format!("server rejected the connection: {reason}")),
@@ -128,7 +96,7 @@ impl IrohConnector {
                     .context("server did not admit the connection (is your id on its allowlist?)"),
             });
         }
-        Ok(IrohChannel::new(conn))
+        Ok(conn)
     }
 }
 
@@ -152,10 +120,8 @@ fn refused_our_alpn(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// The server's application close reason, if it rejected us with one. The reason is peer-controlled,
-/// so it is control-char-stripped and length-capped before it can reach the user's terminal.
-/// `close_reason()` is non-blocking (returns `None` if the peer didn't close with a reason), so this
-/// can't hang the error path.
+/// The server's application close reason, if any: peer-controlled, so stripped of control
+/// characters and capped before it can reach the user's terminal.
 fn server_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
     use iroh::endpoint::{ApplicationClose, ConnectionError};
     let ConnectionError::ApplicationClosed(ApplicationClose { reason, .. }) =
@@ -171,20 +137,15 @@ fn server_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-/// Reconnect backoff for a failed dial attempt (1-based `attempt`), in milliseconds.
+/// The wait before redialing after `attempt` (from 1) failures.
 fn backoff(attempt: u32) -> Duration {
     RECONNECT_BACKOFF_BASE
         .saturating_mul(1u32 << attempt.min(4))
         .min(RECONNECT_BACKOFF_MAX)
 }
 
-/// The reconnect attempt counter after a connection drops, given how long it stayed up (`dwell`).
-///
-/// A connection that lasted at least [`MIN_CONNECTION_DWELL`] proved itself, so the backoff resets
-/// to 0 (a genuine mid-session drop reconnects promptly). A shorter-lived one — e.g. a server that
-/// accepts then immediately closes — is treated like a failed dial: the counter increments
-/// (saturating) so the next redial backs off, preventing a tight reconnect/repaint churn loop.
-/// Pure so the branch logic is unit-testable without driving a real connection.
+/// The attempt counter after a connection that lasted `dwell` dropped: reset if it lasted
+/// [`MIN_CONNECTION_DWELL`], else counted as a failed dial.
 const fn next_attempt_after_drop(attempt: u32, dwell: Duration) -> u32 {
     if dwell.as_millis() >= MIN_CONNECTION_DWELL.as_millis() {
         0
@@ -193,9 +154,8 @@ const fn next_attempt_after_drop(attempt: u32, dwell: Duration) -> u32 {
     }
 }
 
-/// Scan typed bytes for the disconnect escape (`Ctrl-^` then `.`) while reconnecting, mirroring
-/// [`ClientSession`]'s prefix machine. `pending` carries the "saw a lone prefix" state across
-/// calls; returns `true` once the user has typed the full quit sequence.
+/// Whether `chunk` completes the quit escape (`Ctrl-^ .`) while reconnecting, as
+/// [`ClientSession`]'s escape machine would; `pending` carries a lone prefix across chunks.
 fn escape_quit(chunk: &[u8], pending: &mut bool) -> bool {
     for &b in chunk {
         if *pending {
@@ -220,14 +180,10 @@ fn window_state(screen: &TerminalScreen) -> WindowState<'_> {
     }
 }
 
-/// Where the client paints frames and reads the window size.
-///
-/// The real binary draws to the terminal via a [`KohBackend`] ([`BackendTerminal`]); a test
-/// captures cells/text as data.
+/// Where the client paints frames and reads the window size: the tty, or a test's capture.
 pub trait ClientTerminal {
-    /// Paint one frame. `state` is the authoritative synced screen (its window state and input
-    /// modes are what the real terminal must mirror); `overlay` is the prediction overlay;
-    /// `status` is the optional status line.
+    /// Paint `state`, the synced screen, with the predictions `overlay` and an optional status
+    /// line.
     fn render(
         &mut self,
         state: &TerminalScreen,
@@ -242,13 +198,9 @@ pub trait ClientTerminal {
     /// paints everything. Default: a no-op, for a terminal that paints everything every time.
     fn window_resized(&mut self) {}
 
-    /// Suspend the client to the background (the `Ctrl-^ Ctrl-Z` escape): restore the user's
-    /// terminal to a usable cooked state, stop the process with `SIGTSTP`, and — once the user
-    /// foregrounds it again (`SIGCONT`) — re-enter raw mode + the alternate screen so the caller can
-    /// force a repaint. Blocks for the whole suspended duration (the entire process is stopped).
-    ///
-    /// Default: a no-op, so a scripted test terminal can never actually stop the test process; only
-    /// the real [`BackendTerminal`] performs the suspend.
+    /// Suspend the client (`Ctrl-^ Ctrl-Z`): restore the user's terminal, stop the process with
+    /// SIGTSTP, and once it is foregrounded take the terminal back. Blocks while stopped. Default:
+    /// a no-op, so a test terminal never stops the test process.
     fn suspend_resume(&mut self) -> std::io::Result<()> {
         Ok(())
     }
@@ -262,29 +214,21 @@ fn own_pid() -> std::io::Result<fuxix::process::Pid> {
         .ok_or_else(|| std::io::Error::other("this process's pid is not a valid pid"))
 }
 
-/// The production [`ClientTerminal`], generic over a [`KohBackend`] (the binary's [`DefaultBackend`],
-/// or a byte-capturing one in tests).
-///
-/// Puts the backend into raw mode + the alternate screen on [`enter`](Self::enter), restored on
-/// drop. It owns the out-of-band ledger (`render::OutOfBand`) and paints the synced grid +
-/// prediction overlay by driving the backend. The mode reset that restores the user's terminal on
-/// drop and suspend lives in [`KohBackend::leave_alt_screen`].
+/// The production [`ClientTerminal`] over a [`KohBackend`]: raw mode and the alternate screen from
+/// [`enter`](Self::enter) until drop, the mirrored window state, and the painted grid.
 pub struct BackendTerminal<B: KohBackend> {
     backend: B,
-    /// Tracks the title / bell / input modes mirrored to the real terminal (see [`render::OutOfBand`]).
+    /// The title, clipboard, bell and input modes mirrored to the terminal.
     oob: render::OutOfBand,
     /// What the terminal was last painted with, so a frame paints only what changed.
     painter: render::Painter,
 }
 
 impl<B: KohBackend> BackendTerminal<B> {
-    /// Take ownership of `backend`, enter raw mode + the alternate screen, and hide the cursor.
-    /// `clipboard_enabled` gates honoring remote OSC-52 clipboard writes (default off).
+    /// Enter raw mode and the alternate screen on `backend`. `clipboard_enabled` lets the server
+    /// set the clipboard (OSC 52).
     pub fn enter(mut backend: B, clipboard_enabled: bool) -> std::io::Result<Self> {
         backend.enter_raw_mode()?;
-        // Build the struct, then enter the alternate screen via the backend — the enter/leave escape
-        // sequences live only in `KohBackend` (`enter_alt_screen` / `leave_alt_screen`).
-        // `enter_alt_screen` writes to the backend and never reads `oob`, so building first is inert.
         let mut this = Self {
             backend,
             oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string())
@@ -303,8 +247,6 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
         overlay: &Overlay<'_>,
         status: Option<&str>,
     ) -> std::io::Result<()> {
-        // Mirror the out-of-band terminal state (title/icon/clipboard/bell/modes) onto the real
-        // terminal, then paint the cell grid.
         self.oob.emit(
             &mut self.backend,
             InputModes::from(state.screen()),
@@ -323,20 +265,15 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
     }
 
     fn suspend_resume(&mut self) -> std::io::Result<()> {
-        // Restore the user's terminal (reset forwarded modes, show cursor, leave the alt screen)
-        // and return to cooked mode, so the suspended job sits at a normal shell.
         self.backend.leave_alt_screen()?;
         self.backend.leave_raw_mode()?;
         let _ = self
             .backend
             .write_bytes("\n[koh suspended — run `fg` to resume]\n".as_bytes());
         let _ = self.backend.flush();
-        // Stop ourselves. SIGTSTP halts the whole process, and the shell reports the job as
-        // "Stopped"; control returns here only once the user foregrounds it (SIGCONT).
+        // Returns once the user foregrounds the job again.
         fuxix::process::kill(own_pid()?, fuxix::process::Signal::Tstp)?;
-        // Foregrounded again: re-enter raw mode + the alternate screen and force the next frame to
-        // re-assert the title / clipboard / input modes and repaint every cell (the terminal was
-        // reset while we were away).
+        // The terminal was reset meanwhile: re-assert everything on the next frame.
         self.backend.enter_raw_mode()?;
         self.backend.enter_alt_screen()?;
         self.oob.invalidate();
@@ -347,49 +284,29 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
 
 impl<B: KohBackend> Drop for BackendTerminal<B> {
     fn drop(&mut self) {
-        // Reset forwarded modes, show the cursor, and leave the alternate screen so the user's
-        // terminal isn't left with mouse reporting on (stray click bytes at the prompt), then return
-        // to cooked mode. Both are best-effort on the teardown path.
+        // Best-effort: a mode left on (mouse reporting, say) would garble the user's shell.
         let _ = self.backend.leave_alt_screen();
         let _ = self.backend.leave_raw_mode();
     }
 }
 
-/// Run a client session, **transparently reconnecting** after the link drops.
+/// Run a client session on `initial`, redialing through `connector` and reattaching to the same
+/// server session whenever the link drops; meanwhile the last screen stays up under a banner.
 ///
-/// Drives the session against `initial` (the already-established first connection); when that
-/// connection dies — typically a phone screen-off long enough that QUIC idle-times-out — it
-/// re-dials via `connector` and reattaches to the same detachable server session instead of
-/// exiting. A fresh [`ClientSession`] is built per connection (the server uses a fresh transport
-/// per attach and full-repaints the live screen), so the user resumes exactly where they were.
-/// While reconnecting, the last screen is held under a "reconnecting…" banner and the quit escape
-/// (`Ctrl-^ .`) still works.
+/// The I/O shell around [`ClientSession`], which makes every protocol decision. `input_rx` carries
+/// typed bytes (its closing ends the session); `resize_rx` carries resize ticks, on which the size
+/// is read from `term` (`initial_size` if that fails). Cancelling `shutdown` (on a fatal signal)
+/// quits like the user, so the terminal is restored. `bell` runs on every remote bell.
 ///
-/// This is the thin I/O shell around [`ClientSession`]: it owns the `tokio::select!`, channels,
-/// sleeps, stream reads and writes, and `term.size()`/`render()`, delegating every protocol
-/// decision to the session's step methods.
-///
-/// `input_rx` carries raw typed bytes (the caller must keep its sender alive for the session;
-/// when it closes, the session ends). `resize_rx` carries resize *ticks* — each one prompts the
-/// loop to re-read the current size from `term`; keep its sender alive even if you never resize,
-/// so the loop doesn't spin on a closed channel. `initial_size` seeds the size if `term.size()` is
-/// unavailable.
-/// Returns the remote shell's exit code (`Some`) when the session ended because the shell exited,
-/// or `None` for a local quit (`Ctrl-^ .`, a closed input channel, or a cancelled `shutdown`) — so
-/// the binary can exit with the remote status.
-///
-/// `shutdown` is a [`CancellationToken`] the caller cancels on a fatal signal (SIGTERM/SIGINT/
-/// SIGHUP): the loop then returns as if the user quit, so `term` is dropped and the terminal is
-/// restored — rather than the process dying at default signal disposition with the TTY left raw.
-/// `bell`, if set, runs on every remote bell.
+/// Returns the remote shell's exit code if it exited, `None` on a local quit.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the I/O shell wires up the channel, connector, prediction policy, size, the two \
+    reason = "the I/O shell wires up the connection, connector, prediction policy, size, the two \
               input/resize channels, the terminal, the shutdown token and the bell hook — each a distinct \
               collaborator; bundling them into a struct would only move the list, not shorten it"
 )]
 pub async fn run_client<T: ClientTerminal>(
-    initial: IrohChannel,
+    initial: Connection,
     connector: IrohConnector,
     pref: DisplayPreference,
     initial_size: Size,
@@ -399,20 +316,17 @@ pub async fn run_client<T: ClientTerminal>(
     shutdown: CancellationToken,
     mut bell: Option<BellHook>,
 ) -> anyhow::Result<Option<u32>> {
-    let mut channel = initial;
-    // Persists ACROSS reconnect cycles (not reset per connection) so a server that keeps dropping us
-    // fast can't escape the backoff by completing each handshake — only a connection that proves
-    // itself (stays up past `MIN_CONNECTION_DWELL`) resets it.
+    let mut conn = initial;
+    // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
     let mut attempt: u32 = 0;
     loop {
-        // A fresh session per (re)connection mirrors the server's fresh-transport-per-attach, which
-        // full-repaints the live screen; re-seed the size from the terminal each time.
+        // A fresh session per connection: the server repaints the live screen on each attach.
         let size = term.size().unwrap_or(initial_size);
         let mut session = ClientSession::new(pref, size);
 
         let conn_started = Instant::now();
         match drive_connection(
-            &channel,
+            &conn,
             &mut session,
             &mut term,
             &mut input_rx,
@@ -423,19 +337,15 @@ pub async fn run_client<T: ClientTerminal>(
         .await?
         {
             Disposition::Quit => {
-                channel.close(0, b"client exit");
+                conn.close(0u32.into(), b"client exit");
                 return Ok(None);
             }
             Disposition::Ended(code) => {
-                channel.close(0, b"client exit");
+                conn.close(0u32.into(), b"client exit");
                 return Ok(code);
             }
             Disposition::LinkLost => {
-                channel.close(0, b"reconnecting");
-                // Did this connection prove itself? A drop after a real session resets the backoff
-                // (prompt reattach); a drop sooner than `MIN_CONNECTION_DWELL` is treated like a
-                // failed dial — bump the attempt so `reconnect` backs off before redialing, so an
-                // accept-then-instantly-close server can't spin us in a tight loop.
+                conn.close(0u32.into(), b"reconnecting");
                 let dwell = conn_started.elapsed();
                 attempt = next_attempt_after_drop(attempt, dwell);
                 match reconnect(
@@ -448,7 +358,7 @@ pub async fn run_client<T: ClientTerminal>(
                 )
                 .await
                 {
-                    ReconnectOutcome::Connected(c) => channel = c,
+                    ReconnectOutcome::Connected(c) => conn = c,
                     ReconnectOutcome::Quit => return Ok(None),
                 }
             }
@@ -466,14 +376,13 @@ enum Disposition {
     LinkLost,
 }
 
-/// Drive one connection: the steady send/render/select loop, returning a [`Disposition`] instead
-/// of breaking — so the caller can reconnect on [`Disposition::LinkLost`] rather than exiting.
+/// Drive one connection until it ends, and say how.
 ///
 /// The client's stream is written by its own task behind a bounded queue, and frames are read by
-/// their own tasks, so nothing here ever waits on the network: the keyboard, and with it the quit
-/// escape, stays live even when the server stops reading.
+/// their own tasks, so nothing here waits on the network: the keyboard, and the quit escape, stay
+/// live even when the server stops reading.
 async fn drive_connection<T: ClientTerminal>(
-    channel: &IrohChannel,
+    conn: &Connection,
     session: &mut ClientSession,
     term: &mut T,
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
@@ -481,7 +390,6 @@ async fn drive_connection<T: ClientTerminal>(
     shutdown: &CancellationToken,
     mut bell: Option<&mut BellHook>,
 ) -> anyhow::Result<Disposition> {
-    let conn = channel.connection();
     let Ok(send) = conn.open_uni().await else {
         return Ok(Disposition::LinkLost);
     };
@@ -490,20 +398,12 @@ async fn drive_connection<T: ClientTerminal>(
     let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(FRAME_QUEUE);
     let _reader = AbortOnDrop(tokio::spawn(read_frames(conn.clone(), frame_tx)));
 
-    // Wall-clock checkpoint for freeze detection. `Instant` (and iroh's idle timer) are monotonic
-    // and PAUSE across a system suspend, so they can't tell a long screen-off from a momentary
-    // stall; `SystemTime` keeps real time across suspend. A large gap between two (≤50ms-cadence)
-    // iterations therefore fingerprints a resume-from-freeze (see `STALE_AFTER_FREEZE`).
+    // Wall-clock time, which keeps running while the process is frozen (see `STALE_AFTER_FREEZE`).
     let mut last_wall = std::time::SystemTime::now();
-    // Last RTT we emitted a debug log for, so an operator with `RUST_LOG=koh=debug` can see whether a
-    // sluggish session is the link (RTT climbing) or the server — without spamming a line per tick.
-    // Only a meaningful change (>= 30 ms) is logged.
+    // Logged on a change of 30 ms or more, to tell a slow link from a slow server in debug logs.
     let mut last_logged_rtt: Option<Duration> = None;
     loop {
-        // If real time jumped far ahead of our ≤50ms polling cadence, the process was suspended
-        // (phone screen-off). The connection is almost certainly dead, so proactively drop it and
-        // reconnect — reattaching to the retained server session — instead of waiting out iroh's
-        // clock-skewed ~5-minute idle timeout. (A backwards clock step, e.g. NTP, reads as no gap.)
+        // A clock stepped backwards reads as no gap.
         let wall_now = std::time::SystemTime::now();
         let wall_gap = wall_now.duration_since(last_wall).unwrap_or(Duration::ZERO);
         last_wall = wall_now;
@@ -516,7 +416,7 @@ async fn drive_connection<T: ClientTerminal>(
         }
 
         let now = Instant::now();
-        let rtt = channel.rtt();
+        let rtt = crate::transport_iroh::rtt(conn);
         if let Some(rtt) = rtt {
             if last_logged_rtt.is_none_or(|prev| prev.abs_diff(rtt) >= Duration::from_millis(30)) {
                 tracing::debug!(rtt_ms = rtt.as_millis(), "link rtt");
@@ -531,9 +431,8 @@ async fn drive_connection<T: ClientTerminal>(
             term.render(session.state(), &session.overlay(), tick.status.as_deref())?;
             session.status_was_shown = status_now;
             session.dirty = false;
-            // Run the bell hook when the remote bell count climbs (rate-limited inside). Only once
-            // a server frame has arrived: the first paint is the blank default, and the first
-            // synced frame primes the hook so bells from before this attach don't fire.
+            // Only once synced: the first synced frame primes the hook, so bells from before this
+            // attach don't fire it.
             if let Some(hook) = bell.as_deref_mut() {
                 if session.synced() {
                     let win = session.window_state();
@@ -549,8 +448,7 @@ async fn drive_connection<T: ClientTerminal>(
         }
 
         tokio::select! {
-            // Input-priority: a queued screen update must never starve local keystrokes. The
-            // server loop is the mirror image and is deliberately NOT biased.
+            // Keystrokes first: queued screen updates must never starve them.
             biased;
 
             maybe = input_rx.recv() => {
@@ -558,14 +456,9 @@ async fn drive_connection<T: ClientTerminal>(
                     Some(chunk) => match session.on_input(Instant::now(), &chunk) {
                         InputOutcome::Quit => return Ok(Disposition::Quit),
                         InputOutcome::Suspend => {
-                            // Ctrl-^ Ctrl-Z: hand the terminal back to the shell, stop, and on
-                            // resume re-enter raw mode and force a full repaint. A no-op for the
-                            // scripted test terminal.
                             term.suspend_resume()?;
                             session.dirty = true;
-                            // The process was parked for the whole foreground-suspend (possibly
-                            // minutes); reset the freeze checkpoint so that deliberate suspend isn't
-                            // misread as a screen-off freeze and forced into a needless reconnect.
+                            // A deliberate suspend is not a freeze to reconnect after.
                             last_wall = std::time::SystemTime::now();
                         }
                         InputOutcome::Forwarded => {}
@@ -573,9 +466,6 @@ async fn drive_connection<T: ClientTerminal>(
                     None => return Ok(Disposition::Quit), // input source closed
                 }
             }
-            // Graceful shutdown: a SIGTERM/SIGINT/SIGHUP (delivered via this token) returns Quit so
-            // `run_client` unwinds and drops the terminal — restoring cooked mode + the main screen
-            // — instead of the process dying at default disposition with the TTY left in raw mode.
             () = shutdown.cancelled() => return Ok(Disposition::Quit),
             permit = writer_tx.reserve(), if session.has_outgoing() => {
                 let Ok(permit) = permit else {
@@ -602,8 +492,6 @@ async fn drive_connection<T: ClientTerminal>(
                 session.on_frame(Instant::now(), &frame);
             }
             maybe = resize_rx.recv() => {
-                // A resize tick: read the fresh size from the terminal and propagate it. A closed
-                // resize channel is fine; keep its sender alive to avoid spinning.
                 if maybe.is_some() {
                     term.window_resized();
                     if let Ok(size) = term.size() {
@@ -686,8 +574,6 @@ async fn end_session<T: ClientTerminal>(
         &Overlay::empty(),
         Some("[koh] session ended"),
     );
-    // Stay responsive to a SIGTERM/SIGINT/SIGHUP right after the shell exits, so an impatient
-    // signal restores the TTY now instead of after the dwell.
     tokio::select! {
         () = tokio::time::sleep(Duration::from_millis(400)) => {}
         () = shutdown.cancelled() => {}
@@ -698,18 +584,14 @@ async fn end_session<T: ClientTerminal>(
 /// The result of a [`reconnect`] loop.
 enum ReconnectOutcome {
     /// A fresh connection was established; resume the session on it.
-    Connected(IrohChannel),
+    Connected(Connection),
     /// The user disconnected (`Ctrl-^ .`) or input closed while reconnecting — exit.
     Quit,
 }
 
-/// Re-dial the server with capped exponential backoff after the link drops, painting a
-/// "reconnecting…" banner over the last screen and staying responsive to the quit escape.
-///
-/// Retries indefinitely (an outage may outlast many attempts, mosh-style); the user can always
-/// `Ctrl-^ .` to give up. A single dial is bounded by [`RECONNECT_CONNECT_TIMEOUT`] and is *not*
-/// cancelled by banner repaints or non-quit keystrokes — it is pinned and polled in place — so a
-/// slow dial still completes.
+/// Redial with capped exponential backoff until connected or the user quits, painting a
+/// "reconnecting…" banner over the last screen. The dial is pinned, so banner repaints and
+/// keystrokes do not restart a slow one.
 async fn reconnect<T: ClientTerminal>(
     connector: &IrohConnector,
     term: &mut T,
@@ -720,77 +602,49 @@ async fn reconnect<T: ClientTerminal>(
 ) -> ReconnectOutcome {
     let started = Instant::now();
     let mut pending_escape = false;
-    let quit_hint = " (Ctrl-^ . to quit)";
     'attempt: loop {
-        // Back off BEFORE dialing whenever we've already failed a dial or the previous connection
-        // dropped too fast (`*attempt > 0`). The caller seeds `*attempt` from the just-dropped
-        // connection's dwell, so a server that completes the handshake then immediately closes is
-        // backed off here rather than redialed instantly. On a proven-then-dropped connection
-        // `*attempt == 0`, so a normal reconnect dials at once. The wait stays responsive to the quit escape / shutdown and keeps the banner clock ticking.
-        if *attempt > 0 {
-            let wait_until = Instant::now()
-                .checked_add(backoff(*attempt))
-                .unwrap_or_else(Instant::now);
-            while Instant::now() < wait_until {
-                let banner = format!(
-                    "[koh] disconnected — reconnecting… {}s{quit_hint}",
-                    started.elapsed().as_secs()
-                );
-                let _ = term.render(last.state(), &Overlay::empty(), Some(banner.as_str()));
-                let remaining = wait_until.saturating_duration_since(Instant::now());
-                tokio::select! {
-                    biased;
-                    maybe = input_rx.recv() => match maybe {
-                        Some(chunk) => {
-                            if escape_quit(&chunk, &mut pending_escape) {
-                                return ReconnectOutcome::Quit;
-                            }
-                        }
-                        None => return ReconnectOutcome::Quit,
-                    },
-                    _ = shutdown.cancelled() => return ReconnectOutcome::Quit,
-                    _ = tokio::time::sleep(remaining.min(Duration::from_secs(1))) => {}
-                }
-            }
-        }
-        let dial = tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect());
+        // Back off before dialing once a dial failed or the last connection dropped too fast
+        // (`*attempt > 0`, which the caller seeds from the connection's dwell), so a server that
+        // completes the handshake and at once closes is not redialed in a tight loop. A proven
+        // connection's drop dials at once.
+        let wait = if *attempt > 0 {
+            backoff(*attempt)
+        } else {
+            Duration::ZERO
+        };
+        let dial = async {
+            tokio::time::sleep(wait).await;
+            tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect()).await
+        };
         tokio::pin!(dial);
         loop {
             let banner = format!(
-                "[koh] disconnected — reconnecting… {}s{quit_hint}",
+                "[koh] disconnected — reconnecting… {}s (Ctrl-^ . to quit)",
                 started.elapsed().as_secs()
             );
             let _ = term.render(last.state(), &Overlay::empty(), Some(banner.as_str()));
-
             tokio::select! {
                 biased;
-
-                maybe = input_rx.recv() => {
-                    match maybe {
-                        Some(chunk) => {
-                            if escape_quit(&chunk, &mut pending_escape) {
-                                return ReconnectOutcome::Quit;
-                            }
+                maybe = input_rx.recv() => match maybe {
+                    Some(chunk) => {
+                        if escape_quit(&chunk, &mut pending_escape) {
+                            return ReconnectOutcome::Quit;
                         }
-                        None => return ReconnectOutcome::Quit, // input source closed
                     }
-                }
-
+                    None => return ReconnectOutcome::Quit, // input source closed
+                },
+                // Honor a SIGTERM/SIGINT/SIGHUP even mid-reconnect, so the terminal is restored.
+                () = shutdown.cancelled() => return ReconnectOutcome::Quit,
                 res = &mut dial => {
                     match res {
-                        Ok(Ok(channel)) => return ReconnectOutcome::Connected(channel),
+                        Ok(Ok(conn)) => return ReconnectOutcome::Connected(conn),
                         Ok(Err(e)) => tracing::info!(reason = %e, attempt = *attempt, "reconnect dial failed"),
                         Err(_) => tracing::info!(attempt = *attempt, "reconnect dial timed out"),
                     }
-                    // Bump the attempt; the top-of-loop backoff waits before the next dial.
                     *attempt = (*attempt).saturating_add(1);
                     continue 'attempt;
                 }
-
-                // Honor a SIGTERM/SIGINT/SIGHUP even mid-reconnect, so the terminal is restored.
-                _ = shutdown.cancelled() => return ReconnectOutcome::Quit,
-
-                _ = tokio::time::sleep(Duration::from_secs(1)) => { /* tick the banner clock */ }
+                () = tokio::time::sleep(Duration::from_secs(1)) => {} // tick the banner clock
             }
         }
     }

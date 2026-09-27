@@ -15,7 +15,6 @@ use clap::{value_parser, Arg, ArgAction, ArgMatches, Command};
 use iroh::{EndpointId, RelayUrl};
 
 use koh::client::ConnectConfig;
-use koh::idcmd::IdConfig;
 use koh::keycmd::{KeyConfig, KeyOp};
 use koh::server::cli::{
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SESSIONS, DEFAULT_SCROLLBACK, DEFAULT_SESSION_TTL_SECS,
@@ -62,7 +61,6 @@ fn relay_url(value: &str) -> Result<RelayUrl, BadValue> {
 pub enum Cmd {
     Serve(ServeConfig),
     Connect(ConnectConfig),
-    Id(IdConfig),
     Key(KeyConfig),
 }
 
@@ -259,7 +257,8 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             clipboard: m.get_flag("clipboard"),
             bell_command: m.get_one::<String>("on_bell").cloned(),
         })),
-        Some(("id", m)) => Ok(Cmd::Id(IdConfig {
+        Some(("id", m)) => Ok(Cmd::Key(KeyConfig {
+            op: KeyOp::Id,
             key_file: m.get_one::<PathBuf>("key_file").cloned(),
         })),
         Some(("key", m)) => {

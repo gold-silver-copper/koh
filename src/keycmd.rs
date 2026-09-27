@@ -1,39 +1,36 @@
-//! `koh key` — inspect or reset the on-disk identity key.
+//! `koh id` and `koh key`: show or reset the on-disk identity key.
 //!
-//! The key file holds the node's secret key, protected by its permissions (0600). `info` prints the
-//! endpoint id it gives; `reset` deletes it, so the next use creates a new identity.
+//! The key file holds the node's secret key, protected by its permissions (0600). `id` prints the
+//! endpoint id it gives, creating the key if there is none; `info` also prints the key file; `reset`
+//! deletes it, so the next use creates a new identity.
 
 use std::path::PathBuf;
-
-use crate::transport_iroh::{default_key_path, format_endpoint_id};
 
 /// What [`run`] should do to the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOp {
+    /// Print the endpoint id alone (`koh id`), creating the key if there is none.
+    Id,
     /// Print the key file and its endpoint id (never the secret).
     Info,
     /// Remove an unused identity after acknowledging endpoint-ID and allowlist changes.
     Reset { confirmed: bool },
 }
 
-/// Configuration for [`run`] — the clap-free, library-facing form of `koh key`'s arguments.
+/// The clap-free form of `koh id`'s and `koh key`'s arguments.
 #[derive(Debug, Clone)]
 pub struct KeyConfig {
-    /// The operation to perform.
     pub op: KeyOp,
-    /// Which identity key to operate on. `None` = the client key path (as `koh id` uses); pass a
-    /// server key explicitly to manage it.
+    /// Which identity key to operate on. `None` = the client key path; pass a server key
+    /// explicitly to manage it.
     pub key_file: Option<PathBuf>,
 }
 
-/// Run `koh key`. Accepts a [`KeyConfig`] or anything convertible into one.
-pub fn run(config: impl Into<KeyConfig>) -> anyhow::Result<()> {
-    let args: KeyConfig = config.into();
-    let key_file = match args.key_file {
-        Some(p) => p,
-        None => default_key_path("client")?,
-    };
-    match args.op {
+/// Run `koh id` or `koh key`.
+pub fn run(config: KeyConfig) -> anyhow::Result<()> {
+    let key_file = crate::identity::key_path(config.key_file, "client")?;
+    match config.op {
+        KeyOp::Id => println!("{}", crate::identity::load(&key_file)?.endpoint_id()),
         KeyOp::Reset { confirmed } => {
             anyhow::ensure!(
                 confirmed,
@@ -56,10 +53,7 @@ pub fn run(config: impl Into<KeyConfig>) -> anyhow::Result<()> {
             );
             let identity = crate::identity::load(&key_file)?;
             println!("key file    : {}", key_file.display());
-            println!(
-                "endpoint id : {}",
-                format_endpoint_id(&identity.secret.public())
-            );
+            println!("endpoint id : {}", identity.endpoint_id());
         }
     }
     Ok(())

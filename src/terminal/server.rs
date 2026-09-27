@@ -1,7 +1,5 @@
-//! The server-side live terminal emulator: a long-lived `fux_vt::Parser` fed by the PTY, plus
-//! the title / icon / bell / clipboard it observes and the query replies it produces. The
-//! echo-ack debounce that tells the client which of its keystrokes are visible lives per
-//! connection in `server`.
+//! The server's live emulator: a `fux_vt::Parser` fed by the PTY, the title, icon, bell and
+//! clipboard it reports, and the replies to the program's queries.
 
 use crate::terminal::grid::RowCache;
 use crate::terminal::{
@@ -17,8 +15,7 @@ fn title_from(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// What the emulator reports beside the grid: fux-vt [`Event`]s (title, icon, bell, OSC 52) and
-/// the replies to terminal queries (DSR / DECXCPR / device attributes / DECRQM).
+/// What the emulator reports beside the grid: fux-vt's [`Event`]s and the replies to queries.
 #[derive(Default)]
 struct Observed {
     title: String,
@@ -26,8 +23,7 @@ struct Observed {
     /// The remote-set clipboard payload (OSC 52, base64), capped at [`MAXIMUM_CLIPBOARD_SIZE`].
     clipboard: String,
     bell_count: u64,
-    /// Bytes the emulator must send back to the application (query answers). Drained into the
-    /// PTY input by the caller — never echoed onto the synced screen.
+    /// Query answers for the program's input, never part of the screen.
     host_replies: Vec<u8>,
 }
 
@@ -40,39 +36,32 @@ impl Sink for Observed {
             Event::Title(t) => self.title = title_from(t),
             Event::IconName(n) => self.icon = title_from(n),
             Event::Bell => self.bell_count = self.bell_count.saturating_add(1),
-            // OSC 52: the app set a clipboard selection; `data` is already base64. Forward it,
-            // capped; an oversized set is ignored.
+            // `data` is base64 already.
             Event::Clipboard { data, .. } if data.len() <= MAXIMUM_CLIPBOARD_SIZE => {
                 self.clipboard = String::from_utf8_lossy(data).into_owned();
             }
-            // An oversized clipboard set is dropped. `Event` is `#[non_exhaustive]`, so the trailing
-            // `_` is required; it only covers events added by a later fux-vt, which koh ignores
-            // until it handles them here.
+            // An oversized clipboard is dropped; `_` is for events a later fux-vt adds.
             Event::Clipboard { .. } | _ => {}
         }
     }
 }
 
-/// The server's authoritative terminal. Owns the live parser and produces the [`TerminalScreen`]
-/// snapshots the connections diff and send.
+/// The server's terminal: the live parser, and the [`TerminalScreen`] snapshots it sends.
 ///
-/// The echo-ack is **not** tracked here: input sequence numbers are per connection, so each
-/// connection's `ServerConn` tracks its own and puts it on its frames.
-///
-/// fux-vt is panic-free by construction and bounded: it retains no OSC/DCS/APC/PM/SOS payload
-/// except the OSC strings it reports as events, which it caps at `fux_vt::OSC_PAYLOAD_LIMIT`.
+/// fux-vt is panic-free and bounded: it keeps no control-string payload beyond the OSC
+/// strings it reports, which it caps.
 pub struct ServerTerminal {
     parser: Parser,
     observed: Observed,
-    /// The shell's exit code once it has exited (propagated to the client on shutdown).
+    /// The program's exit code once it exited.
     exit_code: Option<u32>,
     /// The last snapshot's rows, which the next one shares where they are unchanged.
     rows: RowCache,
 }
 
 impl ServerTerminal {
-    /// An emulator of the given (clamped) size retaining `scrollback` history lines. Fails only
-    /// if fux-vt refuses the allocation (see [`MAX_SCROLLBACK`](crate::server::cli::MAX_SCROLLBACK)).
+    /// An emulator of this (clamped) size keeping `scrollback` lines. Fails only if fux-vt refuses
+    /// the allocation (see [`MAX_SCROLLBACK`](crate::server::cli::MAX_SCROLLBACK)).
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Result<Self, fux_vt::Error> {
         let Size { rows, cols } = clamp_dims(Size { rows, cols });
         let options = Options {
@@ -92,27 +81,21 @@ impl ServerTerminal {
         self.exit_code = Some(code);
     }
 
-    /// Feed a chunk of the child shell's output into the screen model. fux-vt fails only on
-    /// allocation or identity exhaustion, keeping whatever prefix it already applied; that is
-    /// logged and the next output continues from the terminal as it stands.
+    /// Feed the program's output. A failure (allocation or identity exhaustion) keeps what was
+    /// applied and is logged.
     pub fn process(&mut self, bytes: &[u8]) {
         if let Err(e) = self.parser.process_with(bytes, &mut self.observed) {
             tracing::warn!(error = %e, "terminal emulator refused shell output");
         }
     }
 
-    /// Take and clear any host-bound replies (DSR/DA/DECRQM answers) produced while processing
-    /// PTY output. The caller MUST write these back to the PTY input so the querying app sees
-    /// them; they are never part of the synced screen.
+    /// Take the replies to the program's queries, which the caller must write to its input.
     pub fn take_host_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.observed.host_replies)
     }
 
-    /// Resize the emulated screen (after applying a client resize to the PTY). The dimensions are
-    /// peer-controlled, so they are clamped to `[MIN_DIM, MAX_DIM]` here — the grid is allocated
-    /// eagerly, so an unbounded resize would OOM the (cross-tenant) server. Defense in
-    /// depth: the call site clamps too, this is the chokepoint. A refused resize (allocation
-    /// limit) keeps the previous size and is logged.
+    /// Resize to `size`, clamped: it comes from the peer. A refused resize keeps the size and is
+    /// logged.
     pub fn resize(&mut self, size: Size) {
         let Size { rows, cols } = clamp_dims(size);
         if let Err(e) = self.parser.resize(rows, cols) {
@@ -120,28 +103,26 @@ impl ServerTerminal {
         }
     }
 
-    /// The size. Test-only: production reads geometry from the snapshot, not the live emulator.
+    /// The size. Test-only.
     #[cfg(test)]
     pub fn size(&self) -> Size {
         let (rows, cols) = self.parser.screen().size();
         Size { rows, cols }
     }
 
-    /// Window title set by the shell (OSC 2), if any. Test-only — production reads it via
-    /// [`snapshot`](Self::snapshot)'s [`TerminalScreen`].
+    /// The window title. Test-only.
     #[cfg(test)]
     pub fn title(&self) -> &str {
         &self.observed.title
     }
 
-    /// Number of audible bells seen so far. Test-only (see [`title`](Self::title)).
+    /// How many bells rang. Test-only.
     #[cfg(test)]
     pub fn bell_count(&self) -> u64 {
         self.observed.bell_count
     }
 
-    /// Whether the emulated app has DECCKM (application cursor keys) on — used to normalize the
-    /// client's arrow-key bytes (SS3 vs CSI) before they reach the PTY.
+    /// Whether the program has application cursor keys (DECCKM) on.
     pub fn application_cursor(&self) -> bool {
         self.parser.screen().application_cursor()
     }

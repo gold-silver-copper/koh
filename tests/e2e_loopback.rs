@@ -13,9 +13,7 @@ use koh::client::{run_client, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::run_session;
 use koh::terminal::{Size, TerminalScreen};
-use koh::transport_iroh::{
-    bind_endpoint_local, generate_secret_key, loopback_addr, IrohChannel, ALPN,
-};
+use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 use tokio::sync::mpsc;
 
 /// A terminal backend that captures the latest authoritative screen as plain text, so a test
@@ -77,7 +75,6 @@ fn full_session_over_loopback_pty() {
             .connect(server_addr, ALPN)
             .await
             .expect("client connect over loopback");
-        let channel = IrohChannel::new(conn);
 
         let latest = Arc::new(Mutex::new(String::new()));
         let term = MockTerminal {
@@ -90,7 +87,7 @@ fn full_session_over_loopback_pty() {
 
         let client_task = tokio::spawn(async move {
             let _ = run_client(
-                channel,
+                conn,
                 connector,
                 DisplayPreference::Never, // predictions are overlay-only; assert on the real grid
                 Size::new(24, 80),

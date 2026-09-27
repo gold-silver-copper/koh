@@ -1,7 +1,5 @@
-//! Unlocked identities and the credential operations behind `koh serve`, `connect`, `id` and `key`.
-//!
-//! Loading an identity holds a shared lease (an `flock` beside the key file) for as long as any
-//! clone of it lives, so `koh key reset` refuses to delete a key a running koh is still using.
+//! Identities. A loaded one holds a shared lease (an `flock` beside the key file) while any clone
+//! lives, so `koh key reset` refuses to delete a key in use.
 use anyhow::{ensure, Context as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,13 +21,17 @@ impl Identity {
     }
 
     #[must_use]
-    pub fn endpoint_id(&self) -> String {
-        crate::transport_iroh::format_endpoint_id(&self.secret.public())
+    pub fn endpoint_id(&self) -> iroh::EndpointId {
+        self.secret.public()
     }
 }
 
-pub fn default_path(role: &str) -> anyhow::Result<PathBuf> {
-    Ok(crate::transport_iroh::default_key_path(role)?)
+/// `path`, or else the default key path for `role` (`"client"` or `"server"`).
+pub fn key_path(path: Option<PathBuf>, role: &str) -> anyhow::Result<PathBuf> {
+    match path {
+        Some(path) => Ok(path),
+        None => Ok(crate::transport_iroh::default_key_path(role)?),
+    }
 }
 
 pub fn load(path: &Path) -> anyhow::Result<Identity> {
@@ -40,13 +42,6 @@ pub fn load(path: &Path) -> anyhow::Result<Identity> {
         secret,
         _lease: Some(lease),
     })
-}
-
-pub fn load_client(path: Option<&Path>) -> anyhow::Result<Identity> {
-    match path {
-        Some(path) => load(path),
-        None => load(&default_path("client")?),
-    }
 }
 
 /// Delete an identity key. Fails while any koh process still holds its lease, and refuses unsafe

@@ -1,7 +1,4 @@
-//! The terminal koh's client paints on: the controlling tty, driven through `fuxix::terminal`.
-//!
-//! It supplies only the platform primitives — raw mode, the window size, and a byte sink. Every
-//! escape sequence comes from [`KohBackend`]'s provided methods.
+//! The controlling tty, through `fuxix::terminal`: raw mode, the window size and a byte sink.
 
 use std::fs::File;
 use std::io::{self, BufWriter, IsTerminal, Write};

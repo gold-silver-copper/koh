@@ -131,6 +131,25 @@ down instead of wedging the teardown. Both producers share
 one sender and enqueue under the session lock, so byte order is preserved (a query reply can't
 overtake the keystroke that triggered it).
 
+## Rendering
+
+The client paints the synced grid, the predictions over it and an optional status line through
+`KohBackend`, whose provided methods write the ANSI; every frame is wrapped in synchronized output
+(DEC 2026), so the terminal shows it at once. `BackendTerminal` keeps what it last painted: the
+grid (whose rows are shared with the session's screen, so keeping it copies no cells), the
+predictions and whether a status line was up. A frame then paints only the cells that differ from
+it, skipping rows it shares without reading them, moving the cursor only to reach a changed cell,
+and repainting a wide glyph whole when either half changed. So a keystroke's echo writes a few
+bytes, and the banners, which repaint every 50 ms, write their own row.
+
+A frame is painted whole, byte for byte as every frame was before, when the terminal may not show
+what was painted: the first frame, after a resume or a window resize, when the screen's size
+changes, when the status line appears or goes, and while the terminal is smaller than the screen.
+It is also painted whole, and the next one too, when a glyph does not fill exactly the cells the
+grid gives it (a predicted wide glyph over a narrow cell, say), because the terminal then lays the
+row out its own way. A property test feeds both ways of painting into a fux-vt terminal and checks
+it shows the same thing after every frame.
+
 ## The predictor
 
 The client guesses what each keystroke does to the screen and shows it immediately, then confirms

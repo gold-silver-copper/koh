@@ -85,6 +85,10 @@ error; upgrade both ends.
   screen costs only the rows that changed, including rows that scrolled.
 - Screen updates take less CPU at both ends: a frame's cell text is stored inline, so building and
   decoding a frame no longer allocates once per run of cells.
+- `koh connect` writes far less to your terminal: a frame paints only the cells that changed, not
+  the whole screen, so a keystroke's echo is a few bytes and the link-down banner no longer repaints
+  every cell every 50 ms. What the terminal shows is unchanged; the whole screen is still repainted
+  on the first frame, after a resize or `Ctrl-^ Ctrl-Z`, and when the status line appears or goes.
 
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with it) for

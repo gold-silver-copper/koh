@@ -109,6 +109,21 @@ impl<'a> Overlay<'a> {
     pub fn cell(&self, row: u16, col: u16) -> Option<&PredictedCell<'a>> {
         self.cells.get(&(row, col))
     }
+    /// An overlay of exactly `cells` and `cursor`, for tests of what draws it.
+    #[cfg(test)]
+    pub(crate) fn of(
+        cells: impl IntoIterator<Item = ((u16, u16), PredictedCell<'a>)>,
+        cursor: Option<(u16, u16)>,
+    ) -> Self {
+        Self {
+            cells: cells.into_iter().collect(),
+            cursor,
+        }
+    }
+    /// Every predicted cell, in `(row, col)` order.
+    pub fn cells(&self) -> impl Iterator<Item = ((u16, u16), &PredictedCell<'a>)> + '_ {
+        self.cells.iter().map(|(&at, cell)| (at, cell))
+    }
     /// The predicted cursor position `(row, col)`, if any.
     pub fn cursor(&self) -> Option<(u16, u16)> {
         self.cursor

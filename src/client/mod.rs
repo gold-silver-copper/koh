@@ -238,6 +238,10 @@ pub trait ClientTerminal {
     /// The current window size as `(rows, cols)`.
     fn size(&self) -> std::io::Result<(u16, u16)>;
 
+    /// The window was resized: whatever it showed may be gone, so the next [`render`](Self::render)
+    /// paints everything. Default: a no-op, for a terminal that paints everything every time.
+    fn window_resized(&mut self) {}
+
     /// Suspend the client to the background (the `Ctrl-^ Ctrl-Z` escape): restore the user's
     /// terminal to a usable cooked state, stop the process with `SIGTSTP`, and — once the user
     /// foregrounds it again (`SIGCONT`) — re-enter raw mode + the alternate screen so the caller can
@@ -269,6 +273,8 @@ pub struct BackendTerminal<B: KohBackend> {
     backend: B,
     /// Tracks the title / bell / input modes mirrored to the real terminal (see [`render::OutOfBand`]).
     oob: render::OutOfBand,
+    /// What the terminal was last painted with, so a frame paints only what changed.
+    painter: render::Painter,
 }
 
 impl<B: KohBackend> BackendTerminal<B> {
@@ -283,6 +289,7 @@ impl<B: KohBackend> BackendTerminal<B> {
             backend,
             oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string())
                 .with_clipboard(clipboard_enabled),
+            painter: render::Painter::default(),
         };
         this.backend.enter_alt_screen()?;
         Ok(this)
@@ -303,11 +310,16 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
             InputModes::from(state.screen()),
             window_state(state),
         )?;
-        render::render(&mut self.backend, state.screen(), overlay, status)
+        self.painter
+            .render(&mut self.backend, state.screen(), overlay, status)
     }
 
     fn size(&self) -> std::io::Result<(u16, u16)> {
         self.backend.size()
+    }
+
+    fn window_resized(&mut self) {
+        self.painter.invalidate();
     }
 
     fn suspend_resume(&mut self) -> std::io::Result<()> {
@@ -323,10 +335,12 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
         // "Stopped"; control returns here only once the user foregrounds it (SIGCONT).
         fuxix::process::kill(own_pid()?, fuxix::process::Signal::Tstp)?;
         // Foregrounded again: re-enter raw mode + the alternate screen and force the next frame to
-        // re-assert the title / clipboard / input modes (the terminal was reset while we were away).
+        // re-assert the title / clipboard / input modes and repaint every cell (the terminal was
+        // reset while we were away).
         self.backend.enter_raw_mode()?;
         self.backend.enter_alt_screen()?;
         self.oob.invalidate();
+        self.painter.invalidate();
         Ok(())
     }
 }
@@ -591,6 +605,7 @@ async fn drive_connection<T: ClientTerminal>(
                 // A resize tick: read the fresh size from the terminal and propagate it. A closed
                 // resize channel is fine; keep its sender alive to avoid spinning.
                 if maybe.is_some() {
+                    term.window_resized();
                     if let Ok((rows, cols)) = term.size() {
                         session.on_resize(rows, cols);
                     }
@@ -910,6 +925,7 @@ mod tests {
         let mut via_trait = BackendTerminal {
             backend: CaptureBackend::default(),
             oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string()),
+            painter: render::Painter::default(),
         };
         via_trait
             .render(&screen, &Overlay::empty(), Some("status"))
@@ -923,13 +939,14 @@ mod tests {
             window_state(&screen),
         )
         .unwrap();
-        render::render(
-            &mut direct,
-            screen.screen(),
-            &Overlay::empty(),
-            Some("status"),
-        )
-        .unwrap();
+        render::Painter::default()
+            .render(
+                &mut direct,
+                screen.screen(),
+                &Overlay::empty(),
+                Some("status"),
+            )
+            .unwrap();
         assert_eq!(via_trait.backend.bytes, direct.bytes);
         assert_ne!(via_trait.backend.bytes, b"");
     }

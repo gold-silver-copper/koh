@@ -171,7 +171,7 @@ impl Grid {
 
     /// Whether `row` is the same in `self` and `other`: the same cells and wrap flag. Rows that
     /// share their cells compare without reading them.
-    pub(super) fn row_eq(&self, other: &Self, row: u16) -> bool {
+    pub fn row_eq(&self, other: &Self, row: u16) -> bool {
         let row = usize::from(row);
         self.lines.get(row) == other.lines.get(row)
     }

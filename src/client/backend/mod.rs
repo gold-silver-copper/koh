@@ -249,11 +249,21 @@ fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool)
 /// An in-memory backend that captures every emitted byte, for unit-testing the render engine and
 /// out-of-band emission without a real TTY. All the platform primitives are inert; the escape
 /// output comes from the trait's provided methods, so tests observe exactly what a real terminal
-/// would receive.
+/// would receive. It reports `size`, 24×80 by default.
 #[cfg(test)]
-#[derive(Default)]
 pub(crate) struct CaptureBackend {
     pub bytes: Vec<u8>,
+    pub size: (u16, u16),
+}
+
+#[cfg(test)]
+impl Default for CaptureBackend {
+    fn default() -> Self {
+        Self {
+            bytes: Vec::new(),
+            size: (24, 80),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -272,7 +282,7 @@ impl KohBackend for CaptureBackend {
         Ok(())
     }
     fn size(&self) -> io::Result<(u16, u16)> {
-        Ok((24, 80))
+        Ok(self.size)
     }
 }
 

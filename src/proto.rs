@@ -109,7 +109,11 @@ const COMPRESSION_LEVEL: u8 = 6;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// Typed bytes, at most [`MAX_INPUT_BYTES`].
-    Input { seq: InputSeq, bytes: Vec<u8> },
+    Input {
+        seq: InputSeq,
+        #[serde(with = "byte_string")]
+        bytes: Vec<u8>,
+    },
     /// The client's window is now `rows × cols`.
     Resize { rows: u16, cols: u16 },
     /// The client applied `frame`; later frames may diff against it.
@@ -117,6 +121,39 @@ pub enum ClientMsg {
     /// The client got a frame whose base it does not hold; the next frame must diff against
     /// [`FrameNum::BLANK`].
     Resync,
+}
+
+/// [`ClientMsg::Input`]'s bytes as a byte string. postcard encodes that exactly as it encodes a
+/// `Vec<u8>` (a varint length, then the bytes), but decodes it with one copy rather than byte by
+/// byte.
+mod byte_string {
+    use serde::{de, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_byte_buf(Bytes)
+    }
+
+    struct Bytes;
+
+    impl de::Visitor<'_> for Bytes {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a byte string")
+        }
+
+        fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(bytes.to_vec())
+        }
+
+        fn visit_byte_buf<E: de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(bytes)
+        }
+    }
 }
 
 /// A screen update: the change from frame `base` to frame `num`.

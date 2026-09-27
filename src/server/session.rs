@@ -82,14 +82,6 @@ impl PtyHost {
         self.emu.resize(size);
     }
 
-    /// Stop the program while a pump thread may still reference it, without joining (best-effort).
-    pub fn kill(&mut self) {
-        if let Err(e) = self.pty.kill() {
-            tracing::warn!(error = %e, "pty kill during teardown failed");
-        }
-        self.pty.kill_hard();
-    }
-
     /// Final, sole-owner teardown. Blocks joining the pump threads, so run it on `spawn_blocking`.
     pub fn shutdown(self) {
         self.pty.shutdown();
@@ -316,7 +308,7 @@ async fn reap_exit_code(host: &mut PtyHost) -> Option<u32> {
     let deadline = Instant::now().checked_add(Duration::from_secs(1));
     loop {
         match host.pty.try_wait() {
-            Ok(Some(status)) => return Some(status.exit_code()),
+            Ok(Some(status)) => return Some(status.code),
             Ok(None) if deadline.is_none_or(|d| Instant::now() < d) => {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }

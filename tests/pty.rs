@@ -47,8 +47,8 @@ fn external_signal_retains_shell_style_exit_status() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = pty.try_wait().expect("wait child") {
-                assert_eq!(status.exit_code(), 137);
-                assert_eq!(status.signal(), Some(fuxix::process::Signal::Kill.raw()));
+                assert_eq!(status.code, 137);
+                assert_eq!(status.signal, Some(fuxix::process::Signal::Kill.raw()));
                 break;
             }
             assert!(
@@ -100,7 +100,7 @@ fn spawns_and_streams_output() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let status = status.expect("the one-shot child must exit and be reaped");
-        assert!(status.success() || status.exit_code() == 0);
+        assert_eq!(status.code, 0);
     });
 }
 
@@ -345,8 +345,7 @@ fn argv_tail_reaches_the_child() {
         }
         let status = status.expect("the child must exit and be reaped");
         assert_eq!(
-            status.exit_code(),
-            7,
+            status.code, 7,
             "the `-c \"exit 7\"` tail must have reached sh"
         );
     });

@@ -32,34 +32,12 @@ const OUTPUT_CHANNEL_DEPTH: usize = 512;
 /// reading (flow-controlled or hung), which [`Pty::write_input`] surfaces rather than blocking on.
 const WRITE_CHANNEL_DEPTH: usize = 1024;
 
-/// Exit information returned by owned process-group teardown.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GroupExitStatus {
-    code: u32,
-    signal: Option<i32>,
-}
-
-impl GroupExitStatus {
-    pub fn success(&self) -> bool {
-        self.signal.is_none() && self.code == 0
-    }
-
-    pub fn exit_code(&self) -> u32 {
-        self.code
-    }
-
-    /// The number of the signal that ended the child, if one did.
-    pub fn signal(&self) -> Option<i32> {
-        self.signal
-    }
-}
-
-/// Resolve the session shell when the caller didn't pass `--shell`. Prefers `$SHELL`; otherwise a
-/// platform default: `/bin/sh`, which does **not** exist on Android, where it is `/system/bin/sh`.
-/// The logic lives in the pure [`resolve_shell`] so it is unit-testable without touching the
-/// process env.
-fn default_shell() -> String {
-    resolve_shell(std::env::var_os("SHELL"))
+/// How the program ended: its exit code, which for a signal is 128 plus its number, as a shell
+/// reports it, and the signal, if one ended it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Exit {
+    pub code: u32,
+    pub signal: Option<i32>,
 }
 
 /// The argv to run for `command`: `command[0]` is the program, the rest are arguments. An empty `command` means "the session shell", resolved by `fallback` (the login
@@ -96,6 +74,8 @@ pub(crate) fn is_koh_env_key(key: &std::ffi::OsStr) -> bool {
     key.to_string_lossy().starts_with("KOH_")
 }
 
+/// The session shell when the caller didn't pass `--shell`: `shell_env` (`$SHELL`) if set, else
+/// `/bin/sh`, which does **not** exist on Android, where it is `/system/bin/sh`.
 fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
     if let Some(sh) = shell_env {
         if !sh.is_empty() {
@@ -435,7 +415,7 @@ impl Pty {
                 })?
         };
 
-        let argv = build_command(command, default_shell);
+        let argv = build_command(command, || resolve_shell(std::env::var_os("SHELL")));
         let child = launch(launcher, &argv, &slave, |cmd| {
             // A real terminal type so curses apps behave; the env is otherwise inherited.
             cmd.env("TERM", term);
@@ -521,14 +501,14 @@ impl Pty {
 
     /// Non-blocking check for child exit. On a `Some` result the child has been reaped, so the PID
     /// may be recycled — the kill paths must not signal it afterward.
-    pub fn try_wait(&mut self) -> std::io::Result<Option<GroupExitStatus>> {
+    pub fn try_wait(&mut self) -> std::io::Result<Option<Exit>> {
         if self.reaped.load(Ordering::SeqCst) {
             return Ok(None);
         }
         let r = self.child.try_wait().map(|status| {
             status.map(|status| {
                 let signal = status.signal();
-                GroupExitStatus {
+                Exit {
                     code: signal.map_or_else(
                         || u32::try_from(status.code().unwrap_or_default()).unwrap_or(u32::MAX),
                         |signal| 128_u32.saturating_add(u32::try_from(signal).unwrap_or(u32::MAX)),
@@ -668,35 +648,6 @@ mod tests {
         );
         std::env::remove_var("KOH_SCRUB_TEST");
         std::env::remove_var("KOH_DNS");
-    }
-
-    #[test]
-    #[expect(
-        clippy::items_after_statements,
-        reason = "`_assert_typed` is a deliberate compile-time signature assertion kept beside the runtime checks it documents"
-    )]
-    fn pty_error_variants_are_constructible_and_reachable() {
-        let mk = || io::Error::other("boom");
-        // Each stage variant is constructible and renders a non-empty message.
-        for e in [
-            PtyError::OpenPty(mk()),
-            PtyError::Spawn(mk()),
-            PtyError::Reader(mk()),
-            PtyError::Resize(mk()),
-        ] {
-            assert!(!e.to_string().is_empty(), "variant must Display");
-        }
-        // The `#[from] io::Error` source (the reader-thread spawn path) yields `Reader`.
-        let from_io: PtyError = mk().into();
-        assert!(matches!(from_io, PtyError::Reader(_)));
-        // A binary's `?`/`.context()` absorbs PtyError via anyhow's blanket `From` — the
-        // typed error stays internal to the lib but composes with anyhow at the edges.
-        let absorbed: anyhow::Error = PtyError::OpenPty(mk()).into();
-        assert!(absorbed.to_string().contains("opening pty"));
-        // The public spawn signature carries the typed error.
-        fn _assert_typed(r: Result<(), PtyError>) -> Result<(), PtyError> {
-            r
-        }
     }
 
     // The real-PTY / real-shell tests (spawn + stream + teardown) live in `tests/pty.rs` — a

@@ -1,0 +1,44 @@
+# TEMPORARY, removed before the PR is ready: macOS's PTY-table growth race, on fresh runners,
+# without and with the table grown first.
+name: pty probe (temporary)
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  race:
+    strategy:
+      fail-fast: false
+      matrix:
+        grow: ["", "1"]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test pty_race_probe --test pty --no-run
+      - name: race
+        env:
+          KOH_PROBE_GROW: ${{ matrix.grow }}
+        run: |
+          sysctl kern.tty.ptmx_max
+          echo "in use: $(ls /dev | grep -c '^ttys')"
+          cargo test --locked --test pty_race_probe -- --ignored --nocapture 2>&1 | grep -E "grew|threads|total"
+          echo "in use: $(ls /dev | grep -c '^ttys')"
+      - name: kernel log
+        if: always()
+        run: sudo log show --last 15m --predicate 'sender == "kernel" AND eventMessage CONTAINS "ptmx"' | tail -15
+  pty-50:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test pty --no-run
+      - name: the PTY tests, 50 times on a fresh runner
+        run: |
+          fails=0
+          for i in $(seq 50); do
+            cargo test --locked --test pty > /tmp/pty.log 2>&1 || { fails=$((fails+1)); grep -E "panicked|posix" /tmp/pty.log | head -3; }
+          done
+          echo "failures: $fails / 50"
+          test "$fails" = 0

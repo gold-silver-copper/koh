@@ -174,6 +174,18 @@ impl Grid {
         self.lines.get(row) == other.lines.get(row)
     }
 
+    /// Whether `row` shows the same cells as `other`'s `other_row`, whatever their wrap flags. Rows
+    /// that share their cells compare without reading them.
+    pub fn same_cells(&self, row: u16, other: &Self, other_row: u16) -> bool {
+        match (
+            self.lines.get(usize::from(row)),
+            other.lines.get(usize::from(other_row)),
+        ) {
+            (Some(line), Some(other)) => line.shares(other) || line.cells == other.cells,
+            _ => false,
+        }
+    }
+
     /// The rows of `base` that moved to become rows of `self`, as runs of rows that moved by the same
     /// offset: at most [`MAX_SHIFTS`], the longest, no two sharing a source or a destination row.
     ///

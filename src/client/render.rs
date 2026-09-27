@@ -1,6 +1,7 @@
 //! Painting the synced grid, the predictions over it and a status line through [`KohBackend`],
-//! cell by cell: a frame paints only the cells that changed ([`Painter`]), emits SGR only when the
-//! style changes, and is wrapped in synchronized output (DEC 2026) so it shows at once.
+//! cell by cell: a frame scrolls the terminal where rows only moved, paints only the cells that
+//! changed ([`Painter`]), emits SGR only when the style changes, and is wrapped in synchronized
+//! output (DEC 2026) so it shows at once.
 
 use std::io;
 
@@ -11,6 +12,11 @@ use fux_vt::{Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
 use unicode_width::UnicodeWidthChar as _;
 
 /// What the terminal was last painted with, so the next frame paints only what changed.
+///
+/// Rows that only moved since (the painted grid's rows, sharing their cells) are moved by scrolling
+/// the terminal, in a scroll region, rather than repainted, where that writes less. Only on a
+/// terminal exactly the screen's size: a scroll moves whole lines of the terminal, so on a wider one it would also move whatever
+/// lies right of the screen. The status line's row never scrolls.
 ///
 /// A frame is painted whole when the terminal may not show what was painted: the first frame, after
 /// [`invalidate`](Self::invalidate) (a resume, a window resize), when the screen's size changed,
@@ -66,6 +72,132 @@ impl Mark<&str> {
         }
     }
 }
+
+/// Whether `a` and `b` (each the marks on one row) draw the same glyphs in the same columns.
+fn same_marks(a: &[Mark<&str>], b: &[Mark<&str>]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| (a.col, a.glyph, a.fg, a.bg) == (b.col, b.glyph, b.fg, b.bg))
+}
+
+/// A scroll of the terminal: the rows `top..bottom` scroll by `by` (negative is up) in a scroll
+/// region, the rows scrolled out of it are gone and the rows scrolled into it blank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Scroll {
+    top: u16,
+    bottom: u16,
+    by: i16,
+}
+
+impl Scroll {
+    /// The row that shows, after the scroll, at `row` of its region: `None` for a blank one.
+    fn source(self, row: u16) -> Option<u16> {
+        let source = u16::try_from(i32::from(row).checked_sub(i32::from(self.by))?).ok()?;
+        (self.top..self.bottom).contains(&source).then_some(source)
+    }
+}
+
+/// About what a scroll costs in bytes: the reset, the region, the scroll and the region's reset.
+const SCROLL_COST: usize = 16;
+
+/// About what moving the cursor to a cell costs in bytes.
+const MOVE_COST: usize = 8;
+
+/// About the bytes painting a row writes, given which of its cells differ from what the terminal
+/// shows: a byte for each, and a cursor move to reach each run of them. Counting stops past
+/// `limit`.
+fn repaint_cost(differs: impl Iterator<Item = bool>, limit: usize) -> usize {
+    let mut cost = 0_usize;
+    let mut in_run = false;
+    for differs in differs {
+        if differs {
+            let step = if in_run {
+                1
+            } else {
+                MOVE_COST.saturating_add(1)
+            };
+            cost = cost.saturating_add(step);
+            if cost > limit {
+                break;
+            }
+        }
+        in_run = differs;
+    }
+    cost
+}
+
+/// Whether `scroll` writes less than painting its rows in place: the rows it moves need no paint,
+/// the rows it leaves blank need their glyphs, and every row in place needs what differs.
+fn worth(scroll: Scroll, screen: &Grid, painted: &Grid) -> bool {
+    let cols = screen.size().cols;
+    let mut with = SCROLL_COST;
+    for row in (scroll.top..scroll.bottom).filter(|&row| scroll.source(row).is_none()) {
+        let differs = (0..cols).map(|col| paint(screen, &[], row, col) != BLANK);
+        with = with.saturating_add(repaint_cost(differs, usize::MAX));
+    }
+    let mut without = 0_usize;
+    for row in scroll.top..scroll.bottom {
+        let (Some(now), Some(before)) = (screen.row(row), painted.row(row)) else {
+            continue;
+        };
+        let left = with.saturating_sub(without);
+        let differs = now.iter().zip(before).map(|(now, before)| now != before);
+        without = without.saturating_add(repaint_cost(differs, left));
+        if without > with {
+            return true;
+        }
+    }
+    false
+}
+
+/// The terminal scrolls that move the rows of the first `height` rows of `painted` where `screen`
+/// has them: the moves [`Grid::moves_from`] finds, the longest first, each kept only if its region
+/// overlaps none kept before, so the scrolls can run one after another, and if it paints less than
+/// painting its rows in place.
+fn scrolls(screen: &Grid, painted: &Grid, height: u16) -> Vec<Scroll> {
+    let mut moves = screen.moves_from(painted, height);
+    moves.sort_by_key(|shift| std::cmp::Reverse(shift.len));
+    let mut kept: Vec<Scroll> = Vec::new();
+    for shift in moves {
+        let (Some(source), Some(destination)) = (shift.source(), shift.destination()) else {
+            continue;
+        };
+        let scroll = Scroll {
+            top: source.start.min(destination.start),
+            bottom: source.end.max(destination.end),
+            by: shift.by.get(),
+        };
+        if kept
+            .iter()
+            .all(|other| scroll.bottom <= other.top || other.bottom <= scroll.top)
+            && worth(scroll, screen, painted)
+        {
+            kept.push(scroll);
+        }
+    }
+    kept
+}
+
+/// For each of `rows` rows, the painted row the terminal shows there once `scrolls` ran: `None`
+/// for a row they left blank.
+fn shown_after(rows: u16, scrolls: &[Scroll]) -> Vec<Option<u16>> {
+    (0..rows)
+        .map(|row| {
+            scrolls
+                .iter()
+                .find(|scroll| (scroll.top..scroll.bottom).contains(&row))
+                .map_or(Some(row), |scroll| scroll.source(row))
+        })
+        .collect()
+}
+
+/// What a row a scroll left blank shows in each cell: the default style had been set.
+const BLANK: Paint<'static> = Paint::Glyph {
+    glyph: " ",
+    style: plain(Color::Default, Color::Default),
+    span: 1,
+};
 
 /// The marks of `marks` (in `(row, col)` order) on `row`.
 fn marks_on<'m, 'a>(marks: &'m [Mark<&'a str>], row: u16) -> &'m [Mark<&'a str>] {
@@ -204,12 +336,26 @@ impl Painter {
             .map(Mark::borrowed)
             .collect();
         let status_row = status.map(|_| rows.saturating_sub(1));
-        // The rows that differ from the last frame; the status line's row is repainted with it.
+        // Rows that only moved scroll into place, on a terminal exactly the screen's size.
+        let exact = backend
+            .size()
+            .is_ok_and(|terminal| terminal == screen.size());
+        let scrolls = match &last {
+            Some(last) if exact => scrolls(screen, &last.grid, status_row.unwrap_or(rows)),
+            _ => Vec::new(),
+        };
+        let shown = shown_after(rows, &scrolls);
+        // The painted row the terminal shows at `row` once scrolled; `None` for a blank one.
+        let shown_at = |row: u16| shown.get(usize::from(row)).copied().flatten();
+        // The rows that differ from what the terminal shows; the status line's row is repainted
+        // with it.
         let changed = |row: u16| {
             last.as_ref().is_none_or(|last| {
                 Some(row) == status_row
-                    || !last.grid.row_eq(screen, row)
-                    || marks_on(&last_marks, row) != marks_on(&marks, row)
+                    || shown_at(row).is_none_or(|from| {
+                        !screen.same_cells(row, &last.grid, from)
+                            || !same_marks(marks_on(&last_marks, from), marks_on(&marks, row))
+                    })
             })
         };
         let whole = last.is_none()
@@ -236,6 +382,14 @@ impl Painter {
                 }
             }
         } else if let Some(last) = &last {
+            if !scrolls.is_empty() {
+                // Rows scrolled in take the current background: the default one.
+                backend.reset_sgr()?;
+                for scroll in &scrolls {
+                    backend.scroll_region(scroll.top, scroll.bottom, scroll.by)?;
+                }
+                backend.reset_scroll_region()?;
+            }
             // Where the cursor is after the last glyph painted, if known: past the last column the
             // terminal may be about to wrap.
             let mut cursor: Option<(u16, u16)> = None;
@@ -248,7 +402,10 @@ impl Painter {
                         col = col.saturating_add(1);
                         continue;
                     };
-                    let before = |col| paint(&last.grid, &last_marks, row, col);
+                    let before = |col| {
+                        shown_at(row)
+                            .map_or(BLANK, |from| paint(&last.grid, &last_marks, from, col))
+                    };
                     // A wide glyph is painted whole when either half of it changed.
                     let differs = repaint_row
                         || now != before(col)
@@ -957,9 +1114,160 @@ mod tests {
         );
     }
 
+    /// The text of row `row` of [`lettered`]: a letter repeated, so no two rows share a cell.
+    fn letters(row: u8) -> String {
+        char::from(b'a'.saturating_add(row)).to_string().repeat(12)
+    }
+
+    /// Six rows of letters, 6×20.
+    fn lettered() -> crate::terminal::ServerTerminal {
+        let mut emu = crate::terminal::ServerTerminal::new(6, 20, 0).unwrap();
+        for (row, line) in (0..6).zip(1..) {
+            emu.process(format!("\x1b[{line};1H{}", letters(row)).as_bytes());
+        }
+        emu
+    }
+
+    /// The bytes painting `more` after the screen `emu` shows, on a terminal of its size.
+    fn after(
+        emu: &mut crate::terminal::ServerTerminal,
+        more: &[u8],
+        status: Option<&str>,
+    ) -> String {
+        let size = Size::new(6, 20);
+        let mut painter = Painter::default();
+        let mut backend = CaptureBackend {
+            size,
+            ..CaptureBackend::default()
+        };
+        painter
+            .render(
+                &mut backend,
+                emu.snapshot().screen(),
+                &Overlay::empty(),
+                status,
+            )
+            .unwrap();
+        emu.process(more);
+        let mut backend = CaptureBackend {
+            size,
+            ..CaptureBackend::default()
+        };
+        painter
+            .render(
+                &mut backend,
+                emu.snapshot().screen(),
+                &Overlay::empty(),
+                status,
+            )
+            .unwrap();
+        String::from_utf8_lossy(&backend.bytes).into_owned()
+    }
+
+    #[test]
+    fn a_scroll_scrolls_the_terminal_and_paints_only_the_new_row() {
+        let mut emu = lettered();
+        let painted = after(&mut emu, format!("\r\n{}", letters(6)).as_bytes(), None);
+        assert_eq!(
+            painted,
+            framed(
+                &format!(
+                    "\x1b[m\x1b[1;6r\x1b[1S\x1b[r\x1b[6;1H{PLAIN}{}\x1b[m",
+                    letters(6)
+                ),
+                "6;13"
+            )
+        );
+    }
+
+    #[test]
+    fn a_scroll_region_and_inserted_lines_scroll_only_their_rows() {
+        // A region of rows 2..=5 scrolled up, a line inserted at row 3 (down to the bottom).
+        let mut emu = lettered();
+        let painted = after(&mut emu, b"\x1b[2;5r\x1b[5;1H\n", None);
+        assert!(painted.contains("\x1b[2;5r\x1b[1S\x1b[r"), "{painted:?}");
+        assert!(!painted.contains("aaa"), "no row repainted: {painted:?}");
+        let mut emu = lettered();
+        let painted = after(&mut emu, b"\x1b[3;1H\x1b[L", None);
+        assert!(painted.contains("\x1b[3;6r\x1b[1T\x1b[r"), "{painted:?}");
+        assert!(!painted.contains("aaa"), "no row repainted: {painted:?}");
+    }
+
+    #[test]
+    fn a_scroll_that_would_write_more_than_it_saves_is_not_made() {
+        // Rows that all read the same: in place, the scrolled rows already show what they would
+        // bring, so only the new row is painted, and nothing scrolls.
+        let mut emu = crate::terminal::ServerTerminal::new(6, 20, 0).unwrap();
+        for row in 1..=6 {
+            emu.process(format!("\x1b[{row};1Hthe same").as_bytes());
+        }
+        let painted = after(&mut emu, b"\r\nthe same", None);
+        assert_eq!(painted, framed("", "6;9"));
+    }
+
+    #[test]
+    fn the_status_line_row_never_scrolls() {
+        let mut emu = lettered();
+        let painted = after(
+            &mut emu,
+            format!("\r\n{}", letters(6)).as_bytes(),
+            Some("down"),
+        );
+        // Rows 1..=5 scroll; row 5 then shows what the status line hid, and the status line's row
+        // is repainted whole, under it.
+        assert!(painted.contains("\x1b[1;5r\x1b[1S\x1b[r"), "{painted:?}");
+        assert!(
+            painted.contains(&format!("\x1b[5;1H{PLAIN}{}", letters(5))),
+            "{painted:?}"
+        );
+        assert!(
+            painted.contains(&format!(
+                "\x1b[6;1H{}        \x1b[m\x1b[6;1H\x1b[7m down ",
+                letters(6)
+            )),
+            "{painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_larger_than_the_screen_is_not_scrolled() {
+        let mut emu = lettered();
+        let mut painter = Painter::default();
+        let size = Size::new(8, 30);
+        let mut backend = CaptureBackend {
+            size,
+            ..CaptureBackend::default()
+        };
+        painter
+            .render(
+                &mut backend,
+                emu.snapshot().screen(),
+                &Overlay::empty(),
+                None,
+            )
+            .unwrap();
+        emu.process(format!("\r\n{}", letters(6)).as_bytes());
+        let mut backend = CaptureBackend {
+            size,
+            ..CaptureBackend::default()
+        };
+        painter
+            .render(
+                &mut backend,
+                emu.snapshot().screen(),
+                &Overlay::empty(),
+                None,
+            )
+            .unwrap();
+        let painted = String::from_utf8_lossy(&backend.bytes);
+        assert!(!painted.contains("\x1b[r"), "{painted:?}");
+        assert!(painted.contains(&letters(6)), "{painted:?}");
+    }
+
     /// Output that exercises what a frame can change: text, wide glyphs, combining marks,
-    /// colours and attributes, cursor motion, erasing, scrolling and inserting lines, wrapping.
-    const PIECES: [&str; 22] = [
+    /// colours and attributes, cursor motion, erasing, scrolling (the whole screen and in a region,
+    /// up and down), inserting and deleting lines, wrapping.
+    const PIECES: [&str; 29] = [
         "a",
         "xyz",
         "日",
@@ -982,6 +1290,13 @@ mod tests {
         "\x1b[19G",
         "\x1b[?25l\x1b[?25h",
         "a line that wraps past the edge",
+        "\x1b[6;1H\r\n",
+        "\x1b[2;5r",
+        "\x1b[r",
+        "\x1b[5;1H\n",
+        "\x1b[2;1H\x1bM",
+        "\x1b[2T",
+        "\x1b[3;1H\x1b[L",
     ];
 
     /// Predicted glyphs, one wider than a cell.
@@ -994,13 +1309,23 @@ mod tests {
         "x",
     ];
 
-    /// The cells and cursor a terminal shows.
+    /// The cells and cursor a terminal shows. A printed space shows what an erased cell of its
+    /// attributes does, the blank a whole repaint prints and a scroll brings in, so it counts as
+    /// one.
     fn shown(terminal: &fux_vt::Parser) -> (Vec<Option<Cell>>, (u16, u16)) {
         let screen = terminal.screen();
         let (rows, cols) = screen.size();
         let cells = (0..rows)
             .flat_map(|row| (0..cols).map(move |col| (row, col)))
-            .map(|(row, col)| screen.cell(row, col).copied())
+            .map(|(row, col)| {
+                screen.cell(row, col).map(|cell| {
+                    if cell.contents() == " " {
+                        Cell::new("", false, cell.attributes()).unwrap()
+                    } else {
+                        *cell
+                    }
+                })
+            })
             .collect();
         (cells, screen.cursor_position())
     }

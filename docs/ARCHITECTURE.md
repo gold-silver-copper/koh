@@ -156,13 +156,27 @@ it, skipping rows it shares without reading them, moving the cursor only to reac
 and repainting a wide glyph whole when either half changed. So a keystroke's echo writes a few
 bytes, and the banners, which repaint every 50 ms, write their own row.
 
+Rows that only moved since the last paint (the painted grid's rows, shared with the new screen at
+other indices) are moved on the terminal, not repainted: in a scroll region (`CSI t;b r`), `CSI n S`
+scrolls up and `CSI n T` down, and `CSI r` resets the region. The painter finds these moves itself,
+by the cells the rows share with the grid it painted, because that grid may be several frames
+behind; each scroll's region must overlap no other, so they can run one after another, and a scroll
+is only made when it writes less than repainting its rows in place, by an estimate that counts a
+byte a differing cell and a cursor move a run of them (lines that differ in a few digits, or share
+most of their blanks, are cheaper repainted). SGR is reset first, so the rows a scroll brings in
+have the default background, and each row is then compared with the row the scroll put there, or
+with a blank one. It scrolls only on a terminal exactly the screen's size, since a scroll moves
+whole terminal lines, and never the status line's row.
+
 A frame is painted whole, byte for byte as every frame was before, when the terminal may not show
 what was painted: the first frame, after a resume or a window resize, when the screen's size
 changes, when the status line appears or goes, and while the terminal is smaller than the screen.
 It is also painted whole, and the next one too, when a glyph does not fill exactly the cells the
 grid gives it (a predicted wide glyph over a narrow cell, say), because the terminal then lays the
 row out its own way. A property test feeds both ways of painting into a fux-vt terminal and checks
-it shows the same thing after every frame.
+it shows the same thing after every frame, scrolling included; there a printed space and an erased
+cell of the same attributes count as the same, since a whole repaint prints spaces where a scroll
+brings in erased cells.
 
 ## The predictor
 

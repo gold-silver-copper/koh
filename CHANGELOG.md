@@ -94,6 +94,10 @@ error; upgrade both ends.
   so a line scrolling in costs that line, not the screen: `seq` at one line per frame sends under a
   third of the bytes it did at 80×24 and a sixth at 200×50, full-width lines at 200×50 a
   fourteenth. The server's diff and the client's apply take a fraction of the CPU they did.
+  `koh connect` scrolls your terminal too, in a scroll region, instead of repainting the rows that
+  moved, where that writes less: a third of the terminal output for `seq` at 80×24 and a scroll
+  region at 200×50, a thirtieth for full-width lines at 200×50, with the client's paint taking about
+  a thirtieth of the CPU there. What the terminal shows is unchanged.
 - Updated `iroh` 1.0.0 → 1.2.0 (with its QUIC backend `noq` 1.0.0 → 1.3.0), which clears Cargo's
   warning that iroh 1.0.0 contains code a future Rust will reject. Also `serde` 1.0.228 → 1.0.229
   and `miniz_oxide` 0.8 → 0.9; every other dependency's minimum version is now the release koh is

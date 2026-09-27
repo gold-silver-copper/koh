@@ -32,3 +32,22 @@ pub mod transport_iroh;
 
 #[cfg(test)]
 mod test_runtime;
+
+/// Cancel `token` on the first of `signals` that arrives, so `koh serve` drains and `koh connect`
+/// restores the terminal instead of the process dying where it stands. Fails only if a handler
+/// cannot be installed.
+pub(crate) fn cancel_on_signals(
+    token: &tokio_util::sync::CancellationToken,
+    signals: &[tokio::signal::unix::SignalKind],
+) -> std::io::Result<()> {
+    for &kind in signals {
+        let mut signal = tokio::signal::unix::signal(kind)?;
+        let token = token.clone();
+        tokio::spawn(async move {
+            if signal.recv().await.is_some() {
+                token.cancel();
+            }
+        });
+    }
+    Ok(())
+}

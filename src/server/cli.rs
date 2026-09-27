@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::SignalKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::audit::{auth_event, Outcome};
@@ -192,7 +192,11 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     // Graceful shutdown: a SIGTERM/SIGINT drains the accept loop cleanly (close the endpoint after
     // the registry stops) instead of hard-killing the process.
     let shutdown = CancellationToken::new();
-    spawn_signal_drain(shutdown.clone())?;
+    crate::cancel_on_signals(
+        &shutdown,
+        &[SignalKind::terminate(), SignalKind::interrupt()],
+    )
+    .context("installing the signal handlers")?;
     serve_endpoint(endpoint, hosting, shutdown).await
 }
 
@@ -419,22 +423,6 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
         }
         Err(e) => error!(error = %e, "session loop error"),
     }
-}
-
-/// Cancel `shutdown` on the first SIGTERM/SIGINT so the accept loop drains gracefully (rather than
-/// the process dying mid-session). Returns an error only if a handler can't be installed.
-fn spawn_signal_drain(shutdown: CancellationToken) -> anyhow::Result<()> {
-    let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
-    let mut intr = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = intr.recv() => {}
-        }
-        info!("received shutdown signal; draining");
-        shutdown.cancel();
-    });
-    Ok(())
 }
 
 #[cfg(test)]

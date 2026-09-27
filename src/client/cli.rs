@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::SignalKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
@@ -213,24 +213,6 @@ async fn close_endpoint(endpoint: &iroh::Endpoint) {
     crate::transport_iroh::close_endpoint(endpoint).await;
 }
 
-/// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so
-/// the client unwinds cleanly and restores the terminal. Called before raw mode is entered (so the
-/// handlers are armed for the entire raw window); an install error surfaces while still cooked.
-fn spawn_signal_shutdown(shutdown: CancellationToken) -> anyhow::Result<()> {
-    let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
-    let mut intr = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
-    let mut hup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = intr.recv() => {}
-            _ = hup.recv() => {}
-        }
-        shutdown.cancel();
-    });
-    Ok(())
-}
-
 /// Warn (once, to stderr) if the locale doesn't look UTF-8. koh assumes UTF-8 end to end; on a
 /// legacy locale, output may be mojibake. We only warn — koh still runs — where mosh refuses.
 fn warn_if_locale_not_utf8() {
@@ -298,7 +280,16 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
         crate::identity::load(&crate::identity::key_path(args.key_file.clone(), "client")?)?;
     let (endpoint, connector, channel) = dial(&args, &identity).await?;
     let shutdown = CancellationToken::new();
-    spawn_signal_shutdown(shutdown.clone())?;
+    // Armed before raw mode is entered, so an install error surfaces while the terminal is cooked.
+    crate::cancel_on_signals(
+        &shutdown,
+        &[
+            SignalKind::terminate(),
+            SignalKind::interrupt(),
+            SignalKind::hangup(),
+        ],
+    )
+    .context("installing the signal handlers")?;
     let (channels, tasks) = super::spawn_client_io()?;
     let result = async {
         let backend = DefaultBackend::new().context("acquiring the terminal")?;

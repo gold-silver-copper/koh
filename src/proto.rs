@@ -168,6 +168,9 @@ pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
 #[derive(Debug, Default)]
 pub struct ClientDecoder {
     buf: Vec<u8>,
+    /// How many bytes at the front of `buf` were already decoded. They are dropped in one move
+    /// once no complete message is left, not after every message: one read can hold thousands.
+    start: usize,
 }
 
 impl ClientDecoder {
@@ -176,10 +179,16 @@ impl ClientDecoder {
         self.buf.extend_from_slice(bytes);
     }
 
+    /// The bytes not decoded yet.
+    fn pending(&self) -> &[u8] {
+        self.buf.get(self.start..).unwrap_or_default()
+    }
+
     /// The next complete message, or `None` if more bytes are needed. An error means the peer
     /// broke the protocol; the caller closes the connection.
     pub fn next_msg(&mut self) -> Result<Option<ClientMsg>, ProtoError> {
-        let Some((len, rest)) = self.buf.split_first_chunk::<4>() else {
+        let Some((len, rest)) = self.pending().split_first_chunk::<4>() else {
+            self.compact();
             return Ok(None);
         };
         let len = usize::try_from(u32::from_be_bytes(*len)).unwrap_or(usize::MAX);
@@ -190,6 +199,7 @@ impl ClientDecoder {
             });
         }
         let Some(body) = rest.get(..len) else {
+            self.compact();
             return Ok(None);
         };
         let msg: ClientMsg = postcard::from_bytes(body)?;
@@ -201,15 +211,24 @@ impl ClientDecoder {
                 });
             }
         }
-        // The header and body were just read, so `4 + len` is within the buffer.
-        let consumed = len.saturating_add(4).min(self.buf.len());
-        self.buf.drain(..consumed);
+        // The header and body were just read, so `start + 4 + len` is within the buffer.
+        self.start = self
+            .start
+            .saturating_add(len)
+            .saturating_add(4)
+            .min(self.buf.len());
         Ok(Some(msg))
+    }
+
+    /// Drop the decoded bytes, moving what is left of a partial message to the front.
+    fn compact(&mut self) {
+        self.buf.drain(..self.start);
+        self.start = 0;
     }
 
     /// The stream ended: fine between messages, a protocol error inside one.
     pub fn finish(&self) -> Result<(), ProtoError> {
-        if self.buf.is_empty() {
+        if self.pending().is_empty() {
             Ok(())
         } else {
             Err(ProtoError::Truncated)
@@ -304,6 +323,36 @@ mod tests {
         }
         decoder.finish().unwrap();
         assert_eq!(out, msgs);
+    }
+
+    #[test]
+    fn a_read_of_many_tiny_messages_decodes_them_all_and_leaves_the_buffer_empty() {
+        let resize = encode_client(&ClientMsg::Resize { rows: 1, cols: 2 }).unwrap();
+        let count = (16 * 1024_usize).div_euclid(resize.len());
+        let mut decoder = ClientDecoder::default();
+        decoder.push(&resize.repeat(count));
+        assert!(decoder.next_msg().unwrap().is_some());
+        assert_eq!(
+            decoder.buf.len(),
+            resize.len() * count,
+            "decoding a message does not move the rest of the read"
+        );
+        let mut decoded = 1;
+        while let Some(msg) = decoder.next_msg().unwrap() {
+            assert_eq!(msg, ClientMsg::Resize { rows: 1, cols: 2 });
+            decoded += 1;
+        }
+        assert_eq!(decoded, count);
+        assert!(decoder.buf.is_empty(), "{} bytes left", decoder.buf.len());
+        decoder.finish().unwrap();
+        // A partial message is kept, at the front, for the next read.
+        decoder.push(&resize[..3]);
+        assert!(decoder.next_msg().unwrap().is_none());
+        decoder.push(&resize[3..]);
+        assert_eq!(
+            decoder.next_msg().unwrap(),
+            Some(ClientMsg::Resize { rows: 1, cols: 2 })
+        );
     }
 
     #[test]

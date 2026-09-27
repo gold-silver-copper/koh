@@ -77,6 +77,8 @@ error; upgrade both ends.
 - Production code is now panic-free under `forbid`, not only `deny`. The SSP transport keeps its
   sent and received state lists in a structurally non-empty type, and the `koh` binary builds its
   Tokio runtime explicitly.
+- `koh serve` takes far less CPU to read a burst of small client messages, such as a flood of
+  resizes: it no longer moves the rest of a read after each message it decodes.
 
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with it) for

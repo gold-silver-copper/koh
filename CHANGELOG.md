@@ -89,6 +89,10 @@ error; upgrade both ends.
   the whole screen, so a keystroke's echo is a few bytes and the link-down banner no longer repaints
   every cell every 50 ms. What the terminal shows is unchanged; the whole screen is still repainted
   on the first frame, after a resize or `Ctrl-^ Ctrl-Z`, and when the status line appears or goes.
+- Updated `iroh` 1.0.0 → 1.2.0 (with its QUIC backend `noq` 1.0.0 → 1.3.0), which clears Cargo's
+  warning that iroh 1.0.0 contains code a future Rust will reject. Also `serde` 1.0.228 → 1.0.229
+  and `miniz_oxide` 0.8 → 0.9; every other dependency's minimum version is now the release koh is
+  tested against (for example `tokio` 1.53.1, `fux-vt` 0.1.3).
 
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with it) for

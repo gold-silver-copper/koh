@@ -23,7 +23,6 @@ use crate::proto::{
     FrameScreen, InputSeq, ProtoError, FRAME_WINDOW, HEARTBEAT, SESSION_ENDED, WINDOW_CELLS,
 };
 use crate::terminal::{Size, TerminalScreen};
-use crate::transport_iroh::IrohChannel;
 use iroh::endpoint::RecvStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -403,7 +402,6 @@ pub async fn run_attached(
     conn: iroh::endpoint::Connection,
     mut session: session::SessionClient,
 ) -> anyhow::Result<SessionExit> {
-    let channel = IrohChannel::new(conn.clone());
     let mut core = ServerConn::default();
     // Seed the core with the live screen so the first frame repaints it onto this connection.
     core.install_snapshot(session.screen(), true);
@@ -415,7 +413,7 @@ pub async fn run_attached(
     let result = loop {
         let now = Instant::now();
         core.promote_echo(now);
-        let rtt = channel.rtt();
+        let rtt = crate::transport_iroh::rtt(&conn);
         if let Some(frame) = core.poll_frame(now, rtt) {
             // Every older frame the client has not acknowledged is superseded.
             let acked = core.acked();

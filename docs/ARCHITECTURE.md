@@ -30,7 +30,7 @@ src/
 ├── proto.rs         the koh/3 wire protocol: client messages, screen frames, caps, pacing
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
 ├── predict.rs       local-echo prediction engine (overlays, epochs)
-├── transport_iroh/  iroh endpoint setup, the identity key file, connection handle, admission
+├── transport_iroh/  iroh endpoint setup, the identity key file, path RTT, admission
 ├── pty.rs           PTYs over fuxix, the `__launch` launcher sessions start through, reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
 ├── client/          the connection loop + ClientSession core + predictor + render + `connect`

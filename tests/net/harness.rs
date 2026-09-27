@@ -165,7 +165,7 @@ impl Client {
         let id = endpoint.id();
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server));
         let channel = connector.connect().await?;
-        let first = channel.connection().clone();
+        let first = channel.clone();
         let size = Arc::new(Mutex::new(Size::new(24, 80)));
         let (painted_tx, painted) = watch::channel(Painted {
             text: String::new(),

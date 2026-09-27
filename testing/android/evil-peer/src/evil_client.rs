@@ -34,7 +34,7 @@ use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE, MAX_INP
 use koh::terminal::Size;
 use koh::transport_iroh::{
     admission, bind_endpoint_local, direct_addr, generate_secret_key, load_or_create_secret_key,
-    parse_endpoint_id, IrohChannel, ALPN,
+    parse_endpoint_id, ALPN,
 };
 use iroh::endpoint::{Connection, SendStream};
 
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     eprintln!("evil-client: attack '{attack}' done");
-    let _ = IrohChannel::new(conn);
+    drop(conn);
     drop(ep);
     Ok(())
 }

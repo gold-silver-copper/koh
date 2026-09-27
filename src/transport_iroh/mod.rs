@@ -1,8 +1,7 @@
 //! # koh-transport-iroh
 //!
 //! The iroh glue: endpoint setup, a persistent node identity, dial-by-endpoint-id, and a
-//! thin [`IrohChannel`] over a `Connection` that gives the connection loops its streams and the
-//! path RTT. Everything QUIC-shaped (encryption, key exchange, NAT traversal, relay fallback,
+//! connection's path RTT. Everything QUIC-shaped (encryption, key exchange, NAT traversal, relay fallback,
 //! roaming/migration, loss recovery, RTT measurement) is iroh's job; this module just exposes
 //! the few primitives the protocol above it ([`crate::proto`]) needs.
 
@@ -499,40 +498,15 @@ pub fn parse_relay_url(s: &str) -> Result<RelayUrl, SetupError> {
         .map_err(|e| SetupError::Other(anyhow::anyhow!("bad relay url: {e}")))
 }
 
-/// One iroh [`Connection`], as the connection loops use it: its streams, its path RTT, closing.
-///
-/// The loops take it concretely, not behind a trait: koh has one transport, and its protocol
-/// logic already lives in the I/O-free cores the tests drive directly.
-#[derive(Clone)]
-pub struct IrohChannel {
-    conn: Connection,
-}
-
-impl IrohChannel {
-    pub fn new(conn: Connection) -> Self {
-        Self { conn }
-    }
-
-    /// The connection, for its streams.
-    pub const fn connection(&self) -> &Connection {
-        &self.conn
-    }
-
-    /// The smoothed round-trip time of the selected path, or `None` before any path exists.
-    pub fn rtt(&self) -> Option<Duration> {
-        let paths = self.conn.paths();
-        paths
-            .iter()
-            .find(iroh::endpoint::Path::is_selected)
-            .or_else(|| paths.iter().next())
-            .map(|p| p.rtt())
-            .or_else(|| self.conn.rtt(PathId::ZERO))
-    }
-
-    /// Immediately close the connection with an application code + reason.
-    pub fn close(&self, code: u32, reason: &[u8]) {
-        self.conn.close(VarInt::from_u32(code), reason);
-    }
+/// The smoothed round-trip time of `conn`'s selected path, or `None` before any path exists.
+pub fn rtt(conn: &Connection) -> Option<Duration> {
+    let paths = conn.paths();
+    paths
+        .iter()
+        .find(iroh::endpoint::Path::is_selected)
+        .or_else(|| paths.iter().next())
+        .map(|p| p.rtt())
+        .or_else(|| conn.rtt(PathId::ZERO))
 }
 
 #[cfg(test)]
@@ -907,7 +881,7 @@ mod tests {
             let echoed = recv.read_to_end(64).await.expect("read the echo");
             assert_eq!(echoed, b"ping-over-real-iroh");
 
-            IrohChannel::new(conn).close(0, b"done");
+            conn.close(0u32.into(), b"done");
             let _ = srv.await;
         });
     }

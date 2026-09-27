@@ -16,7 +16,6 @@ use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohCo
 use crate::predict::DisplayPreference;
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, relay_addr,
-    IrohChannel,
 };
 
 /// Configuration for [`connect`] — the clap-free, library-facing form of `koh connect`'s
@@ -181,7 +180,7 @@ impl BellHook {
 async fn dial(
     config: &ConnectConfig,
     identity: &crate::identity::Identity,
-) -> anyhow::Result<(iroh::Endpoint, IrohConnector, IrohChannel)> {
+) -> anyhow::Result<(iroh::Endpoint, IrohConnector, iroh::endpoint::Connection)> {
     let secret = identity.secret.clone();
     let server = config.server;
     let (endpoint, target) = if let Some(addr) = config.direct {
@@ -374,10 +373,10 @@ mod tests {
             };
             let client = async {
                 let (endpoint, connector, channel) = dial(&config, &identity).await?;
-                channel.close(0, b"test reconnect");
+                channel.close(0u32.into(), b"test reconnect");
                 // The same connector `run_client` redials with after a link loss.
                 let channel = connector.connect().await?;
-                channel.close(0, b"test done");
+                channel.close(0u32.into(), b"test done");
                 endpoint.close().await;
                 Ok::<_, anyhow::Error>(())
             };

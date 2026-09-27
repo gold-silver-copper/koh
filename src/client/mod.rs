@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use crate::predict::{DisplayPreference, Overlay};
 use crate::proto::{decode_frame, encode_client, Frame, MAX_FRAME, SESSION_ENDED};
 use crate::terminal::{Size, TerminalScreen};
-use crate::transport_iroh::{IrohChannel, ALPN};
+use crate::transport_iroh::ALPN;
 use iroh::endpoint::{Connection, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
@@ -80,7 +80,7 @@ fn looks_like_resume_from_freeze(wall_gap: Duration) -> bool {
     wall_gap >= STALE_AFTER_FREEZE
 }
 
-/// Dials the server and awaits its admission ack, yielding a fresh [`IrohChannel`].
+/// Dials the server and awaits its admission ack, yielding a fresh connection.
 ///
 /// One instance is reused for the **initial** connection and for every **transparent reconnect**
 /// after the link drops (e.g. a phone screen-off long enough that the QUIC connection idle-times
@@ -102,7 +102,7 @@ impl IrohConnector {
     /// not on its allowlist, or it's at capacity) closes the connection instead of admitting; that
     /// surfaces as an `Err` (the binary reports it before entering raw mode), so a rejected client
     /// fails fast rather than re-dialing forever.
-    pub async fn connect(&self) -> anyhow::Result<IrohChannel> {
+    pub async fn connect(&self) -> anyhow::Result<Connection> {
         let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
             Ok(conn) => conn,
             Err(e) if refused_our_alpn(&e) => {
@@ -127,7 +127,7 @@ impl IrohConnector {
                     .context("server did not admit the connection (is your id on its allowlist?)"),
             });
         }
-        Ok(IrohChannel::new(conn))
+        Ok(conn)
     }
 }
 
@@ -383,12 +383,12 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
 /// `bell`, if set, runs on every remote bell.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the I/O shell wires up the channel, connector, prediction policy, size, the two \
+    reason = "the I/O shell wires up the connection, connector, prediction policy, size, the two \
               input/resize channels, the terminal, the shutdown token and the bell hook — each a distinct \
               collaborator; bundling them into a struct would only move the list, not shorten it"
 )]
 pub async fn run_client<T: ClientTerminal>(
-    initial: IrohChannel,
+    initial: Connection,
     connector: IrohConnector,
     pref: DisplayPreference,
     initial_size: Size,
@@ -398,7 +398,7 @@ pub async fn run_client<T: ClientTerminal>(
     shutdown: CancellationToken,
     mut bell: Option<BellHook>,
 ) -> anyhow::Result<Option<u32>> {
-    let mut channel = initial;
+    let mut conn = initial;
     // Persists ACROSS reconnect cycles (not reset per connection) so a server that keeps dropping us
     // fast can't escape the backoff by completing each handshake — only a connection that proves
     // itself (stays up past `MIN_CONNECTION_DWELL`) resets it.
@@ -411,7 +411,7 @@ pub async fn run_client<T: ClientTerminal>(
 
         let conn_started = Instant::now();
         match drive_connection(
-            &channel,
+            &conn,
             &mut session,
             &mut term,
             &mut input_rx,
@@ -422,15 +422,15 @@ pub async fn run_client<T: ClientTerminal>(
         .await?
         {
             Disposition::Quit => {
-                channel.close(0, b"client exit");
+                conn.close(0u32.into(), b"client exit");
                 return Ok(None);
             }
             Disposition::Ended(code) => {
-                channel.close(0, b"client exit");
+                conn.close(0u32.into(), b"client exit");
                 return Ok(code);
             }
             Disposition::LinkLost => {
-                channel.close(0, b"reconnecting");
+                conn.close(0u32.into(), b"reconnecting");
                 // Did this connection prove itself? A drop after a real session resets the backoff
                 // (prompt reattach); a drop sooner than `MIN_CONNECTION_DWELL` is treated like a
                 // failed dial — bump the attempt so `reconnect` backs off before redialing, so an
@@ -447,7 +447,7 @@ pub async fn run_client<T: ClientTerminal>(
                 )
                 .await
                 {
-                    ReconnectOutcome::Connected(c) => channel = c,
+                    ReconnectOutcome::Connected(c) => conn = c,
                     ReconnectOutcome::Quit => return Ok(None),
                 }
             }
@@ -472,7 +472,7 @@ enum Disposition {
 /// their own tasks, so nothing here ever waits on the network: the keyboard, and with it the quit
 /// escape, stays live even when the server stops reading.
 async fn drive_connection<T: ClientTerminal>(
-    channel: &IrohChannel,
+    conn: &Connection,
     session: &mut ClientSession,
     term: &mut T,
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
@@ -480,7 +480,6 @@ async fn drive_connection<T: ClientTerminal>(
     shutdown: &CancellationToken,
     mut bell: Option<&mut BellHook>,
 ) -> anyhow::Result<Disposition> {
-    let conn = channel.connection();
     let Ok(send) = conn.open_uni().await else {
         return Ok(Disposition::LinkLost);
     };
@@ -515,7 +514,7 @@ async fn drive_connection<T: ClientTerminal>(
         }
 
         let now = Instant::now();
-        let rtt = channel.rtt();
+        let rtt = crate::transport_iroh::rtt(conn);
         if let Some(rtt) = rtt {
             if last_logged_rtt.is_none_or(|prev| prev.abs_diff(rtt) >= Duration::from_millis(30)) {
                 tracing::debug!(rtt_ms = rtt.as_millis(), "link rtt");
@@ -697,7 +696,7 @@ async fn end_session<T: ClientTerminal>(
 /// The result of a [`reconnect`] loop.
 enum ReconnectOutcome {
     /// A fresh connection was established; resume the session on it.
-    Connected(IrohChannel),
+    Connected(Connection),
     /// The user disconnected (`Ctrl-^ .`) or input closed while reconnecting — exit.
     Quit,
 }

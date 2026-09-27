@@ -54,15 +54,23 @@ impl ClientIoTasks {
         .await
         .context("joining stdin producer task")
         .and_then(|result| result);
-        match (resize_result, input_result) {
-            (Err(primary), Err(cleanup)) => {
-                tracing::warn!(error = ?cleanup, "stdin producer cleanup also failed");
-                Err(primary)
-            }
-            (Err(primary), Ok(())) => Err(primary),
-            (Ok(()), Err(cleanup)) => Err(cleanup),
-            (Ok(()), Ok(())) => Ok(()),
+        first_error(resize_result, input_result)
+    }
+}
+
+/// `result`, or `cleanup`'s error if only the cleanup failed. A cleanup error behind a failed
+/// `result` is logged rather than lost.
+pub(super) fn first_error<T>(
+    result: anyhow::Result<T>,
+    cleanup: anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    match (result, cleanup) {
+        (Ok(value), cleanup) => cleanup.map(|()| value),
+        (Err(primary), Err(cleanup)) => {
+            tracing::warn!(error = ?cleanup, "cleanup also failed");
+            Err(primary)
         }
+        (Err(primary), Ok(())) => Err(primary),
     }
 }
 

@@ -312,16 +312,7 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     .await;
     close_endpoint(&endpoint).await;
     drop(identity);
-    let cleanup = tasks.shutdown().await;
-    match (result, cleanup) {
-        (Err(primary), Err(cleanup)) => {
-            tracing::warn!(error = ?cleanup, "client I/O cleanup also failed");
-            Err(primary)
-        }
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup)) => Err(cleanup),
-        (Ok(value), Ok(())) => Ok(value),
-    }
+    super::io::first_error(result, tasks.shutdown().await)
 }
 
 #[cfg(test)]

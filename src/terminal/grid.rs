@@ -126,9 +126,10 @@ impl Grid {
                         wrapped: false,
                     };
                 };
-                // fux-vt gives a row a new version with any change to it, so a row at the version
-                // it was cached at holds the same cells without comparing them. A row with a new
-                // version may still be unchanged (rewritten the same), so it is compared.
+                // fux-vt gives a row a new version with each edit that changes it, and with no
+                // other, so a row at the version it was cached at holds the same cells without
+                // comparing them. A row with a new version may still hold the same cells (erased,
+                // then written back), so it is compared.
                 let cells = match cache.get(&live.id) {
                     Some((version, cells))
                         if cells.len() == live.cells.len()

@@ -15,8 +15,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::time::Duration;
 
+use fuxix::poll::{Events, PollFd};
 use fuxix::process::{Pid, Signal};
+use fuxix::Errno;
 use tokio::sync::mpsc;
 
 /// Size of each output chunk read from the PTY master.
@@ -260,6 +264,56 @@ fn become_program(argv: &[OsString]) -> io::Error {
     io::Error::other(format!("starting {}: {error}", program.to_string_lossy()))
 }
 
+/// How long the writer waits for the terminal to take more input before it looks at `stopping`
+/// again. Only reached while a write cannot proceed, so it costs nothing in an interactive session.
+const WRITE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Write all of `bytes` to `fd`, waiting for the terminal to take them, unless `stopping` is set or
+/// the terminal is gone; whether all of it was written.
+///
+/// The master is non-blocking, so the wait is a `poll` the flag is checked around: a program that
+/// stops reading its input cannot wedge this thread, as a blocking write to a full terminal input
+/// queue does — the kernel does not wake that write even once the program is dead.
+fn write_while_running(fd: &OwnedFd, bytes: &[u8], stopping: &AtomicBool) -> bool {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if stopping.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut waiting = [PollFd::new(fd, Events::OUT)];
+        match fuxix::poll::poll(&mut waiting, Some(WRITE_POLL_INTERVAL)) {
+            Ok(_) => {}
+            Err(errno) if errno == Errno::INTR => continue,
+            Err(errno) => {
+                tracing::debug!(error = %errno, "pty writer stopping");
+                return false;
+            }
+        }
+        let ready = waiting.first().map_or(Events::ERR, PollFd::revents);
+        if ready.intersects(Events::ERR | Events::HUP | Events::NVAL) {
+            return false; // the terminal is gone
+        }
+        if !ready.intersects(Events::OUT) {
+            continue; // the timeout passed: look at `stopping` again
+        }
+        match fuxix::io::write(fd, rest) {
+            Ok(0) => return false,
+            // `write` never reports more than it was given, so `get(n..)` is always `Some`; the
+            // `else` is a panic-free fallback that can't actually run.
+            Ok(n) => match rest.get(n..) {
+                Some(remaining) => rest = remaining,
+                None => return false,
+            },
+            Err(errno) if errno == Errno::AGAIN || errno == Errno::INTR => {}
+            Err(errno) => {
+                tracing::debug!(error = %errno, "pty writer stopping");
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// A running shell behind a PTY.
 ///
 /// Construct with [`Pty::spawn`], which also returns the receiver of the child's output.
@@ -283,6 +337,9 @@ pub struct Pty {
     /// join them rather than leaking detached threads. `None` only after `shutdown` takes them.
     reader_handle: Option<std::thread::JoinHandle<()>>,
     writer_handle: Option<std::thread::JoinHandle<()>>,
+    /// Set while the session is being torn down: the writer thread gives up whatever the program
+    /// left unread, so a join never waits on a write that can no longer complete.
+    stopping: Arc<AtomicBool>,
 }
 
 impl Pty {
@@ -310,8 +367,15 @@ impl Pty {
         // queued output and the next master read reports EOF: a quick command's entire output was
         // lost about 3 times in 1000 under load. With the reader already blocked in `read`, every
         // byte is consumed as it is written.
-        let mut reader = File::from(master.try_clone()?);
-        let mut writer = File::from(master.try_clone()?);
+        let reader = master.try_clone()?;
+        let writer = master.try_clone()?;
+        // Both pumps wait in `poll` and never in a read or a write: a clone shares the master's
+        // file description, so this one flag covers both. A blocking write to a terminal whose
+        // input queue is full is not woken when the program that stopped reading it dies, which
+        // wedged the writer thread (and so a session's teardown) for good.
+        fuxix::io::set_nonblocking(&master, true)
+            .map_err(|e| PtyError::OpenPty(io::Error::from(e)))?;
+        let stopping = Arc::new(AtomicBool::new(false));
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_DEPTH);
         let reader_handle = std::thread::Builder::new()
@@ -319,9 +383,18 @@ impl Pty {
             .spawn(move || {
                 let mut buf = [0u8; READ_CHUNK];
                 loop {
-                    match reader.read(&mut buf) {
+                    let mut waiting = [PollFd::new(&reader, Events::IN)];
+                    match fuxix::poll::poll(&mut waiting, None) {
+                        Ok(_) => {}
+                        Err(errno) if errno == Errno::INTR => continue,
+                        Err(errno) => {
+                            tracing::debug!(error = %errno, "pty reader stopping");
+                            break;
+                        }
+                    }
+                    match fuxix::io::read(&reader, &mut buf) {
                         Ok(0) => break, // EOF: the slave closed (macOS)
-                        // `Read::read` guarantees `n <= buf.len()`, so `get(..n)` is always
+                        // `read` never reports more than `buf.len()` bytes, so `get(..n)` is always
                         // `Some`; the `else` is a panic-free fallback that can't actually run.
                         Ok(n) => {
                             let Some(chunk) = buf.get(..n) else { break };
@@ -329,9 +402,10 @@ impl Pty {
                                 break; // receiver dropped: session over
                             }
                         }
+                        Err(errno) if errno == Errno::AGAIN || errno == Errno::INTR => {}
                         // Linux reports the slave closing as EIO.
-                        Err(e) => {
-                            tracing::debug!(error = %e, "pty reader stopping");
+                        Err(errno) => {
+                            tracing::debug!(error = %errno, "pty reader stopping");
                             break;
                         }
                     }
@@ -344,23 +418,22 @@ impl Pty {
         // before the EOT that EOFs the child. The thread exits as soon as the last sender (held in
         // `Pty`) drops.
         let (writer_tx, writer_rx) = sync_channel::<Vec<u8>>(WRITE_CHANNEL_DEPTH);
-        let writer_handle = std::thread::Builder::new()
-            .name("koh-pty-writer".into())
-            .spawn(move || {
-                while let Ok(chunk) = writer_rx.recv() {
-                    if writer
-                        .write_all(&chunk)
-                        .and_then(|()| writer.flush())
-                        .is_err()
-                    {
-                        break; // master closed / child gone
+        let writer_handle = {
+            let stopping = Arc::clone(&stopping);
+            std::thread::Builder::new()
+                .name("koh-pty-writer".into())
+                .spawn(move || {
+                    while let Ok(chunk) = writer_rx.recv() {
+                        if !write_while_running(&writer, &chunk, &stopping) {
+                            break; // master closed, child gone, or teardown
+                        }
                     }
-                }
-                // A newline then EOT: a terminal in canonical mode takes EOT as end of input only
-                // at the start of a line. Ctrl-D is VEOF unless the program changed it, and the
-                // child is signalled on drop regardless.
-                let _ = writer.write_all(b"\n\x04");
-            })?;
+                    // A newline then EOT: a terminal in canonical mode takes EOT as end of input
+                    // only at the start of a line. Ctrl-D is VEOF unless the program changed it,
+                    // and the child is signalled on drop regardless.
+                    write_while_running(&writer, b"\n\x04", &stopping);
+                })?
+        };
 
         let argv = build_command(command, default_shell);
         let child = launch(launcher, &argv, &slave, |cmd| {
@@ -383,6 +456,7 @@ impl Pty {
                 reaped: AtomicBool::new(false),
                 reader_handle: Some(reader_handle),
                 writer_handle: Some(writer_handle),
+                stopping,
             },
             rx,
         ))
@@ -398,6 +472,9 @@ impl Pty {
         // is the breadcrumb for that (otherwise impossible-looking) stall. Skip the kill entirely
         // once the child is reaped: it is already dead (reader saw EOF) and its PID may be recycled.
         // The `drop(self)` below still runs `Drop`, which is likewise reaped-gated.
+        // Before the kill, so the writer stops as soon as it next looks: what the program has not
+        // read by now it never will.
+        self.stopping.store(true, Ordering::SeqCst);
         if !self.reaped.load(Ordering::SeqCst) {
             if let Err(e) = self.kill() {
                 tracing::warn!(error = %e, "pty kill on shutdown failed; reader join may stall");
@@ -510,6 +587,7 @@ impl Drop for Pty {
         //
         // Skip signaling once the child is reaped: a reaped child is already dead and its
         // PID may have been recycled, so SIGHUP/SIGKILL here could hit an unrelated process.
+        self.stopping.store(true, Ordering::SeqCst);
         if self.reaped.load(Ordering::SeqCst) {
             return;
         }

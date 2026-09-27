@@ -51,11 +51,11 @@ try=1
 while [ "$try" -le 3 ]; do
   OUT="$(to 60 adb $ADB_SERIAL shell "${DNS:+KOH_DNS=$DNS }$KENV $DEVICE_BIN connect $SID --key-file /data/local/tmp/koh-relay-cli.key" 2>&1 || true)"
   sleep 2
-  printf '%s\n' "$(cat_dev "$SRVLOG")" | grep -qE 'client authorized|started a new session' && { established=1; break; }
+  [ "$(attach_count "$(cat_dev "$SRVLOG")" "$RELAY_CLI_ID")" -ge 1 ] && { established=1; break; }
   try=$((try + 1))
 done
 SRV="$(cat_dev "$SRVLOG")"
-printf '%s\n' "$OUT" | grep -iE 'connecting|connected|ndk-context|error' | sed 's/^/    connect| /' | head -3
+printf '%s\n' "$OUT" | grep -iE 'koh:|ndk-context|error' | sed 's/^/    connect| /' | head -3
 
 # The HARD gate is the DNS-fix regression: an ndk-context panic on the real resolution path.
 if printf '%s\n' "$OUT$SRV" | grep -q 'ndk-context'; then

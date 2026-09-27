@@ -46,7 +46,8 @@ while [ "$w" -lt 15 ]; do
   w=$((w + 1)); sleep 1
 done
 [ -n "$CPID" ] || { bad "client never attached"; rm -f "$CLILOG"; finish "stress-client-wake-reconnect"; }
-wait_file_contains "$SRV_LOG" "started a new session" 8 || true
+# A running client may still be dialing: freeze it only once the server has attached its session.
+wait_attached "$KEY" 12 || { bad "client never attached"; rm -f "$CLILOG"; finish "stress-client-wake-reconnect"; }
 echo "    client attached (server=$SPID, client=$CPID)"
 
 # Freeze the client past the 20s detector threshold (still well under the 300s idle timeout, so

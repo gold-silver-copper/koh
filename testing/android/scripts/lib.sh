@@ -134,8 +134,28 @@ kill_remote_koh() {
   adb $ADB_SERIAL shell "pkill -f $DEVICE_BIN" >/dev/null 2>&1 || true
 }
 
+# --- running a test from an orchestrator ----------------------------------------------------------
+# run_test <script>: run one test, showing its output as it goes. Sets TEST_RC (its exit status) and
+# TEST_SKIPPED (1 if it printed a SKIP line): a skip exits 0, and must not be counted as a pass.
+run_test() {
+  _log="$(mktemp)"; _rcf="$(mktemp)"
+  { _r=0; sh "$1" || _r=$?; echo "$_r" > "$_rcf"; } 2>&1 | tee "$_log"
+  TEST_RC="$(cat "$_rcf")"
+  TEST_SKIPPED=0
+  if grep -q '^ *SKIP:' "$_log"; then TEST_SKIPPED=1; fi
+  rm -f "$_log" "$_rcf"
+}
+
 # --- assertions ------------------------------------------------------------------------------------
 contains()     { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+# koh's client prints nothing once it connects, so a connection is proven by the server's log: the
+# line recording that the client's session was started or reattached, which follows its admission.
+SESSION_ATTACHED='started a new session|reattaching to this peer'
+# How many connections of <client-id> the server attached, in the server log text $1.
+attach_count() { printf '%s\n' "$1" | grep -F "$2" | grep -cE "$SESSION_ATTACHED" || true; }
+# A client that gets through connect and admission fails next without a terminal (`adb shell`
+# without -t): that error in its output shows it was admitted.
+PAST_ADMISSION="acquiring the terminal"
 # A 64-hex endpoint id appears anywhere in $1.
 has_endpoint_id() { printf '%s' "$1" | grep -qE '[0-9a-f]{64}'; }
 # Fail (return 1) if either crash signature is present in $1.

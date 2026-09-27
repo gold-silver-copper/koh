@@ -23,7 +23,7 @@
 //!
 //! `empty-frags`, `partial-frags` and `bad-version` are accepted as aliases of `garbage` /
 //! `bad-alpn`, the nearest koh/3 attacks: koh/3 has no fragments and the ALPN is the version. The
-//! Android scripts still call them by those names.
+//! Android scripts call `bad-version`; the fragment names are kept for older invocations.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

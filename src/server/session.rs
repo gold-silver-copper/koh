@@ -26,6 +26,12 @@ pub(crate) const REAP_INTERVAL: Duration = Duration::from_secs(5);
 /// How much input may wait for a session's PTY before a connection must stop reading its stream.
 const INPUT_QUEUE: usize = 256;
 
+/// Most output chunks taken into one snapshot beyond the one that woke the session. A snapshot is a
+/// whole screen, a million cells at the largest size a client may ask for, so one per 8 KiB read
+/// had a chatty program allocate (and the allocator hold on to) gigabytes a second. Bounded, so a
+/// program that never stops writing cannot starve input and resizes.
+const OUTPUT_CHUNKS_PER_SNAPSHOT: usize = 64;
+
 /// The hosted program: a PTY-spawned process behind a `fux-vt` emulator. Owned by one session task.
 pub struct PtyHost {
     pub emu: ServerTerminal,
@@ -169,6 +175,19 @@ struct SessionHandle {
     control: mpsc::Sender<SessionMsg>,
 }
 
+/// Up to `limit` items `rx` already holds, without waiting. An end of the channel is left for the
+/// next `recv` to report.
+fn drain_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize) -> Vec<T> {
+    let mut ready = Vec::new();
+    while ready.len() < limit {
+        match rx.try_recv() {
+            Ok(item) => ready.push(item),
+            Err(_) => break,
+        }
+    }
+    ready
+}
+
 /// Run one session: own the PTY host, drain its output into the emulator, publish each screen,
 /// apply attached connections' input, and end when the shell exits or the detach TTL expires.
 async fn session_task(
@@ -205,6 +224,9 @@ async fn session_task(
             chunk = pty_rx.recv(), if !exited => {
                 if let Some(chunk) = chunk {
                     host.emu.process(&chunk);
+                    for more in drain_ready(&mut pty_rx, OUTPUT_CHUNKS_PER_SNAPSHOT) {
+                        host.emu.process(&more);
+                    }
                     let replies = host.emu.take_host_replies();
                     if !replies.is_empty() {
                         // Query answers (DSR/DA/DECRQM) are host I/O, not screen content.
@@ -462,4 +484,27 @@ async fn attach_in(
         .ok()?;
     let (client, _) = rx.await.ok()?;
     Some((client, AttachKind::Created))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drain_ready, OUTPUT_CHUNKS_PER_SNAPSHOT};
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn a_burst_of_output_is_taken_in_bounded_batches_and_the_end_is_left_for_recv() {
+        let (tx, mut rx) = mpsc::channel::<usize>(512);
+        for n in 0..100 {
+            tx.try_send(n).unwrap();
+        }
+        let first = drain_ready(&mut rx, OUTPUT_CHUNKS_PER_SNAPSHOT);
+        assert_eq!(first, (0..OUTPUT_CHUNKS_PER_SNAPSHOT).collect::<Vec<_>>());
+        drop(tx);
+        let rest = drain_ready(&mut rx, OUTPUT_CHUNKS_PER_SNAPSHOT);
+        assert_eq!(rest, (OUTPUT_CHUNKS_PER_SNAPSHOT..100).collect::<Vec<_>>());
+        // The channel's end is not swallowed: the session loop's `recv` still sees it and reaps
+        // the program.
+        assert!(drain_ready(&mut rx, OUTPUT_CHUNKS_PER_SNAPSHOT).is_empty());
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
+    }
 }

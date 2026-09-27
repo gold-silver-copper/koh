@@ -7,7 +7,7 @@
 #   B) admission-stall attack: an admitted-but-stalling client must be timed out by the server's
 #      bounded admission step, and the server must survive.
 #   C) malicious SERVER (admission direction): a real koh client must REFUSE a server that sends a
-#      bad admission byte or never admits it (never reach "connected.") — fail-closed on-device.
+#      bad admission byte or never admits it (exit with that refusal) — fail-closed on-device.
 #
 # Every malicious peer must be on the server's --allow list to reach the data plane (koh has no
 # accept-any mode), so the harness pre-registers their keys. Self-SKIPs cleanly if the evil-peer
@@ -24,7 +24,7 @@ RSS_LIMIT="${KOH_EVIL_RSS_LIMIT_KB:-262144}" # 256 MiB ceiling across the whole 
 echo "Stress: malicious-peer harness — crafted client + admission attacks (level=$STRESS_LEVEL)"
 
 # The evil client must be allowlisted to reach the data plane; it loads its (persistent, allowlisted)
-# identity from $EVIL_KEY via $EVIL_KEY_FILE. $KENV opens the always-encrypted key non-interactively.
+# identity from $EVIL_KEY via $EVIL_KEY_FILE (a raw key file, as koh's own).
 EVIL_KEY=/data/local/tmp/koh-evilcli.key
 EVIL_ENV="EVIL_KEY_FILE=$EVIL_KEY $KENV"
 
@@ -36,23 +36,33 @@ start_server "" || { bad "server failed to start"; finish "stress-evil-peer"; }
 SPID="$(server_pid)"
 WIT="/tmp/koh-evil-witness-$$.log"
 pty_connect_host_bg /data/local/tmp/koh-evil-witness.key "$WIT" 120 ""
-wait_file_contains_host "$WIT" "connected." 12 || true
+wait_attached /data/local/tmp/koh-evil-witness.key 12 || bad "the benign witness never attached"
 echo "    server pid=$SPID; benign witness attached"
 ADDR="127.0.0.1:$SERVER_PORT"
 
-# <label> <attack-and-args...>: fire it, then require the server alive + bounded.
-run_client_attack() {
-  _label="$1"; shift
-  echo "  -- client attack: $_label"
-  adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR $*" >/dev/null 2>&1 || true
-  sleep 3
-  if [ -z "$(proc_state "$SPID")" ]; then bad "[$_label] server was KILLED"; return; fi
+# Require the server alive with bounded memory after <label>'s attack.
+require_server_bounded() {
+  if [ -z "$(proc_state "$SPID")" ]; then bad "[$1] server was KILLED"; return; fi
   _rss="$(rss_kb "$SPID")"
   if [ "$_rss" -le "$RSS_LIMIT" ]; then
-    ok "[$_label] server alive, RSS ${_rss}kB <= ${RSS_LIMIT}kB"
+    ok "[$1] server alive, RSS ${_rss}kB <= ${RSS_LIMIT}kB"
   else
-    bad "[$_label] server RSS ${_rss}kB exceeded ${RSS_LIMIT}kB (possible leak/OOM)"
+    bad "[$1] server RSS ${_rss}kB exceeded ${RSS_LIMIT}kB (possible leak/OOM)"
   fi
+}
+
+# <label> <attack> [args...]: fire it, require it ran to the end (the evil client says so only once
+# every crafted message is written, which QUIC's flow control makes the server's reading), then
+# require the server alive + bounded. Sets EVIL_OUT.
+run_client_attack() {
+  _label="$1"; shift
+  _atk="$1"
+  echo "  -- client attack: $_label"
+  EVIL_OUT="$(adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR $*" 2>&1 || true)"
+  contains "attack '$_atk' done" "$EVIL_OUT" \
+    || bad "[$_label] the attack never ran: $(printf '%s\n' "$EVIL_OUT" | tail -1)"
+  sleep 3
+  require_server_bounded "$_label"
 }
 
 ACC="$(scaled 2000 8000)" # accumulation count scales with intensity
@@ -63,11 +73,13 @@ ACC="$(scaled 2000 8000)" # accumulation count scales with intensity
 echo "  -- client attack: oversized message prefix (KOH-02)"
 BOMB_LINE='message of [0-9]* bytes exceeds the'
 BOMB0="$(cat_dev "$SRV_LOG" | grep -c "$BOMB_LINE" || true)"
-adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR bomb" >/dev/null 2>&1 || true
+BOMB_OUT="$(adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR bomb" 2>&1 || true)"
+contains "attack 'bomb' done" "$BOMB_OUT" \
+  || bad "[bomb] the attack never ran: $(printf '%s\n' "$BOMB_OUT" | tail -1)"
 sleep 3
 BOMB1="$(cat_dev "$SRV_LOG" | grep -c "$BOMB_LINE" || true)"
 if [ -z "$(proc_state "$SPID")" ]; then
-  bad "[bomb] server was KILLED by the decompression bomb"
+  bad "[bomb] server was KILLED by the oversized message prefix"
 else
   _rss="$(rss_kb "$SPID")"
   [ "$_rss" -le "$RSS_LIMIT" ] && ok "[bomb] server RSS bounded (${_rss}kB)" || bad "[bomb] RSS ${_rss}kB > ${RSS_LIMIT}kB"
@@ -76,62 +88,117 @@ else
     || bad "[bomb] no size-cap rejection logged — the per-message cap may be gone"
 fi
 
-run_client_attack "empty-fragment flood"   empty-frags 30000
-run_client_attack "partial-fragment flood" partial-frags 30000
+# How many server log lines match <pattern> so far.
+log_count() { cat_dev "$SRV_LOG" | grep -c "$1" || true; }
+BROKE_LINE='client broke the protocol'
+
+# oversized: a well-framed input message whose body is over the input cap; the server must refuse
+# it and close that connection.
+B0="$(log_count "$BOMB_LINE")"
+run_client_attack "over-cap input message" oversized
+[ "$(log_count "$BOMB_LINE")" -gt "$B0" ] \
+  && ok "[oversized] server refused the over-cap message and closed the connection" \
+  || bad "[oversized] no size-cap rejection logged"
+
+# second-stream: the server grants one client stream; a second must never open.
+run_client_attack "second input stream" second-stream
+contains "second stream blocked by the limit" "$EVIL_OUT" \
+  && ok "[second-stream] the server's one-stream limit blocked a second stream" \
+  || bad "[second-stream] a second client stream opened: $(printf '%s\n' "$EVIL_OUT" | grep evil-client | tail -1)"
+
 run_client_attack "state accumulation"     accumulate "$ACC" 4096
 
-# resize-flood: the server must COALESCE to one resize, not run one ioctl(TIOCSWINSZ) +
-# SIGWINCH + grid-realloc per event. A per-event regression is a CPU/syscall storm (minutes of CPU
-# for 400k events), not an RSS blowup — so we gate on CPU jiffies burned, not memory.
+# resize-flood: the server must COALESCE to one resize per read, not run one ioctl(TIOCSWINSZ) +
+# SIGWINCH + grid-realloc per event. A per-event regression is a CPU storm, not an RSS blowup, so
+# this gates on CPU ticks. The cap is far above what decoding 400k messages costs (20-600 ticks
+# measured across runs on the emulator, which accounts CPU coarsely) and far below a per-event
+# regression: the flood alternates 1000x1000 and 2x2, so every event would reallocate a million-cell
+# grid — minutes of CPU, not seconds. Exactly one resize per read is pinned off-device by
+# `a_read_keeps_only_the_last_resize_and_concatenates_keys`.
 echo "  -- client attack: resize flood (KOH-05 coalescing)"
 J0="$(cpu_jiffies "$SPID")"
-adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR resize-flood 400000" >/dev/null 2>&1 || true
+TICK_CAP="${KOH_EVIL_CPU_TICKS:-2000}"
+FLOOD_OUT="$(adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR resize-flood 400000" 2>&1 || true)"
 sleep 4
 DJ=$(( $(cpu_jiffies "$SPID") - J0 ))
+contains "attack 'resize-flood' done" "$FLOOD_OUT" \
+  || bad "[resize-flood] the attack never ran: $(printf '%s\n' "$FLOOD_OUT" | tail -1)"
 if [ -z "$(proc_state "$SPID")" ]; then
   bad "[resize-flood] server was KILLED"
-elif [ "$DJ" -le "${KOH_EVIL_CPU_TICKS:-500}" ]; then
-  ok "[resize-flood] server coalesced (burned ${DJ} CPU ticks <= 500; 400k per-event ops would burn thousands)"
+elif [ "$DJ" -le "$TICK_CAP" ]; then
+  ok "[resize-flood] server coalesced (burned ${DJ} CPU ticks <= ${TICK_CAP})"
 else
   bad "[resize-flood] server burned ${DJ} CPU ticks — a per-event resize regression?"
 fi
 
 run_client_attack "keys flood (PTY write/budget)" keys-flood 6
-run_client_attack "garbage datagrams"             garbage 30000
-run_client_attack "bad protocol version"          bad-version
+G0="$(log_count "$BROKE_LINE")"
+run_client_attack "garbage on the input stream"   garbage 30000
+[ "$(log_count "$BROKE_LINE")" -gt "$G0" ] \
+  && ok "[garbage] server rejected the malformed stream and closed the connection" \
+  || bad "[garbage] no protocol-error close logged for the garbage"
+
+# bad-version: koh/3's ALPN *is* its version, so a wrong one must be refused by the TLS handshake —
+# the evil client never reaches the data plane at all.
+echo "  -- client attack: bad protocol version (the ALPN is the version)"
+BV_OUT="$(adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR bad-version" 2>&1 || true)"
+sleep 2
+if contains "connect returned Err" "$BV_OUT"; then
+  ok "[bad-version] the handshake refused the wrong ALPN"
+else
+  bad "[bad-version] the wrong ALPN was not refused: $(printf '%s\n' "$BV_OUT" | tail -1)"
+fi
+require_server_bounded "bad-version"
 
 SRV="$(cat_dev "$SRV_LOG")"
 [ -n "$(proc_state "$SPID")" ] && ok "server survived ALL client attacks" || bad "server died under the attacks"
 assert_no_crash "$SRV" >/dev/null && ok "no panic/abort in the server log" || bad "server log shows a crash"
-# The witness PTY capture records the reconnect banner IF its session was disrupted; its presence —
-# not the historical "connected." banner — is the real cross-tenant-impact signal.
+# The witness PTY capture records the reconnect banner IF its session was disrupted; its presence is
+# the cross-tenant-impact signal.
 if grep -aq 'reconnecting' "$WIT"; then
   bad "the benign witness session was disrupted (cross-tenant impact)"
 else
   ok "the benign witness stayed attached (no cross-tenant impact)"
 fi
-# A fresh legit client must still reach "connected." after the barrage — assert on ITS OWN captured
-# output (connect_once → run_remote sets $OUT), not the server's stale log.
+# A fresh legit client must still be admitted after the barrage: its own output shows it got past
+# admission, and the server attached its session.
 connect_once /data/local/tmp/koh-evil-fresh.key
-if printf '%s\n' "$OUT" | grep -q 'connected.'; then
+sleep 1
+if contains "$PAST_ADMISSION" "$OUT" \
+  && [ "$(attach_count "$(cat_dev "$SRV_LOG")" "$(koh_id_of /data/local/tmp/koh-evil-fresh.key)")" -ge 1 ]; then
   ok "a fresh legit client still connects after the barrage"
 else
-  echo "  note: fresh-client connect not confirmed (loopback flake; not a hard gate)"
+  bad "a fresh legit client was not admitted after the barrage"
+  printf '%s\n' "$OUT" | grep 'koh:' | sed 's/^/      /'
 fi
 rm -f "$WIT"
 stop_all_koh
 
-# ---- Part B: admission-stall attack — an admitted-but-stalling client must be timed out -----------
+# ---- Part B: admission-stall attack — a stalling client must hold nobody up -----------------------
+# The admission ack is one byte on a stream the server opens, and QUIC does not need the client to
+# accept it, so the server's 3s admission deadline need not fire for the server to be unharmed. What
+# must hold is that a client which never accepts the ack holds nobody up: every connection is served
+# in its own task, behind the connection and pending-handshake caps. So we keep one stalling and
+# require a legit client to be admitted while it does.
+STALL_KEY=/data/local/tmp/koh-evil-stall-fresh.key
+allow_client_key "$STALL_KEY"
 start_server "" || { bad "server failed to start for Part B"; finish "stress-evil-peer"; }
-echo "  -- admission-stall attack (the server's 3s admission timeout must fire; KOH-08)"
-adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT stall-admission" >/dev/null 2>&1 || true
-sleep 7
-SRV="$(cat_dev "$SRV_LOG")"
-if printf '%s\n' "$SRV" | grep -qE 'admission ack timed out|too many handshakes'; then
-  ok "the server bounded the stalled admission (timeout/cap fired)"
+echo "  -- admission-stall attack (a stalling client must hold nobody up; KOH-08)"
+( adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID 127.0.0.1:$SERVER_PORT stall-admission" >/dev/null 2>&1 || true ) &
+STALL_BG=$!
+sleep 2
+connect_once "$STALL_KEY"
+sleep 1
+if contains "$PAST_ADMISSION" "$OUT" \
+  && [ "$(attach_count "$(cat_dev "$SRV_LOG")" "$(koh_id_of "$STALL_KEY")")" -ge 1 ]; then
+  ok "a legit client was admitted while the stalling one was connected"
 else
-  echo "  note: no explicit admission-timeout line logged this run (still asserting survival below)"
+  bad "the stalling client held up a legit one (admission is not bounded per connection)"
 fi
+wait "$STALL_BG" 2>/dev/null || true
+SRV="$(cat_dev "$SRV_LOG")"
+printf '%s\n' "$SRV" | grep -qE 'admission ack timed out|too many handshakes' \
+  && echo "    note: the server also logged its admission timeout / handshake cap"
 [ -n "$(server_pid)" ] && ok "server survived the admission-stall attack" || bad "server died under the admission-stall attack"
 assert_no_crash "$SRV" >/dev/null && ok "no panic in the server log" || bad "server log shows a crash"
 stop_all_koh
@@ -150,14 +217,20 @@ if [ -x "$EVIL_SERVER_HOST" ]; then
       w=$((w + 1)); sleep 1
     done
     if [ -z "$EID" ] || [ -z "$EPORT" ]; then bad "[$atk] evil-server did not announce its id/port"; rm -f "$ESLOG"; continue; fi
-    # A koh client dials the malicious server; it must FAIL admission (never reach "connected.")
-    # because a non-ADMIT byte is rejected and a never-opened admission stream times out.
-    # run_remote injects $KENV so the client can open its own (always-encrypted) key.
+    # A koh client dials the malicious server; it must FAIL admission and exit with the refusal: a
+    # non-ADMIT byte is rejected, and a never-opened admission stream hits the 15s connect timeout.
+    case "$atk" in
+      bad-admit) refusal="server did not admit the connection" ;;
+      *) refusal="timed out connecting" ;;
+    esac
     run_remote "$DEVICE_BIN connect $EID --direct 127.0.0.1:$EPORT --key-file /data/local/tmp/koh-evilcli-$atk.key"
-    if printf '%s\n' "$OUT" | grep -q 'connected.'; then
+    if contains "$PAST_ADMISSION" "$OUT"; then
       bad "[$atk] the koh client was TRICKED into connecting to the malicious server!"
+    elif [ "$RC" != 0 ] && contains "$refusal" "$OUT"; then
+      ok "[$atk] the koh client refused the malicious server (exit $RC: $refusal)"
     else
-      ok "[$atk] the koh client refused the malicious server (never reached 'connected.')"
+      bad "[$atk] the koh client did not refuse with \"$refusal\" (exit $RC)"
+      printf '%s\n' "$OUT" | grep 'koh:' | sed 's/^/      /'
     fi
     rm -f "$ESLOG"
   done

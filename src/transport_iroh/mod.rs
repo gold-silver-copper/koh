@@ -113,14 +113,30 @@ fn load_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
     Ok(SecretKey::from_bytes(&raw))
 }
 
-/// Publish `contents` at `path` without replacing a file another process published first: write a
-/// born-private (0600) temporary file, then hard-link it into place. Returns whether this call
-/// published it.
+/// Publish `contents` at `path` without replacing a file another process published first: with the
+/// containing directory locked, check `path` is still free, write a born-private (0600) temporary
+/// file and rename it into place. Returns whether this call published it.
+///
+/// Not a hard link, which would need no lock: Android's SELinux policy denies `link` to the shell
+/// and to apps.
 fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        // Held until this returns: creators take turns, so only the first finds `path` free, and a
+        // reader sees no key or a whole one.
+        let directory = std::fs::File::open(parent)?;
+        directory.lock()?;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         let (tmp, mut file) = loop {
             let tmp = path.with_extension(format!(
                 "tmp.{}.{:016x}",
@@ -142,14 +158,12 @@ fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<bool> {
             file.write_all(contents)?;
             file.sync_all()?;
             drop(file);
-            match std::fs::hard_link(&tmp, path) {
-                Ok(()) => Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-                Err(error) => Err(error),
-            }
+            std::fs::rename(&tmp, path)
         })();
-        let _ = std::fs::remove_file(tmp);
-        result
+        if result.is_err() {
+            let _ = std::fs::remove_file(tmp);
+        }
+        result.map(|()| true)
     }
     #[cfg(not(unix))]
     {
@@ -493,6 +507,19 @@ pub fn loopback_addr(ep: &Endpoint) -> EndpointAddr {
         addr = addr.with_ip_addr(SocketAddr::from(([127, 0, 0, 1], port)));
     }
     addr
+}
+
+/// How long closing an endpoint waits for its peers to see the close.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+/// Close `endpoint`, waiting at most [`CLOSE_WAIT`] for its peers to see it; whether they did in
+/// time. iroh's close drains every connection for three probe timeouts of its slowest path, and a
+/// peer that vanished while paths to its other addresses were still being probed kept `koh serve`
+/// from exiting for over ten seconds after SIGTERM.
+pub(crate) async fn close_endpoint(endpoint: &Endpoint) -> bool {
+    tokio::time::timeout(CLOSE_WAIT, endpoint.close())
+        .await
+        .is_ok()
 }
 
 /// A dial-able [`EndpointAddr`] from a peer's id + a known direct socket address (LAN / loopback,

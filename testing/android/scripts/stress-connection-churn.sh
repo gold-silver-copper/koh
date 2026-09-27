@@ -19,12 +19,10 @@ SPID="$(server_pid)"
 RSS0="$(rss_kb "$SPID")"
 echo "  server pid=$SPID  baseline RSS=${RSS0}kB"
 
-connected=0
 i=1
 while [ "$i" -le "$CYCLES" ]; do
-  # Non-TTY connect: completes the handshake (prints "connected.") then exits at raw mode → detach.
+  # Non-TTY connect: completes the handshake, is admitted, then exits at the terminal → detach.
   connect_once /data/local/tmp/koh-churn.key
-  contains "connected." "$OUT" && connected=$((connected + 1))
   if contains "$PANIC_NDK" "$OUT" || contains "$PANIC_RUST" "$OUT"; then
     bad "client panicked on cycle $i"; break
   fi
@@ -35,9 +33,10 @@ done
 SPID2="$(server_pid)"
 RSS1="$(rss_kb "${SPID2:-0}")"
 SRV="$(cat_dev "$SRV_LOG")"
+connected="$(attach_count "$SRV" "$(koh_id_of /data/local/tmp/koh-churn.key)")"
 echo "  handshakes completed: $connected/$CYCLES   server RSS: ${RSS0}kB -> ${RSS1}kB"
 
-[ "$connected" = "$CYCLES" ] && ok "every cycle completed the handshake" || bad "$((CYCLES - connected)) cycles did not reach \"connected.\""
+[ "$connected" = "$CYCLES" ] && ok "every cycle completed the handshake" || bad "$((CYCLES - connected)) cycles were not admitted and attached"
 [ -n "$SPID2" ] && ok "server survived the churn (pid=$SPID2)" || bad "server died during the churn"
 assert_no_crash "$SRV" >/dev/null && ok "no panic in the server log" || bad "server log shows a panic"
 # Allow generous slack (alloc caching/scrollback) but catch a real per-connection leak.

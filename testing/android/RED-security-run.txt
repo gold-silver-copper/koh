@@ -1,3 +1,4 @@
+Recorded against koh 0.3.0 (033fba8), before the 0.3.1 security fixes, from an older checkout.
 Device: emulator-5554
 /Users/kisaczka/Desktop/code/moshers2/target/aarch64-linux-android/release/koh: 1 file pushed, 0 skipped. 492.9 MB/s (26867568 bytes in 0.052s)
 

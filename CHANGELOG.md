@@ -86,6 +86,29 @@ error; upgrade both ends.
   `der` 0.8.0 → 0.8.2 and `spin` 0.10.0 → 0.10.1.
 
 ### Fixed
+- **One client could make `koh serve` hold over half a gigabyte**, enough for Android to kill it
+  and every session in it. A client that never acknowledged a frame was resent the screen every
+  round trip, and the server kept a full copy of it for each of the 16 frames it remembers: at the
+  largest size a client may ask for (1000×1000, about 32 MB a screen) that was about 680 MB, from
+  one resize. Frames now share the screen they show, and the unacknowledged ones hold at most one
+  screen of that size beyond the newest; the wire protocol is unchanged.
+- A session at a large size whose program wrote a lot at once could make `koh serve` briefly take
+  gigabytes of memory: the server took a whole new snapshot of the screen for every 8 KiB the
+  program wrote. It now takes one per burst of output (up to 64 reads).
+- `koh serve` could take over ten seconds to exit after SIGTERM or Ctrl-C, when a client had just
+  vanished without closing its connection while iroh was still trying paths to the client's other
+  addresses (common on a phone, which has several). Closing the endpoint now waits at most two
+  seconds for peers to see it, as `koh connect` already did.
+- **A session whose program stopped reading its input could keep `koh serve` from ever exiting**
+  on Linux and Android. Input is written to the terminal from a dedicated thread; once the
+  terminal's input queue was full that write blocked, and the kernel never woke it — not even once
+  the program was dead — so tearing the session down waited on it for good. A large paste into a
+  program that reads nothing (`sleep`, a wedged shell) was enough. The thread now waits in `poll`
+  and gives up what the program never read as soon as the session is torn down.
+- **koh could not create a key on Android** (since 0.12.1): `koh serve`, `connect` and `id` failed
+  with "Permission denied" whenever the key file did not exist yet. A new key was published with a
+  hard link, which Android's SELinux policy denies to the shell and to apps. It is now renamed into
+  place with the key's directory locked, which keeps two first runs racing to one identity.
 - On macOS, starting a session could fail with "Unknown error: -6", stall for up to about half a
   second, or, rarely, hang for good, while PTYs were being allocated concurrently anywhere on the
   machine. These are two races in the macOS kernel's PTY driver; fuxix 0.1.2 works around both

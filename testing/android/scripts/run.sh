@@ -13,23 +13,29 @@ bootstrap_sdk_env
 require_device_or_skip
 echo "Device: ${ADB_SERIAL#-s }"
 wait_for_boot || { echo "ERROR: device never finished booting" >&2; exit 1; }
+# Rebuild what changed since the last run (a no-op when nothing did).
+sh "$HERE/build-android.sh"
 
-# Build once and push once up front (each test also ensures these, idempotently).
+# Push once up front (each test also ensures the binary, idempotently).
 push_binary
 echo "Binary on device: $DEVICE_BIN"
 echo
 
 total=0
 failed=0
+skipped=0; skipped_names=""
 for t in test-dns-resolver test-dns-override test-loopback-e2e; do
   total=$((total + 1))
   echo "──────────────────────── $t ────────────────────────"
-  if sh "$HERE/$t.sh"; then :; else failed=$((failed + 1)); fi
+  run_test "$HERE/$t.sh"
+  if [ "$TEST_RC" != 0 ]; then failed=$((failed + 1))
+  elif [ "$TEST_SKIPPED" = 1 ]; then skipped=$((skipped + 1)); skipped_names="$skipped_names $t"; fi
   echo
 done
 
-passed=$((total - failed))
+passed=$((total - failed - skipped))
 echo "════════════════════════════════════════════════════════"
-echo "Android emulator tests: $passed/$total passed"
+echo "Android emulator tests: $passed/$total passed, $skipped skipped"
+[ -n "$skipped_names" ] && echo "skipped:$skipped_names"
 [ "$failed" = 0 ] || { echo "RESULT: FAIL"; exit 1; }
 echo "RESULT: PASS"

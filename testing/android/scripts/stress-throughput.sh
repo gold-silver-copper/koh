@@ -30,7 +30,7 @@ SPID="$(server_pid)"
 RSS0="$(rss_kb "$SPID")"
 
 pty_connect_bg /data/local/tmp/koh-tp.key "$CLILOG" "$HOLD" ""
-wait_file_contains "$CLILOG" "connected." 12 && ok "a client attached (the flood starts on attach)" || bad "the client never attached"
+wait_attached /data/local/tmp/koh-tp.key 12 && ok "a client attached (the flood starts on attach)" || bad "the client never attached"
 
 # Sample server RSS while the flood is in flight; wait for the sentinel (whole flood processed).
 peak="$RSS0"; done_flood=0; k=0

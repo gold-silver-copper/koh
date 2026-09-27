@@ -23,22 +23,20 @@ adb $ADB_SERIAL shell "rm -f $SPAWNS" >/dev/null 2>&1 || true
 allow_client_key "$KEY"
 start_server "--shell $FLOOD" || { bad "server failed to start"; finish "stress-reattach-continuity"; }
 
-connect_a() {  # connect_a <host-log>; connects, holds briefly, quits cleanly
+connect_a() {  # connect_a <host-log> <n>; connects (the server's n-th attach), holds briefly, quits
   pty_connect_host_bg "$KEY" "$1" 5 ""
-  # wait for "connected." then for the client to finish (quit on hold-expiry)
-  wait_file_contains_host "$1" "connected." 12 || true
+  # wait for the attach, then for the client to finish (quit on hold-expiry)
+  wait_attached "$KEY" 12 "$2" || bad "connection $2 was never attached"
   wait "${PTY_BG_PID:-0}" 2>/dev/null || true
 }
-# Host-side variant of wait_file_contains (the PTY stream is captured to a HOST file here).
-wait_file_contains_host() { _j=0; while [ "$_j" -lt "$3" ]; do grep -aq "$2" "$1" 2>/dev/null && return 0; _j=$((_j+1)); sleep 1; done; return 1; }
 
 # First connect: creates the session (1 spawn), then detaches on quit.
-connect_a "/tmp/koh-reatt-1-$$.log"
+connect_a "/tmp/koh-reatt-1-$$.log" 1
 wait_file_contains "$SRV_LOG" "client detached" 10 && echo "    first client detached (session retained)" || bad "server did not detach the first client"
 sleep 2
 
 # Second connect (same key): must reattach to the SAME session — no new spawn.
-connect_a "/tmp/koh-reatt-2-$$.log"
+connect_a "/tmp/koh-reatt-2-$$.log" 2
 sleep 2
 
 SRV="$(cat_dev "$SRV_LOG")"

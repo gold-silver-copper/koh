@@ -32,6 +32,8 @@ while [ "$w" -lt 12 ]; do
   w=$((w + 1)); sleep 1
 done
 [ -n "$CPID" ] || { bad "client never attached"; rm -f "$CLILOG"; stop_all_koh; finish "stress-client-freeze"; }
+# A running client may still be dialing: freeze it only once the server has attached its session.
+wait_attached /data/local/tmp/koh-freeze.key 12 || { bad "client never attached"; rm -f "$CLILOG"; finish "stress-client-freeze"; }
 echo "    client attached (server=$SPID, client=$CPID)"
 
 # Freeze the client.

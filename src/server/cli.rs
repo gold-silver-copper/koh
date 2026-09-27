@@ -377,7 +377,9 @@ pub async fn serve_endpoint(
     info!("draining: stopping the registry and closing endpoint");
     shutdown.cancel();
     registry.shutdown().await;
-    endpoint.close().await;
+    if !crate::transport_iroh::close_endpoint(&endpoint).await {
+        warn!("peers did not see the endpoint close in time; exiting anyway");
+    }
     Ok(())
 }
 

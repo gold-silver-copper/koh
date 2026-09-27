@@ -23,13 +23,13 @@ if [ "${KOH_STRESS_NETEM:-}" != "1" ]; then
   echo "SKIP: set KOH_STRESS_NETEM=1 to run the roaming/outage test (needs root + tc)"
   exit 0
 fi
-OUTAGE="${KOH_STRESS_ROAM_OUTAGE_SECS:-6}"   # must stay < the 300s connection idle timeout
+# Long enough for the link-down banner, which koh draws after 9s of silence (three missed 3s
+# heartbeats), and well under the 300s connection idle timeout.
+OUTAGE="${KOH_STRESS_ROAM_OUTAGE_SECS:-14}"
 echo "Stress: roaming — ${OUTAGE}s total loopback outage mid-session, then recover (level=$STRESS_LEVEL)"
 
-adb $ADB_SERIAL root >/dev/null 2>&1 || true
-adb $ADB_SERIAL wait-for-device >/dev/null 2>&1 || true
-adb $ADB_SERIAL shell 'command -v tc' >/dev/null 2>&1 || { echo "SKIP: 'tc' not present on this image"; exit 0; }
-cleanup_tc() { adb $ADB_SERIAL shell "tc qdisc del dev lo root" >/dev/null 2>&1 || true; }
+have_root_tc || { echo "SKIP: no root 'tc' on this image (needs 'su 0 tc': a userdebug/eng build)"; exit 0; }
+cleanup_tc() { as_root tc qdisc del dev lo root >/dev/null 2>&1 || true; }
 
 allow_client_key /data/local/tmp/koh-roam.key
 start_server "" || { bad "server failed to start"; finish "stress-roaming"; }
@@ -40,19 +40,24 @@ pty_connect_host_bg /data/local/tmp/koh-roam.key "$CLILOG" $((OUTAGE + 30)) ""
 w=0; CPID=""
 while [ "$w" -lt 12 ]; do CPID="$(other_pid "$SPID")"; [ -n "$CPID" ] && break; w=$((w + 1)); sleep 1; done
 [ -n "$CPID" ] || { bad "client never attached"; rm -f "$CLILOG"; stop_all_koh; finish "stress-roaming"; }
+# A running client may still be dialing: black the link out only once the server has attached it.
+wait_attached /data/local/tmp/koh-roam.key 12 || { bad "client never attached"; rm -f "$CLILOG"; finish "stress-roaming"; }
 echo "    client attached (server=$SPID, client=$CPID)"
 
 # Total outage on the QUIC path.
 cleanup_tc
-if ! adb $ADB_SERIAL shell "tc qdisc add dev lo root netem loss 100%" >/dev/null 2>&1; then
-  echo "SKIP: couldn't apply a 100%-loss qdisc (no permission / no netem)"; rm -f "$CLILOG"; stop_all_koh; exit 0
+# Root tc works here (checked above), so failing to black the link out is a failure, not a skip.
+if ! as_root tc qdisc add dev lo root netem loss 100%; then
+  bad "couldn't apply a 100%-loss qdisc"; rm -f "$CLILOG"; finish "stress-roaming"
 fi
 echo "    loopback blacked out (100% loss)"
-sleep "$OUTAGE"
 
 # The client should NOTICE the outage (its hold-the-session banner) but NOT exit.
-noticed=0
-grep -aqE 'resuming|link down' "$CLILOG" 2>/dev/null && noticed=1
+noticed=0; w=0
+while [ "$w" -lt "$OUTAGE" ]; do
+  grep -aq 'link down' "$CLILOG" 2>/dev/null && noticed=1
+  w=$((w + 1)); sleep 1
+done
 [ -n "$(proc_state "$CPID")" ] && ok "client stayed alive during the outage (held the session)" || bad "client exited during the outage"
 
 # Restore the network and let QUIC recover.
@@ -67,7 +72,8 @@ case "$st" in
   "") bad "client died across the outage (should have ridden it out)" ;;
   *) bad "client in unexpected state after recovery: $st" ;;
 esac
-[ "$noticed" = 1 ] && ok "client surfaced its link-down banner during the outage" || echo "  note: link-down banner not observed (outage may have been shorter than the 3s detection)"
+[ "$noticed" = 1 ] && ok "client surfaced its link-down banner during the outage" \
+  || bad "client never drew its link-down banner during the ${OUTAGE}s outage"
 # It rode out the outage on the SAME connection — no detach/reconnect happened server-side.
 if printf '%s\n' "$SRV" | grep -qE 'client detached|reattaching'; then
   bad "the session detached/reconnected — the outage should have been ridden out on the same connection"

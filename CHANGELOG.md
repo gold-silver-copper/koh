@@ -93,7 +93,9 @@ error; upgrade both ends.
 - Output that scrolls sends far less: rows that only moved are moved by the client, not sent again,
   so a line scrolling in costs that line, not the screen: `seq` at one line per frame sends under a
   third of the bytes it did at 80×24 and a sixth at 200×50, full-width lines at 200×50 a
-  fourteenth. The server's diff and the client's apply take a fraction of the CPU they did.
+  fourteenth. The server's diff and the client's apply take a fraction of the CPU they did, and its
+  snapshots no longer compare the rows the program left alone (fux-vt versions each row): full-width
+  lines scrolling a 1000×1000 screen cost the server 0.4 ms a frame instead of 69 ms.
   `koh connect` scrolls your terminal too, in a scroll region, instead of repainting the rows that
   moved, where that writes less: a third of the terminal output for `seq` at 80×24 and a scroll
   region at 200×50, a thirtieth for full-width lines at 200×50, with the client's paint taking about

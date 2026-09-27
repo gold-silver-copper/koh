@@ -71,9 +71,9 @@ impl PartialEq for Row {
 
 impl Eq for Row {}
 
-/// The rows of the last snapshot, by fux-vt row id: a row whose cells are unchanged is shared
-/// with the next snapshot, wherever it moved, instead of copied.
-pub(super) type RowCache = HashMap<RowId, Arc<[Cell]>>;
+/// The rows of the last snapshot, by fux-vt row id, with the row's version then: a row whose cells
+/// are unchanged is shared with the next snapshot, wherever it moved, instead of copied.
+pub(super) type RowCache = HashMap<RowId, (u64, Arc<[Cell]>)>;
 
 /// `cells` as a row exactly `cols` wide. A live row is exactly that wide, and is copied once into
 /// its own allocation; anything longer is cut, anything shorter padded with blank cells.
@@ -126,11 +126,19 @@ impl Grid {
                         wrapped: false,
                     };
                 };
+                // fux-vt gives a row a new version with any change to it, so a row at the version
+                // it was cached at holds the same cells without comparing them. A row with a new
+                // version may still be unchanged (rewritten the same), so it is compared.
                 let cells = match cache.get(&live.id) {
-                    Some(cells) if **cells == *live.cells => Arc::clone(cells),
+                    Some((version, cells))
+                        if cells.len() == live.cells.len()
+                            && (*version == live.version || **cells == *live.cells) =>
+                    {
+                        Arc::clone(cells)
+                    }
                     _ => exactly(live.cells, cols),
                 };
-                next.insert(live.id, Arc::clone(&cells));
+                next.insert(live.id, (live.version, Arc::clone(&cells)));
                 Row {
                     cells,
                     wrapped: live.wrapped,

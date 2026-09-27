@@ -143,6 +143,54 @@ impl ServerTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::Grid;
+
+    /// Output that changes rows in every way: text, rewriting a row the same, erasing, scrolling,
+    /// inserted and deleted lines, the alternate screen, a reset.
+    const PIECES: [&str; 12] = [
+        "text",
+        "\r\n",
+        "\x1b[H",
+        "\x1b[Htext",
+        "\x1b[2J",
+        "\x1b[K",
+        "\x1b[2;4r\x1b[4;1H\n\x1b[r",
+        "\x1b[2L",
+        "\x1b[M",
+        "\x1b[?1049h",
+        "\x1b[?1049l",
+        "\x1bc",
+    ];
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// A snapshot that reuses the last one's rows (by fux-vt row id and version) shows exactly
+        /// what one built from nothing does.
+        #[test]
+        fn a_snapshot_reusing_rows_shows_the_emulator_exactly(
+            steps in proptest::collection::vec(
+                (
+                    proptest::collection::vec(0..PIECES.len(), 0..4),
+                    proptest::option::of((2u16..8, 2u16..12)),
+                ),
+                1..16,
+            ),
+        ) {
+            let mut t = ServerTerminal::new(5, 10, 3).expect("emulator");
+            for (pieces, resize) in steps {
+                for piece in pieces {
+                    t.process(PIECES[piece].as_bytes());
+                }
+                if let Some((rows, cols)) = resize {
+                    t.resize(Size::new(rows, cols));
+                }
+                let reused = t.snapshot();
+                let fresh = Grid::of(t.parser.screen(), &mut RowCache::default());
+                proptest::prop_assert_eq!(reused.screen(), &fresh);
+            }
+        }
+    }
 
     #[test]
     fn answers_cursor_position_report() {

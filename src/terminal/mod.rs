@@ -1,16 +1,8 @@
-//! # koh-terminal — the screen the server sends
+//! The screen the server sends: a [`Grid`] of `fux_vt::Cell`s, which the server's emulator
+//! ([`ServerTerminal`]) produces, plus the title, icon, clipboard, bell count and exit code.
 //!
-//! The terminal *screen*, not a byte stream. The server parses the shell's output with `fux-vt`
-//! ([`ServerTerminal`]) into a 2-D cell grid; frames bring the client to the server's *current*
-//! screen, skipping any intermediate ones.
-//!
-//! ## A structured diff, no parser on the client
-//!
-//! [`TerminalScreen`] holds a plain [`Grid`] of `fux_vt::Cell`s plus the out-of-band channels: the
-//! window `title`/`icon`, the `clipboard` and `bell` events and the shell's `exit_code`. A
-//! [`ScreenDiff`] carries the changed rows as run-length-encoded cells, the cursor and the modes.
-//! The client validates and copies cells; it never runs a terminal parser on server-controlled
-//! bytes.
+//! A [`ScreenDiff`] carries the changed rows as run-length-encoded cells, the cursor and the modes.
+//! The client validates and copies cells; it never runs a terminal parser on server bytes.
 
 use std::num::NonZeroU16;
 use std::sync::Arc;
@@ -27,34 +19,22 @@ pub use server::ServerTerminal;
 
 /// Default screen geometry, used for the blank screen both ends start from.
 pub const DEFAULT_SIZE: Size = Size::new(24, 80);
-/// Bounds on a peer-controlled terminal geometry.
-///
-/// A grid is allocated eagerly (`rows × cols` cells on the server's emulator and on the client),
-/// so an unclamped resize from a hostile peer is an out-of-memory bomb: 65000×65000 is billions
-/// of cells. Every peer-influenced [`Size`] MUST pass through [`clamp_dims`] before a grid is
-/// built, on both the server (a client's `Resize`) and the client (a server's
-/// `ScreenDiff.resize`). `MAX_DIM` is generous versus any real terminal (1000×1000 already dwarfs
-/// any display); `MIN_DIM` keeps a degenerate 1-wide terminal out of the shell's way.
+/// Bounds on a peer-controlled geometry. A grid is allocated whole, so every size a peer sends
+/// passes through [`clamp_dims`] first: 65000×65000 would be billions of cells. 1000×1000 dwarfs
+/// any display.
 pub const MIN_DIM: u16 = 2;
 pub const MAX_DIM: u16 = 1000;
 
-/// Upper bound on a synced window title / icon name, in characters.
-///
-/// mosh truncates OSC 0/1/2 at parse; no real app sends a multi-KiB title, so this just bounds a
-/// hostile/runaway one. Enforced on the trusted server emulator *and* re-applied on the client,
-/// which must never trust the wire.
+/// Most characters in a window title or icon name, as mosh caps them; applied by the server's
+/// emulator and again by the client, which trusts nothing on the wire.
 pub(crate) const MAX_TITLE_LEN: usize = 256;
 
-/// Upper bound on a forwarded clipboard payload (mosh's `MAXIMUM_CLIPBOARD_SIZE`).
-///
-/// A larger OSC-52 set is dropped rather than synced, so a remote app can't make either end ship
-/// megabytes. Enforced server-side at capture *and* client-side at apply.
+/// Most bytes in a forwarded clipboard (OSC 52), as mosh caps it; a larger one is dropped. Applied
+/// at both ends.
 pub const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
 
-/// Clamp a peer-supplied size into `[MIN_DIM, MAX_DIM]` on both axes.
-///
-/// The single chokepoint both the server and the client funnel a resize through before building a
-/// grid, so the two paths can never disagree and no resize can allocate an unbounded grid.
+/// Clamp a peer-supplied size into `[MIN_DIM, MAX_DIM]` on both axes: the one gate every resize
+/// passes at both ends before a grid is built.
 #[must_use]
 pub fn clamp_dims(size: Size) -> Size {
     Size {
@@ -72,8 +52,7 @@ fn capped_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Truncate `s` to at most `max` bytes, never splitting a multi-byte UTF-8 scalar (so the result is
-/// always valid UTF-8). Used for the clipboard cap, which is a byte budget.
+/// Truncate `s` to at most `max` bytes, never splitting a scalar.
 fn capped_bytes(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -88,19 +67,15 @@ fn capped_bytes(s: &str, max: usize) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalScreen {
     grid: Grid,
-    /// Window title (OSC 2), propagated so the client can mirror it.
+    /// Window title (OSC 2).
     title: String,
-    /// Window icon name (OSC 1), propagated alongside the title (mosh emits `]1;`/`]2;` when the
-    /// two differ, else a combined `]0;`).
+    /// Window icon name (OSC 1).
     icon: String,
-    /// The terminal's clipboard selection set by the remote app via OSC 52 (base64 payload, capped
-    /// server-side), forwarded so a remote yank reaches the local clipboard. Empty if unset.
+    /// The clipboard the program set (OSC 52, base64), empty if none.
     clipboard: String,
-    /// Monotonic count of audible bells (BEL) the server has seen. The client rings its terminal
-    /// once when this increases (mosh treats the bell count as part of frame identity).
+    /// How many bells the program rang; the client rings when it grows.
     bell_count: u64,
-    /// Set once the remote shell has exited, carrying its exit code so the client can exit with
-    /// the same status (mosh parity). `None` while the shell is alive.
+    /// The program's exit code once it exited, for the client to exit with.
     exit_code: Option<u32>,
 }
 
@@ -122,8 +97,7 @@ impl TerminalScreen {
         }
     }
 
-    /// Construct a screen by feeding `bytes` of terminal output into a fresh emulator of the
-    /// given (clamped) size. For tests.
+    /// The screen a fresh emulator of this (clamped) size shows after `bytes`. For tests.
     pub fn from_bytes(rows: u16, cols: u16, bytes: &[u8]) -> Self {
         ServerTerminal::new(rows, cols, 0).map_or_else(
             |_| Self::default(),
@@ -134,7 +108,7 @@ impl TerminalScreen {
         )
     }
 
-    /// Borrow the grid (for rendering and predictor reconciliation).
+    /// The grid.
     pub const fn screen(&self) -> &Grid {
         &self.grid
     }
@@ -168,7 +142,7 @@ impl TerminalScreen {
         &self.clipboard
     }
 
-    /// Monotonic count of audible bells the server has seen (the client rings on an increase).
+    /// How many bells the program rang.
     pub const fn bell_count(&self) -> u64 {
         self.bell_count
     }
@@ -572,7 +546,7 @@ impl From<WireModes> for Modes {
     }
 }
 
-/// The wire delta between two [`TerminalScreen`]s (mosh `HostMessage`).
+/// The change from one [`TerminalScreen`] to another, on the wire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenDiff {
     /// The new size if the screen was resized; the client starts from a blank grid of that size,
@@ -582,10 +556,9 @@ pub struct ScreenDiff {
     pub title: Option<String>,
     /// New window icon name if it changed.
     pub icon: Option<String>,
-    /// New clipboard payload if it changed (OSC 52; the client re-emits it to the local terminal).
+    /// New clipboard if it changed.
     pub clipboard: Option<String>,
-    /// The server's audible-bell count at the target state (absolute; the client rings when it
-    /// increases past what it last saw). Always carried so a bell-only change isn't lost.
+    /// The bell count, always sent, so a change of it alone is not lost.
     pub bell_count: u64,
     /// The remote shell's exit code, set on the final (shutdown) frame.
     pub exit_code: Option<u32>,
@@ -628,12 +601,8 @@ impl TerminalScreen {
 
     /// Apply `diff`, a diff against this screen. A malformed diff changes nothing.
     pub fn apply(&mut self, diff: &ScreenDiff) {
-        // Everything below is server-controlled. Validate the whole grid part first and commit
-        // only if all of it is well-formed: a malformed frame is dropped and the prior screen
-        // kept, never half-applied.
-        //
-        // LOAD-BEARING: this `clamp_dims` is the only bound on a single resize's grid
-        // allocation. The mirror clamp on the server lives in `terminal/server.rs`.
+        // All server-controlled: the grid is validated whole before any of it is committed, so a
+        // malformed frame changes nothing. This clamp is what bounds the grid a resize allocates.
         let Size { rows, cols } = diff.resize.map_or_else(|| self.size(), clamp_dims);
         if diff.rows.len() > usize::from(rows) {
             return;
@@ -659,12 +628,9 @@ impl TerminalScreen {
             .set_cursor((crow.min(rows.saturating_sub(1)), ccol.min(cols)));
         self.grid.set_modes(diff.modes.into());
 
-        // Monotonic: never regress on a reordered/older diff (the client applies only newer
-        // frames, but `max` is the defensive, obviously-correct choice).
+        // Never backwards.
         self.bell_count = self.bell_count.max(diff.bell_count);
-        // Title / icon / clipboard arrive from the wire. The server emulator caps them, but the
-        // client must NOT trust that — a malicious server could ship an oversized payload to bloat
-        // the client or stuff its terminal. Re-apply the same caps here before storing.
+        // Capped again: the server's emulator caps them, but a hostile server need not.
         if let Some(title) = &diff.title {
             self.title = capped_chars(title, MAX_TITLE_LEN);
         }

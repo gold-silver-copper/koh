@@ -1,9 +1,6 @@
-//! # koh-transport-iroh
-//!
-//! The iroh glue: endpoint setup, a persistent node identity, dial-by-endpoint-id, and a
-//! connection's path RTT. Everything QUIC-shaped (encryption, key exchange, NAT traversal, relay fallback,
-//! roaming/migration, loss recovery, RTT measurement) is iroh's job; this module just exposes
-//! the few primitives the protocol above it ([`crate::proto`]) needs.
+//! The iroh glue: endpoint setup, the identity key file, dial addresses and a connection's path
+//! RTT. Everything QUIC-shaped (encryption, NAT traversal, relays, roaming, loss recovery) is
+//! iroh's.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -14,20 +11,14 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 
 pub mod admission;
 
-/// Keepalive + connection idle-timeout tuned so a phone screen-off doesn't drop the connection.
-/// iroh's defaults already PING every 5s and drop a *path* after 15s, but the *connection* idle
-/// timeout defaults to ~30s; we raise it to 300s (5 min) so a short suspend (Android freezing the
-/// process, so keepalives stop) is ridden out on the *same* connection with no visible reconnect.
-/// Longer outages are handled above this layer: the client transparently re-dials and reattaches
-/// to the detachable server session (see `crate::client::run_client`), so we don't need to hold a
-/// dead connection open indefinitely here.
+/// The connection idle timeout is 5 minutes, not iroh's ~30 s, so a short suspend (Android
+/// freezing the process, so keepalives stop) is ridden out on the same connection; the client
+/// redials after a longer one.
 ///
-/// Stream limits differ by role. The server accepts only the client's one message stream. The
-/// client accepts the admission bi-stream and a few concurrent frame streams; the server resets a
-/// frame's stream once a newer frame supersedes it, so only a handful are ever open.
+/// The server accepts only the client's one message stream; the client, the admission bi-stream
+/// and a few frame streams (superseded ones are reset, so few are ever open).
 fn koh_transport_config(accept: bool) -> QuicTransportConfig {
-    // `IdleTimeout` is a QUIC varint of milliseconds; building it from a `u32` is infallible,
-    // unlike `IdleTimeout::try_from(Duration)`.
+    // From a `u32` of milliseconds, unlike from a `Duration`, it cannot fail.
     const IDLE_TIMEOUT_MS: u32 = 300_000;
     let (uni, bidi) = if accept { (1, 0) } else { (8, 1) };
     QuicTransportConfig::builder()
@@ -38,10 +29,8 @@ fn koh_transport_config(accept: bool) -> QuicTransportConfig {
         .build()
 }
 
-/// The ALPN that identifies the koh protocol on the wire.
-///
-/// The ALPN is the protocol version: the stream protocol in [`crate::proto`]. A peer speaking
-/// anything else fails the TLS handshake with a clear error rather than misparsing mid-session.
+/// The ALPN, which is the protocol version ([`crate::proto`]): a peer on another fails the TLS
+/// handshake instead of misparsing mid-session.
 pub const ALPN: &[u8] = b"koh/3";
 
 /// Errors from endpoint/identity setup.
@@ -65,24 +54,17 @@ pub enum SetupError {
 /// The length of a key file: an iroh secret key's raw bytes, and nothing else.
 pub const KEY_LEN: usize = 32;
 
-/// Load a persistent [`SecretKey`] from `path`, or generate + persist one if absent.
-///
-/// The file holds the key's raw bytes, protected by its permissions (owner-only, 0600) like an SSH
-/// host key: anyone who can read it is that identity. A stable key gives the server a stable
-/// [`EndpointId`].
+/// Load the [`SecretKey`] at `path`, creating it if absent. The file is the key's raw bytes,
+/// protected by its permissions (0600) like an SSH host key.
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
-    // `Path::exists` follows links and therefore reports a dangling symlink as absent. Inspect the
-    // directory entry itself so every existing node, including a dangling link, reaches the secure
-    // open/validation path.
+    // Not `Path::exists`, which follows links: a dangling symlink must reach the checked open.
     let entry_exists = match std::fs::symlink_metadata(path) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error.into()),
     };
     if entry_exists {
-        // Refuse a dangerous containing dir FIRST: the load below tightens the key's
-        // perms and reads it, and in a dir where another user can unlink/replace entries they could
-        // swap `id.key` for their own.
+        // First: in a dir another user can write, they could swap the key for their own.
         if let Some(parent) = path.parent() {
             ensure_state_dir_secure(parent)?;
         }
@@ -91,13 +73,12 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, SetupError> {
         let sk = generate_secret_key()?;
         if let Some(parent) = path.parent() {
             create_dir_private(parent)?;
-            // Reject a world-writable state dir before writing the identity key into it.
             ensure_state_dir_secure(parent)?;
         }
         if create_secret_file(path, &sk.to_bytes())? {
             Ok(sk)
         } else {
-            // Another same-user process won the atomic create race; its key is the one identity.
+            // Another process created it first; its key is the identity.
             load_secret_key(path)
         }
     }
@@ -163,8 +144,7 @@ fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<bool> {
     result.map(|()| true)
 }
 
-/// Create `dir` (recursively) with mode 0700, so a freshly-created state dir doesn't expose its
-/// contents. The mode applies to the components it creates; an existing dir is left as it is.
+/// Create `dir` and its missing parents with mode 0700; an existing dir is left as it is.
 pub(crate) fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
@@ -173,14 +153,9 @@ pub(crate) fn create_dir_private(dir: &Path) -> std::io::Result<()> {
         .create(dir)
 }
 
-/// Read the key file at `path`, doing every step on a single opened file descriptor so there is no
-/// path-based recheck window.
-///
-/// Open with `O_NOFOLLOW` (a symlinked final component is refused at open — `ELOOP`), confirm via
-/// the fd that it is a regular file, tighten group/other-accessible perms to 0600 via the fd
-/// (`fchmod`, never a second path `chmod`), then read the contents from the same fd. A co-tenant
-/// who swaps `id.key` for a symlink can therefore neither redirect the `chmod`/read to another file
-/// nor race a gap between a check and an act — there is only the one open.
+/// Read the key file at `path`: opened with `O_NOFOLLOW`, then checked, tightened and read through
+/// that one descriptor, so a swapped-in symlink can neither redirect the chmod or the read nor race
+/// a gap between a check and an act.
 fn read_key_file_secure(path: &Path) -> Result<Vec<u8>, SetupError> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -210,11 +185,8 @@ fn read_key_file_secure(path: &Path) -> Result<Vec<u8>, SetupError> {
     Ok(bytes)
 }
 
-/// Tighten an existing group/other-accessible key file to 0600 — operating on the held
-/// **fd** (`File::set_permissions` is `fchmod`), so it can't be redirected to a different inode by a
-/// path swap. The key IS the node identity, so a loose key is a local-impersonation
-/// risk; a key file whose perms were loosened out-of-band (manual `chmod`, a restore from a
-/// permissive backup/umask) is re-tightened here on load.
+/// Tighten a group/other-accessible key file to 0600 through its descriptor (`fchmod`): a loosened
+/// key, say from a permissive backup, lets a local user impersonate its owner.
 fn tighten_key_perms_via_fd(file: &std::fs::File, path: &Path, meta: &std::fs::Metadata) {
     use std::os::unix::fs::PermissionsExt as _;
     let mode = meta.permissions().mode();
@@ -235,12 +207,7 @@ fn tighten_key_perms_via_fd(file: &std::fs::File, path: &Path, meta: &std::fs::M
     }
 }
 
-/// Refuse a state dir a co-tenant could tamper with, and flag a merely-loose one.
-///
-/// A dir another user can write lets them unlink/replace the secret key even though the key file
-/// itself is 0600, so this hard-errors (pointing at `--key-file`); a merely group/other-readable
-/// one only grants traverse, so it just warns. `create_dir_private` already makes koh-created dirs
-/// 0700, so this only fires on a pre-existing loosened dir. No-op for the CWD.
+/// Refuse a state dir another user could replace the key in, and warn about a merely loose one.
 pub(crate) fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
     use std::os::unix::fs::PermissionsExt;
     if dir.as_os_str().is_empty() {
@@ -250,10 +217,9 @@ pub(crate) fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
         return Ok(());
     };
     let mode = meta.permissions().mode();
-    // The real threat is a dir where *another user* can unlink/replace the key: an
-    // **other-writable, non-sticky** dir. The sticky bit (e.g. /tmp's 1777) restricts unlink to file
-    // owners. A merely group-writable dir is allowed: Android's standard scratch /data/local/tmp is
-    // 0771 (group `shell`, NOT other-writable), and a single-user device has no co-tenant.
+    // Only other-writable without the sticky bit (which limits unlink to owners, as in /tmp's 1777)
+    // lets another user replace the key. Group-writable is allowed: Android's /data/local/tmp is
+    // 0771, and a single-user device has no co-tenant.
     let other_writable = mode & 0o002 != 0;
     let sticky = mode & 0o1000 != 0;
     if other_writable && !sticky {
@@ -278,12 +244,8 @@ pub(crate) fn ensure_state_dir_secure(dir: &Path) -> Result<(), SetupError> {
     Ok(())
 }
 
-/// koh's config directory — the SINGLE place koh ever keeps files it owns. XDG-style and always
-/// under `~/.config`: `$XDG_CONFIG_HOME/koh` when set, else `$HOME/.config/koh`. There is
-/// deliberately no platform-specific dir (no macOS `Application Support`), no `$TMPDIR` /
-/// `/data/local/tmp` / CWD fallback, and no `$KOH_STATE_DIR` override — one canonical location.
-/// `None` only when neither `$XDG_CONFIG_HOME` nor `$HOME` is set (a daemon with no environment),
-/// in which case the caller must pass an explicit `--key-file`. Pure over its inputs (unit-testable).
+/// koh's config directory, the one place it keeps files: `$XDG_CONFIG_HOME/koh`, else
+/// `$HOME/.config/koh`, with no platform-specific or temporary fallback. `None` if neither is set.
 fn config_dir_from(
     xdg_config_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
@@ -295,11 +257,8 @@ fn config_dir_from(
     nonempty(home).map(|h| std::path::PathBuf::from(h).join(".config").join("koh"))
 }
 
-/// The default persistent key path for `role` (`"client"`/`"server"`) when `--key-file` isn't given.
-///
-/// `<config-dir>/<role>.key` under `~/.config/koh` (see `config_dir_from`). The dir is created 0700
-/// when the key is first written (`load_or_create_secret_key`). Errors (rather than scattering a key
-/// into the CWD/tmp) when `~/.config` can't be located — pass `--key-file` in that case.
+/// The default key path for `role` (`"client"` or `"server"`): `<config dir>/<role>.key`. An
+/// error, not a fallback, if there is no config dir.
 pub fn default_key_path(role: &str) -> Result<std::path::PathBuf, SetupError> {
     config_dir_from(
         std::env::var_os("XDG_CONFIG_HOME"),
@@ -313,8 +272,7 @@ pub fn default_key_path(role: &str) -> Result<std::path::PathBuf, SetupError> {
     })
 }
 
-/// Generate a fresh secret key from the OS's randomness. Fails only if the OS has none to give;
-/// there is no fallback, because a predictable key is no key.
+/// A new secret key from the OS's randomness, with no fallback: a predictable key is no key.
 pub fn generate_secret_key() -> std::io::Result<SecretKey> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)?;
@@ -328,8 +286,7 @@ pub fn parse_endpoint_id(s: &str) -> Result<EndpointId, SetupError> {
         .map_err(|e| SetupError::BadEndpointId(e.to_string()))
 }
 
-/// Parse a `$KOH_DNS` value: either `IP:PORT` (e.g. `8.8.8.8:53`) or a bare `IP`
-/// (e.g. `1.1.1.1`, defaulting to port 53). Returns `None` for anything unparseable.
+/// A `$KOH_DNS` value: `IP:PORT`, or an `IP` on port 53.
 fn parse_dns_spec(spec: &str) -> Option<SocketAddr> {
     let spec = spec.trim();
     spec.parse::<SocketAddr>().ok().or_else(|| {
@@ -339,23 +296,11 @@ fn parse_dns_spec(spec: &str) -> Option<SocketAddr> {
     })
 }
 
-/// An explicit DNS resolver for iroh's discovery, or `None` to keep iroh's default
-/// (the host's system DNS).
+/// The nameserver `$KOH_DNS` names, else Google's on Android, else `None` for the system's.
 ///
-/// iroh builds `DnsResolver::default()` for **every** endpoint it binds (see
-/// `Endpoint::builder(...).dns_resolver` / the `unwrap_or_default()` at bind time), and that
-/// default reads the host's resolver config. On Android that read goes through the app's JNI
-/// context, which a bare CLI (e.g. a Termux build) does not have — so it **panics**
-/// (`ndk-context: android context was not initialized`) instead of returning an error iroh could
-/// fall back from. We sidestep it by pinning an explicit public nameserver, which never touches
-/// the system config (`DnsResolver::with_nameserver`).
-///
-/// - `$KOH_DNS` (any platform): override the nameserver, as `IP` or `IP:PORT`. Lets a desktop
-///   opt in / pick a reachable resolver, and makes this path testable off-Android.
-/// - On Android, default to Google Public DNS (`8.8.8.8:53`) even when unset.
-/// - Elsewhere, `None`: keep iroh's system-DNS default (honors split-horizon / corporate DNS).
-// On Android every branch returns `Some`, so clippy flags the wrapper there; the `Option` exists
-// for the desktop `None` branch (which that target can't see), so scope the expectation to Android.
+/// iroh builds a default resolver for every endpoint, which reads the system config; on Android
+/// that goes through a JNI context a bare CLI (Termux) lacks, and panics. An explicit nameserver
+/// never reads it.
 #[cfg_attr(
     target_os = "android",
     expect(
@@ -385,8 +330,7 @@ fn discovery_dns_resolver() -> Option<iroh::dns::DnsResolver> {
     }
 }
 
-/// Apply koh's transport config and DNS resolver, register [`ALPN`] if `accept` (server side),
-/// and bind.
+/// [`configure`] `builder` and bind.
 async fn bind(
     builder: iroh::endpoint::Builder,
     secret: SecretKey,
@@ -398,10 +342,8 @@ async fn bind(
         .map_err(|e| SetupError::Other(e.into()))
 }
 
-/// Apply koh's identity, transport config and (when `accept`ing) ALPN to an endpoint builder.
-///
-/// Every endpoint koh binds goes through this; tests use it to bind endpoints on their own
-/// transports.
+/// Apply koh's identity, transport config, DNS resolver and (when `accept`ing) ALPN to `builder`.
+/// Every endpoint koh binds goes through this, tests' included.
 pub fn configure(
     builder: iroh::endpoint::Builder,
     secret: SecretKey,
@@ -410,8 +352,6 @@ pub fn configure(
     let mut builder = builder
         .secret_key(secret)
         .transport_config(koh_transport_config(accept));
-    // Even with no discovery, iroh constructs a default `DnsResolver` at bind time, which panics
-    // on a bare-CLI Android build; pin an explicit resolver there. See `discovery_dns_resolver`.
     if let Some(resolver) = discovery_dns_resolver() {
         builder = builder.dns_resolver(resolver);
     }
@@ -421,25 +361,19 @@ pub fn configure(
     builder
 }
 
-/// Build an iroh [`Endpoint`] with the `presets::N0` profile (relay + DNS discovery, so a
-/// bare endpoint id is dialable).
-///
-/// `accept` registers our ALPN so the endpoint can accept incoming connections (server side).
+/// Bind an endpoint with n0's relays and DNS discovery, so a bare endpoint id is dialable. `accept`
+/// lets it accept connections (the server).
 pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
     bind(Endpoint::builder(presets::N0), secret, accept).await
 }
 
-/// Build an iroh [`Endpoint`] with **no relay and no discovery** (`presets::Minimal`).
-///
-/// Use this for same-host / same-LAN sessions and for tests: peers must be dialed by a full
-/// [`EndpointAddr`] (id + direct socket address), e.g. via [`loopback_addr`]. It avoids any
-/// dependency on n0's public relay/DNS, so it is fully hermetic.
+/// Bind an endpoint with no relay and no discovery, dialed by id and socket address (LAN,
+/// loopback, tests).
 pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
     bind(Endpoint::builder(presets::Minimal), secret, accept).await
 }
 
-/// A dial-able [`EndpointAddr`] for `ep` over the IPv4 loopback interface (id + 127.0.0.1:port).
-/// Pair with [`bind_endpoint_local`] to connect two endpoints on one host without a relay.
+/// `ep`'s address on the IPv4 loopback interface.
 pub fn loopback_addr(ep: &Endpoint) -> EndpointAddr {
     let mut addr = EndpointAddr::new(ep.id());
     if let Some(port) = ep
@@ -456,32 +390,25 @@ pub fn loopback_addr(ep: &Endpoint) -> EndpointAddr {
 /// How long closing an endpoint waits for its peers to see the close.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
 
-/// Close `endpoint`, waiting at most [`CLOSE_WAIT`] for its peers to see it; whether they did in
-/// time. iroh's close drains every connection for three probe timeouts of its slowest path, and a
-/// peer that vanished while paths to its other addresses were still being probed kept `koh serve`
-/// from exiting for over ten seconds after SIGTERM.
+/// Close `endpoint`, waiting at most [`CLOSE_WAIT`] for its peers to see it; whether they did.
+/// iroh waits three probe timeouts of the slowest path, over ten seconds for a vanished peer.
 pub(crate) async fn close_endpoint(endpoint: &Endpoint) -> bool {
     tokio::time::timeout(CLOSE_WAIT, endpoint.close())
         .await
         .is_ok()
 }
 
-/// A dial-able [`EndpointAddr`] from a peer's id + a known direct socket address (LAN / loopback,
-/// no relay/discovery needed). Use with [`bind_endpoint_local`].
+/// A peer's address from its id and a direct socket address.
 pub fn direct_addr(id: EndpointId, addr: SocketAddr) -> EndpointAddr {
     EndpointAddr::new(id).with_ip_addr(addr)
 }
 
-/// A dial-able [`EndpointAddr`] from a peer's id + a relay URL (relay-assisted, incl. NAT
-/// traversal). Use with [`bind_endpoint_with_relay`] pointed at the same relay.
+/// A peer's address from its id and the relay it uses.
 pub fn relay_addr(id: EndpointId, relay: RelayUrl) -> EndpointAddr {
     EndpointAddr::new(id).with_relay_url(relay)
 }
 
-/// Build an iroh [`Endpoint`] whose only relay is `relay` (no n0 relays, no DNS discovery).
-///
-/// Used for self-hosted relays (private deployments): peers dial by id + this same relay URL
-/// ([`relay_addr`]). Covers NAT traversal / roaming via the local relay.
+/// Bind an endpoint whose only relay is `relay` (self-hosted), with no discovery.
 pub async fn bind_endpoint_with_relay(
     secret: SecretKey,
     accept: bool,

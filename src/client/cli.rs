@@ -1,7 +1,5 @@
-//! The `koh connect` / `koh id` command implementations.
-//!
-//! Dial a server by id and run the reconnecting client session against the real terminal. The
-//! session loop itself lives in [`crate::client::run_client`]; this just wires up the real terminal I/O.
+//! The `koh connect` command: dial the server and run [`crate::client::run_client`] on the real
+//! terminal.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,26 +16,20 @@ use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, relay_addr,
 };
 
-/// Configuration for [`connect`] — the clap-free, library-facing form of `koh connect`'s
-/// arguments. No `Default`: `server` is required.
+/// The clap-free form of `koh connect`'s arguments.
 #[derive(Debug, Clone)]
 pub struct ConnectConfig {
     /// Server endpoint id to connect to.
     pub server: EndpointId,
-    /// Path to the client's persistent secret key (its endpoint id must be on the server's
-    /// allowlist). `None` = the platform default client key path.
+    /// The secret-key file; `None` for the default client key path.
     pub key_file: Option<PathBuf>,
-    /// Dial the server at a direct socket address (LAN / loopback; no relay or discovery).
-    /// Takes precedence over `relay_url` if both are set.
+    /// Dial this socket address directly, with no relay or discovery; wins over `relay_url`.
     pub direct: Option<SocketAddr>,
-    /// Dial the server via a self-hosted relay URL instead of n0's public relays.
+    /// Dial through a self-hosted relay instead of n0's.
     pub relay_url: Option<RelayUrl>,
-    /// Honor remote OSC-52 clipboard writes. Off by default in the CLI (`--clipboard`).
+    /// Let the server set the clipboard (OSC 52).
     pub clipboard: bool,
-    /// A shell command to run (via `sh -c`) whenever the remote bell count climbs, e.g.
-    /// `termux-notification -t "koh bell"`. Detached from the terminal, rate-limited to one spawn
-    /// per second; bells that rang before this client attached do not fire it, bells during a
-    /// reconnect do. `None` = no hook.
+    /// A shell command to run on the remote bell (see [`BellHook`]).
     pub bell_command: Option<String>,
 }
 
@@ -55,18 +47,12 @@ impl ConnectConfig {
     }
 }
 
-/// Runs a user command whenever the remote bell rings: `--on-bell` / [`ConnectConfig::bell_command`].
+/// Runs a command (`sh -c`) when the remote bell rings (`--on-bell`), at most once a second.
 ///
-/// The decision (`observe`) is pure and rate-limited so it is unit-testable; the spawn is
-/// detached — stdin/stdout/stderr on `/dev/null`, since the TUI owns the terminal — with
-/// `KOH_BELL_COUNT` and `KOH_TITLE` in the environment and every other `KOH_*` variable scrubbed
-/// (the same guard as `pty.rs`). The child is reaped on a background task and never awaited by
-/// the session loop.
-///
-/// The remote bell count is cumulative for the life of the server session, so the hook is
-/// [`prime`](Self::prime)d with the count of the first synced frame: bells that rang before you
-/// attached do not fire it. The hook outlives a reconnect (it is not re-primed), so bells that
-/// rang during an outage do.
+/// The command is detached, with its stdio on `/dev/null` (the TUI owns the terminal),
+/// `KOH_BELL_COUNT` and `KOH_TITLE` set and every other `KOH_*` variable scrubbed. The bell count
+/// is cumulative for the server session, so the first synced frame [`prime`](Self::prime)s it:
+/// bells from before the attach do not fire, bells during a reconnect do.
 #[derive(Debug, Clone)]
 pub struct BellHook {
     command: String,
@@ -92,9 +78,7 @@ impl BellHook {
         }
     }
 
-    /// Seed the hook with the bell count of the first synced frame, without spawning: bells that
-    /// rang before this client attached are not "new". A no-op once any count has been seen, so a
-    /// reconnect keeps counting from where it was and bells during the outage still fire.
+    /// Take `count` as seen, without firing, unless a count was seen already.
     pub fn prime(&mut self, count: u64) {
         if !self.primed {
             self.last_count = count;
@@ -102,9 +86,8 @@ impl BellHook {
         }
     }
 
-    /// Note the remote bell count at `now_ms`. Returns `true` when the hook should spawn now: the
-    /// count climbed since the last observation and at least [`BELL_HOOK_MIN_INTERVAL_MS`] passed
-    /// since the last spawn. A rise inside the window is coalesced (absorbed, not deferred).
+    /// Note the bell count at `now_ms`; whether to fire: it rose, and the last spawn was at least
+    /// [`BELL_HOOK_MIN_INTERVAL_MS`] ago. A rise within that is absorbed, not deferred.
     pub fn observe(&mut self, count: u64, now_ms: u64) -> bool {
         let rose = count > self.last_count;
         self.last_count = count;
@@ -131,9 +114,8 @@ impl BellHook {
         }
     }
 
-    /// Build the detached command: `sh -c CMD` with `parent_env` minus every `KOH_*` key, plus
-    /// `KOH_BELL_COUNT` / `KOH_TITLE`, and all three fds on `/dev/null`. Pure given `parent_env`,
-    /// so the scrub is testable with a synthetic environment.
+    /// The command to spawn, with `parent_env` scrubbed of `KOH_*` (given, so tests can pass their
+    /// own).
     pub(crate) fn command(
         &self,
         count: u64,
@@ -155,12 +137,10 @@ impl BellHook {
         cmd
     }
 
-    /// Spawn the command detached (never blocks the session loop; the child is reaped by a
-    /// background task).
+    /// Spawn the command, reaped on a thread of its own so it can never block the session.
     pub fn fire(&self, count: u64, title: &str) {
         match self.command(count, title, std::env::vars_os()).spawn() {
             Ok(mut child) => {
-                // Reap off the async loop; a stuck hook can't wedge the session.
                 let reaper = std::thread::Builder::new()
                     .name("koh-bell-hook".into())
                     .spawn(move || {
@@ -175,8 +155,8 @@ impl BellHook {
     }
 }
 
-/// Bind an endpoint for `config`'s dial mode and make the first, admitted connection. The returned
-/// connector redials the same target with the same identity after a link loss.
+/// Bind an endpoint for `config` and make the first connection; the connector redials the same
+/// target.
 async fn dial(
     config: &ConnectConfig,
     identity: &crate::identity::Identity,
@@ -213,10 +193,9 @@ async fn close_endpoint(endpoint: &iroh::Endpoint) {
     crate::transport_iroh::close_endpoint(endpoint).await;
 }
 
-/// Warn (once, to stderr) if the locale doesn't look UTF-8. koh assumes UTF-8 end to end; on a
-/// legacy locale, output may be mojibake. We only warn — koh still runs — where mosh refuses.
+/// Warn if the locale does not look UTF-8, which koh assumes; mosh refuses to run instead.
 fn warn_if_locale_not_utf8() {
-    // `$LC_ALL` overrides `$LC_CTYPE`, which overrides `$LANG` (POSIX precedence).
+    // In POSIX's order of precedence.
     let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()));
@@ -233,9 +212,9 @@ fn warn_if_locale_not_utf8() {
     }
 }
 
-/// With `$KOH_LOG` set, log to that file at debug level: the TUI owns the terminal. The file is
-/// made owner-only (0600) through its descriptor whether or not it existed, since debug logs can
-/// carry sensitive material; if that fails, nothing is logged to it.
+/// With `$KOH_LOG` set, log to that file at debug level (the TUI owns the terminal). It is made
+/// 0600 through its descriptor, existing or not, as debug logs can be sensitive; failing that,
+/// nothing is logged.
 fn log_to_koh_log() {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let Ok(path) = std::env::var("KOH_LOG") else {
@@ -260,22 +239,14 @@ fn log_to_koh_log() {
     crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG);
 }
 
-/// `koh connect <server-id>` — connect to a koh server and run the (auto-reconnecting) session.
-///
-/// Returns the remote shell's exit code if the session ended because the shell exited.
-///
-/// Takes over the calling process's terminal (raw mode, alternate screen) and its stdin for the
-/// session's lifetime, and installs signal handlers; call it from a binary's main path.
+/// `koh connect`: the remote shell's exit code if it exited. Takes the process's terminal, stdin
+/// and signal handlers for the session.
 pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     log_to_koh_log();
 
-    // koh assumes a UTF-8 terminal (the predictor reassembles UTF-8 graphemes; the renderer emits
-    // UTF-8). Warn — but don't refuse, unlike mosh — if the locale looks non-UTF-8, so mojibake is
-    // diagnosable rather than mysterious.
     warn_if_locale_not_utf8();
 
-    // Held for the whole session: the identity's lease keeps `koh key reset` from deleting the key
-    // while this client may still redial with it.
+    // Held for the session: its lease stops `koh key reset` while it may redial.
     let identity =
         crate::identity::load(&crate::identity::key_path(args.key_file.clone(), "client")?)?;
     let (endpoint, connector, channel) = dial(&args, &identity).await?;

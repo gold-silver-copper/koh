@@ -1,12 +1,5 @@
-//! The `koh serve` command.
-//!
-//! Binds an iroh endpoint with a persistent identity, authorizes incoming clients against a
-//! node-id allowlist, and for each accepted connection runs a PTY-backed shell whose screen is
-//! kept in sync with the client over koh/3 (see [`crate::proto`]).
-//!
-//! Auth model (deliberately *not* iroh-ssh's "anyone with the endpoint id gets a shell"):
-//! a connection is only served if the client's endpoint id is on the `--allow` list. There is no
-//! "accept any peer" escape hatch — an allowlist entry is the sole way in.
+//! The `koh serve` command: bind an endpoint with a persistent identity, admit only the clients on
+//! the `--allow` list, and host each one's session. There is no "accept any peer" mode.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -24,60 +17,47 @@ use crate::server::{run_attached, SessionExit};
 use crate::transport_iroh::{bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, ALPN};
 use tracing::{error, info, warn};
 
-/// Deadline on the QUIC crypto handshake (`Incoming::await`) before a stalled dial is dropped and
-/// its connection + pending-handshake permits released. A legitimate 1-RTT QUIC handshake
-/// finishes in well under this even on a slow mobile link; the cap exists so a peer can't pin a
-/// pending slot for the 300s idle timeout koh configures (`koh_transport_config`).
+/// Deadline on the QUIC handshake, so a stalled dial cannot hold its permits for the 5-minute idle
+/// timeout; a real handshake takes far less, even on a slow mobile link.
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Configuration for [`serve`] — the clap-free, library-facing form of `koh serve`'s arguments.
-///
-/// The `koh` binary builds it from the command line; tests build it directly. [`Default`] gives the
-/// same values as the CLI's defaults, with an empty `allow` list — which [`serve`] rejects, exactly
-/// as the CLI does, because an allowlist entry is the sole way in.
+/// The clap-free form of `koh serve`'s arguments. [`Default`] gives the CLI's defaults, with an
+/// empty `allow`, which [`serve`] rejects.
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
-    /// Path to the persistent secret-key file (gives a stable endpoint id across restarts).
-    /// `None` = the platform default server key path.
+    /// The secret-key file; `None` for the default server key path.
     pub key_file: Option<PathBuf>,
-    /// Authorized client endpoint ids. At least one is required — koh only serves peers whose
-    /// node-id is on this list.
+    /// The client endpoint ids allowed in; at least one.
     pub allow: Vec<EndpointId>,
-    /// The program to host in the session PTY, as argv: `command[0]` is the program, the rest are
-    /// its arguments, passed verbatim (no shell splitting). Empty = the user's login shell.
+    /// The program each session runs, as argv, verbatim; empty for the login shell.
     pub command: Vec<String>,
-    /// Scrollback lines retained by the server-side emulator (per session). 0 = no scrollback.
-    /// Bounded to `0..=1_000_000`, like the CLI.
+    /// Scrollback lines each session's emulator keeps, at most [`MAX_SCROLLBACK`].
     pub scrollback: u64,
-    /// Keep a detached session's shell alive this long (seconds) for the client to reconnect.
+    /// How long a detached session lives, in seconds.
     pub session_ttl_secs: u64,
-    /// Host via a self-hosted relay URL instead of n0's public relays. Takes precedence over
-    /// `local` if both are set.
+    /// A self-hosted relay instead of n0's; wins over `local`.
     pub relay_url: Option<RelayUrl>,
-    /// Bind without any relay/discovery (LAN / loopback). Clients dial with `--direct <ip:port>`.
+    /// No relay or discovery; clients dial with `--direct <ip:port>`.
     pub local: bool,
-    /// Maximum number of connections being handled concurrently (minimum 1).
+    /// Most connections handled at once (at least 1).
     pub max_connections: u32,
-    /// Maximum number of distinct live sessions, one per authorized peer (minimum 1).
+    /// Most live sessions, one per peer (at least 1).
     pub max_sessions: u32,
-    /// The binary each session's program is started through. The default, the running binary,
-    /// is what `koh serve` uses: it dispatches `__launch` to [`crate::pty::launched`].
+    /// The binary each session's program starts through: by default the running one, which hands
+    /// `__launch` to [`crate::pty::launched`].
     pub launcher: crate::pty::Launcher,
 }
 
 /// The CLI's default for `--scrollback`.
 pub const DEFAULT_SCROLLBACK: u64 = 1000;
-/// The CLI's default for `--session-ttl-secs` (24h: mosh-style "close the laptop, reopen later").
+/// The CLI's default for `--session-ttl-secs`: a day, to close the laptop and reopen it later.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
 /// The CLI's default for `--max-connections`.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 64;
 /// The CLI's default for `--max-sessions`.
 pub const DEFAULT_MAX_SESSIONS: u32 = 64;
-/// Upper bound on `scrollback` (the CLI's `value_parser` range; re-checked in [`serve`]).
-///
-/// fux-vt caps each buffer at 64 Mi cells (history plus live rows, times the width), so the
-/// history must leave room for a `MAX_DIM × MAX_DIM` screen or a wide resize would be refused:
-/// `(65_000 + 1000) × 1000 < 64 Mi`. Pinned by a `terminal::server` test.
+/// Upper bound on `scrollback`. fux-vt caps a buffer at 64 Mi cells, which must hold the history
+/// and a `MAX_DIM × MAX_DIM` screen: `(65_000 + 1000) × 1000 < 64 Mi`.
 pub const MAX_SCROLLBACK: u64 = 65_000;
 
 impl Default for ServeConfig {
@@ -97,10 +77,8 @@ impl Default for ServeConfig {
     }
 }
 
-/// Render `data` as a QR code for a **dark-background** terminal, or `None` if it is too large to
-/// encode. The polarity follows the `qrcode` crate's documented terminal recipe — QR-dark modules
-/// become the terminal background and QR-light modules the foreground blocks — so a phone camera
-/// reads it as a normal dark-on-light code. (A light-background terminal would see it inverted.)
+/// `data` as a QR code for a dark-background terminal (dark modules drawn as the background, so a
+/// camera reads dark on light), or `None` if it is too large to encode.
 fn connect_qr(data: &str) -> Option<String> {
     use qrcode::render::unicode::Dense1x2;
     let code = qrcode::QrCode::new(data).ok()?;
@@ -113,11 +91,8 @@ fn connect_qr(data: &str) -> Option<String> {
     )
 }
 
-/// `koh serve` — host a PTY shell for authorized clients over iroh.
-///
-/// The program hosted is [`ServeConfig::command`] (any argv, not only a shell).
-///
-/// Installs a global `tracing` subscriber writing to stderr if none is installed yet.
+/// `koh serve`: host [`ServeConfig::command`] for the allowed clients until SIGTERM or SIGINT.
+/// Logs to stderr.
 pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     crate::log::init(std::io::stderr, tracing::Level::INFO);
     let hosting = Hosting::from_config(&args)?;
@@ -161,8 +136,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
 
-    // Always print a scannable QR of the endpoint id — point a phone camera at it instead of
-    // copying 64 hex chars.
+    // A phone camera can read the id instead of anyone copying 64 hex digits.
     if let Some(qr) = connect_qr(&id_str) {
         eprintln!(
             "\nScan for the endpoint id (point a phone camera at it). Assumes a dark-background \
@@ -173,8 +147,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
         warn!("could not render the connect QR (endpoint id too large to encode)");
     }
 
-    // Transport crypto posture (koh is a policy-taker: QUIC + TLS 1.3 come from iroh). Logged so an
-    // operator can see at a glance what protects the link — and that post-quantum KEX is not yet on.
+    // What protects the link, iroh's choice: so an operator sees post-quantum KEX is not on.
     info!(
         transport = "QUIC + TLS 1.3 (iroh)",
         kex = "X25519",
@@ -182,8 +155,6 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
         "transport crypto posture"
     );
 
-    // Graceful shutdown: a SIGTERM/SIGINT drains the accept loop cleanly (close the endpoint after
-    // the registry stops) instead of hard-killing the process.
     let shutdown = CancellationToken::new();
     crate::cancel_on_signals(
         &shutdown,
@@ -193,8 +164,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     serve_endpoint(endpoint, hosting, shutdown).await
 }
 
-/// What `koh serve` hosts, validated from a [`ServeConfig`]: who may connect, the program each
-/// session runs, and the limits.
+/// A validated [`ServeConfig`]: who may connect, what each session runs, and the limits.
 pub struct Hosting {
     allow: HashSet<EndpointId>,
     command: Arc<[String]>,
@@ -206,8 +176,7 @@ pub struct Hosting {
 }
 
 impl Hosting {
-    /// Validate the hosting part of `args`. The CLI enforces these ranges in clap; a directly built
-    /// `ServeConfig` bypasses that, so they are re-checked here.
+    /// Validate `args`: clap checks these ranges, but a `ServeConfig` built in code does not.
     pub fn from_config(args: &ServeConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(
             args.scrollback <= MAX_SCROLLBACK,
@@ -215,8 +184,6 @@ impl Hosting {
             args.scrollback
         );
         anyhow::ensure!(args.max_sessions >= 1, "max_sessions must be at least 1");
-        // The node-id allowlist is the sole authorization gate. Every authorized peer gets the
-        // same access. At least one entry is required: koh never serves an unlisted peer.
         let allow: HashSet<EndpointId> = args.allow.iter().copied().collect();
         if allow.is_empty() {
             anyhow::bail!(
@@ -227,8 +194,6 @@ impl Hosting {
             args.max_connections >= 1,
             "max_connections must be at least 1"
         );
-        // Validated above (scrollback <= MAX_SCROLLBACK), so the conversions to the usize the
-        // emulator, the store and the semaphores want cannot fail on any supported target.
         Ok(Self {
             allow,
             command: args.command.clone().into(),
@@ -244,18 +209,14 @@ impl Hosting {
     }
 }
 
-/// Serve authorized clients on an already-bound `endpoint`.
-///
-/// Runs until `shutdown` is cancelled or the endpoint closes, then closes it. This is `koh serve`'s
-/// accept pipeline; tests run it on endpoints bound to their own transports.
+/// Serve the allowed clients on `endpoint` until `shutdown` is cancelled or it closes, then close
+/// it: `koh serve`'s accept loop, which tests run on their own transports.
 pub async fn serve_endpoint(
     endpoint: iroh::Endpoint,
     hosting: Hosting,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let allow = Arc::new(hosting.allow);
-    // The registry task owns the live sessions: it creates, reattaches, caps and reaps them, so a
-    // reconnecting client lands back in the same session at the current screen.
     let registry = Registry::spawn(SessionSpec {
         command: hosting.command,
         scrollback: hosting.scrollback,
@@ -264,16 +225,11 @@ pub async fn serve_endpoint(
         launcher: hosting.launcher,
     });
 
-    // Bound concurrent connection-handling tasks: each accepted connection holds a permit for its
-    // whole lifetime, so a flood can't spawn unbounded tasks. Excess dials are refused cheaply
-    // (before the crypto handshake) via `Incoming::refuse`.
+    // Each connection holds a permit for its life; past the cap a dial is refused before its
+    // handshake, which is cheap.
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(hosting.max_connections));
-    // Separate, smaller cap on *un-admitted, in-flight* handshakes: a slowloris that opens
-    // connections but stalls the QUIC handshake (or never accepts the admission stream) would
-    // otherwise pin every connection permit for the whole handshake-timeout window. A pending permit
-    // is released the moment admission completes (the `drop(pending_permit)` in the accept task), so
-    // established sessions never count against this — only stalls do — and excess pending dials are
-    // refused cheaply (pre-handshake) like the connection cap.
+    // A smaller cap on connections not yet admitted, so peers that stall their handshakes cannot
+    // hold every connection permit. Admission releases it.
     let pending_cap = hosting.max_connections.div_ceil(4).max(4);
     let handshake_limit = Arc::new(tokio::sync::Semaphore::new(pending_cap));
 
@@ -286,27 +242,14 @@ pub async fn serve_endpoint(
                 None => break, // endpoint closed
             },
         };
-        // Connection cap: grab a permit before doing any work for this connection. If the
-        // server is at capacity, refuse the incoming dial cheaply — `refuse()` rejects it without
-        // the (expensive) crypto handshake, so a flood can't pin unbounded resources.
-        // --- Trust-boundary admission pipeline ---
-        // An accepted connection runs an ORDERED gauntlet before it gets a session, deliberately
-        // inlined so each control is a single local edit and the order reads as one sequence:
-        //   (1) connection-cap permit, (2) pending-handshake permit, then in the task:
-        //   (3) QUIC-handshake timeout, (4) node-id allowlist, (5) a 1-byte admission ack so
-        //   the client can tell "admitted" from a deliberate reject, then attach. Authorization is the
-        //   allowlist — the peer's node-id is already cryptographically authenticated by the QUIC/TLS
-        //   handshake, so there is no passphrase/second-factor step. The pure controls (allowlist /
-        //   caps / admission) live in session.rs / transport_iroh::admission with their own tests; what
-        //   stays here is the I/O-bound permit/guard ownership dance.
+        // Admission, in order: a connection permit, a pending-handshake permit, the handshake within
+        // its deadline, the allowlist (the handshake authenticated the peer's id), then the admission
+        // ack and the session.
         let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
             warn!("refusing connection: at max-connections capacity");
             incoming.refuse();
             continue;
         };
-        // Pending-handshake cap: refuse if too many un-authenticated handshakes are
-        // already in flight, so stalls can't consume the whole connection budget. (`permit` above
-        // is released on this `continue`.)
         let Ok(pending_permit) = handshake_limit.clone().try_acquire_owned() else {
             warn!("refusing connection: too many handshakes in flight");
             incoming.refuse();
@@ -315,15 +258,8 @@ pub async fn serve_endpoint(
         let allow = allow.clone();
         let sessions = registry.clone();
         tokio::spawn(async move {
-            // Held for the whole task: releases the connection-cap permit on every exit path.
             let _permit = permit;
-            // Held only until auth completes (dropped explicitly on success, or on any early
-            // return below), so an established session doesn't occupy a pending-handshake slot.
             let pending_permit = pending_permit;
-            // Bound the QUIC handshake itself: `incoming.await` has no internal deadline
-            // short of iroh's 300s idle timeout, so a peer that yields an `Incoming` then stalls
-            // would otherwise pin this conn + pending permit for ~5 min — and ~`pending_cap` such
-            // stalls would deny all new connections. The timeout releases both permits promptly.
             let conn = match tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT, incoming).await {
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => {
@@ -341,16 +277,12 @@ pub async fn serve_endpoint(
                 conn.close(1u32.into(), b"not authorized");
                 return;
             }
-            // Authenticated + authorized: free the pending-handshake slot so it isn't held for the
-            // (potentially long-lived) session that follows. The connection-cap permit is
-            // still held. The admission ack + attach happen in `serve_connection`.
             drop(pending_permit);
             serve_connection(conn, &sessions).await;
         });
     }
 
-    // The accept loop ended (endpoint closed or a shutdown signal): stop the registry (which tears
-    // down every session) before closing the endpoint.
+    // Sessions first, then the endpoint.
     info!("draining: stopping the registry and closing endpoint");
     shutdown.cancel();
     registry.shutdown().await;
@@ -360,13 +292,11 @@ pub async fn serve_endpoint(
     Ok(())
 }
 
-/// Serve one authenticated, allowlisted connection: send the admission ack, attach the peer's
-/// session, and drive it. Dropping the session client on return detaches.
+/// Serve one allowed connection: send the admission ack, then attach its peer's session and drive
+/// it; returning detaches.
 async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry) {
     let peer = conn.remote_id();
-    // Authorized: send the 1-byte admission ack so the client can distinguish "admitted" from a
-    // deliberate reject (without it a rejected client would re-dial forever). Bounded by a short
-    // timeout so a client that never accepts the stream can't pin the slot.
+    // Bounded, so a client that never accepts the stream cannot hold its slot.
     match tokio::time::timeout(
         Duration::from_secs(3),
         crate::transport_iroh::admission::admit(&conn),
@@ -385,11 +315,8 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
     }
     auth_event(Outcome::Accepted, &peer, "authorized; attaching session");
 
-    // Attach to (or create) this client's detachable session, then serve the connection.
     let Some((client, attach_kind)) = registry.attach(peer).await else {
-        // At the live-session cap: refuse a brand-new peer rather than spawn an unbounded
-        // shell. A reconnecting peer would have matched its existing session, so this only ever
-        // rejects a genuinely new one.
+        // At the session cap, which only a new peer can hit.
         warn!(peer = %peer, "refusing session: at max-sessions capacity");
         conn.close(1u32.into(), b"server at session capacity");
         return;
@@ -406,7 +333,6 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
             );
         }
     }
-    // Dropping `client` on return (or panic) detaches; the session keeps running for reattach.
     match run_attached(conn, client).await {
         Ok(SessionExit::Detached) => {
             info!(peer = %peer, "client detached (session retained)");

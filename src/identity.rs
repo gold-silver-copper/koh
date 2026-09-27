@@ -1,7 +1,5 @@
-//! Unlocked identities and the credential operations behind `koh serve`, `connect`, `id` and `key`.
-//!
-//! Loading an identity holds a shared lease (an `flock` beside the key file) for as long as any
-//! clone of it lives, so `koh key reset` refuses to delete a key a running koh is still using.
+//! Identities. A loaded one holds a shared lease (an `flock` beside the key file) while any clone
+//! lives, so `koh key reset` refuses to delete a key in use.
 use anyhow::{ensure, Context as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

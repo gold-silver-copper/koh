@@ -1,11 +1,8 @@
-//! The terminal the client paints on: [`KohBackend`] and its one implementation, [`Tty`].
+//! The terminal the client paints on.
 //!
-//! The client's render path (`super::render`) and its [`ClientTerminal`](super::ClientTerminal)
-//! adapter ([`BackendTerminal`](super::BackendTerminal)) speak only to [`KohBackend`]. Its required
-//! methods are the platform primitives (raw mode, the window size, writing bytes); every escape
-//! sequence — the cell grid, the cursor, the out-of-band window state — is a provided method that
-//! writes standard ANSI/DEC bytes. [`Tty`] supplies the primitives through `fuxix::terminal`; the
-//! tests' `CaptureBackend` records the bytes instead.
+//! [`KohBackend`]'s required methods are the platform primitives (raw mode, the size, writing
+//! bytes); its provided methods write every escape sequence. [`Tty`] is the real terminal; tests
+//! capture the bytes instead.
 
 use std::fmt;
 use std::io;
@@ -20,21 +17,13 @@ pub use self::tty::Tty;
 /// The terminal the `koh` binary paints through.
 pub type DefaultBackend = Tty;
 
-/// The DEC private modes koh may have forwarded to the user's terminal (X10 `?9` + all mouse modes
-/// and encodings, bracketed paste `?2004`, application cursor keys `?1`) plus normal keypad
-/// (`ESC >`). Reset together whenever koh leaves the alternate screen — on drop *or* on suspend — so
-/// the user's shell isn't left with mouse reporting on, injecting stray bytes at the prompt.
-///
-/// This ledger is deliberately **backend-independent**: it lives here (not in any one backend) and
-/// is emitted by [`KohBackend::leave_alt_screen`], so every backend restores the same mode set.
+/// Every mode koh may have forwarded (mouse reporting and encodings, bracketed paste, cursor and
+/// keypad keys), reset on leaving the alternate screen, so the user's shell does not get stray
+/// mouse bytes at its prompt.
 pub(crate) const RESET_FORWARDED_MODES: &[u8] =
     b"\x1b[?9l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>";
 
-/// A compact, backend-neutral style fingerprint for one cell.
-///
-/// Carries only what koh renders (fg/bg plus the boolean cell attributes); `Copy` +
-/// `PartialEq` so the render loop can diff it against the previous cell and re-emit SGR only when it
-/// actually changes.
+/// A cell's style as koh draws it, compared with the last to emit SGR only on a change.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub struct CellStyle {
     pub fg: Color,
@@ -46,40 +35,25 @@ pub struct CellStyle {
     pub inverse: bool,
 }
 
-/// A pluggable terminal backend for the `koh connect` client.
-///
-/// Modeled on Ratatui's `Backend`, but split so the escape-sequence emission (the provided methods)
-/// is shared and only the platform primitives (the required methods) vary per backend. Callers hold
-/// a backend inside [`BackendTerminal`](super::BackendTerminal), which owns the mode ledger and the
-/// frame lifecycle; a backend itself is stateless beyond its terminal handle.
-///
-/// All output is buffered by the backend and made visible by [`flush`](Self::flush) — the render
-/// path flushes once per frame, so a repaint reaches the terminal atomically (it is additionally
-/// wrapped in DEC synchronized output by [`begin_frame`](Self::begin_frame) /
-/// [`end_frame`](Self::end_frame)).
+/// The terminal `koh connect` paints on. Output is buffered until [`flush`](Self::flush), once per
+/// frame.
 pub trait KohBackend {
-    // --- required: the genuinely platform-specific operations ---
-
-    /// Append raw bytes to the output buffer (not necessarily flushed until [`flush`](Self::flush)).
+    /// Append bytes to the output buffer.
     fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()>;
 
-    /// Flush buffered output so it becomes visible on the terminal.
+    /// Write the buffered output to the terminal.
     fn flush(&mut self) -> io::Result<()>;
 
-    /// Put the terminal into raw mode (no line buffering, no echo, no signal-generating keys).
+    /// Put the terminal in raw mode.
     fn enter_raw_mode(&mut self) -> io::Result<()>;
 
-    /// Return the terminal to cooked mode. Must be safe to call even if raw mode was never entered.
+    /// Restore the terminal's mode; harmless if raw mode was never entered.
     fn leave_raw_mode(&mut self) -> io::Result<()>;
 
     /// The current terminal size.
     fn size(&self) -> io::Result<Size>;
 
-    // --- provided: standard ANSI/DEC emission (override only to use a different encoding) ---
-
-    /// Format `args` straight into the output buffer, piece by piece through
-    /// [`write_bytes`](Self::write_bytes), with no intermediate `String`. This is what `write!`
-    /// on a backend calls.
+    /// Format `args` into the output buffer with no intermediate `String`; what `write!` calls.
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
         /// Forwards formatted pieces to the backend, keeping the first I/O error for the caller.
         struct Pieces<'a, B: ?Sized> {
@@ -106,43 +80,37 @@ pub trait KohBackend {
         Ok(())
     }
 
-    /// Enter the alternate screen (clearing it) and hide the cursor, then flush. Paired with
-    /// [`leave_alt_screen`](Self::leave_alt_screen). DEC 1049 + hide-cursor.
+    /// Enter the alternate screen and hide the cursor.
     fn enter_alt_screen(&mut self) -> io::Result<()> {
         self.write_bytes(b"\x1b[?1049h\x1b[?25l")?;
         self.flush()
     }
 
-    /// Reset the forwarded input modes (`RESET_FORWARDED_MODES`), show the cursor, and leave the
-    /// alternate screen, then flush. This is the teardown that restores the user's terminal on drop
-    /// and on suspend — kept here (not in the caller) so it runs identically for every backend.
+    /// Reset the forwarded modes, show the cursor and leave the alternate screen: the user's
+    /// terminal as it was.
     fn leave_alt_screen(&mut self) -> io::Result<()> {
         self.write_bytes(RESET_FORWARDED_MODES)?;
         self.write_bytes(b"\x1b[?25h\x1b[?1049l")?;
         self.flush()
     }
 
-    /// Begin one repaint: open a DEC synchronized-output frame (mode 2026) and hide the cursor while
-    /// painting, so the terminal reveals the whole frame at once with no tearing.
+    /// Open a synchronized-output frame (DEC 2026) and hide the cursor, so the frame shows at once.
     fn begin_frame(&mut self) -> io::Result<()> {
         self.write_bytes(b"\x1b[?2026h\x1b[?25l")
     }
 
-    /// End the repaint: close the synchronized-output frame. The terminal now shows the frame.
+    /// Close the synchronized-output frame.
     fn end_frame(&mut self) -> io::Result<()> {
         self.write_bytes(b"\x1b[?2026l")
     }
 
     /// Move the cursor to a 0-based `(row, col)` (emitted as the 1-based CUP sequence).
     fn move_to(&mut self, row: u16, col: u16) -> io::Result<()> {
-        // u32 math so the `+ 1` can never overflow the u16 coordinate (overflow-checks are on in
-        // release), and cols/rows are peer-controlled (though clamped) — never trust them not to be
-        // at the type max.
+        // In u32, so `u16::MAX + 1` cannot overflow.
         write!(self, "\x1b[{};{}H", u32::from(row) + 1, u32::from(col) + 1)
     }
 
-    /// Apply a full cell style: SGR reset, then each set attribute, then fg and bg. Emitted only
-    /// when the style changes (the render loop diffs), so this is not on the per-cell hot path.
+    /// Set a whole style: reset, then each attribute, then the colours.
     fn set_style(&mut self, style: CellStyle) -> io::Result<()> {
         self.reset_sgr()?; // clears everything (incl. colors), then re-apply
         if style.bold {
@@ -169,37 +137,32 @@ pub trait KohBackend {
         self.write_bytes(b"\x1b[m")
     }
 
-    /// Turn on reverse video (`ESC [ 7 m`) — used for the status line.
+    /// Turn on reverse video (`ESC [ 7 m`), for the status line.
     fn set_reverse(&mut self) -> io::Result<()> {
         self.write_bytes(b"\x1b[7m")
     }
 
-    /// Print a glyph at the current cursor position. `glyph` is borrowed (from the screen grid or
-    /// the prediction overlay), so the per-cell hot path never allocates.
+    /// Print a glyph at the cursor.
     fn print(&mut self, glyph: &str) -> io::Result<()> {
         self.write_bytes(glyph.as_bytes())
     }
 
-    /// Show the cursor (`ESC [ ? 25 h`). The render path calls this after positioning the cursor,
-    /// only when the remote screen wants it visible.
+    /// Show the cursor (`ESC [ ? 25 h`).
     fn show_cursor(&mut self) -> io::Result<()> {
         self.write_bytes(b"\x1b[?25h")
     }
 
-    /// Set the combined window title + icon name (`OSC 0`), used when the app's icon name equals its
-    /// title. `title` is already sanitized/prefixed by the caller's ledger.
+    /// Set the window title and icon name together (`OSC 0`).
     fn set_window_title(&mut self, title: &str) -> io::Result<()> {
         write!(self, "\x1b]0;{title}\x07")
     }
 
-    /// Set a distinct icon name (`OSC 1`) and window title (`OSC 2`). Both are sanitized/prefixed by
-    /// the caller's ledger.
+    /// Set the icon name (`OSC 1`) and the window title (`OSC 2`).
     fn set_window_icon_and_title(&mut self, icon: &str, title: &str) -> io::Result<()> {
         write!(self, "\x1b]1;{icon}\x07\x1b]2;{title}\x07")
     }
 
-    /// Forward an OSC-52 clipboard write (`OSC 52`). The caller has already gated this on the
-    /// `--clipboard` opt-in and validated `base64` as strict base64 within the size cap.
+    /// Set the clipboard (`OSC 52`) to `base64`, which the caller validated.
     fn set_clipboard(&mut self, base64: &str) -> io::Result<()> {
         write!(self, "\x1b]52;c;{base64}\x07")
     }
@@ -209,31 +172,22 @@ pub trait KohBackend {
         self.write_bytes(b"\x07")
     }
 
-    /// Re-assert the remote app's input modes (bracketed paste / mouse reporting / application
-    /// cursor keys) on the local terminal. `bytes` are the DEC-private-mode set/reset escapes
-    /// produced by diffing the screen's mode state, forwarded verbatim so the local terminal reports
-    /// input exactly as the remote app expects.
+    /// Write the sequences that set the program's input modes.
     fn write_input_modes(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.write_bytes(bytes)
     }
 }
 
-/// Emit one SGR color parameter for `color` on the foreground (`fg == true`) or background layer.
-///
-/// Palette indices 0–7 map to the classic 30–37 / 40–47 codes and 8–15 to the
-/// bright 90–97 / 100–107 codes (both **theme-aware** — the terminal's palette, not the fixed
-/// 256-color slots), 16–255 to `38;5;n` / `48;5;n`, true color to `38;2;r;g;b` / `48;2;r;g;b`, and
-/// the default color to `39` / `49`.
+/// Emit `color` as the foreground (`fg`) or background. Indices 0–15 use the classic 30–37/90–97
+/// (40–47/100–107) codes, which follow the user's theme, rather than `38;5;n`.
 fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool) -> io::Result<()> {
     match color {
         Color::Default => out.write_bytes(if fg { b"\x1b[39m" } else { b"\x1b[49m" }),
         Color::Idx(i) if i < 8 => {
-            // 0..=7 → 30..=37 (fg) / 40..=47 (bg): the lead digit, then the index.
             let lead = if fg { 3 } else { 4 };
             write!(out, "\x1b[{lead}{i}m")
         }
         Color::Idx(i) if i < 16 => {
-            // 8..=15 → 90..=97 (fg) / 100..=107 (bg): the lead, then the index less 8 (`i & 7`).
             let lead = if fg { 9 } else { 10 };
             write!(out, "\x1b[{lead}{}m", i & 7)
         }
@@ -248,10 +202,8 @@ fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool)
     }
 }
 
-/// An in-memory backend that captures every emitted byte, for unit-testing the render engine and
-/// out-of-band emission without a real TTY. All the platform primitives are inert; the escape
-/// output comes from the trait's provided methods, so tests observe exactly what a real terminal
-/// would receive. It reports `size`, 24×80 by default.
+/// A backend that captures the bytes a terminal would receive, for tests. It reports `size`, 24×80
+/// by default.
 #[cfg(test)]
 pub(crate) struct CaptureBackend {
     pub bytes: Vec<u8>,

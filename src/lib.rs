@@ -1,23 +1,15 @@
-//! # koh
-//!
 //! The library behind the `koh` remote shell: `koh serve` hosts a PTY for allowlisted peers and
 //! `koh connect` renders it with predictive local echo, reconnecting transparently.
 //!
-//! ## Modules
-//!
-//! [`transport_iroh`] owns endpoint setup, the identity key file and connection admission.
-//! [`identity`] loads identities and holds their reset leases; [`keycmd`] implements `koh id` and
-//! `koh key`. [`proto`] is the wire protocol: input messages on one stream, screen
-//! frames on their own. [`terminal`], [`predict`] and [`pty`] implement the remote-shell payload;
-//! [`server`] hosts detachable sessions and [`client`] renders them on the tty. The `koh` binary
-//! (`src/main.rs`, `src/args.rs`) adds the command line.
+//! [`transport_iroh`] sets up endpoints, the key file and admission; [`identity`] loads identities
+//! and their reset leases; [`keycmd`] is `koh id` and `koh key`. [`proto`] is the wire protocol;
+//! [`terminal`], [`predict`] and [`pty`] the screen, the prediction and the PTY; [`server`] hosts
+//! sessions and [`client`] renders them.
 //!
 //! Production code is panic-free by construction: `Cargo.toml` forbids the panic lints, lossy casts
-//! and unchecked arithmetic for the library, the binary and the tests, and a `forbid` cannot be
-//! lifted by a local `#[allow]` or `#[expect]`. Tests may panic (see `clippy.toml`).
+//! and unchecked arithmetic, and a `forbid` cannot be lifted locally. Tests may panic.
 //!
-//! The library exists so the binary, its tests and the fuzz targets share code. Everything in it
-//! is internal and may change in any release.
+//! The library exists so the binary, tests and fuzz targets share code; all of it is internal.
 
 pub mod client;
 pub mod identity;

@@ -34,8 +34,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 impl ClientIoTasks {
-    /// Cancels both producers and joins them. The input poll checks cancellation at least every
-    /// 100 ms, so teardown never waits for another byte on stdin.
+    /// Cancel both producers and join them; the input poll sees that within 100 ms.
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
         self.cancel.cancel();
         let resize_result = match self.resize.take() {

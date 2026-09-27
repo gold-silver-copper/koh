@@ -61,6 +61,30 @@ jobs:
           echo "layering edges OK"
       - name: test
         run: cargo test --locked
+      # TEMPORARY, removed before the PR is ready: the PTY limit and PTY use on the runner.
+      - name: pty probe (temporary)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            sysctl kern.tty.ptmx_max
+            count() { ls /dev | grep -c '^ttys'; }
+          else
+            echo "kernel.pty.max $(cat /proc/sys/kernel/pty/max)"
+            count() { cat /proc/sys/kernel/pty/nr; }
+          fi
+          echo "in use before: $(count)"
+          ( while true; do echo "$SECONDS $(count)"; sleep 0.02; done ) > /tmp/ptys.txt &
+          sampler=$!
+          cargo test --locked 2>&1 | grep -E "Running|test result|panicked" || true
+          echo "peak during cargo test (seconds, in use): $(sort -k2 -n /tmp/ptys.txt | tail -1)"
+          : > /tmp/ptys.txt
+          fails=0
+          for i in $(seq 25); do
+            cargo test --locked --test pty > /tmp/pty.log 2>&1 || { fails=$((fails+1)); grep -E "panicked|posix" /tmp/pty.log | head -3; }
+          done
+          echo "pty binary failures: $fails / 25; peak (seconds, in use): $(sort -k2 -n /tmp/ptys.txt | tail -1)"
+          kill $sampler
+          echo "in use after: $(count)"
       - name: docs (deny broken intra-doc links)
         # Catches renamed intra-doc links before they ship a broken docs.rs build.
         run: cargo doc --no-deps --locked

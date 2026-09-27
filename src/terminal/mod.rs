@@ -13,7 +13,7 @@
 //! bytes.
 
 use fux_vt::{Attributes, Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 mod grid;
 mod server;
@@ -197,75 +197,118 @@ impl From<WireColor> for Color {
     }
 }
 
-/// Cell `kind` on the wire.
-const KIND_NARROW: u8 = 0;
-const KIND_WIDE: u8 = 1;
-const KIND_CONTINUATION: u8 = 2;
+/// A cell's kind on the wire. The variant's index is its byte, so an unknown kind fails to decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CellKind {
+    Narrow,
+    Wide,
+    /// The right half of a wide glyph.
+    Continuation,
+}
 
-/// `style` bits on the wire.
-const STYLE_BOLD: u8 = 1;
-const STYLE_DIM: u8 = 2;
-const STYLE_ITALIC: u8 = 4;
-const STYLE_UNDERLINE: u8 = 8;
-const STYLE_INVERSE: u8 = 16;
-const STYLE_ALL: u8 = 31;
+/// A cell's style on the wire: one bit per attribute. Decoding rejects any bit outside the five
+/// defined, so every value holds only known bits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WireStyle(u8);
+
+impl WireStyle {
+    pub const BOLD: u8 = 1;
+    pub const DIM: u8 = 2;
+    pub const ITALIC: u8 = 4;
+    pub const UNDERLINE: u8 = 8;
+    pub const INVERSE: u8 = 16;
+    const ALL: u8 = 31;
+
+    /// The style with exactly `bits`, or `None` if any is not a defined bit.
+    pub const fn new(bits: u8) -> Option<Self> {
+        if bits & !Self::ALL == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    const fn has(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
+}
+
+impl Serialize for WireStyle {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireStyle {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bits = u8::deserialize(deserializer)?;
+        Self::new(bits).ok_or_else(|| {
+            de::Error::invalid_value(
+                de::Unexpected::Unsigned(u64::from(bits)),
+                &"style bits within 0b11111",
+            )
+        })
+    }
+}
 
 /// One cell on the wire. `text` is at most `fux_vt::Cell::CONTENTS_CAPACITY` bytes; a
 /// continuation (the right half of a wide glyph) is empty with default colours and no style.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireCell {
     pub text: String,
-    pub kind: u8,
+    pub kind: CellKind,
     pub fg: WireColor,
     pub bg: WireColor,
-    pub style: u8,
+    pub style: WireStyle,
 }
 
 impl WireCell {
     fn of(cell: &Cell) -> Self {
         let a = cell.attributes();
         let bit = |on: bool, b: u8| if on { b } else { 0 };
+        let style = bit(a.bold(), WireStyle::BOLD)
+            | bit(a.dim(), WireStyle::DIM)
+            | bit(a.italic(), WireStyle::ITALIC)
+            | bit(a.underline(), WireStyle::UNDERLINE)
+            | bit(a.inverse(), WireStyle::INVERSE);
         Self {
             text: cell.contents().to_owned(),
             kind: if cell.is_wide_continuation() {
-                KIND_CONTINUATION
+                CellKind::Continuation
             } else if cell.is_wide() {
-                KIND_WIDE
+                CellKind::Wide
             } else {
-                KIND_NARROW
+                CellKind::Narrow
             },
             fg: a.foreground.into(),
             bg: a.background.into(),
-            style: bit(a.bold(), STYLE_BOLD)
-                | bit(a.dim(), STYLE_DIM)
-                | bit(a.italic(), STYLE_ITALIC)
-                | bit(a.underline(), STYLE_UNDERLINE)
-                | bit(a.inverse(), STYLE_INVERSE),
+            // Only defined bits were set above.
+            style: WireStyle(style),
         }
     }
 
-    /// The cell this encodes, or `None` if the encoding is malformed (unknown kind or style
-    /// bits, oversized text, or a continuation carrying content).
+    /// The cell this encodes, or `None` if the encoding is malformed (oversized text, or a
+    /// continuation carrying content).
     fn cell(&self) -> Option<Cell> {
-        if self.style & !STYLE_ALL != 0 {
-            return None;
-        }
         match self.kind {
-            KIND_CONTINUATION => (self.text.is_empty()
+            CellKind::Continuation => (self.text.is_empty()
                 && self.fg == WireColor::Default
                 && self.bg == WireColor::Default
-                && self.style == 0)
-                .then(Cell::wide_continuation),
-            KIND_NARROW | KIND_WIDE => {
+                && self.style == WireStyle::default())
+            .then(Cell::wide_continuation),
+            CellKind::Narrow | CellKind::Wide => {
                 let attributes = Attributes::new(self.fg.into(), self.bg.into())
-                    .with_bold(self.style & STYLE_BOLD != 0)
-                    .with_dim(self.style & STYLE_DIM != 0)
-                    .with_italic(self.style & STYLE_ITALIC != 0)
-                    .with_underline(self.style & STYLE_UNDERLINE != 0)
-                    .with_inverse(self.style & STYLE_INVERSE != 0);
-                Cell::new(&self.text, self.kind == KIND_WIDE, attributes)
+                    .with_bold(self.style.has(WireStyle::BOLD))
+                    .with_dim(self.style.has(WireStyle::DIM))
+                    .with_italic(self.style.has(WireStyle::ITALIC))
+                    .with_underline(self.style.has(WireStyle::UNDERLINE))
+                    .with_inverse(self.style.has(WireStyle::INVERSE));
+                Cell::new(&self.text, self.kind == CellKind::Wide, attributes)
             }
-            _ => None,
         }
     }
 }
@@ -332,6 +375,68 @@ impl RowDiff {
     }
 }
 
+/// The mouse reporting mode on the wire. The variant's index is its byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireMouseMode {
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+impl From<MouseProtocolMode> for WireMouseMode {
+    fn from(mode: MouseProtocolMode) -> Self {
+        match mode {
+            MouseProtocolMode::None => Self::None,
+            MouseProtocolMode::Press => Self::Press,
+            MouseProtocolMode::PressRelease => Self::PressRelease,
+            MouseProtocolMode::ButtonMotion => Self::ButtonMotion,
+            MouseProtocolMode::AnyMotion => Self::AnyMotion,
+        }
+    }
+}
+
+impl From<WireMouseMode> for MouseProtocolMode {
+    fn from(mode: WireMouseMode) -> Self {
+        match mode {
+            WireMouseMode::None => Self::None,
+            WireMouseMode::Press => Self::Press,
+            WireMouseMode::PressRelease => Self::PressRelease,
+            WireMouseMode::ButtonMotion => Self::ButtonMotion,
+            WireMouseMode::AnyMotion => Self::AnyMotion,
+        }
+    }
+}
+
+/// The mouse report encoding on the wire. The variant's index is its byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireMouseEncoding {
+    Default,
+    Utf8,
+    Sgr,
+}
+
+impl From<MouseProtocolEncoding> for WireMouseEncoding {
+    fn from(encoding: MouseProtocolEncoding) -> Self {
+        match encoding {
+            MouseProtocolEncoding::Default => Self::Default,
+            MouseProtocolEncoding::Utf8 => Self::Utf8,
+            MouseProtocolEncoding::Sgr => Self::Sgr,
+        }
+    }
+}
+
+impl From<WireMouseEncoding> for MouseProtocolEncoding {
+    fn from(encoding: WireMouseEncoding) -> Self {
+        match encoding {
+            WireMouseEncoding::Default => Self::Default,
+            WireMouseEncoding::Utf8 => Self::Utf8,
+            WireMouseEncoding::Sgr => Self::Sgr,
+        }
+    }
+}
+
 /// The modes on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireModes {
@@ -339,8 +444,8 @@ pub struct WireModes {
     pub application_cursor: bool,
     pub application_keypad: bool,
     pub bracketed_paste: bool,
-    pub mouse_mode: u8,
-    pub mouse_encoding: u8,
+    pub mouse_mode: WireMouseMode,
+    pub mouse_encoding: WireMouseEncoding,
 }
 
 impl From<Modes> for WireModes {
@@ -350,44 +455,22 @@ impl From<Modes> for WireModes {
             application_cursor: m.application_cursor,
             application_keypad: m.application_keypad,
             bracketed_paste: m.bracketed_paste,
-            mouse_mode: match m.mouse_mode {
-                MouseProtocolMode::None => 0,
-                MouseProtocolMode::Press => 1,
-                MouseProtocolMode::PressRelease => 2,
-                MouseProtocolMode::ButtonMotion => 3,
-                MouseProtocolMode::AnyMotion => 4,
-            },
-            mouse_encoding: match m.mouse_encoding {
-                MouseProtocolEncoding::Default => 0,
-                MouseProtocolEncoding::Utf8 => 1,
-                MouseProtocolEncoding::Sgr => 2,
-            },
+            mouse_mode: m.mouse_mode.into(),
+            mouse_encoding: m.mouse_encoding.into(),
         }
     }
 }
 
-impl WireModes {
-    fn modes(self) -> Option<Modes> {
-        Some(Modes {
-            hide_cursor: self.hide_cursor,
-            application_cursor: self.application_cursor,
-            application_keypad: self.application_keypad,
-            bracketed_paste: self.bracketed_paste,
-            mouse_mode: match self.mouse_mode {
-                0 => MouseProtocolMode::None,
-                1 => MouseProtocolMode::Press,
-                2 => MouseProtocolMode::PressRelease,
-                3 => MouseProtocolMode::ButtonMotion,
-                4 => MouseProtocolMode::AnyMotion,
-                _ => return None,
-            },
-            mouse_encoding: match self.mouse_encoding {
-                0 => MouseProtocolEncoding::Default,
-                1 => MouseProtocolEncoding::Utf8,
-                2 => MouseProtocolEncoding::Sgr,
-                _ => return None,
-            },
-        })
+impl From<WireModes> for Modes {
+    fn from(m: WireModes) -> Self {
+        Self {
+            hide_cursor: m.hide_cursor,
+            application_cursor: m.application_cursor,
+            application_keypad: m.application_keypad,
+            bracketed_paste: m.bracketed_paste,
+            mouse_mode: m.mouse_mode.into(),
+            mouse_encoding: m.mouse_encoding.into(),
+        }
     }
 }
 
@@ -456,9 +539,6 @@ impl TerminalScreen {
         let (rows, cols) = diff
             .resize
             .map_or_else(|| self.size(), |(r, c)| clamp_dims(r, c));
-        let Some(modes) = diff.modes.modes() else {
-            return;
-        };
         if diff.rows.len() > usize::from(rows) {
             return;
         }
@@ -484,7 +564,7 @@ impl TerminalScreen {
         let (crow, ccol) = diff.cursor;
         self.grid
             .set_cursor((crow.min(rows.saturating_sub(1)), ccol.min(cols)));
-        self.grid.set_modes(modes);
+        self.grid.set_modes(diff.modes.into());
 
         // Monotonic: never regress on a reordered/older diff (the client applies only newer
         // frames, but `max` is the defensive, obviously-correct choice).
@@ -594,15 +674,20 @@ mod tests {
                 .prop_map(|(r, g, b)| WireColor::Rgb(r, g, b))
                 .boxed(),
         ]);
-        (".{0,30}", 0u8..4, color.clone(), color, any::<u8>()).prop_map(
-            |(text, kind, fg, bg, style)| WireCell {
+        let kind = proptest::sample::select(vec![
+            CellKind::Narrow,
+            CellKind::Wide,
+            CellKind::Continuation,
+        ]);
+        (".{0,30}", kind, color.clone(), color, 0u8..=31).prop_map(|(text, kind, fg, bg, style)| {
+            WireCell {
                 text,
                 kind,
                 fg,
                 bg,
-                style,
-            },
-        )
+                style: WireStyle::new(style).unwrap(),
+            }
+        })
     }
 
     fn row_diff() -> impl proptest::strategy::Strategy<Value = RowDiff> {
@@ -630,7 +715,19 @@ mod tests {
             rows in proptest::collection::vec(row_diff(), 0..6),
             resize in proptest::option::of((proptest::prelude::any::<u16>(), proptest::prelude::any::<u16>())),
             cursor in proptest::prelude::any::<(u16, u16)>(),
-            modes in proptest::prelude::any::<(bool, bool, bool, bool, u8, u8)>(),
+            modes in proptest::prelude::any::<(bool, bool, bool, bool)>(),
+            mouse_mode in proptest::sample::select(vec![
+                WireMouseMode::None,
+                WireMouseMode::Press,
+                WireMouseMode::PressRelease,
+                WireMouseMode::ButtonMotion,
+                WireMouseMode::AnyMotion,
+            ]),
+            mouse_encoding in proptest::sample::select(vec![
+                WireMouseEncoding::Default,
+                WireMouseEncoding::Utf8,
+                WireMouseEncoding::Sgr,
+            ]),
             title in proptest::option::of(".{0,512}"),
             icon in proptest::option::of(".{0,512}"),
             clipboard in proptest::option::of(".{0,40000}"),
@@ -642,8 +739,8 @@ mod tests {
                 application_cursor: modes.1,
                 application_keypad: modes.2,
                 bracketed_paste: modes.3,
-                mouse_mode: modes.4,
-                mouse_encoding: modes.5,
+                mouse_mode,
+                mouse_encoding,
             };
             let diff = ScreenDiff {
                 resize, title, icon, clipboard, bell_count, exit_code, cursor, modes, rows,
@@ -751,7 +848,7 @@ mod tests {
         let base = screen_from(24, 80, b"keep me");
         let target = screen_from(24, 80, b"changed\r\nmore");
         let good = target.diff_from(&base);
-        let mutations: [fn(&mut ScreenDiff); 9] = [
+        let mutations: [fn(&mut ScreenDiff); 6] = [
             |d| d.rows[0].row = 24,           // row out of range
             |d| d.rows[0].runs[0].count += 1, // overruns the width
             |d| {
@@ -763,11 +860,8 @@ mod tests {
                 let cell = d.rows[0].runs[0].cell.clone();
                 d.rows[0].runs.insert(0, Run { count: 0, cell }); // empty run
             },
-            |d| d.rows[0].runs[0].cell.kind = 3,   // unknown kind
-            |d| d.rows[0].runs[0].cell.style = 32, // unknown style bit
             |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CONTENTS_CAPACITY + 1),
-            |d| d.rows[0].runs[0].cell.kind = KIND_CONTINUATION, // continuation with text
-            |d| d.modes.mouse_mode = 9,                          // unknown mouse mode
+            |d| d.rows[0].runs[0].cell.kind = CellKind::Continuation, // continuation with text
         ];
         for (i, mutate) in mutations.iter().enumerate() {
             let mut diff = good.clone();
@@ -780,6 +874,117 @@ mod tests {
         let mut c = base;
         c.apply(&good);
         assert_eq!(c, target);
+    }
+
+    /// A [`ScreenDiff`] in the same wire shape with plain fields, to encode values the typed one
+    /// cannot hold.
+    #[derive(Clone, Serialize)]
+    struct RawDiff {
+        resize: Option<(u16, u16)>,
+        title: Option<String>,
+        icon: Option<String>,
+        clipboard: Option<String>,
+        bell_count: u64,
+        exit_code: Option<u32>,
+        cursor: (u16, u16),
+        modes: RawModes,
+        rows: Vec<RawRow>,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct RawModes {
+        hide_cursor: bool,
+        application_cursor: bool,
+        application_keypad: bool,
+        bracketed_paste: bool,
+        mouse_mode: u8,
+        mouse_encoding: u8,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct RawRow {
+        row: u16,
+        wrapped: bool,
+        runs: Vec<RawRun>,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct RawRun {
+        count: u16,
+        cell: RawCell,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct RawCell {
+        text: String,
+        kind: u8,
+        fg: WireColor,
+        bg: WireColor,
+        style: u8,
+    }
+
+    /// A resize to 2×2 whose first row reads `xx`.
+    fn raw_two_by_two() -> RawDiff {
+        RawDiff {
+            resize: Some((2, 2)),
+            title: None,
+            icon: None,
+            clipboard: None,
+            bell_count: 0,
+            exit_code: None,
+            cursor: (0, 0),
+            modes: RawModes {
+                hide_cursor: false,
+                application_cursor: false,
+                application_keypad: false,
+                bracketed_paste: false,
+                mouse_mode: 4,
+                mouse_encoding: 2,
+            },
+            rows: vec![RawRow {
+                row: 0,
+                wrapped: false,
+                runs: vec![RawRun {
+                    count: 2,
+                    cell: RawCell {
+                        text: "x".to_owned(),
+                        kind: 0,
+                        fg: WireColor::Default,
+                        bg: WireColor::Default,
+                        style: 31,
+                    },
+                }],
+            }],
+        }
+    }
+
+    fn decode_raw(raw: &RawDiff) -> postcard::Result<ScreenDiff> {
+        postcard::from_bytes(&postcard::to_allocvec(raw)?)
+    }
+
+    #[test]
+    fn malformed_cells_and_modes_fail_to_decode() {
+        // What the types cannot hold fails at decode, so the client drops the frame before any
+        // `apply`.
+        let good = decode_raw(&raw_two_by_two()).expect("a well-formed diff decodes");
+        let mut screen = TerminalScreen::default();
+        screen.apply(&good);
+        assert_eq!(screen.size(), (2, 2));
+        assert_eq!(screen.screen().cell(0, 1).map(Cell::contents), Some("x"));
+        let mutations: [fn(&mut RawDiff); 4] = [
+            |d| d.rows[0].runs[0].cell.kind = 3,   // unknown kind
+            |d| d.rows[0].runs[0].cell.style = 32, // unknown style bit
+            |d| d.modes.mouse_mode = 5,            // unknown mouse mode
+            |d| d.modes.mouse_encoding = 3,        // unknown mouse encoding
+        ];
+        for (i, mutate) in mutations.iter().enumerate() {
+            let mut raw = raw_two_by_two();
+            mutate(&mut raw);
+            assert!(
+                decode_raw(&raw).is_err(),
+                "mutation {i} must fail to decode"
+            );
+        }
     }
 
     #[test]

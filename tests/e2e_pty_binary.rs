@@ -94,7 +94,7 @@ fn real_client_binary_renders_over_pty() {
         let _ = std::fs::remove_file(&key_path);
 
         // The client creates its identity key on first run, without a prompt.
-        let (mut client, output) = Pty::spawn(
+        let (client, output) = Pty::spawn(
             24,
             80,
             &[
@@ -143,7 +143,7 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
         let _ = std::fs::remove_file(&key_path);
 
         // An interactive bash with job control, as a user's login shell would be.
-        let (mut bash, output) = Pty::spawn(
+        let (bash, output) = Pty::spawn(
             24,
             80,
             &[

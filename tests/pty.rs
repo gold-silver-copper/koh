@@ -112,7 +112,7 @@ fn spawns_and_streams_output() {
 fn interactive_shell_echoes_input() {
     current_thread().expect("tokio runtime").block_on(async {
         // Spawn the default shell, send a command, and verify the echoed output comes back.
-        let (mut pty, mut rx) =
+        let (pty, mut rx) =
             Pty::spawn(24, 80, &[], "xterm-256color", &launcher()).expect("spawn shell");
         // Give the shell a moment to start, then type a command that prints a marker.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -280,8 +280,8 @@ fn reaped_child_is_not_signaled_again() {
     current_thread().expect("tokio runtime").block_on(async {
         // Once the child is reaped (try_wait/wait returned Some), every kill path must be a
         // no-op so it can't signal a recycled PID. We can't force PID reuse in a test, but we exercise
-        // the reaped-gate: a one-shot `echo` exits and is reaped, after which kill()/kill_hard()/
-        // shutdown() must be safe no-ops (no error, no panic).
+        // the reaped-gate: a one-shot `echo` exits and is reaped, after which kill() and shutdown()
+        // must be safe no-ops (no error, no panic).
         let (mut pty, mut rx) =
             Pty::spawn(24, 80, &["echo".to_owned()], "xterm-256color", &launcher())
                 .expect("spawn echo");
@@ -307,7 +307,6 @@ fn reaped_child_is_not_signaled_again() {
         // After reaping, every kill path is gated and must be a safe no-op (never signaling a PID we no
         // longer own).
         assert!(pty.kill().is_ok(), "kill() after reap is a gated no-op");
-        pty.kill_hard(); // must not signal a (possibly recycled) PID, must not panic
         pty.shutdown(); // consumes; Drop is reaped-gated; must not panic
     });
 }
@@ -522,7 +521,7 @@ fn the_shell_leads_its_own_session_and_owns_its_terminal() {
             Some(pid),
             "the shell leads its own session"
         );
-        pty.kill_hard();
+        drop(pty);
     });
 }
 

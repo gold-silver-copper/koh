@@ -442,34 +442,14 @@ impl Pty {
         ))
     }
 
-    /// Gracefully tear down the session and join both I/O pump threads (rather than leaking them
-    /// as detached threads). Consumes the `Pty`. It first kills the child — so the reader's
-    /// blocking `read` returns EOF — then drops the writer sender — so the writer's `recv` returns
-    /// — guaranteeing both threads unblock before we join them, so this never deadlocks.
+    /// Tear the session down and join both pump threads. Dropping the `Pty` signals the child, so
+    /// the reader sees EOF, and closes the writer's channel, so neither join can hang.
     pub fn shutdown(mut self) {
-        // A failed kill is logged, not ignored: if the child somehow survives it keeps the slave
-        // fd open, the reader stays blocked on read(), and the join below would hang — so a warning
-        // is the breadcrumb for that (otherwise impossible-looking) stall. Skip the kill entirely
-        // once the child is reaped: it is already dead (reader saw EOF) and its PID may be recycled.
-        // The `drop(self)` below still runs `Drop`, which is likewise reaped-gated.
-        // Before the kill, so the writer stops as soon as it next looks: what the program has not
-        // read by now it never will.
-        self.stopping.store(true, Ordering::SeqCst);
-        if !self.reaped.load(Ordering::SeqCst) {
-            if let Err(e) = self.kill() {
-                tracing::warn!(error = %e, "pty kill on shutdown failed; reader join may stall");
-            }
-        }
         let reader = self.reader_handle.take();
         let writer = self.writer_handle.take();
-        // Dropping `self` drops `writer_tx`, which lets the writer thread observe the channel
-        // close and exit; the child kill above lets the reader thread hit EOF and exit.
         drop(self);
-        if let Some(h) = writer {
-            let _ = h.join();
-        }
-        if let Some(h) = reader {
-            let _ = h.join();
+        for handle in [writer, reader].into_iter().flatten() {
+            let _ = handle.join();
         }
     }
 
@@ -525,21 +505,8 @@ impl Pty {
 
     /// Terminate the child with SIGHUP, as a terminal hanging up would. No-op once the child is
     /// reaped, so we never SIGHUP a recycled PID.
-    pub fn kill(&mut self) -> io::Result<()> {
+    pub fn kill(&self) -> io::Result<()> {
         self.signal(Signal::Hup)
-    }
-
-    /// Force-kill the child with SIGKILL (which cannot be trapped). [`kill`](Self::kill) only
-    /// sends SIGHUP, so a child that ignores SIGHUP (e.g. `trap '' HUP`) would otherwise keep the
-    /// PTY slave fd open and wedge the reader thread on a blocking `read()` forever — leaking a
-    /// thread + fds per session.
-    ///
-    /// Skips signaling once the child has been **reaped**: the kernel may have recycled its PID,
-    /// so SIGKILL could hit an unrelated same-uid process. A reaped child is already dead (its fds
-    /// closed, so the reader already saw EOF), so there is nothing to kill; an un-reaped zombie
-    /// still reserves its PID, so the SIGKILL below targets only a PID we still own.
-    pub fn kill_hard(&self) {
-        let _ = self.signal(Signal::Kill);
     }
 
     /// Send `signal` to the child, unless it has been reaped (its PID may be recycled).
@@ -555,24 +522,16 @@ impl Pty {
 }
 
 impl Drop for Pty {
+    /// Whether dropped after [`shutdown`](Pty::shutdown) or on an error path, the child must die
+    /// so the reader thread cannot block forever on a slave it keeps open. The threads are not
+    /// joined here: that could block a tokio worker; `shutdown` joins them.
     fn drop(&mut self) {
-        // A `Pty` dropped without an explicit [`Pty::shutdown`] (an error path, a panicking
-        // session task) must still guarantee the child dies, so the
-        // detached reader thread can't block forever on a still-open slave fd. SIGHUP
-        // first (a well-behaved shell exits cleanly), then SIGKILL so a SIGHUP-immune child also
-        // dies → the reader hits EOF and the pump threads exit. `writer_tx` drops with the struct,
-        // EOFing the child's stdin. We deliberately do NOT join the threads here (that could block
-        // the dropping thread, possibly a tokio worker); SIGKILL makes them exit promptly on their
-        // own, and `shutdown` remains the path that joins.
-        //
-        // Skip signaling once the child is reaped: a reaped child is already dead and its
-        // PID may have been recycled, so SIGHUP/SIGKILL here could hit an unrelated process.
+        // What the program has not read by now it never will: the writer stops at its next look.
         self.stopping.store(true, Ordering::SeqCst);
-        if self.reaped.load(Ordering::SeqCst) {
-            return;
-        }
+        // SIGHUP first, for a clean exit, then SIGKILL for a program that ignores it. Neither once
+        // the child is reaped (see `signal`).
         let _ = self.signal(Signal::Hup);
-        self.kill_hard();
+        let _ = self.signal(Signal::Kill);
     }
 }
 

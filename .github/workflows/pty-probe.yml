@@ -20,9 +20,11 @@ jobs:
         env:
           KOH_PROBE_GROW: ${{ matrix.grow }}
         run: |
+          if [ -n "$KOH_PROBE_GROW" ]; then exit 0; fi
           sysctl kern.tty.ptmx_max
           echo "in use: $(ls /dev | grep -c '^ttys')"
-          cargo test --locked --test pty_race_probe -- --ignored --nocapture 2>&1 | grep -E "grew|threads|total"
+          cargo test --locked --test pty_race_probe pty_table_boundary_race -- --ignored --nocapture 2>&1 | grep -E "held"
+          cargo test --locked --test pty_race_probe pty_table_growth_race -- --ignored --nocapture 2>&1 | grep -E "grew|threads|total"
           echo "in use: $(ls /dev | grep -c '^ttys')"
       - name: kernel log
         if: always()
@@ -42,3 +44,19 @@ jobs:
           done
           echo "failures: $fails / 50"
           test "$fails" = 0
+  late-reader:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: the short-lived-children test against a reader started late
+        run: |
+          for delay in 50 500; do
+            git checkout -- src/pty.rs
+            perl -0pi -e "s|(let mut buf = vec!\\[0u8; READ_CHUNK\\];)|std::thread::sleep(Duration::from_millis($delay));\\n                \\1|" src/pty.rs
+            grep -c "from_millis($delay)" src/pty.rs
+            for i in 1 2; do
+              cargo test --locked --test pty short_lived 2>&1 | grep -E "test result|output was lost" | head -2 || true
+            done
+          done

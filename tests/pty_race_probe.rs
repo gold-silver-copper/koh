@@ -61,3 +61,37 @@ fn pty_table_growth_race() {
     }
     println!("total errors {total:?}");
 }
+
+/// One thread raises the PTYs held, one at a time, through the table's 16-slot boundaries, while
+/// churners free and retake a PTY each: errors by how many were held when they struck.
+#[test]
+#[ignore = "a CI probe, run explicitly"]
+fn pty_table_boundary_race() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let churners: Vec<_> = (0_u64..32)
+        .map(|i| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(pty) = fuxix::pty::open(24, 80) {
+                        std::thread::sleep(Duration::from_micros(i * 7));
+                        drop(pty);
+                    }
+                }
+            })
+        })
+        .collect();
+    let mut held = Vec::new();
+    let mut errors: BTreeMap<usize, BTreeMap<String, usize>> = BTreeMap::new();
+    while held.len() < 440 {
+        match fuxix::pty::open(24, 80) {
+            Ok(pty) => held.push(pty),
+            Err(e) => *errors.entry(held.len()).or_default().entry(e.to_string()).or_default() += 1,
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for churner in churners {
+        churner.join().unwrap();
+    }
+    println!("held {}; errors by PTYs held: {errors:?}", held.len());
+}

@@ -282,12 +282,10 @@ fn log_to_koh_log() {
 /// `koh connect <server-id>` — connect to a koh server and run the (auto-reconnecting) session.
 ///
 /// Returns the remote shell's exit code if the session ended because the shell exited.
-/// Accepts a [`ConnectConfig`] or anything convertible into one.
 ///
 /// Takes over the calling process's terminal (raw mode, alternate screen) and its stdin for the
 /// session's lifetime, and installs signal handlers; call it from a binary's main path.
-pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<u32>> {
-    let args: ConnectConfig = config.into();
+pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     log_to_koh_log();
 
     // koh assumes a UTF-8 terminal (the predictor reassembles UTF-8 graphemes; the renderer emits
@@ -297,7 +295,8 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
 
     // Held for the whole session: the identity's lease keeps `koh key reset` from deleting the key
     // while this client may still redial with it.
-    let identity = crate::identity::load_client(args.key_file.as_deref())?;
+    let identity =
+        crate::identity::load(&crate::identity::key_path(args.key_file.clone(), "client")?)?;
     let (endpoint, connector, channel) = dial(&args, &identity).await?;
     let shutdown = CancellationToken::new();
     spawn_signal_shutdown(shutdown.clone())?;

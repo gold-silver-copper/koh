@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use koh::pty::{Launcher, Pty};
 use koh::server::run_session;
-use koh::transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
+use koh::transport_iroh::{bind_endpoint_local, generate_secret_key};
 
 /// The `koh` binary, as the launcher every program here starts through.
 fn launcher() -> Launcher {
@@ -24,7 +24,7 @@ fn launcher() -> Launcher {
 /// A loopback server hosting `sh` for one connection: its id and IPv4 port, and its task.
 async fn loopback_server() -> anyhow::Result<(String, u16, tokio::task::JoinHandle<()>)> {
     let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
-    let server_id = format_endpoint_id(&server_ep.id());
+    let server_id = server_ep.id().to_string();
     let server_port = server_ep
         .bound_sockets()
         .iter()

@@ -35,7 +35,6 @@ impl Outcome {
 /// INFO for an accepted outcome, WARN for a denial. `peer` is the node-id hex (always known: the
 /// QUIC/TLS handshake authenticates it before any admission decision).
 pub fn auth_event(outcome: Outcome, peer: &EndpointId, reason: &str) {
-    let peer = crate::transport_iroh::format_endpoint_id(peer);
     if matches!(outcome, Outcome::Accepted) {
         tracing::info!(target: "koh::auth", event = "authz", outcome = outcome.token(), peer = %peer, reason);
     } else {

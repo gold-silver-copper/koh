@@ -43,7 +43,6 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
     match cmd {
         Cmd::Serve(config) => koh::server::serve(config).await.map(|()| None),
         Cmd::Connect(config) => koh::client::connect(config).await,
-        Cmd::Id(config) => koh::idcmd::run_id(config).map(|()| None),
         Cmd::Key(config) => koh::keycmd::run(config).map(|()| None),
     }
 }

@@ -6,8 +6,8 @@
 //! ## Modules
 //!
 //! [`transport_iroh`] owns endpoint setup, the identity key file and connection admission.
-//! [`identity`] loads identities and holds their reset leases; [`idcmd`] and [`keycmd`] implement
-//! `koh id` and `koh key`. [`proto`] is the wire protocol: input messages on one stream, screen
+//! [`identity`] loads identities and holds their reset leases; [`keycmd`] implements `koh id` and
+//! `koh key`. [`proto`] is the wire protocol: input messages on one stream, screen
 //! frames on their own. [`terminal`], [`predict`] and [`pty`] implement the remote-shell payload;
 //! [`server`] hosts detachable sessions and [`client`] renders them on the tty. The `koh` binary
 //! (`src/main.rs`, `src/args.rs`) adds the command line.
@@ -20,7 +20,6 @@
 //! is internal and may change in any release.
 
 pub mod client;
-pub mod idcmd;
 pub mod identity;
 pub mod keycmd;
 pub mod log;

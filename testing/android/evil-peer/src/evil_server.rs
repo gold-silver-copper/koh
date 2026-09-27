@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use koh::transport_iroh::{bind_endpoint_local, format_endpoint_id, generate_secret_key};
+use koh::transport_iroh::{bind_endpoint_local, generate_secret_key};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("no bound ipv4 socket"))?;
 
     // Machine-readable lines the test harness greps to drive a koh client at us.
-    println!("EVIL_ID={}", format_endpoint_id(&id));
+    println!("EVIL_ID={id}");
     println!("EVIL_PORT={port}");
     eprintln!("evil-server: attack '{attack}' listening on 127.0.0.1:{port}");
 

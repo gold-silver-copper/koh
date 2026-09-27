@@ -21,9 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::server::audit::{auth_event, Outcome};
 use crate::server::session::{AttachKind, Registry, SessionSpec};
 use crate::server::{run_attached, SessionExit};
-use crate::transport_iroh::{
-    bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id, ALPN,
-};
+use crate::transport_iroh::{bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, ALPN};
 use tracing::{error, info, warn};
 
 /// Deadline on the QUIC crypto handshake (`Incoming::await`) before a stalled dial is dropped and
@@ -117,19 +115,14 @@ fn connect_qr(data: &str) -> Option<String> {
 
 /// `koh serve` — host a PTY shell for authorized clients over iroh.
 ///
-/// The program hosted is [`ServeConfig::command`] (any argv, not only a shell). Accepts a
-/// [`ServeConfig`] or anything convertible into one.
+/// The program hosted is [`ServeConfig::command`] (any argv, not only a shell).
 ///
 /// Installs a global `tracing` subscriber writing to stderr if none is installed yet.
-pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
-    let args: ServeConfig = config.into();
+pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     crate::log::init(std::io::stderr, tracing::Level::INFO);
     let hosting = Hosting::from_config(&args)?;
 
-    let key_file = match args.key_file.clone() {
-        Some(p) => p,
-        None => crate::transport_iroh::default_key_path("server")?,
-    };
+    let key_file = crate::identity::key_path(args.key_file.clone(), "server")?;
     let identity = crate::identity::load(&key_file)?;
     let secret = identity.secret.clone();
 
@@ -148,7 +141,7 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
             .context("binding endpoint")?
     };
     let my_id = endpoint.id();
-    let id_str = format_endpoint_id(&my_id);
+    let id_str = my_id.to_string();
 
     // How a client should dial us, given the chosen profile.
     let connect_hint = if let Some(url) = &args.relay_url {
@@ -400,17 +393,17 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
         // At the live-session cap: refuse a brand-new peer rather than spawn an unbounded
         // shell. A reconnecting peer would have matched its existing session, so this only ever
         // rejects a genuinely new one.
-        warn!(peer = %format_endpoint_id(&peer), "refusing session: at max-sessions capacity");
+        warn!(peer = %peer, "refusing session: at max-sessions capacity");
         conn.close(1u32.into(), b"server at session capacity");
         return;
     };
     match attach_kind {
         AttachKind::Created => {
-            info!(peer = %format_endpoint_id(&peer), "started a new session");
+            info!(peer = %peer, "started a new session");
         }
         AttachKind::Reattached { detached_for } => {
             info!(
-                peer = %format_endpoint_id(&peer),
+                peer = %peer,
                 detached_secs = detached_for.map(|d| d.as_secs()),
                 "reattaching to this peer's existing session"
             );
@@ -419,10 +412,10 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
     // Dropping `client` on return (or panic) detaches; the session keeps running for reattach.
     match run_attached(conn, client).await {
         Ok(SessionExit::Detached) => {
-            info!(peer = %format_endpoint_id(&peer), "client detached (session retained)");
+            info!(peer = %peer, "client detached (session retained)");
         }
         Ok(SessionExit::ShellExited) => {
-            info!(peer = %format_endpoint_id(&peer), "shell exited");
+            info!(peer = %peer, "shell exited");
         }
         Err(e) => error!(error = %e, "session loop error"),
     }

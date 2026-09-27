@@ -15,7 +15,6 @@ mod io;
 mod render;
 mod session;
 
-pub use crate::idcmd::{run_id, IdConfig};
 pub use backend::{DefaultBackend, KohBackend};
 pub use cli::{connect, BellHook, ConnectConfig};
 pub(crate) use io::spawn_client_io;

@@ -329,11 +329,6 @@ pub fn parse_endpoint_id(s: &str) -> Result<EndpointId, SetupError> {
         .map_err(|e| SetupError::BadEndpointId(e.to_string()))
 }
 
-/// The canonical (hex) string form of an [`EndpointId`], suitable for copy/paste.
-pub fn format_endpoint_id(id: &EndpointId) -> String {
-    id.to_string()
-}
-
 /// Parse a `$KOH_DNS` value: either `IP:PORT` (e.g. `8.8.8.8:53`) or a bare `IP`
 /// (e.g. `1.1.1.1`, defaulting to port 53). Returns `None` for anything unparseable.
 fn parse_dns_spec(spec: &str) -> Option<SocketAddr> {
@@ -591,7 +586,7 @@ mod tests {
 
         // The endpoint id is stable and round-trips through its string form.
         let id = sk1.public();
-        let s = format_endpoint_id(&id);
+        let s = id.to_string();
         assert_eq!(parse_endpoint_id(&s).unwrap(), id);
 
         let _ = std::fs::remove_dir_all(&dir);

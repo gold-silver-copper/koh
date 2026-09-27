@@ -37,8 +37,7 @@ src/
 │   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through fuxix::terminal)
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
 ├── log.rs           the `RUST_LOG` filter `serve` and `connect` install (`target=level` directives)
-├── idcmd.rs         `koh id` — print this machine's endpoint id
-└── keycmd.rs        `koh key` — show the identity, or reset it
+└── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identity, reset it
 tests/net/           koh over a fault-injecting link between real iroh endpoints
 tests/               PTYs, sessions, loopback e2e, admission, the binary on a PTY, upgrade in
                      place, key creation races, and the Android suites (opt-in)

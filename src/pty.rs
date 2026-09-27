@@ -381,7 +381,8 @@ impl Pty {
         let reader_handle = std::thread::Builder::new()
             .name("koh-pty-reader".into())
             .spawn(move || {
-                let mut buf = [0u8; READ_CHUNK];
+                // Each read lands in the buffer that is sent on, so a chunk is never copied.
+                let mut buf = vec![0u8; READ_CHUNK];
                 loop {
                     let mut waiting = [PollFd::new(&reader, Events::IN)];
                     match fuxix::poll::poll(&mut waiting, None) {
@@ -394,11 +395,10 @@ impl Pty {
                     }
                     match fuxix::io::read(&reader, &mut buf) {
                         Ok(0) => break, // EOF: the slave closed (macOS)
-                        // `read` never reports more than `buf.len()` bytes, so `get(..n)` is always
-                        // `Some`; the `else` is a panic-free fallback that can't actually run.
                         Ok(n) => {
-                            let Some(chunk) = buf.get(..n) else { break };
-                            if tx.blocking_send(chunk.to_vec()).is_err() {
+                            let mut chunk = std::mem::replace(&mut buf, vec![0u8; READ_CHUNK]);
+                            chunk.truncate(n);
+                            if tx.blocking_send(chunk).is_err() {
                                 break; // receiver dropped: session over
                             }
                         }

@@ -200,8 +200,8 @@ impl Grid {
     /// A row moved when `self` holds the very cells (the same allocation) `base` held elsewhere:
     /// snapshots and applied frames share the cells of rows that only moved. Only the first `height`
     /// rows of each are looked at, and of those only the rows whose cells differ from the other
-    /// grid's at the same index: a row still in place moved nowhere. Cells either grid holds twice
-    /// there are never matched.
+    /// grid's at the same index: a row still in place moved nowhere. Cells either grid holds in two
+    /// such rows are never matched.
     pub(crate) fn moves_from(&self, base: &Self, height: u16) -> Vec<Shift> {
         if self.size != base.size {
             return Vec::new();
@@ -218,15 +218,32 @@ impl Grid {
             return Vec::new();
         }
         let from = unique_rows(base, &displaced);
-        let to = unique_rows(self, &displaced);
+        // Where each displaced row came from, if it holds cells of one displaced base row.
+        let mut sources: Vec<Option<u16>> = (0_u16..)
+            .zip(&self.lines)
+            .zip(&displaced)
+            .map(|((row, line), &displaced)| {
+                displaced
+                    .then(|| from.get(&line.id()).copied().flatten())
+                    .flatten()
+                    .filter(|&source| source != row)
+            })
+            .collect();
+        // Cells two rows hold came from one base row: neither is a move.
+        let mut taken: HashMap<u16, usize> = HashMap::new();
+        for &source in sources.iter().flatten() {
+            let count = taken.entry(source).or_default();
+            *count = count.saturating_add(1);
+        }
+        for source in &mut sources {
+            if source.is_some_and(|source| taken.get(&source) > Some(&1)) {
+                *source = None;
+            }
+        }
         let mut runs: Vec<Shift> = Vec::new();
         // The last row that moved, and the row it came from.
         let mut last: Option<(u16, u16)> = None;
-        for (row, line) in (0_u16..).zip(self.lines.iter().take(height)) {
-            let source = (to.get(&line.id()) == Some(&Some(row)))
-                .then(|| from.get(&line.id()).copied().flatten())
-                .flatten()
-                .filter(|&source| source != row);
+        for (row, &source) in (0_u16..).zip(&sources) {
             let Some(source) = source else {
                 last = None;
                 continue;

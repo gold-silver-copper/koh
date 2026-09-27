@@ -153,10 +153,10 @@ fn repaint_cost(differs: impl Iterator<Item = bool>, limit: usize) -> usize {
 /// Whether `scroll` writes less than painting its rows in place: the rows it moves need no paint,
 /// the rows it leaves blank need their glyphs, and every row in place needs what differs.
 fn worth(scroll: Scroll, screen: &Grid, painted: &Grid) -> bool {
-    let cols = screen.size().cols;
     let mut with = SCROLL_COST;
     for row in (scroll.top..scroll.bottom).filter(|&row| scroll.source(row).is_none()) {
-        let differs = (0..cols).map(|col| paint(screen, &[], row, col) != BLANK);
+        let cells = screen.row(row).unwrap_or_default();
+        let differs = cells.iter().map(|cell| !shows_blank(cell));
         with = with.saturating_add(repaint_cost(differs, usize::MAX));
     }
     let mut without = 0_usize;
@@ -213,6 +213,14 @@ fn shown_after(rows: u16, scrolls: &[Scroll]) -> Vec<Option<u16>> {
                 .map_or(Some(row), |scroll| scroll.source(row))
         })
         .collect()
+}
+
+/// Whether `cell` draws what a row a scroll brought in shows: a blank in the default style.
+fn shows_blank(cell: &Cell) -> bool {
+    !cell.is_wide()
+        && !cell.is_wide_continuation()
+        && matches!(cell.contents(), "" | " ")
+        && cell.attributes() == fux_vt::Attributes::default()
 }
 
 /// What a row a scroll left blank shows in each cell: the default style had been set.

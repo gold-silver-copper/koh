@@ -367,20 +367,20 @@ impl RowDiff {
         Self { row, wrapped, runs }
     }
 
-    /// Decode into exactly `cols` cells, or `None` if the runs are malformed or don't cover the
-    /// row exactly. Work is bounded by `cols`: every run is non-empty.
-    fn cells(&self, cols: u16) -> Option<Vec<Cell>> {
-        let mut out = Vec::with_capacity(usize::from(cols));
+    /// Append exactly `cols` decoded cells to `out`, or return `None` if the runs are malformed or
+    /// don't cover the row exactly (`out` then holds a partial row, which the caller discards).
+    /// Work is bounded by `cols`: every run is non-empty.
+    fn decode_into(&self, cols: u16, out: &mut Vec<Cell>) -> Option<()> {
+        let mut len = 0_usize;
         for run in &self.runs {
             let count = usize::from(run.count.get());
-            let end = out.len().checked_add(count);
-            if end.is_none_or(|end| end > usize::from(cols)) {
-                return None;
-            }
+            len = len
+                .checked_add(count)
+                .filter(|&len| len <= usize::from(cols))?;
             let cell = run.cell.cell()?;
             out.extend(std::iter::repeat_n(cell, count));
         }
-        (out.len() == usize::from(cols)).then_some(out)
+        (len == usize::from(cols)).then_some(())
     }
 }
 
@@ -551,22 +551,21 @@ impl TerminalScreen {
         if diff.rows.len() > usize::from(rows) {
             return;
         }
-        let mut decoded = Vec::with_capacity(diff.rows.len());
+        // Every row decodes into one staging buffer, `cols` cells each, in the diff's order. At
+        // most `rows × cols` cells, which the clamp bounds.
+        let width = usize::from(cols);
+        let mut staged = Vec::with_capacity(diff.rows.len().saturating_mul(width));
         for row in &diff.rows {
-            if row.row >= rows {
+            if row.row >= rows || row.decode_into(cols, &mut staged).is_none() {
                 return;
             }
-            let Some(cells) = row.cells(cols) else {
-                return;
-            };
-            decoded.push((row.row, row.wrapped, cells));
         }
         if diff.resize.is_some() {
             self.grid = Grid::blank(rows, cols);
         }
         // Only the rows the diff carries are replaced; the rest stay shared with the base.
-        for (row, wrapped, cells) in decoded {
-            self.grid.set_row(row, Arc::from(cells), wrapped);
+        for (row, cells) in diff.rows.iter().zip(staged.chunks(width.max(1))) {
+            self.grid.set_row(row.row, Arc::from(cells), row.wrapped);
         }
         let (crow, ccol) = diff.cursor;
         self.grid
@@ -883,6 +882,31 @@ mod tests {
         let mut c = base;
         c.apply(&good);
         assert_eq!(c, target);
+    }
+
+    #[test]
+    fn a_malformed_last_row_drops_the_rows_before_it_too() {
+        // Every row is validated before any is committed: rows that decoded fine before the
+        // malformed one are not applied either.
+        let base = screen_from(24, 80, b"keep\r\nkeep\r\nkeep");
+        let target = screen_from(24, 80, b"one\r\ntwo\r\nthree");
+        let good = target.diff_from(&base);
+        assert_eq!(good.rows.len(), 3);
+        let mutations: [fn(&mut ScreenDiff); 3] = [
+            |d| d.rows[2].row = 24,
+            |d| {
+                let run = &mut d.rows[2].runs[0];
+                run.count = run.count.checked_add(1).unwrap();
+            },
+            |d| d.rows[2].runs[0].cell.kind = CellKind::Continuation,
+        ];
+        for (i, mutate) in mutations.iter().enumerate() {
+            let mut diff = good.clone();
+            mutate(&mut diff);
+            let mut c = base.clone();
+            c.apply(&diff);
+            assert_eq!(c, base, "mutation {i} must drop the whole frame");
+        }
     }
 
     /// A [`ScreenDiff`] in the same wire shape with plain fields, to encode values the typed one

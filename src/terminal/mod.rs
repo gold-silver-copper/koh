@@ -269,10 +269,13 @@ impl<'de> Deserialize<'de> for WireStyle {
     }
 }
 
-/// A cell's text on the wire: at most [`Cell::CONTENTS_CAPACITY`] bytes of UTF-8.
+/// A cell's text on the wire: at most [`Cell::CONTENTS_CAPACITY`] bytes of UTF-8, and no control
+/// character.
 ///
 /// Stored inline, as `fux_vt::Cell` stores it, so building or decoding a run allocates nothing.
-/// It encodes as a string; decoding refuses a longer one, which drops the frame.
+/// The client prints a cell's text to the user's terminal as is, so it must not be able to carry
+/// an escape sequence: fux-vt never puts a control character in a cell, and decoding refuses one,
+/// as it refuses text too long for a cell, which drops the frame. It encodes as a string.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct CellText {
     len: u8,
@@ -280,8 +283,12 @@ pub struct CellText {
 }
 
 impl CellText {
-    /// `text`, or `None` if it is longer than [`Cell::CONTENTS_CAPACITY`] bytes.
+    /// `text`, or `None` if it is longer than [`Cell::CONTENTS_CAPACITY`] bytes or holds a
+    /// control character (C0, DEL or C1).
     pub fn new(text: &str) -> Option<Self> {
+        if text.chars().any(char::is_control) {
+            return None;
+        }
         let mut bytes = [0; Cell::CONTENTS_CAPACITY];
         bytes
             .get_mut(..text.len())?
@@ -330,11 +337,15 @@ impl de::Visitor<'_> for CellTextVisitor {
     type Value = CellText;
 
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "a string of at most {} bytes", Cell::CONTENTS_CAPACITY)
+        write!(
+            f,
+            "a string of at most {} bytes with no control character",
+            Cell::CONTENTS_CAPACITY
+        )
     }
 
     fn visit_str<E: de::Error>(self, text: &str) -> Result<CellText, E> {
-        CellText::new(text).ok_or_else(|| E::invalid_length(text.len(), &self))
+        CellText::new(text).ok_or_else(|| E::invalid_value(de::Unexpected::Str(text), &self))
     }
 }
 
@@ -1080,13 +1091,15 @@ mod tests {
         screen.apply(&good);
         assert_eq!(screen.size(), (2, 2));
         assert_eq!(screen.screen().cell(0, 1).map(Cell::contents), Some("x"));
-        let mutations: [fn(&mut RawDiff); 6] = [
+        let mutations: [fn(&mut RawDiff); 8] = [
             |d| d.rows[0].runs[0].count = 0, // empty run
             |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CONTENTS_CAPACITY + 1),
-            |d| d.rows[0].runs[0].cell.kind = 3,   // unknown kind
-            |d| d.rows[0].runs[0].cell.style = 32, // unknown style bit
-            |d| d.modes.mouse_mode = 5,            // unknown mouse mode
-            |d| d.modes.mouse_encoding = 3,        // unknown mouse encoding
+            |d| d.rows[0].runs[0].cell.text = "\x1b".to_owned(), // an escape for the terminal
+            |d| d.rows[0].runs[0].cell.text = "\u{9b}".to_owned(), // a C1 control
+            |d| d.rows[0].runs[0].cell.kind = 3,                 // unknown kind
+            |d| d.rows[0].runs[0].cell.style = 32,               // unknown style bit
+            |d| d.modes.mouse_mode = 5,                          // unknown mouse mode
+            |d| d.modes.mouse_encoding = 3,                      // unknown mouse encoding
         ];
         for (i, mutate) in mutations.iter().enumerate() {
             let mut raw = raw_two_by_two();
@@ -1147,6 +1160,9 @@ mod tests {
             Some(full)
         );
         assert!(CellText::new(&"x".repeat(Cell::CONTENTS_CAPACITY + 1)).is_none());
+        for control in ["\x1b[2J", "\x07", "\x7f", "\u{9d}", "a\nb"] {
+            assert!(CellText::new(control).is_none(), "{control:?}");
+        }
         assert!(CellText::default().is_empty());
         // The encoding is the string's, and a decoded string must fit.
         let text = CellText::new("日本").unwrap();

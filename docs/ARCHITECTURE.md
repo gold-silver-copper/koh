@@ -105,7 +105,9 @@ opt-in events (title, icon, bell, clipboard) and extended replies (DECRQM, DECXC
 turned on. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
 cursor and the modes; after a resize the client starts from a blank grid and receives every
 non-blank row. The client validates and copies cells and never runs a terminal parser, so server
-bytes never reach one.
+bytes never reach one. That includes the user's terminal, which the client prints a cell's text to
+as is: decoding refuses a cell whose text holds a control character, so no escape sequence can
+ride in one.
 
 ## Headless drivers (the protocol is I/O-free; the shells are thin)
 

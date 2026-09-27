@@ -48,8 +48,9 @@ error; upgrade both ends.
   `fux_vt::Parser`, a bounded, panic-free emulator; `vt100` is no longer a dependency. The screen
   diff is now structured: every changed row whole, as run-length-encoded cells, plus the cursor and
   modes. It replaces vt100's escape-sequence patch, which the client used to replay through its
-  own vt100 parser. The client validates every row and cell and drops a malformed frame whole, so
-  server bytes never reach a terminal parser on the client. The `catch_unwind` containment and the
+  own vt100 parser. The client validates every row and cell, a cell's text included (it may hold
+  no control character, so it cannot carry an escape sequence to the user's terminal), and drops a
+  malformed frame whole, so server bytes never reach a terminal parser on the client. The `catch_unwind` containment and the
   64 KiB control-string pre-filter are gone: fux-vt cannot panic, retains no DCS/APC/PM/SOS payload
   and caps OSC strings at 64 KiB.
 - **Breaking: the koh/3 stream protocol replaces SSP over datagrams.** Keystrokes travel on one

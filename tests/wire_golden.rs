@@ -233,6 +233,22 @@ fn frames_encode_as_pinned() {
 }
 
 #[test]
+fn a_control_character_in_a_cell_fails_to_decode() {
+    // The first run of the full frame is four 'a's: count 4, then the 1-byte text 'a'. The same
+    // frame with ESC in place of the 'a' must be refused, not printed to the user's terminal.
+    let pinned = unhex(FULL_FRAME).expect("hex");
+    let run = [4, 1, b'a'];
+    let at = pinned
+        .windows(run.len())
+        .position(|window| window == run)
+        .expect("the first run");
+    let mut escaped = pinned.clone();
+    escaped[at + 2] = 0x1b;
+    assert!(postcard::from_bytes::<Frame>(&pinned).is_ok());
+    assert!(postcard::from_bytes::<Frame>(&escaped).is_err());
+}
+
+#[test]
 fn modes_encode_as_pinned() {
     let modes = modes();
     assert_eq!(modes.len(), MODES.len());

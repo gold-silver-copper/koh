@@ -1,8 +1,8 @@
 //! Painting the synchronized screen grid (plus prediction overlays and a status line)
 //! onto the local terminal through [`KohBackend`].
 //!
-//! We render cell-by-cell because the predictor needs to draw speculative cells (underlined)
-//! *on top of* the authoritative grid. Style changes are diffed against the previous cell so we emit minimal SGR. Each frame
+//! We render cell-by-cell because the predictor needs to draw speculative cells *on top of* the
+//! authoritative grid. Style changes are diffed against the previous cell so we emit minimal SGR. Each frame
 //! is wrapped in synchronized output (DEC mode 2026) so the terminal shows it atomically
 //! (no tearing/flicker on full repaints or resizes).
 //!
@@ -39,21 +39,17 @@ pub fn render(
                     continue;
                 }
             }
-            // A prediction wins on glyph/underline for this cell — EXCEPT an "unknown" cell,
-            // which only hints: it underlines the real cell rather than overwriting its glyph.
+            // A prediction wins on glyph and colours for this cell.
             let pred = overlay.cell(row, col);
-            let concrete = pred.filter(|p| !p.unknown); // prediction carrying a real glyph
-            let hint_underline = pred.is_some_and(|p| p.unknown && p.underline);
 
-            let style = if let Some(p) = concrete {
+            let style = if let Some(p) = pred {
                 CellStyle {
                     fg: p.fg,
                     bg: p.bg,
                     bold: false,
                     dim: false,
                     italic: false,
-                    // mosh flags predictions with underline on high-latency links.
-                    underline: p.underline,
+                    underline: false,
                     inverse: false,
                 }
             } else if let Some(c) = cell {
@@ -63,7 +59,7 @@ pub fn render(
                     bold: c.bold(),
                     dim: c.dim(),
                     italic: c.italic(),
-                    underline: c.underline() || hint_underline,
+                    underline: c.underline(),
                     inverse: c.inverse(),
                 }
             } else {
@@ -73,7 +69,7 @@ pub fn render(
                     bold: false,
                     dim: false,
                     italic: false,
-                    underline: hint_underline,
+                    underline: false,
                     inverse: false,
                 }
             };
@@ -86,7 +82,7 @@ pub fn render(
             // Borrow a &str per branch — no per-cell String allocation on the hot repaint path:
             // `contents()` already returns &str and the predicted glyph is borrowed from the
             // overlay, both outliving this write. An empty glyph renders as a blank cell.
-            let glyph: &str = if let Some(p) = concrete {
+            let glyph: &str = if let Some(p) = pred {
                 &p.glyph
             } else if let Some(c) = cell.filter(|c| c.has_contents()) {
                 c.contents()
@@ -628,6 +624,7 @@ mod tests {
 
         let s = render_to_string(&echoed, &overlay, None);
         assert!(s.contains('Z'), "predicted glyph not rendered");
+        assert!(!s.contains("\x1b[4m"), "predictions are not underlined");
     }
 
     // --- InputModes emits vt100 0.16's input-mode bytes ---

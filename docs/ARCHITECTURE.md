@@ -122,18 +122,18 @@ overtake the keystroke that triggered it).
 
 ## The predictor
 
-The client guesses what each keystroke does to the screen and shows it immediately (underlined on
-high-RTT links), then confirms or corrects when the authoritative server frame arrives. Confirmation
+The client guesses what each keystroke does to the screen and shows it immediately, then confirms
+or corrects when the authoritative server frame arrives. Confirmation
 is driven by the server's **echo-ack** (a 50 ms-debounced "your input up to frame N is now on
 screen"), not the raw network ack. Password prompts get no predicted echo — suppression is
 *emergent*: non-echoed input fails validation, kills its epoch, and keeps subsequent predictions
 hidden, with no explicit password heuristic. Prediction is **always on** in koh (`DisplayPreference::
 Always`), so keystrokes engage on every link; the engine also implements an adaptive-by-SRTT
-engagement mode that the client no longer selects. The underline *flagging* stays SRTT-gated
-(> 80 ms) with hysteresis.
+engagement mode that the client no longer selects. Predictions are drawn plain, not underlined,
+and a cell it knows changed but not to what is not drawn at all, so the real cell shows.
 
-The port faithfully implements epoch-gated confirmation, adaptive engagement, flagging, glitch
-escalation, and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
+The port faithfully implements epoch-gated confirmation, adaptive engagement, glitch escalation,
+and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
 backspace, CR/LF, the left/right arrow keys (CSI **and** SS3/application-cursor form), and whole
 UTF-8 graphemes including double-width CJK/emoji (cursor advances by two cells). Control/escape
 sequences it doesn't model open a fresh epoch but make no concrete guess (they fall back to the

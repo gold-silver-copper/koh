@@ -80,19 +80,16 @@ pub enum DisplayPreference {
 const ENGAGE_ABOVE_MS: f64 = 60.0;
 const DISENGAGE_BELOW_MS: f64 = 40.0;
 
-/// A speculative cell for the renderer to draw on top of the authoritative grid.
+/// A speculative cell for the renderer to draw, as is, on top of the authoritative grid.
+///
+/// Only concrete guesses become one: a cell the predictor knows changed but not to what is left
+/// out of the [`Overlay`], so the real cell beneath shows.
 #[derive(Clone, Debug)]
 pub struct PredictedCell {
-    /// The predicted glyph. **Empty when [`unknown`](PredictedCell::unknown)** — the renderer
-    /// must then only hint (underline the existing real cell), never overwrite its content.
+    /// The predicted glyph; empty for a blank shifted in by an insert or a backspace.
     pub glyph: String,
     pub fg: Color,
     pub bg: Color,
-    /// Whether to underline it. Always false now; kept because the renderer reads it.
-    pub underline: bool,
-    /// "Something changed here but we don't know what" (e.g. content shifted in from off-screen
-    /// by an insert/backspace). Rendered as an underline-only hint, never a guessed glyph.
-    pub unknown: bool,
 }
 
 /// The render-facing snapshot of current predictions.
@@ -726,8 +723,6 @@ impl PredictionEngine {
                     glyph: cell.glyph.clone(),
                     fg: cell.fg,
                     bg: cell.bg,
-                    underline: false,
-                    unknown: false,
                 },
             );
         }
@@ -1057,16 +1052,13 @@ mod tests {
 
     #[test]
     fn a_slow_link_shows_confirmed_predictions() {
-        // Adaptive: an RTT above the engage threshold shows predictions (never underlined now).
+        // Adaptive: an RTT above the engage threshold shows predictions (drawn plain; the render
+        // tests check they are not underlined).
         let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Adaptive, 120.0);
         e.set_local_frame_sent(1);
         e.new_user_byte(b'y', &echoed);
         let ov = e.overlay();
         assert_eq!(ov.cell(0, 1).map(|c| c.glyph.as_str()), Some("y"));
-        assert!(
-            !ov.cell(0, 1).unwrap().underline,
-            "predictions are not underlined"
-        );
     }
 
     #[test]

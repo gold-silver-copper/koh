@@ -86,7 +86,13 @@ fn pty_table_boundary_race() {
     while held.len() < 440 {
         match fuxix::pty::open(24, 80) {
             Ok(pty) => held.push(pty),
-            Err(e) => *errors.entry(held.len()).or_default().entry(e.to_string()).or_default() += 1,
+            Err(e) => {
+                *errors
+                    .entry(held.len())
+                    .or_default()
+                    .entry(e.to_string())
+                    .or_default() += 1;
+            }
         }
     }
     stop.store(true, Ordering::Relaxed);

@@ -46,12 +46,19 @@ pub struct TickResult {
     pub status: Option<String>,
 }
 
+/// A frame this session applied: its number and the screen it left.
+#[derive(Default)]
+struct Applied {
+    num: FrameNum,
+    screen: TerminalScreen,
+}
+
 /// The client side of one connection.
 pub struct ClientSession {
     /// The newest applied frame and its screen.
-    current: (FrameNum, TerminalScreen),
+    current: Applied,
     /// The frames applied before it, oldest first, at most `FRAME_WINDOW - 1`.
-    older: VecDeque<(FrameNum, TerminalScreen)>,
+    older: VecDeque<Applied>,
     /// A `Resync` was sent and no frame has applied since.
     resync_sent: bool,
     /// The newest input the server has reported reflected on screen.
@@ -82,7 +89,7 @@ impl ClientSession {
     /// A session for a new connection, telling the server the window is `rows × cols`.
     pub fn new(pref: DisplayPreference, rows: u16, cols: u16) -> Self {
         Self {
-            current: (FrameNum::BLANK, TerminalScreen::default()),
+            current: Applied::default(),
             older: VecDeque::new(),
             resync_sent: false,
             echo_ack: InputSeq::default(),
@@ -157,7 +164,8 @@ impl ClientSession {
         };
         self.predictor.set_local_frame_sent(seq.0.saturating_sub(1));
         for &b in bytes {
-            self.predictor.new_user_byte(b, self.current.1.screen());
+            self.predictor
+                .new_user_byte(b, self.current.screen.screen());
         }
         let mut rest = bytes;
         while !rest.is_empty() {
@@ -208,18 +216,18 @@ impl ClientSession {
     /// is one this session holds; otherwise it only proves the link is alive.
     pub fn on_frame(&mut self, now: Instant, frame: &Frame) {
         self.last_heard = Some(now);
-        if frame.num <= self.current.0 {
+        if frame.num <= self.current.num {
             return;
         }
         let base = if frame.base == FrameNum::BLANK {
             Some(TerminalScreen::default())
-        } else if frame.base == self.current.0 {
-            Some(self.current.1.clone())
+        } else if frame.base == self.current.num {
+            Some(self.current.screen.clone())
         } else {
             self.older
                 .iter()
-                .find(|(num, _)| *num == frame.base)
-                .map(|(_, screen)| screen.clone())
+                .find(|older| older.num == frame.base)
+                .map(|older| older.screen.clone())
         };
         let Some(mut screen) = base else {
             if !self.resync_sent {
@@ -229,7 +237,13 @@ impl ClientSession {
             return;
         };
         screen.apply(&frame.diff);
-        let previous = std::mem::replace(&mut self.current, (frame.num, screen));
+        let previous = std::mem::replace(
+            &mut self.current,
+            Applied {
+                num: frame.num,
+                screen,
+            },
+        );
         self.older.push_back(previous);
         while self.older.len() >= FRAME_WINDOW {
             self.older.pop_front();
@@ -238,7 +252,7 @@ impl ClientSession {
         self.acknowledge(frame.num);
         self.echo_ack = self.echo_ack.max(frame.echo_ack);
         self.predictor.set_local_frame_late_acked(self.echo_ack.0);
-        self.predictor.cull(self.current.1.screen());
+        self.predictor.cull(self.current.screen.screen());
         self.dirty = true;
     }
 
@@ -273,7 +287,7 @@ impl ClientSession {
                 .any(|m| matches!(m, ClientMsg::Ack { .. }))
             {
                 self.outgoing.push_back(ClientMsg::Ack {
-                    frame: self.current.0,
+                    frame: self.current.num,
                 });
             }
         }
@@ -318,18 +332,18 @@ impl ClientSession {
 
     /// Whether a frame reported that the shell exited (its code is on [`state`](Self::state)).
     pub const fn exited(&self) -> bool {
-        self.current.1.exit_code().is_some()
+        self.current.screen.exit_code().is_some()
     }
 
     /// The newest applied screen.
     pub const fn state(&self) -> &TerminalScreen {
-        &self.current.1
+        &self.current.screen
     }
 
     /// Whether a server frame has been applied, i.e. [`state`](Self::state) is the server's and
     /// not the blank screen a session starts from.
     pub fn synced(&self) -> bool {
-        self.current.0 > FrameNum::BLANK
+        self.current.num > FrameNum::BLANK
     }
 
     /// The prediction overlay to draw over [`state`](Self::state).
@@ -339,12 +353,12 @@ impl ClientSession {
 
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
     pub fn window_state(&self) -> WindowState<'_> {
-        window_state(&self.current.1)
+        window_state(&self.current.screen)
     }
 
     /// The newest applied screen's grid.
     pub const fn screen(&self) -> &Grid {
-        self.current.1.screen()
+        self.current.screen.screen()
     }
 }
 

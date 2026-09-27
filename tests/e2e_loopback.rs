@@ -28,7 +28,7 @@ impl ClientTerminal for MockTerminal {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        _overlay: &Overlay,
+        _overlay: &Overlay<'_>,
         _status: Option<&str>,
     ) -> std::io::Result<()> {
         *self

@@ -84,27 +84,29 @@ const DISENGAGE_BELOW_MS: f64 = 40.0;
 ///
 /// Only concrete guesses become one: a cell the predictor knows changed but not to what is left
 /// out of the [`Overlay`], so the real cell beneath shows.
-#[derive(Clone, Debug)]
-pub struct PredictedCell {
-    /// The predicted glyph; empty for a blank shifted in by an insert or a backspace.
-    pub glyph: String,
+#[derive(Clone, Copy, Debug)]
+pub struct PredictedCell<'a> {
+    /// The predicted glyph, borrowed from the engine; empty for a blank shifted in by an insert or
+    /// a backspace.
+    pub glyph: &'a str,
     pub fg: Color,
     pub bg: Color,
 }
 
-/// The render-facing snapshot of current predictions.
+/// The render-facing snapshot of current predictions, borrowing its glyphs from the
+/// [`PredictionEngine`] it came from.
 #[derive(Default, Debug)]
-pub struct Overlay {
-    cells: BTreeMap<(u16, u16), PredictedCell>,
+pub struct Overlay<'a> {
+    cells: BTreeMap<(u16, u16), PredictedCell<'a>>,
     cursor: Option<(u16, u16)>,
 }
 
-impl Overlay {
+impl<'a> Overlay<'a> {
     pub fn empty() -> Self {
         Self::default()
     }
     /// The predicted cell at `(row, col)`, if any.
-    pub fn cell(&self, row: u16, col: u16) -> Option<&PredictedCell> {
+    pub fn cell(&self, row: u16, col: u16) -> Option<&PredictedCell<'a>> {
         self.cells.get(&(row, col))
     }
     /// The predicted cursor position `(row, col)`, if any.
@@ -698,7 +700,7 @@ impl PredictionEngine {
 
     /// Build the render overlay for the current frame, honoring the display policy and epoch
     /// gating. Empty when nothing should be shown.
-    pub fn overlay(&self) -> Overlay {
+    pub fn overlay(&self) -> Overlay<'_> {
         let show = match self.pref {
             DisplayPreference::Never => false,
             DisplayPreference::Always => true,
@@ -720,7 +722,7 @@ impl PredictionEngine {
             ov.cells.insert(
                 (row, col),
                 PredictedCell {
-                    glyph: cell.glyph.clone(),
+                    glyph: &cell.glyph,
                     fg: cell.fg,
                     bg: cell.bg,
                 },
@@ -899,7 +901,7 @@ mod tests {
         e.new_user_byte(b'y', &echoed);
         let ov = e.overlay();
         assert_eq!(
-            ov.cell(0, 1).map(|c| c.glyph.as_str()),
+            ov.cell(0, 1).map(|c| c.glyph),
             Some("y"),
             "typing after confirmation is visible over the fake view"
         );
@@ -1044,7 +1046,7 @@ mod tests {
         e.new_user_byte(b'y', &echoed); // cursor now at (0,1)
         let ov = e.overlay();
         assert_eq!(
-            ov.cell(0, 1).map(|c| c.glyph.as_str()),
+            ov.cell(0, 1).map(|c| c.glyph),
             Some("y"),
             "typing after confirmation must be visible"
         );
@@ -1058,7 +1060,7 @@ mod tests {
         e.set_local_frame_sent(1);
         e.new_user_byte(b'y', &echoed);
         let ov = e.overlay();
-        assert_eq!(ov.cell(0, 1).map(|c| c.glyph.as_str()), Some("y"));
+        assert_eq!(ov.cell(0, 1).map(|c| c.glyph), Some("y"));
     }
 
     #[test]
@@ -1335,7 +1337,7 @@ mod tests {
         }
         let ov = e.overlay();
         assert_eq!(
-            ov.cell(0, 1).map(|c| c.glyph.as_str()),
+            ov.cell(0, 1).map(|c| c.glyph),
             Some("世"),
             "the wide grapheme is predicted at the cursor column"
         );
@@ -1368,7 +1370,7 @@ mod tests {
             // The first typed char lands at col 1 (cursor seeded from the echoed "x"); the accent
             // is the 3rd char, so column 3.
             assert_eq!(
-                ov.cell(0, 3).map(|c| c.glyph.as_str()),
+                ov.cell(0, 3).map(|c| c.glyph),
                 Some(accent),
                 "{word}: accented char must be predicted as the real grapheme"
             );

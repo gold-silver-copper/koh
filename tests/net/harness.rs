@@ -83,12 +83,12 @@ struct Recorder {
 }
 
 /// The glyphs a prediction overlay draws, row by row.
-fn predicted_glyphs(overlay: &Overlay, (rows, cols): (u16, u16)) -> String {
+fn predicted_glyphs(overlay: &Overlay<'_>, (rows, cols): (u16, u16)) -> String {
     let mut glyphs = String::new();
     for row in 0..rows {
         for col in 0..cols {
             if let Some(cell) = overlay.cell(row, col) {
-                glyphs.push_str(&cell.glyph);
+                glyphs.push_str(cell.glyph);
             }
         }
     }
@@ -99,7 +99,7 @@ impl ClientTerminal for Recorder {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay,
+        overlay: &Overlay<'_>,
         status: Option<&str>,
     ) -> std::io::Result<()> {
         let painted = Painted {

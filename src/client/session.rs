@@ -333,7 +333,7 @@ impl ClientSession {
     }
 
     /// The prediction overlay to draw over [`state`](Self::state).
-    pub fn overlay(&self) -> Overlay {
+    pub fn overlay(&self) -> Overlay<'_> {
         self.predictor.overlay()
     }
 
@@ -581,7 +581,7 @@ mod tests {
         );
         s.on_input(later, b"y");
         assert_eq!(
-            s.overlay().cell(0, 1).map(|c| c.glyph.as_str()),
+            s.overlay().cell(0, 1).map(|c| c.glyph),
             Some("y"),
             "typing after a confirmed echo is shown"
         );

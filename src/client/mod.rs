@@ -231,7 +231,7 @@ pub trait ClientTerminal {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay,
+        overlay: &Overlay<'_>,
         status: Option<&str>,
     ) -> std::io::Result<()>;
 
@@ -293,7 +293,7 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay,
+        overlay: &Overlay<'_>,
         status: Option<&str>,
     ) -> std::io::Result<()> {
         // Mirror the out-of-band terminal state (title/icon/clipboard/bell/modes) onto the real

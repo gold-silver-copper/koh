@@ -21,7 +21,7 @@ use fux_vt::{Color, MouseProtocolEncoding, MouseProtocolMode};
 pub fn render(
     backend: &mut impl KohBackend,
     screen: &Grid,
-    overlay: &Overlay,
+    overlay: &Overlay<'_>,
     status: Option<&str>,
 ) -> io::Result<()> {
     let (rows, cols) = screen.size();
@@ -83,7 +83,7 @@ pub fn render(
             // `contents()` already returns &str and the predicted glyph is borrowed from the
             // overlay, both outliving this write. An empty glyph renders as a blank cell.
             let glyph: &str = if let Some(p) = pred {
-                &p.glyph
+                p.glyph
             } else if let Some(c) = cell.filter(|c| c.has_contents()) {
                 c.contents()
             } else {
@@ -391,7 +391,7 @@ mod tests {
     }
 
     /// Render into a capture backend and return the emitted bytes as a lossy string.
-    fn render_to_string(screen: &Grid, overlay: &Overlay, status: Option<&str>) -> String {
+    fn render_to_string(screen: &Grid, overlay: &Overlay<'_>, status: Option<&str>) -> String {
         let mut backend = CaptureBackend::default();
         render(&mut backend, screen, overlay, status).unwrap();
         String::from_utf8_lossy(&backend.bytes).into_owned()

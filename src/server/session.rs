@@ -131,9 +131,7 @@ impl SessionClient {
         self.screens.borrow().clone()
     }
 
-    /// Reserve a slot to send input; `None` if the session ended. Awaiting the returned permit-free
-    /// send never blocks the caller's loop indefinitely (the queue is bounded, so a full queue is
-    /// itself the backpressure).
+    /// Whether the session still takes input: `false` once it ended.
     pub fn can_send(&self) -> bool {
         !self.input.is_closed()
     }

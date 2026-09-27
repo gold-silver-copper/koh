@@ -64,11 +64,11 @@ struct CursorKeyNormalizer {
 }
 
 impl CursorKeyNormalizer {
-    /// Normalize `input` for an app whose application-cursor-keys mode is `app_cursor`, returning
-    /// the bytes to feed the PTY.
-    fn normalize(&mut self, input: &[u8], app_cursor: bool) -> Vec<u8> {
+    /// Normalize `input` for an app whose application-cursor-keys mode is `app_cursor`, appending
+    /// the bytes to feed the PTY to `out`.
+    fn normalize_into(&mut self, input: &[u8], app_cursor: bool, out: &mut Vec<u8>) {
         // A capacity hint: one spare byte for a held escape; saturating cannot matter.
-        let mut out = Vec::with_capacity(input.len().saturating_add(1));
+        out.reserve(input.len().saturating_add(1));
         for &b in input {
             match self.state {
                 Ss3State::Ground => {
@@ -98,7 +98,6 @@ impl CursorKeyNormalizer {
                 }
             }
         }
-        out
     }
 }
 
@@ -260,9 +259,8 @@ impl ServerConn {
             match msg {
                 ClientMsg::Input { seq, bytes } => {
                     self.echo.register(seq, now);
-                    drained
-                        .keys
-                        .extend(self.cursor_keys.normalize(&bytes, app_cursor));
+                    self.cursor_keys
+                        .normalize_into(&bytes, app_cursor, &mut drained.keys);
                 }
                 ClientMsg::Resize { rows, cols } => {
                     drained.resize = Some(crate::terminal::clamp_dims(rows, cols));
@@ -619,7 +617,7 @@ mod tests {
         let mut n = CursorKeyNormalizer::default();
         let mut out = Vec::new();
         for c in chunks {
-            out.extend(n.normalize(c, app_cursor));
+            n.normalize_into(c, app_cursor, &mut out);
         }
         out
     }

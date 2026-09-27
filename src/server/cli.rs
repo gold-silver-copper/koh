@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use iroh::EndpointId;
+use iroh::{EndpointId, RelayUrl};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
@@ -22,8 +22,7 @@ use crate::server::audit::{auth_event, Outcome};
 use crate::server::session::{AttachKind, Registry, SessionSpec};
 use crate::server::{run_attached, SessionExit};
 use crate::transport_iroh::{
-    bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id,
-    parse_endpoint_id, parse_relay_url, ALPN,
+    bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, format_endpoint_id, ALPN,
 };
 use tracing::{error, info, warn};
 
@@ -45,7 +44,7 @@ pub struct ServeConfig {
     pub key_file: Option<PathBuf>,
     /// Authorized client endpoint ids. At least one is required — koh only serves peers whose
     /// node-id is on this list.
-    pub allow: Vec<String>,
+    pub allow: Vec<EndpointId>,
     /// The program to host in the session PTY, as argv: `command[0]` is the program, the rest are
     /// its arguments, passed verbatim (no shell splitting). Empty = the user's login shell.
     pub command: Vec<String>,
@@ -56,7 +55,7 @@ pub struct ServeConfig {
     pub session_ttl_secs: u64,
     /// Host via a self-hosted relay URL instead of n0's public relays. Takes precedence over
     /// `local` if both are set.
-    pub relay_url: Option<String>,
+    pub relay_url: Option<RelayUrl>,
     /// Bind without any relay/discovery (LAN / loopback). Clients dial with `--direct <ip:port>`.
     pub local: bool,
     /// Maximum number of connections being handled concurrently (minimum 1).
@@ -142,9 +141,8 @@ pub async fn serve(config: impl Into<ServeConfig>) -> anyhow::Result<()> {
     let secret = identity.secret.clone();
 
     // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
-    let endpoint = if let Some(url) = &args.relay_url {
-        let relay = parse_relay_url(url)?;
-        bind_endpoint_with_relay(secret, true, relay)
+    let endpoint = if let Some(relay) = &args.relay_url {
+        bind_endpoint_with_relay(secret, true, relay.clone())
             .await
             .context("binding endpoint")?
     } else if args.local {
@@ -236,11 +234,7 @@ impl Hosting {
         anyhow::ensure!(args.max_sessions >= 1, "max_sessions must be at least 1");
         // The node-id allowlist is the sole authorization gate. Every authorized peer gets the
         // same access. At least one entry is required: koh never serves an unlisted peer.
-        let mut allow: HashSet<EndpointId> = HashSet::new();
-        for s in &args.allow {
-            let id = parse_endpoint_id(s).with_context(|| format!("bad --allow id: {s}"))?;
-            allow.insert(id);
-        }
+        let allow: HashSet<EndpointId> = args.allow.iter().copied().collect();
         if allow.is_empty() {
             anyhow::bail!(
                 "no clients authorized: pass --allow <endpoint-id> (repeatable; get one from `koh id`)"

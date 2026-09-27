@@ -13,7 +13,7 @@ use koh::client::{run_client, BellHook, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::terminal::TerminalScreen;
-use koh::transport_iroh::{format_endpoint_id, generate_secret_key};
+use koh::transport_iroh::generate_secret_key;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -39,7 +39,7 @@ impl Server {
         let id = secret.public();
         let endpoint = net.endpoint(secret, true).await?;
         let config = ServeConfig {
-            allow: allow.iter().map(format_endpoint_id).collect(),
+            allow: allow.to_vec(),
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
             scrollback: 0,
             launcher: koh::pty::Launcher::new(env!("CARGO_BIN_EXE_koh")),

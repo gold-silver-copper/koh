@@ -198,7 +198,6 @@ async fn session_task(
 ) {
     let (screens_tx, _screens_rx) = watch::channel(Arc::new(host.snapshot()));
     let (input_tx, mut input_rx) = mpsc::channel::<ClientInput>(INPUT_QUEUE);
-    let input_tx = Arc::new(input_tx);
     let mut attached: usize = 0;
     let mut last_detach: Option<Instant> = None;
     let mut pending_keys: Vec<u8> = Vec::new();
@@ -263,7 +262,7 @@ async fn session_task(
                     attached = attached.saturating_add(1);
                     let client = SessionClient {
                         screens: screens_tx.subscribe(),
-                        input: (*input_tx).clone(),
+                        input: input_tx.clone(),
                         control,
                     };
                     // If the connection is already gone, treat it as an immediate detach.

@@ -208,6 +208,147 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
     });
 }
 
+/// `koh id` for the key at `key`, creating it: the endpoint id, as the binary prints it.
+fn endpoint_id(key: &std::path::Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_koh"))
+        .args(["id", "--key-file"])
+        .arg(key)
+        .output()?;
+    anyhow::ensure!(out.status.success(), "koh id: {out:?}");
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// A `koh serve --local --port <port>` process hosting `sh` for `client`, once it reports ready.
+fn serve_on_port(
+    key: &std::path::Path,
+    port: u16,
+    client: &str,
+) -> anyhow::Result<std::process::Child> {
+    use std::io::BufRead as _;
+    let mut server = std::process::Command::new(env!("CARGO_BIN_EXE_koh"))
+        .args([
+            "serve",
+            "--local",
+            "--port",
+            &port.to_string(),
+            "--allow",
+            client,
+        ])
+        .args(["--shell", "sh", "--key-file"])
+        .arg(key)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let stderr = server
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stderr pipe"))?;
+    let (ready, is_ready) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Read to the end, so the server never blocks on a full pipe.
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.contains(&format!("udp port    : {port}")) {
+                let _ = ready.send(());
+            }
+        }
+    });
+    if is_ready.recv_timeout(Duration::from_secs(20)).is_err() {
+        let _ = server.kill();
+        anyhow::bail!("the server never reported port {port}");
+    }
+    Ok(server)
+}
+
+/// Stop `server` as a service manager would, with SIGTERM, and wait for it to exit.
+fn stop(mut server: std::process::Child) -> anyhow::Result<()> {
+    let pid = fuxix::process::Pid::of(&server).ok_or_else(|| anyhow::anyhow!("no pid"))?;
+    fuxix::process::kill(pid, fuxix::process::Signal::Term)?;
+    for _ in 0..100 {
+        if server.try_wait()?.is_some() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = server.kill();
+    anyhow::bail!("the server did not exit on SIGTERM")
+}
+
+/// A `koh serve --local --port` restarted under a connected client (a new process, the same key
+/// and port) is found again: the client redials the address it dialed. The session died with the
+/// old server, so the client gets a fresh one.
+#[test]
+fn a_client_redials_a_local_server_restarted_on_its_port() {
+    runtime().expect("tokio runtime").block_on(async {
+        let dir = std::env::temp_dir().join(format!("koh-restart-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("a test dir");
+        let (server_key, client_key) = (dir.join("server.key"), dir.join("client.key"));
+        let server_id = endpoint_id(&server_key).expect("the server's id");
+        let client_id = endpoint_id(&client_key).expect("the client's id");
+        let port = std::net::UdpSocket::bind(("0.0.0.0", 0))
+            .and_then(|socket| socket.local_addr())
+            .expect("a free port")
+            .port();
+
+        let server = serve_on_port(&server_key, port, &client_id).expect("the server");
+        let (client, output) = Pty::spawn(
+            24,
+            80,
+            &[
+                env!("CARGO_BIN_EXE_koh").to_owned(),
+                "connect".to_owned(),
+                server_id,
+                "--direct".to_owned(),
+                format!("127.0.0.1:{port}"),
+                "--key-file".to_owned(),
+                client_key.display().to_string(),
+            ],
+            "xterm-256color",
+            &launcher(),
+        )
+        .expect("spawn client binary");
+        let buf = capture(output);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // A variable only this session holds, and an answer only a remote shell computes.
+        client
+            .write_input(b"X=kept; echo before_${X}_$((6*7))\r")
+            .expect("type");
+        let at = wait_for(&buf, 0, "before_kept_42", 20)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        stop(server).expect("stop the server");
+        let at = wait_for(&buf, at, "reconnecting", 20)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let server = serve_on_port(&server_key, port, &client_id).expect("the restarted server");
+
+        // Typing while the client redials is dropped, so type until the new session answers.
+        let mut seen = Err(String::new());
+        for _ in 0..15 {
+            client
+                .write_input(b"echo after_${X:-fresh}_$((6*7))\r")
+                .expect("type");
+            seen = wait_for(&buf, at, "after_fresh_42", 2).await;
+            if seen.is_ok() {
+                break;
+            }
+        }
+
+        let _ = client.write_input(&[0x1e, b'.']);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = client.kill();
+        let stopped = stop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+        stopped.expect("stop the restarted server");
+        seen.unwrap_or_else(|e| panic!("the client found the restarted server: {e}"));
+    });
+}
+
 /// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
 /// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {

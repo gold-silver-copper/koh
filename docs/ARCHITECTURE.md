@@ -214,10 +214,15 @@ detector** turns a multi-minute wake-up hang into a ~1–2 s reattach: if real t
 drops the (almost certainly dead) connection, and re-dials immediately. A sub-20 s glance still
 rides out silently on the existing connection.
 
-> **`--direct` caveat:** transparent re-dial targets the *same* address it first dialed, so a
-> `--direct <ip:port>` client can't reconnect if the server restarts on a new ephemeral **port**.
-> The relay/discovery path (a bare endpoint id) re-dials by node id and reconnects across address
-> changes — use it (or a fixed port) when you need reconnection to survive a server restart.
+> **`--direct` and server restarts:** transparent re-dial targets the *same* address it first
+> dialed. By default `koh serve` binds an ephemeral UDP port, so a restarted server is elsewhere and
+> a `--direct <ip:port>` client redials the old port forever. `koh serve --port <PORT>` binds a fixed
+> port (IPv4, and IPv6 where the host has it), so the restarted server is where the client looks,
+> and it reattaches, to a fresh session: the old session's program died with the old server. A
+> server stopped with SIGTERM closes its connections, so clients redial at once; one that died
+> without closing them (SIGKILL, a crash, a power cut) leaves them to notice through the 5-minute
+> idle timeout. The relay/discovery path (a bare endpoint id) re-dials by node id and follows the
+> server across address changes.
 
 ## Sessions, connections and the bell hook
 
@@ -323,8 +328,9 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   server → PTY-hosted `sh` → fux-vt → iroh → client render.
 - **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** attached to an allocated PTY (so
   `isatty()` is true and raw mode runs for real), driven by scripted keystrokes with rendered
-  frames read back from the master, connected with `--direct` to an in-process server; and the
-  `Ctrl-^ Ctrl-Z` suspend under a job-control bash.
+  frames read back from the master, connected with `--direct` to an in-process server; the
+  `Ctrl-^ Ctrl-Z` suspend under a job-control bash; and a `koh serve --local --port` process
+  restarted under a connected client, which finds it again.
 - **`tests/upgrade_in_place.rs`** (Linux) — a running `koh serve` whose binary file is removed
   still starts sessions, because it launches them from `/proc/self/exe`.
 

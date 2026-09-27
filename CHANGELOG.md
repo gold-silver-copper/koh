@@ -21,6 +21,12 @@ Synchronization Protocol over QUIC datagrams, but its own stream protocol, ALPN 
 client and a 0.13 server (or the reverse) refuse each other at the TLS handshake with a clear
 error; upgrade both ends.
 
+### Added
+- `koh serve --port <PORT>` binds that UDP port (IPv4, and IPv6 where the host has it) instead of
+  an ephemeral one, in every profile, and the banner shows the port. A client dialing
+  `--direct <ip:port>` redials the address it first dialed, so with a fixed port it finds a
+  restarted server and reattaches, to a fresh session. A port already in use is a clear error.
+
 ### Changed
 - **`koh serve` starts each session's program through `koh __launch`**, a hidden subcommand of
   its own binary that makes the program a session leader with the PTY as its controlling

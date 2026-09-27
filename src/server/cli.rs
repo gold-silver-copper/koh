@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::server::audit::{auth_event, Outcome};
 use crate::server::session::{AttachKind, Registry, SessionSpec};
 use crate::server::{run_attached, SessionExit};
-use crate::transport_iroh::{bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, ALPN};
+use crate::transport_iroh::{bind_on, Network, ALPN};
 use tracing::{error, info, warn};
 
 /// Deadline on the QUIC handshake, so a stalled dial cannot hold its permits for the 5-minute idle
@@ -39,6 +39,9 @@ pub struct ServeConfig {
     pub relay_url: Option<RelayUrl>,
     /// No relay or discovery; clients dial with `--direct <ip:port>`.
     pub local: bool,
+    /// The UDP port to bind (IPv4 and IPv6); `None` for ephemeral ports. A fixed port lets a client
+    /// dialing `--direct <ip:port>` redial a restarted server.
+    pub port: Option<u16>,
     /// Most connections handled at once (at least 1).
     pub max_connections: u32,
     /// Most live sessions, one per peer (at least 1).
@@ -70,6 +73,7 @@ impl Default for ServeConfig {
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             relay_url: None,
             local: false,
+            port: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_sessions: DEFAULT_MAX_SESSIONS,
             launcher: crate::pty::Launcher::this_binary(),
@@ -102,27 +106,32 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     let secret = identity.secret.clone();
 
     // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
-    let endpoint = match (&args.relay_url, args.local) {
-        (Some(relay), _) => bind_endpoint_with_relay(secret, true, relay.clone()).await,
-        (None, true) => bind_endpoint_local(secret, true).await,
-        (None, false) => bind_endpoint(secret, true).await,
-    }
-    .context("binding endpoint")?;
+    let network = match (&args.relay_url, args.local) {
+        (Some(relay), _) => Network::Relay(relay.clone()),
+        (None, true) => Network::Local,
+        (None, false) => Network::N0,
+    };
+    let endpoint = bind_on(secret, true, &network, args.port)
+        .await
+        .context("binding endpoint")?;
     let my_id = endpoint.id();
     let id_str = my_id.to_string();
+    let port = endpoint
+        .bound_sockets()
+        .iter()
+        .find(|s| s.is_ipv4())
+        .map_or(0, std::net::SocketAddr::port);
 
     // How a client should dial us, given the chosen profile.
-    let connect_hint = if let Some(url) = &args.relay_url {
-        format!("koh connect {id_str} --relay-url {url}")
-    } else if args.local {
-        let port = endpoint
-            .bound_sockets()
-            .iter()
-            .find(|s| s.is_ipv4())
-            .map_or(0, std::net::SocketAddr::port);
-        format!("koh connect {id_str} --direct <this-host-ip>:{port}")
+    let connect_hint = match &network {
+        Network::Relay(url) => format!("koh connect {id_str} --relay-url {url}"),
+        Network::Local => format!("koh connect {id_str} --direct <this-host-ip>:{port}"),
+        Network::N0 => format!("koh connect {id_str}"),
+    };
+    let port_note = if args.port.is_some() {
+        String::new()
     } else {
-        format!("koh connect {id_str}")
+        " (ephemeral; --port fixes it across restarts)".to_owned()
     };
 
     eprintln!("┌─ koh server ready ──────────────────────────────────────");
@@ -133,6 +142,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
         "│ auth        : allowlist ({} client(s))",
         hosting.allow.len()
     );
+    eprintln!("│ udp port    : {port}{port_note}");
     eprintln!("│ connect     : {connect_hint}");
     eprintln!("└───────────────────────────────────────────────────────────");
 
@@ -357,6 +367,7 @@ mod tests {
         assert_eq!(c.max_connections, 64);
         assert_eq!(c.max_sessions, 64);
         assert!(!c.local && c.relay_url.is_none() && c.key_file.is_none());
+        assert_eq!(c.port, None);
     }
 
     #[test]

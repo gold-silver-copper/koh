@@ -37,8 +37,9 @@ exclude = [
 iroh = "=1.2.0"
 # terminal / pty / tui. fux-vt is the server's emulator and supplies the cell type the client grid
 # stores. 0.1.1 was the first release with what koh needs (opt-in events, extended replies, keypad
-# state, cell constructors); the floor is the release koh is tested against.
-fux-vt = "0.1.3"
+# state, cell constructors); 0.1.5 changes a row's version only when an edit changes the row, which
+# the server's snapshots rely on to skip unchanged rows.
+fux-vt = "0.1.5"
 unicode-width = "0.2.2"
 # The system calls koh makes beyond std, each safe to call: the server's PTYs and the session
 # launcher (a new session with the PTY as its controlling terminal), the client's terminal (raw

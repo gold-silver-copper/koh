@@ -99,7 +99,13 @@ screen that holds the row unchanged: a snapshot shares the rows the program left
 fux-vt's row ids, so rows that scrolled are shared too) with the snapshot before it, and a client
 screen shares every row a diff did not carry with the base it was applied to. So a screen costs the
 rows that changed, two screens compare and diff by skipping the rows they share, and each end's
-memory for its recent screens is counted in distinct rows. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's
+memory for its recent screens is counted in distinct rows. The list of rows is itself shared by
+every screen holding all of them, and copied only when a row is replaced, so copying a screen
+touches no row. A snapshot reads each live row's fux-vt id and version, which fux-vt changes only
+when an edit changes the row: a row at the id and version the last snapshot saw at its place is
+taken as it was, one seen elsewhere is found by id, and if no row changed the snapshot shares the
+last one's list whole. Counting a window's memory looks only at the rows that differ from the
+newest screen's at the same place. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's
 opt-in events (title, icon, bell, clipboard) and extended replies (DECRQM, DECXCPR, secondary DA)
 turned on. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
 cursor and the modes; after a resize the client starts from a blank grid and receives every

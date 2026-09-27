@@ -1500,6 +1500,77 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_with_no_row_changed_shares_the_whole_row_list() {
+        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
+        emu.process(b"one\r\ntwo");
+        let before = emu.snapshot();
+        // A query, a title, the cursor moved: no row changed.
+        emu.process(b"\x1b[6n\x1b]2;title\x07\x1b[5;5H");
+        let after = emu.snapshot();
+        assert!(after.grid.shares_all_rows(&before.grid));
+        assert_eq!(after.grid.cursor_position(), (4, 4));
+        // A client applying a frame that carries no row keeps sharing its base's.
+        let mut client = before.clone();
+        client.apply(&after.diff_from(&before));
+        assert!(client.grid.shares_all_rows(&before.grid));
+        assert_eq!(client, after);
+        // A changed row: its own list, the base's untouched.
+        emu.process(b"x");
+        let changed = emu.snapshot();
+        assert!(!changed.grid.shares_all_rows(&after.grid));
+        let mut client = after.clone();
+        client.apply(&changed.diff_from(&after));
+        assert!(!client.grid.shares_all_rows(&after.grid));
+        assert_eq!(client, changed);
+        assert_eq!(after.screen().contents(), "one\ntwo");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// The window counts agree with the plain count, over frames that scroll, change rows,
+        /// resize, and share a blank grid's one allocation.
+        #[test]
+        fn window_counts_agree_with_the_plain_count(
+            steps in proptest::collection::vec(
+                (
+                    proptest::collection::vec(0..SCROLL_PIECES.len(), 0..4),
+                    proptest::option::of((2u16..10, 2u16..14)),
+                ),
+                1..10,
+            ),
+            base in 0usize..10,
+        ) {
+            let mut emu = ServerTerminal::new(8, 12, 0).expect("emulator");
+            let mut frames = vec![TerminalScreen::default(), emu.snapshot()];
+            for (pieces, resize) in steps {
+                for piece in pieces {
+                    emu.process(SCROLL_PIECES[piece].as_bytes());
+                }
+                if let Some((rows, cols)) = resize {
+                    emu.resize(Size::new(rows, cols));
+                }
+                let target = emu.snapshot();
+                // As a client has it: applied to the last frame, sharing its rows.
+                let mut applied = frames.last().cloned().unwrap_or_default();
+                applied.apply(&target.diff_from(frames.last().unwrap()));
+                frames.push(target);
+                frames.push(applied);
+            }
+            let grids: Vec<&Grid> = frames.iter().map(|f| &f.grid).collect();
+            let base = grids[base.min(grids.len().saturating_sub(1))];
+            proptest::prop_assert_eq!(
+                Grid::cells_beyond(base, grids.iter().copied()),
+                Grid::cells_counted_plainly([base], grids.iter().copied())
+            );
+            proptest::prop_assert_eq!(
+                Grid::distinct_cells(grids.iter().copied()),
+                Grid::cells_counted_plainly([], grids.iter().copied())
+            );
+        }
+    }
+
+    #[test]
     fn apply_replaces_only_the_rows_the_diff_carries() {
         let base = screen_from(24, 80, b"one\r\ntwo\r\nthree");
         let target = screen_from(24, 80, b"one\r\nTWO\r\nthree");

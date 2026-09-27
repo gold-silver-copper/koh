@@ -114,6 +114,16 @@ error; upgrade both ends.
   warning that iroh 1.0.0 contains code a future Rust will reject. Also `serde` 1.0.228 → 1.0.229
   and `miniz_oxide` 0.8 → 0.9; every other dependency's minimum version is now the release koh is
   tested against (for example `tokio` 1.53.1, `fux-vt` 0.1.3).
+- Updated `fux-vt` 0.1.3 → 0.1.5, which changes a row's version only when an edit changes the row.
+  A program that redraws lines it left as they were (each line's text, then erase to its end) no
+  longer makes `koh serve` compare the whole screen: such a redraw costs the server 7 µs a frame
+  instead of 30 µs at 200×50, and 0.1 ms instead of 2.4 ms at 1000×1000.
+- Frames that change few rows cost far less at both ends on large screens: a screen's list of rows
+  is shared until a row is replaced, a snapshot matches rows by their place before searching, and
+  the memory the recent frames hold is counted from the rows that differ. At 1000×1000 a frame in
+  which nothing changed takes the server 8 µs to snapshot instead of 82 µs, the client 6 µs to take
+  instead of 222 µs and 10 µs to paint instead of 84 µs; a keystroke's frame takes 21, 51 and 32 µs
+  instead of 80, 204 and 99 µs.
 
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with it) for

@@ -293,9 +293,6 @@ impl ClientSession {
                 });
             }
         }
-        // The predictor engages adaptively on the link's round-trip time.
-        self.predictor
-            .set_rtt_ms(rtt.map_or(0.0, |rtt| rtt.as_secs_f64() * 1000.0));
         let silent = self
             .last_heard
             .map(|heard| now.saturating_duration_since(heard));

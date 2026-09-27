@@ -7,10 +7,8 @@
 //! ## What it does
 //!
 //! Instant echo of ordinary typing, with epoch-gated confirmation driven by the server's debounced
-//! **echo-ack** (not the raw network ack), engagement by round-trip time, and emergent
-//! password/no-echo suppression. It predicts ASCII printables, backspace, CR/LF, the left/right
-//! arrow keys, and
-//! whole UTF-8 graphemes (including double-width CJK/emoji, whose cursor advances by two
+//! **echo-ack** (not the raw network ack) and emergent password/no-echo suppression. It predicts
+//! ASCII printables, backspace, CR/LF, the left/right arrow keys, and whole UTF-8 graphemes (including double-width CJK/emoji, whose cursor advances by two
 //! cells). Control/escape/CSI bytes it doesn't model (and ambiguous edge-of-row cases) open a
 //! fresh epoch but make no concrete prediction — they fall back to the server's real echo.
 //! This never corrupts the display — a wrong or unconfirmed guess is reconciled away — it just
@@ -53,8 +51,8 @@ pub struct CellView<'a> {
 
 /// The read-only view of an authoritative screen the predictor reconciles against.
 ///
-/// koh's client grid (`terminal::Grid`) and `fux_vt::Screen` implement it, and the tests implement
-/// it for a plain char grid. It keeps `predict` free of any `crate::` import (the CI layering guard
+/// koh's client grid (`terminal::Grid`) implements it, and the tests implement it for fux-vt's
+/// screen and a plain char grid. It keeps `predict` free of any `crate::` import (the CI layering guard
 /// enforces that).
 pub trait ScreenView {
     fn size(&self) -> Size;
@@ -64,23 +62,6 @@ pub trait ScreenView {
     fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>>;
 }
 
-impl ScreenView for fux_vt::Screen {
-    fn size(&self) -> Size {
-        let (rows, cols) = Self::size(self);
-        Size { rows, cols }
-    }
-    fn cursor_position(&self) -> (u16, u16) {
-        Self::cursor_position(self)
-    }
-    fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>> {
-        Self::cell(self, row, col).map(|c| CellView {
-            contents: if c.has_contents() { c.contents() } else { "" },
-            fg: c.fgcolor(),
-            bg: c.bgcolor(),
-        })
-    }
-}
-
 /// When predictions are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayPreference {
@@ -88,15 +69,7 @@ pub enum DisplayPreference {
     Always,
     /// Never predict (the plain, non-speculative path).
     Never,
-    /// Render only while the link is slow enough to benefit.
-    Adaptive,
 }
-
-/// [`Adaptive`](DisplayPreference::Adaptive) starts showing predictions once the round-trip time
-/// rises above this, and stops once it falls below [`DISENGAGE_BELOW_MS`]. The gap is hysteresis,
-/// so a link hovering near the threshold does not flicker predictions on and off.
-const ENGAGE_ABOVE_MS: f64 = 60.0;
-const DISENGAGE_BELOW_MS: f64 = 40.0;
 
 /// A speculative cell for the renderer to draw, as is, on top of the authoritative grid.
 ///
@@ -199,8 +172,7 @@ enum EscState {
 ///
 /// Drive it: [`set_local_frame_sent`](Self::set_local_frame_sent)
 /// before feeding typed bytes; [`new_user_byte`](Self::new_user_byte) per typed byte;
-/// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) + [`set_rtt_ms`](Self::set_rtt_ms)
-/// + [`cull`](Self::cull) when a server frame arrives; [`overlay`](Self::overlay) to render.
+/// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) + [`cull`](Self::cull) when a server frame arrives; [`overlay`](Self::overlay) to render.
 pub struct PredictionEngine {
     pref: DisplayPreference,
     cells: BTreeMap<(u16, u16), PredCell>,
@@ -209,10 +181,6 @@ pub struct PredictionEngine {
     confirmed_epoch: u64,
     local_frame_sent: u64,
     late_acked: u64,
-    /// The link round-trip time (ms) the client last reported, for adaptive engagement.
-    rtt_ms: f64,
-    /// Whether adaptive engagement is currently showing predictions (latched, with hysteresis).
-    engaged: bool,
     last_size: Option<Size>,
     last_byte: u8,
     /// Escape-sequence parser state across raw input bytes (for arrow-key prediction).
@@ -240,8 +208,6 @@ impl PredictionEngine {
             confirmed_epoch: 0,
             local_frame_sent: 0,
             late_acked: 0,
-            rtt_ms: 0.0,
-            engaged: false,
             last_size: None,
             last_byte: 0,
             esc: EscState::Ground,
@@ -322,15 +288,6 @@ impl PredictionEngine {
     /// The server's echo-ack: the newest input frame reflected on screen.
     pub fn set_local_frame_late_acked(&mut self, n: u64) {
         self.late_acked = n;
-    }
-    /// The link round-trip time (ms), for adaptive engagement (with hysteresis).
-    pub fn set_rtt_ms(&mut self, ms: f64) {
-        self.rtt_ms = ms;
-        if ms > ENGAGE_ABOVE_MS {
-            self.engaged = true;
-        } else if ms < DISENGAGE_BELOW_MS {
-            self.engaged = false;
-        }
     }
 
     /// The frame a prediction made now expires at: the next input frame after the newest sent.
@@ -734,12 +691,7 @@ impl PredictionEngine {
     /// Build the render overlay for the current frame, honoring the display policy and epoch
     /// gating. Empty when nothing should be shown.
     pub fn overlay(&self) -> Overlay<'_> {
-        let show = match self.pref {
-            DisplayPreference::Never => false,
-            DisplayPreference::Always => true,
-            DisplayPreference::Adaptive => self.engaged,
-        };
-        if !show {
+        if self.pref == DisplayPreference::Never {
             return Overlay::empty();
         }
         let mut ov = Overlay::empty();
@@ -869,6 +821,23 @@ mod tests {
 
     use fux_vt::Screen;
 
+    impl ScreenView for Screen {
+        fn size(&self) -> Size {
+            let (rows, cols) = Self::size(self);
+            Size { rows, cols }
+        }
+        fn cursor_position(&self) -> (u16, u16) {
+            Self::cursor_position(self)
+        }
+        fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>> {
+            Self::cell(self, row, col).map(|c| CellView {
+                contents: if c.has_contents() { c.contents() } else { "" },
+                fg: c.fgcolor(),
+                bg: c.bgcolor(),
+            })
+        }
+    }
+
     fn screen_of(bytes: &[u8]) -> Screen {
         let mut p = fux_vt::Parser::new(24, 80, 0).expect("24x80 parser");
         p.process(bytes).expect("process");
@@ -918,7 +887,6 @@ mod tests {
             cursor: (0, 0),
         };
         let mut e = PredictionEngine::new(DisplayPreference::Always);
-        e.set_rtt_ms(250.0);
         e.set_local_frame_sent(0);
         e.new_user_byte(b'x', &blank);
         assert!(e.overlay().is_empty(), "hidden until confirmed");
@@ -1039,9 +1007,8 @@ mod tests {
     /// Drive a confirmation round: type `first` (hidden), have the server echo it on `echoed`
     /// and ack frame 1, cull (advancing `confirmed_epoch`). Returns the engine ready for
     /// subsequent typing to be *visible*.
-    fn confirm_first_keystroke(pref: DisplayPreference, srtt: f64) -> (PredictionEngine, Screen) {
-        let mut e = PredictionEngine::new(pref);
-        e.set_rtt_ms(srtt);
+    fn confirm_first_keystroke() -> (PredictionEngine, Screen) {
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
         e.new_user_byte(b'x', &blank);
@@ -1058,7 +1025,7 @@ mod tests {
     #[test]
     fn predictions_hidden_until_server_confirms_echo() {
         // P0 (security): a secret typed before ANY server confirmation must never be drawn,
-        // even with Display::Always (proving the *epoch* gate, not the SRTT gate, suppresses it).
+        // even with Display::Always.
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
@@ -1074,7 +1041,7 @@ mod tests {
     #[test]
     fn confirmed_echo_makes_subsequent_typing_visible() {
         // After the server proves it echoes (one Correct), later typing in the confirmed epoch shows.
-        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+        let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
         e.new_user_byte(b'y', &echoed); // cursor now at (0,1)
         let ov = e.overlay();
@@ -1083,48 +1050,6 @@ mod tests {
             Some("y"),
             "typing after confirmation must be visible"
         );
-    }
-
-    #[test]
-    fn a_slow_link_shows_confirmed_predictions() {
-        // Adaptive: an RTT above the engage threshold shows predictions (drawn plain; the render
-        // tests check they are not underlined).
-        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Adaptive, 120.0);
-        e.set_local_frame_sent(1);
-        e.new_user_byte(b'y', &echoed);
-        let ov = e.overlay();
-        assert_eq!(ov.cell(0, 1).map(|c| c.glyph), Some("y"));
-    }
-
-    #[test]
-    fn adaptive_engagement_has_hysteresis() {
-        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Adaptive, 120.0);
-        e.set_local_frame_sent(1);
-        e.new_user_byte(b'y', &echoed);
-        assert!(!e.overlay().is_empty(), "engaged above 60 ms");
-        // Between the thresholds the latch holds its state.
-        e.set_rtt_ms(50.0);
-        assert!(
-            !e.overlay().is_empty(),
-            "still engaged in the hysteresis band"
-        );
-        // Below the low threshold it disengages and the real echo wins.
-        e.set_rtt_ms(30.0);
-        assert!(e.overlay().is_empty(), "disengaged below 40 ms");
-        // And re-engages only above the high threshold, not within the band.
-        e.set_rtt_ms(50.0);
-        assert!(e.overlay().is_empty(), "45 ms does not re-engage");
-        e.set_rtt_ms(70.0);
-        assert!(!e.overlay().is_empty(), "re-engaged above 60 ms");
-    }
-
-    #[test]
-    fn no_prediction_shown_on_fast_link() {
-        // Even after a confirmation, a fast link keeps adaptive engagement off so the real echo wins.
-        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Adaptive, 5.0);
-        e.set_local_frame_sent(1);
-        e.new_user_byte(b'y', &echoed);
-        assert!(e.overlay().is_empty());
     }
 
     #[test]
@@ -1148,7 +1073,6 @@ mod tests {
     #[test]
     fn never_mode_predicts_nothing() {
         let mut e = PredictionEngine::new(DisplayPreference::Never);
-        e.set_rtt_ms(500.0);
         let screen = screen_of(b"");
         e.new_user_byte(b'x', &screen);
         assert!(e.overlay().is_empty());
@@ -1330,7 +1254,7 @@ mod tests {
     fn left_arrow_predicts_cursor_and_leaves_no_glyph() {
         // After confirming a keystroke (cursor at (0,1)), a left arrow predicts the cursor one
         // column left and must NOT leave literal '[' / 'D' glyphs from the escape bytes.
-        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+        let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
         for &b in b"\x1b[D" {
             e.new_user_byte(b, &echoed); // ESC [ D
@@ -1350,7 +1274,7 @@ mod tests {
     #[test]
     fn ss3_left_arrow_is_normalized_and_predicted() {
         // Application-cursor-mode arrow: ESC O D must behave like ESC [ D.
-        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+        let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
         for &b in b"\x1bOD" {
             e.new_user_byte(b, &echoed); // ESC O D
@@ -1363,7 +1287,7 @@ mod tests {
         // A CJK character is double-width: its multi-byte UTF-8 arrives one byte at a time and is
         // reassembled into a single predicted glyph, with the cursor stepping forward two cells
         // (and no stray glyph in the continuation cell).
-        let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+        let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
         for &b in "世".as_bytes() {
             e.new_user_byte(b, &echoed); // cursor seeds from the real screen at (0,1)
@@ -1394,7 +1318,7 @@ mod tests {
         // glyph is always the real character. (`)` is the meaningful char-level artifact; ü's raw
         // 0xFC can't even exist in a Rust `String`, so reassembly itself is the guarantee.)
         for (word, accent) in [("glück", "ü"), ("faĩl", "ĩ")] {
-            let (mut e, echoed) = confirm_first_keystroke(DisplayPreference::Always, 250.0);
+            let (mut e, echoed) = confirm_first_keystroke();
             e.set_local_frame_sent(1);
             for &b in word.as_bytes() {
                 e.new_user_byte(b, &echoed);

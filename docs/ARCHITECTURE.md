@@ -29,7 +29,7 @@ src/
 ├── lib.rs           crate root: module declarations + the architecture overview
 ├── proto.rs         the koh/3 wire protocol: client messages, screen frames, caps, pacing
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
-├── predict.rs       local-echo prediction engine (overlays, epochs, adaptive engage)
+├── predict.rs       local-echo prediction engine (overlays, epochs)
 ├── transport_iroh/  iroh endpoint setup, the identity key file, connection handle, admission
 ├── pty.rs           PTYs over fuxix, the `__launch` launcher sessions start through, reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
@@ -158,11 +158,10 @@ is driven by the server's **echo-ack** (a 50 ms-debounced "your input up to fram
 screen"), not the raw network ack. Password prompts get no predicted echo — suppression is
 *emergent*: non-echoed input fails validation, kills its epoch, and keeps subsequent predictions
 hidden, with no explicit password heuristic. Prediction is **always on** in koh (`DisplayPreference::
-Always`), so keystrokes engage on every link; the engine also implements an adaptive-by-SRTT
-engagement mode that the client no longer selects. Predictions are drawn plain, not underlined,
+Always`), so keystrokes engage on every link. Predictions are drawn plain, not underlined,
 and a cell it knows changed but not to what is not drawn at all, so the real cell shows.
 
-The port faithfully implements epoch-gated confirmation, adaptive engagement, glitch escalation,
+The port faithfully implements epoch-gated confirmation, glitch escalation,
 and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
 backspace, CR/LF, the left/right arrow keys (CSI **and** SS3/application-cursor form), and whole
 UTF-8 graphemes including double-width CJK/emoji (cursor advances by two cells). Control/escape
@@ -331,7 +330,7 @@ prove correctness; only a real two-device run over a real radio proves *feel* an
 
 | Property | How koh delivers it |
 |---|---|
-| Keystrokes appear instantly on every link | predictor (engages above 60 ms RTT once the server proves it echoes; confirmed by later frames) |
+| Keystrokes appear instantly on every link | predictor (shows once the server proves it echoes; confirmed by later frames) |
 | Survives suspend/resume + IP change, re-syncs to current screen | QUIC connection migration + a fresh frame against an acknowledged base (no backlog) |
 | A burst of superseded output never delays the current screen | one stream per frame, older frames reset; only the latest screen is sent |
 | Password prompts show no predicted echo | emergent no-echo suppression in the predictor |

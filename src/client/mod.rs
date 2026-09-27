@@ -718,77 +718,49 @@ async fn reconnect<T: ClientTerminal>(
 ) -> ReconnectOutcome {
     let started = Instant::now();
     let mut pending_escape = false;
-    let quit_hint = " (Ctrl-^ . to quit)";
     'attempt: loop {
-        // Back off BEFORE dialing whenever we've already failed a dial or the previous connection
-        // dropped too fast (`*attempt > 0`). The caller seeds `*attempt` from the just-dropped
-        // connection's dwell, so a server that completes the handshake then immediately closes is
-        // backed off here rather than redialed instantly. On a proven-then-dropped connection
-        // `*attempt == 0`, so a normal reconnect dials at once. The wait stays responsive to the quit escape / shutdown and keeps the banner clock ticking.
-        if *attempt > 0 {
-            let wait_until = Instant::now()
-                .checked_add(backoff(*attempt))
-                .unwrap_or_else(Instant::now);
-            while Instant::now() < wait_until {
-                let banner = format!(
-                    "[koh] disconnected — reconnecting… {}s{quit_hint}",
-                    started.elapsed().as_secs()
-                );
-                let _ = term.render(last.state(), &Overlay::empty(), Some(banner.as_str()));
-                let remaining = wait_until.saturating_duration_since(Instant::now());
-                tokio::select! {
-                    biased;
-                    maybe = input_rx.recv() => match maybe {
-                        Some(chunk) => {
-                            if escape_quit(&chunk, &mut pending_escape) {
-                                return ReconnectOutcome::Quit;
-                            }
-                        }
-                        None => return ReconnectOutcome::Quit,
-                    },
-                    _ = shutdown.cancelled() => return ReconnectOutcome::Quit,
-                    _ = tokio::time::sleep(remaining.min(Duration::from_secs(1))) => {}
-                }
-            }
-        }
-        let dial = tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect());
+        // Back off before dialing once a dial failed or the last connection dropped too fast
+        // (`*attempt > 0`, which the caller seeds from the connection's dwell), so a server that
+        // completes the handshake and at once closes is not redialed in a tight loop. A proven
+        // connection's drop dials at once.
+        let wait = if *attempt > 0 {
+            backoff(*attempt)
+        } else {
+            Duration::ZERO
+        };
+        let dial = async {
+            tokio::time::sleep(wait).await;
+            tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect()).await
+        };
         tokio::pin!(dial);
         loop {
             let banner = format!(
-                "[koh] disconnected — reconnecting… {}s{quit_hint}",
+                "[koh] disconnected — reconnecting… {}s (Ctrl-^ . to quit)",
                 started.elapsed().as_secs()
             );
             let _ = term.render(last.state(), &Overlay::empty(), Some(banner.as_str()));
-
             tokio::select! {
                 biased;
-
-                maybe = input_rx.recv() => {
-                    match maybe {
-                        Some(chunk) => {
-                            if escape_quit(&chunk, &mut pending_escape) {
-                                return ReconnectOutcome::Quit;
-                            }
+                maybe = input_rx.recv() => match maybe {
+                    Some(chunk) => {
+                        if escape_quit(&chunk, &mut pending_escape) {
+                            return ReconnectOutcome::Quit;
                         }
-                        None => return ReconnectOutcome::Quit, // input source closed
                     }
-                }
-
+                    None => return ReconnectOutcome::Quit, // input source closed
+                },
+                // Honor a SIGTERM/SIGINT/SIGHUP even mid-reconnect, so the terminal is restored.
+                () = shutdown.cancelled() => return ReconnectOutcome::Quit,
                 res = &mut dial => {
                     match res {
-                        Ok(Ok(channel)) => return ReconnectOutcome::Connected(channel),
+                        Ok(Ok(conn)) => return ReconnectOutcome::Connected(conn),
                         Ok(Err(e)) => tracing::info!(reason = %e, attempt = *attempt, "reconnect dial failed"),
                         Err(_) => tracing::info!(attempt = *attempt, "reconnect dial timed out"),
                     }
-                    // Bump the attempt; the top-of-loop backoff waits before the next dial.
                     *attempt = (*attempt).saturating_add(1);
                     continue 'attempt;
                 }
-
-                // Honor a SIGTERM/SIGINT/SIGHUP even mid-reconnect, so the terminal is restored.
-                _ = shutdown.cancelled() => return ReconnectOutcome::Quit,
-
-                _ = tokio::time::sleep(Duration::from_secs(1)) => { /* tick the banner clock */ }
+                () = tokio::time::sleep(Duration::from_secs(1)) => {} // tick the banner clock
             }
         }
     }

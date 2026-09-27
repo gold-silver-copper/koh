@@ -146,23 +146,37 @@ pub enum ProtoError {
 
 /// Encode one client message with its length prefix.
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
-    if let ClientMsg::Input { bytes, .. } = msg {
-        if bytes.len() > MAX_INPUT_BYTES {
-            return Err(ProtoError::InputTooLarge {
-                len: bytes.len(),
-                max: MAX_INPUT_BYTES,
-            });
-        }
+    let input = match msg {
+        ClientMsg::Input { bytes, .. } => bytes.len(),
+        ClientMsg::Resize { .. } | ClientMsg::Ack { .. } | ClientMsg::Resync => 0,
+    };
+    if input > MAX_INPUT_BYTES {
+        return Err(ProtoError::InputTooLarge {
+            len: input,
+            max: MAX_INPUT_BYTES,
+        });
     }
-    let body = postcard::to_allocvec(msg)?;
-    let Ok(len) = u32::try_from(body.len()) else {
+    // The body goes straight after a placeholder for its length, into one buffer sized for the
+    // typed bytes plus the envelope.
+    let mut out = Vec::with_capacity(input.saturating_add(ENVELOPE));
+    out.extend_from_slice(&[0; 4]);
+    let mut out = postcard::to_extend(msg, out)?;
+    let body = out.len().saturating_sub(4);
+    let Ok(len) = u32::try_from(body) else {
         return Err(ProtoError::TooLarge {
-            len: body.len(),
+            len: body,
             max: MAX_CLIENT_MESSAGE,
         });
     };
-    Ok([len.to_be_bytes().as_slice(), &body].concat())
+    if let Some(prefix) = out.first_chunk_mut::<4>() {
+        *prefix = len.to_be_bytes();
+    }
+    Ok(out)
 }
+
+/// Room for a client message beside its typed bytes: the length prefix, the variant and the
+/// varints of the sequence number and the byte count.
+const ENVELOPE: usize = 32;
 
 /// Splits the client's stream back into messages, however its bytes arrive.
 #[derive(Debug, Default)]

@@ -173,7 +173,8 @@ impl Grid {
     }
 
     /// Whether `row` shares its cells with `other`'s, rather than holding a copy.
-    pub fn row_shared(&self, other: &Self, row: u16) -> bool {
+    #[cfg(test)]
+    pub(super) fn row_shared(&self, other: &Self, row: u16) -> bool {
         let row = usize::from(row);
         match (self.lines.get(row), other.lines.get(row)) {
             (Some(line), Some(other)) => line.shares(other),

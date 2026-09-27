@@ -12,7 +12,7 @@ use iroh::{Endpoint, EndpointId, SecretKey};
 use koh::client::{run_client, BellHook, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
-use koh::terminal::TerminalScreen;
+use koh::terminal::{Size, TerminalScreen};
 use koh::transport_iroh::generate_secret_key;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -79,11 +79,11 @@ pub struct Options {
 struct Recorder {
     painted: watch::Sender<Painted>,
     history: Arc<Mutex<Vec<Painted>>>,
-    size: Arc<Mutex<(u16, u16)>>,
+    size: Arc<Mutex<Size>>,
 }
 
 /// The glyphs a prediction overlay draws, row by row.
-fn predicted_glyphs(overlay: &Overlay<'_>, (rows, cols): (u16, u16)) -> String {
+fn predicted_glyphs(overlay: &Overlay<'_>, Size { rows, cols }: Size) -> String {
     let mut glyphs = String::new();
     for row in 0..rows {
         for col in 0..cols {
@@ -126,7 +126,7 @@ impl ClientTerminal for Recorder {
         Ok(())
     }
 
-    fn size(&self) -> std::io::Result<(u16, u16)> {
+    fn size(&self) -> std::io::Result<Size> {
         Ok(*self.size.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
@@ -136,7 +136,7 @@ pub struct Client {
     pub id: EndpointId,
     input: mpsc::Sender<Vec<u8>>,
     resize: mpsc::Sender<()>,
-    size: Arc<Mutex<(u16, u16)>>,
+    size: Arc<Mutex<Size>>,
     painted: watch::Receiver<Painted>,
     history: Arc<Mutex<Vec<Painted>>>,
     /// The first connection, so a test can cut it and watch the client reconnect.
@@ -166,7 +166,7 @@ impl Client {
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server));
         let channel = connector.connect().await?;
         let first = channel.connection().clone();
-        let size = Arc::new(Mutex::new((24, 80)));
+        let size = Arc::new(Mutex::new(Size::new(24, 80)));
         let (painted_tx, painted) = watch::channel(Painted {
             text: String::new(),
             predicted: String::new(),
@@ -185,7 +185,7 @@ impl Client {
             channel,
             connector,
             options.predict.unwrap_or(DisplayPreference::Never),
-            (24, 80),
+            Size::new(24, 80),
             input_rx,
             resize_rx,
             term,
@@ -211,7 +211,7 @@ impl Client {
 
     /// Resize the client's terminal to `rows × cols`.
     pub async fn resize_to(&self, rows: u16, cols: u16) -> anyhow::Result<()> {
-        *self.size.lock().unwrap_or_else(PoisonError::into_inner) = (rows, cols);
+        *self.size.lock().unwrap_or_else(PoisonError::into_inner) = Size::new(rows, cols);
         Ok(self.resize.send(()).await?)
     }
 

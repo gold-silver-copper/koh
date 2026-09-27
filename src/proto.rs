@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::terminal::{ScreenDiff, TerminalScreen};
+use crate::terminal::{ScreenDiff, Size, TerminalScreen};
 
 /// A frame number. Frame 0 is the blank default screen both ends start from; it is never sent.
 /// Real frames count from 1 on each connection.
@@ -132,8 +132,8 @@ pub enum ClientMsg {
         #[serde(with = "byte_string")]
         bytes: Vec<u8>,
     },
-    /// The client's window is now `rows × cols`.
-    Resize { rows: u16, cols: u16 },
+    /// The client's window is now this size.
+    Resize(Size),
     /// The client applied `frame`; later frames may diff against it.
     Ack { frame: FrameNum },
     /// The client got a frame whose base it does not hold; the next frame must diff against
@@ -203,7 +203,7 @@ pub enum ProtoError {
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
     let input = match msg {
         ClientMsg::Input { bytes, .. } => bytes.len(),
-        ClientMsg::Resize { .. } | ClientMsg::Ack { .. } | ClientMsg::Resync => 0,
+        ClientMsg::Resize(_) | ClientMsg::Ack { .. } | ClientMsg::Resync => 0,
     };
     if input > MAX_INPUT_BYTES {
         return Err(ProtoError::InputTooLarge {
@@ -365,10 +365,7 @@ mod tests {
                 seq: InputSeq(1),
                 bytes: b"ls -la\r".to_vec(),
             },
-            ClientMsg::Resize {
-                rows: 50,
-                cols: 132,
-            },
+            ClientMsg::Resize(Size::new(50, 132)),
             ClientMsg::Ack { frame: FrameNum(9) },
             ClientMsg::Resync,
             ClientMsg::Input {
@@ -396,7 +393,7 @@ mod tests {
 
     #[test]
     fn a_read_of_many_tiny_messages_decodes_them_all_and_leaves_the_buffer_empty() {
-        let resize = encode_client(&ClientMsg::Resize { rows: 1, cols: 2 }).unwrap();
+        let resize = encode_client(&ClientMsg::Resize(Size::new(1, 2))).unwrap();
         let count = (16 * 1024_usize).div_euclid(resize.len());
         let mut decoder = ClientDecoder::default();
         decoder.push(&resize.repeat(count));
@@ -408,7 +405,7 @@ mod tests {
         );
         let mut decoded = 1;
         while let Some(msg) = decoder.next_msg().unwrap() {
-            assert_eq!(msg, ClientMsg::Resize { rows: 1, cols: 2 });
+            assert_eq!(msg, ClientMsg::Resize(Size::new(1, 2)));
             decoded += 1;
         }
         assert_eq!(decoded, count);
@@ -420,7 +417,7 @@ mod tests {
         decoder.push(&resize[3..]);
         assert_eq!(
             decoder.next_msg().unwrap(),
-            Some(ClientMsg::Resize { rows: 1, cols: 2 })
+            Some(ClientMsg::Resize(Size::new(1, 2)))
         );
     }
 
@@ -458,7 +455,7 @@ mod tests {
 
     #[test]
     fn truncated_and_garbage_client_streams_are_errors() {
-        let stream = encode_client(&ClientMsg::Resize { rows: 1, cols: 2 }).unwrap();
+        let stream = encode_client(&ClientMsg::Resize(Size::new(1, 2))).unwrap();
         for cut in 1..stream.len() {
             assert!(
                 matches!(decode_all(&stream[..cut]), Err(ProtoError::Truncated)),

@@ -21,18 +21,18 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 mod grid;
 mod server;
 
+pub use crate::predict::Size;
 pub use grid::{Grid, Modes};
 pub use server::ServerTerminal;
 
 /// Default screen geometry, used for the blank screen both ends start from.
-pub const DEFAULT_ROWS: u16 = 24;
-pub const DEFAULT_COLS: u16 = 80;
+pub const DEFAULT_SIZE: Size = Size::new(24, 80);
 /// Bounds on a peer-controlled terminal geometry.
 ///
 /// A grid is allocated eagerly (`rows × cols` cells on the server's emulator and on the client),
-/// so an unclamped resize from a hostile peer is an out-of-memory bomb: `(65000, 65000)` is
-/// billions of cells. Every peer-influenced `(rows, cols)` MUST pass through [`clamp_dims`]
-/// before a grid is built, on both the server (a client's `Resize`) and the client (a server's
+/// so an unclamped resize from a hostile peer is an out-of-memory bomb: 65000×65000 is billions
+/// of cells. Every peer-influenced [`Size`] MUST pass through [`clamp_dims`] before a grid is
+/// built, on both the server (a client's `Resize`) and the client (a server's
 /// `ScreenDiff.resize`). `MAX_DIM` is generous versus any real terminal (1000×1000 already dwarfs
 /// any display); `MIN_DIM` keeps a degenerate 1-wide terminal out of the shell's way.
 pub const MIN_DIM: u16 = 2;
@@ -51,13 +51,16 @@ pub(crate) const MAX_TITLE_LEN: usize = 256;
 /// megabytes. Enforced server-side at capture *and* client-side at apply.
 pub const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
 
-/// Clamp a peer-supplied `(rows, cols)` into `[MIN_DIM, MAX_DIM]`.
+/// Clamp a peer-supplied size into `[MIN_DIM, MAX_DIM]` on both axes.
 ///
 /// The single chokepoint both the server and the client funnel a resize through before building a
 /// grid, so the two paths can never disagree and no resize can allocate an unbounded grid.
 #[must_use]
-pub fn clamp_dims(rows: u16, cols: u16) -> (u16, u16) {
-    (rows.clamp(MIN_DIM, MAX_DIM), cols.clamp(MIN_DIM, MAX_DIM))
+pub fn clamp_dims(size: Size) -> Size {
+    Size {
+        rows: size.rows.clamp(MIN_DIM, MAX_DIM),
+        cols: size.cols.clamp(MIN_DIM, MAX_DIM),
+    }
 }
 
 /// Truncate `s` to at most `max` characters (not bytes), preserving whole scalars.
@@ -103,7 +106,7 @@ pub struct TerminalScreen {
 
 impl Default for TerminalScreen {
     fn default() -> Self {
-        Self::with_grid(Grid::blank(DEFAULT_ROWS, DEFAULT_COLS))
+        Self::with_grid(Grid::blank(DEFAULT_SIZE))
     }
 }
 
@@ -141,8 +144,7 @@ impl TerminalScreen {
         self.exit_code
     }
 
-    /// `(rows, cols)`.
-    pub const fn size(&self) -> (u16, u16) {
+    pub const fn size(&self) -> Size {
         self.grid.size()
     }
 
@@ -573,9 +575,9 @@ impl From<WireModes> for Modes {
 /// The wire delta between two [`TerminalScreen`]s (mosh `HostMessage`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenDiff {
-    /// New `(rows, cols)` if the screen was resized; the client starts from a blank grid of that
-    /// size, and `rows` then carries every row that isn't blank.
-    pub resize: Option<(u16, u16)>,
+    /// The new size if the screen was resized; the client starts from a blank grid of that size,
+    /// and `rows` then carries every row that isn't blank.
+    pub resize: Option<Size>,
     /// New window title if it changed.
     pub title: Option<String>,
     /// New window icon name if it changed.
@@ -599,7 +601,7 @@ impl TerminalScreen {
     /// The diff that turns `base` into `self`.
     pub fn diff_from(&self, base: &Self) -> ScreenDiff {
         let resized = self.size() != base.size();
-        let (rows, _) = self.size();
+        let rows = self.size().rows;
         let changed = (0..rows).filter_map(|r| {
             let cells = self.grid.row(r)?;
             let wrapped = self.grid.row_wrapped(r);
@@ -632,9 +634,7 @@ impl TerminalScreen {
         //
         // LOAD-BEARING: this `clamp_dims` is the only bound on a single resize's grid
         // allocation. The mirror clamp on the server lives in `terminal/server.rs`.
-        let (rows, cols) = diff
-            .resize
-            .map_or_else(|| self.size(), |(r, c)| clamp_dims(r, c));
+        let Size { rows, cols } = diff.resize.map_or_else(|| self.size(), clamp_dims);
         if diff.rows.len() > usize::from(rows) {
             return;
         }
@@ -648,7 +648,7 @@ impl TerminalScreen {
             }
         }
         if diff.resize.is_some() {
-            self.grid = Grid::blank(rows, cols);
+            self.grid = Grid::blank(Size { rows, cols });
         }
         // Only the rows the diff carries are replaced; the rest stay shared with the base.
         for (row, cells) in diff.rows.iter().zip(staged.chunks(width.max(1))) {
@@ -719,31 +719,39 @@ mod tests {
             b"now a much wider and taller screen\r\nwith two lines",
         );
         let diff = b.diff_from(&a);
-        assert_eq!(diff.resize, Some((40, 120)));
+        assert_eq!(diff.resize, Some(Size::new(40, 120)));
         let mut c = a;
         c.apply(&diff);
         assert_eq!(c, b);
-        assert_eq!(c.size(), (40, 120));
+        assert_eq!(c.size(), Size::new(40, 120));
     }
 
     #[test]
     fn clamp_dims_bounds_both_extremes() {
         assert_eq!(
-            clamp_dims(65000, 65000),
-            (MAX_DIM, MAX_DIM),
+            clamp_dims(Size::new(65000, 65000)),
+            Size::new(MAX_DIM, MAX_DIM),
             "huge -> MAX_DIM"
         );
-        assert_eq!(clamp_dims(0, 0), (MIN_DIM, MIN_DIM), "zero -> MIN_DIM");
-        assert_eq!(clamp_dims(24, 80), (24, 80), "in-range passes through");
         assert_eq!(
-            clamp_dims(0, 5000),
-            (MIN_DIM, MAX_DIM),
+            clamp_dims(Size::new(0, 0)),
+            Size::new(MIN_DIM, MIN_DIM),
+            "zero -> MIN_DIM"
+        );
+        assert_eq!(
+            clamp_dims(Size::new(24, 80)),
+            Size::new(24, 80),
+            "in-range passes through"
+        );
+        assert_eq!(
+            clamp_dims(Size::new(0, 5000)),
+            Size::new(MIN_DIM, MAX_DIM),
             "mixed clamps each axis"
         );
     }
 
     /// A diff that changes nothing but `resize`, for the clamp tests.
-    fn resize_only(resize: (u16, u16)) -> ScreenDiff {
+    fn resize_only(resize: Size) -> ScreenDiff {
         ScreenDiff {
             resize: Some(resize),
             title: None,
@@ -839,12 +847,13 @@ mod tests {
                 mouse_mode,
                 mouse_encoding,
             };
+            let resize = resize.map(|(rows, cols)| Size::new(rows, cols));
             let diff = ScreenDiff {
                 resize, title, icon, clipboard, bell_count, exit_code, cursor, modes, rows,
             };
             let mut screen = TerminalScreen::default();
             screen.apply(&diff); // must not panic on adversarial input
-            let (rows, cols) = screen.size();
+            let Size { rows, cols } = screen.size();
             proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&rows), "rows {rows} escaped the clamp");
             proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&cols), "cols {cols} escaped the clamp");
             for r in 0..rows {
@@ -865,7 +874,7 @@ mod tests {
             if let Ok(diff) = postcard::from_bytes::<ScreenDiff>(&bytes) {
                 let mut screen = TerminalScreen::default();
                 screen.apply(&diff);
-                let (rows, cols) = screen.size();
+                let Size { rows, cols } = screen.size();
                 proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&rows) && (MIN_DIM..=MAX_DIM).contains(&cols));
             }
         }
@@ -883,7 +892,7 @@ mod tests {
             emu.process(&first);
             let base = emu.snapshot();
             if let Some((rows, cols)) = resize {
-                emu.resize(rows, cols);
+                emu.resize(Size::new(rows, cols));
             }
             emu.process(&second);
             let target = emu.snapshot();
@@ -898,17 +907,21 @@ mod tests {
         // A malicious server ships a (65000, 65000) resize. The client must NOT build a giant
         // grid: apply clamps to MAX_DIM and reconstructs a bounded screen without OOM/panic.
         let mut c = TerminalScreen::default();
-        c.apply(&resize_only((65000, 65000))); // must not OOM/panic
-        assert_eq!(c.size(), (MAX_DIM, MAX_DIM), "client clamps a giant resize");
+        c.apply(&resize_only(Size::new(65000, 65000))); // must not OOM/panic
+        assert_eq!(
+            c.size(),
+            Size::new(MAX_DIM, MAX_DIM),
+            "client clamps a giant resize"
+        );
     }
 
     #[test]
     fn client_apply_clamps_zero_resize() {
         let mut c = TerminalScreen::default();
-        c.apply(&resize_only((0, 0))); // must not panic
+        c.apply(&resize_only(Size::new(0, 0))); // must not panic
         assert_eq!(
             c.size(),
-            (MIN_DIM, MIN_DIM),
+            Size::new(MIN_DIM, MIN_DIM),
             "client clamps a zero-dimension resize"
         );
     }
@@ -1089,7 +1102,7 @@ mod tests {
         let good = decode_raw(&raw_two_by_two()).expect("a well-formed diff decodes");
         let mut screen = TerminalScreen::default();
         screen.apply(&good);
-        assert_eq!(screen.size(), (2, 2));
+        assert_eq!(screen.size(), Size::new(2, 2));
         assert_eq!(screen.screen().cell(0, 1).map(Cell::contents), Some("x"));
         let mutations: [fn(&mut RawDiff); 8] = [
             |d| d.rows[0].runs[0].count = 0, // empty run
@@ -1308,7 +1321,7 @@ mod tests {
 
     /// Trimmed text of one screen row (blank cells as spaces), for line-level assertions.
     fn row_text(s: &Grid, row: u16) -> String {
-        let (_, cols) = s.size();
+        let cols = s.size().cols;
         (0..cols)
             .map(|c| match s.cell(row, c).map(Cell::contents) {
                 Some(g) if !g.is_empty() => g.to_string(),

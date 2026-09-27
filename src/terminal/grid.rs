@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use fux_vt::{Cell, MouseProtocolEncoding, MouseProtocolMode, RowId};
 
-use crate::predict::{CellView, ScreenView};
+use crate::predict::{CellView, ScreenView, Size};
 
 /// The terminal modes the client mirrors onto the real terminal (or draws with).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,8 +88,7 @@ fn exactly(cells: &[Cell], cols: u16) -> Arc<[Cell]> {
 /// is pending (fux-vt's parked cursor).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grid {
-    rows: u16,
-    cols: u16,
+    size: Size,
     lines: Vec<Row>,
     cursor: (u16, u16),
     modes: Modes,
@@ -97,15 +96,14 @@ pub struct Grid {
 
 impl Grid {
     /// A blank grid (default cells, cursor home, default modes). Every row shares one allocation.
-    pub fn blank(rows: u16, cols: u16) -> Self {
+    pub fn blank(size: Size) -> Self {
         let blank = Row {
-            cells: vec![Cell::default(); usize::from(cols)].into(),
+            cells: vec![Cell::default(); usize::from(size.cols)].into(),
             wrapped: false,
         };
         Self {
-            rows,
-            cols,
-            lines: vec![blank; usize::from(rows)],
+            size,
+            lines: vec![blank; usize::from(size.rows)],
             cursor: (0, 0),
             modes: Modes::default(),
         }
@@ -139,17 +137,15 @@ impl Grid {
             .collect();
         *cache = next;
         Self {
-            rows,
-            cols,
+            size: Size { rows, cols },
             lines,
             cursor: screen.cursor_position(),
             modes: Modes::of(screen),
         }
     }
 
-    /// `(rows, cols)`.
-    pub const fn size(&self) -> (u16, u16) {
-        (self.rows, self.cols)
+    pub const fn size(&self) -> Size {
+        self.size
     }
 
     /// The cell at `(row, col)`, or `None` out of bounds.
@@ -188,7 +184,7 @@ impl Grid {
     /// Replace `row` with `cells`, which must be exactly `cols` long. Out of bounds or a wrong
     /// length changes nothing.
     pub(super) fn set_row(&mut self, row: u16, cells: Arc<[Cell]>, wrapped: bool) {
-        if cells.len() != usize::from(self.cols) {
+        if cells.len() != usize::from(self.size.cols) {
             return;
         }
         if let Some(line) = self.lines.get_mut(usize::from(row)) {
@@ -250,7 +246,7 @@ impl Grid {
     /// where a row soft-wraps into the next, trailing empty rows dropped.
     pub fn contents(&self) -> String {
         let mut out = String::new();
-        for row in 0..self.rows {
+        for row in 0..self.size.rows {
             let line: String = self
                 .row(row)
                 .unwrap_or_default()
@@ -272,7 +268,7 @@ impl Grid {
 }
 
 impl ScreenView for Grid {
-    fn size(&self) -> (u16, u16) {
+    fn size(&self) -> Size {
         Self::size(self)
     }
     fn cursor_position(&self) -> (u16, u16) {

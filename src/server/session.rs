@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::terminal::{ServerTerminal, TerminalScreen, DEFAULT_COLS, DEFAULT_ROWS};
+use crate::terminal::{ServerTerminal, Size, TerminalScreen, DEFAULT_SIZE};
 use anyhow::Context;
 use iroh::EndpointId;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -47,7 +47,7 @@ impl PtyHost {
         scrollback: usize,
         launcher: &crate::pty::Launcher,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
-        let (rows, cols) = (DEFAULT_ROWS, DEFAULT_COLS);
+        let Size { rows, cols } = DEFAULT_SIZE;
         let emu = ServerTerminal::new(rows, cols, scrollback)
             .context("creating the terminal emulator")?;
         let (pty, pty_rx) = crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", launcher)
@@ -73,12 +73,13 @@ impl PtyHost {
         }
     }
 
-    /// The client's terminal is now `rows × cols` (already clamped to `[MIN_DIM, MAX_DIM]`).
-    pub fn resize(&mut self, rows: u16, cols: u16) {
+    /// The client's terminal is now `size` (already clamped to `[MIN_DIM, MAX_DIM]`).
+    pub fn resize(&mut self, size: Size) {
+        let Size { rows, cols } = size;
         if let Err(e) = self.pty.resize(rows, cols) {
             tracing::warn!(error = %e, rows, cols, "pty resize failed");
         }
-        self.emu.resize(rows, cols);
+        self.emu.resize(size);
     }
 
     /// Stop the program while a pump thread may still reference it, without joining (best-effort).
@@ -98,7 +99,7 @@ impl PtyHost {
 /// What a connection sends its session.
 enum ClientInput {
     Keys(Vec<u8>),
-    Resize { rows: u16, cols: u16 },
+    Resize(Size),
 }
 
 /// Whether [`Registry::attach`] created a fresh session or reattached to a running one.
@@ -151,8 +152,8 @@ impl SessionClient {
     }
 
     /// Send a resize to the PTY.
-    pub async fn send_resize(&self, rows: u16, cols: u16) {
-        let _ = self.input.send(ClientInput::Resize { rows, cols }).await;
+    pub async fn send_resize(&self, size: Size) {
+        let _ = self.input.send(ClientInput::Resize(size)).await;
     }
 }
 
@@ -249,8 +250,8 @@ async fn session_task(
                                 pending_keys = keys;
                             }
                         }
-                        ClientInput::Resize { rows, cols } => {
-                            host.resize(rows, cols);
+                        ClientInput::Resize(size) => {
+                            host.resize(size);
                             screens_tx.send_replace(Arc::new(host.snapshot()));
                         }
                     }

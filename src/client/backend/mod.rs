@@ -12,6 +12,8 @@ use std::io;
 
 use fux_vt::Color;
 
+use crate::terminal::Size;
+
 mod tty;
 pub use self::tty::Tty;
 
@@ -70,8 +72,8 @@ pub trait KohBackend {
     /// Return the terminal to cooked mode. Must be safe to call even if raw mode was never entered.
     fn leave_raw_mode(&mut self) -> io::Result<()>;
 
-    /// The current terminal size as `(rows, cols)`.
-    fn size(&self) -> io::Result<(u16, u16)>;
+    /// The current terminal size.
+    fn size(&self) -> io::Result<Size>;
 
     // --- provided: standard ANSI/DEC emission (override only to use a different encoding) ---
 
@@ -253,7 +255,7 @@ fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool)
 #[cfg(test)]
 pub(crate) struct CaptureBackend {
     pub bytes: Vec<u8>,
-    pub size: (u16, u16),
+    pub size: Size,
 }
 
 #[cfg(test)]
@@ -261,7 +263,7 @@ impl Default for CaptureBackend {
     fn default() -> Self {
         Self {
             bytes: Vec::new(),
-            size: (24, 80),
+            size: Size::new(24, 80),
         }
     }
 }
@@ -281,7 +283,7 @@ impl KohBackend for CaptureBackend {
     fn leave_raw_mode(&mut self) -> io::Result<()> {
         Ok(())
     }
-    fn size(&self) -> io::Result<(u16, u16)> {
+    fn size(&self) -> io::Result<Size> {
         Ok(self.size)
     }
 }

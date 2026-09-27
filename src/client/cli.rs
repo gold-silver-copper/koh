@@ -333,7 +333,7 @@ pub async fn connect(config: impl Into<ConnectConfig>) -> anyhow::Result<Option<
         let backend = DefaultBackend::new().context("acquiring the terminal")?;
         let terminal = BackendTerminal::enter(backend, args.clipboard)
             .context("entering raw mode / alt screen")?;
-        let size = terminal.size().unwrap_or((24, 80));
+        let size = terminal.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
         crate::client::run_client(
             channel,
             connector,

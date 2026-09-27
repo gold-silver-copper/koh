@@ -22,7 +22,7 @@ use crate::proto::{
     encode_frame, frame_interval, retry_after, ClientDecoder, ClientMsg, Frame, FrameNum,
     FrameScreen, InputSeq, ProtoError, FRAME_WINDOW, HEARTBEAT, SESSION_ENDED, WINDOW_CELLS,
 };
-use crate::terminal::TerminalScreen;
+use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::IrohChannel;
 use iroh::endpoint::RecvStream;
 use tokio_util::sync::CancellationToken;
@@ -172,7 +172,7 @@ struct Drained {
     /// The last resize among the messages, clamped to `[MIN_DIM, MAX_DIM]`. Earlier ones in the same
     /// read have no observable effect, so they are dropped rather than each costing a
     /// `TIOCSWINSZ`, a `SIGWINCH` and an emulator reallocation.
-    resize: Option<(u16, u16)>,
+    resize: Option<Size>,
 }
 
 /// The server side of one connection: the I/O-free protocol core.
@@ -256,8 +256,8 @@ impl ServerConn {
                     self.cursor_keys
                         .normalize_into(&bytes, app_cursor, &mut drained.keys);
                 }
-                ClientMsg::Resize { rows, cols } => {
-                    drained.resize = Some(crate::terminal::clamp_dims(rows, cols));
+                ClientMsg::Resize(size) => {
+                    drained.resize = Some(crate::terminal::clamp_dims(size));
                 }
                 ClientMsg::Ack { frame } => self.ack(frame),
                 ClientMsg::Resync => self.resync(),
@@ -476,8 +476,8 @@ pub async fn run_attached(
                             if !drained.keys.is_empty() {
                                 session.send_keys(drained.keys).await;
                             }
-                            if let Some((rows, cols)) = drained.resize {
-                                session.send_resize(rows, cols).await;
+                            if let Some(size) = drained.resize {
+                                session.send_resize(size).await;
                             }
                             if !session.can_send() {
                                 break Ok(SessionExit::Detached); // the session ended
@@ -598,7 +598,7 @@ mod tests {
         encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_WINDOW, HEARTBEAT,
         WINDOW_CELLS,
     };
-    use crate::terminal::TerminalScreen;
+    use crate::terminal::{Size, TerminalScreen};
 
     /// Feed `chunks` through one normalizer at the given app-cursor mode, return the PTY bytes.
     fn norm(chunks: &[&[u8]], app_cursor: bool) -> Vec<u8> {
@@ -652,16 +652,13 @@ mod tests {
                 seq: InputSeq(1),
                 bytes: b"ab".to_vec(),
             },
-            ClientMsg::Resize { rows: 10, cols: 20 },
+            ClientMsg::Resize(Size::new(10, 20)),
             ClientMsg::Input {
                 seq: InputSeq(2),
                 bytes: b"\x1bOA".to_vec(),
             },
-            ClientMsg::Resize { rows: 30, cols: 40 },
-            ClientMsg::Resize {
-                rows: 65000,
-                cols: 1,
-            },
+            ClientMsg::Resize(Size::new(30, 40)),
+            ClientMsg::Resize(Size::new(65000, 1)),
             ClientMsg::Input {
                 seq: InputSeq(3),
                 bytes: b"ef".to_vec(),
@@ -672,7 +669,7 @@ mod tests {
             drained,
             Drained {
                 keys: b"ab\x1b[Aef".to_vec(),
-                resize: Some(crate::terminal::clamp_dims(65000, 1)),
+                resize: Some(crate::terminal::clamp_dims(Size::new(65000, 1))),
             }
         );
         conn.push_client_bytes(&stream(&[ClientMsg::Input {

@@ -14,7 +14,7 @@ use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::server::run_session;
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
-use koh::terminal::{clamp_dims, TerminalScreen};
+use koh::terminal::{clamp_dims, Size, TerminalScreen};
 use koh::transport_iroh::admission::await_admission;
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 use tokio_util::sync::CancellationToken;
@@ -270,13 +270,10 @@ fn run_session_delivers_keys_and_clamped_resizes_then_kills_the_shell() -> anyho
         });
         let mut client = RawClient::connect(addr, generate_secret_key()?, false).await?;
         client
-            .write(&ClientMsg::Resize {
-                rows: 65000,
-                cols: 1,
-            })
+            .write(&ClientMsg::Resize(Size::new(65000, 1)))
             .await?;
         client.type_bytes(b"xy").await?;
-        let clamped = clamp_dims(65000, 1);
+        let clamped = clamp_dims(Size::new(65000, 1));
         let done = |c: &RawClient| {
             c.screen()
                 .is_some_and(|s| s.screen().contents().contains("xy") && s.size() == clamped)

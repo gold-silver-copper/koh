@@ -14,7 +14,7 @@ use std::io;
 
 use super::backend::{CellStyle, KohBackend};
 use crate::predict::Overlay;
-use crate::terminal::{Grid, MAXIMUM_CLIPBOARD_SIZE};
+use crate::terminal::{Grid, Size, MAXIMUM_CLIPBOARD_SIZE};
 use fux_vt::{Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
 use unicode_width::UnicodeWidthChar as _;
 
@@ -162,7 +162,7 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<'a>], row: u16, col: u16) -> Paint<'a
 /// Whether every glyph `grid` and `marks` draw on `row` fills exactly the cells the grid gives it:
 /// one column for a narrow cell, two for a wide one followed by the half it covers.
 fn regular(grid: &Grid, marks: &[Mark<'_>], row: u16) -> bool {
-    let (_, cols) = grid.size();
+    let cols = grid.size().cols;
     let mut col = 0;
     while col < cols {
         let Paint::Glyph { glyph, span, .. } = paint(grid, marks, row, col) else {
@@ -199,7 +199,7 @@ impl Painter {
         overlay: &Overlay<'_>,
         status: Option<&str>,
     ) -> io::Result<()> {
-        let (rows, cols) = screen.size();
+        let Size { rows, cols } = screen.size();
         let marks: Vec<Mark<'_>> = overlay
             .cells()
             .map(|((row, col), p)| Mark {
@@ -213,10 +213,10 @@ impl Painter {
         // The terminal must hold the whole screen for a cell to land where it is painted.
         let fits = backend
             .size()
-            .is_ok_and(|(term_rows, term_cols)| term_rows >= rows && term_cols >= cols);
+            .is_ok_and(|terminal| terminal.rows >= rows && terminal.cols >= cols);
         let last = self.last.take().filter(|last| {
             fits && !last.irregular
-                && last.grid.size() == (rows, cols)
+                && last.grid.size() == screen.size()
                 && last.status == status.is_some()
         });
         let last_marks: Vec<Mark<'_>> = last
@@ -1077,11 +1077,11 @@ mod tests {
             larger in proptest::prelude::any::<bool>(),
         ) {
             let (rows, cols) = (6, 20);
-            let size = if larger { (8, 30) } else { (rows, cols) };
+            let size = if larger { Size::new(8, 30) } else { Size::new(rows, cols) };
             let mut emu = crate::terminal::ServerTerminal::new(rows, cols, 0).unwrap();
             let mut painter = Painter::default();
-            let mut incremental = fux_vt::Parser::new(size.0, size.1, 0).unwrap();
-            let mut whole = fux_vt::Parser::new(size.0, size.1, 0).unwrap();
+            let mut incremental = fux_vt::Parser::new(size.rows, size.cols, 0).unwrap();
+            let mut whole = fux_vt::Parser::new(size.rows, size.cols, 0).unwrap();
             for (pieces, status, prediction) in steps {
                 for piece in pieces {
                     emu.process(PIECES[piece].as_bytes());

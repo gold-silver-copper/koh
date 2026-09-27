@@ -22,7 +22,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fux_vt::Color;
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
+
+/// A terminal's geometry: `rows` lines of `cols` cells each.
+///
+/// Defined here, at the bottom of the crate, so the predictor, which imports nothing from
+/// `crate::`, shares it with the rest; [`terminal`](crate::terminal) re-exports it. On the wire it
+/// is its two `u16`s, rows first, as the `(rows, cols)` pair it replaces was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Size {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl Size {
+    pub const fn new(rows: u16, cols: u16) -> Self {
+        Self { rows, cols }
+    }
+}
 
 /// One cell as the predictor sees it: the glyph (empty for a blank or a wide-glyph continuation)
 /// and its colours.
@@ -39,8 +57,7 @@ pub struct CellView<'a> {
 /// it for a plain char grid. It keeps `predict` free of any `crate::` import (the CI layering guard
 /// enforces that).
 pub trait ScreenView {
-    /// `(rows, cols)`.
-    fn size(&self) -> (u16, u16);
+    fn size(&self) -> Size;
     /// The cursor as `(row, col)`, 0-indexed.
     fn cursor_position(&self) -> (u16, u16);
     /// The cell at `(row, col)`, or `None` when out of bounds.
@@ -48,8 +65,9 @@ pub trait ScreenView {
 }
 
 impl ScreenView for fux_vt::Screen {
-    fn size(&self) -> (u16, u16) {
-        Self::size(self)
+    fn size(&self) -> Size {
+        let (rows, cols) = Self::size(self);
+        Size { rows, cols }
     }
     fn cursor_position(&self) -> (u16, u16) {
         Self::cursor_position(self)
@@ -195,7 +213,7 @@ pub struct PredictionEngine {
     rtt_ms: f64,
     /// Whether adaptive engagement is currently showing predictions (latched, with hysteresis).
     engaged: bool,
-    last_size: Option<(u16, u16)>,
+    last_size: Option<Size>,
     last_byte: u8,
     /// Escape-sequence parser state across raw input bytes (for arrow-key prediction).
     esc: EscState,
@@ -357,7 +375,7 @@ impl PredictionEngine {
     }
 
     fn newline_cr(&mut self, screen: &dyn ScreenView) {
-        let (rows, _) = screen.size();
+        let rows = screen.size().rows;
         self.init_cursor(screen);
         if let Some(c) = self.cursor.as_mut() {
             c.col = 0;
@@ -375,7 +393,7 @@ impl PredictionEngine {
     fn predict_arrow(&mut self, screen: &dyn ScreenView, dir: i32) {
         self.init_cursor(screen);
         let exp = self.next_frame();
-        let (_, cols) = screen.size();
+        let cols = screen.size().cols;
         if let Some(c) = self.cursor.as_mut() {
             // Right stops before the last column, left at column 0. The width is peer-controlled,
             // so the step is checked: at `u16::MAX` or with `cols == 0` the cursor just stays.
@@ -405,7 +423,7 @@ impl PredictionEngine {
             self.become_tentative(); // combining / zero-width: can't place safely
             return;
         }
-        let (_, cols) = screen.size();
+        let cols = screen.size().cols;
         let (row, col) = {
             let c = self.init_cursor(screen);
             (c.row, c.col)
@@ -440,7 +458,7 @@ impl PredictionEngine {
         }
         self.last_byte = byte;
 
-        let (rows, cols) = screen.size();
+        let Size { rows, cols } = screen.size();
         if rows == 0 || cols == 0 {
             return;
         }
@@ -617,7 +635,7 @@ impl PredictionEngine {
             }
         }
         self.last_size = Some(size);
-        let (rows, cols) = size;
+        let Size { rows, cols } = size;
 
         let late = self.late_acked;
         let confirmed = self.confirmed_epoch;
@@ -829,7 +847,7 @@ fn cell_validity(
 }
 
 fn cursor_validity(cur: &PredCursor, screen: &dyn ScreenView, late_acked: u64) -> Validity {
-    let (rows, cols) = screen.size();
+    let Size { rows, cols } = screen.size();
     if cur.row >= rows || cur.col >= cols {
         return Validity::IncorrectOrExpired;
     }
@@ -864,8 +882,8 @@ mod tests {
     }
 
     impl ScreenView for FakeView {
-        fn size(&self) -> (u16, u16) {
-            (
+        fn size(&self) -> Size {
+            Size::new(
                 u16::try_from(self.rows.len()).expect("rows fit u16"),
                 u16::try_from(self.rows[0].len()).expect("columns fit u16"),
             )

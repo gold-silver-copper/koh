@@ -7,7 +7,7 @@
 use koh::proto::{
     decode_frame, encode_client, encode_frame, ClientDecoder, ClientMsg, Frame, FrameNum, InputSeq,
 };
-use koh::terminal::{ServerTerminal, TerminalScreen, WireModes};
+use koh::terminal::{ServerTerminal, Size, TerminalScreen, WireModes};
 
 /// Terminal output exercising every part of a cell and of the side channels: runs, wide glyphs
 /// and their continuations, a combining mark, every colour kind on both layers, every style bit,
@@ -88,14 +88,8 @@ fn client_msgs() -> Vec<ClientMsg> {
             seq: InputSeq(300),
             bytes: (0..200_u8).collect(),
         },
-        ClientMsg::Resize {
-            rows: 50,
-            cols: 132,
-        },
-        ClientMsg::Resize {
-            rows: 1000,
-            cols: 1000,
-        },
+        ClientMsg::Resize(Size::new(50, 132)),
+        ClientMsg::Resize(Size::new(1000, 1000)),
         ClientMsg::Ack {
             frame: FrameNum(70_000),
         },

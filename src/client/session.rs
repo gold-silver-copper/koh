@@ -14,7 +14,7 @@ use crate::proto::{
     retry_after, ClientMsg, Frame, FrameNum, FrameScreen, InputSeq, FRAME_WINDOW, HEARTBEAT,
     MAX_INPUT_BYTES, WINDOW_CELLS,
 };
-use crate::terminal::{Grid, TerminalScreen};
+use crate::terminal::{Grid, Size, TerminalScreen};
 
 use super::render::WindowState;
 use super::{window_state, ESCAPE_PREFIX, SUSPEND_KEY};
@@ -83,15 +83,15 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
-    /// A session for a new connection, telling the server the window is `rows × cols`.
-    pub fn new(pref: DisplayPreference, rows: u16, cols: u16) -> Self {
+    /// A session for a new connection, telling the server the window's `size`.
+    pub fn new(pref: DisplayPreference, size: Size) -> Self {
         Self {
             current: FrameScreen::default(),
             older: VecDeque::new(),
             resync_sent: false,
             echo_ack: InputSeq::default(),
             last_seq: InputSeq::default(),
-            outgoing: VecDeque::from([ClientMsg::Resize { rows, cols }]),
+            outgoing: VecDeque::from([ClientMsg::Resize(size)]),
             queued_input: 0,
             input_paused: false,
             last_heard: None,
@@ -193,17 +193,12 @@ impl ClientSession {
 
     /// Note a new window size: queue it for the server and reset the predictor, whose
     /// predictions a resize invalidates.
-    pub fn on_resize(&mut self, rows: u16, cols: u16) {
+    pub fn on_resize(&mut self, size: Size) {
         // Only the last of several unsent resizes matters.
-        if let Some(ClientMsg::Resize {
-            rows: queued_rows,
-            cols: queued_cols,
-        }) = self.outgoing.back_mut()
-        {
-            *queued_rows = rows;
-            *queued_cols = cols;
+        if let Some(ClientMsg::Resize(queued)) = self.outgoing.back_mut() {
+            *queued = size;
         } else {
-            self.outgoing.push_back(ClientMsg::Resize { rows, cols });
+            self.outgoing.push_back(ClientMsg::Resize(size));
         }
         self.predictor.reset();
         self.dirty = true;
@@ -376,7 +371,10 @@ mod tests {
 
     fn start() -> (Instant, ClientSession) {
         let now = Instant::now();
-        (now, ClientSession::new(DisplayPreference::Always, 24, 80))
+        (
+            now,
+            ClientSession::new(DisplayPreference::Always, Size::new(24, 80)),
+        )
     }
 
     fn screen(bytes: &[u8]) -> TerminalScreen {
@@ -406,7 +404,7 @@ mod tests {
         msgs.iter()
             .filter_map(|m| match m {
                 ClientMsg::Input { bytes, .. } => Some(bytes.as_slice()),
-                ClientMsg::Resize { .. } | ClientMsg::Ack { .. } | ClientMsg::Resync => None,
+                ClientMsg::Resize(_) | ClientMsg::Ack { .. } | ClientMsg::Resync => None,
             })
             .flatten()
             .copied()
@@ -416,7 +414,7 @@ mod tests {
     #[test]
     fn a_session_first_tells_the_server_its_window_size() {
         let (_, mut s) = start();
-        assert_eq!(drain(&mut s), [ClientMsg::Resize { rows: 24, cols: 80 }]);
+        assert_eq!(drain(&mut s), [ClientMsg::Resize(Size::new(24, 80))]);
     }
 
     #[test]
@@ -460,7 +458,7 @@ mod tests {
     #[test]
     fn input_is_numbered_in_order_and_a_paste_is_split() {
         let now = Instant::now();
-        let mut s = ClientSession::new(DisplayPreference::Never, 24, 80);
+        let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
         let paste: Vec<u8> = (0..200_000u32).map(|i| b'a' + (i % 26) as u8).collect();
         s.on_input(now, b"first");
         s.on_input(now, &paste);
@@ -469,7 +467,7 @@ mod tests {
             .iter()
             .filter_map(|m| match m {
                 ClientMsg::Input { seq, bytes } => Some((*seq, bytes.len())),
-                ClientMsg::Resize { .. } | ClientMsg::Ack { .. } | ClientMsg::Resync => None,
+                ClientMsg::Resize(_) | ClientMsg::Ack { .. } | ClientMsg::Resync => None,
             })
             .collect();
         assert!(inputs.iter().all(|&(_, len)| len <= MAX_INPUT_BYTES));
@@ -485,7 +483,7 @@ mod tests {
     fn typing_past_the_queue_limit_is_dropped_and_reported_until_it_drains() {
         // Queueing, not prediction, is under test; skip predicting a megabyte byte by byte.
         let now = Instant::now();
-        let mut s = ClientSession::new(DisplayPreference::Never, 24, 80);
+        let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
         let chunk = vec![b'z'; MAX_INPUT_BYTES];
         for _ in 0..MAX_QUEUED_INPUT.div_euclid(MAX_INPUT_BYTES) {
             s.on_input(now, &chunk);
@@ -740,25 +738,19 @@ mod tests {
     #[test]
     fn resizes_coalesce_and_reset_the_predictor() {
         let (now, mut s) = start();
-        s.on_resize(30, 100);
-        s.on_resize(40, 120);
+        s.on_resize(Size::new(30, 100));
+        s.on_resize(Size::new(40, 120));
         s.on_input(now, b"a");
-        s.on_resize(50, 132);
+        s.on_resize(Size::new(50, 132));
         assert_eq!(
             drain(&mut s),
             [
-                ClientMsg::Resize {
-                    rows: 40,
-                    cols: 120
-                },
+                ClientMsg::Resize(Size::new(40, 120)),
                 ClientMsg::Input {
                     seq: InputSeq(1),
                     bytes: b"a".to_vec()
                 },
-                ClientMsg::Resize {
-                    rows: 50,
-                    cols: 132
-                },
+                ClientMsg::Resize(Size::new(50, 132)),
             ]
         );
         assert!(s.overlay().is_empty(), "a resize drops predictions");

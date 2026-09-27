@@ -330,7 +330,10 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   the `koh` binary's `__launch`: output streaming and teardown, exit statuses, the
   reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its
   terminal; the session registry's attach/reattach/cap/TTL/teardown; `run_session` and the
-  per-connection echo-ack over loopback iroh.
+  per-connection echo-ack over loopback iroh. On macOS `tests/pty.rs` first grows the kernel's PTY
+  table past what its tests hold at once: an open that finds the table full while another PTY is
+  being freed fails with ENXIO (the table grows 16 slots at a time and never shrinks), which its
+  many short-lived PTYs hit on a fresh machine.
 - **`tests/e2e_loopback.rs`** — the whole loop over loopback: scripted keystroke → client → iroh →
   server → PTY-hosted `sh` → fux-vt → iroh → client render.
 - **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** attached to an allocated PTY (so

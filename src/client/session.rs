@@ -631,6 +631,37 @@ mod tests {
     }
 
     #[test]
+    fn a_window_of_scrolled_frames_costs_one_screen_and_the_new_rows() {
+        // Output scrolling a line a frame on a screen a quarter of the budget: the rows that only
+        // moved stay shared, so the whole window is kept where copies would allow four frames.
+        let (now, mut s) = start();
+        let (rows, cols) = (500, 500);
+        let mut emu = ServerTerminal::new(rows, cols, 0).expect("emulator");
+        let lines: Vec<String> = (0..rows).map(|row| format!("line {row}")).collect();
+        emu.process(lines.join("\r\n").as_bytes());
+        let mut prev = emu.snapshot();
+        s.on_frame(now, &frame(1, 0, 0, &TerminalScreen::default(), &prev));
+        for n in 2..=20 {
+            emu.process(format!("\r\nline {n}").as_bytes());
+            let next = emu.snapshot();
+            let frame = frame(n, n - 1, 0, &prev, &next);
+            assert_eq!(frame.diff.shifts.iter().count(), 1, "frame {n}");
+            s.on_frame(now, &frame);
+            assert_eq!(s.state(), &next);
+            prev = next;
+        }
+        assert_eq!(s.older.len(), FRAME_WINDOW - 1);
+        // Per frame, the row that scrolled off and the one written.
+        let screens = std::iter::once(&*s.current.screen).chain(s.older.iter().map(|f| &*f.screen));
+        let distinct = TerminalScreen::distinct_cells(screens);
+        assert!(
+            distinct <= (usize::from(rows) + 2 * FRAME_WINDOW) * usize::from(cols),
+            "{distinct} cells"
+        );
+        assert!(4 * usize::from(rows) * usize::from(cols) <= WINDOW_CELLS);
+    }
+
+    #[test]
     fn a_frame_confirms_echoed_predictions() {
         let (now, mut s) = start();
         s.on_input(now, b"x");

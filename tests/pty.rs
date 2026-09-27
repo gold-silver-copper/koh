@@ -358,7 +358,8 @@ fn short_lived_children_never_lose_their_output() {
         // running before the spawn. A reader started late loses about 3 outputs in 1000 under
         // load; spawning many at once is the load, and every one must deliver its marker.
         // 16 at a time stays well under macOS's PTY cap (`kern.tty.ptmx_max`, 511) even when several
-        // PTY tests run at once; 128 rounds reproduce a late reader on every run.
+        // PTY tests run at once, and within the room `launcher` makes in the kernel's PTY table;
+        // 128 rounds reproduce a late reader on every run.
         const CHILDREN: usize = 16;
         const ROUNDS: usize = 128;
         for round in 0..ROUNDS {
@@ -563,7 +564,37 @@ fn a_child_that_ignores_sighup_dies_when_its_pty_is_dropped() {
     });
 }
 
-/// The launcher every PTY in these tests starts through.
+/// The launcher every PTY in these tests starts through. First, once, room in the kernel's PTY
+/// table (see [`grow_the_pty_table`]), so every test's PTYs are allocated after it.
 fn launcher() -> koh::pty::Launcher {
+    static GROWN: std::sync::Once = std::sync::Once::new();
+    GROWN.call_once(grow_the_pty_table);
     koh::pty::Launcher::new(env!("CARGO_BIN_EXE_koh"))
+}
+
+/// How many PTYs [`grow_the_pty_table`] opens: well past what these tests hold at once (about 30).
+const PTY_HEADROOM: usize = 64;
+
+/// Grow macOS's PTY table past what these tests hold at once, so no PTY they open finds it full.
+///
+/// macOS allocates PTYs from a table that grows 16 slots at a time and never shrinks. An open that
+/// finds it full picks the slot past its end, then drops a lock to allocate, and grows the table
+/// only if it is still full: if another PTY was freed meanwhile, it does not grow it and the open
+/// fails with ENXIO ("minor number out of range" in the kernel's log; `ptmx_get_ioctl` in XNU's
+/// `bsd/kern/tty_ptmx.c`). A fresh machine's table is small, and these tests open PTYs while
+/// others are freed, at a new high, so one could fail that way. Opening this many at once, and
+/// only then freeing them, leaves the table larger than these tests ever fill.
+fn grow_the_pty_table() {
+    if cfg!(target_os = "macos") {
+        let mut held = Vec::with_capacity(PTY_HEADROOM);
+        // Another process's free can race these opens the same way; a few more tries win.
+        for _ in 0..PTY_HEADROOM.saturating_mul(2) {
+            if held.len() == PTY_HEADROOM {
+                break;
+            }
+            if let Ok(pty) = fuxix::pty::open(24, 80) {
+                held.push(pty);
+            }
+        }
+    }
 }

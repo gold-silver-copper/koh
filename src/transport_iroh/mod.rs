@@ -2,11 +2,13 @@
 //! RTT. Everything QUIC-shaped (encryption, NAT traversal, relays, roaming, loss recovery) is
 //! iroh's.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
-use iroh::endpoint::{presets, Connection, IdleTimeout, PathId, QuicTransportConfig, VarInt};
+use iroh::endpoint::{
+    presets, BindOpts, Connection, IdleTimeout, PathId, QuicTransportConfig, VarInt,
+};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 
 pub mod admission;
@@ -47,6 +49,8 @@ pub enum SetupError {
     NotAKey(String),
     #[error("could not parse endpoint id: {0}")]
     BadEndpointId(String),
+    #[error("UDP port {0} is already in use (another koh serve?); stop it or pick another --port")]
+    PortInUse(u16),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -330,16 +334,64 @@ fn discovery_dns_resolver() -> Option<iroh::dns::DnsResolver> {
     }
 }
 
-/// [`configure`] `builder` and bind.
-async fn bind(
-    builder: iroh::endpoint::Builder,
+/// Where an endpoint finds its peers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Network {
+    /// n0's relays and DNS discovery, so a bare endpoint id is dialable.
+    N0,
+    /// No relay and no discovery: dialed by id and socket address (LAN, loopback, tests).
+    Local,
+    /// Only this self-hosted relay, and no discovery.
+    Relay(RelayUrl),
+}
+
+/// Bind an endpoint on `network`, [`configure`]d, on UDP `port` for IPv4 and, where the host has
+/// it, IPv6; `None` binds ephemeral ports. `accept` lets it accept connections (the server).
+///
+/// A fixed port lets a client dialing an address find a restarted server where it was. A port in
+/// use is [`SetupError::PortInUse`].
+pub async fn bind_on(
     secret: SecretKey,
     accept: bool,
+    network: &Network,
+    port: Option<u16>,
 ) -> Result<Endpoint, SetupError> {
+    let builder = match network {
+        Network::N0 => Endpoint::builder(presets::N0),
+        Network::Local => Endpoint::builder(presets::Minimal),
+        Network::Relay(relay) => {
+            Endpoint::builder(presets::Minimal).relay_mode(RelayMode::custom([relay.clone()]))
+        }
+    };
+    let builder = match port {
+        // IPv6 as iroh binds it by default: skipped where the host has none.
+        Some(port) => builder
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::UNSPECIFIED, port))
+            .and_then(|builder| {
+                builder.bind_addr_with_opts(
+                    (Ipv6Addr::UNSPECIFIED, port),
+                    BindOpts::default().set_is_required(false),
+                )
+            })
+            .map_err(|e| SetupError::Other(anyhow::Error::new(e)))?,
+        None => builder,
+    };
     configure(builder, secret, accept)
         .bind()
         .await
-        .map_err(|e| SetupError::Other(e.into()))
+        .map_err(|e| {
+            let error = anyhow::Error::new(e);
+            let in_use = error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+            });
+            match port {
+                Some(port) if in_use => SetupError::PortInUse(port),
+                _ => SetupError::Other(error),
+            }
+        })
 }
 
 /// Apply koh's identity, transport config, DNS resolver and (when `accept`ing) ALPN to `builder`.
@@ -364,13 +416,13 @@ pub fn configure(
 /// Bind an endpoint with n0's relays and DNS discovery, so a bare endpoint id is dialable. `accept`
 /// lets it accept connections (the server).
 pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
-    bind(Endpoint::builder(presets::N0), secret, accept).await
+    bind_on(secret, accept, &Network::N0, None).await
 }
 
 /// Bind an endpoint with no relay and no discovery, dialed by id and socket address (LAN,
 /// loopback, tests).
 pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
-    bind(Endpoint::builder(presets::Minimal), secret, accept).await
+    bind_on(secret, accept, &Network::Local, None).await
 }
 
 /// `ep`'s address on the IPv4 loopback interface.
@@ -414,8 +466,7 @@ pub async fn bind_endpoint_with_relay(
     accept: bool,
     relay: RelayUrl,
 ) -> Result<Endpoint, SetupError> {
-    let builder = Endpoint::builder(presets::Minimal).relay_mode(RelayMode::custom([relay]));
-    bind(builder, secret, accept).await
+    bind_on(secret, accept, &Network::Relay(relay), None).await
 }
 
 /// Parse a relay URL string (e.g. `https://relay.example:3340`).
@@ -810,6 +861,47 @@ mod tests {
 
             conn.close(0u32.into(), b"done");
             let _ = srv.await;
+        });
+    }
+
+    #[test]
+    fn a_fixed_port_is_bound_and_a_taken_one_is_reported() {
+        crate::test_runtime::current_thread().block_on(async {
+            // A port the OS just handed out, so almost surely free.
+            let port = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                .and_then(|socket| socket.local_addr())
+                .expect("a free port")
+                .port();
+            let secret = generate_secret_key().expect("OS randomness");
+            let first = bind_on(secret.clone(), true, &Network::Local, Some(port))
+                .await
+                .expect("bind the port");
+            let bound = first.bound_sockets();
+            assert!(
+                bound.iter().any(|s| s.is_ipv4() && s.port() == port),
+                "{bound:?}"
+            );
+            assert!(
+                bound
+                    .iter()
+                    .filter(|s| s.is_ipv6())
+                    .all(|s| s.port() == port),
+                "{bound:?}"
+            );
+            // The same port again, as a second server would: a clear error, not a random port.
+            match bind_on(secret, true, &Network::Local, Some(port)).await {
+                Err(SetupError::PortInUse(p)) => assert_eq!(p, port),
+                Err(e) => panic!("expected PortInUse, got {e}"),
+                Ok(_) => panic!("a taken port must not bind"),
+            }
+            assert_eq!(
+                SetupError::PortInUse(port).to_string(),
+                format!(
+                    "UDP port {port} is already in use (another koh serve?); stop it or pick \
+                     another --port"
+                )
+            );
+            first.close().await;
         });
     }
 

@@ -110,6 +110,25 @@ pub trait KohBackend {
         write!(self, "\x1b[{};{}H", u32::from(row) + 1, u32::from(col) + 1)
     }
 
+    /// Scroll the 0-based rows `top..bottom` by `by` (negative is up) inside a scroll region
+    /// (DECSTBM, then SU or SD), leaving the region set and the cursor home. `top..bottom` holds at
+    /// least two rows.
+    fn scroll_region(&mut self, top: u16, bottom: u16, by: i16) -> io::Result<()> {
+        write!(self, "\x1b[{};{}r", u32::from(top) + 1, bottom)?;
+        let lines = by.unsigned_abs();
+        if by < 0 {
+            write!(self, "\x1b[{lines}S")
+        } else {
+            write!(self, "\x1b[{lines}T")
+        }
+    }
+
+    /// Reset the scroll region to the whole terminal (DECSTBM without parameters), moving the
+    /// cursor home.
+    fn reset_scroll_region(&mut self) -> io::Result<()> {
+        self.write_bytes(b"\x1b[r")
+    }
+
     /// Set a whole style: reset, then each attribute, then the colours.
     fn set_style(&mut self, style: CellStyle) -> io::Result<()> {
         self.reset_sgr()?; // clears everything (incl. colors), then re-apply
@@ -333,6 +352,13 @@ mod tests {
         let bytes = emit(KohBackend::leave_alt_screen);
         assert!(bytes.starts_with(RESET_FORWARDED_MODES));
         assert!(bytes.ends_with(b"\x1b[?25h\x1b[?1049l"));
+    }
+
+    #[test]
+    fn scroll_region_bytes() {
+        assert_eq!(emit(|b| b.scroll_region(0, 24, -1)), b"\x1b[1;24r\x1b[1S");
+        assert_eq!(emit(|b| b.scroll_region(4, 20, 3)), b"\x1b[5;20r\x1b[3T");
+        assert_eq!(emit(KohBackend::reset_scroll_region), b"\x1b[r");
     }
 
     #[test]

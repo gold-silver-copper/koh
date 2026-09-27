@@ -103,7 +103,22 @@ memory for its recent screens is counted in distinct rows. The server's live emu
 opt-in events (title, icon, bell, clipboard) and extended replies (DECRQM, DECXCPR, secondary DA)
 turned on. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
 cursor and the modes; after a resize the client starts from a blank grid and receives every
-non-blank row. The client validates and copies cells and never runs a terminal parser, so server
+non-blank row.
+
+Rows that only moved are moved, not sent. A scroll, of the whole screen or inside a scroll region,
+and an inserted or deleted line leave the rows they move holding the same cells, so the server finds
+them by the cells they share with the base, in runs that moved by the same offset, and sends each
+run as a `Shift { top, len, by }`: rows `top..top + len` of the base go to `top + by`. All shifts
+read the base, no two share a source or a destination row, and a row a shift left and none filled
+is blank, which is what a scroll brings in. The client moves those rows' cells (shared, not copied)
+before replacing the rows the diff carries, so a one-line scroll sends the shift (4 bytes on a
+24-row screen) and the new line, not the screen. Decoding checks what needs no screen size (at
+most 32 shifts, no zero length or offset, both ranges within 1000 rows, no shared rows); `apply`
+checks the ranges against the screen and refuses shifts with a resize, and drops the frame whole
+if anything is wrong. What a shift cannot say is sent as rows: a row moved and changed, a row that
+appears twice, a horizontal shift inside a row, and the shortest runs past the 32nd.
+
+The client validates and copies cells and never runs a terminal parser, so server
 bytes never reach one. That includes the user's terminal, which the client prints a cell's text to
 as is: decoding refuses a cell whose text holds a control character, so no escape sequence can
 ride in one.
@@ -141,13 +156,30 @@ it, skipping rows it shares without reading them, moving the cursor only to reac
 and repainting a wide glyph whole when either half changed. So a keystroke's echo writes a few
 bytes, and the banners, which repaint every 50 ms, write their own row.
 
+Rows that only moved since the last paint (the painted grid's rows, shared with the new screen at
+other indices) are moved on the terminal, not repainted: in a scroll region (`CSI t;b r`), `CSI n S`
+scrolls up and `CSI n T` down, and `CSI r` resets the region. The painter finds these moves itself,
+by the cells the rows share with the grid it painted, because that grid may be several frames
+behind; each scroll's region must overlap no other, so they can run one after another, and a scroll
+is only made when it writes less than repainting its rows in place, by an estimate that counts a
+byte a differing cell and a cursor move a run of them (lines that differ in a few digits, or share
+most of their blanks, are cheaper repainted). SGR is reset first, so the rows a scroll brings in
+have the default background, and each row is then compared with the row the scroll put there, or
+with a blank one. It scrolls only on a terminal exactly the screen's size, since a scroll moves
+whole terminal lines, and never the status line's row.
+
 A frame is painted whole, byte for byte as every frame was before, when the terminal may not show
 what was painted: the first frame, after a resume or a window resize, when the screen's size
 changes, when the status line appears or goes, and while the terminal is smaller than the screen.
-It is also painted whole, and the next one too, when a glyph does not fill exactly the cells the
-grid gives it (a predicted wide glyph over a narrow cell, say), because the terminal then lays the
-row out its own way. A property test feeds both ways of painting into a fux-vt terminal and checks
-it shows the same thing after every frame.
+It is also painted whole, and the next one too, when a glyph does not fill exactly the cells it is
+given (a hostile server's wide glyph in the last column, say), because the terminal then lays the
+row out its own way. Predictions never cause that: a predicted wide glyph comes with the cell it
+covers, which is skipped as a grid continuation is, and a glyph of the grid that a prediction half
+hides is drawn as a blank in the prediction's style, as a terminal leaves a wide glyph one of whose
+halves is overwritten. A property test feeds both ways of painting into a fux-vt terminal and checks
+it shows the same thing after every frame, scrolling included; there a printed space and an erased
+cell of the same attributes count as the same, since a whole repaint prints spaces where a scroll
+brings in erased cells.
 
 ## The predictor
 
@@ -163,10 +195,14 @@ and a cell it knows changed but not to what is not drawn at all, so the real cel
 The port faithfully implements epoch-gated confirmation, glitch escalation,
 and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
 backspace, CR/LF, the left/right arrow keys (CSI **and** SS3/application-cursor form), and whole
-UTF-8 graphemes including double-width CJK/emoji (cursor advances by two cells). Control/escape
-sequences it doesn't model open a fresh epoch but make no concrete guess (they fall back to the
-server's real echo). A wrong or unconfirmed guess is always reconciled away — it never corrupts the
-display.
+UTF-8 graphemes including double-width CJK/emoji (cursor advances by two cells). A wide glyph is
+predicted as two cells, the glyph and the cell it covers; the covered cell is right when the
+server shows a wide glyph's right half there, and never confirms an epoch. The insert-mode shift
+moves each wide glyph with its right half; one the shift splits (at the right edge, or typed
+inside) becomes unknown rather than half drawn. Backspace over a wide glyph, which a line editor
+takes back two cells, is not modelled. Control/escape sequences it doesn't model open a fresh epoch
+but make no concrete guess (they fall back to the server's real echo). A wrong or unconfirmed guess
+is always reconciled away — it never corrupts the display.
 
 ## Reconnect & detachable sessions
 
@@ -185,10 +221,15 @@ detector** turns a multi-minute wake-up hang into a ~1–2 s reattach: if real t
 drops the (almost certainly dead) connection, and re-dials immediately. A sub-20 s glance still
 rides out silently on the existing connection.
 
-> **`--direct` caveat:** transparent re-dial targets the *same* address it first dialed, so a
-> `--direct <ip:port>` client can't reconnect if the server restarts on a new ephemeral **port**.
-> The relay/discovery path (a bare endpoint id) re-dials by node id and reconnects across address
-> changes — use it (or a fixed port) when you need reconnection to survive a server restart.
+> **`--direct` and server restarts:** transparent re-dial targets the *same* address it first
+> dialed. By default `koh serve` binds an ephemeral UDP port, so a restarted server is elsewhere and
+> a `--direct <ip:port>` client redials the old port forever. `koh serve --port <PORT>` binds a fixed
+> port (IPv4, and IPv6 where the host has it), so the restarted server is where the client looks,
+> and it reattaches, to a fresh session: the old session's program died with the old server. A
+> server stopped with SIGTERM closes its connections, so clients redial at once; one that died
+> without closing them (SIGKILL, a crash, a power cut) leaves them to notice through the 5-minute
+> idle timeout. The relay/discovery path (a bare endpoint id) re-dials by node id and follows the
+> server across address changes.
 
 ## Sessions, connections and the bell hook
 
@@ -289,13 +330,17 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   the `koh` binary's `__launch`: output streaming and teardown, exit statuses, the
   reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its
   terminal; the session registry's attach/reattach/cap/TTL/teardown; `run_session` and the
-  per-connection echo-ack over loopback iroh.
+  per-connection echo-ack over loopback iroh. On macOS `tests/pty.rs` first grows the kernel's PTY
+  table past what its tests hold at once: an open that finds the table full while another PTY is
+  being freed fails with ENXIO (the table grows 16 slots at a time and never shrinks), which its
+  many short-lived PTYs hit on a fresh machine.
 - **`tests/e2e_loopback.rs`** — the whole loop over loopback: scripted keystroke → client → iroh →
   server → PTY-hosted `sh` → fux-vt → iroh → client render.
 - **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** attached to an allocated PTY (so
   `isatty()` is true and raw mode runs for real), driven by scripted keystrokes with rendered
-  frames read back from the master, connected with `--direct` to an in-process server; and the
-  `Ctrl-^ Ctrl-Z` suspend under a job-control bash.
+  frames read back from the master, connected with `--direct` to an in-process server; the
+  `Ctrl-^ Ctrl-Z` suspend under a job-control bash; and a `koh serve --local --port` process
+  restarted under a connected client, which finds it again.
 - **`tests/upgrade_in_place.rs`** (Linux) — a running `koh serve` whose binary file is removed
   still starts sessions, because it launches them from `/proc/self/exe`.
 

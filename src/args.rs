@@ -141,6 +141,13 @@ fn serve() -> Command {
                 .help("Bind without any relay/discovery (LAN / loopback). Clients dial with --direct <ip:port>"),
         )
         .arg(
+            Arg::new("port")
+                .long("port")
+                .value_name("PORT")
+                .value_parser(value_parser!(u16).range(1..))
+                .help("Bind this UDP port (IPv4 and IPv6) instead of an ephemeral one, so clients dialing --direct <ip:port> find the server again after a restart"),
+        )
+        .arg(
             Arg::new("max_connections")
                 .long("max-connections")
                 .value_name("MAX_CONNECTIONS")
@@ -242,6 +249,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             session_ttl_secs: value(m, "session_ttl_secs")?,
             relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
             local: m.get_flag("local"),
+            port: m.get_one::<u16>("port").copied(),
             max_connections: value(m, "max_connections")?,
             max_sessions: value(m, "max_sessions")?,
             launcher: koh::pty::Launcher::this_binary(),
@@ -339,6 +347,7 @@ mod tests {
         assert_eq!(c.max_connections, d.max_connections);
         assert_eq!(c.max_sessions, d.max_sessions);
         assert!(!c.local && c.relay_url.is_none() && c.key_file.is_none());
+        assert_eq!(c.port, d.port);
 
         // A single `--shell` is just the program.
         let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", ID, "--shell", "/bin/zsh"]) else {
@@ -350,6 +359,22 @@ mod tests {
             panic!("serve");
         };
         assert_eq!(c.command, Vec::<String>::new());
+    }
+
+    #[test]
+    fn serve_port_is_a_nonzero_udp_port() {
+        let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", ID, "--local", "--port", "4433"])
+        else {
+            panic!("serve");
+        };
+        assert_eq!(c.port, Some(4433));
+        assert!(c.local);
+        for port in ["0", "65536", "http"] {
+            let error = command()
+                .try_get_matches_from(["koh", "serve", "--allow", ID, "--port", port])
+                .expect_err("an invalid port");
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{port}");
+        }
     }
 
     #[test]

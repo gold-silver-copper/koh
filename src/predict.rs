@@ -29,13 +29,17 @@ impl Size {
     }
 }
 
-/// One cell as the predictor sees it: the glyph (empty for a blank or a wide-glyph continuation)
-/// and its colours.
+/// One cell as the predictor sees it: the glyph (empty for a blank or a wide-glyph continuation),
+/// its colours, and whether it is either half of a wide glyph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellView<'a> {
     pub contents: &'a str,
     pub fg: Color,
     pub bg: Color,
+    /// The left half of a wide glyph, whose right half is the next cell.
+    pub wide: bool,
+    /// The right half of a wide glyph.
+    pub continuation: bool,
 }
 
 /// The screen the predictor reconciles against: the client's grid, or a test's. A trait, so
@@ -60,14 +64,17 @@ pub enum DisplayPreference {
 /// A speculative cell for the renderer to draw, as is, on top of the authoritative grid.
 ///
 /// Only concrete guesses become one: a cell the predictor knows changed but not to what is left
-/// out of the [`Overlay`], so the real cell beneath shows.
+/// out of the [`Overlay`], so the real cell beneath shows. A wide glyph is predicted in two cells:
+/// the glyph, and the cell to its right `covered`, which the glyph draws over.
 #[derive(Clone, Copy, Debug)]
 pub struct PredictedCell<'a> {
     /// The predicted glyph, borrowed from the engine; empty for a blank shifted in by an insert or
-    /// a backspace.
+    /// a backspace, and for a covered cell.
     pub glyph: &'a str,
     pub fg: Color,
     pub bg: Color,
+    /// The right half of the predicted wide glyph to its left: nothing of its own to draw.
+    pub covered: bool,
 }
 
 /// The render-facing snapshot of current predictions, borrowing its glyphs from the
@@ -110,6 +117,50 @@ impl<'a> Overlay<'a> {
     }
 }
 
+/// What a prediction says a cell shows.
+#[derive(Clone)]
+struct Guess {
+    glyph: String,
+    fg: Color,
+    bg: Color,
+    /// Changed, but not known to what: never drawn.
+    unknown: bool,
+    /// The glyph is wide: the cell to its right is `covered`.
+    wide: bool,
+    /// The right half of the wide glyph to its left.
+    covered: bool,
+}
+
+impl Guess {
+    /// `glyph`, narrow or wide, in `fg` on `bg`.
+    fn glyph(glyph: String, wide: bool, fg: Color, bg: Color) -> Self {
+        Self {
+            glyph,
+            fg,
+            bg,
+            unknown: false,
+            wide,
+            covered: false,
+        }
+    }
+
+    /// The right half of a wide glyph in `fg` on `bg`.
+    fn covered(fg: Color, bg: Color) -> Self {
+        Self {
+            covered: true,
+            ..Self::glyph(String::new(), false, fg, bg)
+        }
+    }
+
+    /// A cell that changed to something not known, keeping `fg` and `bg`.
+    fn unknown(fg: Color, bg: Color) -> Self {
+        Self {
+            unknown: true,
+            ..Self::glyph(String::new(), false, fg, bg)
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PredCell {
     expiration_frame: u64,
@@ -122,6 +173,11 @@ struct PredCell {
     original_contents: Option<String>,
     /// Changed, but not known to what: never drawn.
     unknown: bool,
+    /// The glyph is wide: the next cell is `covered`.
+    wide: bool,
+    /// The right half of the wide glyph to its left: it confirms nothing, and is right when the
+    /// server shows a wide glyph's right half there.
+    covered: bool,
 }
 
 #[derive(Clone)]
@@ -195,55 +251,88 @@ impl PredictionEngine {
         }
     }
 
-    /// The glyph, colours and unknown-ness at a cell, predicted if there is a prediction: what a
-    /// row shift copies.
-    fn pred_or_real_glyph(
-        &self,
-        screen: &dyn ScreenView,
-        row: u16,
-        col: u16,
-    ) -> (String, Color, Color, bool) {
+    /// What a cell shows, predicted if there is a prediction: what a row shift copies, a wide
+    /// glyph's halves included.
+    fn guess_at(&self, screen: &dyn ScreenView, row: u16, col: u16) -> Guess {
         if let Some(p) = self.cells.get(&(row, col)) {
-            (p.glyph.clone(), p.fg, p.bg, p.unknown)
+            Guess {
+                glyph: p.glyph.clone(),
+                fg: p.fg,
+                bg: p.bg,
+                unknown: p.unknown,
+                wide: p.wide,
+                covered: p.covered,
+            }
         } else {
             let (fg, bg) = glyph_style(screen, row, col);
-            (cell_glyph(screen, row, col), fg, bg, false)
+            let cell = screen.cell(row, col);
+            Guess {
+                glyph: cell_glyph(screen, row, col),
+                fg,
+                bg,
+                unknown: false,
+                wide: cell.is_some_and(|c| c.wide),
+                covered: cell.is_some_and(|c| c.continuation),
+            }
         }
     }
 
-    /// Predict `glyph` at `(row, col)`, stamped with the next frame, the current epoch (which hides
+    /// Predict `guess` at `(row, col)`, stamped with the next frame, the current epoch (which hides
     /// it until confirmed) and the glyph it overwrites. One place, so no caller can get the
     /// security-relevant stamps wrong.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the per-cell fields differ across the call sites; the invariant fields are stamped here"
-    )]
-    fn place_cell(
-        &mut self,
-        screen: &dyn ScreenView,
-        row: u16,
-        col: u16,
-        glyph: String,
-        fg: Color,
-        bg: Color,
-        unknown: bool,
-    ) {
+    fn place_cell(&mut self, screen: &dyn ScreenView, row: u16, col: u16, guess: Guess) {
         self.cells.insert(
             (row, col),
             PredCell {
                 expiration_frame: self.next_frame(),
                 tentative_epoch: self.prediction_epoch,
-                glyph,
-                fg,
-                bg,
-                original_contents: if unknown {
+                original_contents: if guess.unknown {
                     None
                 } else {
                     Some(cell_glyph(screen, row, col))
                 },
-                unknown,
+                glyph: guess.glyph,
+                fg: guess.fg,
+                bg: guess.bg,
+                unknown: guess.unknown,
+                wide: guess.wide,
+                covered: guess.covered,
             },
         );
+    }
+
+    /// Keep each predicted wide glyph on `row` with its right half: a wide glyph whose right half
+    /// is not the next cell's prediction, or a right half whose glyph is not the cell to its left,
+    /// was split (by a shift at the edge, or an edit inside a wide glyph) and is unknown.
+    fn keep_wide_glyphs_whole(&mut self, row: u16) {
+        let known = |cell: Option<&PredCell>, pick: fn(&PredCell) -> bool| {
+            cell.is_some_and(|cell| !cell.unknown && pick(cell))
+        };
+        let split: Vec<u16> = self
+            .cells
+            .range((row, 0)..=(row, u16::MAX))
+            .filter(|(_, cell)| !cell.unknown && (cell.wide || cell.covered))
+            .filter(|&(&(_, col), cell)| {
+                let whole = if cell.wide {
+                    let right = col.checked_add(1).map(|right| (row, right));
+                    known(right.and_then(|at| self.cells.get(&at)), |c| c.covered)
+                } else {
+                    let left = col.checked_sub(1).map(|left| (row, left));
+                    known(left.and_then(|at| self.cells.get(&at)), |c| c.wide)
+                };
+                !whole
+            })
+            .map(|(&(_, col), _)| col)
+            .collect();
+        for col in split {
+            if let Some(cell) = self.cells.get_mut(&(row, col)) {
+                cell.glyph.clear();
+                cell.unknown = true;
+                cell.wide = false;
+                cell.covered = false;
+                cell.original_contents = None;
+            }
+        }
     }
 
     /// The newest epoch the server confirmed echoes. Test-only.
@@ -332,7 +421,7 @@ impl PredictionEngine {
 
     /// Predict the grapheme `g` at the cursor and advance it by `g`'s width. A zero-width one, or
     /// one reaching the right edge (where the terminal may wrap), opens a new epoch instead. It
-    /// overwrites, with no insert-mode shift.
+    /// overwrites, with no insert-mode shift; a wide one covers the next cell too.
     fn predict_wide(&mut self, g: &str, screen: &dyn ScreenView) {
         let w = u16::try_from(g.width()).unwrap_or(u16::MAX);
         if w == 0 {
@@ -352,7 +441,12 @@ impl PredictionEngine {
         };
         let exp = self.next_frame();
         let (fg, bg) = glyph_style(screen, row, col);
-        self.place_cell(screen, row, col, g.to_string(), fg, bg, false);
+        let wide = w == 2;
+        self.place_cell(screen, row, col, Guess::glyph(g.to_string(), wide, fg, bg));
+        if let Some(right) = col.checked_add(1).filter(|_| wide) {
+            self.place_cell(screen, row, right, Guess::covered(fg, bg));
+        }
+        self.keep_wide_glyphs_whole(row);
         if let Some(c) = self.cursor.as_mut() {
             c.expiration_frame = exp;
             c.col = next_col;
@@ -455,16 +549,22 @@ impl PredictionEngine {
                     (c.row, c.col)
                 };
                 // Insert mode, as a line editor renders it: shift the tail right, from the right end
-                // so each cell reads its left neighbour's content before it moves.
+                // so each cell reads its left neighbour's content before it moves. A wide glyph
+                // moves with its right half; one split at the edge is unknown.
                 for (left, i) in (col..cols).zip((col..cols).skip(1)).rev() {
-                    let (g, fg, bg, src_unknown) = self.pred_or_real_glyph(screen, row, left);
+                    let guess = self.guess_at(screen, row, left);
                     // The rightmost cell takes content pushed off-screen -> unknown.
-                    let unknown = i.checked_add(1) == Some(cols) || src_unknown;
-                    let glyph = if unknown { String::new() } else { g };
-                    self.place_cell(screen, row, i, glyph, fg, bg, unknown);
+                    let guess = if i.checked_add(1) == Some(cols) || guess.unknown {
+                        Guess::unknown(guess.fg, guess.bg)
+                    } else {
+                        guess
+                    };
+                    self.place_cell(screen, row, i, guess);
                 }
                 let (fg, bg) = glyph_style(screen, row, col);
-                self.place_cell(screen, row, col, (byte as char).to_string(), fg, bg, false);
+                let typed = Guess::glyph((byte as char).to_string(), false, fg, bg);
+                self.place_cell(screen, row, col, typed);
+                self.keep_wide_glyphs_whole(row);
                 let exp = self.next_frame();
                 if let Some(c) = self.cursor.as_mut() {
                     c.expiration_frame = exp;
@@ -478,6 +578,19 @@ impl PredictionEngine {
                 }
             }
             0x7f | 0x08 => {
+                // Backspace over a wide glyph deletes both its halves, which is not modelled: a new
+                // epoch, nothing predicted.
+                let (row, col) = self
+                    .cursor
+                    .as_ref()
+                    .map_or_else(|| screen.cursor_position(), |c| (c.row, c.col));
+                if let Some(prev) = col.checked_sub(1) {
+                    let deleted = self.guess_at(screen, row, prev);
+                    if deleted.wide || deleted.covered {
+                        self.become_tentative();
+                        return;
+                    }
+                }
                 // Backspace: step the cursor back one column.
                 let exp = self.next_frame();
                 let (row, col, do_pred) = {
@@ -497,13 +610,18 @@ impl PredictionEngine {
                     for i in col..cols {
                         // `i < cols - 2` is mosh's `i + 2 < width` without overflow.
                         let right = i.checked_add(1).filter(|_| i < cols.saturating_sub(2));
-                        let (g, fg, bg, unknown) = match right {
-                            Some(right) => self.pred_or_real_glyph(screen, row, right),
-                            None => (String::new(), Color::Default, Color::Default, true),
+                        let guess = match right {
+                            Some(right) => self.guess_at(screen, row, right),
+                            None => Guess::unknown(Color::Default, Color::Default),
                         };
-                        let glyph = if unknown { String::new() } else { g };
-                        self.place_cell(screen, row, i, glyph, fg, bg, unknown);
+                        let guess = if guess.unknown {
+                            Guess::unknown(guess.fg, guess.bg)
+                        } else {
+                            guess
+                        };
+                        self.place_cell(screen, row, i, guess);
                     }
+                    self.keep_wide_glyphs_whole(row);
                 }
             }
             0x0d | 0x0a => {
@@ -639,6 +757,7 @@ impl PredictionEngine {
                     glyph: &cell.glyph,
                     fg: cell.fg,
                     bg: cell.bg,
+                    covered: cell.covered,
                 },
             );
         }
@@ -711,6 +830,15 @@ fn cell_validity(
         // We never predicted a concrete glyph here, so it can never *confirm* an epoch.
         return Validity::CorrectNoCredit;
     }
+    if cell.covered {
+        // A wide glyph's right half says nothing of its own: right when the server shows one here,
+        // never credit (its glyph, to the left, is graded).
+        return if screen.cell(row, col).is_some_and(|c| c.continuation) {
+            Validity::CorrectNoCredit
+        } else {
+            Validity::IncorrectOrExpired
+        };
+    }
     if is_blank(&cell.glyph) {
         return Validity::CorrectNoCredit; // too easy to falsely match
     }
@@ -762,6 +890,8 @@ mod tests {
                 contents: if c.has_contents() { c.contents() } else { "" },
                 fg: c.fgcolor(),
                 bg: c.bgcolor(),
+                wide: c.is_wide(),
+                continuation: c.is_wide_continuation(),
             })
         }
     }
@@ -801,6 +931,8 @@ mod tests {
                 contents,
                 fg: Color::Default,
                 bg: Color::Default,
+                wide: false,
+                continuation: false,
             })
         }
     }
@@ -929,6 +1061,45 @@ mod tests {
                 );
             }
             let _ = pe.overlay(); // must not panic on the accumulated prediction set
+        }
+
+        /// Whatever is typed over a screen of wide glyphs, a wide glyph the overlay shows has the
+        /// next cell covered, and a covered cell follows one: the renderer draws them whole.
+        #[test]
+        fn predicted_wide_glyphs_are_shown_whole(
+            bytes in proptest::collection::vec(
+                proptest::sample::select(
+                    [&b"a"[..], "日".as_bytes(), "\u{1f980}".as_bytes(), b"\x7f", b"\x1b[D", b"\x1b[C", b"\r"]
+                        .to_vec(),
+                ),
+                0..40,
+            ),
+            start in 0u16..12,
+        ) {
+            let screen = sized_screen_of(3, 12, format!("本x日 ab本\x1b[1;{}H", start.saturating_add(1)).as_bytes());
+            let mut e = PredictionEngine::new(DisplayPreference::Always);
+            // Everything shown: the check is on what the overlay holds, not on when it confirms.
+            e.confirmed_epoch = u64::MAX;
+            e.set_local_frame_sent(0);
+            for byte in bytes.concat() {
+                e.new_user_byte(byte, &screen);
+                let ov = e.overlay();
+                for ((row, col), cell) in ov.cells() {
+                    let left = col.checked_sub(1).and_then(|left| ov.cell(row, left));
+                    let right = col.checked_add(1).and_then(|right| ov.cell(row, right));
+                    if cell.covered {
+                        proptest::prop_assert!(
+                            left.is_some_and(|l| !l.covered && l.glyph.width() == 2),
+                            "a covered cell at {col} follows no wide glyph"
+                        );
+                    } else if cell.glyph.width() == 2 {
+                        proptest::prop_assert!(
+                            right.is_some_and(|r| r.covered),
+                            "a wide glyph at {col} covers nothing"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1153,6 +1324,8 @@ mod tests {
                 bg: Color::Default,
                 original_contents: Some(String::new()),
                 unknown: false,
+                wide: false,
+                covered: false,
             },
         );
         let blank = screen_of(b"");
@@ -1227,13 +1400,140 @@ mod tests {
             "the wide grapheme is predicted at the cursor column"
         );
         assert!(
-            ov.cell(0, 2).is_none(),
-            "the continuation cell of a wide char carries no predicted glyph"
+            ov.cell(0, 2)
+                .is_some_and(|c| c.covered && c.glyph.is_empty()),
+            "the continuation cell of a wide char is covered, with no predicted glyph of its own"
         );
         assert_eq!(
             ov.cursor(),
             Some((0, 3)),
             "cursor advances by two cells for a double-width char"
+        );
+    }
+
+    /// A screen of `rows`×`cols` showing `bytes`.
+    fn sized_screen_of(rows: u16, cols: u16, bytes: &[u8]) -> Screen {
+        let mut p = fux_vt::Parser::new(rows, cols, 0).expect("parser");
+        p.process(bytes).expect("process");
+        p.screen().clone()
+    }
+
+    /// What is predicted at `(0, col)`: the glyph, `U` for unknown, `>` for a covered cell.
+    fn predicted_at(e: &PredictionEngine, col: u16) -> Option<String> {
+        e.cells.get(&(0, col)).map(|c| {
+            if c.unknown {
+                "U".to_owned()
+            } else if c.covered {
+                ">".to_owned()
+            } else {
+                c.glyph.clone()
+            }
+        })
+    }
+
+    #[test]
+    fn inserting_before_a_wide_glyph_moves_it_whole() {
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.set_local_frame_sent(0);
+        let screen = screen_of("a本b\x1b[1;1H".as_bytes());
+        e.new_user_byte(b'X', &screen);
+        let row: Vec<_> = (0..5).map(|col| predicted_at(&e, col)).collect();
+        let expected = ["X", "a", "本", ">", "b"].map(|g| Some(g.to_owned()));
+        assert_eq!(row, expected);
+        assert!(e.cells.get(&(0, 2)).is_some_and(|c| c.wide));
+    }
+
+    #[test]
+    fn a_wide_glyph_split_by_a_shift_is_unknown() {
+        // Pushed to the edge, its right half would leave the screen.
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.set_local_frame_sent(0);
+        let screen = sized_screen_of(2, 6, "abc本\x1b[1;1H".as_bytes());
+        e.new_user_byte(b'X', &screen);
+        assert_eq!(predicted_at(&e, 4).as_deref(), Some("U"), "its glyph");
+        assert_eq!(predicted_at(&e, 5).as_deref(), Some("U"), "its right half");
+        // Typed inside one, its halves part.
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.set_local_frame_sent(0);
+        let screen = screen_of("本x\x1b[1;2H".as_bytes());
+        e.new_user_byte(b'a', &screen);
+        assert_eq!(predicted_at(&e, 1).as_deref(), Some("a"));
+        assert_eq!(
+            predicted_at(&e, 2).as_deref(),
+            Some("U"),
+            "the moved right half"
+        );
+        // Deleting before one moves it left, whole.
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.set_local_frame_sent(0);
+        let screen = screen_of("ab本c\x1b[1;3H".as_bytes());
+        e.new_user_byte(0x7f, &screen);
+        let row: Vec<_> = (1..4).map(|col| predicted_at(&e, col)).collect();
+        assert_eq!(row, ["本", ">", "c"].map(|g| Some(g.to_owned())));
+    }
+
+    #[test]
+    fn a_wide_glyph_typed_over_another_wide_glyph_s_half_leaves_no_half() {
+        // Typed over the right half of a predicted wide glyph: that glyph cannot show.
+        let (mut e, echoed) = confirm_first_keystroke();
+        e.set_local_frame_sent(1);
+        for &b in "日".as_bytes() {
+            e.new_user_byte(b, &echoed);
+        }
+        e.cursor = e.cursor.clone().map(|c| PredCursor { col: 2, ..c });
+        for &b in "本".as_bytes() {
+            e.new_user_byte(b, &echoed);
+        }
+        let row: Vec<_> = (1..5).map(|col| predicted_at(&e, col)).collect();
+        assert_eq!(
+            row,
+            ["U", "本", ">"]
+                .map(|g| Some(g.to_owned()))
+                .into_iter()
+                .chain([None])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn backspace_over_a_wide_glyph_is_not_predicted() {
+        // A line editor deletes both halves: not modelled, so a new epoch and nothing predicted.
+        let (mut e, _) = confirm_first_keystroke();
+        let screen = screen_of("x本".as_bytes());
+        e.set_local_frame_sent(1);
+        let epoch = e.prediction_epoch;
+        e.new_user_byte(0x7f, &screen);
+        assert!(e.cells.is_empty(), "nothing predicted");
+        assert!(e.prediction_epoch > epoch, "a new epoch");
+        assert!(e.overlay().is_empty());
+    }
+
+    #[test]
+    fn a_covered_cell_is_graded_against_a_right_half_and_confirms_nothing() {
+        let covered = PredCell {
+            expiration_frame: 1,
+            tentative_epoch: 1,
+            glyph: String::new(),
+            fg: Color::Default,
+            bg: Color::Default,
+            original_contents: Some(String::new()),
+            unknown: false,
+            wide: false,
+            covered: true,
+        };
+        let wide = screen_of("x本".as_bytes());
+        let narrow = screen_of(b"xab");
+        assert!(
+            cell_validity(&covered, &wide, 0, 2, 24, 80, 1) == Validity::CorrectNoCredit,
+            "a right half where it was predicted: right, but no credit"
+        );
+        assert!(
+            cell_validity(&covered, &narrow, 0, 2, 24, 80, 1) == Validity::IncorrectOrExpired,
+            "a narrow glyph where a right half was predicted: wrong"
+        );
+        assert!(
+            cell_validity(&covered, &narrow, 0, 2, 24, 80, 0) == Validity::Pending,
+            "before its frame"
         );
     }
 

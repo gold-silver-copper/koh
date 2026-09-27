@@ -63,7 +63,7 @@ fn a_server_whose_binary_was_removed_still_starts_sessions() {
         // The upgrade: the file the server was started from is gone.
         std::fs::remove_file(&installed).expect("remove the installed binary");
 
-        let (mut client, mut output) = Pty::spawn(
+        let (client, mut output) = Pty::spawn(
             24,
             80,
             &[

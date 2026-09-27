@@ -62,6 +62,19 @@ impl Eq for Row {}
 /// with the next snapshot, wherever it moved, instead of copied.
 pub(super) type RowCache = HashMap<RowId, Arc<[Cell]>>;
 
+/// `cells` as a row exactly `cols` wide. A live row is exactly that wide, and is copied once into
+/// its own allocation; anything longer is cut, anything shorter padded with blank cells.
+fn exactly(cells: &[Cell], cols: u16) -> Arc<[Cell]> {
+    let cols = usize::from(cols);
+    if let Some(row) = cells.get(..cols) {
+        return row.into();
+    }
+    let mut row = Vec::with_capacity(cols);
+    row.extend_from_slice(cells);
+    row.resize(cols, Cell::default());
+    row.into()
+}
+
 /// A fixed-size screen of `fux_vt::Cell`s with a cursor, per-row soft-wrap flags and modes.
 ///
 /// Always exactly `rows` rows of exactly `cols` cells. A row's cells are shared, not copied,
@@ -98,34 +111,35 @@ impl Grid {
     /// holding this snapshot's rows.
     pub(super) fn of(screen: &fux_vt::Screen, cache: &mut RowCache) -> Self {
         let (rows, cols) = screen.size();
-        let mut grid = Self::blank(rows, cols);
         let window = screen.window(0, rows, cols);
         let mut next = RowCache::with_capacity(usize::from(rows));
-        for (row, line) in (0..rows).zip(grid.lines.iter_mut()) {
-            let Some(live) = window.row(row) else {
-                continue;
-            };
-            let cells = match cache.get(&live.id) {
-                Some(cells) if **cells == *live.cells => Arc::clone(cells),
-                // Live rows are exactly `cols` wide; copy what exists and leave any shortfall blank.
-                _ => {
-                    let mut cells = line.cells.to_vec();
-                    for (d, s) in cells.iter_mut().zip(live.cells) {
-                        *d = *s;
-                    }
-                    cells.into()
+        let lines = (0..rows)
+            .map(|row| {
+                let Some(live) = window.row(row) else {
+                    return Row {
+                        cells: exactly(&[], cols),
+                        wrapped: false,
+                    };
+                };
+                let cells = match cache.get(&live.id) {
+                    Some(cells) if **cells == *live.cells => Arc::clone(cells),
+                    _ => exactly(live.cells, cols),
+                };
+                next.insert(live.id, Arc::clone(&cells));
+                Row {
+                    cells,
+                    wrapped: live.wrapped,
                 }
-            };
-            next.insert(live.id, Arc::clone(&cells));
-            *line = Row {
-                cells,
-                wrapped: live.wrapped,
-            };
-        }
+            })
+            .collect();
         *cache = next;
-        grid.cursor = screen.cursor_position();
-        grid.modes = Modes::of(screen);
-        grid
+        Self {
+            rows,
+            cols,
+            lines,
+            cursor: screen.cursor_position(),
+            modes: Modes::of(screen),
+        }
     }
 
     /// `(rows, cols)`.

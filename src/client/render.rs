@@ -38,23 +38,25 @@ struct Painted {
     /// The grid. Its rows are shared with the screen it came from, so keeping it copies no cells.
     grid: Grid,
     /// The predictions drawn over it, in `(row, col)` order.
-    predicted: Vec<Drawn>,
+    predicted: Vec<Mark<String>>,
     status: bool,
     /// Whether the terminal may not show exactly this frame (see [`Painter`]).
     irregular: bool,
 }
 
-/// A prediction as it was drawn.
-struct Drawn {
+/// A prediction drawn over a cell: its glyph borrowed while a frame is painted (`&str`), owned
+/// once it has been (`String`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Mark<G> {
     row: u16,
     col: u16,
-    glyph: String,
+    glyph: G,
     fg: Color,
     bg: Color,
 }
 
-impl Drawn {
-    fn mark(&self) -> Mark<'_> {
+impl Mark<String> {
+    fn borrowed(&self) -> Mark<&str> {
         Mark {
             row: self.row,
             col: self.col,
@@ -65,19 +67,9 @@ impl Drawn {
     }
 }
 
-/// A prediction drawn over a cell.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Mark<'a> {
-    row: u16,
-    col: u16,
-    glyph: &'a str,
-    fg: Color,
-    bg: Color,
-}
-
-impl Mark<'_> {
-    fn drawn(self) -> Drawn {
-        Drawn {
+impl Mark<&str> {
+    fn owned(self) -> Mark<String> {
+        Mark {
             row: self.row,
             col: self.col,
             glyph: self.glyph.to_owned(),
@@ -88,7 +80,7 @@ impl Mark<'_> {
 }
 
 /// The marks of `marks` (in `(row, col)` order) on `row`.
-fn marks_on<'m, 'a>(marks: &'m [Mark<'a>], row: u16) -> &'m [Mark<'a>] {
+fn marks_on<'m, 'a>(marks: &'m [Mark<&'a str>], row: u16) -> &'m [Mark<&'a str>] {
     let start = marks.partition_point(|mark| mark.row < row);
     let end = marks.partition_point(|mark| mark.row <= row);
     marks.get(start..end).unwrap_or_default()
@@ -121,7 +113,7 @@ const fn plain(fg: Color, bg: Color) -> CellStyle {
 }
 
 /// What `grid` with the predictions `marks` draws at `(row, col)`.
-fn paint<'a>(grid: &'a Grid, marks: &[Mark<'a>], row: u16, col: u16) -> Paint<'a> {
+fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Paint<'a> {
     let cell = grid.cell(row, col);
     if cell.is_some_and(Cell::is_wide_continuation) {
         return Paint::Covered;
@@ -161,7 +153,7 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<'a>], row: u16, col: u16) -> Paint<'a
 
 /// Whether every glyph `grid` and `marks` draw on `row` fills exactly the cells the grid gives it:
 /// one column for a narrow cell, two for a wide one followed by the half it covers.
-fn regular(grid: &Grid, marks: &[Mark<'_>], row: u16) -> bool {
+fn regular(grid: &Grid, marks: &[Mark<&str>], row: u16) -> bool {
     let cols = grid.size().cols;
     let mut col = 0;
     while col < cols {
@@ -200,7 +192,7 @@ impl Painter {
         status: Option<&str>,
     ) -> io::Result<()> {
         let Size { rows, cols } = screen.size();
-        let marks: Vec<Mark<'_>> = overlay
+        let marks: Vec<Mark<&str>> = overlay
             .cells()
             .map(|((row, col), p)| Mark {
                 row,
@@ -219,10 +211,10 @@ impl Painter {
                 && last.grid.size() == screen.size()
                 && last.status == status.is_some()
         });
-        let last_marks: Vec<Mark<'_>> = last
+        let last_marks: Vec<Mark<&str>> = last
             .iter()
             .flat_map(|last| &last.predicted)
-            .map(Drawn::mark)
+            .map(Mark::borrowed)
             .collect();
         let status_row = status.map(|_| rows.saturating_sub(1));
         // The rows that differ from the last frame; the status line's row is repainted with it.
@@ -327,7 +319,7 @@ impl Painter {
         backend.end_frame()?;
         let painted = Painted {
             grid: screen.clone(),
-            predicted: marks.into_iter().map(Mark::drawn).collect(),
+            predicted: marks.into_iter().map(Mark::owned).collect(),
             status: status.is_some(),
             irregular: irregular || !fits,
         };

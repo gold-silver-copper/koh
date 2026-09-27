@@ -175,17 +175,15 @@ struct SessionHandle {
     control: mpsc::Sender<SessionMsg>,
 }
 
-/// Up to `limit` items `rx` already holds, without waiting. An end of the channel is left for the
-/// next `recv` to report.
-fn drain_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize) -> Vec<T> {
-    let mut ready = Vec::new();
-    while ready.len() < limit {
-        match rx.try_recv() {
-            Ok(item) => ready.push(item),
-            Err(_) => break,
-        }
+/// Hand `take` up to `limit` items `rx` already holds, without waiting, as they come off the
+/// channel. An end of the channel is left for the next `recv` to report.
+fn take_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize, mut take: impl FnMut(T)) {
+    for _ in 0..limit {
+        let Ok(item) = rx.try_recv() else {
+            break;
+        };
+        take(item);
     }
-    ready
 }
 
 /// Run one session: own the PTY host, drain its output into the emulator, publish each screen,
@@ -224,9 +222,9 @@ async fn session_task(
             chunk = pty_rx.recv(), if !exited => {
                 if let Some(chunk) = chunk {
                     host.emu.process(&chunk);
-                    for more in drain_ready(&mut pty_rx, OUTPUT_CHUNKS_PER_SNAPSHOT) {
+                    take_ready(&mut pty_rx, OUTPUT_CHUNKS_PER_SNAPSHOT, |more| {
                         host.emu.process(&more);
-                    }
+                    });
                     let replies = host.emu.take_host_replies();
                     if !replies.is_empty() {
                         // Query answers (DSR/DA/DECRQM) are host I/O, not screen content.
@@ -488,7 +486,7 @@ async fn attach_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_ready, OUTPUT_CHUNKS_PER_SNAPSHOT};
+    use super::{take_ready, OUTPUT_CHUNKS_PER_SNAPSHOT};
     use tokio::sync::mpsc;
 
     #[test]
@@ -497,14 +495,23 @@ mod tests {
         for n in 0..100 {
             tx.try_send(n).unwrap();
         }
-        let first = drain_ready(&mut rx, OUTPUT_CHUNKS_PER_SNAPSHOT);
-        assert_eq!(first, (0..OUTPUT_CHUNKS_PER_SNAPSHOT).collect::<Vec<_>>());
+        let taken = |rx: &mut mpsc::Receiver<usize>| {
+            let mut taken = Vec::new();
+            take_ready(rx, OUTPUT_CHUNKS_PER_SNAPSHOT, |n| taken.push(n));
+            taken
+        };
+        assert_eq!(
+            taken(&mut rx),
+            (0..OUTPUT_CHUNKS_PER_SNAPSHOT).collect::<Vec<_>>()
+        );
         drop(tx);
-        let rest = drain_ready(&mut rx, OUTPUT_CHUNKS_PER_SNAPSHOT);
-        assert_eq!(rest, (OUTPUT_CHUNKS_PER_SNAPSHOT..100).collect::<Vec<_>>());
+        assert_eq!(
+            taken(&mut rx),
+            (OUTPUT_CHUNKS_PER_SNAPSHOT..100).collect::<Vec<_>>()
+        );
         // The channel's end is not swallowed: the session loop's `recv` still sees it and reaps
         // the program.
-        assert!(drain_ready(&mut rx, OUTPUT_CHUNKS_PER_SNAPSHOT).is_empty());
+        assert!(taken(&mut rx).is_empty());
         assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
     }
 }

@@ -127,19 +127,12 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     let secret = identity.secret.clone();
 
     // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
-    let endpoint = if let Some(relay) = &args.relay_url {
-        bind_endpoint_with_relay(secret, true, relay.clone())
-            .await
-            .context("binding endpoint")?
-    } else if args.local {
-        bind_endpoint_local(secret, true)
-            .await
-            .context("binding endpoint")?
-    } else {
-        bind_endpoint(secret, true)
-            .await
-            .context("binding endpoint")?
-    };
+    let endpoint = match (&args.relay_url, args.local) {
+        (Some(relay), _) => bind_endpoint_with_relay(secret, true, relay.clone()).await,
+        (None, true) => bind_endpoint_local(secret, true).await,
+        (None, false) => bind_endpoint(secret, true).await,
+    }
+    .context("binding endpoint")?;
     let my_id = endpoint.id();
     let id_str = my_id.to_string();
 

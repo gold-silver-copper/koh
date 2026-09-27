@@ -512,14 +512,13 @@ impl TerminalScreen {
     /// The diff that turns `base` into `self`.
     pub fn diff_from(&self, base: &Self) -> ScreenDiff {
         let resized = self.size() != base.size();
-        let (rows, cols) = self.size();
-        let blank = vec![Cell::default(); usize::from(cols)];
+        let (rows, _) = self.size();
         let changed = (0..rows).filter_map(|r| {
             let cells = self.grid.row(r)?;
             let wrapped = self.grid.row_wrapped(r);
             // A row shared with the base is the same without comparing its cells.
             let same = if resized {
-                cells == blank.as_slice() && !wrapped
+                !wrapped && cells.iter().all(|cell| *cell == Cell::default())
             } else {
                 self.grid.row_eq(&base.grid, r)
             };

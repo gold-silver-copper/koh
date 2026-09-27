@@ -509,6 +509,19 @@ pub fn loopback_addr(ep: &Endpoint) -> EndpointAddr {
     addr
 }
 
+/// How long closing an endpoint waits for its peers to see the close.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+/// Close `endpoint`, waiting at most [`CLOSE_WAIT`] for its peers to see it; whether they did in
+/// time. iroh's close drains every connection for three probe timeouts of its slowest path, and a
+/// peer that vanished while paths to its other addresses were still being probed kept `koh serve`
+/// from exiting for over ten seconds after SIGTERM.
+pub(crate) async fn close_endpoint(endpoint: &Endpoint) -> bool {
+    tokio::time::timeout(CLOSE_WAIT, endpoint.close())
+        .await
+        .is_ok()
+}
+
 /// A dial-able [`EndpointAddr`] from a peer's id + a known direct socket address (LAN / loopback,
 /// no relay/discovery needed). Use with [`bind_endpoint_local`].
 pub fn direct_addr(id: EndpointId, addr: SocketAddr) -> EndpointAddr {

@@ -95,6 +95,10 @@ error; upgrade both ends.
 - A session at a large size whose program wrote a lot at once could make `koh serve` briefly take
   gigabytes of memory: the server took a whole new snapshot of the screen for every 8 KiB the
   program wrote. It now takes one per burst of output (up to 64 reads).
+- `koh serve` could take over ten seconds to exit after SIGTERM or Ctrl-C, when a client had just
+  vanished without closing its connection while iroh was still trying paths to the client's other
+  addresses (common on a phone, which has several). Closing the endpoint now waits at most two
+  seconds for peers to see it, as `koh connect` already did.
 - **A session whose program stopped reading its input could keep `koh serve` from ever exiting**
   on Linux and Android. Input is written to the terminal from a dedicated thread; once the
   terminal's input queue was full that write blocked, and the kernel never woke it — not even once

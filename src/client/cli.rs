@@ -209,9 +209,9 @@ async fn dial(
     }
 }
 
-/// Close `endpoint`, waiting at most two seconds for the peer to see it.
+/// Close `endpoint`, waiting a bounded time for the server to see it.
 async fn close_endpoint(endpoint: &iroh::Endpoint) {
-    let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.close()).await;
+    crate::transport_iroh::close_endpoint(endpoint).await;
 }
 
 /// Spawn a task that cancels `shutdown` on the first fatal signal (SIGTERM / SIGINT / SIGHUP), so

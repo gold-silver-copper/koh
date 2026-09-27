@@ -103,7 +103,22 @@ memory for its recent screens is counted in distinct rows. The server's live emu
 opt-in events (title, icon, bell, clipboard) and extended replies (DECRQM, DECXCPR, secondary DA)
 turned on. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
 cursor and the modes; after a resize the client starts from a blank grid and receives every
-non-blank row. The client validates and copies cells and never runs a terminal parser, so server
+non-blank row.
+
+Rows that only moved are moved, not sent. A scroll, of the whole screen or inside a scroll region,
+and an inserted or deleted line leave the rows they move holding the same cells, so the server finds
+them by the cells they share with the base, in runs that moved by the same offset, and sends each
+run as a `Shift { top, len, by }`: rows `top..top + len` of the base go to `top + by`. All shifts
+read the base, no two share a source or a destination row, and a row a shift left and none filled
+is blank, which is what a scroll brings in. The client moves those rows' cells (shared, not copied)
+before replacing the rows the diff carries, so a one-line scroll sends the shift (4 bytes on a
+24-row screen) and the new line, not the screen. Decoding checks what needs no screen size (at
+most 32 shifts, no zero length or offset, both ranges within 1000 rows, no shared rows); `apply`
+checks the ranges against the screen and refuses shifts with a resize, and drops the frame whole
+if anything is wrong. What a shift cannot say is sent as rows: a row moved and changed, a row that
+appears twice, a horizontal shift inside a row, and the shortest runs past the 32nd.
+
+The client validates and copies cells and never runs a terminal parser, so server
 bytes never reach one. That includes the user's terminal, which the client prints a cell's text to
 as is: decoding refuses a cell whose text holds a control character, so no escape sequence can
 ride in one.

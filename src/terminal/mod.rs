@@ -4,7 +4,8 @@
 //! A [`ScreenDiff`] carries the changed rows as run-length-encoded cells, the cursor and the modes.
 //! The client validates and copies cells; it never runs a terminal parser on server bytes.
 
-use std::num::NonZeroU16;
+use std::num::{NonZeroI16, NonZeroU16};
+use std::ops::Range;
 use std::sync::Arc;
 
 use fux_vt::{Attributes, Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
@@ -546,6 +547,139 @@ impl From<WireModes> for Modes {
     }
 }
 
+/// Most [`Shift`]s in one diff. Each costs at most O(rows) to apply; the server keeps the longest
+/// runs when it finds more.
+pub const MAX_SHIFTS: usize = 32;
+
+/// Rows of the base that moved: rows `top..top + len` go to `top + by..top + len + by` (a negative
+/// `by` is up).
+///
+/// Both ranges lie within `0..MAX_DIM`, which decoding checks; a zero length or offset fails to
+/// decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shift {
+    pub top: u16,
+    pub len: NonZeroU16,
+    pub by: NonZeroI16,
+}
+
+impl Shift {
+    /// The rows it moves, if within `0..MAX_DIM`.
+    pub fn source(self) -> Option<Range<u16>> {
+        let end = self.top.checked_add(self.len.get())?;
+        (end <= MAX_DIM).then_some(self.top..end)
+    }
+
+    /// The rows it moves them to, if within `0..MAX_DIM`.
+    pub fn destination(self) -> Option<Range<u16>> {
+        let source = self.source()?;
+        let moved =
+            |row: u16| u16::try_from(i32::from(row).checked_add(i32::from(self.by.get()))?).ok();
+        let (start, end) = (moved(source.start)?, moved(source.end)?);
+        (end <= MAX_DIM).then_some(start..end)
+    }
+
+    /// Each source row with its destination.
+    pub(crate) fn pairs(self) -> impl Iterator<Item = (u16, u16)> {
+        let source = self.source().unwrap_or_default();
+        let destination = self.destination().unwrap_or_default();
+        source.zip(destination)
+    }
+}
+
+/// Whether no two of `ranges` share a row.
+fn disjoint(ranges: &[Range<u16>]) -> bool {
+    ranges.iter().enumerate().all(|(i, a)| {
+        ranges
+            .iter()
+            .skip(i.saturating_add(1))
+            .all(|b| a.end <= b.start || b.end <= a.start)
+    })
+}
+
+/// The rows a diff moves before it replaces any.
+///
+/// At most [`MAX_SHIFTS`] [`Shift`]s, all reading the base, no two sharing a source row or a
+/// destination row. A row a shift moved and no shift moved into is blank.
+///
+/// Decoding checks all of that; only the screen's size is left for [`TerminalScreen::apply`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Shifts(Vec<Shift>);
+
+impl Shifts {
+    /// `shifts`, or `None` if there are too many, one leaves `0..MAX_DIM`, or two share a row.
+    pub fn new(shifts: Vec<Shift>) -> Option<Self> {
+        if shifts.len() > MAX_SHIFTS {
+            return None;
+        }
+        let sources: Vec<Range<u16>> = shifts.iter().map(|s| s.source()).collect::<Option<_>>()?;
+        let destinations: Vec<Range<u16>> = shifts
+            .iter()
+            .map(|s| s.destination())
+            .collect::<Option<_>>()?;
+        (disjoint(&sources) && disjoint(&destinations)).then_some(Self(shifts))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Shift> {
+        self.0.iter()
+    }
+
+    /// Whether every row they touch is within a screen of `rows` rows.
+    fn fit(&self, rows: u16) -> bool {
+        self.0.iter().all(|shift| {
+            shift.source().is_some_and(|s| s.end <= rows)
+                && shift.destination().is_some_and(|d| d.end <= rows)
+        })
+    }
+}
+
+impl<'a> IntoIterator for &'a Shifts {
+    type Item = &'a Shift;
+    type IntoIter = std::slice::Iter<'a, Shift>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'de> Deserialize<'de> for Shifts {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_seq(ShiftsVisitor)
+    }
+}
+
+/// Reads at most [`MAX_SHIFTS`] shifts, so a hostile length costs nothing, then checks them.
+struct ShiftsVisitor;
+
+impl<'de> de::Visitor<'de> for ShiftsVisitor {
+    type Value = Shifts;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "at most {MAX_SHIFTS} row shifts within the screen, no two sharing a row"
+        )
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Shifts, A::Error> {
+        let mut shifts = Vec::new();
+        while let Some(shift) = seq.next_element()? {
+            if shifts.len() == MAX_SHIFTS {
+                return Err(de::Error::invalid_length(
+                    MAX_SHIFTS.saturating_add(1),
+                    &self,
+                ));
+            }
+            shifts.push(shift);
+        }
+        Shifts::new(shifts).ok_or_else(|| de::Error::invalid_value(de::Unexpected::Seq, &self))
+    }
+}
+
 /// The change from one [`TerminalScreen`] to another, on the wire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenDiff {
@@ -566,7 +700,10 @@ pub struct ScreenDiff {
     pub cursor: (u16, u16),
     /// The modes at the target state.
     pub modes: WireModes,
-    /// Every row that differs from the base (or from blank after a resize), whole.
+    /// Rows of the base that moved, applied before `rows`: a scroll, in or out of a region, or an
+    /// inserted or deleted line. Never with a resize.
+    pub shifts: Shifts,
+    /// Every row that differs from the base once shifted (or from blank after a resize), whole.
     pub rows: Vec<RowDiff>,
 }
 
@@ -575,6 +712,21 @@ impl TerminalScreen {
     pub fn diff_from(&self, base: &Self) -> ScreenDiff {
         let resized = self.size() != base.size();
         let rows = self.size().rows;
+        // Rows that only moved are found by the cells they share with the base, and moved rather
+        // than sent.
+        let moves = if resized {
+            Vec::new()
+        } else {
+            self.grid.moves_from(&base.grid, rows)
+        };
+        let (shifts, moved) = match Shifts::new(moves) {
+            Some(shifts) if !shifts.is_empty() => match base.grid.shifted(&shifts) {
+                Some(moved) => (shifts, Some(moved)),
+                None => (Shifts::default(), None),
+            },
+            _ => (Shifts::default(), None),
+        };
+        let base_grid = moved.as_ref().unwrap_or(&base.grid);
         let changed = (0..rows).filter_map(|r| {
             let cells = self.grid.row(r)?;
             let wrapped = self.grid.row_wrapped(r);
@@ -582,7 +734,7 @@ impl TerminalScreen {
             let same = if resized {
                 !wrapped && cells.iter().all(|cell| *cell == Cell::default())
             } else {
-                self.grid.row_eq(&base.grid, r)
+                self.grid.row_eq(base_grid, r)
             };
             (!same).then(|| RowDiff::of(r, cells, wrapped))
         });
@@ -595,6 +747,7 @@ impl TerminalScreen {
             exit_code: self.exit_code,
             cursor: self.grid.cursor_position(),
             modes: self.grid.modes().into(),
+            shifts,
             rows: changed.collect(),
         }
     }
@@ -604,7 +757,9 @@ impl TerminalScreen {
         // All server-controlled: the grid is validated whole before any of it is committed, so a
         // malformed frame changes nothing. This clamp is what bounds the grid a resize allocates.
         let Size { rows, cols } = diff.resize.map_or_else(|| self.size(), clamp_dims);
-        if diff.rows.len() > usize::from(rows) {
+        if diff.rows.len() > usize::from(rows)
+            || (!diff.shifts.is_empty() && (diff.resize.is_some() || !diff.shifts.fit(rows)))
+        {
             return;
         }
         // Every row decodes into one staging buffer, `cols` cells each, in the diff's order. At
@@ -616,9 +771,16 @@ impl TerminalScreen {
                 return;
             }
         }
-        if diff.resize.is_some() {
-            self.grid = Grid::blank(Size { rows, cols });
-        }
+        let grid = if diff.resize.is_some() {
+            Grid::blank(Size { rows, cols })
+        } else {
+            // Rows move as shared cells, never copied.
+            let Some(moved) = self.grid.shifted(&diff.shifts) else {
+                return;
+            };
+            moved
+        };
+        self.grid = grid;
         // Only the rows the diff carries are replaced; the rest stay shared with the base.
         for (row, cells) in diff.rows.iter().zip(staged.chunks(width.max(1))) {
             self.grid.set_row(row.row, Arc::from(cells), row.wrapped);
@@ -727,6 +889,7 @@ mod tests {
             exit_code: None,
             cursor: (0, 0),
             modes: Modes::default().into(),
+            shifts: Shifts::default(),
             rows: Vec::new(),
         }
     }
@@ -774,6 +937,22 @@ mod tests {
             .prop_map(|(row, wrapped, runs)| RowDiff { row, wrapped, runs })
     }
 
+    /// Shifts of any shape: within a small screen or not, overlapping or not, as many as allowed.
+    fn shifts() -> impl proptest::strategy::Strategy<Value = Shifts> {
+        use proptest::prelude::*;
+        proptest::collection::vec(
+            (0u16..40, 1u16..40, -40i16..40).prop_filter_map("nonzero", |(top, len, by)| {
+                Some(Shift {
+                    top,
+                    len: NonZeroU16::new(len)?,
+                    by: NonZeroI16::new(by)?,
+                })
+            }),
+            0..4,
+        )
+        .prop_filter_map("valid shifts", Shifts::new)
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
 
@@ -784,6 +963,7 @@ mod tests {
         #[test]
         fn apply_is_panic_free_and_holds_invariants(
             rows in proptest::collection::vec(row_diff(), 0..6),
+            shifts in shifts(),
             resize in proptest::option::of((proptest::prelude::any::<u16>(), proptest::prelude::any::<u16>())),
             cursor in proptest::prelude::any::<(u16, u16)>(),
             modes in proptest::prelude::any::<(bool, bool, bool, bool)>(),
@@ -815,7 +995,7 @@ mod tests {
             };
             let resize = resize.map(|(rows, cols)| Size::new(rows, cols));
             let diff = ScreenDiff {
-                resize, title, icon, clipboard, bell_count, exit_code, cursor, modes, rows,
+                resize, title, icon, clipboard, bell_count, exit_code, cursor, modes, shifts, rows,
             };
             let mut screen = TerminalScreen::default();
             screen.apply(&diff); // must not panic on adversarial input
@@ -865,6 +1045,201 @@ mod tests {
             let mut client = base.clone();
             client.apply(&target.diff_from(&base));
             proptest::prop_assert_eq!(client, target);
+        }
+    }
+
+    /// Scroll-heavy output: text, line feeds at the bottom, scroll regions, scrolling up and down,
+    /// reverse index, inserted and deleted lines, erasing.
+    const SCROLL_PIECES: [&str; 14] = [
+        "text",
+        "\r\n",
+        "\r\nmore",
+        "\x1b[2;7r",
+        "\x1b[r",
+        "\x1b[7;1H",
+        "\x1b[2;1H\x1bM",
+        "\x1b[2S",
+        "\x1b[T",
+        "\x1b[3;1H\x1b[2L",
+        "\x1b[4;1H\x1b[M",
+        "\x1b[K",
+        "\x1b[2J",
+        "日本",
+    ];
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// Scrolling output diffs against any older frame (the acknowledged one can be several
+        /// back) and applies to exactly the server's screen, the moved rows shared with the base.
+        #[test]
+        fn scrolled_screens_roundtrip_from_any_older_base(
+            steps in proptest::collection::vec(
+                proptest::collection::vec(0..SCROLL_PIECES.len(), 1..5),
+                1..10,
+            ),
+            back in 1usize..4,
+        ) {
+            let mut emu = ServerTerminal::new(8, 12, 0).expect("emulator");
+            let mut frames = vec![emu.snapshot()];
+            for pieces in steps {
+                for piece in pieces {
+                    emu.process(SCROLL_PIECES[piece].as_bytes());
+                }
+                let target = emu.snapshot();
+                let base = &frames[frames.len().saturating_sub(back)];
+                let diff = target.diff_from(base);
+                let mut client = base.clone();
+                client.apply(&diff);
+                proptest::prop_assert_eq!(&client, &target);
+                // Every shifted row is shared with the base, not copied, unless the diff also carries
+                // it (its wrap flag changed).
+                for (from, to) in diff.shifts.iter().flat_map(|shift| shift.pairs()) {
+                    let sent = diff.rows.iter().any(|row| row.row == to);
+                    proptest::prop_assert!(sent || client.grid.lines_share(to, &base.grid, from));
+                }
+                frames.push(target);
+            }
+        }
+    }
+
+    /// The diff from `base_bytes` to `base_bytes` then `more` on a 24×80 screen, applied.
+    fn scrolled(base_bytes: &[u8], more: &[u8]) -> (TerminalScreen, TerminalScreen, ScreenDiff) {
+        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
+        emu.process(base_bytes);
+        let base = emu.snapshot();
+        emu.process(more);
+        let target = emu.snapshot();
+        let diff = target.diff_from(&base);
+        let mut client = base.clone();
+        client.apply(&diff);
+        assert_eq!(client, target);
+        (base, target, diff)
+    }
+
+    /// 24 numbered rows.
+    fn numbered() -> Vec<u8> {
+        let mut bytes = Vec::from(&b"\x1b[H\x1b[2J"[..]);
+        for i in 1..=24 {
+            bytes.extend_from_slice(format!("\x1b[{i};1Hrow {i}").as_bytes());
+        }
+        bytes
+    }
+
+    fn shift(top: u16, len: u16, by: i16) -> Shift {
+        Shift {
+            top,
+            len: NonZeroU16::new(len).unwrap(),
+            by: NonZeroI16::new(by).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_scroll_moves_rows_instead_of_sending_them() {
+        let mut lines = Vec::new();
+        for n in 0..30 {
+            lines.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        let (_, _, diff) = scrolled(&lines, b"new line\r\n");
+        assert_eq!(diff.shifts, Shifts(vec![shift(1, 22, -1)]));
+        // Only the line that arrived is sent: the new row at the bottom is blank, as it was.
+        assert_eq!(diff.rows.len(), 1);
+        assert_eq!(diff.rows[0].row, 22);
+    }
+
+    #[test]
+    fn a_scroll_in_a_region_inserted_and_deleted_lines_move_rows() {
+        // Each moves one run of rows and brings in blank rows, which the rows the shift left blank
+        // already are: no row is sent.
+        let cases: [(&[u8], Shift); 5] = [
+            // DECSTBM rows 5..=20, then a line feed at the region's bottom: rows 5..20 move up.
+            (b"\x1b[5;20r\x1b[20;1H\n", shift(5, 15, -1)),
+            // Reverse index at the region's top: rows 4..19 move down.
+            (b"\x1b[5;20r\x1b[5;1H\x1bM", shift(4, 15, 1)),
+            // Scroll down two lines in the region.
+            (b"\x1b[5;20r\x1b[2T", shift(4, 14, 2)),
+            // Insert two lines at row 3: rows 3..22 move down.
+            (b"\x1b[3;1H\x1b[2L", shift(2, 20, 2)),
+            // Delete a line at row 10: the rows below move up.
+            (b"\x1b[10;1H\x1b[M", shift(10, 14, -1)),
+        ];
+        for (more, expected) in cases {
+            let (_, _, diff) = scrolled(&numbered(), more);
+            assert_eq!(diff.shifts, Shifts(vec![expected]), "{more:?}");
+            assert_eq!(diff.rows, Vec::<RowDiff>::new(), "{more:?}");
+        }
+    }
+
+    #[test]
+    fn a_resize_sends_no_shifts() {
+        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
+        emu.process(&numbered());
+        let base = emu.snapshot();
+        emu.resize(Size::new(24, 100));
+        emu.process(b"\r\n");
+        let diff = emu.snapshot().diff_from(&base);
+        assert!(diff.resize.is_some() && diff.shifts.is_empty());
+    }
+
+    #[test]
+    fn malformed_shifts_drop_the_whole_frame() {
+        let (base, target, good) = scrolled(&numbered(), b"\x1b[24;1H\nlast");
+        assert!(!good.shifts.is_empty());
+        let mutations: [fn(&mut ScreenDiff); 4] = [
+            // Past the bottom of a 24-row screen, though within `MAX_DIM`.
+            |d| d.shifts = Shifts(vec![shift(20, 5, -1)]),
+            |d| d.shifts = Shifts(vec![shift(0, 24, 1)]),
+            // With a resize.
+            |d| d.resize = Some(Size::new(24, 80)),
+            // A row the shifts must bring into place is not sent: the frame is still well formed,
+            // so this one applies, to something other than the target.
+            |d| d.shifts = Shifts::default(),
+        ];
+        for (i, mutate) in mutations.iter().enumerate() {
+            let mut diff = good.clone();
+            mutate(&mut diff);
+            let mut c = base.clone();
+            c.apply(&diff);
+            if i == 3 {
+                assert_ne!(c, target, "the shifts matter");
+            } else {
+                assert_eq!(c, base, "mutation {i} must drop the frame");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_shifts_fail_to_decode() {
+        let with = |shifts: &[(u16, u16, i16)]| {
+            let mut raw = raw_two_by_two();
+            raw.resize = None;
+            raw.shifts = shifts
+                .iter()
+                .map(|&(top, len, by)| RawShift { top, len, by })
+                .collect();
+            decode_raw(&raw)
+        };
+        assert!(with(&[(0, 1, 1)]).is_ok());
+        assert!(with(&[(0, 1, 1), (5, 2, -1)]).is_ok());
+        let spread: Vec<(u16, u16, i16)> = (0..=MAX_SHIFTS)
+            .map(|i| (u16::try_from(i * 3).unwrap(), 1, 1))
+            .collect();
+        assert!(
+            with(&spread[..MAX_SHIFTS]).is_ok(),
+            "the most shifts allowed"
+        );
+        let bad: [&[(u16, u16, i16)]; 8] = [
+            &[(0, 1, 0)],              // a zero offset
+            &[(0, 0, 1)],              // an empty shift
+            &[(0, 1, -1)],             // above the top
+            &[(MAX_DIM - 1, 2, 1)],    // past MAX_DIM
+            &[(MAX_DIM - 2, 1, 2)],    // moved past MAX_DIM
+            &[(0, 3, 5), (2, 1, 9)],   // two sources share a row
+            &[(0, 2, 5), (10, 2, -4)], // two destinations share a row
+            &spread,                   // one too many
+        ];
+        for (i, shifts) in bad.iter().enumerate() {
+            assert!(with(shifts).is_err(), "case {i} must fail to decode");
         }
     }
 
@@ -987,7 +1362,15 @@ mod tests {
         exit_code: Option<u32>,
         cursor: (u16, u16),
         modes: RawModes,
+        shifts: Vec<RawShift>,
         rows: Vec<RawRow>,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct RawShift {
+        top: u16,
+        len: u16,
+        by: i16,
     }
 
     #[derive(Clone, Serialize)]
@@ -1040,6 +1423,7 @@ mod tests {
                 mouse_mode: 4,
                 mouse_encoding: 2,
             },
+            shifts: Vec::new(),
             rows: vec![RawRow {
                 row: 0,
                 wrapped: false,

@@ -46,8 +46,9 @@ error; upgrade both ends.
   and `zeroize` are no longer dependencies.
 - **Terminal emulation is `fux-vt`, and the client runs no parser.** The server's emulator is
   `fux_vt::Parser`, a bounded, panic-free emulator; `vt100` is no longer a dependency. The screen
-  diff is now structured: every changed row whole, as run-length-encoded cells, plus the cursor and
-  modes. It replaces vt100's escape-sequence patch, which the client used to replay through its
+  diff is now structured: the rows that only moved (a scroll, in or out of a scroll region, an
+  inserted or deleted line) as row shifts, every other changed row whole, as run-length-encoded
+  cells, plus the cursor and modes. It replaces vt100's escape-sequence patch, which the client used to replay through its
   own vt100 parser. The client validates every row and cell, a cell's text included (it may hold
   no control character, so it cannot carry an escape sequence to the user's terminal), and drops a
   malformed frame whole, so server bytes never reach a terminal parser on the client. The `catch_unwind` containment and the
@@ -89,6 +90,10 @@ error; upgrade both ends.
   the whole screen, so a keystroke's echo is a few bytes and the link-down banner no longer repaints
   every cell every 50 ms. What the terminal shows is unchanged; the whole screen is still repainted
   on the first frame, after a resize or `Ctrl-^ Ctrl-Z`, and when the status line appears or goes.
+- Output that scrolls sends far less: rows that only moved are moved by the client, not sent again,
+  so a line scrolling in costs that line, not the screen: `seq` at one line per frame sends under a
+  third of the bytes it did at 80×24 and a sixth at 200×50, full-width lines at 200×50 a
+  fourteenth. The server's diff and the client's apply take a fraction of the CPU they did.
 - Updated `iroh` 1.0.0 → 1.2.0 (with its QUIC backend `noq` 1.0.0 → 1.3.0), which clears Cargo's
   warning that iroh 1.0.0 contains code a future Rust will reject. Also `serde` 1.0.228 → 1.0.229
   and `miniz_oxide` 0.8 → 0.9; every other dependency's minimum version is now the release koh is

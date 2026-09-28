@@ -22,7 +22,7 @@ fn check(screen: &TerminalScreen) {
     assert!((MIN_DIM..=MAX_DIM).contains(&rows) && (MIN_DIM..=MAX_DIM).contains(&cols));
     for row in 0..rows {
         assert_eq!(
-            screen.screen().row(row).map(<[_]>::len),
+            screen.screen().row(row).map(|cells| cells.len()),
             Some(usize::from(cols))
         );
     }

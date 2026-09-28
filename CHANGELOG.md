@@ -114,6 +114,12 @@ error; upgrade both ends.
   warning that iroh 1.0.0 contains code a future Rust will reject. Also `serde` 1.0.228 → 1.0.229
   and `miniz_oxide` 0.8 → 0.9; every other dependency's minimum version is now the release koh is
   tested against (for example `tokio` 1.53.1, `fux-vt` 0.1.3).
+- Updated `fux-vt` 0.1.5 → 0.2.0. Each grapheme cluster (an emoji with its joiners or modifiers, a
+  flag, a letter with its marks) is kept whole in one cell and shown as one glyph, where it was
+  split across cells before, and a variation selector that makes a character wide now does. Cells
+  also carry the underline colour (SGR 58), hidden, strikeout and slow or rapid blink, which
+  `koh connect` draws. The koh/3 cell encoding changes with it: a cell's text may be up to 128
+  bytes, its style is two bytes, and it carries an underline colour.
 - Updated `fux-vt` 0.1.3 → 0.1.5, which changes a row's version only when an edit changes the row.
   A program that redraws lines it left as they were (each line's text, then erase to its end) no
   longer makes `koh serve` compare the whole screen: such a redraw costs the server 7 µs a frame

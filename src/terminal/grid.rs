@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::num::{NonZeroI16, NonZeroU16};
 use std::sync::Arc;
 
-use fux_vt::{Cell, MouseProtocolEncoding, MouseProtocolMode, RowId};
+use fux_vt::{Cell, CellRef, Cells, MouseProtocolEncoding, MouseProtocolMode, RowId};
 
 use super::{Shift, Shifts, MAX_SHIFTS};
 use crate::predict::{CellView, ScreenView, Size};
@@ -35,11 +35,11 @@ impl Modes {
     }
 }
 
-/// One row of a [`Grid`]: its cells, shared by every screen that holds the row unchanged, and
-/// whether it soft-wraps into the next.
+/// One row of a [`Grid`]: its cells with their text, shared by every screen that holds the row
+/// unchanged, and whether it soft-wraps into the next.
 #[derive(Clone, Debug)]
 struct Row {
-    cells: Arc<[Cell]>,
+    cells: Arc<Cells>,
     wrapped: bool,
 }
 
@@ -47,7 +47,7 @@ impl Row {
     /// A row of `cols` blank cells.
     fn blank(cols: u16) -> Self {
         Self {
-            cells: vec![Cell::default(); usize::from(cols)].into(),
+            cells: Arc::new(Cells::new(usize::from(cols))),
             wrapped: false,
         }
     }
@@ -58,8 +58,8 @@ impl Row {
     }
 
     /// The allocation this row's cells live in, which every row sharing them has too.
-    fn id(&self) -> *const Cell {
-        Arc::as_ptr(&self.cells).cast()
+    fn id(&self) -> *const Cells {
+        Arc::as_ptr(&self.cells)
     }
 }
 
@@ -90,7 +90,7 @@ impl RowCache {
         index: usize,
         live: &fux_vt::Row<'_>,
         by_id: &mut Option<HashMap<RowId, usize>>,
-    ) -> Option<Arc<[Cell]>> {
+    ) -> Option<Arc<Cells>> {
         let at = if self.ids.get(index).is_some_and(|(id, _)| *id == live.id) {
             index
         } else {
@@ -108,7 +108,7 @@ impl RowCache {
         // a row at the version it was cached at holds the same cells without comparing them. A
         // row with a new version may still hold the same cells (erased, then written back), so it
         // is compared.
-        (cells.len() == live.cells.len() && (*version == live.version || **cells == *live.cells))
+        (cells.len() == live.len() && (*version == live.version || cells.iter().eq(live.cells())))
             .then(|| Arc::clone(cells))
     }
 
@@ -121,23 +121,20 @@ impl RowCache {
                     live.id == *id
                         && live.version == *version
                         && live.wrapped == line.wrapped
-                        && live.cells.len() == line.cells.len()
+                        && live.len() == line.cells.len()
                 },
             )
     }
 }
 
-/// `cells` as a row exactly `cols` wide. A live row is exactly that wide, and is copied once into
-/// its own allocation; anything longer is cut, anything shorter padded with blank cells.
-fn exactly(cells: &[Cell], cols: u16) -> Arc<[Cell]> {
-    let cols = usize::from(cols);
-    if let Some(row) = cells.get(..cols) {
-        return row.into();
+/// A copy of `row`, cells and text, exactly `cols` wide. A live row is exactly that wide;
+/// anything longer is cut, anything shorter padded with blank cells.
+fn exactly(row: Option<&fux_vt::Row<'_>>, cols: u16) -> Arc<Cells> {
+    let mut cells: Cells = row.map_or_else(Cells::default, |row| row.cells().collect());
+    if cells.len() != usize::from(cols) {
+        cells.resize(usize::from(cols), Cell::default());
     }
-    let mut row = Vec::with_capacity(cols);
-    row.extend_from_slice(cells);
-    row.resize(cols, Cell::default());
-    row.into()
+    Arc::new(cells)
 }
 
 /// A screen of `fux_vt::Cell`s with a cursor, soft-wrap flags and modes.
@@ -179,14 +176,14 @@ impl Grid {
                 .map(|index| {
                     let Some(row) = live.get(index) else {
                         return Row {
-                            cells: exactly(&[], cols),
+                            cells: exactly(None, cols),
                             wrapped: false,
                         };
                     };
                     Row {
                         cells: cache
                             .cells(index, row, &mut by_id)
-                            .unwrap_or_else(|| exactly(row.cells, cols)),
+                            .unwrap_or_else(|| exactly(Some(row), cols)),
                         wrapped: row.wrapped,
                     }
                 })
@@ -207,12 +204,12 @@ impl Grid {
     }
 
     /// The cell at `(row, col)`, or `None` out of bounds.
-    pub fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
+    pub fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>> {
         self.row(row)?.get(usize::from(col))
     }
 
     /// One row's cells, or `None` out of bounds.
-    pub fn row(&self, row: u16) -> Option<&[Cell]> {
+    pub fn row(&self, row: u16) -> Option<&Cells> {
         self.lines.get(usize::from(row)).map(|line| &*line.cells)
     }
 
@@ -385,7 +382,7 @@ impl Grid {
         seen: impl IntoIterator<Item = &'a Self>,
         grids: impl IntoIterator<Item = &'a Self>,
     ) -> usize {
-        let mut ids: std::collections::HashSet<*const Cell> = seen
+        let mut ids: std::collections::HashSet<*const Cells> = seen
             .into_iter()
             .flat_map(|grid| grid.lines.iter().map(Row::id))
             .collect();
@@ -399,7 +396,7 @@ impl Grid {
 
     /// Replace `row` with `cells`, which must be exactly `cols` long. Out of bounds or a wrong
     /// length changes nothing.
-    pub(super) fn set_row(&mut self, row: u16, cells: Arc<[Cell]>, wrapped: bool) {
+    pub(super) fn set_row(&mut self, row: u16, cells: Arc<Cells>, wrapped: bool) {
         if cells.len() != usize::from(self.size.cols) {
             return;
         }
@@ -417,7 +414,7 @@ impl Grid {
             return 0;
         };
         // Sorted, rows sharing an allocation sit together: cheaper than hashing every row.
-        let mut rows: Vec<(*const Cell, usize)> = first
+        let mut rows: Vec<(*const Cells, usize)> = first
             .lines
             .iter()
             .map(|line| (line.id(), line.cells.len()))
@@ -438,7 +435,7 @@ impl Grid {
     /// with `base` or with one already read is skipped.
     pub fn cells_beyond<'a>(base: &Self, grids: impl IntoIterator<Item = &'a Self>) -> usize {
         let mut read: Vec<*const [Row]> = vec![Arc::as_ptr(&base.lines)];
-        let mut others: HashMap<*const Cell, usize> = HashMap::new();
+        let mut others: HashMap<*const Cells, usize> = HashMap::new();
         for grid in grids {
             let lines = Arc::as_ptr(&grid.lines);
             if read.contains(&lines) {
@@ -490,8 +487,8 @@ impl Grid {
         for row in 0..self.size.rows {
             let line: String = self
                 .row(row)
-                .unwrap_or_default()
-                .iter()
+                .into_iter()
+                .flat_map(Cells::iter)
                 .filter(|c| !c.is_wide_continuation())
                 .map(|c| if c.has_contents() { c.contents() } else { " " })
                 .collect();
@@ -510,7 +507,7 @@ impl Grid {
 
 /// Where each row of `grid` that `rows` picks is, by the allocation of its cells: `None` for cells
 /// two of them share.
-fn unique_rows(grid: &Grid, rows: &[bool]) -> HashMap<*const Cell, Option<u16>> {
+fn unique_rows(grid: &Grid, rows: &[bool]) -> HashMap<*const Cells, Option<u16>> {
     let mut found = HashMap::new();
     for ((row, line), _) in (0_u16..)
         .zip(grid.lines.iter())

@@ -129,6 +129,13 @@ bytes never reach one. That includes the user's terminal, which the client print
 as is: decoding refuses a cell whose text holds a control character, so no escape sequence can
 ride in one.
 
+A cell is one grapheme cluster, as fux-vt 0.2 segments output (UAX #29): a ZWJ emoji sequence, a
+flag or a base with its marks stays in one cell, whose width is the cluster's. A cluster of up to 17
+bytes is held in the cell; a longer one, up to 128, in its row's text (`fux_vt::Cells`), which the
+client rebuilds as it decodes the row. On the wire a cell carries its cluster (at most 128 bytes),
+its kind, its colours, its underline colour and its style bits: bold, dim, italic, underline,
+inverse, hidden, strikeout and a slow or rapid blink.
+
 ## Headless drivers (the protocol is I/O-free; the shells are thin)
 
 Both ends split into a synchronous, I/O-free core and a thin async shell. The client's

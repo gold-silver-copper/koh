@@ -64,9 +64,13 @@ impl ServerTerminal {
     /// the allocation (see [`MAX_SCROLLBACK`](crate::server::cli::MAX_SCROLLBACK)).
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Result<Self, fux_vt::Error> {
         let Size { rows, cols } = clamp_dims(Size { rows, cols });
+        // Not the kitty keyboard protocol: koh forwards the keys the user's terminal sends, so a
+        // program told it may use the protocol would get keys it did not ask for. No reflow and no
+        // terminal identity either: a resize and the answers to queries stay as they were.
         let options = Options {
             events: true,
             extended_replies: true,
+            ..Options::default()
         };
         Ok(Self {
             parser: Parser::with_options(rows, cols, scrollback, options)?,

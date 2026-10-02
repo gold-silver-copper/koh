@@ -8,8 +8,8 @@ use std::io;
 use super::backend::{CellStyle, KohBackend};
 use crate::predict::Overlay;
 use crate::terminal::{Grid, Size, MAXIMUM_CLIPBOARD_SIZE};
-use fux_vt::{Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
-use unicode_width::UnicodeWidthChar as _;
+use fux_vt::{Blink, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode};
+use unicode_width::UnicodeWidthStr as _;
 
 /// What the terminal was last painted with, so the next frame paints only what changed.
 ///
@@ -155,8 +155,11 @@ fn repaint_cost(differs: impl Iterator<Item = bool>, limit: usize) -> usize {
 fn worth(scroll: Scroll, screen: &Grid, painted: &Grid) -> bool {
     let mut with = SCROLL_COST;
     for row in (scroll.top..scroll.bottom).filter(|&row| scroll.source(row).is_none()) {
-        let cells = screen.row(row).unwrap_or_default();
-        let differs = cells.iter().map(|cell| !shows_blank(cell));
+        let differs = screen
+            .row(row)
+            .into_iter()
+            .flat_map(Cells::iter)
+            .map(|cell| !shows_blank(cell));
         with = with.saturating_add(repaint_cost(differs, usize::MAX));
     }
     let mut without = 0_usize;
@@ -165,7 +168,10 @@ fn worth(scroll: Scroll, screen: &Grid, painted: &Grid) -> bool {
             continue;
         };
         let left = with.saturating_sub(without);
-        let differs = now.iter().zip(before).map(|(now, before)| now != before);
+        let differs = now
+            .iter()
+            .zip(before.iter())
+            .map(|(now, before)| now != before);
         without = without.saturating_add(repaint_cost(differs, left));
         if without > with {
             return true;
@@ -216,7 +222,7 @@ fn shown_after(rows: u16, scrolls: &[Scroll]) -> Vec<Option<u16>> {
 }
 
 /// Whether `cell` draws what a row a scroll brought in shows: a blank in the default style.
-fn shows_blank(cell: &Cell) -> bool {
+fn shows_blank(cell: CellRef<'_>) -> bool {
     !cell.is_wide()
         && !cell.is_wide_continuation()
         && matches!(cell.contents(), "" | " ")
@@ -255,11 +261,15 @@ const fn plain(fg: Color, bg: Color) -> CellStyle {
     CellStyle {
         fg,
         bg,
+        underline_color: Color::Default,
         bold: false,
         dim: false,
         italic: false,
         underline: false,
         inverse: false,
+        hidden: false,
+        strikeout: false,
+        blink: Blink::None,
     }
 }
 
@@ -289,9 +299,9 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
         };
     }
     let cell = grid.cell(row, col);
-    let other_half = if cell.is_some_and(Cell::is_wide_continuation) {
+    let other_half = if cell.is_some_and(|c| c.is_wide_continuation()) {
         col.checked_sub(1)
-    } else if cell.is_some_and(Cell::is_wide) {
+    } else if cell.is_some_and(|c| c.is_wide()) {
         col.checked_add(1)
     } else {
         None
@@ -314,19 +324,20 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
         return Paint::Covered;
     }
     Paint::Glyph {
-        glyph: if c.contents().is_empty() {
-            " "
-        } else {
-            c.contents()
-        },
+        // Read without its text when it has none, as most cells.
+        glyph: if c.has_contents() { c.contents() } else { " " },
         style: CellStyle {
             fg: c.fgcolor(),
             bg: c.bgcolor(),
+            underline_color: c.underline_color(),
             bold: c.bold(),
             dim: c.dim(),
             italic: c.italic(),
             underline: c.underline(),
             inverse: c.inverse(),
+            hidden: c.hidden(),
+            strikeout: c.strikeout(),
+            blink: c.blink(),
         },
         span: if c.is_wide() { 2 } else { 1 },
     }
@@ -341,9 +352,9 @@ fn regular(grid: &Grid, marks: &[Mark<&str>], row: u16) -> bool {
         let Paint::Glyph { glyph, span, .. } = paint(grid, marks, row, col) else {
             return false; // a half no glyph covers
         };
-        let columns = glyph
-            .chars()
-            .fold(0_usize, |sum, c| sum.saturating_add(c.width().unwrap_or(0)));
+        // A cluster's width as fux-vt measures it, the string's: a variation selector or a
+        // joiner can make a sequence of narrow characters wide.
+        let columns = glyph.width();
         let covers = span == 1
             || col
                 .checked_add(1)
@@ -764,7 +775,6 @@ mod tests {
     use super::*;
     use crate::client::backend::CaptureBackend;
     use crate::predict::{DisplayPreference, PredictedCell, PredictionEngine};
-    use unicode_width::UnicodeWidthStr as _;
 
     fn screen_of(bytes: &[u8]) -> Grid {
         crate::terminal::TerminalScreen::from_bytes(24, 80, bytes)
@@ -1307,6 +1317,26 @@ mod tests {
     }
 
     #[test]
+    fn a_cluster_a_variation_selector_widens_is_painted_in_place() {
+        // "❤️" is two narrow characters that fux-vt keeps as one wide cell; measured as a string it
+        // fills that cell exactly, so a change elsewhere paints only itself.
+        let mut painter = Painter::default();
+        paint_frame(
+            &mut painter,
+            &screen_of("\u{2764}\u{fe0f}ab".as_bytes()),
+            &Overlay::empty(),
+            None,
+        );
+        let changed = paint_frame(
+            &mut painter,
+            &screen_of("\u{2764}\u{fe0f}aB".as_bytes()),
+            &Overlay::empty(),
+            None,
+        );
+        assert_eq!(changed, framed(&format!("\x1b[1;4H{PLAIN}B\x1b[m"), "1;5"));
+    }
+
+    #[test]
     fn a_malformed_grid_repaints_everything_twice() {
         // A hostile server's wide glyph in the last column, which the terminal cannot show where
         // the grid puts it: it lays the row out its own way, so that frame and the next are painted
@@ -1319,6 +1349,7 @@ mod tests {
             kind,
             fg: WireColor::Default,
             bg: WireColor::Default,
+            underline_color: WireColor::Default,
             style: WireStyle::default(),
         };
         let mut diff = blank.diff_from(&blank);
@@ -1339,7 +1370,7 @@ mod tests {
         let mut malformed = blank.clone();
         malformed.apply(&diff);
         let malformed = malformed.screen().clone();
-        assert!(malformed.cell(0, 79).is_some_and(Cell::is_wide));
+        assert!(malformed.cell(0, 79).is_some_and(|c| c.is_wide()));
         let mut painter = Painter::default();
         paint_frame(&mut painter, blank.screen(), &Overlay::empty(), None);
         assert_eq!(
@@ -1506,10 +1537,18 @@ mod tests {
         assert!(painted.contains(&letters(6)), "{painted:?}");
     }
 
-    /// Output that exercises what a frame can change: text, wide glyphs, combining marks,
-    /// colours and attributes, cursor motion, erasing, scrolling (the whole screen and in a region,
-    /// up and down), inserting and deleting lines, wrapping.
-    const PIECES: [&str; 29] = [
+    /// Output that exercises what a frame can change: text, wide glyphs, combining marks, clusters
+    /// (a ZWJ family, a flag, a heart a variation selector widens), colours and every attribute,
+    /// cursor motion, erasing, scrolling (the whole screen and in a region, up and down),
+    /// inserting and deleting lines, wrapping.
+    const PIECES: [&str; 36] = [
+        "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
+        "\u{1f1fa}\u{1f1f8}",
+        "\u{2764}\u{fe0f}",
+        "\x1b[5;9m",
+        "\x1b[6m",
+        "\x1b[8m",
+        "\x1b[4;58;5;9m",
         "a",
         "xyz",
         "日",
@@ -1551,21 +1590,30 @@ mod tests {
         "x",
     ];
 
+    /// What a cell shows: its text, whether it is either half of a wide glyph, its attributes.
+    type Look = (String, bool, bool, fux_vt::Attributes);
+
     /// The cells and cursor a terminal shows. A printed space shows what an erased cell of its
     /// attributes does, the blank a whole repaint prints and a scroll brings in, so it counts as
     /// one.
-    fn shown(terminal: &fux_vt::Parser) -> (Vec<Option<Cell>>, (u16, u16)) {
+    fn shown(terminal: &fux_vt::Parser) -> (Vec<Option<Look>>, (u16, u16)) {
         let screen = terminal.screen();
         let (rows, cols) = screen.size();
         let cells = (0..rows)
             .flat_map(|row| (0..cols).map(move |col| (row, col)))
             .map(|(row, col)| {
                 screen.cell(row, col).map(|cell| {
-                    if cell.contents() == " " {
-                        Cell::new("", false, cell.attributes()).unwrap()
+                    let text = if cell.contents() == " " {
+                        ""
                     } else {
-                        *cell
-                    }
+                        cell.contents()
+                    };
+                    (
+                        text.to_owned(),
+                        cell.is_wide(),
+                        cell.is_wide_continuation(),
+                        cell.attributes(),
+                    )
                 })
             })
             .collect();

@@ -7,7 +7,7 @@
 use std::fmt;
 use std::io;
 
-use fux_vt::Color;
+use fux_vt::{Blink, Color};
 
 use crate::terminal::Size;
 
@@ -28,11 +28,15 @@ pub(crate) const RESET_FORWARDED_MODES: &[u8] =
 pub struct CellStyle {
     pub fg: Color,
     pub bg: Color,
+    pub underline_color: Color,
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
+    pub hidden: bool,
+    pub strikeout: bool,
+    pub blink: Blink,
 }
 
 /// The terminal `koh connect` paints on. Output is buffered until [`flush`](Self::flush), once per
@@ -147,8 +151,21 @@ pub trait KohBackend {
         if style.inverse {
             self.write_bytes(b"\x1b[7m")?;
         }
+        if style.hidden {
+            self.write_bytes(b"\x1b[8m")?;
+        }
+        if style.strikeout {
+            self.write_bytes(b"\x1b[9m")?;
+        }
+        match style.blink {
+            Blink::None => {}
+            Blink::Slow => self.write_bytes(b"\x1b[5m")?,
+            Blink::Rapid => self.write_bytes(b"\x1b[6m")?,
+        }
         write_sgr_color(self, style.fg, true)?;
-        write_sgr_color(self, style.bg, false)
+        write_sgr_color(self, style.bg, false)?;
+        // Only when set: a terminal that does not know SGR 58 may read its parameters as others.
+        write_underline_color(self, style.underline_color)
     }
 
     /// Reset all SGR attributes (`ESC [ m`, the zero-parameter form).
@@ -194,6 +211,16 @@ pub trait KohBackend {
     /// Write the sequences that set the program's input modes.
     fn write_input_modes(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.write_bytes(bytes)
+    }
+}
+
+/// Emit `color` as the underline colour (SGR 58), unless it is the default (the text's colour),
+/// which the reset before every style already restored.
+fn write_underline_color(out: &mut (impl KohBackend + ?Sized), color: Color) -> io::Result<()> {
+    match color {
+        Color::Default => Ok(()),
+        Color::Idx(i) => write!(out, "\x1b[58;5;{i}m"),
+        Color::Rgb(r, g, b) => write!(out, "\x1b[58;2;{r};{g};{b}m"),
     }
 }
 
@@ -352,6 +379,40 @@ mod tests {
         let bytes = emit(KohBackend::leave_alt_screen);
         assert!(bytes.starts_with(RESET_FORWARDED_MODES));
         assert!(bytes.ends_with(b"\x1b[?25h\x1b[?1049l"));
+    }
+
+    #[test]
+    fn a_style_emits_every_attribute_it_has() {
+        let style = CellStyle {
+            fg: Color::Idx(1),
+            bg: Color::Default,
+            underline_color: Color::Rgb(1, 2, 3),
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: true,
+            inverse: false,
+            hidden: true,
+            strikeout: true,
+            blink: Blink::Rapid,
+        };
+        assert_eq!(
+            emit(|b| b.set_style(style)),
+            b"\x1b[m\x1b[4m\x1b[8m\x1b[9m\x1b[6m\x1b[31m\x1b[49m\x1b[58;2;1;2;3m"
+        );
+        let plain = CellStyle {
+            underline_color: Color::Default,
+            hidden: false,
+            strikeout: false,
+            blink: Blink::None,
+            underline: false,
+            ..style
+        };
+        assert_eq!(emit(|b| b.set_style(plain)), b"\x1b[m\x1b[31m\x1b[49m");
+        assert_eq!(
+            emit(|b| write_underline_color(b, Color::Idx(200))),
+            b"\x1b[58;5;200m"
+        );
     }
 
     #[test]

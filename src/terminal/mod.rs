@@ -8,7 +8,9 @@ use std::num::{NonZeroI16, NonZeroU16};
 use std::ops::Range;
 use std::sync::Arc;
 
-use fux_vt::{Attributes, Cell, Color, MouseProtocolEncoding, MouseProtocolMode};
+use fux_vt::{
+    Attributes, Blink, Cell, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode,
+};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 mod grid;
@@ -197,95 +199,166 @@ pub enum CellKind {
     Continuation,
 }
 
-/// A cell's style on the wire: one bit per attribute. Decoding rejects any bit outside the five
-/// defined, so every value holds only known bits.
+/// A cell's style on the wire: one bit per attribute, and for blinking one of two. Decoding rejects
+/// any bit outside those defined, and both blinks at once, so every value is a style a cell can
+/// have.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WireStyle(u8);
+pub struct WireStyle(u16);
 
 impl WireStyle {
-    pub const BOLD: u8 = 1;
-    pub const DIM: u8 = 2;
-    pub const ITALIC: u8 = 4;
-    pub const UNDERLINE: u8 = 8;
-    pub const INVERSE: u8 = 16;
-    const ALL: u8 = 31;
+    pub const BOLD: u16 = 1;
+    pub const DIM: u16 = 2;
+    pub const ITALIC: u16 = 4;
+    pub const UNDERLINE: u16 = 8;
+    pub const INVERSE: u16 = 16;
+    pub const HIDDEN: u16 = 32;
+    pub const STRIKEOUT: u16 = 64;
+    pub const BLINK_SLOW: u16 = 128;
+    pub const BLINK_RAPID: u16 = 256;
+    const ALL: u16 = 511;
 
-    /// The style with exactly `bits`, or `None` if any is not a defined bit.
-    pub const fn new(bits: u8) -> Option<Self> {
-        if bits & !Self::ALL == 0 {
+    /// The style with exactly `bits`, or `None` if any is not a defined bit, or both blinks are.
+    pub const fn new(bits: u16) -> Option<Self> {
+        let blinks = Self::BLINK_SLOW | Self::BLINK_RAPID;
+        if bits & !Self::ALL == 0 && bits & blinks != blinks {
             Some(Self(bits))
         } else {
             None
         }
     }
 
-    pub const fn bits(self) -> u8 {
+    pub const fn bits(self) -> u16 {
         self.0
     }
 
-    const fn has(self, bit: u8) -> bool {
+    const fn has(self, bit: u16) -> bool {
         self.0 & bit != 0
+    }
+
+    /// The style of `attributes`.
+    fn of(attributes: Attributes) -> Self {
+        let bit = |on: bool, b: u16| if on { b } else { 0 };
+        let blink = match attributes.blink() {
+            Blink::None => 0,
+            Blink::Slow => Self::BLINK_SLOW,
+            Blink::Rapid => Self::BLINK_RAPID,
+        };
+        // Only defined bits, and at most one blink.
+        Self(
+            bit(attributes.bold(), Self::BOLD)
+                | bit(attributes.dim(), Self::DIM)
+                | bit(attributes.italic(), Self::ITALIC)
+                | bit(attributes.underline(), Self::UNDERLINE)
+                | bit(attributes.inverse(), Self::INVERSE)
+                | bit(attributes.hidden(), Self::HIDDEN)
+                | bit(attributes.strikeout(), Self::STRIKEOUT)
+                | blink,
+        )
+    }
+
+    /// `attributes` with this style.
+    const fn on(self, attributes: Attributes) -> Attributes {
+        let blink = if self.has(Self::BLINK_SLOW) {
+            Blink::Slow
+        } else if self.has(Self::BLINK_RAPID) {
+            Blink::Rapid
+        } else {
+            Blink::None
+        };
+        attributes
+            .with_bold(self.has(Self::BOLD))
+            .with_dim(self.has(Self::DIM))
+            .with_italic(self.has(Self::ITALIC))
+            .with_underline(self.has(Self::UNDERLINE))
+            .with_inverse(self.has(Self::INVERSE))
+            .with_hidden(self.has(Self::HIDDEN))
+            .with_strikeout(self.has(Self::STRIKEOUT))
+            .with_blink(blink)
     }
 }
 
 impl Serialize for WireStyle {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u8(self.0)
+        serializer.serialize_u16(self.0)
     }
 }
 
 impl<'de> Deserialize<'de> for WireStyle {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bits = u8::deserialize(deserializer)?;
+        let bits = u16::deserialize(deserializer)?;
         Self::new(bits).ok_or_else(|| {
             de::Error::invalid_value(
                 de::Unexpected::Unsigned(u64::from(bits)),
-                &"style bits within 0b11111",
+                &"style bits within 0b1_1111_1111, at most one blink",
             )
         })
     }
 }
 
-/// A cell's text on the wire: at most [`Cell::CONTENTS_CAPACITY`] bytes of UTF-8, and no control
-/// character.
+/// A cell's text on the wire: one grapheme cluster, at most [`Cell::CLUSTER_CAPACITY`] bytes of
+/// UTF-8, and no control character.
 ///
-/// Stored inline, as `fux_vt::Cell` stores it, so building or decoding a run allocates nothing.
 /// The client prints a cell's text to the user's terminal as is, so it must not be able to carry
 /// an escape sequence: fux-vt never puts a control character in a cell, and decoding refuses one,
-/// as it refuses text too long for a cell, which drops the frame. It encodes as a string.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub struct CellText {
-    len: u8,
-    bytes: [u8; Cell::CONTENTS_CAPACITY],
+/// as it refuses text too long for a cell, which drops the frame. Text up to
+/// [`CellText::INLINE`] bytes, nearly all of it, is stored inline, so building or decoding a run of
+/// it allocates nothing; a longer cluster is boxed, which a frame pays for in its own bytes. It
+/// encodes as a string.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CellText(Text);
+
+#[derive(Clone, PartialEq, Eq)]
+enum Text {
+    Inline {
+        len: u8,
+        bytes: [u8; CellText::INLINE],
+    },
+    Long(Box<str>),
+}
+
+impl Default for CellText {
+    fn default() -> Self {
+        Self(Text::Inline {
+            len: 0,
+            bytes: [0; Self::INLINE],
+        })
+    }
 }
 
 impl CellText {
-    /// `text`, or `None` if it is longer than [`Cell::CONTENTS_CAPACITY`] bytes or holds a
+    /// The most bytes kept inline.
+    pub const INLINE: usize = 22;
+
+    /// `text`, or `None` if it is longer than [`Cell::CLUSTER_CAPACITY`] bytes or holds a
     /// control character (C0, DEL or C1).
     pub fn new(text: &str) -> Option<Self> {
-        if text.chars().any(char::is_control) {
+        if text.len() > Cell::CLUSTER_CAPACITY || text.chars().any(char::is_control) {
             return None;
         }
-        let mut bytes = [0; Cell::CONTENTS_CAPACITY];
-        bytes
-            .get_mut(..text.len())?
-            .copy_from_slice(text.as_bytes());
-        Some(Self {
+        let mut bytes = [0; Self::INLINE];
+        let Some(inline) = bytes.get_mut(..text.len()) else {
+            return Some(Self(Text::Long(text.into())));
+        };
+        inline.copy_from_slice(text.as_bytes());
+        Some(Self(Text::Inline {
             len: u8::try_from(text.len()).ok()?,
             bytes,
-        })
+        }))
     }
 
     pub fn as_str(&self) -> &str {
-        // Only ever a whole `&str`'s bytes, so the prefix is valid UTF-8.
-        self.bytes
-            .get(..usize::from(self.len))
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .unwrap_or_default()
+        match &self.0 {
+            // Only ever a whole `&str`'s bytes, so the prefix is valid UTF-8.
+            Text::Inline { len, bytes } => bytes
+                .get(..usize::from(*len))
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .unwrap_or_default(),
+            Text::Long(text) => text,
+        }
     }
 
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn is_empty(&self) -> bool {
+        self.as_str().is_empty()
     }
 }
 
@@ -317,7 +390,7 @@ impl de::Visitor<'_> for CellTextVisitor {
         write!(
             f,
             "a string of at most {} bytes with no control character",
-            Cell::CONTENTS_CAPACITY
+            Cell::CLUSTER_CAPACITY
         )
     }
 
@@ -334,20 +407,15 @@ pub struct WireCell {
     pub kind: CellKind,
     pub fg: WireColor,
     pub bg: WireColor,
+    pub underline_color: WireColor,
     pub style: WireStyle,
 }
 
 impl WireCell {
-    fn of(cell: &Cell) -> Self {
+    fn of(cell: CellRef<'_>) -> Self {
         let a = cell.attributes();
-        let bit = |on: bool, b: u8| if on { b } else { 0 };
-        let style = bit(a.bold(), WireStyle::BOLD)
-            | bit(a.dim(), WireStyle::DIM)
-            | bit(a.italic(), WireStyle::ITALIC)
-            | bit(a.underline(), WireStyle::UNDERLINE)
-            | bit(a.inverse(), WireStyle::INVERSE);
         Self {
-            // A cell holds at most `CONTENTS_CAPACITY` bytes, as `CellText` does.
+            // fux-vt keeps at most `CLUSTER_CAPACITY` bytes, and no control character.
             text: CellText::new(cell.contents()).unwrap_or_default(),
             kind: if cell.is_wide_continuation() {
                 CellKind::Continuation
@@ -356,30 +424,38 @@ impl WireCell {
             } else {
                 CellKind::Narrow
             },
-            fg: a.foreground.into(),
-            bg: a.background.into(),
-            // Only defined bits were set above.
-            style: WireStyle(style),
+            fg: a.foreground().into(),
+            bg: a.background().into(),
+            underline_color: a.underline_color().into(),
+            style: WireStyle::of(a),
         }
     }
 
-    /// The cell this encodes, or `None` if the encoding is malformed (a continuation carrying
-    /// content).
-    fn cell(&self) -> Option<Cell> {
+    /// Set cell `at` of `cells` to this one, or return `None` if the encoding is malformed (a
+    /// continuation carrying content). Text the row has no room left for is cut to what fits
+    /// inline, as fux-vt cuts it; a row from fux-vt always has the room.
+    fn write_to(&self, cells: &mut Cells, at: usize) -> Option<()> {
         match self.kind {
-            CellKind::Continuation => (self.text.is_empty()
-                && self.fg == WireColor::Default
-                && self.bg == WireColor::Default
-                && self.style == WireStyle::default())
-            .then(Cell::wide_continuation),
+            CellKind::Continuation => {
+                let plain = self.text.is_empty()
+                    && self.fg == WireColor::Default
+                    && self.bg == WireColor::Default
+                    && self.underline_color == WireColor::Default
+                    && self.style == WireStyle::default();
+                plain.then(|| cells.set_cell(at, Cell::wide_continuation()))
+            }
             CellKind::Narrow | CellKind::Wide => {
-                let attributes = Attributes::new(self.fg.into(), self.bg.into())
-                    .with_bold(self.style.has(WireStyle::BOLD))
-                    .with_dim(self.style.has(WireStyle::DIM))
-                    .with_italic(self.style.has(WireStyle::ITALIC))
-                    .with_underline(self.style.has(WireStyle::UNDERLINE))
-                    .with_inverse(self.style.has(WireStyle::INVERSE));
-                Cell::new(self.text.as_str(), self.kind == CellKind::Wide, attributes)
+                let attributes = self
+                    .style
+                    .on(Attributes::new(self.fg.into(), self.bg.into())
+                        .with_underline_color(self.underline_color.into()));
+                cells.set_text(
+                    at,
+                    self.text.as_str(),
+                    self.kind == CellKind::Wide,
+                    attributes,
+                );
+                Some(())
             }
         }
     }
@@ -415,10 +491,10 @@ pub struct RowDiff {
 }
 
 impl RowDiff {
-    fn of(row: u16, cells: &[Cell], wrapped: bool) -> Self {
+    fn of(row: u16, cells: &Cells, wrapped: bool) -> Self {
         let mut runs: Vec<Run> = Vec::new();
-        let mut previous: Option<&Cell> = None;
-        for cell in cells {
+        let mut previous: Option<CellRef<'_>> = None;
+        for cell in cells.iter() {
             let extended = previous == Some(cell) && runs.last_mut().is_some_and(Run::extend);
             if !extended {
                 runs.push(Run {
@@ -431,21 +507,32 @@ impl RowDiff {
         Self { row, wrapped, runs }
     }
 
-    /// Append exactly `cols` decoded cells to `out`, or return `None` if the runs are malformed or
-    /// don't cover the row exactly (`out` then holds a partial row, which the caller discards).
-    /// Work is bounded by `cols`: every run is non-empty.
-    fn decode_into(&self, cols: u16, out: &mut Vec<Cell>) -> Option<()> {
-        let mut len = 0_usize;
+    /// The row these runs decode to, exactly `cols` cells, or `None` if the runs are malformed or
+    /// don't cover the row exactly. Work is bounded by `cols`: every run is non-empty, and each
+    /// cell's text by [`Cell::CLUSTER_CAPACITY`].
+    fn decode(&self, cols: u16) -> Option<Cells> {
+        let mut cells = Cells::new(usize::from(cols));
+        let mut at = 0_usize;
         for run in &self.runs {
-            let count = usize::from(run.count.get());
-            len = len
-                .checked_add(count)
-                .filter(|&len| len <= usize::from(cols))?;
-            let cell = run.cell.cell()?;
-            out.extend(std::iter::repeat_n(cell, count));
+            let end = at
+                .checked_add(usize::from(run.count.get()))
+                .filter(|&end| end <= usize::from(cols))?;
+            for col in at..end {
+                run.cell.write_to(&mut cells, col)?;
+            }
+            at = end;
         }
-        (len == usize::from(cols)).then_some(())
+        (at == usize::from(cols)).then_some(cells)
     }
+}
+
+/// Whether `cell` is what a blank grid holds: no text, neither half of a wide glyph, the default
+/// style.
+fn is_blank(cell: CellRef<'_>) -> bool {
+    !cell.has_contents()
+        && !cell.is_wide()
+        && !cell.is_wide_continuation()
+        && cell.attributes() == Attributes::default()
 }
 
 /// The mouse reporting mode on the wire. The variant's index is its byte.
@@ -732,7 +819,7 @@ impl TerminalScreen {
             let wrapped = self.grid.row_wrapped(r);
             // A row shared with the base is the same without comparing its cells.
             let same = if resized {
-                !wrapped && cells.iter().all(|cell| *cell == Cell::default())
+                !wrapped && cells.iter().all(is_blank)
             } else {
                 self.grid.row_eq(base_grid, r)
             };
@@ -762,14 +849,14 @@ impl TerminalScreen {
         {
             return;
         }
-        // Every row decodes into one staging buffer, `cols` cells each, in the diff's order. At
-        // most `rows × cols` cells, which the clamp bounds.
-        let width = usize::from(cols);
-        let mut staged = Vec::with_capacity(diff.rows.len().saturating_mul(width));
+        // Every row decodes before any is committed, in the diff's order. At most `rows × cols`
+        // cells, which the clamp bounds.
+        let mut staged = Vec::with_capacity(diff.rows.len());
         for row in &diff.rows {
-            if row.row >= rows || row.decode_into(cols, &mut staged).is_none() {
+            let Some(cells) = (row.row < rows).then(|| row.decode(cols)).flatten() else {
                 return;
-            }
+            };
+            staged.push(cells);
         }
         let grid = if diff.resize.is_some() {
             Grid::blank(Size { rows, cols })
@@ -782,8 +869,8 @@ impl TerminalScreen {
         };
         self.grid = grid;
         // Only the rows the diff carries are replaced; the rest stay shared with the base.
-        for (row, cells) in diff.rows.iter().zip(staged.chunks(width.max(1))) {
-            self.grid.set_row(row.row, Arc::from(cells), row.wrapped);
+        for (row, cells) in diff.rows.iter().zip(staged) {
+            self.grid.set_row(row.row, Arc::new(cells), row.wrapped);
         }
         let (crow, ccol) = diff.cursor;
         self.grid
@@ -909,16 +996,19 @@ mod tests {
             CellKind::Wide,
             CellKind::Continuation,
         ]);
-        let text = ".{0,22}".prop_filter_map("fits a cell", |text| CellText::new(&text));
-        (text, kind, color.clone(), color, 0u8..=31).prop_map(|(text, kind, fg, bg, style)| {
-            WireCell {
+        // Inline and boxed text, every style bit and blink.
+        let text = ".{0,40}".prop_filter_map("fits a cell", |text| CellText::new(&text));
+        let style = (0u16..=511).prop_filter_map("a style", WireStyle::new);
+        (text, kind, color.clone(), color.clone(), color, style).prop_map(
+            |(text, kind, fg, bg, underline_color, style)| WireCell {
                 text,
                 kind,
                 fg,
                 bg,
-                style: WireStyle::new(style).unwrap(),
-            }
-        })
+                underline_color,
+                style,
+            },
+        )
     }
 
     fn row_diff() -> impl proptest::strategy::Strategy<Value = RowDiff> {
@@ -1003,7 +1093,7 @@ mod tests {
             proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&rows), "rows {rows} escaped the clamp");
             proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&cols), "cols {cols} escaped the clamp");
             for r in 0..rows {
-                proptest::prop_assert_eq!(screen.screen().row(r).map(<[Cell]>::len), Some(usize::from(cols)));
+                proptest::prop_assert_eq!(screen.screen().row(r).map(Cells::len), Some(usize::from(cols)));
             }
             let (crow, ccol) = screen.screen().cursor_position();
             proptest::prop_assert!(crow < rows && ccol <= cols);
@@ -1402,7 +1492,8 @@ mod tests {
         kind: u8,
         fg: WireColor,
         bg: WireColor,
-        style: u8,
+        underline_color: WireColor,
+        style: u16,
     }
 
     /// A resize to 2×2 whose first row reads `xx`.
@@ -1434,7 +1525,8 @@ mod tests {
                         kind: 0,
                         fg: WireColor::Default,
                         bg: WireColor::Default,
-                        style: 31,
+                        underline_color: WireColor::Idx(3),
+                        style: 511 - 256,
                     },
                 }],
             }],
@@ -1453,14 +1545,15 @@ mod tests {
         let mut screen = TerminalScreen::default();
         screen.apply(&good);
         assert_eq!(screen.size(), Size::new(2, 2));
-        assert_eq!(screen.screen().cell(0, 1).map(Cell::contents), Some("x"));
-        let mutations: [fn(&mut RawDiff); 8] = [
+        assert_eq!(screen.screen().cell(0, 1).map(|c| c.contents()), Some("x"));
+        let mutations: [fn(&mut RawDiff); 9] = [
             |d| d.rows[0].runs[0].count = 0, // empty run
-            |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CONTENTS_CAPACITY + 1),
+            |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CLUSTER_CAPACITY + 1),
             |d| d.rows[0].runs[0].cell.text = "\x1b".to_owned(), // an escape for the terminal
             |d| d.rows[0].runs[0].cell.text = "\u{9b}".to_owned(), // a C1 control
             |d| d.rows[0].runs[0].cell.kind = 3,                 // unknown kind
-            |d| d.rows[0].runs[0].cell.style = 32,               // unknown style bit
+            |d| d.rows[0].runs[0].cell.style = 512,              // unknown style bit
+            |d| d.rows[0].runs[0].cell.style = 128 | 256,        // both blinks
             |d| d.modes.mouse_mode = 5,                          // unknown mouse mode
             |d| d.modes.mouse_encoding = 3,                      // unknown mouse encoding
         ];
@@ -1484,7 +1577,7 @@ mod tests {
         assert!(after.grid.row_shared(&before.grid, 0));
         assert!(after.grid.row_shared(&before.grid, 1));
         assert!(!after.grid.row_shared(&before.grid, 2), "the changed row");
-        assert_eq!(after.grid.row(2).map(<[Cell]>::len), Some(80));
+        assert_eq!(after.grid.row(2).map(Cells::len), Some(80));
         // Scrolled rows are shared too, wherever they moved: one screen and one row in all.
         for n in 0..30 {
             emu.process(format!("\r\nline {n}").as_bytes());
@@ -1588,12 +1681,24 @@ mod tests {
 
     #[test]
     fn cell_text_holds_what_a_cell_holds() {
-        let full = "é".repeat(Cell::CONTENTS_CAPACITY.div_euclid(2));
+        // Inline, just past inline, and a whole cluster.
+        for len in [
+            CellText::INLINE,
+            CellText::INLINE + 1,
+            Cell::CLUSTER_CAPACITY,
+        ] {
+            let text = "x".repeat(len);
+            assert_eq!(
+                CellText::new(&text).map(|t| t.as_str().to_owned()),
+                Some(text)
+            );
+        }
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
         assert_eq!(
-            CellText::new(&full).map(|t| t.as_str().to_owned()),
-            Some(full)
+            CellText::new(family).map(|t| t.as_str().to_owned()),
+            Some(family.to_owned())
         );
-        assert!(CellText::new(&"x".repeat(Cell::CONTENTS_CAPACITY + 1)).is_none());
+        assert!(CellText::new(&"x".repeat(Cell::CLUSTER_CAPACITY + 1)).is_none());
         for control in ["\x1b[2J", "\x07", "\x7f", "\u{9d}", "a\nb"] {
             assert!(CellText::new(control).is_none(), "{control:?}");
         }
@@ -1603,7 +1708,7 @@ mod tests {
         let bytes = postcard::to_allocvec(&text).unwrap();
         assert_eq!(bytes, postcard::to_allocvec("日本").unwrap());
         assert_eq!(postcard::from_bytes::<CellText>(&bytes).unwrap(), text);
-        let long = postcard::to_allocvec(&"x".repeat(Cell::CONTENTS_CAPACITY + 1)).unwrap();
+        let long = postcard::to_allocvec(&"x".repeat(Cell::CLUSTER_CAPACITY + 1)).unwrap();
         assert!(postcard::from_bytes::<CellText>(&long).is_err());
     }
 
@@ -1744,7 +1849,7 @@ mod tests {
     fn row_text(s: &Grid, row: u16) -> String {
         let cols = s.size().cols;
         (0..cols)
-            .map(|c| match s.cell(row, c).map(Cell::contents) {
+            .map(|c| match s.cell(row, c).map(|c| c.contents()) {
                 Some(g) if !g.is_empty() => g.to_string(),
                 _ => " ".to_string(),
             })
@@ -1919,6 +2024,53 @@ mod tests {
         let c = roundtrip(24, 80, b"abc\n\xcc\x82\ndef\n");
         let contents = c.screen().contents();
         assert!(contents.contains("abc") && contents.contains("def"));
+    }
+
+    #[test]
+    fn grapheme_clusters_and_every_attribute_roundtrip() {
+        // Clusters fux-vt keeps whole, some too long to hold inline, and every attribute.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        let flag = "\u{1f1fa}\u{1f1f8}";
+        let heart = "\u{2764}\u{fe0f}";
+        let marked = format!("e{}", "\u{301}".repeat(40));
+        let bytes = format!(
+            "{family}{flag}{heart}{marked}\r\n\
+             \x1b[5mA\x1b[6mB\x1b[8mC\x1b[9mD\x1b[m\x1b[4;58;5;9mE\x1b[58;2;1;2;3mF\x1b[m"
+        );
+        let c = roundtrip(24, 80, bytes.as_bytes());
+        let s = c.screen();
+        let cluster = |col| s.cell(0, col).map(|c| c.contents().to_owned());
+        assert_eq!(cluster(0).as_deref(), Some(family));
+        assert_eq!(cluster(2).as_deref(), Some(flag));
+        assert_eq!(
+            cluster(4).as_deref(),
+            Some(heart),
+            "a variation selector makes it wide"
+        );
+        assert!(s.cell(4, 0).is_none_or(|c| !c.is_wide()));
+        assert!(s.cell(0, 4).is_some_and(|c| c.is_wide()));
+        assert_eq!(cluster(6).map(|t| t.len()), Some(marked.len()));
+        let cell = |col| s.cell(1, col).expect("a cell");
+        assert_eq!(cell(0).blink(), Blink::Slow);
+        assert_eq!(cell(1).blink(), Blink::Rapid);
+        assert!(cell(2).hidden());
+        assert!(cell(3).strikeout());
+        assert!(cell(4).underline() && cell(4).underline_color() == Color::Idx(9));
+        assert_eq!(cell(5).underline_color(), Color::Rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn a_row_past_its_text_budget_arrives_as_the_server_has_it() {
+        // Clusters of 100 bytes in every cell of a 20-column row: more text than a row keeps, so
+        // fux-vt cuts the last ones to what fits inline, and the client's row must match.
+        let long = format!("e{}", "\u{301}".repeat(49));
+        let row = long.repeat(20);
+        let c = roundtrip(4, 20, row.as_bytes());
+        let lens: Vec<usize> = (0..20)
+            .filter_map(|col| c.screen().cell(0, col).map(|c| c.contents().len()))
+            .collect();
+        assert!(lens.contains(&long.len()), "{lens:?}");
+        assert!(lens.iter().any(|&len| len < long.len()), "{lens:?}");
     }
 
     #[test]

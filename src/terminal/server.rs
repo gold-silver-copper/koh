@@ -51,6 +51,8 @@ impl Sink for Observed {
 ///
 /// - events: the title, icon, bell and clipboard, which the client mirrors;
 /// - extended replies: DECRQM, DECXCPR and secondary DA, as a terminal answers them;
+/// - in-band resize (mode 2048) and the size query (`CSI 18 t`): koh knows the size, and tells a
+///   program that asks, after a resize too;
 /// - reflow: a resize re-wraps the primary screen and its history, as the user's terminal would.
 ///
 /// Left off: the kitty keyboard protocol (koh forwards the keys the user's terminal sends, so a
@@ -60,6 +62,8 @@ impl Sink for Observed {
 pub const OPTIONS: Options = Options::new()
     .with_events(true)
     .with_extended_replies(true)
+    .with_in_band_resize(true)
+    .with_size_reports(true)
     .with_reflow(true);
 
 /// The server's terminal: the live parser, and the [`TerminalScreen`] snapshots it sends.
@@ -113,6 +117,12 @@ impl ServerTerminal {
         if let Err(e) = self.parser.resize(rows, cols) {
             tracing::warn!(error = %e, rows, cols, "terminal emulator refused a resize");
         }
+    }
+
+    /// The report a program that set in-band resize (mode 2048) is sent after a resize, for its
+    /// input; `None` if it did not set it.
+    pub fn resize_report(&self) -> Option<Vec<u8>> {
+        self.parser.resize_report()
     }
 
     /// The size. Test-only.
@@ -221,6 +231,24 @@ mod tests {
         assert_eq!(t.take_host_replies(), b"\x1b[?1;2c");
         t.process(b"\x1b[>c"); // secondary DA
         assert_eq!(t.take_host_replies(), b"\x1b[>1;10;0c");
+    }
+
+    #[test]
+    fn answers_the_size_query_and_reports_a_resize_to_a_program_that_asked() {
+        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
+        t.process(b"\x1b[18t");
+        assert_eq!(t.take_host_replies(), b"\x1b[8;24;80t");
+        // No report before a program sets mode 2048.
+        t.resize(Size::new(30, 90));
+        assert_eq!(t.resize_report(), None);
+        t.process(b"\x1b[?2048h");
+        // Setting it reports the size at once.
+        assert_eq!(t.take_host_replies(), b"\x1b[48;30;90;0;0t");
+        t.resize(Size::new(20, 60));
+        assert_eq!(
+            t.resize_report().as_deref(),
+            Some(&b"\x1b[48;20;60;0;0t"[..])
+        );
     }
 
     #[test]

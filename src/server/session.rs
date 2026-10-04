@@ -222,6 +222,13 @@ async fn session_task(
                         }
                         ClientInput::Resize(size) => {
                             host.resize(size);
+                            // A program that asked for in-band resize reports (mode 2048) hears of
+                            // it on its input, after anything typed before.
+                            if let Some(report) = host.emu.resize_report() {
+                                if !host.input(&report) {
+                                    pending_keys.extend_from_slice(&report);
+                                }
+                            }
                             screens_tx.send_replace(Arc::new(host.snapshot()));
                         }
                     }

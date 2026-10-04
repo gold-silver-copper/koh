@@ -300,3 +300,43 @@ fn a_forced_mid_session_drop_reconnects_to_the_same_shell() {
             server.stop().await;
         });
 }
+
+#[test]
+fn a_program_that_asked_hears_of_a_resize_on_its_input() {
+    crate::harness::runtime()
+        .expect("tokio runtime")
+        .block_on(async {
+            // Mode 2048: the program gets `CSI 48 ; rows ; cols ; 0 ; 0 t` when it sets the mode,
+            // and again after each resize. `cat -v` shows what reaches its input.
+            let net = clean();
+            let (server, mut client) = session(
+                &net,
+                &[
+                    "sh",
+                    "-c",
+                    "stty raw -echo; printf '\\033[?2048h'; exec cat -v",
+                ],
+            )
+            .await
+            .expect("start a session");
+            assert!(
+                client
+                    .wait_until(WAIT, |t| t.contains("^[[48;24;80;0;0t"))
+                    .await
+                    .is_some(),
+                "the report when the mode was set; screen:\n{}",
+                client.screen()
+            );
+            client.resize_to(30, 90).await.expect("resize");
+            assert!(
+                client
+                    .wait_until(WAIT, |t| t.contains("^[[48;30;90;0;0t"))
+                    .await
+                    .is_some(),
+                "the report after the resize; screen:\n{}",
+                client.screen()
+            );
+            let _ = client.finish().await;
+            server.stop().await;
+        });
+}

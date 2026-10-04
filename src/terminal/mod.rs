@@ -18,7 +18,7 @@ mod server;
 
 pub use crate::predict::Size;
 pub use grid::{drawn, Grid, Modes};
-pub use server::{ServerTerminal, IDENTITY, OPTIONS};
+pub use server::{FrameHold, ServerTerminal, FRAME_HOLD, IDENTITY, OPTIONS};
 
 /// Default screen geometry, used for the blank screen both ends start from.
 pub const DEFAULT_SIZE: Size = Size::new(24, 80);

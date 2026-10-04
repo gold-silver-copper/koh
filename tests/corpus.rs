@@ -17,12 +17,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::proto::{decode_frame, encode_frame, ClientMsg, Frame, FrameNum, InputSeq};
-use koh::terminal::{ServerTerminal, Size, TerminalScreen};
+use koh::terminal::{FrameHold, ServerTerminal, Size, TerminalScreen, FRAME_HOLD};
 use recording::Recording;
 
 /// The scrollback a server keeps by default (`koh serve --scrollback`).
@@ -82,62 +82,89 @@ impl KohBackend for Capture {
     }
 }
 
-/// The first difference between what `shown` shows and what `expected` shows, if there is one. A
-/// printed space shows what an erased cell of its attributes does, so the two count as one.
-fn difference(shown: &fux_vt::Screen, expected: &fux_vt::Screen) -> Option<String> {
-    if shown.size() != expected.size() {
-        return Some(format!(
-            "size {:?}, expected {:?}",
-            shown.size(),
-            expected.size()
-        ));
-    }
-    let (rows, cols) = expected.size();
-    for row in 0..rows {
-        for col in 0..cols {
-            let look = |screen: &fux_vt::Screen| {
+/// What a cell shows: its text (a printed space shows what an erased cell of its attributes does,
+/// so the two count as one), whether it is either half of a wide glyph, and its attributes.
+type Look = (String, bool, bool, fux_vt::Attributes);
+
+/// What a screen shows: its size, every cell, whether the cursor is hidden and where it is.
+#[derive(Clone, Debug, PartialEq)]
+struct View {
+    size: (u16, u16),
+    cells: Vec<Option<Look>>,
+    hidden: bool,
+    cursor: (u16, u16),
+}
+
+impl View {
+    /// What `screen` shows. With `drawn`, as the server draws it: in the colours its program set.
+    fn of(screen: &fux_vt::Screen, drawn: bool) -> Self {
+        let (rows, cols) = screen.size();
+        let cells = (0..rows)
+            .flat_map(|row| (0..cols).map(move |col| (row, col)))
+            .map(|(row, col)| {
                 screen.cell(row, col).map(|cell| {
                     let text = if cell.contents() == " " {
                         String::new()
                     } else {
                         cell.contents().to_owned()
                     };
-                    // koh/3 carries underline as one bit, so a style is compared as underlined or not.
-                    let attributes = cell.attributes();
+                    // koh/3 carries underline as one bit, so a style is compared as underlined
+                    // or not.
+                    let mut attributes = cell.attributes();
+                    attributes = attributes.with_underline(attributes.underline());
+                    if drawn {
+                        attributes = koh::terminal::drawn(attributes, screen);
+                    }
                     (
                         text,
                         cell.is_wide(),
                         cell.is_wide_continuation(),
-                        attributes.with_underline(attributes.underline()),
+                        attributes,
                     )
                 })
-            };
-            let mut b = look(expected);
-            // The server draws a program's colours as RGB.
-            if let Some(cell) = b.as_mut() {
-                cell.3 = koh::terminal::drawn(cell.3, expected);
-            }
-            let (a, b) = (look(shown), b);
-            if a != b {
-                return Some(format!("cell ({row}, {col}): shown {a:?}, expected {b:?}"));
-            }
+            })
+            .collect();
+        Self {
+            size: screen.size(),
+            cells,
+            hidden: screen.hide_cursor(),
+            cursor: screen.cursor_position(),
         }
     }
-    if shown.hide_cursor() != expected.hide_cursor() {
-        return Some(format!(
-            "cursor hidden {}, expected {}",
-            shown.hide_cursor(),
-            expected.hide_cursor()
-        ));
+
+    /// The first difference between what `shown` shows and this, if there is one.
+    fn difference(&self, shown: &Self) -> Option<String> {
+        if shown.size != self.size {
+            return Some(format!("size {:?}, expected {:?}", shown.size, self.size));
+        }
+        let cols = usize::from(self.size.1).max(1);
+        for (at, (a, b)) in shown.cells.iter().zip(&self.cells).enumerate() {
+            if a != b {
+                let (row, col) = (at.checked_div(cols), at.checked_rem(cols));
+                return Some(format!(
+                    "cell ({row:?}, {col:?}): shown {a:?}, expected {b:?}"
+                ));
+            }
+        }
+        if shown.hidden != self.hidden {
+            return Some(format!(
+                "cursor hidden {}, expected {}",
+                shown.hidden, self.hidden
+            ));
+        }
+        if !self.hidden && shown.cursor != self.cursor {
+            return Some(format!(
+                "cursor at {:?}, expected {:?}",
+                shown.cursor, self.cursor
+            ));
+        }
+        None
     }
-    if !expected.hide_cursor() && shown.cursor_position() != expected.cursor_position() {
-        return Some(format!(
-            "cursor at {:?}, expected {:?}",
-            shown.cursor_position(),
-            expected.cursor_position()
-        ));
-    }
-    None
+}
+
+/// `ms` after `now`.
+fn later(now: Instant, ms: u64) -> Instant {
+    now.checked_add(Duration::from_millis(ms)).unwrap_or(now)
 }
 
 /// What a replay sent and checked.
@@ -151,8 +178,15 @@ struct Replayed {
 /// The server and client ends of one replay, and the terminal the client paints.
 struct Session {
     server: ServerTerminal,
-    /// The server's screen, from a parser of its own.
+    /// When the server sends a screen, while a program draws a frame.
+    hold: FrameHold,
+    /// The server's screen, from a parser of its own, fed a byte at a time so that it sees exactly
+    /// where each frame begins.
     expected: fux_vt::Parser,
+    /// What the expected screen showed when the frame being drawn began, and when that was.
+    frame_start: Option<(View, Instant)>,
+    /// The time, which the replay moves on by a millisecond a piece.
+    now: Instant,
     client: ClientSession,
     terminal: BackendTerminal<Capture>,
     capture: Capture,
@@ -178,6 +212,9 @@ impl Session {
             // The server's parser, with its options and scrollback.
             expected: fux_vt::Parser::with_options(rows, cols, SCROLLBACK, koh::terminal::OPTIONS)
                 .map_err(|e| e.to_string())?,
+            hold: FrameHold::default(),
+            frame_start: None,
+            now: Instant::now(),
             client: ClientSession::new(DisplayPreference::Never, size),
             terminal: BackendTerminal::enter(capture.clone(), false).map_err(|e| e.to_string())?,
             capture,
@@ -203,17 +240,42 @@ impl Session {
         Ok(())
     }
 
-    fn output(&mut self, piece: &[u8]) -> Result<(), String> {
+    /// The program wrote `piece`; the screen the server sends after it, if any.
+    fn output(&mut self, piece: &[u8]) -> Result<Option<TerminalScreen>, String> {
+        self.now = later(self.now, 1);
         self.server.process(piece);
         // The program already had its replies when it was recorded.
         drop(self.server.take_host_replies());
-        self.expected.process(piece).map_err(|e| e.to_string())
+        for byte in piece {
+            let drawing = self.expected.screen().synchronized_output();
+            self.expected
+                .process(std::slice::from_ref(byte))
+                .map_err(|e| e.to_string())?;
+            if !drawing && self.expected.screen().synchronized_output() {
+                // A frame begins: the screen as it was is a whole one.
+                self.frame_start = Some((View::of(self.expected.screen(), true), self.now));
+            }
+        }
+        Ok(self.hold.after_output(&mut self.server, self.now))
     }
 
-    /// Snapshot the server, send the frame, and deliver it unless `dropped`. Whether the client
-    /// applied it.
-    fn frame(&mut self, dropped: bool) -> Result<bool, String> {
-        let screen = self.server.snapshot();
+    /// What the user should see once `screen` arrives: while the program draws a frame, and for
+    /// no longer than the hold, the screen as it was when the frame began; else the screen.
+    fn expected_view(&self) -> View {
+        match &self.frame_start {
+            Some((view, began))
+                if self.expected.screen().synchronized_output()
+                    && self.now.saturating_duration_since(*began) < FRAME_HOLD =>
+            {
+                view.clone()
+            }
+            Some(_) | None => View::of(self.expected.screen(), true),
+        }
+    }
+
+    /// Send a frame of `screen`, delivered unless `dropped`. Whether the client applied it.
+    fn frame(&mut self, screen: &TerminalScreen, dropped: bool) -> Result<bool, String> {
+        let screen = screen.clone();
         let frame = Frame {
             num: self.next,
             base: self.base.0,
@@ -260,7 +322,8 @@ impl Session {
                 .map_err(|e| e.to_string())?;
             let painted = std::mem::take(&mut *self.capture.painted.borrow_mut());
             self.shown.process(&painted).map_err(|e| e.to_string())?;
-            if let Some(difference) = difference(self.shown.screen(), self.expected.screen()) {
+            let expected = self.expected_view();
+            if let Some(difference) = expected.difference(&View::of(self.shown.screen(), false)) {
                 return Err(format!("frame {}: {difference}", frame.num.0));
             }
         }
@@ -283,17 +346,23 @@ fn replay(recording: &Recording, seed: u64, loss: f64) -> Result<Replayed, Strin
             let len = usize::try_from(rng.upto(PIECE)).unwrap_or(usize::MAX);
             let (piece, after) = rest.split_at(len.min(rest.len()));
             rest = after;
-            session.output(piece).map_err(at)?;
+            let sent = session.output(piece).map_err(at)?;
             // The server snapshots once per burst of output, not per read: a frame after some
             // pieces, and always at the step's end.
-            if !rest.is_empty() && rng.chance(0.5) {
+            if let Some(screen) = sent.filter(|_| !rest.is_empty() && rng.chance(0.5)) {
                 let dropped = rng.chance(loss);
-                session.frame(dropped).map_err(at)?;
+                session.frame(&screen, dropped).map_err(at)?;
             }
         }
-        // The step's last screen is resent until the client has it.
+        // The step's end, when the program has been quiet a while: a frame it left unfinished is
+        // let go, and the step's last screen is resent until the client has it.
+        session.now = later(session.now, 400);
+        let screen = match session.hold.expire(&mut session.server, session.now) {
+            Some(screen) => screen,
+            None => session.server.snapshot(),
+        };
         let mut tries = 0u32;
-        while !session.frame(rng.chance(loss)).map_err(at)? {
+        while !session.frame(&screen, rng.chance(loss)).map_err(at)? {
             tries = tries.saturating_add(1);
             if tries > 100 {
                 return Err(at(

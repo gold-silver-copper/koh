@@ -5,6 +5,8 @@ use crate::terminal::grid::RowCache;
 use crate::terminal::{
     clamp_dims, Grid, Size, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
 };
+use std::time::{Duration, Instant};
+
 use fux_vt::{Event, Options, Parser, Sink};
 
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
@@ -92,6 +94,11 @@ pub struct ServerTerminal {
     exit_code: Option<u32>,
     /// The last snapshot's rows, which the next one shares where they are unchanged.
     rows: RowCache,
+    /// The screen as it was when the program last began a frame (synchronized output), a whole
+    /// one, until taken.
+    frame_start: Option<TerminalScreen>,
+    /// Where the program's output ends a frame.
+    frame_ends: FrameEnds,
 }
 
 impl ServerTerminal {
@@ -104,6 +111,8 @@ impl ServerTerminal {
             observed: Observed::default(),
             exit_code: None,
             rows: RowCache::default(),
+            frame_start: None,
+            frame_ends: FrameEnds::default(),
         })
     }
 
@@ -114,10 +123,44 @@ impl ServerTerminal {
 
     /// Feed the program's output. A failure (allocation or identity exhaustion) keeps what was
     /// applied and is logged.
+    ///
+    /// Where the program begins a frame (synchronized output, `CSI ? 2026 h`), the screen as it was
+    /// is kept, for [`FrameHold`] to send while the frame is drawn.
     pub fn process(&mut self, bytes: &[u8]) {
-        if let Err(e) = self.parser.process_with(bytes, &mut self.observed) {
-            tracing::warn!(error = %e, "terminal emulator refused shell output");
+        // Fed in pieces that each end at an ESU, so that whether a frame was being drawn just
+        // before a BSU is known: at the start of its piece, or after a BSU earlier in it.
+        let mut start = 0;
+        let ends = self.frame_ends.after_each(bytes);
+        for end in ends.into_iter().chain(std::iter::once(bytes.len())) {
+            let mut rest = bytes.get(start..end).unwrap_or_default();
+            start = end;
+            loop {
+                let drawing = self.synchronized();
+                match self.parser.process_until_frame(rest, &mut self.observed) {
+                    Ok(Some(taken)) if taken > 0 => {
+                        if !drawing {
+                            self.frame_start = Some(self.snapshot());
+                        }
+                        rest = rest.get(taken..).unwrap_or_default();
+                    }
+                    Ok(Some(_) | None) => break,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "terminal emulator refused shell output");
+                        break;
+                    }
+                }
+            }
         }
+    }
+
+    /// Whether the program is drawing a frame it wants shown whole (synchronized output).
+    pub fn synchronized(&self) -> bool {
+        self.parser.screen().synchronized_output()
+    }
+
+    /// The screen as it was when the program last began a frame, if not taken since.
+    pub fn take_frame_start(&mut self) -> Option<TerminalScreen> {
+        self.frame_start.take()
     }
 
     /// Take the replies to the program's queries, which the caller must write to its input.
@@ -177,10 +220,144 @@ impl ServerTerminal {
     }
 }
 
+/// Finds where a program ends synchronized output (ESU, `CSI ? … 2026 … l`) in its output, its state
+/// carried from one read to the next so that a sequence split between them is found too.
+#[derive(Debug, Default)]
+struct FrameEnds {
+    state: Scan,
+    /// The parameters of the private CSI being read, up to [`FrameEnds::PARAMS`] bytes.
+    params: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Scan {
+    #[default]
+    Ground,
+    Escape,
+    /// After `ESC [`.
+    Csi,
+    /// In a CSI that starts with `?`, whose parameters may name 2026.
+    Private,
+    /// In a CSI that cannot be an ESU, to its final byte.
+    Other,
+}
+
+impl FrameEnds {
+    /// The longest parameter list read; a longer one is not an ESU koh looks for.
+    const PARAMS: usize = 64;
+
+    /// The offsets in `bytes` just past each ESU.
+    fn after_each(&mut self, bytes: &[u8]) -> Vec<usize> {
+        let mut ends = Vec::new();
+        for (at, &byte) in bytes.iter().enumerate() {
+            self.state = match (self.state, byte) {
+                (_, 0x1b) => Scan::Escape,
+                (Scan::Escape, b'[') => Scan::Csi,
+                (Scan::Csi, b'?') => {
+                    self.params.clear();
+                    Scan::Private
+                }
+                (Scan::Private, b'0'..=b'9' | b';') if self.params.len() < Self::PARAMS => {
+                    self.params.push(byte);
+                    Scan::Private
+                }
+                (Scan::Private, b'l')
+                    if self.params.split(|&b| b == b';').any(|p| p == b"2026") =>
+                {
+                    ends.push(at.saturating_add(1));
+                    Scan::Ground
+                }
+                (Scan::Csi | Scan::Private | Scan::Other, 0x40..=0x7e) | (Scan::Escape, _) => {
+                    Scan::Ground
+                }
+                (Scan::Csi | Scan::Private | Scan::Other, _) => Scan::Other,
+                (Scan::Ground, _) => Scan::Ground,
+            };
+        }
+        ends
+    }
+}
+
+/// The longest a program's frame is held before its screen is sent anyway, so that a program that
+/// stopped mid-frame cannot freeze the screen. Terminals bound it between 100 and 200 ms.
+pub const FRAME_HOLD: Duration = Duration::from_millis(150);
+
+/// Which screen a session sends while a program draws a frame it wants shown whole: not the
+/// half-drawn one.
+///
+/// A program asks for it with synchronized output (DEC 2026). While the frame is drawn, the screen as it was when
+/// the frame began goes out, once; at its end (ESU, a resize or a reset), the screen. A frame held
+/// longer than [`FRAME_HOLD`] is let go, and the screen goes out as if the program had ended it.
+/// Without I/O: the session gives it the time.
+#[derive(Debug, Default)]
+pub struct FrameHold {
+    /// When the frame held was first seen.
+    since: Option<Instant>,
+    /// Whether the frame held was let go after [`FRAME_HOLD`].
+    released: bool,
+}
+
+impl FrameHold {
+    /// After the program's output was fed to `emu`, at `now`: the screen to send, if any.
+    pub fn after_output(
+        &mut self,
+        emu: &mut ServerTerminal,
+        now: Instant,
+    ) -> Option<TerminalScreen> {
+        let started = emu.take_frame_start();
+        if !emu.synchronized() {
+            self.since = None;
+            self.released = false;
+            return Some(emu.snapshot());
+        }
+        if started.is_some() {
+            // A frame began in this output, so any before it ended: hold this one from now, even
+            // if the one before was let go and ended within the same output.
+            self.since = Some(now);
+            self.released = false;
+            return started;
+        }
+        let since = *self.since.get_or_insert(now);
+        if self.released || now.saturating_duration_since(since) >= FRAME_HOLD {
+            self.released = true;
+            return Some(emu.snapshot());
+        }
+        started
+    }
+
+    /// When the frame held is let go, if one is held.
+    pub fn deadline(&self) -> Option<Instant> {
+        if self.released {
+            return None;
+        }
+        self.since.and_then(|since| since.checked_add(FRAME_HOLD))
+    }
+
+    /// At `now`, past [`FrameHold::deadline`]: the screen to send, if a frame is still held.
+    pub fn expire(&mut self, emu: &mut ServerTerminal, now: Instant) -> Option<TerminalScreen> {
+        if !emu.synchronized() {
+            self.since = None;
+            self.released = false;
+            return None;
+        }
+        if self.deadline().is_some_and(|deadline| now >= deadline) {
+            self.released = true;
+            return Some(emu.snapshot());
+        }
+        None
+    }
+
+    /// Whether a frame is held: the screen sent is the one from before it began.
+    pub fn holding(&self) -> bool {
+        self.since.is_some() && !self.released
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::terminal::Grid;
+    use std::time::{Duration, Instant};
 
     /// Output that changes rows in every way: text, rewriting a row the same, erasing, scrolling,
     /// inserted and deleted lines, the alternate screen, a reset.
@@ -311,6 +488,100 @@ mod tests {
         // The program is answered with the colours it set.
         t.process(b"\x1b]4;1;#00ff00\x07\x1b]4;1;?\x07");
         assert_eq!(t.take_host_replies(), b"\x1b]4;1;rgb:0000/ffff/0000\x07");
+    }
+
+    /// The text of row 0 of `screen`.
+    fn top(screen: &TerminalScreen) -> String {
+        screen
+            .screen()
+            .contents()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_frame_being_drawn_is_not_sent_half_drawn() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        let mut hold = FrameHold::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        t.process(b"old frame");
+        assert_eq!(top(&hold.after_output(&mut t, at(0)).unwrap()), "old frame");
+        // The program begins a frame and draws half of it: the screen from before goes out, once.
+        t.process(b"\x1b[?2026h\x1b[H\x1b[2Knew");
+        assert_eq!(
+            top(&hold.after_output(&mut t, at(10)).unwrap()),
+            "old frame"
+        );
+        assert!(hold.holding());
+        t.process(b" fra");
+        assert!(
+            hold.after_output(&mut t, at(20)).is_none(),
+            "nothing while it draws"
+        );
+        // It ends the frame: the whole of it goes out.
+        t.process(b"me\x1b[?2026l");
+        assert_eq!(
+            top(&hold.after_output(&mut t, at(30)).unwrap()),
+            "new frame"
+        );
+        assert!(!hold.holding() && hold.deadline().is_none());
+        // A whole frame in one read is sent as it is.
+        t.process(b"\x1b[?2026h\x1b[H\x1b[2Kthird\x1b[?2026l");
+        assert_eq!(top(&hold.after_output(&mut t, at(40)).unwrap()), "third");
+    }
+
+    #[test]
+    fn a_frame_never_ended_is_let_go_after_the_hold() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        let mut hold = FrameHold::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        t.process(b"before\x1b[?2026h\x1b[H\x1b[2Kstuck");
+        assert_eq!(top(&hold.after_output(&mut t, at(0)).unwrap()), "before");
+        assert_eq!(hold.deadline(), Some(at(0) + FRAME_HOLD));
+        assert!(
+            hold.expire(&mut t, at(100)).is_none(),
+            "not before the deadline"
+        );
+        assert_eq!(top(&hold.expire(&mut t, at(150)).unwrap()), "stuck");
+        assert!(hold.deadline().is_none() && !hold.holding());
+        // Let go, later output goes out as it comes, until the frame ends.
+        t.process(b"!");
+        assert_eq!(top(&hold.after_output(&mut t, at(160)).unwrap()), "stuck!");
+        t.process(b"\x1b[?2026l\x1b[?2026h");
+        assert!(hold.after_output(&mut t, at(170)).is_some());
+        assert!(hold.holding(), "a new frame is held again");
+    }
+
+    #[test]
+    fn a_frame_end_split_between_reads_is_found() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        t.process(b"\x1b[?2026h\x1b[2Kone");
+        drop(t.take_frame_start());
+        // The ESU in two reads, then the next frame begins: it starts from the frame ended.
+        t.process(b"\x1b[?20");
+        t.process(b"26l\x1b[?2026h\x1b[H\x1b[2Ktw");
+        assert_eq!(top(&t.take_frame_start().expect("a frame began")), "one");
+        // A BSU again while the frame is drawn begins none.
+        t.process(b"o\x1b[?2026h");
+        assert!(t.take_frame_start().is_none());
+    }
+
+    #[test]
+    fn a_resize_ends_the_frame_held() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        let mut hold = FrameHold::default();
+        let now = Instant::now();
+        t.process(b"a\x1b[?2026hb");
+        assert!(hold.after_output(&mut t, now).is_some());
+        t.resize(Size::new(5, 20));
+        assert!(!t.synchronized());
+        assert!(hold.expire(&mut t, now + FRAME_HOLD).is_none());
+        assert!(!hold.holding());
     }
 
     #[test]

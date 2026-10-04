@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::terminal::{ServerTerminal, Size, TerminalScreen, DEFAULT_SIZE};
+use crate::terminal::{FrameHold, ServerTerminal, Size, TerminalScreen, DEFAULT_SIZE};
 use anyhow::Context;
 use iroh::EndpointId;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -162,6 +162,14 @@ fn take_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize, mut take: impl FnMut(
     }
 }
 
+/// Wait until `deadline`, or forever if there is none.
+async fn until(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(Instant::from_std(deadline)).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Run one session until its program exits and its client leaves, or its detach TTL expires.
 async fn session_task(
     peer: EndpointId,
@@ -178,6 +186,9 @@ async fn session_task(
     let mut pending_keys: Vec<u8> = Vec::new();
     // After the program exits, its final screen is served until the client leaves.
     let mut exited = false;
+
+    // A frame the program is drawing (synchronized output) is not sent half drawn.
+    let mut hold = FrameHold::default();
 
     let tick_period = ttl.min(REAP_INTERVAL).max(Duration::from_millis(1));
     let mut ttl_tick = tokio::time::interval(tick_period);
@@ -202,14 +213,23 @@ async fn session_task(
                         // Query answers go to the program, not the screen.
                         let _ = host.input(&replies);
                     }
+                    if let Some(screen) = hold.after_output(&mut host.emu, std::time::Instant::now()) {
+                        screens_tx.send_replace(Arc::new(screen));
+                    }
                 } else {
-                    // The program exited: publish a final screen carrying its status.
+                    // The program exited: publish a final screen carrying its status, whole even
+                    // if it stopped mid-frame.
                     if let Some(code) = reap_exit_code(&mut host).await {
                         host.emu.set_exit_code(code);
                     }
                     exited = true;
+                    screens_tx.send_replace(Arc::new(host.snapshot()));
                 }
-                screens_tx.send_replace(Arc::new(host.snapshot()));
+            },
+            _ = until(hold.deadline()) => {
+                if let Some(screen) = hold.expire(&mut host.emu, std::time::Instant::now()) {
+                    screens_tx.send_replace(Arc::new(screen));
+                }
             },
             input = input_rx.recv(), if can_read_input => {
                 // `input_tx` is held below, so this only ends with the task.

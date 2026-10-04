@@ -10,16 +10,7 @@ use std::path::Path;
 
 /// Recordings the user's terminal shows otherwise than the server, and why. Each must still
 /// differ, so that a fix takes its recording off this list.
-pub const DIFFERS: &[(&str, &str)] = &[
-    ("micro-small", CLUSTER_JOINED),
-    ("vim-unicode", CLUSTER_JOINED),
-];
-
-/// Why a recording whose program places a skin-tone modifier on its own differs.
-pub const CLUSTER_JOINED: &str = "the program places 👍 and then 🏽 with a cursor move between \
-    (`CSI 5;18H 👍 CSI 5;20H 🏽`), so the server's screen has two cells; the client prints adjacent \
-    cells one after another with no cursor move, and the user's terminal joins the modifier to \
-    the 👍, as one cluster.";
+pub const DIFFERS: &[(&str, &str)] = &[];
 
 /// One step of a recording: the terminal resized first, if `resize` says so, then `keys` were
 /// typed, and the program's output to the step's end followed.

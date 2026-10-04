@@ -343,6 +343,18 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
     }
 }
 
+/// Whether printing `glyph` right after `before` would continue `before`'s cluster: a skin-tone
+/// modifier or a combining mark the program placed in a cell of its own, which a terminal joins to
+/// the glyph printed just before it unless the cursor moved between them.
+fn joins(before: Option<&str>, glyph: &str) -> bool {
+    before.is_some_and(|before| {
+        glyph
+            .chars()
+            .next()
+            .is_some_and(|c| fux_vt::continues_cluster(before, c))
+    })
+}
+
 /// Whether every glyph `grid` and `marks` draw on `row` fills exactly the cells the grid gives it:
 /// one column for a narrow cell, two for a wide one followed by the half it covers.
 fn regular(grid: &Grid, marks: &[Mark<&str>], row: u16) -> bool {
@@ -444,13 +456,19 @@ impl Painter {
             for row in 0..rows {
                 irregular = irregular || !regular(screen, &marks, row);
                 backend.move_to(row, 0)?;
+                let mut printed: Option<&str> = None;
                 for col in 0..cols {
                     if let Paint::Glyph { glyph, style, .. } = paint(screen, &marks, row, col) {
+                        // A cell of its own, though it would join the glyph before it.
+                        if joins(printed, glyph) {
+                            backend.move_to(row, col)?;
+                        }
                         if cur_style != Some(style) {
                             backend.set_style(style)?;
                             cur_style = Some(style);
                         }
                         backend.print(glyph)?;
+                        printed = Some(glyph);
                     }
                 }
             }
@@ -466,6 +484,8 @@ impl Painter {
             // Where the cursor is after the last glyph painted, if known: past the last column the
             // terminal may be about to wrap.
             let mut cursor: Option<(u16, u16)> = None;
+            // The glyph printed last, which the next one printed with no cursor move follows.
+            let mut printed: Option<&str> = None;
             for row in (0..rows).filter(|&row| changed(row)) {
                 let repaint_row = Some(row) == status_row;
                 let mut col = 0;
@@ -487,7 +507,7 @@ impl Painter {
                                 paint(screen, &marks, row, next) != before(next)
                             }));
                     if differs {
-                        if cursor != Some((row, col)) {
+                        if cursor != Some((row, col)) || joins(printed, glyph) {
                             backend.move_to(row, col)?;
                         }
                         if cur_style != Some(style) {
@@ -495,6 +515,7 @@ impl Painter {
                             cur_style = Some(style);
                         }
                         backend.print(glyph)?;
+                        printed = Some(glyph);
                         cursor = col
                             .checked_add(span)
                             .filter(|&next| next < cols)
@@ -1213,6 +1234,42 @@ mod tests {
     }
 
     /// Paint `grid` with `overlay` through `painter` into `terminal`, 6×20.
+    #[test]
+    fn a_modifier_placed_in_a_cell_of_its_own_is_not_joined_to_the_glyph_before_it() {
+        // vim places 👍 and then 🏽 with a cursor move between them, so the screen holds two
+        // cells; printed one after the other they would be one cluster on the user's terminal.
+        let at = |bytes: &[u8]| {
+            crate::terminal::TerminalScreen::from_bytes(6, 20, bytes)
+                .screen()
+                .clone()
+        };
+        let two = at("\u{1f44d}\x1b[1;3H\u{1f3fd}".as_bytes());
+        let looks = |terminal: &fux_vt::Parser| {
+            [0, 2].map(|col| {
+                terminal
+                    .screen()
+                    .cell(0, col)
+                    .map(|c| c.contents().to_owned())
+            })
+        };
+        let expected = [Some("\u{1f44d}".to_owned()), Some("\u{1f3fd}".to_owned())];
+        // Painted whole.
+        let mut terminal = fux_vt::Parser::new(6, 20, 0).unwrap();
+        paint_into(
+            &mut Painter::default(),
+            &mut terminal,
+            &two,
+            &Overlay::empty(),
+        );
+        assert_eq!(looks(&terminal), expected);
+        // Painted as a change: the two cells after one another on a row painted before.
+        let mut painter = Painter::default();
+        let mut terminal = fux_vt::Parser::new(6, 20, 0).unwrap();
+        paint_into(&mut painter, &mut terminal, &at(b"ab"), &Overlay::empty());
+        paint_into(&mut painter, &mut terminal, &two, &Overlay::empty());
+        assert_eq!(looks(&terminal), expected);
+    }
+
     fn paint_into(
         painter: &mut Painter,
         terminal: &mut fux_vt::Parser,

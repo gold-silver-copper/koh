@@ -143,6 +143,9 @@ error; upgrade both ends.
   `der` 0.8.0 → 0.8.2 and `spin` 0.10.0 → 0.10.1.
 
 ### Fixed
+- A skin-tone modifier or combining mark a program placed in a cell of its own (vim and micro
+  place 👍 and 🏽 with a cursor move between) is painted there, not joined to the glyph before it:
+  the client moves the cursor before a glyph that would continue the cluster printed just before.
 - **A server could make `koh connect` hold about half a gigabyte**, enough to get it killed on a
   phone. The client keeps the screens of its last 16 frames as bases for the next ones, each a full
   copy: a server on a 1000×1000 terminal (about 32 MB a screen), or a hostile one, sending full

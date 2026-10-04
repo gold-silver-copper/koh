@@ -7,7 +7,7 @@ use std::io;
 
 use super::backend::{CellStyle, KohBackend};
 use crate::predict::Overlay;
-use crate::terminal::{Grid, Size, MAXIMUM_CLIPBOARD_SIZE};
+use crate::terminal::{Grid, Link, Size, MAXIMUM_CLIPBOARD_SIZE};
 use fux_vt::{
     Blink, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, UnderlineStyle,
 };
@@ -30,6 +30,8 @@ pub(super) struct Painter {
     last: Option<Painted>,
     /// Whether the terminal draws underline styles (`4:n`); if not, they are painted plain.
     underline_styles: bool,
+    /// Whether hyperlinks are painted (OSC 8); if not, their text is painted plain.
+    hyperlinks: bool,
 }
 
 /// A frame as it was painted.
@@ -238,6 +240,7 @@ const BLANK: Paint<'static> = Paint::Glyph {
     glyph: " ",
     style: plain(Color::Default, Color::Default),
     span: 1,
+    link: None,
 };
 
 /// The marks of `marks` (in `(row, col)` order) on `row`.
@@ -252,11 +255,13 @@ fn marks_on<'m, 'a>(marks: &'m [Mark<&'a str>], row: u16) -> &'m [Mark<&'a str>]
 enum Paint<'a> {
     /// The right half of a wide glyph, which the glyph to its left covers.
     Covered,
-    /// `glyph` in `style`, over `span` cells of the grid: 2 for a wide cell, else 1.
+    /// `glyph` in `style`, over `span` cells of the grid: 2 for a wide cell, else 1, and the
+    /// hyperlink it has, if any.
     Glyph {
         glyph: &'a str,
         style: CellStyle,
         span: u16,
+        link: Option<&'a Link>,
     },
 }
 
@@ -300,6 +305,7 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
             },
             style: plain(mark.fg, mark.bg),
             span: if covers_next { 2 } else { 1 },
+            link: None,
         };
     }
     let cell = grid.cell(row, col);
@@ -315,6 +321,7 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
             glyph: " ",
             style,
             span: 1,
+            link: None,
         };
     }
     let Some(c) = cell else {
@@ -322,6 +329,7 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
             glyph: " ",
             style: plain(Color::Default, Color::Default),
             span: 1,
+            link: None,
         };
     };
     if c.is_wide_continuation() {
@@ -344,7 +352,32 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
             blink: c.blink(),
         },
         span: if c.is_wide() { 2 } else { 1 },
+        link: grid.link(row, col),
     }
+}
+
+/// Make `want` the hyperlink the glyphs printed next have, in place of `open`: close the one open,
+/// if any, and open `want`, if any.
+fn switch_link<'a>(
+    backend: &mut impl KohBackend,
+    open: &mut Option<&'a Link>,
+    want: Option<&'a Link>,
+) -> io::Result<()> {
+    if *open != want {
+        if open.is_some() {
+            backend.close_link()?;
+        }
+        if let Some(link) = want {
+            backend.open_link(link)?;
+        }
+        *open = want;
+    }
+    Ok(())
+}
+
+/// `link` if it is to be painted: links are `on`, and it is safe to write; else its text alone.
+fn paintable(link: Option<&Link>, on: bool) -> Option<&Link> {
+    link.filter(|link| on && link.safe())
 }
 
 /// Whether printing `glyph` right after `before` would continue `before`'s cluster: a skin-tone
@@ -390,6 +423,15 @@ impl Painter {
     pub(super) fn set_underline_styles(&mut self, on: bool) {
         if self.underline_styles != on {
             self.underline_styles = on;
+            self.invalidate();
+        }
+    }
+
+    /// Paint hyperlinks if `on`, their text alone if not; what is painted already is painted
+    /// again.
+    pub(super) fn set_hyperlinks(&mut self, on: bool) {
+        if self.hyperlinks != on {
+            self.hyperlinks = on;
             self.invalidate();
         }
     }
@@ -464,6 +506,9 @@ impl Painter {
         backend.begin_frame()?;
 
         let mut cur_style: Option<CellStyle> = None;
+        // The hyperlink the glyphs printed now have on the terminal, if any.
+        let mut open_link: Option<&Link> = None;
+        let links_on = self.hyperlinks;
         let mut irregular = false;
         if whole {
             for row in 0..rows {
@@ -471,7 +516,10 @@ impl Painter {
                 backend.move_to(row, 0)?;
                 let mut printed: Option<&str> = None;
                 for col in 0..cols {
-                    if let Paint::Glyph { glyph, style, .. } = paint(screen, &marks, row, col) {
+                    if let Paint::Glyph {
+                        glyph, style, link, ..
+                    } = paint(screen, &marks, row, col)
+                    {
                         // A cell of its own, though it would join the glyph before it.
                         if joins(printed, glyph) {
                             backend.move_to(row, col)?;
@@ -481,6 +529,7 @@ impl Painter {
                             backend.set_style(style)?;
                             cur_style = Some(style);
                         }
+                        switch_link(backend, &mut open_link, paintable(link, links_on))?;
                         backend.print(glyph)?;
                         printed = Some(glyph);
                     }
@@ -505,7 +554,13 @@ impl Painter {
                 let mut col = 0;
                 while col < cols {
                     let now = paint(screen, &marks, row, col);
-                    let Paint::Glyph { glyph, style, span } = now else {
+                    let Paint::Glyph {
+                        glyph,
+                        style,
+                        span,
+                        link,
+                    } = now
+                    else {
                         col = col.saturating_add(1);
                         continue;
                     };
@@ -529,6 +584,7 @@ impl Painter {
                             backend.set_style(style)?;
                             cur_style = Some(style);
                         }
+                        switch_link(backend, &mut open_link, paintable(link, links_on))?;
                         backend.print(glyph)?;
                         printed = Some(glyph);
                         cursor = col
@@ -541,6 +597,8 @@ impl Painter {
             }
         }
 
+        // No link is left open, for the status line or the user's shell to inherit.
+        switch_link(backend, &mut open_link, None)?;
         if cur_style.is_some() {
             backend.reset_sgr()?;
         }
@@ -1327,6 +1385,91 @@ mod tests {
         );
     }
 
+    /// The bytes a painter (with links `on`) paints for `screen`, a 6×20 one.
+    fn painted_with_links(screen: &Grid, on: bool) -> Vec<u8> {
+        let mut painter = Painter::default();
+        painter.set_hyperlinks(on);
+        let mut backend = CaptureBackend {
+            size: Size::new(6, 20),
+            ..CaptureBackend::default()
+        };
+        painter
+            .render(&mut backend, screen, &Overlay::empty(), None)
+            .unwrap();
+        backend.bytes
+    }
+
+    #[test]
+    fn a_hyperlink_is_painted_as_one_and_closed_after() {
+        let screen = crate::terminal::TerminalScreen::from_bytes(
+            6,
+            20,
+            b"a\x1b]8;id=x;https://example.org/\x1b\\link\x1b]8;;\x1b\\b",
+        );
+        let bytes = painted_with_links(screen.screen(), true);
+        let painted = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            painted.contains("\x1b]8;id=x;https://example.org/\x1b\\link\x1b]8;;\x1b\\b"),
+            "{painted:?}"
+        );
+        let options = fux_vt::Options::new().with_hyperlinks(true);
+        let mut terminal = fux_vt::Parser::with_options(6, 20, 0, options).unwrap();
+        terminal.process(&bytes).unwrap();
+        let link = |col| {
+            terminal
+                .screen()
+                .link(0, col)
+                .map(|l| (l.uri().to_owned(), l.id().map(str::to_owned)))
+        };
+        assert_eq!(link(0), None);
+        for col in 1..5 {
+            assert_eq!(
+                link(col),
+                Some(("https://example.org/".to_owned(), Some("x".to_owned())))
+            );
+        }
+        assert_eq!(link(5), None);
+        assert!(terminal.screen().hyperlink().is_none(), "none left open");
+        // With links off (`--no-hyperlinks`), the text alone.
+        let off = painted_with_links(screen.screen(), false);
+        assert!(!String::from_utf8_lossy(&off).contains("\x1b]8"));
+    }
+
+    #[test]
+    fn a_servers_link_that_is_not_safe_to_write_is_painted_as_plain_text() {
+        use crate::terminal::{TerminalScreen, WireLink};
+        // A hostile server's link that would end the OSC 8 and set the clipboard, or carry a
+        // space, or an id with a separator: each painted as its text, with no escape sequence.
+        let text = TerminalScreen::from_bytes(6, 20, b"link");
+        for (uri, id) in [
+            ("x\x1b]52;c;Y3VybCBldmlsfHNo\x07", ""),
+            ("https://example.org/a b", ""),
+            ("https://example.org/", "a;b"),
+            ("", ""),
+        ] {
+            let mut diff = text.diff_from(&TerminalScreen::default());
+            for row in &mut diff.rows {
+                row.links = vec![WireLink {
+                    uri: uri.to_owned(),
+                    id: id.to_owned(),
+                }];
+                for run in &mut row.runs {
+                    run.cell.link = 1;
+                }
+            }
+            let mut screen = TerminalScreen::default();
+            screen.apply(&diff);
+            assert!(screen.screen().link(0, 0).is_some(), "the link arrived");
+            let painted =
+                String::from_utf8_lossy(&painted_with_links(screen.screen(), true)).into_owned();
+            assert!(painted.contains("link"), "{painted:?}");
+            assert!(
+                !painted.contains("\x1b]8") && !painted.contains("\x1b]52"),
+                "{uri:?} {id:?}: {painted:?}"
+            );
+        }
+    }
+
     fn paint_into(
         painter: &mut Painter,
         terminal: &mut fux_vt::Parser,
@@ -1465,6 +1608,7 @@ mod tests {
             bg: WireColor::Default,
             underline_color: WireColor::Default,
             style: WireStyle::default(),
+            link: 0,
         };
         let mut diff = blank.diff_from(&blank);
         diff.rows = vec![RowDiff {
@@ -1480,6 +1624,7 @@ mod tests {
                     cell: cell("世", CellKind::Wide),
                 },
             ],
+            links: Vec::new(),
         }];
         let mut malformed = blank.clone();
         malformed.apply(&diff);

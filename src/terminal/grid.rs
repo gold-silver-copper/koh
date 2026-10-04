@@ -37,12 +37,98 @@ impl Modes {
     }
 }
 
+/// A hyperlink (OSC 8): its URI, and the id the program gave it, empty for none.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Link {
+    pub uri: String,
+    pub id: String,
+}
+
+impl Link {
+    /// Whether this link may be painted as one: a URI of printable ASCII (no space) within
+    /// [`fux_vt::URI_LIMIT`], and an id of printable ASCII without `;` or `:` within
+    /// [`fux_vt::ID_LIMIT`]. A server could send anything, and a link is written to the user's
+    /// terminal inside an escape sequence, so one that is not is painted as plain text.
+    pub fn safe(&self) -> bool {
+        let printable = |b: &u8| (0x21..=0x7e).contains(b);
+        !self.uri.is_empty()
+            && self.uri.len() <= fux_vt::URI_LIMIT
+            && self.uri.bytes().all(|b| printable(&b))
+            && self.id.len() <= fux_vt::ID_LIMIT
+            && self
+                .id
+                .bytes()
+                .all(|b| printable(&b) && b != b';' && b != b':')
+    }
+
+    /// The bytes this link costs: its URI and its id.
+    pub fn len(&self) -> usize {
+        self.uri.len().saturating_add(self.id.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.uri.is_empty() && self.id.is_empty()
+    }
+}
+
+/// The most distinct links one row keeps. A row with more keeps the first, and its other cells
+/// show no link.
+pub const MAX_ROW_LINKS: usize = 64;
+
+/// A row's links: each distinct one once, and by column the one each cell has (0 for none, else
+/// one more than its place in `table`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowLinks {
+    pub(super) table: Vec<Link>,
+    pub(super) cells: Vec<u16>,
+}
+
+impl RowLinks {
+    /// The link of the cell at `col`.
+    pub fn at(&self, col: usize) -> Option<&Link> {
+        let index = usize::from(*self.cells.get(col)?);
+        self.table.get(index.checked_sub(1)?)
+    }
+
+    /// The bytes the links cost.
+    pub(super) fn bytes(&self) -> usize {
+        self.table.iter().map(Link::len).sum()
+    }
+
+    /// The links of a live row, `cols` wide, or `None` if it has none.
+    fn of(row: &fux_vt::Row<'_>, cols: u16) -> Option<Arc<Self>> {
+        if !row.has_links() {
+            return None;
+        }
+        let mut links = Self::default();
+        for col in 0..usize::from(cols) {
+            let index = row.link(col).map_or(0, |link| {
+                let link = Link {
+                    uri: link.uri().to_owned(),
+                    id: link.id().unwrap_or_default().to_owned(),
+                };
+                let at = links.table.iter().position(|l| *l == link).or_else(|| {
+                    (links.table.len() < MAX_ROW_LINKS).then(|| {
+                        links.table.push(link);
+                        links.table.len().saturating_sub(1)
+                    })
+                });
+                at.and_then(|at| u16::try_from(at.saturating_add(1)).ok())
+                    .unwrap_or(0)
+            });
+            links.cells.push(index);
+        }
+        (!links.table.is_empty()).then(|| Arc::new(links))
+    }
+}
+
 /// One row of a [`Grid`]: its cells with their text, shared by every screen that holds the row
-/// unchanged, and whether it soft-wraps into the next.
+/// unchanged, whether it soft-wraps into the next, and its cells' links.
 #[derive(Clone, Debug)]
 struct Row {
     cells: Arc<Cells>,
     wrapped: bool,
+    links: Option<Arc<RowLinks>>,
 }
 
 impl Row {
@@ -51,6 +137,7 @@ impl Row {
         Self {
             cells: Arc::new(Cells::new(usize::from(cols))),
             wrapped: false,
+            links: None,
         }
     }
 
@@ -67,7 +154,9 @@ impl Row {
 
 impl PartialEq for Row {
     fn eq(&self, other: &Self) -> bool {
-        self.wrapped == other.wrapped && (self.shares(other) || self.cells == other.cells)
+        self.wrapped == other.wrapped
+            && self.links == other.links
+            && (self.shares(other) || self.cells == other.cells)
     }
 }
 
@@ -153,15 +242,15 @@ pub(super) struct RowCache {
 }
 
 impl RowCache {
-    /// The cached cells for the live row `live` at `index`, if they are what it holds: its own row
+    /// The cached row for the live row `live` at `index`, if it is what it holds: its own row
     /// found by id (at the same index, else by `by_id`, built on first need), at the cached version
-    /// or, at another version, with the same cells.
+    /// or, at another version, with the same cells and no links.
     fn cells(
         &self,
         index: usize,
         live: &fux_vt::Row<'_>,
         by_id: &mut Option<HashMap<RowId, usize>>,
-    ) -> Option<Arc<Cells>> {
+    ) -> Option<(Arc<Cells>, Option<Arc<RowLinks>>)> {
         let at = if self.ids.get(index).is_some_and(|(id, _)| *id == live.id()) {
             index
         } else {
@@ -174,13 +263,15 @@ impl RowCache {
             *by_id.get(&live.id())?
         };
         let (_, version) = self.ids.get(at)?;
-        let cells = &self.lines.get(at)?.cells;
-        // fux-vt gives a row a new version with each edit that changes it, and with no other, so
-        // a row at the version it was cached at holds the same cells without comparing them. A
-        // row with a new version may still hold the same cells (erased, then written back), so it
-        // is compared.
-        (cells.len() == live.len() && (*version == live.version() || cells.iter().eq(live.cells())))
-            .then(|| Arc::clone(cells))
+        let line = self.lines.get(at)?;
+        let cells = &line.cells;
+        // fux-vt gives a row a new version with each edit that changes it, its links included,
+        // and with no other, so a row at the version it was cached at holds the same cells without
+        // comparing them. A row with a new version may still hold the same cells (erased, then
+        // written back), so it is compared, if neither has links.
+        let same = *version == live.version()
+            || (line.links.is_none() && !live.has_links() && cells.iter().eq(live.cells()));
+        (cells.len() == live.len() && same).then(|| (Arc::clone(cells), line.links.clone()))
     }
 
     /// Whether the live rows `rows` are exactly the cached ones: the same ids, at the same
@@ -259,13 +350,19 @@ impl Grid {
                         return Row {
                             cells: exactly(None, cols, cache.palette.as_ref()),
                             wrapped: false,
+                            links: None,
                         };
                     };
+                    let (cells, links) = cache.cells(index, row, &mut by_id).unwrap_or_else(|| {
+                        (
+                            exactly(Some(row), cols, cache.palette.as_ref()),
+                            RowLinks::of(row, cols),
+                        )
+                    });
                     Row {
-                        cells: cache
-                            .cells(index, row, &mut by_id)
-                            .unwrap_or_else(|| exactly(Some(row), cols, cache.palette.as_ref())),
+                        cells,
                         wrapped: row.wrapped(),
+                        links,
                     }
                 })
                 .collect();
@@ -292,6 +389,16 @@ impl Grid {
     /// One row's cells, or `None` out of bounds.
     pub fn row(&self, row: u16) -> Option<&Cells> {
         self.lines.get(usize::from(row)).map(|line| &*line.cells)
+    }
+
+    /// The hyperlink of the cell at `(row, col)`, if it has one.
+    pub fn link(&self, row: u16, col: u16) -> Option<&Link> {
+        self.row_links(row)?.at(usize::from(col))
+    }
+
+    /// One row's links, or `None` if it has none or is out of bounds.
+    pub fn row_links(&self, row: u16) -> Option<&RowLinks> {
+        self.lines.get(usize::from(row))?.links.as_deref()
     }
 
     /// Whether `row` soft-wraps into the next one.
@@ -475,15 +582,25 @@ impl Grid {
             .sum()
     }
 
-    /// Replace `row` with `cells`, which must be exactly `cols` long. Out of bounds or a wrong
-    /// length changes nothing.
-    pub(super) fn set_row(&mut self, row: u16, cells: Arc<Cells>, wrapped: bool) {
+    /// Replace `row` with `cells`, which must be exactly `cols` long, and their `links`. Out of
+    /// bounds or a wrong length changes nothing.
+    pub(super) fn set_row(
+        &mut self,
+        row: u16,
+        cells: Arc<Cells>,
+        wrapped: bool,
+        links: Option<Arc<RowLinks>>,
+    ) {
         if cells.len() != usize::from(self.size.cols) {
             return;
         }
         if usize::from(row) < self.lines.len() {
             if let Some(line) = Arc::make_mut(&mut self.lines).get_mut(usize::from(row)) {
-                *line = Row { cells, wrapped };
+                *line = Row {
+                    cells,
+                    wrapped,
+                    links,
+                };
             }
         }
     }

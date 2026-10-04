@@ -22,6 +22,11 @@ client and a 0.13 server (or the reverse) refuse each other at the TLS handshake
 error; upgrade both ends.
 
 ### Added
+- **Hyperlinks.** A program's OSC 8 links (`ls --hyperlink`, delta, compilers, claude) now reach
+  your terminal as links, on by default; `koh connect --no-hyperlinks` paints them as plain text.
+  Each is checked before it is painted, and a server's links are bounded on the wire (64 a row,
+  fux-vt's URI and id limits, 1 MiB a frame). The koh/3 encoding gains each row's links and each
+  cell's link.
 - **Underline styles.** A curly, double, dotted or dashed underline (neovim's diagnostics, for
   one) now reaches your terminal as it was set, if your terminal draws them: `koh connect` asks it
   once at start-up (XTGETTCAP for `Smulx`, and DECRQSS of a curly pen), and paints a plain
@@ -36,7 +41,7 @@ error; upgrade both ends.
 - **Clipboard writes are on by default.** A remote program's OSC 52 copy now sets your clipboard
   without `--clipboard`, which is gone; `koh connect --no-clipboard` turns it off. A hostile server
   can therefore replace what you copied, so pass `--no-clipboard` to a server you do not trust.
-  Only base64 of at most 1 MiB is forwarded, and the clipboard is never read.
+  Only base64 of at most 16 KiB is forwarded, and the clipboard is never read.
 - The server's terminal re-wraps the screen and its history on a resize (reflow), answers the size
   query and in-band resize (mode 2048), keeps a program's colours (OSC 4, 10, 11) and draws them as
   RGB without changing your terminal's palette, and answers device attributes and XTVERSION as

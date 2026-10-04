@@ -83,8 +83,15 @@ impl KohBackend for Capture {
 }
 
 /// What a cell shows: its text (a printed space shows what an erased cell of its attributes does,
-/// so the two count as one), whether it is either half of a wide glyph, and its attributes.
-type Look = (String, bool, bool, fux_vt::Attributes);
+/// so the two count as one), whether it is either half of a wide glyph, its attributes, and its
+/// hyperlink's URI and id.
+type Look = (
+    String,
+    bool,
+    bool,
+    fux_vt::Attributes,
+    Option<(String, Option<String>)>,
+);
 
 /// What a screen shows: its size, every cell, whether the cursor is hidden and where it is.
 #[derive(Clone, Debug, PartialEq)]
@@ -112,11 +119,15 @@ impl View {
                     if drawn {
                         attributes = koh::terminal::drawn(attributes, screen);
                     }
+                    let link = screen
+                        .link(row, col)
+                        .map(|l| (l.uri().to_owned(), l.id().map(str::to_owned)));
                     (
                         text,
                         cell.is_wide(),
                         cell.is_wide_continuation(),
                         attributes,
+                        link,
                     )
                 })
             })
@@ -218,10 +229,18 @@ impl Session {
                 let mut terminal =
                     BackendTerminal::enter(capture.clone(), false).map_err(|e| e.to_string())?;
                 terminal.set_underline_styles(true);
+                terminal.set_hyperlinks(true);
                 terminal
             },
             capture,
-            shown: fux_vt::Parser::new(rows, cols, 0).map_err(|e| e.to_string())?,
+            // A terminal that keeps hyperlinks, as the user's does.
+            shown: fux_vt::Parser::with_options(
+                rows,
+                cols,
+                0,
+                fux_vt::Options::new().with_hyperlinks(true),
+            )
+            .map_err(|e| e.to_string())?,
             base: (FrameNum::BLANK, TerminalScreen::default()),
             sent: VecDeque::new(),
             next: FrameNum::BLANK.next(),

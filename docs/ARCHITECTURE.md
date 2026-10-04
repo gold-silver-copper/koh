@@ -154,6 +154,13 @@ draws them, which it asks the terminal once at start-up (XTGETTCAP for `Smulx`, 
 curly underline through DECRQSS, before primary device attributes; `client::probe`); otherwise
 it paints a plain underline, as a terminal that does not know `4:n` would draw none.
 
+A row also carries its hyperlinks (OSC 8): its distinct links once (at most 64, each URI and id
+within fux-vt's limits), and each cell the index of its link, so a row moved or shared keeps its
+links with it and needs no screen-wide table. A diff carries at most 1 MiB of links; the server
+leaves off a row's links past that, and the client drops a frame over it. The client paints a
+link with OSC 8 (with the program's id, if it gave one) unless `--no-hyperlinks`, after checking
+it again, and closes it before any cell without it and at the frame's end.
+
 ## Headless drivers (the protocol is I/O-free; the shells are thin)
 
 Both ends split into a synchronous, I/O-free core and a thin async shell. The client's

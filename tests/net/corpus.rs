@@ -134,11 +134,15 @@ fn difference(shown: &fux_vt::Screen, expected: &fux_vt::Screen) -> Option<Strin
                     } else {
                         cell.contents().to_owned()
                     };
+                    let link = screen
+                        .link(row, col)
+                        .map(|l| (l.uri().to_owned(), l.id().map(str::to_owned)));
                     (
                         text,
                         cell.is_wide(),
                         cell.is_wide_continuation(),
                         cell.attributes(),
+                        link,
                     )
                 })
             };
@@ -219,8 +223,15 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
         painted: Arc::default(),
         size: Arc::new(Mutex::new(start)),
     };
+    // A terminal that keeps hyperlinks, as the user's does.
     let shown = Arc::new(Mutex::new(
-        fux_vt::Parser::new(start.rows, start.cols, 0).map_err(|e| anyhow::anyhow!("{e}"))?,
+        fux_vt::Parser::with_options(
+            start.rows,
+            start.cols,
+            0,
+            fux_vt::Options::new().with_hyperlinks(true),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
     ));
     let (paints_tx, mut paints) = watch::channel(0u64);
     let terminal = Readback {
@@ -228,6 +239,7 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
             // The user's terminal draws underline styles, as the one reading the paint does.
             let mut terminal = BackendTerminal::enter(shared.clone(), false)?;
             terminal.set_underline_styles(true);
+            terminal.set_hyperlinks(true);
             terminal
         },
         shared: shared.clone(),

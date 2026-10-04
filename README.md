@@ -37,6 +37,7 @@ Useful flags:
 
 ```sh
 --no-clipboard            # ignore the server's OSC-52 clipboard writes (on by default)
+--no-hyperlinks           # paint the server's hyperlinks as plain text (links on by default)
 --on-bell <cmd>           # run a shell command whenever the remote bell rings
 --shell <program>         # host a program instead of the login shell (repeat to pass args)
 --key-file <path>         # use a custom identity-key path

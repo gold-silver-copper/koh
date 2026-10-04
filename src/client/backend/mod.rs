@@ -9,7 +9,7 @@ use std::io;
 
 use fux_vt::{Blink, Color, UnderlineStyle};
 
-use crate::terminal::Size;
+use crate::terminal::{Link, Size};
 
 mod tty;
 pub use self::tty::Tty;
@@ -230,6 +230,21 @@ pub trait KohBackend {
     /// Set the clipboard (`OSC 52`) to `base64`, which the caller validated.
     fn set_clipboard(&mut self, base64: &str) -> io::Result<()> {
         write!(self, "\x1b]52;c;{base64}\x07")
+    }
+
+    /// Open `link` (OSC 8) for the glyphs printed next, with its id if it has one. The caller
+    /// checked it is safe to write ([`Link::safe`]).
+    fn open_link(&mut self, link: &Link) -> io::Result<()> {
+        if link.id.is_empty() {
+            write!(self, "\x1b]8;;{}\x1b\\", link.uri)
+        } else {
+            write!(self, "\x1b]8;id={};{}\x1b\\", link.id, link.uri)
+        }
+    }
+
+    /// Close the hyperlink open (OSC 8 with no URI).
+    fn close_link(&mut self) -> io::Result<()> {
+        self.write_bytes(b"\x1b]8;;\x1b\\")
     }
 
     /// Ring the terminal bell (BEL).

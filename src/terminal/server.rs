@@ -74,6 +74,8 @@ pub const IDENTITY: fux_vt::Identity = fux_vt::Identity {
 /// - setting reports (DECRQSS) for the pen, the cursor shape and the margins: neovim draws its
 ///   diagnostics' curly underline only if the pen it set comes back with `4:3`, and koh carries
 ///   underline styles;
+/// - hyperlinks (OSC 8): each cell's link goes in its row on the wire, and the client paints it,
+///   unless the user turns links off;
 /// - koh's [`IDENTITY`].
 ///
 /// Left off: the kitty keyboard protocol (koh forwards the keys the user's terminal sends, so a
@@ -88,6 +90,7 @@ pub const OPTIONS: Options = Options::new()
     .with_palette(true)
     .with_reflow(true)
     .with_setting_reports(true)
+    .with_hyperlinks(true)
     .with_identity(Some(IDENTITY));
 
 /// The server's terminal: the live parser, and the [`TerminalScreen`] snapshots it sends.

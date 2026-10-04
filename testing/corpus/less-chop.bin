@@ -1,0 +1,321 @@
+[?1049h[40;1H[?1h=      [1m1[0m //! Direct DEC ANSI transition parser, based on Paul Williams's transition
+      [1m2[0m //! model (reference and attribution in the crate README), with UTF-8 ground decoding.
+      [1m3[0m //! Ignored control strings retain no payload. No parser dependency is used.
+      [1m4[0m 
+      [1m5[0m use crate::{Error, Reply, Screen, screen::Dispatch};
+      [1m6[0m 
+      [1m7[0m #[cfg(test)]
+      [1m8[0m #[path = "../tests/corpus/mod.rs"]
+      [1m9[0m mod test_corpus;
+     [1m10[0m 
+     [1m11[0m #[derive(Clone, Debug)]
+     [1m12[0m pub(crate) struct Parameters {
+     [1m13[0m     values: [u16; 32],
+     [1m14[0m     /// True when this value continues the previous colon-delimited group.
+     [1m15[0m     sub: [bool; 32],
+     [1m16[0m     len: usize,
+     [1m17[0m }
+     [1m18[0m impl Default for Parameters {
+     [1m19[0m     fn default() -> Self {
+     [1m20[0m         Self {
+     [1m21[0m             values: [0; 32],
+     [1m22[0m             sub: [false; 32],
+     [1m23[0m             len: 1,
+     [1m24[0m         }
+     [1m25[0m     }
+     [1m26[0m }
+     [1m27[0m impl Parameters {
+     [1m28[0m     fn digit(&mut self, byte: u8) {
+     [1m29[0m         // A value too large for a u16 stays at its largest.
+     [1m30[0m         if let Some(n) = self.len.checked_sub(1).and_then(|i| self.values.get_mut(i))
+     [1m31[0m             && let Some(digit) = byte.checked_sub(b'0')
+     [1m32[0m         {
+     [1m33[0m             *n = n.saturating_mul(10).saturating_add(u16::from(digit));
+     [1m34[0m         }
+     [1m35[0m     }
+     [1m36[0m     fn separator(&mut self, colon: bool) -> bool {
+     [1m37[0m         let Some(len) = self.len.checked_add(1).filter(|n| *n <= self.values.len()) else {
+     [1m38[0m             return false;
+     [1m39[0m         };
+[7msrc/parser.rs[27m[K[K [KESCESC[KOO[KCC[H[2J[H[H[2J[H      [1m1[0m s's transition
+      [1m2[0m ith UTF-8 ground decoding.
+      [1m3[0m endency is used.
+      [1m4[0m 
+      [1m5[0m 
+      [1m6[0m 
+      [1m7[0m 
+      [1m8[0m 
+      [1m9[0m 
+     [1m10[0m 
+     [1m11[0m 
+     [1m12[0m 
+     [1m13[0m 
+     [1m14[0m limited group.
+     [1m15[0m 
+     [1m16[0m 
+     [1m17[0m 
+     [1m18[0m 
+     [1m19[0m 
+     [1m20[0m 
+     [1m21[0m 
+     [1m22[0m 
+     [1m23[0m 
+     [1m24[0m 
+     [1m25[0m 
+     [1m26[0m 
+     [1m27[0m 
+     [1m28[0m 
+     [1m29[0m 
+     [1m30[0m | self.values.get_mut(i))
+     [1m31[0m 
+     [1m32[0m 
+     [1m33[0m om(digit));
+     [1m34[0m 
+     [1m35[0m 
+     [1m36[0m 
+     [1m37[0m n <= self.values.len()) else {
+     [1m38[0m 
+     [1m39[0m 
+:[K[K [KESCESC[KOO[KCC[H[2J[H[H[2J[H      [1m1[0m 
+      [1m2[0m 
+      [1m3[0m 
+      [1m4[0m 
+      [1m5[0m 
+      [1m6[0m 
+      [1m7[0m 
+      [1m8[0m 
+      [1m9[0m 
+     [1m10[0m 
+     [1m11[0m 
+     [1m12[0m 
+     [1m13[0m 
+     [1m14[0m 
+     [1m15[0m 
+     [1m16[0m 
+     [1m17[0m 
+     [1m18[0m 
+     [1m19[0m 
+     [1m20[0m 
+     [1m21[0m 
+     [1m22[0m 
+     [1m23[0m 
+     [1m24[0m 
+     [1m25[0m 
+     [1m26[0m 
+     [1m27[0m 
+     [1m28[0m 
+     [1m29[0m 
+     [1m30[0m 
+     [1m31[0m 
+     [1m32[0m 
+     [1m33[0m 
+     [1m34[0m 
+     [1m35[0m 
+     [1m36[0m 
+     [1m37[0m 
+     [1m38[0m 
+     [1m39[0m 
+:[K[K [KESCESC[KOO[KDD[H[2J[H[H[2J[H      [1m1[0m s's transition
+      [1m2[0m ith UTF-8 ground decoding.
+      [1m3[0m endency is used.
+      [1m4[0m 
+      [1m5[0m 
+      [1m6[0m 
+      [1m7[0m 
+      [1m8[0m 
+      [1m9[0m 
+     [1m10[0m 
+     [1m11[0m 
+     [1m12[0m 
+     [1m13[0m 
+     [1m14[0m limited group.
+     [1m15[0m 
+     [1m16[0m 
+     [1m17[0m 
+     [1m18[0m 
+     [1m19[0m 
+     [1m20[0m 
+     [1m21[0m 
+     [1m22[0m 
+     [1m23[0m 
+     [1m24[0m 
+     [1m25[0m 
+     [1m26[0m 
+     [1m27[0m 
+     [1m28[0m 
+     [1m29[0m 
+     [1m30[0m | self.values.get_mut(i))
+     [1m31[0m 
+     [1m32[0m 
+     [1m33[0m om(digit));
+     [1m34[0m 
+     [1m35[0m 
+     [1m36[0m 
+     [1m37[0m n <= self.values.len()) else {
+     [1m38[0m 
+     [1m39[0m 
+:[K[K/[Kmm[Kaa[Ktt[Kcc[Khh[K[1;1H[K      [1m1[0m s's transition
+[2;1H[K      [1m2[0m ith UTF-8 ground decoding.
+[3;1H[K      [1m3[0m endency is used.
+[4;1H[K      [1m4[0m 
+[5;1H[K      [1m5[0m 
+[6;1H[K      [1m6[0m 
+[7;1H[K      [1m7[0m 
+[8;1H[K      [1m8[0m 
+[9;1H[K      [1m9[0m 
+[10;1H[K     [1m10[0m 
+[11;1H[K     [1m11[0m 
+[12;1H[K     [1m12[0m 
+[13;1H[K     [1m13[0m 
+[14;1H[K     [1m14[0m limited group.
+[15;1H[K     [1m15[0m 
+[16;1H[K     [1m16[0m 
+[17;1H[K     [1m17[0m 
+[18;1H[K     [1m18[0m 
+[19;1H[K     [1m19[0m 
+[20;1H[K     [1m20[0m 
+[21;1H[K     [1m21[0m 
+[22;1H[K     [1m22[0m 
+[23;1H[K     [1m23[0m 
+[24;1H[K     [1m24[0m 
+[25;1H[K     [1m25[0m 
+[26;1H[K     [1m26[0m 
+[27;1H[K     [1m27[0m 
+[28;1H[K     [1m28[0m 
+[29;1H[K     [1m29[0m 
+[30;1H[K     [1m30[0m | self.values.get_mut(i))
+[31;1H[K     [1m31[0m 
+[32;1H[K     [1m32[0m 
+[33;1H[K     [1m33[0m om(digit));
+[34;1H[K     [1m34[0m 
+[35;1H[K     [1m35[0m 
+[36;1H[K     [1m36[0m 
+[37;1H[K     [1m37[0m n <= self.values.len()) else {
+[38;1H[K     [1m38[0m 
+[39;1H[K     [1m39[0m 
+[40;1H[1;1H[K      [1m1[0m s's transition
+[2;1H[K      [1m2[0m ith UTF-8 ground decoding.
+[3;1H[K      [1m3[0m endency is used.
+[4;1H[K      [1m4[0m 
+[5;1H[K      [1m5[0m 
+[6;1H[K      [1m6[0m 
+[7;1H[K      [1m7[0m 
+[8;1H[K      [1m8[0m 
+[9;1H[K      [1m9[0m 
+[10;1H[K     [1m10[0m 
+[11;1H[K     [1m11[0m 
+[12;1H[K     [1m12[0m 
+[13;1H[K     [1m13[0m 
+[14;1H[K     [1m14[0m limited group.
+[15;1H[K     [1m15[0m 
+[16;1H[K     [1m16[0m 
+[17;1H[K     [1m17[0m 
+[18;1H[K     [1m18[0m 
+[19;1H[K     [1m19[0m 
+[20;1H[K     [1m20[0m 
+[21;1H[K     [1m21[0m 
+[22;1H[K     [1m22[0m 
+[23;1H[K     [1m23[0m 
+[24;1H[K     [1m24[0m 
+[25;1H[K     [1m25[0m 
+[26;1H[K     [1m26[0m 
+[27;1H[K     [1m27[0m 
+[28;1H[K     [1m28[0m 
+[29;1H[K     [1m29[0m 
+[30;1H[K     [1m30[0m | self.values.get_mut(i))
+[31;1H[K     [1m31[0m 
+[32;1H[K     [1m32[0m 
+[33;1H[K     [1m33[0m om(digit));
+[34;1H[K     [1m34[0m 
+[35;1H[K     [1m35[0m 
+[36;1H[K     [1m36[0m 
+[37;1H[K     [1m37[0m n <= self.values.len()) else {
+[38;1H[K     [1m38[0m 
+[39;1H[K     [1m39[0m 
+[40;1H...skipping...
+     [1m93[0m     let (length, mut code) = [7mmatch[27m first {
+     [1m94[0m         0xc2..=0xdf => (2, u32::from(first & 0x1f)),
+     [1m95[0m         0xe0..=0xef => (3, u32::from(first & 0x0f)),
+     [1m96[0m         0xf0..=0xf4 => (4, u32::from(first & 0x07)),
+     [1m97[0m         _ => return None,
+     [1m98[0m     };
+     [1m99[0m     let (low, high) = [7mmatch[27m first {
+    [1m100[0m         0xe0 => (0xa0, 0xbf),
+    [1m101[0m         0xed => (0x80, 0x9f),
+    [1m102[0m         0xf0 => (0x90, 0xbf),
+    [1m103[0m         0xf4 => (0x80, 0x8f),
+    [1m104[0m         _ => (0x80, 0xbf),
+    [1m105[0m     };
+    [1m106[0m     let continuation = bytes.get(1..length)?;
+    [1m107[0m     for (i, &byte) in continuation.iter().enumerate() {
+    [1m108[0m         let (low, high) = if i == 0 { (low, high) } else { (0x80, 0xbf) };
+    [1m109[0m         if !(low..=high).contains(&byte) {
+    [1m110[0m             return None;
+    [1m111[0m         }
+    [1m112[0m         code = code.checked_shl(6)? | u32::from(byte & 0x3f);
+    [1m113[0m     }
+    [1m114[0m     Some((char::from_u32(code)?, length))
+    [1m115[0m }
+    [1m116[0m 
+    [1m117[0m #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    [1m118[0m enum State {
+    [1m119[0m     #[default]
+    [1m120[0m     Ground,
+    [1m121[0m     Escape,
+    [1m122[0m     EscapeIntermediate,
+    [1m123[0m     CsiEntry,
+    [1m124[0m     CsiParam,
+    [1m125[0m     CsiIntermediate,
+    [1m126[0m     CsiIgnore,
+    [1m127[0m     DcsEntry,
+    [1m128[0m     DcsParam,
+    [1m129[0m     DcsIntermediate,
+    [1m130[0m     DcsIgnore,
+    [1m131[0m     DcsString,
+:[K[K/[K    [1m132[0m     OscString,
+    [1m133[0m     SosPmApcString,
+    [1m134[0m }
+    [1m135[0m 
+    [1m136[0m /// The most OSC payload bytes retained for [`Event`] delivery and
+    [1m137[0m /// hyperlinks. A longer OSC string is consumed without an event or a link;
+:[K[K...skipping...
+    [1m954[0m                     Some(Reply::of(format_args!("\x1b[>1;{version};0c")))
+    [1m955[0m                 }
+    [1m956[0m                 None if extended => Some(Reply::of(format_args!("\x1b[>1;10;0c"))),
+    [1m957[0m                 None => None,
+    [1m958[0m             },
+    [1m959[0m             (b">", b'q') if n == 0 => {
+    [1m960[0m                 let identity = identity?;
+    [1m961[0m                 let length = identity.name.len().checked_add(identity.version.len())?;
+    [1m962[0m                 if length > Identity::MAX_LEN {
+    [1m963[0m                     return None;
+    [1m964[0m                 }
+    [1m965[0m                 let (name, version) = (identity.name, identity.version);
+    [1m966[0m                 Some(Reply::of(format_args!("\x1bP>|{name} {version}\x1b\\")))
+    [1m967[0m             }
+    [1m968[0m             (b"", b't') if n == 18 && self.options.size_reports => {
+    [1m969[0m                 let (rows, cols) = self.screen.size();
+    [1m970[0m                 Some(Reply::of(format_args!("\x1b[8;{rows};{cols}t")))
+    [1m971[0m             }
+    [1m972[0m             (b"?$", b'p') if modes => {
+    [1m973[0m                 let status = [7mmatch[27m n {
+    [1m974[0m                     2048 if !self.options.in_band_resize => 0,
+    [1m975[0m                     2031 if !self.options.color_scheme_updates => 0,
+    [1m976[0m                     _ => self.screen.private_mode_status(n),
+    [1m977[0m                 };
+    [1m978[0m                 Some(Reply::of(format_args!("\x1b[?{n};{status}$y")))
+    [1m979[0m             }
+    [1m980[0m             (b"$", b'p') if modes => {
+    [1m981[0m                 // IRM alone of the ANSI modes is known.
+    [1m982[0m                 let status = [7mmatch[27m n {
+    [1m983[0m                     4 if self.screen.insert_mode() => 1,
+    [1m984[0m                     4 => 2,
+    [1m985[0m                     _ => 0,
+    [1m986[0m                 };
+    [1m987[0m                 Some(Reply::of(format_args!("\x1b[{n};{status}$y")))
+    [1m988[0m             }
+    [1m989[0m             _ => None,
+    [1m990[0m         }
+    [1m991[0m     }
+    [1m992[0m }
+[7m(END)[27m[K[K[?1l>[?1049l

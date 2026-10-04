@@ -1,0 +1,50 @@
+{
+  "command": [
+    "nvim",
+    "-O",
+    "src/grid.rs",
+    "src/screen.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "nvim-wide",
+  "replies": "\\e[?69;2$y\\e[?2026;2$y\\e[?2027;0$y\\e[?2031;2$y\\e[?2048;2$y\\eP1$r0;4:3m\\e\\\\\\e[?0u\\e[?62;22c\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e[48;50;200;0;0t\\e[?62;22c\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    50,
+    200
+  ],
+  "steps": [
+    {
+      "end": 82370,
+      "keys": ""
+    },
+    {
+      "end": 89639,
+      "keys": "\\x04"
+    },
+    {
+      "end": 90036,
+      "keys": "\\x17w"
+    },
+    {
+      "end": 94918,
+      "keys": "\\x04"
+    },
+    {
+      "end": 95346,
+      "keys": ":set cursorline\\r"
+    },
+    {
+      "end": 95616,
+      "keys": ":qa\\r"
+    }
+  ],
+  "version": "NVIM v0.12.5"
+}

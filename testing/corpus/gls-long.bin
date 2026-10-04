@@ -1,0 +1,15 @@
+]8;;file://localhost/private/tmp/fux-corpus/work/tree\tree]8;;\:
+total 4
+drwxr-xr-x 3  96 2026-01-02 11:04 [0m[01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/build\build]8;;\[0m
+drwxr-xr-x 5 160 2026-01-02 11:04 [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs\docs]8;;\[0m
+drwxr-xr-x 4 128 2026-01-02 11:04 [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/media\media]8;;\[0m
+-rw-r--r-- 1   6 2026-01-02 11:04 ]8;;file://localhost/private/tmp/fux-corpus/work/tree/notes.txt\notes.txt]8;;\
+lrwxr-xr-x 1  14 2026-01-02 11:04 [01;36m]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs/README.md\readme-link]8;;\[0m -> ]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs/README.md\docs/README.md]8;;\
+drwxr-xr-x 6 192 2026-01-02 11:04 [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/src\src]8;;\[0m
+
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/src\tree/src]8;;\:
+total 100
+-rw-r--r-- 1 60437 2026-01-02 11:04 ]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/grid.rs\grid.rs]8;;\
+drwxr-xr-x 3    96 2026-01-02 11:04 [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/parser\parser]8;;\[0m
+-rw-r--r-- 1 39976 2026-01-02 11:04 ]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/parser.rs\parser.rs]8;;\
+drwxr-xr-x 3    96 2026-01-02 11:04 [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/screen\screen]8;;\[0m

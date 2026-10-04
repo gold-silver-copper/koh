@@ -1,0 +1,45 @@
+{
+  "command": [
+    "less",
+    "-R",
+    "colored.txt"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "less-color",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 3162,
+      "keys": ""
+    },
+    {
+      "end": 5278,
+      "keys": " "
+    },
+    {
+      "end": 8608,
+      "keys": "b"
+    },
+    {
+      "end": 17948,
+      "keys": "/fn\\r"
+    },
+    {
+      "end": 17967,
+      "keys": "q"
+    }
+  ],
+  "version": "less 668 (POSIX regular expressions)"
+}

@@ -1,0 +1,54 @@
+{
+  "command": [
+    "mc",
+    "-u",
+    ".",
+    "../src"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "SHELL=/bin/sh",
+    "XDG_CONFIG_HOME=/tmp/fux-corpus/home/.config"
+  ],
+  "note": "",
+  "program": "mc-small",
+  "replies": "",
+  "scrubbed": [
+    "localhost"
+  ],
+  "size": [
+    24,
+    80
+  ],
+  "steps": [
+    {
+      "end": 3571,
+      "keys": ""
+    },
+    {
+      "end": 3739,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 3901,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 4175,
+      "keys": "\\t"
+    },
+    {
+      "end": 4335,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 4536,
+      "keys": "\\e[21~"
+    }
+  ],
+  "version": "GNU Midnight Commander 4.8.33"
+}

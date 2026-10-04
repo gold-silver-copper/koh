@@ -1,0 +1,35 @@
+{
+  "command": [
+    "btop"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "no process list, disks or battery (HOME's btop.conf)",
+  "program": "btop-small",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    24,
+    80
+  ],
+  "steps": [
+    {
+      "end": 52076,
+      "keys": ""
+    },
+    {
+      "end": 95442,
+      "keys": ""
+    },
+    {
+      "end": 95526,
+      "keys": "q"
+    }
+  ],
+  "version": "btop version: 1.4.7"
+}

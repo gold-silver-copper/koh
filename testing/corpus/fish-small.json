@@ -1,0 +1,45 @@
+{
+  "command": [
+    "fish"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "fish-small",
+  "replies": "\\e[?0u\\eP>|fux 0.17.0\\e\\\\\\e]11;rgb:0000/0000/0000\\e\\\\\\e[?62;22c\\e]11;rgb:0000/0000/0000\\e\\\\\\e[1;1R\\e[?62;22c\\e]11;rgb:0000/0000/0000\\e\\\\\\e[6;1R\\e[?62;22c\\e]11;rgb:0000/0000/0000\\e\\\\\\e[10;1R\\e[?62;22c",
+  "scrubbed": [
+    "localhost"
+  ],
+  "size": [
+    10,
+    40
+  ],
+  "steps": [
+    {
+      "end": 245,
+      "keys": ""
+    },
+    {
+      "end": 676,
+      "keys": "echo the quick brown fox jumps over the lazy dog and keeps running past the edge"
+    },
+    {
+      "end": 1189,
+      "keys": "\\r"
+    },
+    {
+      "end": 2052,
+      "keys": "ls\\r"
+    },
+    {
+      "end": 2160,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "fish, version 4.9.3"
+}

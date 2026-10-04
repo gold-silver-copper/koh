@@ -1,0 +1,70 @@
+{
+  "command": [
+    "ncdu",
+    "--color",
+    "dark",
+    "tree"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "ncdu",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 1779,
+      "keys": ""
+    },
+    {
+      "end": 2025,
+      "keys": "j"
+    },
+    {
+      "end": 2265,
+      "keys": "j"
+    },
+    {
+      "end": 2858,
+      "keys": "\\r"
+    },
+    {
+      "end": 3054,
+      "keys": "j"
+    },
+    {
+      "end": 3841,
+      "keys": "h"
+    },
+    {
+      "end": 4753,
+      "keys": "i"
+    },
+    {
+      "end": 4843,
+      "keys": "i"
+    },
+    {
+      "end": 5348,
+      "keys": "n"
+    },
+    {
+      "end": 5860,
+      "keys": "s"
+    },
+    {
+      "end": 5916,
+      "keys": "q"
+    }
+  ],
+  "version": "ncdu 2.9.2"
+}

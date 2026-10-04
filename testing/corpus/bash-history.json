@@ -1,0 +1,67 @@
+{
+  "command": [
+    "bash",
+    "--noprofile",
+    "--rcfile",
+    "/tmp/fux-corpus/home/.bashrc",
+    "-i"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "bash-history",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 39,
+      "keys": ""
+    },
+    {
+      "end": 43,
+      "keys": "\\e[A"
+    },
+    {
+      "end": 52,
+      "keys": "\\e[A"
+    },
+    {
+      "end": 60,
+      "keys": "\\x15"
+    },
+    {
+      "end": 258,
+      "keys": "\\x12cargo"
+    },
+    {
+      "end": 295,
+      "keys": "\\x07"
+    },
+    {
+      "end": 296,
+      "keys": "\\x15"
+    },
+    {
+      "end": 681,
+      "keys": "history\\r"
+    },
+    {
+      "end": 765,
+      "keys": "!ec\\r"
+    },
+    {
+      "end": 786,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "GNU bash, version 5.3.3(1)-release (aarch64-apple-darwin24.4.0)"
+}

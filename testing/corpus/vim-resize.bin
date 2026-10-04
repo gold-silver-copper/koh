@@ -1,0 +1,199 @@
+[?1049h[>4;2m[?1h=[?2004h[?1004h[1;40r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[40;1H"src/grid.rs" 1578L, 60437B[2;1H▽[6n[2;1H  [3;1HPzz\[0%m[6n[3;1H           [1;1H[>c]11;?]10;?[1;1H[38;5;130m   1 use[m [35mstd[m[35m::[m[35mcollections[m[35m::[m{HashMap, VecDeque};
+[38;5;130m   2 use[m [35mstd[m[35m::[m[35mhash[m[35m::[m{BuildHasherDefault, Hasher};[2;50H[K[3;1H[38;5;130m   3 use[m [35mstd[m[35m::[m[35mnum[m[35m::[mNonZeroU16;[3;31H[K[4;1H[38;5;130m   4 use[m [35mstd[m[35m::[m[35mops[m[35m::[mRange;
+[38;5;130m   5 use[m [35mstd[m[35m::[m[35msync[m[35m::[mArc;
+[38;5;130m   6 
+   7 use[m [35mcrate[m[35m::[m[35mcell[m[35m::[m{Line, Spill};
+[38;5;130m   8 use[m [35mcrate[m[35m::[m[35mlink[m[35m::[mLinks;
+[38;5;130m   9 use[m [35mcrate[m[35m::[m{Attributes, Cell, CellRef, Error, Row, RowId};
+[38;5;130m  10 
+  11 [m[35m/// A grid's number of rows or columns. Never zero, so a grid always has a[m
+[38;5;130m  12 [m[35m/// last row and a last column.[m
+[38;5;130m  13 [m[35m#[derive([m[32mClone[m[35m, [m[32mCopy[m[35m, [m[32mDebug[m[35m, [m[32mPartialEq[m[35m, [m[32mEq[m[35m)][m
+[38;5;130m  14 pub[m[35m([m[38;5;130mcrate[m[35m)[m [38;5;130mstruct[m [36mExtent[m(NonZeroU16);
+[38;5;130m  15 
+  16 impl[m Extent {
+[38;5;130m  17 [m    [38;5;130mpub[m [38;5;130mfn[m [36mnew[m(n: [32mu16[m) [38;5;130m->[m [32mResult[m[38;5;130m<[m[32mSelf[m, Error[38;5;130m>[m {
+[38;5;130m  18 [m[8C[35mNonZeroU16[m[35m::[m[36mnew[m(n).[36mmap[m([32mSelf[m).[36mok_or[m([35mError[m[35m::[mZeroSize)
+[38;5;130m  19 [m    }
+[38;5;130m  20 [m    [38;5;130mpub[m [38;5;130mfn[m [36mget[m([31mself[m) [38;5;130m->[m [32mu16[m {
+[38;5;130m  21 [m[8C[31mself[m.[31m0[m.[36mget[m()
+[38;5;130m  22 [m    }
+[38;5;130m  23 [m    [35m/// The last row or column.[m
+[38;5;130m  24 [m    [38;5;130mpub[m [38;5;130mfn[m [36mlast[m([31mself[m) [38;5;130m->[m [32mu16[m {
+[38;5;130m  25 [m[8C[34m// Exact: an extent is at least one.[m
+[38;5;130m  26 [m[8C[31mself[m.[31m0[m.[36mget[m().[36msaturating_sub[m([31m1[m)
+[38;5;130m  27 [m    }
+[38;5;130m  28 [m}
+[38;5;130m  29 
+  30 [m[35m/// Maximum addressable retained cells per buffer (2.5 GiB at 40 bytes/cell).[m
+[38;5;130m  31 [m[35m/// Storage is committed only for live/retained rows, not empty history slots.[m
+[38;5;130m  32 pub[m[35m([m[38;5;130mcrate[m[35m)[m [32mconst[m MAX_CELLS: [32musize[m [38;5;130m=[m [31m64[m [38;5;130m*[m [31m1024[m [38;5;130m*[m [31m1024[m;
+[38;5;130m  33 pub[m[35m([m[38;5;130mcrate[m[35m)[m [32mconst[m MAX_ROWS: [32musize[m [38;5;130m=[m [31m1_048_576[m;
+[38;5;130m  34 
+  35 [m[35m#[derive([m[32mClone[m[35m, [m[32mCopy[m[35m, [m[32mDebug[m[35m)][m
+[38;5;130m  36 struct[m [36mMeta[m {
+[38;5;130m  37 [m    id: RowId,
+[38;5;130m  38 [m    version: [32mu64[m,
+[1m[7msrc/grid.rs                                                                                           1,1            Top[1;6H[?25h[?4mP+q436f\P+q6b75\P+q6b64\P+q6b72\P+q6b6c\P+q2332\P+q2334\P+q2569\P+q2a37\P+q6b31\P$q q\[?12$p[27m[23m[29m[m[H[2J[?25l[1;1H[93m   1 [m[93muse[m [38;5;81mstd[m[38;5;224m::[m[38;5;81mcollections[m[38;5;224m::[m{HashMap, VecDeque};
+[93m   2 [m[93muse[m [38;5;81mstd[m[38;5;224m::[m[38;5;81mhash[m[38;5;224m::[m{BuildHasherDefault, Hasher};
+[93m   3 [m[93muse[m [38;5;81mstd[m[38;5;224m::[m[38;5;81mnum[m[38;5;224m::[mNonZeroU16;
+[93m   4 [m[93muse[m [38;5;81mstd[m[38;5;224m::[m[38;5;81mops[m[38;5;224m::[mRange;
+[93m   5 [m[93muse[m [38;5;81mstd[m[38;5;224m::[m[38;5;81msync[m[38;5;224m::[mArc;
+[93m   6 
+   7 [m[93muse[m [38;5;81mcrate[m[38;5;224m::[m[38;5;81mcell[m[38;5;224m::[m{Line, Spill};
+[93m   8 [m[93muse[m [38;5;81mcrate[m[38;5;224m::[m[38;5;81mlink[m[38;5;224m::[mLinks;
+[93m   9 [m[93muse[m [38;5;81mcrate[m[38;5;224m::[m{Attributes, Cell, CellRef, Error, Row, RowId};
+[93m  10 
+  11 [m[38;5;224m/// A grid's number of rows or columns. Never zero, so a grid always has a[m
+[93m  12 [m[38;5;224m/// last row and a last column.[m
+[93m  13 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m, [m[38;5;121mPartialEq[m[38;5;81m, [m[38;5;121mEq[m[38;5;81m)][m
+[93m  14 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [93mstruct[m [1m[96mExtent[m(NonZeroU16);
+[93m  15 
+  16 [m[93mimpl[m Extent {
+[93m  17 [m    [93mpub[m [93mfn[m [1m[96mnew[m(n: [38;5;121mu16[m) [93m->[m [38;5;121mResult[m[93m<[m[38;5;121mSelf[m, Error[93m>[m {
+[93m  18 [m[8C[38;5;81mNonZeroU16[m[38;5;224m::[m[1m[96mnew[m(n).[1m[96mmap[m([38;5;121mSelf[m).[1m[96mok_or[m([38;5;81mError[m[38;5;224m::[mZeroSize)
+[93m  19 [m    }
+[93m  20 [m    [93mpub[m [93mfn[m [1m[96mget[m([95mself[m) [93m->[m [38;5;121mu16[m {
+[93m  21 [m[8C[95mself[m.[95m0[m.[1m[96mget[m()
+[93m  22 [m    }
+[93m  23 [m    [38;5;224m/// The last row or column.[m
+[93m  24 [m    [93mpub[m [93mfn[m [1m[96mlast[m([95mself[m) [93m->[m [38;5;121mu16[m {
+[93m  25 [m[8C[96m// Exact: an extent is at least one.[m
+[93m  26 [m[8C[95mself[m.[95m0[m.[1m[96mget[m().[1m[96msaturating_sub[m([95m1[m)
+[93m  27 [m    }
+[93m  28 [m}
+[93m  29 
+  30 [m[38;5;224m/// Maximum addressable retained cells per buffer (2.5 GiB at 40 bytes/cell).[m
+[93m  31 [m[38;5;224m/// Storage is committed only for live/retained rows, not empty history slots.[m
+[93m  32 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_CELLS: [38;5;121musize[m [93m=[m [95m64[m [93m*[m [95m1024[m [93m*[m [95m1024[m;
+[93m  33 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_ROWS: [38;5;121musize[m [93m=[m [95m1_048_576[m;
+[93m  34 
+  35 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m)][m
+[93m  36 [m[93mstruct[m [1m[96mMeta[m {
+[93m  37 [m    id: RowId,
+[93m  38 [m    version: [38;5;121mu64[m,
+[1m[7msrc/grid.rs                                                                                           1,1            Top[m[40;1H"src/grid.rs" 1578L, 60437B[1;6H[?25h[?25l[40;110Hj[1;6H[40;110H [2;6H[39;103H[1m[7m2,[2;6H[?25h[27m[23m[29m[m[H[2J[?25l[1;1H[93m   2 [m[93muse[m [38;5;81mstd[m[38;5;224m::[m[38;5;81mhash[m[38;5;224m::[m{BuildHasherDefault, Hasher};
+[93m   3 [m[93muse[m [38;5;81mstd[m[38;5;224m::[m[38;5;81mnum[m[38;5;224m::[mNonZeroU16;
+[93m   4 [m[93muse[m [38;5;81mstd[m[38;5;224m::[m[38;5;81mops[m[38;5;224m::[mRange;
+[93m   5 [m[93muse[m [38;5;81mstd[m[38;5;224m::[m[38;5;81msync[m[38;5;224m::[mArc;
+[93m   6 
+   7 [m[93muse[m [38;5;81mcrate[m[38;5;224m::[m[38;5;81mcell[m[38;5;224m::[m{Line, Spill};
+[93m   8 [m[93muse[m [38;5;81mcrate[m[38;5;224m::[m[38;5;81mlink[m[38;5;224m::[mLinks;
+[93m   9 [m[93muse[m [38;5;81mcrate[m[38;5;224m::[m{Attributes, Cell, CellRef, Error, Row, RowId};
+[93m  10 
+  11 [m[38;5;224m/// A grid's number of rows or columns. Never zero, so a grid always has a[m
+[93m  12 [m[38;5;224m/// last row and a last column.[m
+[93m  13 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m, [m[38;5;121mPartialEq[m[38;5;81m, [m[38;5;121mEq[m[38;5;81m)][m
+[93m  14 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [93mstruct[m [1m[96mExtent[m(NonZeroU16);
+[93m  15 
+  16 [m[93mimpl[m Extent {
+[93m  17 [m    [93mpub[m [93mfn[m [1m[96mnew[m(n: [38;5;121mu16[m) [93m->[m [38;5;121mResult[m[93m<[m[38;5;121mSelf[m, Error[93m>[m {
+[93m  18 [m[8C[38;5;81mNonZeroU16[m[38;5;224m::[m[1m[96mnew[m(n).[1m[96mmap[m([38;5;121mSelf[m).[1m[96mok_or[m([38;5;81mError[m[38;5;224m::[mZeroSize)
+[93m  19 [m    }
+[93m  20 [m    [93mpub[m [93mfn[m [1m[96mget[m([95mself[m) [93m->[m [38;5;121mu16[m {
+[93m  21 [m[8C[95mself[m.[95m0[m.[1m[96mget[m()
+[93m  22 [m    }
+[93m  23 [m    [38;5;224m/// The last row or column.[m
+[1m[7msrc/grid.rs                                                   2,1             0%[1;6H[?25h[?25l[m[24;70H^D[1;6H[24;70H  [1;6H[1;22r[1;1H[11M[1;24r[12;1H[93m  24 [m    [93mpub[m [93mfn[m [1m[96mlast[m([95mself[m) [93m->[m [38;5;121mu16[m {
+[93m  25 [m[8C[96m// Exact: an extent is at least one.[m
+[93m  26 [m[8C[95mself[m.[95m0[m.[1m[96mget[m().[1m[96msaturating_sub[m([95m1[m)
+[93m  27 [m    }
+[93m  28 [m}
+[93m  29 
+  30 [m[38;5;224m/// Maximum addressable retained cells per buffer (2.5 GiB at 40 bytes/celll[m[19;1H[93m     [m[38;5;224m).[m
+[93m  31 [m[38;5;224m/// Storage is committed only for live/retained rows, not empty history sloo[m[21;1H[93m     [m[38;5;224mts.[m
+[93m  32 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_CELLS: [38;5;121musize[m [93m=[m [95m64[m [93m*[m [95m1024[m [93m*[m [95m1024[m;[23;63H[1m[7m13,1[1;6H[?25h[27m[23m[29m[m[H[2J[?25l[1;1H[93m  12 [m[38;5;224m/// last row and a last column.[m
+[93m  13 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m, [m[38;5;121mPartialEq[m[38;5;81m, [m[38;5;121mEq[m[38;5;81m)][m
+[93m  14 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [93mstruct[m [1m[96mExtent[m(NonZeroU16);
+[93m  15 
+  16 [m[93mimpl[m Extent {
+[93m  17 [m    [93mpub[m [93mfn[m [1m[96mnew[m(n: [38;5;121mu16[m) [93m->[m [38;5;121mResult[m[93m<[m[38;5;121mSelf[m, Error[93m>[m {
+[93m  18 [m[8C[38;5;81mNonZeroU16[m[38;5;224m::[m[1m[96mnew[m(n).[1m[96mmap[m([38;5;121mSelf[m).[1m[96mok_or[m([38;5;81mError[m[38;5;224m::[mZeroSize)
+[93m  19 [m    }
+[93m  20 [m    [93mpub[m [93mfn[m [1m[96mget[m([95mself[m) [93m->[m [38;5;121mu16[m {
+[93m  21 [m[8C[95mself[m.[95m0[m.[1m[96mget[m()
+[93m  22 [m    }
+[93m  23 [m    [38;5;224m/// The last row or column.[m
+[93m  24 [m    [93mpub[m [93mfn[m [1m[96mlast[m([95mself[m) [93m->[m [38;5;121mu16[m {
+[93m  25 [m[8C[96m// Exact: an extent is at least one.[m
+[93m  26 [m[8C[95mself[m.[95m0[m.[1m[96mget[m().[1m[96msaturating_sub[m([95m1[m)
+[93m  27 [m    }
+[93m  28 [m}
+[93m  29 
+  30 [m[38;5;224m/// Maximum addressable retained cells per buffer (2.5 GiB at 40 bytes/cell).[m
+[93m  31 [m[38;5;224m/// Storage is committed only for live/retained rows, not empty history slots.[m
+[93m  32 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_CELLS: [38;5;121musize[m [93m=[m [95m64[m [93m*[m [95m1024[m [93m*[m [95m1024[m;
+[93m  33 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_ROWS: [38;5;121musize[m [93m=[m [95m1_048_576[m;
+[93m  34 
+  35 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m)][m
+[93m  36 [m[93mstruct[m [1m[96mMeta[m {
+[93m  37 [m    id: RowId,
+[93m  38 [m    version: [38;5;121mu64[m,
+[93m  39 [m    width: [38;5;121mu16[m,
+[93m  40 [m    wrapped: [38;5;121mbool[m,
+[93m  41 [m    [38;5;224m/// How far into the row a cell may differ from `Cell::default()`:[m
+[93m  42 [m    [38;5;224m/// every cell from here to `width` is blank, so recycling the slot[m
+[93m  43 [m    [38;5;224m/// clears only the cells before it. A short line scrolled away costs a[m
+[93m  44 [m    [38;5;224m/// few cells, not a row of cold memory.[m
+[93m  45 [m    used: [38;5;121mu16[m,
+[93m  46 [m    [38;5;224m/// Whether the row has an array of links in `Grid::linked`.[m
+[93m  47 [m    linked: [38;5;121mbool[m,
+[93m  48 [m    [38;5;224m/// Whether a prompt starts on the row (OSC 133 ; A).[m
+[93m  49 [m    prompt: [38;5;121mbool[m,
+[93m  50 [m}
+[93m  51 
+  52 [m[96m// The two flags fit where the struct had padding: a row without links costs[m
+[93m  53 [m[96m// no more than it did before links.[m
+[93m  54 [m[38;5;121mconst[m _: () [93m=[m [38;5;81massert![m([38;5;81mstd[m[38;5;224m::[m[38;5;81mmem[m[38;5;224m::[m[1m[96msize_of[m[38;5;224m::[m[93m<[mMeta[93m>[m() [93m==[m [95m24[m);
+[93m  55 
+  56 [m[93mimpl[m Meta {
+[93m  57 [m    [93mfn[m [1m[96mnew[m(id: RowId, version: [38;5;121mu64[m, width: [38;5;121mu16[m, wrapped: [38;5;121mbool[m, used: [38;5;121mu16[m) [93m->[m [38;5;121mSelf[m {
+[93m  58 [m[8C[38;5;121mSelf[m {
+[93m  59 [m[12Cid,
+[1m[7msrc/grid.rs                                                                                                                                                                           13,1            0%[2;6H[?25h[?25l[50;1H[m:vsplit[1;101H[7m|[2;101H|[3;101H|[4;101H|[5;101H|[6;101H|[7;101H|[8;101H|[9;101H|[10;101H|[11;101H|[12;101H|[13;101H|[14;101H|[15;101H|[16;101H|[17;101H|[18;101H|[19;101H|[20;101H|[21;101H|[22;101H|[23;101H|[24;101H|[25;101H|[26;101H|[27;101H|[28;101H|[29;101H|[30;101H|[31;101H|[32;101H|[33;101H|[34;101H|[35;101H|[36;101H|[37;101H|[38;101H|[39;101H|[40;101H|[41;101H|[42;101H|[43;101H|[44;101H|[45;101H|[46;101H|[47;101H|[48;101H|[m[49;83H[1m[7m13,1[12C0%[m[1;102H[93m  12 [m[38;5;224m/// last row and a last column.[m[2;102H[93m  13 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m, [m[38;5;121mPartialEq[m[38;5;81m, [m[38;5;121mEq[m[38;5;81m)][m[3;102H[93m  14 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [93mstruct[m [1m[96mExtent[m(NonZeroU16);[4;102H[93m  15 [5;102H  16 [m[93mimpl[m Extent {[6;102H[93m  17 [m    [93mpub[m [93mfn[m [1m[96mnew[m(n: [38;5;121mu16[m) [93m->[m [38;5;121mResult[m[93m<[m[38;5;121mSelf[m, Error[93m>[m {[7;102H[93m  18 [m[8C[38;5;81mNonZeroU16[m[38;5;224m::[m[1m[96mnew[m(n).[1m[96mmap[m([38;5;121mSelf[m).[1m[96mok_or[m([38;5;81mError[m[38;5;224m::[mZeroSize)[8;102H[93m  19 [m    }[9;102H[93m  20 [m    [93mpub[m [93mfn[m [1m[96mget[m([95mself[m) [93m->[m [38;5;121mu16[m {[10;102H[93m  21 [m[8C[95mself[m.[95m0[m.[1m[96mget[m()[11;102H[93m  22 [m    }[12;102H[93m  23 [m    [38;5;224m/// The last row or column.[m[13;102H[93m  24 [m    [93mpub[m [93mfn[m [1m[96mlast[m([95mself[m) [93m->[m [38;5;121mu16[m {[14;102H[93m  25 [m[8C[96m// Exact: an extent is at least one.[m[15;102H[93m  26 [m[8C[95mself[m.[95m0[m.[1m[96mget[m().[1m[96msaturating_sub[m([95m1[m)[16;102H[93m  27 [m    }[17;102H[93m  28 [m}[18;102H[93m  29 [19;102H  30 [m[38;5;224m/// Maximum addressable retained cells per buffer (2.5 GiB at 40 bytes/cell).[m[20;102H[93m  31 [m[38;5;224m/// Storage is committed only for live/retained rows, not empty history slots.[m[21;102H[93m  32 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_CELLS: [38;5;121musize[m [93m=[m [95m64[m [93m*[m [95m1024[m [93m*[m [95m1024[m;[22;102H[93m  33 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_ROWS: [38;5;121musize[m [93m=[m [95m1_048_576[m;[23;102H[93m  34 [24;102H  35 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m)][m[25;102H[93m  36 [m[93mstruct[m [1m[96mMeta[m {[26;102H[93m  37 [m    id: RowId,[27;102H[93m  38 [m    version: [38;5;121mu64[m,[28;102H[93m  39 [m    width: [38;5;121mu16[m,[29;102H[93m  40 [m    wrapped: [38;5;121mbool[m,[30;102H[93m  41 [m    [38;5;224m/// How far into the row a cell may differ from `Cell::default()`:[m[31;102H[93m  42 [m    [38;5;224m/// every cell from here to `width` is blank, so recycling the slot[m[32;102H[93m  43 [m    [38;5;224m/// clears only the cells before it. A short line scrolled away costs a[m[33;102H[93m  44 [m    [38;5;224m/// few cells, not a row of cold memory.[m[34;102H[93m  45 [m    used: [38;5;121mu16[m,[35;102H[93m  46 [m    [38;5;224m/// Whether the row has an array of links in `Grid::linked`.[m[36;102H[93m  47 [m    linked: [38;5;121mbool[m,[37;102H[93m  48 [m    [38;5;224m/// Whether a prompt starts on the row (OSC 133 ; A).[m[38;102H[93m  49 [m    prompt: [38;5;121mbool[m,[39;102H[93m  50 [m}[40;102H[93m  51 [41;102H  52 [m[96m// The two flags fit where the struct had padding: a row without links costs[m[42;102H[93m  53 [m[96m// no more than it did before links.[m[43;102H[93m  54 [m[38;5;121mconst[m _: () [93m=[m [38;5;81massert![m([38;5;81mstd[m[38;5;224m::[m[38;5;81mmem[m[38;5;224m::[m[1m[96msize_of[m[38;5;224m::[m[93m<[mMeta[93m>[m() [93m==[m [95m24[m);[44;102H[93m  55 [45;102H  56 [m[93mimpl[m Meta {[46;102H[93m  57 [m    [93mfn[m [1m[96mnew[m(id: RowId, version: [38;5;121mu64[m, width: [38;5;121mu16[m, wrapped: [38;5;121mbool[m, used: [38;5;121mu16[m) [93m->[m [38;5;121mSelf[m {[47;102H[93m  58 [m[8C[38;5;121mSelf[m {[48;102H[93m  59 [m[12Cid,[49;102H[7msrc/grid.rs                                                                      13,1            0%[2;6H[?25h[27m[23m[29m[m[H[2J[?25l[1;1H[93m  13 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m, [m[38;5;121mPart[m[7m|[m
+[93m     [m[38;5;121mialEq[m[38;5;81m, [m[38;5;121mEq[m[38;5;81m)][m[22C[7m|[m
+[93m  14 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [93mstruct[m [1m[96mExtent[m(NonZeroU[7m|[m
+[93m     [m16);[29C[7m|[m
+[93m  15 [m[33C[7m|[m
+[93m  16 [m[93mimpl[m Extent {[20C[7m|[m
+[93m  17 [m    [93mpub[m [93mfn[m [1m[96mnew[m(n: [38;5;121mu16[m) [93m->[m [38;5;121mResult[m[93m<[m[7m|[m
+[93m     [m[38;5;121mSelf[m, Error[93m>[m {[19C[7m|[m
+[1m[7msrc/grid.rs         13,1            0% [m[1;40H[93m [2;40H [3;40H [4;40H [5;40H [6;40H [7;40H [8;40H [m[9;40H[7m<[1;6H[?25h[27m[23m[29m[m[H[2J[?25l[1;1H[93m  12 [m[38;5;224m/// last row and a last column.[m  [7m|[m
+[93m  13 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m, [m[38;5;121mPart[m[7m|[m
+[93m     [m[38;5;121mialEq[m[38;5;81m, [m[38;5;121mEq[m[38;5;81m)][m[22C[7m|[m
+[93m  14 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [93mstruct[m [1m[96mExtent[m(NonZeroU[7m|[m
+[93m     [m16);[29C[7m|[m
+[93m  15 [m[33C[7m|[m
+[93m  16 [m[93mimpl[m Extent {[20C[7m|[m
+[93m  17 [m    [93mpub[m [93mfn[m [1m[96mnew[m(n: [38;5;121mu16[m) [93m->[m [38;5;121mResult[m[93m<[m[7m|[m
+[93m     [m[38;5;121mSelf[m, Error[93m>[m {[19C[7m|[m
+[93m  18 [m[8C[38;5;81mNonZeroU16[m[38;5;224m::[m[1m[96mnew[m(n).[1m[96mmap[m([38;5;121mSe[m[7m|[m
+[93m     [m[38;5;121mlf[m).[1m[96mok_or[m([38;5;81mError[m[38;5;224m::[mZeroSize)[7C[7m|[m
+[93m  19 [m    }[28C[7m|[m
+[93m  20 [m    [93mpub[m [93mfn[m [1m[96mget[m([95mself[m) [93m->[m [38;5;121mu16[m {    [7m|[m
+[93m  21 [m[8C[95mself[m.[95m0[m.[1m[96mget[m()[13C[7m|[m
+[93m  22 [m    }[28C[7m|[m
+[93m  23 [m    [38;5;224m/// The last row or column.[m  [7m|[m
+[93m  24 [m    [93mpub[m [93mfn[m [1m[96mlast[m([95mself[m) [93m->[m [38;5;121mu16[m {   [7m|[m
+[93m  25 [m[8C[96m// Exact: an extent is at[m[7m|[m
+[93m     [m[96m least one.[m[22C[7m|[m
+[93m  26 [m[8C[95mself[m.[95m0[m.[1m[96mget[m().[1m[96msaturating_s[m[7m|[m
+[93m     [m[1m[96mub[m([95m1[m)[28C[7m|[m
+[93m  27 [m    }[28C[7m|[m
+[93m  28 [m}[32C[7m|[m
+[93m  29 [m[33C[7m|[m
+[93m  30 [m[38;5;224m/// Maximum addressable retained [m[7m|[m
+[93m     [m[38;5;224mcells per buffer (2.5 GiB at 40 b[m[7m|[m
+[93m     [m[38;5;224mytes/cell).[m[22C[7m|[m
+[93m  31 [m[38;5;224m/// Storage is committed only for[m[7m|[m
+[93m     [m[38;5;224m live/retained rows, not empty hi[m[7m|[m
+[93m     [m[38;5;224mstory slots.[m[21C[7m|[m
+[93m  32 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_CELLS: [38;5;121musize[m[7m|[m
+[93m     [m [93m=[m [95m64[m [93m*[m [95m1024[m [93m*[m [95m1024[m;[13C[7m|[m
+[93m  33 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_ROWS: [38;5;121musize[m [7m|[m
+[93m     [m[93m=[m [95m1_048_576[m;[21C[7m|[m
+[93m  34 [m[33C[7m|[m
+[93m  35 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m)][m    [7m|[m
+[93m  36 [m[93mstruct[m [1m[96mMeta[m {[20C[7m|[m
+[93m  37 [m    id: RowId,[19C[7m|[m
+[1m[7msrc/grid.rs         13,1            0% [m[1;40H[93m  12 [m[38;5;224m/// last row and a last column.[m[2;40H[93m  13 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m, [m[38;5;121mPartialEq[m[38;5;81m, [m[38;5;121mEq[m[38;5;81m)][m[3;40H[93m  14 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [93mstruct[m [1m[96mExtent[m(NonZeroU16);[4;40H[93m  15 [5;40H  16 [m[93mimpl[m Extent {[6;40H[93m  17 [m    [93mpub[m [93mfn[m [1m[96mnew[m(n: [38;5;121mu16[m) [93m->[m [38;5;121mResult[m[93m<[m[38;5;121mSelf[m, Error[93m>[m {[7;40H[93m  18 [m[8C[38;5;81mNonZeroU16[m[38;5;224m::[m[1m[96mnew[m(n).[1m[96mmap[m([38;5;121mSelf[m).[1m[96mok_or[m([38;5;81mError[m[38;5;224m::[mZeroSize)[8;40H[93m  19 [m    }[9;40H[93m  20 [m    [93mpub[m [93mfn[m [1m[96mget[m([95mself[m) [93m->[m [38;5;121mu16[m {[10;40H[93m  21 [m[8C[95mself[m.[95m0[m.[1m[96mget[m()[11;40H[93m  22 [m    }[12;40H[93m  23 [m    [38;5;224m/// The last row or column.[m[13;40H[93m  24 [m    [93mpub[m [93mfn[m [1m[96mlast[m([95mself[m) [93m->[m [38;5;121mu16[m {[14;40H[93m  25 [m[8C[96m// Exact: an extent is at least one.[m[15;40H[93m  26 [m[8C[95mself[m.[95m0[m.[1m[96mget[m().[1m[96msaturating_sub[m([95m1[m)[16;40H[93m  27 [m    }[17;40H[93m  28 [m}[18;40H[93m  29 [19;40H  30 [m[38;5;224m/// Maximum addressable retained cells per buffer (2.5 GiB at 40 bytes/cell)[m[20;40H[93m     [m[38;5;224m.[m[21;40H[93m  31 [m[38;5;224m/// Storage is committed only for live/retained rows, not empty history slot[m[22;40H[93m     [m[38;5;224ms.[m[23;40H[93m  32 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_CELLS: [38;5;121musize[m [93m=[m [95m64[m [93m*[m [95m1024[m [93m*[m [95m1024[m;[24;40H[93m  33 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [38;5;121mconst[m MAX_ROWS: [38;5;121musize[m [93m=[m [95m1_048_576[m;[25;40H[93m  34 [26;40H  35 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m)][m[27;40H[93m  36 [m[93mstruct[m [1m[96mMeta[m {[28;40H[93m  37 [m    id: RowId,[29;40H[93m  38 [m    version: [38;5;121mu64[m,[30;40H[93m  39 [m    width: [38;5;121mu16[m,[31;40H[93m  40 [m    wrapped: [38;5;121mbool[m,[32;40H[93m  41 [m    [38;5;224m/// How far into the row a cell may differ from `Cell::default()`:[m[33;40H[93m  42 [m    [38;5;224m/// every cell from here to `width` is blank, so recycling the slot[m[34;40H[93m  43 [m    [38;5;224m/// clears only the cells before it. A short line scrolled away costs a[m[35;40H[93m  44 [m    [38;5;224m/// few cells, not a row of cold memory.[m[36;40H[93m  45 [m    used: [38;5;121mu16[m,[37;40H[93m  46 [m    [38;5;224m/// Whether the row has an array of links in `Grid::linked`.[m[38;40H[93m  47 [m    linked: [38;5;121mbool[m,[39;40H[7msrc/grid.rs                                                    13,1            0%[2;6H[?25h[?25l[40;1H[m:qa[?2004l[>4;m[23;2t[23;1t[40;1H[K[40;1H[?1004l[?2004l[?1l>[?1049l[?25h[>4;m

@@ -1,0 +1,31 @@
+{
+  "command": [
+    "bat",
+    "--paging=never",
+    "--style=full",
+    "--line-range=1:60",
+    "README.md"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "bat-markdown",
+  "replies": "\\e]10;rgb:ffff/ffff/ffff\\x07\\e]11;rgb:0000/0000/0000\\x07\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    24,
+    80
+  ],
+  "steps": [
+    {
+      "end": 14675,
+      "keys": ""
+    }
+  ],
+  "version": "bat 0.26.1"
+}

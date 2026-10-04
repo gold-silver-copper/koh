@@ -1,0 +1,49 @@
+{
+  "command": [
+    "bat",
+    "--paging=always",
+    "src/grid.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "bat-page",
+  "replies": "\\e]10;rgb:ffff/ffff/ffff\\x07\\e]11;rgb:0000/0000/0000\\x07\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 10645,
+      "keys": ""
+    },
+    {
+      "end": 18867,
+      "keys": " "
+    },
+    {
+      "end": 40782,
+      "keys": "/fn \\r"
+    },
+    {
+      "end": 53310,
+      "keys": "n"
+    },
+    {
+      "end": 63894,
+      "keys": "G"
+    },
+    {
+      "end": 63913,
+      "keys": "q"
+    }
+  ],
+  "version": "bat 0.26.1"
+}

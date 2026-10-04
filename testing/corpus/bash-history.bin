@@ -1,0 +1,23 @@
+[?2004h/private/tmp/fux-corpus/work $ exitcd ..[K(reverse-i-search)`': [Kc': cd sr[7mc[27m/a': [7mca[27mrgo build --release[1@r': [7mcar[27m[1@g': [7mcarg[27m[1@o': [7mcargo[27m[17P/private/tmp/fux-corpus/work $ history
+[?2004l    1  cargo build --release
+    2  git status
+    3  ls -la src
+    4  echo hello world
+    5  grep -n parse src/parser.rs
+    6  echo inside vim
+    7  seq 1 30
+    8  exit
+    9  echo inside nvim
+   10  seq 1 50
+   11  ls -F
+   12  exit
+   13  ls src/parser
+   14  cd src/
+   15  
+   16  exit
+   17  history
+[?2004h/private/tmp/fux-corpus/work $ !ec
+[?2004lecho inside nvim
+inside nvim
+[?2004h/private/tmp/fux-corpus/work $ exit
+[?2004lexit

@@ -1,0 +1,80 @@
+{
+  "command": [
+    "hx",
+    "README.md"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "helix-select",
+  "replies": "\\e[?0u\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 29168,
+      "keys": ""
+    },
+    {
+      "end": 58234,
+      "keys": "%"
+    },
+    {
+      "end": 58352,
+      "keys": "s"
+    },
+    {
+      "end": 93775,
+      "keys": "the\\r"
+    },
+    {
+      "end": 95542,
+      "keys": ","
+    },
+    {
+      "end": 96143,
+      "keys": "x"
+    },
+    {
+      "end": 96403,
+      "keys": "x"
+    },
+    {
+      "end": 97625,
+      "keys": "C"
+    },
+    {
+      "end": 97848,
+      "keys": "C"
+    },
+    {
+      "end": 97910,
+      "keys": "\\e"
+    },
+    {
+      "end": 106985,
+      "keys": "gg"
+    },
+    {
+      "end": 107171,
+      "keys": "w"
+    },
+    {
+      "end": 107396,
+      "keys": "e"
+    },
+    {
+      "end": 114947,
+      "keys": ":q!\\r"
+    }
+  ],
+  "version": "helix 25.07.1 (a05c151b)"
+}

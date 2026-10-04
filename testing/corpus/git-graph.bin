@@ -1,0 +1,11 @@
+[?1h=* [33m1c40adf[m [m[33m ([m[1;32mfix[m[33m)[m[m Screen: a fix on a branch [2m(Corpus Author, 2026-01-12)[m[m
+* [33m713e619[m [m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m[m Add the screen [2m(Corpus Author, 2026-01-11)[m[m
+*   [33m1aa23ef[m [m[33m ([m[1;33mtag: [m[1;33mv0.1.0[m[33m)[m[m Merge branch 'feature' [2m(Corpus Author, 2026-01-10)[m[m
+[32m|[m[33m\[m  [m
+[32m|[m * [33m120625f[m [m[33m ([m[1;32mfeature[m[33m)[m[m Add hyperlinks [2m(Corpus Author, 2026-01-08)[m[m
+[32m|[m * [33m2815563[m [m[m Parser: drop a check [2m(Corpus Author, 2026-01-07)[m[m
+* [33m|[m [33m0881083[m [m[m README: how it is built [2m(Corpus Author, 2026-01-09)[m[m
+[33m|[m[33m/[m  [m
+* [33m39d37df[m [m[m Add the grid [2m(Corpus Author, 2026-01-06)[m[m
+* [33m0f505d5[m [m[m Add the parser [2m(Corpus Author, 2026-01-05)[m[m
+[K[?1l>

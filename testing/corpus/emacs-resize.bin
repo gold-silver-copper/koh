@@ -1,0 +1,336 @@
+[?1049h[?12;25h[?1h=[H[2J[40d[K[?1l>[?12l[?25h[?1049l[39;49m[?1049h[?12;25h[?1h=[>0c]11;?\]10;?\[>4;1m[c[>0q[?2004h[?1004h[H[2J[40d[?25l[38;2;255;255;255m[48;2;0;0;0mor information about GNU Emacs and the GNU system, type [39;49m[38;2;173;216;230m[48;2;48;48;48mC-h C-a[39;49m[38;2;255;255;255m[48;2;0;0;0m.                                                       [39;49m[1@[38;2;255;255;255m[48;2;0;0;0mF[39;49m[?12l[?25h[?12;25h[2d[40d[?25l[38;2;255;255;255m[48;2;0;0;0mor information about GNU Emacs and the GNU system, type [39;49m[38;2;173;216;230m[48;2;48;48;48mC-h C-a[39;49m[38;2;255;255;255m[48;2;0;0;0m.                                                       [39;49m[1@[38;2;255;255;255m[48;2;0;0;0mF[39;49m[H[38;2;0;0;0m[48;2;255;255;255mFile Edit Options Buffers Tools Help                                                                                    [0m[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! Hyperlinks (OSC 8, `references/modern/osc8_hyperlinks.md`): the links a                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! grid's cells point to, each held once, and the cells' links, held per row                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! beside the cells for the rows that have any.                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//!                                                                                                                     [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! A cell's link is a `u16` in its row's array, 0 for none and otherwise one                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! more than the link's place in the table. Only a cell with contents has                                              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! one: an erased cell keeps whatever number it had, unread, until a glyph                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! is printed there, which always writes its link; so erasing, which blanks                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! cells, never touches the arrays. The second half of a wide glyph has its                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! first half's link.                                                                                                  [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//!                                                                                                                     [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! The table counts the numbers in the arrays (an erased cell's too), so the                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! links no row has are found without reading the rows: every change to an                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! array holds and releases the numbers it writes and drops.                                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0muse std::collections::HashMap;                                                                                          [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0muse std::sync::Arc;                                                                                                     [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The longest URI kept, as VTE and iTerm2 bound it (the spec's "Length                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// limits"). A longer one opens no link.                                                                               [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub const URI_LIMIT: usize = 2083;                                                                                      [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The longest `id` kept, as VTE bounds it (the spec's "Length limits"). A                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// link with a longer one is not opened.                                                                               [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub const ID_LIMIT: usize = 250;                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The most links a grid holds at once: a cell's link is a `u16`, 0 for none.                                          [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub(crate) const LINK_COUNT: usize = 65_535;                                                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The most bytes of URIs and ids a grid holds at once, each link counted                                              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// with `ENTRY_COST` more for what holds it.                                                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub(crate) const LINK_BYTES: usize = 4 << 20;                                                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// What a link costs beyond its URI and id: its entry, and its place in the                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// map of ids.                                                                                                         [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mconst ENTRY_COST: usize = 64;                                                                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// After making room fails (every link left is on the screen), how many                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// more links are refused before trying again: the links and the history's                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// rows are walked at most once in this many links.                                                                    [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mconst STALL: u32 = 256;                                                                                                 [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;229;229;229m[48;2;51;51;51m-UUU:--- F1  [39;49m[1m[38;2;229;229;229m[48;2;51;51;51mlink.rs     [0m[39;49m[38;2;229;229;229m[48;2;51;51;51m   Top L1     (Fundamental) -------------------------------------------------------------------[39;49m
+[A[?12l[?25h[?12;25h[2d[H[2J[24d[?25l[38;2;255;255;255m[48;2;0;0;0mor information about GNU Emacs and the GNU system, type [39;49m[38;2;173;216;230m[48;2;48;48;48mC-h C-a[39;49m[38;2;255;255;255m[48;2;0;0;0m.               [39;49m[1@[38;2;255;255;255m[48;2;0;0;0mF[39;49m[H[38;2;0;0;0m[48;2;255;255;255mFile Edit Options Buffers Tools Help                                            [0m[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! Hyperlinks (OSC 8, `references/modern/osc8_hyperlinks.md`): the links a     [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! grid's cells point to, each held once, and the cells' links, held per row   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! beside the cells for the rows that have any.                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//!                                                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! A cell's link is a `u16` in its row's array, 0 for none and otherwise one   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! more than the link's place in the table. Only a cell with contents has      [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! one: an erased cell keeps whatever number it had, unread, until a glyph     [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! is printed there, which always writes its link; so erasing, which blanks    [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! cells, never touches the arrays. The second half of a wide glyph has its    [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! first half's link.                                                          [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//!                                                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! The table counts the numbers in the arrays (an erased cell's too), so the   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! links no row has are found without reading the rows: every change to an     [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m//! array holds and releases the numbers it writes and drops.                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0muse std::collections::HashMap;                                                  [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0muse std::sync::Arc;                                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The longest URI kept, as VTE and iTerm2 bound it (the spec's "Length        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// limits"). A longer one opens no link.                                       [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub const URI_LIMIT: usize = 2083;                                              [39;49m
+[A
+[38;2;229;229;229m[48;2;51;51;51m-UUU:--- F1  [39;49m[1m[38;2;229;229;229m[48;2;51;51;51mlink.rs     [0m[39;49m[38;2;229;229;229m[48;2;51;51;51m   Top L1     (Fundamental) ---------------------------[39;49m
+[A[?12l[?25h[?12;25h[2d[24d[?25l[38;2;255;255;255m[48;2;0;0;0m                                                                  [39;49m[2;3H[38;2;255;255;255m[48;2;0;0;0m/ limits"). A longer one opens no link.                                  [39;49m
+[38;2;255;255;255m[48;2;0;0;0mpub const URI_LIMIT: usize = 2083;                                           [39;49m[4;3H[38;2;255;255;255m[48;2;0;0;0m/ The longest `id` kept, as VTE bounds it (the spec's "Length limits"). A[39;49m[5;3H[38;2;255;255;255m[48;2;0;0;0m/ link with a longer one is not opened.[39;49m
+[38;2;255;255;255m[48;2;0;0;0mpub const ID_LIMIT: usize = 250;                                             [39;49m[7;3H[38;2;255;255;255m[48;2;0;0;0m/ The most links a grid holds at once: a cell's link is a `u16`, 0 for none.[39;49m
+[38;2;255;255;255m[48;2;0;0;0mpub(crate) const LINK_COUNT: usize = 65_535;                               [39;49m[9;3H[38;2;255;255;255m[48;2;0;0;0m/ The most bytes of URIs and ids a grid holds at once, each link counted  [39;49m[10;3H[38;2;255;255;255m[48;2;0;0;0m/ with `ENTRY_COST` more for what holds it.                               [39;49m
+[38;2;255;255;255m[48;2;0;0;0mpub(crate) const LINK_BYTES: usize = 4 << 20;[39;49m[12;3H[38;2;255;255;255m[48;2;0;0;0m/ What a link costs beyond its URI and id: its entry, and its place in the[39;49m[13;3H[38;2;255;255;255m[48;2;0;0;0m/ map of ids.                                                              [39;49m
+[38;2;255;255;255m[48;2;0;0;0mconst ENTRY_COST: usize = 64;                                              [39;49m[15;3H[38;2;255;255;255m[48;2;0;0;0m/ After making room fails (every link left is on the screen), how many[39;49m
+[38;2;255;255;255m[48;2;0;0;0m/// more links are refused before trying again: the links and the history's[39;49m
+[38;2;255;255;255m[48;2;0;0;0m/// rows are walked at most once in this many links.[39;49m
+[38;2;255;255;255m[48;2;0;0;0mconst STALL: u32 = 256;[39;49m[20;5H[38;2;255;255;255m[48;2;0;0;0mA cell's hyperlink: where it points, the program's `id` for it, if it[39;49m[21;5H[38;2;255;255;255m[48;2;0;0;0mgave one, and a number that tells links apart.[39;49m
+[38;2;255;255;255m[48;2;0;0;0m#[derive(Clone, Copy, Debug, PartialEq, Eq)][39;49m[23;29H[38;2;229;229;229m[48;2;51;51;51m 7% L20[39;49m[?12l[?25h[?12;25h[H
+[H[2J[50d[?25l[38;2;255;255;255m[48;2;0;0;0m                                                                                                                                                                                                       [39;49m[1@[38;2;255;255;255m[48;2;0;0;0m [39;49m[H[38;2;0;0;0m[48;2;255;255;255mFile Edit Options Buffers Tools Help                                                                                                                                                                    [0m[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// limits"). A longer one opens no link.                                                                                                                                                               [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub const URI_LIMIT: usize = 2083;                                                                                                                                                                      [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The longest `id` kept, as VTE bounds it (the spec's "Length limits"). A                                                                                                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// link with a longer one is not opened.                                                                                                                                                               [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub const ID_LIMIT: usize = 250;                                                                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The most links a grid holds at once: a cell's link is a `u16`, 0 for none.                                                                                                                          [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub(crate) const LINK_COUNT: usize = 65_535;                                                                                                                                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The most bytes of URIs and ids a grid holds at once, each link counted                                                                                                                              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// with `ENTRY_COST` more for what holds it.                                                                                                                                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub(crate) const LINK_BYTES: usize = 4 << 20;                                                                                                                                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// What a link costs beyond its URI and id: its entry, and its place in the                                                                                                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// map of ids.                                                                                                                                                                                         [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mconst ENTRY_COST: usize = 64;                                                                                                                                                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// After making room fails (every link left is on the screen), how many                                                                                                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// more links are refused before trying again: the links and the history's                                                                                                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// rows are walked at most once in this many links.                                                                                                                                                    [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mconst STALL: u32 = 256;                                                                                                                                                                                 [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// A cell's hyperlink: where it points, the program's `id` for it, if it                                                                                                                               [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// gave one, and a number that tells links apart.                                                                                                                                                      [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m#[derive(Clone, Copy, Debug, PartialEq, Eq)]                                                                                                                                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub struct Hyperlink<'a> {                                                                                                                                                                              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    uri: &'a str,                                                                                                                                                                                       [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    id: Option<&'a str>,                                                                                                                                                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    key: u64,                                                                                                                                                                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m}                                                                                                                                                                                                       [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mimpl<'a> Hyperlink<'a> {                                                                                                                                                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    /// The URI, as the program sent it: at most [`URI_LIMIT`] bytes, each a                                                                                                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    /// printable ASCII character.                                                                                                                                                                      [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    pub fn uri(&self) -> &'a str {                                                                                                                                                                      [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m        self.uri                                                                                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    }                                                                                                                                                                                                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    /// The `id` parameter the program gave the link, if it gave a nonempty                                                                                                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    /// one: at most [`ID_LIMIT`] printable ASCII bytes.                                                                                                                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    pub fn id(&self) -> Option<&'a str> {                                                                                                                                                               [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m        self.id                                                                                                                                                                                         [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    }                                                                                                                                                                                                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    /// A number that identifies the link among the parser's links, never                                                                                                                               [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    /// given to another: cells with the same key are one link, as the spec                                                                                                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    /// groups them. Each `OSC 8` with a URI and no `id` opens a link of its                                                                                                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    /// own; one with an `id` and a URI already open on the screen, the same                                                                                                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    /// link again.                                                                                                                                                                                     [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    pub fn key(&self) -> u64 {                                                                                                                                                                          [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m        self.key                                                                                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    }                                                                                                                                                                                                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m}                                                                                                                                                                                                       [39;49m
+[A
+[38;2;229;229;229m[48;2;51;51;51m-UUU:--- F1  [39;49m[1m[38;2;229;229;229m[48;2;51;51;51mlink.rs     [0m[39;49m[38;2;229;229;229m[48;2;51;51;51m    7% L20    (Fundamental) ---------------------------------------------------------------------------------------------------------------------------------------------------[39;49m
+[A[?12l[?25h[?12;25h[2d[2;100H[?25l[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! Hyperlinks (OSC 8, `references/modern/osc8_hyperlinks.md`): the links a[39;49m[3;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! grid's cells point to, each held once, and the cells' links, held per row[39;49m[4;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! beside the cells for the rows that have any.[39;49m[5;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//![39;49m
+[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! A cell's link is a `u16` in its row's array, 0 for none and otherwise one[39;49m[7;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! more than the link's place in the table. Only a cell with contents has[39;49m[8;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! one: an erased cell keeps whatever number it had, unread, until a glyph[39;49m[9;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! is printed there, which always writes its link; so erasing, which blanks[39;49m[10;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! cells, never touches the arrays. The second half of a wide glyph has its[39;49m[11;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! first half's link.[39;49m[12;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//![39;49m
+[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! The table counts the numbers in the arrays (an erased cell's too), so the[39;49m[14;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! links no row has are found without reading the rows: every change to an[39;49m[15;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! array holds and releases the numbers it writes and drops.[39;49m[16;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m
+[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0muse std::collections::HashMap;[39;49m[18;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0muse std::sync::Arc;[39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                   [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m
+[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// The longest URI kept, as VTE and iTerm2 bound it (the spec's "Length[39;49m[21;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// limits"). A longer one opens no link.[39;49m[22;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mpub const URI_LIMIT: usize = 2083;[39;49m[23;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// The longest `id` kept, as VTE bounds it (the spec's "Length limits"). A[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    uri: &'a str,                                                                                  [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// link with a longer one is not opened.[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    id: Option<&'a str>,                                                                           [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mpub const ID_LIMIT: usize = 250;[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    key: u64,                                                                                      [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// The most links a grid holds at once: a cell's link is a `u16`, 0 for none.[39;49m[27;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mpub(crate) const LINK_COUNT: usize = 65_535;[39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                   [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// The most bytes of URIs and ids a grid holds at once, each link counted[39;49m[29;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// with `ENTRY_COST` more for what holds it.[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    /// The URI, as the program sent it: at most [`URI_LIMIT`] bytes, each a                       [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mpub(crate) const LINK_BYTES: usize = 4 << 20;[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    /// printable ASCII character.                                                                 [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// What a link costs beyond its URI and id: its entry, and its place in the[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    pub fn uri(&self) -> &'a str {                                                                 [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// map of ids.[39;49m
+[38;2;255;255;255m[48;2;0;0;0m        self.uri                                                                                   [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mconst ENTRY_COST: usize = 64;[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    }                                                                                              [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// After making room fails (every link left is on the screen), how many[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    /// The `id` parameter the program gave the link, if it gave a nonempty                        [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// more links are refused before trying again: the links and the history's[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    /// one: at most [`ID_LIMIT`] printable ASCII bytes.                                           [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// rows are walked at most once in this many links.[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    pub fn id(&self) -> Option<&'a str> {                                                          [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mconst STALL: u32 = 256;[39;49m
+[38;2;255;255;255m[48;2;0;0;0m        self.id                                                                                    [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    }                                                                                              [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// A cell's hyperlink: where it points, the program's `id` for it, if it[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    /// A number that identifies the link among the parser's links, never                          [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// gave one, and a number that tells links apart.[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    /// given to another: cells with the same key are one link, as the spec                        [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m#[derive(Clone, Copy, Debug, PartialEq, Eq)][39;49m
+[38;2;255;255;255m[48;2;0;0;0m    /// groups them. Each `OSC 8` with a URI and no `id` opens a link of its                       [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mpub struct Hyperlink<'a> {[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    /// own; one with an `id` and a URI already open on the screen, the same                       [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m    uri: &'a str,[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    /// link again.                                                                                [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m    id: Option<&'a str>,[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    pub fn key(&self) -> u64 {                                                                     [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m    key: u64,[39;49m
+[38;2;255;255;255m[48;2;0;0;0m        self.key                                                                                   [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m}[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    }                                                                                              [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m
+[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mimpl<'a> Hyperlink<'a> {[39;49m[49;100H[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;204;204;204m[48;2;77;77;77m-UUU:--- F1  [39;49m[1m[38;2;204;204;204m[48;2;77;77;77mlink.rs     [0m[39;49m[38;2;204;204;204m[48;2;77;77;77m   Top L20    (Fundamental) -----------------------------------------------[39;49m
+[?12l[?25h[?12;25h[2d[H[2J[40d[?25l[38;2;255;255;255m[48;2;0;0;0m                                                                                                                       [39;49m[1@[38;2;255;255;255m[48;2;0;0;0m [39;49m[H[38;2;0;0;0m[48;2;255;255;255mFile Edit Options Buffers Tools Help                                                                                    [0m[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// limits"). A longer one opens no link.                  [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! Hyperlinks (OSC 8, `references/modern/osc8_hyperlinks.m\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub const URI_LIMIT: usize = 2083;                         [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0md`): the links a                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The longest `id` kept, as VTE bounds it (the spec's "L\[39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! grid's cells point to, each held once, and the cells' l\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mength limits"). A                                          [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0minks, held per row                                          [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// link with a longer one is not opened.                  [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! beside the cells for the rows that have any.            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub const ID_LIMIT: usize = 250;                           [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//!                                                         [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The most links a grid holds at once: a cell's link is \[39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! A cell's link is a `u16` in its row's array, 0 for none\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0ma `u16`, 0 for none.                                       [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m and otherwise one                                          [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub(crate) const LINK_COUNT: usize = 65_535;               [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! more than the link's place in the table. Only a cell wi\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// The most bytes of URIs and ids a grid holds at once, e\[39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mth contents has                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mach link counted                                           [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! one: an erased cell keeps whatever number it had, unrea\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// with `ENTRY_COST` more for what holds it.              [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0md, until a glyph                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub(crate) const LINK_BYTES: usize = 4 << 20;              [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! is printed there, which always writes its link; so eras\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// What a link costs beyond its URI and id: its entry, an\[39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0ming, which blanks                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0md its place in the                                         [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! cells, never touches the arrays. The second half of a w\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// map of ids.                                            [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mide glyph has its                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mconst ENTRY_COST: usize = 64;                              [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! first half's link.                                      [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// After making room fails (every link left is on the scr\[39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//!                                                         [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0meen), how many                                             [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! The table counts the numbers in the arrays (an erased c\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// more links are refused before trying again: the links \[39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mell's too), so the                                          [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mand the history's                                          [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! links no row has are found without reading the rows: ev\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// rows are walked at most once in this many links.       [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mery change to an                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mconst STALL: u32 = 256;                                    [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m//! array holds and releases the numbers it writes and drop\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                           [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0ms.                                                          [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// A cell's hyperlink: where it points, the program's `id\[39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m                                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m` for it, if it                                            [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0muse std::collections::HashMap;                              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m/// gave one, and a number that tells links apart.         [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0muse std::sync::Arc;                                         [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m#[derive(Clone, Copy, Debug, PartialEq, Eq)]               [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m                                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mpub struct Hyperlink<'a> {                                 [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// The longest URI kept, as VTE and iTerm2 bound it (the s\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    uri: &'a str,                                          [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mpec's "Length                                               [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    id: Option<&'a str>,                                   [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// limits"). A longer one opens no link.                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    key: u64,                                              [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mpub const URI_LIMIT: usize = 2083;                          [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m}                                                          [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// The longest `id` kept, as VTE bounds it (the spec's "Le\[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                           [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mngth limits"). A                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mimpl<'a> Hyperlink<'a> {                                   [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// link with a longer one is not opened.                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m    /// The URI, as the program sent it: at most [`URI_LIM\[39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0mpub const ID_LIMIT: usize = 250;                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mIT`] bytes, each a                                         [39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;255;255;255m[48;2;0;0;0m/// The most links a grid holds at once: a cell's link is a\[39;49m
+[A
+[38;2;229;229;229m[48;2;51;51;51m-UUU:--- F1  [39;49m[1m[38;2;229;229;229m[48;2;51;51;51mlink.rs     [0m[39;49m[38;2;229;229;229m[48;2;51;51;51m    7% L20    (Fundamental) ------[39;49m[38;2;204;204;204m[48;2;77;77;77m|[39;49m[38;2;204;204;204m[48;2;77;77;77m-UUU:--- F1  [39;49m[1m[38;2;204;204;204m[48;2;77;77;77mlink.rs     [0m[39;49m[38;2;204;204;204m[48;2;77;77;77m   Top L20    (Fundamental) -------[39;49m
+[A[?12l[?25h[?12;25h[2d[40d[K[?1004l[?2004l[>4m[?1l>[?12l[?25h[?1049l[39;49m

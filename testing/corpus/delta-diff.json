@@ -1,0 +1,48 @@
+{
+  "command": [
+    "git",
+    "-c",
+    "core.pager=delta --paging=always --side-by-side",
+    "diff",
+    "a0279cc~1",
+    "a0279cc"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "GIT_CONFIG_NOSYSTEM=1"
+  ],
+  "note": "",
+  "program": "delta-diff",
+  "replies": "\\e]10;rgb:ffff/ffff/ffff\\x07\\e]11;rgb:0000/0000/0000\\x07\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 12854,
+      "keys": ""
+    },
+    {
+      "end": 23150,
+      "keys": " "
+    },
+    {
+      "end": 34871,
+      "keys": " "
+    },
+    {
+      "end": 45373,
+      "keys": "b"
+    },
+    {
+      "end": 45384,
+      "keys": "q"
+    }
+  ],
+  "version": "delta 0.19.2, git version 2.51.0"
+}

@@ -1,0 +1,44 @@
+{
+  "command": [
+    "man",
+    "./fux-corpus-long.7"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "man-wide",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    50,
+    200
+  ],
+  "steps": [
+    {
+      "end": 4535,
+      "keys": ""
+    },
+    {
+      "end": 9019,
+      "keys": " "
+    },
+    {
+      "end": 19326,
+      "keys": "/option\\r"
+    },
+    {
+      "end": 20184,
+      "keys": "n"
+    },
+    {
+      "end": 20203,
+      "keys": "q"
+    }
+  ],
+  "version": "man (macOS), mandoc"
+}

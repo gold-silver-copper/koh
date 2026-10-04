@@ -1,0 +1,73 @@
+{
+  "command": [
+    "lazygit"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "XDG_CONFIG_HOME=/tmp/fux-corpus/home/.config",
+    "GIT_CONFIG_NOSYSTEM=1"
+  ],
+  "note": "",
+  "program": "lazygit",
+  "replies": "\\e[8;40;120t\\e[?2048;2$y\\e[?1000;2$y\\e[?1006;2$y\\e[?9001;0$y\\e[?0u\\eP>|fux 0.17.0\\e\\\\\\e[?62;22c\\e[8;40;120t\\e[48;40;120;0;0t",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 8936,
+      "keys": ""
+    },
+    {
+      "end": 12419,
+      "keys": "4"
+    },
+    {
+      "end": 14287,
+      "keys": "j"
+    },
+    {
+      "end": 16921,
+      "keys": "j"
+    },
+    {
+      "end": 20006,
+      "keys": "\\r"
+    },
+    {
+      "end": 20543,
+      "keys": "j"
+    },
+    {
+      "end": 24033,
+      "keys": "\\e"
+    },
+    {
+      "end": 27643,
+      "keys": "3"
+    },
+    {
+      "end": 27689,
+      "keys": "j"
+    },
+    {
+      "end": 30744,
+      "keys": "2"
+    },
+    {
+      "end": 32798,
+      "keys": "j"
+    },
+    {
+      "end": 32909,
+      "keys": "q"
+    }
+  ],
+  "version": "lazygit 0.65.1"
+}

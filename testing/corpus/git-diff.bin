@@ -1,0 +1,137 @@
+[?1h= README.md   | 2 [32m++[m[m
+ src/grid.rs | 6 [32m++[m[31m----[m[m
+ 2 files changed, 4 insertions(+), 4 deletions(-)[m
+[m
+[1mdiff --git a/README.md b/README.md[m[m
+[1mindex b8b7b0e..111d0d6 100644[m[m
+[1m--- a/README.md[m[m
+[1m+++ b/README.md[m[m
+[36m@@ -3,3 +3,5 @@[m[m
+ A repository made for the corpus.[m[m
+ [m[m
+ Built with cargo.[m[m
+[32m+[m[m
+[32m+[m[32mStaged.[m[m
+[1mdiff --git a/src/grid.rs b/src/grid.rs[m[m
+[1mindex 8dd968d..4f013d1 100644[m[m
+[1m--- a/src/grid.rs[m[m
+[1m+++ b/src/grid.rs[m[m
+[36m@@ -17,9 +17,6 @@[m [mimpl Extent {[m[m
+     pub fn new(n: u16) -> Result<Self, Error> {[m[m
+         NonZeroU16::new(n).map(Self).ok_or(Error::ZeroSize)[m[m
+     }[m[m
+[31m-    pub fn get(self) -> u16 {[m[m
+[31m-        self.0.get()[m[m
+[31m-    }[m[m
+     /// The last row or column.[m[m
+     pub fn last(self) -> u16 {[m[m
+         // Exact: an extent is at least one.[m[m
+[36m@@ -47,7 +44,7 @@[m [mstruct Meta {[m[m
+     linked: bool,[m[m
+     /// Whether a prompt starts on the row (OSC 133 ; A).[m[m
+     prompt: bool,[m[m
+[31m-}[m[m
+[32m+[m[32m} // edited[m[m
+ [m[m
+ // The two flags fit where the struct had padding: a row without links costs[m[m
+ // no more than it did before links.[m[m
+[36m@@ -198,6 +195,7 @@[m [mimpl Grid {[m[m
+     fn allocate(&mut self, next: &mut u64, version: u64) -> Result<usize, Error> {[m[m
+:[K[K         let slot = self.meta.len();[m[m
+         let end = self[m[m
+[32m+[m[32m    // a line added[m[m
+             .cells[m[m
+             .len()[m[m
+             .checked_add(self.stride)[m[m
+[7m(END)[27m[K[K/[Kff[Knn[K[1;1H[K[1m--- a/README.md[m[m
+[2;1H[K[1m+++ b/README.md[m[m
+[3;1H[K[36m@@ -3,3 +3,5 @@[m[m
+[4;1H[K A repository made for the corpus.[m[m
+[5;1H[K [m[m
+[6;1H[K Built with cargo.[m[m
+[7;1H[K[32m+[m[m
+[8;1H[K[32m+[m[32mStaged.[m[m
+[9;1H[K[1mdiff --git a/src/grid.rs b/src/grid.rs[m[m
+[10;1H[K[1mindex 8dd968d..4f013d1 100644[m[m
+[11;1H[K[1m--- a/src/grid.rs[m[m
+[12;1H[K[1m+++ b/src/grid.rs[m[m
+[13;1H[K[36m@@ -17,9 +17,6 @@[m [mimpl Extent {[m[m
+[14;1H[K     pub fn new(n: u16) -> Result<Self, Error> {[m[m
+[15;1H[K         NonZeroU16::new(n).map(Self).ok_or(Error::ZeroSize)[m[m
+[16;1H[K     }[m[m
+[17;1H[K[31m-    pub fn get(self) -> u16 {[m[m
+[18;1H[K[31m-        self.0.get()[m[m
+[19;1H[K[31m-    }[m[m
+[20;1H[K     /// The last row or column.[m[m
+[21;1H[K     pub fn last(self) -> u16 {[m[m
+[22;1H[K         // Exact: an extent is at least one.[m[m
+[23;1H[K[36m@@ -47,7 +44,7 @@[m [mstruct Meta {[m[m
+[24;1H[K     linked: bool,[m[m
+[25;1H[K     /// Whether a prompt starts on the row (OSC 133 ; A).[m[m
+[26;1H[K     prompt: bool,[m[m
+[27;1H[K[31m-}[m[m
+[28;1H[K[32m+[m[32m} // edited[m[m
+[29;1H[K [m[m
+[30;1H[K // The two flags fit where the struct had padding: a row without links costs[m[m
+[31;1H[K // no more than it did before links.[m[m
+[32;1H[K[36m@@ -198,6 +195,7 @@[m [mimpl Grid {[m[m
+[33;1H[K     fn allocate(&mut self, next: &mut u64, version: u64) -> Result<usize, Error> {[m[m
+[34;1H[K         let slot = self.meta.len();[m[m
+[35;1H[K         let end = self[m[m
+[36;1H[K[32m+[m[32m    // a line added[m[m
+[37;1H[K             .cells[m[m
+[38;1H[K             .len()[m[m
+[39;1H[K             .checked_add(self.stride)[m[m
+[40;1H[1;1H[K[1m--- a/README.md[m[m
+[2;1H[K[1m+++ b/README.md[m[m
+[3;1H[K[36m@@ -3,3 +3,5 @@[m[m
+[4;1H[K A repository made for the corpus.[m[m
+[5;1H[K [m[m
+[6;1H[K Built with cargo.[m[m
+[7;1H[K[32m+[m[m
+[8;1H[K[32m+[m[32mStaged.[m[m
+[9;1H[K[1mdiff --git a/src/grid.rs b/src/grid.rs[m[m
+[10;1H[K[1mindex 8dd968d..4f013d1 100644[m[m
+[11;1H[K[1m--- a/src/grid.rs[m[m
+[12;1H[K[1m+++ b/src/grid.rs[m[m
+[13;1H[K[36m@@ -17,9 +17,6 @@[m [mimpl Extent {[m[m
+[14;1H[K     pub [7mfn[27m new(n: u16) -> Result<Self, Error> {[m[m
+[15;1H[K         NonZeroU16::new(n).map(Self).ok_or(Error::ZeroSize)[m[m
+[16;1H[K     }[m[m
+[17;1H[K[31m-    pub [7mfn[27m[31m get(self) -> u16 {[m[m
+[18;1H[K[31m-        self.0.get()[m[m
+[19;1H[K[31m-    }[m[m
+[20;1H[K     /// The last row or column.[m[m
+[21;1H[K     pub [7mfn[27m last(self) -> u16 {[m[m
+[22;1H[K         // Exact: an extent is at least one.[m[m
+[23;1H[K[36m@@ -47,7 +44,7 @@[m [mstruct Meta {[m[m
+[24;1H[K     linked: bool,[m[m
+[25;1H[K     /// Whether a prompt starts on the row (OSC 133 ; A).[m[m
+[26;1H[K     prompt: bool,[m[m
+[27;1H[K[31m-}[m[m
+[28;1H[K[32m+[m[32m} // edited[m[m
+[29;1H[K [m[m
+[30;1H[K // The two flags fit where the struct had padding: a row without links costs[m[m
+[31;1H[K // no more than it did before links.[m[m
+[32;1H[K[36m@@ -198,6 +195,7 @@[m [mimpl Grid {[m[m
+[33;1H[K     [7mfn[27m allocate(&mut self, next: &mut u64, version: u64) -> Result<usize, Error> {[m[m
+[34;1H[K         let slot = self.meta.len();[m[m
+[35;1H[K         let end = self[m[m
+[36;1H[K[32m+[m[32m    // a line added[m[m
+[37;1H[K             .cells[m[m
+[38;1H[K             .len()[m[m
+[39;1H[K             .checked_add(self.stride)[m[m
+[40;1H[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[7m(END)[27m[K[K[?1l>

@@ -1,0 +1,52 @@
+{
+  "command": [
+    "micro",
+    "unicode.txt"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "micro-small",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    24,
+    80
+  ],
+  "steps": [
+    {
+      "end": 10498,
+      "keys": ""
+    },
+    {
+      "end": 11498,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 12291,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 13247,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 13311,
+      "keys": "\\e[F"
+    },
+    {
+      "end": 14601,
+      "keys": "\\e[C"
+    },
+    {
+      "end": 14682,
+      "keys": "\\x11"
+    }
+  ],
+  "version": "micro 2.0.15"
+}

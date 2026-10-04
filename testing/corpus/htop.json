@@ -1,0 +1,57 @@
+{
+  "command": [
+    "htop",
+    "-p",
+    "45993,45994,45995"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "htop -p: only the three processes the scenario starts",
+  "program": "htop",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 2417,
+      "keys": ""
+    },
+    {
+      "end": 2883,
+      "keys": ""
+    },
+    {
+      "end": 2951,
+      "keys": "P"
+    },
+    {
+      "end": 3495,
+      "keys": "M"
+    },
+    {
+      "end": 3741,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 7233,
+      "keys": "\\eOP"
+    },
+    {
+      "end": 9578,
+      "keys": "q"
+    },
+    {
+      "end": 9639,
+      "keys": "q"
+    }
+  ],
+  "version": "htop 3.5.3-3.5.3"
+}

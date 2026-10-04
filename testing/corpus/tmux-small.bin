@@ -1,0 +1,200 @@
+[?1049h[22;0;0t[?1h=[H[2J[?12l[?25h[?1000l[?1002l[?1003l[?1006l[?1005l[?2004h[?2031h[?996n(B[m[?12l[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;24r[c[>c[>q]10;?\]11;?\[1;1H[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[corpus] 0:sh*[60X[60Ccorpus(B[m[?12l[?25h[1;1H]10;?\]11;?\[?7727h(B[m[?12l[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;24r[?7727h(B[m[?12l[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;24r[?7727h(B[m[?12l[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;24r[18t[14t(B[m[?12l[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;24r[1;1H[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[corpus] 0:sh*[60X[60Ccorpus(B[m[?12l[?25h[1;1H$ [?25l[30m[42m[24;1H[corpus] 0:bash*[58X[58Ccorpus(B[m[?12l[?25h[1;3Hecho small
+small
+$ [?25l[H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[corpus] 0:bash- 1:sh*[52X[52Ccorpus(B[m[?12l[?25h[1;1H[?25l[30m[42m[24d[corpus] 0:bash- 1:tmux*[50X[50Ccorpus(B[m[?12l[?25h[1;1H$ [?25l[12;1H─────────────────────────────────────────[32m───────────────────────────────────────(B[m[1;1H$[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[2B[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[corpus] 0:bash- 1:tmux*[50X[50Ccorpus(B[m[?12l[?25h[13;1H[H$ [K[13;1H$ [?25l[12;1H─────────────────────────────────────────[32m───────────────────────────────────────(B[m[30m[42m[24;1H[corpus] 0:bash- 1:bash*[50X[50Ccorpus(B[m[?12l[?25h[13;3Hls
+bad.c                   grid-old.rs             repo-lazygit-small
+broken                  hello                   repo-lazygit-stage
+Cargo.toml              latest                  run.sh
+colored.txt             npm                     src
+empty                   project                 tiny
+fux-corpus-long.7       README.md               tree
+fux-corpus-tables.1     repo                    unicode.txt
+fux-corpus.1            repo-add
+grid-new.rs             repo-lazygit
+$ [?25l[H$ echo small[K
+small[K
+$[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[corpus] 0:bash* 1:bash-[50X[50Ccorpus(B[m[?12l[?25h[3;3Hexit
+logout
+[?25l[7B─────────────────────────────────────────[32m───────────────────────────────────────(B[m[1;1H$[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[2B$ ls[K
+bad.c[19X[19Cgrid-old.rs[13X[13Crepo-lazygit-small[K
+broken[18X[18Chello[19X[19Crepo-lazygit-stage[K
+Cargo.toml[14X[14Clatest[18X[18Crun.sh[K
+colored.txt[13X[13Cnpm[21X[21Csrc[K
+empty[19X[19Cproject[17X[17Ctiny[K
+fux-corpus-long.7       README.md[15X[15Ctree[K
+fux-corpus-tables.1     repo[20X[20Cunicode.txt[K
+fux-corpus.1[12X[12Crepo-add[K
+grid-new.rs[13X[13Crepo-lazygit[K
+$[K[30m[42m
+[corpus] 1:bash*[58X[58Ccorpus(B[m[?12l[?25h[23;3H[?25l[30m[43m
+No next window[39m[K(B[m[23;3H[12;1H─────────────────────────────────────────[32m───────────────────────────────────────(B[m[1;1H$[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[2B$ ls[K
+bad.c[19X[19Cgrid-old.rs[13X[13Crepo-lazygit-small[K
+broken[18X[18Chello[19X[19Crepo-lazygit-stage[K
+Cargo.toml[14X[14Clatest[18X[18Crun.sh[K
+colored.txt[13X[13Cnpm[21X[21Csrc[K
+empty[19X[19Cproject[17X[17Ctiny[K
+fux-corpus-long.7       README.md[15X[15Ctree[K
+fux-corpus-tables.1     repo[20X[20Cunicode.txt[K
+fux-corpus.1[12X[12Crepo-add[K
+grid-new.rs[13X[13Crepo-lazygit[K
+$[K[30m[42m
+[corpus] 1:bash*[58X[58Ccorpus(B[m[23;3H[?12l[?25he[13;23r[23;1H
+[22;4Hxit
+[K[1;24r[23;1H[13;23r[23;1H
+[Alogout
+[K[?25l[?12l[?25h[1;24r[23;1H[?25l[H$[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[corpus] 1:bash*[58X[58Ccorpus(B[m[?12l[?25h[1;3H[H$ [Kexit
+logout
+[1;24r(B[m[?1l>[H[2J[?12l[?25h[?1000l[?1002l[?1003l[?1006l[?1005l[?2004l[?7727l[?1004l[?1049l[23;0;0t[?2031l[exited]

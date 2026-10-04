@@ -1,0 +1,52 @@
+{
+  "command": [
+    "man",
+    "./fux-corpus.1"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "man-small",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    10,
+    40
+  ],
+  "steps": [
+    {
+      "end": 272,
+      "keys": ""
+    },
+    {
+      "end": 361,
+      "keys": "j"
+    },
+    {
+      "end": 422,
+      "keys": "j"
+    },
+    {
+      "end": 743,
+      "keys": " "
+    },
+    {
+      "end": 1056,
+      "keys": " "
+    },
+    {
+      "end": 2197,
+      "keys": "/scrub\\r"
+    },
+    {
+      "end": 2216,
+      "keys": "q"
+    }
+  ],
+  "version": "man (macOS), mandoc"
+}

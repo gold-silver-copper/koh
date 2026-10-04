@@ -1,0 +1,7 @@
+[1m[92m   Compiling[0m words v0.1.0 (/private/tmp/fux-corpus/work/tiny/words)
+[1m[92m   Compiling[0m lines v0.1.0 (/private/tmp/fux-corpus/work/tiny/lines)
+[1m[92m   Compiling[0m unicode-width v0.2.0 (/private/tmp/fux-corpus/work/tiny/width)
+[1m[92m   Compiling[0m counts v0.1.0 (/private/tmp/fux-corpus/work/tiny/counts)
+[1m[96m    Building[0m [                             ] 0/6: words, counts, lines, unicode-width                                 [K[1m[92m   Compiling[0m fux-vt v0.1.0 (/private/tmp/fux-corpus/work/tiny/vt)
+[1m[96m    Building[0m [                             ] 0/6: words, counts, lines, fux-vt, unicode-width                         [1m[96m    Building[0m [===>                         ] 1/6: words, counts, lines, fux-vt                                        [1m[96m    Building[0m [========>                    ] 2/6: counts, lines, fux-vt                                               [1m[96m    Building[0m [=============>               ] 3/6: lines, fux-vt                                                       [K[1m[92m   Compiling[0m app v0.1.0 (/private/tmp/fux-corpus/work/tiny/app)
+[1m[96m    Building[0m [==================>          ] 4/6: app(bin), fux-vt                                                    [1m[96m    Building[0m [=======================>     ] 5/6: fux-vt                                                              [K[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 2.10s

@@ -1,0 +1,54 @@
+{
+  "command": [
+    "fzf",
+    "--height=40%",
+    "--layout=reverse",
+    "--border"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "FZF_DEFAULT_COMMAND=find . -type f"
+  ],
+  "note": "",
+  "program": "fzf-height",
+  "replies": "\\e[1;1R\\e[1;1R",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 8105,
+      "keys": ""
+    },
+    {
+      "end": 10448,
+      "keys": "p"
+    },
+    {
+      "end": 12528,
+      "keys": "a"
+    },
+    {
+      "end": 14260,
+      "keys": "r"
+    },
+    {
+      "end": 14683,
+      "keys": "\\x0e"
+    },
+    {
+      "end": 15106,
+      "keys": "\\x10"
+    },
+    {
+      "end": 15185,
+      "keys": "\\r"
+    }
+  ],
+  "version": "fzf 0.65.2 (brew)"
+}

@@ -1,0 +1,611 @@
+[?1049h[22;0;0t[?1h=[H[2J[?12l[?25h[?1000l[?1002l[?1003l[?1006l[?1005l[?2004h[?2031h[?996n(B[m[?12l[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;40r[c[>c[>q]10;?\]11;?\[1;1H[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[corpus] 0:sh*[100X[100Ccorpus(B[m[?12l[?25h[1;1H]10;?\]11;?\[?7727h(B[m[?12l[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;40r[?7727h(B[m[?12l[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;40r[?7727h(B[m[?12l[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;40r[18t[14t(B[m[?12l[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;40r[1;1H[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[corpus] 0:sh*[100X[100Ccorpus(B[m[?12l[?25h[1;1H$ [?25l[30m[42m[40;1H[corpus] 0:bash*[98X[98Ccorpus(B[m[?12l[?25h[1;3Hvim src/link.rs
+[?25l[H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[?12l[?25h[2d[1;39r[1;1H[2;39r[38S[1;1H[K[39d"src/link.rs"[1;40r[39;14H[?25l 420L, 15634B[H[38;5;130m  1 (B[m[35m//! Hyperlinks (OSC 8, `references/modern/osc8_hyperlinks.md`): the links a
+[38;5;130m  2 (B[m[35m//! grid's cells point to, each held once, and the cells' links, held per row
+[38;5;130m  3 (B[m[35m//! beside the cells for the rows that have any.
+[38;5;130m  4 (B[m[35m//!
+[38;5;130m  5 (B[m[35m//! A cell's link is a `u16` in its row's array, 0 for none and otherwise one
+[38;5;130m  6 (B[m[35m//! more than the link's place in the table. Only a cell with contents has
+[38;5;130m  7 (B[m[35m//! one: an erased cell keeps whatever number it had, unread, until a glyph
+[38;5;130m  8 (B[m[35m//! is printed there, which always writes its link; so erasing, which blanks
+[38;5;130m  9 (B[m[35m//! cells, never touches the arrays. The second half of a wide glyph has its
+[38;5;130m 10 (B[m[35m//! first half's link.
+[38;5;130m 11 (B[m[35m//!
+[38;5;130m 12 (B[m[35m//! The table counts the numbers in the arrays (an erased (B[m[35mcell's too), so the
+[38;5;130m 13 (B[m[35m//! links no row has are found without reading the rows: every change to an
+[38;5;130m 14 (B[m[35m//! array holds and releases the numbers it writes and drops.
+[38;5;130m 15 
+ 16 use[39m [35mstd::collections::[39mHashMap;
+[38;5;130m 17 use[39m [35mstd::sync::[39mArc;
+[38;5;130m 18 
+ 19 (B[m[35m/// The longest URI kept, as VTE and iTerm2 bound it (the spec's "Length
+[38;5;130m 20 (B[m[35m/// limits"). A longer one opens no link.
+[38;5;130m 21 pub[39m [32mconst[39m URI_LIMIT: [32musize[39m [38;5;130m=[39m [31m2083[39m;
+[38;5;130m 22 (B[m[35m/// The longest `id` kept, as VTE bounds it (the spec's "Length limits"). A
+[38;5;130m 23 (B[m[35m/// link with a longer one is not opened.
+[38;5;130m 24 pub[39m [32mconst[39m ID_LIMIT: [32musize[39m [38;5;130m=[39m [31m250[39m;
+[38;5;130m 25 (B[m[35m/// The most links a grid holds at once: a cell's link is a `u16`, 0 for none.
+[38;5;130m 26 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m LINK_COUNT: [32musize[39m [38;5;130m=[39m [31m65_535[39m;
+[38;5;130m 27 (B[m[35m/// The most bytes of URIs and ids a grid holds at once, each link counted
+[38;5;130m 28 (B[m[35m/// with `ENTRY_COST` more for what holds it.
+[38;5;130m 29 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m LINK_BYTES: [32musize[39m [38;5;130m=[39m [31m4[39m [38;5;130m<<[39m [31m20[39m;
+[38;5;130m 30 (B[m[35m/// What a link costs beyond its URI and id: its entry, and its place in the
+[38;5;130m 31 (B[m[35m/// map of ids.
+[38;5;130m 32 (B[m[32mconst[39m ENTRY_COST: [32musize[39m [38;5;130m=[39m [31m64[39m;
+[38;5;130m 33 (B[m[35m/// After making room fails (every link left is on the screen), how many
+[38;5;130m 34 (B[m[35m/// more links are refused before trying again: the links and the history's(B[m
+[38;5;130m 35 (B[m[35m/// rows are walked at most once in this many links.
+[38;5;130m 36 (B[m[32mconst[39m STALL: [32mu32[39m [38;5;130m=[39m [31m256[39m;
+[38;5;130m 37 
+[39m[1m[7msrc/link.rs                                                                                           1,1            Top[1;5H[?12l[?25h(B[m[?25l[56C│[2;61H│[3;61H│[4;61H│[5;61H│[6;61H│[7;61H│[8;61H│[9;61H│[10;61H│[11;61H│[12;61H│[13;61H│[14;61H│[15;61H│[16;61H│[17;61H│[18;61H│[19;61H│[20;61H│[21;61H[32m│[22;61H│[23;61H│[24;61H│[25;61H│[26;61H│[27;61H│[28;61H│[29;61H│[30;61H│[31;61H│[32;61H│[33;61H│[34;61H│[35;61H│[36;61H│[37;61H│[38;61H│[39;61H│(B[m[38;5;130m[H  1 (B[m[35m//! Hyperlinks (OSC 8, `references/modern/osc8_hyperlink[39m[38;5;130m
+  2 (B[m[35m//! grid's cells point to, each held once, and the cells[39m[38;5;130m
+  3 (B[m[35m//! beside the cells for the rows that have any.[39m        [38;5;130m
+  4 (B[m[35m//![39m[53X[38;5;130m
+  5 (B[m[35m//! A cell's link is a `u16` in its row's array, 0 for n[39m[38;5;130m
+  6 (B[m[35m//! more than the link's place in the table. Only a cell[39m[38;5;130m
+  7 (B[m[35m//! one: an erased cell keeps whatever number it had, un[39m[38;5;130m
+  8 (B[m[35m//! is printed there, which always writes its link; so e[39m[38;5;130m
+  9 (B[m[35m//! cells, never touches the arrays. The second half of [39m[38;5;130m
+ 10 (B[m[35m//! first half's link.[39m[34X[38;5;130m
+ 11 (B[m[35m//![39m[53X[38;5;130m
+ 12 (B[m[35m//! The table counts the numbers in the arrays (an erase[39m[38;5;130m
+ 13 (B[m[35m//! links no row has are found without reading the rows:[39m[38;5;130m
+ 14 (B[m[35m//! array holds and releases the numbers it writes and d[39m[38;5;130m
+ 15[39m[57X[38;5;130m
+ 16 use[39m [35mstd::collections::[39mHashMap;[26X[38;5;130m
+ 17 use[39m [35mstd::sync::[39mArc;[37X[38;5;130m
+ 18[39m[57X[38;5;130m
+ 19 (B[m[35m/// The longest URI kept, as VTE and iTerm2 bound it (th[39m[38;5;130m
+ 20 (B[m[35m/// limits"). A longer one opens no link.[39m[15X[38;5;130m
+ 21 pub[39m [32mconst[39m URI_LIMIT: [32musize[39m [38;5;130m=[39m [31m2083[39m;[22X[38;5;130m
+ 22 (B[m[35m/// The longest `id` kept, as VTE bounds it (the spec's [39m[38;5;130m
+ 23 (B[m[35m/// link with a longer one is not opened.[39m[15X[38;5;130m
+ 24 pub[39m [32mconst[39m ID_LIMIT: [32musize[39m [38;5;130m=[39m [31m250[39m;[24X[38;5;130m
+ 25 (B[m[35m/// The most links a grid holds at once: a cell's link i[39m[38;5;130m
+ 26 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m LINK_COUNT: [32musize[39m [38;5;130m=[39m [31m65_535[39m;[12X[38;5;130m
+ 27 (B[m[35m/// The most bytes of URIs and ids a grid holds at once,[39m[38;5;130m
+ 28 (B[m[35m/// with `ENTRY_COST` more for what holds it.[39m[11X[38;5;130m
+ 29 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m LINK_BYTES: [32musize[39m [38;5;130m=[39m [31m4[39m [38;5;130m<<[39m [31m20[39m;[11X[38;5;130m
+ 30 (B[m[35m/// What a link costs beyond its URI and id: its entry, [39m[38;5;130m
+ 31 (B[m[35m/// map of ids.[39m[41X[38;5;130m
+ 32 (B[m[32mconst[39m ENTRY_COST: [32musize[39m [38;5;130m=[39m [31m64[39m;[27X[38;5;130m
+ 33 (B[m[35m/// After making room fails (every link left is on the s[39m[38;5;130m
+ 34 (B[m[35m/// more links are refused before trying again: the link[39m[38;5;130m
+ 35 (B[m[35m/// rows are walked at most once in this many links.[39m    [38;5;130m
+ 36 (B[m[32mconst[39m STALL: [32mu32[39m [38;5;130m=[39m [31m256[39m;[33X[38;5;130m
+ 37[39m[57X[1m[7m
+src/link.rs                                                 (B[m
+"src/link.rs" 420L, 15634B[34X[1;62H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[corpus] 0:bash*[98X[98Ccorpus(B[m[?12l[?25h[1;62H[1;39r[2;60H[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K[1d[1K[H[38;5;130m  1 (B[m[35m//! Hyperlinks (OSC 8, `references/modern/osc8_hyperlink
+[38;5;130m    (B[m[35ms.md`): the links a
+[38;5;130m  2 (B[m[35m//! grid's cells point to, each held once, and the cells
+[38;5;130m    (B[m[35m' links, held per row
+[38;5;130m  3 (B[m[35m//! beside the cells for the rows that have any.
+[38;5;130m  4 (B[m[35m//!
+[38;5;130m  5 (B[m[35m//! A cell's link is a `u16` in its row's array, 0 for n
+[38;5;130m    (B[m[35mone and otherwise one
+[38;5;130m  6 (B[m[35m//! more than the link's place in the table. Only a cell
+[38;5;130m    (B[m[35m with contents has
+[38;5;130m  7 (B[m[35m//! one: an erased cell keeps whatever number it had, un
+[38;5;130m    (B[m[35mread, until a glyph
+[38;5;130m  8 (B[m[35m//! is printed there, which always writes its link; so e
+[38;5;130m    (B[m[35mrasing, which blanks
+[38;5;130m  9 (B[m[35m//! c[1;40r[1;62H(B[m[15;10H[35mells, never touches the arrays. The second half of 
+[38;5;130m    (B[m[35ma wide glyph has its
+[38;5;130m 10 (B[m[35m//! first half's link.
+[38;5;130m 11 (B[m[35m//!
+[38;5;130m 12 (B[m[35m//! The table counts the numbers in the arrays (an erase
+[38;5;130m    (B[m[35md cell's too), so the
+[38;5;130m 13 (B[m[35m//! links no row has are found without reading the rows:
+[38;5;130m    (B[m[35m every change to an
+[38;5;130m 14 (B[m[35m//! array holds and releases the numbers it writes and d
+[38;5;130m    (B[m[35mrops.
+[38;5;130m 15 
+ 16 use[39m [35mstd::collections::[39mHashMap;
+[38;5;130m 17 use[39m [35mstd::sync::[39mArc;
+[38;5;130m 18 
+ 19 (B[m[35m/// The longest URI kept, as VTE and iTerm2 bound it (th
+[38;5;130m    (B[m[35me spec's "Length
+[38;5;130m 20 (B[m[35m/// limits"). A longer one opens no link.[1;62H(B[m[32;1H[38;5;130m 21 pub[39m [32mconst[39m URI_LIMIT: [32musize[39m [38;5;130m=[39m [31m2083[39m;
+[38;5;130m 22 (B[m[35m/// The longest `id` kept, as VTE bounds it (the spec's 
+[38;5;130m    (B[m[35m"Length limits"). A
+[38;5;130m 23 (B[m[35m/// link with a longer one is not opened.
+[38;5;130m 24 pub[39m [32mconst[39m ID_LIMIT: [32musize[39m [38;5;130m=[39m [31m250[39m;
+[38;5;130m    [94m@                                                       
+[39m[1m[7msrc/link.rs                               1,1            Top[1;62H(B[m$ vim src/grid.rs[2;62H[?25l[A[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[1;61H│[2;61H│[3;61H│[4;61H│[5;61H│[6;61H│[7;61H│[8;61H│[9;61H│[10;61H│[11;61H│[12;61H│[13;61H│[14;61H│[15;61H│[16;61H│[17;61H│[18;61H│[19;61H│[20;61H│[21;61H[32m│[22;61H│[23;61H│[24;61H│[25;61H│[26;61H│[27;61H│[28;61H│[29;61H│[30;61H│[31;61H│[32;61H│[33;61H│[34;61H│[35;61H│[36;61H│[37;61H│[38;61H│[39;61H│(B[m[?12l[?25h[2d[1;39r[2;62H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[1d[K[39d"src/grid.rs"[1;40r[39;75H[?25l 1578L, 60437B[1;62H[38;5;130m   1 use[39m [35mstd::collections::[39m{HashMap, VecDeque};[2;62H[38;5;130m   2 use[39m [35mstd::hash::[39m{BuildHasherDefault, Hasher};[3;62H[38;5;130m   3 use[39m [35mstd::num::[39mNonZeroU16;[4;62H[38;5;130m   4 use[39m [35mstd::ops::[39mRange;[5;62H[38;5;130m   5 use[39m [35mstd::sync::[39mArc;[6;62H[38;5;130m   6 [7;62H   7 use[39m [35mcrate::cell::[39m{Line, Spill};[8;62H[38;5;130m   8 use[39m [35mcrate::link::[39mLinks;[9;62H[38;5;130m   9 use[39m [35mcrate::[39m{Attributes, Cell, CellRef, Error, Row, Row[10;62H[38;5;130m     [39mId};[11;62H[38;5;130m  10 [12;62H  11 (B[m[35m/// A grid's number of rows or columns. Never zero, so[13;62H[38;5;130m     (B[m[35m a grid always has a[14;62H[38;5;130m  12 (B[m[35m/// last row and a last column.[15;62H[38;5;130m  13 (B[m[35m#[derive([32mClone[35m, (B[m[32mCopy[35m, [32mDebug[35m, [32mPartialEq[35m, [32mEq[35m)][16;62H[38;5;130m  14 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [38;5;130mstruct[39m [36mExtent[39m(NonZeroU16);[17;62H[38;5;130m  15 [18;62H  16 impl[39m Extent {[19;62H[38;5;130m  17 [39m    [38;5;130mpub[39m [38;5;130mfn[39m [36mnew[39m(n: [32mu16[39m) [38;5;130m->[39m [32mResult[38;5;130m<(B[m[32mSelf[39m, Error[38;5;130m>[39m {[20;62H[38;5;130m  18 [8C(B[m[35mNonZeroU16::[36mnew[39m(n).[36mmap[39m([32mSelf[39m).[36mok_or[39m([35mError::[39mZero[21;62H[38;5;130m     [39mSize)[22;62H[38;5;130m  19 [39m    }[23;62H[38;5;130m  20 [39m    [38;5;130mpub[39m [38;5;130mfn[39m [36mget[39m([31mself[39m) [38;5;130m->[39m [32mu16[39m {[24;62H[38;5;130m  21 [8C(B[m[31mself[39m.[31m0[39m.[36mget[39m()[25;62H[38;5;130m  22 [39m    }[26;62H[38;5;130m  23 [39m    [35m/// The last row or column.[27;62H[38;5;130m  24 [39m    [38;5;130mpub[39m [38;5;130mfn[39m [36mlast[39m([31mself[39m) [38;5;130m->[39m [32mu16[39m {[28;62H[38;5;130m  25 [8C(B[m[34m// Exact: an extent is at least one.[29;62H[38;5;130m  26 [8C(B[m[31mself[39m.[31m0[39m.[36mget[39m().[36msaturating_sub[39m([31m1[39m)[30;62H[38;5;130m  27 [39m    }[31;62H[38;5;130m  28 [39m}[32;62H[38;5;130m  29 [33;62H  30 (B[m[35m/// Maximum addressable retained cells per buffer (2.5[34;62H[38;5;130m     (B[m[35m GiB at 40 bytes/cell).[35;62H[38;5;130m  31 (B[m[35m/// Storage is committed only for live/retained rows, [36;62H[38;5;130m     (B[m[35mnot empty history slots.[37;62H[38;5;130m  32 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m MAX_CELLS: [32musize[39m [38;5;130m=[39m [31m64[39m [38;5;130m*[39m [31m1024[39m [38;5;130m*[39m [31m1024[39m;[38;62H[1m[7msrc/grid.rs                              1,1            Top[1;67H[?12l[?25h(B[m[?25l[6D│[2;61H│[3;61H│[4;61H│[5;61H│[6;61H│[7;61H│[8;61H│[9;61H│[10;61H│[11;61H│[12;61H│[13;61H│[14;61H│[15;61H│[16;61H│[17;61H│[18;61H│[19;61H│[20;61H│[21;61H[32m│[22;61H│[23;61H│[24;61H│[25;61H│[26;61H│[27;61H│[28;61H│[29;61H│[30;61H│[31;61H│[32;61H│[33;61H│[34;61H│[35;61H│[36;61H│[37;61H│[38;61H│[39;61H│(B[m[30m[42m
+[corpus] 0:vim*[99X[99Ccorpus(B[m[?12l[?25h[1;67H[39;110H^D[1;67H[?25l[39;110H  [34;111H[38;5;130m[1;62H  17[39m     [38;5;130mpub[39m [38;5;130mfn[39m [36mnew[39m(n: [32mu16[39m) [38;5;130m->[39m [32mResult[38;5;130m<(B[m[32mSelf[39m, Error[38;5;130m>[39m {       [38;5;130m[2;62H  18[39m         [35mNonZeroU16::[36mnew[39m(n).[36mmap[39m([32mSelf[39m).[36mok_or[39m([35mError::[39mZero[38;5;130m[3;62H     [39mSize)[K[38;5;130m[4;62H  19[39m     }[K[38;5;130m[5;62H  20[39m     [38;5;130mpub[39m [38;5;130mfn[39m [36mget[39m([31mself[39m) [38;5;130m->[39m [32mu16[39m {[K[38;5;130m[6;62H  21[39m         [31mself[39m.[31m0[39m.[36mget[39m()[K[38;5;130m[7;62H  22[39m     }[K[38;5;130m[8;62H  23[39m     [35m/// The last row or column.[39m[K[38;5;130m[9;62H  24[39m     [38;5;130mpub[39m [38;5;130mfn[39m [36mlast[39m([31mself[39m) [38;5;130m->[39m [32mu16[39m {[K[38;5;130m[10;62H  25[39m         [34m// Exact: an extent is at least one.[39m[K[38;5;130m[11;62H  26[39m         [31mself[39m.[31m0[39m.[36mget[39m().[36msaturating_sub[39m([31m1[39m)[K[38;5;130m[12;62H  27[39m     }[K[38;5;130m[13;62H  28 [39m}[K[38;5;130m[14;62H  29[39m[K[38;5;130m[15;62H  30 (B[m[35m/// Maximum addressable retained cells per buffer (2.5[39m[35m[16;62H      GiB at 40 bytes/cell).[39m[K[38;5;130m[17;62H  31 (B[m[35m/// Storage is committed only for live/retained rows, [39m[38;5;130m[18;62H     (B[m[35mnot empty history slots.[39m[K[38;5;130m[19;62H  32 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m MAX_CELLS: [32musize[39m [38;5;130m=[39m [31m64[39m [38;5;130m*[39m [31m1024[39m [38;5;130m*[39m [31m1024[39m; [38;5;130m[20;62H  33 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m MAX_ROWS: [32musize[39m [38;5;130m=[39m [31m1_048_576[39m;         [38;5;130m[21;62H  34[39m[K[38;5;130m[22;62H  35 (B[m[35m#[derive([32mClone[35m, [32mCopy[35m, [32mDebug[35m)][39m[K[38;5;130m[23;62H  36 struct[39m [36mMeta[39m {[K[38;5;130m[24;62H  37[39m     id: RowId,[K[38;5;130m[25;62H  38[39m     version: [32mu64[39m,[K[38;5;130m[26;62H  39[39m     width: [32mu16[39m,[K[38;5;130m[27;62H  40[39m     wrapped: [32mbool[39m,[K[38;5;130m[28;62H  41[39m     [35m/// How far into the row a cell may differ from `C[39m[38;5;130m[29;62H     (B[m[35mell::default()`:[39m[K[38;5;130m[30;62H  42[39m     [35m/// every cell from here to `width` is blank, so r[39m[38;5;130m[31;62H     (B[m[35mecycling the slot[39m[K[38;5;130m[32;62H  43[39m     [35m/// clears only the cells before it. A short line [39m[38;5;130m[33;62H     (B[m[35mscrolled away costs a[39m[K[38;5;130m[34;62H  44[39m     [35m/// few cells, not a row of cold memory.[39m[K[38;5;130m[35;62H  45[39m     used: [32mu16[39m,[K[38;5;130m[36;62H  46[39m     [35m/// Whether the row has an array of links in `Grid[39m[38;5;130m[37;62H     (B[m[35m::linked`.[39m[K[1m[7m[38;62Hsrc/grid.rs                              17,5            1%(B[m[39;62H[K[1;71H[?12l[?25h[?25l[10D[32m│[2;61H│[3;61H│[4;61H│[5;61H│[6;61H│[7;61H│[8;61H│[9;61H│[10;61H│[11;61H│[12;61H│[13;61H│[14;61H│[15;61H│[16;61H│[17;61H│[18;61H│[19;61H│[20;61H│[21;61H[39m│[22;61H│[23;61H│[24;61H│[25;61H│[26;61H│[27;61H│[28;61H│[29;61H│[30;61H│[31;61H│[32;61H│[33;61H│[34;61H│[35;61H│[36;61H│[37;61H│[38;61H│[39;61H│(B[m[38;5;130m[H  1 (B[m[35m//! Hyperlinks (OSC 8, `references/modern/osc8_hyperlink[39m[38;5;130m
+    (B[m[35ms.md`): the links a[39m[37X[38;5;130m
+  2 (B[m[35m//! grid's cells point to, each held once, and the cells[39m[38;5;130m
+    (B[m[35m' links, held per row[39m[35X[38;5;130m
+  3 (B[m[35m//! beside the cells for the rows that have any.[39m        [38;5;130m
+  4 (B[m[35m//![39m[53X[38;5;130m
+  5 (B[m[35m//! A cell's link is a `u16` in its row's array, 0 for n[39m[38;5;130m
+    (B[m[35mone and otherwise one[39m[35X[38;5;130m
+  6 (B[m[35m//! more than the link's place in the table. Only a cell[39m[35m
+     with contents has[39m[38X[38;5;130m
+  7 (B[m[35m//! one: an erased cell keeps whatever number it had, un[39m[38;5;130m
+    (B[m[35mread, until a glyph[39m[37X[38;5;130m
+  8 (B[m[35m//! is printed there, which always writes its link; so e[39m[38;5;130m
+    (B[m[35mrasing, which blanks[39m[36X[38;5;130m
+  9 (B[m[35m//! cells, never touches the arrays. The second half of [39m[38;5;130m
+    (B[m[35ma wide glyph has its[39m[36X[38;5;130m
+ 10 (B[m[35m//! first half's link.[39m[34X[38;5;130m
+ 11 (B[m[35m//![39m[53X[38;5;130m
+ 12 (B[m[35m//! The table counts the numbers in the arrays (an erase[39m[38;5;130m
+    (B[m[35md cell's too), so the[39m[35X[38;5;130m
+ 13 (B[m[35m//! links no row has are found without reading the rows:[39m[35m
+     every change to an[39m[37X[38;5;130m
+ 14 (B[m[35m//! array holds and releases the numbers it writes and d[39m[38;5;130m
+    (B[m[35mrops.[39m[51X[38;5;130m
+ 15[39m[57X[38;5;130m
+ 16 use[39m [35mstd::collections::[39mHashMap;[26X[38;5;130m
+ 17 use[39m [35mstd::sync::[39mArc;[37X[38;5;130m
+ 18[39m[57X[38;5;130m
+ 19 (B[m[35m/// The longest URI kept, as VTE and iTerm2 bound it (th[39m[38;5;130m
+    (B[m[35me spec's "Length[39m[40X[38;5;130m
+ 20 (B[m[35m/// limits"). A longer one opens no link.[39m[15X[38;5;130m
+ 21 pub[39m [32mconst[39m URI_LIMIT: [32musize[39m [38;5;130m=[39m [31m2083[39m;[22X[38;5;130m
+ 22 (B[m[35m/// The longest `id` kept, as VTE bounds it (the spec's [39m[38;5;130m
+    (B[m[35m"Length limits"). A[39m[37X[38;5;130m
+ 23 (B[m[35m/// link with a longer one is not opened.[39m[15X[38;5;130m
+ 24 pub[39m [32mconst[39m ID_LIMIT: [32musize[39m [38;5;130m=[39m [31m250[39m;[24X[38;5;130m
+    [94m@[55X[39m[1m[7m
+src/link.rs                               1,1            Top(B[m[39;60H[1K[38;5;130m[1;62H  17[39m     [38;5;130mpub[39m [38;5;130mfn[39m [36mnew[39m(n: [32mu16[39m) [38;5;130m->[39m [32mResult[38;5;130m<(B[m[32mSelf[39m, Error[38;5;130m>[39m {       [38;5;130m[2;62H  18[39m         [35mNonZeroU16::[36mnew[39m(n).[36mmap[39m([32mSelf[39m).[36mok_or[39m([35mError::[39mZero[38;5;130m[3;62H     [39mSize)[K[38;5;130m[4;62H  19[39m     }[K[38;5;130m[5;62H  20[39m     [38;5;130mpub[39m [38;5;130mfn[39m [36mget[39m([31mself[39m) [38;5;130m->[39m [32mu16[39m {[K[38;5;130m[6;62H  21[39m         [31mself[39m.[31m0[39m.[36mget[39m()[K[38;5;130m[7;62H  22[39m     }[K[38;5;130m[8;62H  23[39m     [35m/// The last row or column.[39m[K[38;5;130m[9;62H  24[39m     [38;5;130mpub[39m [38;5;130mfn[39m [36mlast[39m([31mself[39m) [38;5;130m->[39m [32mu16[39m {[K[38;5;130m[10;62H  25[39m         [34m// Exact: an extent is at least one.[39m[K[38;5;130m[11;62H  26[39m         [31mself[39m.[31m0[39m.[36mget[39m().[36msaturating_sub[39m([31m1[39m)[K[38;5;130m[12;62H  27[39m     }[K[38;5;130m[13;62H  28 [39m}[K[38;5;130m[14;62H  29[39m[K[38;5;130m[15;62H  30 (B[m[35m/// Maximum addressable retained cells per buffer (2.5[39m[35m[16;62H      GiB at 40 bytes/cell).[39m[K[38;5;130m[17;62H  31 (B[m[35m/// Storage is committed only for live/retained rows, [39m[38;5;130m[18;62H     (B[m[35mnot empty history slots.[39m[K[38;5;130m[19;62H  32 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m MAX_CELLS: [32musize[39m [38;5;130m=[39m [31m64[39m [38;5;130m*[39m [31m1024[39m [38;5;130m*[39m [31m1024[39m; [38;5;130m[20;62H  33 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m MAX_ROWS: [32musize[39m [38;5;130m=[39m [31m1_048_576[39m;         [38;5;130m[21;62H  34[39m[K[38;5;130m[22;62H  35 (B[m[35m#[derive([32mClone[35m, [32mCopy[35m, [32mDebug[35m)][39m[K[38;5;130m[23;62H  36 struct[39m [36mMeta[39m {[K[38;5;130m[24;62H  37[39m     id: RowId,[K[38;5;130m[25;62H  38[39m     version: [32mu64[39m,[K[38;5;130m[26;62H  39[39m     width: [32mu16[39m,[K[38;5;130m[27;62H  40[39m     wrapped: [32mbool[39m,[K[38;5;130m[28;62H  41[39m     [35m/// How far into the row a cell may differ from `C[39m[38;5;130m[29;62H     (B[m[35mell::default()`:[39m[K[38;5;130m[30;62H  42[39m     [35m/// every cell from here to `width` is blank, so r[39m[38;5;130m[31;62H     (B[m[35mecycling the slot[39m[K[38;5;130m[32;62H  43[39m     [35m/// clears only the cells before it. A short line [39m[38;5;130m[33;62H     (B[m[35mscrolled away costs a[39m[K[38;5;130m[34;62H  44[39m     [35m/// few cells, not a row of cold memory.[39m[K[38;5;130m[35;62H  45[39m     used: [32mu16[39m,[K[38;5;130m[36;62H  46[39m     [35m/// Whether the row has an array of links in `Grid[39m[38;5;130m[37;62H     (B[m[35m::linked`.[39m[K[1m[7m[38;62Hsrc/grid.rs                              17,5            1%(B[m[39;62H[K[30m[42m
+[corpus] 0:vim*[99X[99Ccorpus(B[m[?12l[?25h[1;5H[39;50H^D[1;5H[?25l[39;50H  [30;12H[38;5;130m[H 12 (B[m[35m//! The table counts the numbers in the arrays (an erase[39m[38;5;130m
+    (B[m[35md cell's too), so the[39m[35X[38;5;130m
+ 13 (B[m[35m//! links no row has are found without reading the rows:[39m[35m
+     every change to an[39m[37X[38;5;130m
+ 14 (B[m[35m//! array holds and releases the numbers it writes and d[39m[38;5;130m
+    (B[m[35mrops.[39m[51X[38;5;130m
+ 15[39m[57X[38;5;130m
+ 16 use[39m [35mstd::collections::[39mHashMap;[26X[38;5;130m
+ 17 use[39m [35mstd::sync::[39mArc;[37X[38;5;130m
+ 18[39m[57X[38;5;130m
+ 19 (B[m[35m/// The longest URI kept, as VTE and iTerm2 bound it (th[39m[38;5;130m
+    (B[m[35me spec's "Length[39m[40X[38;5;130m
+ 20 (B[m[35m/// limits"). A longer one opens no link.[39m[15X[38;5;130m
+ 21 pub[39m [32mconst[39m URI_LIMIT: [32musize[39m [38;5;130m=[39m [31m2083[39m;[22X[38;5;130m
+ 22 (B[m[35m/// The longest `id` kept, as VTE bounds it (the spec's [39m[38;5;130m
+    (B[m[35m"Length limits"). A[39m[37X[38;5;130m
+ 23 (B[m[35m/// link with a longer one is not opened.[39m[15X[38;5;130m
+ 24 pub[39m [32mconst[39m ID_LIMIT: [32musize[39m [38;5;130m=[39m [31m250[39m;[24X[38;5;130m
+ 25 (B[m[35m/// The most links a grid holds at once: a cell's link i[39m[38;5;130m
+    (B[m[35ms a `u16`, 0 for none.[39m[34X[38;5;130m
+ 26 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m LINK_COUNT: [32musize[39m [38;5;130m=[39m [31m65_535[39m;[12X[38;5;130m
+ 27 (B[m[35m/// The most bytes of URIs and ids a grid holds at once,[39m[35m
+     each link counted[39m[38X[38;5;130m
+ 28 (B[m[35m/// with `ENTRY_COST` more for what holds it.[39m[11X[38;5;130m
+ 29 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m LINK_BYTES: [32musize[39m [38;5;130m=[39m [31m4[39m [38;5;130m<<[39m [31m20[39m;[11X[38;5;130m
+ 30 (B[m[35m/// What a link costs beyond its URI and id: its entry, [39m[38;5;130m
+    (B[m[35mand its place in the[39m[36X[38;5;130m
+ 31 (B[m[35m/// map of ids.[39m[41X[38;5;130m
+ 32 (B[m[32mconst[39m ENTRY_COST: [32musize[39m [38;5;130m=[39m [31m64[39m;[27X[38;5;130m
+ 33 (B[m[35m/// After making room fails (every link left is on the s[39m[38;5;130m
+    (B[m[35mcreen), how many[39m[40X[38;5;130m
+ 34 (B[m[35m/// more links are refused before trying again: the link[39m[38;5;130m
+    (B[m[35ms and the history's[39m[37X[38;5;130m
+ 35 (B[m[35m/// rows are walked at most once in this many links.[39m    [38;5;130m
+ 36 (B[m[32mconst[39m STALL: [32mu32[39m [38;5;130m=[39m [31m256[39m;[33X[38;5;130m
+ 37[39m[57X[38;5;130m
+    [94m@[55X[39m[1m[7m
+src/link.rs                               12,1            2%(B[m[39;60H[1K[1;5H[?12l[?25h[39;1H:q[?25l[59C[1K[2;1H[?12l[?25h[?25l[H$ vim src/link.rs[43X[2;60H[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K[1;61H[32m│[2;61H│[3;61H│[4;61H│[5;61H│[6;61H│[7;61H│[8;61H│[9;61H│[10;61H│[11;61H│[12;61H│[13;61H│[14;61H│[15;61H│[16;61H│[17;61H│[18;61H│[19;61H│[20;61H│[21;61H[39m│[22;61H│[23;61H│[24;61H│[25;61H│[26;61H│[27;61H│[28;61H│[29;61H│[30;61H│[31;61H│[32;61H│[33;61H│[34;61H│[35;61H│[36;61H│[37;61H│[38;61H│[39;61H│(B[m[?12l[?25h[2;1H$ [?25l[1;61H│[2;61H│[3;61H│[4;61H│[5;61H│[6;61H│[7;61H│[8;61H│[9;61H│[10;61H│[11;61H│[12;61H│[13;61H│[14;61H│[15;61H│[16;61H│[17;61H│[18;61H│[19;61H│[20;61H│[21;61H[32m│[22;61H│[23;61H│[24;61H│[25;61H│[26;61H│[27;61H│[28;61H│[29;61H│[30;61H│[31;61H│[32;61H│[33;61H│[34;61H│[35;61H│[36;61H│[37;61H│[38;61H│[39;61H│(B[m[H$ vim src/link.rs[43X
+$[59X[3;60H[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K
+[1K[38;5;130m[1;62H  17[39m     [38;5;130mpub[39m [38;5;130mfn[39m [36mnew[39m(n: [32mu16[39m) [38;5;130m->[39m [32mResult[38;5;130m<(B[m[32mSelf[39m, Error[38;5;130m>[39m {       [38;5;130m[2;62H  18[39m         [35mNonZeroU16::[36mnew[39m(n).[36mmap[39m([32mSelf[39m).[36mok_or[39m([35mError::[39mZero[38;5;130m[3;62H     [39mSize)[K[38;5;130m[4;62H  19[39m     }[K[38;5;130m[5;62H  20[39m     [38;5;130mpub[39m [38;5;130mfn[39m [36mget[39m([31mself[39m) [38;5;130m->[39m [32mu16[39m {[K[38;5;130m[6;62H  21[39m         [31mself[39m.[31m0[39m.[36mget[39m()[K[38;5;130m[7;62H  22[39m     }[K[38;5;130m[8;62H  23[39m     [35m/// The last row or column.[39m[K[38;5;130m[9;62H  24[39m     [38;5;130mpub[39m [38;5;130mfn[39m [36mlast[39m([31mself[39m) [38;5;130m->[39m [32mu16[39m {[K[38;5;130m[10;62H  25[39m         [34m// Exact: an extent is at least one.[39m[K[38;5;130m[11;62H  26[39m         [31mself[39m.[31m0[39m.[36mget[39m().[36msaturating_sub[39m([31m1[39m)[K[38;5;130m[12;62H  27[39m     }[K[38;5;130m[13;62H  28 [39m}[K[38;5;130m[14;62H  29[39m[K[38;5;130m[15;62H  30 (B[m[35m/// Maximum addressable retained cells per buffer (2.5[39m[35m[16;62H      GiB at 40 bytes/cell).[39m[K[38;5;130m[17;62H  31 (B[m[35m/// Storage is committed only for live/retained rows, [39m[38;5;130m[18;62H     (B[m[35mnot empty history slots.[39m[K[38;5;130m[19;62H  32 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m MAX_CELLS: [32musize[39m [38;5;130m=[39m [31m64[39m [38;5;130m*[39m [31m1024[39m [38;5;130m*[39m [31m1024[39m; [38;5;130m[20;62H  33 pub(B[m[35m([38;5;130mcrate(B[m[35m)[39m [32mconst[39m MAX_ROWS: [32musize[39m [38;5;130m=[39m [31m1_048_576[39m;         [38;5;130m[21;62H  34[39m[K[38;5;130m[22;62H  35 (B[m[35m#[derive([32mClone[35m, [32mCopy[35m, [32mDebug[35m)][39m[K[38;5;130m[23;62H  36 struct[39m [36mMeta[39m {[K[38;5;130m[24;62H  37[39m     id: RowId,[K[38;5;130m[25;62H  38[39m     version: [32mu64[39m,[K[38;5;130m[26;62H  39[39m     width: [32mu16[39m,[K[38;5;130m[27;62H  40[39m     wrapped: [32mbool[39m,[K[38;5;130m[28;62H  41[39m     [35m/// How far into the row a cell may differ from `C[39m[38;5;130m[29;62H     (B[m[35mell::default()`:[39m[K[38;5;130m[30;62H  42[39m     [35m/// every cell from here to `width` is blank, so r[39m[38;5;130m[31;62H     (B[m[35mecycling the slot[39m[K[38;5;130m[32;62H  43[39m     [35m/// clears only the cells before it. A short line [39m[38;5;130m[33;62H     (B[m[35mscrolled away costs a[39m[K[38;5;130m[34;62H  44[39m     [35m/// few cells, not a row of cold memory.[39m[K[38;5;130m[35;62H  45[39m     used: [32mu16[39m,[K[38;5;130m[36;62H  46[39m     [35m/// Whether the row has an array of links in `Grid[39m[38;5;130m[37;62H     (B[m[35m::linked`.[39m[K[1m[7m[38;62Hsrc/grid.rs                              17,5            1%(B[m[39;62H[K[30m[42m
+[corpus] 0:bash*[98X[98Ccorpus(B[m[?12l[?25h[1;71H[?25l[10D│[2;61H│[3;61H│[4;61H│[5;61H│[6;61H│[7;61H│[8;61H│[9;61H│[10;61H│[11;61H│[12;61H│[13;61H│[14;61H│[15;61H│[16;61H│[17;61H│[18;61H│[19;61H│[20;61H│[21;61H[32m│[22;61H│[23;61H│[24;61H│[25;61H│[26;61H│[27;61H│[28;61H│[29;61H│[30;61H│[31;61H│[32;61H│[33;61H│[34;61H│[35;61H│[36;61H│[37;61H│[38;61H│[39;61H│(B[m[30m[42m
+[corpus] 0:vim*[99X[99Ccorpus(B[m[?12l[?25h[1;71H[39;62H:q[?25l[K[2d[?12l[?25h[?25l[A$ vim src/grid.rs[K[2;62H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[1;61H│[2;61H│[3;61H│[4;61H│[5;61H│[6;61H│[7;61H│[8;61H│[9;61H│[10;61H│[11;61H│[12;61H│[13;61H│[14;61H│[15;61H│[16;61H│[17;61H│[18;61H│[19;61H│[20;61H│[21;61H[32m│[22;61H│[23;61H│[24;61H│[25;61H│[26;61H│[27;61H│[28;61H│[29;61H│[30;61H│[31;61H│[32;61H│[33;61H│[34;61H│[35;61H│[36;61H│[37;61H│[38;61H│[39;61H│(B[m[?12l[?25h[2d$ [?25l[1;61H│[2;61H│[3;61H│[4;61H│[5;61H│[6;61H│[7;61H│[8;61H│[9;61H│[10;61H│[11;61H│[12;61H│[13;61H│[14;61H│[15;61H│[16;61H│[17;61H│[18;61H│[19;61H│[20;61H│[21;61H[32m│[22;61H│[23;61H│[24;61H│[25;61H│[26;61H│[27;61H│[28;61H│[29;61H│[30;61H│[31;61H│[32;61H│[33;61H│[34;61H│[35;61H│[36;61H│[37;61H│[38;61H│[39;61H│(B[m[30m[42m
+[corpus] 0:bash*[98X[98Ccorpus(B[m[?12l[?25h[2;64Hexit[3;62Hlogout[4;62H[?25l[H$ vim src/link.rs[K
+$[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[corpus] 0:bash*[98X[98Ccorpus(B[m[?12l[?25h[2;3H$ [Kexit
+logout
+[1;40r(B[m[?1l>[H[2J[?12l[?25h[?1000l[?1002l[?1003l[?1006l[?1005l[?2004l[?7727l[?1004l[?1049l[23;0;0t[?2031l[exited]

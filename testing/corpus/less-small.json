@@ -1,0 +1,52 @@
+{
+  "command": [
+    "less",
+    "unicode.txt"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "less-small",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    10,
+    40
+  ],
+  "steps": [
+    {
+      "end": 405,
+      "keys": ""
+    },
+    {
+      "end": 472,
+      "keys": "j"
+    },
+    {
+      "end": 522,
+      "keys": "j"
+    },
+    {
+      "end": 992,
+      "keys": " "
+    },
+    {
+      "end": 1428,
+      "keys": "G"
+    },
+    {
+      "end": 1852,
+      "keys": "g"
+    },
+    {
+      "end": 1871,
+      "keys": "q"
+    }
+  ],
+  "version": "less 668 (POSIX regular expressions)"
+}

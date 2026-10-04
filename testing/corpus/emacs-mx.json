@@ -1,0 +1,66 @@
+{
+  "command": [
+    "emacs",
+    "-nw",
+    "-Q",
+    "README.md"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "emacs-mx",
+  "replies": "\\e[>1;1700;0c\\e]11;rgb:0000/0000/0000\\e\\\\\\e]10;rgb:ffff/ffff/ffff\\e\\\\\\e[?62;22c\\eP>|fux 0.17.0\\e\\\\",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 7385,
+      "keys": ""
+    },
+    {
+      "end": 7631,
+      "keys": "\\ex"
+    },
+    {
+      "end": 7713,
+      "keys": "revert-b\\t"
+    },
+    {
+      "end": 9962,
+      "keys": "\\t"
+    },
+    {
+      "end": 11342,
+      "keys": "\\x07"
+    },
+    {
+      "end": 11343,
+      "keys": "\\x07"
+    },
+    {
+      "end": 15419,
+      "keys": "\\x18\\x02"
+    },
+    {
+      "end": 16675,
+      "keys": "\\x18o"
+    },
+    {
+      "end": 19880,
+      "keys": "q"
+    },
+    {
+      "end": 19945,
+      "keys": "\\x18\\x03"
+    }
+  ],
+  "version": "GNU Emacs 31.1"
+}

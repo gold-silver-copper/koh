@@ -1,0 +1,236 @@
+[?1049h[40;1H[?1h=     File: [1msrc/link.rs[0m[m
+   1 [32m//![0m[32m Hyperlinks (OSC 8, `references/modern/osc8_hyperlinks.md`): the links a[0m[m
+   2 [32m//![0m[32m grid's cells point to, each held once, and the cells' links, held per row[0m[m
+   3 [32m//![0m[32m beside the cells for the rows that have any.[0m[m
+   4 [32m//![0m[m
+   5 [32m//![0m[32m A cell's link is a `u16` in its row's array, 0 for none and otherwise one[0m[m
+   6 [32m//![0m[32m more than the link's place in the table. Only a cell with contents has[0m[m
+   7 [32m//![0m[32m one: an erased cell keeps whatever number it had, unread, until a glyph[0m[m
+   8 [32m//![0m[32m is printed there, which always writes its link; so erasing, which blanks[0m[m
+   9 [32m//![0m[32m cells, never touches the arrays. The second half of a wide glyph has its[0m[m
+  10 [32m//![0m[32m first half's link.[0m[m
+  11 [32m//![0m[m
+  12 [32m//![0m[32m The table counts the numbers in the arrays (an erased cell's too), so the[0m[m
+  13 [32m//![0m[32m links no row has are found without reading the rows: every change to an[0m[m
+  14 [32m//![0m[32m array holds and releases the numbers it writes and drops.[0m[m
+  15 [m
+  16 [35muse[0m std::collections::HashMap;[m
+  17 [35muse[0m std::sync::Arc;[m
+  18 [m
+  19 [32m///[0m[32m The longest URI kept, as VTE and iTerm2 bound it (the spec's "Length[0m[m
+  20 [32m///[0m[32m limits"). A longer one opens no link.[0m[m
+  21 [35mpub[0m [35mconst[0m [33mURI_LIMIT[0m: [35musize[0m [35m=[0m [33m2083[0m;[m
+  22 [32m///[0m[32m The longest `id` kept, as VTE bounds it (the spec's "Length limits"). A[0m[m
+  23 [32m///[0m[32m link with a longer one is not opened.[0m[m
+  24 [35mpub[0m [35mconst[0m [33mID_LIMIT[0m: [35musize[0m [35m=[0m [33m250[0m;[m
+  25 [32m///[0m[32m The most links a grid holds at once: a cell's link is a `u16`, 0 for none.[0m[m
+  26 [35mpub[0m([35mcrate[0m) [35mconst[0m [33mLINK_COUNT[0m: [35musize[0m [35m=[0m [33m65_535[0m;[m
+  27 [32m///[0m[32m The most bytes of URIs and ids a grid holds at once, each link counted[0m[m
+  28 [32m///[0m[32m with `ENTRY_COST` more for what holds it.[0m[m
+  29 [35mpub[0m([35mcrate[0m) [35mconst[0m [33mLINK_BYTES[0m: [35musize[0m [35m=[0m [33m4[0m [35m<[0m[35m<[0m [33m20[0m;[m
+  30 [32m///[0m[32m What a link costs beyond its URI and id: its entry, and its place in the[0m[m
+  31 [32m///[0m[32m map of ids.[0m[m
+  32 [35mconst[0m [33mENTRY_COST[0m: [35musize[0m [35m=[0m [33m64[0m;[m
+  33 [32m///[0m[32m After making room fails (every link left is on the screen), how many[0m[m
+  34 [32m///[0m[32m more links are refused before trying again: the links and the history's[0m[m
+  35 [32m///[0m[32m rows are walked at most once in this many links.[0m[m
+  36 [35mconst[0m [33mSTALL[0m: [35mu32[0m [35m=[0m [33m256[0m;[m
+  37 [m
+  38 [32m///[0m[32m A cell's hyperlink: where it points, the program's `id` for it, if it[0m[m
+[7mcolored.txt[27m[K[K  39 [32m///[0m[32m gave one, and a number that tells links apart.[0m[m
+  40 #[derive(Clone, Copy, Debug, PartialEq, Eq)][m
+  41 [35mpub[0m [35mstruct[0m [33mHyperlink[0m<[35m'a[0m> {[m
+  42     uri: [35m&[0m[35m'a[0m [35mstr[0m,[m
+  43     id: Option<[35m&[0m[35m'a[0m [35mstr[0m>,[m
+  44     key: [35mu64[0m,[m
+  45 }[m
+  46 [m
+  47 [35mimpl[0m<[35m'a[0m> [33mHyperlink[0m<[35m'a[0m> {[m
+  48     [32m///[0m[32m The URI, as the program sent it: at most [`URI_LIMIT`] bytes, each a[0m[m
+  49     [32m///[0m[32m printable ASCII character.[0m[m
+  50     [35mpub[0m [35mfn[0m [34muri[0m([35m&[0m[36mself[0m) -> [35m&[0m[35m'a[0m [35mstr[0m {[m
+  51         self.uri[m
+  52     }[m
+  53     [32m///[0m[32m The `id` parameter the program gave the link, if it gave a nonempty[0m[m
+  54     [32m///[0m[32m one: at most [`ID_LIMIT`] printable ASCII bytes.[0m[m
+  55     [35mpub[0m [35mfn[0m [34mid[0m([35m&[0m[36mself[0m) -> Option<[35m&[0m[35m'a[0m [35mstr[0m> {[m
+  56         self.id[m
+  57     }[m
+  58     [32m///[0m[32m A number that identifies the link among the parser's links, never[0m[m
+  59     [32m///[0m[32m given to another: cells with the same key are one link, as the spec[0m[m
+  60     [32m///[0m[32m groups them. Each `OSC 8` with a URI and no `id` opens a link of its[0m[m
+  61     [32m///[0m[32m own; one with an `id` and a URI already open on the screen, the same[0m[m
+  62     [32m///[0m[32m link again.[0m[m
+  63     [35mpub[0m [35mfn[0m [34mkey[0m([35m&[0m[36mself[0m) -> [35mu64[0m {[m
+  64         self.key[m
+  65     }[m
+  66 }[m
+  67 [m
+  68 [32m///[0m[32m A link as a grid holds it, with how many cells have its number.[0m[m
+  69 #[derive(Clone, Debug)][m
+  70 [35mstruct[0m [33mEntry[0m {[m
+  71     uri: Arc<[35mstr[0m>,[m
+  72     id: Option<Arc<[35mstr[0m>>,[m
+  73     key: [35mu64[0m,[m
+  74     cells: [35mu32[0m,[m
+  75 }[m
+  76 [m
+  77 [35mimpl[0m [33mEntry[0m {[m
+:[K[K[HM  38 [32m///[0m[32m A cell's hyperlink: where it points, the program's `id` for it, if it[0m[m
+[HM  37 [m
+[HM  36 [35mconst[0m [33mSTALL[0m: [35mu32[0m [35m=[0m [33m256[0m;[m
+[HM  35 [32m///[0m[32m rows are walked at most once in this many links.[0m[m
+[HM  34 [32m///[0m[32m more links are refused before trying again: the links and the history's[0m[m
+[HM  33 [32m///[0m[32m After making room fails (every link left is on the screen), how many[0m[m
+[HM  32 [35mconst[0m [33mENTRY_COST[0m: [35musize[0m [35m=[0m [33m64[0m;[m
+[HM  31 [32m///[0m[32m map of ids.[0m[m
+[HM  30 [32m///[0m[32m What a link costs beyond its URI and id: its entry, and its place in the[0m[m
+[HM  29 [35mpub[0m([35mcrate[0m) [35mconst[0m [33mLINK_BYTES[0m: [35musize[0m [35m=[0m [33m4[0m [35m<[0m[35m<[0m [33m20[0m;[m
+[HM  28 [32m///[0m[32m with `ENTRY_COST` more for what holds it.[0m[m
+[HM  27 [32m///[0m[32m The most bytes of URIs and ids a grid holds at once, each link counted[0m[m
+[HM  26 [35mpub[0m([35mcrate[0m) [35mconst[0m [33mLINK_COUNT[0m: [35musize[0m [35m=[0m [33m65_535[0m;[m
+[HM  25 [32m///[0m[32m The most links a grid holds at once: a cell's link is a `u16`, 0 for none.[0m[m
+[HM  24 [35mpub[0m [35mconst[0m [33mID_LIMIT[0m: [35musize[0m [35m=[0m [33m250[0m;[m
+[HM  23 [32m///[0m[32m link with a longer one is not opened.[0m[m
+[HM  22 [32m///[0m[32m The longest `id` kept, as VTE bounds it (the spec's "Length limits"). A[0m[m
+[HM  21 [35mpub[0m [35mconst[0m [33mURI_LIMIT[0m: [35musize[0m [35m=[0m [33m2083[0m;[m
+[HM  20 [32m///[0m[32m limits"). A longer one opens no link.[0m[m
+[HM  19 [32m///[0m[32m The longest URI kept, as VTE and iTerm2 bound it (the spec's "Length[0m[m
+[HM  18 [m
+[HM  17 [35muse[0m std::sync::Arc;[m
+[HM  16 [35muse[0m std::collections::HashMap;[m
+[HM  15 [m
+[HM  14 [32m//![0m[32m array holds and releases the numbers it writes and drops.[0m[m
+[HM  13 [32m//![0m[32m links no row has are found without reading the rows: every change to an[0m[m
+[HM  12 [32m//![0m[32m The table counts the numbers in the arrays (an erased cell's too), so the[0m[m
+[HM  11 [32m//![0m[m
+[HM  10 [32m//![0m[32m first half's link.[0m[m
+[HM   9 [32m//![0m[32m cells, never touches the arrays. The second half of a wide glyph has its[0m[m
+[HM   8 [32m//![0m[32m is printed there, which always writes its link; so erasing, which blanks[0m[m
+[HM   7 [32m//![0m[32m one: an erased cell keeps whatever number it had, unread, until a glyph[0m[m
+[HM   6 [32m//![0m[32m more than the link's place in the table. Only a cell with contents has[0m[m
+[HM   5 [32m//![0m[32m A cell's link is a `u16` in its row's array, 0 for none and otherwise one[0m[m
+[HM   4 [32m//![0m[m
+[HM   3 [32m//![0m[32m beside the cells for the rows that have any.[0m[m
+[HM   2 [32m//![0m[32m grid's cells point to, each held once, and the cells' links, held per row[0m[m
+[HM   1 [32m//![0m[32m Hyperlinks (OSC 8, `references/modern/osc8_hyperlinks.md`): the links a[0m[m
+[HM     File: [1msrc/link.rs[0m[m
+[40;1H[K:[K[K/[Kff[Knn[K[1;1H[K     File: [1msrc/link.rs[0m[m
+[2;1H[K   1 [32m//![0m[32m Hyperlinks (OSC 8, `references/modern/osc8_hyperlinks.md`): the links a[0m[m
+[3;1H[K   2 [32m//![0m[32m grid's cells point to, each held once, and the cells' links, held per row[0m[m
+[4;1H[K   3 [32m//![0m[32m beside the cells for the rows that have any.[0m[m
+[5;1H[K   4 [32m//![0m[m
+[6;1H[K   5 [32m//![0m[32m A cell's link is a `u16` in its row's array, 0 for none and otherwise one[0m[m
+[7;1H[K   6 [32m//![0m[32m more than the link's place in the table. Only a cell with contents has[0m[m
+[8;1H[K   7 [32m//![0m[32m one: an erased cell keeps whatever number it had, unread, until a glyph[0m[m
+[9;1H[K   8 [32m//![0m[32m is printed there, which always writes its link; so erasing, which blanks[0m[m
+[10;1H[K   9 [32m//![0m[32m cells, never touches the arrays. The second half of a wide glyph has its[0m[m
+[11;1H[K  10 [32m//![0m[32m first half's link.[0m[m
+[12;1H[K  11 [32m//![0m[m
+[13;1H[K  12 [32m//![0m[32m The table counts the numbers in the arrays (an erased cell's too), so the[0m[m
+[14;1H[K  13 [32m//![0m[32m links no row has are found without reading the rows: every change to an[0m[m
+[15;1H[K  14 [32m//![0m[32m array holds and releases the numbers it writes and drops.[0m[m
+[16;1H[K  15 [m
+[17;1H[K  16 [35muse[0m std::collections::HashMap;[m
+[18;1H[K  17 [35muse[0m std::sync::Arc;[m
+[19;1H[K  18 [m
+[20;1H[K  19 [32m///[0m[32m The longest URI kept, as VTE and iTerm2 bound it (the spec's "Length[0m[m
+[21;1H[K  20 [32m///[0m[32m limits"). A longer one opens no link.[0m[m
+[22;1H[K  21 [35mpub[0m [35mconst[0m [33mURI_LIMIT[0m: [35musize[0m [35m=[0m [33m2083[0m;[m
+[23;1H[K  22 [32m///[0m[32m The longest `id` kept, as VTE bounds it (the spec's "Length limits"). A[0m[m
+[24;1H[K  23 [32m///[0m[32m link with a longer one is not opened.[0m[m
+[25;1H[K  24 [35mpub[0m [35mconst[0m [33mID_LIMIT[0m: [35musize[0m [35m=[0m [33m250[0m;[m
+[26;1H[K  25 [32m///[0m[32m The most links a grid holds at once: a cell's link is a `u16`, 0 for none.[0m[m
+[27;1H[K  26 [35mpub[0m([35mcrate[0m) [35mconst[0m [33mLINK_COUNT[0m: [35musize[0m [35m=[0m [33m65_535[0m;[m
+[28;1H[K  27 [32m///[0m[32m The most bytes of URIs and ids a grid holds at once, each link counted[0m[m
+[29;1H[K  28 [32m///[0m[32m with `ENTRY_COST` more for what holds it.[0m[m
+[30;1H[K  29 [35mpub[0m([35mcrate[0m) [35mconst[0m [33mLINK_BYTES[0m: [35musize[0m [35m=[0m [33m4[0m [35m<[0m[35m<[0m [33m20[0m;[m
+[31;1H[K  30 [32m///[0m[32m What a link costs beyond its URI and id: its entry, and its place in the[0m[m
+[32;1H[K  31 [32m///[0m[32m map of ids.[0m[m
+[33;1H[K  32 [35mconst[0m [33mENTRY_COST[0m: [35musize[0m [35m=[0m [33m64[0m;[m
+[34;1H[K  33 [32m///[0m[32m After making room fails (every link left is on the screen), how many[0m[m
+[35;1H[K  34 [32m///[0m[32m more links are refused before trying again: the links and the history's[0m[m
+[36;1H[K  35 [32m///[0m[32m rows are walked at most once in this many links.[0m[m
+[37;1H[K  36 [35mconst[0m [33mSTALL[0m: [35mu32[0m [35m=[0m [33m256[0m;[m
+[38;1H[K  37 [m
+[39;1H[K  38 [32m///[0m[32m A cell's hyperlink: where it points, the program's `id` for it, if it[0m[m
+[40;1H[1;1H[K     File: [1msrc/link.rs[0m[m
+[2;1H[K   1 [32m//![0m[32m Hyperlinks (OSC 8, `references/modern/osc8_hyperlinks.md`): the links a[0m[m
+[3;1H[K   2 [32m//![0m[32m grid's cells point to, each held once, and the cells' links, held per row[0m[m
+[4;1H[K   3 [32m//![0m[32m beside the cells for the rows that have any.[0m[m
+[5;1H[K   4 [32m//![0m[m
+[6;1H[K   5 [32m//![0m[32m A cell's link is a `u16` in its row's array, 0 for none and otherwise one[0m[m
+[7;1H[K   6 [32m//![0m[32m more than the link's place in the table. Only a cell with contents has[0m[m
+[8;1H[K   7 [32m//![0m[32m one: an erased cell keeps whatever number it had, unread, until a glyph[0m[m
+[9;1H[K   8 [32m//![0m[32m is printed there, which always writes its link; so erasing, which blanks[0m[m
+[10;1H[K   9 [32m//![0m[32m cells, never touches the arrays. The second half of a wide glyph has its[0m[m
+[11;1H[K  10 [32m//![0m[32m first half's link.[0m[m
+[12;1H[K  11 [32m//![0m[m
+[13;1H[K  12 [32m//![0m[32m The table counts the numbers in the arrays (an erased cell's too), so the[0m[m
+[14;1H[K  13 [32m//![0m[32m links no row has are found without reading the rows: every change to an[0m[m
+[15;1H[K  14 [32m//![0m[32m array holds and releases the numbers it writes and drops.[0m[m
+[16;1H[K  15 [m
+[17;1H[K  16 [35muse[0m std::collections::HashMap;[m
+[18;1H[K  17 [35muse[0m std::sync::Arc;[m
+[19;1H[K  18 [m
+[20;1H[K  19 [32m///[0m[32m The longest URI kept, as VTE and iTerm2 bound it (the spec's "Length[0m[m
+[21;1H[K  20 [32m///[0m[32m limits"). A longer one opens no link.[0m[m
+[22;1H[K  21 [35mpub[0m [35mconst[0m [33mURI_LIMIT[0m: [35musize[0m [35m=[0m [33m2083[0m;[m
+[23;1H[K  22 [32m///[0m[32m The longest `id` kept, as VTE bounds it (the spec's "Length limits"). A[0m[m
+[24;1H[K  23 [32m///[0m[32m link with a longer one is not opened.[0m[m
+[25;1H[K  24 [35mpub[0m [35mconst[0m [33mID_LIMIT[0m: [35musize[0m [35m=[0m [33m250[0m;[m
+[26;1H[K  25 [32m///[0m[32m The most links a grid holds at once: a cell's link is a `u16`, 0 for none.[0m[m
+[27;1H[K  26 [35mpub[0m([35mcrate[0m) [35mconst[0m [33mLINK_COUNT[0m: [35musize[0m [35m=[0m [33m65_535[0m;[m
+[28;1H[K  27 [32m///[0m[32m The most bytes of URIs and ids a grid holds at once, each link counted[0m[m
+[29;1H[K  28 [32m///[0m[32m with `ENTRY_COST` more for what holds it.[0m[m
+[30;1H[K  29 [35mpub[0m([35mcrate[0m) [35mconst[0m [33mLINK_BYTES[0m: [35musize[0m [35m=[0m [33m4[0m [35m<[0m[35m<[0m [33m20[0m;[m
+[31;1H[K  30 [32m///[0m[32m What a link costs beyond its URI and id: its entry, and its place in the[0m[m
+[32;1H[K  31 [32m///[0m[32m map of ids.[0m[m
+[33;1H[K  32 [35mconst[0m [33mENTRY_COST[0m: [35musize[0m [35m=[0m [33m64[0m;[m
+[34;1H[K  33 [32m///[0m[32m After making room fails (every link left is on the screen), how many[0m[m
+[35;1H[K  34 [32m///[0m[32m more links are refused before trying again: the links and the history's[0m[m
+[36;1H[K  35 [32m///[0m[32m rows are walked at most once in this many links.[0m[m
+[37;1H[K  36 [35mconst[0m [33mSTALL[0m: [35mu32[0m [35m=[0m [33m256[0m;[m
+[38;1H[K  37 [m
+[39;1H[K  38 [32m///[0m[32m A cell's hyperlink: where it points, the program's `id` for it, if it[0m[m
+[40;1H...skipping...
+  50     [35mpub[0m [35m[7mfn[27m[35m[0m[35m[0m [34muri[0m([35m&[0m[36mself[0m) -> [35m&[0m[35m'a[0m [35mstr[0m {[m
+  51         self.uri[m
+  52     }[m
+  53     [32m///[0m[32m The `id` parameter the program gave the link, if it gave a nonempty[0m[m
+  54     [32m///[0m[32m one: at most [`ID_LIMIT`] printable ASCII bytes.[0m[m
+  55     [35mpub[0m [35m[7mfn[27m[35m[0m[35m[0m [34mid[0m([35m&[0m[36mself[0m) -> Option<[35m&[0m[35m'a[0m [35mstr[0m> {[m
+  56         self.id[m
+  57     }[m
+  58     [32m///[0m[32m A number that identifies the link among the parser's links, never[0m[m
+  59     [32m///[0m[32m given to another: cells with the same key are one link, as the spec[0m[m
+  60     [32m///[0m[32m groups them. Each `OSC 8` with a URI and no `id` opens a link of its[0m[m
+  61     [32m///[0m[32m own; one with an `id` and a URI already open on the screen, the same[0m[m
+  62     [32m///[0m[32m link again.[0m[m
+  63     [35mpub[0m [35m[7mfn[27m[35m[0m[35m[0m [34mkey[0m([35m&[0m[36mself[0m) -> [35mu64[0m {[m
+  64         self.key[m
+  65     }[m
+  66 }[m
+  67 [m
+  68 [32m///[0m[32m A link as a grid holds it, with how many cells have its number.[0m[m
+  69 #[derive(Clone, Debug)][m
+  70 [35mstruct[0m [33mEntry[0m {[m
+  71     uri: Arc<[35mstr[0m>,[m
+  72     id: Option<Arc<[35mstr[0m>>,[m
+  73     key: [35mu64[0m,[m
+  74     cells: [35mu32[0m,[m
+  75 }[m
+  76 [m
+  77 [35mimpl[0m [33mEntry[0m {[m
+  78     [35m[7mfn[27m[35m[0m [34mcost[0m([36muri[0m: [35m&[0m[35mstr[0m, [36mid[0m: Option<[35m&[0m[35mstr[0m>) -> [35musize[0m {[m
+  79         uri.[36mlen[0m()[m
+  80             .[36msaturating_add[0m(id.[36mmap_or[0m([33m0[0m, [35mstr[0m::len))[m
+  81             .[36msaturating_add[0m([33mENTRY_COST[0m)[m
+  82     }[m
+  83 }[m
+  84 [m
+  85 [32m///[0m[32m A grid's links: each once, found by its number, and by `id` and URI for[0m[m
+  86 [32m///[0m[32m the links that have an `id`; with how many cells have each, so that a[0m[m
+  87 [32m///[0m[32m link no cell has is found without reading the cells.[0m[m
+  88 #[derive(Clone, Debug, Default)][m
+:[K[K[?1l>[?1049l

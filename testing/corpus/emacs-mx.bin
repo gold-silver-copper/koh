@@ -1,0 +1,147 @@
+[?1049h[?12;25h[?1h=[H[2J[40d[K[?1l>[?12l[?25h[?1049l[39;49m[?1049h[?12;25h[?1h=[>0c]11;?\]10;?\[>4;1m[c[>0q[?2004h[?1004h[H[2J[40d[?25l[38;2;255;255;255m[48;2;0;0;0mor information about GNU Emacs and the GNU system, type [39;49m[38;2;173;216;230m[48;2;48;48;48mC-h C-a[39;49m[38;2;255;255;255m[48;2;0;0;0m.                                                       [39;49m[1@[38;2;255;255;255m[48;2;0;0;0mF[39;49m[?12l[?25h[?12;25h[2d[40d[?25l[38;2;255;255;255m[48;2;0;0;0mor information about GNU Emacs and the GNU system, type [39;49m[38;2;173;216;230m[48;2;48;48;48mC-h C-a[39;49m[38;2;255;255;255m[48;2;0;0;0m.                                                       [39;49m[1@[38;2;255;255;255m[48;2;0;0;0mF[39;49m[H[38;2;0;0;0m[48;2;255;255;255mFile Edit Options Buffers Tools Help                                                                                    [0m[39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m# fux-vt-compare: fux-vt beside other terminal emulators                                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mAn excluded package with its own lockfile. It runs fux-vt beside a panel of                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mother terminal emulators ("engines"):                                                                                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m- engines linked into the binary: Ghostty's core (libghostty-vt), alacritty_terminal,                                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m  libvterm, avt, wezterm-term and the vt100 crate;                                                                      [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m- engines run as processes of their own: xterm.js (`@xterm/headless` under                                              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m  Node), tmux, and xterm itself under Xvfb.                                                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mEvery engine gets the same output. After each piece of it, and each resize,                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0meach engine's screen is compared with fux-vt's, cell by cell, along with the                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mcursor, the modes, soft wraps, the title, cursor reports and recent history.                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt fails a case only where the engines outvote it (see "The vote"). A                                               [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfailing case is shrunk to the smallest one that still fails and printed with                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mthe command that replays it. `bench` times every engine on the same                                                     [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mworkloads. The corpus (`corpus/`) holds what real programs wrote to a                                                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mterminal, recorded by `record`.                                                                                         [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mIt is not built or run by fux's own gates. It needs Zig, a Ghostty                                                      [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mcheckout, libvterm's source and, for the engines in their own processes,                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mNode, tmux, xterm and Xvfb. `run.sh` fetches the first three.                                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mNo engine is the truth. When the panel outvotes fux-vt, the difference says                                             [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mwhere to look. xterm's behaviour and the standards decide which side is                                                 [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mright. Some differences are choices fux-vt makes on purpose, and each family                                            [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mbelow records which.                                                                                                    [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m## Running it                                                                                                           [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m```sh                                                                                                                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh                       # families expected to agree, 20000 cases, beside the panel                 [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh engines               # which engines run here, which vote, what each cannot tell                 [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh cases                 # the named cases beside every engine, with each engine's mark              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh verdicts              # the families with a recorded verdict, beside the engines that decide each [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh matrix                # family by engine: % of cases each engine differs from fux-vt              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh bench                 # MB/s for every engine on every workload, and the corpus                   [39;49m
+[A
+[38;2;229;229;229m[48;2;51;51;51m-UUU:--- F1  [39;49m[1m[38;2;229;229;229m[48;2;51;51;51mREADME.md   [0m[39;49m[38;2;229;229;229m[48;2;51;51;51m   Top L1     (Fundamental) -------------------------------------------------------------------[39;49m
+[A[?12l[?25h[?12;25h[2d[40d[?25l[38;2;0;205;205m[48;2;0;0;0mM-x [39;49m[38;2;255;255;255m[48;2;0;0;0m                                                              [39;49m[1;33H[38;2;0;0;0m[48;2;255;255;255mMinibuf Help[0m[39;49m[?12l[?25h[?12;25h[40;5H[?25l[38;2;255;255;255m[48;2;0;0;0mrevert-buffer [39;49m[?12l[?25h[?12;25h[1;39r[32;1H[7M[1;40r[40;19H[?25l[38;2;255;255;255m[48;2;0;0;0m[Complete, but not unique] [39;49m[33;1H[38;2;255;255;255m[48;2;0;0;0mType [39;49m[38;2;173;216;230m[48;2;48;48;48mM-RET[39;49m[38;2;255;255;255m[48;2;0;0;0m on a completion to select it.                                                                                [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mType [39;49m[38;2;173;216;230m[48;2;48;48;48mM-<down>[39;49m[38;2;255;255;255m[48;2;0;0;0m or [39;49m[38;2;173;216;230m[48;2;48;48;48mM-<up>[39;49m[38;2;255;255;255m[48;2;0;0;0m to move point between completions.                                                              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[A
+[38;2;179;179;179m[48;2;0;0;0m4 possible completions: [39;49m[38;2;255;255;255m[48;2;0;0;0m                                                                                                [39;49m
+[A
+[38;2;173;216;230m[48;2;0;0;0mrevert-buffer[39;49m[38;2;255;255;255m[48;2;0;0;0m                                              [39;49m[38;2;173;216;230m[48;2;0;0;0mrevert-buffer[39;49m[1m[38;2;255;255;255m[48;2;0;0;0m-[0m[39;49m[38;2;255;255;255m[48;2;0;0;0mquick[39;49m[3m[38;2;179;179;179m[48;2;0;0;0m (C-x x g)[0m[39;49m[38;2;255;255;255m[48;2;0;0;0m                                [39;49m
+[A
+[38;2;173;216;230m[48;2;0;0;0mrevert-buffer[39;49m[1m[38;2;255;255;255m[48;2;0;0;0m-[0m[39;49m[38;2;255;255;255m[48;2;0;0;0mwith-coding-system[39;49m[3m[38;2;179;179;179m[48;2;0;0;0m (C-x RET r)[0m[39;49m[38;2;255;255;255m[48;2;0;0;0m               [39;49m[38;2;173;216;230m[48;2;0;0;0mrevert-buffer[39;49m[1m[38;2;255;255;255m[48;2;0;0;0m-[0m[39;49m[38;2;255;255;255m[48;2;0;0;0mwith-fine-grain                                [39;49m
+[A
+[38;2;204;204;204m[48;2;77;77;77m-UUU:%*-d F1  [39;49m[1m[38;2;204;204;204m[48;2;77;77;77m*Completions*[0m[39;49m[38;2;204;204;204m[48;2;77;77;77m   All L1     (Completion List) -------------------------------------------------------------[39;49m
+[A[?12l[?25h[?12;25h[40;18H[1;39r[32;1H[7L[1;40r[40;1H[?25l[38;2;255;255;255m[48;2;0;0;0mQuit                                         [39;49m[1;33H[38;2;0;0;0m[48;2;255;255;255mHelp        [0m[39;49m[32;1H[38;2;255;255;255m[48;2;0;0;0m```sh                                                                                                                   [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh                       # families expected to agree, 20000 cases, beside the panel                 [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh engines               # which engines run here, which vote, what each cannot tell                 [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh cases                 # the named cases beside every engine, with each engine's mark              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh verdicts              # the families with a recorded verdict, beside the engines that decide each [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh matrix                # family by engine: % of cases each engine differs from fux-vt              [39;49m
+[A
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh bench                 # MB/s for every engine on every workload, and the corpus                   [39;49m
+[A[?12l[?25h[?12;25h[2d[40d[?25l[38;2;255;255;255m[48;2;0;0;0m     [39;49m[20;1H[38;2;229;229;229m[48;2;51;51;51m-UUU:--- F1  [39;49m[1m[38;2;229;229;229m[48;2;51;51;51mREADME.md   [0m[39;49m[38;2;229;229;229m[48;2;51;51;51m   Top L1     (Fundamental) -------------------------------------------------------------------[39;49m
+[4m[38;2;229;229;229m[48;2;51;51;51mCRM[0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51m [0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51mBuffer[0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51m              [0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51m   Size[0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51m [0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51mMode[0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51m             [0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51mFile                                                                   [0m[39;49m
+[38;2;255;255;255m[48;2;0;0;0m.   [39;49m[1m[38;2;255;255;255m[48;2;0;0;0mREADME.md[0m[39;49m[38;2;255;255;255m[48;2;0;0;0m             56519 Fundamental      /private/tmp/fux-corpus/work/README.md[39;49m
+[38;2;255;255;255m[48;2;0;0;0m    [39;49m[1m[38;2;255;255;255m[48;2;0;0;0m*scratch*[0m[39;49m[38;2;255;255;255m[48;2;0;0;0m               147 Lisp Interaction             [39;49m
+[38;2;255;255;255m[48;2;0;0;0m %* [39;49m[1m[38;2;255;255;255m[48;2;0;0;0m*Messages*[0m[39;49m[38;2;255;255;255m[48;2;0;0;0m              101 Messages[39;49m
+[38;2;255;255;255m[48;2;0;0;0m %* [39;49m[1m[38;2;255;255;255m[48;2;0;0;0m*Completions*[0m[39;49m[38;2;255;255;255m[48;2;0;0;0m           245 Completion List                            [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;204;204;204m[48;2;77;77;77m-UUU:%%- F1  [39;49m[1m[38;2;204;204;204m[48;2;77;77;77m*Buffer List*[0m[39;49m[38;2;204;204;204m[48;2;77;77;77m   All L1     (Buffer Menu) ------------------------------------------------------------------[39;49m
+[?12l[?25h[?12;25h[2d[40d[?25l[38;2;255;255;255m[48;2;0;0;0m [39;49m[1;33H[38;2;0;0;0m[48;2;255;255;255mBuffer-Menu Help[0m[39;49m[20;1H[38;2;204;204;204m[48;2;77;77;77m-UUU:--- F1  [39;49m[1m[38;2;204;204;204m[48;2;77;77;77mREADME.md   [0m[39;49m[38;2;204;204;204m[48;2;77;77;77m   Top L1     (Fundamental) -------------------------------------------------------------------[39;49m
+[4m[38;2;229;229;229m[48;2;51;51;51mCRM[0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51m [0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51mBuffer[0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51m              [0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51m   Size[0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51m [0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51mMode[0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51m             [0m[39;49m[4m[38;2;229;229;229m[48;2;51;51;51mFile                                                                   [0m[39;49m
+[39d[38;2;229;229;229m[48;2;51;51;51m-UUU:%%- F1  [39;49m[1m[38;2;229;229;229m[48;2;51;51;51m*Buffer List*[0m[39;49m[38;2;229;229;229m[48;2;51;51;51m   All L1     (Buffer Menu) ------------------------------------------------------------------[39;49m
+[?12l[?25h[?12;25h[22d[40d[?25l[38;2;255;255;255m[48;2;0;0;0m [39;49m[1;33H[38;2;0;0;0m[48;2;255;255;255mHelp            [0m[39;49m[20;1H[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0mIt is not built or run by fux's own gates. It needs Zig, a Ghostty                                                      [39;49m
+[38;2;255;255;255m[48;2;0;0;0mcheckout, libvterm's source and, for the engines in their own processes,               [39;49m
+[38;2;255;255;255m[48;2;0;0;0mNode, tmux, xterm and Xvfb. `run.sh` fetches the first three.[39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0mNo engine is the truth. When the panel outvotes fux-vt, the difference says[39;49m
+[38;2;255;255;255m[48;2;0;0;0mwhere to look. xterm's behaviour and the standards decide which side is                                                 [39;49m
+[38;2;255;255;255m[48;2;0;0;0mright. Some differences are choices fux-vt makes on purpose, and each family                                            [39;49m
+[38;2;255;255;255m[48;2;0;0;0mbelow records which.                                                                                                    [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m## Running it                                                                                                           [39;49m
+[38;2;255;255;255m[48;2;0;0;0m                                                                                                                        [39;49m
+[38;2;255;255;255m[48;2;0;0;0m```sh                                                                                                                   [39;49m
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh                       # families expected to agree, 20000 cases, beside the panel                 [39;49m
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh engines               # which engines run here, which vote, what each cannot tell                 [39;49m
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh cases                 # the named cases beside every engine, with each engine's mark              [39;49m
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh verdicts              # the families with a recorded verdict, beside the engines that decide each [39;49m
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh matrix                # family by engine: % of cases each engine differs from fux-vt              [39;49m
+[38;2;255;255;255m[48;2;0;0;0mfux-vt/compare/run.sh bench                 # MB/s for every engine on every workload, and the corpus                   [39;49m
+[39;6H[38;2;229;229;229m[48;2;51;51;51m--- F1  [39;49m[1m[38;2;229;229;229m[48;2;51;51;51mREADME.md   [0m[39;49m[38;2;229;229;229m[48;2;51;51;51m   Top L1     (Fundamental) -[39;49m[?12l[?25h[?12;25h[H
+[40d[K[?1004l[?2004l[>4m[?1l>[?12l[?25h[?1049l[39;49m

@@ -1,0 +1,231 @@
+[?1049h[22;0;0t[?1h=[H[2J[?2004h[?69$p[?2026$p[?2027$p[?2031$p[?2048$p[0m[4:3mP$qm\[?u[c]11;?[5n[?25h]11;?[5n[?2026h[?2031h[?2048h[>3u(B[m[H                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        [1 q[?1002h[?1006h[H[?2026l[c[?2026h(B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209024;https://neovim.io/doc/user/helptag/?tag=help.txt\help.txt(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\        Nvim[K
+[K
+(B[m[4:2m[58:2::224:226:234m[38;2;20;22;27m[48;2;20;22;27m==============================================================================(B[m[38;2;224;226;234m[48;2;20;22;27m[K
+(B[0;1m[38;2;224;226;234m[48;2;20;22;27mNvim documentation(B[m[38;2;224;226;234m[48;2;20;22;27m[K
+[K
+If you are new to Nvim, see (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209025;https://neovim.io/doc/user/helptag/?tag=nvim-intro\nvim-intro(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\. (To go to a help link, move the[K
+cursor to it and hit (B[m[38;2;140;248;247m[48;2;20;22;27mCTRL-](B[m[38;2;224;226;234m[48;2;20;22;27m, or ctrl-click with mouse. Try it here: (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209026;https://neovim.io/doc/user/helptag/?tag=bars\bars(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\.)[K
+[K
+(B[0;4m[58:2::224:226:234m[38;2;20;22;27m[48;2;20;22;27m------------------------------------------------------------------------------(B[m[38;2;224;226;234m[48;2;20;22;27m[K
+(B[0;1m[38;2;224;226;234m[48;2;20;22;27mAbout Nvim(B[m[38;2;224;226;234m[48;2;20;22;27m                                              (B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209027;https://neovim.io/doc/user/helptag/?tag=reference_toc\reference_toc(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\ (B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209028;https://neovim.io/doc/user/helptag/?tag=Q_ct\Q_ct(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\[K
+[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209029;https://neovim.io/doc/user/helptag/?tag=news\news(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  News since the previous release[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209030;https://neovim.io/doc/user/helptag/?tag=nvim\nvim(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  Getting started with Nvim[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209031;https://neovim.io/doc/user/helptag/?tag=tutor\tutor(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                 30-minute interactive course for beginners[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209032;https://neovim.io/doc/user/helptag/?tag=vim-differences\vim-differences(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\       Nvim compared to Vim[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209033;https://neovim.io/doc/user/helptag/?tag=faq\faq(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                   Frequently Asked Questions[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209034;https://neovim.io/doc/user/helptag/?tag=tips\tips(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  Various tips[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209035;https://neovim.io/doc/user/helptag/?tag=bugs\bugs(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  Where to send bug reports[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209036;https://neovim.io/doc/user/helptag/?tag=support\support(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\               Supported platforms[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209037;https://neovim.io/doc/user/helptag/?tag=copying\copying(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\               About copyrights[K
+(B[m[38;2;224;226;234m[48;2;79;82;88mhelp.txt [Help][-][RO]                                                                                1,1            Top
+(B[m[38;2;79;82;88m[48;2;20;22;27m  1 (B[m[38;2;224;226;234m[48;2;20;22;27m[K
+(B[m[38;2;79;82;88m[48;2;20;22;27m~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+(B[m[38;2;196;198;205m[48;2;44;46;51m[No Name]                                                                                             0,0-1          All(B[m[38;2;224;226;234m[48;2;20;22;27m
+[J[2 q[2 q[H(B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209024;https://neovim.io/doc/user/helptag/?tag=help.txt\help.txt(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\        Nvim[K
+[K
+(B[m[4:2m[58:2::224:226:234m[38;2;20;22;27m[48;2;20;22;27m==============================================================================(B[m[38;2;224;226;234m[48;2;20;22;27m[K
+(B[0;1m[38;2;224;226;234m[48;2;20;22;27mNvim documentation(B[m[38;2;224;226;234m[48;2;20;22;27m[K
+[K
+If you are new to Nvim, see (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209025;https://neovim.io/doc/user/helptag/?tag=nvim-intro\nvim-intro(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\. (To go to a help link, move the[K
+cursor to it and hit (B[m[38;2;140;248;247m[48;2;20;22;27mCTRL-](B[m[38;2;224;226;234m[48;2;20;22;27m, or ctrl-click with mouse. Try it here: (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209026;https://neovim.io/doc/user/helptag/?tag=bars\bars(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\.)[K
+[K
+(B[0;4m[58:2::224:226:234m[38;2;20;22;27m[48;2;20;22;27m------------------------------------------------------------------------------(B[m[38;2;224;226;234m[48;2;20;22;27m[K
+(B[0;1m[38;2;224;226;234m[48;2;20;22;27mAbout Nvim(B[m[38;2;224;226;234m[48;2;20;22;27m                                              (B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209027;https://neovim.io/doc/user/helptag/?tag=reference_toc\reference_toc(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\ (B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209028;https://neovim.io/doc/user/helptag/?tag=Q_ct\Q_ct(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\[K
+[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209029;https://neovim.io/doc/user/helptag/?tag=news\news(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  News since the previous release[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209030;https://neovim.io/doc/user/helptag/?tag=nvim\nvim(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  Getting started with Nvim[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209031;https://neovim.io/doc/user/helptag/?tag=tutor\tutor(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                 30-minute interactive course for beginners[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209032;https://neovim.io/doc/user/helptag/?tag=vim-differences\vim-differences(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\       Nvim compared to Vim[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209033;https://neovim.io/doc/user/helptag/?tag=faq\faq(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                   Frequently Asked Questions[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209034;https://neovim.io/doc/user/helptag/?tag=tips\tips(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  Various tips[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209035;https://neovim.io/doc/user/helptag/?tag=bugs\bugs(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  Where to send bug reports[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209036;https://neovim.io/doc/user/helptag/?tag=support\support(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\               Supported platforms[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209037;https://neovim.io/doc/user/helptag/?tag=copying\copying(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\               About copyrights[K
+(B[m[38;2;224;226;234m[48;2;79;82;88mhelp.txt [Help][-][RO]                                                                                1,1            Top
+(B[m[38;2;79;82;88m[48;2;20;22;27m  1 (B[m[38;2;224;226;234m[48;2;20;22;27m[K
+(B[m[38;2;79;82;88m[48;2;20;22;27m~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+(B[m[38;2;196;198;205m[48;2;44;46;51m[No Name]                                                                                             0,0-1          All(B[m[38;2;224;226;234m[48;2;20;22;27m
+[J[H[?2026l[?2026h(B[m[38;2;224;226;234m[48;2;20;22;27m[H[2J(B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209024;https://neovim.io/doc/user/helptag/?tag=help.txt\help.txt(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\        Nvim
+
+(B[m[4:2m[58:2::224:226:234m[38;2;20;22;27m[48;2;20;22;27m==============================================================================
+(B[0;1m[38;2;224;226;234m[48;2;20;22;27mNvim documentation
+
+(B[m[38;2;224;226;234m[48;2;20;22;27mIf you are new to Nvim, see (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209025;https://neovim.io/doc/user/helptag/?tag=nvim-intro\nvim-intro(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\. (To go to a help link, move the
+cursor to it and hit (B[m[38;2;140;248;247m[48;2;20;22;27mCTRL-](B[m[38;2;224;226;234m[48;2;20;22;27m, or ctrl-click with mouse. Try it here: (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209026;https://neovim.io/doc/user/helptag/?tag=bars\bars(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\.)
+
+(B[0;4m[58:2::224:226:234m[38;2;20;22;27m[48;2;20;22;27m------------------------------------------------------------------------------
+(B[0;1m[38;2;224;226;234m[48;2;20;22;27mAbout Nvim(B[m[38;2;224;226;234m[48;2;20;22;27m                                              (B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209027;https://neovim.io/doc/user/helptag/?tag=reference_toc\reference_toc(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\ (B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209028;https://neovim.io/doc/user/helptag/?tag=Q_ct\Q_ct]8;;\
+
+(B[m[38;2;224;226;234m[48;2;20;22;27m- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209029;https://neovim.io/doc/user/helptag/?tag=news\news(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  News since the previous release
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209030;https://neovim.io/doc/user/helptag/?tag=nvim\nvim(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  Getting started with Nvim
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209031;https://neovim.io/doc/user/helptag/?tag=tutor\tutor(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                 30-minute interactive course for beginners
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209032;https://neovim.io/doc/user/helptag/?tag=vim-differences\vim-differences(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\       Nvim compared to Vim
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209033;https://neovim.io/doc/user/helptag/?tag=faq\faq(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                   Frequently Asked Questions
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209034;https://neovim.io/doc/user/helptag/?tag=tips\tips(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  Various tips
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209035;https://neovim.io/doc/user/helptag/?tag=bugs\bugs(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                  Where to send bug reports
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209036;https://neovim.io/doc/user/helptag/?tag=support\support(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\               Supported platforms
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209037;https://neovim.io/doc/user/helptag/?tag=copying\copying(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\               About copyrights
+(B[m[38;2;224;226;234m[48;2;79;82;88mhelp.txt [Help][-][RO]                                                                                1,1            Top
+(B[m[38;2;79;82;88m[48;2;20;22;27m  1 
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+(B[m[38;2;196;198;205m[48;2;44;46;51m[No Name]                                                                                             0,0-1          All
+(B[m[38;2;224;226;234m[48;2;20;22;27m                                                                                                                        [H[?2026lP+q4D73\[?2026h[2 q[2 q[?2026l[?2026h[?1004h[?2026l[?2026h[40;110H^D[H[?2026l[?2026h[40;110H  [1;20r[H[10M[r[11;1H[K
+(B[0;4m[58:2::224:226:234m[38;2;20;22;27m[48;2;20;22;27m------------------------------------------------------------------------------(B[m[38;2;224;226;234m[48;2;20;22;27m[K
+(B[0;1m[38;2;224;226;234m[48;2;20;22;27mUsage(B[m[38;2;224;226;234m[48;2;20;22;27m[K
+[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209038;https://neovim.io/doc/user/helptag/?tag=helphelp\helphelp(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\              Using the (B[m[38;2;140;248;247m[48;2;20;22;27m:help(B[m[38;2;224;226;234m[48;2;20;22;27m files[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209039;https://neovim.io/doc/user/helptag/?tag=intro\intro(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                 Introduction to Vim[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209040;https://neovim.io/doc/user/helptag/?tag=quickref\quickref(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\              Overview of common commands[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209041;https://neovim.io/doc/user/helptag/?tag=index\index(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\                 Index of all commands[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209042;https://neovim.io/doc/user/helptag/?tag=user-manual\user-manual(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\           User manual: How to accomplish editing tasks.[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209043;https://neovim.io/doc/user/helptag/?tag=message.txt\message.txt(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\           (Error) messages and explanations[K[21;104H(B[m[38;2;224;226;234m[48;2;79;82;88m1,0-1          7%[H[?2026l[?2026h[39B(B[m[38;2;224;226;234m[48;2;20;22;27m/window[2 q[?1002l[?1006l[40;1H[?2026l[?2026h[2 q[?1002h[?1006h[?2026l[?25l[?2026h[102C[1/4][1;20r[H[9M[r[12;1H- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209044;https://neovim.io/doc/user/helptag/?tag=Kuwasha\Kuwasha(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\               Helping poor children in Uganda[K
+[K
+(B[0;4m[58:2::224:226:234m[38;2;20;22;27m[48;2;20;22;27m------------------------------------------------------------------------------(B[m[38;2;224;226;234m[48;2;20;22;27m[K
+(B[0;1m[38;2;224;226;234m[48;2;20;22;27mBasic editing(B[m[38;2;224;226;234m[48;2;20;22;27m[K
+[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209045;https://neovim.io/doc/user/helptag/?tag=starting\starting(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\              Starting Vim, Vim command arguments, initialisation[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209046;https://neovim.io/doc/user/helptag/?tag=edit-files\edit-files(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\            Editing and writing files[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209047;https://neovim.io/doc/user/helptag/?tag=motion.txt\motion.txt(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\            Commands for moving around[K
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209048;https://neovim.io/doc/user/helptag/?tag=scrolling\scrolling(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\             Scrolling the text in the (B[m[38;2;7;8;13m[48;2;252;224;148mwindow(B[m[38;2;224;226;234m[48;2;20;22;27m[K[21;103H(B[m[38;2;224;226;234m[48;2;79;82;88m39,42-51       13[20;51H[?2026l[?25h[?2026h[40;110H(B[m[38;2;224;226;234m[48;2;20;22;27m^][20;51H[?2026l[?2026h[40;110H  [H(B[0;1m[38;2;224;226;234m[48;2;20;22;27m1. Introduction(B[m[38;2;224;226;234m[48;2;20;22;27m                                 (B[0;1m[38;2;238;241;248m[48;2;107;83;0m]8;id=3790209049;https://neovim.io/doc/user/helptag/?tag=windows-intro\window(B[0;1m[38;2;224;226;234m[48;2;20;22;27ms-intro(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\ (B[0;1m[38;2;238;241;248m[48;2;107;83;0m]8;id=3790209050;https://neovim.io/doc/user/helptag/?tag=window\window]8;;\
+
+(B[m[38;2;224;226;234m[48;2;20;22;27mSummary:[70X
+   A buffer is the in-memory text of a file.[5;4HA (B[m[38;2;238;241;248m[48;2;107;83;0mwindow(B[m[38;2;224;226;234m[48;2;20;22;27m is a viewport on a buffer.
+   A tabpage is a collection of (B[m[38;2;238;241;248m[48;2;107;83;0mwindow(B[m[38;2;224;226;234m[48;2;20;22;27ms.[5X
+[43X
+A (B[m[38;2;238;241;248m[48;2;107;83;0mwindow(B[m[38;2;224;226;234m[48;2;20;22;27m is a viewport onto a buffer.  You can use multiple (B[m[38;2;238;241;248m[48;2;107;83;0mwindow(B[m[38;2;224;226;234m[48;2;20;22;27ms on one
+buffer, or several (B[m[38;2;238;241;248m[48;2;107;83;0mwindow(B[m[38;2;224;226;234m[48;2;20;22;27ms on different buffers.
+[69X
+A buffer is a file loaded into memory for editing.  The original file remains
+unchanged until you write the buffer to the file.[6X
+
+A buffer can be in one of three states:[39X
+[13X[16;57H(B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209051;https://neovim.io/doc/user/helptag/?tag=active-buffer\active-buffer]8;;\
+(B[m[38;2;224;226;234m[48;2;20;22;27mactive:   The buffer is displayed in a (B[m[38;2;238;241;248m[48;2;107;83;0mwindow(B[m[38;2;224;226;234m[48;2;20;22;27m.  If there is a file for this
+          buffer, it has been read into the buffer.  The buffer may have been
+          modified since then and thus be different from the file.
+                                                        (B[0;1m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209052;https://neovim.io/doc/user/helptag/?tag=hidden-buffer\hidden-buffer]8;;\
+(B[m[38;2;224;226;234m[48;2;79;82;88mwindows.txt [Help][-][RO]                                                                             19,37-65        1[1;63H[?2026l[?2026h[40;110H(B[m[38;2;224;226;234m[48;2;20;22;27m^O[1;63H[?2026l[?2026h[40;110H  [H- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209043;https://neovim.io/doc/user/helptag/?tag=message.txt\message.txt(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\           (Error) messages and explanations[11X
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209044;https://neovim.io/doc/user/helptag/?tag=Kuwasha\Kuwasha(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\               Helping poor children in Uganda
+[8X
+(B[0;4m[58:2::224:226:234m[38;2;20;22;27m[48;2;20;22;27m------------------------------------------------------------------------------
+(B[0;1m[38;2;224;226;234m[48;2;20;22;27mBasic editing(B[m[38;2;224;226;234m[48;2;20;22;27m[25X[6;4H[37X
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209045;https://neovim.io/doc/user/helptag/?tag=starting\starting(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\              Starting Vim, Vim command arguments, initialisation
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209046;https://neovim.io/doc/user/helptag/?tag=edit-files\edit-files(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\            Editing and writing files[25X
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209047;https://neovim.io/doc/user/helptag/?tag=motion.txt\motion.txt(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\            Commands for moving around
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209048;https://neovim.io/doc/user/helptag/?tag=scrolling\scrolling(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\             Scrolling the text in the (B[m[38;2;7;8;13m[48;2;252;224;148mwindow
+(B[m[38;2;224;226;234m[48;2;20;22;27m- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209053;https://neovim.io/doc/user/helptag/?tag=insert.txt\insert.txt(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\            Insert and Replace mode[30X
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209054;https://neovim.io/doc/user/helptag/?tag=change.txt\change.txt(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\            Deleting and replacing text
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209055;https://neovim.io/doc/user/helptag/?tag=undo-redo\undo-redo(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\             Undo and Redo
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209056;https://neovim.io/doc/user/helptag/?tag=repeat.txt\repeat.txt(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\            Repeating commands, Vim scripts and debugging
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209057;https://neovim.io/doc/user/helptag/?tag=visual-mode\visual-mode(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\           Using Visual mode (selecting text)
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209058;https://neovim.io/doc/user/helptag/?tag=various\various(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\               Various other commands[23X
+- (B[0;4m[38;2;224;226;234m[48;2;20;22;27m]8;id=3790209059;https://neovim.io/doc/user/helptag/?tag=crash-recovery\crash-recovery(B[m[38;2;224;226;234m[48;2;20;22;27m]8;;\        Recovering from a crash[28X[18;11H[67X
+(B[0;4m[58:2::224:226:234m[38;2;20;22;27m[48;2;20;22;27m------------------------------------------------------------------------------
+(B[0;1m[38;2;224;226;234m[48;2;20;22;27mAdvanced editing(B[m[38;2;224;226;234m[48;2;20;22;27m[53X
+(B[m[38;2;224;226;234m[48;2;79;82;88mhelp.txt [Help][-][RO]                                                                                39,42-51       2[10;51H[?2026l[?2026h(B[m[38;2;224;226;234m[48;2;20;22;27m[30B[107X:q[2 q[?1002l[?1006l[40;1H[?2026l[?2026h[H(B[m[38;2;79;82;88m[48;2;20;22;27m  1 (B[m[38;2;224;226;234m[48;2;20;22;27m[53X
+(B[m[38;2;79;82;88m[48;2;20;22;27m~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K[17B(B[m[38;2;224;226;234m[48;2;79;82;88m[No Name]                                                                                             0,0-1          All[2 q[?1002h[?1006h[1;5H[?2026l[?2026h(B[m[38;2;224;226;234m[48;2;20;22;27m[39B  [40;1H:q[2 q[?1002l[?1006l[40;1H[?2026l[?2026h[2 q[?1002h[?1006h[?2026l[?2026h[?2031l[2 q[?1002l[?1006l(B[m[?25h[0 q[?1l>[<u[?2048l[?2004l[?1004l[c[?2026l[?2026h[?1049l[23;0;0t[?2026l

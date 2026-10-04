@@ -1,0 +1,158 @@
+[?1049h[24;1H[?1h=FUX-CORPUS-TABLES(1)             User Commands            FUX-CORPUS-TABLES(1)
+
+[1mNAME[0m
+     fux-corpus-tables - the engines the corpus is replayed through, in tables
+
+[1mSYNOPSIS[0m
+     [1mfux-vt-compare[0m [1mcorpus[0m [[1m--engines[0m [4mlist[24m] [[1m--show[0m] [[4mname[24m...]
+
+[1mDESCRIPTION[0m
+     Each recording is replayed through [1mfux-vt[0m and the engines below, and
+     their screens are compared after every step.  [4mxterm[24m decides what it can
+     tell; the panel decides the rest.
+
+[1mENGINES[0m
+     ┌───────────────────────────────────────────────────────────────┐
+     │[1mEngine[0m      [1mKind[0m         [1mCannot[0m [1mtell[0m                           │
+     ├───────────────────────────────────────────────────────────────┤
+     │ghostty     in process   link groups                           │
+     │alacritty   in process   blink, 2026, 2048, prompt marks       │
+     │libvterm    in process   dim, underline colour, kitty          │
+     │avt         in process   underline colour, hidden, keypad      │
+     │wezterm     in process   pending wrap, 2026, 2048              │
+     │vt100       in process   underline colour, blink, hidden       │
+:[K[K     │xterm.js    Node         underline colour, kitty, 2048         │
+     │tmux        a server     kitty, 2026, 2048                     │
+     │xterm       Xvfb         pending wrap, underline colour, kitty │
+     └───────────────────────────────────────────────────────────────┘
+
+[1mFIELDS[0m
+     ┌───────┬────────────────────────────────────────────────────────────────┐
+     │[1mField[0m  │                        [1mWhat[0m [1mis[0m [1mcompared[0m                        │
+     ├───────┼────────────────────────────────────────────────────────────────┤
+     │text   │ the whole grapheme cluster of each cell, and its width         │
+     ├───────┼────────────────────────────────────────────────────────────────┤
+     │style  │ foreground, background and underline colour; bold, dim,        │
+     │       │ italic, underline, blink, inverse, hidden and strikeout        │
+     ├───────┼────────────────────────────────────────────────────────────────┤
+     │link   │ the URI of an OSC 8 hyperlink, and which cells share it        │
+     ├───────┼────────────────────────────────────────────────────────────────┤
+     │cursor │ its row and column, and whether a wrap is pending              │
+     ├───────┼────────────────────────────────────────────────────────────────┤
+     │modes  │ DECAWM, DECOM, DECCKM, DECKPAM, bracketed paste, focus         │
+     │       │ reports, synchronized output, in-band resize and the kitty     │
+     │       │ keyboard flags                                                 │
+     └───────┴────────────────────────────────────────────────────────────────┘
+
+:[K[K[1mSTATUSES[0m
+     • [1mAgree:[0m every step agrees beside xterm and the panel.
+
+     • [1mDiffers:[0m a step differs, for a reason recorded beside it, with the
+       command that shows it.
+
+     • [1mNew:[0m a recording with no status, which fails the run until one is
+       given.
+
+[1mEXAMPLES[0m
+     Replay one recording beside xterm and the panel, and show the screen:
+
+     $ fux-vt/compare/run.sh corpus --show man-tables
+     ok       man-tables (9 steps, 6000 bytes)   +xterm +ghostty
+
+     Record it again:
+
+     $ fux-vt/compare/corpus/record.sh man-tables
+
+[1mEXIT[0m [1mSTATUS[0m
+     0   every recording expected to agree agrees
+     1   one regressed, or has no status
+     2   the command line or a recording could not be read
+:[K[K/[KEE[KXX[KII[KTT[K[1;1H[K[1mSTATUSES[0m
+[2;1H[K     • [1mAgree:[0m every step agrees beside xterm and the panel.
+[3;1H[K
+[4;1H[K     • [1mDiffers:[0m a step differs, for a reason recorded beside it, with the
+[5;1H[K       command that shows it.
+[6;1H[K
+[7;1H[K     • [1mNew:[0m a recording with no status, which fails the run until one is
+[8;1H[K       given.
+[9;1H[K
+[10;1H[K[1mEXAMPLES[0m
+[11;1H[K     Replay one recording beside xterm and the panel, and show the screen:
+[12;1H[K
+[13;1H[K     $ fux-vt/compare/run.sh corpus --show man-tables
+[14;1H[K     ok       man-tables (9 steps, 6000 bytes)   +xterm +ghostty
+[15;1H[K
+[16;1H[K     Record it again:
+[17;1H[K
+[18;1H[K     $ fux-vt/compare/corpus/record.sh man-tables
+[19;1H[K
+[20;1H[K[1mEXIT[0m [1mSTATUS[0m
+[21;1H[K     0   every recording expected to agree agrees
+[22;1H[K     1   one regressed, or has no status
+[23;1H[K     2   the command line or a recording could not be read
+[24;1H[1;1H[K[1mSTATUSES[0m
+[2;1H[K     • [1mAgree:[0m every step agrees beside xterm and the panel.
+[3;1H[K
+[4;1H[K     • [1mDiffers:[0m a step differs, for a reason recorded beside it, with the
+[5;1H[K       command that shows it.
+[6;1H[K
+[7;1H[K     • [1mNew:[0m a recording with no status, which fails the run until one is
+[8;1H[K       given.
+[9;1H[K
+[10;1H[K[1mEXAMPLES[0m
+[11;1H[K     Replay one recording beside xterm and the panel, and show the screen:
+[12;1H[K
+[13;1H[K     $ fux-vt/compare/run.sh corpus --show man-tables
+[14;1H[K     ok       man-tables (9 steps, 6000 bytes)   +xterm +ghostty
+[15;1H[K
+[16;1H[K     Record it again:
+[17;1H[K
+[18;1H[K     $ fux-vt/compare/corpus/record.sh man-tables
+[19;1H[K
+[20;1H[K[1m[7mEXIT[27m[0m [1mSTATUS[0m
+[21;1H[K     0   every recording expected to agree agrees
+[22;1H[K     1   one regressed, or has no status
+[23;1H[K     2   the command line or a recording could not be read
+[24;1H
+[1mSEE[0m [1mALSO[0m
+     [1mfux-corpus[0m(1), [1mfux-corpus-long[0m(7), [1mless[0m(1)
+
+fux-vt-compare                    2026-10-03              FUX-CORPUS-TABLES(1)
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[1m~[0m
+[7m(END)[27m[K[K[H[2J[HM     │vt100       in process   underline colour, blink, hidden       │
+[HM     │wezterm     in process   pending wrap, 2026, 2048              │
+[HM     │avt         in process   underline colour, hidden, keypad      │
+[HM     │libvterm    in process   dim, underline colour, kitty          │
+[HM     │alacritty   in process   blink, 2026, 2048, prompt marks       │
+[HM     │ghostty     in process   link groups                           │
+[HM     ├───────────────────────────────────────────────────────────────┤
+[HM     │[1mEngine[0m      [1mKind[0m         [1mCannot[0m [1mtell[0m                           │
+[HM     ┌───────────────────────────────────────────────────────────────┐
+[HM[1mENGINES[0m
+[HM
+[HM     tell; the panel decides the rest.
+[HM     their screens are compared after every step.  [4mxterm[24m decides what it can
+[HM     Each recording is replayed through [1mfux-vt[0m and the engines below, and
+[HM[1mDESCRIPTION[0m
+[HM
+[HM     [1mfux-vt-compare[0m [1mcorpus[0m [[1m--engines[0m [4mlist[24m] [[1m--show[0m] [[4mname[24m...]
+[HM[1mSYNOPSIS[0m
+[HM
+[HM     fux-corpus-tables - the engines the corpus is replayed through, in tables
+[HM[1mNAME[0m
+[HM
+[HMFUX-CORPUS-TABLES(1)             User Commands            FUX-CORPUS-TABLES(1)
+[24;1H[K:[K[K[?1l>[?1049l

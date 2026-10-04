@@ -1,0 +1,52 @@
+{
+  "command": [
+    "vim",
+    "src/link.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "vim-small",
+  "replies": "\\e[2;2R\\e[3;1R\\e[>1;1700;0c\\e]11;rgb:0000/0000/0000\\x07\\e]10;rgb:ffff/ffff/ffff\\x07\\e[?12;0$y",
+  "scrubbed": [],
+  "size": [
+    24,
+    80
+  ],
+  "steps": [
+    {
+      "end": 3850,
+      "keys": ""
+    },
+    {
+      "end": 5897,
+      "keys": "\\x06"
+    },
+    {
+      "end": 7798,
+      "keys": "\\x06"
+    },
+    {
+      "end": 9945,
+      "keys": "\\x02"
+    },
+    {
+      "end": 10480,
+      "keys": "/pub\\r"
+    },
+    {
+      "end": 11286,
+      "keys": "n"
+    },
+    {
+      "end": 11390,
+      "keys": ":q\\r"
+    }
+  ],
+  "version": "VIM - Vi IMproved 9.1 (2024 Jan 02, compiled Aug  8 2026 16:52:02)"
+}

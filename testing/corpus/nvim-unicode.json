@@ -1,0 +1,72 @@
+{
+  "command": [
+    "nvim",
+    "unicode.txt"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "nvim-unicode",
+  "replies": "\\e[?69;0$y\\e[?2026;2$y\\e[?2027;0$y\\e[?2031;2$y\\e[?2048;2$y\\eP1$r0;4:3m\\e\\\\\\e[?0u\\e[?62;22c\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e[48;40;120;0;0t\\e[?62;22c\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 16054,
+      "keys": ""
+    },
+    {
+      "end": 16173,
+      "keys": "j"
+    },
+    {
+      "end": 16333,
+      "keys": "j"
+    },
+    {
+      "end": 16489,
+      "keys": "j"
+    },
+    {
+      "end": 16650,
+      "keys": "$"
+    },
+    {
+      "end": 16811,
+      "keys": "0"
+    },
+    {
+      "end": 16968,
+      "keys": "w"
+    },
+    {
+      "end": 17126,
+      "keys": "w"
+    },
+    {
+      "end": 17369,
+      "keys": "x"
+    },
+    {
+      "end": 17575,
+      "keys": ":set list\\r"
+    },
+    {
+      "end": 17737,
+      "keys": "G"
+    },
+    {
+      "end": 18006,
+      "keys": ":q!\\r"
+    }
+  ],
+  "version": "NVIM v0.12.5"
+}

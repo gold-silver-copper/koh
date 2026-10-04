@@ -1,0 +1,77 @@
+{
+  "command": [
+    "/bin/zsh",
+    "-i"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "ZDOTDIR=/tmp/fux-corpus/home/zsh-menu"
+  ],
+  "note": "",
+  "program": "zsh-menu",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 237,
+      "keys": ""
+    },
+    {
+      "end": 679,
+      "keys": "ls src/\\t"
+    },
+    {
+      "end": 1145,
+      "keys": "\\t"
+    },
+    {
+      "end": 1412,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 1435,
+      "keys": "\\r"
+    },
+    {
+      "end": 1464,
+      "keys": "\\x15"
+    },
+    {
+      "end": 1593,
+      "keys": "git ch\\t"
+    },
+    {
+      "end": 2559,
+      "keys": "\\t"
+    },
+    {
+      "end": 2812,
+      "keys": "\\x03"
+    },
+    {
+      "end": 3098,
+      "keys": "cd sr\\t\\r"
+    },
+    {
+      "end": 3357,
+      "keys": "false\\r"
+    },
+    {
+      "end": 3612,
+      "keys": "cd ..\\r"
+    },
+    {
+      "end": 3629,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "zsh 5.9 (arm64-apple-darwin26.0)"
+}

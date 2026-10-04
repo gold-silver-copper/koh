@@ -1,0 +1,45 @@
+{
+  "command": [
+    "top",
+    "-s",
+    "3",
+    "-o",
+    "pid",
+    "-pid",
+    "58067",
+    "-pid",
+    "58068",
+    "-pid",
+    "58069"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "top -pid: only the three processes the scenario starts",
+  "program": "top",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 1118,
+      "keys": ""
+    },
+    {
+      "end": 1400,
+      "keys": ""
+    },
+    {
+      "end": 1423,
+      "keys": "q"
+    }
+  ],
+  "version": "top (macOS)"
+}

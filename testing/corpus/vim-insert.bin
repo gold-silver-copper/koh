@@ -1,0 +1,108 @@
+[?1049h[>4;2m[?1h=[?2004h[?1004h[1;40r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[40;1H"src/screen.rs" 2171L, 87034B[2;1H▽[6n[2;1H  [3;1HPzz\[0%m[6n[3;1H           [1;1H[>c]11;?]10;?[1;1H[38;5;130m   1 use[m [35mcrate[m[35m::[m[35mlink[m[35m::[m{Held, Pen};
+[38;5;130m   2 use[m [35mcrate[m[35m::[m[35municode[m[35m::[mCluster;[2;34H[K[3;1H[38;5;130m   3 use[m [35mcrate[m[35m::[m{[3;18H[K[4;1H[38;5;130m   4 [m    Attributes, Blink, Cell, CellRef, Color, Error, Hyperlink, Mark, Options, Reply, Row, RowId,
+[38;5;130m   5 [m    UnderlineStyle, Window,
+[38;5;130m   6 [m    [35mgrid[m[35m::[m{Grid, Scroll},
+[38;5;130m   7 [m    [35mparser[m[35m::[mParameters,
+[38;5;130m   8 [m};
+[38;5;130m   9 use[m [35municode_width[m[35m::[m{UnicodeWidthChar, UnicodeWidthStr};
+[38;5;130m  10 
+  11 [m[35m/// The mouse reporting a program asked for, the latest set winning[m
+[38;5;130m  12 [m[35m/// (`CSI ? 9 / 1000 / 1002 / 1003 h`). State only: fux-vt reports nothing.[m
+[38;5;130m  13 [m[35m#[derive([m[32mClone[m[35m, [m[32mCopy[m[35m, [m[32mDebug[m[35m, [m[32mDefault[m[35m, [m[32mPartialEq[m[35m, [m[32mEq[m[35m)][m
+[38;5;130m  14 [m[35m#[non_exhaustive][m
+[38;5;130m  15 pub[m [38;5;130menum[m [36mMouseProtocolMode[m {
+[38;5;130m  16 [m    [35m/// No reporting.[m
+[38;5;130m  17 [m    [35m#[default][m
+[38;5;130m  18 [m    [31mNone[m,
+[38;5;130m  19 [m    [35m/// Mode 9, X10: button presses.[m
+[38;5;130m  20 [m    Press,
+[38;5;130m  21 [m    [35m/// Mode 1000: presses and releases.[m
+[38;5;130m  22 [m    PressRelease,
+[38;5;130m  23 [m    [35m/// Mode 1002: also motion while a button is down.[m
+[38;5;130m  24 [m    ButtonMotion,
+[38;5;130m  25 [m    [35m/// Mode 1003: also motion with no button down.[m
+[38;5;130m  26 [m    AnyMotion,
+[38;5;130m  27 [m}
+[38;5;130m  28 [m[35m/// How mouse reports are to be encoded (`CSI ? 1005 / 1006 h`).[m
+[38;5;130m  29 [m[35m#[derive([m[32mClone[m[35m, [m[32mCopy[m[35m, [m[32mDebug[m[35m, [m[32mDefault[m[35m, [m[32mPartialEq[m[35m, [m[32mEq[m[35m)][m
+[38;5;130m  30 [m[35m#[non_exhaustive][m
+[38;5;130m  31 pub[m [38;5;130menum[m [36mMouseProtocolEncoding[m {
+[38;5;130m  32 [m    [35m/// The legacy encoding: coordinates as single bytes.[m
+[38;5;130m  33 [m    [35m#[default][m
+[38;5;130m  34 [m    [32mDefault[m,
+[38;5;130m  35 [m    [35m/// Mode 1005: coordinates in UTF-8.[m
+[38;5;130m  36 [m    Utf8,
+[38;5;130m  37 [m    [35m/// Mode 1006, SGR: `CSI < b ; x ; y M`, or `m` for a release.[m
+[38;5;130m  38 [m    Sgr,
+[1m[7msrc/screen.rs                                                                                         1,1            Top[1;6H[?25h[?4mP+q436f\P+q6b75\P+q6b64\P+q6b72\P+q6b6c\P+q2332\P+q2334\P+q2569\P+q2a37\P+q6b31\P$q q\[?12$p[27m[23m[29m[m[H[2J[?25l[1;1H[93m   1 [m[93muse[m [38;5;81mcrate[m[38;5;224m::[m[38;5;81mlink[m[38;5;224m::[m{Held, Pen};
+[93m   2 [m[93muse[m [38;5;81mcrate[m[38;5;224m::[m[38;5;81municode[m[38;5;224m::[mCluster;
+[93m   3 [m[93muse[m [38;5;81mcrate[m[38;5;224m::[m{
+[93m   4 [m    Attributes, Blink, Cell, CellRef, Color, Error, Hyperlink, Mark, Options, Reply, Row, RowId,
+[93m   5 [m    UnderlineStyle, Window,
+[93m   6 [m    [38;5;81mgrid[m[38;5;224m::[m{Grid, Scroll},
+[93m   7 [m    [38;5;81mparser[m[38;5;224m::[mParameters,
+[93m   8 [m};
+[93m   9 [m[93muse[m [38;5;81municode_width[m[38;5;224m::[m{UnicodeWidthChar, UnicodeWidthStr};
+[93m  10 
+  11 [m[38;5;224m/// The mouse reporting a program asked for, the latest set winning[m
+[93m  12 [m[38;5;224m/// (`CSI ? 9 / 1000 / 1002 / 1003 h`). State only: fux-vt reports nothing.[m
+[93m  13 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m, [m[38;5;121mDefault[m[38;5;81m, [m[38;5;121mPartialEq[m[38;5;81m, [m[38;5;121mEq[m[38;5;81m)][m
+[93m  14 [m[38;5;81m#[non_exhaustive][m
+[93m  15 [m[93mpub[m [93menum[m [1m[96mMouseProtocolMode[m {
+[93m  16 [m    [38;5;224m/// No reporting.[m
+[93m  17 [m    [38;5;81m#[default][m
+[93m  18 [m    [95mNone[m,
+[93m  19 [m    [38;5;224m/// Mode 9, X10: button presses.[m
+[93m  20 [m    Press,
+[93m  21 [m    [38;5;224m/// Mode 1000: presses and releases.[m
+[93m  22 [m    PressRelease,
+[93m  23 [m    [38;5;224m/// Mode 1002: also motion while a button is down.[m
+[93m  24 [m    ButtonMotion,
+[93m  25 [m    [38;5;224m/// Mode 1003: also motion with no button down.[m
+[93m  26 [m    AnyMotion,
+[93m  27 [m}
+[93m  28 [m[38;5;224m/// How mouse reports are to be encoded (`CSI ? 1005 / 1006 h`).[m
+[93m  29 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mCopy[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m, [m[38;5;121mDefault[m[38;5;81m, [m[38;5;121mPartialEq[m[38;5;81m, [m[38;5;121mEq[m[38;5;81m)][m
+[93m  30 [m[38;5;81m#[non_exhaustive][m
+[93m  31 [m[93mpub[m [93menum[m [1m[96mMouseProtocolEncoding[m {
+[93m  32 [m    [38;5;224m/// The legacy encoding: coordinates as single bytes.[m
+[93m  33 [m    [38;5;81m#[default][m
+[93m  34 [m    [38;5;121mDefault[m,
+[93m  35 [m    [38;5;224m/// Mode 1005: coordinates in UTF-8.[m
+[93m  36 [m    Utf8,
+[93m  37 [m    [38;5;224m/// Mode 1006, SGR: `CSI < b ; x ; y M`, or `m` for a release.[m
+[93m  38 [m    Sgr,
+[1m[7msrc/screen.rs                                                                                         1,1            Top[m[40;1H"src/screen.rs" 2171L, 87034B[1;6H[?25h[?25l[40;110HG[1;6H[40;110H [38;6H[1;1H[93m2134[m[1C            _ [93m=>[m [95mself[m.attributes.[1m[96mwith_underline_color[m(colour),
+[93m2135[m[1C        };[2;16H[K[3;1H[93m2136[m[1C    }[3;11H[K[4;1H[93m2137[m[4;10H[K[5;1H[93m2138[m[5C[38;5;224m/// The colour of 38, 48 or 58 in their semicolon form, taken from the[m
+[93m2139[m[5C[38;5;224m/// parameters after it, as xterm reads it: `5;index` or `2;r;g;b`, a[m
+[93m2140[m[5C[38;5;224m/// value the list ends before being 0. Another kind takes only itself.[m
+[93m2141[m[1C    [38;5;224m/// `None`, with what it named taken all the same, if the colour is out[m
+[93m2142[m[1C    [38;5;224m/// of range.[m[9;23H[K[10;1H[93m2143[m[5C[93mfn[m [1m[96mcolour_after[m[93m<[m[38;5;224m'a[m[93m>[m(
+[93m2144[m[1C        groups: [38;5;121m&mut[m [38;5;81mstd[m[38;5;224m::[m[38;5;81miter[m[38;5;224m::[mPeekable[93m<impl[m [38;5;121mIterator[m[93m<[mItem [93m=[m [38;5;121m&[m[38;5;224m'a[m [[38;5;121mu16[m][93m>>[m,
+[93m2145[m[1C    ) [93m->[m [38;5;121mOption[m[93m<[mColor[93m>[m {[12;30H[K[13;1H[93m2146[m[1C        [93mlet[m kind [93m=[m [93mmatch[m groups.[1m[96mpeek[m() {[13;46H[K[14;1H[93m2147[m[1C            [95mSome[m([kind]) [93m=>[m [38;5;121m*[mkind,
+[93m2148[m[1C            _ [93m=>[m [93mreturn[m [95mNone[m,
+[93m2149[m[5C    };[16;16H[K[17;1H[93m2150[m[5C    groups.[1m[96mnext[m();
+[93m2151[m[5C    [93mlet[m count [93m=[m [93mmatch[m kind {
+[93m2152[m[5C        [95m2[m [93m=>[m [95m3[m,[19;25H[K[20;1H[93m2153[m[5C        [95m5[m [93m=>[m [95m1[m,
+[93m2154[m[5C        _ [93m=>[m [93mreturn[m [95mNone[m,[21;35H[K[22;1H[93m2155[m[5C    };[22;16H[K[23;1H[93m2156[m[5C    [93mlet[m [38;5;121mmut[m values [93m=[m [[95m0u16[m; [95m3[m];[23;41H[K[24;1H[93m2157[m[5C    [93mfor[m value [93min[m values.[1m[96miter_mut[m().[1m[96mtake[m(count) {
+[93m2158[m[5C        [93mlet[m [95mSome[m([n]) [93m=[m groups.[1m[96mpeek[m() [93melse[m {[25;54H[K[26;1H[93m2159[m[5C            [93mbreak[m;
+[93m2160[m[1C [11C};
+[93m2161[m[1C            [38;5;121m*[mvalue [93m=[m [38;5;121m*[mn;[28;30H[K[29;1H[93m2162[m[1C            groups.[1m[96mnext[m();[29;32H[K[30;1H[93m2163[m[1C        }[30;15H[K[31;1H[93m2164[m[1C        [93mlet[m [a, b, c] [93m=[m values;[31;37H[K[32;1H[93m2165[m[5C    [93mif[m kind [93m==[m [95m5[m {[32;28H[K[33;1H[93m2166[m[5C        [38;5;121mu8[m[38;5;224m::[m[1m[96mtry_from[m(a).[1m[96mok[m().[1m[96mmap[m([38;5;81mColor[m[38;5;224m::[mIdx)
+[93m2167[m[5C    } [93melse[m {
+[93m2168[m[5C        [1m[96mrgb[m(a, b, c)[35;30H[K[36;1H[93m2169[m[5C    }
+[93m2170[m[5C}[37;11H[K[38;1H[93m2171[m[1C}[38;10H[K[39;103H[1m[7m2171,1[9CBot[38;6H[?25h[?25l[m[40;110Ho[38;6H[40;110H [38;6H
+
+[1m-- INSERT --[m[40;13H[K[1;38r[38;1H
+[1;40r[38;1H[93m2172 [m[39;15H[1m[7m[+][88C2,[38;6H[?25h[?25l[1;38r[m[1;1H[2M[1;40r[36;6H[93mfn[m [1m[96madded[m() [93m->[m [38;5;121musize[m {
+[93m2173 [m    [95m1[m
+[93m2174 [m}[36;26H[46m{[38;6H}[m[39;106H[1m[7m4,2 [38;7H[?25h[m[40;1H[K[38;6H[?25l[40;110H^[[38;6H[40;110H  [38;7H[39;108H[1m[7m1 [38;6H[?25h[?25l[m[40;110Ho[38;6H[40;110H [38;6H
+
+[1m-- INSERT --[1;38r[m[38;1H
+[1;40r[38;1H[93m2175 [m[35;26H{[37;6H}[39;106H[1m[7m5,[38;6H[?25h[?25l[m[40;4H[1mKeyword completion (^N^P) -- Searching...[m[38;6Hset
+
+[38;5;121mScanning tags.[m[1mp[m[40;15H[K[40;10H[38;5;121mincluded file: src/link.rs[40;29H.[m[40;30H[K[40;29H[38;5;121municode[m[1m-- Keyword completion (^N^P) [m[38;5;121mmatch 1 of 20[38;9H[m[18;5H[38;5;242m[40m set                        [m[19;5H[30m[105m sets                       [20;5H self                       [21;5H sequence                   [22;5H selector                   [23;5H second                     [24;5H send                       [25;5H sequences                  [26;5H sends                      [27;5H see                        [28;5H set_link                   [29;5H semantic                   [30;5H sees                       [31;5H sent                       [32;5H setting                    [33;5H set_cursor                 [34;5H setting_report             [35;5H set_colour                 [36;5H semicolon                  [37;5H separated      src/link.rs [38;9H[?25h[?25l[m[40;29H[K[40;29H[1m [m[38;5;121mmatch 2 of 20[38;10H[ms[18;5H[30m[105m set                        [m[19;5H[38;5;242m[40m sets                       [38;10H[?25h[?25l[m[40;29H[K[40;29H[1m [m[38;5;121mmatch 3 of 20[38;10H[m[95mself[m[19;5H[30m[105m sets                       [m[20;5H[38;5;242m[40m self                       [38;10H[?25h[m[40;1H[K[38;9H[?25l[40;110H^[[38;9H[40;110H  [38;10H
+
+[1m-- Keyword completion (^N^P) [m[38;5;121mmatch 3 of 20[m[40;1H[K[40;1H[1m-- INSERT --[m[40;1H[K[18;5H[93m [m        };[18;16H[K[19;5H[93m [m        [93mlet[m [38;5;121mmut[m values [93m=[m [[95m0[m[20;5H[93m [m        [93mfor[m value [93min[m values[21;5H[93m [m            [93mlet[m [95mSome[m([n]) [93m=[m[22;5H[93m [m                [93mbreak[m;[22;28H[K[23;5H[93m [m            };[23;20H[K[24;5H[93m [m            [38;5;121m*[mvalue [93m=[m [38;5;121m*[mn;[24;30H[K[25;5H[93m [m            groups.[1m[96mnext[m();[25;32H[K[26;5H[93m [m        }[26;15H[K[27;5H[93m [m        [93mlet[m [a, b, c] [93m=[m val[28;5H[93m [m        [93mif[m kind [93m==[m [95m5[m {[28;28H[K[29;5H[93m [m            [38;5;121mu8[m[38;5;224m::[m[1m[96mtry_from[m(a)[30;5H[93m [m        } [93melse[m {[30;22H[K[31;5H[93m [m            [1m[96mrgb[m(a, b, c)[31;30H[K[32;5H[93m [m        }[32;15H[K[33;5H[93m [m    }[33;11H[K[34;5H[93m [m}[34;7H[K[35;5H[93m [m[93mfn[m [1m[96madded[m() [93m->[m [38;5;121musize[m {[35;27H[K[36;5H[93m [m    [95m1[m[36;11H[K[37;5H[93m [m}[37;7H[K[39;108H[1m[7m4 [38;9H[?25h[?25l[m[40;110Hu[38;9H
+
+1 line less; before #2  2 seconds ago[40;110H[K[37;6H[35;26H[46m{[37;6H}[m
+[94m~                                                                                                                       [m[39;106H[1m[7m4,1 [37;6H[?25h[?25l[m[40;1H[K[40;1H:q![?2004l[>4;m[23;2t[23;1t[40;1H[K[40;1H[?1004l[?2004l[?1l>[?1049l[?25h[>4;m

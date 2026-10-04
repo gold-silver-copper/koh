@@ -1,0 +1,72 @@
+{
+  "command": [
+    "vim",
+    "src/screen.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "vim-insert",
+  "replies": "\\e[2;2R\\e[3;1R\\e[>1;1700;0c\\e]11;rgb:0000/0000/0000\\x07\\e]10;rgb:ffff/ffff/ffff\\x07\\e[?12;0$y",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 5861,
+      "keys": ""
+    },
+    {
+      "end": 8865,
+      "keys": "G"
+    },
+    {
+      "end": 9024,
+      "keys": "o"
+    },
+    {
+      "end": 9230,
+      "keys": "fn added() -> usize {\\r1\\r}"
+    },
+    {
+      "end": 9324,
+      "keys": "\\e"
+    },
+    {
+      "end": 9482,
+      "keys": "o"
+    },
+    {
+      "end": 10518,
+      "keys": "se\\x0e"
+    },
+    {
+      "end": 10705,
+      "keys": "\\x0e"
+    },
+    {
+      "end": 10906,
+      "keys": "\\x0e"
+    },
+    {
+      "end": 12225,
+      "keys": "\\e"
+    },
+    {
+      "end": 12500,
+      "keys": "u"
+    },
+    {
+      "end": 12618,
+      "keys": ":q!\\r"
+    }
+  ],
+  "version": "VIM - Vi IMproved 9.1 (2024 Jan 02, compiled Aug  8 2026 16:52:02)"
+}

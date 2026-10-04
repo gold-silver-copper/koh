@@ -1,0 +1,120 @@
+{
+  "command": [
+    "vim",
+    "src/parser.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "vim",
+  "replies": "\\e[2;2R\\e[3;1R\\e[>1;1700;0c\\e]11;rgb:0000/0000/0000\\x07\\e]10;rgb:ffff/ffff/ffff\\x07\\e[?12;0$y",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 6203,
+      "keys": ""
+    },
+    {
+      "end": 6272,
+      "keys": "j"
+    },
+    {
+      "end": 6344,
+      "keys": "j"
+    },
+    {
+      "end": 6418,
+      "keys": "5j"
+    },
+    {
+      "end": 7822,
+      "keys": "\\x04"
+    },
+    {
+      "end": 9395,
+      "keys": "\\x04"
+    },
+    {
+      "end": 10945,
+      "keys": "\\x15"
+    },
+    {
+      "end": 14330,
+      "keys": "G"
+    },
+    {
+      "end": 17548,
+      "keys": "gg"
+    },
+    {
+      "end": 17650,
+      "keys": "/fn \\r"
+    },
+    {
+      "end": 17738,
+      "keys": "n"
+    },
+    {
+      "end": 17826,
+      "keys": "n"
+    },
+    {
+      "end": 19052,
+      "keys": "*"
+    },
+    {
+      "end": 19255,
+      "keys": "V"
+    },
+    {
+      "end": 19486,
+      "keys": "j"
+    },
+    {
+      "end": 19795,
+      "keys": "j"
+    },
+    {
+      "end": 20183,
+      "keys": "\\e"
+    },
+    {
+      "end": 21940,
+      "keys": ":split\\r"
+    },
+    {
+      "end": 22292,
+      "keys": "\\x17j"
+    },
+    {
+      "end": 22639,
+      "keys": "\\x17k"
+    },
+    {
+      "end": 22690,
+      "keys": ":set spell\\r"
+    },
+    {
+      "end": 23537,
+      "keys": "\\x04"
+    },
+    {
+      "end": 25429,
+      "keys": ":q\\r"
+    },
+    {
+      "end": 25547,
+      "keys": ":q!\\r"
+    }
+  ],
+  "version": "VIM - Vi IMproved 9.1 (2024 Jan 02, compiled Aug  8 2026 16:52:02)"
+}

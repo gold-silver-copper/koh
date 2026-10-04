@@ -1,0 +1,66 @@
+{
+  "command": [
+    "emacs",
+    "-nw",
+    "-Q",
+    "src/link.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "emacs-resize",
+  "replies": "\\e[>1;1700;0c\\e]11;rgb:0000/0000/0000\\e\\\\\\e]10;rgb:ffff/ffff/ffff\\e\\\\\\e[?62;22c\\eP>|fux 0.17.0\\e\\\\",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 7385,
+      "keys": ""
+    },
+    {
+      "end": 10678,
+      "keys": "",
+      "resize": [
+        24,
+        80
+      ]
+    },
+    {
+      "end": 13054,
+      "keys": "\\x16"
+    },
+    {
+      "end": 25540,
+      "keys": "",
+      "resize": [
+        50,
+        200
+      ]
+    },
+    {
+      "end": 35137,
+      "keys": "\\x183"
+    },
+    {
+      "end": 45214,
+      "keys": "",
+      "resize": [
+        40,
+        120
+      ]
+    },
+    {
+      "end": 45279,
+      "keys": "\\x18\\x03"
+    }
+  ],
+  "version": "GNU Emacs 31.1"
+}

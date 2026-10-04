@@ -1,0 +1,92 @@
+{
+  "command": [
+    "/bin/zsh",
+    "-i"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "ZDOTDIR=/tmp/fux-corpus/home/zsh"
+  ],
+  "note": "",
+  "program": "zsh",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 204,
+      "keys": ""
+    },
+    {
+      "end": 221,
+      "keys": "echo hello wrld"
+    },
+    {
+      "end": 224,
+      "keys": "\\x02\\x02\\x02"
+    },
+    {
+      "end": 231,
+      "keys": "o"
+    },
+    {
+      "end": 236,
+      "keys": "\\x01"
+    },
+    {
+      "end": 241,
+      "keys": "\\x05"
+    },
+    {
+      "end": 469,
+      "keys": "\\r"
+    },
+    {
+      "end": 644,
+      "keys": "ls \\t"
+    },
+    {
+      "end": 651,
+      "keys": "\\t"
+    },
+    {
+      "end": 682,
+      "keys": "\\x15"
+    },
+    {
+      "end": 707,
+      "keys": "cat Ca\\t"
+    },
+    {
+      "end": 997,
+      "keys": "\\r"
+    },
+    {
+      "end": 1011,
+      "keys": "\\e[A"
+    },
+    {
+      "end": 1035,
+      "keys": "\\x15"
+    },
+    {
+      "end": 1256,
+      "keys": "\\x12hello"
+    },
+    {
+      "end": 1532,
+      "keys": "\\r"
+    },
+    {
+      "end": 1549,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "zsh 5.9 (arm64-apple-darwin26.0)"
+}

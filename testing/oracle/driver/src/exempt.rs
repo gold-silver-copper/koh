@@ -39,10 +39,6 @@ pub const EXEMPTIONS: &[(&str, &str)] = &[
          them as RGB",
     ),
     (
-        "margins",
-        "DECRQM of mode 69 (`CSI ? 69 $ p`): the server answers it as not recognized",
-    ),
-    (
         "underline",
         "SGR underline styles (`4:n`, `21`) and DECRQSS (`DCS $ q`): carried on the wire, and \
          answered",
@@ -94,7 +90,6 @@ fn csi(private: Option<u8>, raw: &[u8], intermediates: &[u8], last: u8) -> Optio
     match (private, intermediates, last) {
         (Some(b'?'), [], b'h' | b'l') if has(b"2026") => Some("sync"),
         (Some(b'?'), [], b'h' | b'l') | (Some(b'?'), [b'$'], b'p') if has(b"2048") => Some("size"),
-        (Some(b'?'), [b'$'], b'p') if has(b"69") => Some("margins"),
         (None, [], b't') if has(b"18") => Some("size"),
         (None | Some(b'>' | b'='), [], b'c') | (Some(b'>'), [], b'q') => Some("identity"),
         (None | Some(b'?'), [], b'n') if has(b"6") => Some("identity"),

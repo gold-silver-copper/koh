@@ -127,6 +127,13 @@ checks the ranges against the screen and refuses shifts with a resize, and drops
 if anything is wrong. What a shift cannot say is sent as rows: a row moved and changed, a row that
 appears twice, a horizontal shift inside a row, and the shortest runs past the 32nd.
 
+A program may also scroll only some columns, between left and right margins (DECLRMM, DECSLRM),
+which fux-vt has and the server's terminal says it has when asked (DECRQM of mode 69): nvim then
+scrolls a split window between margins. A shift moves whole rows, so those rows go as rows. That
+costs nothing measurable: nvim run under koh, splitting a window and scrolling in both halves at
+40x120, sent 92.9 KB to the client with mode 69 answered as known and 92.8 KB with it answered as
+unknown (three runs each, 0.3% apart), so the server answers it as known.
+
 The client validates and copies cells and never runs a terminal parser, so server
 bytes never reach one. That includes the user's terminal, which the client prints a cell's text to
 as is: decoding refuses a cell whose text holds a control character, so no escape sequence can

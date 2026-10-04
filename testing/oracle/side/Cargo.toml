@@ -1,0 +1,15 @@
+[package]
+name = "koh-oracle-side"
+version = "0.0.0"
+description = "One side of koh's oracle: koh at a tree, running the driver's cases"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# koh at this tree. `oracle.sh` copies this crate into a worktree of the commit compared, where
+# the same path is that commit's koh.
+koh = { path = "../../.." }
+
+[lints]
+workspace = true

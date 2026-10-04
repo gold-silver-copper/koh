@@ -1,0 +1,13 @@
+diff --git i/src/terminal/mod.rs w/src/terminal/mod.rs
+index 395a25f..d544186 100644
+--- i/src/terminal/mod.rs
++++ w/src/terminal/mod.rs
+@@ -251,7 +251,7 @@ impl WireStyle {
+                 | bit(attributes.underline(), Self::UNDERLINE)
+                 | bit(attributes.inverse(), Self::INVERSE)
+                 | bit(attributes.hidden(), Self::HIDDEN)
+-                | bit(attributes.strikeout(), Self::STRIKEOUT)
++                // PLANTED: strikeout is not carried.
+                 | blink,
+         )
+     }

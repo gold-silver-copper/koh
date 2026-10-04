@@ -1,0 +1,15 @@
+diff --git i/src/terminal/server.rs w/src/terminal/server.rs
+index 7ea5727..1fd0e03 100644
+--- i/src/terminal/server.rs
++++ w/src/terminal/server.rs
+@@ -100,6 +100,10 @@ impl ServerTerminal {
+     /// logged.
+     pub fn resize(&mut self, size: Size) {
+         let Size { rows, cols } = clamp_dims(size);
++        // PLANTED: a resize that makes the screen taller is missed.
++        if rows > self.parser.screen().size().0 {
++            return;
++        }
+         if let Err(e) = self.parser.resize(rows, cols) {
+             tracing::warn!(error = %e, rows, cols, "terminal emulator refused a resize");
+         }

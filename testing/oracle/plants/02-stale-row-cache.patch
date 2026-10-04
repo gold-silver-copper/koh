@@ -1,0 +1,14 @@
+diff --git i/src/terminal/grid.rs w/src/terminal/grid.rs
+index a45e45d..d3a74aa 100644
+--- i/src/terminal/grid.rs
++++ w/src/terminal/grid.rs
+@@ -108,7 +108,8 @@ impl RowCache {
+         // a row at the version it was cached at holds the same cells without comparing them. A
+         // row with a new version may still hold the same cells (erased, then written back), so it
+         // is compared.
+-        (cells.len() == live.len() && (*version == live.version() || cells.iter().eq(live.cells())))
++        // PLANTED: a cached row is taken by its id alone, whatever its version.
++        (cells.len() == live.len())
+             .then(|| Arc::clone(cells))
+     }
+ 

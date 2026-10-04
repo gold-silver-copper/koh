@@ -1,0 +1,15 @@
+diff --git i/src/terminal/mod.rs w/src/terminal/mod.rs
+index 395a25f..7827950 100644
+--- i/src/terminal/mod.rs
++++ w/src/terminal/mod.rs
+@@ -834,7 +834,9 @@ impl TerminalScreen {
+             exit_code: self.exit_code,
+             cursor: self.grid.cursor_position(),
+             modes: self.grid.modes().into(),
+-            shifts,
++            // PLANTED: a shift that moves rows down is dropped after the rows were diffed.
++            shifts: Shifts::new(shifts.iter().copied().filter(|s| s.by.get() < 0).collect())
++                .unwrap_or_default(),
+             rows: changed.collect(),
+         }
+     }

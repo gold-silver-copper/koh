@@ -239,6 +239,49 @@ fn log_to_koh_log() {
     crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG);
 }
 
+/// The longest the client waits for the user's terminal to answer its start-up questions. A local
+/// terminal answers within milliseconds; one that answers nothing leaves the defaults.
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Ask the user's terminal what it draws (see [`super::probe`]) and paint accordingly. Its answers
+/// are read out of `input`; what was typed meanwhile goes on to the session, first, on the input
+/// returned.
+async fn probe_terminal<B: crate::client::KohBackend>(
+    terminal: &mut BackendTerminal<B>,
+    mut input: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+    let mut replies = super::probe::Replies::default();
+    if terminal.ask(super::probe::QUERIES).is_ok() {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(PROBE_WAIT)
+            .unwrap_or_else(tokio::time::Instant::now);
+        while !replies.done() {
+            match tokio::time::timeout_at(deadline, input.recv()).await {
+                Ok(Some(bytes)) => replies.push(&bytes),
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
+    terminal.set_underline_styles(replies.underline_styles());
+    tracing::debug!(
+        underline_styles = replies.underline_styles(),
+        "the user's terminal"
+    );
+    let typed = replies.typed();
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        if !typed.is_empty() && tx.send(typed).await.is_err() {
+            return;
+        }
+        while let Some(bytes) = input.recv().await {
+            if tx.send(bytes).await.is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 /// `koh connect`: the remote shell's exit code if it exited. Takes the process's terminal, stdin
 /// and signal handlers for the session.
 pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
@@ -264,15 +307,16 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     let (channels, tasks) = super::spawn_client_io()?;
     let result = async {
         let backend = DefaultBackend::new().context("acquiring the terminal")?;
-        let terminal = BackendTerminal::enter(backend, args.clipboard)
+        let mut terminal = BackendTerminal::enter(backend, args.clipboard)
             .context("entering raw mode / alt screen")?;
+        let input_rx = probe_terminal(&mut terminal, channels.input_rx).await;
         let size = terminal.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
         crate::client::run_client(
             channel,
             connector,
             DisplayPreference::Always,
             size,
-            channels.input_rx,
+            input_rx,
             channels.resize_rx,
             terminal,
             shutdown,

@@ -115,8 +115,7 @@ impl ClientTerminal for Readback {
     }
 }
 
-/// The first difference between `shown` and `expected`, cell by cell, then the cursor; the
-/// underline as one bit, which is what koh/3 carries.
+/// The first difference between `shown` and `expected`, cell by cell, then the cursor.
 fn difference(shown: &fux_vt::Screen, expected: &fux_vt::Screen) -> Option<String> {
     if shown.size() != expected.size() {
         return Some(format!(
@@ -135,12 +134,11 @@ fn difference(shown: &fux_vt::Screen, expected: &fux_vt::Screen) -> Option<Strin
                     } else {
                         cell.contents().to_owned()
                     };
-                    let attributes = cell.attributes();
                     (
                         text,
                         cell.is_wide(),
                         cell.is_wide_continuation(),
-                        attributes.with_underline(attributes.underline()),
+                        cell.attributes(),
                     )
                 })
             };
@@ -226,7 +224,12 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     ));
     let (paints_tx, mut paints) = watch::channel(0u64);
     let terminal = Readback {
-        terminal: BackendTerminal::enter(shared.clone(), false)?,
+        terminal: {
+            // The user's terminal draws underline styles, as the one reading the paint does.
+            let mut terminal = BackendTerminal::enter(shared.clone(), false)?;
+            terminal.set_underline_styles(true);
+            terminal
+        },
         shared: shared.clone(),
         shown: shown.clone(),
         paints: paints_tx,

@@ -22,6 +22,11 @@ client and a 0.13 server (or the reverse) refuse each other at the TLS handshake
 error; upgrade both ends.
 
 ### Added
+- **Underline styles.** A curly, double, dotted or dashed underline (neovim's diagnostics, for
+  one) now reaches your terminal as it was set, if your terminal draws them: `koh connect` asks it
+  once at start-up (XTGETTCAP for `Smulx`, and DECRQSS of a curly pen), and paints a plain
+  underline otherwise. The server answers DECRQSS, so neovim knows it may use them. The koh/3
+  encoding gains the underline's style; a plain underline encodes as before.
 - `koh serve --port <PORT>` binds that UDP port (IPv4, and IPv6 where the host has it) instead of
   an ephemeral one, in every profile, and the banner shows the port. A client dialing
   `--direct <ip:port>` redials the address it first dialed, so with a fixed port it finds a

@@ -71,6 +71,9 @@ pub const IDENTITY: fux_vt::Identity = fux_vt::Identity {
 ///   snapshots draw them as RGB, so the user's own palette never changes and nothing is left
 ///   changed when they detach;
 /// - reflow: a resize re-wraps the primary screen and its history, as the user's terminal would;
+/// - setting reports (DECRQSS) for the pen, the cursor shape and the margins: neovim draws its
+///   diagnostics' curly underline only if the pen it set comes back with `4:3`, and koh carries
+///   underline styles;
 /// - koh's [`IDENTITY`].
 ///
 /// Left off: the kitty keyboard protocol (koh forwards the keys the user's terminal sends, so a
@@ -84,6 +87,7 @@ pub const OPTIONS: Options = Options::new()
     .with_size_reports(true)
     .with_palette(true)
     .with_reflow(true)
+    .with_setting_reports(true)
     .with_identity(Some(IDENTITY));
 
 /// The server's terminal: the live parser, and the [`TerminalScreen`] snapshots it sends.
@@ -593,6 +597,25 @@ mod tests {
         t.process(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07");
         assert_eq!(t.snapshot().clipboard(), "aGVsbG8=");
         assert_eq!(t.take_host_replies(), b"", "nor is it answered");
+    }
+
+    #[test]
+    fn tells_neovim_it_keeps_underline_styles() {
+        // neovim sets a curly underline and asks for the pen (DECRQSS); it draws its diagnostics
+        // curly only if `4:3` comes back.
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        t.process(b"\x1b[4:3m\x1bP$qm\x1b\\");
+        let reply = t.take_host_replies();
+        assert!(
+            reply.starts_with(b"\x1bP1$r") && reply.windows(3).any(|w| w == b"4:3"),
+            "{:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        // And the style reaches the screen sent.
+        t.process(b"x");
+        let snapshot = t.snapshot();
+        let cell = snapshot.screen().cell(0, 0).expect("a cell");
+        assert_eq!(cell.underline_style(), fux_vt::UnderlineStyle::Curly);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use fux_vt::{
     Attributes, Blink, Cell, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode,
+    UnderlineStyle,
 };
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -199,9 +200,11 @@ pub enum CellKind {
     Continuation,
 }
 
-/// A cell's style on the wire: one bit per attribute, and for blinking one of two. Decoding rejects
-/// any bit outside those defined, and both blinks at once, so every value is a style a cell can
-/// have.
+/// A cell's style on the wire: one bit per attribute, for blinking one of two, and for an underline
+/// its style.
+///
+/// Decoding rejects any bit outside those defined, both blinks at once, a style no
+/// underline has, and a style without an underline, so every value is a style a cell can have.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WireStyle(u16);
 
@@ -215,12 +218,25 @@ impl WireStyle {
     pub const STRIKEOUT: u16 = 64;
     pub const BLINK_SLOW: u16 = 128;
     pub const BLINK_RAPID: u16 = 256;
-    const ALL: u16 = 511;
+    /// The underline's style, in bits 9 to 11: a single underline is none of them, so a plain
+    /// underline is [`WireStyle::UNDERLINE`] alone, as before styles were carried.
+    pub const UNDERLINE_DOUBLE: u16 = 512;
+    pub const UNDERLINE_CURLY: u16 = 1024;
+    pub const UNDERLINE_DOTTED: u16 = 1536;
+    pub const UNDERLINE_DASHED: u16 = 2048;
+    const UNDERLINE_STYLE: u16 = 3584;
+    const ALL: u16 = 4095;
 
-    /// The style with exactly `bits`, or `None` if any is not a defined bit, or both blinks are.
+    /// The style with exactly `bits`, or `None` if any is not a defined bit, both blinks are, the
+    /// underline's style is none defined, or a style is given with no underline.
     pub const fn new(bits: u16) -> Option<Self> {
         let blinks = Self::BLINK_SLOW | Self::BLINK_RAPID;
-        if bits & !Self::ALL == 0 && bits & blinks != blinks {
+        let style = bits & Self::UNDERLINE_STYLE;
+        if bits & !Self::ALL == 0
+            && bits & blinks != blinks
+            && style <= Self::UNDERLINE_DASHED
+            && (style == 0 || bits & Self::UNDERLINE != 0)
+        {
             Some(Self(bits))
         } else {
             None
@@ -243,7 +259,15 @@ impl WireStyle {
             Blink::Rapid => Self::BLINK_RAPID,
             Blink::None | _ => 0,
         };
-        // Only defined bits, and at most one blink.
+        // A style fux-vt adds later is carried as a single underline.
+        let style = match attributes.underline_style() {
+            UnderlineStyle::Double => Self::UNDERLINE_DOUBLE,
+            UnderlineStyle::Curly => Self::UNDERLINE_CURLY,
+            UnderlineStyle::Dotted => Self::UNDERLINE_DOTTED,
+            UnderlineStyle::Dashed => Self::UNDERLINE_DASHED,
+            UnderlineStyle::None | UnderlineStyle::Single | _ => 0,
+        };
+        // Only defined bits, at most one blink, and a style only with an underline.
         Self(
             bit(attributes.bold(), Self::BOLD)
                 | bit(attributes.dim(), Self::DIM)
@@ -252,7 +276,8 @@ impl WireStyle {
                 | bit(attributes.inverse(), Self::INVERSE)
                 | bit(attributes.hidden(), Self::HIDDEN)
                 | bit(attributes.strikeout(), Self::STRIKEOUT)
-                | blink,
+                | blink
+                | if attributes.underline() { style } else { 0 },
         )
     }
 
@@ -265,11 +290,22 @@ impl WireStyle {
         } else {
             Blink::None
         };
+        let underline = if self.has(Self::UNDERLINE) {
+            match self.0 & Self::UNDERLINE_STYLE {
+                Self::UNDERLINE_DOUBLE => UnderlineStyle::Double,
+                Self::UNDERLINE_CURLY => UnderlineStyle::Curly,
+                Self::UNDERLINE_DOTTED => UnderlineStyle::Dotted,
+                Self::UNDERLINE_DASHED => UnderlineStyle::Dashed,
+                _ => UnderlineStyle::Single,
+            }
+        } else {
+            UnderlineStyle::None
+        };
         attributes
             .with_bold(self.has(Self::BOLD))
             .with_dim(self.has(Self::DIM))
             .with_italic(self.has(Self::ITALIC))
-            .with_underline(self.has(Self::UNDERLINE))
+            .with_underline_style(underline)
             .with_inverse(self.has(Self::INVERSE))
             .with_hidden(self.has(Self::HIDDEN))
             .with_strikeout(self.has(Self::STRIKEOUT))
@@ -289,7 +325,8 @@ impl<'de> Deserialize<'de> for WireStyle {
         Self::new(bits).ok_or_else(|| {
             de::Error::invalid_value(
                 de::Unexpected::Unsigned(u64::from(bits)),
-                &"style bits within 0b1_1111_1111, at most one blink",
+                &"style bits within 0b1111_1111_1111, at most one blink, an underline style of \
+                  at most 4 and only with an underline",
             )
         })
     }
@@ -996,9 +1033,9 @@ mod tests {
             CellKind::Wide,
             CellKind::Continuation,
         ]);
-        // Inline and boxed text, every style bit and blink.
+        // Inline and boxed text, every style bit, blink and underline style.
         let text = ".{0,40}".prop_filter_map("fits a cell", |text| CellText::new(&text));
-        let style = (0u16..=511).prop_filter_map("a style", WireStyle::new);
+        let style = (0u16..=4095).prop_filter_map("a style", WireStyle::new);
         (text, kind, color.clone(), color.clone(), color, style).prop_map(
             |(text, kind, fg, bg, underline_color, style)| WireCell {
                 text,
@@ -1546,13 +1583,16 @@ mod tests {
         screen.apply(&good);
         assert_eq!(screen.size(), Size::new(2, 2));
         assert_eq!(screen.screen().cell(0, 1).map(|c| c.contents()), Some("x"));
-        let mutations: [fn(&mut RawDiff); 9] = [
+        let mutations: [fn(&mut RawDiff); 12] = [
             |d| d.rows[0].runs[0].count = 0, // empty run
             |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CLUSTER_CAPACITY + 1),
             |d| d.rows[0].runs[0].cell.text = "\x1b".to_owned(), // an escape for the terminal
             |d| d.rows[0].runs[0].cell.text = "\u{9b}".to_owned(), // a C1 control
             |d| d.rows[0].runs[0].cell.kind = 3,                 // unknown kind
-            |d| d.rows[0].runs[0].cell.style = 512,              // unknown style bit
+            |d| d.rows[0].runs[0].cell.style = 4096,             // unknown style bit
+            |d| d.rows[0].runs[0].cell.style = 512,              // a style with no underline
+            |d| d.rows[0].runs[0].cell.style = 8 | 0x0a00,       // an underline style past dashed
+            |d| d.rows[0].runs[0].cell.style = 8 | 0x0e00,       // the last style value
             |d| d.rows[0].runs[0].cell.style = 128 | 256,        // both blinks
             |d| d.modes.mouse_mode = 5,                          // unknown mouse mode
             |d| d.modes.mouse_encoding = 3,                      // unknown mouse encoding

@@ -147,8 +147,12 @@ A cell is one grapheme cluster, as fux-vt segments output (UAX #29): a ZWJ emoji
 flag or a base with its marks stays in one cell, whose width is the cluster's. A cluster of up to 17
 bytes is held in the cell; a longer one, up to 128, in its row's text (`fux_vt::Cells`), which the
 client rebuilds as it decodes the row. On the wire a cell carries its cluster (at most 128 bytes),
-its kind, its colours, its underline colour and its style bits: bold, dim, italic, underline,
-inverse, hidden, strikeout and a slow or rapid blink.
+its kind, its colours, its underline colour and its style bits: bold, dim, italic, underline
+and the underline's style (single, double, curly, dotted, dashed), inverse, hidden, strikeout and
+a slow or rapid blink. The client paints an underline's style (`4:n`) only if the user's terminal
+draws them, which it asks the terminal once at start-up (XTGETTCAP for `Smulx`, and the pen with a
+curly underline through DECRQSS, before primary device attributes; `client::probe`); otherwise
+it paints a plain underline, as a terminal that does not know `4:n` would draw none.
 
 ## Headless drivers (the protocol is I/O-free; the shells are thin)
 

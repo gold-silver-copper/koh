@@ -8,7 +8,9 @@ use std::io;
 use super::backend::{CellStyle, KohBackend};
 use crate::predict::Overlay;
 use crate::terminal::{Grid, Size, MAXIMUM_CLIPBOARD_SIZE};
-use fux_vt::{Blink, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode};
+use fux_vt::{
+    Blink, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, UnderlineStyle,
+};
 use unicode_width::UnicodeWidthStr as _;
 
 /// What the terminal was last painted with, so the next frame paints only what changed.
@@ -26,6 +28,8 @@ use unicode_width::UnicodeWidthStr as _;
 #[derive(Default)]
 pub(super) struct Painter {
     last: Option<Painted>,
+    /// Whether the terminal draws underline styles (`4:n`); if not, they are painted plain.
+    underline_styles: bool,
 }
 
 /// A frame as it was painted.
@@ -265,7 +269,7 @@ const fn plain(fg: Color, bg: Color) -> CellStyle {
         bold: false,
         dim: false,
         italic: false,
-        underline: false,
+        underline: UnderlineStyle::None,
         inverse: false,
         hidden: false,
         strikeout: false,
@@ -333,7 +337,7 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
             bold: c.bold(),
             dim: c.dim(),
             italic: c.italic(),
-            underline: c.underline(),
+            underline: c.underline_style(),
             inverse: c.inverse(),
             hidden: c.hidden(),
             strikeout: c.strikeout(),
@@ -381,6 +385,15 @@ fn regular(grid: &Grid, marks: &[Mark<&str>], row: u16) -> bool {
 
 impl Painter {
     /// Forget what was painted: the next frame is painted whole.
+    /// Paint underline styles (`4:n`) if `on`, plain underlines if not; what is painted already
+    /// is painted again.
+    pub(super) fn set_underline_styles(&mut self, on: bool) {
+        if self.underline_styles != on {
+            self.underline_styles = on;
+            self.invalidate();
+        }
+    }
+
     pub(super) fn invalidate(&mut self) {
         self.last = None;
     }
@@ -463,6 +476,7 @@ impl Painter {
                         if joins(printed, glyph) {
                             backend.move_to(row, col)?;
                         }
+                        let style = style.drawn(self.underline_styles);
                         if cur_style != Some(style) {
                             backend.set_style(style)?;
                             cur_style = Some(style);
@@ -510,6 +524,7 @@ impl Painter {
                         if cursor != Some((row, col)) || joins(printed, glyph) {
                             backend.move_to(row, col)?;
                         }
+                        let style = style.drawn(self.underline_styles);
                         if cur_style != Some(style) {
                             backend.set_style(style)?;
                             cur_style = Some(style);

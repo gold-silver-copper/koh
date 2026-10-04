@@ -7,7 +7,7 @@
 use std::fmt;
 use std::io;
 
-use fux_vt::{Blink, Color};
+use fux_vt::{Blink, Color, UnderlineStyle};
 
 use crate::terminal::Size;
 
@@ -32,11 +32,33 @@ pub struct CellStyle {
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: UnderlineStyle,
     pub inverse: bool,
     pub hidden: bool,
     pub strikeout: bool,
     pub blink: Blink,
+}
+
+impl CellStyle {
+    /// This style as a terminal draws it: an underline's style only if `styles` (the terminal
+    /// draws them), else a plain underline. A terminal that does not know `4:n` draws no underline
+    /// at all, or reads the colon as a semicolon (underline and italic).
+    #[must_use]
+    pub fn drawn(self, styles: bool) -> Self {
+        let underline = match self.underline {
+            UnderlineStyle::None => UnderlineStyle::None,
+            style @ (UnderlineStyle::Double
+            | UnderlineStyle::Curly
+            | UnderlineStyle::Dotted
+            | UnderlineStyle::Dashed)
+                if styles =>
+            {
+                style
+            }
+            UnderlineStyle::Single | _ => UnderlineStyle::Single,
+        };
+        Self { underline, ..self }
+    }
 }
 
 /// The terminal `koh connect` paints on. Output is buffered until [`flush`](Self::flush), once per
@@ -145,8 +167,15 @@ pub trait KohBackend {
         if style.italic {
             self.write_bytes(b"\x1b[3m")?;
         }
-        if style.underline {
-            self.write_bytes(b"\x1b[4m")?;
+        match style.underline {
+            UnderlineStyle::None => {}
+            // Kitty's `4:n`, only where the terminal draws it (see `CellStyle::drawn`).
+            UnderlineStyle::Double => self.write_bytes(b"\x1b[4:2m")?,
+            UnderlineStyle::Curly => self.write_bytes(b"\x1b[4:3m")?,
+            UnderlineStyle::Dotted => self.write_bytes(b"\x1b[4:4m")?,
+            UnderlineStyle::Dashed => self.write_bytes(b"\x1b[4:5m")?,
+            // A style fux-vt adds later is drawn plain.
+            UnderlineStyle::Single | _ => self.write_bytes(b"\x1b[4m")?,
         }
         if style.inverse {
             self.write_bytes(b"\x1b[7m")?;
@@ -390,7 +419,7 @@ mod tests {
             bold: false,
             dim: false,
             italic: false,
-            underline: true,
+            underline: UnderlineStyle::Single,
             inverse: false,
             hidden: true,
             strikeout: true,
@@ -405,10 +434,27 @@ mod tests {
             hidden: false,
             strikeout: false,
             blink: Blink::None,
-            underline: false,
+            underline: UnderlineStyle::None,
             ..style
         };
         assert_eq!(emit(|b| b.set_style(plain)), b"\x1b[m\x1b[31m\x1b[49m");
+        // Each underline style, where the terminal draws them; plain where it does not.
+        for (underline, sgr) in [
+            (UnderlineStyle::Double, &b"\x1b[4:2m"[..]),
+            (UnderlineStyle::Curly, b"\x1b[4:3m"),
+            (UnderlineStyle::Dotted, b"\x1b[4:4m"),
+            (UnderlineStyle::Dashed, b"\x1b[4:5m"),
+        ] {
+            let styled = CellStyle { underline, ..plain };
+            assert_eq!(
+                emit(|b| b.set_style(styled.drawn(true))),
+                [b"\x1b[m", sgr, b"\x1b[31m\x1b[49m"].concat()
+            );
+            assert_eq!(
+                emit(|b| b.set_style(styled.drawn(false))),
+                b"\x1b[m\x1b[4m\x1b[31m\x1b[49m"
+            );
+        }
         assert_eq!(
             emit(|b| write_underline_color(b, Color::Idx(200))),
             b"\x1b[58;5;200m"

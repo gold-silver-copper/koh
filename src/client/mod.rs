@@ -7,6 +7,7 @@
 pub mod backend;
 pub mod cli;
 mod io;
+mod probe;
 mod render;
 mod session;
 
@@ -237,6 +238,18 @@ impl<B: KohBackend> BackendTerminal<B> {
         };
         this.backend.enter_alt_screen()?;
         Ok(this)
+    }
+
+    /// Paint underline styles (`4:n`) if the terminal draws them (`on`), else plain underlines,
+    /// the default; what the terminal shows is painted again.
+    pub fn set_underline_styles(&mut self, on: bool) {
+        self.painter.set_underline_styles(on);
+    }
+
+    /// Ask the user's terminal `queries` (written and flushed now).
+    pub(crate) fn ask(&mut self, queries: &[u8]) -> std::io::Result<()> {
+        self.backend.write_bytes(queries)?;
+        self.backend.flush()
     }
 }
 

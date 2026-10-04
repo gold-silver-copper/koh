@@ -108,10 +108,7 @@ impl View {
                     } else {
                         cell.contents().to_owned()
                     };
-                    // koh/3 carries underline as one bit, so a style is compared as underlined
-                    // or not.
                     let mut attributes = cell.attributes();
-                    attributes = attributes.with_underline(attributes.underline());
                     if drawn {
                         attributes = koh::terminal::drawn(attributes, screen);
                     }
@@ -216,7 +213,13 @@ impl Session {
             frame_start: None,
             now: Instant::now(),
             client: ClientSession::new(DisplayPreference::Never, size),
-            terminal: BackendTerminal::enter(capture.clone(), false).map_err(|e| e.to_string())?,
+            terminal: {
+                // The user's terminal draws underline styles, as the one reading the paint does.
+                let mut terminal =
+                    BackendTerminal::enter(capture.clone(), false).map_err(|e| e.to_string())?;
+                terminal.set_underline_styles(true);
+                terminal
+            },
             capture,
             shown: fux_vt::Parser::new(rows, cols, 0).map_err(|e| e.to_string())?,
             base: (FrameNum::BLANK, TerminalScreen::default()),

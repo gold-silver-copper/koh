@@ -33,6 +33,10 @@ service.
    forwarded, always to the `c` selection; the clipboard is never read (a query, `OSC 52 ; c ; ?`,
    is neither forwarded nor answered, and the client asks the user's terminal nothing), so nothing
    the user copied reaches the server.
+   **Questions to the user's terminal:** the client asks it one set of questions, itself, once at
+   start-up (whether it draws underline styles, and its device attributes, `client::probe`), and
+   reads the answers out of stdin before the session starts; nothing a server sends makes the
+   client ask the terminal anything, and the answers never reach the server.
 3. **Network / MITM** — QUIC + TLS 1.3 (via iroh) give transport encryption and node-id
    authentication by construction (no TOFU window). Considered: replay, and connection-level tamper.
 4. **Local attacker** — another uid on the same host. Targets: the identity key file, the state dir,

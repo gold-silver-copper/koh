@@ -205,7 +205,7 @@ fn run() -> Result<bool, String> {
     for (name, why) in exempt::EXEMPTIONS {
         let count = oracle
             .tally
-            .0
+            .counts
             .iter()
             .find(|(n, _)| n == name)
             .map_or(0, |(_, c)| *c);

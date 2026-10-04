@@ -70,6 +70,16 @@ The driver stops at the first difference, shrinks the case (steps taken out a ch
 then output and keys shortened, lost frames delivered, ticks shortened, while the sides still
 differ), prints it, and saves it under `target/cases/`. `--replay` runs a saved case again.
 
+## Exemptions
+
+`driver/src/exempt.rs` names each change made on purpose since the commit compared against, and
+what sets it off. Each is taken out of every case before either side sees it, read as fux-vt
+reads it, so the rest of the case is still compared. A sequence split between two output steps
+is read whole, and an ESC inside a sequence starts the next one, as in fux-vt. The driver says how
+many times each applied. Reflow is exempted without dropping resizes: from a case's first resize
+on, the case runs on the alternate screen, which resizes without reflow. Once the commit compared
+against has a change, its exemption comes off the list.
+
 ## The planted bugs
 
 `plants/` holds five bugs, each a patch to koh; `testing/oracle.sh --plants` applies each to a

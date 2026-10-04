@@ -158,9 +158,9 @@ pub trait KohBackend {
             self.write_bytes(b"\x1b[9m")?;
         }
         match style.blink {
-            Blink::None => {}
             Blink::Slow => self.write_bytes(b"\x1b[5m")?,
             Blink::Rapid => self.write_bytes(b"\x1b[6m")?,
+            Blink::None | _ => {}
         }
         write_sgr_color(self, style.fg, true)?;
         write_sgr_color(self, style.bg, false)?;
@@ -218,9 +218,9 @@ pub trait KohBackend {
 /// which the reset before every style already restored.
 fn write_underline_color(out: &mut (impl KohBackend + ?Sized), color: Color) -> io::Result<()> {
     match color {
-        Color::Default => Ok(()),
         Color::Idx(i) => write!(out, "\x1b[58;5;{i}m"),
         Color::Rgb(r, g, b) => write!(out, "\x1b[58;2;{r};{g};{b}m"),
+        Color::Default | _ => Ok(()),
     }
 }
 
@@ -228,7 +228,6 @@ fn write_underline_color(out: &mut (impl KohBackend + ?Sized), color: Color) -> 
 /// (40–47/100–107) codes, which follow the user's theme, rather than `38;5;n`.
 fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool) -> io::Result<()> {
     match color {
-        Color::Default => out.write_bytes(if fg { b"\x1b[39m" } else { b"\x1b[49m" }),
         Color::Idx(i) if i < 8 => {
             let lead = if fg { 3 } else { 4 };
             write!(out, "\x1b[{lead}{i}m")
@@ -245,6 +244,7 @@ fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool)
             let lead = if fg { 38 } else { 48 };
             write!(out, "\x1b[{lead};2;{r};{g};{b}m")
         }
+        Color::Default | _ => out.write_bytes(if fg { b"\x1b[39m" } else { b"\x1b[49m" }),
     }
 }
 

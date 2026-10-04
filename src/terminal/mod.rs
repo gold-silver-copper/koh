@@ -173,9 +173,9 @@ pub enum WireColor {
 impl From<Color> for WireColor {
     fn from(c: Color) -> Self {
         match c {
-            Color::Default => Self::Default,
             Color::Idx(i) => Self::Idx(i),
             Color::Rgb(r, g, b) => Self::Rgb(r, g, b),
+            Color::Default | _ => Self::Default,
         }
     }
 }
@@ -239,9 +239,9 @@ impl WireStyle {
     fn of(attributes: Attributes) -> Self {
         let bit = |on: bool, b: u16| if on { b } else { 0 };
         let blink = match attributes.blink() {
-            Blink::None => 0,
             Blink::Slow => Self::BLINK_SLOW,
             Blink::Rapid => Self::BLINK_RAPID,
+            Blink::None | _ => 0,
         };
         // Only defined bits, and at most one blink.
         Self(
@@ -548,11 +548,11 @@ pub enum WireMouseMode {
 impl From<MouseProtocolMode> for WireMouseMode {
     fn from(mode: MouseProtocolMode) -> Self {
         match mode {
-            MouseProtocolMode::None => Self::None,
             MouseProtocolMode::Press => Self::Press,
             MouseProtocolMode::PressRelease => Self::PressRelease,
             MouseProtocolMode::ButtonMotion => Self::ButtonMotion,
             MouseProtocolMode::AnyMotion => Self::AnyMotion,
+            MouseProtocolMode::None | _ => Self::None,
         }
     }
 }
@@ -580,9 +580,9 @@ pub enum WireMouseEncoding {
 impl From<MouseProtocolEncoding> for WireMouseEncoding {
     fn from(encoding: MouseProtocolEncoding) -> Self {
         match encoding {
-            MouseProtocolEncoding::Default => Self::Default,
             MouseProtocolEncoding::Utf8 => Self::Utf8,
             MouseProtocolEncoding::Sgr => Self::Sgr,
+            MouseProtocolEncoding::Default | _ => Self::Default,
         }
     }
 }
@@ -1940,25 +1940,13 @@ mod tests {
     }
 
     #[test]
-    fn back_and_forward_tab_unsupported_but_roundtrip_clean() {
-        // mosh emulation-back-tab: in mosh's hand-written emulator, CBT (CSI Z) / CHT (CSI I)
-        // move between tab stops. fux-vt does NOT implement them (they are outside its sequence
-        // matrix), so they are no-ops (a known, minor divergence from mosh). What we DO guarantee
-        // is that the unhandled sequences round-trip identically server↔client and corrupt nothing.
-        // If fux-vt ever gains CBT/CHT, this test flips and should become the real mosh assertion
-        // ("hello, world" / a forward-tabbed "ab      tab").
+    fn back_and_forward_tab_roundtrip() {
+        // mosh emulation-back-tab: CBT (CSI Z) and CHT (CSI I) move between tab stops, and the
+        // result round-trips identically server↔client. fux-vt implements both since 0.3.
         let c = roundtrip(24, 80, b"hello, wurld\x1b[Zo");
-        assert_eq!(
-            row_text(c.screen(), 0),
-            "hello, wurldo",
-            "CBT currently a no-op in fux-vt"
-        );
+        assert_eq!(row_text(c.screen(), 0), "hello, world");
         let c2 = roundtrip(24, 80, b"ab\x1b[Itab");
-        assert_eq!(
-            row_text(c2.screen(), 0),
-            "abtab",
-            "CHT currently a no-op in fux-vt"
-        );
+        assert_eq!(row_text(c2.screen(), 0), "ab      tab");
     }
 
     #[test]

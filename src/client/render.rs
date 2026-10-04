@@ -627,29 +627,29 @@ impl InputModes {
         let prev_mode = prev.map_or(Mode::None, |p| p.mouse_mode);
         if self.mouse_mode != prev_mode {
             match self.mouse_mode {
-                Mode::None => buf.extend_from_slice(match prev_mode {
-                    Mode::None => b"",
-                    Mode::Press => b"\x1b[?9l",
-                    Mode::PressRelease => b"\x1b[?1000l",
-                    Mode::ButtonMotion => b"\x1b[?1002l",
-                    Mode::AnyMotion => b"\x1b[?1003l",
-                }),
                 Mode::Press => buf.extend_from_slice(b"\x1b[?9h"),
                 Mode::PressRelease => buf.extend_from_slice(b"\x1b[?1000h"),
                 Mode::ButtonMotion => buf.extend_from_slice(b"\x1b[?1002h"),
                 Mode::AnyMotion => buf.extend_from_slice(b"\x1b[?1003h"),
+                Mode::None | _ => buf.extend_from_slice(match prev_mode {
+                    Mode::Press => b"\x1b[?9l",
+                    Mode::PressRelease => b"\x1b[?1000l",
+                    Mode::ButtonMotion => b"\x1b[?1002l",
+                    Mode::AnyMotion => b"\x1b[?1003l",
+                    Mode::None | _ => b"",
+                }),
             }
         }
         let prev_enc = prev.map_or(Enc::Default, |p| p.mouse_encoding);
         if self.mouse_encoding != prev_enc {
             match self.mouse_encoding {
-                Enc::Default => buf.extend_from_slice(match prev_enc {
-                    Enc::Default => b"",
-                    Enc::Utf8 => b"\x1b[?1005l",
-                    Enc::Sgr => b"\x1b[?1006l",
-                }),
                 Enc::Utf8 => buf.extend_from_slice(b"\x1b[?1005h"),
                 Enc::Sgr => buf.extend_from_slice(b"\x1b[?1006h"),
+                Enc::Default | _ => buf.extend_from_slice(match prev_enc {
+                    Enc::Utf8 => b"\x1b[?1005l",
+                    Enc::Sgr => b"\x1b[?1006l",
+                    Enc::Default | _ => b"",
+                }),
             }
         }
         buf

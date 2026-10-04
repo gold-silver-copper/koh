@@ -9,6 +9,7 @@
 
 mod case;
 mod compare;
+mod exempt;
 mod inputs;
 #[expect(
     dead_code,
@@ -82,11 +83,14 @@ struct Oracle {
     side: Side,
     base: Side,
     bytes: (u64, u64),
+    tally: exempt::Tally,
 }
 
 impl Oracle {
     /// The difference the sides show on `case`, if any.
     fn check(&mut self, case: &Case) -> Result<Option<String>, String> {
+        let stripped = exempt::strip(case, &mut self.tally);
+        let case = &stripped;
         let (a, b) = match (self.base.run(case), self.side.run(case)) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), Ok(_)) | (Ok(_), Err(e)) => return Ok(Some(e)),
@@ -140,6 +144,7 @@ fn run() -> Result<bool, String> {
         side: Side::new("tree", args.side.clone()),
         base: Side::new("base", args.base.clone()),
         bytes: (0, 0),
+        tally: exempt::Tally::default(),
     };
     let started = Instant::now();
     if let Some(path) = &args.replay {
@@ -197,6 +202,15 @@ fn run() -> Result<bool, String> {
         "alike: {cases} cases in {:.1}s",
         started.elapsed().as_secs_f64()
     );
+    for (name, why) in exempt::EXEMPTIONS {
+        let count = oracle
+            .tally
+            .0
+            .iter()
+            .find(|(n, _)| n == name)
+            .map_or(0, |(_, c)| *c);
+        println!("exempt {name}: {count} taken out ({why})");
+    }
     Ok(true)
 }
 

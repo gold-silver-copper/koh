@@ -46,6 +46,22 @@ impl Sink for Observed {
     }
 }
 
+/// What the server's terminal does beyond fux-vt's defaults, each because koh carries it to the
+/// user:
+///
+/// - events: the title, icon, bell and clipboard, which the client mirrors;
+/// - extended replies: DECRQM, DECXCPR and secondary DA, as a terminal answers them;
+/// - reflow: a resize re-wraps the primary screen and its history, as the user's terminal would.
+///
+/// Left off: the kitty keyboard protocol (koh forwards the keys the user's terminal sends, so a
+/// program told it may use the protocol would get keys it did not ask for); prompt marks (koh does
+/// not carry scrollback, where they are used); rectangle checksums (a program reading back its
+/// screen, which xterm refuses by default).
+pub const OPTIONS: Options = Options::new()
+    .with_events(true)
+    .with_extended_replies(true)
+    .with_reflow(true);
+
 /// The server's terminal: the live parser, and the [`TerminalScreen`] snapshots it sends.
 ///
 /// fux-vt is panic-free and bounded: it keeps no control-string payload beyond the OSC
@@ -64,14 +80,8 @@ impl ServerTerminal {
     /// the allocation (see [`MAX_SCROLLBACK`](crate::server::cli::MAX_SCROLLBACK)).
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Result<Self, fux_vt::Error> {
         let Size { rows, cols } = clamp_dims(Size { rows, cols });
-        // Not the kitty keyboard protocol: koh forwards the keys the user's terminal sends, so a
-        // program told it may use the protocol would get keys it did not ask for. No reflow and no
-        // terminal identity either: a resize and the answers to queries stay as they were.
-        let mut options = Options::default();
-        options.events = true;
-        options.extended_replies = true;
         Ok(Self {
-            parser: Parser::with_options(rows, cols, scrollback, options)?,
+            parser: Parser::with_options(rows, cols, scrollback, OPTIONS)?,
             observed: Observed::default(),
             exit_code: None,
             rows: RowCache::default(),
@@ -211,6 +221,22 @@ mod tests {
         assert_eq!(t.take_host_replies(), b"\x1b[?1;2c");
         t.process(b"\x1b[>c"); // secondary DA
         assert_eq!(t.take_host_replies(), b"\x1b[>1;10;0c");
+    }
+
+    #[test]
+    fn a_resize_rewraps_the_primary_screen() {
+        let mut t = ServerTerminal::new(4, 20, 100).expect("emulator");
+        t.process(b"0123456789abcdefghijKLMNO");
+        t.resize(Size::new(4, 30));
+        let snapshot = t.snapshot();
+        let first = (0..30)
+            .filter_map(|col| snapshot.screen().cell(0, col))
+            .map(|c| c.contents().to_owned())
+            .collect::<String>();
+        assert_eq!(
+            first, "0123456789abcdefghijKLMNO",
+            "the wrapped line is one row again"
+        );
     }
 
     #[test]

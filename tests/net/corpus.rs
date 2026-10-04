@@ -239,8 +239,10 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
         CancellationToken::new(),
         None,
     ));
+    // The server's parser, with its options; the harness's server keeps no scrollback.
     let mut expected =
-        fux_vt::Parser::new(start.rows, start.cols, 0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        fux_vt::Parser::with_options(start.rows, start.cols, 0, koh::terminal::OPTIONS)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut result = Ok(());
     for (index, (step, output)) in recording.outputs().enumerate() {
         if let Some((rows, cols)) = step.resize {

@@ -170,7 +170,9 @@ impl Session {
         };
         Ok(Self {
             server: ServerTerminal::new(rows, cols, SCROLLBACK).map_err(|e| e.to_string())?,
-            expected: fux_vt::Parser::new(rows, cols, 0).map_err(|e| e.to_string())?,
+            // The server's parser, with its options and scrollback.
+            expected: fux_vt::Parser::with_options(rows, cols, SCROLLBACK, koh::terminal::OPTIONS)
+                .map_err(|e| e.to_string())?,
             client: ClientSession::new(DisplayPreference::Never, size),
             terminal: BackendTerminal::enter(capture.clone(), false).map_err(|e| e.to_string())?,
             capture,

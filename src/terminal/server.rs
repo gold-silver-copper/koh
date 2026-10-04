@@ -107,6 +107,8 @@ pub struct ServerTerminal {
     /// The screen as it was when the program last began a frame (synchronized output), a whole
     /// one, until taken.
     frame_start: Option<TerminalScreen>,
+    /// Whether the program began a frame since this was last asked.
+    frame_began: bool,
     /// Where the program's output ends a frame.
     frame_ends: FrameEnds,
 }
@@ -122,6 +124,7 @@ impl ServerTerminal {
             exit_code: None,
             rows: RowCache::default(),
             frame_start: None,
+            frame_began: false,
             frame_ends: FrameEnds::default(),
         })
     }
@@ -141,15 +144,24 @@ impl ServerTerminal {
         // before a BSU is known: at the start of its piece, or after a BSU earlier in it.
         let mut start = 0;
         let ends = self.frame_ends.after_each(bytes);
-        for end in ends.into_iter().chain(std::iter::once(bytes.len())) {
+        let pieces = ends.len();
+        for (piece, end) in ends
+            .into_iter()
+            .chain(std::iter::once(bytes.len()))
+            .enumerate()
+        {
             let mut rest = bytes.get(start..end).unwrap_or_default();
             start = end;
+            // A frame begun in any piece but the last is ended by the ESU that ends its piece,
+            // so only one begun in the last can still be drawn when these bytes are done.
+            let last = piece == pieces;
             loop {
                 let drawing = self.synchronized();
                 match self.parser.process_until_frame(rest, &mut self.observed) {
                     Ok(Some(taken)) if taken > 0 => {
                         if !drawing {
-                            self.frame_start = Some(self.snapshot());
+                            self.frame_start = last.then(|| self.snapshot());
+                            self.frame_began = true;
                         }
                         rest = rest.get(taken..).unwrap_or_default();
                     }
@@ -168,9 +180,13 @@ impl ServerTerminal {
         self.parser.screen().synchronized_output()
     }
 
-    /// The screen as it was when the program last began a frame, if not taken since.
-    pub fn take_frame_start(&mut self) -> Option<TerminalScreen> {
-        self.frame_start.take()
+    /// Whether the program began a frame since this was last asked, and the screen as it was
+    /// when it began the last one, if that one may still be drawn.
+    pub fn take_frame_start(&mut self) -> (bool, Option<TerminalScreen>) {
+        (
+            std::mem::take(&mut self.frame_began),
+            self.frame_start.take(),
+        )
     }
 
     /// Take the replies to the program's queries, which the caller must write to its input.
@@ -259,7 +275,25 @@ impl FrameEnds {
     /// The offsets in `bytes` just past each ESU.
     fn after_each(&mut self, bytes: &[u8]) -> Vec<usize> {
         let mut ends = Vec::new();
-        for (at, &byte) in bytes.iter().enumerate() {
+        let mut at = 0usize;
+        while let Some(&byte) = bytes.get(at) {
+            // Outside a sequence only an ESC matters, and in one that cannot be an ESU only its
+            // end: the bytes between are skipped.
+            let skip = match self.state {
+                Scan::Ground => byte != 0x1b,
+                Scan::Other => byte != 0x1b && !(0x40..=0x7e).contains(&byte),
+                Scan::Escape | Scan::Csi | Scan::Private => false,
+            };
+            if skip {
+                let rest = bytes.get(at..).unwrap_or_default();
+                let ends =
+                    |b: &u8| *b == 0x1b || (self.state == Scan::Other && (0x40..=0x7e).contains(b));
+                at = rest
+                    .iter()
+                    .position(ends)
+                    .map_or(bytes.len(), |next| at.saturating_add(next));
+                continue;
+            }
             self.state = match (self.state, byte) {
                 (_, 0x1b) => Scan::Escape,
                 (Scan::Escape, b'[') => Scan::Csi,
@@ -283,6 +317,7 @@ impl FrameEnds {
                 (Scan::Csi | Scan::Private | Scan::Other, _) => Scan::Other,
                 (Scan::Ground, _) => Scan::Ground,
             };
+            at = at.saturating_add(1);
         }
         ends
     }
@@ -314,13 +349,13 @@ impl FrameHold {
         emu: &mut ServerTerminal,
         now: Instant,
     ) -> Option<TerminalScreen> {
-        let started = emu.take_frame_start();
+        let (began, started) = emu.take_frame_start();
         if !emu.synchronized() {
             self.since = None;
             self.released = false;
             return Some(emu.snapshot());
         }
-        if started.is_some() {
+        if began {
             // A frame began in this output, so any before it ended: hold this one from now, even
             // if the one before was let go and ended within the same output.
             self.since = Some(now);
@@ -571,14 +606,16 @@ mod tests {
     fn a_frame_end_split_between_reads_is_found() {
         let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
         t.process(b"\x1b[?2026h\x1b[2Kone");
-        drop(t.take_frame_start());
+        let _ = t.take_frame_start();
         // The ESU in two reads, then the next frame begins: it starts from the frame ended.
         t.process(b"\x1b[?20");
         t.process(b"26l\x1b[?2026h\x1b[H\x1b[2Ktw");
-        assert_eq!(top(&t.take_frame_start().expect("a frame began")), "one");
+        let (began, started) = t.take_frame_start();
+        assert!(began);
+        assert_eq!(top(&started.expect("a frame began")), "one");
         // A BSU again while the frame is drawn begins none.
         t.process(b"o\x1b[?2026h");
-        assert!(t.take_frame_start().is_none());
+        assert_eq!(t.take_frame_start(), (false, None));
     }
 
     #[test]

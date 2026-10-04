@@ -40,7 +40,10 @@ src/
 └── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identity, reset it
 tests/net/           koh over a fault-injecting link between real iroh endpoints
 tests/               PTYs, sessions, loopback e2e, admission, the binary on a PTY, upgrade in
-                     place, key creation races, and the Android suites (opt-in)
+                     place, key creation races, the corpus, and the Android suites (opt-in)
+testing/corpus/      113 real programs' output (from fux), replayed by tests, oracle and bench
+testing/oracle/      koh at the working tree beside koh at a commit (`testing/oracle.sh`)
+testing/bench/       the scoreboard: koh beside mosh and ssh (`testing/scoreboard.sh`)
 ```
 
 Dependency direction is strict: `proto` sits on `terminal`; `server` and `client` (+ the `koh`
@@ -327,6 +330,13 @@ deterministically:
 - **Property tests and fuzzing** on the attacker-reachable parsers — assert never-panic and bounded.
   Coverage-guided fuzz targets: `screen_apply` (the structured diff), `server_process` and
   `proto_decode` (both directions of the wire).
+- **The corpus** (`tests/corpus.rs`) — 113 recordings of real programs (`testing/corpus/`, from
+  fux: shells, editors, pagers, TUIs, compilers, claude) through the whole pipeline in PTY-sized
+  pieces with their resizes: snapshot, frame, encoder and decoder, `ClientSession`, koh's own
+  `BackendTerminal`. After every frame, a fux-vt terminal reading every painted byte must show
+  what a fux-vt parser fed the same output shows; over a lossy link too, where it must converge on
+  every step. The recordings known to show otherwise are listed with the reason
+  (`testing/corpus/recording.rs`).
 
 ### Tier 1 — real iroh endpoints on one machine (`cargo test`)
 
@@ -337,8 +347,10 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   custom transport): loss, delay, jitter, duplication, reordering and outages under real QUIC. It
   covers screen convergence (and that a stale screen is never shown), exactly-once ordered input,
   reattach, a forced mid-session drop, exit status, resize, XON/XOFF, input backpressure, the bell
-  hook, prediction and the no-echo property, and hostile clients and servers. An `#[ignore]`d
-  baseline measures echo latency, output bursts, bytes and outage recovery per network profile.
+  hook, prediction and the no-echo property, and hostile clients and servers. The corpus runs
+  here too, through a real server and client under loss (eleven recordings by default, every one
+  with `KOH_NET_CORPUS=all`). An `#[ignore]`d baseline measures echo latency, output bursts, bytes
+  and outage recovery per network profile.
 - **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs, started through
   the `koh` binary's `__launch`: output streaming and teardown, exit statuses, the
   reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its
@@ -356,6 +368,19 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   restarted under a connected client, which finds it again.
 - **`tests/upgrade_in_place.rs`** (Linux) — a running `koh serve` whose binary file is removed
   still starts sessions, because it launches them from `/proc/self/exe`.
+
+Two harnesses sit beside the tests, each its own Cargo workspace:
+
+- **The oracle** (`testing/oracle.sh`, [`testing/oracle/`](../testing/oracle/README.md)) runs koh
+  at the working tree and koh at a commit (the merge base with `origin/main` by default) on the
+  same sessions (the corpus, and random output, keystrokes, lost frames, time and resizes) and
+  compares what the user's terminal would show, the replies and the client's messages after every
+  step, reporting each side's frame bytes. A difference is shrunk and saved. It finds each of five
+  planted bugs (`testing/oracle.sh --plants`).
+- **The scoreboard** (`testing/scoreboard.sh`, [`testing/bench/`](../testing/bench/README.md))
+  writes [`SCOREBOARD.md`](SCOREBOARD.md): koh beside mosh and ssh by bytes on the wire for each
+  recording and synthetic workload, keystroke latency beside a flood on three links, server memory
+  per session and instructions retired.
 
 Terminal I/O is behind `ClientTerminal`, so the same session loop runs against the real terminal
 (binary) or a capturing mock (tests). One layer down, `client::backend::KohBackend`'s provided

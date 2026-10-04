@@ -38,8 +38,11 @@ impl Sink for Observed {
             Event::Title(t) => self.title = title_from(t),
             Event::IconName(n) => self.icon = title_from(n),
             Event::Bell => self.bell_count = self.bell_count.saturating_add(1),
-            // `data` is base64 already.
-            Event::Clipboard { data, .. } if data.len() <= MAXIMUM_CLIPBOARD_SIZE => {
+            // `data` is base64 already. A query (`?`) asks for the clipboard, which koh never
+            // reads, so it is not one to set.
+            Event::Clipboard { data, .. }
+                if data.len() <= MAXIMUM_CLIPBOARD_SIZE && data != b"?" =>
+            {
                 self.clipboard = String::from_utf8_lossy(data).into_owned();
             }
             // An oversized clipboard is dropped; `_` is for events a later fux-vt adds.
@@ -582,6 +585,14 @@ mod tests {
         assert!(!t.synchronized());
         assert!(hold.expire(&mut t, now + FRAME_HOLD).is_none());
         assert!(!hold.holding());
+    }
+
+    #[test]
+    fn a_clipboard_query_sets_nothing() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        t.process(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07");
+        assert_eq!(t.snapshot().clipboard(), "aGVsbG8=");
+        assert_eq!(t.take_host_replies(), b"", "nor is it answered");
     }
 
     #[test]

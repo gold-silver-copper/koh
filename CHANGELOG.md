@@ -28,6 +28,14 @@ error; upgrade both ends.
   restarted server and reattaches, to a fresh session. A port already in use is a clear error.
 
 ### Changed
+- **Clipboard writes are on by default.** A remote program's OSC 52 copy now sets your clipboard
+  without `--clipboard`, which is gone; `koh connect --no-clipboard` turns it off. A hostile server
+  can therefore replace what you copied, so pass `--no-clipboard` to a server you do not trust.
+  Only base64 of at most 1 MiB is forwarded, and the clipboard is never read.
+- The server's terminal re-wraps the screen and its history on a resize (reflow), answers the size
+  query and in-band resize (mode 2048), keeps a program's colours (OSC 4, 10, 11) and draws them as
+  RGB without changing your terminal's palette, and answers device attributes and XTVERSION as
+  koh. A frame a program draws with synchronized output (DEC 2026) is no longer sent half drawn.
 - Updated `fux-vt` 0.2.0 → 0.3.0. Bold and dim can now be on together (`SGR 1;2`), as in xterm,
   where before the later one replaced the earlier; CBT (`CSI Z`) and CHT (`CSI I`) now move between
   tab stops, as mosh's emulator does. The wire is unchanged.

@@ -36,7 +36,7 @@ koh key reset --yes       # delete the identity key; the next use creates a new 
 Useful flags:
 
 ```sh
---clipboard               # opt in to OSC-52 clipboard writes
+--no-clipboard            # ignore the server's OSC-52 clipboard writes (on by default)
 --on-bell <cmd>           # run a shell command whenever the remote bell rings
 --shell <program>         # host a program instead of the login shell (repeat to pass args)
 --key-file <path>         # use a custom identity-key path

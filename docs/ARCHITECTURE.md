@@ -108,9 +108,13 @@ touches no row. A snapshot reads each live row's fux-vt id and version, which fu
 when an edit changes the row: a row at the id and version the last snapshot saw at its place is
 taken as it was, one seen elsewhere is found by id, and if no row changed the snapshot shares the
 last one's list whole. Counting a window's memory looks only at the rows that differ from the
-newest screen's at the same place. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's
-opt-in events (title, icon, bell, clipboard) and extended replies (DECRQM, DECXCPR, secondary DA)
-turned on. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
+newest screen's at the same place. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with the options in
+`terminal::OPTIONS`, each for what koh carries: events (title, icon, bell, clipboard), extended
+replies (DECRQM, DECXCPR, secondary DA), in-band resize and the size query, the palette (a
+program's colours, drawn as RGB in snapshots, so the user's palette never changes), reflow, and
+koh's identity for device attributes and XTVERSION. A frame a program draws with synchronized
+output is not sent half drawn (`FrameHold`): while it is drawn the screen from before it goes out,
+and it is let go after 150 ms. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
 cursor and the modes; after a resize the client starts from a blank grid and receives every
 non-blank row.
 

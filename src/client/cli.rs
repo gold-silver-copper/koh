@@ -27,7 +27,7 @@ pub struct ConnectConfig {
     pub direct: Option<SocketAddr>,
     /// Dial through a self-hosted relay instead of n0's.
     pub relay_url: Option<RelayUrl>,
-    /// Let the server set the clipboard (OSC 52).
+    /// Let the server set the clipboard (OSC 52); on unless `--no-clipboard`.
     pub clipboard: bool,
     /// A shell command to run on the remote bell (see [`BellHook`]).
     pub bell_command: Option<String>,
@@ -41,7 +41,7 @@ impl ConnectConfig {
             key_file: None,
             direct: None,
             relay_url: None,
-            clipboard: false,
+            clipboard: true,
             bell_command: None,
         }
     }

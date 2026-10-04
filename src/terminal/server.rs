@@ -46,6 +46,15 @@ impl Sink for Observed {
     }
 }
 
+/// Who the server's terminal says it is: koh, at this version.
+///
+/// It answers device attributes (`CSI c`, `CSI > c`) and XTVERSION (`CSI > q`) with it. A name no
+/// program knows makes no program assume a feature of a terminal it does know.
+pub const IDENTITY: fux_vt::Identity = fux_vt::Identity {
+    name: "koh",
+    version: env!("CARGO_PKG_VERSION"),
+};
+
 /// What the server's terminal does beyond fux-vt's defaults, each because koh carries it to the
 /// user:
 ///
@@ -53,7 +62,8 @@ impl Sink for Observed {
 /// - extended replies: DECRQM, DECXCPR and secondary DA, as a terminal answers them;
 /// - in-band resize (mode 2048) and the size query (`CSI 18 t`): koh knows the size, and tells a
 ///   program that asks, after a resize too;
-/// - reflow: a resize re-wraps the primary screen and its history, as the user's terminal would.
+/// - reflow: a resize re-wraps the primary screen and its history, as the user's terminal would;
+/// - koh's [`IDENTITY`].
 ///
 /// Left off: the kitty keyboard protocol (koh forwards the keys the user's terminal sends, so a
 /// program told it may use the protocol would get keys it did not ask for); prompt marks (koh does
@@ -64,7 +74,8 @@ pub const OPTIONS: Options = Options::new()
     .with_extended_replies(true)
     .with_in_band_resize(true)
     .with_size_reports(true)
-    .with_reflow(true);
+    .with_reflow(true)
+    .with_identity(Some(IDENTITY));
 
 /// The server's terminal: the live parser, and the [`TerminalScreen`] snapshots it sends.
 ///
@@ -225,12 +236,29 @@ mod tests {
     }
 
     #[test]
-    fn answers_device_attributes() {
+    fn answers_device_attributes_and_xtversion_as_koh() {
         let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.process(b"\x1b[c"); // primary DA: fux-vt answers as a VT100 with advanced video
-        assert_eq!(t.take_host_replies(), b"\x1b[?1;2c");
-        t.process(b"\x1b[>c"); // secondary DA
-        assert_eq!(t.take_host_replies(), b"\x1b[>1;10;0c");
+        t.process(b"\x1b[c"); // primary DA: a VT220-class terminal with ANSI colour
+        assert_eq!(t.take_host_replies(), b"\x1b[?62;22c");
+        // Secondary DA: koh's version as major * 10000 + minor * 100 + patch.
+        let mut parts = env!("CARGO_PKG_VERSION")
+            .split('.')
+            .map(|p| p.parse::<u32>().expect("a number"));
+        let (major, minor, patch) = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        t.process(b"\x1b[>c");
+        assert_eq!(
+            t.take_host_replies(),
+            format!("\x1b[>1;{};0c", major * 10000 + minor * 100 + patch).as_bytes()
+        );
+        t.process(b"\x1b[>q"); // XTVERSION
+        assert_eq!(
+            t.take_host_replies(),
+            format!("\x1bP>|koh {}\x1b\\", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
     }
 
     #[test]

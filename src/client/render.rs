@@ -1270,6 +1270,35 @@ mod tests {
         assert_eq!(looks(&terminal), expected);
     }
 
+    #[test]
+    fn a_programs_colours_are_painted_without_changing_the_users_palette() {
+        let screen = crate::terminal::TerminalScreen::from_bytes(
+            6,
+            20,
+            b"\x1b]4;1;#ff0000\x07\x1b]11;#000080\x07\x1b[31mR",
+        );
+        let mut backend = CaptureBackend {
+            size: Size::new(6, 20),
+            ..CaptureBackend::default()
+        };
+        Painter::default()
+            .render(&mut backend, screen.screen(), &Overlay::empty(), None)
+            .unwrap();
+        let painted = String::from_utf8_lossy(&backend.bytes).into_owned();
+        for osc in ["\x1b]4", "\x1b]10", "\x1b]11", "\x1b]104", "\x1b]11"] {
+            assert!(!painted.contains(osc), "{osc:?} sent: {painted:?}");
+        }
+        let options = fux_vt::Options::new().with_palette(true);
+        let mut terminal = fux_vt::Parser::with_options(6, 20, 0, options).unwrap();
+        terminal.process(&backend.bytes).unwrap();
+        assert!(!terminal.screen().colors_changed(), "the user's palette");
+        let cell = terminal.screen().cell(0, 0).unwrap();
+        assert_eq!(
+            (cell.contents(), cell.fgcolor(), cell.bgcolor()),
+            ("R", Color::Rgb(0xff, 0, 0), Color::Rgb(0, 0, 0x80))
+        );
+    }
+
     fn paint_into(
         painter: &mut Painter,
         terminal: &mut fux_vt::Parser,

@@ -62,6 +62,9 @@ pub const IDENTITY: fux_vt::Identity = fux_vt::Identity {
 /// - extended replies: DECRQM, DECXCPR and secondary DA, as a terminal answers them;
 /// - in-band resize (mode 2048) and the size query (`CSI 18 t`): koh knows the size, and tells a
 ///   program that asks, after a resize too;
+/// - the palette: a program's colours (OSC 4, 10, 11 and the rest) are kept and answered, and
+///   snapshots draw them as RGB, so the user's own palette never changes and nothing is left
+///   changed when they detach;
 /// - reflow: a resize re-wraps the primary screen and its history, as the user's terminal would;
 /// - koh's [`IDENTITY`].
 ///
@@ -74,6 +77,7 @@ pub const OPTIONS: Options = Options::new()
     .with_extended_replies(true)
     .with_in_band_resize(true)
     .with_size_reports(true)
+    .with_palette(true)
     .with_reflow(true)
     .with_identity(Some(IDENTITY));
 
@@ -277,6 +281,36 @@ mod tests {
             t.resize_report().as_deref(),
             Some(&b"\x1b[48;20;60;0;0t"[..])
         );
+    }
+
+    #[test]
+    fn a_programs_colours_are_drawn_as_rgb_until_it_resets_them() {
+        use fux_vt::Color;
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        t.process(b"\x1b[31mR\x1b[39mD");
+        let colours = |t: &mut ServerTerminal, col: u16| {
+            let snapshot = t.snapshot();
+            let cell = snapshot.screen().cell(0, col).expect("a cell");
+            (cell.fgcolor(), cell.bgcolor())
+        };
+        assert_eq!(colours(&mut t, 0), (Color::Idx(1), Color::Default));
+        // The row's cells do not change, only how they are drawn: the snapshot draws them anew.
+        t.process(b"\x1b]4;1;#ff0000\x1b\\\x1b]10;rgb:11/22/33\x07\x1b]11;#000080\x07");
+        let navy = Color::Rgb(0, 0, 0x80);
+        assert_eq!(colours(&mut t, 0), (Color::Rgb(0xff, 0, 0), navy));
+        assert_eq!(colours(&mut t, 1), (Color::Rgb(0x11, 0x22, 0x33), navy));
+        assert_eq!(
+            colours(&mut t, 7).1,
+            navy,
+            "a blank cell is in the background set"
+        );
+        // Reset, each colour is the user's terminal's again.
+        t.process(b"\x1b]104;1\x07\x1b]110\x07\x1b]111\x07");
+        assert_eq!(colours(&mut t, 0), (Color::Idx(1), Color::Default));
+        assert_eq!(colours(&mut t, 1), (Color::Default, Color::Default));
+        // The program is answered with the colours it set.
+        t.process(b"\x1b]4;1;#00ff00\x07\x1b]4;1;?\x07");
+        assert_eq!(t.take_host_replies(), b"\x1b]4;1;rgb:0000/ffff/0000\x07");
     }
 
     #[test]

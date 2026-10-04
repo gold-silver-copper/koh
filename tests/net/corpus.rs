@@ -144,7 +144,12 @@ fn difference(shown: &fux_vt::Screen, expected: &fux_vt::Screen) -> Option<Strin
                     )
                 })
             };
-            let (a, b) = (look(shown), look(expected));
+            let mut b = look(expected);
+            // The server draws a program's colours as RGB.
+            if let Some(cell) = b.as_mut() {
+                cell.3 = koh::terminal::drawn(cell.3, expected);
+            }
+            let (a, b) = (look(shown), b);
             if a != b {
                 return Some(format!("cell ({row}, {col}): shown {a:?}, expected {b:?}"));
             }

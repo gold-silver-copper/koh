@@ -17,7 +17,7 @@ mod grid;
 mod server;
 
 pub use crate::predict::Size;
-pub use grid::{Grid, Modes};
+pub use grid::{drawn, Grid, Modes};
 pub use server::{ServerTerminal, IDENTITY, OPTIONS};
 
 /// Default screen geometry, used for the blank screen both ends start from.

@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::num::{NonZeroI16, NonZeroU16};
 use std::sync::Arc;
 
-use fux_vt::{Cell, CellRef, Cells, MouseProtocolEncoding, MouseProtocolMode, RowId};
+use fux_vt::{
+    Attributes, Cell, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, RowId,
+};
 
 use super::{Shift, Shifts, MAX_SHIFTS};
 use crate::predict::{CellView, ScreenView, Size};
@@ -71,10 +73,79 @@ impl PartialEq for Row {
 
 impl Eq for Row {}
 
+/// The colours a program set (OSC 4, and the default foreground and background with OSC 10 and
+/// 11), by which a snapshot draws its cells: each set entry, and each set default, as RGB.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Palette {
+    /// By index, the colour the program set it to; `None` where it left it alone or reset it.
+    entries: Vec<Option<(u8, u8, u8)>>,
+    foreground: Option<(u8, u8, u8)>,
+    background: Option<(u8, u8, u8)>,
+}
+
+impl Palette {
+    /// The colours `screen`'s program set, or `None` if it set none, as most do not.
+    fn of(screen: &fux_vt::Screen) -> Option<Self> {
+        screen.colors_changed().then(|| Self {
+            entries: (0..=u8::MAX).map(|i| screen.palette_color(i)).collect(),
+            foreground: screen.dynamic_color(10),
+            background: screen.dynamic_color(11),
+        })
+    }
+
+    /// `attributes` in these colours: an indexed colour whose entry was set as the colour set,
+    /// and the default foreground and background, if set, as those; every other colour as it is,
+    /// for the user's terminal to draw in its own. A default underline colour is the text's, and
+    /// stays.
+    fn draw(&self, attributes: Attributes) -> Attributes {
+        let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb(r, g, b);
+        let colour = |c: Color, default: Option<(u8, u8, u8)>| match c {
+            Color::Idx(n) => self
+                .entries
+                .get(usize::from(n))
+                .copied()
+                .flatten()
+                .map_or(c, rgb),
+            Color::Default => default.map_or(c, rgb),
+            Color::Rgb(..) | _ => c,
+        };
+        attributes
+            .with_foreground(colour(attributes.foreground(), self.foreground))
+            .with_background(colour(attributes.background(), self.background))
+            .with_underline_color(colour(attributes.underline_color(), None))
+    }
+
+    /// `cells` drawn in these colours. The right half of a wide glyph is drawn with its left.
+    fn recolor(&self, cells: &mut Cells) {
+        for i in 0..cells.len() {
+            let Some(attributes) = cells
+                .get(i)
+                .filter(|cell| !cell.is_wide_continuation())
+                .map(|cell| cell.attributes())
+            else {
+                continue;
+            };
+            let drawn = self.draw(attributes);
+            if drawn != attributes {
+                cells.set_attributes(i, drawn);
+            }
+        }
+    }
+}
+
+/// `attributes` as a snapshot of `screen` draws them: in the colours its program set, if any. What
+/// a terminal reading the client's paint shows for a cell of `screen`.
+pub fn drawn(attributes: Attributes, screen: &fux_vt::Screen) -> Attributes {
+    Palette::of(screen).map_or(attributes, |palette| palette.draw(attributes))
+}
+
 /// The last snapshot's rows, with each one's fux-vt row id and version then: a row whose cells are
 /// unchanged is shared with the next snapshot, wherever it moved, instead of copied.
 #[derive(Default)]
 pub(super) struct RowCache {
+    /// The palette the rows were drawn in. A new palette changes no row's version, so it starts
+    /// the cache over.
+    palette: Option<Palette>,
     /// By live index, the id and version of the row the snapshot took there.
     ids: Vec<(RowId, u64)>,
     /// The snapshot's rows, which the next one shares whole when no row changed.
@@ -127,12 +198,15 @@ impl RowCache {
     }
 }
 
-/// A copy of `row`, cells and text, exactly `cols` wide. A live row is exactly that wide;
-/// anything longer is cut, anything shorter padded with blank cells.
-fn exactly(row: Option<&fux_vt::Row<'_>>, cols: u16) -> Arc<Cells> {
+/// A copy of `row`, cells and text, exactly `cols` wide, drawn in `palette`. A live row is exactly
+/// that wide; anything longer is cut, anything shorter padded with blank cells.
+fn exactly(row: Option<&fux_vt::Row<'_>>, cols: u16, palette: Option<&Palette>) -> Arc<Cells> {
     let mut cells: Cells = row.map_or_else(Cells::default, |row| row.cells().collect());
     if cells.len() != usize::from(cols) {
         cells.resize(usize::from(cols), Cell::default());
+    }
+    if let Some(palette) = palette {
+        palette.recolor(&mut cells);
     }
     Arc::new(cells)
 }
@@ -169,6 +243,13 @@ impl Grid {
         let (rows, cols) = screen.size();
         let window = screen.window(0, rows, cols);
         let live: Vec<fux_vt::Row<'_>> = (0..rows).filter_map(|row| window.row(row)).collect();
+        let palette = Palette::of(screen);
+        if palette != cache.palette {
+            *cache = RowCache {
+                palette,
+                ..RowCache::default()
+            };
+        }
         // If not a row changed, the last snapshot's rows are shared whole.
         if live.len() != usize::from(rows) || !cache.holds(&live) {
             let mut by_id = None;
@@ -176,14 +257,14 @@ impl Grid {
                 .map(|index| {
                     let Some(row) = live.get(index) else {
                         return Row {
-                            cells: exactly(None, cols),
+                            cells: exactly(None, cols, cache.palette.as_ref()),
                             wrapped: false,
                         };
                     };
                     Row {
                         cells: cache
                             .cells(index, row, &mut by_id)
-                            .unwrap_or_else(|| exactly(Some(row), cols)),
+                            .unwrap_or_else(|| exactly(Some(row), cols, cache.palette.as_ref())),
                         wrapped: row.wrapped(),
                     }
                 })

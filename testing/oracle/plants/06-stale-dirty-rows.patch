@@ -1,0 +1,14 @@
+diff --git i/src/terminal/grid.rs w/src/terminal/grid.rs
+index c86b70d..6908c23 100644
+--- i/src/terminal/grid.rs
++++ w/src/terminal/grid.rs
+@@ -430,7 +430,8 @@ impl Grid {
+             return None;
+         }
+         let mut lines: Option<Vec<Row>> = None;
+-        for (index, row) in screen.dirty_live_rows_since(mark) {
++        // PLANTED: only the first row that changed is taken.
++        for (index, row) in screen.dirty_live_rows_since(mark).take(1) {
+             let at = usize::from(index);
+             let line = Row {
+                 cells: exactly(Some(&row), cols, cache.palette.as_ref()),

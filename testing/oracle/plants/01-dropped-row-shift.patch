@@ -1,9 +1,9 @@
 diff --git i/src/terminal/mod.rs w/src/terminal/mod.rs
-index 395a25f..7827950 100644
+index 670208f..ae3c6d8 100644
 --- i/src/terminal/mod.rs
 +++ w/src/terminal/mod.rs
-@@ -834,7 +834,9 @@ impl TerminalScreen {
-             exit_code: self.exit_code,
+@@ -1430,7 +1430,9 @@ impl TerminalScreen {
+             tty: self.tty.filter(|_| self.tty != base.tty),
              cursor: self.grid.cursor_position(),
              modes: self.grid.modes().into(),
 -            shifts,

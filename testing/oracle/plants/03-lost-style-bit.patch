@@ -1,8 +1,8 @@
 diff --git i/src/terminal/mod.rs w/src/terminal/mod.rs
-index 5b5e298..421512e 100644
+index 670208f..78038aa 100644
 --- i/src/terminal/mod.rs
 +++ w/src/terminal/mod.rs
-@@ -281,7 +281,7 @@ impl WireStyle {
+@@ -512,7 +512,7 @@ impl WireStyle {
                  | bit(attributes.underline(), Self::UNDERLINE)
                  | bit(attributes.inverse(), Self::INVERSE)
                  | bit(attributes.hidden(), Self::HIDDEN)

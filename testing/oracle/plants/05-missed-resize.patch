@@ -1,8 +1,8 @@
 diff --git i/src/terminal/server.rs w/src/terminal/server.rs
-index 7ea5727..1fd0e03 100644
+index 896ac45..368b066 100644
 --- i/src/terminal/server.rs
 +++ w/src/terminal/server.rs
-@@ -100,6 +100,10 @@ impl ServerTerminal {
+@@ -206,6 +206,10 @@ impl ServerTerminal {
      /// logged.
      pub fn resize(&mut self, size: Size) {
          let Size { rows, cols } = clamp_dims(size);

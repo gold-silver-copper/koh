@@ -32,6 +32,9 @@ build_side_at() {
     fi
     mkdir -p "$tree/$oracle"
     cp "$oracle/Cargo.toml" "$tree/$oracle/"
+    # The working tree's temporary patch to unpublished fux crates is not the commit's: the
+    # commit builds with the versions its own lockfile names.
+    sed -i '/^# TEMPORARY/,$d' "$tree/$oracle/Cargo.toml"
     rm -rf "$tree/$oracle/side" "$tree/$oracle/driver"
     cp -R "$oracle/side" "$oracle/driver" "$tree/$oracle/"
     cp "$tree/Cargo.lock" "$tree/$oracle/Cargo.lock"

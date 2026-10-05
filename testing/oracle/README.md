@@ -81,10 +81,6 @@ on, the case runs on the alternate screen, which resizes without reflow. Once th
 against has a change, its exemption comes off the list. Against `main` (which has the rest) only
 reflow remains, for fux-vt 0.3.1's fix: a shrink brings no history row back above the cursor.
 
-While koh's working tree builds against unpublished fux crates through a `[patch]` in
-`testing/oracle/Cargo.toml`, a commit's side is built without it, with the versions the commit's
-own lockfile names (`oracle.sh` strips the patch).
-
 ## The planted bugs
 
 `plants/` holds six bugs, each a patch to koh; `testing/oracle.sh --plants` applies each to a

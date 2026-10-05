@@ -443,6 +443,20 @@ mod tests {
     use crate::terminal::Grid;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn a_palette_change_redraws_rows_that_did_not_change() {
+        // Setting a palette entry changes no row's version: the snapshot from the rows changed
+        // since the last must still draw every row in the new colour.
+        let mut emu = ServerTerminal::new(4, 10, 0).unwrap();
+        emu.process(b"\x1b[31mred\x1b[m");
+        let before = emu.snapshot();
+        emu.process(b"\x1b]4;1;rgb:10/20/30\x07");
+        let after = emu.snapshot();
+        let colour = |s: &TerminalScreen| s.screen().cell(0, 0).unwrap().attributes().foreground();
+        assert_eq!(colour(&before), fux_vt::Color::Idx(1));
+        assert_eq!(colour(&after), fux_vt::Color::Rgb(0x10, 0x20, 0x30));
+    }
+
     /// Output that changes rows in every way: text, rewriting a row the same, erasing, scrolling,
     /// inserted and deleted lines, the alternate screen, a reset.
     const PIECES: [&str; 12] = [

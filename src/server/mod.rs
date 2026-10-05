@@ -209,6 +209,14 @@ const DELIVERY_SAMPLES: usize = 16;
 /// QUIC's initial window.
 const INITIAL_BUDGET: usize = 12_000;
 
+/// Most frames in flight: half the window of frames the server keeps (and the client keeps as
+/// bases), so that every frame in flight is still in the window when its delivery is heard of, and
+/// a fast program on a slow round trip cannot outrun the acknowledgements.
+const MAX_IN_FLIGHT: usize = FRAME_WINDOW.div_euclid(2);
+
+/// Most frames in flight with which an echo still goes at once: past them it waits like any frame.
+const MAX_IN_FLIGHT_ECHO: usize = FRAME_WINDOW - 2;
+
 /// Most rows a frame may change and still go at once as the program's echo of the user's input.
 const ECHO_ROWS: usize = 4;
 
@@ -383,12 +391,32 @@ impl ServerConn {
     /// The frame bytes in flight at `now`: sent, not delivered, and not given up on (a frame not
     /// delivered within a retry interval is lost, or reset, and its newest screen is resent).
     fn in_flight_bytes(&self, now: Instant, rtt: Option<Duration>) -> usize {
+        self.live_in_flight(now, rtt)
+            .map(|(_, bytes, _)| *bytes)
+            .fold(0, usize::saturating_add)
+    }
+
+    /// The frames in flight at `now` (as [`in_flight_bytes`](Self::in_flight_bytes) counts them).
+    fn in_flight_frames(&self, now: Instant, rtt: Option<Duration>) -> usize {
+        self.live_in_flight(now, rtt).count()
+    }
+
+    fn live_in_flight(
+        &self,
+        now: Instant,
+        rtt: Option<Duration>,
+    ) -> impl Iterator<Item = &(FrameNum, usize, Instant)> {
         let given_up = retry_after(rtt);
         self.in_flight
             .iter()
-            .filter(|(_, _, sent)| now.saturating_duration_since(*sent) < given_up)
-            .map(|(_, bytes, _)| *bytes)
-            .fold(0, usize::saturating_add)
+            .filter(move |(_, _, sent)| now.saturating_duration_since(*sent) < given_up)
+    }
+
+    /// Whether the link has room for a frame at `now`: the bytes in flight under the budget (or
+    /// none), and fewer frames in flight than `most`.
+    fn room(&self, now: Instant, rtt: Option<Duration>, most: usize) -> bool {
+        let bytes = self.in_flight_bytes(now, rtt);
+        (bytes == 0 || bytes < self.budget(rtt)) && self.in_flight_frames(now, rtt) < most
     }
 
     /// The frame bytes the link may have in flight: about a round trip's worth.
@@ -432,12 +460,14 @@ impl ServerConn {
             .last_sent_at
             .map(|at| now.saturating_duration_since(at));
         let passed = |floor: Duration| since.is_none_or(|since| since >= floor);
-        let in_flight = self.in_flight_bytes(now, rtt);
-        let room = in_flight == 0 || in_flight < self.budget(rtt);
+        let room = self.room(now, rtt, MAX_IN_FLIGHT);
         let unacked = self.last_num > self.acked.num;
         let retry_due = unacked && since.is_some_and(|since| since >= retry_after(rtt));
         let heartbeat_due = since.is_none_or(|since| since >= HEARTBEAT);
-        let echo = self.unsent_change && passed(ECHO_FLOOR) && self.carries_echo();
+        let echo = self.unsent_change
+            && passed(ECHO_FLOOR)
+            && self.carries_echo()
+            && self.in_flight_frames(now, rtt) < MAX_IN_FLIGHT_ECHO;
         let due = (changed && passed(FRAME_FLOOR) && room) || echo || retry_due || heartbeat_due;
         if !due {
             return None;
@@ -505,20 +535,35 @@ impl ServerConn {
             .map_or(now, |at| at.checked_add(HEARTBEAT).unwrap_or(now));
         let changed = self.unsent_change || self.echo.echo_ack() != self.last_sent_echo;
         if changed {
-            let in_flight = self.in_flight_bytes(now, rtt);
-            if in_flight == 0 || in_flight < self.budget(rtt) || self.carries_echo() {
-                let floor = if self.carries_echo() {
-                    ECHO_FLOOR
-                } else {
-                    FRAME_FLOOR
-                };
-                let after = self
-                    .last_sent_at
-                    .map_or(now, |at| at.checked_add(floor).unwrap_or(now));
-                wake = wake.min(after);
-            } else if let Some(&(_, _, sent)) = self.in_flight.front() {
-                // No room: a delivery makes some, or the oldest frame is given up on.
-                wake = wake.min(sent.checked_add(retry_after(rtt)).unwrap_or(now));
+            // As `poll_frame` decides: an echo goes after its floor, anything else once the floor
+            // passed with room in flight, else when a delivery makes room or a frame is given up.
+            let floor = if self.unsent_change
+                && self.carries_echo()
+                && self.in_flight_frames(now, rtt) < MAX_IN_FLIGHT_ECHO
+            {
+                Some(ECHO_FLOOR)
+            } else if self.room(now, rtt, MAX_IN_FLIGHT) {
+                Some(FRAME_FLOOR)
+            } else {
+                None
+            };
+            match floor {
+                Some(floor) => {
+                    let after = self
+                        .last_sent_at
+                        .map_or(now, |at| at.checked_add(floor).unwrap_or(now));
+                    wake = wake.min(after);
+                }
+                None => {
+                    if let Some(given_up) = self
+                        .in_flight
+                        .iter()
+                        .map(|(_, _, sent)| sent.checked_add(retry_after(rtt)).unwrap_or(now))
+                        .find(|&at| at > now)
+                    {
+                        wake = wake.min(given_up);
+                    }
+                }
             }
         }
         if self.last_num > self.acked.num {
@@ -1202,6 +1247,63 @@ mod tests {
         );
         c.ack(big.num, t + Duration::from_millis(100));
         assert!(c.poll_frame(t + Duration::from_millis(100), rtt).is_some());
+    }
+
+    #[test]
+    fn with_nothing_it_may_send_the_connection_does_not_wake_at_once() {
+        // Typed input awaits its echo, the echo-ack changed but not the screen, and the link is
+        // full: nothing can go until a delivery, so the loop must not spin.
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
+        let t = t0 + ms(200);
+        c.install_snapshot(Arc::new(screen(b"$ ")), true);
+        let full = c.poll_frame(t, rtt).unwrap();
+        c.frame_sent(full.num, 20_000, t);
+        c.push_client_bytes(&stream(&[ClientMsg::Input {
+            seq: InputSeq(1),
+            bytes: b"x".to_vec(),
+        }]));
+        c.drain_client(t, false).unwrap();
+        // A second key, still awaiting its echo once the first is promoted.
+        c.push_client_bytes(&stream(&[ClientMsg::Input {
+            seq: InputSeq(2),
+            bytes: b"y".to_vec(),
+        }]));
+        c.drain_client(t + ms(30), false).unwrap();
+        let later = t + ms(60);
+        c.promote_echo(later);
+        assert!(
+            c.poll_frame(later, rtt).is_none(),
+            "no room, and no new screen to echo"
+        );
+        assert!(
+            c.next_wake(later, rtt) > later,
+            "the loop sleeps until something can go"
+        );
+    }
+
+    #[test]
+    fn frames_in_flight_never_outrun_the_window_of_frames_kept() {
+        // Tiny frames, far under the byte budget, from a program changing the screen nonstop: past
+        // half the window in flight, the next waits, so every delivery heard of is still a frame
+        // the server holds.
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
+        let mut at = t0 + ms(200);
+        for n in 0..super::MAX_IN_FLIGHT {
+            c.install_snapshot(Arc::new(screen(format!("count {n}").as_bytes())), true);
+            let frame = c.poll_frame(at, rtt).expect("room for it");
+            c.frame_sent(frame.num, 40, at);
+            at += FRAME_FLOOR;
+        }
+        c.install_snapshot(Arc::new(screen(b"count more")), true);
+        assert!(c.poll_frame(at, rtt).is_none(), "half the window in flight");
+        assert!(
+            c.next_wake(at, rtt) > at,
+            "and the loop sleeps until a delivery"
+        );
     }
 
     #[test]

@@ -1,0 +1,54 @@
+{
+  "command": [
+    "nnn",
+    "-d",
+    "-H"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "SHELL=/bin/sh"
+  ],
+  "note": "",
+  "program": "nnn-detail",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 907,
+      "keys": ""
+    },
+    {
+      "end": 1020,
+      "keys": "j"
+    },
+    {
+      "end": 1142,
+      "keys": "j"
+    },
+    {
+      "end": 1262,
+      "keys": "j"
+    },
+    {
+      "end": 1529,
+      "keys": "l"
+    },
+    {
+      "end": 2226,
+      "keys": "h"
+    },
+    {
+      "end": 2283,
+      "keys": "q"
+    }
+  ],
+  "version": "nnn 5.3"
+}

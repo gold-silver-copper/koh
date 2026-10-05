@@ -1,0 +1,58 @@
+{
+  "command": [
+    "nvim",
+    "-d",
+    "grid-old.rs",
+    "grid-new.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "nvim-diff",
+  "replies": "\\e[?69;0$y\\e[?2026;2$y\\e[?2027;0$y\\e[?2031;2$y\\e[?2048;2$y\\eP1$r0;4:3m\\e\\\\\\e[?0u\\e[?62;22c\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e[48;40;120;0;0t\\e[?62;22c\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 44061,
+      "keys": ""
+    },
+    {
+      "end": 44230,
+      "keys": "]c"
+    },
+    {
+      "end": 44436,
+      "keys": "]c"
+    },
+    {
+      "end": 48243,
+      "keys": "do"
+    },
+    {
+      "end": 48561,
+      "keys": "\\x17w"
+    },
+    {
+      "end": 48771,
+      "keys": "[c"
+    },
+    {
+      "end": 49055,
+      "keys": "\\x04"
+    },
+    {
+      "end": 49321,
+      "keys": ":qa!\\r"
+    }
+  ],
+  "version": "NVIM v0.12.5"
+}

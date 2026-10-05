@@ -40,7 +40,10 @@ src/
 └── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identity, reset it
 tests/net/           koh over a fault-injecting link between real iroh endpoints
 tests/               PTYs, sessions, loopback e2e, admission, the binary on a PTY, upgrade in
-                     place, key creation races, and the Android suites (opt-in)
+                     place, key creation races, the corpus, and the Android suites (opt-in)
+testing/corpus/      113 real programs' output (from fux), replayed by tests, oracle and bench
+testing/oracle/      koh at the working tree beside koh at a commit (`testing/oracle.sh`)
+testing/bench/       the scoreboard: koh beside mosh and ssh (`testing/scoreboard.sh`)
 ```
 
 Dependency direction is strict: `proto` sits on `terminal`; `server` and `client` (+ the `koh`
@@ -105,9 +108,13 @@ touches no row. A snapshot reads each live row's fux-vt id and version, which fu
 when an edit changes the row: a row at the id and version the last snapshot saw at its place is
 taken as it was, one seen elsewhere is found by id, and if no row changed the snapshot shares the
 last one's list whole. Counting a window's memory looks only at the rows that differ from the
-newest screen's at the same place. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with fux-vt's
-opt-in events (title, icon, bell, clipboard) and extended replies (DECRQM, DECXCPR, secondary DA)
-turned on. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
+newest screen's at the same place. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with the options in
+`terminal::OPTIONS`, each for what koh carries: events (title, icon, bell, clipboard), extended
+replies (DECRQM, DECXCPR, secondary DA), in-band resize and the size query, the palette (a
+program's colours, drawn as RGB in snapshots, so the user's palette never changes), reflow, and
+koh's identity for device attributes and XTVERSION. A frame a program draws with synchronized
+output is not sent half drawn (`FrameHold`): while it is drawn the screen from before it goes out,
+and it is let go after 150 ms. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
 cursor and the modes; after a resize the client starts from a blank grid and receives every
 non-blank row.
 
@@ -124,6 +131,13 @@ checks the ranges against the screen and refuses shifts with a resize, and drops
 if anything is wrong. What a shift cannot say is sent as rows: a row moved and changed, a row that
 appears twice, a horizontal shift inside a row, and the shortest runs past the 32nd.
 
+A program may also scroll only some columns, between left and right margins (DECLRMM, DECSLRM),
+which fux-vt has and the server's terminal says it has when asked (DECRQM of mode 69): nvim then
+scrolls a split window between margins. A shift moves whole rows, so those rows go as rows. That
+costs nothing measurable: nvim run under koh, splitting a window and scrolling in both halves at
+40x120, sent 92.9 KB to the client with mode 69 answered as known and 92.8 KB with it answered as
+unknown (three runs each, 0.3% apart), so the server answers it as known.
+
 The client validates and copies cells and never runs a terminal parser, so server
 bytes never reach one. That includes the user's terminal, which the client prints a cell's text to
 as is: decoding refuses a cell whose text holds a control character, so no escape sequence can
@@ -133,8 +147,19 @@ A cell is one grapheme cluster, as fux-vt segments output (UAX #29): a ZWJ emoji
 flag or a base with its marks stays in one cell, whose width is the cluster's. A cluster of up to 17
 bytes is held in the cell; a longer one, up to 128, in its row's text (`fux_vt::Cells`), which the
 client rebuilds as it decodes the row. On the wire a cell carries its cluster (at most 128 bytes),
-its kind, its colours, its underline colour and its style bits: bold, dim, italic, underline,
-inverse, hidden, strikeout and a slow or rapid blink.
+its kind, its colours, its underline colour and its style bits: bold, dim, italic, underline
+and the underline's style (single, double, curly, dotted, dashed), inverse, hidden, strikeout and
+a slow or rapid blink. The client paints an underline's style (`4:n`) only if the user's terminal
+draws them, which it asks the terminal once at start-up (XTGETTCAP for `Smulx`, and the pen with a
+curly underline through DECRQSS, before primary device attributes; `client::probe`); otherwise
+it paints a plain underline, as a terminal that does not know `4:n` would draw none.
+
+A row also carries its hyperlinks (OSC 8): its distinct links once (at most 64, each URI and id
+within fux-vt's limits), and each cell the index of its link, so a row moved or shared keeps its
+links with it and needs no screen-wide table. A diff carries at most 1 MiB of links; the server
+leaves off a row's links past that, and the client drops a frame over it. The client paints a
+link with OSC 8 (with the program's id, if it gave one) unless `--no-hyperlinks`, after checking
+it again, and closes it before any cell without it and at the frame's end.
 
 ## Headless drivers (the protocol is I/O-free; the shells are thin)
 
@@ -327,6 +352,13 @@ deterministically:
 - **Property tests and fuzzing** on the attacker-reachable parsers — assert never-panic and bounded.
   Coverage-guided fuzz targets: `screen_apply` (the structured diff), `server_process` and
   `proto_decode` (both directions of the wire).
+- **The corpus** (`tests/corpus.rs`) — 113 recordings of real programs (`testing/corpus/`, from
+  fux: shells, editors, pagers, TUIs, compilers, claude) through the whole pipeline in PTY-sized
+  pieces with their resizes: snapshot, frame, encoder and decoder, `ClientSession`, koh's own
+  `BackendTerminal`. After every frame, a fux-vt terminal reading every painted byte must show
+  what a fux-vt parser fed the same output shows; over a lossy link too, where it must converge on
+  every step. The recordings known to show otherwise are listed with the reason
+  (`testing/corpus/recording.rs`).
 
 ### Tier 1 — real iroh endpoints on one machine (`cargo test`)
 
@@ -337,8 +369,10 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   custom transport): loss, delay, jitter, duplication, reordering and outages under real QUIC. It
   covers screen convergence (and that a stale screen is never shown), exactly-once ordered input,
   reattach, a forced mid-session drop, exit status, resize, XON/XOFF, input backpressure, the bell
-  hook, prediction and the no-echo property, and hostile clients and servers. An `#[ignore]`d
-  baseline measures echo latency, output bursts, bytes and outage recovery per network profile.
+  hook, prediction and the no-echo property, and hostile clients and servers. The corpus runs
+  here too, through a real server and client under loss (eleven recordings by default, every one
+  with `KOH_NET_CORPUS=all`). An `#[ignore]`d baseline measures echo latency, output bursts, bytes
+  and outage recovery per network profile.
 - **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs, started through
   the `koh` binary's `__launch`: output streaming and teardown, exit statuses, the
   reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its
@@ -356,6 +390,19 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   restarted under a connected client, which finds it again.
 - **`tests/upgrade_in_place.rs`** (Linux) — a running `koh serve` whose binary file is removed
   still starts sessions, because it launches them from `/proc/self/exe`.
+
+Two harnesses sit beside the tests, each its own Cargo workspace:
+
+- **The oracle** (`testing/oracle.sh`, [`testing/oracle/`](../testing/oracle/README.md)) runs koh
+  at the working tree and koh at a commit (the merge base with `origin/main` by default) on the
+  same sessions (the corpus, and random output, keystrokes, lost frames, time and resizes) and
+  compares what the user's terminal would show, the replies and the client's messages after every
+  step, reporting each side's frame bytes. A difference is shrunk and saved. It finds each of five
+  planted bugs (`testing/oracle.sh --plants`).
+- **The scoreboard** (`testing/scoreboard.sh`, [`testing/bench/`](../testing/bench/README.md))
+  writes [`SCOREBOARD.md`](SCOREBOARD.md): koh beside mosh and ssh by bytes on the wire for each
+  recording and synthetic workload, keystroke latency beside a flood on three links, server memory
+  per session and instructions retired.
 
 Terminal I/O is behind `ClientTerminal`, so the same session loop runs against the real terminal
 (binary) or a capturing mock (tests). One layer down, `client::backend::KohBackend`'s provided

@@ -1,0 +1,31 @@
+[?u[>0q]11;?\[?1049hP+q696e646e\P+q71756572792d6f732d6e616d65\[?1049l[0c]7;file://localhost/private/tmp/fux-corpus/work]0;/p/t/f/work\[m]11;?\[6n[0c[?2004h[?2031h[=5u]133;A;click_events=1\/p/t/f/work> ]133;B\[K[13Cecho [18Cthe [22Cquick [28Cbrown [34Cfox [38Cjumps [4Cover [9Cthe [13Clazy [18Cdog [22Cand [26Ckeeps [32Crunning 
+[A[38Cg past [5Cthe [9Cedge[13C[A[Aecho [36mthe[39m [36mquick[39m [36mbrown[39m [36mfox[39m [36mju[39m[36mmps[39m [36mover[39m [36mthe[39m [36mlazy[39m [36mdog[39m [36mand[39m [36mkeeps[39m [36mrunning[39m [36mpast[39m [36mthe[39m [36medge[39m[13C[?2004l[?2031l[=0u
+[m]133;C;cmdline_url=echo%20the%20quick%20brown%20fox%20jumps%20over%20the%20lazy%20dog%20and%20keeps%20running%20past%20the%20edge\]0;echo the quick brown /p/t/f/work\[mthe quick brown fox jumps over the lazy dog and keeps running past the edge
+]133;D;0\[?25h[2m⏎[m                                       ⏎ [K]7;file://localhost/private/tmp/fux-corpus/work]0;/p/t/f/work\[m]11;?\[6n[0c[?2004h[?2031h[=5u]133;A;click_events=1\/p/t/f/work> ]133;B\[K[13C[?2004l[?2031l[=0uls[15C
+[m]133;C;cmdline_url=ls\]0;ls /p/t/f/work\[mbad.c
+[35mbroken[39;49m[0m@
+Cargo.toml
+colored.txt
+[34mempty[39;49m[0m/
+fux-corpus-long.7
+fux-corpus-tables.1
+fux-corpus.1
+grid-new.rs
+grid-old.rs
+[34mhello[39;49m[0m/
+[35mlatest[39;49m[0m@
+[34mnpm[39;49m[0m/
+[34mproject[39;49m[0m/
+README.md
+[34mrepo[39;49m[0m/
+[34mrepo-add[39;49m[0m/
+[34mrepo-lazygit[39;49m[0m/
+[34mrepo-lazygit-small[39;49m[0m/
+[34mrepo-lazygit-stage[39;49m[0m/
+[31mrun.sh[39;49m[0m*
+[34msrc[39;49m[0m/
+[34mtiny[39;49m[0m/
+[34mtree[39;49m[0m/
+unicode.txt
+]133;D;0\[?25h[2m⏎[m                                       ⏎ [K]7;file://localhost/private/tmp/fux-corpus/work]0;/p/t/f/work\[m]11;?\[6n[0c[?2004h[?2031h[=5u]133;A;click_events=1\/p/t/f/work> ]133;B\[K[13C[?2004l[?2031l[=0uexit[17C
+[m]133;C;cmdline_url=exit\]0;exit /p/t/f/work\[m]133;D;0\[?25h[m

@@ -1,0 +1,57 @@
+{
+  "command": [
+    "tig",
+    "--all"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "GIT_CONFIG_NOSYSTEM=1"
+  ],
+  "note": "",
+  "program": "tig",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 1496,
+      "keys": ""
+    },
+    {
+      "end": 1843,
+      "keys": "j"
+    },
+    {
+      "end": 2162,
+      "keys": "j"
+    },
+    {
+      "end": 3527,
+      "keys": "\\r"
+    },
+    {
+      "end": 3760,
+      "keys": "j"
+    },
+    {
+      "end": 4384,
+      "keys": " "
+    },
+    {
+      "end": 4680,
+      "keys": "q"
+    },
+    {
+      "end": 4733,
+      "keys": "q"
+    }
+  ],
+  "version": "tig version 2.6.1"
+}

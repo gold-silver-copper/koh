@@ -1,0 +1,85 @@
+[1m[92m   Compiling[0m words v0.1.0 (/private/tmp/fux-corpus/work/tiny/words)
+[1m[92m   Compiling[0m counts v0.1.0 (/private/tmp/fux-corpus/work/tiny/counts)
+[1m[92m   Compiling[0m unicode-width v0.2.0 (/private/tmp/fux-corpus/work/tiny/width)
+[1m[92m   Compiling[0m lines v0.1.0 (/private/tmp/fux-corpus/work/tiny/lines)
+[1m[92m   Compiling[0m app v0.1.0 (/private/tmp/fux-corpus/work/tiny/app)
+[1m[96m    Building[0m [================>           ] 8/13: app(bin test), unicode_width(test), counts(test), words(test), line…[1m[96m    Building[0m [==================>         ] 9/13: app(bin test), counts(test), words(test), lines(test)               [1m[96m    Building[0m [===================>       ] 10/13: counts(test), words(test), lines(test)                              [1m[96m    Building[0m [=====================>     ] 11/13: counts(test), lines(test)                                           [1m[96m    Building[0m [=======================>   ] 12/13: lines(test)                                                         [K[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.41s
+[1m[92m     Running[0m unittests src/main.rs (target/debug/build/app/67e5cbbfa2854a28/out/app-67e5cbbfa2854a28)
+
+running 2 tests
+test tests::agrees_with_itself ... [32mok(B[m
+test tests::a_test_that_fails ... [31mFAILED(B[m
+
+failures:
+
+---- tests::a_test_that_fails stdout ----
+
+thread 'tests::a_test_that_fails' (137364043) panicked at app/src/main.rs:17:9:
+assertion `left == right` failed: two words are not three
+  left: 2
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::a_test_that_fails
+
+test result: [31mFAILED(B[m. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `-p app --bin app`
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/build/counts/333112b8a8d0aacc/out/counts-333112b8a8d0aacc)
+
+running 2 tests
+test tests::counts_nothing_in_nothing ... [32mok(B[m
+test tests::counts_the_counts ... [32mok(B[m
+
+test result: [32mok(B[m. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/build/lines/d9fbb0f00439de8f/out/lines-d9fbb0f00439de8f)
+
+running 2 tests
+test tests::counts_nothing_in_nothing ... [32mok(B[m
+test tests::counts_the_lines ... [32mok(B[m
+
+test result: [32mok(B[m. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/build/unicode-width/3daa045e7a55152a/out/unicode_width-3daa045e7a55152a)
+
+running 0 tests
+
+test result: [32mok(B[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/build/words/7ed4a026174bbdd9/out/words-7ed4a026174bbdd9)
+
+running 2 tests
+test tests::counts_nothing_in_nothing ... [32mok(B[m
+test tests::counts_the_words ... [32mok(B[m
+
+test result: [32mok(B[m. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m counts
+
+running 0 tests
+
+test result: [32mok(B[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m lines
+
+running 0 tests
+
+test result: [32mok(B[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m unicode_width
+
+running 0 tests
+
+test result: [32mok(B[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m words
+
+running 0 tests
+
+test result: [32mok(B[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: 1 target failed:
+    `-p app --bin app`

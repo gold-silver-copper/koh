@@ -1,0 +1,55 @@
+{
+  "command": [
+    "bash",
+    "--noprofile",
+    "--rcfile",
+    "/tmp/fux-corpus/home/.bashrc",
+    "-i"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "bash-small",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    10,
+    40
+  ],
+  "steps": [
+    {
+      "end": 39,
+      "keys": ""
+    },
+    {
+      "end": 119,
+      "keys": "echo the quick brown fox jumps over the lazy dog and keeps running past the edge"
+    },
+    {
+      "end": 125,
+      "keys": "\\x01"
+    },
+    {
+      "end": 137,
+      "keys": "\\ef"
+    },
+    {
+      "end": 149,
+      "keys": "\\ef"
+    },
+    {
+      "end": 281,
+      "keys": "\\r"
+    },
+    {
+      "end": 302,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "GNU bash, version 5.3.3(1)-release (aarch64-apple-darwin24.4.0)"
+}

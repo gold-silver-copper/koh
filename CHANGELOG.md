@@ -22,12 +22,30 @@ client and a 0.13 server (or the reverse) refuse each other at the TLS handshake
 error; upgrade both ends.
 
 ### Added
+- **Hyperlinks.** A program's OSC 8 links (`ls --hyperlink`, delta, compilers, claude) now reach
+  your terminal as links, on by default; `koh connect --no-hyperlinks` paints them as plain text.
+  Each is checked before it is painted, and a server's links are bounded on the wire (64 a row,
+  fux-vt's URI and id limits, 1 MiB a frame). The koh/3 encoding gains each row's links and each
+  cell's link.
+- **Underline styles.** A curly, double, dotted or dashed underline (neovim's diagnostics, for
+  one) now reaches your terminal as it was set, if your terminal draws them: `koh connect` asks it
+  once at start-up (XTGETTCAP for `Smulx`, and DECRQSS of a curly pen), and paints a plain
+  underline otherwise. The server answers DECRQSS, so neovim knows it may use them. The koh/3
+  encoding gains the underline's style; a plain underline encodes as before.
 - `koh serve --port <PORT>` binds that UDP port (IPv4, and IPv6 where the host has it) instead of
   an ephemeral one, in every profile, and the banner shows the port. A client dialing
   `--direct <ip:port>` redials the address it first dialed, so with a fixed port it finds a
   restarted server and reattaches, to a fresh session. A port already in use is a clear error.
 
 ### Changed
+- **Clipboard writes are on by default.** A remote program's OSC 52 copy now sets your clipboard
+  without `--clipboard`, which is gone; `koh connect --no-clipboard` turns it off. A hostile server
+  can therefore replace what you copied, so pass `--no-clipboard` to a server you do not trust.
+  Only base64 of at most 16 KiB is forwarded, and the clipboard is never read.
+- The server's terminal re-wraps the screen and its history on a resize (reflow), answers the size
+  query and in-band resize (mode 2048), keeps a program's colours (OSC 4, 10, 11) and draws them as
+  RGB without changing your terminal's palette, and answers device attributes and XTVERSION as
+  koh. A frame a program draws with synchronized output (DEC 2026) is no longer sent half drawn.
 - Updated `fux-vt` 0.2.0 → 0.3.0. Bold and dim can now be on together (`SGR 1;2`), as in xterm,
   where before the later one replaced the earlier; CBT (`CSI Z`) and CHT (`CSI I`) now move between
   tab stops, as mosh's emulator does. The wire is unchanged.
@@ -143,6 +161,9 @@ error; upgrade both ends.
   `der` 0.8.0 → 0.8.2 and `spin` 0.10.0 → 0.10.1.
 
 ### Fixed
+- A skin-tone modifier or combining mark a program placed in a cell of its own (vim and micro
+  place 👍 and 🏽 with a cursor move between) is painted there, not joined to the glyph before it:
+  the client moves the cursor before a glyph that would continue the cluster printed just before.
 - **A server could make `koh connect` hold about half a gigabyte**, enough to get it killed on a
   phone. The client keeps the screens of its last 16 frames as bases for the next ones, each a full
   copy: a server on a 1000×1000 terminal (about 32 MB a screen), or a hostile one, sending full

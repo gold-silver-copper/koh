@@ -1,0 +1,55 @@
+{
+  "command": [
+    "nvim",
+    "-p",
+    "src/lib.rs",
+    "src/link.rs",
+    "README.md"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "nvim-tabs",
+  "replies": "\\e[?69;0$y\\e[?2026;2$y\\e[?2027;0$y\\e[?2031;2$y\\e[?2048;2$y\\eP1$r0;4:3m\\e\\\\\\e[?0u\\e[?62;22c\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e[48;40;120;0;0t\\e[?62;22c\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 33762,
+      "keys": ""
+    },
+    {
+      "end": 39955,
+      "keys": "gt"
+    },
+    {
+      "end": 43393,
+      "keys": "gt"
+    },
+    {
+      "end": 49657,
+      "keys": "gT"
+    },
+    {
+      "end": 50433,
+      "keys": ":tabnew\\r"
+    },
+    {
+      "end": 57073,
+      "keys": ":tabclose\\r"
+    },
+    {
+      "end": 57342,
+      "keys": ":qa\\r"
+    }
+  ],
+  "version": "NVIM v0.12.5"
+}

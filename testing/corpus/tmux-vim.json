@@ -1,0 +1,91 @@
+{
+  "command": [
+    "tmux",
+    "-L",
+    "fux-corpus",
+    "-f",
+    "/dev/null",
+    "new-session",
+    "-s",
+    "corpus",
+    ";",
+    "set-option",
+    "-g",
+    "status-right",
+    "corpus",
+    ";",
+    "set-option",
+    "-g",
+    "default-terminal",
+    "tmux-256color"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "SHELL=/bin/sh",
+    "ENV=/tmp/fux-corpus/home/.shrc",
+    "TMUX_TMPDIR=/tmp/fux-corpus/tmux"
+  ],
+  "note": "",
+  "program": "tmux-vim",
+  "replies": "\\e[?997;1n\\e[?62;22c\\e[>1;1700;0c\\eP>|fux 0.17.0\\e\\\\\\e]10;rgb:ffff/ffff/ffff\\e\\\\\\e]11;rgb:0000/0000/0000\\e\\\\\\e]10;rgb:ffff/ffff/ffff\\e\\\\\\e]11;rgb:0000/0000/0000\\e\\\\\\e[8;40;120t",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 1046,
+      "keys": ""
+    },
+    {
+      "end": 4737,
+      "keys": "vim src/link.rs\\r"
+    },
+    {
+      "end": 11226,
+      "keys": "\\x02%"
+    },
+    {
+      "end": 14946,
+      "keys": "vim src/grid.rs\\r"
+    },
+    {
+      "end": 18623,
+      "keys": "\\x04"
+    },
+    {
+      "end": 24848,
+      "keys": "\\x02o"
+    },
+    {
+      "end": 27762,
+      "keys": "\\x04"
+    },
+    {
+      "end": 28488,
+      "keys": ":q\\r"
+    },
+    {
+      "end": 32330,
+      "keys": "\\x02o"
+    },
+    {
+      "end": 33506,
+      "keys": ":q\\r"
+    },
+    {
+      "end": 34330,
+      "keys": "exit\\r"
+    },
+    {
+      "end": 34482,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "tmux 3.7c"
+}

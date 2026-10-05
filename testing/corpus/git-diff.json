@@ -1,0 +1,46 @@
+{
+  "command": [
+    "git",
+    "-c",
+    "color.ui=always",
+    "diff",
+    "--stat",
+    "-p",
+    "HEAD"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "GIT_CONFIG_NOSYSTEM=1"
+  ],
+  "note": "",
+  "program": "git-diff",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 1497,
+      "keys": ""
+    },
+    {
+      "end": 1734,
+      "keys": " "
+    },
+    {
+      "end": 5690,
+      "keys": "/fn\\r"
+    },
+    {
+      "end": 5701,
+      "keys": "q"
+    }
+  ],
+  "version": "git version 2.51.0"
+}

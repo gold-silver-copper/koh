@@ -1,0 +1,43 @@
+{
+  "command": [
+    "git",
+    "log",
+    "--graph",
+    "--all",
+    "--decorate",
+    "--color=always",
+    "--format=%C(yellow)%h%C(reset) %C(auto)%d%C(reset) %s %C(dim)(%an, %ad)%C(reset)",
+    "--date=short"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "GIT_CONFIG_NOSYSTEM=1"
+  ],
+  "note": "",
+  "program": "git-graph",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 942,
+      "keys": ""
+    },
+    {
+      "end": 942,
+      "keys": " "
+    },
+    {
+      "end": 942,
+      "keys": "q"
+    }
+  ],
+  "version": "git version 2.51.0"
+}

@@ -1,0 +1,375 @@
+[?1049h[40;1H[?1h=# fux-vt-compare: fux-vt beside other terminal emulators
+
+An excluded package with its own lockfile. It runs fux-vt beside a panel of
+other terminal emulators ("engines"):
+
+- engines linked into the binary: Ghostty's core (libghostty-vt), alacritty_terminal,
+  libvterm, avt, wezterm-term and the vt100 crate;
+- engines run as processes of their own: xterm.js (`@xterm/headless` under
+  Node), tmux, and xterm itself under Xvfb.
+
+Every engine gets the same output. After each piece of it, and each resize,
+each engine's screen is compared with fux-vt's, cell by cell, along with the
+cursor, the modes, soft wraps, the title, cursor reports and recent history.
+fux-vt fails a case only where the engines outvote it (see "The vote"). A
+failing case is shrunk to the smallest one that still fails and printed with
+the command that replays it. `bench` times every engine on the same
+workloads. The corpus (`corpus/`) holds what real programs wrote to a
+terminal, recorded by `record`.
+
+It is not built or run by fux's own gates. It needs Zig, a Ghostty
+checkout, libvterm's source and, for the engines in their own processes,
+Node, tmux, xterm and Xvfb. `run.sh` fetches the first three.
+
+No engine is the truth. When the panel outvotes fux-vt, the difference says
+where to look. xterm's behaviour and the standards decide which side is
+right. Some differences are choices fux-vt makes on purpose, and each family
+below records which.
+
+## Running it
+
+```sh
+fux-vt/compare/run.sh                       # families expected to agree, 20000 cases, beside the panel
+fux-vt/compare/run.sh engines               # which engines run here, which vote, what each cannot tell
+fux-vt/compare/run.sh cases                 # the named cases beside every engine, with each engine's mark
+fux-vt/compare/run.sh verdicts              # the families with a recorded verdict, beside the engines that decide each
+fux-vt/compare/run.sh matrix                # family by engine: % of cases each engine differs from fux-vt
+fux-vt/compare/run.sh bench                 # MB/s for every engine on every workload, and the corpus
+fux-vt/compare/run.sh bench --engines ghostty corpus   # each recording alone too
+fux-vt/compare/run.sh --list                # the families, their status and reasons
+[7mREADME.md[27m[K[Kfux-vt/compare/run.sh survey                # each family alone: how often it fails, and the smallest failure
+:[K[Kfux-vt/compare/run.sh run --family sgr --family text --cases 2000 --seed 7
+:[K[Kfux-vt/compare/run.sh run --engines ghostty,libvterm,xterm   # any panel
+fux-vt/compare/run.sh replay --engines all --size 1x5 'abcde\x08X'
+fux-vt/compare/run.sh --no-reflow           # fux-vt set up as fux sets it up
+fux-vt/compare/run.sh corpus                # the recordings beside xterm and the panel; exit 1 if one regresses
+fux-vt/compare/run.sh corpus --show vim     # one recording, and fux-vt's screen at its end
+fux-vt/compare/run.sh inventory > fux-vt/compare/corpus/INVENTORY.md   # what the recordings send
+fux-vt/compare/corpus/record.sh [NAME...]   # record the corpus again (see "The corpus")
+fux-vt/compare/run.sh --cargo test          # any cargo subcommand, in the same environment
+fux-vt/compare/run.sh --cargo clippy --all-targets -- -D warnings
+```
+
+The first run fetches Zig 0.16.0, Ghostty and libvterm into
+`~/.cache/fux-vt-compare` (or `$FUX_VT_COMPARE_CACHE`). It also installs
+`@xterm/headless` with `npm ci` in `node/` when Node is present. The first
+build takes a few minutes (Ghostty by Zig, then wezterm-term). After that,
+`fux-vt/compare/target/release/fux-vt-compare` can be run directly.
+
+- `run` exits 1 if any case fails, and prints up to five distinct shrunk
+  cases. Each one shows:
+  - its families and the `replay` command;
+  - the fields fux-vt is outvoted on;
+  - each engine's verdict and differences;
+  - fux-vt's screen beside the first engine that differs (`.` blank, `_`
+    cursor, `↩` soft-wrapped, `≠` a row that differs).
+- `cases` marks each engine: `+` agrees, `-` differs, `!` abstains.
+- `--seed` replays a run exactly. Every random choice comes from it.
+- `--engines` takes names joined by commas, or one of:
+  - `panel`, the voters, which is the default for `run`, `survey`, `matrix`
+    and `replay`;
+  - `all`, the default for `cases` and `bench`;
+  - `in-process`.
+
+## The vote
+
+Each engine says what it can tell (`Can` in `src/engine.rs`): `engines`
+lists what each one cannot. Each engine is compared with fux-vt only on
+those fields, field by field: each cell's text, width and every attribute,
+the cursor, each mode, the title, the reports, each history row.
+
+:[K[Kfux-vt is outvoted on a field when more of the engines that can tell it
+share one other value than agree with fux-vt. A case fails at the first step
+where fux-vt is outvoted on any field. So:
+
+- An engine's quirk alone never fails a case unless it is the only engine
+  on the panel.
+- Engines that each differ from fux-vt in a way of their own don't outvote
+  it.
+- A tie doesn't outvote it.
+
+An engine that fails or panics abstains for the rest of that case. The
+report says why, and the run goes on: vt100 panics on wrapping a
+one-row screen, and wezterm on HTS one past the edge. xterm.js abstains from
+terminals narrower than 2 columns, which it can't be.
+
+**The default panel** is every voter that runs here: ghostty, alacritty,
+libvterm, avt and wezterm.
+
+**The panel can be wrong.** xterm decides where it splits. In `autowrap`, it
+outvotes fux-vt even though xterm agrees with fux-vt, so that family is
+:[K[K[HM  - its families and the `replay` command;
+[HM  cases. Each one shows:
+[HM- `run` exits 1 if any case fails, and prints up to five distinct shrunk
+[HM
+[HM`fux-vt/compare/target/release/fux-vt-compare` can be run directly.
+[HMbuild takes a few minutes (Ghostty by Zig, then wezterm-term). After that,
+[HM`@xterm/headless` with `npm ci` in `node/` when Node is present. The first
+[HM`~/.cache/fux-vt-compare` (or `$FUX_VT_COMPARE_CACHE`). It also installs
+[HMThe first run fetches Zig 0.16.0, Ghostty and libvterm into
+[HM
+[HM```
+[HMfux-vt/compare/run.sh --cargo clippy --all-targets -- -D warnings
+[HMfux-vt/compare/run.sh --cargo test          # any cargo subcommand, in the same environment
+[HMfux-vt/compare/corpus/record.sh [NAME...]   # record the corpus again (see "The corpus")
+[HMfux-vt/compare/run.sh inventory > fux-vt/compare/corpus/INVENTORY.md   # what the recordings send
+[HMfux-vt/compare/run.sh corpus --show vim     # one recording, and fux-vt's screen at its end
+[HMfux-vt/compare/run.sh corpus                # the recordings beside xterm and the panel; exit 1 if one regresses
+[HMfux-vt/compare/run.sh --no-reflow           # fux-vt set up as fux sets it up
+[HMfux-vt/compare/run.sh replay --engines all --size 1x5 'abcde\x08X'
+[HMfux-vt/compare/run.sh run --engines ghostty,libvterm,xterm   # any panel
+[HMfux-vt/compare/run.sh run --family sgr --family text --cases 2000 --seed 7
+[HMfux-vt/compare/run.sh survey                # each family alone: how often it fails, and the smallest failure
+[HMfux-vt/compare/run.sh --list                # the families, their status and reasons
+[HMfux-vt/compare/run.sh bench --engines ghostty corpus   # each recording alone too
+[HMfux-vt/compare/run.sh bench                 # MB/s for every engine on every workload, and the corpus
+[HMfux-vt/compare/run.sh matrix                # family by engine: % of cases each engine differs from fux-vt
+[HMfux-vt/compare/run.sh verdicts              # the families with a recorded verdict, beside the engines that decide each
+[HMfux-vt/compare/run.sh cases                 # the named cases beside every engine, with each engine's mark
+[HMfux-vt/compare/run.sh engines               # which engines run here, which vote, what each cannot tell
+[HMfux-vt/compare/run.sh                       # families expected to agree, 20000 cases, beside the panel
+[HM```sh
+[HM
+[HM## Running it
+[HM
+[HMbelow records which.
+[HMright. Some differences are choices fux-vt makes on purpose, and each family
+[HMwhere to look. xterm's behaviour and the standards decide which side is
+[HMNo engine is the truth. When the panel outvotes fux-vt, the difference says
+[HM
+[40;1H[K:[K[K/[Krr[Kee[Kff[Kll[Koo[Kww[K[1;1H[K
+[2;1H[KNo engine is the truth. When the panel outvotes fux-vt, the difference says
+[3;1H[Kwhere to look. xterm's behaviour and the standards decide which side is
+[4;1H[Kright. Some differences are choices fux-vt makes on purpose, and each family
+[5;1H[Kbelow records which.
+[6;1H[K
+[7;1H[K## Running it
+[8;1H[K
+[9;1H[K```sh
+[10;1H[Kfux-vt/compare/run.sh                       # families expected to agree, 20000 cases, beside the panel
+[11;1H[Kfux-vt/compare/run.sh engines               # which engines run here, which vote, what each cannot tell
+[12;1H[Kfux-vt/compare/run.sh cases                 # the named cases beside every engine, with each engine's mark
+[13;1H[Kfux-vt/compare/run.sh verdicts              # the families with a recorded verdict, beside the engines that decide each
+[14;1H[Kfux-vt/compare/run.sh matrix                # family by engine: % of cases each engine differs from fux-vt
+[15;1H[Kfux-vt/compare/run.sh bench                 # MB/s for every engine on every workload, and the corpus
+[16;1H[Kfux-vt/compare/run.sh bench --engines ghostty corpus   # each recording alone too
+[17;1H[Kfux-vt/compare/run.sh --list                # the families, their status and reasons
+[18;1H[Kfux-vt/compare/run.sh survey                # each family alone: how often it fails, and the smallest failure
+[19;1H[Kfux-vt/compare/run.sh run --family sgr --family text --cases 2000 --seed 7
+[20;1H[Kfux-vt/compare/run.sh run --engines ghostty,libvterm,xterm   # any panel
+[21;1H[Kfux-vt/compare/run.sh replay --engines all --size 1x5 'abcde\x08X'
+[22;1H[Kfux-vt/compare/run.sh --no-reflow           # fux-vt set up as fux sets it up
+[23;1H[Kfux-vt/compare/run.sh corpus                # the recordings beside xterm and the panel; exit 1 if one regresses
+[24;1H[Kfux-vt/compare/run.sh corpus --show vim     # one recording, and fux-vt's screen at its end
+[25;1H[Kfux-vt/compare/run.sh inventory > fux-vt/compare/corpus/INVENTORY.md   # what the recordings send
+[26;1H[Kfux-vt/compare/corpus/record.sh [NAME...]   # record the corpus again (see "The corpus")
+[27;1H[Kfux-vt/compare/run.sh --cargo test          # any cargo subcommand, in the same environment
+[28;1H[Kfux-vt/compare/run.sh --cargo clippy --all-targets -- -D warnings
+[29;1H[K```
+[30;1H[K
+[31;1H[KThe first run fetches Zig 0.16.0, Ghostty and libvterm into
+[32;1H[K`~/.cache/fux-vt-compare` (or `$FUX_VT_COMPARE_CACHE`). It also installs
+[33;1H[K`@xterm/headless` with `npm ci` in `node/` when Node is present. The first
+[34;1H[Kbuild takes a few minutes (Ghostty by Zig, then wezterm-term). After that,
+[35;1H[K`fux-vt/compare/target/release/fux-vt-compare` can be run directly.
+[36;1H[K
+[37;1H[K- `run` exits 1 if any case fails, and prints up to five distinct shrunk
+[38;1H[K  cases. Each one shows:
+[39;1H[K  - its families and the `replay` command;
+[40;1H[1;1H[K
+[2;1H[KNo engine is the truth. When the panel outvotes fux-vt, the difference says
+[3;1H[Kwhere to look. xterm's behaviour and the standards decide which side is
+[4;1H[Kright. Some differences are choices fux-vt makes on purpose, and each family
+[5;1H[Kbelow records which.
+[6;1H[K
+[7;1H[K## Running it
+[8;1H[K
+[9;1H[K```sh
+[10;1H[Kfux-vt/compare/run.sh                       # families expected to agree, 20000 cases, beside the panel
+[11;1H[Kfux-vt/compare/run.sh engines               # which engines run here, which vote, what each cannot tell
+[12;1H[Kfux-vt/compare/run.sh cases                 # the named cases beside every engine, with each engine's mark
+[13;1H[Kfux-vt/compare/run.sh verdicts              # the families with a recorded verdict, beside the engines that decide each
+[14;1H[Kfux-vt/compare/run.sh matrix                # family by engine: % of cases each engine differs from fux-vt
+[15;1H[Kfux-vt/compare/run.sh bench                 # MB/s for every engine on every workload, and the corpus
+[16;1H[Kfux-vt/compare/run.sh bench --engines ghostty corpus   # each recording alone too
+[17;1H[Kfux-vt/compare/run.sh --list                # the families, their status and reasons
+[18;1H[Kfux-vt/compare/run.sh survey                # each family alone: how often it fails, and the smallest failure
+[19;1H[Kfux-vt/compare/run.sh run --family sgr --family text --cases 2000 --seed 7
+[20;1H[Kfux-vt/compare/run.sh run --engines ghostty,libvterm,xterm   # any panel
+[21;1H[Kfux-vt/compare/run.sh replay --engines all --size 1x5 'abcde\x08X'
+[22;1H[Kfux-vt/compare/run.sh --no-[7mreflow[27m           # fux-vt set up as fux sets it up
+[23;1H[Kfux-vt/compare/run.sh corpus                # the recordings beside xterm and the panel; exit 1 if one regresses
+[24;1H[Kfux-vt/compare/run.sh corpus --show vim     # one recording, and fux-vt's screen at its end
+[25;1H[Kfux-vt/compare/run.sh inventory > fux-vt/compare/corpus/INVENTORY.md   # what the recordings send
+[26;1H[Kfux-vt/compare/corpus/record.sh [NAME...]   # record the corpus again (see "The corpus")
+[27;1H[Kfux-vt/compare/run.sh --cargo test          # any cargo subcommand, in the same environment
+[28;1H[Kfux-vt/compare/run.sh --cargo clippy --all-targets -- -D warnings
+[29;1H[K```
+[30;1H[K
+[31;1H[KThe first run fetches Zig 0.16.0, Ghostty and libvterm into
+[32;1H[K`~/.cache/fux-vt-compare` (or `$FUX_VT_COMPARE_CACHE`). It also installs
+[33;1H[K`@xterm/headless` with `npm ci` in `node/` when Node is present. The first
+[34;1H[Kbuild takes a few minutes (Ghostty by Zig, then wezterm-term). After that,
+[35;1H[K`fux-vt/compare/target/release/fux-vt-compare` can be run directly.
+[36;1H[K
+[37;1H[K- `run` exits 1 if any case fails, and prints up to five distinct shrunk
+[38;1H[K  cases. Each one shows:
+[39;1H[K  - its families and the `replay` command;
+[40;1H  - the fields fux-vt is outvoted on;
+  - each engine's verdict and differences;
+  - fux-vt's screen beside the first engine that differs (`.` blank, `_`
+    cursor, `↩` soft-wrapped, `≠` a row that differs).
+- `cases` marks each engine: `+` agrees, `-` differs, `!` abstains.
+- `--seed` replays a run exactly. Every random choice comes from it.
+- `--engines` takes names joined by commas, or one of:
+  - `panel`, the voters, which is the default for `run`, `survey`, `matrix`
+    and `replay`;
+  - `all`, the default for `cases` and `bench`;
+  - `in-process`.
+
+## The vote
+
+Each engine says what it can tell (`Can` in `src/engine.rs`): `engines`
+lists what each one cannot. Each engine is compared with fux-vt only on
+those fields, field by field: each cell's text, width and every attribute,
+the cursor, each mode, the title, the reports, each history row.
+
+fux-vt is outvoted on a field when more of the engines that can tell it
+share one other value than agree with fux-vt. A case fails at the first step
+:[K[K/[K...skipping...
+| fux-vt | the subject, by path, set up as ratty sets it up ([7mreflow[27m, an identity, events), with the DECRQM answers, in-b and resize, colour-scheme reports, kitty keyboard, hyperlinks and prompt marks fux's panes have | — | `--no-[7mreflow[27m`: as  fux sets it up |
+| ghostty | libghostty-vt 0.2.1 over Ghostty `7aa95917`, built by Zig 0.16 (see "Setup") | link groups | mode 2027 on; h istory kept in bytes; a link's URI only (`GridRef::hyperlink_uri`), a row's mark from `Row::semantic_prompt` (a primary  prompt's row, not a continuation's) |
+| alacritty | alacritty_terminal 0.26.0 | blink, 2026, 2048, prompt marks | synchronized updates applied at once (no eve nt loop); a wide glyph on one column panics it, which the adapter repairs |
+| libvterm | libvterm 0.3.3 from its release tarball, through a C shim (`src/engines/libvterm_shim.c`); modes and pendin g wrap read from the pinned source's `vterm_internal.h` | dim, underline colour, kitty, 2026, 2048, links, prompt marks  | the shim guards five crashes, hangs and out-of-bounds reads that random cases reach (found with ASan and UBSan; each l isted with a replay in its file) |
+| avt | avt 0.18.0 | underline colour, hidden, keypad, bracketed paste, focus, kitty, 2026, 2048, links, prompt marks, t itle, reports | takes `&str`: the adapter carries split UTF-8 and turns invalid bytes into U+FFFD |
+| wezterm | wezterm-term at `cab25161` (git) | pending wrap, 2026, 2048, link groups, prompt marks | replies come throug h a writer thread, synced with a paste marker; links without an id to one URI are one link |
+| vt100 | vt100 0.16.2 | underline colour, blink, hidden, strikeout, autowrap, origin, focus, kitty, 2026, 2048, links,  prompt marks, reports | doesn't vote |
+| xterm.js | @xterm/headless 6.0.0 with addon-unicode-graphemes 0.4.0, `[7mreflow[27mCursorLine` on, one Node process for every  terminal (`node/engine.mjs`) | underline colour, kitty, 2048, prompt marks | patches a crash in ED 1 (see its file); li nks read from its core, not the public API (`urlId`, `OscLinkService`) |
+| tmux | the installed tmux (3.7c here): a private server, one session per terminal, read with `capture-pane -p -e -N -F ` and `display -p` | kitty, 2026, 2048, link groups | links from the OSC 8 `-e` prints, prompt marks from `-F`'s `P`; a  `sh` pane program copies bytes in raw mode; every step is synced with DA1 (`CSI c`), which no family sends; a sync waits  for a reply to each DA1 request in the output too (real programs send them) |
+| xterm | the installed xterm (XTerm 411 here) under one Xvfb per run, read by printing every page (`CSI ? 11 i`) throug h `printerCommand`, modes by DECRQM, resize by `CSI 8 t` | pending wrap, underline colour, kitty, 2026, 2048, links, pro mpt marks | the deciding vote for most disputed families (`verdicts`); the style of a row's blank cells after its last d rawn cell cannot be read, and xterm abstains from a case with SGR 58, which it lacks (see its file) |
+
+## Setup and pins
+
+| What | Pin | Why |
+| --- | --- | --- |
+| `libghostty-vt` | `=0.2.1` (`libghostty-vt-sys` 0.2.2 in `Cargo.lock`) | the Rust bindings |
+| Ghostty | `7aa9591746ff` (2026-07-22), through `GHOSTTY_SOURCE_DIR` | the first commit built by Zig 0.16. The bindings  pin `a887df42` (2026-07-11), which needs Zig 0.15. Between the two, the C API changed only in the kitty-graphics tempor ary-file option (built out here: `default-features = false`) and one new data key |
+| Zig | 0.16.0 | Zig 0.15.2 cannot link anything on macOS 27 |
+:[K[K?[K[H[2J[HMshare one other value than agree with fux-vt. A case fails at the first step
+[HMfux-vt is outvoted on a field when more of the engines that can tell it
+[HM
+[HMthe cursor, each mode, the title, the reports, each history row.
+[HMthose fields, field by field: each cell's text, width and every attribute,
+[HMlists what each one cannot. Each engine is compared with fux-vt only on
+[HMEach engine says what it can tell (`Can` in `src/engine.rs`): `engines`
+[HM
+[HM## The vote
+[HM
+[HM  - `in-process`.
+[HM  - `all`, the default for `cases` and `bench`;
+[HM    and `replay`;
+[HM  - `panel`, the voters, which is the default for `run`, `survey`, `matrix`
+[HM- `--engines` takes names joined by commas, or one of:
+[HM- `--seed` replays a run exactly. Every random choice comes from it.
+[HM- `cases` marks each engine: `+` agrees, `-` differs, `!` abstains.
+[HM    cursor, `↩` soft-wrapped, `≠` a row that differs).
+[HM  - fux-vt's screen beside the first engine that differs (`.` blank, `_`
+[HM  - each engine's verdict and differences;
+[HM  - the fields fux-vt is outvoted on;
+[HM  - its families and the `replay` command;
+[HM  cases. Each one shows:
+[HM- `run` exits 1 if any case fails, and prints up to five distinct shrunk
+[HM
+[HM`fux-vt/compare/target/release/fux-vt-compare` can be run directly.
+[HMbuild takes a few minutes (Ghostty by Zig, then wezterm-term). After that,
+[HM`@xterm/headless` with `npm ci` in `node/` when Node is present. The first
+[HM`~/.cache/fux-vt-compare` (or `$FUX_VT_COMPARE_CACHE`). It also installs
+[HMThe first run fetches Zig 0.16.0, Ghostty and libvterm into
+[HM
+[HM```
+[HMfux-vt/compare/run.sh --cargo clippy --all-targets -- -D warnings
+[HMfux-vt/compare/run.sh --cargo test          # any cargo subcommand, in the same environment
+[HMfux-vt/compare/corpus/record.sh [NAME...]   # record the corpus again (see "The corpus")
+[HMfux-vt/compare/run.sh inventory > fux-vt/compare/corpus/INVENTORY.md   # what the recordings send
+[HMfux-vt/compare/run.sh corpus --show vim     # one recording, and fux-vt's screen at its end
+[HMfux-vt/compare/run.sh corpus                # the recordings beside xterm and the panel; exit 1 if one regresses
+[HMfux-vt/compare/run.sh --no-[7mreflow[27m           # fux-vt set up as fux sets it up
+[40;1H[K:[K[K...skipping...
+differ, all at the end, where it sets an empty title and xterm shows its
+default one, `xterm`.
+
+### The inventory
+
+`inventory` lists every sequence the recordings send, normalized (numbers
+that only place the cursor or pick a colour are `n`; each mode and each SGR
+attribute a row of its own), with how often, which programs sent it, and
+what fux-vt does with it. A fux-vt parser set up as fux's reads each
+sequence in turn: what it reports through `Sink::unhandled`, or answers, it
+is seen doing. What it consumes without a word is named from its source:
+private modes `Screen::mode` does not keep, SGR parameters `Screen::sgr`
+passes over or reads in part, the OSC numbers `Parser::dispatch_osc` drops,
+and every DCS, APC, PM and SOS string. Those lists are in
+`src/inventory.rs`, and must follow fux-vt. `corpus/INVENTORY.md` is its
+output, made again with the recordings.
+
+## Files
+
+| File | What |
+| --- | --- |
+| `run.sh` | fetch and pin Zig, Ghostty and libvterm, install node deps, build, run |
+| `build.rs` | compile libvterm and its shim |
+| `src/main.rs` | commands |
+| `src/engine.rs` | the `Engine` trait and its reading rules, `Can`, the engine list |
+| `src/engines/*.rs` | one adapter per engine, each documenting its quirks; `pane.rs` is what tmux and xterm share (the  pane program, syncing, SGR decoding) |
+| `node/` | the xterm.js server and its pinned packages |
+| `src/case.rs` | running, voting, generating and shrinking cases; reports |
+| `src/families.rs` | the families: generators, statuses and reasons |
+| `src/cases.rs` | the named cases |
+| `src/snapshot.rs` | what is compared, field by field, and the side-by-side view |
+| `src/bench.rs` | the workloads and the speed table |
+| `src/escape.rs` | bytes as replayable text, and back |
+| `src/rng.rs` | splitmix64, as in `diff/` |
+| `src/record.rs` | `record`: a program on a PTY, its output recorded, fux-vt answering its queries |
+| `src/corpus.rs` | the recordings: loading, replaying beside the engines, their statuses |
+| `src/inventory.rs` | what the recordings send, and what fux-vt does with it |
+| `corpus/` | the recordings, their keys, `record.sh` that makes them, and the man page one shows |
+[7m(END)[27m[K[K[H[2J[HMfux-vt/compare/run.sh --list                # the families, their status and reasons
+[HMfux-vt/compare/run.sh bench --engines ghostty corpus   # each recording alone too
+[HMfux-vt/compare/run.sh bench                 # MB/s for every engine on every workload, and the corpus
+[HMfux-vt/compare/run.sh matrix                # family by engine: % of cases each engine differs from fux-vt
+[HMfux-vt/compare/run.sh verdicts              # the families with a recorded verdict, beside the engines that decide each
+[HMfux-vt/compare/run.sh cases                 # the named cases beside every engine, with each engine's mark
+[HMfux-vt/compare/run.sh engines               # which engines run here, which vote, what each cannot tell
+[HMfux-vt/compare/run.sh                       # families expected to agree, 20000 cases, beside the panel
+[HM```sh
+[HM
+[HM## Running it
+[HM
+[HMbelow records which.
+[HMright. Some differences are choices fux-vt makes on purpose, and each family
+[HMwhere to look. xterm's behaviour and the standards decide which side is
+[HMNo engine is the truth. When the panel outvotes fux-vt, the difference says
+[HM
+[HMNode, tmux, xterm and Xvfb. `run.sh` fetches the first three.
+[HMcheckout, libvterm's source and, for the engines in their own processes,
+[HMIt is not built or run by fux's own gates. It needs Zig, a Ghostty
+[HM
+[HMterminal, recorded by `record`.
+[HMworkloads. The corpus (`corpus/`) holds what real programs wrote to a
+[HMthe command that replays it. `bench` times every engine on the same
+[HMfailing case is shrunk to the smallest one that still fails and printed with
+[HMfux-vt fails a case only where the engines outvote it (see "The vote"). A
+[HMcursor, the modes, soft wraps, the title, cursor reports and recent history.
+[HMeach engine's screen is compared with fux-vt's, cell by cell, along with the
+[HMEvery engine gets the same output. After each piece of it, and each resize,
+[HM
+[HM  Node), tmux, and xterm itself under Xvfb.
+[HM- engines run as processes of their own: xterm.js (`@xterm/headless` under
+[HM  libvterm, avt, wezterm-term and the vt100 crate;
+[HM- engines linked into the binary: Ghostty's core (libghostty-vt), alacritty_terminal,
+[HM
+[HMother terminal emulators ("engines"):
+[HMAn excluded package with its own lockfile. It runs fux-vt beside a panel of
+[HM
+[HM# fux-vt-compare: fux-vt beside other terminal emulators
+[40;1H[K:[K[K[?1l>[?1049l

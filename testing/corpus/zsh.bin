@@ -1,0 +1,13 @@
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J/private/tmp/fux-corpus/work % [K[?2004heecho hello wrldorld[13D[16C[?2004l
+hello world
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J/private/tmp/fux-corpus/work % [K[?2004hlls 
+[Jbroken@       empty/        hello/        README.md     src/          
+Cargo.toml    fux-corpus.1  latest@       run.sh*       [A[A[0m[27m[24m[31Cls[K[1Cbroken
+[J[A[40C[9D         [9Dccat Cargo.toml[1m [0m[0m [?2004l
+[J[package]
+name = "corpus"
+version = "0.1.0"
+edition = "2024"
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J/private/tmp/fux-corpus/work % [K[?2004hcat Cargo.toml[14D              [14D
+bck-i-search: _[K[A[16Cecho [4mh[24mello world[1B[33Dh_[A[20C[4mh[4me[24m[1B[23De_[A[19C[1C[4me[4ml[24m[1B[23Dl_[A[18C[2C[4ml[4ml[24m[1B[23Dl_[A[17C[3C[4ml[4mo[24m[1B[23Do_[A[16C[24mh[24me[24ml[24ml[24mo[1B[K[A[36C[?2004l[1Bhello world
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J/private/tmp/fux-corpus/work % [K[?2004heexit[?2004l

@@ -1,0 +1,68 @@
+{
+  "command": [
+    "hx",
+    "README.md"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "helix-resize",
+  "replies": "\\e[?0u\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 29168,
+      "keys": ""
+    },
+    {
+      "end": 45277,
+      "keys": "",
+      "resize": [
+        24,
+        80
+      ]
+    },
+    {
+      "end": 59781,
+      "keys": "\\x04"
+    },
+    {
+      "end": 101685,
+      "keys": "",
+      "resize": [
+        50,
+        200
+      ]
+    },
+    {
+      "end": 138979,
+      "keys": "\\x17v"
+    },
+    {
+      "end": 178418,
+      "keys": "",
+      "resize": [
+        40,
+        120
+      ]
+    },
+    {
+      "end": 198138,
+      "keys": ":q\\r"
+    },
+    {
+      "end": 204497,
+      "keys": ":q\\r"
+    }
+  ],
+  "version": "helix 25.07.1 (a05c151b)"
+}

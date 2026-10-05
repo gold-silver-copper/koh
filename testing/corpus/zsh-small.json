@@ -1,0 +1,53 @@
+{
+  "command": [
+    "/bin/zsh",
+    "-i"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "ZDOTDIR=/tmp/fux-corpus/home/zsh-menu"
+  ],
+  "note": "",
+  "program": "zsh-small",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    10,
+    40
+  ],
+  "steps": [
+    {
+      "end": 155,
+      "keys": ""
+    },
+    {
+      "end": 257,
+      "keys": "echo the quick brown fox jumps over the lazy dog and keeps running past the edge"
+    },
+    {
+      "end": 263,
+      "keys": "\\x01"
+    },
+    {
+      "end": 267,
+      "keys": "\\x05"
+    },
+    {
+      "end": 510,
+      "keys": "\\r"
+    },
+    {
+      "end": 955,
+      "keys": "ls\\r"
+    },
+    {
+      "end": 972,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "zsh 5.9 (arm64-apple-darwin26.0)"
+}

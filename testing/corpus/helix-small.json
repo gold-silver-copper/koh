@@ -1,0 +1,48 @@
+{
+  "command": [
+    "hx",
+    "fux-corpus.1"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "helix-small",
+  "replies": "\\e[?0u\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    24,
+    80
+  ],
+  "steps": [
+    {
+      "end": 9566,
+      "keys": ""
+    },
+    {
+      "end": 15922,
+      "keys": "\\x04"
+    },
+    {
+      "end": 16652,
+      "keys": "/SH\\r"
+    },
+    {
+      "end": 23417,
+      "keys": "n"
+    },
+    {
+      "end": 29571,
+      "keys": "n"
+    },
+    {
+      "end": 32379,
+      "keys": ":q\\r"
+    }
+  ],
+  "version": "helix 25.07.1 (a05c151b)"
+}

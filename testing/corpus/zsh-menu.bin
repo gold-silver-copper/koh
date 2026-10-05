@@ -1,0 +1,26 @@
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J[34m/private/tmp/fux-corpus/work[39m % [K[85C[33m[0][39m[88D[?2004hlls src/[32m[39m[32m[39m[32m[39m[32m[39m
+[1m[32m-- file --[39m[0m
+[34mcell[0m/       [34mgrid[0m/       lib.rs      [34mparser[0m/     [34mscreen[0m/     [34municode[0m/                                            
+[Jcell.rs     [Jgrid.rs     [Jlink.rs     [Jparser.rs   [Jscreen.rs   [Junicode.rs  [J                                        [3A[0m[27m[24m[39m[31Cls src/[K[78C[33m[0][39m[39m[81D[32m[39m[32m[39m[32m[39mcell[1m/[0m[32m[39m
+[1m[32m-- file --[39m[0m[K[K
+[7mcell/     [0m  [34mgrid[0m/       lib.rs      [34mparser[0m/     [34mscreen[0m/     [34municode[0m/                                            [K
+[Jcell.rs     [Jgrid.rs     [Jlink.rs     [Jparser.rs   [Jscreen.rs   [Junicode.rs  [J                                        [3A[0m[27m[24m[39m[31Cls src/cell[1m/[0m[K[73C[33m[0][39m[39m[76D
+[1B[7mcell/     [0m  [7mcell/     [0m  [A[A[0m[27m[24m[39m[31Cls src/cell[1m/[0m[K[73C[33m[0][39m[39m[76D[0m.rs
+[1B[34mcell[0m/       [1B[7mcell.rs   [0m  [3A[0m[27m[24m[39m[31Cls src/cell.rs[K[71C[33m[0][39m[39m[74D
+[J[A[45C[1m [0m[15D              [0m [15Dggit ch[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39me[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m[32m[39m
+[J[1m[32m-- main porcelain command --[39m[0m
+[0mcheckout         -- checkout branch or paths to working tree
+cherry-pick      -- apply changes introduced by some existing commits
+[1m[32m-- plumbing manipulator command --[39m[0m
+[0mcheckout-index   -- copy files from index to working directory
+[1m[32m-- plumbing interrogator command --[39m[0m
+[0mcherry           -- find commits not merged upstream
+[1m[32m-- plumbing internal helper command --[39m[0m
+[0mcheck-attr       -- display gitattributes information
+check-ignore     -- debug gitignore/exclude files
+check-mailmap    -- show canonical names and email addresses of contacts
+[Jcheck-ref-format -- ensure that a reference name is well formed[J[12A[0m[27m[24m[39m[31Cgit che[K[78C[33m[0][39m[39m[81D[?2004l
+[J[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J[34m/private/tmp/fux-corpus/work[39m % [K[83C[33m[130][39m[88D[?2004hccd sr[32m[39mc[1m/[0m[0m [?2004l
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J[34m/private/tmp/fux-corpus/work/src[39m % [K[81C[33m[0][39m[84D[?2004hffalse[?2004l
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J[34m/private/tmp/fux-corpus/work/src[39m % [K[81C[33m[1][39m[84D[?2004hccd ..[?2004l
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J[34m/private/tmp/fux-corpus/work[39m % [K[85C[33m[0][39m[88D[?2004heexit[?2004l

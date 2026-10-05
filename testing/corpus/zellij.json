@@ -1,0 +1,63 @@
+{
+  "command": [
+    "zellij",
+    "--config",
+    "/tmp/fux-corpus/home/.config/zellij/config.kdl",
+    "--session",
+    "corpus"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "SHELL=/bin/sh",
+    "ENV=/tmp/fux-corpus/home/.shrc",
+    "ZELLIJ_SOCKET_DIR=/tmp/fux-corpus/zellij",
+    "XDG_CONFIG_HOME=/tmp/fux-corpus/home/.config"
+  ],
+  "note": "",
+  "program": "zellij",
+  "replies": "\\e[?997;1n\\e]11;rgb:0000/0000/0000\\e\\\\\\e]10;rgb:ffff/ffff/ffff\\e\\\\\\e[?2026;2$y",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 16244,
+      "keys": ""
+    },
+    {
+      "end": 43343,
+      "keys": "\\x10n"
+    },
+    {
+      "end": 43620,
+      "keys": "echo inside zellij\\r"
+    },
+    {
+      "end": 71129,
+      "keys": "\\x10d"
+    },
+    {
+      "end": 81033,
+      "keys": "seq 1 20\\r"
+    },
+    {
+      "end": 98501,
+      "keys": "\\x14n"
+    },
+    {
+      "end": 119909,
+      "keys": "\\x14h"
+    },
+    {
+      "end": 120004,
+      "keys": "\\x11"
+    }
+  ],
+  "version": "zellij 0.44.3"
+}

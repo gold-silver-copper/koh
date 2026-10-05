@@ -1,0 +1,73 @@
+{
+  "command": [
+    "/bin/zsh",
+    "-i"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "ZDOTDIR=/tmp/fux-corpus/home/zsh-menu"
+  ],
+  "note": "",
+  "program": "zsh-resize",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 237,
+      "keys": ""
+    },
+    {
+      "end": 323,
+      "keys": "echo a line long enough to wrap when the terminal is narrow, typed before the resize"
+    },
+    {
+      "end": 470,
+      "keys": "",
+      "resize": [
+        20,
+        60
+      ]
+    },
+    {
+      "end": 470,
+      "keys": "\\x05"
+    },
+    {
+      "end": 652,
+      "keys": "",
+      "resize": [
+        40,
+        120
+      ]
+    },
+    {
+      "end": 981,
+      "keys": "\\r"
+    },
+    {
+      "end": 1430,
+      "keys": "seq 1 50\\r"
+    },
+    {
+      "end": 1516,
+      "keys": "",
+      "resize": [
+        24,
+        80
+      ]
+    },
+    {
+      "end": 1533,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "zsh 5.9 (arm64-apple-darwin26.0)"
+}

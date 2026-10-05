@@ -1,0 +1,47 @@
+[1mdiff --git a/src/grid.rs b/src/grid.rs[m
+[1mindex 8dd968d..4f013d1 100644[m
+[1m--- a/src/grid.rs[m
+[1m+++ b/src/grid.rs[m
+[36m@@ -17,9 +17,6 @@[m [mimpl Extent {[m
+     pub fn new(n: u16) -> Result<Self, Error> {[m
+         NonZeroU16::new(n).map(Self).ok_or(Error::ZeroSize)[m
+     }[m
+[31m-    pub fn get(self) -> u16 {[m
+[31m-        self.0.get()[m
+[31m-    }[m
+     /// The last row or column.[m
+     pub fn last(self) -> u16 {[m
+         // Exact: an extent is at least one.[m
+[1;34m(1/3) Stage this hunk [y,n,q,a,d,j,J,g,/,e,p,?]? [my
+[36m@@ -47,7 +44,7 @@[m [mstruct Meta {[m
+     linked: bool,[m
+     /// Whether a prompt starts on the row (OSC 133 ; A).[m
+     prompt: bool,[m
+[31m-}[m
+[32m+[m[32m} // edited[m
+ [m
+ // The two flags fit where the struct had padding: a row without links costs[m
+ // no more than it did before links.[m
+[1;34m(2/3) Stage this hunk [y,n,q,a,d,K,j,J,g,/,e,p,?]? [mn
+[36m@@ -198,6 +195,7 @@[m [mimpl Grid {[m
+     fn allocate(&mut self, next: &mut u64, version: u64) -> Result<usize, Error> {[m
+         let slot = self.meta.len();[m
+         let end = self[m
+[32m+[m[32m    // a line added[m
+             .cells[m
+             .len()[m
+             .checked_add(self.stride)[m
+[1;34m(3/3) Stage this hunk [y,n,q,a,d,K,g,/,e,p,?]? [m?
+[1;31my - stage this hunk
+n - do not stage this hunk
+q - quit; do not stage this hunk or any of the remaining ones
+a - stage this hunk and all later hunks in the file
+d - do not stage this hunk or any of the later hunks in the file
+[m[1;31mK - leave this hunk undecided, see previous hunk[m
+[1;31mg - select a hunk to go to[m
+[1;31m/ - search for a hunk matching the given regex[m
+[1;31me - manually edit the current hunk[m
+[1;31mp - print the current hunk, 'P' to use the pager[m
+[1;31m? - print help[m
+[1;34m(3/3) Stage this hunk [y,n,q,a,d,K,g,/,e,p,?]? [mq
+

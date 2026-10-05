@@ -1,0 +1,33 @@
+{
+  "command": [
+    "npm",
+    "install",
+    "--offline",
+    "--no-audit",
+    "--no-fund",
+    "--no-update-notifier",
+    "../lib"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "a package from the directory beside it, offline",
+  "program": "npm-install",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 50,
+      "keys": ""
+    }
+  ],
+  "version": "npm 11.19.1, node v26.10.0"
+}

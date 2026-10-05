@@ -1,0 +1,65 @@
+{
+  "command": [
+    "/bin/zsh",
+    "-i"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "ZDOTDIR=/tmp/fux-corpus/home/zsh-menu"
+  ],
+  "note": "",
+  "program": "zsh-history",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 237,
+      "keys": ""
+    },
+    {
+      "end": 241,
+      "keys": "\\e[A"
+    },
+    {
+      "end": 250,
+      "keys": "\\e[A"
+    },
+    {
+      "end": 261,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 273,
+      "keys": "\\x15"
+    },
+    {
+      "end": 494,
+      "keys": "\\x12hello"
+    },
+    {
+      "end": 803,
+      "keys": "\\r"
+    },
+    {
+      "end": 1101,
+      "keys": "echo !!\\r"
+    },
+    {
+      "end": 1560,
+      "keys": "fc -l\\r"
+    },
+    {
+      "end": 1577,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "zsh 5.9 (arm64-apple-darwin26.0)"
+}

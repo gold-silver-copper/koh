@@ -1,0 +1,14 @@
+[?2004h/private/tmp/fux-corpus/work $ echo hello wrld[1@o[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C
+[?2004lhello world
+[?2004h/private/tmp/fux-corpus/work $ ls 
+broken        empty/        hello/        README.md     src/          
+Cargo.toml    fux-corpus.1  latest        run.sh        
+/private/tmp/fux-corpus/work $ ls [Kcat Cargo.toml 
+[?2004l[package]
+name = "corpus"
+version = "0.1.0"
+edition = "2024"
+[?2004h/private/tmp/fux-corpus/work $ cat Cargo.toml [K(reverse-i-search)`': [Kh': echo [7mh[27mello world[1@e': echo [7mhe[27m[1@l': echo [7mhel[27m[1@l': echo [7mhell[27m[1@o': echo [7mhello[27m[4@/private/tmp/fux-corpus/work $ echo hello
+[?2004lhello world
+[?2004h/private/tmp/fux-corpus/work $ exit
+[?2004lexit

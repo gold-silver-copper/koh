@@ -1,0 +1,48 @@
+{
+  "command": [
+    "man",
+    "./fux-corpus-tables.1"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "man-tables",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    24,
+    80
+  ],
+  "steps": [
+    {
+      "end": 1557,
+      "keys": ""
+    },
+    {
+      "end": 4434,
+      "keys": " "
+    },
+    {
+      "end": 5231,
+      "keys": " "
+    },
+    {
+      "end": 7661,
+      "keys": "/EXIT\\r"
+    },
+    {
+      "end": 9332,
+      "keys": "g"
+    },
+    {
+      "end": 9351,
+      "keys": "q"
+    }
+  ],
+  "version": "man (macOS), mandoc"
+}

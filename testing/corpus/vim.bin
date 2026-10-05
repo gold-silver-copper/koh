@@ -1,0 +1,199 @@
+[?1049h[>4;2m[?1h=[?2004h[?1004h[1;40r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[40;1H"src/parser.rs" 1098L, 44626B[2;1H▽[6n[2;1H  [3;1HPzz\[0%m[6n[3;1H           [1;1H[>c]11;?]10;?[1;1H[38;5;130m   1 [m[35m//! Direct DEC ANSI transition parser, based on Paul Williams's transition[m
+[38;5;130m   2 [m[35m//! model (reference and attribution in the crate README), with UTF-8 ground decoding.[m[2;92H[K[3;1H[38;5;130m   3 [m[35m//! Ignored control strings retain no payload. No parser dependency is used.[m[3;82H[K[4;1H[38;5;130m   4 
+   5 use[m [35mcrate[m[35m::[m{Error, Reply, Screen, [35mscreen[m[35m::[mDispatch};
+[38;5;130m   6 
+   7 [m[35m#[cfg(test)][m
+[38;5;130m   8 [m[35m#[path = [m[31m"../tests/corpus/mod.rs"[m[35m][m
+[38;5;130m   9 mod[m [36mtest_corpus[m;
+[38;5;130m  10 
+  11 [m[35m#[derive([m[32mClone[m[35m, [m[32mDebug[m[35m)][m
+[38;5;130m  12 pub[m[35m([m[38;5;130mcrate[m[35m)[m [38;5;130mstruct[m [36mParameters[m {
+[38;5;130m  13 [m    values: [[32mu16[m; [31m32[m],
+[38;5;130m  14 [m    [35m/// True when this value continues the previous colon-delimited group.[m
+[38;5;130m  15 [m    sub: [[32mbool[m; [31m32[m],
+[38;5;130m  16 [m    len: [32musize[m,
+[38;5;130m  17 [m}
+[38;5;130m  18 impl[m [32mDefault[m [38;5;130mfor[m Parameters {
+[38;5;130m  19 [m    [38;5;130mfn[m [36mdefault[m() [38;5;130m->[m [32mSelf[m {
+[38;5;130m  20 [m[8C[32mSelf[m {
+[38;5;130m  21 [m[12Cvalues: [[31m0[m; [31m32[m],
+[38;5;130m  22 [m[12Csub: [[31mfalse[m; [31m32[m],
+[38;5;130m  23 [m[12Clen: [31m1[m,
+[38;5;130m  24 [m[8C}
+[38;5;130m  25 [m    }
+[38;5;130m  26 [m}
+[38;5;130m  27 impl[m Parameters {
+[38;5;130m  28 [m    [38;5;130mfn[m [36mdigit[m([32m&mut[m [31mself[m, byte: [32mu8[m) {
+[38;5;130m  29 [m[8C[34m// A value too large for a u16 stays at its largest.[m
+[38;5;130m  30 [8Cif[m [38;5;130mlet[m [31mSome[m(n) [38;5;130m=[m [31mself[m.len.[36mchecked_sub[m([31m1[m).[36mand_then[m([38;5;130m|[mi[38;5;130m|[m [31mself[m.values.[36mget_mut[m(i))
+[38;5;130m  31 [12C&&[m [38;5;130mlet[m [31mSome[m(digit) [38;5;130m=[m byte.[36mchecked_sub[m([31mb'0'[m)
+[38;5;130m  32 [m[8C{
+[38;5;130m  33 [m[12C[32m*[mn [38;5;130m=[m n.[36msaturating_mul[m([31m10[m).[36msaturating_add[m([32mu16[m[35m::[m[36mfrom[m(digit));
+[38;5;130m  34 [m[8C}
+[38;5;130m  35 [m    }
+[38;5;130m  36 [m    [38;5;130mfn[m [36mseparator[m([32m&mut[m [31mself[m, colon: [32mbool[m) [38;5;130m->[m [32mbool[m {
+[38;5;130m  37 [8Clet[m [31mSome[m(len) [38;5;130m=[m [31mself[m.len.[36mchecked_add[m([31m1[m).[36mfilter[m([38;5;130m|[mn[38;5;130m|[m [32m*[mn [38;5;130m<=[m [31mself[m.values.[36mlen[m()) [38;5;130melse[m {
+[38;5;130m  38 [12Creturn[m [31mfalse[m;
+[1m[7msrc/parser.rs                                                                                         1,1            Top[1;6H[?25h[?4mP+q436f\P+q6b75\P+q6b64\P+q6b72\P+q6b6c\P+q2332\P+q2334\P+q2569\P+q2a37\P+q6b31\P$q q\[?12$p[27m[23m[29m[m[H[2J[?25l[1;1H[93m   1 [m[38;5;224m//! Direct DEC ANSI transition parser, based on Paul Williams's transition[m
+[93m   2 [m[38;5;224m//! model (reference and attribution in the crate README), with UTF-8 ground decoding.[m
+[93m   3 [m[38;5;224m//! Ignored control strings retain no payload. No parser dependency is used.[m
+[93m   4 
+   5 [m[93muse[m [38;5;81mcrate[m[38;5;224m::[m{Error, Reply, Screen, [38;5;81mscreen[m[38;5;224m::[mDispatch};
+[93m   6 
+   7 [m[38;5;81m#[cfg(test)][m
+[93m   8 [m[38;5;81m#[path = [m[95m"../tests/corpus/mod.rs"[m[38;5;81m][m
+[93m   9 [m[93mmod[m [1m[96mtest_corpus[m;
+[93m  10 
+  11 [m[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m)][m
+[93m  12 [m[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [93mstruct[m [1m[96mParameters[m {
+[93m  13 [m    values: [[38;5;121mu16[m; [95m32[m],
+[93m  14 [m    [38;5;224m/// True when this value continues the previous colon-delimited group.[m
+[93m  15 [m    sub: [[38;5;121mbool[m; [95m32[m],
+[93m  16 [m    len: [38;5;121musize[m,
+[93m  17 [m}
+[93m  18 [m[93mimpl[m [38;5;121mDefault[m [93mfor[m Parameters {
+[93m  19 [m    [93mfn[m [1m[96mdefault[m() [93m->[m [38;5;121mSelf[m {
+[93m  20 [m[8C[38;5;121mSelf[m {
+[93m  21 [m[12Cvalues: [[95m0[m; [95m32[m],
+[93m  22 [m[12Csub: [[95mfalse[m; [95m32[m],
+[93m  23 [m[12Clen: [95m1[m,
+[93m  24 [m[8C}
+[93m  25 [m    }
+[93m  26 [m}
+[93m  27 [m[93mimpl[m Parameters {
+[93m  28 [m    [93mfn[m [1m[96mdigit[m([38;5;121m&mut[m [95mself[m, byte: [38;5;121mu8[m) {
+[93m  29 [m[8C[96m// A value too large for a u16 stays at its largest.[m
+[93m  30 [m[8C[93mif[m [93mlet[m [95mSome[m(n) [93m=[m [95mself[m.len.[1m[96mchecked_sub[m([95m1[m).[1m[96mand_then[m([93m|[mi[93m|[m [95mself[m.values.[1m[96mget_mut[m(i))
+[93m  31 [m[12C[93m&&[m [93mlet[m [95mSome[m(digit) [93m=[m byte.[1m[96mchecked_sub[m([95mb'0'[m)
+[93m  32 [m[8C{
+[93m  33 [m[12C[38;5;121m*[mn [93m=[m n.[1m[96msaturating_mul[m([95m10[m).[1m[96msaturating_add[m([38;5;121mu16[m[38;5;224m::[m[1m[96mfrom[m(digit));
+[93m  34 [m[8C}
+[93m  35 [m    }
+[93m  36 [m    [93mfn[m [1m[96mseparator[m([38;5;121m&mut[m [95mself[m, colon: [38;5;121mbool[m) [93m->[m [38;5;121mbool[m {
+[93m  37 [m[8C[93mlet[m [95mSome[m(len) [93m=[m [95mself[m.len.[1m[96mchecked_add[m([95m1[m).[1m[96mfilter[m([93m|[mn[93m|[m [38;5;121m*[mn [93m<=[m [95mself[m.values.[1m[96mlen[m()) [93melse[m {
+[93m  38 [m[12C[93mreturn[m [95mfalse[m;
+[1m[7msrc/parser.rs                                                                                         1,1            Top[m[40;1H"src/parser.rs" 1098L, 44626B[1;6H[?25h[?25l[40;110Hj[1;6H[40;110H [2;6H[39;103H[1m[7m2,[2;6H[?25h[?25l[m[40;110Hj[2;6H[40;110H [3;6H[39;103H[1m[7m3,[3;6H[?25h[?25l[m[40;110H5j[3;6H[40;110H  [8;6H[39;103H[1m[7m8,[8;6H[?25h[?25l[m[40;110H^D[8;6H[40;110H  [8;6H[1;38r[1;1H[19M[1;40r[20;1H[93m  39 [m[8C};
+[93m  40 [m[8C[96m// The new parameter starts empty: `clear` left what a sequence[m
+[93m  41 [m[8C[96m// before put there.[m
+[93m  42 [m[8C[93mif[m [93mlet[m [95mSome[m(sub) [93m=[m [95mself[m.sub.[1m[96mget_mut[m([95mself[m.len) {
+[93m  43 [m[12C[38;5;121m*[msub [93m=[m colon;
+[93m  44 [m[8C}
+[93m  45 [m[8C[93mif[m [93mlet[m [95mSome[m(value) [93m=[m [95mself[m.values.[1m[96mget_mut[m([95mself[m.len) {
+[93m  46 [m[12C[38;5;121m*[mvalue [93m=[m [95m0[m;
+[93m  47 [m[8C}
+[93m  48 [m[8C[95mself[m.len [93m=[m len;
+[93m  49 [m[8C[95mtrue[m
+[93m  50 [m    }
+[93m  51 [m    [38;5;224m/// Back to one empty parameter, touching only what `separator` and[m
+[93m  52 [m    [38;5;224m/// `digit` read: a sequence is begun on every ESC, so this is kept to[m
+[93m  53 [m    [38;5;224m/// two stores rather than rewriting all the parameters.[m
+[93m  54 [m    [93mfn[m [1m[96mclear[m([38;5;121m&mut[m [95mself[m) {
+[93m  55 [m[8C[95mself[m.len [93m=[m [95m1[m;
+[93m  56 [m[8C[93mif[m [93mlet[m [95mSome[m(value) [93m=[m [95mself[m.values.[1m[96mfirst_mut[m() {
+[93m  57 [m[12C[38;5;121m*[mvalue [93m=[m [95m0[m;[40;1H[K[39;103H[1m[7m27,1[11C 1%[8;6H[?25h[?25l[m[40;110H^D[8;6H[40;110H  [8;18H[1;38r[1;1H[19M[1;40r[20;1H[93m  58 [m[8C}
+[93m  59 [m    }
+[93m  60 [m    [93mpub[m [93mfn[m [1m[96mgroups[m([38;5;121m&[m[95mself[m) [93m->[m [93mimpl[m [38;5;121mIterator[m[93m<[mItem [93m=[m [38;5;121m&[m[[38;5;121mu16[m][93m>[m [93m+[m [93muse<[m[38;5;224m'_[m[93m>[m {
+[93m  61 [m[8C[93mlet[m [38;5;121mmut[m start [93m=[m [95m0[m;
+[93m  62 [m[8C[38;5;81mstd[m[38;5;224m::[m[38;5;81miter[m[38;5;224m::[m[1m[96mfrom_fn[m([38;5;121mmove[m [93m||[m {
+[93m  63 [m[12C[93mif[m start [93m>=[m [95mself[m.len {
+[93m  64 [m[16C[93mreturn[m [95mNone[m;
+[93m  65 [m[12C}
+[93m  66 [m[12C[93mlet[m [38;5;121mmut[m end [93m=[m start.[1m[96mchecked_add[m([95m1[m)[38;5;224m?[m;
+[93m  67 [m[12C[93mwhile[m end [93m<[m [95mself[m.len [93m&&[m [95mself[m.sub.[1m[96mget[m(end).[1m[96mcopied[m().[1m[96munwrap_or[m([95mfalse[m) {
+[93m  68 [m[16Cend [93m=[m end.[1m[96mchecked_add[m([95m1[m)[38;5;224m?[m;
+[93m  69 [m[12C}
+[93m  70 [m[12C[93mlet[m result [93m=[m [95mself[m.values.[1m[96mget[m(start..end);
+[93m  71 [m[12Cstart [93m=[m end;
+[93m  72 [m[12Cresult
+[93m  73 [m[8C})
+[93m  74 [m    }
+[93m  75 [m    [38;5;224m/// Whether no parameter was given (or only 0, which reads the same).[m
+[93m  76 [m    [93mfn[m [1m[96mis_empty[m([38;5;121m&[m[95mself[m) [93m->[m [38;5;121mbool[m {[39;103H[1m[7m46,13[11C3%[8;18H[?25h[?25l[m[40;110H^U[8;18H[40;110H  [8;6H[1;38r[1;1H[19L[1;40r[1;1H[93m  20 [m[8C[38;5;121mSelf[m {
+[93m  21 [m[12Cvalues: [[95m0[m; [95m32[m],
+[93m  22 [m[12Csub: [[95mfalse[m; [95m32[m],
+[93m  23 [m[12Clen: [95m1[m,
+[93m  24 [m[8C}
+[93m  25 [m    }
+[93m  26 [m}
+[93m  27 [m[93mimpl[m Parameters {
+[93m  28 [m    [93mfn[m [1m[96mdigit[m([38;5;121m&mut[m [95mself[m, byte: [38;5;121mu8[m) {
+[93m  29 [m[8C[96m// A value too large for a u16 stays at its largest.[m
+[93m  30 [m[8C[93mif[m [93mlet[m [95mSome[m(n) [93m=[m [95mself[m.len.[1m[96mchecked_sub[m([95m1[m).[1m[96mand_then[m([93m|[mi[93m|[m [95mself[m.values.[1m[96mget_mut[m(i))
+[93m  31 [m[12C[93m&&[m [93mlet[m [95mSome[m(digit) [93m=[m byte.[1m[96mchecked_sub[m([95mb'0'[m)
+[93m  32 [m[8C{
+[93m  33 [m[12C[38;5;121m*[mn [93m=[m n.[1m[96msaturating_mul[m([95m10[m).[1m[96msaturating_add[m([38;5;121mu16[m[38;5;224m::[m[1m[96mfrom[m(digit));
+[93m  34 [m[8C}
+[93m  35 [m    }
+[93m  36 [m    [93mfn[m [1m[96mseparator[m([38;5;121m&mut[m [95mself[m, colon: [38;5;121mbool[m) [93m->[m [38;5;121mbool[m {
+[93m  37 [m[8C[93mlet[m [95mSome[m(len) [93m=[m [95mself[m.len.[1m[96mchecked_add[m([95m1[m).[1m[96mfilter[m([93m|[mn[93m|[m [38;5;121m*[mn [93m<=[m [95mself[m.values.[1m[96mlen[m()) [93melse[m {
+[93m  38 [m[12C[93mreturn[m [95mfalse[m;[39;103H[1m[7m27,1  [10C1%[8;6H[?25h[?25l[m[40;110HG[8;6H[40;110H [38;6H[1;1H[93m1061[m[9C    },
+[93m1062[m[13C([95mb">"[m, [95mb'q'[m) [93mif[m n [93m==[m [95m0[m [93m=>[m {
+[93m1063[m[13C    [93mlet[m identity [93m=[m identity[38;5;224m?[m;
+[93m1064[m[13C    [93mlet[m length [93m=[m identity.name.[1m[96mlen[m().[1m[96mchecked_add[m(identity.version.[1m[96mlen[m())[38;5;224m?[m;
+[93m1065[m[9C [7C[93mif[m length [93m>[m [38;5;81mIdentity[m[38;5;224m::[mMAX_LEN {
+[93m1066[m[5C [15C[93mreturn[m [95mNone[m;
+[93m1067[m[1C [15C}
+[93m1068[m[1C                [93mlet[m (name, version) [93m=[m (identity.name, identity.version);
+[93m1069[m[5C            [95mSom[m[1C([38;5;81mReply[m[38;5;224m::[m[1m[96mof[m([38;5;81mformat_args![m([95m"[m[38;5;224m\x1b[m[95mP>|{name} {version}[m[38;5;224m\x1b\\[m[95m"[m)))
+[93m1070[m[9C    }[10;19H[K[11;1H[93m1071[m[9C    ([95mb""[m, [95mb't'[m) [93mif[m n [93m==[m [95m18[m [93m&&[m [95mself[m.options.size_reports [93m=>[m {[11;74H[K[12;1H[93m1072[m[13C    [93mlet[m (rows, cols) [93m=[m [95mself[m.screen.[1m[96msize[m();[12;60H[K[13;1H[93m1073[m[9C [7C[95mSome[m([38;5;81mReply[m[38;5;224m::[m[1m[96mof[m([38;5;81mformat_args![m([95m"[m[38;5;224m\x1b[m[95m[8;{rows};{cols}t"[m)))
+[93m1074[m[13C}[14;19H[K[15;1H[93m1075[m[9C    ([95mb"*"[m, [95mb'y'[m) [93mif[m [95mself[m.options.rectangle_checksums [93m=>[m {
+[93m1076[m[5C [11C[95mSome[m([95mself[m.screen.[1m[96mrectangle_checksum[m([38;5;121m&[m[95mself[m.params))
+[93m1077[m[5C        }[17;19H[K[18;1H[93m1078[m[9C    ([95mb"?$"[m, [95mb'p'[m) [93mif[m modes [93m=>[m {[18;45H[K[19;1H[93m1079[m[13C    [93mlet[m status [93m=[m [93mmatch[m n {
+[93m1080[m[9C  [10C[95m2048[m [93mif[m [93m![m[95mself[m.options.in_band_resize [93m=>[m [95m0[m,
+[93m1081[m[9C            [95m2031[m [93mif[m [93m![m[95mself[m.options.color_scheme_updates [93m=>[m [95m0[m,[21;74H[K[22;1H[93m1082[m[9C            _ [93m=>[m [95mself[m.screen.[1m[96mprivate_mode_status[m(n),
+[93m1083[m[9C        };[23;24H[K[24;1H[93m1084[m[13C    [95mSome[m([38;5;81mReply[m[38;5;224m::[m[1m[96mof[m([38;5;81mformat_args![m([95m"[m[38;5;224m\x1b[m[95m[?{n};{status}$y"[m)))
+[93m1085[m[9C    }
+[93m1086[m[9C    ([95mb"$"[m, [95mb'p'[m) [93mif[m modes [93m=>[m {[26;44H[K[27;1H[93m1087[m[13C    [96m// IRM alone of the ANSI modes is known.[m
+[93m1088[m[9C [7C[93mlet[m status [93m=[m [93mmatch[m n {
+[93m1089[m[9C            [95m4[m [93mif[m [95mself[m.screen.[1m[96minsert_mode[m() [93m=>[m [95m1[m,
+[93m1090[m[9C    [8C[95m4[m [93m=>[m [95m2[m,
+[93m1091[m[5C [15C_ [93m=>[m [95m0[m,
+[93m1092[m[5C            };[32;24H[K[33;1H[93m1093[m[5C            [95mSome[m([38;5;81mReply[m[38;5;224m::[m[1m[96mof[m([38;5;81mformat_args![m([95m"[m[38;5;224m\x1b[m[95m[{n};{status}$y"[m)))[33;74H[K[34;1H[93m1094[m[5C        }[34;19H[K[35;1H[93m1095[m[5C        _ [93m=>[m [95mNone[m,[35;28H[K[36;1H[93m1096[m[9C}[36;15H[K[37;1H[93m1097[m[5C}[37;14H[K[38;1H[93m1098[m[1C}[38;18H[K[39;103H[1m[7m1098,1[9CBot[38;6H[?25h[?25l[m[40;110Hgg[38;6H[40;110H  [1;6H[93m   [m[2C[38;5;224m//! Direct DEC ANSI transition parser, based on Paul Williams's transition[m
+[93m   [m[2C[38;5;224m//! model (reference and attribution in the crate README), with UTF-8 ground decoding.[m
+[93m   [m[2C[38;5;224m//! Ignored control strings retain no payload. No parser dependency is used.[m
+[93m   [m[4;22H[K[5;1H[93m   [m[2C[93muse[m [38;5;81mcrate[m[38;5;224m::[m{Error, Reply, Screen, [38;5;81mscreen[m[38;5;224m::[mDispatch};
+[93m   [m[6;26H[K[7;1H[93m   [m[2C[38;5;81m#[cfg(test)][m[7;22H[K[8;1H[93m   [m[2C[38;5;81m#[path = [m[95m"../tests/corpus/mod.rs"[m[38;5;81m][m[8;40H[K[9;1H[93m   [m[2C[93mmod[m [1m[96mtest_corpus[m;[9;22H[K[10;1H[93m  1[m[10;18H[K[11;1H[93m  1[m[2C[38;5;81m#[derive([m[38;5;121mClone[m[38;5;81m, [m[38;5;121mDebug[m[38;5;81m)][m[11;30H[K[12;1H[93m  1[m[2C[93mpub[m[38;5;224m([m[93mcrate[m[38;5;224m)[m [93mstruct[m [1m[96mParameters[m {[12;36H[K[13;1H[93m  1[m[6Cvalues: [[38;5;121mu16[m; [95m32[m],[13;28H[K[14;1H[93m  1[m[6C[38;5;224m/// True when this value continues the previous colon-delimited group.[m
+[93m  1[m[6Csub: [[38;5;121mbool[m; [95m32[m],[15;26H[K[16;1H[93m  1[m[6Clen: [38;5;121musize[m,[16;22H[K[17;1H[93m  1[m[2C}[17;18H[K[18;1H[93m  1[m[2C[93mimpl[m [38;5;121mDefault[m [93mfor[m Parameters {[18;35H[K[19;1H[93m  1[m[6C[93mfn[m [1m[96mdefault[m() [93m->[m [38;5;121mSelf[m {[19;33H[K[20;1H[93m  2[m[10C[38;5;121mSelf[m {[20;26H[K[21;1H[93m  2[m[14Cvalues: [[1C; [95m32[m],[21;34H[K[22;1H[93m  2[m[14Csub: [[95mfalse[m; [95m32[m],[22;35H[K[23;1H[93m  2[m[14Clen: [95m1[m,
+[93m  2[m[10C}[24;22H[K[25;1H[93m  2[m[6C}[25;18H[K[26;1H[93m  2[m[2C}[26;18H[K[27;1H[93m  2[m[2C[93mimpl[m Parameters {[27;23H[K[28;1H[93m  2[m[6C[93mfn[m [1m[96mdigit[m([38;5;121m&mut[m [95mself[m, byte: [38;5;121mu8[m) {[28;41H[K[29;1H[93m  2[m[10C[96m// A value too large for a u16 stays at its largest.[m
+[93m  3[m[10C[93mif[m [93mlet[m [95mSome[m(n) [93m=[m [95mself[m.len.[1m[96mchecked_sub[m([95m1[m).[1m[96mand_then[m([93m|[mi[93m|[m [95mself[m.values.[1m[96mget_mut[m(i))
+[93m  3[m[14C[93m&&[m [93mlet[m [95mSome[m(digit) [93m=[m byte.[1m[96mchecked_sub[m([95mb'0'[m)
+[93m  3[m[10C{[32;22H[K[33;1H[93m  3[m[14C[38;5;121m*[mn [93m=[m n.[1m[96msaturating_mul[m([95m10[m).[1m[96msaturating_add[m([38;5;121mu16[m[38;5;224m::[m[1m[96mfrom[m(digit));
+[93m  3[m[10C}[34;18H[K[35;1H[93m  3[m[6C}[35;18H[K[36;1H[93m  3[m[6C[93mfn[m [1m[96mseparator[m([38;5;121m&mut[m [95mself[m, colon: [38;5;121mbool[m) [93m->[m [38;5;121mbool[m {
+[93m  3[m[6C    [93mlet[m [95mSome[m(len) [93m=[m [95mself[m.len.[1m[96mchecked_add[m([95m1[m).[1m[96mfilter[m([93m|[mn[93m|[m [38;5;121m*[mn [93m<=[m [95mself[m.values.[1m[96mlen[m()) [93melse[m {
+[93m  3[m[2C [11C[93mreturn[m [95mfalse[m;[39;104H[1m[7m,1    [8CTop[1;6H[?25h[?25l[40;1H[m/fn [19;10H[30m[103mfn [28;10Hfn [36;10Hfn [m[39;104H[1m[7m9,5[19;10H[?25h[?25l[m[40;110Hn[19;10H[40;110H[K[40;1H[28;10H[39;103H[1m[7m28,[28;10H[?25h[?25l[m[40;110Hn[28;10H[40;110H[K[40;1H[36;10H[39;103H[1m[7m36,[36;10H[?25h[?25l[m[40;110H*[36;10H[40;2H\<fn\>[40;110H[K[40;1H[38;10H[1;38r[1;1H[16M[1;40r[3;12H [12;12H [20;12H 
+
+
+[93m  39 [m[8C};
+[93m  40 [m[8C[96m// The new parameter starts empty: `clear` left what a sequence[m
+[93m  41 [m[8C[96m// before put there.[m
+[93m  42 [m[8C[93mif[m [93mlet[m [95mSome[m(sub) [93m=[m [95mself[m.sub.[1m[96mget_mut[m([95mself[m.len) {
+[93m  43 [m[12C[38;5;121m*[msub [93m=[m colon;
+[93m  44 [m[8C}
+[93m  45 [m[8C[93mif[m [93mlet[m [95mSome[m(value) [93m=[m [95mself[m.values.[1m[96mget_mut[m([95mself[m.len) {
+[93m  46 [m[12C[38;5;121m*[mvalue [93m=[m [95m0[m;
+[93m  47 [m[8C}
+[93m  48 [m[8C[95mself[m.len [93m=[m len;
+[93m  49 [m[8C[95mtrue[m
+[93m  50 [m    }
+[93m  51 [m    [38;5;224m/// Back to one empty parameter, touching only what `separator` and[m
+[93m  52 [m    [38;5;224m/// `digit` read: a sequence is begun on every ESC, so this is kept to[m
+[93m  53 [m    [38;5;224m/// two stores rather than rewriting all the parameters.[m
+[93m  54 [m    [30m[103mfn[m [1m[96mclear[m([38;5;121m&mut[m [95mself[m) {[40;1H[K[39;103H[1m[7m54,[12C 1%[38;10H[?25h[?25l[m[40;110HV[38;10H[40;110H1[38;10H[30m[48;5;248m    [1Cn [m[1m[30m[48;5;248mclear[m[30m[48;5;248m(&mut self) { [m
+
+[1m-- VISUAL LINE --[m[40;110H[K[40;110H1[38;10H[?25h[?25l[40;110Hj[38;10H[40;110H2[38;10H[1;38r[38;1H
+[1;40r[37;10H[30m[48;5;248mf[m
+[93m  55 [m[30m[48;5;248m    [m [30m[48;5;248m   self.len = 1; [m[40;110H[K[40;110H2[38;10H[39;104H[1m[7m5,[38;10H[?25h[?25l[m[40;110Hj[38;10H[40;110H3[38;10H[1;38r[38;1H
+[1;40r[37;10H[30m[48;5;248m [m
+[93m  56 [m[30m[48;5;248m    [m [30m[48;5;248m   if let Some(value) = self.values.[m[1m[30m[48;5;248mfirst_mut[m[30m[48;5;248m() { [m[40;110H[K[40;110H3[38;10H[39;104H[1m[7m6,[38;10H[?25h[?25l[m[40;110H^[[38;10H[40;110H3 [38;10H[40;111H^[[38;10H[40;110H   [38;10H[36;6H    [30m[103mfn[m [1m[96mclear[m([38;5;121m&mut[m [95mself[m) {[36;31H[K[37;6H        [95mself[m.len [93m=[m [95m1[m;[37;27H[K[38;6H        [93mif[m [93mlet[m [95mSome[m(value) [93m=[m [95mself[m.values.[1m[96mfirst_mut[m() {[38;60H[K[40;1H[K[38;10H[?25h[?25l
+
+:split[1;3H[93m38[m[5C        [93mreturn[m [95mfalse[m;[1;31H[K[2;3H[93m39[m[9C};[2;16H[K[3;3H[93m40[m[9C[96m// The new parameter starts empty: `clear` left what a sequence[m[4;3H[93m41[m[9C[96m// before put there.[m[4;34H[K[5;3H[93m42[m[9C[93mif[m [93mlet[m [95mSome[m(sub) [93m=[m [95mself[m.sub.[1m[96mget_mut[m([95mself[m.len) {[6;3H[93m43[m[9C    [38;5;121m*[msub [93m=[m colon;[7;3H[93m44[m[5C    }[8;3H[93m45[m[1C [7C[93mif[m [93mlet[m [95mSome[m(value) [93m=[m [95mself[m.values.[1m[96mget_mut[m([95mself[m.len) {[9;3H[93m46[m[1C            [38;5;121m*[mvalue [93m=[m [95m0[m;[10;3H[93m47[m[5C    }[10;15H[K[11;3H[93m48[m[9C[95mself[m.len [93m=[m len;[11;29H[K[12;3H[93m49[m[9C[95mtrue[m[12;18H[K[13;3H[93m50[m[5C}[13;18H[K[14;3H[93m51[m[5C[38;5;224m/// Back to one empty parameter, touching only what `separator` and[m[15;3H[93m52[m[5C[38;5;224m/// `digit` read: a sequence is begun on every ESC, so this is kept to[m[16;3H[93m53[m[5C[38;5;224m/// two stores rather than rewriting all the parameters.[m[17;3H[93m54[m[5C[30m[103mfn[m [1m[96mclear[m([38;5;121m&mut[m [95mself[m) {[18;3H[93m55[m[5C    [95mself[m.len [93m=[m [95m1[m;[18;28H[K[19;3H[93m56[m[9C[93mif[m [93mlet[m [95mSome[m(value) [93m=[m [95mself[m.values.[1m[96mfirst_mut[m() {[19;60H[K[20;1H[1m[7msrc/parser.rs                                                                                         56,5            3%[m[39;1H[7msrc/parser.rs[m[1m[7m [m[7m                                                                                         56,5            3%[19;10H[?25h[?25l[m[40;110H^Wj[19;10H[40;110H   [38;10H[20;1H[7msrc/parser.rs[m[1m[7m [m[7m                                                                                         56,5            3%[m[39;1H[1m[7msrc/parser.rs                                                                                         56,5            3%[38;10H[?25h[?25l[m[40;110H^Wk[38;10H[40;110H   [19;10H
+[1m[7msrc/parser.rs                                                                                         56,5            3%[m[39;1H[7msrc/parser.rs[m[1m[7m [m[7m                                                                                         56,5            3%[19;10H[?25h[?25l[m[40;1H[K[40;1H:set spell[19;10H[?25h[?25l[40;110H^D[19;10H[40;110H  [19;18H[1;19r[1;1H[9M[1;40r[11;1H[93m  57 [m[12C[38;5;121m*[mvalue [93m=[m [95m0[m;
+[93m  58 [m[8C}
+[93m  59 [m    }
+[93m  60 [m    [93mpub[m [30m[103mfn[m [1m[96mgroups[m([38;5;121m&[m[95mself[m) [93m->[m [93mimpl[m [38;5;121mIterator[m[93m<[mItem [93m=[m [38;5;121m&[m[[38;5;121mu16[m][93m>[m [93m+[m [93muse<[m[38;5;224m'_[m[93m>[m {
+[93m  61 [m[8C[93mlet[m [38;5;121mmut[m start [93m=[m [95m0[m;
+[93m  62 [m[8C[38;5;81mstd[m[38;5;224m::[m[38;5;81miter[m[38;5;224m::[m[1m[96mfrom_fn[m([38;5;121mmove[m [93m||[m {
+[93m  63 [m[12C[93mif[m start [93m>=[m [95mself[m.len [46m{[m
+[93m  64 [m[16C[93mreturn[m [95mNone[m;
+[93m  65 [m[12C[46m}[m[40;1H[K[20;103H[1m[7m65,13[11C4%[19;18H[?25h[?25l[40;1H[m:q[1;3H[93m19[m[5C[30m[103mfn[m [1m[96mdefault[m() [93m->[m [38;5;121mSelf[m {[2;3H[93m20[m[9C[38;5;121mSelf[m {[2;20H[K[3;3H[93m21[m[9C    values: [[95m0[m; [95m32[m],[4;3H[93m22[m[5C [7Csub: [[95mfalse[m; [95m32[m],[5;3H[93m23[m[5C        len: [95m1[m,[5;25H[K[6;3H[93m24[m[5C    }[6;15H[K[7;3H[93m25[m[5C}[7;11H[K[8;3H[93m26[m[1C}[8;10H[K[9;3H[93m27[m[1C[93mimpl[m Parameters {[9;23H[K[10;3H[93m28[m[5C[30m[103mfn[m [1m[96mdigit[m([38;5;121m&mut[m [95mself[m, byte: [38;5;121mu8[m) {[10;41H[K[11;3H[93m29[m[9C[96m// A value too large for a u16 stays at its largest.[m[12;3H[93m30[m[9C[93mif[m [93mlet[m [95mSome[m(n) [93m=[m [95mself[m.len.[1m[96mchecked_sub[m([95m1[m).[1m[96mand_then[m([93m|[mi[93m|[m [95mself[m.values.[1m[96mget_mut[m(i))[13;3H[93m31[m[5C [7C[93m&&[m [93mlet[m [95mSome[m(digit) [93m=[m byte.[1m[96mchecked_sub[m([95mb'0'[m)[14;3H[93m32[m[5C    {[14;15H[K[15;3H[93m33[m[9C    [38;5;121m*[mn [93m=[m n.[1m[96msaturating_mul[m([95m10[m).[1m[96msaturating_add[m([38;5;121mu16[m[38;5;224m::[m[1m[96mfrom[m(digit));[16;3H[93m34[m[9C}[16;15H[K[17;3H[93m35[m[5C}[17;18H[K[18;3H[93m36[m[5C[30m[103mfn[m [1m[96mseparator[m([38;5;121m&mut[m [95mself[m, colon: [38;5;121mbool[m) [93m->[m [38;5;121mbool[m {[19;3H[93m37[m[9C[93mlet[m [95mSome[m(len) [93m=[m [95mself[m.len.[1m[96mchecked_add[m([95m1[m).[1m[96mfilter[m([93m|[mn[93m|[m [38;5;121m*[mn [93m<=[m [95mself[m.values.[1m[96mlen[m()) [93melse[m {
+[93m  38 [m            [93mreturn[m [95mfalse[m;[20;31H[K[39;1H[1m[7msrc/parser.rs                                                                                         56,5            1%[38;10H[?25h[?25l[m[40;1H[K[40;1H:q![?2004l[>4;m[23;2t[23;1t[40;1H[K[40;1H[?1004l[?2004l[?1l>[?1049l[?25h[>4;m

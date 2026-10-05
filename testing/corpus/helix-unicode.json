@@ -1,0 +1,72 @@
+{
+  "command": [
+    "hx",
+    "unicode.txt"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "helix-unicode",
+  "replies": "\\e[?0u\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 13600,
+      "keys": ""
+    },
+    {
+      "end": 13976,
+      "keys": "j"
+    },
+    {
+      "end": 14223,
+      "keys": "j"
+    },
+    {
+      "end": 14561,
+      "keys": "j"
+    },
+    {
+      "end": 14899,
+      "keys": "j"
+    },
+    {
+      "end": 19348,
+      "keys": "gl"
+    },
+    {
+      "end": 23738,
+      "keys": "gh"
+    },
+    {
+      "end": 23934,
+      "keys": "w"
+    },
+    {
+      "end": 24163,
+      "keys": "w"
+    },
+    {
+      "end": 25009,
+      "keys": "d"
+    },
+    {
+      "end": 25900,
+      "keys": "u"
+    },
+    {
+      "end": 30510,
+      "keys": ":q!\\r"
+    }
+  ],
+  "version": "helix 25.07.1 (a05c151b)"
+}

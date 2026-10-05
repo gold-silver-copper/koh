@@ -1,0 +1,82 @@
+{
+  "command": [
+    "mc",
+    "-u",
+    ".",
+    "../src"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "SHELL=/bin/sh",
+    "XDG_CONFIG_HOME=/tmp/fux-corpus/home/.config"
+  ],
+  "note": "",
+  "program": "mc",
+  "replies": "",
+  "scrubbed": [
+    "localhost"
+  ],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 6936,
+      "keys": ""
+    },
+    {
+      "end": 7144,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 7346,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 7546,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 8166,
+      "keys": "\\r"
+    },
+    {
+      "end": 8368,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 8573,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 11058,
+      "keys": "\\eOR"
+    },
+    {
+      "end": 13361,
+      "keys": " "
+    },
+    {
+      "end": 18516,
+      "keys": "q"
+    },
+    {
+      "end": 18854,
+      "keys": "\\t"
+    },
+    {
+      "end": 19059,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 19325,
+      "keys": "\\e[21~"
+    }
+  ],
+  "version": "GNU Midnight Commander 4.8.33"
+}

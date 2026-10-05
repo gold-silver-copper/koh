@@ -1,0 +1,15 @@
+[package]
+name = "koh-oracle"
+version = "0.0.0"
+description = "koh's oracle: koh at the working tree beside koh at a commit"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# The user's terminal, reading what each side paints: one parser for both, so a difference is
+# koh's, not the reader's.
+fux-vt = "0.3.0"
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+[?2004h/private/tmp/fux-corpus/work $ ls src/
+cell/       grid/       lib.rs      parser/     screen/     unicode/    
+cell.rs     grid.rs     link.rs     parser.rs   screen.rs   unicode.rs  
+/private/tmp/fux-corpus/work $ ls src/parser
+[?2004ltests.rs
+[?2004h/private/tmp/fux-corpus/work $ cd src/
+[?2004l[?2004h/private/tmp/fux-corpus/work/src $ cd ..
+[?2004l[?2004h/private/tmp/fux-corpus/work $ echo [Kexit
+[?2004lexit

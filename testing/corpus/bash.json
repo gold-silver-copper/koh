@@ -1,0 +1,94 @@
+{
+  "command": [
+    "bash",
+    "--noprofile",
+    "--rcfile",
+    "/tmp/fux-corpus/home/.bashrc",
+    "-i"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor"
+  ],
+  "note": "",
+  "program": "bash",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 39,
+      "keys": ""
+    },
+    {
+      "end": 54,
+      "keys": "echo hello wrld"
+    },
+    {
+      "end": 57,
+      "keys": "\\x02\\x02\\x02"
+    },
+    {
+      "end": 62,
+      "keys": "o"
+    },
+    {
+      "end": 75,
+      "keys": "\\x01"
+    },
+    {
+      "end": 123,
+      "keys": "\\x05"
+    },
+    {
+      "end": 186,
+      "keys": "\\r"
+    },
+    {
+      "end": 190,
+      "keys": "ls \\t"
+    },
+    {
+      "end": 356,
+      "keys": "\\t"
+    },
+    {
+      "end": 362,
+      "keys": "\\x15"
+    },
+    {
+      "end": 377,
+      "keys": "cat Ca\\t"
+    },
+    {
+      "end": 492,
+      "keys": "\\r"
+    },
+    {
+      "end": 507,
+      "keys": "\\e[A"
+    },
+    {
+      "end": 525,
+      "keys": "\\x15"
+    },
+    {
+      "end": 742,
+      "keys": "\\x12hello"
+    },
+    {
+      "end": 856,
+      "keys": "\\r"
+    },
+    {
+      "end": 877,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "GNU bash, version 5.3.3(1)-release (aarch64-apple-darwin24.4.0)"
+}

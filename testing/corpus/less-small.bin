@@ -1,0 +1,24 @@
+[?1049h[10;1H[?1h=Plain ASCII, then text of other widths a nd scripts.
+
+Wide (CJK): 日本語のテキスト、中文文本， 한국어 텍스트。
+Fullwidth: ＡＢＣ　ｘｙｚ　１２３
+Emoji: 🙂 🚀 👍🏽 👩‍💻 🇵🇱 🏳️‍🌈 ❤️ ✨
+Combining: é → é, ä → ä, ﬁ ligature, Z̤͔ͧ̑̓ä͖̭̈̇lͮ̒ͫ ǧ̗͚̚o̙̔ͮ̇͐̇
+[7municode.txt[27m[K[KGreek: Αλφάβητο, Cyrillic: Кириллица, He :[K[Kbrew: עברית, Arabic: العربية
+:[K[KBox drawing: ┌─┬─┐ │ │ │ ├─┼─┤ └─┴─┘ ═══  ║ ╔╗╚╝
+Symbols: ← ↑ → ↓ ⇒ ∀ ∃ ∈ ∑ √ ∞ ≠ ≤ ≥ ± ×  ÷ ° € £ ¥
+A long line of wide glyphs that wraps: 
+一二三四五六七八九十一二三四五六七八九十 一二三四五六七八九十一二三四五六七八九十 一二三四五六七八九十一二三四五六七八九十
+        A line that starts with a tab, a :[K[K...skipping...
+Symbols: ← ↑ → ↓ ⇒ ∀ ∃ ∈ ∑ √ ∞ ≠ ≤ ≥ ± ×  ÷ ° € £ ¥
+A long line of wide glyphs that wraps: 
+一二三四五六七八九十一二三四五六七八九十 一二三四五六七八九十一二三四五六七八九十 一二三四五六七八九十一二三四五六七八九十
+        A line that starts with a tab, a nd one with trailing spaces:
+The end.
+[7m(END)[27m[K[K[H[2J[HMǧ̗͚̚o̙̔ͮ̇͐̇
+[HMCombining: é → é, ä → ä, ﬁ ligature, Z̤͔ͧ̑̓ä͖̭̈̇lͮ̒ͫ[HMEmoji: 🙂 🚀 👍🏽 👩‍💻 🇵🇱 🏳️‍🌈 ❤️ ✨
+[HMFullwidth: ＡＢＣ　ｘｙｚ　１２３
+[HM한국어 텍스트。
+[HMWide (CJK): 日本語のテキスト、中文文本，[HM
+[HMnd scripts.
+[HMPlain ASCII, then text of other widths a[10;1H[K:[K[K[?1l>[?1049l

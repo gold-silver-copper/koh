@@ -1,0 +1,58 @@
+[?1049h[10;1H[?1h=FUX-CORPUS(1)            User Commands
+
+[1mNAME[0m
+     fux-corpus - recordings of real
+     programs, replayed through
+     terminal emulators
+
+[1mSYNOPSIS[0m
+     [1mfux-vt-compare[0m [1mrecord[0m [1m--keys[0m [4mfile[24m
+:[K[K     [1m--out[0m [4mprefix[24m [[1m--size[0m [4mrows[24mx[4mcols[24m]
+:[K[K     [1m--[0m [4mprogram[24m [[4margs[24m...]
+:[K[K     [1mfux-vt-compare[0m [1mcorpus[0m [[1m--engines[0m
+     [4mlist[24m] [[4mname[24m...]
+
+[1mDESCRIPTION[0m
+     A recording is what a program
+     wrote to its terminal, byte for
+     byte, while keys were typed into
+     it, one step at a time.  [1mrecord[0m
+     runs the program on a
+:[K[K     pseudoterminal as a pane of
+     [1mfux[0m(1) runs it, with
+     [1mTERM=xterm-256color[0m and an
+     environment of its own, and
+     answers its queries as fux would.
+
+     [1mcorpus[0m gives each recording to
+     fux-vt and to other engines, and
+     compares their screens after
+:[K[K/[Kss[Kcc[Krr[Kuu[Kbb[K[1;1H[K     pseudoterminal as a pane of
+[2;1H[K     [1mfux[0m(1) runs it, with
+[3;1H[K     [1mTERM=xterm-256color[0m and an
+[4;1H[K     environment of its own, and
+[5;1H[K     answers its queries as fux would.
+[6;1H[K
+[7;1H[K     [1mcorpus[0m gives each recording to
+[8;1H[K     fux-vt and to other engines, and
+[9;1H[K     compares their screens after
+[10;1H[1;1H[K     pseudoterminal as a pane of
+[2;1H[K     [1mfux[0m(1) runs it, with
+[3;1H[K     [1mTERM=xterm-256color[0m and an
+[4;1H[K     environment of its own, and
+[5;1H[K     answers its queries as fux would.
+[6;1H[K
+[7;1H[K     [1mcorpus[0m gives each recording to
+[8;1H[K     fux-vt and to other engines, and
+[9;1H[K     compares their screens after
+[10;1H...skipping...
+     [1m--[0m[1m[7mscrub[27m[0m [4mold[24m[1m=[0m[4mnew[24m
+            Replace [4mold[24m in the output,
+            before it is saved.
+
+     [1m--engines[0m [4mlist[24m
+            Engine names joined by
+            commas, as [1mrun[0m takes them.
+
+[1mFILES[0m
+:[K[K[?1l>[?1049l

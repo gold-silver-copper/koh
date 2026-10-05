@@ -264,3 +264,91 @@ fn a_bad_admission_byte_is_rejected_not_treated_as_admitted() -> anyhow::Result<
         Ok(())
     })
 }
+
+#[test]
+fn a_servers_hostile_links_are_shown_as_text_or_dropped() -> anyhow::Result<()> {
+    use koh::terminal::{WireLink, MAX_LINK_BYTES, MAX_ROW_LINKS};
+    // Ten rows of the most and longest links are past what a diff may carry.
+    const { assert!(10 * MAX_ROW_LINKS * fux_vt::URI_LIMIT > MAX_LINK_BYTES) };
+    crate::harness::runtime()?.block_on(async {
+        let net = net();
+        let good = identity()?;
+        let evil_id = evil_server(&net, good.public(), |conn| {
+            tokio::spawn(async move {
+                let base = TerminalScreen::default();
+                // Each frame from the blank screen, with links its rows should not have.
+                let frame = |num: u64, text: &str, links: &dyn Fn(&mut koh::terminal::RowDiff)| {
+                    let screen = TerminalScreen::from_bytes(24, 80, text.as_bytes());
+                    let mut diff = screen.diff_from(&base);
+                    for row in &mut diff.rows {
+                        links(row);
+                    }
+                    encode_frame(&Frame {
+                        num: FrameNum(num),
+                        base: FrameNum::BLANK,
+                        echo_ack: InputSeq(0),
+                        diff,
+                    })
+                };
+                let evil = |row: &mut koh::terminal::RowDiff| {
+                    row.links = vec![WireLink {
+                        uri: "x\x1b]52;c;Y3VybCBldmlsfHNo\x07".to_owned(),
+                        id: String::new(),
+                    }];
+                    for run in &mut row.runs {
+                        run.cell.link = 1;
+                    }
+                };
+                let lacking = |row: &mut koh::terminal::RowDiff| {
+                    for run in &mut row.runs {
+                        run.cell.link = 1;
+                    }
+                };
+                let heavy = |row: &mut koh::terminal::RowDiff| {
+                    let long = WireLink {
+                        uri: "u".repeat(fux_vt::URI_LIMIT),
+                        id: String::new(),
+                    };
+                    row.links = vec![long; MAX_ROW_LINKS];
+                };
+                let frames = [
+                    frame(1, "shown as text", &evil),
+                    frame(2, "lacking", &lacking),
+                    // Ten rows of the most links a row may have, each the longest: past the bytes a
+                    // diff may carry.
+                    frame(3, &format!("{}heavy", "row\r\n".repeat(9)), &heavy),
+                    frame(4, "after", &|_| {}),
+                ];
+                for bytes in frames.into_iter().flatten() {
+                    send_frame_bytes(&conn, bytes).await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                conn.closed().await;
+            })
+        })
+        .await?;
+        let endpoint = net.endpoint(good, false).await?;
+        let mut client = Client::connect_on(endpoint, evil_id, Options::default()).await?;
+        anyhow::ensure!(
+            client
+                .wait_until(WAIT, |t| t.contains("after"))
+                .await
+                .is_some(),
+            "the client kept going; screen:\n{}",
+            client.screen()
+        );
+        let shown: Vec<String> = client.history().into_iter().map(|p| p.text).collect();
+        anyhow::ensure!(
+            shown.iter().any(|t| t.contains("shown as text")),
+            "an unsafe link's text is shown"
+        );
+        anyhow::ensure!(
+            !shown
+                .iter()
+                .any(|t| t.contains("lacking") || t.contains("heavy")),
+            "a frame naming a link its row lacks, or with too many link bytes, is dropped"
+        );
+        client.abort();
+        Ok(())
+    })
+}

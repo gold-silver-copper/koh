@@ -1,0 +1,78 @@
+{
+  "command": [
+    "tmux",
+    "-L",
+    "fux-corpus",
+    "-f",
+    "/dev/null",
+    "new-session",
+    "-s",
+    "corpus",
+    ";",
+    "set-option",
+    "-g",
+    "status-right",
+    "corpus"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "SHELL=/bin/sh",
+    "ENV=/tmp/fux-corpus/home/.shrc",
+    "TMUX_TMPDIR=/tmp/fux-corpus/tmux"
+  ],
+  "note": "",
+  "program": "tmux-copy",
+  "replies": "\\e[?997;1n\\e[?62;22c\\e[>1;1700;0c\\eP>|fux 0.17.0\\e\\\\\\e]10;rgb:ffff/ffff/ffff\\e\\\\\\e]11;rgb:0000/0000/0000\\e\\\\\\e]10;rgb:ffff/ffff/ffff\\e\\\\\\e]11;rgb:0000/0000/0000\\e\\\\\\e[8;40;120t",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 1046,
+      "keys": ""
+    },
+    {
+      "end": 3332,
+      "keys": "seq 1 200\\r"
+    },
+    {
+      "end": 3700,
+      "keys": "\\x02["
+    },
+    {
+      "end": 4311,
+      "keys": "\\e[5~"
+    },
+    {
+      "end": 4434,
+      "keys": "\\x12"
+    },
+    {
+      "end": 4898,
+      "keys": "150\\r"
+    },
+    {
+      "end": 5091,
+      "keys": "n"
+    },
+    {
+      "end": 5498,
+      "keys": "q"
+    },
+    {
+      "end": 5611,
+      "keys": "clear\\r"
+    },
+    {
+      "end": 5763,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "tmux 3.7c"
+}

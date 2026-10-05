@@ -1,0 +1,60 @@
+{
+  "command": [
+    "nvim",
+    "src/main.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "no language server: the diagnostics are set by :Diag, in HOME's init.lua",
+  "program": "nvim-diagnostics",
+  "replies": "\\e[?69;0$y\\e[?2026;2$y\\e[?2027;0$y\\e[?2031;2$y\\e[?2048;2$y\\eP1$r0;4:3m\\e\\\\\\e[?0u\\e[?62;22c\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e[48;40;120;0;0t\\e[?62;22c\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 27498,
+      "keys": ""
+    },
+    {
+      "end": 36951,
+      "keys": ":Diag\\r"
+    },
+    {
+      "end": 37029,
+      "keys": "]d"
+    },
+    {
+      "end": 37066,
+      "keys": "]d"
+    },
+    {
+      "end": 37237,
+      "keys": "\\x17d"
+    },
+    {
+      "end": 37786,
+      "keys": "j"
+    },
+    {
+      "end": 48917,
+      "keys": ":lua vim.diagnostic.setloclist()\\r"
+    },
+    {
+      "end": 58911,
+      "keys": ":lclose\\r"
+    },
+    {
+      "end": 59180,
+      "keys": ":q!\\r"
+    }
+  ],
+  "version": "NVIM v0.12.5"
+}

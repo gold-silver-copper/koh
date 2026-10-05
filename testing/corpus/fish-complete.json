@@ -1,0 +1,65 @@
+{
+  "command": [
+    "fish"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "fish-complete",
+  "replies": "\\e[?0u\\eP>|fux 0.17.0\\e\\\\\\e]11;rgb:0000/0000/0000\\e\\\\\\e[?62;22c\\e]11;rgb:0000/0000/0000\\e\\\\\\e[1;1R\\e[?62;22c\\e]11;rgb:0000/0000/0000\\e\\\\\\e[3;1R\\e[?62;22c",
+  "scrubbed": [
+    "localhost"
+  ],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 245,
+      "keys": ""
+    },
+    {
+      "end": 2155,
+      "keys": "set -\\t"
+    },
+    {
+      "end": 2319,
+      "keys": "\\t"
+    },
+    {
+      "end": 2592,
+      "keys": "\\t"
+    },
+    {
+      "end": 2635,
+      "keys": "\\e"
+    },
+    {
+      "end": 2648,
+      "keys": "\\x15"
+    },
+    {
+      "end": 3031,
+      "keys": "ls src/\\t"
+    },
+    {
+      "end": 3267,
+      "keys": "\\t"
+    },
+    {
+      "end": 3280,
+      "keys": "\\r"
+    },
+    {
+      "end": 3782,
+      "keys": "exit\\r"
+    }
+  ],
+  "version": "fish, version 4.9.3"
+}

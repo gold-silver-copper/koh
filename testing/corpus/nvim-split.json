@@ -1,0 +1,60 @@
+{
+  "command": [
+    "nvim",
+    "src/screen.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "nvim-split",
+  "replies": "\\e[?69;2$y\\e[?2026;2$y\\e[?2027;0$y\\e[?2031;2$y\\e[?2048;2$y\\eP1$r0;4:3m\\e\\\\\\e[?0u\\e[?62;22c\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e]11;rgb:0000/0000/0000\\x07\\e[0n\\e[48;40;120;0;0t\\e[?62;22c\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 28001,
+      "keys": ""
+    },
+    {
+      "end": 32270,
+      "keys": ":split\\r"
+    },
+    {
+      "end": 39878,
+      "keys": ":vsplit src/grid.rs\\r"
+    },
+    {
+      "end": 40196,
+      "keys": "\\x17w"
+    },
+    {
+      "end": 42000,
+      "keys": "\\x04"
+    },
+    {
+      "end": 42386,
+      "keys": "\\x17w"
+    },
+    {
+      "end": 46695,
+      "keys": "\\x17="
+    },
+    {
+      "end": 53544,
+      "keys": ":only\\r"
+    },
+    {
+      "end": 53812,
+      "keys": ":q\\r"
+    }
+  ],
+  "version": "NVIM v0.12.5"
+}

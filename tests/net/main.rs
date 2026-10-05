@@ -6,6 +6,7 @@
 mod baseline;
 mod bell;
 mod convergence;
+mod corpus;
 mod harness;
 mod hostile_peer;
 mod link;

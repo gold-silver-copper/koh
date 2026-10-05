@@ -1,0 +1,17 @@
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J[34m/private/tmp/fux-corpus/work[39m % [K[85C[33m[0][39m[88D[?2004hexitcd ..exit     
+bck-i-search: _[K[A[16Cecho [4mh[24mello world[1B[33Dh_[A[20C[4mh[4me[24m[1B[23De_[A[19C[1C[4me[4ml[24m[1B[23Dl_[A[18C[2C[4ml[4ml[24m[1B[23Dl_[A[17C[3C[4ml[4mo[24m[1B[23Do_[A[16C[24mh[24me[24ml[24ml[24mo[1B[K[A[36C[?2004l[1Bhello world
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J[34m/private/tmp/fux-corpus/work[39m % [K[85C[33m[0][39m[88D[?2004heecho !![?2004l
+echo echo hello world
+echo hello world
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J[34m/private/tmp/fux-corpus/work[39m % [K[85C[33m[0][39m[88D[?2004hffc -l[?2004l
+    1  cargo build --release
+    2  git status
+    3  ls -la src
+    4  echo hello world
+    5  cd src
+    6  false
+    7  cd ..
+    8  exit
+    9  echo hello world
+   10  echo echo hello world
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[J[34m/private/tmp/fux-corpus/work[39m % [K[85C[33m[0][39m[88D[?2004heexit[?2004l

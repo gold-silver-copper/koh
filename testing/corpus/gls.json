@@ -1,0 +1,33 @@
+{
+  "command": [
+    "gls",
+    "--color=always",
+    "--hyperlink=always",
+    "-F",
+    ".",
+    "src"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor"
+  ],
+  "note": "",
+  "program": "gls",
+  "replies": "",
+  "scrubbed": [
+    "localhost"
+  ],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 1900,
+      "keys": ""
+    }
+  ],
+  "version": "ls (GNU coreutils) 9.12"
+}

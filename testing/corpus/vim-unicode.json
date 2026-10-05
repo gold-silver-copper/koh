@@ -1,0 +1,72 @@
+{
+  "command": [
+    "vim",
+    "unicode.txt"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "vim-unicode",
+  "replies": "\\e[2;2R\\e[3;1R\\e[>1;1700;0c\\e]11;rgb:0000/0000/0000\\x07\\e]10;rgb:ffff/ffff/ffff\\x07\\e[?12;0$y",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 10366,
+      "keys": ""
+    },
+    {
+      "end": 10438,
+      "keys": "j"
+    },
+    {
+      "end": 10514,
+      "keys": "j"
+    },
+    {
+      "end": 10586,
+      "keys": "j"
+    },
+    {
+      "end": 10663,
+      "keys": "$"
+    },
+    {
+      "end": 10740,
+      "keys": "0"
+    },
+    {
+      "end": 10813,
+      "keys": "w"
+    },
+    {
+      "end": 10888,
+      "keys": "w"
+    },
+    {
+      "end": 11039,
+      "keys": "x"
+    },
+    {
+      "end": 11292,
+      "keys": ":set list\\r"
+    },
+    {
+      "end": 11370,
+      "keys": "G"
+    },
+    {
+      "end": 11488,
+      "keys": ":q!\\r"
+    }
+  ],
+  "version": "VIM - Vi IMproved 9.1 (2024 Jan 02, compiled Aug  8 2026 16:52:02)"
+}

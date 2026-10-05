@@ -1,0 +1,28 @@
+{
+  "command": [
+    "cargo",
+    "build"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "cargo-errors",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 2206,
+      "keys": ""
+    }
+  ],
+  "version": "cargo 1.98.1 (797e8a9bc 2026-08-05)"
+}

@@ -1,0 +1,14 @@
+diff --git i/src/terminal/mod.rs w/src/terminal/mod.rs
+index 395a25f..df02c46 100644
+--- i/src/terminal/mod.rs
++++ w/src/terminal/mod.rs
+@@ -874,7 +874,8 @@ impl TerminalScreen {
+         }
+         let (crow, ccol) = diff.cursor;
+         self.grid
+-            .set_cursor((crow.min(rows.saturating_sub(1)), ccol.min(cols)));
++            // PLANTED: a cursor in the last two columns is put in the one before them.
++            .set_cursor((crow.min(rows.saturating_sub(1)), ccol.min(cols.saturating_sub(2))));
+         self.grid.set_modes(diff.modes.into());
+ 
+         // Never backwards.

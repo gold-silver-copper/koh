@@ -1,0 +1,58 @@
+{
+  "command": [
+    "fzf",
+    "--preview",
+    "bat --color=always --style=numbers {}"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "FZF_DEFAULT_COMMAND=find src -type f"
+  ],
+  "note": "",
+  "program": "fzf-preview",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 25611,
+      "keys": ""
+    },
+    {
+      "end": 40894,
+      "keys": "g"
+    },
+    {
+      "end": 41599,
+      "keys": "r"
+    },
+    {
+      "end": 41626,
+      "keys": "\\x0e"
+    },
+    {
+      "end": 58152,
+      "keys": "\\x10"
+    },
+    {
+      "end": 58778,
+      "keys": "\\x7f"
+    },
+    {
+      "end": 72379,
+      "keys": "\\x7f"
+    },
+    {
+      "end": 72463,
+      "keys": "\\r"
+    }
+  ],
+  "version": "fzf 0.65.2 (brew), bat 0.26.1"
+}

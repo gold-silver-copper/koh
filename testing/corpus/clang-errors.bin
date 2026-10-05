@@ -1,0 +1,12 @@
+[1mbad.c:6:22: [0m[0;1;31merror: [0m[1mexpected ';' at end of declaration[0m
+    6 |     [0;34mint[0m w = b.x - a.x[0m
+      | [0;1;32m                     ^
+[0m      | [0;32m                     ;
+[0m[1mbad.c:13:20: [0m[0;1;35mwarning: [0m[1mformat specifies type 'char *' but the argument has type 'int' [-Wformat][0m
+   13 |     printf([0;32m"%s\n"[0m, area(a, b));[0m
+      | [0;1;32m            ~~     ^~~~~~~~~~
+[0m      | [0;32m            %d
+[0m[1mbad.c:14:12: [0m[0;1;31merror: [0m[1muse of undeclared identifier 'undefined'[0m
+   14 |     [0;34mreturn[0m undefined;[0m
+      | [0;1;32m           ^~~~~~~~~
+[0m1 warning and 2 errors generated.

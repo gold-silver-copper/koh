@@ -1,0 +1,48 @@
+{
+  "command": [
+    "nano",
+    "README.md"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "pico",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    24,
+    80
+  ],
+  "steps": [
+    {
+      "end": 2343,
+      "keys": ""
+    },
+    {
+      "end": 3376,
+      "keys": "\\x16"
+    },
+    {
+      "end": 6334,
+      "keys": "\\x17reflow\\r"
+    },
+    {
+      "end": 6947,
+      "keys": "\\x0b"
+    },
+    {
+      "end": 7344,
+      "keys": "\\x18"
+    },
+    {
+      "end": 7379,
+      "keys": "n"
+    }
+  ],
+  "version": "UW PICO 5.09 (/usr/bin/nano)"
+}

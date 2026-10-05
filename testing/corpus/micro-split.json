@@ -1,0 +1,60 @@
+{
+  "command": [
+    "micro",
+    "src/link.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "micro-split",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 37631,
+      "keys": ""
+    },
+    {
+      "end": 56853,
+      "keys": "\\x05vsplit src/grid.rs\\r"
+    },
+    {
+      "end": 57726,
+      "keys": "\\x17"
+    },
+    {
+      "end": 59120,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 60923,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 63497,
+      "keys": "\\x05hsplit\\r"
+    },
+    {
+      "end": 78483,
+      "keys": "\\x11"
+    },
+    {
+      "end": 86005,
+      "keys": "\\x11"
+    },
+    {
+      "end": 86086,
+      "keys": "\\x11"
+    }
+  ],
+  "version": "micro 2.0.15"
+}

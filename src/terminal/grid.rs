@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::num::{NonZeroI16, NonZeroU16};
 use std::sync::Arc;
 
-use fux_vt::{Cell, CellRef, Cells, MouseProtocolEncoding, MouseProtocolMode, RowId};
+use fux_vt::{
+    Attributes, Cell, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, RowId,
+};
 
 use super::{Shift, Shifts, MAX_SHIFTS};
 use crate::predict::{CellView, ScreenView, Size};
@@ -35,12 +37,98 @@ impl Modes {
     }
 }
 
+/// A hyperlink (OSC 8): its URI, and the id the program gave it, empty for none.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Link {
+    pub uri: String,
+    pub id: String,
+}
+
+impl Link {
+    /// Whether this link may be painted as one: a URI of printable ASCII (no space) within
+    /// [`fux_vt::URI_LIMIT`], and an id of printable ASCII without `;` or `:` within
+    /// [`fux_vt::ID_LIMIT`]. A server could send anything, and a link is written to the user's
+    /// terminal inside an escape sequence, so one that is not is painted as plain text.
+    pub fn safe(&self) -> bool {
+        let printable = |b: &u8| (0x21..=0x7e).contains(b);
+        !self.uri.is_empty()
+            && self.uri.len() <= fux_vt::URI_LIMIT
+            && self.uri.bytes().all(|b| printable(&b))
+            && self.id.len() <= fux_vt::ID_LIMIT
+            && self
+                .id
+                .bytes()
+                .all(|b| printable(&b) && b != b';' && b != b':')
+    }
+
+    /// The bytes this link costs: its URI and its id.
+    pub fn len(&self) -> usize {
+        self.uri.len().saturating_add(self.id.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.uri.is_empty() && self.id.is_empty()
+    }
+}
+
+/// The most distinct links one row keeps. A row with more keeps the first, and its other cells
+/// show no link.
+pub const MAX_ROW_LINKS: usize = 64;
+
+/// A row's links: each distinct one once, and by column the one each cell has (0 for none, else
+/// one more than its place in `table`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowLinks {
+    pub(super) table: Vec<Link>,
+    pub(super) cells: Vec<u16>,
+}
+
+impl RowLinks {
+    /// The link of the cell at `col`.
+    pub fn at(&self, col: usize) -> Option<&Link> {
+        let index = usize::from(*self.cells.get(col)?);
+        self.table.get(index.checked_sub(1)?)
+    }
+
+    /// The bytes the links cost.
+    pub(super) fn bytes(&self) -> usize {
+        self.table.iter().map(Link::len).sum()
+    }
+
+    /// The links of a live row, `cols` wide, or `None` if it has none.
+    fn of(row: &fux_vt::Row<'_>, cols: u16) -> Option<Arc<Self>> {
+        if !row.has_links() {
+            return None;
+        }
+        let mut links = Self::default();
+        for col in 0..usize::from(cols) {
+            let index = row.link(col).map_or(0, |link| {
+                let link = Link {
+                    uri: link.uri().to_owned(),
+                    id: link.id().unwrap_or_default().to_owned(),
+                };
+                let at = links.table.iter().position(|l| *l == link).or_else(|| {
+                    (links.table.len() < MAX_ROW_LINKS).then(|| {
+                        links.table.push(link);
+                        links.table.len().saturating_sub(1)
+                    })
+                });
+                at.and_then(|at| u16::try_from(at.saturating_add(1)).ok())
+                    .unwrap_or(0)
+            });
+            links.cells.push(index);
+        }
+        (!links.table.is_empty()).then(|| Arc::new(links))
+    }
+}
+
 /// One row of a [`Grid`]: its cells with their text, shared by every screen that holds the row
-/// unchanged, and whether it soft-wraps into the next.
+/// unchanged, whether it soft-wraps into the next, and its cells' links.
 #[derive(Clone, Debug)]
 struct Row {
     cells: Arc<Cells>,
     wrapped: bool,
+    links: Option<Arc<RowLinks>>,
 }
 
 impl Row {
@@ -49,6 +137,7 @@ impl Row {
         Self {
             cells: Arc::new(Cells::new(usize::from(cols))),
             wrapped: false,
+            links: None,
         }
     }
 
@@ -65,16 +154,87 @@ impl Row {
 
 impl PartialEq for Row {
     fn eq(&self, other: &Self) -> bool {
-        self.wrapped == other.wrapped && (self.shares(other) || self.cells == other.cells)
+        self.wrapped == other.wrapped
+            && self.links == other.links
+            && (self.shares(other) || self.cells == other.cells)
     }
 }
 
 impl Eq for Row {}
 
+/// The colours a program set (OSC 4, and the default foreground and background with OSC 10 and
+/// 11), by which a snapshot draws its cells: each set entry, and each set default, as RGB.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Palette {
+    /// By index, the colour the program set it to; `None` where it left it alone or reset it.
+    entries: Vec<Option<(u8, u8, u8)>>,
+    foreground: Option<(u8, u8, u8)>,
+    background: Option<(u8, u8, u8)>,
+}
+
+impl Palette {
+    /// The colours `screen`'s program set, or `None` if it set none, as most do not.
+    fn of(screen: &fux_vt::Screen) -> Option<Self> {
+        screen.colors_changed().then(|| Self {
+            entries: (0..=u8::MAX).map(|i| screen.palette_color(i)).collect(),
+            foreground: screen.dynamic_color(10),
+            background: screen.dynamic_color(11),
+        })
+    }
+
+    /// `attributes` in these colours: an indexed colour whose entry was set as the colour set,
+    /// and the default foreground and background, if set, as those; every other colour as it is,
+    /// for the user's terminal to draw in its own. A default underline colour is the text's, and
+    /// stays.
+    fn draw(&self, attributes: Attributes) -> Attributes {
+        let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb(r, g, b);
+        let colour = |c: Color, default: Option<(u8, u8, u8)>| match c {
+            Color::Idx(n) => self
+                .entries
+                .get(usize::from(n))
+                .copied()
+                .flatten()
+                .map_or(c, rgb),
+            Color::Default => default.map_or(c, rgb),
+            Color::Rgb(..) | _ => c,
+        };
+        attributes
+            .with_foreground(colour(attributes.foreground(), self.foreground))
+            .with_background(colour(attributes.background(), self.background))
+            .with_underline_color(colour(attributes.underline_color(), None))
+    }
+
+    /// `cells` drawn in these colours. The right half of a wide glyph is drawn with its left.
+    fn recolor(&self, cells: &mut Cells) {
+        for i in 0..cells.len() {
+            let Some(attributes) = cells
+                .get(i)
+                .filter(|cell| !cell.is_wide_continuation())
+                .map(|cell| cell.attributes())
+            else {
+                continue;
+            };
+            let drawn = self.draw(attributes);
+            if drawn != attributes {
+                cells.set_attributes(i, drawn);
+            }
+        }
+    }
+}
+
+/// `attributes` as a snapshot of `screen` draws them: in the colours its program set, if any. What
+/// a terminal reading the client's paint shows for a cell of `screen`.
+pub fn drawn(attributes: Attributes, screen: &fux_vt::Screen) -> Attributes {
+    Palette::of(screen).map_or(attributes, |palette| palette.draw(attributes))
+}
+
 /// The last snapshot's rows, with each one's fux-vt row id and version then: a row whose cells are
 /// unchanged is shared with the next snapshot, wherever it moved, instead of copied.
 #[derive(Default)]
 pub(super) struct RowCache {
+    /// The palette the rows were drawn in. A new palette changes no row's version, so it starts
+    /// the cache over.
+    palette: Option<Palette>,
     /// By live index, the id and version of the row the snapshot took there.
     ids: Vec<(RowId, u64)>,
     /// The snapshot's rows, which the next one shares whole when no row changed.
@@ -82,15 +242,15 @@ pub(super) struct RowCache {
 }
 
 impl RowCache {
-    /// The cached cells for the live row `live` at `index`, if they are what it holds: its own row
+    /// The cached row for the live row `live` at `index`, if it is what it holds: its own row
     /// found by id (at the same index, else by `by_id`, built on first need), at the cached version
-    /// or, at another version, with the same cells.
+    /// or, at another version, with the same cells and no links.
     fn cells(
         &self,
         index: usize,
         live: &fux_vt::Row<'_>,
         by_id: &mut Option<HashMap<RowId, usize>>,
-    ) -> Option<Arc<Cells>> {
+    ) -> Option<(Arc<Cells>, Option<Arc<RowLinks>>)> {
         let at = if self.ids.get(index).is_some_and(|(id, _)| *id == live.id()) {
             index
         } else {
@@ -103,13 +263,15 @@ impl RowCache {
             *by_id.get(&live.id())?
         };
         let (_, version) = self.ids.get(at)?;
-        let cells = &self.lines.get(at)?.cells;
-        // fux-vt gives a row a new version with each edit that changes it, and with no other, so
-        // a row at the version it was cached at holds the same cells without comparing them. A
-        // row with a new version may still hold the same cells (erased, then written back), so it
-        // is compared.
-        (cells.len() == live.len() && (*version == live.version() || cells.iter().eq(live.cells())))
-            .then(|| Arc::clone(cells))
+        let line = self.lines.get(at)?;
+        let cells = &line.cells;
+        // fux-vt gives a row a new version with each edit that changes it, its links included,
+        // and with no other, so a row at the version it was cached at holds the same cells without
+        // comparing them. A row with a new version may still hold the same cells (erased, then
+        // written back), so it is compared, if neither has links.
+        let same = *version == live.version()
+            || (line.links.is_none() && !live.has_links() && cells.iter().eq(live.cells()));
+        (cells.len() == live.len() && same).then(|| (Arc::clone(cells), line.links.clone()))
     }
 
     /// Whether the live rows `rows` are exactly the cached ones: the same ids, at the same
@@ -127,12 +289,15 @@ impl RowCache {
     }
 }
 
-/// A copy of `row`, cells and text, exactly `cols` wide. A live row is exactly that wide;
-/// anything longer is cut, anything shorter padded with blank cells.
-fn exactly(row: Option<&fux_vt::Row<'_>>, cols: u16) -> Arc<Cells> {
+/// A copy of `row`, cells and text, exactly `cols` wide, drawn in `palette`. A live row is exactly
+/// that wide; anything longer is cut, anything shorter padded with blank cells.
+fn exactly(row: Option<&fux_vt::Row<'_>>, cols: u16, palette: Option<&Palette>) -> Arc<Cells> {
     let mut cells: Cells = row.map_or_else(Cells::default, |row| row.cells().collect());
     if cells.len() != usize::from(cols) {
         cells.resize(usize::from(cols), Cell::default());
+    }
+    if let Some(palette) = palette {
+        palette.recolor(&mut cells);
     }
     Arc::new(cells)
 }
@@ -169,6 +334,13 @@ impl Grid {
         let (rows, cols) = screen.size();
         let window = screen.window(0, rows, cols);
         let live: Vec<fux_vt::Row<'_>> = (0..rows).filter_map(|row| window.row(row)).collect();
+        let palette = Palette::of(screen);
+        if palette != cache.palette {
+            *cache = RowCache {
+                palette,
+                ..RowCache::default()
+            };
+        }
         // If not a row changed, the last snapshot's rows are shared whole.
         if live.len() != usize::from(rows) || !cache.holds(&live) {
             let mut by_id = None;
@@ -176,15 +348,21 @@ impl Grid {
                 .map(|index| {
                     let Some(row) = live.get(index) else {
                         return Row {
-                            cells: exactly(None, cols),
+                            cells: exactly(None, cols, cache.palette.as_ref()),
                             wrapped: false,
+                            links: None,
                         };
                     };
+                    let (cells, links) = cache.cells(index, row, &mut by_id).unwrap_or_else(|| {
+                        (
+                            exactly(Some(row), cols, cache.palette.as_ref()),
+                            RowLinks::of(row, cols),
+                        )
+                    });
                     Row {
-                        cells: cache
-                            .cells(index, row, &mut by_id)
-                            .unwrap_or_else(|| exactly(Some(row), cols)),
+                        cells,
                         wrapped: row.wrapped(),
+                        links,
                     }
                 })
                 .collect();
@@ -211,6 +389,16 @@ impl Grid {
     /// One row's cells, or `None` out of bounds.
     pub fn row(&self, row: u16) -> Option<&Cells> {
         self.lines.get(usize::from(row)).map(|line| &*line.cells)
+    }
+
+    /// The hyperlink of the cell at `(row, col)`, if it has one.
+    pub fn link(&self, row: u16, col: u16) -> Option<&Link> {
+        self.row_links(row)?.at(usize::from(col))
+    }
+
+    /// One row's links, or `None` if it has none or is out of bounds.
+    pub fn row_links(&self, row: u16) -> Option<&RowLinks> {
+        self.lines.get(usize::from(row))?.links.as_deref()
     }
 
     /// Whether `row` soft-wraps into the next one.
@@ -394,15 +582,25 @@ impl Grid {
             .sum()
     }
 
-    /// Replace `row` with `cells`, which must be exactly `cols` long. Out of bounds or a wrong
-    /// length changes nothing.
-    pub(super) fn set_row(&mut self, row: u16, cells: Arc<Cells>, wrapped: bool) {
+    /// Replace `row` with `cells`, which must be exactly `cols` long, and their `links`. Out of
+    /// bounds or a wrong length changes nothing.
+    pub(super) fn set_row(
+        &mut self,
+        row: u16,
+        cells: Arc<Cells>,
+        wrapped: bool,
+        links: Option<Arc<RowLinks>>,
+    ) {
         if cells.len() != usize::from(self.size.cols) {
             return;
         }
         if usize::from(row) < self.lines.len() {
             if let Some(line) = Arc::make_mut(&mut self.lines).get_mut(usize::from(row)) {
-                *line = Row { cells, wrapped };
+                *line = Row {
+                    cells,
+                    wrapped,
+                    links,
+                };
             }
         }
     }

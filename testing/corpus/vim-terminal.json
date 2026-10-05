@@ -1,0 +1,49 @@
+{
+  "command": [
+    "vim"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "SHELL=/bin/sh",
+    "ENV=/tmp/fux-corpus/home/.shrc"
+  ],
+  "note": "",
+  "program": "vim-terminal",
+  "replies": "\\e[2;2R\\e[3;1R\\e[>1;1700;0c\\e]11;rgb:0000/0000/0000\\x07\\e]10;rgb:ffff/ffff/ffff\\x07\\e[?12;0$y",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 10943,
+      "keys": ""
+    },
+    {
+      "end": 13927,
+      "keys": ":terminal\\r"
+    },
+    {
+      "end": 14078,
+      "keys": "echo inside vim\\r"
+    },
+    {
+      "end": 14492,
+      "keys": "seq 1 30\\r"
+    },
+    {
+      "end": 17569,
+      "keys": "exit\\r"
+    },
+    {
+      "end": 17687,
+      "keys": ":q!\\r"
+    }
+  ],
+  "version": "VIM - Vi IMproved 9.1 (2024 Jan 02, compiled Aug  8 2026 16:52:02)"
+}

@@ -5,6 +5,8 @@ use crate::terminal::grid::RowCache;
 use crate::terminal::{
     clamp_dims, Grid, Size, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
 };
+use std::time::{Duration, Instant};
+
 use fux_vt::{Event, Options, Parser, Sink};
 
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
@@ -36,8 +38,11 @@ impl Sink for Observed {
             Event::Title(t) => self.title = title_from(t),
             Event::IconName(n) => self.icon = title_from(n),
             Event::Bell => self.bell_count = self.bell_count.saturating_add(1),
-            // `data` is base64 already.
-            Event::Clipboard { data, .. } if data.len() <= MAXIMUM_CLIPBOARD_SIZE => {
+            // `data` is base64 already. A query (`?`) asks for the clipboard, which koh never
+            // reads, so it is not one to set.
+            Event::Clipboard { data, .. }
+                if data.len() <= MAXIMUM_CLIPBOARD_SIZE && data != b"?" =>
+            {
                 self.clipboard = String::from_utf8_lossy(data).into_owned();
             }
             // An oversized clipboard is dropped; `_` is for events a later fux-vt adds.
@@ -45,6 +50,48 @@ impl Sink for Observed {
         }
     }
 }
+
+/// Who the server's terminal says it is: koh, at this version.
+///
+/// It answers device attributes (`CSI c`, `CSI > c`) and XTVERSION (`CSI > q`) with it. A name no
+/// program knows makes no program assume a feature of a terminal it does know.
+pub const IDENTITY: fux_vt::Identity = fux_vt::Identity {
+    name: "koh",
+    version: env!("CARGO_PKG_VERSION"),
+};
+
+/// What the server's terminal does beyond fux-vt's defaults, each because koh carries it to the
+/// user:
+///
+/// - events: the title, icon, bell and clipboard, which the client mirrors;
+/// - extended replies: DECRQM, DECXCPR and secondary DA, as a terminal answers them;
+/// - in-band resize (mode 2048) and the size query (`CSI 18 t`): koh knows the size, and tells a
+///   program that asks, after a resize too;
+/// - the palette: a program's colours (OSC 4, 10, 11 and the rest) are kept and answered, and
+///   snapshots draw them as RGB, so the user's own palette never changes and nothing is left
+///   changed when they detach;
+/// - reflow: a resize re-wraps the primary screen and its history, as the user's terminal would;
+/// - setting reports (DECRQSS) for the pen, the cursor shape and the margins: neovim draws its
+///   diagnostics' curly underline only if the pen it set comes back with `4:3`, and koh carries
+///   underline styles;
+/// - hyperlinks (OSC 8): each cell's link goes in its row on the wire, and the client paints it,
+///   unless the user turns links off;
+/// - koh's [`IDENTITY`].
+///
+/// Left off: the kitty keyboard protocol (koh forwards the keys the user's terminal sends, so a
+/// program told it may use the protocol would get keys it did not ask for); prompt marks (koh does
+/// not carry scrollback, where they are used); rectangle checksums (a program reading back its
+/// screen, which xterm refuses by default).
+pub const OPTIONS: Options = Options::new()
+    .with_events(true)
+    .with_extended_replies(true)
+    .with_in_band_resize(true)
+    .with_size_reports(true)
+    .with_palette(true)
+    .with_reflow(true)
+    .with_setting_reports(true)
+    .with_hyperlinks(true)
+    .with_identity(Some(IDENTITY));
 
 /// The server's terminal: the live parser, and the [`TerminalScreen`] snapshots it sends.
 ///
@@ -57,6 +104,13 @@ pub struct ServerTerminal {
     exit_code: Option<u32>,
     /// The last snapshot's rows, which the next one shares where they are unchanged.
     rows: RowCache,
+    /// The screen as it was when the program last began a frame (synchronized output), a whole
+    /// one, until taken.
+    frame_start: Option<TerminalScreen>,
+    /// Whether the program began a frame since this was last asked.
+    frame_began: bool,
+    /// Where the program's output ends a frame.
+    frame_ends: FrameEnds,
 }
 
 impl ServerTerminal {
@@ -64,17 +118,14 @@ impl ServerTerminal {
     /// the allocation (see [`MAX_SCROLLBACK`](crate::server::cli::MAX_SCROLLBACK)).
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Result<Self, fux_vt::Error> {
         let Size { rows, cols } = clamp_dims(Size { rows, cols });
-        // Not the kitty keyboard protocol: koh forwards the keys the user's terminal sends, so a
-        // program told it may use the protocol would get keys it did not ask for. No reflow and no
-        // terminal identity either: a resize and the answers to queries stay as they were.
-        let mut options = Options::default();
-        options.events = true;
-        options.extended_replies = true;
         Ok(Self {
-            parser: Parser::with_options(rows, cols, scrollback, options)?,
+            parser: Parser::with_options(rows, cols, scrollback, OPTIONS)?,
             observed: Observed::default(),
             exit_code: None,
             rows: RowCache::default(),
+            frame_start: None,
+            frame_began: false,
+            frame_ends: FrameEnds::default(),
         })
     }
 
@@ -85,10 +136,57 @@ impl ServerTerminal {
 
     /// Feed the program's output. A failure (allocation or identity exhaustion) keeps what was
     /// applied and is logged.
+    ///
+    /// Where the program begins a frame (synchronized output, `CSI ? 2026 h`), the screen as it was
+    /// is kept, for [`FrameHold`] to send while the frame is drawn.
     pub fn process(&mut self, bytes: &[u8]) {
-        if let Err(e) = self.parser.process_with(bytes, &mut self.observed) {
-            tracing::warn!(error = %e, "terminal emulator refused shell output");
+        // Fed in pieces that each end at an ESU, so that whether a frame was being drawn just
+        // before a BSU is known: at the start of its piece, or after a BSU earlier in it.
+        let mut start = 0;
+        let ends = self.frame_ends.after_each(bytes);
+        let pieces = ends.len();
+        for (piece, end) in ends
+            .into_iter()
+            .chain(std::iter::once(bytes.len()))
+            .enumerate()
+        {
+            let mut rest = bytes.get(start..end).unwrap_or_default();
+            start = end;
+            // A frame begun in any piece but the last is ended by the ESU that ends its piece,
+            // so only one begun in the last can still be drawn when these bytes are done.
+            let last = piece == pieces;
+            loop {
+                let drawing = self.synchronized();
+                match self.parser.process_until_frame(rest, &mut self.observed) {
+                    Ok(Some(taken)) if taken > 0 => {
+                        if !drawing {
+                            self.frame_start = last.then(|| self.snapshot());
+                            self.frame_began = true;
+                        }
+                        rest = rest.get(taken..).unwrap_or_default();
+                    }
+                    Ok(Some(_) | None) => break,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "terminal emulator refused shell output");
+                        break;
+                    }
+                }
+            }
         }
+    }
+
+    /// Whether the program is drawing a frame it wants shown whole (synchronized output).
+    pub fn synchronized(&self) -> bool {
+        self.parser.screen().synchronized_output()
+    }
+
+    /// Whether the program began a frame since this was last asked, and the screen as it was
+    /// when it began the last one, if that one may still be drawn.
+    pub fn take_frame_start(&mut self) -> (bool, Option<TerminalScreen>) {
+        (
+            std::mem::take(&mut self.frame_began),
+            self.frame_start.take(),
+        )
     }
 
     /// Take the replies to the program's queries, which the caller must write to its input.
@@ -103,6 +201,12 @@ impl ServerTerminal {
         if let Err(e) = self.parser.resize(rows, cols) {
             tracing::warn!(error = %e, rows, cols, "terminal emulator refused a resize");
         }
+    }
+
+    /// The report a program that set in-band resize (mode 2048) is sent after a resize, for its
+    /// input; `None` if it did not set it.
+    pub fn resize_report(&self) -> Option<Vec<u8>> {
+        self.parser.resize_report()
     }
 
     /// The size. Test-only.
@@ -142,10 +246,163 @@ impl ServerTerminal {
     }
 }
 
+/// Finds where a program ends synchronized output (ESU, `CSI ? … 2026 … l`) in its output, its state
+/// carried from one read to the next so that a sequence split between them is found too.
+#[derive(Debug, Default)]
+struct FrameEnds {
+    state: Scan,
+    /// The parameters of the private CSI being read, up to [`FrameEnds::PARAMS`] bytes.
+    params: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Scan {
+    #[default]
+    Ground,
+    Escape,
+    /// After `ESC [`.
+    Csi,
+    /// In a CSI that starts with `?`, whose parameters may name 2026.
+    Private,
+    /// In a CSI that cannot be an ESU, to its final byte.
+    Other,
+}
+
+impl FrameEnds {
+    /// The longest parameter list read; a longer one is not an ESU koh looks for.
+    const PARAMS: usize = 64;
+
+    /// The offsets in `bytes` just past each ESU.
+    fn after_each(&mut self, bytes: &[u8]) -> Vec<usize> {
+        let mut ends = Vec::new();
+        let mut at = 0usize;
+        while let Some(&byte) = bytes.get(at) {
+            // Outside a sequence only an ESC matters, and in one that cannot be an ESU only its
+            // end: the bytes between are skipped.
+            let skip = match self.state {
+                Scan::Ground => byte != 0x1b,
+                Scan::Other => byte != 0x1b && !(0x40..=0x7e).contains(&byte),
+                Scan::Escape | Scan::Csi | Scan::Private => false,
+            };
+            if skip {
+                let rest = bytes.get(at..).unwrap_or_default();
+                let ends =
+                    |b: &u8| *b == 0x1b || (self.state == Scan::Other && (0x40..=0x7e).contains(b));
+                at = rest
+                    .iter()
+                    .position(ends)
+                    .map_or(bytes.len(), |next| at.saturating_add(next));
+                continue;
+            }
+            self.state = match (self.state, byte) {
+                (_, 0x1b) => Scan::Escape,
+                (Scan::Escape, b'[') => Scan::Csi,
+                (Scan::Csi, b'?') => {
+                    self.params.clear();
+                    Scan::Private
+                }
+                (Scan::Private, b'0'..=b'9' | b';') if self.params.len() < Self::PARAMS => {
+                    self.params.push(byte);
+                    Scan::Private
+                }
+                (Scan::Private, b'l')
+                    if self.params.split(|&b| b == b';').any(|p| p == b"2026") =>
+                {
+                    ends.push(at.saturating_add(1));
+                    Scan::Ground
+                }
+                (Scan::Csi | Scan::Private | Scan::Other, 0x40..=0x7e) | (Scan::Escape, _) => {
+                    Scan::Ground
+                }
+                (Scan::Csi | Scan::Private | Scan::Other, _) => Scan::Other,
+                (Scan::Ground, _) => Scan::Ground,
+            };
+            at = at.saturating_add(1);
+        }
+        ends
+    }
+}
+
+/// The longest a program's frame is held before its screen is sent anyway, so that a program that
+/// stopped mid-frame cannot freeze the screen. Terminals bound it between 100 and 200 ms.
+pub const FRAME_HOLD: Duration = Duration::from_millis(150);
+
+/// Which screen a session sends while a program draws a frame it wants shown whole: not the
+/// half-drawn one.
+///
+/// A program asks for it with synchronized output (DEC 2026). While the frame is drawn, the screen as it was when
+/// the frame began goes out, once; at its end (ESU, a resize or a reset), the screen. A frame held
+/// longer than [`FRAME_HOLD`] is let go, and the screen goes out as if the program had ended it.
+/// Without I/O: the session gives it the time.
+#[derive(Debug, Default)]
+pub struct FrameHold {
+    /// When the frame held was first seen.
+    since: Option<Instant>,
+    /// Whether the frame held was let go after [`FRAME_HOLD`].
+    released: bool,
+}
+
+impl FrameHold {
+    /// After the program's output was fed to `emu`, at `now`: the screen to send, if any.
+    pub fn after_output(
+        &mut self,
+        emu: &mut ServerTerminal,
+        now: Instant,
+    ) -> Option<TerminalScreen> {
+        let (began, started) = emu.take_frame_start();
+        if !emu.synchronized() {
+            self.since = None;
+            self.released = false;
+            return Some(emu.snapshot());
+        }
+        if began {
+            // A frame began in this output, so any before it ended: hold this one from now, even
+            // if the one before was let go and ended within the same output.
+            self.since = Some(now);
+            self.released = false;
+            return started;
+        }
+        let since = *self.since.get_or_insert(now);
+        if self.released || now.saturating_duration_since(since) >= FRAME_HOLD {
+            self.released = true;
+            return Some(emu.snapshot());
+        }
+        started
+    }
+
+    /// When the frame held is let go, if one is held.
+    pub fn deadline(&self) -> Option<Instant> {
+        if self.released {
+            return None;
+        }
+        self.since.and_then(|since| since.checked_add(FRAME_HOLD))
+    }
+
+    /// At `now`, past [`FrameHold::deadline`]: the screen to send, if a frame is still held.
+    pub fn expire(&mut self, emu: &mut ServerTerminal, now: Instant) -> Option<TerminalScreen> {
+        if !emu.synchronized() {
+            self.since = None;
+            self.released = false;
+            return None;
+        }
+        if self.deadline().is_some_and(|deadline| now >= deadline) {
+            self.released = true;
+            return Some(emu.snapshot());
+        }
+        None
+    }
+
+    /// Whether a frame is held: the screen sent is the one from before it began.
+    pub fn holding(&self) -> bool {
+        self.since.is_some() && !self.released
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::terminal::Grid;
+    use std::time::{Duration, Instant};
 
     /// Output that changes rows in every way: text, rewriting a row the same, erasing, scrolling,
     /// inserted and deleted lines, the alternate screen, a reset.
@@ -205,12 +462,216 @@ mod tests {
     }
 
     #[test]
-    fn answers_device_attributes() {
+    fn answers_device_attributes_and_xtversion_as_koh() {
         let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.process(b"\x1b[c"); // primary DA: fux-vt answers as a VT100 with advanced video
-        assert_eq!(t.take_host_replies(), b"\x1b[?1;2c");
-        t.process(b"\x1b[>c"); // secondary DA
-        assert_eq!(t.take_host_replies(), b"\x1b[>1;10;0c");
+        t.process(b"\x1b[c"); // primary DA: a VT220-class terminal with ANSI colour
+        assert_eq!(t.take_host_replies(), b"\x1b[?62;22c");
+        // Secondary DA: koh's version as major * 10000 + minor * 100 + patch.
+        let mut parts = env!("CARGO_PKG_VERSION")
+            .split('.')
+            .map(|p| p.parse::<u32>().expect("a number"));
+        let (major, minor, patch) = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        t.process(b"\x1b[>c");
+        assert_eq!(
+            t.take_host_replies(),
+            format!("\x1b[>1;{};0c", major * 10000 + minor * 100 + patch).as_bytes()
+        );
+        t.process(b"\x1b[>q"); // XTVERSION
+        assert_eq!(
+            t.take_host_replies(),
+            format!("\x1bP>|koh {}\x1b\\", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
+    }
+
+    #[test]
+    fn answers_the_size_query_and_reports_a_resize_to_a_program_that_asked() {
+        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
+        t.process(b"\x1b[18t");
+        assert_eq!(t.take_host_replies(), b"\x1b[8;24;80t");
+        // No report before a program sets mode 2048.
+        t.resize(Size::new(30, 90));
+        assert_eq!(t.resize_report(), None);
+        t.process(b"\x1b[?2048h");
+        // Setting it reports the size at once.
+        assert_eq!(t.take_host_replies(), b"\x1b[48;30;90;0;0t");
+        t.resize(Size::new(20, 60));
+        assert_eq!(
+            t.resize_report().as_deref(),
+            Some(&b"\x1b[48;20;60;0;0t"[..])
+        );
+    }
+
+    #[test]
+    fn a_programs_colours_are_drawn_as_rgb_until_it_resets_them() {
+        use fux_vt::Color;
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        t.process(b"\x1b[31mR\x1b[39mD");
+        let colours = |t: &mut ServerTerminal, col: u16| {
+            let snapshot = t.snapshot();
+            let cell = snapshot.screen().cell(0, col).expect("a cell");
+            (cell.fgcolor(), cell.bgcolor())
+        };
+        assert_eq!(colours(&mut t, 0), (Color::Idx(1), Color::Default));
+        // The row's cells do not change, only how they are drawn: the snapshot draws them anew.
+        t.process(b"\x1b]4;1;#ff0000\x1b\\\x1b]10;rgb:11/22/33\x07\x1b]11;#000080\x07");
+        let navy = Color::Rgb(0, 0, 0x80);
+        assert_eq!(colours(&mut t, 0), (Color::Rgb(0xff, 0, 0), navy));
+        assert_eq!(colours(&mut t, 1), (Color::Rgb(0x11, 0x22, 0x33), navy));
+        assert_eq!(
+            colours(&mut t, 7).1,
+            navy,
+            "a blank cell is in the background set"
+        );
+        // Reset, each colour is the user's terminal's again.
+        t.process(b"\x1b]104;1\x07\x1b]110\x07\x1b]111\x07");
+        assert_eq!(colours(&mut t, 0), (Color::Idx(1), Color::Default));
+        assert_eq!(colours(&mut t, 1), (Color::Default, Color::Default));
+        // The program is answered with the colours it set.
+        t.process(b"\x1b]4;1;#00ff00\x07\x1b]4;1;?\x07");
+        assert_eq!(t.take_host_replies(), b"\x1b]4;1;rgb:0000/ffff/0000\x07");
+    }
+
+    /// The text of row 0 of `screen`.
+    fn top(screen: &TerminalScreen) -> String {
+        screen
+            .screen()
+            .contents()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_frame_being_drawn_is_not_sent_half_drawn() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        let mut hold = FrameHold::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        t.process(b"old frame");
+        assert_eq!(top(&hold.after_output(&mut t, at(0)).unwrap()), "old frame");
+        // The program begins a frame and draws half of it: the screen from before goes out, once.
+        t.process(b"\x1b[?2026h\x1b[H\x1b[2Knew");
+        assert_eq!(
+            top(&hold.after_output(&mut t, at(10)).unwrap()),
+            "old frame"
+        );
+        assert!(hold.holding());
+        t.process(b" fra");
+        assert!(
+            hold.after_output(&mut t, at(20)).is_none(),
+            "nothing while it draws"
+        );
+        // It ends the frame: the whole of it goes out.
+        t.process(b"me\x1b[?2026l");
+        assert_eq!(
+            top(&hold.after_output(&mut t, at(30)).unwrap()),
+            "new frame"
+        );
+        assert!(!hold.holding() && hold.deadline().is_none());
+        // A whole frame in one read is sent as it is.
+        t.process(b"\x1b[?2026h\x1b[H\x1b[2Kthird\x1b[?2026l");
+        assert_eq!(top(&hold.after_output(&mut t, at(40)).unwrap()), "third");
+    }
+
+    #[test]
+    fn a_frame_never_ended_is_let_go_after_the_hold() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        let mut hold = FrameHold::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        t.process(b"before\x1b[?2026h\x1b[H\x1b[2Kstuck");
+        assert_eq!(top(&hold.after_output(&mut t, at(0)).unwrap()), "before");
+        assert_eq!(hold.deadline(), Some(at(0) + FRAME_HOLD));
+        assert!(
+            hold.expire(&mut t, at(100)).is_none(),
+            "not before the deadline"
+        );
+        assert_eq!(top(&hold.expire(&mut t, at(150)).unwrap()), "stuck");
+        assert!(hold.deadline().is_none() && !hold.holding());
+        // Let go, later output goes out as it comes, until the frame ends.
+        t.process(b"!");
+        assert_eq!(top(&hold.after_output(&mut t, at(160)).unwrap()), "stuck!");
+        t.process(b"\x1b[?2026l\x1b[?2026h");
+        assert!(hold.after_output(&mut t, at(170)).is_some());
+        assert!(hold.holding(), "a new frame is held again");
+    }
+
+    #[test]
+    fn a_frame_end_split_between_reads_is_found() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        t.process(b"\x1b[?2026h\x1b[2Kone");
+        let _ = t.take_frame_start();
+        // The ESU in two reads, then the next frame begins: it starts from the frame ended.
+        t.process(b"\x1b[?20");
+        t.process(b"26l\x1b[?2026h\x1b[H\x1b[2Ktw");
+        let (began, started) = t.take_frame_start();
+        assert!(began);
+        assert_eq!(top(&started.expect("a frame began")), "one");
+        // A BSU again while the frame is drawn begins none.
+        t.process(b"o\x1b[?2026h");
+        assert_eq!(t.take_frame_start(), (false, None));
+    }
+
+    #[test]
+    fn a_resize_ends_the_frame_held() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        let mut hold = FrameHold::default();
+        let now = Instant::now();
+        t.process(b"a\x1b[?2026hb");
+        assert!(hold.after_output(&mut t, now).is_some());
+        t.resize(Size::new(5, 20));
+        assert!(!t.synchronized());
+        assert!(hold.expire(&mut t, now + FRAME_HOLD).is_none());
+        assert!(!hold.holding());
+    }
+
+    #[test]
+    fn a_clipboard_query_sets_nothing() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        t.process(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07");
+        assert_eq!(t.snapshot().clipboard(), "aGVsbG8=");
+        assert_eq!(t.take_host_replies(), b"", "nor is it answered");
+    }
+
+    #[test]
+    fn tells_neovim_it_keeps_underline_styles() {
+        // neovim sets a curly underline and asks for the pen (DECRQSS); it draws its diagnostics
+        // curly only if `4:3` comes back.
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        t.process(b"\x1b[4:3m\x1bP$qm\x1b\\");
+        let reply = t.take_host_replies();
+        assert!(
+            reply.starts_with(b"\x1bP1$r") && reply.windows(3).any(|w| w == b"4:3"),
+            "{:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        // And the style reaches the screen sent.
+        t.process(b"x");
+        let snapshot = t.snapshot();
+        let cell = snapshot.screen().cell(0, 0).expect("a cell");
+        assert_eq!(cell.underline_style(), fux_vt::UnderlineStyle::Curly);
+    }
+
+    #[test]
+    fn a_resize_rewraps_the_primary_screen() {
+        let mut t = ServerTerminal::new(4, 20, 100).expect("emulator");
+        t.process(b"0123456789abcdefghijKLMNO");
+        t.resize(Size::new(4, 30));
+        let snapshot = t.snapshot();
+        let first = (0..30)
+            .filter_map(|col| snapshot.screen().cell(0, col))
+            .map(|c| c.contents().to_owned())
+            .collect::<String>();
+        assert_eq!(
+            first, "0123456789abcdefghijKLMNO",
+            "the wrapped line is one row again"
+        );
     }
 
     #[test]

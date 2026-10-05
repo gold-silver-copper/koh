@@ -1,0 +1,58 @@
+{
+  "command": [
+    "less",
+    "-S",
+    "-N",
+    "src/parser.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "less-chop",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 1966,
+      "keys": ""
+    },
+    {
+      "end": 2857,
+      "keys": "\\e[C"
+    },
+    {
+      "end": 3612,
+      "keys": "\\e[C"
+    },
+    {
+      "end": 4503,
+      "keys": "\\e[D"
+    },
+    {
+      "end": 8761,
+      "keys": "/match\\r"
+    },
+    {
+      "end": 9057,
+      "keys": "n"
+    },
+    {
+      "end": 11405,
+      "keys": "G"
+    },
+    {
+      "end": 11424,
+      "keys": "q"
+    }
+  ],
+  "version": "less 668 (POSIX regular expressions)"
+}

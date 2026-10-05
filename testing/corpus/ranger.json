@@ -1,0 +1,69 @@
+{
+  "command": [
+    "ranger",
+    "/tmp/fux-corpus/work/tree"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "XDG_CONFIG_HOME=/tmp/fux-corpus/home/.config",
+    "XDG_DATA_HOME=/tmp/fux-corpus/home/.local/share",
+    "SHELL=/bin/sh"
+  ],
+  "note": "ranger shows the owner of each file: the recorder's login is scrubbed to x's of its length",
+  "program": "ranger",
+  "replies": "",
+  "scrubbed": [
+    "xxxxxxxx"
+  ],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 1576,
+      "keys": ""
+    },
+    {
+      "end": 1948,
+      "keys": "j"
+    },
+    {
+      "end": 2304,
+      "keys": "j"
+    },
+    {
+      "end": 2715,
+      "keys": "j"
+    },
+    {
+      "end": 3375,
+      "keys": "l"
+    },
+    {
+      "end": 3646,
+      "keys": "j"
+    },
+    {
+      "end": 4953,
+      "keys": "h"
+    },
+    {
+      "end": 5564,
+      "keys": "zh"
+    },
+    {
+      "end": 5683,
+      "keys": "j"
+    },
+    {
+      "end": 5733,
+      "keys": "q"
+    }
+  ],
+  "version": "ranger 1.9.4"
+}

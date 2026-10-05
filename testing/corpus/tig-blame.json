@@ -1,0 +1,54 @@
+{
+  "command": [
+    "tig",
+    "blame",
+    "src/parser.rs"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "GIT_CONFIG_NOSYSTEM=1"
+  ],
+  "note": "",
+  "program": "tig-blame",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 9408,
+      "keys": ""
+    },
+    {
+      "end": 9814,
+      "keys": "j"
+    },
+    {
+      "end": 10201,
+      "keys": "j"
+    },
+    {
+      "end": 12424,
+      "keys": " "
+    },
+    {
+      "end": 17197,
+      "keys": "\\r"
+    },
+    {
+      "end": 20647,
+      "keys": "q"
+    },
+    {
+      "end": 20700,
+      "keys": "q"
+    }
+  ],
+  "version": "tig version 2.6.1"
+}

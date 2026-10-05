@@ -1,0 +1,60 @@
+{
+  "command": [
+    "micro",
+    "README.md"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC"
+  ],
+  "note": "",
+  "program": "micro-edit",
+  "replies": "",
+  "scrubbed": [],
+  "size": [
+    40,
+    120
+  ],
+  "steps": [
+    {
+      "end": 30597,
+      "keys": ""
+    },
+    {
+      "end": 60566,
+      "keys": "\\x06reflow\\r"
+    },
+    {
+      "end": 93912,
+      "keys": "\\x0e"
+    },
+    {
+      "end": 95782,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 99079,
+      "keys": "\\e[B"
+    },
+    {
+      "end": 102830,
+      "keys": "added"
+    },
+    {
+      "end": 103640,
+      "keys": "\\x1a"
+    },
+    {
+      "end": 103721,
+      "keys": "\\x11"
+    },
+    {
+      "end": 103721,
+      "keys": "n"
+    }
+  ],
+  "version": "micro 2.0.15"
+}

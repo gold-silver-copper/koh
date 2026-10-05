@@ -1,0 +1,109 @@
+[?1049h[1;40r(B[m[4l[?7h[?1h=[?25l[39;49m[?1000h[39;49m(B[m[H[2J
+[J[Aloading...[Kkranger\[?1h=[?1000hkranger\(B[0;1m[34m/[36mtmp/[34mfux-corpus/work/tree/[39mbuild[K
+[91m [94mempty        [39m(B[m (B[0;1;7m[94m build                                    1 [39m(B[m ...
+(B[0;1m[91m [94mhello        [39m(B[m (B[0;1m[91m [94mdocs[37X[3;58H3 
+[91m [94mnpm          [39m(B[m (B[0;1m[91m [94mmedia[36X[4;58H2 
+[91m [94mproject      [39m(B[m (B[0;1m[91m [94msrc[38X[5;58H4 
+[91m [94mrepo         [39m(B[m (B[0;1m[91m (B[0mnotes.txt[6;56H6 B
+(B[0;1m[91m [94mrepo-add     [39m(B[m (B[0;1m[91m (B[0m[36mreadme-link[22X[7;50H-> 24.5 K 
+(B[0;1m[91m [94mrepo-lazygit 
+[91m [94mrepo-lazygit~
+[91m [94mrepo-lazygit~
+[91m [94msrc          
+[91m [94mtiny         
+(B[0;1;7m[94m tree         
+(B[0;1m[91m (B[0mbad.c
+(B[0;1m[97m [35mbroken       
+[91m (B[0mCargo.toml
+(B[0;1m[91m (B[0mcolored.txt
+(B[0;1m[91m (B[0mfux-corpus~.7
+(B[0;1m[91m (B[0mfux-corpus~.1
+(B[0;1m[91m (B[0mfux-corpus.1
+(B[0;1m[91m (B[0mgrid-new.rs
+(B[0;1m[91m (B[0mgrid-old.rs
+(B[0;1m[91m (B[0m[36mlatest       
+(B[0;1m[91m (B[0mREADME.md
+(B[0;1m[91m [92mrun.sh       
+[91m (B[0municode.txt[40d[36mdrwxr-xr-x[39m 3 xxxxxxxx wheel 1 2026-01-02 11:04[40;91H24.5K sum, 144G free  1/6  Al[?7ll[?7h[1;11H(B[m
+[16G[2;61H(B[0;1;7m[94m cache                                                      [2;16H[39m(B[m[1;27H(B[0;1mdocs[K[2;16H[91m [94mbuild[36X[2;58H1 [39m(B[m ...(B[m[K[3;16H(B[0;1;7m[94m docs                                     3 [40;12H(B[0m5[40;29H3[113G2[2;16H(B[m
+[2;61H(B[0;1;7m[94m guides                                                     [3;61H(B[0;1m[91m (B[0mfux-corpus.1[4;61H(B[0;1m[91m (B[0mREADME.md[3;16H(B[m[1;27H(B[0;1mmedia[2;61H(B[0m...(B[m[K[3;16H(B[0;1m[91m [94mdocs[37X[3;58H3 [39m(B[m[K[4;16H(B[0;1;7m[94m media                                    2 [39m(B[m[K[40;12H4[40;29H2[113G3[3;16H(B[m
+[2;61H(B[0;7m b-300k.dat                                                 [3;61H(B[0;1m[91m (B[0mzeros-2m.raw[4;16H(B[m[1;27H(B[0;1msrc[K[2;61H(B[0m...(B[m[K
+[K[4;16H(B[0;1m[91m [94mmedia[36X[4;58H2 [5;16H(B[0;1;7m[94m src                                      4 [40;12H(B[0m6[40;29H4[113G4[4;16H(B[m
+[2;61H(B[0;1;7m[94m parser                                                     [3;61H(B[0;1m[91m [94mscreen[K[4;61H[91m (B[0mgrid.rs[5;61H(B[0;1m[91m (B[0mparser.rs[5;16H(B[m[1;27H(B[0;1m[34msrc/[39mparser
+[C[94mbuild[2;16H(B[0;1;7m[94m parser                                   1 [39m(B[m ...(B[m[K
+[C(B[0;1m[94mdocs [3;17Hscreen[3;58H1 [39m(B[m[K
+[C(B[0;1m[94mmedia[4;17H(B[0mgrid.rs[31X[4;55H59 K (B[m[K
+(B[0;1;7m[94m src          [39m(B[m (B[0;1m[91m (B[0mparser.rs[29X[5;55H39 K (B[m[K
+[Cnotes.txt    (B[m[K
+[C[36mreadme-link  [39m(B[m[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[40;12H3[40;29H1[40;91H98.1[113G1/4[5;16H(B[m[2d[2;61H(B[0;7m tests.rs                                                   [2;16H(B[m[1;31H(B[0;1mscreen[2;16H[91m [94mparser[35X[2;58H1 [39m(B[m ...(B[m[K[3;16H(B[0;1;7m[94m screen                                   1 [40;113H(B[0m2[2;16H(B[m
+[2;61H(B[0;7m screen.rs                                                  [3;16H(B[m[1;27H(B[0;1msrc[K
+[C[94mempty[2;17Hbuild [2;61H[91m [94mparser[K
+[Chello[3;16H[91m [94mdocs[37X[3;58H3 [39m(B[m (B[0;1;7m[94m screen                                                     [4;2H(B[0;1m[94mnpm  [4;17Hmedia[36X[4;58H2 [39m(B[m (B[0;1m[91m (B[0mgrid.rs
+(B[0;1m[91m [94mproject      [39m(B[m (B[0;1;7m[94m src                                      4 [39m(B[m (B[0;1m[91m (B[0mparser.rs
+[C(B[0;1m[94mrepo         [39m(B[m (B[0;1m[91m (B[0mnotes.txt[6;56H6 B
+[C(B[0;1m[94mrepo-add     [39m(B[m (B[0;1m[91m (B[0m[36mreadme-link[22X[7;50H-> 24.5 K 
+(B[0;1m[91m [94mrepo-lazygit 
+[91m [94mrepo-lazygit~
+[91m [94mrepo-lazygit~
+[91m [94msrc          
+[91m [94mtiny         
+(B[0;1;7m[94m tree         
+(B[0;1m[91m (B[0mbad.c
+(B[0;1m[97m [35mbroken       
+[91m (B[0mCargo.toml
+(B[0;1m[91m (B[0mcolored.txt
+(B[0;1m[91m (B[0mfux-corpus~.7
+(B[0;1m[91m (B[0mfux-corpus~.1
+(B[0;1m[91m (B[0mfux-corpus.1
+(B[0;1m[91m (B[0mgrid-new.rs
+(B[0;1m[91m (B[0mgrid-old.rs
+(B[0;1m[91m (B[0m[36mlatest       
+(B[0;1m[91m (B[0mREADME.md
+(B[0;1m[91m [92mrun.sh       
+[91m (B[0municode.txt[40;12H6[40;29H4[40;91H24.5[113G4/6[3;16H(B[m
+
+[1;119H(B[0;1mz[26d(B[0;4mkey          command                                                                                                    [27;2H(B[0mf[27;14Hconsole filter%space
+ z[28;14Hconsole filter%space
+ u[29;14Hset autoupdate_cumulative_size!
+ c[30;14Hset collapse_preview!
+ I[31;14Hset flushinput!
+ m[32;14Hset mouse_enabled!
+ P[33;14Hset preview_directories!
+ p[34;14Hset preview_files!
+ i[35;14Hset preview_images!
+ h[36;14Hset show_hidden!
+ s[37;14Hset sort_case_insensitive!
+ d[38;14Hset sort_directories_first!
+ v[39;14Hset use_preview_script![5;16H(B[m[1;119H(B[0;1m [26d[91m (B[0municode.txt  (B[m[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[5;16H[?1l>[?12l[?25h[?1000l[40;1H[?1049l[?1l>

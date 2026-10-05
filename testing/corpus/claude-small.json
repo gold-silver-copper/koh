@@ -1,0 +1,36 @@
+{
+  "command": [
+    "claude"
+  ],
+  "env": [
+    "PATH=/tmp/fux-corpus/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME=/tmp/fux-corpus/home",
+    "LANG=en_US.UTF-8",
+    "COLORTERM=truecolor",
+    "TZ=UTC",
+    "DISABLE_AUTOUPDATER=1"
+  ],
+  "note": "onboarding done and the directory trusted, in HOME's .claude.json",
+  "program": "claude-small",
+  "replies": "\\eP>|fux 0.17.0\\e\\\\\\e[?0u\\e[?62;22c\\e[?2026;2$y\\e[?1016;0$y\\e[?62;22c",
+  "scrubbed": [],
+  "size": [
+    24,
+    80
+  ],
+  "steps": [
+    {
+      "end": 2087,
+      "keys": ""
+    },
+    {
+      "end": 2635,
+      "keys": "\\x03"
+    },
+    {
+      "end": 3336,
+      "keys": "\\x03"
+    }
+  ],
+  "version": "Claude Code 2.1.288 (Claude Code)"
+}

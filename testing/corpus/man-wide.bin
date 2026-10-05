@@ -1,0 +1,209 @@
+[?1049h[50;1H[?1h=FUX-CORPUS-LONG(7)                                                                           Miscellaneous                                                                          FUX-CORPUS-LONG(7)
+
+[1mNAME[0m
+     fux-corpus-long - a long page of generated text, for paging and searching
+
+[1mSECTION[0m [1m1[0m
+     Reflow panel row column mark scroll state recording row frame colour cell cursor pane resize column mode cursor link pane row program region palette engine engine recording row program
+     recording reflow row palette cell link wrap reply resize glyph.
+
+     Control glyph paint resize cell vote column link program sequence control parser step paint recording client column cursor [4mcolour[24m query server vote column row escape panel program field window
+     reply history vote parser screen client parser wide key region paint row colour reply wrap mode reflow reflow paint [1mscroll[0m cursor wide window reflow link query wrap pane link query resize
+     parser field history palette glyph cursor narrow glyph palette vote palette terminal paint recording narrow report reply terminal glyph resize.
+
+     Query server report attribute step parser window parser state cursor palette scroll palette server attribute control colour server key [4mlink[24m key terminal server panel parser panel cursor vote
+     region [1mcolour[0m history attribute server.
+
+     [1m--recording[0m
+            An option of section 1, described at some length so that it wraps to the next line at any width a terminal has.
+
+[1mSECTION[0m [1m2[0m
+     Mark resize wrap row parser client vote recording prompt resize frame wrap mark glyph prompt frame screen window narrow step terminal glyph narrow glyph server key region link row [4mescape[24m
+     sequence field prompt prompt link server scroll link row mode attribute query cell scroll frame window link.
+
+     Attribute parser sequence cursor state screen control link client window screen history control prompt key reply frame column region [4mframe[24m palette scroll cursor report query cell narrow query
+     wrap pane field report reflow glyph mark frame program paint sequence cursor query row narrow pane column query screen engine cursor report cursor step palette column report region client.
+
+     Reply step mode reply cell client narrow wide query window terminal report state control link sequence mode cell escape colour parser narrow terminal control history cursor server query frame
+     panel attribute mode frame terminal cursor report cursor glyph reflow recording cell reflow screen escape escape engine [1mrow[0m palette cursor recording prompt glyph vote step history sequence
+     paint glyph reply key panel glyph cell frame engine pane frame wrap prompt frame program screen field.
+
+     [1m--recording[0m
+            An option of section 2, described at some length so that it wraps to the next line at any width a terminal has.
+
+[1mSECTION[0m [1m3[0m
+     Prompt report state wrap step engine frame query region [4mrow[24m state palette paint paint reflow screen wide terminal paint field window reflow escape glyph resize parser history sequence region
+     control terminal sequence control reflow region attribute terminal reply report state.
+
+     Escape report panel report reflow panel mode escape server link vote [1mmode[0m reflow region wide panel wide column colour frame paint link palette window control window pane wrap link attribute
+     mode cursor narrow control link cursor sequence mode state [1mwrap[0m report program attribute screen resize history resize prompt colour [1mescape[0m history.
+
+     [1m--recording[0m
+            An option of section 3, described at some length so that it wraps to the next line at any width a terminal has.
+
+[1mSECTION[0m [1m4[0m
+     Report palette step terminal terminal mark escape client query sequence panel mode server prompt mode link mode screen resize panel escape row screen attribute paint field panel resize [4mprompt[24m
+     cursor report palette vote pane state palette paint cell [1mquery[0m control resize state field reflow attribute terminal reply frame column colour [1mserver[0m paint attribute escape attribute palette
+     client.
+
+     Server screen engine resize mode engine reflow cell history cell client column row report attribute column [4mcursor[24m step control state query control key cell report sequence query escape terminal
+:[K[K     step engine column screen palette scroll server client history report pane paint wrap paint narrow terminal escape glyph step mode sequence sequence client state step.
+
+     [1m--cell[0m An option of section 4, described at some length so that it wraps to the next line at any width a terminal has.
+
+[1mSECTION[0m [1m5[0m
+     Server palette window state cell reply palette region row attribute step recording attribute column state frame narrow window step report vote terminal scroll engine step key parser colour cell
+     state.
+
+     Vote escape resize row escape program parser resize resize screen state panel attribute reflow reflow colour terminal pane wide pane region cursor reflow program state client wide wrap
+     [1mattribute[0m terminal row link glyph panel reflow cursor program key state frame wide glyph parser reply wide prompt wide column scroll.  [1mkey[0m
+
+     [1m--paint[0m
+            An option of section 5, described at some length so that it wraps to the next line at any width a terminal has.
+
+[1mSECTION[0m [1m6[0m
+     Window key client narrow server reflow scroll column wrap parser pane state cursor window frame frame vote cell cell engine wrap cursor sequence frame cursor row frame history panel wrap screen
+     column key region attribute wrap paint reply [4mstate[24m wide field palette column parser key report.
+
+     Key row reply prompt report escape engine recording vote [1mmode[0m sequence terminal cell palette glyph reply key engine pane [1mlink[0m resize frame state row wrap paint palette key panel cell screen row
+     terminal program parser escape scroll prompt parser mark palette resize recording.
+
+     Resize attribute prompt step panel frame panel panel resize [4mmode[24m key narrow frame escape column escape engine row server mark terminal history pane client cursor panel window narrow palette
+     scroll report palette panel cell region control report row query engine.
+
+     [1m--wide[0m An option of section 6, described at some length so that it wraps to the next line at any width a terminal has.
+
+[1mSECTION[0m [1m7[0m
+     Screen screen cell wrap panel engine cell column cell column recording state attribute mark vote column history scroll mode colour colour region cell cell engine cursor engine engine reply
+     server [4mrow[24m scroll wrap scroll panel colour reply sequence control pane.
+
+     Report program wide reply colour palette paint wide region engine cursor paint [4msequence[24m link scroll engine sequence parser scroll reflow reflow cursor pane panel screen state colour escape
+     report pane mark frame wide [1mpane[0m history engine palette client wrap mark step step panel cell parser recording sequence prompt glyph window vote link sequence wide client window report
+     recording palette wrap control client panel mode.  [1mresize[0m
+
+     Field vote narrow panel sequence terminal history paint scroll cell report mark colour wide attribute prompt parser scroll program client mark colour server frame screen engine state prompt
+     control resize client colour field narrow reflow frame region key parser engine row report query history reflow row terminal column resize resize engine field parser recording report scroll
+     palette escape reflow prompt palette reflow client.
+
+     [1m--engine[0m
+            An option of section 7, described at some length so that it wraps to the next line at any width a terminal has.
+
+[1mSECTION[0m [1m8[0m
+     Paint colour prompt cursor window vote region link region report resize [1mresize[0m palette wrap server paint link row server client glyph [4mcontrol[24m paint mode paint wide mark step terminal wide
+     sequence client program paint vote reply client state pane resize field column [1mengine[0m narrow engine.
+
+     Link reflow mark program row reflow escape scroll terminal cell attribute [1mfield[0m server step vote row frame mark key history [1mserver[0m key glyph engine field step field cursor colour [4mregion[24m cell
+     vote engine client engine narrow scroll vote narrow cell resize scroll panel terminal state wrap escape link report escape narrow resize cell sequence screen pane program panel.
+
+     Row sequence state program window server field wide glyph region state panel wide engine resize server history window query program control reply query row key panel step control step terminal
+:[K[K/[Koo[Kpp[Ktt[Kii[Koo[Knn[K[1;1H[K     step engine column screen palette scroll server client history report pane paint wrap paint narrow terminal escape glyph step mode sequence sequence client state step.
+[2;1H[K
+[3;1H[K     [1m--cell[0m An option of section 4, described at some length so that it wraps to the next line at any width a terminal has.
+[4;1H[K
+[5;1H[K[1mSECTION[0m [1m5[0m
+[6;1H[K     Server palette window state cell reply palette region row attribute step recording attribute column state frame narrow window step report vote terminal scroll engine step key parser colour cell
+[7;1H[K     state.
+[8;1H[K
+[9;1H[K     Vote escape resize row escape program parser resize resize screen state panel attribute reflow reflow colour terminal pane wide pane region cursor reflow program state client wide wrap
+[10;1H[K     [1mattribute[0m terminal row link glyph panel reflow cursor program key state frame wide glyph parser reply wide prompt wide column scroll.  [1mkey[0m
+[11;1H[K
+[12;1H[K     [1m--paint[0m
+[13;1H[K            An option of section 5, described at some length so that it wraps to the next line at any width a terminal has.
+[14;1H[K
+[15;1H[K[1mSECTION[0m [1m6[0m
+[16;1H[K     Window key client narrow server reflow scroll column wrap parser pane state cursor window frame frame vote cell cell engine wrap cursor sequence frame cursor row frame history panel wrap screen
+[17;1H[K     column key region attribute wrap paint reply [4mstate[24m wide field palette column parser key report.
+[18;1H[K
+[19;1H[K     Key row reply prompt report escape engine recording vote [1mmode[0m sequence terminal cell palette glyph reply key engine pane [1mlink[0m resize frame state row wrap paint palette key panel cell screen row
+[20;1H[K     terminal program parser escape scroll prompt parser mark palette resize recording.
+[21;1H[K
+[22;1H[K     Resize attribute prompt step panel frame panel panel resize [4mmode[24m key narrow frame escape column escape engine row server mark terminal history pane client cursor panel window narrow palette
+[23;1H[K     scroll report palette panel cell region control report row query engine.
+[24;1H[K
+[25;1H[K     [1m--wide[0m An option of section 6, described at some length so that it wraps to the next line at any width a terminal has.
+[26;1H[K
+[27;1H[K[1mSECTION[0m [1m7[0m
+[28;1H[K     Screen screen cell wrap panel engine cell column cell column recording state attribute mark vote column history scroll mode colour colour region cell cell engine cursor engine engine reply
+[29;1H[K     server [4mrow[24m scroll wrap scroll panel colour reply sequence control pane.
+[30;1H[K
+[31;1H[K     Report program wide reply colour palette paint wide region engine cursor paint [4msequence[24m link scroll engine sequence parser scroll reflow reflow cursor pane panel screen state colour escape
+[32;1H[K     report pane mark frame wide [1mpane[0m history engine palette client wrap mark step step panel cell parser recording sequence prompt glyph window vote link sequence wide client window report
+[33;1H[K     recording palette wrap control client panel mode.  [1mresize[0m
+[34;1H[K
+[35;1H[K     Field vote narrow panel sequence terminal history paint scroll cell report mark colour wide attribute prompt parser scroll program client mark colour server frame screen engine state prompt
+[36;1H[K     control resize client colour field narrow reflow frame region key parser engine row report query history reflow row terminal column resize resize engine field parser recording report scroll
+[37;1H[K     palette escape reflow prompt palette reflow client.
+[38;1H[K
+[39;1H[K     [1m--engine[0m
+[40;1H[K            An option of section 7, described at some length so that it wraps to the next line at any width a terminal has.
+[41;1H[K
+[42;1H[K[1mSECTION[0m [1m8[0m
+[43;1H[K     Paint colour prompt cursor window vote region link region report resize [1mresize[0m palette wrap server paint link row server client glyph [4mcontrol[24m paint mode paint wide mark step terminal wide
+[44;1H[K     sequence client program paint vote reply client state pane resize field column [1mengine[0m narrow engine.
+[45;1H[K
+[46;1H[K     Link reflow mark program row reflow escape scroll terminal cell attribute [1mfield[0m server step vote row frame mark key history [1mserver[0m key glyph engine field step field cursor colour [4mregion[24m cell
+[47;1H[K     vote engine client engine narrow scroll vote narrow cell resize scroll panel terminal state wrap escape link report escape narrow resize cell sequence screen pane program panel.
+[48;1H[K
+[49;1H[K     Row sequence state program window server field wide glyph region state panel wide engine resize server history window query program control reply query row key panel step control step terminal
+[50;1H[1;1H[K     step engine column screen palette scroll server client history report pane paint wrap paint narrow terminal escape glyph step mode sequence sequence client state step.
+[2;1H[K
+[3;1H[K     [1m--cell[0m An [7moption[27m of section 4, described at some length so that it wraps to the next line at any width a terminal has.
+[4;1H[K
+[5;1H[K[1mSECTION[0m [1m5[0m
+[6;1H[K     Server palette window state cell reply palette region row attribute step recording attribute column state frame narrow window step report vote terminal scroll engine step key parser colour cell
+[7;1H[K     state.
+[8;1H[K
+[9;1H[K     Vote escape resize row escape program parser resize resize screen state panel attribute reflow reflow colour terminal pane wide pane region cursor reflow program state client wide wrap
+[10;1H[K     [1mattribute[0m terminal row link glyph panel reflow cursor program key state frame wide glyph parser reply wide prompt wide column scroll.  [1mkey[0m
+[11;1H[K
+[12;1H[K     [1m--paint[0m
+[13;1H[K            An [7moption[27m of section 5, described at some length so that it wraps to the next line at any width a terminal has.
+[14;1H[K
+[15;1H[K[1mSECTION[0m [1m6[0m
+[16;1H[K     Window key client narrow server reflow scroll column wrap parser pane state cursor window frame frame vote cell cell engine wrap cursor sequence frame cursor row frame history panel wrap screen
+[17;1H[K     column key region attribute wrap paint reply [4mstate[24m wide field palette column parser key report.
+[18;1H[K
+[19;1H[K     Key row reply prompt report escape engine recording vote [1mmode[0m sequence terminal cell palette glyph reply key engine pane [1mlink[0m resize frame state row wrap paint palette key panel cell screen row
+[20;1H[K     terminal program parser escape scroll prompt parser mark palette resize recording.
+[21;1H[K
+[22;1H[K     Resize attribute prompt step panel frame panel panel resize [4mmode[24m key narrow frame escape column escape engine row server mark terminal history pane client cursor panel window narrow palette
+[23;1H[K     scroll report palette panel cell region control report row query engine.
+[24;1H[K
+[25;1H[K     [1m--wide[0m An [7moption[27m of section 6, described at some length so that it wraps to the next line at any width a terminal has.
+[26;1H[K
+[27;1H[K[1mSECTION[0m [1m7[0m
+[28;1H[K     Screen screen cell wrap panel engine cell column cell column recording state attribute mark vote column history scroll mode colour colour region cell cell engine cursor engine engine reply
+[29;1H[K     server [4mrow[24m scroll wrap scroll panel colour reply sequence control pane.
+[30;1H[K
+[31;1H[K     Report program wide reply colour palette paint wide region engine cursor paint [4msequence[24m link scroll engine sequence parser scroll reflow reflow cursor pane panel screen state colour escape
+[32;1H[K     report pane mark frame wide [1mpane[0m history engine palette client wrap mark step step panel cell parser recording sequence prompt glyph window vote link sequence wide client window report
+[33;1H[K     recording palette wrap control client panel mode.  [1mresize[0m
+[34;1H[K
+[35;1H[K     Field vote narrow panel sequence terminal history paint scroll cell report mark colour wide attribute prompt parser scroll program client mark colour server frame screen engine state prompt
+[36;1H[K     control resize client colour field narrow reflow frame region key parser engine row report query history reflow row terminal column resize resize engine field parser recording report scroll
+[37;1H[K     palette escape reflow prompt palette reflow client.
+[38;1H[K
+[39;1H[K     [1m--engine[0m
+[40;1H[K            An [7moption[27m of section 7, described at some length so that it wraps to the next line at any width a terminal has.
+[41;1H[K
+[42;1H[K[1mSECTION[0m [1m8[0m
+[43;1H[K     Paint colour prompt cursor window vote region link region report resize [1mresize[0m palette wrap server paint link row server client glyph [4mcontrol[24m paint mode paint wide mark step terminal wide
+[44;1H[K     sequence client program paint vote reply client state pane resize field column [1mengine[0m narrow engine.
+[45;1H[K
+[46;1H[K     Link reflow mark program row reflow escape scroll terminal cell attribute [1mfield[0m server step vote row frame mark key history [1mserver[0m key glyph engine field step field cursor colour [4mregion[24m cell
+[47;1H[K     vote engine client engine narrow scroll vote narrow cell resize scroll panel terminal state wrap escape link report escape narrow resize cell sequence screen pane program panel.
+[48;1H[K
+[49;1H[K     Row sequence state program window server field wide glyph region state panel wide engine resize server history window query program control reply query row key panel step control step terminal
+[50;1H     [1mreply[0m glyph step escape recording pane mode history history field history step palette window reply terminal sequence report query pane wide recording cell reply glyph program glyph query link
+     field paint [4mquery[24m parser mark cursor mark link paint history attribute.
+:[K[K/[K
+     [1m--narrow[0m
+            An [7moption[27m of section 8, described at some length so that it wraps to the next line at any width a terminal has.
+
+[1mSECTION[0m [1m9[0m
+     Screen row cell link state client paint column step engine reflow region cursor report sequence program palette panel cursor vote frame reflow narrow window wide state mode palette narrow
+     [4mpalette[24m cell report parser row link screen.
+
+     Screen engine column window control sequence palette server region engine state glyph control palette row narrow window link glyph window glyph query resize resize mode glyph screen query
+     program [1mnarrow[0m reply control wide report paint scroll sequence client server region [4mwrap[24m glyph frame row engine vote colour link server reply region report attribute state pane report.
+:[K[K[?1l>[?1049l

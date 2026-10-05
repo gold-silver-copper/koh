@@ -1,0 +1,118 @@
+[?1049h[1;40r[4l[40;1H(B[m[37m[40m(B[m[39;49m[K[?1049l[?1001s[?1002h[?1006h[?2004h[?1049h[1;40r[4l[?1h=(B[m[39m[49m[1;40r[H[2J[2;119H[1K [37m[44m┐[2;120H]7;file://localhost/private/tmp/fux-corpus/work/tree\]7;file://localhost/private/tmp/fux-corpus/work/tree\]7;file://localhost/private/tmp/fux-corpus/work/tree\[1;1H[30m[46m  Left     File     Command     Options     Right[K
+[37m[44m┌<─[30m[47m /private/tmp/fux-corpus/work/tree [37m[44m────────────────.[^]>┐┌<─ /private/tmp/fux-corpus/work/src ─────────────────.[^]>
+│[93m.n               Name                [37m│[93m Size  [37m│[93mModify time [37m││[93m.n               Name                [37m│[93m Size  [37m│[93mModify time [37m│[4;1H│[30m[46m/..                                  │UP--DIR│Oct  3 16:16[37m[44m││[97m/..                                  [37m│[97mUP--DIR[37m│[97mOct  3 16:16[37m│[5;1H│[97m/.hidden                             [37m│[97m     96[37m│[97mJan  2  2026[37m││[97m/cell                                [37m│[97m     96[37m│[97mJan  2  2026[37m│[6;1H│[97m/build                               [37m│[97m     96[37m│[97mJan  2  2026[37m││[97m/grid                                [37m│[97m     96[37m│[97mJan  2  2026[37m│[7;1H│[97m/docs                                [37m│[97m    160[37m│[97mJan  2  2026[37m││[97m/parser                              [37m│[97m     96[37m│[97mJan  2  2026[37m│[8;1H│[97m/media                               [37m│[97m    128[37m│[97mJan  2  2026[37m││[97m/screen                              [37m│[97m     96[37m│[97mJan  2  2026[37m│[9;1H│[97m/src                                 [37m│[97m    192[37m│[97mJan  2  2026[37m││[97m/unicode                             [37m│[97m    128[37m│[97mJan  2  2026[37m│[10;1H│[33m notes.txt                           [37m│[33m      6[37m│[33mJan  2  2026[37m││ cell.rs                             │  34902│Jan  2  2026│[11;1H│@readme-link                         │     14│Jan  2  2026││ grid.rs                             │  60437│Jan  2  2026│[12;1H│                                     │       │            ││ lib.rs                              │  13140│Jan  2  2026│[13;1H│                                     │       │            ││ link.rs                             │  15634│Jan  2  2026│[14;1H│                                     │       │            ││ parser.rs                           │  39976│Jan  2  2026│[15;1H│                                     │       │            ││ screen.rs                           │  78587│Jan  2  2026│[16;1H│                                     │       │            ││ unicode.rs                          │   7176│Jan  2  2026│[17;1H│                                     │       │            ││                                     │       │            │[18;1H│                                     │       │            ││                                     │       │            │[19;1H│                                     │       │            ││                                     │       │            │[20;1H│                                     │       │            ││                                     │       │            │[21;1H│                                     │       │            ││                                     │       │            │[22;1H│                                     │       │            ││                                     │       │            │[23;1H│                                     │       │            ││                                     │       │            │[24;1H│                                     │       │            ││                                     │       │            │[25;1H│                                     │       │            ││                                     │       │            │[26;1H│                                     │       │            ││                                     │       │            │[27;1H│                                     │       │            ││                                     │       │            │[28;1H│                                     │       │            ││                                     │       │            │[29;1H│                                     │       │            ││                                     │       │            │[30;1H│                                     │       │            ││                                     │       │            │[31;1H│                                     │       │            ││                                     │       │            │[32;1H│                                     │       │            ││                                     │       │            │[33;1H│                                     │       │            ││                                     │       │            │[34;1H│                                     │       │            ││                                     │       │            │[35;1H│                                     │       │            ││                                     │       │            │[36;1H├──────────────────────────────────────────────────────────┤├──────────────────────────────────────────────────────────┤[37;1H│UP--DIR                                                   ││UP--DIR                                                   │[38;1H└────────────────────────────────────── 144G / 926G (15%) ─┘└────────────────────────────────────── 144G / 926G (15%) ─┘[39;1H[39m[49m$
+[97m[40m 1[30m[46mHelp      [97m[40m 2[30m[46mMenu      [97m[40m 3[30m[46mView      [97m[40m 4[30m[46mEdit      [97m[40m 5[30m[46mCopy      [97m[40m 6[30m[46mRenMov    [97m[40m 7[30m[46mMkdir     [97m[40m 8[30m[46mDelete    [97m[40m 9[30m[46mPullDn    [97m[40m10[30m[46mQuit[K[39;3H[4;2H[97m[44m/..                                  [37m│[97mUP--DIR[37m│[97mOct  3 16:16[5;2H[30m[46m/.hidden                             │     96│Jan  2  2026[37;2H[37m[44m/.hidden[39;3H[5;2H[97m/.hidden                             [37m│[97m     96[37m│[97mJan  2  2026[6;2H[30m[46m/build                               │     96│Jan  2  2026[37;3H[37m[44mbuild  [39;3H[6;2H[97m/build                               [37m│[97m     96[37m│[97mJan  2  2026[7;2H[30m[46m/docs                                │    160│Jan  2  2026[37;3H[37m[44mdocs [39;3H[2;120H]7;file://localhost/private/tmp/fux-corpus/work/tree/docs\[2;38H[30m[47m/docs [4;2H[46m/..                                  │UP--DIR│Jan  2  2026[5;3H[97m[44mguides [6;2H[33m README.md                           [37m│[33m  25101[37m│[33mJan  2  2026[7;2H[37m fux-corpus.1                        │   1900│Jan  2  2026[8;2H                                     │       │            [9;2H                                     │       │            [10;2H                                     │       │            [11;2H            [31C  │            [37;2HUP--DIR[39;3H[4;2H[97m/..                                  [37m│[97mUP--DIR[37m│[97mJan  2  2026[5;2H[30m[46m/guides                              │     96│Jan  2  2026[37;2H[37m[44m/guides[39;3H[5;2H[97m/guides                              [37m│[97m     96[37m│[97mJan  2  2026[6;2H[30m[46m README.md                           │  25101│Jan  2  2026[37;2H[37m[44m README.md[39;3H[1;1H[30m[46m/private/tmp/fux-corpus/work/tree/docs/README.md [44C2179/25101[15C8%[2;1H[37m[44m# fux-vt-compare: fux-vt beside other terminal emulators[K
+[K
+An excluded package with its own lockfile. It runs fux-vt beside a panel of[K
+other terminal emulators ("engines"):[K
+[K
+- engines linked into the binary: Ghostty's core (libghostty-vt), alacritty_terminal,[K
+  libvterm, avt, wezterm-term and the vt100 crate;[K
+- engines run as processes of their own: xterm.js (`@xterm/headless` under[K
+  Node), tmux, and xterm itself under Xvfb.[K
+[K
+Every engine gets the same output. After each piece of it, and each resize,[K
+each engine's screen is compared with fux-vt's, cell by cell, along with the[K
+cursor, the modes, soft wraps, the title, cursor reports and recent history.[K
+fux-vt fails a case only where the engines outvote it (see "The vote"). A[K
+failing case is shrunk to the smallest one that still fails and printed with[K
+the command that replays it. `bench` times every engine on the same[K
+workloads. The corpus (`corpus/`) holds what real programs wrote to a[K
+terminal, recorded by `record`.[K
+[K
+It is not built or run by fux's own gates. It needs Zig, a Ghostty[K
+checkout, libvterm's source and, for the engines in their own processes,[K
+Node, tmux, xterm and Xvfb. `run.sh` fetches the first three.[K
+[K
+No engine is the truth. When the panel outvotes fux-vt, the difference says[K
+where to look. xterm's behaviour and the standards decide which side is[K
+right. Some differences are choices fux-vt makes on purpose, and each family[K
+below records which.[K
+[K
+## Running it[K
+[K
+```sh[K
+fux-vt/compare/run.sh[17C [5C# families expected to agree, 20000 cases, beside the panel[K
+fux-vt/compare/run.sh engines[9C [5C# which engines run here, which vote, what each cannot tell[K
+fux-vt/compare/run.sh cases[11C [5C# the named cases beside every engine, with each engine's mark[K
+fux-vt/compare/run.sh verdicts              # the families with a recorded verdict, beside the engines that decide each[K
+fux-vt/compare/run.sh matrix[16C# family by engine: % of cases each engine differs from fux-vt[K
+fux-vt/compare/run.sh bench                 # MB/s for every engine on every workload, and the corpus[K
+fux-vt/compare/run.sh bench --engines ghostty corpus   # each recording alone too[K[40;15H[30m[46mUnWrap[6CQuit[8CHex [8CGoto[8C      [6CSearch[6CRaw   [6CFormat[40;120H[1;94H4366[20C17
+[37m[44mfux-vt/compare/run.sh --list                # the families, their status and reasons
+fux-vt/compare/run.sh survey[16C# each family alone: how often it fails, and the smallest failure
+fux-vt/compare/run.sh run --family sgr --family text --cases 2000 --seed 7[K
+fux-vt/compare/run.sh run --engines ghostty,libvterm,xterm   # any panel
+fux-vt/compare/run.sh replay --engines all --size 1x5 'abcde\x08X'
+fux-vt/compare/run.sh --no-reflow           # fux-vt set up as fux sets it up[K
+fux-vt/compare/run.sh corpus                # the recordings beside xterm and the panel; exit 1 if one regresses
+fux-vt/compare/run.sh corpus --show vim     # one recording, and fux-vt's screen at its end
+fux-vt/compare/run.sh inventory > fux-vt/compare/corpus/INVENTORY.md   # what the recordings send
+fux-vt/compare/corpus/record.sh [NAME...]   # record the corpus again (see "The corpus")
+fux-vt/compare/run.sh --cargo test          # any cargo subcommand, in the same environment
+fux-vt/compare/run.sh --cargo clippy --all-targets -- -D warnings[K
+```[K
+[K
+The first run fetches Zig 0.16.0, Ghostty and libvterm into[K
+`~/.cache/fux-vt-compare` (or `$FUX_VT_COMPARE_CACHE`). It also installs
+`@xterm/headless` with `npm ci` in `node/` when Node is present. The first
+build takes a few minutes (Ghostty by Zig, then wezterm-term). After that,
+`fux-vt/compare/target/release/fux-vt-compare` can be run directly.
+[K
+- `run` exits 1 if any case fails, and prints up to five distinct shrunk
+  cases. Each one shows:[K[24;3H- its families and the `replay` command;
+  - the fields fux-vt is outvoted on;[K
+  - each engine's verdict and differences;[K
+  - fux-vt's screen beside the first engine that differs (`.` blank, `_`[K
+    cursor, `↩` soft-wrapped, `≠` a row that differs).
+- `cases` marks each engine: `+` agrees, `-` differs, `!` abstains.
+- `--seed` replays a run exactly. Every random choice comes from it.
+- `--engines` takes names joined by commas, or one of:
+  - `panel`, the voters, which is the default for `run`, `survey`, `matrix`
+    and `replay`;[K
+  - `all`, the default for `cases` and `bench`;[K
+  - `in-process`.[K
+[K
+## The vote[K
+[K
+Each engine says what it can tell (`Can` in `src/engine.rs`): `engines`[K[1;120H]7;file://localhost/private/tmp/fux-corpus/work/tree/docs\[30m[46m  Left     File     Command     Options     Right[K
+[37m[44m┌<─[30m[47m /private/tmp/fux-corpus/work/tree/docs [37m[44m───────────.[^]>┐┌<─ /private/tmp/fux-corpus/work/src ─────────────────.[^]>┐[3;1H│[93m.n               Name                [37m│[93m Size  [37m│[93mModify time [37m││[93m.n               Name                [37m│[93m Size  [37m│[93mModify time [37m│[4;1H│[97m/..                                  [37m│[97mUP--DIR[37m│[97mJan  2  2026[37m││[97m/..                                  [37m│[97mUP--DIR[37m│[97mOct  3 16:16[37m│[5;1H│[97m/guides                              [37m│[97m     96[37m│[97mJan  2  2026[37m││[97m/cell                                [37m│[97m     96[37m│[97mJan  2  2026[37m│[6;1H│[30m[46m README.md                           │  25101│Jan  2  2026[37m[44m││[97m/grid                                [37m│[97m     96[37m│[97mJan  2  2026[37m│[7;1H│ fux-corpus.1                   [5C│   1900│Jan  2  2026││[97m/parser                              [37m│[97m     96[37m│[97mJan  2  2026[37m│[8;1H│                           [10C│[5C  │            ││[97m/screen                              [37m│[97m     96[37m│[97mJan  2  2026[37m│[9;1H│                                     │[5C  │            ││[97m/unicode                             [37m│[97m    128[37m│[97mJan  2  2026[37m│[10;1H│                                     │       │            ││ cell.rs                             │  34902│Jan  2  2026│[11;1H│                                     │       │            ││ grid.rs                   [10C│  60437│Jan  2  2026│[12;1H│                                     │[5C  │            ││ lib.rs                       [7C│  13140│Jan  2  2026│[13;1H│                                     │       │            ││ link.rs[29C│  15634│Jan  2  2026│[14;1H│  [35C│[7C│[12C││ parser.rs[27C│  39976│Jan  2  2026│[15;1H│[37C│[7C│[12C││ screen.rs[27C│  78587│Jan  2  2026│[16;1H│                                     │       │            ││ unicode.rs[26C│   7176│Jan  2  2026│[17;1H│                                     │       │            ││           [26C│[7C│[12C│[18;1H│                                     │       │            ││             [24C│[7C│[12C│[19;1H│                                     │       │            ││             [24C│[7C│[12C│[20;1H│                                     │       │            ││      [31C│[7C│[12C│[21;1H│[37C│[7C│[12C││[37C│[7C│[12C│[22;1H│                                     │       │            ││           [26C│[7C│[12C│[23;1H│                       [14C│[7C│[12C││[37C│[7C│[12C│[24;1H│                                     │       │[12C││[37C│[7C│[12C│[25;1H│                                     │[7C│[12C││[37C│[7C│[12C│[26;1H│                                     │       │[12C││[37C│[7C│[12C│[27;1H│                                     │       │            ││           [26C│[7C│[12C│[28;1H│                                     │       │       [5C││[37C│[7C│[12C│[29;1H│                                     │       │            ││      [31C│[7C│[12C│[30;1H│                                     │       │            ││       [30C│[7C│[12C│[31;1H│                                     │       │       [5C││[37C│[7C│[12C│[32;1H│                                     │       │            ││              [23C│[7C│[12C│[33;1H│                [21C│[7C│[12C││[37C│[7C│[12C│[34;1H│                                     │       │[12C││[37C│[7C│[12C│[35;1H│                [21C│[7C│[12C││[37C│[7C│[12C│[36;1H├──────────────────────────────────────────────────────────┤├──────────────────────────────────────────────────────────┤[37;1H│ README.md[48C││UP--DIR[51C│[38;1H└────────────────────────────────────── 144G / 926G (15%) ─┘└────────────────────────────────────── 144G / 926G (15%) ─┘[39;1H[39m[49m$[K[40;15H[30m[46mMenu  [6CView[8CEdit[8CCopy[8CRenMov[6CMkdir [6CDelete[6CPullDn[39;3H]7;file://localhost/private/tmp/fux-corpus/work/src\[2;4H[37m[44m /private/tmp/fux-corpus/work/tree/docs [20C[30m[47m /private/tmp/fux-corpus/work/src [4;62H[46m/..                                  │UP--DIR│Oct  3 16:16[6;2H[33m[44m README.md                           [37m│[33m  25101[37m│[33mJan  2  2026[39;3H[4;62H[97m/..                                  [37m│[97mUP--DIR[37m│[97mOct  3 16:16[5;62H[30m[46m/cell                                │     96│Jan  2  2026[37;62H[37m[44m/cell  [39;3H[1;1H[39m[49m[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[1;120H[?2004l[?1006l[?1002l[?1001r[?1l>[40;1H(B[m[39;49m[K[?1049l[39;49m

@@ -93,3 +93,8 @@ significant_drop_tightening = "allow"   # false-positives on single-statement lo
 duration_suboptimal_units = "allow"     # `from_secs(3600)` is clearer than a contrived larger unit
 # `const fn` on every getter is high-churn for debatable benefit; not enforced.
 missing_const_for_fn = "allow"
+
+# TEMPORARY, until fux-vt 0.3.1 and fuxix 0.1.6 are on crates.io (as in koh's Cargo.toml).
+[patch.crates-io]
+fux-vt = { git = "https://github.com/gold-silver-copper/fux", rev = "6baf2e3" }
+fuxix = { git = "https://github.com/gold-silver-copper/fux", rev = "6baf2e3" }

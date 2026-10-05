@@ -10,7 +10,7 @@ use crate::proto::{
     decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, FrameScreen,
     InputSeq, FRAME_WINDOW, HEARTBEAT, MAX_INPUT_BYTES, WINDOW_CELLS,
 };
-use crate::terminal::{Grid, HistoryReply, Size, TerminalScreen};
+use crate::terminal::{Grid, HistoryReply, RowEncodings, Size, TerminalScreen};
 
 use super::render::WindowState;
 use super::scrollback::Scrollback;
@@ -77,8 +77,8 @@ pub struct ClientSession {
     last_activity: Option<Instant>,
     /// The window's height, for the view's pages.
     rows: u16,
-    /// The dictionary of the base the last frame was on, made once for the frames on it.
-    dictionary: Option<(FrameNum, Arc<[u8]>)>,
+    /// Rows' encodings, kept from one frame's dictionary to the next.
+    encodings: RowEncodings,
     /// Set whenever the rendered output may have changed; cleared once the caller repaints.
     pub(crate) dirty: bool,
     /// Whether a status banner was painted last frame, so its removal repaints once more.
@@ -104,7 +104,7 @@ impl ClientSession {
             scrollback: Scrollback::default(),
             last_activity: None,
             rows: size.rows,
-            dictionary: None,
+            encodings: RowEncodings::default(),
             dirty: true,
             status_was_shown: false,
         }
@@ -234,33 +234,26 @@ impl ClientSession {
     /// A frame's stream arrived: its body inflated against its base's dictionary, then applied as
     /// [`on_frame`](Self::on_frame) does. A frame on a base not held asks for a resync; one that
     /// does not inflate or decode is dropped, as a lost one would be.
-    pub fn on_frame_stream(&mut self, now: Instant, base: FrameNum, body: &[u8]) {
+    pub fn on_frame_stream(&mut self, now: Instant, base: FrameNum, rows: &[u16], body: &[u8]) {
         self.last_heard = Some(now);
-        let dictionary = match &self.dictionary {
-            Some((num, dictionary)) if *num == base => Arc::clone(dictionary),
-            _ => {
-                let screen = if base == FrameNum::BLANK {
-                    Some(Arc::default())
-                } else if base == self.current.num {
-                    Some(Arc::clone(&self.current.screen))
-                } else {
-                    self.older
-                        .iter()
-                        .find(|older| older.num == base)
-                        .map(|older| Arc::clone(&older.screen))
-                };
-                let Some(screen) = screen else {
-                    if !self.resync_sent {
-                        self.resync_sent = true;
-                        self.outgoing.push_back(ClientMsg::Resync);
-                    }
-                    return;
-                };
-                let dictionary: Arc<[u8]> = dictionary_for(base, &screen).into();
-                self.dictionary = Some((base, Arc::clone(&dictionary)));
-                dictionary
-            }
+        let screen = if base == FrameNum::BLANK {
+            Some(Arc::default())
+        } else if base == self.current.num {
+            Some(Arc::clone(&self.current.screen))
+        } else {
+            self.older
+                .iter()
+                .find(|older| older.num == base)
+                .map(|older| Arc::clone(&older.screen))
         };
+        let Some(screen) = screen else {
+            if !self.resync_sent {
+                self.resync_sent = true;
+                self.outgoing.push_back(ClientMsg::Resync);
+            }
+            return;
+        };
+        let dictionary = dictionary_for(base, &screen, rows, &mut self.encodings);
         match decode_frame_body(base, body, &dictionary) {
             Ok(frame) => self.on_frame(now, &frame),
             Err(e) => tracing::debug!(error = %e, "dropping an undecodable frame"),

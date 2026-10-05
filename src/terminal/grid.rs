@@ -239,6 +239,8 @@ pub(super) struct RowCache {
     ids: Vec<(RowId, u64)>,
     /// The snapshot's rows, which the next one shares whole when no row changed.
     lines: Arc<[Row]>,
+    /// The screen as of the snapshot: what changed since, it says.
+    mark: Option<fux_vt::Mark>,
 }
 
 impl RowCache {
@@ -336,6 +338,9 @@ impl Grid {
     /// `cache` is left holding this snapshot's rows.
     pub(super) fn of(screen: &fux_vt::Screen, cache: &mut RowCache) -> Self {
         let (rows, cols) = screen.size();
+        if let Some(grid) = Self::of_dirty(screen, cache) {
+            return grid;
+        }
         let window = screen.window(0, rows, cols);
         let live: Vec<fux_vt::Row<'_>> = (0..rows).filter_map(|row| window.row(row)).collect();
         let palette = Palette::of(screen);
@@ -373,6 +378,7 @@ impl Grid {
             cache.ids = live.iter().map(|row| (row.id(), row.version())).collect();
             cache.lines = lines.into();
         }
+        cache.mark = Some(screen.mark());
         Self {
             size: Size { rows, cols },
             lines: Arc::clone(&cache.lines),
@@ -404,6 +410,47 @@ impl Grid {
             cursor: screen.cursor_position(),
             modes: Modes::of(screen),
         }
+    }
+
+    /// The snapshot from the rows that changed since the last one alone, when nothing but rows'
+    /// contents did (fux-vt says so): a snapshot's cost then follows what changed, not the screen's
+    /// size. `None` when the screen changed otherwise (a scroll, resize, reset, a switch of screens,
+    /// the palette), for the full snapshot.
+    fn of_dirty(screen: &fux_vt::Screen, cache: &mut RowCache) -> Option<Self> {
+        let mark = cache.mark?;
+        let (rows, cols) = screen.size();
+        if screen.full_refresh_since(mark)
+            || Palette::of(screen) != cache.palette
+            || cache.lines.len() != usize::from(rows)
+            || cache
+                .lines
+                .first()
+                .is_some_and(|line| line.cells.len() != usize::from(cols))
+        {
+            return None;
+        }
+        let mut lines: Option<Vec<Row>> = None;
+        for (index, row) in screen.dirty_live_rows_since(mark) {
+            let at = usize::from(index);
+            let line = Row {
+                cells: exactly(Some(&row), cols, cache.palette.as_ref()),
+                wrapped: row.wrapped(),
+                links: RowLinks::of(&row, cols),
+            };
+            let lines = lines.get_or_insert_with(|| cache.lines.to_vec());
+            *lines.get_mut(at)? = line;
+            *cache.ids.get_mut(at)? = (row.id(), row.version());
+        }
+        if let Some(lines) = lines {
+            cache.lines = lines.into();
+        }
+        cache.mark = Some(screen.mark());
+        Some(Self {
+            size: Size { rows, cols },
+            lines: Arc::clone(&cache.lines),
+            cursor: screen.cursor_position(),
+            modes: Modes::of(screen),
+        })
     }
 
     pub const fn size(&self) -> Size {

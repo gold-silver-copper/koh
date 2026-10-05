@@ -46,3 +46,8 @@ path = "fuzz_targets/history_apply.rs"
 test = false
 doc = false
 bench = false
+
+# TEMPORARY, until fux-vt 0.3.1 and fuxix 0.1.6 are on crates.io (as in koh's Cargo.toml).
+[patch.crates-io]
+fux-vt = { git = "https://github.com/gold-silver-copper/fux", rev = "6baf2e3" }
+fuxix = { git = "https://github.com/gold-silver-copper/fux", rev = "6baf2e3" }

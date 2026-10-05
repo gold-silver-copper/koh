@@ -178,13 +178,14 @@ const FULL_FRAME: &str =
 
 /// [`full_frame`] as its stream carries it, compressed.
 const FULL_FRAME_STREAM: &str =
-    "00003dd1bb4ec3301406e0f33b6948b889210b137e02ba22240610524130202edd436b35554312b52e656c371606\
-    26162458b8497d10061e023174e611f0b1533cd89f6df91cfb782a68020431229d2aa9bb3a530899dd5691234c1a\
-    cdc165636b47c023123e4cf3040544351f09d92682d9c3cbec71eadb193cf535a936201d22aa1a2802fa04d8093a\
-    8445a792f0e9a4cd31e1399f9aceb76a986ec9eac4746dab73be50cd5c8596e7f1052d007b2e13b0ef968043866f\
-    70c1080d9a8c35835dc606adce2378b4021cb1c61ca267c5310e58cfac33d6376bc889228e77cd991642eb16efdf\
-    b2da569c7864c5098f5d21b0fefb74fffe33be33c3871bdedcf08aaa5482dc6dabd2c5a9d6e560bb5eef15e9a6ba\
-    49aeca4cd5d1335f12c789ccbab992599177a4ca8b612795da73e76ae67f82428efa49e956fe9ffa07";
+    "0000060001020304053dd1bb4ec3301406e0f33b6948b889210b137e02ba22240610524130202edd436b35554312\
+    b52e656c37160626162458b8497d10061e023174e611f0b1533cd89f6df91cfb782a68020431229d2aa9bb3a5308\
+    99dd5691234c1acdc165636b47c023123e4cf3040544351f09d92682d9c3cbec71eadb193cf535a936201d22aa1a\
+    2802fa04d8093a8445a792f0e9a4cd31e1399f9aceb76a986ec9eac4746dab73be50cd5c8596e7f1052d007b2e13\
+    b0ef968043866f70c1080d9a8c35835dc606adce2378b4021cb1c61ca267c5310e58cfac33d6376bc889228e77cd\
+    991642eb16efdfb2da569c7864c5098f5d21b0fefb74fffe33be33c3871bdedcf08aaa5482dc6dabd2c5a9d6e560\
+    bb5eef15e9a6ba49aeca4cd5d1335f12c789ccbab992599177a4ca8b612795da73e76ae67f82428efa49e956fe9f\
+    fa07";
 
 /// The postcard encoding of [`incremental_frame`].
 const INCREMENTAL_FRAME: &str =
@@ -193,8 +194,8 @@ const INCREMENTAL_FRAME: &str =
 
 /// [`incremental_frame`] as its stream carries it, compressed.
 const INCREMENTAL_FRAME_STREAM: &str =
-    "00ac023dd1b10900200c44517310b8315ccd5e1054b0771eddd1c224edab3efc8b832dee4a73d104b29631736feb\
-    7f8c8e07";
+    "00ac02010535ccb10900200c0440f310f8c2215ccd5e1054b0771eddd122497bc53d5c1c0957ba8b2690adce5546\
+    dfb6e4183e";
 
 /// The postcard encoding of each of [`modes`].
 const MODES: [&str; 8] = [
@@ -230,8 +231,8 @@ const SCROLLED_FRAME: &str =
 
 /// [`scrolled_frame`] as its stream carries it, compressed.
 const SCROLLED_FRAME_STREAM: &str =
-    "00ad025591b10900200c04f3915459c2ddd442080aba81fbe88c0a62215c7770cd2d9e3cf05220d16b003910abf6\
-    d0aa598a3e17f70fda";
+    "00ad020105358cc1090020080055f0112ed16ed5239082daa07d6ac60411ee7507f7e8d241f7a680c50b221b4022\
+    bbaca9da6aeec36f294e1f";
 
 /// The postcard encoding of [`history_reply`], as a server message.
 const HISTORY_REPLY: &str =

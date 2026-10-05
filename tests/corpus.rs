@@ -329,11 +329,13 @@ impl Session {
         if dropped {
             return Ok(false);
         }
-        let ServerMsg::Frame { base, body } = decode_server(&bytes).map_err(|e| e.to_string())?
+        let ServerMsg::Frame { base, rows, body } =
+            decode_server(&bytes).map_err(|e| e.to_string())?
         else {
             return Err("history for a frame".to_owned());
         };
-        self.client.on_frame_stream(Instant::now(), base, &body);
+        self.client
+            .on_frame_stream(Instant::now(), base, &rows, &body);
         let applied = self.client.applied() == frame.num;
         // Delivered: the server takes that as the acknowledgement (or the client's own `Ack`, a
         // nudge, below).

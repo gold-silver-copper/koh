@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::proto::{
-    dictionary_for, encode_frame_with, encode_history, retry_after, ClientDecoder, ClientMsg,
-    Frame, FrameNum, FrameScreen, InputSeq, ProtoError, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT,
-    MAX_PENDING_HISTORY, SESSION_ENDED, WINDOW_CELLS,
+    encode_history, retry_after, ClientDecoder, ClientMsg, Frame, FrameEncoder, FrameNum,
+    FrameScreen, InputSeq, ProtoError, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
+    SESSION_ENDED, WINDOW_CELLS,
 };
 use crate::terminal::{HistoryRequest, Size, TerminalScreen};
 use iroh::endpoint::RecvStream;
@@ -194,8 +194,8 @@ pub(crate) struct ServerConn {
     history: VecDeque<HistoryRequest>,
     /// An answer is on its way to the client; the next waits for it to be delivered.
     history_busy: bool,
-    /// The dictionary of the base frames are diffed against, made once for the frames on it.
-    dictionary: Option<(FrameNum, Arc<[u8]>)>,
+    /// Encodes frames, primed for the base they are diffed against.
+    encoder: FrameEncoder,
     /// Frames sent and not yet delivered, oldest first: each one's number, size and when it went.
     in_flight: VecDeque<(FrameNum, usize, Instant)>,
     /// How long recent frames took to be delivered, for the link's rate.
@@ -278,7 +278,7 @@ impl ServerConn {
             final_frame: None,
             history: VecDeque::new(),
             history_busy: false,
-            dictionary: None,
+            encoder: FrameEncoder::default(),
             in_flight: VecDeque::new(),
             deliveries: Deliveries::default(),
         }
@@ -468,23 +468,15 @@ impl ServerConn {
         Some(frame)
     }
 
-    /// `frame`, just polled, encoded for its stream against its base's dictionary.
+    /// `frame`, just polled, encoded for its stream against its base, the acknowledged screen.
     fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>, ProtoError> {
-        let dictionary = match &self.dictionary {
-            Some((num, dictionary)) if *num == frame.base => Arc::clone(dictionary),
-            _ => {
-                let screen = if frame.base == self.acked.num {
-                    &self.acked.screen
-                } else {
-                    // Polled frames are always on the acknowledged one; a blank base otherwise.
-                    &Arc::default()
-                };
-                let dictionary: Arc<[u8]> = dictionary_for(frame.base, screen).into();
-                self.dictionary = Some((frame.base, Arc::clone(&dictionary)));
-                dictionary
-            }
+        let base = if frame.base == self.acked.num {
+            Arc::clone(&self.acked.screen)
+        } else {
+            // Polled frames are always on the acknowledged one; a blank base otherwise.
+            Arc::default()
         };
-        encode_frame_with(frame, &dictionary)
+        self.encoder.encode(frame, &base)
     }
 
     /// The newest frame the client has acknowledged.

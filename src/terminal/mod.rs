@@ -4,6 +4,7 @@
 //! A [`ScreenDiff`] carries the changed rows as run-length-encoded cells, the cursor and the modes.
 //! The client validates and copies cells; it never runs a terminal parser on server bytes.
 
+use std::collections::HashMap;
 use std::num::{NonZeroI16, NonZeroU16};
 use std::ops::Range;
 use std::sync::Arc;
@@ -50,6 +51,86 @@ pub const MAX_LINK_BYTES: usize = 1 << 20;
 
 /// Most bytes of a run's text: a character, of at most 4 bytes, for each cell of the widest row.
 pub const MAX_RUN_TEXT: usize = 4 * MAX_DIM as usize;
+
+/// Rows' encodings for frames' dictionaries, kept from one dictionary to the next.
+///
+/// Most of a dictionary's rows are unchanged since the last, shared, so encoding them again would
+/// be the same work. Keyed by the row's shared cells, which an entry holds, so that no other row can take
+/// their place while it is kept; an entry not used by the newest dictionary goes.
+#[derive(Debug, Default)]
+pub struct RowEncodings {
+    /// By the address of the row's cells (held, so not reused): the row's cells, wrap flag and
+    /// links, and its encoding without its index.
+    kept: HashMap<usize, RowEncoding>,
+    /// The cells the dictionary being built used.
+    used: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct RowEncoding {
+    #[expect(
+        dead_code,
+        reason = "held, not read: while it is, no other row's cells can take the address the \
+                  entry is keyed by"
+    )]
+    cells: Arc<Cells>,
+    wrapped: bool,
+    links: Option<Arc<RowLinks>>,
+    /// The row's wrap flag, runs and links as [`RowDiff`] encodes them after its index.
+    bytes: Vec<u8>,
+}
+
+impl RowEncodings {
+    /// Append row `row`, of these parts, to `out` as a frame encodes it.
+    fn append(
+        &mut self,
+        row: u16,
+        (cells, wrapped, links): (Arc<Cells>, bool, Option<Arc<RowLinks>>),
+        out: &mut Vec<u8>,
+    ) {
+        let key = Arc::as_ptr(&cells).addr();
+        let hit = self.kept.get(&key).filter(|kept| {
+            kept.wrapped == wrapped
+                && match (&kept.links, &links) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, Some(_)) | (Some(_), None) => false,
+                }
+        });
+        let Ok(index) = postcard::to_extend(&row, std::mem::take(out)) else {
+            return;
+        };
+        *out = index;
+        if let Some(kept) = hit {
+            out.extend_from_slice(&kept.bytes);
+        } else {
+            let (runs, wire_links) = runs_of(&cells, links.as_deref());
+            let Ok(bytes) = postcard::to_allocvec(&(wrapped, runs, wire_links)) else {
+                return;
+            };
+            out.extend_from_slice(&bytes);
+            self.kept.insert(
+                key,
+                RowEncoding {
+                    cells,
+                    wrapped,
+                    links,
+                    bytes,
+                },
+            );
+        }
+        self.used.push(key);
+    }
+
+    /// The dictionary is built: forget the rows it did not use.
+    fn done(&mut self) {
+        let used: std::collections::HashSet<usize> = self.used.drain(..).collect();
+        self.kept.retain(|key, _| used.contains(key));
+    }
+}
+
+/// How many rows above the cursor a frame's dictionary takes besides the rows the frame changes.
+const DICTIONARY_CONTEXT: u16 = 8;
 
 /// Most bytes of a frame's dictionary ([`TerminalScreen::dictionary`]): DEFLATE's window, the
 /// farthest back a compressed frame can reach.
@@ -243,61 +324,51 @@ impl TerminalScreen {
         }
     }
 
-    /// The dictionary a frame diffed against this screen is compressed against: its rows as a
-    /// frame encodes them ([`RowDiff`]), those nearest the cursor last, where a compressor reaches
-    /// them most cheaply, then its side channels, cursor and modes as a frame carries them; at most
-    /// [`DICTIONARY_BYTES`] in all.
+    /// The dictionary a frame diffed against this screen, changing `rows`, is compressed against:
+    /// those rows as this screen has them, after a few above the cursor, encoded as a frame
+    /// encodes rows ([`RowDiff`]), then the screen's side channels, cursor and modes as a frame
+    /// carries them; at most [`DICTIONARY_BYTES`] in all, the last of it kept.
     ///
-    /// The rows are taken outwards from the cursor's until the budget is spent, so the cost is
-    /// bounded on the largest screen: at most the budget and one row more.
-    pub fn dictionary(&self) -> Vec<u8> {
-        let rows = self.size().rows;
-        let cursor = self.grid.cursor_position().0.min(rows.saturating_sub(1));
-        let mut encoded: Vec<Vec<u8>> = Vec::new();
-        let mut total = 0_usize;
-        let mut budget = MAX_LINK_BYTES;
-        for step in 0..rows.saturating_mul(2) {
-            // The cursor's row, then one above, one below, and so on outwards.
-            let away = step.div_ceil(2);
-            let row = if step % 2 == 1 {
-                cursor.checked_sub(away)
-            } else {
-                cursor.checked_add(away).filter(|&r| r < rows)
-            };
-            let Some(row) = row else {
-                continue;
-            };
-            let Some(cells) = self.grid.row(row) else {
-                continue;
-            };
-            let diff = RowDiff::of(
-                row,
-                cells,
-                self.grid.row_wrapped(row),
-                self.grid.row_links(row),
-                &mut budget,
-            );
-            let Ok(bytes) = postcard::to_allocvec(&diff) else {
-                continue;
-            };
-            total = total.saturating_add(bytes.len());
-            encoded.push(bytes);
-            if total >= DICTIONARY_BYTES {
-                break;
+    /// A changed row then compresses against what it was, and the header against the base's.
+    /// What it costs follows the rows the frame changes, not the screen's size, and `encodings`
+    /// keeps rows' encodings from one dictionary to the next. A row this screen lacks is left out.
+    pub fn dictionary(&self, rows: &[u16], encodings: &mut RowEncodings) -> Vec<u8> {
+        let mut out = Vec::new();
+        // First the rows just above the cursor and its own, which a new line most often repeats
+        // (a prompt, the line of output before), then the changed rows, nearest the frame.
+        let cursor = self.grid.cursor_position().0;
+        let context =
+            (cursor.saturating_sub(DICTIONARY_CONTEXT)..=cursor).filter(|row| !rows.contains(row));
+        for row in context.chain(rows.iter().copied()) {
+            if let Some(parts) = self.grid.row_parts(row) {
+                encodings.append(row, parts, &mut out);
             }
         }
-        let mut out = Vec::with_capacity(total.min(DICTIONARY_BYTES));
-        for bytes in encoded.iter().rev() {
-            out.extend_from_slice(bytes);
-        }
-        // Last, the screen's side channels, cursor and modes as a frame that changes no row
-        // carries them: most frames' own are the same, or nearly.
-        if let Ok(header) = postcard::to_allocvec(&self.diff_from(self)) {
+        encodings.done();
+        if let Ok(header) = postcard::to_allocvec(&self.header()) {
             out.extend_from_slice(&header);
         }
         // Only the last window's worth can be reached.
         let excess = out.len().saturating_sub(DICTIONARY_BYTES);
         out.split_off(excess)
+    }
+
+    /// This screen's side channels, cursor and modes as a frame that changes no row carries them.
+    fn header(&self) -> ScreenDiff {
+        ScreenDiff {
+            resize: None,
+            title: None,
+            icon: None,
+            clipboard: None,
+            bell_count: self.bell_count,
+            exit_code: self.exit_code,
+            history: None,
+            tty: None,
+            cursor: self.grid.cursor_position(),
+            modes: self.grid.modes().into(),
+            shifts: Shifts::default(),
+            rows: Vec::new(),
+        }
     }
 
     /// How many rows differ between this screen and `other`, or `None` if their sizes do. Rows
@@ -697,15 +768,6 @@ impl WireCell {
             .on(Attributes::new(self.fg.into(), self.bg.into())
                 .with_underline_color(self.underline_color.into()))
     }
-
-    /// Whether this cell draws as `other` does: the same colours and style.
-    fn same_look(&self, other: &Self) -> bool {
-        self.fg == other.fg
-            && self.bg == other.bg
-            && self.underline_color == other.underline_color
-            && self.style == other.style
-            && self.link == other.link
-    }
 }
 
 /// `count` consecutive identical cells, or `count` cells (or glyphs) of the text's characters.
@@ -759,21 +821,6 @@ impl Run {
             CellKind::WideChars => count.saturating_mul(2),
             CellKind::Narrow | CellKind::Wide | CellKind::Continuation | CellKind::Chars => count,
         }
-    }
-
-    /// Add `ch` to a run of characters.
-    fn push_char(&mut self, ch: char) -> bool {
-        let Some(count) = self.count.checked_add(1) else {
-            return false;
-        };
-        let mut text = self.cell.text.as_str().to_owned();
-        text.push(ch);
-        let Some(text) = CellText::run(&text) else {
-            return false;
-        };
-        self.count = count;
-        self.cell.text = text;
-        true
     }
 
     /// Add one more cell. `false` if the run already holds `u16::MAX` cells, the most `count`
@@ -887,50 +934,50 @@ fn runs_of(cells: &Cells, links: Option<&RowLinks>) -> (Vec<Run>, Vec<WireLink>)
     let mut runs: Vec<Run> = Vec::new();
     // The last cell, while the last run is of cells identical to it.
     let mut previous: Option<(CellRef<'_>, u16)> = None;
+    // The look (attributes and link) of the last run, while it is of characters, or a lone narrow
+    // character that may begin one: what a cell must have to join it.
+    let mut look: Option<(Attributes, u16)> = None;
+    // The text of the last run while it is a run of characters still growing, kept here and not
+    // in the run, so that each character costs a push rather than a copy of the text.
+    let mut open: Option<String> = None;
     let mut col = 0_usize;
     while let Some(cell) = cells.get(col) {
         let link = link_at(col);
-        let wire = WireCell {
-            link,
-            ..WireCell::of(cell)
-        };
-        let narrow = lone_char(cell).filter(|_| wire.kind == CellKind::Narrow);
-        // A wide glyph of one character followed by its plain continuation, of the same link.
-        let wide = lone_char(cell).filter(|_| {
-            wire.kind == CellKind::Wide
-                && cells
-                    .get(col.saturating_add(1))
-                    .is_some_and(|next| WireCell::of(next).plain_continuation())
-                && link_at(col.saturating_add(1)) == link
-        });
-        let last = runs.last_mut();
-        let joined = match (last, narrow, wide) {
-            (Some(last), Some(ch), _)
-                if last.cell.kind == CellKind::Chars && last.cell.same_look(&wire) =>
+        let wide_glyph = cell.is_wide();
+        let narrow = !wide_glyph && !cell.is_wide_continuation();
+        // Compared before anything is built: most cells join the run before them.
+        let same_look = look == Some((cell.attributes(), link));
+        let joined = match runs.last_mut() {
+            Some(last)
+                if same_look
+                    && narrow
+                    && !(last.cell.kind != CellKind::Chars && previous == Some((cell, link))) =>
             {
-                last.push_char(ch).then_some(1)
+                match (last.cell.kind, lone_char(cell)) {
+                    (CellKind::Chars, Some(ch)) => grow(last, &mut open, ch, 1),
+                    // A lone character, then another that looks the same: a run of characters.
+                    (CellKind::Narrow, Some(ch)) if last.count == NonZeroU16::MIN => {
+                        last.cell.kind = CellKind::Chars;
+                        open = Some(last.cell.text.as_str().to_owned());
+                        grow(last, &mut open, ch, 1)
+                    }
+                    _ => None,
+                }
             }
-            (Some(last), _, Some(ch))
-                if last.cell.kind == CellKind::WideChars && last.cell.same_look(&wire) =>
+            Some(last)
+                if same_look
+                    && wide_glyph
+                    && last.cell.kind == CellKind::WideChars
+                    && plain_continuation_after(cells, col, link, &link_at) =>
             {
-                last.push_char(ch).then_some(2)
+                lone_char(cell).and_then(|ch| grow(last, &mut open, ch, 2))
             }
-            (Some(last), _, _) if previous == Some((cell, link)) => {
+            Some(last) if previous == Some((cell, link)) => {
                 if last.extend() {
                     col = col.saturating_add(1);
                     continue;
                 }
                 None
-            }
-            // A lone character, then another that looks the same: a run of characters.
-            (Some(last), Some(ch), _)
-                if last.cell.kind == CellKind::Narrow
-                    && last.count == NonZeroU16::MIN
-                    && last.cell.same_look(&wire)
-                    && last.cell.text.as_str().chars().count() == 1 =>
-            {
-                last.cell.kind = CellKind::Chars;
-                last.push_char(ch).then_some(1)
             }
             _ => None,
         };
@@ -939,7 +986,14 @@ fn runs_of(cells: &Cells, links: Option<&RowLinks>) -> (Vec<Run>, Vec<WireLink>)
             col = col.saturating_add(used);
             continue;
         }
-        if wide.is_some() {
+        seal(&mut runs, &mut open);
+        let wire = WireCell {
+            link,
+            ..WireCell::of(cell)
+        };
+        let wide = lone_char(cell)
+            .filter(|_| wide_glyph && plain_continuation_after(cells, col, link, &link_at));
+        if let Some(ch) = wide {
             runs.push(Run {
                 count: NonZeroU16::MIN,
                 cell: WireCell {
@@ -947,9 +1001,12 @@ fn runs_of(cells: &Cells, links: Option<&RowLinks>) -> (Vec<Run>, Vec<WireLink>)
                     ..wire
                 },
             });
+            open = Some(ch.to_string());
+            look = Some((cell.attributes(), link));
             previous = None;
             col = col.saturating_add(2);
         } else {
+            look = (narrow && lone_char(cell).is_some()).then(|| (cell.attributes(), link));
             runs.push(Run {
                 count: NonZeroU16::MIN,
                 cell: wire,
@@ -958,6 +1015,7 @@ fn runs_of(cells: &Cells, links: Option<&RowLinks>) -> (Vec<Run>, Vec<WireLink>)
             col = col.saturating_add(1);
         }
     }
+    seal(&mut runs, &mut open);
     let links = links.map_or_else(Vec::new, |links| {
         links
             .table
@@ -969,6 +1027,36 @@ fn runs_of(cells: &Cells, links: Option<&RowLinks>) -> (Vec<Run>, Vec<WireLink>)
             .collect()
     });
     (runs, links)
+}
+
+/// Whether the cell after `col` is the plain continuation of a wide glyph at `col` with `link`:
+/// empty, in the default style, of the same link, as a run of wide glyphs implies it.
+fn plain_continuation_after(
+    cells: &Cells,
+    col: usize,
+    link: u16,
+    link_at: &dyn Fn(usize) -> u16,
+) -> bool {
+    let next = col.saturating_add(1);
+    cells.get(next).is_some_and(|c| {
+        c.is_wide_continuation() && !c.has_contents() && c.attributes() == Attributes::default()
+    }) && link_at(next) == link
+}
+
+/// The open run of characters takes `ch`: its count in the run, its text in `open`. The cells it
+/// took (`used`), or `None` if the run is full.
+fn grow(last: &mut Run, open: &mut Option<String>, ch: char, used: usize) -> Option<usize> {
+    last.count = last.count.checked_add(1)?;
+    open.get_or_insert_with(String::new).push(ch);
+    Some(used)
+}
+
+/// Store the open run of characters' text in it ([`runs_of`]).
+fn seal(runs: &mut [Run], open: &mut Option<String>) {
+    if let (Some(text), Some(last)) = (open.take(), runs.last_mut()) {
+        // A row's characters, at most 4 bytes each: within a run's limit.
+        last.cell.text = CellText::run(&text).unwrap_or_default();
+    }
 }
 
 /// The row `runs` decode to, exactly `cols` cells, with its `links`, or `None` if the runs are
@@ -2405,6 +2493,29 @@ mod tests {
         let mut client = TerminalScreen::default();
         client.apply(&long);
         assert_eq!(client, TerminalScreen::default());
+    }
+
+    #[test]
+    fn a_dictionary_from_kept_encodings_is_the_one_made_afresh() {
+        let mut kept = RowEncodings::default();
+        let mut emu = ServerTerminal::new(10, 30, 0).unwrap();
+        for n in 0..40 {
+            emu.process(format!("line {n} \x1b[3{}mcolour\x1b[m\r\n", n % 7).as_bytes());
+            if n % 3 == 0 {
+                emu.process(b"\x1b[2;5Hedit");
+            }
+            let screen = emu.snapshot();
+            let rows: Vec<u16> = (0..10).filter(|r| (r + n) % 4 == 0).collect();
+            assert_eq!(
+                screen.dictionary(&rows, &mut kept),
+                screen.dictionary(&rows, &mut RowEncodings::default()),
+                "step {n}"
+            );
+        }
+        assert!(
+            kept.kept.len() <= 10,
+            "only the newest dictionary's rows are kept"
+        );
     }
 
     #[test]

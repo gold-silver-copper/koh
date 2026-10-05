@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::terminal::{HistoryReply, HistoryRequest, ScreenDiff, Size, TerminalScreen};
+use crate::terminal::{
+    HistoryReply, HistoryRequest, RowEncodings, ScreenDiff, Size, TerminalScreen,
+};
 
 /// A frame number. Frame 0 is the blank default screen both ends start from; it is never sent.
 /// Real frames count from 1 on each connection.
@@ -327,10 +329,11 @@ impl ClientDecoder {
 /// inflate against its base, or history rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerMsg {
-    /// A frame diffed against frame `base`, whose compressed `body` inflates only against that
-    /// screen's dictionary ([`decode_frame_body`]).
+    /// A frame diffed against frame `base`, changing `rows`, whose compressed `body` inflates only
+    /// against that screen's dictionary of those rows ([`decode_frame_body`]).
     Frame {
         base: FrameNum,
+        rows: Vec<u16>,
         body: Vec<u8>,
     },
     History(HistoryReply),
@@ -340,67 +343,117 @@ pub enum ServerMsg {
 const TAG_FRAME: u8 = 0;
 const TAG_HISTORY: u8 = 1;
 
-/// Encode a frame for its stream: its tag, its base's number, then the frame compressed against
-/// `base`, the screen of frame `frame.base`.
+/// Encode a frame for its stream: its tag, its base's number, the rows it changes, then the frame
+/// compressed against `base`, the screen of frame `frame.base`.
 ///
-/// The compressor starts from `base`'s dictionary ([`TerminalScreen::dictionary`]), so a row the
-/// frame changes compresses against what the row was: a ticking clock or a typed character costs a
-/// few bytes. Both ends hold the base screen, and the client refuses a frame whose base it does not
-/// hold, so the dictionaries cannot disagree. The blank screen's dictionary is empty.
+/// The compressor starts from a dictionary of the rows the frame changes as `base` has them
+/// ([`TerminalScreen::dictionary`]), so a changed row compresses against what it was: a ticking
+/// clock or a typed character costs a few bytes. Both ends hold the base screen, the stream names
+/// the rows, and the client refuses a frame whose base it does not hold, so the dictionaries cannot
+/// disagree. The blank screen's dictionary is empty.
 pub fn encode_frame(frame: &Frame, base: &TerminalScreen) -> Result<Vec<u8>, ProtoError> {
-    encode_frame_with(frame, &dictionary_for(frame.base, base))
+    let rows = changed_rows(frame);
+    encode_frame_primed(
+        frame,
+        &rows,
+        Primed::new(&dictionary_for(
+            frame.base,
+            base,
+            &rows,
+            &mut RowEncodings::default(),
+        )),
+    )
 }
 
-/// [`encode_frame`] with the base's dictionary already made.
+/// [`encode_frame`] with the dictionary already made.
 pub fn encode_frame_with(frame: &Frame, dictionary: &[u8]) -> Result<Vec<u8>, ProtoError> {
-    let raw = postcard::to_allocvec(frame)?;
-    let mut out = postcard::to_extend(&frame.base.0, vec![TAG_FRAME])?;
-    out.extend_from_slice(&deflate_with(dictionary, &raw));
-    Ok(out)
+    encode_frame_primed(frame, &changed_rows(frame), Primed::new(dictionary))
 }
 
-/// The dictionary a frame on `base`, whose screen is `screen`, is compressed against.
-pub fn dictionary_for(base: FrameNum, screen: &TerminalScreen) -> Vec<u8> {
+/// Encodes frames for the server and the scoreboard alike, keeping rows' encodings for the next
+/// frame's dictionary.
+#[derive(Debug, Default)]
+pub struct FrameEncoder {
+    encodings: RowEncodings,
+}
+
+impl FrameEncoder {
+    /// `frame` encoded for its stream; `base` is the screen of frame `frame.base`.
+    pub fn encode(&mut self, frame: &Frame, base: &TerminalScreen) -> Result<Vec<u8>, ProtoError> {
+        let rows = changed_rows(frame);
+        let dictionary = dictionary_for(frame.base, base, &rows, &mut self.encodings);
+        encode_frame_primed(frame, &rows, Primed::new(&dictionary))
+    }
+}
+
+/// The rows `frame` changes, in its order.
+fn changed_rows(frame: &Frame) -> Vec<u16> {
+    frame.diff.rows.iter().map(|row| row.row).collect()
+}
+
+/// The dictionary a frame on `base`, whose screen is `screen`, changing `rows`, is compressed
+/// against.
+pub fn dictionary_for(
+    base: FrameNum,
+    screen: &TerminalScreen,
+    rows: &[u16],
+    encodings: &mut RowEncodings,
+) -> Vec<u8> {
     if base == FrameNum::BLANK {
         Vec::new()
     } else {
-        screen.dictionary()
+        screen.dictionary(rows, encodings)
     }
+}
+
+/// A compressor that has taken a dictionary in, to compress a frame after it.
+#[derive(Clone)]
+pub struct Primed(miniz_oxide::deflate::core::CompressorOxide);
+
+impl Primed {
+    /// A compressor primed with `dictionary`.
+    pub fn new(dictionary: &[u8]) -> Self {
+        use miniz_oxide::deflate::core::{
+            compress_to_output, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush,
+        };
+        let flags = create_comp_flags_from_zip_params(COMPRESSION_LEVEL.into(), -15, 0);
+        let mut compressor = CompressorOxide::new(flags);
+        if !dictionary.is_empty() {
+            let _ = compress_to_output(&mut compressor, dictionary, TDEFLFlush::Sync, |_| true);
+        }
+        Self(compressor)
+    }
+
+    /// `raw` compressed as if it followed the dictionary.
+    fn compress(mut self, raw: &[u8]) -> Vec<u8> {
+        use miniz_oxide::deflate::core::{compress_to_output, TDEFLFlush};
+        let mut out = Vec::with_capacity(raw.len().div_euclid(2).saturating_add(64));
+        let _ = compress_to_output(&mut self.0, raw, TDEFLFlush::Finish, |bytes| {
+            out.extend_from_slice(bytes);
+            true
+        });
+        out
+    }
+}
+
+/// [`encode_frame`] with the rows it changes and a compressor primed with their dictionary.
+fn encode_frame_primed(frame: &Frame, rows: &[u16], primed: Primed) -> Result<Vec<u8>, ProtoError> {
+    let raw = postcard::to_allocvec(frame)?;
+    let mut out = postcard::to_extend(&frame.base.0, vec![TAG_FRAME])?;
+    out = postcard::to_extend(&rows, out)?;
+    out.extend_from_slice(&primed.compress(&raw));
+    Ok(out)
 }
 
 /// Encode history rows for their stream.
 pub fn encode_history(reply: &HistoryReply) -> Result<Vec<u8>, ProtoError> {
     let raw = postcard::to_allocvec(reply)?;
     let mut out = vec![TAG_HISTORY];
-    out.extend_from_slice(&deflate_with(&[], &raw));
+    out.extend_from_slice(&Primed::new(&[]).compress(&raw));
     Ok(out)
 }
 
-/// `raw` DEFLATE-compressed (raw, no zlib header) as if it followed `dictionary`: the dictionary is
-/// compressed first and ended with a sync flush, which ends on a byte, and only what follows is
-/// kept. Its back-references may reach into the dictionary.
-fn deflate_with(dictionary: &[u8], raw: &[u8]) -> Vec<u8> {
-    use miniz_oxide::deflate::core::{
-        compress_to_output, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush,
-    };
-    let flags = create_comp_flags_from_zip_params(COMPRESSION_LEVEL.into(), -15, 0);
-    let mut compressor = CompressorOxide::new(flags);
-    let mut out = Vec::with_capacity(raw.len().div_euclid(2).saturating_add(64));
-    if !dictionary.is_empty() {
-        let _ = compress_to_output(&mut compressor, dictionary, TDEFLFlush::Sync, |bytes| {
-            out.extend_from_slice(bytes);
-            true
-        });
-    }
-    let skip = out.len();
-    let _ = compress_to_output(&mut compressor, raw, TDEFLFlush::Finish, |bytes| {
-        out.extend_from_slice(bytes);
-        true
-    });
-    out.split_off(skip)
-}
-
-/// What [`deflate_with`] compressed against `dictionary`, at most `limit` bytes of it, or `None`
+/// What [`Primed`] compressed after `dictionary`, at most `limit` bytes of it, or `None`
 /// if `body` is corrupt or inflates past the limit. The dictionary is the window the body's
 /// back-references reach into; nothing reaches before it.
 fn inflate_with(dictionary: &[u8], body: &[u8], limit: usize) -> Option<Vec<u8>> {
@@ -454,9 +507,11 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMsg, ProtoError> {
     }
     match bytes.split_first() {
         Some((&TAG_FRAME, rest)) => {
-            let (base, body) = postcard::take_from_bytes::<u64>(rest)?;
+            let (base, rest) = postcard::take_from_bytes::<u64>(rest)?;
+            let (rows, body) = take_rows(rest)?;
             Ok(ServerMsg::Frame {
                 base: FrameNum(base),
+                rows,
                 body: body.to_vec(),
             })
         }
@@ -466,6 +521,26 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMsg, ProtoError> {
         }
         _ => Err(ProtoError::UnknownStream),
     }
+}
+
+/// The rows a frame's stream names, and what follows: a count, at most [`MAX_DIM`], then each row.
+/// Read one by one, so a hostile count allocates nothing it does not carry.
+fn take_rows(bytes: &[u8]) -> Result<(Vec<u16>, &[u8]), ProtoError> {
+    let (count, mut rest) = postcard::take_from_bytes::<u32>(bytes)?;
+    let count = usize::try_from(count).unwrap_or(usize::MAX);
+    if count > usize::from(crate::terminal::MAX_DIM) {
+        return Err(ProtoError::TooLarge {
+            len: count,
+            max: usize::from(crate::terminal::MAX_DIM),
+        });
+    }
+    let mut rows = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (row, after) = postcard::take_from_bytes::<u16>(rest)?;
+        rows.push(row);
+        rest = after;
+    }
+    Ok((rows, rest))
 }
 
 /// Inflate a frame's body against its base's dictionary ([`dictionary_for`]) and decode it. A
@@ -487,8 +562,9 @@ pub fn decode_frame_body(
 /// Decode a stream that must hold a frame on `screen`, the screen of the frame's base.
 pub fn decode_frame(bytes: &[u8], screen: &TerminalScreen) -> Result<Frame, ProtoError> {
     match decode_server(bytes)? {
-        ServerMsg::Frame { base, body } => {
-            decode_frame_body(base, &body, &dictionary_for(base, screen))
+        ServerMsg::Frame { base, rows, body } => {
+            let dictionary = dictionary_for(base, screen, &rows, &mut RowEncodings::default());
+            decode_frame_body(base, &body, &dictionary)
         }
         ServerMsg::History(_) => Err(ProtoError::NotAFrame),
     }
@@ -669,6 +745,28 @@ mod tests {
     }
 
     #[test]
+    fn a_primed_compressor_shared_by_frames_on_one_base_encodes_as_a_fresh_one() {
+        let base = TerminalScreen::from_bytes(24, 80, &b"some text on the base\r\n".repeat(10));
+        let mut encoder = FrameEncoder::default();
+        for n in 1..5_u8 {
+            let target = TerminalScreen::from_bytes(
+                24,
+                80,
+                &[b"some text on the base\r\n".repeat(10), vec![b'a' + n]].concat(),
+            );
+            let frame = Frame {
+                num: FrameNum(10 + u64::from(n)),
+                base: FrameNum(9),
+                echo_ack: InputSeq(0),
+                diff: target.diff_from(&base),
+            };
+            let shared = encoder.encode(&frame, &base).unwrap();
+            assert_eq!(shared, encode_frame(&frame, &base).unwrap());
+            assert_eq!(decode_frame(&shared, &base).unwrap(), frame);
+        }
+    }
+
+    #[test]
     fn truncated_and_corrupt_frames_are_errors() {
         let base = TerminalScreen::default();
         let bytes = encode_frame(&frame(), &base).unwrap();
@@ -684,7 +782,7 @@ mod tests {
         // 64 MiB of zeros deflates to a few KiB; inflating it must stop at the cap.
         let bomb = miniz_oxide::deflate::compress_to_vec(&vec![0u8; 4 * MAX_FRAME], 9);
         assert!(bomb.len() < MAX_FRAME);
-        let mut stream = vec![TAG_FRAME, 0];
+        let mut stream = vec![TAG_FRAME, 0, 0];
         stream.extend_from_slice(&bomb);
         assert!(matches!(
             decode_frame(&stream, &TerminalScreen::default()),

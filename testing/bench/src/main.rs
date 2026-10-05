@@ -50,13 +50,16 @@ struct Args {
     wire: bool,
     latency: bool,
     settle: bool,
+    /// The link profiles latency and settling are measured on, by a word of their names; all if
+    /// none is given.
+    profiles: Option<Vec<String>>,
     memory: bool,
     instructions: bool,
 }
 
 const USAGE: &str = "koh-bench --koh BIN [--out FILE] [--recordings all|none|a,b] \
                      [--systems koh,mosh,ssh] [--samples N] [--runs N] [--repeats N] \
-                     [--skip wire,latency,settle,memory,instructions]";
+                     [--skip wire,latency,settle,memory,instructions] [--profiles clean,loss,Mbit,kbit]";
 
 fn args() -> anyhow::Result<Args> {
     let mut args = Args {
@@ -70,6 +73,7 @@ fn args() -> anyhow::Result<Args> {
         wire: true,
         latency: true,
         settle: true,
+        profiles: None,
         memory: true,
         instructions: true,
     };
@@ -105,6 +109,9 @@ fn args() -> anyhow::Result<Args> {
             "--samples" => args.samples = value()?.parse()?,
             "--runs" => args.runs = value()?.parse::<usize>()?.max(1),
             "--repeats" => args.repeats = value()?.parse::<usize>()?.max(1),
+            "--profiles" => {
+                args.profiles = Some(value()?.split(',').map(str::to_owned).collect());
+            }
             "--skip" => {
                 for skip in value()?.split(',') {
                     match skip {
@@ -208,6 +215,15 @@ fn wire_cell(result: &Result<Wire, String>) -> String {
             kib(w.counts.to_server.bytes)
         ),
         Err(_) => "failed".to_owned(),
+    }
+}
+
+impl Args {
+    /// Whether the profile `name` is to be measured.
+    fn wants(&self, name: &str) -> bool {
+        self.profiles
+            .as_ref()
+            .is_none_or(|words| words.iter().any(|w| name.contains(w.as_str())))
     }
 }
 
@@ -479,7 +495,8 @@ async fn run(args: &Args) -> anyhow::Result<String> {
     }
 
     if args.latency {
-        for (seed, (name, profile)) in (1u64..).zip(profiles()) {
+        for (seed, (name, profile)) in (1u64..).zip(profiles()).filter(|(_, (n, _))| args.wants(n))
+        {
             let mut by = Vec::new();
             for &system in &systems {
                 let mut runs = LatencyRuns::default();
@@ -520,7 +537,9 @@ async fn run(args: &Args) -> anyhow::Result<String> {
     if args.settle {
         for action in Action::ALL {
             let mut by_profile = Vec::new();
-            for (seed, (name, profile)) in (1u64..).zip(profiles()) {
+            for (seed, (name, profile)) in
+                (1u64..).zip(profiles()).filter(|(_, (n, _))| args.wants(n))
+            {
                 let mut by = Vec::new();
                 for &system in &systems {
                     let mut p50s = Vec::new();

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
 use koh::predict::{DisplayPreference, Overlay};
-use koh::proto::{decode_frame, encode_frame, ClientMsg, Frame, FrameNum, InputSeq};
+use koh::proto::{decode_server, encode_frame, ClientMsg, Frame, FrameNum, InputSeq, ServerMsg};
 use koh::terminal::{FrameHold, ServerTerminal, Size, TerminalScreen, FRAME_HOLD};
 use recording::Recording;
 
@@ -295,6 +295,17 @@ impl Session {
         }
     }
 
+    /// The client has frame `acked`: the frames before it are no bases any more.
+    fn ack(&mut self, acked: FrameNum) {
+        if let Some(at) = self.sent.iter().position(|(num, _)| *num == acked) {
+            let mut newer = self.sent.split_off(at);
+            if let Some(base) = newer.pop_front() {
+                self.base = base;
+            }
+            self.sent = newer;
+        }
+    }
+
     /// Send a frame of `screen`, delivered unless `dropped`. Whether the client applied it.
     fn frame(&mut self, screen: &TerminalScreen, dropped: bool) -> Result<bool, String> {
         let screen = screen.clone();
@@ -305,7 +316,7 @@ impl Session {
             diff: screen.diff_from(&self.base.1),
         };
         self.next = self.next.next();
-        let bytes = encode_frame(&frame).map_err(|e| e.to_string())?;
+        let bytes = encode_frame(&frame, &self.base.1).map_err(|e| e.to_string())?;
         self.replayed.frames = self.replayed.frames.saturating_add(1);
         self.replayed.wire_bytes = self
             .replayed
@@ -318,23 +329,22 @@ impl Session {
         if dropped {
             return Ok(false);
         }
-        let frame = decode_frame(&bytes).map_err(|e| e.to_string())?;
-        self.client.on_frame(Instant::now(), &frame);
-        let mut applied = false;
+        let ServerMsg::Frame { base, rows, body } =
+            decode_server(&bytes).map_err(|e| e.to_string())?
+        else {
+            return Err("history for a frame".to_owned());
+        };
+        self.client
+            .on_frame_stream(Instant::now(), base, &rows, &body);
+        let applied = self.client.applied() == frame.num;
+        // Delivered: the server takes that as the acknowledgement (or the client's own `Ack`, a
+        // nudge, below).
+        self.ack(frame.num);
         while let Some(msg) = self.client.pop_outgoing() {
             match msg {
-                ClientMsg::Ack { frame: acked } => {
-                    applied = acked == frame.num;
-                    if let Some(at) = self.sent.iter().position(|(num, _)| *num == acked) {
-                        let mut newer = self.sent.split_off(at);
-                        if let Some(base) = newer.pop_front() {
-                            self.base = base;
-                        }
-                        self.sent = newer;
-                    }
-                }
+                ClientMsg::Ack { frame: acked } => self.ack(acked),
                 ClientMsg::Resync => self.base = (FrameNum::BLANK, TerminalScreen::default()),
-                ClientMsg::Input { .. } | ClientMsg::Resize(_) => {}
+                ClientMsg::Input { .. } | ClientMsg::Resize(_) | ClientMsg::History(_) => {}
             }
         }
         if applied {
@@ -469,4 +479,206 @@ fn the_corpus_is_read_whole() {
     assert_eq!((nvim.rows, nvim.cols), (40, 120));
     assert_eq!(nvim.steps[1].keys, b":split\r");
     assert_eq!(nvim.steps[3].keys, b"\x17w");
+}
+
+/// Where a recording's frame bytes go: for `KOH_RECORDING`, its final screen as one frame from the
+/// blank screen, raw and compressed, and how much of the raw encoding is text. A tool, not a test.
+#[test]
+#[ignore = "an analysis: KOH_RECORDING=name cargo test --test corpus frame_bytes -- --ignored --nocapture"]
+fn frame_bytes() {
+    let Ok(name) = std::env::var("KOH_RECORDING") else {
+        return;
+    };
+    let corpus = corpus().expect("corpus");
+    if name == "all" {
+        frame_size_histogram(&corpus).expect("histogram");
+        return;
+    }
+    let recording = corpus.iter().find(|r| r.name == name).expect("recording");
+    let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK).expect("emu");
+    let mut previous = TerminalScreen::default();
+    for (num, (step, output)) in (0_u64..).zip(recording.outputs()) {
+        if let Some((rows, cols)) = step.resize {
+            server.resize(Size::new(rows, cols));
+        }
+        server.process(output);
+        let screen = server.snapshot();
+        let frame = Frame {
+            num: FrameNum(num + 1),
+            base: FrameNum(num),
+            echo_ack: InputSeq::default(),
+            diff: screen.diff_from(&previous),
+        };
+        let raw = postcard::to_allocvec(&frame).expect("raw");
+        let wire = encode_frame(&frame, &previous).expect("wire");
+        let alone = koh::proto::encode_frame_with(&frame, &[]).expect("alone");
+        let text: usize = frame
+            .diff
+            .rows
+            .iter()
+            .flat_map(|r| &r.runs)
+            .map(|r| r.cell.text.as_str().len())
+            .sum();
+        let runs: usize = frame.diff.rows.iter().map(|r| r.runs.len()).sum();
+        println!(
+            "step {num}: rows {} runs {runs} text {text} raw {} wire {} (alone {}), shifts {}",
+            frame.diff.rows.len(),
+            raw.len(),
+            wire.len(),
+            alone.len(),
+            frame.diff.shifts.iter().count()
+        );
+        previous = screen;
+    }
+}
+
+/// What the predictor did over the corpus: guesses shown, those the next screen did not bear out
+/// (a brief flash), and guesses still shown after the frame that echoes their keys that disagree
+/// with it (which must never happen).
+#[derive(Default)]
+struct Guesses {
+    shown: usize,
+    wrong: usize,
+    disagreeing: Vec<String>,
+}
+
+/// Replay `recording` with its keys typed into a predicting client, each step's output answered
+/// with a frame that echoes every key typed so far.
+fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
+    let size = Size::new(recording.rows, recording.cols);
+    let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK)
+        .map_err(|e| e.to_string())?;
+    let mut client = ClientSession::new(DisplayPreference::Always, size);
+    let mut sent = TerminalScreen::default();
+    let mut num = FrameNum::BLANK;
+    let mut typed = InputSeq::default();
+    let now = Instant::now();
+    let cell = |screen: &TerminalScreen, row: u16, col: u16| {
+        screen
+            .screen()
+            .cell(row, col)
+            .map(|c| c.contents().to_owned())
+            .unwrap_or_default()
+    };
+    for (index, (step, output)) in recording.outputs().enumerate() {
+        if let Some((rows, cols)) = step.resize {
+            server.resize(Size::new(rows, cols));
+            client.on_resize(Size::new(rows, cols));
+        }
+        if !step.keys.is_empty() {
+            client.on_input(now, &step.keys);
+        }
+        while let Some(msg) = client.pop_outgoing() {
+            if let ClientMsg::Input { seq, .. } = msg {
+                typed = typed.max(seq);
+            }
+        }
+        let before: Vec<((u16, u16), String)> = client
+            .overlay()
+            .cells()
+            .filter(|(_, c)| !c.covered)
+            .map(|(at, c)| (at, c.glyph.to_owned()))
+            .collect();
+        server.process(output);
+        let screen = server.snapshot();
+        let next = num.next();
+        client.on_frame(
+            now,
+            &Frame {
+                num: next,
+                base: num,
+                echo_ack: typed,
+                diff: screen.diff_from(&sent),
+            },
+        );
+        num = next;
+        sent = screen;
+        into.shown = into.shown.saturating_add(before.len());
+        into.wrong = into.wrong.saturating_add(
+            before
+                .iter()
+                .filter(|((row, col), glyph)| cell(client.state(), *row, *col) != *glyph)
+                .count(),
+        );
+        for ((row, col), c) in client.overlay().cells() {
+            let shown = cell(client.state(), row, col);
+            if !c.covered && shown != c.glyph {
+                into.disagreeing.push(format!(
+                    "{} step {index}: ({row}, {col}) guessed {:?}, the server shows {shown:?}",
+                    recording.name, c.glyph
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn confirmed_guesses_never_disagree_with_the_server() {
+    let corpus = corpus().expect("corpus");
+    let mut total = Guesses::default();
+    for recording in corpus
+        .iter()
+        .filter(|r| r.steps.iter().any(|s| !s.keys.is_empty()))
+    {
+        guesses(recording, &mut total).expect("replay");
+    }
+    println!(
+        "guesses shown {}, not borne out by the next screen {}",
+        total.shown, total.wrong
+    );
+    assert!(total.shown > 0, "the corpus's keys made no guess");
+    assert!(
+        total.disagreeing.is_empty(),
+        "{}",
+        total.disagreeing.join("\n")
+    );
+}
+
+/// How big koh's frames are on the recordings: each step's screen as one frame on the step
+/// before, as its stream carries it, counted by size, with the bytes each size takes.
+fn frame_size_histogram(corpus: &[Recording]) -> Result<(), String> {
+    const BOUNDS: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, usize::MAX];
+    let mut counts = [0_usize; 9];
+    let mut bytes = [0_usize; 9];
+    for recording in corpus {
+        let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK)
+            .map_err(|e| e.to_string())?;
+        let mut previous = TerminalScreen::default();
+        for (num, (step, output)) in (0_u64..).zip(recording.outputs()) {
+            if let Some((rows, cols)) = step.resize {
+                server.resize(Size::new(rows, cols));
+            }
+            server.process(output);
+            let screen = server.snapshot();
+            let frame = Frame {
+                num: FrameNum(num.saturating_add(1)),
+                base: FrameNum(num),
+                echo_ack: InputSeq::default(),
+                diff: screen.diff_from(&previous),
+            };
+            let len = encode_frame(&frame, &previous)
+                .map_err(|e| e.to_string())?
+                .len();
+            let at = BOUNDS.iter().position(|&b| len < b).unwrap_or(8);
+            if let (Some(count), Some(sum)) = (counts.get_mut(at), bytes.get_mut(at)) {
+                *count = count.saturating_add(1);
+                *sum = sum.saturating_add(len);
+            }
+            previous = screen;
+        }
+    }
+    let total: usize = bytes.iter().sum();
+    let frames: usize = counts.iter().sum();
+    println!("{frames} frames, {total} bytes");
+    for ((bound, count), sum) in BOUNDS.iter().zip(counts).zip(bytes) {
+        let label = if *bound == usize::MAX {
+            "4096+".to_owned()
+        } else {
+            format!("<{bound}")
+        };
+        let percent = sum.saturating_mul(100).checked_div(total).unwrap_or(0);
+        println!("{label:>6}: {count:>5} frames, {sum:>7} bytes ({percent}%)");
+    }
+    Ok(())
 }

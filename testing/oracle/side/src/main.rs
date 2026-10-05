@@ -172,6 +172,9 @@ impl Session {
             diff: screen.diff_from(&self.base.1),
         };
         self.next = self.next.next();
+        #[cfg(koh_frame_base)]
+        let bytes = encode_frame(&frame, &self.base.1).map_err(|e| e.to_string())?;
+        #[cfg(not(koh_frame_base))]
         let bytes = encode_frame(&frame).map_err(|e| e.to_string())?;
         let _ = writeln!(out, "bytes {}", bytes.len());
         self.sent.push_back((frame.num, screen));
@@ -179,29 +182,48 @@ impl Session {
             self.sent.pop_front();
         }
         if !dropped {
+            #[cfg(koh_frame_base)]
+            let frame = decode_frame(&bytes, &self.base.1).map_err(|e| e.to_string())?;
+            #[cfg(not(koh_frame_base))]
             let frame = decode_frame(&bytes).map_err(|e| e.to_string())?;
             self.client.on_frame(self.now(), &frame);
+            // The server takes the frame's delivery as its acknowledgement.
+            #[cfg(koh_delivery_ack)]
+            self.ack(frame.num);
         }
         Ok(())
+    }
+
+    /// The client has frame `frame`: the frames before it are no bases any more.
+    fn ack(&mut self, frame: FrameNum) {
+        if let Some(at) = self.sent.iter().position(|(num, _)| *num == frame) {
+            let mut newer = self.sent.split_off(at);
+            if let Some(base) = newer.pop_front() {
+                self.base = base;
+            }
+            self.sent = newer;
+        }
     }
 
     /// Deliver the client's messages to the server.
     fn drain(&mut self, out: &mut String) {
         while let Some(msg) = self.client.pop_outgoing() {
-            let _ = writeln!(out, "sent {msg:?}");
-            match msg {
-                ClientMsg::Ack { frame } => {
-                    if let Some(at) = self.sent.iter().position(|(num, _)| *num == frame) {
-                        let mut newer = self.sent.split_off(at);
-                        if let Some(base) = newer.pop_front() {
-                            self.base = base;
-                        }
-                        self.sent = newer;
-                    }
-                }
-                ClientMsg::Resync => self.base = (FrameNum::BLANK, TerminalScreen::default()),
-                ClientMsg::Input { seq, .. } => self.echoed = seq,
-                ClientMsg::Resize(_) => {}
+            let line = format!("{msg:?}");
+            // Scrollback requests are new (a side at an older commit has none), and change
+            // nothing the user's terminal shows until the user opens the view. Acknowledgements
+            // are the transport's business: a later commit takes a frame's delivery as one and
+            // sends them only to nudge.
+            if !line.starts_with("History") && !line.starts_with("Ack") {
+                let _ = writeln!(out, "sent {line}");
+            }
+            // Matched with `if let`, not `match`, so the side builds against a commit whose
+            // messages are fewer or more.
+            if let ClientMsg::Ack { frame } = msg {
+                self.ack(frame);
+            } else if let ClientMsg::Input { seq, .. } = msg {
+                self.echoed = seq;
+            } else if matches!(msg, ClientMsg::Resync) {
+                self.base = (FrameNum::BLANK, TerminalScreen::default());
             }
         }
     }

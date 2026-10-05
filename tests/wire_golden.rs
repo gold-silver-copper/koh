@@ -5,9 +5,12 @@
 //! bytes in the same commit, deliberately.
 
 use koh::proto::{
-    decode_frame, encode_client, encode_frame, ClientDecoder, ClientMsg, Frame, FrameNum, InputSeq,
+    decode_frame, decode_server, encode_client, encode_frame, encode_history, ClientDecoder,
+    ClientMsg, Frame, FrameNum, InputSeq, ServerMsg,
 };
-use koh::terminal::{ServerTerminal, Size, TerminalScreen, WireModes};
+use koh::terminal::{
+    HistoryReply, HistoryRequest, ServerTerminal, Size, TerminalScreen, WireModes,
+};
 
 /// Terminal output exercising every part of a cell and of the side channels: runs, wide glyphs
 /// and their continuations, a combining mark, a cluster too long to keep inline, every colour kind
@@ -36,42 +39,58 @@ fn exited_screen() -> Result<TerminalScreen, fux_vt::Error> {
 }
 
 /// A resize, every row kind, the side channels and the exit code, from the blank screen.
-fn full_frame() -> Result<Frame, fux_vt::Error> {
-    Ok(Frame {
+fn full_frame() -> Result<(Frame, TerminalScreen), fux_vt::Error> {
+    let base = TerminalScreen::default();
+    let frame = Frame {
         num: FrameNum(300),
         base: FrameNum::BLANK,
         echo_ack: InputSeq(129),
-        diff: exited_screen()?.diff_from(&TerminalScreen::default()),
-    })
+        diff: exited_screen()?.diff_from(&base),
+    };
+    Ok((frame, base))
 }
 
 /// An incremental frame: one row changed, no resize, the side channels unchanged.
-fn incremental_frame() -> Result<Frame, fux_vt::Error> {
+fn incremental_frame() -> Result<(Frame, TerminalScreen), fux_vt::Error> {
     let mut emu = ServerTerminal::new(6, 20, 0)?;
     emu.process(OUTPUT);
     let base = emu.snapshot();
     emu.process(b"\x1b[6;1Hlast row");
-    Ok(Frame {
+    let frame = Frame {
         num: FrameNum(301),
         base: FrameNum(300),
         echo_ack: InputSeq(130),
         diff: emu.snapshot().diff_from(&base),
-    })
+    };
+    Ok((frame, base))
 }
 
 /// A frame that scrolls: the screen scrolled up a line and a line written at the bottom, the rest
-/// moved rather than sent.
-fn scrolled_frame() -> Result<Frame, fux_vt::Error> {
-    let mut emu = ServerTerminal::new(6, 20, 0)?;
+/// moved rather than sent, and the line scrolled off kept in history.
+fn scrolled_frame() -> Result<(Frame, TerminalScreen), fux_vt::Error> {
+    let mut emu = ServerTerminal::new(6, 20, 10)?;
     emu.process(OUTPUT);
     let base = emu.snapshot();
     emu.process(b"\x1b[6;1H\r\nscrolled in");
-    Ok(Frame {
+    let frame = Frame {
         num: FrameNum(302),
         base: FrameNum(301),
         echo_ack: InputSeq(130),
         diff: emu.snapshot().diff_from(&base),
-    })
+    };
+    Ok((frame, base))
+}
+
+/// The history the scrolled frame's server holds: the two rows its output scrolled off.
+fn history_reply() -> Result<HistoryReply, fux_vt::Error> {
+    let mut emu = ServerTerminal::new(6, 20, 10)?;
+    emu.process(OUTPUT);
+    emu.process(b"\x1b[6;1H\r\nscrolled in\r\n");
+    let mark = emu.snapshot().history();
+    Ok(emu.history(HistoryRequest {
+        newest: mark.newest,
+        count: 5,
+    }))
 }
 
 /// The modes for every mouse mode (with the default encoding) and every mouse encoding (with
@@ -114,6 +133,10 @@ fn client_msgs() -> Vec<ClientMsg> {
             frame: FrameNum(70_000),
         },
         ClientMsg::Resync,
+        ClientMsg::History(HistoryRequest {
+            newest: 70_000,
+            count: 256,
+        }),
     ]
 }
 
@@ -141,44 +164,38 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The postcard encoding of [`full_frame`].
 const FULL_FRAME: &str =
-    "ac020081010106140109746865207469746c6501087468652069636f6e0108614756736247383d02010302040101\
-    0101030200060000080401610000000000000103e697a501000000000001000200000000000103e69cac01000000\
-    00000100020000000000010365cc8100000000000002012000000000000009000000000000000001000901017200\
-    01010000000001016700010a000000000101700001c8000000000101740002010203000000000101520000010400\
-    00000101470000010b000000010150000001640000000101540000020405060000000c0000000000000000020007\
-    01014200000000010001014400000000020001014900000000040001015500000000080001015600000000100001\
-    0141000000001f000e000000000000000003000d01014b0000000080010001016b00000000800200010148000000\
-    00a0020001015300000000e002000101750000000109080001017600000002070809080001016300000000880800\
-    010164000000008804000101770000000088100001014c0000000000010119f09f91a8e2808df09f91a9e2808df0\
-    9f91a7e2808df09f91a601000000000001000200000000000800000000000000011468747470733a2f2f6b6f682e\
-    6578616d706c652f016b04011401016100000000000001012000000000000001016c000000000000010169000000\
-    00000001016e00000000000001016500000000000001012000000000000001016c00000000000001016f00000000\
-    000001016e00000000000001016700000000000001012000000000000001016500000000000001016e0000000000\
-    0001016f000000000000010175000000000000010167000000000000010168000000000000010120000000000000\
-    0101740000000000000005000701016f000000000000010120000000000000010177000000000000010172000000\
-    0000000101610000000000000101700000000000000e0000000000000000";
+    "ac020081010106140109746865207469746c6501087468652069636f6e0108614756736247383d02010300000204\
+    01010101030200060000050401610000000000000206e697a5e69cac040000000000010365cc8100000000000002\
+    01200000000000000900000000000000000100090101720001010000000001016700010a000000000101700001c8\
+    00000000010174000201020300000000010152000001040000000101470000010b00000001015000000164000000\
+    0101540000020405060000000c000000000000000002000701014200000000010001014400000000020001014900\
+    0000000400010155000000000800010156000000001000010141000000001f000e000000000000000003000d0101\
+    4b0000000080010001016b0000000080020001014800000000a0020001015300000000e002000101750000000109\
+    08000101760000000207080908000101630000000088080001016400000000880400010177000000008810000101\
+    4c0000000000010119f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6010000000000010002000000\
+    00000800000000000000011468747470733a2f2f6b6f682e6578616d706c652f016b040101141461206c696e6520\
+    6c6f6e6720656e6f75676820740300000000000005000206066f20777261700300000000000e0000000000000000";
 
 /// [`full_frame`] as its stream carries it, compressed.
 const FULL_FRAME_STREAM: &str =
-    "75d1bd4ec3301007f0fb3b699bf025862e4cf409e88a9018404805c180f8e85e5aaba91a9aa8752963bbb13030b1\
-    20c1c297d40761e0211003338f80cfae23418407fb27c777179fa7822640b18c5045b2a23a2a9608989d66d243d0\
-    a8d50767b5f54d014ff8d0c31354240a7c34c80c785fb78fb024e1b6eea67fb7e4fbc40608542c429a0d5008f409\
-    26046813e6ac52c29b95d261c2b33ed2936f54d3d3bcd1a19e5a4627ba825fd0bf480b2ebfa012b06d2b013b760b\
-    d863f81aa78c40a3ce58d6d862acd292cbe0d122b0cf1a738aae11e7d8653db08e591fac21170a39df05572a05c6\
-    4dfe7ec56a1971e19111173cb08dc0caf7fdcdcbe7f85a2faf7679b6cbd3ef7e06ae75e548a974b051ad7693684d\
-    5e36ced35856d1f55146f642aee140ecd071e839c8ff0f27b9c3eddc61993b93450d7351512e5ccdee53e0a74a72\
-    9f470e7d87ec6ea945f6543f";
+    "0000060001020304053dd1bb4ec3301406e0f33b6948b889210b137e02ba22240610524130202edd436b35554312\
+    b52e656c37160626162458b8497d10061e023174e611f0b1533cd89f6df91cfb782a68020431229d2aa9bb3a5308\
+    99dd5691234c1acdc165636b47c023123e4cf3040544351f09d92682d9c3cbec71eadb193cf535a936201d22aa1a\
+    2802fa04d8093a8445a792f0e9a4cd31e1399f9aceb76a986ec9eac4746dab73be50cd5c8596e7f1052d007b2e13\
+    b0ef968043866f70c1080d9a8c35835dc606adce2378b4021cb1c61ca267c5310e58cfac33d6376bc889228e77cd\
+    991642eb16efdfb2da569c7864c5098f5d21b0fefb74fffe33be33c3871bdedcf08aaa5482dc6dabd2c5a9d6e560\
+    bb5eef15e9a6ba49aeca4cd5d1335f12c789ccbab992599177a4ca8b612795da73e76ae67f82428efa49e956fe9f\
+    fa07";
 
 /// The postcard encoding of [`incremental_frame`].
 const INCREMENTAL_FRAME: &str =
-    "ad02ac0282010000000002000508010101010302000105000901016c000000000000010161000000000000010173\
-    00000000000001017400000000000001012000000000000001017200000000000001016f00000000000001017700\
-    00000000000c0000000000000000";
+    "ad02ac02820100000000020000000508010101010302000105000208086c61737420726f770300000000000c0000\
+    000000000000";
 
 /// [`incremental_frame`] as its stream carries it, compressed.
 const INCREMENTAL_FRAME_STREAM: &str =
-    "35c6c109c0201004c0dd0b42022922ade52f082af8b71eed5151775ed3ad59252683bb395d063a3ca4c742fe4a52\
-    b2f22951094ad979710c";
+    "00ac02010535ccb10900200c0440f310f8c2215ccd5e1054b0771eddd122497bc53d5c1c0957ba8b2690adce5546\
+    dfb6e4183e";
 
 /// The postcard encoding of each of [`modes`].
 const MODES: [&str; 8] = [
@@ -193,7 +210,7 @@ const MODES: [&str; 8] = [
 ];
 
 /// Each of [`client_msgs`] as the client's stream carries it, length prefix included.
-const CLIENT_MSGS: [&str; 6] = [
+const CLIENT_MSGS: [&str; 7] = [
     "0000000a0001076c73202d6c610d",
     "000000cd00ac02c801000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324\
         25262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152\
@@ -204,22 +221,72 @@ const CLIENT_MSGS: [&str; 6] = [
     "0000000501e807e807",
     "0000000402f0a204",
     "0000000103",
+    "0000000604f0a2048002",
 ];
 
 /// The postcard encoding of [`scrolled_frame`].
 const SCROLLED_FRAME: &str =
-    "ae02ad028201000000000200050b010101010302010105010105000b010173000000000000010163000000000000\
-    01017200000000000001016f00000000000002016c00000000000001016500000000000001016400000000000001\
-    012000000000000001016900000000000001016e000000000000090000000000000000";
+    "ae02ad02820100000000020001010100050b01010101030201010501010500020b0b7363726f6c6c656420696e03\
+    0000000000090000000000000000";
 
 /// [`scrolled_frame`] as its stream carries it, compressed.
 const SCROLLED_FRAME_STREAM: &str =
-    "35c8c10980301044d199911cc426ec4d3d08a2a01dd84f52639624f3d9c3db29cafa8948480ba349648a437c1f5a\
-    e466bcc6d3215e5e0e633756e334ee8e19a30a";
+    "00ad020105358cc1090020080055f0112ed16ed5239082daa07d6ac60411ee7507f7e8d241f7a680c50b221b4022\
+    bbaca9da6aeec36f294e1f";
+
+/// The postcard encoding of [`history_reply`], as a server message.
+const HISTORY_REPLY: &str =
+    "020100050401610000000000000206e697a5e69cac040000000000010365cc810000000000000201200000000000\
+    000900000000000000000200090101720001010000000001016700010a000000000101700001c800000000010174\
+    000201020300000000010152000001040000000101470000010b0000000101500000016400000001015400000204\
+    05060000000c0000000000000000";
+
+#[test]
+fn history_rows_encode_as_pinned() {
+    let reply = history_reply().expect("reply");
+    assert_eq!(reply.rows.len(), 2, "two rows scrolled off");
+    let pinned = unhex(HISTORY_REPLY).expect("hex");
+    let msg = ServerMsg::History(reply.clone());
+    let encoded = encode_history(&reply).expect("encodes");
+    assert_eq!(decode_server(&encoded).expect("decodes"), msg);
+    let raw = miniz_oxide::inflate::decompress_to_vec(&encoded[1..]).expect("inflates");
+    assert_eq!(hex(&raw), hex(&pinned));
+    assert!(
+        decode_frame(&encoded, &TerminalScreen::default()).is_err(),
+        "history rows are not a frame"
+    );
+}
+
+#[test]
+#[ignore = "prints the pinned values, to paste after a deliberate change to the wire"]
+fn print_pinned() {
+    for (name, (frame, base)) in [
+        ("FULL_FRAME", full_frame().expect("frame")),
+        ("INCREMENTAL_FRAME", incremental_frame().expect("frame")),
+        ("SCROLLED_FRAME", scrolled_frame().expect("frame")),
+    ] {
+        println!(
+            "{name} {}",
+            hex(&postcard::to_allocvec(&frame).expect("encodes"))
+        );
+        println!(
+            "{name}_STREAM {}",
+            hex(&encode_frame(&frame, &base).expect("encodes"))
+        );
+    }
+    let reply = history_reply().expect("reply");
+    let raw =
+        miniz_oxide::inflate::decompress_to_vec(&encode_history(&reply).expect("encodes")[1..])
+            .expect("inflates");
+    println!("HISTORY_REPLY {}", hex(&raw));
+    for msg in client_msgs() {
+        println!("CLIENT {}", hex(&encode_client(&msg).expect("encodes")));
+    }
+}
 
 #[test]
 fn a_scrolled_frame_moves_rows() {
-    let frame = scrolled_frame().expect("frame");
+    let (frame, _) = scrolled_frame().expect("frame");
     let shifts: Vec<_> = frame.diff.shifts.iter().collect();
     assert_eq!(shifts.len(), 1);
     assert_eq!(
@@ -249,7 +316,7 @@ fn client_messages_encode_as_pinned() {
 
 #[test]
 fn frames_encode_as_pinned() {
-    for (frame, pinned, stream) in [
+    for ((frame, base), pinned, stream) in [
         (full_frame().expect("frame"), FULL_FRAME, FULL_FRAME_STREAM),
         (
             incremental_frame().expect("frame"),
@@ -274,11 +341,11 @@ fn frames_encode_as_pinned() {
             frame
         );
         // The compressed stream is pinned only through decoding: DEFLATE may pick other bytes
-        // for the same body.
+        // for the same body. It inflates only against its base's dictionary.
         let stream = unhex(stream).expect("hex");
-        assert_eq!(decode_frame(&stream).expect("decodes"), frame);
+        assert_eq!(decode_frame(&stream, &base).expect("decodes"), frame);
         assert_eq!(
-            decode_frame(&encode_frame(&frame).expect("encodes")).expect("decodes"),
+            decode_frame(&encode_frame(&frame, &base).expect("encodes"), &base).expect("decodes"),
             frame
         );
     }

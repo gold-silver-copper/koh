@@ -1,8 +1,8 @@
 diff --git i/src/terminal/grid.rs w/src/terminal/grid.rs
-index 3dfe098..b07c6b3 100644
+index c86b70d..6a42ad7 100644
 --- i/src/terminal/grid.rs
 +++ w/src/terminal/grid.rs
-@@ -269,8 +269,8 @@ impl RowCache {
+@@ -271,8 +271,8 @@ impl RowCache {
          // and with no other, so a row at the version it was cached at holds the same cells without
          // comparing them. A row with a new version may still hold the same cells (erased, then
          // written back), so it is compared, if neither has links.

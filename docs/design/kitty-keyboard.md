@@ -58,9 +58,13 @@ koh/3 changes in place while it is unreleased; after a release this needs a new 
 
 ## Prediction
 
-`predict.rs` reads raw bytes today: printables, backspace, CR, and the arrow keys in their CSI and
-SS3 forms. With events it reads keys instead, which is simpler, because there is one form of each
-arrow, and it stops mistaking kitty's encoded keys for unknown sequences. Key releases and pure
+`predict.rs` reads raw bytes today: printables, backspace, CR, the arrow keys in their CSI and SS3
+forms, Home and End, and the line editor's keys (`Ctrl-W`, `Ctrl-U`, `Ctrl-A`, `Ctrl-E`,
+`Alt-Backspace`, `Alt-B`, `Alt-F`), reading an escape sequence whole, parameters and all. With
+events it reads keys instead, which is simpler, because there is one form of each key (`Alt-B` is
+`b` with Alt, whatever the terminal sent), and it stops mistaking kitty's encoded keys for unknown
+sequences. The PTY's modes, which the client now learns for the predictor (echo and line mode),
+do not bear on the encoding. Key releases and pure
 modifier presses predict nothing. The predictor's epoch rules do not change.
 
 ## How to test it

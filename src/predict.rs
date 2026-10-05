@@ -10,8 +10,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fux_vt::Color;
+
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
+
+/// How the program's PTY takes typed keys: whether the kernel echoes them, and edits lines.
+///
+/// Line mode without echo is a password prompt (`getpass`, `read -s`, sudo, ssh,
+/// passwd); neither is a line editor or a full-screen program, which echo for themselves. Here
+/// for the same reason as [`Size`]; [`terminal`](crate::terminal) re-exports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TtyModes {
+    pub echo: bool,
+    pub line: bool,
+}
+
+impl TtyModes {
+    /// A password prompt: lines read without echo. Nothing typed may be shown.
+    pub const fn password(self) -> bool {
+        self.line && !self.echo
+    }
+}
 
 /// A terminal's geometry: `rows` lines of `cols` cells each.
 ///
@@ -203,9 +222,14 @@ enum EscState {
     Ground,
     /// Saw `ESC`.
     Esc,
-    /// Saw `ESC [` (also covers `ESC O` after normalization) — awaiting the final byte.
+    /// Saw `ESC [` (also covers `ESC O` after normalization) — awaiting the final byte, with
+    /// these parameter bytes so far.
     Csi,
 }
+
+/// Most parameter bytes of an escape sequence the predictor reads; a longer one is not a key it
+/// predicts.
+const MAX_CSI_PARAMS: usize = 8;
 
 /// The prediction engine.
 ///
@@ -228,6 +252,18 @@ pub struct PredictionEngine {
     /// A partial UTF-8 sequence, and the length its lead byte announced (0 when none).
     utf8_buf: Vec<u8>,
     utf8_need: usize,
+    /// How the program's PTY takes typed keys, as the newest frame said.
+    tty: Option<TtyModes>,
+    /// Trust from the last connection to the same session, given once a frame shows no password
+    /// prompt.
+    carried: bool,
+    /// The parameter bytes of the escape sequence being read.
+    csi: Vec<u8>,
+    /// Where the line being typed began, when known: the first key typed after Enter. Keys that
+    /// go to the line's start (`Ctrl-A`, Home, `Ctrl-U`) are predicted only when it is.
+    input_start: Option<(u16, u16)>,
+    /// Enter was typed and no key since: the next printable key begins a line.
+    fresh_line: bool,
 }
 
 impl PredictionEngine {
@@ -248,7 +284,52 @@ impl PredictionEngine {
             esc: EscState::Ground,
             utf8_buf: Vec::new(),
             utf8_need: 0,
+            tty: None,
+            carried: false,
+            csi: Vec::new(),
+            input_start: None,
+            fresh_line: false,
         }
+    }
+
+    /// Whether the newest epoch is confirmed: typing is being shown as it is predicted.
+    pub fn trusted(&self) -> bool {
+        self.prediction_epoch == self.confirmed_epoch
+    }
+
+    /// Start trusting as the last connection to the same session did, once a frame shows the PTY
+    /// is not at a password prompt ([`set_tty`](Self::set_tty)).
+    pub fn carry_trust(&mut self) {
+        self.carried = true;
+    }
+
+    /// How the program's PTY takes typed keys, as a frame said.
+    ///
+    /// At a password prompt (lines read without echo) nothing is predicted and every prediction
+    /// goes: a typed secret is never shown, whatever was confirmed before. Otherwise carried trust
+    /// is given.
+    pub fn set_tty(&mut self, tty: Option<TtyModes>) {
+        self.tty = tty;
+        if self.password() {
+            if !self.cells.is_empty() || self.cursor.is_some() {
+                self.reset();
+            }
+            self.carried = false;
+            return;
+        }
+        if std::mem::take(&mut self.carried) {
+            self.confirmed_epoch = self.confirmed_epoch.max(self.prediction_epoch);
+        }
+    }
+
+    /// Whether the PTY is at a password prompt.
+    fn password(&self) -> bool {
+        self.tty.is_some_and(TtyModes::password)
+    }
+
+    /// Whether the kernel echoes what is typed, so a printable key shows where the cursor is.
+    fn kernel_echo(&self) -> bool {
+        self.tty.is_some_and(|tty| tty.echo)
     }
 
     /// What a cell shows, predicted if there is a prediction: what a row shift copies, a wide
@@ -453,9 +534,240 @@ impl PredictionEngine {
         }
     }
 
+    /// A key not modelled: a new epoch, nothing predicted, and where the line began is no longer
+    /// known (the key may have recalled another line, or moved the cursor anywhere).
+    fn unmodelled(&mut self) {
+        self.become_tentative();
+        self.input_start = None;
+        self.fresh_line = false;
+    }
+
+    /// Whether line editing keys may be predicted: a line editor reads keys (no kernel echo, which
+    /// edits a line its own way).
+    fn editing(&self) -> bool {
+        !self.kernel_echo()
+    }
+
+    /// The predicted cursor's row and column, else the screen's.
+    fn cursor_at(&self, screen: &dyn ScreenView) -> (u16, u16) {
+        self.cursor
+            .as_ref()
+            .map_or_else(|| screen.cursor_position(), |c| (c.row, c.col))
+    }
+
+    /// The glyph `(row, col)` shows, predicted or not, or `None` if it is unknown or half of a
+    /// wide glyph, where word boundaries cannot be read.
+    fn glyph_at(&self, screen: &dyn ScreenView, row: u16, col: u16) -> Option<String> {
+        let guess = self.guess_at(screen, row, col);
+        (!guess.unknown && !guess.wide && !guess.covered).then_some(guess.glyph)
+    }
+
+    /// Whether the cell at `(row, col)` holds a character `word` accepts. Blank is no word.
+    fn in_word(
+        &self,
+        screen: &dyn ScreenView,
+        row: u16,
+        col: u16,
+        word: fn(char) -> bool,
+    ) -> Option<bool> {
+        let glyph = self.glyph_at(screen, row, col)?;
+        Some(glyph.chars().next().is_some_and(word))
+    }
+
+    /// Delete the `n` cells before the cursor as a line editor does: the cursor steps back `n`,
+    /// the rest of the row shifts left, and the last cells take what was off-screen (unknown).
+    /// Nothing is predicted if a wide glyph is in the way.
+    fn delete_before(&mut self, screen: &dyn ScreenView, n: u16) {
+        let cols = screen.size().cols;
+        let (row, col) = self.cursor_at(screen);
+        let Some(to) = col.checked_sub(n).filter(|_| n > 0) else {
+            return;
+        };
+        self.init_cursor(screen);
+        if (to..cols).any(|c| {
+            let g = self.guess_at(screen, row, c);
+            g.wide || g.covered
+        }) {
+            self.unmodelled();
+            return;
+        }
+        for i in to..cols {
+            let from = i
+                .checked_add(n)
+                .filter(|&from| from < cols.saturating_sub(1));
+            let guess = match from {
+                Some(from) => self.guess_at(screen, row, from),
+                None => Guess::unknown(Color::Default, Color::Default),
+            };
+            let guess = if guess.unknown {
+                Guess::unknown(guess.fg, guess.bg)
+            } else {
+                guess
+            };
+            self.place_cell(screen, row, i, guess);
+        }
+        let exp = self.next_frame();
+        if let Some(c) = self.cursor.as_mut() {
+            c.col = to;
+            c.expiration_frame = exp;
+        }
+    }
+
+    /// `Ctrl-W` (`word` is not whitespace) or `Alt-Backspace` (`word` is alphanumeric): delete
+    /// back over what is not a word, then over the word. Predicted only when the word is bounded
+    /// on its left by a cell that is not one, after where the line began if that is known, so a
+    /// prompt is never taken for the line.
+    fn predict_kill_word(&mut self, screen: &dyn ScreenView, word: fn(char) -> bool) {
+        if !self.editing() {
+            return self.unmodelled();
+        }
+        let (row, col) = self.cursor_at(screen);
+        let floor = self
+            .input_start
+            .filter(|(r, _)| *r == row)
+            .map_or(0, |(_, c)| c);
+        let mut at = col;
+        let mut seen_word = false;
+        loop {
+            let Some(prev) = at.checked_sub(1).filter(|&p| p >= floor) else {
+                // Reached the line's start (or the row's): sure only if where the line began is
+                // known, and something was deleted.
+                if self.input_start.is_some() && at < col {
+                    break;
+                }
+                return self.unmodelled();
+            };
+            match self.in_word(screen, row, prev, word) {
+                None => return self.unmodelled(),
+                Some(true) => seen_word = true,
+                Some(false) if seen_word => break,
+                Some(false) => {}
+            }
+            at = prev;
+        }
+        let n = col.saturating_sub(at);
+        if n == 0 {
+            return self.unmodelled();
+        }
+        self.delete_before(screen, n);
+    }
+
+    /// `Ctrl-U`: delete from where the line began to the cursor, if that is known.
+    fn predict_kill_line(&mut self, screen: &dyn ScreenView) {
+        let (row, col) = self.cursor_at(screen);
+        match self.input_start.filter(|(r, c)| *r == row && *c <= col) {
+            Some((_, start)) if self.editing() => {
+                self.delete_before(screen, col.saturating_sub(start));
+            }
+            _ => self.unmodelled(),
+        }
+    }
+
+    /// Move the predicted cursor to `col` on its row.
+    fn move_cursor_to(&mut self, screen: &dyn ScreenView, col: u16) {
+        self.init_cursor(screen);
+        let exp = self.next_frame();
+        if let Some(c) = self.cursor.as_mut() {
+            c.col = col;
+            c.expiration_frame = exp;
+        }
+    }
+
+    /// `Ctrl-A`, Home: the cursor to where the line began, if that is known.
+    fn predict_line_start(&mut self, screen: &dyn ScreenView) {
+        let (row, _) = self.cursor_at(screen);
+        match self.input_start.filter(|(r, _)| *r == row) {
+            Some((_, start)) if self.editing() => self.move_cursor_to(screen, start),
+            _ => self.unmodelled(),
+        }
+    }
+
+    /// `Ctrl-E`, End: the cursor past the last character of its row, if the line ends on it (the
+    /// row is not soft-wrapped into the next) and that is at or after the cursor.
+    fn predict_line_end(&mut self, screen: &dyn ScreenView) {
+        let cols = screen.size().cols;
+        let (row, col) = self.cursor_at(screen);
+        let mut end = 0_u16;
+        for c in 0..cols {
+            // Typing and deleting leave the last two columns unknown (what an edit pushed off or
+            // pulled in): blank unless the line nearly fills the row.
+            let edge = c >= cols.saturating_sub(2);
+            match self.glyph_at(screen, row, c) {
+                None if edge => {}
+                None => return self.unmodelled(),
+                Some(g) if !is_blank(&g) => end = c.saturating_add(1),
+                Some(_) => {}
+            }
+        }
+        if !self.editing() || end < col || end >= cols {
+            return self.unmodelled();
+        }
+        self.move_cursor_to(screen, end);
+    }
+
+    /// `Alt-B` (back) or `Alt-F` (`forward`): the cursor over what is not alphanumeric, then over
+    /// a word, as readline moves; predicted only when it stops inside the row, and inside the line
+    /// if where it began is known.
+    fn predict_word_motion(&mut self, screen: &dyn ScreenView, forward: bool) {
+        if !self.editing() {
+            return self.unmodelled();
+        }
+        let cols = screen.size().cols;
+        let (row, col) = self.cursor_at(screen);
+        let floor = self
+            .input_start
+            .filter(|(r, _)| *r == row)
+            .map_or(0, |(_, c)| c);
+        let mut at = col;
+        let mut seen_word = false;
+        loop {
+            // The cell to step over: the one before, back; the one at the cursor, forward.
+            let next = if forward {
+                Some(at).filter(|&a| a < cols.saturating_sub(1))
+            } else {
+                at.checked_sub(1).filter(|&p| p >= floor)
+            };
+            let Some(cell) = next else {
+                if !forward && self.input_start.is_some() && seen_word {
+                    break;
+                }
+                return self.unmodelled();
+            };
+            match self.in_word(screen, row, cell, char::is_alphanumeric) {
+                None => return self.unmodelled(),
+                Some(true) => seen_word = true,
+                Some(false) if seen_word => break,
+                Some(false)
+                    if forward
+                        && self
+                            .glyph_at(screen, row, cell)
+                            .is_some_and(|g| is_blank(&g)) =>
+                {
+                    // Past the line's end: readline stops at it; where that is, is not sure.
+                    return self.unmodelled();
+                }
+                Some(false) => {}
+            }
+            at = if forward {
+                cell.saturating_add(1)
+            } else {
+                cell
+            };
+        }
+        if at == col {
+            return self.unmodelled();
+        }
+        self.move_cursor_to(screen, at);
+    }
+
     /// Predict what typed `byte` does to `screen`, after culling the existing predictions.
     pub fn new_user_byte(&mut self, byte: u8, screen: &dyn ScreenView) {
         if self.pref == DisplayPreference::Never {
+            return;
+        }
+        if self.password() {
+            // Nothing typed at a password prompt is predicted, nor shown.
+            self.become_tentative();
             return;
         }
         self.cull(screen);
@@ -492,24 +804,36 @@ impl PredictionEngine {
             self.become_tentative();
         }
 
-        // Swallow escape sequences, predicting left and right arrows (`ESC O x` became `ESC [ x`).
+        // Swallow escape sequences, predicting the keys modelled (`ESC O x` became `ESC [ x`).
         match self.esc {
             EscState::Esc => {
-                self.esc = if byte == b'[' {
-                    EscState::Csi
-                } else {
-                    self.become_tentative(); // an escape we don't model -> wait for the server
-                    EscState::Ground
-                };
+                self.esc = EscState::Ground;
+                match byte {
+                    b'[' => {
+                        self.esc = EscState::Csi;
+                        self.csi.clear();
+                    }
+                    b'b' => self.predict_word_motion(screen, false),
+                    b'f' => self.predict_word_motion(screen, true),
+                    0x7f | 0x08 => self.predict_kill_word(screen, char::is_alphanumeric),
+                    _ => self.unmodelled(), // an escape we don't model -> wait for the server
+                }
                 return;
             }
             EscState::Csi => {
+                if (0x20..=0x3f).contains(&byte) && self.csi.len() < MAX_CSI_PARAMS {
+                    self.csi.push(byte);
+                    return;
+                }
                 self.esc = EscState::Ground;
-                match byte {
-                    b'C' => self.predict_arrow(screen, 1),  // right
-                    b'D' => self.predict_arrow(screen, -1), // left
-                    // Anything else, parameters included, is not predicted.
-                    _ => self.become_tentative(),
+                let params = std::mem::take(&mut self.csi);
+                match (params.as_slice(), byte) {
+                    (b"", b'C') => self.predict_arrow(screen, 1),  // right
+                    (b"", b'D') => self.predict_arrow(screen, -1), // left
+                    (b"" | b"1", b'H') | (b"1" | b"7", b'~') => self.predict_line_start(screen),
+                    (b"" | b"1", b'F') | (b"4" | b"8", b'~') => self.predict_line_end(screen),
+                    // Anything else is not predicted.
+                    _ => self.unmodelled(),
                 }
                 return;
             }
@@ -539,6 +863,14 @@ impl PredictionEngine {
 
         match byte {
             0x20..=0x7e => {
+                if self.kernel_echo() {
+                    // The kernel echoes it: no need to wait for the program to prove it does.
+                    self.confirmed_epoch = self.confirmed_epoch.max(self.prediction_epoch);
+                }
+                if std::mem::take(&mut self.fresh_line) {
+                    let c = self.init_cursor(screen);
+                    self.input_start = Some((c.row, c.col));
+                }
                 let col = self.init_cursor(screen).col;
                 if col >= cols.saturating_sub(1) {
                     // Last column is ambiguous (wrap vs. overwrite); hide until confirmed.
@@ -628,10 +960,16 @@ impl PredictionEngine {
                 // A scroll cannot be predicted cleanly: a new epoch, and the cursor moves.
                 self.become_tentative();
                 self.newline_cr(screen);
+                self.input_start = None;
+                self.fresh_line = true;
             }
+            0x17 => self.predict_kill_word(screen, |c| !c.is_whitespace()), // Ctrl-W
+            0x15 => self.predict_kill_line(screen),                         // Ctrl-U
+            0x01 => self.predict_line_start(screen),                        // Ctrl-A
+            0x05 => self.predict_line_end(screen),                          // Ctrl-E
             _ => {
                 // Other controls: a new epoch, nothing predicted.
-                self.become_tentative();
+                self.unmodelled();
             }
         }
     }
@@ -739,7 +1077,7 @@ impl PredictionEngine {
 
     /// What to draw now: the predictions in confirmed epochs, unless predictions are off.
     pub fn overlay(&self) -> Overlay<'_> {
-        if self.pref == DisplayPreference::Never {
+        if self.pref == DisplayPreference::Never || self.password() {
             return Overlay::empty();
         }
         let mut ov = Overlay::empty();
@@ -781,6 +1119,7 @@ impl PredictionEngine {
     /// resize.
     fn reset_decoder(&mut self) {
         self.esc = EscState::Ground;
+        self.csi.clear();
         self.utf8_buf.clear();
         self.utf8_need = 0;
         self.last_byte = 0;
@@ -1568,5 +1907,166 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A predictor trusted at a line editor (no kernel echo, no line mode), on `bytes`' screen.
+    fn editor_on(bytes: &[u8]) -> (PredictionEngine, Screen) {
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let screen = screen_of(bytes);
+        e.carry_trust();
+        e.set_tty(Some(TtyModes {
+            echo: false,
+            line: false,
+        }));
+        e.cull(&screen);
+        (e, screen)
+    }
+
+    /// Type `keys` into `e` over `screen`, as one input frame.
+    fn type_keys(e: &mut PredictionEngine, screen: &Screen, keys: &[u8]) {
+        e.set_local_frame_sent(1);
+        for &b in keys {
+            e.new_user_byte(b, screen);
+        }
+    }
+
+    /// Row 0 as shown: the overlay over the screen, trailing blanks trimmed; and the cursor's
+    /// column as predicted.
+    fn shown_row(e: &PredictionEngine, screen: &Screen) -> (String, Option<u16>) {
+        let ov = e.overlay();
+        let text: String = (0..80)
+            .map(|col| match ov.cell(0, col) {
+                Some(cell) => cell.glyph.to_owned(),
+                None => cell_glyph(screen, 0, col),
+            })
+            .map(|g| if g.is_empty() { " ".to_owned() } else { g })
+            .collect();
+        (text.trim_end().to_owned(), ov.cursor().map(|(_, c)| c))
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_cursor_and_never_the_prompt() {
+        let (mut e, screen) = editor_on(b"$ git commit -m msg");
+        type_keys(&mut e, &screen, &[0x17]);
+        assert_eq!(
+            shown_row(&e, &screen),
+            ("$ git commit -m".to_owned(), Some(16))
+        );
+        type_keys(&mut e, &screen, &[0x17]);
+        assert_eq!(shown_row(&e, &screen).0, "$ git commit");
+        // An empty line: the word left of the cursor is the prompt's, which is not the line's.
+        let (mut e, screen) = editor_on(b"$ ");
+        type_keys(&mut e, &screen, &[0x17]);
+        assert!(e.overlay().is_empty(), "nothing predicted");
+    }
+
+    #[test]
+    fn alt_backspace_deletes_back_to_punctuation() {
+        let (mut e, screen) = editor_on(b"$ cd /usr/lib");
+        type_keys(&mut e, &screen, b"\x1b\x7f");
+        assert_eq!(shown_row(&e, &screen), ("$ cd /usr/".to_owned(), Some(10)));
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_a_go_to_where_the_line_began_only_when_it_is_known() {
+        let (mut e, screen) = editor_on(b"$ ls -l");
+        type_keys(&mut e, &screen, &[0x15]);
+        assert!(e.overlay().is_empty(), "where the line began is not known");
+        // Typed after Enter, the line's start is known.
+        let (mut e, screen) = editor_on(b"$ ");
+        e.fresh_line = true;
+        type_keys(&mut e, &screen, b"echo hi");
+        assert_eq!(shown_row(&e, &screen), ("$ echo hi".to_owned(), Some(9)));
+        type_keys(&mut e, &screen, &[0x01]);
+        assert_eq!(shown_row(&e, &screen).1, Some(2), "Ctrl-A");
+        type_keys(&mut e, &screen, &[0x05]);
+        assert_eq!(shown_row(&e, &screen).1, Some(9), "Ctrl-E");
+        type_keys(&mut e, &screen, &[0x15]);
+        assert_eq!(shown_row(&e, &screen), ("$".to_owned(), Some(2)), "Ctrl-U");
+    }
+
+    #[test]
+    fn home_end_and_word_motion_move_the_cursor_only() {
+        let (mut e, screen) = editor_on(b"$ make test\x1b[2D");
+        type_keys(&mut e, &screen, b"\x1b[F");
+        assert_eq!(
+            shown_row(&e, &screen),
+            ("$ make test".to_owned(), Some(11)),
+            "End"
+        );
+        type_keys(&mut e, &screen, b"\x1bb");
+        assert_eq!(
+            shown_row(&e, &screen).1,
+            Some(7),
+            "Alt-B: the start of test"
+        );
+        type_keys(&mut e, &screen, b"\x1bb");
+        assert_eq!(
+            shown_row(&e, &screen).1,
+            Some(2),
+            "Alt-B: the start of make"
+        );
+        type_keys(&mut e, &screen, b"\x1bf");
+        assert_eq!(shown_row(&e, &screen).1, Some(6), "Alt-F: the end of make");
+        // Home with the line's start unknown: not predicted; the cursor stays where it was.
+        type_keys(&mut e, &screen, b"\x1b[1~");
+        assert_eq!(shown_row(&e, &screen).1, Some(6));
+    }
+
+    #[test]
+    fn a_csi_with_parameters_is_read_whole_and_draws_nothing() {
+        let (mut e, screen) = editor_on(b"$ ab");
+        type_keys(&mut e, &screen, b"\x1b[3~\x1b[1;5C");
+        let (text, _) = shown_row(&e, &screen);
+        assert_eq!(text, "$ ab", "no '~' or 'C' drawn");
+    }
+
+    #[test]
+    fn a_password_prompt_shows_nothing_typed_even_after_trust() {
+        let (mut e, screen) = editor_on(b"$ ");
+        type_keys(&mut e, &screen, b"sudo");
+        assert!(!e.overlay().is_empty(), "trusted at the shell");
+        // sudo turns echo off and reads a line: whatever was trusted, nothing shows.
+        let prompt = screen_of(b"$ sudo\r\n[sudo] password for me: ");
+        e.set_tty(Some(TtyModes {
+            echo: false,
+            line: true,
+        }));
+        e.cull(&prompt);
+        type_keys(&mut e, &prompt, b"hunter2");
+        assert!(e.overlay().is_empty());
+        assert!(e.cells.is_empty(), "nothing even kept");
+        // Carried trust is not given at one either.
+        let mut fresh = PredictionEngine::new(DisplayPreference::Always);
+        fresh.carry_trust();
+        fresh.set_tty(Some(TtyModes {
+            echo: false,
+            line: true,
+        }));
+        type_keys(&mut fresh, &prompt, b"hunter2");
+        assert!(fresh.overlay().is_empty());
+    }
+
+    #[test]
+    fn kernel_echo_is_trusted_from_the_first_key() {
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let screen = screen_of(b"");
+        e.set_tty(Some(TtyModes {
+            echo: true,
+            line: true,
+        }));
+        type_keys(&mut e, &screen, b"hi");
+        assert_eq!(shown_row(&e, &screen), ("hi".to_owned(), Some(2)));
+        // Without echo known, the first key waits for the server, as before.
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        type_keys(&mut e, &screen, b"hi");
+        assert!(e.overlay().is_empty());
+    }
+
+    #[test]
+    fn trust_carried_from_a_reconnect_shows_the_first_key() {
+        let (mut e, screen) = editor_on(b"$ ");
+        type_keys(&mut e, &screen, b"l");
+        assert_eq!(shown_row(&e, &screen).0, "$ l");
     }
 }

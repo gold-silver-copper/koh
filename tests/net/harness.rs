@@ -41,7 +41,6 @@ impl Server {
         let config = ServeConfig {
             allow: allow.to_vec(),
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
-            scrollback: 0,
             launcher: koh::pty::Launcher::new(env!("CARGO_BIN_EXE_koh")),
             ..ServeConfig::default()
         };

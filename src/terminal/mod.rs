@@ -4,6 +4,7 @@
 //! A [`ScreenDiff`] carries the changed rows as run-length-encoded cells, the cursor and the modes.
 //! The client validates and copies cells; it never runs a terminal parser on server bytes.
 
+use std::collections::HashMap;
 use std::num::{NonZeroI16, NonZeroU16};
 use std::ops::Range;
 use std::sync::Arc;
@@ -15,10 +16,15 @@ use fux_vt::{
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 mod grid;
+mod history;
 mod server;
 
-pub use crate::predict::Size;
+pub use crate::predict::{Size, TtyModes};
 pub use grid::{drawn, Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
+pub use history::{
+    HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, KeptRow,
+    HISTORY_CACHE_CELLS, MAX_HISTORY_CELLS, MAX_HISTORY_ROWS,
+};
 pub use server::{FrameHold, ServerTerminal, FRAME_HOLD, IDENTITY, OPTIONS};
 
 /// Default screen geometry, used for the blank screen both ends start from.
@@ -42,6 +48,93 @@ pub const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
 /// A screen's links are a few KiB (fux-vt keeps at most 4 MiB a screen); the server leaves off a row's links past this, and the
 /// client drops a frame that carries more, so a hostile server cannot make the client keep much.
 pub const MAX_LINK_BYTES: usize = 1 << 20;
+
+/// Most bytes of a run's text: a character, of at most 4 bytes, for each cell of the widest row.
+pub const MAX_RUN_TEXT: usize = 4 * MAX_DIM as usize;
+
+/// Rows' encodings for frames' dictionaries, kept from one dictionary to the next.
+///
+/// Most of a dictionary's rows are unchanged since the last, shared, so encoding them again would
+/// be the same work. Keyed by the row's shared cells, which an entry holds, so that no other row can take
+/// their place while it is kept; an entry not used by the newest dictionary goes.
+#[derive(Debug, Default)]
+pub struct RowEncodings {
+    /// By the address of the row's cells (held, so not reused): the row's cells, wrap flag and
+    /// links, and its encoding without its index.
+    kept: HashMap<usize, RowEncoding>,
+    /// The cells the dictionary being built used.
+    used: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct RowEncoding {
+    #[expect(
+        dead_code,
+        reason = "held, not read: while it is, no other row's cells can take the address the \
+                  entry is keyed by"
+    )]
+    cells: Arc<Cells>,
+    wrapped: bool,
+    links: Option<Arc<RowLinks>>,
+    /// The row's wrap flag, runs and links as [`RowDiff`] encodes them after its index.
+    bytes: Vec<u8>,
+}
+
+impl RowEncodings {
+    /// Append row `row`, of these parts, to `out` as a frame encodes it.
+    fn append(
+        &mut self,
+        row: u16,
+        (cells, wrapped, links): (Arc<Cells>, bool, Option<Arc<RowLinks>>),
+        out: &mut Vec<u8>,
+    ) {
+        let key = Arc::as_ptr(&cells).addr();
+        let hit = self.kept.get(&key).filter(|kept| {
+            kept.wrapped == wrapped
+                && match (&kept.links, &links) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, Some(_)) | (Some(_), None) => false,
+                }
+        });
+        let Ok(index) = postcard::to_extend(&row, std::mem::take(out)) else {
+            return;
+        };
+        *out = index;
+        if let Some(kept) = hit {
+            out.extend_from_slice(&kept.bytes);
+        } else {
+            let (runs, wire_links) = runs_of(&cells, links.as_deref());
+            let Ok(bytes) = postcard::to_allocvec(&(wrapped, runs, wire_links)) else {
+                return;
+            };
+            out.extend_from_slice(&bytes);
+            self.kept.insert(
+                key,
+                RowEncoding {
+                    cells,
+                    wrapped,
+                    links,
+                    bytes,
+                },
+            );
+        }
+        self.used.push(key);
+    }
+
+    /// The dictionary is built: forget the rows it did not use.
+    fn done(&mut self) {
+        let used: std::collections::HashSet<usize> = self.used.drain(..).collect();
+        self.kept.retain(|key, _| used.contains(key));
+    }
+}
+
+/// How many rows above the cursor a frame's dictionary takes besides the rows the frame changes.
+const DICTIONARY_CONTEXT: u16 = 8;
+
+/// Most bytes of a frame's dictionary ([`TerminalScreen::dictionary`]): DEFLATE's window, the
+/// farthest back a compressed frame can reach.
+pub const DICTIONARY_BYTES: usize = 32 * 1024;
 
 /// Clamp a peer-supplied size into `[MIN_DIM, MAX_DIM]` on both axes: the one gate every resize
 /// passes at both ends before a grid is built.
@@ -87,6 +180,10 @@ pub struct TerminalScreen {
     bell_count: u64,
     /// The program's exit code once it exited, for the client to exit with.
     exit_code: Option<u32>,
+    /// Where the server's history stands: what the client may ask for.
+    history: HistoryMark,
+    /// How the PTY takes typed keys, if known.
+    tty: Option<TtyModes>,
 }
 
 impl Default for TerminalScreen {
@@ -104,6 +201,8 @@ impl TerminalScreen {
             clipboard: String::new(),
             bell_count: 0,
             exit_code: None,
+            history: HistoryMark { newest: 0, len: 0 },
+            tty: None,
         }
     }
 
@@ -157,6 +256,115 @@ impl TerminalScreen {
         self.bell_count
     }
 
+    /// Where the server's history stands.
+    pub const fn history(&self) -> HistoryMark {
+        self.history
+    }
+
+    /// How the program's PTY takes typed keys, if the server said.
+    pub const fn tty(&self) -> Option<TtyModes> {
+        self.tty
+    }
+
+    /// This screen scrolled `offset` rows back into the history `cache` holds part of: the
+    /// history rows above its top, then its own rows, the top `rows` of them shown. A row not held
+    /// is blank. The cursor is hidden, and mouse reporting on, so the wheel can scroll.
+    #[must_use]
+    pub fn scrolled_back(&self, cache: &HistoryCache, offset: usize) -> Self {
+        let size = self.size();
+        let mut grid = self.grid.clone();
+        let blank: Arc<Cells> = Arc::new(Cells::new(usize::from(size.cols)));
+        for row in 0..size.rows {
+            // The row `offset - row` above the screen's top is history; the rest is the screen's.
+            let shown = if let Some(above) = offset
+                .checked_sub(usize::from(row))
+                .filter(|&above| above > 0)
+            {
+                u64::try_from(above.saturating_sub(1))
+                    .ok()
+                    .map(|back| self.history.newest.saturating_sub(back))
+                    .filter(|&name| self.history.holds(name))
+                    .and_then(|name| cache.screen_row(name, size.cols))
+            } else {
+                let below = usize::from(row).saturating_sub(offset);
+                u16::try_from(below)
+                    .ok()
+                    .and_then(|from| self.grid.row_parts(from))
+            };
+            let (cells, wrapped, links) =
+                shown.unwrap_or_else(|| (Arc::clone(&blank), false, None));
+            grid.set_row(row, cells, wrapped, links);
+        }
+        grid.set_modes(Modes {
+            hide_cursor: true,
+            mouse_mode: MouseProtocolMode::PressRelease,
+            mouse_encoding: MouseProtocolEncoding::Sgr,
+            ..self.grid.modes()
+        });
+        Self {
+            grid,
+            ..self.clone()
+        }
+    }
+
+    /// The dictionary a frame diffed against this screen, changing `rows`, is compressed against:
+    /// those rows as this screen has them, after a few above the cursor, encoded as a frame
+    /// encodes rows ([`RowDiff`]), then the screen's side channels, cursor and modes as a frame
+    /// carries them; at most [`DICTIONARY_BYTES`] in all, the last of it kept.
+    ///
+    /// A changed row then compresses against what it was, and the header against the base's.
+    /// What it costs follows the rows the frame changes, not the screen's size, and `encodings`
+    /// keeps rows' encodings from one dictionary to the next. A row this screen lacks is left out.
+    pub fn dictionary(&self, rows: &[u16], encodings: &mut RowEncodings) -> Vec<u8> {
+        let mut out = Vec::new();
+        // First the rows just above the cursor and its own, which a new line most often repeats
+        // (a prompt, the line of output before), then the changed rows, nearest the frame.
+        let cursor = self.grid.cursor_position().0;
+        let context =
+            (cursor.saturating_sub(DICTIONARY_CONTEXT)..=cursor).filter(|row| !rows.contains(row));
+        for row in context.chain(rows.iter().copied()) {
+            if let Some(parts) = self.grid.row_parts(row) {
+                encodings.append(row, parts, &mut out);
+            }
+        }
+        encodings.done();
+        if let Ok(header) = postcard::to_allocvec(&self.header()) {
+            out.extend_from_slice(&header);
+        }
+        // Only the last window's worth can be reached.
+        let excess = out.len().saturating_sub(DICTIONARY_BYTES);
+        out.split_off(excess)
+    }
+
+    /// This screen's side channels, cursor and modes as a frame that changes no row carries them.
+    fn header(&self) -> ScreenDiff {
+        ScreenDiff {
+            resize: None,
+            title: None,
+            icon: None,
+            clipboard: None,
+            bell_count: self.bell_count,
+            exit_code: self.exit_code,
+            history: None,
+            tty: None,
+            cursor: self.grid.cursor_position(),
+            modes: self.grid.modes().into(),
+            shifts: Shifts::default(),
+            rows: Vec::new(),
+        }
+    }
+
+    /// How many rows differ between this screen and `other`, or `None` if their sizes do. Rows
+    /// that share their cells compare without reading them.
+    pub fn rows_differing(&self, other: &Self) -> Option<usize> {
+        let size = self.size();
+        (size == other.size()).then(|| {
+            (0..size.rows)
+                .filter(|&r| !self.grid.row_eq(&other.grid, r))
+                .count()
+        })
+    }
+
     /// The cells `screens` hold in memory together: a row several of them share counts once.
     pub fn distinct_cells<'a>(screens: impl IntoIterator<Item = &'a Self>) -> usize {
         Grid::distinct_cells(screens.into_iter().map(|screen| &screen.grid))
@@ -204,6 +412,12 @@ pub enum CellKind {
     Wide,
     /// The right half of a wide glyph.
     Continuation,
+    /// A run's narrow cells, one character of its text each, in turn: same-style text as one
+    /// string, about a byte a cell.
+    Chars,
+    /// A run's wide glyphs, one character of its text each, each with its continuation: two
+    /// cells a character.
+    WideChars,
 }
 
 /// A cell's style on the wire: one bit per attribute, for blinking one of two, and for an underline
@@ -339,7 +553,7 @@ impl<'de> Deserialize<'de> for WireStyle {
 }
 
 /// A cell's text on the wire: one grapheme cluster, at most [`Cell::CLUSTER_CAPACITY`] bytes of
-/// UTF-8, and no control character.
+/// UTF-8 (or, for a run of characters, one character a cell), and no control character.
 ///
 /// The client prints a cell's text to the user's terminal as is, so it must not be able to carry
 /// an escape sequence: fux-vt never puts a control character in a cell, and decoding refuses one,
@@ -375,7 +589,16 @@ impl CellText {
     /// `text`, or `None` if it is longer than [`Cell::CLUSTER_CAPACITY`] bytes or holds a
     /// control character (C0, DEL or C1).
     pub fn new(text: &str) -> Option<Self> {
-        if text.len() > Cell::CLUSTER_CAPACITY || text.chars().any(char::is_control) {
+        if text.len() > Cell::CLUSTER_CAPACITY {
+            return None;
+        }
+        Self::run(text)
+    }
+
+    /// `text` as a run's text ([`CellKind::Chars`], [`CellKind::WideChars`]): at most
+    /// [`MAX_RUN_TEXT`] bytes, with no control character.
+    fn run(text: &str) -> Option<Self> {
+        if text.len() > MAX_RUN_TEXT || text.chars().any(char::is_control) {
             return None;
         }
         let mut bytes = [0; Self::INLINE];
@@ -432,13 +655,13 @@ impl de::Visitor<'_> for CellTextVisitor {
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "a string of at most {} bytes with no control character",
-            Cell::CLUSTER_CAPACITY
+            "a string of at most {MAX_RUN_TEXT} bytes with no control character"
         )
     }
 
     fn visit_str<E: de::Error>(self, text: &str) -> Result<CellText, E> {
-        CellText::new(text).ok_or_else(|| E::invalid_value(de::Unexpected::Str(text), &self))
+        // A cell's own text is held to a cluster's size by its run ([`Run`]), which knows its kind.
+        CellText::run(text).ok_or_else(|| E::invalid_value(de::Unexpected::Str(text), &self))
     }
 }
 
@@ -482,39 +705,107 @@ impl WireCell {
     /// inline, as fux-vt cuts it; a row from fux-vt always has the room.
     fn write_to(&self, cells: &mut Cells, at: usize) -> Option<()> {
         match self.kind {
-            CellKind::Continuation => {
-                let plain = self.text.is_empty()
-                    && self.fg == WireColor::Default
-                    && self.bg == WireColor::Default
-                    && self.underline_color == WireColor::Default
-                    && self.style == WireStyle::default();
-                plain.then(|| cells.set_cell(at, Cell::wide_continuation()))
-            }
+            CellKind::Continuation => self
+                .plain_continuation()
+                .then(|| cells.set_cell(at, Cell::wide_continuation())),
             CellKind::Narrow | CellKind::Wide => {
-                let attributes = self
-                    .style
-                    .on(Attributes::new(self.fg.into(), self.bg.into())
-                        .with_underline_color(self.underline_color.into()));
                 cells.set_text(
                     at,
                     self.text.as_str(),
                     self.kind == CellKind::Wide,
-                    attributes,
+                    self.attributes(),
                 );
+                Some(())
+            }
+            CellKind::Chars => {
+                let mut buf = [0; 4];
+                for (col, ch) in (at..).zip(self.text.as_str().chars()) {
+                    cells.set_text(col, ch.encode_utf8(&mut buf), false, self.attributes());
+                }
+                Some(())
+            }
+            CellKind::WideChars => {
+                let mut buf = [0; 4];
+                for (pair, ch) in self.text.as_str().chars().enumerate() {
+                    let col = pair.checked_mul(2).and_then(|c| c.checked_add(at))?;
+                    cells.set_text(col, ch.encode_utf8(&mut buf), true, self.attributes());
+                    cells.set_cell(col.checked_add(1)?, Cell::wide_continuation());
+                }
                 Some(())
             }
         }
     }
+
+    /// Whether this is a continuation as one is sent: empty, with default colours and no style.
+    fn plain_continuation(&self) -> bool {
+        self.kind == CellKind::Continuation
+            && self.text.is_empty()
+            && self.fg == WireColor::Default
+            && self.bg == WireColor::Default
+            && self.underline_color == WireColor::Default
+            && self.style == WireStyle::default()
+    }
+
+    fn attributes(&self) -> Attributes {
+        self.style
+            .on(Attributes::new(self.fg.into(), self.bg.into())
+                .with_underline_color(self.underline_color.into()))
+    }
 }
 
-/// `count` consecutive identical cells. A run is never empty: a zero count fails to decode.
+/// `count` consecutive identical cells, or `count` cells (or glyphs) of the text's characters.
+///
+/// For [`CellKind::Chars`] and [`CellKind::WideChars`] the text's characters go in turn. A run is
+/// never empty: a zero count fails to decode, as does a cell's text longer than a cluster, or a
+/// run's text whose characters are not `count`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawRun")]
 pub struct Run {
     pub count: NonZeroU16,
     pub cell: WireCell,
 }
 
+/// A [`Run`] as it decodes, before its text is checked against its kind.
+#[derive(Deserialize)]
+struct RawRun {
+    count: NonZeroU16,
+    cell: WireCell,
+}
+
+impl TryFrom<RawRun> for Run {
+    type Error = &'static str;
+
+    fn try_from(raw: RawRun) -> Result<Self, Self::Error> {
+        let text = raw.cell.text.as_str();
+        let fits = match raw.cell.kind {
+            CellKind::Narrow | CellKind::Wide | CellKind::Continuation => {
+                text.len() <= Cell::CLUSTER_CAPACITY
+            }
+            CellKind::Chars | CellKind::WideChars => {
+                text.chars().count() == usize::from(raw.count.get())
+            }
+        };
+        if fits {
+            Ok(Self {
+                count: raw.count,
+                cell: raw.cell,
+            })
+        } else {
+            Err("a run whose text does not fit its kind")
+        }
+    }
+}
+
 impl Run {
+    /// The cells the run covers.
+    fn cells(&self) -> usize {
+        let count = usize::from(self.count.get());
+        match self.cell.kind {
+            CellKind::WideChars => count.saturating_mul(2),
+            CellKind::Narrow | CellKind::Wide | CellKind::Continuation | CellKind::Chars => count,
+        }
+    }
+
     /// Add one more cell. `false` if the run already holds `u16::MAX` cells, the most `count`
     /// can say; the caller then starts a new run.
     fn extend(&mut self) -> bool {
@@ -589,94 +880,222 @@ impl RowDiff {
             }
             fits
         });
-        let mut runs: Vec<Run> = Vec::new();
-        let mut previous: Option<(CellRef<'_>, u16)> = None;
-        for (col, cell) in cells.iter().enumerate() {
-            let link = links
-                .and_then(|links| links.cells.get(col).copied())
-                .unwrap_or(0);
-            let extended =
-                previous == Some((cell, link)) && runs.last_mut().is_some_and(Run::extend);
-            if !extended {
-                runs.push(Run {
-                    count: NonZeroU16::MIN,
-                    cell: WireCell {
-                        link,
-                        ..WireCell::of(cell)
-                    },
-                });
-            }
-            previous = Some((cell, link));
-        }
+        let (runs, links) = runs_of(cells, links);
         Self {
             row,
             wrapped,
             runs,
-            links: links.map_or_else(Vec::new, |links| {
-                links
-                    .table
-                    .iter()
-                    .map(|link| WireLink {
-                        uri: link.uri.clone(),
-                        id: link.id.clone(),
-                    })
-                    .collect()
-            }),
+            links,
         }
     }
 
-    /// The row these runs decode to, exactly `cols` cells, with its links, or `None` if the runs
-    /// are malformed, don't cover the row exactly, or name a link the row does not have. Work is
-    /// bounded by `cols`: every run is non-empty, and each cell's text by
-    /// [`Cell::CLUSTER_CAPACITY`].
+    /// The row these runs decode to, exactly `cols` cells, with its links (see [`cells_of`]).
     fn decode(&self, cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
-        if self.links.len() > MAX_ROW_LINKS {
-            return None;
-        }
-        let mut cells = Cells::new(usize::from(cols));
-        let mut linked = Vec::new();
-        let mut at = 0_usize;
-        for run in &self.runs {
-            let end = at
-                .checked_add(usize::from(run.count.get()))
-                .filter(|&end| end <= usize::from(cols))?;
-            if usize::from(run.cell.link) > self.links.len() {
-                return None;
-            }
-            for col in at..end {
-                run.cell.write_to(&mut cells, col)?;
-                if !self.links.is_empty() {
-                    linked.push(run.cell.link);
-                }
-            }
-            at = end;
-        }
-        if at != usize::from(cols) {
-            return None;
-        }
-        let links = (!self.links.is_empty()).then(|| {
-            Arc::new(RowLinks {
-                table: self
-                    .links
-                    .iter()
-                    .map(|link| Link {
-                        uri: link.uri.clone(),
-                        id: link.id.clone(),
-                    })
-                    .collect(),
-                cells: linked,
-            })
-        });
-        Some((cells, links))
+        cells_of(&self.runs, &self.links, cols)
     }
 
     /// The bytes of hyperlinks this row carries.
     fn link_bytes(&self) -> usize {
-        self.links
-            .iter()
-            .map(|link| link.uri.len().saturating_add(link.id.len()))
-            .sum()
+        link_bytes(&self.links)
     }
+}
+
+/// `cells` as runs, with `links`: identical cells as one run, same-looking narrow characters as one
+/// run of their text ([`CellKind::Chars`]), and same-looking wide glyphs as one
+/// ([`CellKind::WideChars`]); each run's cells name the same link.
+fn runs_of(cells: &Cells, links: Option<&RowLinks>) -> (Vec<Run>, Vec<WireLink>) {
+    let link_at = |col: usize| {
+        links
+            .and_then(|links| links.cells.get(col).copied())
+            .unwrap_or(0)
+    };
+    // The one character of a cell that holds exactly one.
+    let lone_char = |cell: CellRef<'_>| {
+        let mut chars = cell.contents().chars();
+        chars.next().filter(|_| chars.next().is_none())
+    };
+    let mut runs: Vec<Run> = Vec::new();
+    // The last cell, while the last run is of cells identical to it.
+    let mut previous: Option<(CellRef<'_>, u16)> = None;
+    // The look (attributes and link) of the last run, while it is of characters, or a lone narrow
+    // character that may begin one: what a cell must have to join it.
+    let mut look: Option<(Attributes, u16)> = None;
+    // The text of the last run while it is a run of characters still growing, kept here and not
+    // in the run, so that each character costs a push rather than a copy of the text.
+    let mut open: Option<String> = None;
+    let mut col = 0_usize;
+    while let Some(cell) = cells.get(col) {
+        let link = link_at(col);
+        let wide_glyph = cell.is_wide();
+        let narrow = !wide_glyph && !cell.is_wide_continuation();
+        // Compared before anything is built: most cells join the run before them.
+        let same_look = look == Some((cell.attributes(), link));
+        let joined = match runs.last_mut() {
+            Some(last)
+                if same_look
+                    && narrow
+                    && !(last.cell.kind != CellKind::Chars && previous == Some((cell, link))) =>
+            {
+                match (last.cell.kind, lone_char(cell)) {
+                    (CellKind::Chars, Some(ch)) => grow(last, &mut open, ch, 1),
+                    // A lone character, then another that looks the same: a run of characters.
+                    (CellKind::Narrow, Some(ch)) if last.count == NonZeroU16::MIN => {
+                        last.cell.kind = CellKind::Chars;
+                        open = Some(last.cell.text.as_str().to_owned());
+                        grow(last, &mut open, ch, 1)
+                    }
+                    _ => None,
+                }
+            }
+            Some(last)
+                if same_look
+                    && wide_glyph
+                    && last.cell.kind == CellKind::WideChars
+                    && plain_continuation_after(cells, col, link, &link_at) =>
+            {
+                lone_char(cell).and_then(|ch| grow(last, &mut open, ch, 2))
+            }
+            Some(last) if previous == Some((cell, link)) => {
+                if last.extend() {
+                    col = col.saturating_add(1);
+                    continue;
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(used) = joined {
+            previous = None;
+            col = col.saturating_add(used);
+            continue;
+        }
+        seal(&mut runs, &mut open);
+        let wire = WireCell {
+            link,
+            ..WireCell::of(cell)
+        };
+        let wide = lone_char(cell)
+            .filter(|_| wide_glyph && plain_continuation_after(cells, col, link, &link_at));
+        if let Some(ch) = wide {
+            runs.push(Run {
+                count: NonZeroU16::MIN,
+                cell: WireCell {
+                    kind: CellKind::WideChars,
+                    ..wire
+                },
+            });
+            open = Some(ch.to_string());
+            look = Some((cell.attributes(), link));
+            previous = None;
+            col = col.saturating_add(2);
+        } else {
+            look = (narrow && lone_char(cell).is_some()).then(|| (cell.attributes(), link));
+            runs.push(Run {
+                count: NonZeroU16::MIN,
+                cell: wire,
+            });
+            previous = Some((cell, link));
+            col = col.saturating_add(1);
+        }
+    }
+    seal(&mut runs, &mut open);
+    let links = links.map_or_else(Vec::new, |links| {
+        links
+            .table
+            .iter()
+            .map(|link| WireLink {
+                uri: link.uri.clone(),
+                id: link.id.clone(),
+            })
+            .collect()
+    });
+    (runs, links)
+}
+
+/// Whether the cell after `col` is the plain continuation of a wide glyph at `col` with `link`:
+/// empty, in the default style, of the same link, as a run of wide glyphs implies it.
+fn plain_continuation_after(
+    cells: &Cells,
+    col: usize,
+    link: u16,
+    link_at: &dyn Fn(usize) -> u16,
+) -> bool {
+    let next = col.saturating_add(1);
+    cells.get(next).is_some_and(|c| {
+        c.is_wide_continuation() && !c.has_contents() && c.attributes() == Attributes::default()
+    }) && link_at(next) == link
+}
+
+/// The open run of characters takes `ch`: its count in the run, its text in `open`. The cells it
+/// took (`used`), or `None` if the run is full.
+fn grow(last: &mut Run, open: &mut Option<String>, ch: char, used: usize) -> Option<usize> {
+    last.count = last.count.checked_add(1)?;
+    open.get_or_insert_with(String::new).push(ch);
+    Some(used)
+}
+
+/// Store the open run of characters' text in it ([`runs_of`]).
+fn seal(runs: &mut [Run], open: &mut Option<String>) {
+    if let (Some(text), Some(last)) = (open.take(), runs.last_mut()) {
+        // A row's characters, at most 4 bytes each: within a run's limit.
+        last.cell.text = CellText::run(&text).unwrap_or_default();
+    }
+}
+
+/// The row `runs` decode to, exactly `cols` cells, with its `links`, or `None` if the runs are
+/// malformed, don't cover the row exactly, or name a link the row does not have. Work is bounded
+/// by `cols`: every run is non-empty, and each cell's text by [`Cell::CLUSTER_CAPACITY`].
+fn cells_of(runs: &[Run], links: &[WireLink], cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
+    if links.len() > MAX_ROW_LINKS {
+        return None;
+    }
+    let mut cells = Cells::new(usize::from(cols));
+    let mut linked = Vec::new();
+    let mut at = 0_usize;
+    for run in runs {
+        let end = at
+            .checked_add(run.cells())
+            .filter(|&end| end <= usize::from(cols))?;
+        if usize::from(run.cell.link) > links.len() {
+            return None;
+        }
+        match run.cell.kind {
+            CellKind::Chars | CellKind::WideChars => run.cell.write_to(&mut cells, at)?,
+            CellKind::Narrow | CellKind::Wide | CellKind::Continuation => {
+                for col in at..end {
+                    run.cell.write_to(&mut cells, col)?;
+                }
+            }
+        }
+        if !links.is_empty() {
+            linked.extend(std::iter::repeat_n(run.cell.link, end.saturating_sub(at)));
+        }
+        at = end;
+    }
+    if at != usize::from(cols) {
+        return None;
+    }
+    let links = (!links.is_empty()).then(|| {
+        Arc::new(RowLinks {
+            table: links
+                .iter()
+                .map(|link| Link {
+                    uri: link.uri.clone(),
+                    id: link.id.clone(),
+                })
+                .collect(),
+            cells: linked,
+        })
+    });
+    Some((cells, links))
+}
+
+/// The bytes of hyperlinks `links` carry.
+fn link_bytes(links: &[WireLink]) -> usize {
+    links
+        .iter()
+        .map(|link| link.uri.len().saturating_add(link.id.len()))
+        .fold(0_usize, usize::saturating_add)
 }
 
 /// Whether `cell` is what a blank grid holds: no text, neither half of a wide glyph, the default
@@ -936,6 +1355,10 @@ pub struct ScreenDiff {
     pub bell_count: u64,
     /// The remote shell's exit code, set on the final (shutdown) frame.
     pub exit_code: Option<u32>,
+    /// Where the server's history stands, if that changed.
+    pub history: Option<HistoryMark>,
+    /// How the PTY takes typed keys, if that changed.
+    pub tty: Option<TtyModes>,
     /// The cursor at the target state.
     pub cursor: (u16, u16),
     /// The modes at the target state.
@@ -986,6 +1409,8 @@ impl TerminalScreen {
             clipboard: (self.clipboard != base.clipboard).then(|| self.clipboard.clone()),
             bell_count: self.bell_count,
             exit_code: self.exit_code,
+            history: (self.history != base.history).then_some(self.history),
+            tty: self.tty.filter(|_| self.tty != base.tty),
             cursor: self.grid.cursor_position(),
             modes: self.grid.modes().into(),
             shifts,
@@ -1055,6 +1480,12 @@ impl TerminalScreen {
         }
         if diff.exit_code.is_some() {
             self.exit_code = diff.exit_code;
+        }
+        if let Some(history) = diff.history {
+            self.history = history;
+        }
+        if diff.tty.is_some() {
+            self.tty = diff.tty;
         }
     }
 }
@@ -1136,6 +1567,8 @@ mod tests {
             title: None,
             icon: None,
             clipboard: None,
+            history: None,
+            tty: None,
             bell_count: 0,
             exit_code: None,
             cursor: (0, 0),
@@ -1268,7 +1701,8 @@ mod tests {
             };
             let resize = resize.map(|(rows, cols)| Size::new(rows, cols));
             let diff = ScreenDiff {
-                resize, title, icon, clipboard, bell_count, exit_code, cursor, modes, shifts, rows,
+                resize, title, icon, clipboard, bell_count, exit_code, history: None, tty: None, cursor, modes,
+                shifts, rows,
             };
             let mut screen = TerminalScreen::default();
             screen.apply(&diff); // must not panic on adversarial input
@@ -1633,6 +2067,8 @@ mod tests {
         clipboard: Option<String>,
         bell_count: u64,
         exit_code: Option<u32>,
+        history: Option<(u64, u32)>,
+        tty: Option<(bool, bool)>,
         cursor: (u16, u16),
         modes: RawModes,
         shifts: Vec<RawShift>,
@@ -1690,6 +2126,8 @@ mod tests {
             clipboard: None,
             bell_count: 0,
             exit_code: None,
+            history: None,
+            tty: None,
             cursor: (0, 0),
             modes: RawModes {
                 hide_cursor: false,
@@ -1948,8 +2386,119 @@ mod tests {
         let bytes = postcard::to_allocvec(&text).unwrap();
         assert_eq!(bytes, postcard::to_allocvec("日本").unwrap());
         assert_eq!(postcard::from_bytes::<CellText>(&bytes).unwrap(), text);
-        let long = postcard::to_allocvec(&"x".repeat(Cell::CLUSTER_CAPACITY + 1)).unwrap();
+        // A run's text may be longer than a cluster, one character a cell, but no longer than a
+        // row's; a cell's own text is held to a cluster by its run.
+        let row = postcard::to_allocvec(&"x".repeat(MAX_RUN_TEXT)).unwrap();
+        assert!(postcard::from_bytes::<CellText>(&row).is_ok());
+        let long = postcard::to_allocvec(&"x".repeat(MAX_RUN_TEXT + 1)).unwrap();
         assert!(postcard::from_bytes::<CellText>(&long).is_err());
+    }
+
+    fn wire_run(count: u16, kind: CellKind, text: &str) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct Raw<'a> {
+            count: u16,
+            text: &'a str,
+            kind: CellKind,
+            colors: [u8; 3],
+            style: u16,
+            link: u16,
+        }
+        postcard::to_allocvec(&Raw {
+            count,
+            text,
+            kind,
+            colors: [0; 3],
+            style: 0,
+            link: 0,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_run_s_text_must_fit_its_kind() {
+        let run = |count, kind, text| postcard::from_bytes::<Run>(&wire_run(count, kind, text));
+        assert!(run(3, CellKind::Chars, "abc").is_ok());
+        assert!(
+            run(2, CellKind::Chars, "abc").is_err(),
+            "more characters than cells"
+        );
+        assert!(
+            run(4, CellKind::Chars, "abc").is_err(),
+            "fewer characters than cells"
+        );
+        assert!(run(2, CellKind::WideChars, "日本").is_ok());
+        assert!(run(3, CellKind::WideChars, "日本").is_err());
+        let cluster = "x".repeat(Cell::CLUSTER_CAPACITY + 1);
+        assert!(
+            run(1, CellKind::Narrow, &cluster).is_err(),
+            "a cell's text is a cluster"
+        );
+        assert!(
+            run(129, CellKind::Chars, &"x".repeat(129)).is_ok(),
+            "a run's may be longer"
+        );
+    }
+
+    #[test]
+    fn runs_of_characters_decode_to_the_cells_they_name() {
+        let target = screen_from(
+            4,
+            12,
+            "ab\x1b[31mcd日本\x1b[m\u{1f468}\u{200d}\u{1f469}x".as_bytes(),
+        );
+        let diff = target.diff_from(&TerminalScreen::default());
+        let kinds: Vec<(CellKind, u16)> = diff.rows[0]
+            .runs
+            .iter()
+            .map(|r| (r.cell.kind, r.count.get()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (CellKind::Chars, 2),
+                (CellKind::Chars, 2),
+                (CellKind::WideChars, 2),
+                (CellKind::Wide, 1),
+                (CellKind::Continuation, 1),
+                (CellKind::Narrow, 1),
+                (CellKind::Narrow, 1),
+            ],
+            "a cluster of several characters goes as a cell of its own"
+        );
+        let mut client = TerminalScreen::default();
+        client.apply(&diff);
+        assert_eq!(client, target);
+        // A run of characters that overruns the row drops the frame.
+        let mut long = diff.clone();
+        long.rows[0].runs[0].count = NonZeroU16::new(13).unwrap();
+        long.rows[0].runs[0].cell.text = CellText::run(&"a".repeat(13)).unwrap();
+        let mut client = TerminalScreen::default();
+        client.apply(&long);
+        assert_eq!(client, TerminalScreen::default());
+    }
+
+    #[test]
+    fn a_dictionary_from_kept_encodings_is_the_one_made_afresh() {
+        let mut kept = RowEncodings::default();
+        let mut emu = ServerTerminal::new(10, 30, 0).unwrap();
+        for n in 0..40 {
+            emu.process(format!("line {n} \x1b[3{}mcolour\x1b[m\r\n", n % 7).as_bytes());
+            if n % 3 == 0 {
+                emu.process(b"\x1b[2;5Hedit");
+            }
+            let screen = emu.snapshot();
+            let rows: Vec<u16> = (0..10).filter(|r| (r + n) % 4 == 0).collect();
+            assert_eq!(
+                screen.dictionary(&rows, &mut kept),
+                screen.dictionary(&rows, &mut RowEncodings::default()),
+                "step {n}"
+            );
+        }
+        assert!(
+            kept.kept.len() <= 10,
+            "only the newest dictionary's rows are kept"
+        );
     }
 
     #[test]
@@ -1959,10 +2508,11 @@ mod tests {
         assert_eq!(diff.rows.len(), 1, "only the changed row is sent");
         assert_eq!(
             diff.rows[0].runs.len(),
-            3,
-            "'a', 'b', then one run of 78 blanks"
+            2,
+            "'ab' as a run of characters, then one run of 78 blanks"
         );
-        assert_eq!(diff.rows[0].runs[2].count.get(), 78);
+        assert_eq!(diff.rows[0].runs[0].cell.kind, CellKind::Chars);
+        assert_eq!(diff.rows[0].runs[1].count.get(), 78);
     }
 
     #[test]

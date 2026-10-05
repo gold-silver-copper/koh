@@ -340,3 +340,57 @@ fn a_program_that_asked_hears_of_a_resize_on_its_input() {
             server.stop().await;
         });
 }
+
+#[test]
+fn scrollback_shows_output_that_scrolled_off_and_again_after_a_reattach() {
+    crate::harness::runtime().expect("runtime").block_on(async {
+        let net = FaultNet::new(Profile::default(), 7);
+        let (server, mut client) = crate::harness::session(&net, &["sh"])
+            .await
+            .expect("session");
+        client
+            .send(b"i=0; while [ $i -lt 200 ]; do echo old line $i; i=$((i+1)); done\r")
+            .await
+            .expect("send");
+        assert!(client
+            .wait_until(WAIT, |t| t.contains("old line 199"))
+            .await
+            .is_some());
+        // Ctrl-^ [ opens the view; g goes to the oldest row.
+        client.send(b"\x1e[g").await.expect("send");
+        let top = client.wait_until(WAIT, oldest).await;
+        assert!(
+            top.is_some(),
+            "the view never showed the oldest row:\n{}",
+            client.screen()
+        );
+        client.send(b"q").await.expect("send");
+        client.drop_first_connection();
+        // Once reattached, the view fetches the history afresh.
+        let mut shown = false;
+        for _ in 0..150 {
+            let _ = client.send(b"q\x1e[g").await;
+            if client
+                .wait_until(Duration::from_millis(200), oldest)
+                .await
+                .is_some()
+            {
+                shown = true;
+                break;
+            }
+        }
+        assert!(
+            shown,
+            "no scrollback after the reattach:\n{}",
+            client.screen()
+        );
+        let _ = client.send(b"q").await;
+        let _ = client.finish().await;
+        server.stop().await;
+    });
+}
+
+/// Whether `screen` shows the first line the scrollback test wrote.
+fn oldest(screen: &str) -> bool {
+    screen.lines().any(|line| line.trim_end() == "old line 0")
+}

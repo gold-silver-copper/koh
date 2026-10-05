@@ -39,3 +39,10 @@ path = "fuzz_targets/server_process.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "history_apply"
+path = "fuzz_targets/history_apply.rs"
+test = false
+doc = false
+bench = false

@@ -78,11 +78,12 @@ reads it, so the rest of the case is still compared. A sequence split between tw
 is read whole, and an ESC inside a sequence starts the next one, as in fux-vt. The driver says how
 many times each applied. Reflow is exempted without dropping resizes: from a case's first resize
 on, the case runs on the alternate screen, which resizes without reflow. Once the commit compared
-against has a change, its exemption comes off the list.
+against has a change, its exemption comes off the list. Against `main` (which has the rest) only
+reflow remains, for fux-vt 0.3.1's fix: a shrink brings no history row back above the cursor.
 
 ## The planted bugs
 
-`plants/` holds five bugs, each a patch to koh; `testing/oracle.sh --plants` applies each to a
+`plants/` holds six bugs, each a patch to koh; `testing/oracle.sh --plants` applies each to a
 worktree of `HEAD`, builds a side from it, and runs the oracle with `HEAD` as the base. Each must
 be found:
 
@@ -93,6 +94,7 @@ be found:
 | `03-lost-style-bit` | strikeout is not carried on the wire |
 | `04-wrong-cursor` | a cursor in the last two columns is put in the one before them |
 | `05-missed-resize` | the server misses a resize that makes the screen taller |
+| `06-stale-dirty-rows` | a snapshot from the rows changed since the last takes only the first of them |
 
 A planted bug that is no longer found means the oracle lost sight of something: fix the oracle,
 not the patch.

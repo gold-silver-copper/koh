@@ -7,7 +7,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use iroh::endpoint::{
-    presets, BindOpts, Connection, IdleTimeout, PathId, QuicTransportConfig, VarInt,
+    presets, AckFrequencyConfig, BindOpts, Connection, IdleTimeout, PathId, QuicTransportConfig,
+    VarInt,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 
@@ -23,13 +24,26 @@ fn koh_transport_config(accept: bool) -> QuicTransportConfig {
     // From a `u32` of milliseconds, unlike from a `Duration`, it cannot fail.
     const IDLE_TIMEOUT_MS: u32 = 300_000;
     let (uni, bidi) = if accept { (1, 0) } else { (8, 1) };
-    QuicTransportConfig::builder()
+    let config = QuicTransportConfig::builder()
         .keep_alive_interval(Duration::from_secs(5))
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))))
         .max_concurrent_uni_streams(VarInt::from_u32(uni))
-        .max_concurrent_bidi_streams(VarInt::from_u32(bidi))
-        .build()
+        .max_concurrent_bidi_streams(VarInt::from_u32(bidi));
+    // The server takes a frame's delivery as its acknowledgement, so it asks the client to
+    // acknowledge within a couple of milliseconds rather than QUIC's 25: the next frame is then
+    // diffed against the newest screen, and a frame is not resent while its acknowledgement waits.
+    // Every other packet is still acknowledged together, as by default.
+    if accept {
+        let mut frequency = AckFrequencyConfig::default();
+        frequency.max_ack_delay(Some(CLIENT_ACK_DELAY));
+        config.ack_frequency_config(Some(frequency)).build()
+    } else {
+        config.build()
+    }
 }
+
+/// How soon the server asks the client's QUIC stack to acknowledge what it got.
+const CLIENT_ACK_DELAY: Duration = Duration::from_millis(2);
 
 /// The ALPN, which is the protocol version ([`crate::proto`]): a peer on another fails the TLS
 /// handshake instead of misparsing mid-session.

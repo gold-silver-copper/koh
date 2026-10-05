@@ -421,6 +421,16 @@ impl Pty {
         }
     }
 
+    /// How the PTY takes typed keys now, as the program set it: echo and line mode. `None` if the
+    /// modes cannot be read.
+    pub fn tty_modes(&self) -> Option<crate::terminal::TtyModes> {
+        let modes = fuxix::terminal::attributes(&self.master).ok()?;
+        Some(crate::terminal::TtyModes {
+            echo: modes.echoes(),
+            line: modes.line_mode(),
+        })
+    }
+
     /// Propagate a window-size change; the kernel raises `SIGWINCH` in the child.
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
         fuxix::terminal::set_window_size(&self.master, rows, cols)

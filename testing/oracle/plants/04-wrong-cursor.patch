@@ -1,8 +1,8 @@
 diff --git i/src/terminal/mod.rs w/src/terminal/mod.rs
-index 395a25f..df02c46 100644
+index 670208f..c8ce13a 100644
 --- i/src/terminal/mod.rs
 +++ w/src/terminal/mod.rs
-@@ -874,7 +874,8 @@ impl TerminalScreen {
+@@ -1480,7 +1480,8 @@ impl TerminalScreen {
          }
          let (crow, ccol) = diff.cursor;
          self.grid

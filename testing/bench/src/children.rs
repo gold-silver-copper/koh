@@ -22,7 +22,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Context as _};
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
 use koh::predict::{DisplayPreference, Overlay};
-use koh::proto::{decode_frame, encode_frame, Frame, FrameNum, InputSeq};
+use koh::proto::{decode_server, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg};
 use koh::terminal::{ServerTerminal, Size, TerminalScreen};
 
 use crate::recording::Recording;
@@ -147,6 +147,7 @@ fn serve(
     let mut emu =
         ServerTerminal::new(workload.rows, workload.cols, 1000).map_err(|e| anyhow!("{e}"))?;
     let mut base = TerminalScreen::default();
+    let mut encoder = FrameEncoder::default();
     let mut frames = Vec::new();
     let mut num = FrameNum::BLANK;
     let mut fed = 0usize;
@@ -174,7 +175,7 @@ fn serve(
                 echo_ack: InputSeq::default(),
                 diff: screen.diff_from(&base),
             };
-            frames.push(encode_frame(&frame).map_err(|e| anyhow!("{e}"))?);
+            frames.push(encoder.encode(&frame, &base).map_err(|e| anyhow!("{e}"))?);
             base = screen;
             num = next;
         }
@@ -219,14 +220,21 @@ fn paint(workload: &Workload, frames: &[Vec<u8>]) -> anyhow::Result<usize> {
     let mut client = ClientSession::new(DisplayPreference::Never, size);
     let now = Instant::now();
     for bytes in frames {
-        let frame = decode_frame(bytes).map_err(|e| anyhow!("{e}"))?;
-        let resized = frame.diff.resize;
-        if let Some(size) = resized {
+        // As the client takes a frame's stream: inflated against its base's dictionary, then
+        // applied. Each frame is on the one before, which the client holds.
+        let ServerMsg::Frame { base, rows, body } =
+            decode_server(bytes).map_err(|e| anyhow!("{e}"))?
+        else {
+            anyhow::bail!("history rows among the frames");
+        };
+        let before = client.state().size();
+        client.on_frame_stream(now, base, &rows, &body);
+        let size = client.state().size();
+        if size != before {
             sink.size.set(size);
             client.on_resize(size);
             terminal.window_resized();
         }
-        client.on_frame(now, &frame);
         while client.pop_outgoing().is_some() {}
         terminal.render(client.state(), &Overlay::empty(), None)?;
     }

@@ -9,6 +9,7 @@ pub mod cli;
 mod io;
 mod probe;
 mod render;
+mod scrollback;
 mod session;
 
 pub use backend::{DefaultBackend, KohBackend};
@@ -20,7 +21,7 @@ pub use session::{ClientSession, InputOutcome, TickResult};
 use std::time::{Duration, Instant};
 
 use crate::predict::{DisplayPreference, Overlay};
-use crate::proto::{decode_frame, encode_client, Frame, MAX_FRAME, SESSION_ENDED};
+use crate::proto::{decode_server, encode_client, ServerMsg, MAX_FRAME, SESSION_ENDED};
 use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::ALPN;
 use iroh::endpoint::{Connection, SendStream};
@@ -36,6 +37,9 @@ pub(crate) const ESCAPE_PREFIX: u8 = 0x1e;
 /// After the escape prefix, suspends the client (as mosh does): in raw mode `Ctrl-Z` is a plain
 /// byte, not SIGTSTP.
 pub(crate) const SUSPEND_KEY: u8 = 0x1a;
+
+/// After [`ESCAPE_PREFIX`], opens the scrollback view.
+pub(crate) const SCROLLBACK_KEY: u8 = b'[';
 
 /// How long a single reconnect dial may run before it is abandoned and retried.
 const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -338,10 +342,15 @@ pub async fn run_client<T: ClientTerminal>(
     let mut conn = initial;
     // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
     let mut attempt: u32 = 0;
+    // Whether typing was shown as predicted when the last connection dropped.
+    let mut trusted = false;
     loop {
         // A fresh session per connection: the server repaints the live screen on each attach.
         let size = term.size().unwrap_or(initial_size);
         let mut session = ClientSession::new(pref, size);
+        if trusted {
+            session.carry_trust();
+        }
 
         let conn_started = Instant::now();
         match drive_connection(
@@ -364,6 +373,7 @@ pub async fn run_client<T: ClientTerminal>(
                 return Ok(code);
             }
             Disposition::LinkLost => {
+                trusted = session.trusted();
                 conn.close(0u32.into(), b"reconnecting");
                 let dwell = conn_started.elapsed();
                 attempt = next_attempt_after_drop(attempt, dwell);
@@ -414,7 +424,7 @@ async fn drive_connection<T: ClientTerminal>(
     };
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
     let _writer = AbortOnDrop(tokio::spawn(write_client_stream(send, writer_rx)));
-    let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(FRAME_QUEUE);
+    let (frame_tx, mut frame_rx) = mpsc::channel::<ServerMsg>(FRAME_QUEUE);
     let _reader = AbortOnDrop(tokio::spawn(read_frames(conn.clone(), frame_tx)));
 
     // Wall-clock time, which keeps running while the process is frozen (see `STALE_AFTER_FREEZE`).
@@ -447,7 +457,10 @@ async fn drive_connection<T: ClientTerminal>(
         // Repaint on new content, while a banner is up, or once more to clear a stale banner.
         let status_now = tick.status.is_some();
         if session.dirty || status_now || session.status_was_shown {
-            term.render(session.state(), &session.overlay(), tick.status.as_deref())?;
+            match session.view() {
+                Some(view) => term.render(&view, &Overlay::empty(), tick.status.as_deref())?,
+                None => term.render(session.state(), &session.overlay(), tick.status.as_deref())?,
+            }
             session.status_was_shown = status_now;
             session.dirty = false;
             // Only once synced: the first synced frame primes the hook, so bells from before this
@@ -508,7 +521,12 @@ async fn drive_connection<T: ClientTerminal>(
                     tracing::info!(reason = ?conn.close_reason(), "link lost; will reconnect");
                     return Ok(disposition);
                 };
-                session.on_frame(Instant::now(), &frame);
+                match frame {
+                    ServerMsg::Frame { base, rows, body } => {
+                        session.on_frame_stream(Instant::now(), base, &rows, &body);
+                    }
+                    ServerMsg::History(reply) => session.on_history(&reply),
+                }
             }
             maybe = resize_rx.recv() => {
                 if maybe.is_some() {
@@ -547,9 +565,9 @@ async fn write_client_stream(mut send: SendStream, mut queue: mpsc::Receiver<Vec
     let _ = send.finish();
 }
 
-/// Accept the server's frame streams, each read on its own task so a stalled or reset stream never
-/// holds up a newer frame. Ends when the connection closes.
-async fn read_frames(conn: Connection, frames: mpsc::Sender<Frame>) {
+/// Accept the server's streams (frames, and history rows), each read on its own task so a stalled or
+/// reset stream never holds up a newer frame. Ends when the connection closes.
+async fn read_frames(conn: Connection, frames: mpsc::Sender<ServerMsg>) {
     while let Ok(mut recv) = conn.accept_uni().await {
         let frames = frames.clone();
         tokio::spawn(async move {
@@ -557,9 +575,9 @@ async fn read_frames(conn: Connection, frames: mpsc::Sender<Frame>) {
             let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
                 return;
             };
-            match decode_frame(&bytes) {
-                Ok(frame) => {
-                    let _ = frames.send(frame).await;
+            match decode_server(&bytes) {
+                Ok(msg) => {
+                    let _ = frames.send(msg).await;
                 }
                 Err(e) => tracing::debug!(error = %e, "dropping an undecodable frame"),
             }

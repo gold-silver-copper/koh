@@ -318,6 +318,8 @@ impl Remote {
             FaultProfile {
                 loss: profile.loss,
                 delay: profile.delay,
+                rate: profile.rate,
+                queue: Duration::from_millis(100),
                 ..FaultProfile::default()
             },
             seed,

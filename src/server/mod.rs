@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::proto::{
-    encode_frame, encode_history, frame_interval, retry_after, ClientDecoder, ClientMsg, Frame,
-    FrameNum, FrameScreen, InputSeq, ProtoError, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
-    SESSION_ENDED, WINDOW_CELLS,
+    dictionary_for, encode_frame_with, encode_history, frame_interval, retry_after, ClientDecoder,
+    ClientMsg, Frame, FrameNum, FrameScreen, InputSeq, ProtoError, FRAME_WINDOW, HEARTBEAT,
+    MAX_PENDING_HISTORY, SESSION_ENDED, WINDOW_CELLS,
 };
 use crate::terminal::{HistoryRequest, Size, TerminalScreen};
 use iroh::endpoint::RecvStream;
@@ -189,6 +189,8 @@ pub(crate) struct ServerConn {
     history: VecDeque<HistoryRequest>,
     /// An answer is on its way to the client; the next waits for it to be delivered.
     history_busy: bool,
+    /// The dictionary of the base frames are diffed against, made once for the frames on it.
+    dictionary: Option<(FrameNum, Arc<[u8]>)>,
 }
 
 impl Default for ServerConn {
@@ -214,6 +216,7 @@ impl ServerConn {
             final_frame: None,
             history: VecDeque::new(),
             history_busy: false,
+            dictionary: None,
         }
     }
 
@@ -350,6 +353,25 @@ impl ServerConn {
         Some(frame)
     }
 
+    /// `frame`, just polled, encoded for its stream against its base's dictionary.
+    fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>, ProtoError> {
+        let dictionary = match &self.dictionary {
+            Some((num, dictionary)) if *num == frame.base => Arc::clone(dictionary),
+            _ => {
+                let screen = if frame.base == self.acked.num {
+                    &self.acked.screen
+                } else {
+                    // Polled frames are always on the acknowledged one; a blank base otherwise.
+                    &Arc::default()
+                };
+                let dictionary: Arc<[u8]> = dictionary_for(frame.base, screen).into();
+                self.dictionary = Some((frame.base, Arc::clone(&dictionary)));
+                dictionary
+            }
+        };
+        encode_frame_with(frame, &dictionary)
+    }
+
     /// The newest frame the client has acknowledged.
     const fn acked(&self) -> FrameNum {
         self.acked.num
@@ -417,6 +439,9 @@ pub async fn run_attached(
     let mut had_client_stream = false;
     let mut read_buf = vec![0u8; 16 * 1024];
     let mut in_flight: VecDeque<(FrameNum, CancellationToken)> = VecDeque::new();
+    // Each frame's task says here when the client has all of it: its acknowledgement. Unbounded,
+    // but at most one message a frame sent.
+    let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel::<FrameNum>();
     // History answers go one at a time; each one's task says here when it is delivered.
     let (history_tx, mut history_rx) = tokio::sync::mpsc::channel::<()>(1);
     let history_cancel = CancellationToken::new();
@@ -441,10 +466,18 @@ pub async fn run_attached(
                     cancel.cancel();
                 }
             }
-            match encode_frame(&frame) {
+            match core.encode(&frame) {
                 Ok(bytes) => {
                     let cancel = CancellationToken::new();
-                    tokio::spawn(send_frame(conn.clone(), bytes, cancel.clone()));
+                    tokio::spawn(send_frame(
+                        conn.clone(),
+                        frame.num,
+                        bytes,
+                        cancel.clone(),
+                        delivered_tx.clone(),
+                        rtt.unwrap_or(Duration::ZERO)
+                            .saturating_add(crate::proto::ACK_DELAY),
+                    ));
                     in_flight.push_back((frame.num, cancel));
                 }
                 Err(e) => tracing::error!(error = %e, "encoding a frame failed"),
@@ -518,6 +551,7 @@ pub async fn run_attached(
                 }
             },
             Some(()) = history_rx.recv() => core.history_delivered(),
+            Some(num) = delivered_rx.recv() => core.ack(num),
             () = tokio::time::sleep_until(wake) => {}
         }
     };
@@ -541,15 +575,25 @@ async fn read_client(
     }
 }
 
-/// Send one frame on its own stream. Cancelling resets the stream, so QUIC stops retransmitting a
-/// frame a newer one has superseded.
-async fn send_frame(conn: iroh::endpoint::Connection, bytes: Vec<u8>, cancel: CancellationToken) {
+/// Send frame `num` on its own stream, and say on `delivered` once the client has all of it.
+/// Cancelling (a newer frame superseded it) resets the stream, so QUIC stops retransmitting it: at
+/// once if it is still being written, else after `grace`.
+async fn send_frame(
+    conn: iroh::endpoint::Connection,
+    num: FrameNum,
+    bytes: Vec<u8>,
+    cancel: CancellationToken,
+    delivered: tokio::sync::mpsc::UnboundedSender<FrameNum>,
+    grace: Duration,
+) {
+    // A frame superseded before it starts is never opened.
     let mut send = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return,
         stream = conn.open_uni() => match stream {
             Ok(stream) => stream,
             Err(_) => return,
         },
-        () = cancel.cancelled() => return,
     };
     let cancelled = tokio::select! {
         written = async {
@@ -563,15 +607,33 @@ async fn send_frame(conn: iroh::endpoint::Connection, bytes: Vec<u8>, cancel: Ca
         }
         () = cancel.cancelled() => true,
     };
-    // Written: wait until the client has it all, or until it is superseded.
-    let cancelled = cancelled
-        || tokio::select! {
-            _ = send.stopped() => false,
-            () = cancel.cancelled() => true,
-        };
-    if cancelled {
-        let _ = send.reset(0u32.into());
+    // Written: wait until the client has it all. All of it delivered (`stopped` with no code) is
+    // the client's acknowledgement: it applies every frame it gets on a base it holds, and keeps a
+    // late one as a base. Superseded once written, it still has `grace` (a round trip and the
+    // acknowledgement's delay) to be delivered, so that through a flood of frames each superseding
+    // the last the server still learns which the client has; then it is reset, so QUIC stops
+    // retransmitting it. Superseded while still being written, it is reset at once.
+    if !cancelled {
+        tokio::select! {
+            stopped = send.stopped() => {
+                if matches!(stopped, Ok(None)) {
+                    let _ = delivered.send(num);
+                }
+                return;
+            }
+            () = cancel.cancelled() => {}
+        }
+        tokio::select! {
+            stopped = send.stopped() => {
+                if matches!(stopped, Ok(None)) {
+                    let _ = delivered.send(num);
+                }
+                return;
+            }
+            () = tokio::time::sleep(grace) => {}
+        }
     }
+    let _ = send.reset(0u32.into());
 }
 
 /// Answer one history request: fetch the rows from the session, and send them on a stream of their
@@ -723,6 +785,76 @@ mod tests {
             None
         );
     }
+
+    /// A server and a client connection on loopback, and the client's endpoint, kept alive.
+    async fn loopback() -> (
+        iroh::endpoint::Connection,
+        iroh::endpoint::Connection,
+        iroh::Endpoint,
+        iroh::Endpoint,
+    ) {
+        use crate::transport_iroh::{
+            bind_endpoint_local, generate_secret_key, loopback_addr, ALPN,
+        };
+        let server = bind_endpoint_local(generate_secret_key().unwrap(), true)
+            .await
+            .unwrap();
+        let client = bind_endpoint_local(generate_secret_key().unwrap(), false)
+            .await
+            .unwrap();
+        let addr = loopback_addr(&server);
+        let (accepted, connected) = tokio::join!(
+            async { server.accept().await.unwrap().await.unwrap() },
+            client.connect(addr, ALPN)
+        );
+        (accepted, connected.unwrap(), server, client)
+    }
+
+    #[test]
+    fn a_delivered_frame_is_acknowledged_and_one_superseded_unwritten_is_not() {
+        use super::send_frame;
+        use tokio_util::sync::CancellationToken;
+        crate::test_runtime::current_thread().block_on(async {
+            let (server, client, _s, _c) = loopback().await;
+            let reader = tokio::spawn(async move {
+                let mut recv = client.accept_uni().await.unwrap();
+                recv.read_to_end(MAX_FRAME_TEST).await.unwrap();
+                client
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let grace = Duration::from_secs(5);
+            let current = CancellationToken::new();
+            tokio::spawn(send_frame(
+                server.clone(),
+                FrameNum(1),
+                vec![1; 100],
+                current,
+                tx.clone(),
+                grace,
+            ));
+            let wait = Duration::from_secs(10);
+            assert_eq!(
+                tokio::time::timeout(wait, rx.recv()).await.ok().flatten(),
+                Some(FrameNum(1))
+            );
+            // Superseded before it was written: never sent, so never acknowledged.
+            let superseded = CancellationToken::new();
+            superseded.cancel();
+            send_frame(
+                server.clone(),
+                FrameNum(2),
+                vec![2; 100],
+                superseded,
+                tx,
+                grace,
+            )
+            .await;
+            assert_eq!(rx.recv().await, None);
+            let _client = reader.await.unwrap();
+        });
+    }
+
+    const MAX_FRAME_TEST: usize = 1024;
 
     #[test]
     fn history_requests_are_answered_one_at_a_time_and_too_many_waiting_is_an_error() {

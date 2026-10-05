@@ -174,7 +174,7 @@ fn serve(
                 echo_ack: InputSeq::default(),
                 diff: screen.diff_from(&base),
             };
-            frames.push(encode_frame(&frame).map_err(|e| anyhow!("{e}"))?);
+            frames.push(encode_frame(&frame, &base).map_err(|e| anyhow!("{e}"))?);
             base = screen;
             num = next;
         }
@@ -219,7 +219,8 @@ fn paint(workload: &Workload, frames: &[Vec<u8>]) -> anyhow::Result<usize> {
     let mut client = ClientSession::new(DisplayPreference::Never, size);
     let now = Instant::now();
     for bytes in frames {
-        let frame = decode_frame(bytes).map_err(|e| anyhow!("{e}"))?;
+        // Each frame is on the one before, which the client holds.
+        let frame = decode_frame(bytes, client.state()).map_err(|e| anyhow!("{e}"))?;
         let resized = frame.diff.resize;
         if let Some(size) = resized {
             sink.size.set(size);

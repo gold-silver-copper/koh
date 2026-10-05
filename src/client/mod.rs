@@ -516,7 +516,9 @@ async fn drive_connection<T: ClientTerminal>(
                     return Ok(disposition);
                 };
                 match frame {
-                    ServerMsg::Frame(frame) => session.on_frame(Instant::now(), &frame),
+                    ServerMsg::Frame { base, body } => {
+                        session.on_frame_stream(Instant::now(), base, &body);
+                    }
                     ServerMsg::History(reply) => session.on_history(&reply),
                 }
             }

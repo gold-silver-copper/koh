@@ -1,10 +1,10 @@
 #![no_main]
 //! Fuzz both directions of the koh/3 wire decode: arbitrary bytes as the client's message stream
-//! (the server's parser) and as a frame's stream contents (the client's parser: bounded inflate
-//! plus postcard). Both must only return errors on bad input, never panic, and never allocate past
-//! their caps.
+//! (the server's parser) and as a server stream (the client's parser: bounded inflate, against a
+//! dictionary for a frame, plus postcard). Both must only return errors on bad input, never
+//! panic, and never allocate past their caps.
 
-use koh::proto::{decode_frame, ClientDecoder};
+use koh::proto::{decode_frame_body, decode_server, ClientDecoder, FrameNum};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -22,5 +22,9 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     let _ = decoder.finish();
-    let _ = decode_frame(data);
+    let _ = decode_server(data);
+    // A frame's body against a dictionary: the first half of the bytes as the dictionary, the
+    // rest as the body, as a server could send against any base.
+    let (dictionary, body) = rest.split_at(rest.len() / 2);
+    let _ = decode_frame_body(FrameNum(1), body, dictionary);
 });

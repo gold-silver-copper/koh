@@ -74,7 +74,7 @@ impl HistoryRow {
         let cells = self
             .runs
             .iter()
-            .map(|run| usize::from(run.count.get()))
+            .map(Run::cells)
             .try_fold(0_usize, usize::checked_add)?;
         u16::try_from(cells)
             .ok()

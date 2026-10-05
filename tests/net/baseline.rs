@@ -165,6 +165,7 @@ fn baseline() {
                 jitter: Duration::from_millis(100),
                 dup: 0.02,
                 reorder: 0.02,
+                ..Profile::default()
             },
             false,
         ),

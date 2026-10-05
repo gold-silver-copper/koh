@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
-    retry_after, ClientMsg, Frame, FrameNum, FrameScreen, InputSeq, FRAME_WINDOW, HEARTBEAT,
-    MAX_INPUT_BYTES, WINDOW_CELLS,
+    decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, FrameScreen,
+    InputSeq, FRAME_WINDOW, HEARTBEAT, MAX_INPUT_BYTES, WINDOW_CELLS,
 };
 use crate::terminal::{Grid, HistoryReply, Size, TerminalScreen};
 
@@ -77,6 +77,8 @@ pub struct ClientSession {
     last_activity: Option<Instant>,
     /// The window's height, for the view's pages.
     rows: u16,
+    /// The dictionary of the base the last frame was on, made once for the frames on it.
+    dictionary: Option<(FrameNum, Arc<[u8]>)>,
     /// Set whenever the rendered output may have changed; cleared once the caller repaints.
     pub(crate) dirty: bool,
     /// Whether a status banner was painted last frame, so its removal repaints once more.
@@ -102,6 +104,7 @@ impl ClientSession {
             scrollback: Scrollback::default(),
             last_activity: None,
             rows: size.rows,
+            dictionary: None,
             dirty: true,
             status_was_shown: false,
         }
@@ -228,10 +231,51 @@ impl ClientSession {
         self.dirty = true;
     }
 
+    /// A frame's stream arrived: its body inflated against its base's dictionary, then applied as
+    /// [`on_frame`](Self::on_frame) does. A frame on a base not held asks for a resync; one that
+    /// does not inflate or decode is dropped, as a lost one would be.
+    pub fn on_frame_stream(&mut self, now: Instant, base: FrameNum, body: &[u8]) {
+        self.last_heard = Some(now);
+        let dictionary = match &self.dictionary {
+            Some((num, dictionary)) if *num == base => Arc::clone(dictionary),
+            _ => {
+                let screen = if base == FrameNum::BLANK {
+                    Some(Arc::default())
+                } else if base == self.current.num {
+                    Some(Arc::clone(&self.current.screen))
+                } else {
+                    self.older
+                        .iter()
+                        .find(|older| older.num == base)
+                        .map(|older| Arc::clone(&older.screen))
+                };
+                let Some(screen) = screen else {
+                    if !self.resync_sent {
+                        self.resync_sent = true;
+                        self.outgoing.push_back(ClientMsg::Resync);
+                    }
+                    return;
+                };
+                let dictionary: Arc<[u8]> = dictionary_for(base, &screen).into();
+                self.dictionary = Some((base, Arc::clone(&dictionary)));
+                dictionary
+            }
+        };
+        match decode_frame_body(base, body, &dictionary) {
+            Ok(frame) => self.on_frame(now, &frame),
+            Err(e) => tracing::debug!(error = %e, "dropping an undecodable frame"),
+        }
+    }
+
     /// A frame arrived: applied if newer and on a base held, else only proof the link lives.
+    ///
+    /// The client sends no acknowledgement: the server takes a frame's delivery as one. So a frame
+    /// that arrives after a newer one, on a base held, is kept among the older screens, as the
+    /// server may diff against it.
     pub fn on_frame(&mut self, now: Instant, frame: &Frame) {
         self.last_heard = Some(now);
         if frame.num <= self.current.num {
+            self.keep_late(frame);
             return;
         }
         // The copy shares every row with the base; the frame replaces only its own.
@@ -265,7 +309,6 @@ impl ClientSession {
             self.older.pop_front();
         }
         self.resync_sent = false;
-        self.acknowledge(frame.num);
         self.echo_ack = self.echo_ack.max(frame.echo_ack);
         self.predictor.set_local_frame_late_acked(self.echo_ack.0);
         self.predictor.cull(self.current.screen.screen());
@@ -282,24 +325,42 @@ impl ClientSession {
         }
     }
 
+    /// Keep `frame`, older than the current one, as a base, if its base is held and it is not.
+    fn keep_late(&mut self, frame: &Frame) {
+        let held = |num: FrameNum| {
+            num == self.current.num || self.older.iter().any(|older| older.num == num)
+        };
+        if held(frame.num) {
+            return;
+        }
+        let base = if frame.base == FrameNum::BLANK {
+            Some(TerminalScreen::default())
+        } else {
+            self.older
+                .iter()
+                .chain(std::iter::once(&self.current))
+                .find(|older| older.num == frame.base)
+                .map(|older| TerminalScreen::clone(&older.screen))
+        };
+        let Some(mut screen) = base else {
+            return;
+        };
+        screen.apply(&frame.diff);
+        self.older.push_back(FrameScreen {
+            num: frame.num,
+            screen: Arc::new(screen),
+        });
+        while self.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
+            self.older.pop_front();
+        }
+    }
+
     /// The cells the older frames hold beyond the current one.
     fn older_cells(&self) -> usize {
         TerminalScreen::cells_beyond(
             &self.current.screen,
             self.older.iter().map(|older| &*older.screen),
         )
-    }
-
-    fn acknowledge(&mut self, num: FrameNum) {
-        // A newer ack supersedes an unsent one.
-        if let Some(pos) = self
-            .outgoing
-            .iter()
-            .position(|m| matches!(m, ClientMsg::Ack { .. }))
-        {
-            self.outgoing.remove(pos);
-        }
-        self.outgoing.push_back(ClientMsg::Ack { frame: num });
     }
 
     /// Advance to `now`: probe for unconfirmed input, and report the status banner.
@@ -371,6 +432,11 @@ impl ClientSession {
     /// The newest applied screen.
     pub fn state(&self) -> &TerminalScreen {
         &self.current.screen
+    }
+
+    /// The newest frame applied.
+    pub const fn applied(&self) -> FrameNum {
+        self.current.num
     }
 
     /// Whether a frame has been applied, so [`state`](Self::state) is the server's.
@@ -555,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn frames_apply_against_a_held_base_and_are_acknowledged() {
+    fn frames_apply_against_a_held_base_and_send_no_acknowledgement() {
         let (now, mut s) = start();
         drain(&mut s);
         let blank = TerminalScreen::default();
@@ -567,8 +633,29 @@ mod tests {
         assert!(s.screen().contents().contains("one"));
         s.on_frame(now, &frame(2, 1, 0, &one, &two));
         assert!(s.screen().contents().contains("one two"));
-        // Only the newest acknowledgement is worth sending.
-        assert_eq!(drain(&mut s), [ClientMsg::Ack { frame: FrameNum(2) }]);
+        // The server takes a frame's delivery as its acknowledgement.
+        assert_eq!(drain(&mut s), []);
+        assert_eq!(s.applied(), FrameNum(2));
+    }
+
+    #[test]
+    fn a_frame_that_arrives_after_a_newer_one_is_kept_as_a_base() {
+        let (now, mut s) = start();
+        drain(&mut s);
+        let blank = TerminalScreen::default();
+        let one = screen(b"one");
+        let two = screen(b"two");
+        let three = screen(b"three");
+        s.on_frame(now, &frame(2, 0, 0, &blank, &two));
+        // Frame 1 is delivered late; the server, told of its delivery, may diff against it.
+        s.on_frame(now, &frame(1, 0, 0, &blank, &one));
+        assert!(
+            s.screen().contents().contains("two"),
+            "the newer stays shown"
+        );
+        s.on_frame(now, &frame(3, 1, 0, &one, &three));
+        assert!(s.screen().contents().contains("three"));
+        assert_eq!(drain(&mut s), [], "no resync: frame 1 was kept");
     }
 
     #[test]
@@ -599,10 +686,7 @@ mod tests {
         s.on_frame(now, &frame(7, 0, 0, &blank, &one));
         assert!(s.screen().contents().contains("one"));
         s.on_frame(now, &frame(8, 3, 0, &one, &one));
-        assert_eq!(
-            drain(&mut s),
-            [ClientMsg::Ack { frame: FrameNum(7) }, ClientMsg::Resync]
-        );
+        assert_eq!(drain(&mut s), [ClientMsg::Resync]);
     }
 
     #[test]
@@ -668,12 +752,8 @@ mod tests {
         s.on_frame(now, &frame(21, 5, 0, &big, &big));
         assert_eq!(drain(&mut s), [ClientMsg::Resync]);
         s.on_frame(now, &frame(22, 19, 0, &big, &big));
-        assert_eq!(
-            drain(&mut s),
-            [ClientMsg::Ack {
-                frame: FrameNum(22)
-            }]
-        );
+        assert_eq!(drain(&mut s), []);
+        assert_eq!(s.applied(), FrameNum(22));
     }
 
     #[test]

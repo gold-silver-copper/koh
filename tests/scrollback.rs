@@ -91,7 +91,7 @@ impl Pair {
                     .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
                 match decode_server(&bytes).map_err(|e| e.to_string())? {
                     ServerMsg::History(reply) => self.client.on_history(&reply),
-                    ServerMsg::Frame(_) => return Err("a frame for history".to_owned()),
+                    ServerMsg::Frame { .. } => return Err("a frame for history".to_owned()),
                 }
             }
         }

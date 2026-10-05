@@ -59,13 +59,29 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
 (`src/proto.rs`):
 
 - **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Input { seq,
-  bytes }` (at most 64 KiB; a paste is split), `Resize`, `Ack { frame }` after applying a frame,
-  `Resync` when a frame's base is unknown, and `History { newest, count }` for scrollback rows.
+  bytes }` (at most 64 KiB; a paste is split), `Resize`, `Resync` when a frame's base is unknown,
+  `History { newest, count }` for scrollback rows, and `Ack { frame }`, now only a nudge (below).
   `seq` numbers each input on the connection.
-- **Server to client: one uni stream per `ServerMsg`**, DEFLATE-compressed and inflated with a 16
-  MiB limit: a `Frame`, or history rows. A frame carries `num`, `base`, `echo_ack` and a
-  `ScreenDiff` from frame `base` to frame `num`. Frame 0 is the blank default screen, which both
-  ends always hold; real frames count from 1.
+- **Server to client: one uni stream per message**: a tag byte, then for a frame its base's number
+  and the frame (`num`, `base`, `echo_ack` and a `ScreenDiff` from frame `base` to frame `num`)
+  DEFLATE-compressed against the base screen's dictionary; for history rows, the rows compressed.
+  Either inflates with a 16 MiB limit. Frame 0 is the blank default screen, which both ends always
+  hold; real frames count from 1.
+- **Compressed against the base.** Both ends hold a frame's base screen, so the compressor starts
+  from a dictionary made of it (`TerminalScreen::dictionary`): the base's rows encoded as a frame
+  encodes them, those nearest the cursor last, at most DEFLATE's 32 KiB window. A row the frame
+  changes then compresses against what it was: a typed character or a ticking clock costs a few
+  bytes. The client refuses a frame whose base it lacks, so the dictionaries cannot disagree.
+- **Rows as runs of text.** A row is runs: identical cells as one run with a count, and
+  same-looking characters as one run of their text (`CellKind::Chars`, `CellKind::WideChars`), so
+  text costs about a byte a cell before compression.
+- **Delivery is the acknowledgement.** The client sends no acknowledgement per frame: when QUIC
+  reports a frame's stream wholly delivered (`stopped` with no code), the server takes it as
+  acknowledged. The client applies every frame it gets on a base it holds, and keeps a frame that
+  arrives after a newer one as a base, so the server may diff against any delivered frame. The
+  server asks the client's QUIC stack to acknowledge within 2 ms (the ACK-frequency extension)
+  rather than 25. A superseded frame that was wholly written gets a round trip and that delay to
+  report its delivery before its stream is reset.
 - **Scrollback by name.** The server names each row as it enters its history with the next number
   of a session counter, so the history's rows always carry consecutive names (a resize, which
   reflows the history, names every row afresh). Each screen carries a `HistoryMark`: the newest
@@ -76,8 +92,8 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   is never sent again. The client keeps at most `HISTORY_CACHE_CELLS` (a million) cells of history,
   dropping the rows farthest from its view; the server queues at most 8 requests, and one more is
   a protocol error.
-- **Bases are acknowledged frames.** The server diffs against the newest frame the client has
-  acknowledged, so a lost frame only delays the screen until the next one. When the server sends a
+- **Bases are acknowledged frames.** The server diffs against the newest frame delivered, so a lost
+  frame only delays the screen until the next one. When the server sends a
   frame it resets the streams of older unacknowledged frames, so QUIC never retransmits a screen a
   newer one has replaced.
 - **Pacing:** a frame goes out when the screen or the echo-ack changed, at most once per frame
@@ -85,9 +101,9 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   client can tell a quiet session from a dead link.
 - **Retries without QUIC's backoff:** on a lossy, jittery path QUIC's probe timeout is several
   round trips and doubles on each loss. So an unacknowledged newest frame is resent, as a new frame
-  that supersedes it, after a round trip plus a frame interval; and input the echo-ack has not
-  confirmed after the same wait makes the client send a repeated `Ack`, a later packet that lets
-  QUIC detect the loss and retransmit at once.
+  that supersedes it, after a round trip, a frame interval and QUIC's acknowledgement delay; and
+  input the echo-ack has not confirmed after the same wait makes the client send an `Ack`, a later
+  packet that lets QUIC detect the loss and retransmit at once.
 - **Bounded state:** each end keeps at most `FRAME_WINDOW` (16) recent screens — the client its
   last applied frames, the server the frames sent since the last acknowledged one. A count alone is
   not a memory bound when a screen can be a million cells (about 32 MB at the 1000×1000 a client may

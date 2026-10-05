@@ -212,21 +212,39 @@ fn wire_cell(result: &Result<Wire, String>) -> String {
 }
 
 /// The link profiles latency and settling are measured on.
-fn profiles() -> [(&'static str, Profile); 3] {
+fn profiles() -> [(&'static str, Profile); 5] {
+    let rtt50 = Duration::from_millis(25);
     [
         ("clean", Profile::default()),
         (
             "50 ms RTT",
             Profile {
-                delay: Duration::from_millis(25),
-                loss: 0.0,
+                delay: rtt50,
+                ..Profile::default()
             },
         ),
         (
             "50 ms RTT, 5% loss",
             Profile {
-                delay: Duration::from_millis(25),
+                delay: rtt50,
                 loss: 0.05,
+                ..Profile::default()
+            },
+        ),
+        (
+            "1 Mbit/s, 50 ms RTT",
+            Profile {
+                delay: rtt50,
+                rate: Some(1_000_000),
+                ..Profile::default()
+            },
+        ),
+        (
+            "256 kbit/s, 50 ms RTT",
+            Profile {
+                delay: rtt50,
+                rate: Some(256_000),
+                ..Profile::default()
             },
         ),
     ]
@@ -442,9 +460,12 @@ async fn run(args: &Args) -> anyhow::Result<String> {
                     "wire {} {}: {}",
                     workload.name,
                     system.name(),
-                    result
-                        .as_ref()
-                        .map_or_else(Clone::clone, |w| wire_cell(&Ok(*w)))
+                    result.as_ref().map_or_else(Clone::clone, |w| format!(
+                        "{} (packets {} / {})",
+                        wire_cell(&Ok(*w)),
+                        w.counts.to_client.packets,
+                        w.counts.to_server.packets
+                    ))
                 );
                 by.push((system, result));
             }

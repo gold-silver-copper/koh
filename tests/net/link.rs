@@ -38,6 +38,12 @@ pub struct Profile {
     /// Probability that a packet is held back by an extra `delay + jitter`, so later packets
     /// overtake it.
     pub reorder: f64,
+    /// Each direction's bandwidth in bits a second, if limited: a packet waits its turn behind
+    /// those before it, as on a slow link, and is dropped if it would wait more than `queue`.
+    pub rate: Option<u64>,
+    /// The longest a packet waits for the link before it is dropped (the bottleneck's buffer),
+    /// when `rate` limits it. Zero means 100 ms.
+    pub queue: Duration,
 }
 
 /// Packets and bytes, counted per destination endpoint.
@@ -95,6 +101,8 @@ struct State {
     sent: HashMap<EndpointId, Count>,
     /// Everything the link let through to each endpoint (duplicates counted twice).
     delivered: HashMap<EndpointId, Count>,
+    /// When the link towards each endpoint is next free, when `rate` limits it.
+    busy_until: HashMap<EndpointId, Instant>,
 }
 
 /// The shared network. Clone it to hand it to several endpoints.
@@ -113,6 +121,7 @@ impl FaultNet {
                 inboxes: HashMap::new(),
                 sent: HashMap::new(),
                 delivered: HashMap::new(),
+                busy_until: HashMap::new(),
             })),
         }
     }
@@ -180,6 +189,34 @@ impl FaultNet {
         if state.rng.chance(profile.loss) {
             return Ok(());
         }
+        // A slow link: the packet goes once the link is free, taking its size's time to send;
+        // past the buffer it is dropped, as a bottleneck's queue drops its tail.
+        let queued = match profile.rate.filter(|&rate| rate > 0) {
+            None => Duration::ZERO,
+            Some(rate) => {
+                let free = state.busy_until.get(&to).copied().unwrap_or(now).max(now);
+                let wait = free.saturating_duration_since(now);
+                let limit = if profile.queue.is_zero() {
+                    Duration::from_millis(100)
+                } else {
+                    profile.queue
+                };
+                if wait > limit {
+                    return Ok(());
+                }
+                let bits = u64::try_from(data.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(8);
+                let sending = Duration::from_nanos(
+                    bits.saturating_mul(1_000_000_000)
+                        .checked_div(rate)
+                        .unwrap_or(0),
+                );
+                let done = free.checked_add(sending).unwrap_or(free);
+                state.busy_until.insert(to, done);
+                done.saturating_duration_since(now)
+            }
+        };
         let copies = if state.rng.chance(profile.dup) { 2 } else { 1 };
         let mut delays = Vec::with_capacity(copies);
         for _ in 0..copies {
@@ -194,7 +231,7 @@ impl FaultNet {
                     .saturating_add(profile.delay)
                     .saturating_add(profile.jitter);
             }
-            delays.push(delay);
+            delays.push(delay.saturating_add(queued));
         }
         let counter = state.delivered.entry(to).or_default();
         for _ in &delays {

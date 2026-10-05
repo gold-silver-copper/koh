@@ -2,9 +2,10 @@
 //!
 //! After admission the client opens one uni stream and writes [`ClientMsg`]s on it, each a 4-byte
 //! big-endian length followed by its postcard encoding. The server sends every screen update as a
-//! [`Frame`] on its own uni stream: the DEFLATE-compressed postcard encoding, and nothing else.
-//! Frames diff against a frame the client has acknowledged, so a lost or reset frame only delays
-//! the screen until the next one.
+//! [`Frame`] on its own uni stream: a tag, the base's number, then the postcard encoding
+//! DEFLATE-compressed against the base screen ([`encode_frame`]); history rows go the same way,
+//! without a base. Frames diff against a frame the client has (its delivery is its
+//! acknowledgement), so a lost or reset frame only delays the screen until the next one.
 //!
 //! Everything here is pure: the connection loops move bytes, this module turns them into messages
 //! and rejects anything oversized or malformed.
@@ -100,13 +101,19 @@ const INITIAL_RTT: Duration = Duration::from_millis(333);
 
 /// How long an unacknowledged frame, or unconfirmed input, waits before the sender acts on its own.
 ///
-/// A round trip plus a frame interval. The server then resends its newest screen as a new frame,
+/// A round trip, a frame interval and the acknowledgement's delay. The server then resends its newest screen as a new frame,
 /// and the client sends a probe, instead of waiting out QUIC's exponentially backed-off probe
 /// timeout, which on a lossy, jittery path is several round trips.
 pub fn retry_after(rtt: Option<Duration>) -> Duration {
     rtt.unwrap_or(INITIAL_RTT)
         .saturating_add(frame_interval(rtt))
+        .saturating_add(ACK_DELAY)
 }
+
+/// The longest a peer's QUIC stack waits before acknowledging what it got (QUIC's default
+/// `max_ack_delay`). A frame's delivery is its acknowledgement, which may come this much after the
+/// round trip.
+pub const ACK_DELAY: Duration = Duration::from_millis(25);
 
 /// The gap the server leaves between frames on a path with round-trip time `rtt`: two frames per
 /// round trip, within `[20 ms, 250 ms]`. An unknown RTT gets the longest gap.
@@ -138,7 +145,9 @@ pub enum ClientMsg {
     },
     /// The client's window is now this size.
     Resize(Size),
-    /// The client applied `frame`; later frames may diff against it.
+    /// The client applied `frame`; later frames may diff against it. A frame's delivery already
+    /// says so, so the client sends this only to nudge: a later packet that lets QUIC detect a lost
+    /// one and retransmit it at once.
     Ack { frame: FrameNum },
     /// The client got a frame whose base it does not hold; the next frame must diff against
     /// [`FrameNum::BLANK`].
@@ -204,8 +213,12 @@ pub enum ProtoError {
     Malformed(#[from] postcard::Error),
     #[error("could not inflate the frame (corrupt, or larger than {MAX_FRAME} bytes)")]
     Inflate,
-    #[error("history rows where a frame was expected")]
+    #[error(
+        "history rows where a frame was expected, or a frame on another base than its stream's"
+    )]
     NotAFrame,
+    #[error("a server stream of an unknown kind")]
+    UnknownStream,
     #[error("more than {MAX_PENDING_HISTORY} history requests waiting")]
     TooManyRequests,
 }
@@ -319,44 +332,128 @@ impl ClientDecoder {
     }
 }
 
-/// A message on one of the server's streams: a frame, or history rows.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+/// A message on one of the server's streams, as the stream's reader takes it: a frame still to
+/// inflate against its base, or history rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerMsg {
-    Frame(Frame),
+    /// A frame diffed against frame `base`, whose compressed `body` inflates only against that
+    /// screen's dictionary ([`decode_frame_body`]).
+    Frame {
+        base: FrameNum,
+        body: Vec<u8>,
+    },
     History(HistoryReply),
 }
 
-/// [`ServerMsg`] as it is encoded, borrowing what it carries: postcard encodes both alike.
-#[derive(Serialize)]
-enum ServerMsgRef<'a> {
-    Frame(&'a Frame),
-    History(&'a HistoryReply),
+/// The first byte of a server stream: what it carries.
+const TAG_FRAME: u8 = 0;
+const TAG_HISTORY: u8 = 1;
+
+/// Encode a frame for its stream: its tag, its base's number, then the frame compressed against
+/// `base`, the screen of frame `frame.base`.
+///
+/// The compressor starts from `base`'s dictionary ([`TerminalScreen::dictionary`]), so a row the
+/// frame changes compresses against what the row was: a ticking clock or a typed character costs a
+/// few bytes. Both ends hold the base screen, and the client refuses a frame whose base it does not
+/// hold, so the dictionaries cannot disagree. The blank screen's dictionary is empty.
+pub fn encode_frame(frame: &Frame, base: &TerminalScreen) -> Result<Vec<u8>, ProtoError> {
+    encode_frame_with(frame, &dictionary_for(frame.base, base))
 }
 
-/// Encode a frame for its stream.
-pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
-    encode_server(&ServerMsgRef::Frame(frame))
+/// [`encode_frame`] with the base's dictionary already made.
+pub fn encode_frame_with(frame: &Frame, dictionary: &[u8]) -> Result<Vec<u8>, ProtoError> {
+    let raw = postcard::to_allocvec(frame)?;
+    let mut out = postcard::to_extend(&frame.base.0, vec![TAG_FRAME])?;
+    out.extend_from_slice(&deflate_with(dictionary, &raw));
+    Ok(out)
+}
+
+/// The dictionary a frame on `base`, whose screen is `screen`, is compressed against.
+pub fn dictionary_for(base: FrameNum, screen: &TerminalScreen) -> Vec<u8> {
+    if base == FrameNum::BLANK {
+        Vec::new()
+    } else {
+        screen.dictionary()
+    }
 }
 
 /// Encode history rows for their stream.
 pub fn encode_history(reply: &HistoryReply) -> Result<Vec<u8>, ProtoError> {
-    encode_server(&ServerMsgRef::History(reply))
+    let raw = postcard::to_allocvec(reply)?;
+    let mut out = vec![TAG_HISTORY];
+    out.extend_from_slice(&deflate_with(&[], &raw));
+    Ok(out)
 }
 
-fn encode_server(msg: &ServerMsgRef<'_>) -> Result<Vec<u8>, ProtoError> {
-    let raw = postcard::to_allocvec(msg)?;
-    Ok(miniz_oxide::deflate::compress_to_vec(
-        &raw,
-        COMPRESSION_LEVEL,
-    ))
+/// `raw` DEFLATE-compressed (raw, no zlib header) as if it followed `dictionary`: the dictionary is
+/// compressed first and ended with a sync flush, which ends on a byte, and only what follows is
+/// kept. Its back-references may reach into the dictionary.
+fn deflate_with(dictionary: &[u8], raw: &[u8]) -> Vec<u8> {
+    use miniz_oxide::deflate::core::{
+        compress_to_output, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush,
+    };
+    let flags = create_comp_flags_from_zip_params(COMPRESSION_LEVEL.into(), -15, 0);
+    let mut compressor = CompressorOxide::new(flags);
+    let mut out = Vec::with_capacity(raw.len().div_euclid(2).saturating_add(64));
+    if !dictionary.is_empty() {
+        let _ = compress_to_output(&mut compressor, dictionary, TDEFLFlush::Sync, |bytes| {
+            out.extend_from_slice(bytes);
+            true
+        });
+    }
+    let skip = out.len();
+    let _ = compress_to_output(&mut compressor, raw, TDEFLFlush::Finish, |bytes| {
+        out.extend_from_slice(bytes);
+        true
+    });
+    out.split_off(skip)
 }
 
-/// Decode a server stream's contents, inflating at most [`MAX_FRAME`] bytes.
-#[expect(
-    clippy::map_err_ignore,
-    reason = "miniz's error carries the partial, attacker-controlled inflate output; \
-              `ProtoError::Inflate` deliberately reports only corrupt-or-oversized"
-)]
+/// What [`deflate_with`] compressed against `dictionary`, at most `limit` bytes of it, or `None`
+/// if `body` is corrupt or inflates past the limit. The dictionary is the window the body's
+/// back-references reach into; nothing reaches before it.
+fn inflate_with(dictionary: &[u8], body: &[u8], limit: usize) -> Option<Vec<u8>> {
+    use miniz_oxide::inflate::core::inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    use miniz_oxide::inflate::core::{decompress, DecompressorOxide};
+    use miniz_oxide::inflate::TINFLStatus;
+    let start = dictionary.len();
+    let most = start.checked_add(limit)?;
+    let mut out = dictionary.to_vec();
+    out.resize(
+        start
+            .saturating_add(body.len().saturating_mul(4).max(1024))
+            .min(most),
+        0,
+    );
+    let mut decompressor = DecompressorOxide::new();
+    let mut input = body;
+    let mut pos = start;
+    loop {
+        let (status, used, wrote) = decompress(
+            &mut decompressor,
+            input,
+            &mut out,
+            pos,
+            TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+        );
+        input = input.get(used..)?;
+        pos = pos.checked_add(wrote)?;
+        // The status is `#[non_exhaustive]`: anything but done or a full buffer is a failure.
+        if matches!(status, TINFLStatus::Done) {
+            break;
+        }
+        if !matches!(status, TINFLStatus::HasMoreOutput) || out.len() >= most {
+            return None;
+        }
+        let grown = out.len().saturating_mul(2).min(most);
+        out.resize(grown, 0);
+    }
+    out.truncate(pos);
+    Some(out.split_off(start))
+}
+
+/// Read a server stream: a frame's base and compressed body, which [`decode_frame_body`] inflates
+/// once the base is found, or history rows, inflated with a [`MAX_FRAME`] limit.
 pub fn decode_server(bytes: &[u8]) -> Result<ServerMsg, ProtoError> {
     if bytes.len() > MAX_FRAME {
         return Err(ProtoError::TooLarge {
@@ -364,15 +461,44 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMsg, ProtoError> {
             max: MAX_FRAME,
         });
     }
-    let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, MAX_FRAME)
-        .map_err(|_| ProtoError::Inflate)?;
-    Ok(postcard::from_bytes(&raw)?)
+    match bytes.split_first() {
+        Some((&TAG_FRAME, rest)) => {
+            let (base, body) = postcard::take_from_bytes::<u64>(rest)?;
+            Ok(ServerMsg::Frame {
+                base: FrameNum(base),
+                body: body.to_vec(),
+            })
+        }
+        Some((&TAG_HISTORY, rest)) => {
+            let raw = inflate_with(&[], rest, MAX_FRAME).ok_or(ProtoError::Inflate)?;
+            Ok(ServerMsg::History(postcard::from_bytes(&raw)?))
+        }
+        _ => Err(ProtoError::UnknownStream),
+    }
 }
 
-/// Decode a stream that must hold a frame.
-pub fn decode_frame(bytes: &[u8]) -> Result<Frame, ProtoError> {
+/// Inflate a frame's body against its base's dictionary ([`dictionary_for`]) and decode it. A
+/// frame that names another base than its stream did is refused.
+pub fn decode_frame_body(
+    base: FrameNum,
+    body: &[u8],
+    dictionary: &[u8],
+) -> Result<Frame, ProtoError> {
+    let raw = inflate_with(dictionary, body, MAX_FRAME).ok_or(ProtoError::Inflate)?;
+    let frame: Frame = postcard::from_bytes(&raw)?;
+    if frame.base == base {
+        Ok(frame)
+    } else {
+        Err(ProtoError::NotAFrame)
+    }
+}
+
+/// Decode a stream that must hold a frame on `screen`, the screen of the frame's base.
+pub fn decode_frame(bytes: &[u8], screen: &TerminalScreen) -> Result<Frame, ProtoError> {
     match decode_server(bytes)? {
-        ServerMsg::Frame(frame) => Ok(frame),
+        ServerMsg::Frame { base, body } => {
+            decode_frame_body(base, &body, &dictionary_for(base, screen))
+        }
         ServerMsg::History(_) => Err(ProtoError::NotAFrame),
     }
 }
@@ -514,16 +640,52 @@ mod tests {
     #[test]
     fn frames_round_trip() {
         let frame = frame();
-        assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+        let base = TerminalScreen::default();
+        assert_eq!(
+            decode_frame(&encode_frame(&frame, &base).unwrap(), &base).unwrap(),
+            frame
+        );
+    }
+
+    #[test]
+    fn a_frame_compresses_against_its_base_and_inflates_only_against_it() {
+        let base =
+            TerminalScreen::from_bytes(24, 80, &b"a line of text that repeats\r\n".repeat(20));
+        let mut target_bytes = b"a line of text that repeats\r\n".repeat(20);
+        target_bytes.extend_from_slice(b"\x1b[3;1Ha line of text that repeatz");
+        let target = TerminalScreen::from_bytes(24, 80, &target_bytes);
+        let frame = Frame {
+            num: FrameNum(8),
+            base: FrameNum(7),
+            echo_ack: InputSeq(0),
+            diff: target.diff_from(&base),
+        };
+        let against_base = encode_frame(&frame, &base).unwrap();
+        let alone = encode_frame_with(&frame, &[]).unwrap();
+        assert!(
+            against_base.len() < alone.len(),
+            "{} against the base, {} alone",
+            against_base.len(),
+            alone.len()
+        );
+        assert_eq!(decode_frame(&against_base, &base).unwrap(), frame);
+        // Another screen's dictionary inflates to something else, or nothing.
+        assert!(decode_frame(&against_base, &target).map_or(true, |f| f != frame));
+        // A frame naming another base than its stream's is refused.
+        let mut lying = against_base;
+        lying[1] = 9;
+        assert!(decode_frame(&lying, &base).is_err());
     }
 
     #[test]
     fn truncated_and_corrupt_frames_are_errors() {
-        let bytes = encode_frame(&frame()).unwrap();
+        let base = TerminalScreen::default();
+        let bytes = encode_frame(&frame(), &base).unwrap();
         for cut in 0..bytes.len() {
-            assert!(decode_frame(&bytes[..cut]).is_err(), "cut at {cut}");
+            assert!(decode_frame(&bytes[..cut], &base).is_err(), "cut at {cut}");
         }
-        assert!(decode_frame(b"not deflate at all").is_err());
+        assert!(decode_frame(b"not deflate at all", &base).is_err());
+        assert!(decode_frame(b"\x07unknown", &base).is_err());
     }
 
     #[test]
@@ -531,7 +693,15 @@ mod tests {
         // 64 MiB of zeros deflates to a few KiB; inflating it must stop at the cap.
         let bomb = miniz_oxide::deflate::compress_to_vec(&vec![0u8; 4 * MAX_FRAME], 9);
         assert!(bomb.len() < MAX_FRAME);
-        assert!(matches!(decode_frame(&bomb), Err(ProtoError::Inflate)));
+        let mut stream = vec![TAG_FRAME, 0];
+        stream.extend_from_slice(&bomb);
+        assert!(matches!(
+            decode_frame(&stream, &TerminalScreen::default()),
+            Err(ProtoError::Inflate)
+        ));
+        let mut stream = vec![TAG_HISTORY];
+        stream.extend_from_slice(&bomb);
+        assert!(matches!(decode_server(&stream), Err(ProtoError::Inflate)));
     }
 
     #[test]
@@ -546,9 +716,9 @@ mod tests {
     #[test]
     fn a_retry_waits_a_round_trip_and_a_frame_interval() {
         let ms = Duration::from_millis;
-        assert_eq!(retry_after(Some(ms(200))), ms(300));
-        assert_eq!(retry_after(Some(ms(10))), ms(30));
-        assert_eq!(retry_after(None), ms(333 + 250));
+        assert_eq!(retry_after(Some(ms(200))), ms(300 + 25));
+        assert_eq!(retry_after(Some(ms(10))), ms(30 + 25));
+        assert_eq!(retry_after(None), ms(333 + 250 + 25));
     }
 
     #[test]

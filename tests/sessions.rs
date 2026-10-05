@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use koh::proto::{decode_frame, encode_client, ClientMsg, Frame, FrameNum, InputSeq, MAX_FRAME};
+use koh::proto::{
+    decode_frame_body, decode_server, dictionary_for, encode_client, ClientMsg, FrameNum, InputSeq,
+    ServerMsg, MAX_FRAME,
+};
 use koh::pty::Launcher;
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::server::run_session;
@@ -170,7 +173,8 @@ fn a_session_whose_shell_exited_is_torn_down() -> anyhow::Result<()> {
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
-    frames: tokio::sync::mpsc::Receiver<Frame>,
+    /// Each frame's base and compressed body, to inflate once its base is found.
+    frames: tokio::sync::mpsc::Receiver<(FrameNum, Vec<u8>)>,
     screens: HashMap<FrameNum, TerminalScreen>,
     newest: FrameNum,
     echo_ack: InputSeq,
@@ -198,8 +202,8 @@ impl RawClient {
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     if let Ok(bytes) = recv.read_to_end(MAX_FRAME).await {
-                        if let Ok(frame) = decode_frame(&bytes) {
-                            let _ = tx.send(frame).await;
+                        if let Ok(ServerMsg::Frame { base, body }) = decode_server(&bytes) {
+                            let _ = tx.send((base, body)).await;
                         }
                     }
                 });
@@ -236,13 +240,20 @@ impl RawClient {
         let deadline = tokio::time::Instant::now()
             .checked_add(Duration::from_millis(ms))
             .context("deadline within range")?;
-        while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, self.frames.recv()).await {
+        while let Ok(Some((base, body))) =
+            tokio::time::timeout_at(deadline, self.frames.recv()).await
+        {
+            let Some(base_screen) = self.screens.get(&base) else {
+                continue;
+            };
+            let Ok(frame) = decode_frame_body(base, &body, &dictionary_for(base, base_screen))
+            else {
+                continue;
+            };
             if frame.num <= self.newest {
                 continue;
             }
-            let Some(base) = self.screens.get(&frame.base) else {
-                continue;
-            };
+            let base = base_screen;
             let mut next = base.clone();
             next.apply(&frame.diff);
             self.screens.insert(frame.num, next);

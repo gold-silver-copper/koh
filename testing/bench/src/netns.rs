@@ -42,9 +42,14 @@ pub fn run(profile: Profile, measure: &str, args: &[String]) -> anyhow::Result<V
     };
     let (uid, gid) = (id("-u")?, id("-g")?);
     let delay = profile.delay.as_millis();
-    let netem = if delay > 0 || profile.loss > 0.0 {
+    // A rate limit's buffer: 100 ms of the link's bytes, in packets of about 1,200 bytes.
+    let rate = profile.rate.map_or_else(String::new, |rate| {
+        let limit = rate.div_euclid(8 * 10 * 1200).max(4);
+        format!(" rate {rate}bit limit {limit}")
+    });
+    let netem = if delay > 0 || profile.loss > 0.0 || profile.rate.is_some() {
         format!(
-            " && tc qdisc add dev lo root netem delay {delay}ms loss {}%",
+            " && tc qdisc add dev lo root netem delay {delay}ms loss {}%{rate}",
             profile.loss * 100.0
         )
     } else {

@@ -292,7 +292,7 @@ fn frames_with_unknown_bases_never_grow_the_client() -> anyhow::Result<()> {
                         echo_ack: InputSeq(0),
                         diff,
                     };
-                    if let Ok(bytes) = encode_frame(&frame) {
+                    if let Ok(bytes) = encode_frame(&frame, &base) {
                         send_frame_bytes(&conn, bytes).await;
                     }
                 }
@@ -351,12 +351,15 @@ fn a_servers_hostile_links_are_shown_as_text_or_dropped() -> anyhow::Result<()> 
                     for row in &mut diff.rows {
                         links(row);
                     }
-                    encode_frame(&Frame {
-                        num: FrameNum(num),
-                        base: FrameNum::BLANK,
-                        echo_ack: InputSeq(0),
-                        diff,
-                    })
+                    encode_frame(
+                        &Frame {
+                            num: FrameNum(num),
+                            base: FrameNum::BLANK,
+                            echo_ack: InputSeq(0),
+                            diff,
+                        },
+                        &TerminalScreen::default(),
+                    )
                 };
                 let evil = |row: &mut koh::terminal::RowDiff| {
                     row.links = vec![WireLink {
@@ -442,12 +445,15 @@ fn hostile_history_rows_never_grow_the_client() -> anyhow::Result<()> {
                     newest: 1_000_000,
                     len: 1_000_000,
                 });
-                if let Ok(bytes) = encode_frame(&Frame {
-                    num: FrameNum(1),
-                    base: FrameNum::BLANK,
-                    echo_ack: InputSeq(0),
-                    diff,
-                }) {
+                if let Ok(bytes) = encode_frame(
+                    &Frame {
+                        num: FrameNum(1),
+                        base: FrameNum::BLANK,
+                        echo_ack: InputSeq(0),
+                        diff,
+                    },
+                    &TerminalScreen::default(),
+                ) {
                     send_frame_bytes(&conn, bytes).await;
                 }
                 let newest = emu.snapshot().history().newest;

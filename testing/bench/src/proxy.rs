@@ -34,6 +34,8 @@ impl Count {
 pub struct Profile {
     pub delay: Duration,
     pub loss: f64,
+    /// Each direction's bandwidth in bits a second, if limited (a 100 ms buffer).
+    pub rate: Option<u64>,
 }
 
 /// What the proxy delivered: to the server, to the client.

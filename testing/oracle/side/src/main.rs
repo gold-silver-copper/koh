@@ -188,20 +188,27 @@ impl Session {
     /// Deliver the client's messages to the server.
     fn drain(&mut self, out: &mut String) {
         while let Some(msg) = self.client.pop_outgoing() {
-            let _ = writeln!(out, "sent {msg:?}");
-            match msg {
-                ClientMsg::Ack { frame } => {
-                    if let Some(at) = self.sent.iter().position(|(num, _)| *num == frame) {
-                        let mut newer = self.sent.split_off(at);
-                        if let Some(base) = newer.pop_front() {
-                            self.base = base;
-                        }
-                        self.sent = newer;
+            let line = format!("{msg:?}");
+            // Scrollback requests are new (a side at an older commit has none), and change
+            // nothing the user's terminal shows until the user opens the view.
+            if line.starts_with("History") {
+                continue;
+            }
+            let _ = writeln!(out, "sent {line}");
+            // Matched with `if let`, not `match`, so the side builds against a commit whose
+            // messages are fewer or more.
+            if let ClientMsg::Ack { frame } = msg {
+                if let Some(at) = self.sent.iter().position(|(num, _)| *num == frame) {
+                    let mut newer = self.sent.split_off(at);
+                    if let Some(base) = newer.pop_front() {
+                        self.base = base;
                     }
+                    self.sent = newer;
                 }
-                ClientMsg::Resync => self.base = (FrameNum::BLANK, TerminalScreen::default()),
-                ClientMsg::Input { seq, .. } => self.echoed = seq,
-                ClientMsg::Resize(_) => {}
+            } else if let ClientMsg::Input { seq, .. } = msg {
+                self.echoed = seq;
+            } else if matches!(msg, ClientMsg::Resync) {
+                self.base = (FrameNum::BLANK, TerminalScreen::default());
             }
         }
     }

@@ -59,11 +59,23 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
 (`src/proto.rs`):
 
 - **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Input { seq,
-  bytes }` (at most 64 KiB; a paste is split), `Resize`, `Ack { frame }` after applying a frame, and
-  `Resync` when a frame's base is unknown. `seq` numbers each input on the connection.
-- **Server to client: one uni stream per `Frame`**, DEFLATE-compressed and inflated with a 16 MiB
-  limit. A frame carries `num`, `base`, `echo_ack` and a `ScreenDiff` from frame `base` to frame
-  `num`. Frame 0 is the blank default screen, which both ends always hold; real frames count from 1.
+  bytes }` (at most 64 KiB; a paste is split), `Resize`, `Ack { frame }` after applying a frame,
+  `Resync` when a frame's base is unknown, and `History { newest, count }` for scrollback rows.
+  `seq` numbers each input on the connection.
+- **Server to client: one uni stream per `ServerMsg`**, DEFLATE-compressed and inflated with a 16
+  MiB limit: a `Frame`, or history rows. A frame carries `num`, `base`, `echo_ack` and a
+  `ScreenDiff` from frame `base` to frame `num`. Frame 0 is the blank default screen, which both
+  ends always hold; real frames count from 1.
+- **Scrollback by name.** The server names each row as it enters its history with the next number
+  of a session counter, so the history's rows always carry consecutive names (a resize, which
+  reflows the history, names every row afresh). Each screen carries a `HistoryMark`: the newest
+  row's name and how many rows the history holds. The client asks for the rows it lacks, by the
+  newest name and a count (at most 256 rows); the server answers one request at a time, each on a
+  stream below frames in priority, the next only once the last is delivered, so history never
+  delays a frame or outruns the link. A named row's cells never change, so a row the client holds
+  is never sent again. The client keeps at most `HISTORY_CACHE_CELLS` (a million) cells of history,
+  dropping the rows farthest from its view; the server queues at most 8 requests, and one more is
+  a protocol error.
 - **Bases are acknowledged frames.** The server diffs against the newest frame the client has
   acknowledged, so a lost frame only delays the screen until the next one. When the server sends a
   frame it resets the streams of older unacknowledged frames, so QUIC never retransmits a screen a
@@ -92,6 +104,12 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   stops reading the client's stream, QUIC flow control stops the client's writes, and the client
   keeps at most 1 MiB of typing before dropping it with an "input paused" status line. The keyboard
   loop never waits on the network, so `Ctrl-^ .` always works.
+- **The scrollback view** (`Ctrl-^ [`, `client::scrollback`): the server's history above the live
+  screen, fetched as the user scrolls with the arrows, Page Up/Down, `k`/`j`, `b`/`f`, `u`/`d`,
+  `g`/`G` or the mouse wheel (the view turns mouse reporting on), and `q` or Escape to leave. The
+  view is anchored to its rows: output that scrolls into history moves it up with them, so what
+  is being read stays still while the live screen goes on below. Out of the view, a client idle for
+  2 s fetches the newest screenful ahead, so opening the view shows rows at once.
 - **Shutdown:** when the shell exits, the server sends the final frame (carrying the exit code),
   waits up to 1 s for its ack, then closes the connection with code 0 and reason `session ended`.
 

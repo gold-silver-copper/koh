@@ -334,7 +334,7 @@ impl Session {
                     }
                 }
                 ClientMsg::Resync => self.base = (FrameNum::BLANK, TerminalScreen::default()),
-                ClientMsg::Input { .. } | ClientMsg::Resize(_) => {}
+                ClientMsg::Input { .. } | ClientMsg::Resize(_) | ClientMsg::History(_) => {}
             }
         }
         if applied {

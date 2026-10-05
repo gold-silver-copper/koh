@@ -9,7 +9,10 @@ use std::time::Duration;
 use anyhow::Context as _;
 use iroh::endpoint::Connection;
 use iroh::{EndpointId, SecretKey};
-use koh::proto::{encode_client, encode_frame, ClientMsg, Frame, FrameNum, InputSeq, MAX_FRAME};
+use koh::proto::{
+    decode_server, encode_client, encode_frame, encode_history, ClientMsg, Frame, FrameNum,
+    InputSeq, ServerMsg, MAX_FRAME, MAX_PENDING_HISTORY,
+};
 use koh::terminal::{ServerTerminal, TerminalScreen};
 use koh::transport_iroh::{admission, generate_secret_key, ALPN};
 
@@ -126,6 +129,71 @@ fn a_flood_of_connections_and_garbage_does_not_take_the_server_down() -> anyhow:
             raw_client_stream(&conn, &[0, 0, 16, 0, 1, 2, 3]).await?;
             conn.close(0u32.into(), b"next");
         }
+        assert_good_client_still_works(&mut good).await?;
+        let _ = good.finish().await;
+        server.stop().await;
+        Ok(())
+    })
+}
+
+#[test]
+fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_connection(
+) -> anyhow::Result<()> {
+    use koh::terminal::{HistoryRequest, MAX_HISTORY_ROWS};
+    crate::harness::runtime()?.block_on(async {
+        let net = net();
+        let evil = identity()?;
+        let (server, mut good) = server_under_attack(&net, evil.public()).await?;
+        let conn = admitted(&net, evil, server.id).await?;
+        let mut send = conn.open_uni().await?;
+        let lines = "i=0; while [ $i -lt 300 ]; do echo line $i; i=$((i+1)); done\r";
+        send.write_all(&encode_client(&ClientMsg::Input {
+            seq: InputSeq(1),
+            bytes: lines.as_bytes().to_vec(),
+        })?)
+        .await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        // As many as may wait, each for every row there could be: answered, each within the bound.
+        let mut asks = Vec::new();
+        for name in 1..=u64::try_from(MAX_PENDING_HISTORY)? {
+            asks.extend(encode_client(&ClientMsg::History(HistoryRequest {
+                newest: name * 100,
+                count: u16::MAX,
+            }))?);
+        }
+        send.write_all(&asks).await?;
+        let mut answers = 0;
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while answers < MAX_PENDING_HISTORY {
+            let mut recv = tokio::time::timeout_at(deadline, conn.accept_uni())
+                .await
+                .context("the answers never came")??;
+            // A frame superseded by a newer one is reset; only history is read here.
+            let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
+                continue;
+            };
+            if let ServerMsg::History(reply) = decode_server(&bytes)? {
+                answers += 1;
+                anyhow::ensure!(reply.rows.len() <= usize::from(MAX_HISTORY_ROWS));
+                anyhow::ensure!(reply.rows.len() <= 300, "more than the history holds");
+            }
+        }
+        // A flood past what may wait breaks the protocol: this connection closes, no other.
+        let mut flood = Vec::new();
+        for _ in 0..100 {
+            flood.extend(encode_client(&ClientMsg::History(HistoryRequest {
+                newest: 1,
+                count: 1,
+            }))?);
+        }
+        send.write_all(&flood).await?;
+        Box::leak(Box::new(send));
+        let closed = tokio::time::timeout(WAIT, conn.closed()).await?;
+        anyhow::ensure!(
+            matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(c)
+                if c.error_code == 2u32.into()),
+            "closed with {closed:?}"
+        );
         assert_good_client_still_works(&mut good).await?;
         let _ = good.finish().await;
         server.stop().await;
@@ -350,5 +418,64 @@ fn a_servers_hostile_links_are_shown_as_text_or_dropped() -> anyhow::Result<()> 
         );
         client.abort();
         Ok(())
+    })
+}
+
+#[test]
+fn hostile_history_rows_never_grow_the_client() -> anyhow::Result<()> {
+    use koh::terminal::{HistoryReply, HistoryRow};
+    crate::harness::runtime()?.block_on(async {
+        let net = net();
+        let good = identity()?;
+        let evil_id = evil_server(&net, good.public(), |conn| {
+            tokio::spawn(async move {
+                // A screen whose history claims a million rows, then rows the client never asked
+                // for: too many, too wide, named outside the history, over and over.
+                let Ok(mut emu) = ServerTerminal::new(24, 80, 1000) else {
+                    return;
+                };
+                for n in 0..200 {
+                    emu.process(format!("line {n}\r\n").as_bytes());
+                }
+                let mut diff = emu.snapshot().diff_from(&TerminalScreen::default());
+                diff.history = Some(koh::terminal::HistoryMark {
+                    newest: 1_000_000,
+                    len: 1_000_000,
+                });
+                if let Ok(bytes) = encode_frame(&Frame {
+                    num: FrameNum(1),
+                    base: FrameNum::BLANK,
+                    echo_ack: InputSeq(0),
+                    diff,
+                }) {
+                    send_frame_bytes(&conn, bytes).await;
+                }
+                let newest = emu.snapshot().history().newest;
+                let real = emu
+                    .history(koh::terminal::HistoryRequest { newest, count: 1 })
+                    .rows;
+                let Some(template) = real.into_iter().next() else {
+                    return;
+                };
+                let wide = |name: u64| HistoryRow {
+                    name,
+                    runs: std::iter::repeat_n(template.runs.clone(), 100)
+                        .flatten()
+                        .collect(),
+                    ..template.clone()
+                };
+                for round in 0..50_u64 {
+                    let rows: Vec<HistoryRow> = (0..300)
+                        .map(|n| wide(1_000_000 - round * 300 - n))
+                        .collect();
+                    if let Ok(bytes) = encode_history(&HistoryReply { rows }) {
+                        send_frame_bytes(&conn, bytes).await;
+                    }
+                }
+                conn.closed().await;
+            })
+        })
+        .await?;
+        client_survives(&net, good, evil_id).await
     })
 }

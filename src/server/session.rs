@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::terminal::{FrameHold, ServerTerminal, Size, TerminalScreen, DEFAULT_SIZE};
+use crate::terminal::{
+    FrameHold, HistoryReply, HistoryRequest, ServerTerminal, Size, TerminalScreen, DEFAULT_SIZE,
+};
 use anyhow::Context;
 use iroh::EndpointId;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -85,6 +87,11 @@ impl PtyHost {
 enum ClientInput {
     Keys(Vec<u8>),
     Resize(Size),
+    /// History rows, answered on `reply`.
+    History {
+        request: HistoryRequest,
+        reply: oneshot::Sender<HistoryReply>,
+    },
 }
 
 /// Whether [`Registry::attach`] created a fresh session or reattached to a running one.
@@ -135,6 +142,23 @@ impl SessionClient {
     /// Send a resize to the PTY.
     pub async fn send_resize(&self, size: Size) {
         let _ = self.input.send(ClientInput::Resize(size)).await;
+    }
+
+    /// The history rows `request` asks for, or `None` if the session ended. The future holds no
+    /// borrow of the client, so it can run on a task of its own.
+    pub fn history(
+        &self,
+        request: HistoryRequest,
+    ) -> impl std::future::Future<Output = Option<HistoryReply>> + Send + 'static {
+        let input = self.input.clone();
+        async move {
+            let (reply, rx) = oneshot::channel();
+            input
+                .send(ClientInput::History { request, reply })
+                .await
+                .ok()?;
+            rx.await.ok()
+        }
     }
 }
 
@@ -250,6 +274,9 @@ async fn session_task(
                                 }
                             }
                             screens_tx.send_replace(Arc::new(host.snapshot()));
+                        }
+                        ClientInput::History { request, reply } => {
+                            let _ = reply.send(host.emu.history(request));
                         }
                     }
                 }

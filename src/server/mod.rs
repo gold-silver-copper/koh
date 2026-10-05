@@ -16,10 +16,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::proto::{
-    encode_frame, frame_interval, retry_after, ClientDecoder, ClientMsg, Frame, FrameNum,
-    FrameScreen, InputSeq, ProtoError, FRAME_WINDOW, HEARTBEAT, SESSION_ENDED, WINDOW_CELLS,
+    encode_frame, encode_history, frame_interval, retry_after, ClientDecoder, ClientMsg, Frame,
+    FrameNum, FrameScreen, InputSeq, ProtoError, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
+    SESSION_ENDED, WINDOW_CELLS,
 };
-use crate::terminal::{Size, TerminalScreen};
+use crate::terminal::{HistoryRequest, Size, TerminalScreen};
 use iroh::endpoint::RecvStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -184,6 +185,10 @@ pub(crate) struct ServerConn {
     last_sent_echo: InputSeq,
     /// The first frame sent after the program exited, and when.
     final_frame: Option<(FrameNum, Instant)>,
+    /// History requests not yet answered, oldest first, at most [`MAX_PENDING_HISTORY`].
+    history: VecDeque<HistoryRequest>,
+    /// An answer is on its way to the client; the next waits for it to be delivered.
+    history_busy: bool,
 }
 
 impl Default for ServerConn {
@@ -207,6 +212,8 @@ impl ServerConn {
             last_sent_at: None,
             last_sent_echo: InputSeq(0),
             final_frame: None,
+            history: VecDeque::new(),
+            history_busy: false,
         }
     }
 
@@ -242,9 +249,31 @@ impl ServerConn {
                 }
                 ClientMsg::Ack { frame } => self.ack(frame),
                 ClientMsg::Resync => self.resync(),
+                ClientMsg::History(request) => {
+                    if self.history.len() >= MAX_PENDING_HISTORY {
+                        return Err(ProtoError::TooManyRequests);
+                    }
+                    self.history.push_back(request);
+                }
             }
         }
         Ok(drained)
+    }
+
+    /// The next history request to answer, if no answer is on its way; the caller calls
+    /// [`history_delivered`](Self::history_delivered) once its answer is delivered.
+    fn next_history(&mut self) -> Option<HistoryRequest> {
+        if self.history_busy {
+            return None;
+        }
+        let request = self.history.pop_front()?;
+        self.history_busy = true;
+        Some(request)
+    }
+
+    /// The last history answer was delivered (or given up on): the next may go.
+    fn history_delivered(&mut self) {
+        self.history_busy = false;
     }
 
     /// The client's stream ended: fine between messages, a protocol error inside one.
@@ -388,7 +417,19 @@ pub async fn run_attached(
     let mut had_client_stream = false;
     let mut read_buf = vec![0u8; 16 * 1024];
     let mut in_flight: VecDeque<(FrameNum, CancellationToken)> = VecDeque::new();
+    // History answers go one at a time; each one's task says here when it is delivered.
+    let (history_tx, mut history_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let history_cancel = CancellationToken::new();
+    let _history_guard = history_cancel.clone().drop_guard();
     let result = loop {
+        if let Some(request) = core.next_history() {
+            tokio::spawn(send_history(
+                conn.clone(),
+                session.history(request),
+                history_tx.clone(),
+                history_cancel.clone(),
+            ));
+        }
         let now = Instant::now();
         core.promote_echo(now);
         let rtt = crate::transport_iroh::rtt(&conn);
@@ -476,6 +517,7 @@ pub async fn run_attached(
                     break Ok(SessionExit::Detached);
                 }
             },
+            Some(()) = history_rx.recv() => core.history_delivered(),
             () = tokio::time::sleep_until(wake) => {}
         }
     };
@@ -531,6 +573,37 @@ async fn send_frame(conn: iroh::endpoint::Connection, bytes: Vec<u8>, cancel: Ca
         let _ = send.reset(0u32.into());
     }
 }
+
+/// Answer one history request: fetch the rows from the session, and send them on a stream of their
+/// own, below frames in priority, so they never delay one. Says on `delivered` once the client has
+/// them all, or they could not go.
+async fn send_history(
+    conn: iroh::endpoint::Connection,
+    reply: impl std::future::Future<Output = Option<crate::terminal::HistoryReply>>,
+    delivered: tokio::sync::mpsc::Sender<()>,
+    cancel: CancellationToken,
+) {
+    let send = async {
+        let reply = reply.await?;
+        let bytes = encode_history(&reply)
+            .map_err(|e| tracing::error!(error = %e, "encoding history rows failed"))
+            .ok()?;
+        let mut send = conn.open_uni().await.ok()?;
+        let _ = send.set_priority(HISTORY_PRIORITY);
+        send.write_all(&bytes).await.ok()?;
+        send.finish().ok()?;
+        let _ = send.stopped().await;
+        Some(())
+    };
+    tokio::select! {
+        _ = send => {}
+        () = cancel.cancelled() => return,
+    }
+    let _ = delivered.send(()).await;
+}
+
+/// The priority of history streams: below frames' (0), so QUIC sends a frame's bytes first.
+const HISTORY_PRIORITY: i32 = -1;
 
 /// Serve `conn` one session of `command`, then tear it down: the server without its accept loop,
 /// for tests.
@@ -649,6 +722,34 @@ mod tests {
             conn.drain_client(Instant::now(), false).unwrap().resize,
             None
         );
+    }
+
+    #[test]
+    fn history_requests_are_answered_one_at_a_time_and_too_many_waiting_is_an_error() {
+        use crate::proto::{ProtoError, MAX_PENDING_HISTORY};
+        use crate::terminal::HistoryRequest;
+        let ask = |newest| ClientMsg::History(HistoryRequest { newest, count: 1 });
+        let mut conn = ServerConn::default();
+        conn.push_client_bytes(&stream(&[ask(1), ask(2)]));
+        conn.drain_client(Instant::now(), false).unwrap();
+        assert_eq!(conn.next_history().map(|r| r.newest), Some(1));
+        assert_eq!(
+            conn.next_history(),
+            None,
+            "the next waits for the last's delivery"
+        );
+        conn.history_delivered();
+        assert_eq!(conn.next_history().map(|r| r.newest), Some(2));
+        conn.history_delivered();
+        assert_eq!(conn.next_history(), None);
+        let flood: Vec<ClientMsg> = (0..=u64::try_from(MAX_PENDING_HISTORY).unwrap())
+            .map(ask)
+            .collect();
+        conn.push_client_bytes(&stream(&flood));
+        assert!(matches!(
+            conn.drain_client(Instant::now(), false),
+            Err(ProtoError::TooManyRequests)
+        ));
     }
 
     #[test]

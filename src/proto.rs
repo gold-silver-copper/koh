@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::terminal::{ScreenDiff, Size, TerminalScreen};
+use crate::terminal::{HistoryReply, HistoryRequest, ScreenDiff, Size, TerminalScreen};
 
 /// A frame number. Frame 0 is the blank default screen both ends start from; it is never sent.
 /// Real frames count from 1 on each connection.
@@ -119,6 +119,10 @@ pub fn frame_interval(rtt: Option<Duration>) -> Duration {
     })
 }
 
+/// Most history requests a client may have waiting for an answer; one more is a protocol error.
+/// The server answers one at a time, so a client cannot make it send faster than the link takes.
+pub const MAX_PENDING_HISTORY: usize = 8;
+
 /// DEFLATE level for frames. Screen diffs are very compressible (runs of spaces, repeated
 /// styles), so a mid level gets most of the ratio at little CPU.
 const COMPRESSION_LEVEL: u8 = 6;
@@ -139,6 +143,9 @@ pub enum ClientMsg {
     /// The client got a frame whose base it does not hold; the next frame must diff against
     /// [`FrameNum::BLANK`].
     Resync,
+    /// The client asks for history rows it lacks (see [`HistoryRequest`]). The server answers each,
+    /// one at a time, at a lower priority than frames.
+    History(HistoryRequest),
 }
 
 /// [`ClientMsg::Input`]'s bytes as a byte string. postcard encodes that exactly as it encodes a
@@ -197,13 +204,20 @@ pub enum ProtoError {
     Malformed(#[from] postcard::Error),
     #[error("could not inflate the frame (corrupt, or larger than {MAX_FRAME} bytes)")]
     Inflate,
+    #[error("history rows where a frame was expected")]
+    NotAFrame,
+    #[error("more than {MAX_PENDING_HISTORY} history requests waiting")]
+    TooManyRequests,
 }
 
 /// Encode one client message with its length prefix.
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
     let input = match msg {
         ClientMsg::Input { bytes, .. } => bytes.len(),
-        ClientMsg::Resize(_) | ClientMsg::Ack { .. } | ClientMsg::Resync => 0,
+        ClientMsg::Resize(_)
+        | ClientMsg::Ack { .. }
+        | ClientMsg::Resync
+        | ClientMsg::History(_) => 0,
     };
     if input > MAX_INPUT_BYTES {
         return Err(ProtoError::InputTooLarge {
@@ -305,22 +319,45 @@ impl ClientDecoder {
     }
 }
 
+/// A message on one of the server's streams: a frame, or history rows.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub enum ServerMsg {
+    Frame(Frame),
+    History(HistoryReply),
+}
+
+/// [`ServerMsg`] as it is encoded, borrowing what it carries: postcard encodes both alike.
+#[derive(Serialize)]
+enum ServerMsgRef<'a> {
+    Frame(&'a Frame),
+    History(&'a HistoryReply),
+}
+
 /// Encode a frame for its stream.
 pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
-    let raw = postcard::to_allocvec(frame)?;
+    encode_server(&ServerMsgRef::Frame(frame))
+}
+
+/// Encode history rows for their stream.
+pub fn encode_history(reply: &HistoryReply) -> Result<Vec<u8>, ProtoError> {
+    encode_server(&ServerMsgRef::History(reply))
+}
+
+fn encode_server(msg: &ServerMsgRef<'_>) -> Result<Vec<u8>, ProtoError> {
+    let raw = postcard::to_allocvec(msg)?;
     Ok(miniz_oxide::deflate::compress_to_vec(
         &raw,
         COMPRESSION_LEVEL,
     ))
 }
 
-/// Decode a frame's stream contents, inflating at most [`MAX_FRAME`] bytes.
+/// Decode a server stream's contents, inflating at most [`MAX_FRAME`] bytes.
 #[expect(
     clippy::map_err_ignore,
     reason = "miniz's error carries the partial, attacker-controlled inflate output; \
               `ProtoError::Inflate` deliberately reports only corrupt-or-oversized"
 )]
-pub fn decode_frame(bytes: &[u8]) -> Result<Frame, ProtoError> {
+pub fn decode_server(bytes: &[u8]) -> Result<ServerMsg, ProtoError> {
     if bytes.len() > MAX_FRAME {
         return Err(ProtoError::TooLarge {
             len: bytes.len(),
@@ -330,6 +367,14 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame, ProtoError> {
     let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, MAX_FRAME)
         .map_err(|_| ProtoError::Inflate)?;
     Ok(postcard::from_bytes(&raw)?)
+}
+
+/// Decode a stream that must hold a frame.
+pub fn decode_frame(bytes: &[u8]) -> Result<Frame, ProtoError> {
+    match decode_server(bytes)? {
+        ServerMsg::Frame(frame) => Ok(frame),
+        ServerMsg::History(_) => Err(ProtoError::NotAFrame),
+    }
 }
 
 #[cfg(test)]

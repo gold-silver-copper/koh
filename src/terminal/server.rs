@@ -1,9 +1,11 @@
 //! The server's live emulator: a `fux_vt::Parser` fed by the PTY, the title, icon, bell and
 //! clipboard it reports, and the replies to the program's queries.
 
-use crate::terminal::grid::RowCache;
+use crate::terminal::grid::{Palette, RowCache};
+use crate::terminal::history::HistoryNames;
 use crate::terminal::{
-    clamp_dims, Grid, Size, TerminalScreen, MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
+    clamp_dims, Grid, HistoryMark, HistoryReply, HistoryRequest, Size, TerminalScreen,
+    MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
 };
 use std::time::{Duration, Instant};
 
@@ -111,6 +113,8 @@ pub struct ServerTerminal {
     frame_began: bool,
     /// Where the program's output ends a frame.
     frame_ends: FrameEnds,
+    /// The names of the history's rows on the wire.
+    names: HistoryNames,
 }
 
 impl ServerTerminal {
@@ -126,6 +130,7 @@ impl ServerTerminal {
             frame_start: None,
             frame_began: false,
             frame_ends: FrameEnds::default(),
+            names: HistoryNames::default(),
         })
     }
 
@@ -201,6 +206,29 @@ impl ServerTerminal {
         if let Err(e) = self.parser.resize(rows, cols) {
             tracing::warn!(error = %e, rows, cols, "terminal emulator refused a resize");
         }
+        // A reflow lays the history out afresh, its rows with new cells.
+        self.names.renew();
+    }
+
+    /// The screen scrolled `offset` rows back into history, as this emulator shows it: what a
+    /// client's scrollback view at `offset` must show. For tests.
+    pub fn window(&self, offset: usize) -> TerminalScreen {
+        TerminalScreen {
+            grid: Grid::window_of(self.parser.screen(), offset),
+            title: self.observed.title.clone(),
+            icon: self.observed.icon.clone(),
+            clipboard: self.observed.clipboard.clone(),
+            bell_count: self.observed.bell_count,
+            exit_code: self.exit_code,
+            history: HistoryMark::default(),
+        }
+    }
+
+    /// The history rows `request` asks for that the history still holds.
+    pub fn history(&mut self, request: HistoryRequest) -> HistoryReply {
+        let screen = self.parser.screen();
+        let palette = Palette::of(screen);
+        self.names.reply(screen, palette.as_ref(), request)
     }
 
     /// The report a program that set in-band resize (mode 2048) is sent after a resize, for its
@@ -242,6 +270,7 @@ impl ServerTerminal {
             clipboard: self.observed.clipboard.clone(),
             bell_count: self.observed.bell_count,
             exit_code: self.exit_code,
+            history: self.names.mark(self.parser.screen()),
         }
     }
 }

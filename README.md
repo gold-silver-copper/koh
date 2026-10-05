@@ -97,7 +97,9 @@ binary, not the library.
 - No SSH bootstrap, no listening port, and no port forwarding needed.
 - Not wire-compatible with mosh or SSH; koh is its own protocol/tool.
 - Intended for personal machines you control; not a full SSH replacement.
-- Does not provide multi-user accounts, file transfer, scrollback sync, or Windows support.
+- Scrollback: `Ctrl-^ [` opens the server's history above the live screen, in full colour, with
+  the arrows, Page Up/Down, the mouse wheel and `q` to leave; new output keeps arriving below.
+- Does not provide multi-user accounts, file transfer, or Windows support.
 
 ## Status
 

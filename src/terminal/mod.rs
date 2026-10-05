@@ -15,10 +15,15 @@ use fux_vt::{
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 mod grid;
+mod history;
 mod server;
 
 pub use crate::predict::Size;
 pub use grid::{drawn, Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
+pub use history::{
+    HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, KeptRow,
+    HISTORY_CACHE_CELLS, MAX_HISTORY_CELLS, MAX_HISTORY_ROWS,
+};
 pub use server::{FrameHold, ServerTerminal, FRAME_HOLD, IDENTITY, OPTIONS};
 
 /// Default screen geometry, used for the blank screen both ends start from.
@@ -87,6 +92,8 @@ pub struct TerminalScreen {
     bell_count: u64,
     /// The program's exit code once it exited, for the client to exit with.
     exit_code: Option<u32>,
+    /// Where the server's history stands: what the client may ask for.
+    history: HistoryMark,
 }
 
 impl Default for TerminalScreen {
@@ -104,6 +111,7 @@ impl TerminalScreen {
             clipboard: String::new(),
             bell_count: 0,
             exit_code: None,
+            history: HistoryMark { newest: 0, len: 0 },
         }
     }
 
@@ -155,6 +163,52 @@ impl TerminalScreen {
     /// How many bells the program rang.
     pub const fn bell_count(&self) -> u64 {
         self.bell_count
+    }
+
+    /// Where the server's history stands.
+    pub const fn history(&self) -> HistoryMark {
+        self.history
+    }
+
+    /// This screen scrolled `offset` rows back into the history `cache` holds part of: the
+    /// history rows above its top, then its own rows, the top `rows` of them shown. A row not held
+    /// is blank. The cursor is hidden, and mouse reporting on, so the wheel can scroll.
+    #[must_use]
+    pub fn scrolled_back(&self, cache: &HistoryCache, offset: usize) -> Self {
+        let size = self.size();
+        let mut grid = self.grid.clone();
+        let blank: Arc<Cells> = Arc::new(Cells::new(usize::from(size.cols)));
+        for row in 0..size.rows {
+            // The row `offset - row` above the screen's top is history; the rest is the screen's.
+            let shown = if let Some(above) = offset
+                .checked_sub(usize::from(row))
+                .filter(|&above| above > 0)
+            {
+                u64::try_from(above.saturating_sub(1))
+                    .ok()
+                    .map(|back| self.history.newest.saturating_sub(back))
+                    .filter(|&name| self.history.holds(name))
+                    .and_then(|name| cache.screen_row(name, size.cols))
+            } else {
+                let below = usize::from(row).saturating_sub(offset);
+                u16::try_from(below)
+                    .ok()
+                    .and_then(|from| self.grid.row_parts(from))
+            };
+            let (cells, wrapped, links) =
+                shown.unwrap_or_else(|| (Arc::clone(&blank), false, None));
+            grid.set_row(row, cells, wrapped, links);
+        }
+        grid.set_modes(Modes {
+            hide_cursor: true,
+            mouse_mode: MouseProtocolMode::PressRelease,
+            mouse_encoding: MouseProtocolEncoding::Sgr,
+            ..self.grid.modes()
+        });
+        Self {
+            grid,
+            ..self.clone()
+        }
     }
 
     /// The cells `screens` hold in memory together: a row several of them share counts once.
@@ -589,94 +643,108 @@ impl RowDiff {
             }
             fits
         });
-        let mut runs: Vec<Run> = Vec::new();
-        let mut previous: Option<(CellRef<'_>, u16)> = None;
-        for (col, cell) in cells.iter().enumerate() {
-            let link = links
-                .and_then(|links| links.cells.get(col).copied())
-                .unwrap_or(0);
-            let extended =
-                previous == Some((cell, link)) && runs.last_mut().is_some_and(Run::extend);
-            if !extended {
-                runs.push(Run {
-                    count: NonZeroU16::MIN,
-                    cell: WireCell {
-                        link,
-                        ..WireCell::of(cell)
-                    },
-                });
-            }
-            previous = Some((cell, link));
-        }
+        let (runs, links) = runs_of(cells, links);
         Self {
             row,
             wrapped,
             runs,
-            links: links.map_or_else(Vec::new, |links| {
-                links
-                    .table
-                    .iter()
-                    .map(|link| WireLink {
-                        uri: link.uri.clone(),
-                        id: link.id.clone(),
-                    })
-                    .collect()
-            }),
+            links,
         }
     }
 
-    /// The row these runs decode to, exactly `cols` cells, with its links, or `None` if the runs
-    /// are malformed, don't cover the row exactly, or name a link the row does not have. Work is
-    /// bounded by `cols`: every run is non-empty, and each cell's text by
-    /// [`Cell::CLUSTER_CAPACITY`].
+    /// The row these runs decode to, exactly `cols` cells, with its links (see [`cells_of`]).
     fn decode(&self, cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
-        if self.links.len() > MAX_ROW_LINKS {
-            return None;
-        }
-        let mut cells = Cells::new(usize::from(cols));
-        let mut linked = Vec::new();
-        let mut at = 0_usize;
-        for run in &self.runs {
-            let end = at
-                .checked_add(usize::from(run.count.get()))
-                .filter(|&end| end <= usize::from(cols))?;
-            if usize::from(run.cell.link) > self.links.len() {
-                return None;
-            }
-            for col in at..end {
-                run.cell.write_to(&mut cells, col)?;
-                if !self.links.is_empty() {
-                    linked.push(run.cell.link);
-                }
-            }
-            at = end;
-        }
-        if at != usize::from(cols) {
-            return None;
-        }
-        let links = (!self.links.is_empty()).then(|| {
-            Arc::new(RowLinks {
-                table: self
-                    .links
-                    .iter()
-                    .map(|link| Link {
-                        uri: link.uri.clone(),
-                        id: link.id.clone(),
-                    })
-                    .collect(),
-                cells: linked,
-            })
-        });
-        Some((cells, links))
+        cells_of(&self.runs, &self.links, cols)
     }
 
     /// The bytes of hyperlinks this row carries.
     fn link_bytes(&self) -> usize {
-        self.links
-            .iter()
-            .map(|link| link.uri.len().saturating_add(link.id.len()))
-            .sum()
+        link_bytes(&self.links)
     }
+}
+
+/// `cells` as runs of identical cells, with `links`: each run's cells name the same link.
+fn runs_of(cells: &Cells, links: Option<&RowLinks>) -> (Vec<Run>, Vec<WireLink>) {
+    let mut runs: Vec<Run> = Vec::new();
+    let mut previous: Option<(CellRef<'_>, u16)> = None;
+    for (col, cell) in cells.iter().enumerate() {
+        let link = links
+            .and_then(|links| links.cells.get(col).copied())
+            .unwrap_or(0);
+        let extended = previous == Some((cell, link)) && runs.last_mut().is_some_and(Run::extend);
+        if !extended {
+            runs.push(Run {
+                count: NonZeroU16::MIN,
+                cell: WireCell {
+                    link,
+                    ..WireCell::of(cell)
+                },
+            });
+        }
+        previous = Some((cell, link));
+    }
+    let links = links.map_or_else(Vec::new, |links| {
+        links
+            .table
+            .iter()
+            .map(|link| WireLink {
+                uri: link.uri.clone(),
+                id: link.id.clone(),
+            })
+            .collect()
+    });
+    (runs, links)
+}
+
+/// The row `runs` decode to, exactly `cols` cells, with its `links`, or `None` if the runs are
+/// malformed, don't cover the row exactly, or name a link the row does not have. Work is bounded
+/// by `cols`: every run is non-empty, and each cell's text by [`Cell::CLUSTER_CAPACITY`].
+fn cells_of(runs: &[Run], links: &[WireLink], cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
+    if links.len() > MAX_ROW_LINKS {
+        return None;
+    }
+    let mut cells = Cells::new(usize::from(cols));
+    let mut linked = Vec::new();
+    let mut at = 0_usize;
+    for run in runs {
+        let end = at
+            .checked_add(usize::from(run.count.get()))
+            .filter(|&end| end <= usize::from(cols))?;
+        if usize::from(run.cell.link) > links.len() {
+            return None;
+        }
+        for col in at..end {
+            run.cell.write_to(&mut cells, col)?;
+            if !links.is_empty() {
+                linked.push(run.cell.link);
+            }
+        }
+        at = end;
+    }
+    if at != usize::from(cols) {
+        return None;
+    }
+    let links = (!links.is_empty()).then(|| {
+        Arc::new(RowLinks {
+            table: links
+                .iter()
+                .map(|link| Link {
+                    uri: link.uri.clone(),
+                    id: link.id.clone(),
+                })
+                .collect(),
+            cells: linked,
+        })
+    });
+    Some((cells, links))
+}
+
+/// The bytes of hyperlinks `links` carry.
+fn link_bytes(links: &[WireLink]) -> usize {
+    links
+        .iter()
+        .map(|link| link.uri.len().saturating_add(link.id.len()))
+        .fold(0_usize, usize::saturating_add)
 }
 
 /// Whether `cell` is what a blank grid holds: no text, neither half of a wide glyph, the default
@@ -936,6 +1004,8 @@ pub struct ScreenDiff {
     pub bell_count: u64,
     /// The remote shell's exit code, set on the final (shutdown) frame.
     pub exit_code: Option<u32>,
+    /// Where the server's history stands, if that changed.
+    pub history: Option<HistoryMark>,
     /// The cursor at the target state.
     pub cursor: (u16, u16),
     /// The modes at the target state.
@@ -986,6 +1056,7 @@ impl TerminalScreen {
             clipboard: (self.clipboard != base.clipboard).then(|| self.clipboard.clone()),
             bell_count: self.bell_count,
             exit_code: self.exit_code,
+            history: (self.history != base.history).then_some(self.history),
             cursor: self.grid.cursor_position(),
             modes: self.grid.modes().into(),
             shifts,
@@ -1055,6 +1126,9 @@ impl TerminalScreen {
         }
         if diff.exit_code.is_some() {
             self.exit_code = diff.exit_code;
+        }
+        if let Some(history) = diff.history {
+            self.history = history;
         }
     }
 }
@@ -1136,6 +1210,7 @@ mod tests {
             title: None,
             icon: None,
             clipboard: None,
+            history: None,
             bell_count: 0,
             exit_code: None,
             cursor: (0, 0),
@@ -1268,7 +1343,8 @@ mod tests {
             };
             let resize = resize.map(|(rows, cols)| Size::new(rows, cols));
             let diff = ScreenDiff {
-                resize, title, icon, clipboard, bell_count, exit_code, cursor, modes, shifts, rows,
+                resize, title, icon, clipboard, bell_count, exit_code, history: None, cursor, modes,
+                shifts, rows,
             };
             let mut screen = TerminalScreen::default();
             screen.apply(&diff); // must not panic on adversarial input
@@ -1633,6 +1709,7 @@ mod tests {
         clipboard: Option<String>,
         bell_count: u64,
         exit_code: Option<u32>,
+        history: Option<(u64, u32)>,
         cursor: (u16, u16),
         modes: RawModes,
         shifts: Vec<RawShift>,
@@ -1690,6 +1767,7 @@ mod tests {
             clipboard: None,
             bell_count: 0,
             exit_code: None,
+            history: None,
             cursor: (0, 0),
             modes: RawModes {
                 hide_cursor: false,

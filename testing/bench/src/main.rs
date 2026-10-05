@@ -21,6 +21,7 @@ mod proxy;
 #[path = "../../corpus/recording.rs"]
 mod recording;
 mod remote;
+mod scrollback;
 mod workloads;
 
 use std::fmt::Write as _;
@@ -210,9 +211,6 @@ fn wire_cell(result: &Result<Wire, String>) -> String {
     }
 }
 
-/// What koh's scrollback is, for the summary. It changes with koh.
-const KOH_SCROLLBACK: &str = "none";
-
 /// The link profiles latency and settling are measured on.
 fn profiles() -> [(&'static str, Profile); 3] {
     [
@@ -368,6 +366,8 @@ struct Results {
     latency: Vec<(&'static str, Vec<(System, LatencyRuns)>)>,
     /// By action, by profile, by system: each run's p50.
     settle: Vec<(Action, Vec<SettleProfile>)>,
+    /// Each workload's history, and what fetching it all costs koh.
+    scrollback: Vec<(String, usize, scrollback::History)>,
 }
 
 async fn run(args: &Args) -> anyhow::Result<String> {
@@ -421,6 +421,16 @@ async fn run(args: &Args) -> anyhow::Result<String> {
             .collect();
         results.synthetic = list.len();
         list.extend(recorded);
+        for workload in &list {
+            match scrollback::measure(workload) {
+                Ok(history) => {
+                    results
+                        .scrollback
+                        .push((workload.name.clone(), workload.bytes(), history));
+                }
+                Err(e) => eprintln!("scrollback {}: {e:#}", workload.name),
+            }
+        }
         for (seed, workload) in (1u64..).zip(&list) {
             let mut by = Vec::new();
             for &system in &systems {
@@ -541,6 +551,7 @@ async fn run(args: &Args) -> anyhow::Result<String> {
     );
     summary(&mut out, &systems, &results);
     wire_section(&mut out, &systems, &results);
+    scrollback_section(&mut out, &systems, &results);
     latency_section(&mut out, &systems, &results, args, namespaces);
     settle_section(&mut out, &systems, &results, args, namespaces);
 
@@ -701,15 +712,69 @@ fn summary(out: &mut String, systems: &[System], results: &Results) {
         }
     }
     let _ = write!(out, "| Scrollback |");
+    let (rows, bytes) = results
+        .scrollback
+        .iter()
+        .fold((0_usize, 0_u64), |(rows, bytes), (_, _, h)| {
+            (rows.saturating_add(h.rows), bytes.saturating_add(h.bytes))
+        });
     for s in systems {
         let v = match s {
-            System::Koh => KOH_SCROLLBACK,
-            System::Mosh => "none",
-            System::Ssh => "the terminal's own",
+            System::Koh if rows > 0 => format!(
+                "the server's, in full colour, kept across reconnects ({rows} rows of the \
+                 workloads in {} KiB)",
+                kib(bytes)
+            ),
+            System::Koh => "the server's, in full colour, kept across reconnects".to_owned(),
+            System::Mosh => "none".to_owned(),
+            System::Ssh => "the terminal's own, lost on a reconnect".to_owned(),
         };
         let _ = write!(out, " {v} |");
     }
-    out.push_str(" - |\n");
+    out.push_str(" **koh** |\n");
+}
+
+fn scrollback_section(out: &mut String, systems: &[System], results: &Results) {
+    let kept: Vec<_> = results
+        .scrollback
+        .iter()
+        .filter(|(_, _, h)| h.rows > 0)
+        .collect();
+    if kept.is_empty() {
+        return;
+    }
+    out.push_str("\n## Scrollback\n\n");
+    out.push_str(
+        "Each workload played into a server emulator keeping the default 1,000 lines, then \
+         every row of its history fetched as koh's scrollback view (`Ctrl-^ [`) fetches them: \
+         the bytes of the compressed history streams, in KiB. koh fetches a row only when the \
+         user scrolls to it (and the newest screenful when idle), and never twice. mosh keeps \
+         no history; ssh's is the user's terminal's, which every byte of output already paid \
+         for, and which a reconnect loses. Workloads that leave no history (those on the \
+         alternate screen) are left out.\n\n",
+    );
+    out.push_str("| Workload | Output KiB | History rows |");
+    for system in systems {
+        let _ = write!(out, " {} |", system.name());
+    }
+    out.push_str("\n| --- | ---: | ---: |");
+    for _ in systems {
+        out.push_str(" ---: |");
+    }
+    out.push('\n');
+    for (name, output, history) in kept {
+        let output = kib(u64::try_from(*output).unwrap_or(0));
+        let _ = write!(out, "| {name} | {output} | {} |", history.rows);
+        for system in systems {
+            let v = match system {
+                System::Koh => kib(history.bytes),
+                System::Mosh => "none".to_owned(),
+                System::Ssh => format!("({output})"),
+            };
+            let _ = write!(out, " {v} |");
+        }
+        out.push('\n');
+    }
 }
 
 fn wire_section(out: &mut String, systems: &[System], results: &Results) {

@@ -1,0 +1,459 @@
+//! The scrollback view (`Ctrl-^ [`): the server's history above the live screen, fetched by name as
+//! the user scrolls, without I/O.
+//!
+//! The view is anchored to what it shows: new output scrolling into history moves the view up with
+//! it, so the rows being read stay still while the screen below goes on. Its keys are less's and
+//! tmux's: the arrows, `k`/`j`, Page Up/Down, `b`/`f`/space, `u`/`d`, Home/End, `g`/`G`, and the
+//! mouse wheel; `q` or Escape leaves.
+
+use std::time::{Duration, Instant};
+
+use crate::terminal::{
+    HistoryCache, HistoryMark, HistoryReply, HistoryRequest, TerminalScreen, MAX_HISTORY_ROWS,
+};
+
+/// Most history requests a client has unanswered: enough to keep rows coming while one is
+/// delivered, well within what the server takes.
+const MAX_OUTSTANDING: usize = 2;
+
+/// Rows the wheel scrolls a notch.
+const WHEEL_ROWS: usize = 3;
+
+/// How long the user must not have typed, nor a frame arrived, before the newest screenful of
+/// history is fetched ahead of need.
+pub const PREFETCH_IDLE: Duration = Duration::from_secs(2);
+
+/// What a key read in the view does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewKeys {
+    /// The view stays.
+    Stay,
+    /// The user left the view.
+    Leave,
+}
+
+/// The history a client holds, and the view of it.
+#[derive(Debug, Default)]
+pub struct Scrollback {
+    cache: HistoryCache,
+    /// The rows scrolled back from the live screen, while the view is open.
+    view: Option<usize>,
+    /// The history as the newest screen showed it.
+    mark: HistoryMark,
+    /// Requests sent and not answered, oldest first: the server answers in order.
+    outstanding: Vec<HistoryRequest>,
+    /// The bytes of an escape sequence split across reads.
+    partial: Vec<u8>,
+}
+
+impl Scrollback {
+    /// Whether the view is open.
+    pub const fn viewing(&self) -> bool {
+        self.view.is_some()
+    }
+
+    /// Open the view, at the live screen.
+    pub fn open(&mut self) {
+        self.view = Some(0);
+        self.partial.clear();
+    }
+
+    /// The rows held, for tests and the status line.
+    pub const fn cache(&self) -> &HistoryCache {
+        &self.cache
+    }
+
+    /// The rows scrolled back, if viewing.
+    pub const fn offset(&self) -> Option<usize> {
+        self.view
+    }
+
+    /// The newest screen showed the history at `mark`: drop the rows it no longer holds, and keep
+    /// the view on the rows it showed.
+    pub fn on_mark(&mut self, mark: HistoryMark) {
+        if mark == self.mark {
+            return;
+        }
+        let old = self.mark;
+        self.mark = mark;
+        self.cache.retain(mark);
+        if let Some(offset) = self.view.as_mut() {
+            // Rows that entered history since: the view moves up with them, unless it is at the
+            // live screen, where it follows the output. A history laid out afresh (a resize) has
+            // new names, and the view keeps its distance instead.
+            let entered = mark
+                .newest
+                .checked_sub(old.newest)
+                .filter(|_| old.len > 0 && mark.holds(old.newest));
+            if *offset > 0 {
+                if let Some(entered) = entered.and_then(|n| usize::try_from(n).ok()) {
+                    *offset = offset.saturating_add(entered);
+                }
+            }
+            *offset = (*offset).min(usize::try_from(mark.len).unwrap_or(usize::MAX));
+        }
+    }
+
+    /// History rows arrived: keep them. A malformed answer is dropped whole.
+    pub fn on_reply(&mut self, reply: &HistoryReply) {
+        if !self.outstanding.is_empty() {
+            self.outstanding.remove(0);
+        }
+        let near = self.focus();
+        if self.cache.insert(reply, self.mark, near).is_none() {
+            tracing::debug!("dropping malformed history rows");
+        }
+    }
+
+    /// The name of the row the view is about: the one at its top, or the newest.
+    fn focus(&self) -> u64 {
+        let back = self
+            .view
+            .and_then(|offset| u64::try_from(offset.saturating_sub(1)).ok())
+            .unwrap_or(0);
+        self.mark.newest.saturating_sub(back)
+    }
+
+    /// The next history request to send, if any: the rows the view shows and a page above them,
+    /// or, idle and out of the view, the newest screenful. `rows` is the screen's height.
+    pub fn next_request(&mut self, rows: u16, idle: bool) -> Option<HistoryRequest> {
+        if self.outstanding.len() >= MAX_OUTSTANDING || self.mark.len == 0 {
+            return None;
+        }
+        let rows_u64 = u64::from(rows);
+        let (newest, span) = match self.view {
+            Some(offset) => {
+                // The view's top row, and a page above it; its bottom is the newest it shows.
+                let top = self.focus();
+                let bottom = top
+                    .saturating_add(rows_u64.saturating_sub(1))
+                    .min(self.mark.newest);
+                (
+                    bottom,
+                    rows_u64.saturating_mul(2).min(
+                        u64::try_from(offset)
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(rows_u64),
+                    ),
+                )
+            }
+            None if idle => (self.mark.newest, rows_u64),
+            None => return None,
+        };
+        let oldest = self.mark.oldest()?;
+        let lowest = newest.saturating_sub(span.saturating_sub(1)).max(oldest);
+        // The newest row missing, and the run of missing rows below it.
+        let missing = (lowest..=newest)
+            .rev()
+            .find(|&name| !self.cache.holds(name) && !self.asked(name))?;
+        let run = (lowest..=missing)
+            .rev()
+            .take_while(|&name| !self.cache.holds(name) && !self.asked(name))
+            .take(usize::from(MAX_HISTORY_ROWS))
+            .count();
+        let request = HistoryRequest {
+            newest: missing,
+            count: u16::try_from(run).unwrap_or(MAX_HISTORY_ROWS),
+        };
+        self.outstanding.push(request);
+        Some(request)
+    }
+
+    /// Whether an unanswered request covers the row named `name`.
+    fn asked(&self, name: u64) -> bool {
+        self.outstanding.iter().any(|request| {
+            name <= request.newest && request.newest.saturating_sub(name) < u64::from(request.count)
+        })
+    }
+
+    /// The connection was lost: requests on it will not be answered.
+    pub fn forget_requests(&mut self) {
+        self.outstanding.clear();
+    }
+
+    /// The screen to show for `live`: `live` scrolled back, while viewing.
+    pub fn shown(&self, live: &TerminalScreen) -> Option<TerminalScreen> {
+        self.view
+            .map(|offset| live.scrolled_back(&self.cache, offset))
+    }
+
+    /// The status line while viewing.
+    pub fn status(&self) -> Option<String> {
+        let offset = self.view?;
+        Some(format!(
+            "[koh] scrollback {offset}/{} — arrows, PgUp/PgDn, wheel; q leaves",
+            self.mark.len
+        ))
+    }
+
+    /// Keys typed while viewing, for a screen `rows` high.
+    pub fn on_keys(&mut self, bytes: &[u8], rows: u16) -> ViewKeys {
+        let mut input = std::mem::take(&mut self.partial);
+        input.extend_from_slice(bytes);
+        let page = usize::from(rows.saturating_sub(1)).max(1);
+        let half = page.div_euclid(2).max(1);
+        let mut rest = input.as_slice();
+        while let Some((&byte, tail)) = rest.split_first() {
+            let (step, used) = match byte {
+                b'q' | 0x03 => return self.leave(),
+                0x1b => match parse_escape(rest) {
+                    Escape::Partial if rest.len() == 1 => return self.leave(),
+                    Escape::Partial => {
+                        self.partial = rest.to_vec();
+                        break;
+                    }
+                    Escape::Key(step, used) => (step, used),
+                },
+                b'k' | b'y' | 0x10 | 0x19 => (Step::Up(1), 1),
+                b'j' | b'e' | 0x0e | 0x05 | b'\r' => (Step::Down(1), 1),
+                b'b' | 0x02 => (Step::Up(page), 1),
+                b'f' | b' ' | 0x06 => (Step::Down(page), 1),
+                b'u' | 0x15 => (Step::Up(half), 1),
+                b'd' | 0x04 => (Step::Down(half), 1),
+                b'g' => (Step::Top, 1),
+                b'G' => (Step::Bottom, 1),
+                _ => (Step::None, 1),
+            };
+            let step = match step {
+                Step::PageUp => Step::Up(page),
+                Step::PageDown => Step::Down(page),
+                step @ (Step::Up(_) | Step::Down(_) | Step::Top | Step::Bottom | Step::None) => {
+                    step
+                }
+            };
+            self.step(step);
+            rest = rest.get(used..).unwrap_or(tail);
+        }
+        ViewKeys::Stay
+    }
+
+    fn leave(&mut self) -> ViewKeys {
+        self.view = None;
+        self.partial.clear();
+        ViewKeys::Leave
+    }
+
+    fn step(&mut self, step: Step) {
+        let Some(offset) = self.view.as_mut() else {
+            return;
+        };
+        let most = usize::try_from(self.mark.len).unwrap_or(usize::MAX);
+        *offset = match step {
+            Step::Up(n) => offset.saturating_add(n).min(most),
+            Step::Down(n) => offset.saturating_sub(n),
+            Step::Top => most,
+            Step::Bottom => 0,
+            Step::PageUp | Step::PageDown | Step::None => *offset,
+        };
+    }
+
+    /// Whether the client was idle long enough to fetch ahead: nothing typed, and no frame, since
+    /// `PREFETCH_IDLE` before `now`.
+    pub fn idle(now: Instant, last_activity: Option<Instant>) -> bool {
+        last_activity.is_none_or(|at| now.saturating_duration_since(at) >= PREFETCH_IDLE)
+    }
+}
+
+/// A move of the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Up(usize),
+    Down(usize),
+    /// A page, which only the view knows.
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+    None,
+}
+
+/// An escape sequence read in the view.
+enum Escape {
+    /// Not complete in what was read.
+    Partial,
+    /// What it does, and its length.
+    Key(Step, usize),
+}
+
+/// The escape sequence at the start of `bytes` (which starts with ESC).
+fn parse_escape(bytes: &[u8]) -> Escape {
+    match bytes.get(1) {
+        None => Escape::Partial,
+        Some(b'O') => match bytes.get(2) {
+            None => Escape::Partial,
+            Some(b'A') => Escape::Key(Step::Up(1), 3),
+            Some(b'B') => Escape::Key(Step::Down(1), 3),
+            Some(b'H') => Escape::Key(Step::Top, 3),
+            Some(b'F') => Escape::Key(Step::Bottom, 3),
+            Some(_) => Escape::Key(Step::None, 3),
+        },
+        Some(b'[') => {
+            // Parameters and intermediates, then a final byte.
+            let Some(len) = bytes
+                .iter()
+                .skip(2)
+                .position(|b| (0x40..=0x7e).contains(b))
+                .map(|at| at.saturating_add(3))
+            else {
+                // A sequence longer than any key is not one; drop it.
+                return if bytes.len() > 32 {
+                    Escape::Key(Step::None, bytes.len())
+                } else {
+                    Escape::Partial
+                };
+            };
+            let body = bytes.get(2..len.saturating_sub(1)).unwrap_or_default();
+            let last = bytes.get(len.saturating_sub(1)).copied().unwrap_or(0);
+            let step = match (body, last) {
+                (b"", b'A') => Step::Up(1),
+                (b"", b'B') => Step::Down(1),
+                (b"" | b"1", b'H') | (b"1" | b"7", b'~') => Step::Top,
+                (b"" | b"1", b'F') | (b"4" | b"8", b'~') => Step::Bottom,
+                (b"5", b'~') => Step::PageUp,
+                (b"6", b'~') => Step::PageDown,
+                (body, b'M') if body.first() == Some(&b'<') => wheel(body),
+                _ => Step::None,
+            };
+            Escape::Key(step, len)
+        }
+        // Alt and a key, or a lone ESC followed by more keys.
+        Some(_) => Escape::Key(Step::None, 2),
+    }
+}
+
+/// An SGR mouse report's step: the wheel scrolls, anything else does nothing.
+fn wheel(body: &[u8]) -> Step {
+    let button = body
+        .get(1..)
+        .unwrap_or_default()
+        .split(|&b| b == b';')
+        .next()
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|b| b.parse::<u16>().ok());
+    match button {
+        Some(b) if b & 64 != 0 && b & 1 == 0 => Step::Up(WHEEL_ROWS),
+        Some(b) if b & 64 != 0 => Step::Down(WHEEL_ROWS),
+        _ => Step::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn viewing(len: u32) -> Scrollback {
+        let mut s = Scrollback::default();
+        s.on_mark(HistoryMark { newest: 1000, len });
+        s.open();
+        s
+    }
+
+    #[test]
+    fn keys_move_the_view_within_the_history() {
+        let mut s = viewing(100);
+        let rows = 25;
+        let press = |s: &mut Scrollback, keys: &[u8]| {
+            assert_eq!(s.on_keys(keys, rows), ViewKeys::Stay);
+            s.offset().unwrap()
+        };
+        assert_eq!(press(&mut s, b"k"), 1);
+        assert_eq!(press(&mut s, b"\x1b[A\x1bOA"), 3);
+        assert_eq!(press(&mut s, b"\x1b[5~"), 27);
+        assert_eq!(press(&mut s, b"\x1b[6~j"), 2);
+        assert_eq!(press(&mut s, b"\x1b[<64;10;5M"), 5, "the wheel up");
+        assert_eq!(press(&mut s, b"\x1b[<65;10;5M"), 2, "the wheel down");
+        assert_eq!(
+            press(&mut s, b"\x1b[<0;10;5M\x1b[<0;10;5m"),
+            2,
+            "a click does nothing"
+        );
+        assert_eq!(press(&mut s, b"g"), 100, "the top is the oldest row");
+        assert_eq!(press(&mut s, b"k"), 100, "and no further");
+        assert_eq!(press(&mut s, b"u"), 100);
+        assert_eq!(press(&mut s, b"d"), 88);
+        assert_eq!(press(&mut s, b"\x1b[F"), 0);
+        assert_eq!(press(&mut s, b"j"), 0, "the live screen is the bottom");
+        assert_eq!(press(&mut s, b"x\x1bx"), 0, "other keys do nothing");
+    }
+
+    #[test]
+    fn an_escape_sequence_split_across_reads_is_read_whole() {
+        let mut s = viewing(100);
+        assert_eq!(s.on_keys(b"\x1b[", 25), ViewKeys::Stay);
+        assert_eq!(s.on_keys(b"5", 25), ViewKeys::Stay);
+        assert_eq!(s.on_keys(b"~", 25), ViewKeys::Stay);
+        assert_eq!(s.offset(), Some(24));
+    }
+
+    #[test]
+    fn q_ctrl_c_or_a_lone_escape_leaves() {
+        for keys in [&b"q"[..], b"\x03", b"\x1b", b"kkq"] {
+            let mut s = viewing(100);
+            assert_eq!(s.on_keys(keys, 25), ViewKeys::Leave, "{keys:?}");
+            assert!(!s.viewing());
+        }
+    }
+
+    #[test]
+    fn the_view_asks_for_what_it_shows_and_a_page_above_two_requests_at_most() {
+        let mut s = viewing(1000);
+        s.on_keys(b"\x1b[5~\x1b[5~", 25);
+        assert_eq!(s.offset(), Some(48));
+        let first = s.next_request(25, false).unwrap();
+        // The view's top is 48 rows up: rows 953..=977 shown, a page above from 928.
+        assert_eq!(first.newest, 977);
+        assert_eq!(first.count, 50);
+        assert_eq!(s.next_request(25, false), None, "nothing left uncovered");
+        s.on_keys(b"g", 25);
+        assert!(s.next_request(25, false).is_some());
+        assert_eq!(s.next_request(25, false), None, "two requests at most");
+        s.on_reply(&HistoryReply::default());
+        assert!(
+            s.next_request(25, false).is_none(),
+            "the top page is already asked for"
+        );
+    }
+
+    #[test]
+    fn out_of_the_view_only_an_idle_client_fetches_ahead() {
+        let mut s = Scrollback::default();
+        s.on_mark(HistoryMark {
+            newest: 500,
+            len: 500,
+        });
+        assert_eq!(s.next_request(25, false), None);
+        let ahead = s.next_request(25, true).unwrap();
+        assert_eq!(
+            (ahead.newest, ahead.count),
+            (500, 25),
+            "one screenful, the newest"
+        );
+        assert_eq!(s.next_request(25, true), None);
+    }
+
+    #[test]
+    fn the_view_moves_with_rows_entering_history_unless_at_the_live_screen() {
+        let mut s = viewing(100);
+        s.on_mark(HistoryMark {
+            newest: 1003,
+            len: 103,
+        });
+        assert_eq!(
+            s.offset(),
+            Some(0),
+            "at the live screen it follows the output"
+        );
+        s.on_keys(b"kk", 25);
+        s.on_mark(HistoryMark {
+            newest: 1010,
+            len: 110,
+        });
+        assert_eq!(s.offset(), Some(9));
+        // A history named afresh (a resize): the view keeps its distance, within the history.
+        s.on_mark(HistoryMark {
+            newest: 5000,
+            len: 4,
+        });
+        assert_eq!(s.offset(), Some(4));
+    }
+}

@@ -10,10 +10,11 @@ use crate::proto::{
     retry_after, ClientMsg, Frame, FrameNum, FrameScreen, InputSeq, FRAME_WINDOW, HEARTBEAT,
     MAX_INPUT_BYTES, WINDOW_CELLS,
 };
-use crate::terminal::{Grid, Size, TerminalScreen};
+use crate::terminal::{Grid, HistoryReply, Size, TerminalScreen};
 
 use super::render::WindowState;
-use super::{window_state, ESCAPE_PREFIX, SUSPEND_KEY};
+use super::scrollback::Scrollback;
+use super::{window_state, ESCAPE_PREFIX, SCROLLBACK_KEY, SUSPEND_KEY};
 
 /// How long the server may go unheard before the "link down" banner: three heartbeats, so one late
 /// frame does not flash it.
@@ -69,6 +70,13 @@ pub struct ClientSession {
     predictor: PredictionEngine,
     /// True after the lone escape prefix, while waiting for the next byte.
     pending_escape: bool,
+    /// The history held, and the scrollback view.
+    scrollback: Scrollback,
+    /// When the user last typed or a frame last applied: history is fetched ahead only after a
+    /// quiet spell.
+    last_activity: Option<Instant>,
+    /// The window's height, for the view's pages.
+    rows: u16,
     /// Set whenever the rendered output may have changed; cleared once the caller repaints.
     pub(crate) dirty: bool,
     /// Whether a status banner was painted last frame, so its removal repaints once more.
@@ -91,6 +99,9 @@ impl ClientSession {
             last_nudge: None,
             predictor: PredictionEngine::new(pref),
             pending_escape: false,
+            scrollback: Scrollback::default(),
+            last_activity: None,
+            rows: size.rows,
             dirty: true,
             status_was_shown: false,
         }
@@ -102,6 +113,8 @@ impl ClientSession {
         let mut quit = false;
         let mut suspend = false;
         let mut fwd: Vec<u8> = Vec::with_capacity(bytes.len());
+        // Bytes for the scrollback view, which go nowhere else.
+        let mut viewed: Vec<u8> = Vec::new();
         for &b in bytes {
             if self.pending_escape {
                 self.pending_escape = false;
@@ -113,13 +126,30 @@ impl ClientSession {
                     suspend = true;
                     break;
                 }
-                fwd.push(ESCAPE_PREFIX);
-                fwd.push(b);
+                if b == SCROLLBACK_KEY {
+                    if !self.scrollback.viewing() {
+                        self.scrollback.open();
+                        self.dirty = true;
+                    }
+                    continue;
+                }
+                if self.scrollback.viewing() {
+                    viewed.extend_from_slice(&[ESCAPE_PREFIX, b]);
+                } else {
+                    fwd.push(ESCAPE_PREFIX);
+                    fwd.push(b);
+                }
             } else if b == ESCAPE_PREFIX {
                 self.pending_escape = true;
+            } else if self.scrollback.viewing() {
+                viewed.push(b);
             } else {
                 fwd.push(b);
             }
+        }
+        if !viewed.is_empty() {
+            self.scrollback.on_keys(&viewed, self.rows);
+            self.dirty = true;
         }
         if quit {
             return InputOutcome::Quit;
@@ -181,6 +211,7 @@ impl ClientSession {
         }
         self.queued_input = self.queued_input.saturating_add(bytes.len());
         self.last_nudge = Some(now);
+        self.last_activity = Some(now);
         self.dirty = true;
     }
 
@@ -192,6 +223,7 @@ impl ClientSession {
         } else {
             self.outgoing.push_back(ClientMsg::Resize(size));
         }
+        self.rows = size.rows;
         self.predictor.reset();
         self.dirty = true;
     }
@@ -237,7 +269,17 @@ impl ClientSession {
         self.echo_ack = self.echo_ack.max(frame.echo_ack);
         self.predictor.set_local_frame_late_acked(self.echo_ack.0);
         self.predictor.cull(self.current.screen.screen());
+        self.scrollback.on_mark(self.current.screen.history());
+        self.last_activity = Some(now);
         self.dirty = true;
+    }
+
+    /// History rows arrived.
+    pub fn on_history(&mut self, reply: &HistoryReply) {
+        self.scrollback.on_reply(reply);
+        if self.scrollback.viewing() {
+            self.dirty = true;
+        }
     }
 
     /// The cells the older frames hold beyond the current one.
@@ -280,6 +322,11 @@ impl ClientSession {
                 });
             }
         }
+        // The history the view shows, or the newest screenful once the client is idle.
+        let idle = Scrollback::idle(now, self.last_activity) && self.synced();
+        while let Some(request) = self.scrollback.next_request(self.rows, idle) {
+            self.outgoing.push_back(ClientMsg::History(request));
+        }
         let silent = self
             .last_heard
             .map(|heard| now.saturating_duration_since(heard));
@@ -290,7 +337,7 @@ impl ClientSession {
             _ if self.input_paused => {
                 Some("[koh] input paused — the server is not taking input".to_owned())
             }
-            _ => None,
+            _ => self.scrollback.status(),
         };
         TickResult {
             wait: Duration::from_millis(50),
@@ -334,6 +381,17 @@ impl ClientSession {
     /// The prediction overlay to draw over [`state`](Self::state).
     pub fn overlay(&self) -> Overlay<'_> {
         self.predictor.overlay()
+    }
+
+    /// The screen to show in place of [`state`](Self::state), without the overlay: the scrollback
+    /// view, while it is open.
+    pub fn view(&self) -> Option<TerminalScreen> {
+        self.scrollback.shown(&self.current.screen)
+    }
+
+    /// The history held and the view of it.
+    pub const fn scrollback(&self) -> &Scrollback {
+        &self.scrollback
     }
 
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
@@ -387,7 +445,10 @@ mod tests {
         msgs.iter()
             .filter_map(|m| match m {
                 ClientMsg::Input { bytes, .. } => Some(bytes.as_slice()),
-                ClientMsg::Resize(_) | ClientMsg::Ack { .. } | ClientMsg::Resync => None,
+                ClientMsg::Resize(_)
+                | ClientMsg::Ack { .. }
+                | ClientMsg::Resync
+                | ClientMsg::History(_) => None,
             })
             .flatten()
             .copied()
@@ -450,7 +511,10 @@ mod tests {
             .iter()
             .filter_map(|m| match m {
                 ClientMsg::Input { seq, bytes } => Some((*seq, bytes.len())),
-                ClientMsg::Resize(_) | ClientMsg::Ack { .. } | ClientMsg::Resync => None,
+                ClientMsg::Resize(_)
+                | ClientMsg::Ack { .. }
+                | ClientMsg::Resync
+                | ClientMsg::History(_) => None,
             })
             .collect();
         assert!(inputs.iter().all(|&(_, len)| len <= MAX_INPUT_BYTES));

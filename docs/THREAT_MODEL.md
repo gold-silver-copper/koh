@@ -41,6 +41,14 @@ service.
    make the client keep much; and before painting one the client checks it again (printable ASCII,
    no space, an id without `;` or `:`), painting a link that fails as plain text, so no escape
    sequence can ride in a URI.
+   **History:** the server already holds the session's history (`--scrollback`, 1,000 lines by
+   default); with the scrollback view the client now holds a part of it too, in memory, for the
+   connection: at most a million cells, dropped when the connection ends. A server's history
+   rows are decoded like a frame's rows (the same refusals), at most 256 rows and 65,536 cells a
+   reply and 1 MiB of links, a malformed reply dropped whole; rows the screen's history mark does
+   not name are not kept. A hostile client cannot make the server send more than its history, nor
+   faster than the link takes: requests are answered one at a time, each once the last is
+   delivered, and more than 8 waiting closes the connection.
    **Questions to the user's terminal:** the client asks it one set of questions, itself, once at
    start-up (whether it draws underline styles, and its device attributes, `client::probe`), and
    reads the answers out of stdin before the session starts; nothing a server sends makes the

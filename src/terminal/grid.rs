@@ -96,7 +96,7 @@ impl RowLinks {
     }
 
     /// The links of a live row, `cols` wide, or `None` if it has none.
-    fn of(row: &fux_vt::Row<'_>, cols: u16) -> Option<Arc<Self>> {
+    pub(super) fn of(row: &fux_vt::Row<'_>, cols: u16) -> Option<Arc<Self>> {
         if !row.has_links() {
             return None;
         }
@@ -174,7 +174,7 @@ pub(super) struct Palette {
 
 impl Palette {
     /// The colours `screen`'s program set, or `None` if it set none, as most do not.
-    fn of(screen: &fux_vt::Screen) -> Option<Self> {
+    pub(super) fn of(screen: &fux_vt::Screen) -> Option<Self> {
         screen.colors_changed().then(|| Self {
             entries: (0..=u8::MAX).map(|i| screen.palette_color(i)).collect(),
             foreground: screen.dynamic_color(10),
@@ -291,7 +291,11 @@ impl RowCache {
 
 /// A copy of `row`, cells and text, exactly `cols` wide, drawn in `palette`. A live row is exactly
 /// that wide; anything longer is cut, anything shorter padded with blank cells.
-fn exactly(row: Option<&fux_vt::Row<'_>>, cols: u16, palette: Option<&Palette>) -> Arc<Cells> {
+pub(super) fn exactly(
+    row: Option<&fux_vt::Row<'_>>,
+    cols: u16,
+    palette: Option<&Palette>,
+) -> Arc<Cells> {
     let mut cells: Cells = row.map_or_else(Cells::default, |row| row.cells().collect());
     if cells.len() != usize::from(cols) {
         cells.resize(usize::from(cols), Cell::default());
@@ -372,6 +376,31 @@ impl Grid {
         Self {
             size: Size { rows, cols },
             lines: Arc::clone(&cache.lines),
+            cursor: screen.cursor_position(),
+            modes: Modes::of(screen),
+        }
+    }
+
+    /// The rows of `screen` scrolled `offset` rows back into its history (all of it at most), as
+    /// the server's emulator shows them, with its cursor and modes: what a client's scrollback
+    /// view at `offset` must show, built without the row cache.
+    pub(super) fn window_of(screen: &fux_vt::Screen, offset: usize) -> Self {
+        let (rows, cols) = screen.size();
+        let window = screen.window(offset, rows, cols);
+        let palette = Palette::of(screen);
+        let lines: Vec<Row> = (0..rows)
+            .map(|r| {
+                let row = window.row(r);
+                Row {
+                    cells: exactly(row.as_ref(), cols, palette.as_ref()),
+                    wrapped: row.is_some_and(|row| row.wrapped()),
+                    links: row.as_ref().and_then(|row| RowLinks::of(row, cols)),
+                }
+            })
+            .collect();
+        Self {
+            size: Size { rows, cols },
+            lines: lines.into(),
             cursor: screen.cursor_position(),
             modes: Modes::of(screen),
         }
@@ -580,6 +609,12 @@ impl Grid {
             .filter(|line| ids.insert(line.id()))
             .map(|line| line.cells.len())
             .sum()
+    }
+
+    /// Row `row`'s shared cells, wrap flag and links, to set into another grid of this width.
+    pub(super) fn row_parts(&self, row: u16) -> Option<(Arc<Cells>, bool, Option<Arc<RowLinks>>)> {
+        let line = self.lines.get(usize::from(row))?;
+        Some((Arc::clone(&line.cells), line.wrapped, line.links.clone()))
     }
 
     /// Replace `row` with `cells`, which must be exactly `cols` long, and their `links`. Out of

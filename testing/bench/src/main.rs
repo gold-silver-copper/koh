@@ -740,8 +740,11 @@ fn summary(out: &mut String, systems: &[System], results: &Results) {
             "",
         );
     }
+    // Settling on the lossy link and on the slowest, where it matters most.
     for (action, by_profile) in &results.settle {
-        if let Some((name, by)) = by_profile.last() {
+        let lossy = by_profile.iter().find(|(name, _)| name.contains("loss"));
+        let slowest = by_profile.last().filter(|(name, _)| !name.contains("loss"));
+        for (name, by) in lossy.into_iter().chain(slowest) {
             let values = by.iter().map(|(s, p, _)| (*s, msf(spread(p)))).collect();
             row(
                 out,
@@ -765,7 +768,7 @@ fn summary(out: &mut String, systems: &[System], results: &Results) {
                  workloads in {} KiB)",
                 kib(bytes)
             ),
-            System::Koh => "the server's, in full colour, kept across reconnects".to_owned(),
+            System::Koh => "none".to_owned(),
             System::Mosh => "none".to_owned(),
             System::Ssh => "the terminal's own, lost on a reconnect".to_owned(),
         };

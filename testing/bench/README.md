@@ -13,6 +13,7 @@ testing/scoreboard.sh --recordings bash,vim-resize # two recordings, the synthet
 testing/scoreboard.sh --recordings none --skip latency
 testing/scoreboard.sh --systems koh --out /tmp/koh.md
 testing/scoreboard.sh --runs 3 --repeats 5         # the defaults: latency and settling 3 times
+testing/scoreboard.sh --profiles Mbit,kbit         # latency and settling on the slow links only
 ```
 
 Latency and settling vary from run to run, so each is measured `--runs` times (3 by default) and
@@ -58,15 +59,18 @@ reading what the client painted (for mosh and ssh, the client's PTY output). Tha
 sees, with prediction where the client predicts. For koh it also times the key to showing on the
 screen the server sent, which is the server's echo without prediction.
 
-Links: clean; 25 ms each way; 25 ms each way with 5% of packets lost each way. koh's link is the
-fault link with that profile. mosh and ssh run inside a network namespace of the harness's own
+Links: clean; 25 ms each way; 25 ms each way with 5% of packets lost each way; 1 Mbit/s and 256
+kbit/s, each with 25 ms each way and a 100 ms buffer, tail-dropped when full. koh's link is the
+fault link with that profile (the rate limits each direction). mosh and ssh run inside a network namespace of the harness's own
 (`netns.rs`): `unshare --user --map-root-user --net` gives one without root, in which the harness
 puts a kernel queueing discipline on loopback (`tc netem delay … loss …`). Each packet crosses
 loopback once, so delay and loss apply once each way, to mosh's UDP and to ssh's TCP alike: TCP's
 retransmissions are paid for as a user pays for them. The measure runs again inside a nested
 namespace that maps the user back to itself (`koh-bench --netns-child …`); `sshd` stays outside,
 since it wants users and a tty group the namespace lacks, and is reached through a Unix socket
-carried on to loopback inside.
+carried on to loopback inside. netem's rate on loopback is one queue for both directions, so mosh's
+and ssh's slow links share it between them, where koh's are a queue each way: what the client sends
+is small beside the screens, so this favours neither much.
 
 ## Time to a settled screen
 
@@ -82,6 +86,13 @@ in the same namespaces as latency:
 - a resize, alternating 30x100 and 40x120, with nvim open.
 
 The median repeat is the run's figure.
+
+## Scrollback
+
+Each workload played into a server emulator keeping the default 1,000 lines, then every row of its
+history fetched as koh's scrollback view fetches them (`Ctrl-^ [`, requests of up to 256 rows):
+the compressed history streams' bytes. In process, with no link. mosh keeps no history; ssh's is
+the user's terminal's, which the output's bytes already paid for, and a reconnect loses.
 
 ## Server memory per session
 

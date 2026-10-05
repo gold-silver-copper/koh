@@ -67,11 +67,9 @@ impl ServerTerminal {
         // Not the kitty keyboard protocol: koh forwards the keys the user's terminal sends, so a
         // program told it may use the protocol would get keys it did not ask for. No reflow and no
         // terminal identity either: a resize and the answers to queries stay as they were.
-        let options = Options {
-            events: true,
-            extended_replies: true,
-            ..Options::default()
-        };
+        let mut options = Options::default();
+        options.events = true;
+        options.extended_replies = true;
         Ok(Self {
             parser: Parser::with_options(rows, cols, scrollback, options)?,
             observed: Observed::default(),

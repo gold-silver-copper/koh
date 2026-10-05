@@ -417,7 +417,7 @@ mod tests {
         );
         assert_eq!(s.on_input(now, &[ESCAPE_PREFIX]), InputOutcome::Forwarded);
         assert_eq!(s.on_input(now, &[SUSPEND_KEY]), InputOutcome::Suspend);
-        assert!(typed(&drain(&mut s)).is_empty());
+        assert_eq!(typed(&drain(&mut s)), b"");
     }
 
     #[test]

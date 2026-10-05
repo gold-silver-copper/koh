@@ -660,11 +660,7 @@ mod tests {
         }]);
         let (first, rest) = bytes.split_at(3);
         conn.push_client_bytes(first);
-        assert!(conn
-            .drain_client(Instant::now(), false)
-            .unwrap()
-            .keys
-            .is_empty());
+        assert_eq!(conn.drain_client(Instant::now(), false).unwrap().keys, b"");
         assert!(
             conn.finish_client().is_err(),
             "the stream ended inside a message"

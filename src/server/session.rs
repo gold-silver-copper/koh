@@ -473,7 +473,7 @@ mod tests {
         );
         // The channel's end is not swallowed: the session loop's `recv` still sees it and reaps
         // the program.
-        assert!(taken(&mut rx).is_empty());
+        assert_eq!(taken(&mut rx), Vec::<usize>::new());
         assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
     }
 }

@@ -91,7 +91,7 @@ impl RowCache {
         live: &fux_vt::Row<'_>,
         by_id: &mut Option<HashMap<RowId, usize>>,
     ) -> Option<Arc<Cells>> {
-        let at = if self.ids.get(index).is_some_and(|(id, _)| *id == live.id) {
+        let at = if self.ids.get(index).is_some_and(|(id, _)| *id == live.id()) {
             index
         } else {
             let by_id = by_id.get_or_insert_with(|| {
@@ -100,7 +100,7 @@ impl RowCache {
                     .map(|(at, (id, _))| (*id, at))
                     .collect()
             });
-            *by_id.get(&live.id)?
+            *by_id.get(&live.id())?
         };
         let (_, version) = self.ids.get(at)?;
         let cells = &self.lines.get(at)?.cells;
@@ -108,7 +108,7 @@ impl RowCache {
         // a row at the version it was cached at holds the same cells without comparing them. A
         // row with a new version may still hold the same cells (erased, then written back), so it
         // is compared.
-        (cells.len() == live.len() && (*version == live.version || cells.iter().eq(live.cells())))
+        (cells.len() == live.len() && (*version == live.version() || cells.iter().eq(live.cells())))
             .then(|| Arc::clone(cells))
     }
 
@@ -118,9 +118,9 @@ impl RowCache {
         rows.len() == self.ids.len()
             && rows.iter().zip(&self.ids).zip(self.lines.iter()).all(
                 |((live, (id, version)), line)| {
-                    live.id == *id
-                        && live.version == *version
-                        && live.wrapped == line.wrapped
+                    live.id() == *id
+                        && live.version() == *version
+                        && live.wrapped() == line.wrapped
                         && live.len() == line.cells.len()
                 },
             )
@@ -184,11 +184,11 @@ impl Grid {
                         cells: cache
                             .cells(index, row, &mut by_id)
                             .unwrap_or_else(|| exactly(Some(row), cols)),
-                        wrapped: row.wrapped,
+                        wrapped: row.wrapped(),
                     }
                 })
                 .collect();
-            cache.ids = live.iter().map(|row| (row.id, row.version)).collect();
+            cache.ids = live.iter().map(|row| (row.id(), row.version())).collect();
             cache.lines = lines.into();
         }
         Self {

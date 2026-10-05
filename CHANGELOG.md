@@ -28,6 +28,10 @@ error; upgrade both ends.
   restarted server and reattaches, to a fresh session. A port already in use is a clear error.
 
 ### Changed
+- Updated `fux-vt` 0.2.0 → 0.3.0. Bold and dim can now be on together (`SGR 1;2`), as in xterm,
+  where before the later one replaced the earlier; CBT (`CSI Z`) and CHT (`CSI I`) now move between
+  tab stops, as mosh's emulator does. The wire is unchanged.
+- Updated `iroh` 1.2.0 → 1.3.0, `fuxix` 0.1.2 → 0.1.5 and `tokio` 1.53.1 → 1.53.2.
 - **`koh serve` starts each session's program through `koh __launch`**, a hidden subcommand of
   its own binary that makes the program a session leader with the PTY as its controlling
   terminal, then becomes it. The program sees what it did before: argv verbatim, `TERM`, no

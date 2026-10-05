@@ -19,7 +19,7 @@ mod grid;
 mod history;
 mod server;
 
-pub use crate::predict::Size;
+pub use crate::predict::{Size, TtyModes};
 pub use grid::{drawn, Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
 pub use history::{
     HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, KeptRow,
@@ -184,23 +184,6 @@ pub struct TerminalScreen {
     history: HistoryMark,
     /// How the PTY takes typed keys, if known.
     tty: Option<TtyModes>,
-}
-
-/// How the program's PTY takes typed keys: whether the kernel echoes them, and edits lines.
-///
-/// Line mode without echo is a password prompt (`getpass`, `read -s`, sudo, ssh,
-/// passwd); neither is a line editor or a full-screen program, which echo for themselves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TtyModes {
-    pub echo: bool,
-    pub line: bool,
-}
-
-impl TtyModes {
-    /// A password prompt: lines read without echo. Nothing typed may be shown.
-    pub const fn password(self) -> bool {
-        self.line && !self.echo
-    }
 }
 
 impl Default for TerminalScreen {

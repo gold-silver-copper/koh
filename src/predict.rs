@@ -11,9 +11,26 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fux_vt::Color;
 
-use crate::terminal::TtyModes;
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
+
+/// How the program's PTY takes typed keys: whether the kernel echoes them, and edits lines.
+///
+/// Line mode without echo is a password prompt (`getpass`, `read -s`, sudo, ssh,
+/// passwd); neither is a line editor or a full-screen program, which echo for themselves. Here
+/// for the same reason as [`Size`]; [`terminal`](crate::terminal) re-exports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TtyModes {
+    pub echo: bool,
+    pub line: bool,
+}
+
+impl TtyModes {
+    /// A password prompt: lines read without echo. Nothing typed may be shown.
+    pub const fn password(self) -> bool {
+        self.line && !self.echo
+    }
+}
 
 /// A terminal's geometry: `rows` lines of `cols` cells each.
 ///

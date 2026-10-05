@@ -1,8 +1,10 @@
 # The scoreboard
 
 `testing/scoreboard.sh` writes `docs/SCOREBOARD.md`: koh beside mosh and plain ssh, on the
-corpus's 113 recordings (`testing/corpus/`) and on four synthetic workloads, by bytes on the wire,
-keystroke latency beside a flood, server memory per session, and the instructions koh retires.
+corpus's 113 recordings (`testing/corpus/`) and on four synthetic workloads, by bytes on the wire and
+on the user's terminal, keystroke latency beside a flood, the time to a settled screen, server
+memory per session, and the instructions koh retires. It opens with a table of who wins each
+axis, so a reader who skips the rest knows the answer.
 It is modelled on fux's scoreboard (`fux-vt/compare/`): every number is measured, and says how.
 
 ```sh
@@ -10,7 +12,11 @@ testing/scoreboard.sh                              # everything, about 30 minute
 testing/scoreboard.sh --recordings bash,vim-resize # two recordings, the synthetic workloads
 testing/scoreboard.sh --recordings none --skip latency
 testing/scoreboard.sh --systems koh --out /tmp/koh.md
+testing/scoreboard.sh --runs 3 --repeats 5         # the defaults: latency and settling 3 times
 ```
+
+Latency and settling vary from run to run, so each is measured `--runs` times (3 by default) and
+given as the median with its range; bytes, memory and instructions are measured once.
 
 mosh is measured when `mosh-server` and `mosh-client` are on `PATH`, ssh when `ssh`, `sshd` and
 `ssh-keygen` are, and instructions when `perf` (or `valgrind`) is; the scoreboard says which were
@@ -38,6 +44,11 @@ step does, types, waits for the script to log the step, and waits for the link t
 
 No IP, UDP or TCP header is counted, for any of them.
 
+**What the user's terminal is given:** the bytes each client wrote to the user's terminal (koh's
+`BackendTerminal`, the PTY mosh-client and ssh write to), and for koh how many times it painted a
+second. A remote shell that sends few bytes but repaints the user's terminal heavily still costs
+the user: a slow terminal, or one over a serial line, shows it.
+
 ## Keystroke latency beside a flood
 
 The program writes a counter to the top row as fast as `awk` can, saving and restoring its cursor
@@ -48,9 +59,29 @@ sees, with prediction where the client predicts. For koh it also times the key t
 screen the server sent, which is the server's echo without prediction.
 
 Links: clean; 25 ms each way; 25 ms each way with 5% of packets lost each way. koh's link is the
-fault link with that profile, mosh's the UDP proxy with the same. ssh has no figure with loss: a TCP
-proxy cannot drop data without TCP hiding the drop, which needs a kernel queueing discipline
-(`tc netem`, root) this harness does not use.
+fault link with that profile. mosh and ssh run inside a network namespace of the harness's own
+(`netns.rs`): `unshare --user --map-root-user --net` gives one without root, in which the harness
+puts a kernel queueing discipline on loopback (`tc netem delay … loss …`). Each packet crosses
+loopback once, so delay and loss apply once each way, to mosh's UDP and to ssh's TCP alike: TCP's
+retransmissions are paid for as a user pays for them. The measure runs again inside a nested
+namespace that maps the user back to itself (`koh-bench --netns-child …`); `sshd` stays outside,
+since it wants users and a tty group the namespace lacks, and is reached through a Unix socket
+carried on to loopback inside.
+
+## Time to a settled screen
+
+What a user waits for after an action: the time from the action to the screen's last change before
+it stays the same for 500 ms, as a fux-vt parser reading the user's terminal sees it. Each action
+is repeated `--repeats` times (5 by default) in one session, on the 25 ms each way, 5% loss link,
+in the same namespaces as latency:
+
+- a key typed into a quiet `cat`;
+- in `nvim --clean` on a 300-line Rust file: a page down, a search jump (`/fn`), a split opened or
+  closed;
+- `clear; ls -l` of a directory of 2,000 files;
+- a resize, alternating 30x100 and 40x120, with nvim open.
+
+The median repeat is the run's figure.
 
 ## Server memory per session
 

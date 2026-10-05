@@ -21,6 +21,11 @@ const STEP: Duration = Duration::from_secs(60);
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Wire {
     pub counts: Counts,
+    /// The bytes the client wrote to the user's terminal.
+    pub written: u64,
+    /// How many times koh's client painted, and over how long.
+    pub paints: u64,
+    pub seconds: f64,
 }
 
 fn minus(a: Count, b: Count) -> Count {
@@ -61,6 +66,12 @@ async fn play(remote: &Remote, workload: &Workload, dir: &Path) -> anyhow::Resul
         .quiet(Duration::from_millis(500), Duration::from_secs(20))
         .await;
     let before = remote.counts();
+    let written_before = remote
+        .shown
+        .written
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let paints_before = *remote.shown.paints.borrow();
+    let start = Instant::now();
     for (index, step) in workload.steps.iter().enumerate() {
         let gated = workload.every.is_none() || index == 0;
         if !gated {
@@ -103,6 +114,13 @@ async fn play(remote: &Remote, workload: &Workload, dir: &Path) -> anyhow::Resul
             to_server: minus(after.to_server, before.to_server),
             to_client: minus(after.to_client, before.to_client),
         },
+        written: remote
+            .shown
+            .written
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(written_before),
+        paints: remote.shown.paints.borrow().saturating_sub(paints_before),
+        seconds: start.elapsed().as_secs_f64(),
     })
 }
 
@@ -238,4 +256,188 @@ pub fn percentile(values: &[Duration], percent: usize) -> Option<Duration> {
         .saturating_add(99)
         .checked_div(100)?;
     sorted.get(rank.saturating_sub(1)).copied()
+}
+
+/// An action whose time until the screen settles is measured: the program it runs in, and what
+/// the user does, again and again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    PageDown,
+    Search,
+    Split,
+    Listing,
+    Resize,
+    QuietKey,
+}
+
+impl Action {
+    pub const ALL: [Self; 6] = [
+        Self::QuietKey,
+        Self::PageDown,
+        Self::Search,
+        Self::Split,
+        Self::Listing,
+        Self::Resize,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PageDown => "nvim, page down",
+            Self::Search => "nvim, a search jump",
+            Self::Split => "nvim, a split opened or closed",
+            Self::Listing => "ls -l of 2,000 files",
+            Self::Resize => "nvim, a resize",
+            Self::QuietKey => "a key typed into a quiet cat",
+        }
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::PageDown => "page-down",
+            Self::Search => "search",
+            Self::Split => "split",
+            Self::Listing => "listing",
+            Self::Resize => "resize",
+            Self::QuietKey => "quiet-key",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.key() == key)
+    }
+}
+
+/// How long the screen must not change to count as settled.
+const SETTLED: Duration = Duration::from_millis(500);
+
+/// A digest of what `screen` shows: every cell's text and attributes, and the cursor.
+fn digest(screen: &fux_vt::Screen) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let (rows, cols) = screen.size();
+    for row in 0..rows {
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                cell.contents().hash(&mut hasher);
+                format!("{:?}", cell.attributes()).hash(&mut hasher);
+            }
+        }
+    }
+    screen.cursor_position().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Wait until what `remote` shows has not changed for [`SETTLED`], up to `cap`; when it last
+/// changed, if it settled.
+async fn settled(remote: &Remote, cap: Duration) -> Option<Instant> {
+    let mut paints = remote.shown.paints.clone();
+    let start = Instant::now();
+    let mut last = remote.shown.with(digest);
+    let mut changed = start;
+    while start.elapsed() < cap {
+        let wait = SETTLED.saturating_sub(changed.elapsed());
+        if wait.is_zero() {
+            return Some(changed);
+        }
+        let _ = tokio::time::timeout(wait, paints.changed()).await;
+        let now = remote.shown.with(digest);
+        if now != last {
+            last = now;
+            changed = Instant::now();
+        }
+    }
+    None
+}
+
+/// The time until the screen settles after `action`, `repeats` times, through `system` over
+/// `profile`. Only the repeats whose screen changed are counted: the first change starts it.
+pub async fn settle(
+    system: System,
+    setup: &Setup,
+    profile: Profile,
+    action: Action,
+    repeats: usize,
+    dir: &Path,
+    seed: u64,
+) -> anyhow::Result<Vec<Duration>> {
+    std::fs::create_dir_all(dir)?;
+    // A source file of koh's for nvim, and a directory of 2,000 files for ls.
+    let text = dir.join("text.rs");
+    let source = include_str!("../../../src/client/render.rs");
+    std::fs::write(&text, source.repeat(3))?;
+    let files = dir.join("files");
+    if action == Action::Listing && !files.exists() {
+        std::fs::create_dir_all(&files)?;
+        for i in 0..2000 {
+            std::fs::write(files.join(format!("file-{i:04}.txt")), b"")?;
+        }
+    }
+    let nvim = || {
+        vec![
+            "nvim".to_owned(),
+            "--clean".to_owned(),
+            "-n".to_owned(),
+            text.display().to_string(),
+        ]
+    };
+    let program = match action {
+        Action::PageDown | Action::Search | Action::Split | Action::Resize => nvim(),
+        Action::Listing => vec!["sh".to_owned()],
+        Action::QuietKey => vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "stty raw -echo; exec cat".to_owned(),
+        ],
+    };
+    let remote = Remote::connect(system, setup, &program, (40, 120), profile, seed).await?;
+    let result = repeat(&remote, action, repeats, &files).await;
+    remote.stop().await;
+    result
+}
+
+async fn repeat(
+    remote: &Remote,
+    action: Action,
+    repeats: usize,
+    files: &Path,
+) -> anyhow::Result<Vec<Duration>> {
+    let cap = Duration::from_secs(20);
+    // The program started and drew its first screen.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    settled(remote, cap)
+        .await
+        .ok_or_else(|| anyhow!("{}: the first screen never settled", remote.system.name()))?;
+    let mut times = Vec::new();
+    for i in 0..repeats {
+        let before = remote.shown.with(digest);
+        let sent = Instant::now();
+        match action {
+            Action::PageDown => remote.send(b"\x06").await?,
+            Action::Search => remote.send(b"/fn \r").await?,
+            Action::Split => {
+                remote
+                    .send(if i % 2 == 0 {
+                        b":vsplit\r"
+                    } else {
+                        b":close\r"
+                    })
+                    .await?;
+            }
+            Action::Listing => {
+                let line = format!("clear; ls -l {}\r", files.display());
+                remote.send(line.as_bytes()).await?;
+            }
+            Action::Resize => {
+                let (rows, cols) = if i % 2 == 0 { (30, 100) } else { (40, 120) };
+                remote.resize(rows, cols).await?;
+            }
+            Action::QuietKey => remote.send(b"x").await?,
+        }
+        if let Some(changed) = settled(remote, cap).await {
+            if remote.shown.with(digest) != before {
+                times.push(changed.saturating_duration_since(sent));
+            }
+        }
+    }
+    Ok(times)
 }

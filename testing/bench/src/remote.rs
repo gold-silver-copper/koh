@@ -48,6 +48,9 @@ impl System {
 pub struct Setup {
     pub koh: PathBuf,
     pub sshd: Option<Sshd>,
+    /// Whether mosh and ssh connect straight to their servers, with no proxy (and no counts): in
+    /// a namespace, where netem is the link and a proxy would put each packet through it twice.
+    pub direct: bool,
 }
 
 /// The user's terminal: a fux-vt parser reading what the client painted, and how many times it
@@ -55,7 +58,10 @@ pub struct Setup {
 #[derive(Clone)]
 pub struct Shown {
     pub parser: Arc<Mutex<fux_vt::Parser>>,
+    /// How many times the client painted (koh) or wrote (mosh, ssh) to the terminal.
     pub paints: watch::Receiver<u64>,
+    /// The bytes the client wrote to the terminal.
+    pub written: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Shown {
@@ -93,7 +99,7 @@ enum Inner {
     },
     Pty {
         pty: Arc<Pty>,
-        proxy: Proxy,
+        proxy: Option<Proxy>,
         reader: JoinHandle<()>,
         mosh_pid: Option<i32>,
     },
@@ -104,6 +110,7 @@ enum Inner {
 struct Readback {
     terminal: BackendTerminal<Buffer>,
     buffer: Buffer,
+    written: Arc<std::sync::atomic::AtomicU64>,
     shown: Arc<Mutex<fux_vt::Parser>>,
     synced: Arc<Mutex<Option<TerminalScreen>>>,
     paints: watch::Sender<u64>,
@@ -152,6 +159,10 @@ impl ClientTerminal for Readback {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
+        self.written.fetch_add(
+            u64::try_from(painted.len()).unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.shown
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -179,7 +190,8 @@ fn parser(rows: u16, cols: u16) -> anyhow::Result<fux_vt::Parser> {
 pub struct Sshd {
     pub port: u16,
     pub key: PathBuf,
-    pid: i32,
+    /// The daemon's pid, if this started it.
+    pid: Option<i32>,
 }
 
 impl Sshd {
@@ -220,7 +232,11 @@ impl Sshd {
         for _ in 0..100 {
             if let Ok(pid) = std::fs::read_to_string(&pidfile) {
                 let pid = pid.trim().parse().context("sshd's pid")?;
-                return Ok(Self { port, key, pid });
+                return Ok(Self {
+                    port,
+                    key,
+                    pid: Some(pid),
+                });
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -228,9 +244,22 @@ impl Sshd {
     }
 }
 
+impl Sshd {
+    /// An sshd another process runs, reached at `port` with `key`.
+    pub const fn at(port: u16, key: PathBuf) -> Self {
+        Self {
+            port,
+            key,
+            pid: None,
+        }
+    }
+}
+
 impl Drop for Sshd {
     fn drop(&mut self) {
-        kill(self.pid);
+        if let Some(pid) = self.pid {
+            kill(pid);
+        }
     }
 }
 
@@ -319,9 +348,11 @@ impl Remote {
         let shown = Arc::new(Mutex::new(parser(rows, cols)?));
         let synced = Arc::new(Mutex::new(None));
         let (paints_tx, paints) = watch::channel(0u64);
+        let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let terminal = Readback {
             terminal: BackendTerminal::enter(buffer.clone(), false)?,
             buffer: buffer.clone(),
+            written: written.clone(),
             shown: shown.clone(),
             synced: synced.clone(),
             paints: paints_tx,
@@ -344,6 +375,7 @@ impl Remote {
             shown: Shown {
                 parser: shown,
                 paints,
+                written,
             },
             synced: Some(synced),
             inner: Inner::Koh {
@@ -366,7 +398,7 @@ impl Remote {
         setup: &Setup,
         argv: &[String],
         (rows, cols): (u16, u16),
-        proxy: Proxy,
+        proxy: Option<Proxy>,
         mosh_pid: Option<i32>,
     ) -> anyhow::Result<(Shown, Inner)> {
         let (pty, mut output) = Pty::spawn(
@@ -380,10 +412,15 @@ impl Remote {
         let pty = Arc::new(pty);
         let shown = Arc::new(Mutex::new(parser(rows, cols)?));
         let (paints_tx, paints) = watch::channel(0u64);
+        let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let reader = {
-            let (shown, pty) = (shown.clone(), pty.clone());
+            let (shown, pty, written) = (shown.clone(), pty.clone(), written.clone());
             tokio::spawn(async move {
                 while let Some(chunk) = output.recv().await {
+                    written.fetch_add(
+                        u64::try_from(chunk.len()).unwrap_or(0),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     let mut replies = Vec::new();
                     let _ = shown
                         .lock()
@@ -400,6 +437,7 @@ impl Remote {
             Shown {
                 parser: shown,
                 paints,
+                written,
             },
             Inner::Pty {
                 pty,
@@ -437,14 +475,19 @@ impl Remote {
                 .parse()
                 .ok()
         });
-        let proxy = Proxy::udp(([127, 0, 0, 1], port).into(), profile, seed).await?;
+        let proxy = if setup.direct {
+            None
+        } else {
+            Some(Proxy::udp(([127, 0, 0, 1], port).into(), profile, seed).await?)
+        };
+        let dial = proxy.as_ref().map_or(port, |p| p.addr.port());
         let argv: Vec<String> = [
             "env".to_owned(),
             "LANG=en_US.UTF-8".to_owned(),
             format!("MOSH_KEY={}", key.trim()),
             "mosh-client".to_owned(),
             "127.0.0.1".to_owned(),
-            proxy.addr.port().to_string(),
+            dial.to_string(),
         ]
         .into();
         let (shown, inner) = Self::client_on_pty(setup, &argv, size, proxy, pid)?;
@@ -463,12 +506,21 @@ impl Remote {
         profile: Profile,
     ) -> anyhow::Result<Self> {
         let sshd = setup.sshd.as_ref().ok_or_else(|| anyhow!("no sshd"))?;
-        let proxy = Proxy::tcp(([127, 0, 0, 1], sshd.port).into(), profile.delay).await?;
+        let proxy = if setup.direct {
+            None
+        } else {
+            Some(Proxy::tcp(([127, 0, 0, 1], sshd.port).into(), profile.delay).await?)
+        };
+        let dial = proxy.as_ref().map_or(sshd.port, |p| p.addr.port());
         let mut argv: Vec<String> = [
             "ssh",
+            // Not the system's configuration: in a namespace its root-owned files look owned by
+            // nobody, which ssh refuses, and the measure should not depend on it anyway.
+            "-F",
+            "/dev/null",
             "-tt",
             "-p",
-            &proxy.addr.port().to_string(),
+            &dial.to_string(),
             "-i",
             &sshd.key.display().to_string(),
             "-o",
@@ -510,7 +562,7 @@ impl Remote {
                     to_client: count(net.delivered(*client_id)),
                 }
             }
-            Inner::Pty { proxy, .. } => proxy.counts(),
+            Inner::Pty { proxy, .. } => proxy.as_ref().map(Proxy::counts).unwrap_or_default(),
         }
     }
 

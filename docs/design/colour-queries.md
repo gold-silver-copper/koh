@@ -6,8 +6,7 @@ Status: proposed, not built. Phase 4 of `koh-next-prompt.md` asks for this note 
 
 Programs ask the terminal for its colours to pick a light or dark theme: OSC 11 (background) and
 OSC 10 (foreground), sometimes OSC 4 for palette entries. In the corpus, bat, delta, emacs, fish,
-nvim, tmux, vim and zellij ask (zellij asks all 256 entries). Since this branch the server's
-terminal answers OSC 4 with xterm's default palette (fux-vt's `palette` option), and with the
+nvim, tmux, vim and zellij ask (zellij asks all 256 entries). The server's terminal answers OSC 4 with xterm's default palette (fux-vt's `palette` option), and with the
 colours a program set. But OSC 10 and 11 for colours nobody set reach koh as
 `Event::ColorQuery`, which koh ignores. A program then waits for its own timeout and guesses.
 emacs waits up to `xterm-query-timeout` (2 s), but measured under koh it fell back to
@@ -69,5 +68,5 @@ None: colour queries and their answers are not typed input.
 - **End to end:** nvim sets `'background'` from OSC 11. Under koh with a light background
   answered, `:set background?` must show `light`, and with a dark one `dark`. bat's theme
   choice is a second check.
-- **The oracle:** exempt OSC 10 and 11 queries (already exempt as palette sequences) until the
-  base answers them.
+- **The oracle:** exempt OSC 10 and 11 queries until the base answers them (the palette
+  exemption that covered them came off once `main` had the palette).

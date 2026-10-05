@@ -302,3 +302,48 @@ fn history_keeps_its_colours_wide_glyphs_and_links() {
         "drawn in the set colour"
     );
 }
+
+#[test]
+fn a_search_finds_text_in_history_older_then_newer() {
+    let mut pair = Pair::new(6, 20).expect("pair");
+    for n in 0..200 {
+        let tag = if n % 50 == 7 { " MARK" } else { "" };
+        pair.server.process(format!("item {n}{tag}\r\n").as_bytes());
+    }
+    pair.frame().expect("frame");
+    let top = |pair: &Pair| {
+        pair.client
+            .view()
+            .expect("view")
+            .screen()
+            .contents()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_owned()
+    };
+    // Typed, the search goes older from the live screen, fetching history as it goes.
+    pair.keys(&[ESCAPE, b'[']).expect("open");
+    pair.keys(b"/MARK\r").expect("search");
+    assert_eq!(top(&pair), "item 157 MARK");
+    pair.keys(b"n").expect("next older");
+    assert_eq!(top(&pair), "item 107 MARK");
+    pair.keys(b"nn").expect("two older");
+    assert_eq!(top(&pair), "item 7 MARK");
+    pair.keys(b"n").expect("none older");
+    assert!(
+        pair.client
+            .scrollback()
+            .status()
+            .is_some_and(|s| s.contains("not found")),
+        "{:?}",
+        pair.client.scrollback().status()
+    );
+    pair.keys(b"N").expect("next newer");
+    assert_eq!(top(&pair), "item 57 MARK");
+    pair.check().expect("the view at a match");
+    // Escape while typing cancels the search, not the view.
+    pair.keys(b"/abc\x1b").expect("cancel");
+    assert!(pair.client.view().is_some());
+}

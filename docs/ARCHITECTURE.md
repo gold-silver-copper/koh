@@ -129,7 +129,9 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   loop never waits on the network, so `Ctrl-^ .` always works.
 - **The scrollback view** (`Ctrl-^ [`, `client::scrollback`): the server's history above the live
   screen, fetched as the user scrolls with the arrows, Page Up/Down, `k`/`j`, `b`/`f`, `u`/`d`,
-  `g`/`G` or the mouse wheel (the view turns mouse reporting on), and `q` or Escape to leave. The
+  `g`/`G` or the mouse wheel (the view turns mouse reporting on), and `q` or Escape to leave. `/`
+  searches the history for text, older from the view's top, fetching rows as it goes (a search
+  waits on the rows it needs first); `n` goes to the next older match, `N` to the next newer. The
   view is anchored to its rows: output that scrolls into history moves it up with them, so what
   is being read stays still while the live screen goes on below. Out of the view, a client idle for
   2 s fetches the newest screenful ahead, so opening the view shows rows at once.

@@ -98,7 +98,8 @@ binary, not the library.
 - Not wire-compatible with mosh or SSH; koh is its own protocol/tool.
 - Intended for personal machines you control; not a full SSH replacement.
 - Scrollback: `Ctrl-^ [` opens the server's history above the live screen, in full colour, with
-  the arrows, Page Up/Down, the mouse wheel and `q` to leave; new output keeps arriving below.
+  the arrows, Page Up/Down, the mouse wheel, `/` to search and `q` to leave; new output keeps
+  arriving below.
 - Does not provide multi-user accounts, file transfer, or Windows support.
 
 ## Status

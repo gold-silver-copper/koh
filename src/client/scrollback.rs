@@ -4,7 +4,8 @@
 //! The view is anchored to what it shows: new output scrolling into history moves the view up with
 //! it, so the rows being read stay still while the screen below goes on. Its keys are less's and
 //! tmux's: the arrows, `k`/`j`, Page Up/Down, `b`/`f`/space, `u`/`d`, Home/End, `g`/`G`, and the
-//! mouse wheel; `q` or Escape leaves.
+//! mouse wheel; `q` or Escape leaves. `/` searches the history for text, older from the view's top,
+//! fetching rows as it goes; `n` finds the next older match and `N` the next newer.
 
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,36 @@ pub struct Scrollback {
     outstanding: Vec<HistoryRequest>,
     /// The bytes of an escape sequence split across reads.
     partial: Vec<u8>,
+    /// A search of the history, while one is typed or under way.
+    search: Option<Search>,
+}
+
+/// Most bytes of a search's text.
+const MAX_QUERY: usize = 256;
+
+/// Most rows one look at the held history reads before it waits for more to arrive or for the
+/// next key: the search's work a call.
+const SEARCH_STEP: usize = 4096;
+
+/// A search of the history.
+#[derive(Debug, Default)]
+struct Search {
+    /// The text sought, as typed.
+    query: Vec<u8>,
+    /// The text is being typed: keys go to it.
+    typing: bool,
+    /// Looking at older rows (else newer).
+    older: bool,
+    /// The next row to look at, while the search is under way.
+    next: Option<u64>,
+    /// The last search ended without a match.
+    failed: bool,
+}
+
+impl Search {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.query).into_owned()
+    }
 }
 
 impl Scrollback {
@@ -103,6 +134,66 @@ impl Scrollback {
         if self.cache.insert(reply, self.mark, near).is_none() {
             tracing::debug!("dropping malformed history rows");
         }
+        self.advance_search();
+    }
+
+    /// Look further for the search's text through the rows held, from where it stands: until a
+    /// match (the view then shows it at its top), the history's end (nothing found), or a row
+    /// not held yet (asked for next).
+    fn advance_search(&mut self) {
+        let Some(oldest) = self.mark.oldest() else {
+            return;
+        };
+        let newest = self.mark.newest;
+        let Some(search) = self.search.as_mut().filter(|s| !s.typing) else {
+            return;
+        };
+        let query = search.text();
+        for _ in 0..SEARCH_STEP {
+            let Some(name) = search.next else {
+                return;
+            };
+            if name < oldest || name > newest {
+                search.next = None;
+                search.failed = true;
+                return;
+            }
+            let Some(row) = self.cache.get(name) else {
+                return;
+            };
+            if row.text().contains(&query) {
+                search.next = None;
+                search.failed = false;
+                // At the view's top: `offset` rows up, the row the newest is at offset 1.
+                self.view = usize::try_from(newest.saturating_sub(name).saturating_add(1)).ok();
+                return;
+            }
+            search.next = if search.older {
+                name.checked_sub(1)
+            } else {
+                name.checked_add(1)
+            };
+        }
+    }
+
+    /// Start looking for the search's text from the row before (`older`) or after the view's top.
+    fn search_from_top(&mut self, older: bool) {
+        let top = self.focus();
+        // At the live screen the view's top is not history: the newest row is the first older.
+        let at_live = self.view == Some(0);
+        if let Some(search) = self.search.as_mut().filter(|s| !s.query.is_empty()) {
+            search.typing = false;
+            search.older = older;
+            search.failed = false;
+            search.next = match (older, at_live) {
+                (true, true) => Some(top),
+                (true, false) => top.checked_sub(1),
+                (false, true) => None,
+                (false, false) => top.checked_add(1),
+            };
+            search.failed = search.next.is_none();
+        }
+        self.advance_search();
     }
 
     /// The name of the row the view is about: the one at its top, or the newest.
@@ -119,6 +210,11 @@ impl Scrollback {
     pub fn next_request(&mut self, rows: u16, idle: bool) -> Option<HistoryRequest> {
         if self.outstanding.len() >= MAX_OUTSTANDING || self.mark.len == 0 {
             return None;
+        }
+        // A search under way asks for the rows it is waiting on first.
+        if let Some(request) = self.search_request() {
+            self.outstanding.push(request);
+            return Some(request);
         }
         let rows_u64 = u64::from(rows);
         let (newest, span) = match self.view {
@@ -159,6 +255,31 @@ impl Scrollback {
         Some(request)
     }
 
+    /// The rows a search waits on, if it does and they are not asked for.
+    fn search_request(&self) -> Option<HistoryRequest> {
+        let search = self.search.as_ref()?;
+        let name = search.next?;
+        if self.cache.holds(name) || self.asked(name) {
+            return None;
+        }
+        let oldest = self.mark.oldest()?;
+        if search.older {
+            let count = name.saturating_sub(oldest).saturating_add(1);
+            Some(HistoryRequest {
+                newest: name,
+                count: u16::try_from(count.min(u64::from(MAX_HISTORY_ROWS))).ok()?,
+            })
+        } else {
+            let newest = name
+                .saturating_add(u64::from(MAX_HISTORY_ROWS).saturating_sub(1))
+                .min(self.mark.newest);
+            Some(HistoryRequest {
+                newest,
+                count: u16::try_from(newest.saturating_sub(name).saturating_add(1)).ok()?,
+            })
+        }
+    }
+
     /// Whether an unanswered request covers the row named `name`.
     fn asked(&self, name: u64) -> bool {
         self.outstanding.iter().any(|request| {
@@ -180,10 +301,25 @@ impl Scrollback {
     /// The status line while viewing.
     pub fn status(&self) -> Option<String> {
         let offset = self.view?;
-        Some(format!(
-            "[koh] scrollback {offset}/{} — arrows, PgUp/PgDn, wheel; q leaves",
-            self.mark.len
-        ))
+        let len = self.mark.len;
+        Some(match &self.search {
+            Some(search) if search.typing => format!("[koh] search: /{}", search.text()),
+            Some(search) if search.next.is_some() => {
+                format!(
+                    "[koh] scrollback {offset}/{len} — searching for {:?}…",
+                    search.text()
+                )
+            }
+            Some(search) if search.failed => {
+                format!(
+                    "[koh] scrollback {offset}/{len} — {:?} not found",
+                    search.text()
+                )
+            }
+            Some(_) | None => format!(
+                "[koh] scrollback {offset}/{len} — arrows, PgUp/PgDn, wheel; / searches; q leaves"
+            ),
+        })
     }
 
     /// Keys typed while viewing, for a screen `rows` high.
@@ -194,8 +330,43 @@ impl Scrollback {
         let half = page.div_euclid(2).max(1);
         let mut rest = input.as_slice();
         while let Some((&byte, tail)) = rest.split_first() {
+            if let Some(search) = self.search.as_mut().filter(|s| s.typing) {
+                match byte {
+                    b'\r' | b'\n' => self.search_from_top(true),
+                    0x7f | 0x08 => {
+                        // Back a character, its UTF-8 continuation bytes with it.
+                        while search
+                            .query
+                            .pop()
+                            .is_some_and(|b| (0x80..=0xbf).contains(&b))
+                        {}
+                    }
+                    0x1b | 0x03 => self.search = None,
+                    byte if byte >= 0x20 && search.query.len() < MAX_QUERY => {
+                        search.query.push(byte);
+                    }
+                    _ => {}
+                }
+                rest = tail;
+                continue;
+            }
             let (step, used) = match byte {
                 b'q' | 0x03 => return self.leave(),
+                b'/' => {
+                    self.search = Some(Search {
+                        typing: true,
+                        ..Search::default()
+                    });
+                    (Step::None, 1)
+                }
+                b'n' => {
+                    self.search_from_top(true);
+                    (Step::None, 1)
+                }
+                b'N' => {
+                    self.search_from_top(false);
+                    (Step::None, 1)
+                }
                 0x1b => match parse_escape(rest) {
                     Escape::Partial if rest.len() == 1 => return self.leave(),
                     Escape::Partial => {
@@ -230,6 +401,7 @@ impl Scrollback {
     fn leave(&mut self) -> ViewKeys {
         self.view = None;
         self.partial.clear();
+        self.search = None;
         ViewKeys::Leave
     }
 

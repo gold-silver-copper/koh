@@ -219,6 +219,18 @@ pub struct KeptRow {
 }
 
 impl KeptRow {
+    /// The row's text, cell by cell, a blank cell a space.
+    pub fn text(&self) -> String {
+        self.cells
+            .iter()
+            .filter(|cell| !cell.is_wide_continuation())
+            .map(|cell| {
+                let text = cell.contents();
+                if text.is_empty() { " " } else { text }.to_owned()
+            })
+            .collect()
+    }
+
     /// The row cut or padded to `cols` cells; a wide glyph the cut would halve is blanked.
     pub fn fitted(&self, cols: u16) -> Arc<Cells> {
         let cols = usize::from(cols);

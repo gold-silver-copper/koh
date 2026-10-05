@@ -768,8 +768,7 @@ fn summary(out: &mut String, systems: &[System], results: &Results) {
                  workloads in {} KiB)",
                 kib(bytes)
             ),
-            System::Koh => "none".to_owned(),
-            System::Mosh => "none".to_owned(),
+            System::Koh | System::Mosh => "none".to_owned(),
             System::Ssh => "the terminal's own, lost on a reconnect".to_owned(),
         };
         let _ = write!(out, " {v} |");

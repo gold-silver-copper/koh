@@ -4,7 +4,7 @@
 use crate::terminal::grid::{Palette, RowCache};
 use crate::terminal::history::HistoryNames;
 use crate::terminal::{
-    clamp_dims, Grid, HistoryMark, HistoryReply, HistoryRequest, Size, TerminalScreen,
+    clamp_dims, Grid, HistoryMark, HistoryReply, HistoryRequest, Size, TerminalScreen, TtyModes,
     MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
 };
 use std::time::{Duration, Instant};
@@ -115,6 +115,8 @@ pub struct ServerTerminal {
     frame_ends: FrameEnds,
     /// The names of the history's rows on the wire.
     names: HistoryNames,
+    /// How the PTY takes typed keys, as last read.
+    tty: Option<TtyModes>,
 }
 
 impl ServerTerminal {
@@ -131,6 +133,7 @@ impl ServerTerminal {
             frame_began: false,
             frame_ends: FrameEnds::default(),
             names: HistoryNames::default(),
+            tty: None,
         })
     }
 
@@ -210,6 +213,11 @@ impl ServerTerminal {
         self.names.renew();
     }
 
+    /// The PTY's modes, read by its owner, for the next snapshot; whether they changed.
+    pub fn set_tty(&mut self, tty: Option<TtyModes>) -> bool {
+        std::mem::replace(&mut self.tty, tty) != tty
+    }
+
     /// The screen scrolled `offset` rows back into history, as this emulator shows it: what a
     /// client's scrollback view at `offset` must show. For tests.
     pub fn window(&self, offset: usize) -> TerminalScreen {
@@ -221,6 +229,7 @@ impl ServerTerminal {
             bell_count: self.observed.bell_count,
             exit_code: self.exit_code,
             history: HistoryMark::default(),
+            tty: self.tty,
         }
     }
 
@@ -271,6 +280,7 @@ impl ServerTerminal {
             bell_count: self.observed.bell_count,
             exit_code: self.exit_code,
             history: self.names.mark(self.parser.screen()),
+            tty: self.tty,
         }
     }
 }

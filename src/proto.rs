@@ -92,21 +92,23 @@ pub const HEARTBEAT: Duration = Duration::from_secs(3);
 /// exited and the client has the final frame.
 pub const SESSION_ENDED: &[u8] = b"session ended";
 
-/// The shortest and longest gap the server leaves between frames.
-const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(20);
-const MAX_FRAME_INTERVAL: Duration = Duration::from_millis(250);
+/// The least gap the server leaves between frames.
+///
+/// Enough to take a burst of output as one frame, little enough not to be felt. How many frames go
+/// is set by what the link takes, not by a timer (`server::ServerConn::poll_frame`).
+pub const FRAME_FLOOR: Duration = Duration::from_millis(5);
 
 /// The RTT assumed before the path has measured one (QUIC's initial RTT).
 const INITIAL_RTT: Duration = Duration::from_millis(333);
 
 /// How long an unacknowledged frame, or unconfirmed input, waits before the sender acts on its own.
 ///
-/// A round trip, a frame interval and the acknowledgement's delay. The server then resends its newest screen as a new frame,
-/// and the client sends a probe, instead of waiting out QUIC's exponentially backed-off probe
-/// timeout, which on a lossy, jittery path is several round trips.
+/// A round trip, the frame floor and the acknowledgement's delay. The server then resends its
+/// newest screen as a new frame, and the client sends a probe, instead of waiting out QUIC's
+/// exponentially backed-off probe timeout, which on a lossy, jittery path is several round trips.
 pub fn retry_after(rtt: Option<Duration>) -> Duration {
     rtt.unwrap_or(INITIAL_RTT)
-        .saturating_add(frame_interval(rtt))
+        .saturating_add(FRAME_FLOOR)
         .saturating_add(ACK_DELAY)
 }
 
@@ -114,17 +116,6 @@ pub fn retry_after(rtt: Option<Duration>) -> Duration {
 /// `max_ack_delay`). A frame's delivery is its acknowledgement, which may come this much after the
 /// round trip.
 pub const ACK_DELAY: Duration = Duration::from_millis(25);
-
-/// The gap the server leaves between frames on a path with round-trip time `rtt`: two frames per
-/// round trip, within `[20 ms, 250 ms]`. An unknown RTT gets the longest gap.
-pub fn frame_interval(rtt: Option<Duration>) -> Duration {
-    rtt.map_or(MAX_FRAME_INTERVAL, |rtt| {
-        // `Duration / u32` panics only on a zero divisor.
-        rtt.checked_div(2)
-            .unwrap_or(MAX_FRAME_INTERVAL)
-            .clamp(MIN_FRAME_INTERVAL, MAX_FRAME_INTERVAL)
-    })
-}
 
 /// Most history requests a client may have waiting for an answer; one more is a protocol error.
 /// The server answers one at a time, so a client cannot make it send faster than the link takes.
@@ -705,20 +696,11 @@ mod tests {
     }
 
     #[test]
-    fn frames_go_out_twice_per_round_trip_within_bounds() {
+    fn a_retry_waits_a_round_trip_the_floor_and_the_acknowledgement_delay() {
         let ms = Duration::from_millis;
-        assert_eq!(frame_interval(None), ms(250));
-        assert_eq!(frame_interval(Some(ms(2))), ms(20));
-        assert_eq!(frame_interval(Some(ms(100))), ms(50));
-        assert_eq!(frame_interval(Some(ms(2000))), ms(250));
-    }
-
-    #[test]
-    fn a_retry_waits_a_round_trip_and_a_frame_interval() {
-        let ms = Duration::from_millis;
-        assert_eq!(retry_after(Some(ms(200))), ms(300 + 25));
-        assert_eq!(retry_after(Some(ms(10))), ms(30 + 25));
-        assert_eq!(retry_after(None), ms(333 + 250 + 25));
+        assert_eq!(retry_after(Some(ms(200))), ms(200 + 5 + 25));
+        assert_eq!(retry_after(Some(ms(10))), ms(10 + 5 + 25));
+        assert_eq!(retry_after(None), ms(333 + 5 + 25));
     }
 
     #[test]

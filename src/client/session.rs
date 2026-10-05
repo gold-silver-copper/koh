@@ -311,6 +311,7 @@ impl ClientSession {
         self.resync_sent = false;
         self.echo_ack = self.echo_ack.max(frame.echo_ack);
         self.predictor.set_local_frame_late_acked(self.echo_ack.0);
+        self.predictor.set_tty(self.current.screen.tty());
         self.predictor.cull(self.current.screen.screen());
         self.scrollback.on_mark(self.current.screen.history());
         self.last_activity = Some(now);
@@ -442,6 +443,18 @@ impl ClientSession {
     /// Whether a frame has been applied, so [`state`](Self::state) is the server's.
     pub fn synced(&self) -> bool {
         self.current.num > FrameNum::BLANK
+    }
+
+    /// Whether typing was being shown as it was predicted: the trust a reconnect to the same session
+    /// carries ([`carry_trust`](Self::carry_trust)).
+    pub fn trusted(&self) -> bool {
+        self.synced() && self.predictor.trusted()
+    }
+
+    /// Trust typing as the last connection to the same session did, once the first frame shows no
+    /// password prompt.
+    pub fn carry_trust(&mut self) {
+        self.predictor.carry_trust();
     }
 
     /// The prediction overlay to draw over [`state`](Self::state).

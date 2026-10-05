@@ -41,6 +41,10 @@ service.
    make the client keep much; and before painting one the client checks it again (printable ASCII,
    no space, an id without `;` or `:`), painting a link that fails as plain text, so no escape
    sequence can ride in a URI.
+   **Typed secrets:** the client predicts typing locally; at a password prompt (the PTY reads
+   lines without echo, which the server reads from its modes and tells the client) nothing typed
+   is predicted or shown, whatever trust the session had. A hostile server can of course claim
+   any modes: it already sees every key.
    **History:** the server already holds the session's history (`--scrollback`, 1,000 lines by
    default); with the scrollback view the client now holds a part of it too, in memory, for the
    connection: at most a million cells, dropped when the connection ends. A server's history

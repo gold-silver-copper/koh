@@ -342,10 +342,15 @@ pub async fn run_client<T: ClientTerminal>(
     let mut conn = initial;
     // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
     let mut attempt: u32 = 0;
+    // Whether typing was shown as predicted when the last connection dropped.
+    let mut trusted = false;
     loop {
         // A fresh session per connection: the server repaints the live screen on each attach.
         let size = term.size().unwrap_or(initial_size);
         let mut session = ClientSession::new(pref, size);
+        if trusted {
+            session.carry_trust();
+        }
 
         let conn_started = Instant::now();
         match drive_connection(
@@ -368,6 +373,7 @@ pub async fn run_client<T: ClientTerminal>(
                 return Ok(code);
             }
             Disposition::LinkLost => {
+                trusted = session.trusted();
                 conn.close(0u32.into(), b"reconnecting");
                 let dwell = conn_started.elapsed();
                 attempt = next_attempt_after_drop(attempt, dwell);

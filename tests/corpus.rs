@@ -525,3 +525,106 @@ fn frame_bytes() {
         previous = screen;
     }
 }
+
+/// What the predictor did over the corpus: guesses shown, those the next screen did not bear out
+/// (a brief flash), and guesses still shown after the frame that echoes their keys that disagree
+/// with it (which must never happen).
+#[derive(Default)]
+struct Guesses {
+    shown: usize,
+    wrong: usize,
+    disagreeing: Vec<String>,
+}
+
+/// Replay `recording` with its keys typed into a predicting client, each step's output answered
+/// with a frame that echoes every key typed so far.
+fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
+    let size = Size::new(recording.rows, recording.cols);
+    let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK)
+        .map_err(|e| e.to_string())?;
+    let mut client = ClientSession::new(DisplayPreference::Always, size);
+    let mut sent = TerminalScreen::default();
+    let mut num = FrameNum::BLANK;
+    let mut typed = InputSeq::default();
+    let now = Instant::now();
+    let cell = |screen: &TerminalScreen, row: u16, col: u16| {
+        screen
+            .screen()
+            .cell(row, col)
+            .map(|c| c.contents().to_owned())
+            .unwrap_or_default()
+    };
+    for (index, (step, output)) in recording.outputs().enumerate() {
+        if let Some((rows, cols)) = step.resize {
+            server.resize(Size::new(rows, cols));
+            client.on_resize(Size::new(rows, cols));
+        }
+        if !step.keys.is_empty() {
+            client.on_input(now, &step.keys);
+        }
+        while let Some(msg) = client.pop_outgoing() {
+            if let ClientMsg::Input { seq, .. } = msg {
+                typed = typed.max(seq);
+            }
+        }
+        let before: Vec<((u16, u16), String)> = client
+            .overlay()
+            .cells()
+            .filter(|(_, c)| !c.covered)
+            .map(|(at, c)| (at, c.glyph.to_owned()))
+            .collect();
+        server.process(output);
+        let screen = server.snapshot();
+        let next = num.next();
+        client.on_frame(
+            now,
+            &Frame {
+                num: next,
+                base: num,
+                echo_ack: typed,
+                diff: screen.diff_from(&sent),
+            },
+        );
+        num = next;
+        sent = screen;
+        into.shown = into.shown.saturating_add(before.len());
+        into.wrong = into.wrong.saturating_add(
+            before
+                .iter()
+                .filter(|((row, col), glyph)| cell(client.state(), *row, *col) != *glyph)
+                .count(),
+        );
+        for ((row, col), c) in client.overlay().cells() {
+            let shown = cell(client.state(), row, col);
+            if !c.covered && shown != c.glyph {
+                into.disagreeing.push(format!(
+                    "{} step {index}: ({row}, {col}) guessed {:?}, the server shows {shown:?}",
+                    recording.name, c.glyph
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn confirmed_guesses_never_disagree_with_the_server() {
+    let corpus = corpus().expect("corpus");
+    let mut total = Guesses::default();
+    for recording in corpus
+        .iter()
+        .filter(|r| r.steps.iter().any(|s| !s.keys.is_empty()))
+    {
+        guesses(recording, &mut total).expect("replay");
+    }
+    println!(
+        "guesses shown {}, not borne out by the next screen {}",
+        total.shown, total.wrong
+    );
+    assert!(total.shown > 0, "the corpus's keys made no guess");
+    assert!(
+        total.disagreeing.is_empty(),
+        "{}",
+        total.disagreeing.join("\n")
+    );
+}

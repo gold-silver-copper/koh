@@ -21,6 +21,10 @@ use tokio_util::sync::CancellationToken;
 /// How often a session checks its detach TTL (sooner for a shorter TTL).
 pub(crate) const REAP_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often a session reads its PTY's modes when nothing else made it: a password prompt that
+/// turned echo off after printing is known to the client within this.
+const TTY_TICK: Duration = Duration::from_millis(100);
+
 /// How much input may wait for a session's PTY before a connection must stop reading its stream.
 const INPUT_QUEUE: usize = 256;
 
@@ -54,6 +58,11 @@ impl PtyHost {
     /// A snapshot of the current screen.
     pub fn snapshot(&mut self) -> TerminalScreen {
         self.emu.snapshot()
+    }
+
+    /// Read the PTY's modes into the emulator, for the next snapshot; whether they changed.
+    pub fn refresh_tty(&mut self) -> bool {
+        self.emu.set_tty(self.pty.tty_modes())
     }
 
     /// Queue keystrokes for the program; `false` if its queue is full, and the caller retries.
@@ -214,6 +223,9 @@ async fn session_task(
     // A frame the program is drawing (synchronized output) is not sent half drawn.
     let mut hold = FrameHold::default();
 
+    let mut tty_tick = tokio::time::interval(TTY_TICK);
+    tty_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     let tick_period = ttl.min(REAP_INTERVAL).max(Duration::from_millis(1));
     let mut ttl_tick = tokio::time::interval(tick_period);
     ttl_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -228,6 +240,7 @@ async fn session_task(
         tokio::select! {
             chunk = pty_rx.recv(), if !exited => {
                 if let Some(chunk) = chunk {
+                    host.refresh_tty();
                     host.emu.process(&chunk);
                     take_ready(&mut pty_rx, OUTPUT_CHUNKS_PER_SNAPSHOT, |more| {
                         host.emu.process(&more);
@@ -266,6 +279,7 @@ async fn session_task(
                         }
                         ClientInput::Resize(size) => {
                             host.resize(size);
+                            host.refresh_tty();
                             // A program that asked for in-band resize reports (mode 2048) hears of
                             // it on its input, after anything typed before.
                             if let Some(report) = host.emu.resize_report() {
@@ -310,6 +324,13 @@ async fn session_task(
                 None => break, // the registry dropped: the whole server is shutting down
             },
             _ = pending_input_retry(!pending_keys.is_empty()) => {}
+            // A program may turn echo off without writing anything (a password prompt printed
+            // first): the client hears of it within a tick.
+            _ = tty_tick.tick(), if !exited && attached > 0 => {
+                if host.refresh_tty() && !hold.holding() {
+                    screens_tx.send_replace(Arc::new(host.snapshot()));
+                }
+            }
             _ = ttl_tick.tick() => {
                 let idle_expired = last_detach.is_some_and(|t| t.elapsed() >= ttl);
                 if attached == 0 && (exited || idle_expired) {

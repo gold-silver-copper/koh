@@ -41,13 +41,14 @@ iroh = "=1.3.0"
 # the server's snapshots rely on to skip unchanged rows; 0.2 keeps each grapheme cluster whole in
 # one cell, with the row's text for clusters too long to hold inline; 0.3 makes its enums and
 # `Options` non-exhaustive and `Row`'s fields methods, keeps bold and dim apart, and adds CBT/CHT.
-fux-vt = "0.3.0"
+fux-vt = "0.3.1"
 unicode-width = "0.2.2"
 # The system calls koh makes beyond std, each safe to call: the server's PTYs and the session
 # launcher (a new session with the PTY as its controlling terminal), the client's terminal (raw
-# mode, the window size), `poll` on stdin, signals and `O_NOFOLLOW`. koh writes its own ANSI and
-# reads raw stdin itself.
-fuxix = "0.1.5"
+# mode, the window size), `poll` on stdin, signals and `O_NOFOLLOW`, and the PTY's modes (whether
+# it echoes and edits lines, for the predictor; 0.1.6). koh writes its own ANSI and reads raw stdin
+# itself.
+fuxix = "0.1.6"
 # serialization. default-features = false drops postcard's `heapless-cas` default, whose
 # `atomic-polyfill` transitive dep is unmaintained (RUSTSEC-2023-0089); we only need `use-std`
 # (which pulls `alloc`) for `to_allocvec`/`from_bytes`.
@@ -183,3 +184,9 @@ significant_drop_tightening = "allow"   # false-positives on single-statement lo
 duration_suboptimal_units = "allow"     # `from_secs(3600)` is clearer than a contrived larger unit
 # `const fn` on every getter is high-churn for debatable benefit; not enforced.
 missing_const_for_fn = "allow"
+
+# TEMPORARY, until fux-vt 0.3.1 and fuxix 0.1.6 are on crates.io: both from fux's main, where they
+# are merged (fux#88, #89, #90, #91). Remove once published.
+[patch.crates-io]
+fux-vt = { git = "https://github.com/gold-silver-copper/fux", rev = "6baf2e3" }
+fuxix = { git = "https://github.com/gold-silver-copper/fux", rev = "6baf2e3" }

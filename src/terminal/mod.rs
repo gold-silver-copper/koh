@@ -101,6 +101,25 @@ pub struct TerminalScreen {
     exit_code: Option<u32>,
     /// Where the server's history stands: what the client may ask for.
     history: HistoryMark,
+    /// How the PTY takes typed keys, if known.
+    tty: Option<TtyModes>,
+}
+
+/// How the program's PTY takes typed keys: whether the kernel echoes them, and edits lines.
+///
+/// Line mode without echo is a password prompt (`getpass`, `read -s`, sudo, ssh,
+/// passwd); neither is a line editor or a full-screen program, which echo for themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TtyModes {
+    pub echo: bool,
+    pub line: bool,
+}
+
+impl TtyModes {
+    /// A password prompt: lines read without echo. Nothing typed may be shown.
+    pub const fn password(self) -> bool {
+        self.line && !self.echo
+    }
 }
 
 impl Default for TerminalScreen {
@@ -119,6 +138,7 @@ impl TerminalScreen {
             bell_count: 0,
             exit_code: None,
             history: HistoryMark { newest: 0, len: 0 },
+            tty: None,
         }
     }
 
@@ -175,6 +195,11 @@ impl TerminalScreen {
     /// Where the server's history stands.
     pub const fn history(&self) -> HistoryMark {
         self.history
+    }
+
+    /// How the program's PTY takes typed keys, if the server said.
+    pub const fn tty(&self) -> Option<TtyModes> {
+        self.tty
     }
 
     /// This screen scrolled `offset` rows back into the history `cache` holds part of: the
@@ -273,6 +298,17 @@ impl TerminalScreen {
         // Only the last window's worth can be reached.
         let excess = out.len().saturating_sub(DICTIONARY_BYTES);
         out.split_off(excess)
+    }
+
+    /// How many rows differ between this screen and `other`, or `None` if their sizes do. Rows
+    /// that share their cells compare without reading them.
+    pub fn rows_differing(&self, other: &Self) -> Option<usize> {
+        let size = self.size();
+        (size == other.size()).then(|| {
+            (0..size.rows)
+                .filter(|&r| !self.grid.row_eq(&other.grid, r))
+                .count()
+        })
     }
 
     /// The cells `screens` hold in memory together: a row several of them share counts once.
@@ -1250,6 +1286,8 @@ pub struct ScreenDiff {
     pub exit_code: Option<u32>,
     /// Where the server's history stands, if that changed.
     pub history: Option<HistoryMark>,
+    /// How the PTY takes typed keys, if that changed.
+    pub tty: Option<TtyModes>,
     /// The cursor at the target state.
     pub cursor: (u16, u16),
     /// The modes at the target state.
@@ -1301,6 +1339,7 @@ impl TerminalScreen {
             bell_count: self.bell_count,
             exit_code: self.exit_code,
             history: (self.history != base.history).then_some(self.history),
+            tty: self.tty.filter(|_| self.tty != base.tty),
             cursor: self.grid.cursor_position(),
             modes: self.grid.modes().into(),
             shifts,
@@ -1373,6 +1412,9 @@ impl TerminalScreen {
         }
         if let Some(history) = diff.history {
             self.history = history;
+        }
+        if diff.tty.is_some() {
+            self.tty = diff.tty;
         }
     }
 }
@@ -1455,6 +1497,7 @@ mod tests {
             icon: None,
             clipboard: None,
             history: None,
+            tty: None,
             bell_count: 0,
             exit_code: None,
             cursor: (0, 0),
@@ -1587,7 +1630,7 @@ mod tests {
             };
             let resize = resize.map(|(rows, cols)| Size::new(rows, cols));
             let diff = ScreenDiff {
-                resize, title, icon, clipboard, bell_count, exit_code, history: None, cursor, modes,
+                resize, title, icon, clipboard, bell_count, exit_code, history: None, tty: None, cursor, modes,
                 shifts, rows,
             };
             let mut screen = TerminalScreen::default();
@@ -1954,6 +1997,7 @@ mod tests {
         bell_count: u64,
         exit_code: Option<u32>,
         history: Option<(u64, u32)>,
+        tty: Option<(bool, bool)>,
         cursor: (u16, u16),
         modes: RawModes,
         shifts: Vec<RawShift>,
@@ -2012,6 +2056,7 @@ mod tests {
             bell_count: 0,
             exit_code: None,
             history: None,
+            tty: None,
             cursor: (0, 0),
             modes: RawModes {
                 hide_cursor: false,

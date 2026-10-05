@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::proto::{
-    dictionary_for, encode_frame_with, encode_history, frame_interval, retry_after, ClientDecoder,
-    ClientMsg, Frame, FrameNum, FrameScreen, InputSeq, ProtoError, FRAME_WINDOW, HEARTBEAT,
+    dictionary_for, encode_frame_with, encode_history, retry_after, ClientDecoder, ClientMsg,
+    Frame, FrameNum, FrameScreen, InputSeq, ProtoError, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT,
     MAX_PENDING_HISTORY, SESSION_ENDED, WINDOW_CELLS,
 };
 use crate::terminal::{HistoryRequest, Size, TerminalScreen};
@@ -147,6 +147,11 @@ impl EchoAck {
         arrived.checked_add(self.timeout)
     }
 
+    /// Whether input arrived within the debounce and is not yet promoted.
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// The current echo-ack.
     pub(crate) const fn echo_ack(&self) -> InputSeq {
         self.acked
@@ -191,6 +196,63 @@ pub(crate) struct ServerConn {
     history_busy: bool,
     /// The dictionary of the base frames are diffed against, made once for the frames on it.
     dictionary: Option<(FrameNum, Arc<[u8]>)>,
+    /// Frames sent and not yet delivered, oldest first: each one's number, size and when it went.
+    in_flight: VecDeque<(FrameNum, usize, Instant)>,
+    /// How long recent frames took to be delivered, for the link's rate.
+    deliveries: Deliveries,
+}
+
+/// How many recent deliveries the link's rate is judged by.
+const DELIVERY_SAMPLES: usize = 16;
+
+/// The bytes the server may have in flight before the link's rate is known: about ten packets,
+/// QUIC's initial window.
+const INITIAL_BUDGET: usize = 12_000;
+
+/// Most rows a frame may change and still go at once as the program's echo of the user's input.
+const ECHO_ROWS: usize = 4;
+
+/// The least gap between frames that carry the echo of the user's input.
+const ECHO_FLOOR: Duration = Duration::from_millis(1);
+
+/// How long recent frames took from being sent to being delivered, and their sizes: what the link
+/// carries in a round trip.
+#[derive(Debug, Default)]
+struct Deliveries {
+    /// Each recent frame's size, and how long it took, newest last.
+    samples: VecDeque<(usize, Duration)>,
+}
+
+impl Deliveries {
+    fn record(&mut self, bytes: usize, took: Duration) {
+        self.samples.push_back((bytes, took));
+        if self.samples.len() > DELIVERY_SAMPLES {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The bytes the link carries in a round trip of `rtt`, about: its rate times the round trip,
+    /// the rate judged by the quickest recent delivery per byte. A frame took a round trip and the
+    /// time its bytes took to go; the quickest delivery of all is near the round trip alone, so
+    /// what a frame took beyond it is its bytes' time. `None` before any delivery.
+    fn budget(&self, rtt: Duration) -> Option<usize> {
+        let quickest = self.samples.iter().map(|(_, took)| *took).min()?;
+        let budget = self
+            .samples
+            .iter()
+            .map(|(bytes, took)| {
+                // At least a millisecond: a frame faster than that says the link is fast, not
+                // how fast.
+                let sending = took.saturating_sub(quickest).max(Duration::from_millis(1));
+                let per_rtt = u128::from(u64::try_from(*bytes).unwrap_or(u64::MAX))
+                    .saturating_mul(rtt.as_nanos())
+                    .checked_div(sending.as_nanos())
+                    .unwrap_or(0);
+                usize::try_from(per_rtt).unwrap_or(usize::MAX)
+            })
+            .max()?;
+        Some(budget)
+    }
 }
 
 impl Default for ServerConn {
@@ -217,6 +279,8 @@ impl ServerConn {
             history: VecDeque::new(),
             history_busy: false,
             dictionary: None,
+            in_flight: VecDeque::new(),
+            deliveries: Deliveries::default(),
         }
     }
 
@@ -250,7 +314,7 @@ impl ServerConn {
                 ClientMsg::Resize(size) => {
                     drained.resize = Some(crate::terminal::clamp_dims(size));
                 }
-                ClientMsg::Ack { frame } => self.ack(frame),
+                ClientMsg::Ack { frame } => self.ack(frame, now),
                 ClientMsg::Resync => self.resync(),
                 ClientMsg::History(request) => {
                     if self.history.len() >= MAX_PENDING_HISTORY {
@@ -286,7 +350,8 @@ impl ServerConn {
 
     /// The client applied `num`, so older frames are no bases any more. An ack for a frame no longer
     /// held is ignored.
-    fn ack(&mut self, num: FrameNum) {
+    fn ack(&mut self, num: FrameNum, now: Instant) {
+        self.delivered(num, now);
         if num <= self.acked.num {
             return;
         }
@@ -300,6 +365,48 @@ impl ServerConn {
         self.sent = rest;
     }
 
+    /// Frame `num` was delivered at `now`: it is no longer in flight, nor are the frames before it,
+    /// which it superseded, and how long it took says how fast the link is.
+    fn delivered(&mut self, num: FrameNum, now: Instant) {
+        if let Some(&(_, bytes, sent)) = self.in_flight.iter().find(|(n, _, _)| *n == num) {
+            self.deliveries
+                .record(bytes, now.saturating_duration_since(sent));
+        }
+        self.in_flight.retain(|(n, _, _)| *n > num);
+    }
+
+    /// Frame `num`, of `bytes` on its stream, went at `now`.
+    fn frame_sent(&mut self, num: FrameNum, bytes: usize, now: Instant) {
+        self.in_flight.push_back((num, bytes, now));
+    }
+
+    /// The frame bytes in flight at `now`: sent, not delivered, and not given up on (a frame not
+    /// delivered within a retry interval is lost, or reset, and its newest screen is resent).
+    fn in_flight_bytes(&self, now: Instant, rtt: Option<Duration>) -> usize {
+        let given_up = retry_after(rtt);
+        self.in_flight
+            .iter()
+            .filter(|(_, _, sent)| now.saturating_duration_since(*sent) < given_up)
+            .map(|(_, bytes, _)| *bytes)
+            .fold(0, usize::saturating_add)
+    }
+
+    /// The frame bytes the link may have in flight: about a round trip's worth.
+    fn budget(&self, rtt: Option<Duration>) -> usize {
+        rtt.and_then(|rtt| self.deliveries.budget(rtt))
+            .unwrap_or(INITIAL_BUDGET)
+    }
+
+    /// Whether the screen's change is small and the user typed in the last echo debounce: a frame
+    /// that likely carries the program's echo, which goes at once.
+    fn carries_echo(&self) -> bool {
+        self.echo.has_pending()
+            && self
+                .screen
+                .rows_differing(&self.acked.screen)
+                .is_some_and(|rows| rows <= ECHO_ROWS)
+    }
+
     /// The client lacks a frame's base: diff against the blank screen until it acknowledges one.
     fn resync(&mut self) {
         self.acked = FrameScreen::default();
@@ -311,19 +418,27 @@ impl ServerConn {
         self.echo.promote(now);
     }
 
-    /// The frame due at `now`, if any: the screen or echo-ack changed and a frame interval passed,
-    /// the newest frame went unacknowledged for a retry interval (resent as a new frame), or a
-    /// heartbeat is due.
+    /// The frame due at `now`, if any.
+    ///
+    /// A changed screen or echo-ack goes once the frame floor has passed and the link has room:
+    /// the frame bytes in flight are under about a round trip's worth (or none are), so frames
+    /// never queue behind each other, and while they would, the screen they would carry is skipped
+    /// for the newest. A small change while the user's input awaits its echo goes at once, room or
+    /// not. Besides, the newest frame is resent as a new one once unacknowledged for a retry
+    /// interval, and a heartbeat goes when the link has been quiet.
     fn poll_frame(&mut self, now: Instant, rtt: Option<Duration>) -> Option<Frame> {
         let changed = self.unsent_change || self.echo.echo_ack() != self.last_sent_echo;
         let since = self
             .last_sent_at
             .map(|at| now.saturating_duration_since(at));
-        let interval_passed = since.is_none_or(|since| since >= frame_interval(rtt));
+        let passed = |floor: Duration| since.is_none_or(|since| since >= floor);
+        let in_flight = self.in_flight_bytes(now, rtt);
+        let room = in_flight == 0 || in_flight < self.budget(rtt);
         let unacked = self.last_num > self.acked.num;
         let retry_due = unacked && since.is_some_and(|since| since >= retry_after(rtt));
         let heartbeat_due = since.is_none_or(|since| since >= HEARTBEAT);
-        let due = (changed && interval_passed) || retry_due || heartbeat_due;
+        let echo = self.unsent_change && passed(ECHO_FLOOR) && self.carries_echo();
+        let due = (changed && passed(FRAME_FLOOR) && room) || echo || retry_due || heartbeat_due;
         if !due {
             return None;
         }
@@ -390,17 +505,29 @@ impl ServerConn {
         })
     }
 
-    /// When the loop must wake at the latest, with nothing else happening.
+    /// When the loop must wake at the latest, with nothing else happening (a delivery wakes it
+    /// too).
     fn next_wake(&self, now: Instant, rtt: Option<Duration>) -> Instant {
         let mut wake = self
             .last_sent_at
             .map_or(now, |at| at.checked_add(HEARTBEAT).unwrap_or(now));
         let changed = self.unsent_change || self.echo.echo_ack() != self.last_sent_echo;
         if changed {
-            let interval = self
-                .last_sent_at
-                .map_or(now, |at| at.checked_add(frame_interval(rtt)).unwrap_or(now));
-            wake = wake.min(interval);
+            let in_flight = self.in_flight_bytes(now, rtt);
+            if in_flight == 0 || in_flight < self.budget(rtt) || self.carries_echo() {
+                let floor = if self.carries_echo() {
+                    ECHO_FLOOR
+                } else {
+                    FRAME_FLOOR
+                };
+                let after = self
+                    .last_sent_at
+                    .map_or(now, |at| at.checked_add(floor).unwrap_or(now));
+                wake = wake.min(after);
+            } else if let Some(&(_, _, sent)) = self.in_flight.front() {
+                // No room: a delivery makes some, or the oldest frame is given up on.
+                wake = wake.min(sent.checked_add(retry_after(rtt)).unwrap_or(now));
+            }
         }
         if self.last_num > self.acked.num {
             let retry = self
@@ -468,6 +595,7 @@ pub async fn run_attached(
             }
             match core.encode(&frame) {
                 Ok(bytes) => {
+                    core.frame_sent(frame.num, bytes.len(), now);
                     let cancel = CancellationToken::new();
                     tokio::spawn(send_frame(
                         conn.clone(),
@@ -551,7 +679,7 @@ pub async fn run_attached(
                 }
             },
             Some(()) = history_rx.recv() => core.history_delivered(),
-            Some(num) = delivered_rx.recv() => core.ack(num),
+            Some(num) = delivered_rx.recv() => core.ack(num, Instant::now()),
             () = tokio::time::sleep_until(wake) => {}
         }
     };
@@ -699,8 +827,8 @@ mod tests {
         distinct_cells, CursorKeyNormalizer, Drained, EchoAck, ServerConn, FINAL_ACK_WAIT,
     };
     use crate::proto::{
-        encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_WINDOW, HEARTBEAT,
-        WINDOW_CELLS,
+        encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_FLOOR,
+        FRAME_WINDOW, HEARTBEAT, WINDOW_CELLS,
     };
     use crate::terminal::{Size, TerminalScreen};
 
@@ -1016,9 +1144,9 @@ mod tests {
     }
 
     #[test]
-    fn the_first_frame_goes_out_at_once_and_later_ones_are_paced() {
+    fn the_first_frame_goes_out_at_once_and_a_burst_waits_for_the_floor() {
         let t0 = Instant::now();
-        let rtt = Some(Duration::from_millis(100)); // a 50 ms frame interval
+        let rtt = Some(Duration::from_millis(100));
         let mut c = ServerConn::default();
         c.install_snapshot(Arc::new(screen(b"hello")), true);
         let first = c
@@ -1029,21 +1157,118 @@ mod tests {
             .screen()
             .contents()
             .contains("hello"));
+        c.frame_sent(first.num, 100, t0);
         assert!(c.poll_frame(t0, rtt).is_none(), "nothing changed");
         c.install_snapshot(Arc::new(screen(b"hello world")), true);
-        assert!(
-            c.poll_frame(t0 + Duration::from_millis(10), rtt).is_none(),
-            "inside the interval"
-        );
-        assert_eq!(
-            c.next_wake(t0 + Duration::from_millis(10), rtt),
-            t0 + Duration::from_millis(50)
-        );
+        let inside = t0 + Duration::from_millis(1);
+        assert!(c.poll_frame(inside, rtt).is_none(), "inside the floor");
+        assert_eq!(c.next_wake(inside, rtt), t0 + FRAME_FLOOR);
         let second = c
-            .poll_frame(t0 + Duration::from_millis(50), rtt)
-            .expect("interval passed");
+            .poll_frame(t0 + FRAME_FLOOR, rtt)
+            .expect("the floor passed, and the link has room");
         assert_eq!(second.num, FrameNum(2));
         assert_eq!(second.base, FrameNum::BLANK, "nothing was acknowledged yet");
+    }
+
+    /// A connection that has learnt the link: a round trip of 50 ms, and 10 kB taking 40 ms
+    /// beyond it, a budget of 12.5 kB in flight. Frames go at `t[0]` and `t[1]` (50 ms on), and
+    /// are delivered at `t[1]` and `t[2]` (140 ms on).
+    fn on_a_slow_link(t: [Instant; 3]) -> Option<(ServerConn, Option<Duration>)> {
+        let rtt = Some(Duration::from_millis(50));
+        let mut c = ServerConn::default();
+        let [start, second, done] = t;
+        c.install_snapshot(Arc::new(screen(b"start")), true);
+        let one = c.poll_frame(start, rtt)?;
+        c.frame_sent(one.num, 100, start);
+        c.ack(one.num, second);
+        c.install_snapshot(Arc::new(screen(b"start, then more")), true);
+        let two = c.poll_frame(second, rtt)?;
+        c.frame_sent(two.num, 10_000, second);
+        c.ack(two.num, done);
+        (c.budget(rtt) == 12_500).then_some((c, rtt))
+    }
+
+    #[test]
+    fn frames_in_flight_never_exceed_about_a_round_trip_of_the_link() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
+        let t = t0 + Duration::from_millis(200);
+        c.install_snapshot(Arc::new(screen(b"a big repaint")), true);
+        let big = c.poll_frame(t, rtt).expect("room for it");
+        c.frame_sent(big.num, 20_000, t);
+        c.install_snapshot(Arc::new(screen(b"a big repaint, changed")), true);
+        let later = t + Duration::from_millis(30);
+        assert!(
+            c.poll_frame(later, rtt).is_none(),
+            "20 kB in flight, past the budget"
+        );
+        assert_eq!(
+            c.next_wake(later, rtt),
+            t + retry_after(rtt),
+            "a delivery wakes the loop, or the frame is given up on"
+        );
+        c.ack(big.num, t + Duration::from_millis(100));
+        assert!(c.poll_frame(t + Duration::from_millis(100), rtt).is_some());
+    }
+
+    #[test]
+    fn a_slow_link_skips_to_the_newest_screen() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
+        let t = t0 + Duration::from_millis(200);
+        c.install_snapshot(Arc::new(screen(b"frame 0")), true);
+        let big = c.poll_frame(t, rtt).unwrap();
+        c.frame_sent(big.num, 20_000, t);
+        let mut at = t;
+        for n in 1..=5 {
+            at += Duration::from_millis(10);
+            c.install_snapshot(Arc::new(screen(format!("frame {n}").as_bytes())), true);
+            assert!(c.poll_frame(at, rtt).is_none(), "screen {n} waits");
+        }
+        c.ack(big.num, at);
+        let next = c.poll_frame(at, rtt).expect("room again");
+        assert_eq!(
+            next.num,
+            big.num.next(),
+            "the screens between were never sent"
+        );
+        let shown = applied(&screen(b"frame 0"), &next);
+        assert!(shown.screen().contents().contains("frame 5"));
+    }
+
+    #[test]
+    fn the_echo_of_typing_goes_at_once_even_with_the_link_full() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
+        let t = t0 + Duration::from_millis(200);
+        c.install_snapshot(Arc::new(screen(b"$ ")), true);
+        let full = c.poll_frame(t, rtt).unwrap();
+        c.frame_sent(full.num, 20_000, t);
+        // The user types; the program's echo changes one row.
+        c.push_client_bytes(&stream(&[ClientMsg::Input {
+            seq: InputSeq(1),
+            bytes: b"l".to_vec(),
+        }]));
+        c.drain_client(t, false).unwrap();
+        c.install_snapshot(Arc::new(screen(b"$ l")), true);
+        let typed = t + Duration::from_millis(1);
+        let echo = c.poll_frame(typed, rtt).expect("the echo goes at once");
+        assert!(applied(&screen(b"$ "), &echo)
+            .screen()
+            .contents()
+            .contains("$ l"));
+        // A large change is not an echo, typed or not: it waits for room.
+        c.frame_sent(echo.num, 100, typed);
+        let lines: Vec<u8> = (0..20)
+            .flat_map(|n| format!("line {n}\r\n").into_bytes())
+            .collect();
+        c.install_snapshot(Arc::new(screen(&lines)), true);
+        assert!(c
+            .poll_frame(typed + Duration::from_millis(2), rtt)
+            .is_none());
     }
 
     #[test]
@@ -1053,7 +1278,7 @@ mod tests {
         c.install_snapshot(Arc::new(screen(b"idle")), true);
         c.poll_frame(t0, None).expect("first frame");
         // Acknowledged, so no retry is due; only the heartbeat is.
-        c.ack(FrameNum(1));
+        c.ack(FrameNum(1), Instant::now());
         let just_before = (t0 + HEARTBEAT)
             .checked_sub(Duration::from_millis(1))
             .unwrap();
@@ -1081,7 +1306,7 @@ mod tests {
             "the same screen, as a frame that supersedes"
         );
         // Once acknowledged, nothing more is resent until something changes.
-        c.ack(FrameNum(2));
+        c.ack(FrameNum(2), Instant::now());
         assert!(c.poll_frame(t0 + retry * 3, rtt).is_none());
     }
 
@@ -1094,15 +1319,15 @@ mod tests {
         let one = c.poll_frame(t0, None).unwrap();
         c.install_snapshot(Arc::new(screen(b"one two")), true);
         let two = c.poll_frame(later(1), None).unwrap();
-        c.ack(FrameNum(1));
+        c.ack(FrameNum(1), Instant::now());
         c.install_snapshot(Arc::new(screen(b"one two three")), true);
         let three = c.poll_frame(later(2), None).unwrap();
         assert_eq!(three.base, FrameNum(1));
         let client_one = applied(&TerminalScreen::default(), &one);
         assert_eq!(applied(&client_one, &three), screen(b"one two three"));
         // An ack for a frame older than the acknowledged one changes nothing.
-        c.ack(FrameNum(2));
-        c.ack(FrameNum(1));
+        c.ack(FrameNum(2), Instant::now());
+        c.ack(FrameNum(1), Instant::now());
         c.install_snapshot(Arc::new(screen(b"four")), true);
         assert_eq!(c.poll_frame(later(3), None).unwrap().base, FrameNum(2));
         let _ = two;
@@ -1115,7 +1340,7 @@ mod tests {
         let mut c = ServerConn::default();
         c.install_snapshot(Arc::new(screen(b"a")), true);
         c.poll_frame(t0, None).unwrap();
-        c.ack(FrameNum(1));
+        c.ack(FrameNum(1), Instant::now());
         c.push_client_bytes(&stream(&[ClientMsg::Resync]));
         c.drain_client(later(1), false).unwrap();
         let rebuilt = c
@@ -1134,9 +1359,9 @@ mod tests {
             c.poll_frame(t0 + Duration::from_secs(n), None).unwrap();
         }
         assert_eq!(c.sent.len(), FRAME_WINDOW);
-        c.ack(FrameNum(1)); // dropped from the window
+        c.ack(FrameNum(1), Instant::now()); // dropped from the window
         assert_eq!(c.acked(), FrameNum::BLANK);
-        c.ack(FrameNum(3));
+        c.ack(FrameNum(3), Instant::now());
         assert_eq!(c.acked(), FrameNum(3));
     }
 
@@ -1158,7 +1383,7 @@ mod tests {
             (c, last)
         };
         let (mut acked, last) = exited();
-        acked.ack(last.num);
+        acked.ack(last.num, Instant::now());
         assert!(acked.finished(sent), "acked: done at once");
         let (unacked, _) = exited();
         let just_before = (sent + FINAL_ACK_WAIT)
@@ -1236,7 +1461,7 @@ mod tests {
             .expect("a heartbeat is due");
         assert_eq!(frame.base, FrameNum::BLANK);
         // An acknowledgement of a dropped frame is ignored, as one past the window is.
-        c.ack(FrameNum(3));
+        c.ack(FrameNum(3), Instant::now());
         assert_eq!(c.acked(), FrameNum::BLANK);
     }
 }

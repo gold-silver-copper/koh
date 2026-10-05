@@ -96,12 +96,19 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   frame only delays the screen until the next one. When the server sends a
   frame it resets the streams of older unacknowledged frames, so QUIC never retransmits a screen a
   newer one has replaced.
-- **Pacing:** a frame goes out when the screen or the echo-ack changed, at most once per frame
-  interval (`clamp(rtt / 2, 20 ms, 250 ms)`), and a heartbeat frame at least every 3 s so the
-  client can tell a quiet session from a dead link.
+- **Pacing by what the link takes:** never more than about a round trip of frame bytes in flight.
+  The server tracks the frames sent and not yet delivered, and judges the link's rate by recent
+  deliveries (the quickest delivery is near the round trip alone, so what a frame took beyond it is
+  its bytes' time); the budget is that rate times the round trip. A changed screen goes once the
+  frame floor (`FRAME_FLOOR`, 5 ms, which only batches a burst) has passed and the bytes in flight
+  are under the budget, or none are in flight. While frames would queue, the screens between are
+  skipped for the newest. A small change (at most four rows) while typed input awaits its echo
+  goes at once, room or not, at most a millisecond apart: the program's echo is never stuck behind
+  a flood. A heartbeat frame goes at least every 3 s so the client can tell a quiet session from a
+  dead link.
 - **Retries without QUIC's backoff:** on a lossy, jittery path QUIC's probe timeout is several
   round trips and doubles on each loss. So an unacknowledged newest frame is resent, as a new frame
-  that supersedes it, after a round trip, a frame interval and QUIC's acknowledgement delay; and
+  that supersedes it, after a round trip, the frame floor and QUIC's acknowledgement delay; and
   input the echo-ack has not confirmed after the same wait makes the client send an `Ack`, a later
   packet that lets QUIC detect the loss and retransmit at once.
 - **Bounded state:** each end keeps at most `FRAME_WINDOW` (16) recent screens — the client its
@@ -258,16 +265,27 @@ brings in erased cells.
 The client guesses what each keystroke does to the screen and shows it immediately, then confirms
 or corrects when the authoritative server frame arrives. Confirmation
 is driven by the server's **echo-ack** (a 50 ms-debounced "your input up to frame N is now on
-screen"), not the raw network ack. Password prompts get no predicted echo — suppression is
-*emergent*: non-echoed input fails validation, kills its epoch, and keeps subsequent predictions
-hidden, with no explicit password heuristic. Prediction is **always on** in koh (`DisplayPreference::
+screen"), not the raw network ack.
+
+**The PTY's modes.** Each screen carries how the program's PTY takes typed keys (`TtyModes`: the
+kernel's echo and line mode, read with `tcgetattr` through fuxix at every snapshot and every 100 ms
+while a client is attached, as a program may turn echo off without writing). Line mode without
+echo is a password prompt (`getpass`, `read -s`, sudo, ssh, passwd): nothing typed is predicted
+and every prediction is dropped, however trusted the session was. Kernel echo is trusted from the
+first key. Otherwise (a line editor, a full-screen program) the epoch logic decides: the first key
+of an epoch stays hidden until the server's echo confirms it, and a mispredict kills its epoch. A
+reconnect to the same session carries the trust it had, given once the first frame shows no
+password prompt. Prediction is **always on** in koh (`DisplayPreference::
 Always`), so keystrokes engage on every link. Predictions are drawn plain, not underlined,
 and a cell it knows changed but not to what is not drawn at all, so the real cell shows.
 
 The port faithfully implements epoch-gated confirmation, glitch escalation,
 and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
-backspace, CR/LF, the left/right arrow keys (CSI **and** SS3/application-cursor form), and whole
-UTF-8 graphemes including double-width CJK/emoji (cursor advances by two cells). A wide glyph is
+backspace, CR/LF, the left/right arrow keys (CSI **and** SS3/application-cursor form), the line
+editor's keys where the guess is sure (`Ctrl-W` and `Alt-Backspace` back to a word's boundary,
+never into what is left of the line's start; `Ctrl-U`, `Ctrl-A` and Home only when where the line
+began is known, from the first key typed after Enter; `Ctrl-E` and End to the end of an unwrapped
+row; `Alt-B` and `Alt-F` by readline's words), and whole UTF-8 graphemes including double-width CJK/emoji (cursor advances by two cells). A wide glyph is
 predicted as two cells, the glyph and the cell it covers; the covered cell is right when the
 server shows a wide glyph's right half there, and never confirms an epoch. The insert-mode shift
 moves each wide glyph with its right half; one the shift splits (at the right edge, or typed

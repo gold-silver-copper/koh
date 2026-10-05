@@ -490,6 +490,9 @@ fn frame_bytes() {
         return;
     };
     let corpus = corpus().expect("corpus");
+    if name == "all" {
+        return frame_size_histogram(&corpus);
+    }
     let recording = corpus.iter().find(|r| r.name == name).expect("recording");
     let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK).expect("emu");
     let mut previous = TerminalScreen::default();
@@ -629,4 +632,49 @@ fn confirmed_guesses_never_disagree_with_the_server() {
         "{}",
         total.disagreeing.join("\n")
     );
+}
+
+/// How big koh's frames are on the recordings: each step's screen as one frame on the step
+/// before, as its stream carries it, counted by size, with the bytes each size takes.
+fn frame_size_histogram(corpus: &[Recording]) {
+    const BOUNDS: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, usize::MAX];
+    let mut counts = [0_usize; 9];
+    let mut bytes = [0_usize; 9];
+    for recording in corpus {
+        let mut server =
+            ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK).expect("emu");
+        let mut previous = TerminalScreen::default();
+        for (num, (step, output)) in (0_u64..).zip(recording.outputs()) {
+            if let Some((rows, cols)) = step.resize {
+                server.resize(Size::new(rows, cols));
+            }
+            server.process(output);
+            let screen = server.snapshot();
+            let frame = Frame {
+                num: FrameNum(num.saturating_add(1)),
+                base: FrameNum(num),
+                echo_ack: InputSeq::default(),
+                diff: screen.diff_from(&previous),
+            };
+            let len = encode_frame(&frame, &previous).expect("wire").len();
+            let at = BOUNDS.iter().position(|&b| len < b).unwrap_or(8);
+            if let (Some(count), Some(sum)) = (counts.get_mut(at), bytes.get_mut(at)) {
+                *count = count.saturating_add(1);
+                *sum = sum.saturating_add(len);
+            }
+            previous = screen;
+        }
+    }
+    let total: usize = bytes.iter().sum();
+    let frames: usize = counts.iter().sum();
+    println!("{frames} frames, {total} bytes");
+    for ((bound, count), sum) in BOUNDS.iter().zip(counts).zip(bytes) {
+        let label = if *bound == usize::MAX {
+            "4096+".to_owned()
+        } else {
+            format!("<{bound}")
+        };
+        let percent = sum.saturating_mul(100).checked_div(total).unwrap_or(0);
+        println!("{label:>6}: {count:>5} frames, {sum:>7} bytes ({percent}%)");
+    }
 }

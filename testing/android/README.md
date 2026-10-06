@@ -56,6 +56,12 @@ echo "no" | avdmanager create avd --name koh_test \
 Homebrew's `openjdk` is keg-only: `java` is not on `PATH` until `$JAVA_HOME/bin` is added, as
 above, and `sdkmanager`/`avdmanager` fail without it.
 
+**On an x86_64 Linux host** use the x86_64 image (`system-images;android-35;google_apis;x86_64`,
+which runs under KVM) and build for it: `export KOH_ANDROID_TARGET=x86_64-linux-android`. The
+build scripts and the evil peer's path follow `KOH_ANDROID_TARGET`; with only the NDK (no
+`cargo-ndk`) they set the target's linker and C compiler (`CC_<triple>`, which `ring` needs) from
+`ANDROID_NDK_HOME`.
+
 Use a **`google_apis`** image, not `google_apis_playstore`: its userdebug build has `su`, which the
 netem tests need for `tc`. Use an **arm64-v8a** image — it runs natively on Apple Silicon and
 matches `koh`'s `aarch64-linux-android` target. The build uses `cargo-ndk` if installed, else the
@@ -140,7 +146,7 @@ KOH_ANDROID_EMULATOR=1 sh testing/android/scripts/stress-throughput.sh
 | `stress-bind-storm` | many rapid endpoint binds (the DNS-init path) | every bind succeeds, never an `ndk-context` panic |
 | `stress-connection-churn` | rapid connect/disconnect vs one server | server survives, RSS bounded (no per-connection leak), no panic |
 | `stress-concurrent-clients` | N simultaneous distinct-peer sessions | all connect, server survives, RSS bounded |
-| `stress-evil-peer` *(needs the cross-compiled evil-peer; else self-SKIPs)* | the **malicious-peer harness**: crafted stream/flood attacks (an over-cap message prefix, an over-cap input, a second input stream, input floods, resize/keys floods, garbage, a wrong ALPN) + an admission-stall from a malicious **client**, and bad-admit/stall-admit from a malicious **server** | every attack is proven to have run, and the server stays **alive + memory-bounded + panic-free** under all of them (witness session intact, fresh client still admitted); a wrong ALPN is refused by the handshake; a client that never accepts its admission ack holds no other client up; and a real koh **client refuses** a server that sends a bad admission byte or never admits (it exits with that refusal) |
+| `stress-evil-peer` *(needs the cross-compiled evil-peer; else self-SKIPs)* | the **malicious-peer harness**: crafted stream/flood attacks (an over-cap message prefix, an over-cap input, a second input stream, input floods, resize/keys floods, paste-event floods, decoded input no terminal sends — a modifier bit no key has, F99, a surrogate kitty code, an over-cap paste piece, too many events, 17 palette colours — garbage, a wrong ALPN) + an admission-stall from a malicious **client**, and bad-admit/stall-admit from a malicious **server** | every attack is proven to have run, and the server stays **alive + memory-bounded + panic-free** under all of them (witness session intact, fresh client still admitted); a wrong ALPN is refused by the handshake; a client that never accepts its admission ack holds no other client up; and a real koh **client refuses** a server that sends a bad admission byte or never admits (it exits with that refusal) |
 | `stress-signal-storm` | repeated SIGTERM/SIGINT teardown | every signal drains gracefully, no orphan, no panic |
 | `stress-throughput` | server-side flood of 2×10⁴ (`quick`) to 2×10⁵ (`full`) lines | whole flood processed end-to-end, no panic, server RSS bounded |
 | `stress-memory-longevity` | unbounded output for tens of seconds | RSS plateaus (no leak) under an absolute cap, no panic |

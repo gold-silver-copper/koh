@@ -16,7 +16,7 @@ use crate::events::{
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
     decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, FrameScreen,
-    InputSeq, FRAME_WINDOW, HEARTBEAT, MAX_INPUT_BYTES, WINDOW_CELLS,
+    InputSeq, FRAME_WINDOW, HEARTBEAT, MAX_INPUT_BYTES, TTY_TICK, WINDOW_CELLS,
 };
 use crate::terminal::{Grid, HistoryReply, RowEncodings, Size, TerminalScreen};
 
@@ -35,6 +35,12 @@ const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 
 /// What the status line says of a paste past [`MAX_QUEUED_INPUT`], which is dropped whole.
 const PASTE_TOO_LONG: &str = "[koh] paste over 1 MiB — not sent";
+
+/// How long after a frame moves the cursor to another row (a fresh prompt) a key typed is shown
+/// only once echoed: the server reads the PTY's modes at least every [`TTY_TICK`], so a program
+/// that turned echo off just after printing its prompt is heard of within about one; two leave
+/// room for the link's jitter.
+const PROMPT_HOLD: Duration = TTY_TICK.saturating_mul(2);
 
 /// How long a notice stays on the status line.
 const NOTICE_FOR: Duration = Duration::from_secs(3);
@@ -97,6 +103,9 @@ pub struct ClientSession {
     notice: Option<(String, Instant)>,
     /// A key's legacy bytes, as last matched against the escape prefix.
     scratch: Vec<u8>,
+    /// When the newest frame moved the cursor to another row: a fresh prompt, whose program may
+    /// still turn echo off. Keys typed within [`PROMPT_HOLD`] of it are shown only once echoed.
+    new_row_at: Option<Instant>,
     /// The history held, and the scrollback view.
     scrollback: Scrollback,
     /// When the user last typed or a frame last applied: history is fetched ahead only after a
@@ -134,6 +143,7 @@ impl ClientSession {
             ask: Vec::new(),
             notice: None,
             scratch: Vec::with_capacity(16),
+            new_row_at: None,
             scrollback: Scrollback::default(),
             last_activity: None,
             rows: size.rows,
@@ -328,7 +338,17 @@ impl ClientSession {
         for event in &events {
             let screen = self.current.screen.screen();
             match event {
-                InputEvent::Key(key) => self.predictor.new_user_key(key.stroke().press, screen),
+                InputEvent::Key(key) => {
+                    // At a fresh prompt the modes the client holds may be from before the program
+                    // turned echo off: the key shows only once echoed.
+                    if self
+                        .new_row_at
+                        .is_some_and(|at| now.saturating_duration_since(at) < PROMPT_HOLD)
+                    {
+                        self.predictor.hold();
+                    }
+                    self.predictor.new_user_key(key.stroke().press, screen);
+                }
                 InputEvent::Mouse(_) | InputEvent::Focus(_) | InputEvent::Paste { .. } => {
                     self.predictor.new_user_other(screen);
                 }
@@ -450,6 +470,9 @@ impl ClientSession {
             return;
         };
         screen.apply(&frame.diff);
+        if screen.screen().cursor_position().0 != self.current.screen.screen().cursor_position().0 {
+            self.new_row_at = Some(now);
+        }
         let previous = std::mem::replace(
             &mut self.current,
             FrameScreen {
@@ -1401,5 +1424,57 @@ mod tests {
                 last: true
             }]
         );
+    }
+
+    /// A program that prints its prompt and turns echo off a moment after (bash's `read -s`) can
+    /// be shown with the modes from before: a key typed at once must not be shown, however
+    /// trusted the session; once the server could have told the new modes, keys are predicted as
+    /// before.
+    #[test]
+    fn a_key_at_a_fresh_prompt_waits_for_its_echo() {
+        use crate::predict::TtyModes;
+        use crate::terminal::ServerTerminal;
+        let echoing = Some(TtyModes {
+            echo: true,
+            line: true,
+        });
+        let t0 = Instant::now();
+        let mut s = ClientSession::new(DisplayPreference::Always, Size::new(24, 80));
+        let mut server = ServerTerminal::new(24, 80, 0).expect("emulator");
+        server.set_tty(echoing);
+        server.process(b"$ ");
+        let first = server.snapshot();
+        s.on_frame(t0, &frame(1, 0, 0, &TerminalScreen::default(), &first));
+        // Long after the prompt: the kernel echoes, so the first key shows at once.
+        let later = t0 + Duration::from_secs(1);
+        s.on_input(later, b"x");
+        assert!(
+            s.overlay().cells().any(|(_, c)| c.glyph == "x"),
+            "kernel echo is predicted from the first key"
+        );
+        drain(&mut s);
+        // The program prints a prompt on a new row; the modes the frame carries still echo.
+        server.process(b"x\r\nSecret: ");
+        let prompt = server.snapshot();
+        let t1 = later + Duration::from_millis(50);
+        s.on_frame(t1, &frame(2, 1, 1, &first, &prompt));
+        s.on_input(t1 + Duration::from_millis(10), b"Q");
+        drain(&mut s);
+        assert!(
+            !s.overlay().cells().any(|(_, c)| c.glyph == "Q"),
+            "a key typed at a fresh prompt is not shown before its echo"
+        );
+        // The program did echo (no password after all): once the server reflects the held key,
+        // and the hold is over, the next key is predicted from the first again.
+        server.process(b"Q");
+        let echoed = server.snapshot();
+        let t2 = t1 + PROMPT_HOLD + Duration::from_millis(1);
+        s.on_frame(t2, &frame(3, 2, 2, &prompt, &echoed));
+        s.on_input(t2, b"Z");
+        assert!(
+            s.overlay().cells().any(|(_, c)| c.glyph == "Z"),
+            "after the hold, kernel echo is predicted again"
+        );
+        assert!(!s.overlay().cells().any(|(_, c)| c.glyph == "Q"));
     }
 }

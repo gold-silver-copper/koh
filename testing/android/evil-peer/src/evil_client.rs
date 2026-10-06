@@ -17,6 +17,11 @@
 //!   resize-flood <n>         one read packed with n resize messages      (resize coalescing)
 //!   keys-flood <mib>         a mib-MiB paste, split into capped messages  (PTY backpressure)
 //!   garbage <n>              n random byte blobs on the stream           (decoder robustness)
+//!   bad-keys <kind>          decoded input no terminal sends: `mods` (a modifier bit no key has),
+//!                            `fkey` (F99), `surrogate` (a kitty code that is no scalar), `paste`
+//!                            (a paste piece over the cap), `events` (too many in one message),
+//!                            `palette` (17 colours)                       (event validation)
+//!   events-flood <mib>       a mib-MiB paste as valid paste events        (PTY backpressure)
 //!   second-stream            open a second client stream                 (one-stream limit)
 //!   bad-alpn                 connect with the wrong ALPN                  (handshake rejects)
 //!   stall-admission          connect but never accept the admission ack  (3s admission timeout)
@@ -30,6 +35,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use koh::events::{
+    InputEvent, WireColours, WireKey, WireKeyCode, WireKitty, MAX_EVENTS, MAX_PASTE_PIECE, PALETTE,
+};
 use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE, MAX_INPUT_BYTES};
 use koh::terminal::Size;
 use koh::transport_iroh::{
@@ -97,6 +105,11 @@ async fn main() -> Result<()> {
                 "accumulate" => accumulate(&mut send, num(4, 3000)).await?,
                 "resize-flood" => resize_flood(&mut send, num(4, 500_000) as usize).await?,
                 "keys-flood" => keys_flood(&mut send, num(4, 6) as usize).await?,
+                "bad-keys" => {
+                    let kind = args.get(4).map_or("mods", String::as_str);
+                    bad_keys(&mut send, kind).await?;
+                }
+                "events-flood" => events_flood(&mut send, num(4, 6) as usize).await?,
                 "garbage" | "empty-frags" | "partial-frags" => {
                     garbage(&mut send, num(4, 30000) as usize).await?;
                 }
@@ -193,6 +206,69 @@ async fn keys_flood(send: &mut SendStream, mib: usize) -> Result<()> {
             &ClientMsg::Input {
                 seq: InputSeq(seq),
                 bytes: chunk.clone(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// One message of decoded input no terminal sends, built by hand (`encode_client` refuses it): the
+/// server must close the connection.
+async fn bad_keys(send: &mut SendStream, kind: &str) -> Result<()> {
+    eprintln!("evil-client: decoded input no terminal sends ({kind})");
+    let key = |key, mods, kitty| InputEvent::Key(WireKey { key, mods, kitty });
+    let keys = |events| ClientMsg::Keys {
+        seq: InputSeq(1),
+        events,
+    };
+    let msg = match kind {
+        "mods" => keys(vec![key(WireKeyCode::Char('x'), 0x80, None)]),
+        "fkey" => keys(vec![key(WireKeyCode::F(99), 0, None)]),
+        "surrogate" => keys(vec![key(
+            WireKeyCode::Char('x'),
+            0,
+            Some(WireKitty {
+                code: Some(0xd800),
+                shifted: None,
+                base: None,
+                mods: 0,
+            }),
+        )]),
+        "paste" => keys(vec![InputEvent::Paste {
+            text: "x".repeat(MAX_PASTE_PIECE + 1),
+            first: true,
+            last: true,
+        }]),
+        "events" => keys(vec![InputEvent::Focus(true); MAX_EVENTS + 1]),
+        "palette" => ClientMsg::Colours(WireColours {
+            palette: vec![None; PALETTE + 1],
+            ..WireColours::default()
+        }),
+        other => return Err(anyhow!("unknown bad-keys kind '{other}'")),
+    };
+    let body = postcard::to_allocvec(&msg)?;
+    let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+    send.write_all(&len.to_be_bytes()).await?;
+    send.write_all(&body).await?;
+    Ok(())
+}
+
+/// A big paste as valid paste events, as fast as QUIC takes them: the server frames and strips
+/// each piece, and the PTY write queue and flow control bound it.
+async fn events_flood(send: &mut SendStream, mib: usize) -> Result<()> {
+    eprintln!("evil-client: a {mib} MiB paste as paste events");
+    let pieces = mib * MIB / MAX_PASTE_PIECE;
+    for n in 0..pieces {
+        write_msg(
+            send,
+            &ClientMsg::Keys {
+                seq: InputSeq(n as u64 + 1),
+                events: vec![InputEvent::Paste {
+                    text: "x".repeat(MAX_PASTE_PIECE),
+                    first: n == 0,
+                    last: n + 1 == pieces,
+                }],
             },
         )
         .await?;

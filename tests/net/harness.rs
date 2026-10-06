@@ -72,6 +72,9 @@ pub struct Options {
     pub bell: Option<BellHook>,
     /// Whether to predict; `None` is `DisplayPreference::Never`.
     pub predict: Option<DisplayPreference>,
+    /// When the client says it dialed; `None` is now. Earlier, as though the client were frozen
+    /// between dialing and running its loop.
+    pub dialed_at: Option<std::time::SystemTime>,
 }
 
 /// The client's terminal: records each painted screen, at a size the test can change.
@@ -178,10 +181,13 @@ impl Client {
             history: history.clone(),
             size: size.clone(),
         };
-        let (input, input_rx) = mpsc::channel(1024);
+        // As koh's own stdin reader (`client::io`): at most 64 reads waiting, so what is typed
+        // waits behind no more than the real client would let pile up.
+        let (input, input_rx) = mpsc::channel(64);
         let (resize, resize_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_client(
             channel,
+            options.dialed_at.unwrap_or_else(std::time::SystemTime::now),
             connector,
             options.predict.unwrap_or(DisplayPreference::Never),
             Size::new(24, 80),
@@ -213,6 +219,13 @@ impl Client {
     pub async fn resize_to(&self, rows: u16, cols: u16) -> anyhow::Result<()> {
         *self.size.lock().unwrap_or_else(PoisonError::into_inner) = Size::new(rows, cols);
         Ok(self.resize.send(()).await?)
+    }
+
+    /// Whether the first connection closes within `within`: the client dropped it to reconnect.
+    pub async fn first_connection_closes(&self, within: Duration) -> bool {
+        tokio::time::timeout(within, self.first.closed())
+            .await
+            .is_ok()
     }
 
     /// Cut the first connection the way an idle timeout would; the client should reconnect.

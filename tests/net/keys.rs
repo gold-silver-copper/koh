@@ -39,28 +39,33 @@ fn nvim_tells_ctrl_i_from_tab_from_a_kitty_terminal() {
                     "nnoremap <C-i> :echo 'got CTRL'..'-I'<CR>",
                     "-c",
                     "nnoremap <Tab> :echo 'got T'..'AB'<CR>",
-                    "-c",
-                    "echo 'READY'",
                 ],
             )
             .await
             .expect("start nvim");
+            // nvim is up once it draws its empty buffer's `~` lines. It asks for the kitty protocol
+            // (`CSI ? u`) at start-up and pushes its flags once answered, after which a kitty
+            // terminal's Ctrl-I reaches it as <C-i>; before, as Tab. So Ctrl-I is typed until it
+            // does, which it must within the wait.
             assert!(
-                client
-                    .wait_until(WAIT, |t| t.contains("READY"))
-                    .await
-                    .is_some(),
+                client.wait_until(WAIT, |t| t.contains('~')).await.is_some(),
                 "nvim did not start:\n{}",
                 client.screen()
             );
-            // nvim asks for the protocol (`CSI ? u`) at start-up and pushes its flags once answered.
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            client.send(b"\x1b[105;5u").await.expect("type Ctrl-I");
-            assert!(
-                client
-                    .wait_until(WAIT, |t| t.contains("got CTRL-I"))
+            let mut told = false;
+            for _ in 0..30 {
+                client.send(b"\x1b[105;5u").await.expect("type Ctrl-I");
+                if client
+                    .wait_until(Duration::from_millis(500), |t| t.contains("got CTRL-I"))
                     .await
-                    .is_some(),
+                    .is_some()
+                {
+                    told = true;
+                    break;
+                }
+            }
+            assert!(
+                told,
                 "Ctrl-I from a kitty terminal must reach nvim as <C-i>:\n{}",
                 client.screen()
             );

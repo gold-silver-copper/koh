@@ -559,7 +559,9 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
     let mut sent = TerminalScreen::default();
     let mut num = FrameNum::BLANK;
     let mut typed = InputSeq::default();
-    let now = Instant::now();
+    // A step a second: keys are typed a moment after the screen they are typed at, as a person
+    // types them, not inside the client's hold at a fresh prompt.
+    let mut now = Instant::now();
     let cell = |screen: &TerminalScreen, row: u16, col: u16| {
         screen
             .screen()
@@ -568,6 +570,7 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
             .unwrap_or_default()
     };
     for (index, (step, output)) in recording.outputs().enumerate() {
+        now = now.checked_add(Duration::from_secs(1)).unwrap_or(now);
         if let Some((rows, cols)) = step.resize {
             server.resize(Size::new(rows, cols));
             client.on_resize(Size::new(rows, cols));
@@ -766,4 +769,52 @@ fn the_corpus_keys_reach_each_program_as_it_read_them() {
     }
     println!("{compared} steps' keys compared, {kitty} to a program in the kitty protocol");
     assert!(compared > 100 && kitty > 10, "{compared} {kitty}");
+}
+
+/// zellij asks for all 256 palette entries at start-up. Given the user's terminal's colours, the
+/// server answers entries 0 to 15 with them and the rest as before (xterm's), and every other
+/// reply is unchanged.
+#[test]
+fn zellij_is_answered_with_the_users_palette() {
+    use koh::events::{WireColours, PALETTE};
+    let corpus = corpus().expect("corpus");
+    let zellij = corpus.iter().find(|r| r.name == "zellij").expect("zellij");
+    let replies = |colours: Option<&WireColours>| {
+        let mut server =
+            ServerTerminal::new(zellij.rows, zellij.cols, SCROLLBACK).expect("emulator");
+        if let Some(colours) = colours {
+            server.set_colours(colours);
+        }
+        let mut all = Vec::new();
+        for (_, output) in zellij.outputs() {
+            server.process(output);
+            all.extend(server.take_host_replies());
+        }
+        String::from_utf8_lossy(&all).into_owned()
+    };
+    let palette: Vec<Option<[u8; 3]>> = (0..PALETTE)
+        .map(|i| Some([u8::try_from(i).unwrap(), 0x11, 0x22]))
+        .collect();
+    let told = WireColours {
+        palette,
+        ..WireColours::default()
+    };
+    let (before, after) = (replies(None), replies(Some(&told)));
+    let entries =
+        |text: &str| -> Vec<String> { text.split("\x1b]4;").skip(1).map(str::to_owned).collect() };
+    let (before, after) = (entries(&before), entries(&after));
+    assert_eq!(before.len(), after.len());
+    assert!(before.len() >= 256, "{}", before.len());
+    let mut changed = 0;
+    for (b, a) in before.iter().zip(&after) {
+        let index: u16 = b.split(';').next().unwrap().parse().unwrap();
+        if index < 16 {
+            let expected = format!("{index};rgb:{index:02x}{index:02x}/1111/2222");
+            assert!(a.starts_with(&expected), "{a:?} for entry {index}");
+            changed += 1;
+        } else {
+            assert_eq!(a, b, "entry {index}");
+        }
+    }
+    assert!(changed >= 16, "{changed}");
 }

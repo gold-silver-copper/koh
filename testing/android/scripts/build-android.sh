@@ -1,5 +1,6 @@
 #!/bin/sh
-# Cross-compile for the Android emulator (aarch64-linux-android, release).
+# Cross-compile for the Android emulator (aarch64-linux-android, release; KOH_ANDROID_TARGET picks
+# another, x86_64-linux-android for an x86_64 image on an x86_64 host).
 #
 #   build-android.sh          koh itself (target/aarch64-linux-android/release/koh)
 #   build-android.sh evil     the malicious-peer harness, evil-client and evil-server
@@ -36,9 +37,14 @@ built() { for a in $ARTIFACTS; do [ -x "$a" ] || return 1; done; }
 rustup target add "$ANDROID_TARGET" >/dev/null 2>&1 || true
 cd "$DIR"
 
+case "$ANDROID_TARGET" in
+  aarch64-linux-android) ABI=arm64-v8a ;;
+  x86_64-linux-android) ABI=x86_64 ;;
+  *) echo "ERROR: unsupported KOH_ANDROID_TARGET $ANDROID_TARGET" >&2; exit 2 ;;
+esac
 if command -v cargo-ndk >/dev/null 2>&1; then
-  echo "Building $DIR with cargo-ndk (-t arm64-v8a -p $API)…"
-  cargo ndk -t arm64-v8a -p "$API" build --release
+  echo "Building $DIR with cargo-ndk (-t $ABI -p $API)…"
+  cargo ndk -t "$ABI" -p "$API" build --release
 else
   # Locate the NDK.
   NDK="${ANDROID_NDK_HOME:-${NDK_HOME:-}}"
@@ -52,11 +58,15 @@ else
   }
   TB="$(ls -d "$NDK"/toolchains/llvm/prebuilt/*/bin 2>/dev/null | head -1)"
   [ -n "$TB" ] || { echo "ERROR: NDK toolchain bin not found under $NDK" >&2; exit 1; }
-  CLANG="$TB/aarch64-linux-android${API}-clang"
+  CLANG="$TB/${ANDROID_TARGET}${API}-clang"
   [ -x "$CLANG" ] || { echo "ERROR: $CLANG missing (API $API not in this NDK?)" >&2; exit 1; }
   echo "Building $DIR with NDK linker: $CLANG"
-  CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG" \
-  CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$TB/llvm-ar" \
+  # CARGO_TARGET_<TRIPLE>_LINKER / _AR for the target, upper-cased with `_` for `-`; and cc-rs's
+  # CC_<triple> / AR_<triple>, for the crates that compile C (ring).
+  VAR="$(printf '%s' "$ANDROID_TARGET" | tr 'a-z-' 'A-Z_')"
+  CCVAR="$(printf '%s' "$ANDROID_TARGET" | tr '-' '_')"
+  env "CARGO_TARGET_${VAR}_LINKER=$CLANG" "CARGO_TARGET_${VAR}_AR=$TB/llvm-ar" \
+    "CC_${CCVAR}=$CLANG" "AR_${CCVAR}=$TB/llvm-ar" \
     cargo build --release --target "$ANDROID_TARGET"
 fi
 

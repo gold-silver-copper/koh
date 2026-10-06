@@ -78,9 +78,12 @@ None: colour queries and their answers are not typed input.
   `ClientMsg::Colours` carries foreground, background, palette 0–15 and the scheme, 8 bits a
   channel, on every connection; `koh connect --no-colours` asks and sends none.
 - The server answers OSC 10 and 11 (in xterm's form, with the program's terminator) and the scheme
-  query, `CSI ? 996 n`; fux-vt answers colours a program set itself. The palette is carried and
-  kept, but OSC 4 is still answered by fux-vt with xterm's defaults: answering it from the user's
-  palette needs a hook in fux-vt, a later step.
+  query, `CSI ? 996 n`; fux-vt answers colours a program set itself.
+- OSC 4 for entries 0 to 15 is answered from the user's palette too: the server gives fux-vt the
+  client's entries (`Parser::set_host_color`, fux-vt 0.3.3), which answers a query of an entry the
+  program has not set with them, a colour the program set still winning and no reset clearing
+  them. Entries past 15 are xterm's defaults, as before. A reattaching client's palette replaces
+  the last whole.
 - Mode 2031 is built too: the client turns scheme reports on in a terminal that answered the scheme
   query, asks the colours again on a report and tells the server once the round's DA1 is in; the
   server tells a program that subscribed when the scheme a client brings differs from the last.

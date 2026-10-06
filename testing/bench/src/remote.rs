@@ -363,6 +363,7 @@ impl Remote {
         let (resize, resize_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_client(
             channel,
+            std::time::SystemTime::now(),
             connector,
             DisplayPreference::Always,
             start,

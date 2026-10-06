@@ -313,6 +313,7 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     let identity =
         crate::identity::load(&crate::identity::key_path(args.key_file.clone(), "client")?)?;
     let (endpoint, connector, channel) = dial(&args, &identity).await?;
+    let dialed_at = std::time::SystemTime::now();
     let shutdown = CancellationToken::new();
     // Armed before raw mode is entered, so an install error surfaces while the terminal is cooked.
     crate::cancel_on_signals(
@@ -335,6 +336,7 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
         let size = terminal.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
         crate::client::run_client(
             channel,
+            dialed_at,
             connector,
             DisplayPreference::Always,
             size,

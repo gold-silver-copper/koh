@@ -88,6 +88,7 @@ fn full_session_over_loopback_pty() {
         let client_task = tokio::spawn(async move {
             let _ = run_client(
                 conn,
+                std::time::SystemTime::now(),
                 connector,
                 DisplayPreference::Never, // predictions are overlay-only; assert on the real grid
                 Size::new(24, 80),

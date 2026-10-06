@@ -22,8 +22,8 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const REAP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often a session reads its PTY's modes when nothing else made it: a password prompt that
-/// turned echo off after printing is known to the client within this.
-const TTY_TICK: Duration = Duration::from_millis(100);
+/// turned echo off after printing is known to the client within this (the wire's contract).
+use crate::proto::TTY_TICK;
 
 /// How much input may wait for a session's PTY before a connection must stop reading its stream.
 const INPUT_QUEUE: usize = 256;

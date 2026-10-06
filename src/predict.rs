@@ -247,6 +247,9 @@ pub struct PredictionEngine {
     confirmed_epoch: u64,
     local_frame_sent: u64,
     late_acked: u64,
+    /// The newest input frame [`hold`](Self::hold) held: nothing is predicted until the server
+    /// has reflected it, so no held key shows and nothing is guessed from a model that lacks it.
+    held_through: Option<u64>,
     last_size: Option<Size>,
     last_byte: u8,
     /// Where input is in an escape sequence (for arrow keys).
@@ -281,6 +284,7 @@ impl PredictionEngine {
             confirmed_epoch: 0,
             local_frame_sent: 0,
             late_acked: 0,
+            held_through: None,
             last_size: None,
             last_byte: 0,
             esc: EscState::Ground,
@@ -774,6 +778,27 @@ impl PredictionEngine {
         }
     }
 
+    /// Predict nothing for what is typed now, nor after, until the server has reflected it: for a
+    /// key whose echo is in doubt. The client may not yet know the PTY's modes as they are now (a
+    /// program that printed a prompt may turn echo off a moment after), and a key typed at a
+    /// password prompt must never be shown. Predictions already made stand.
+    pub fn hold(&mut self) {
+        self.held_through = Some(self.next_frame());
+        self.become_tentative();
+    }
+
+    /// Whether a held key is not yet reflected on the screen.
+    fn holding(&mut self) -> bool {
+        match self.held_through {
+            Some(held) if self.late_acked < held => true,
+            Some(_) => {
+                self.held_through = None;
+                false
+            }
+            None => false,
+        }
+    }
+
     /// Input the predictor does not model reached the program (a mouse event, a focus change, a
     /// paste): what it shows next is unknown.
     pub fn new_user_other(&mut self, screen: &dyn ScreenView) {
@@ -799,6 +824,9 @@ impl PredictionEngine {
             return;
         }
         self.cull(screen);
+        if self.holding() {
+            return;
+        }
 
         let mut byte = byte;
         if self.last_byte == 0x1b && byte == b'O' {

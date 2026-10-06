@@ -129,19 +129,23 @@ fn screens(a: &Terminal, b: &Terminal, names: (&str, &str)) -> Option<String> {
             }
         }
     }
-    // The paste, cursor-key, keypad and mouse-encoding modes are the client's own now, not the
-    // program's mirrored (the `input-modes` exemption).
     let modes = |s: &fux_vt::Screen| {
         (
             s.hide_cursor(),
             (!s.hide_cursor()).then(|| s.cursor_position()),
             s.mouse_protocol_mode(),
+            s.mouse_protocol_encoding(),
+            s.bracketed_paste(),
+            s.focus_reporting(),
+            s.application_cursor(),
+            s.application_keypad(),
         )
     };
     let (ma, mb) = (modes(sa), modes(sb));
     if ma != mb {
         return Some(format!(
-            "cursor and modes (hidden, at, mouse): {} {ma:?}, {} {mb:?}",
+            "cursor and modes (hidden, at, mouse, encoding, paste, focus, cursor keys, keypad): {} \
+             {ma:?}, {} {mb:?}",
             names.0, names.1
         ));
     }

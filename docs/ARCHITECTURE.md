@@ -77,7 +77,8 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   on, normal cursor keys and keypad, SGR mouse reports while the program wants the mouse.
 - **Colours.** The client asks its terminal's foreground, background, palette 0–15 and scheme at
   start-up (and again when the terminal reports a new scheme, mode 2031) and tells the server; the
-  server's terminal answers programs' OSC 10, OSC 11 and `CSI ? 996 n` from them, and sends a
+  server's terminal answers programs' OSC 10, OSC 11, OSC 4 for entries 0–15 and `CSI ? 996 n`
+  from them, and sends a
   program that subscribed to mode 2031 the new scheme when a client brings one.
 - **Server to client: one uni stream per message**: a tag byte, then for a frame its base's number
   and the frame (`num`, `base`, `echo_ack` and a `ScreenDiff` from frame `base` to frame `num`)
@@ -290,8 +291,11 @@ screen"), not the raw network ack.
 kernel's echo and line mode, read with `tcgetattr` through fuxix at every snapshot and every 100 ms
 while a client is attached, as a program may turn echo off without writing). Line mode without
 echo is a password prompt (`getpass`, `read -s`, sudo, ssh, passwd): nothing typed is predicted
-and every prediction is dropped, however trusted the session was. Kernel echo is trusted from the
-first key. Otherwise (a line editor, a full-screen program) the epoch logic decides: the first key
+and every prediction is dropped, however trusted the session was. The modes the client holds
+can lag the PTY's by a read interval (a program that prints its prompt, then turns echo off), so a
+key typed within 200 ms of a frame that moved the cursor to another row (a fresh prompt) is not
+predicted until the server has reflected it (`PredictionEngine::hold`). Kernel echo is trusted
+from the first key otherwise. Otherwise (a line editor, a full-screen program) the epoch logic decides: the first key
 of an epoch stays hidden until the server's echo confirms it, and a mispredict kills its epoch. A
 reconnect to the same session carries the trust it had, given once the first frame shows no
 password prompt. Prediction is **always on** in koh (`DisplayPreference::
@@ -327,8 +331,10 @@ connection out; the client then transparently re-dials and reattaches to the sam
 holding the last screen under a `reconnecting…` banner in the meantime. A **wall-clock freeze
 detector** turns a multi-minute wake-up hang into a ~1–2 s reattach: if real time jumps more than
 20 s between two (≤50 ms-cadence) loop iterations, the client concludes the process was suspended,
-drops the (almost certainly dead) connection, and re-dials immediately. A sub-20 s glance still
-rides out silently on the existing connection.
+drops the (almost certainly dead) connection, and re-dials immediately. The first iteration
+measures from when the connection was dialed, so a freeze while the client starts (probing the
+user's terminal, entering raw mode) counts too. A sub-20 s glance still rides out silently on the
+existing connection.
 
 > **`--direct` and server restarts:** transparent re-dial targets the *same* address it first
 > dialed. By default `koh serve` binds an ephemeral UDP port, so a restarted server is elsewhere and

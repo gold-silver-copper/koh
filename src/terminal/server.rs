@@ -155,9 +155,6 @@ pub struct ServerTerminal {
     /// A paste begun and not ended, and whether it was framed (the program had bracketed paste
     /// set when it began).
     paste_open: Option<bool>,
-    /// The user's terminal's palette entries 0 to 15, as the client last told. Kept for programs
-    /// that ask; fux-vt answers OSC 4 with xterm's defaults for now.
-    palette: [Option<[u8; 3]>; PALETTE],
 }
 
 impl ServerTerminal {
@@ -176,7 +173,6 @@ impl ServerTerminal {
             names: HistoryNames::default(),
             tty: None,
             paste_open: None,
-            palette: [None; PALETTE],
         })
     }
 
@@ -239,9 +235,14 @@ impl ServerTerminal {
         let colours_now = colours.colours();
         let before = self.observed.colours.scheme;
         self.observed.colours = colours_now;
-        self.palette = [None; PALETTE];
-        for (slot, entry) in self.palette.iter_mut().zip(&colours.palette) {
-            *slot = *entry;
+        // Each entry the client gave, and none it did not: a reattaching client's palette
+        // replaces the last client's whole. fux-vt answers a program's query of an entry it has
+        // not set (OSC 4) with it; one the program set wins.
+        for index in 0..PALETTE {
+            let entry = colours.palette.get(index).copied().flatten();
+            if let Ok(index) = u8::try_from(index) {
+                self.parser.set_host_color(index, entry.map(Into::into));
+            }
         }
         match (before, colours_now.scheme) {
             (Some(before), Some(now))
@@ -257,11 +258,6 @@ impl ServerTerminal {
     /// [`encode_input`](Self::encode_input) encodes for.
     pub fn live(&self) -> &fux_vt::Screen {
         self.parser.screen()
-    }
-
-    /// The user's terminal's palette entry `index` (0 to 15), as the client last told.
-    pub fn user_palette(&self, index: usize) -> Option<[u8; 3]> {
-        self.palette.get(index).copied().flatten()
     }
 
     /// Record the shell's exit code; the next snapshot carries it to the client.
@@ -1159,7 +1155,6 @@ mod tests {
             b"",
             "no program subscribed"
         );
-        assert_eq!(t.user_palette(0), Some([0, 0, 0]));
         // With the terminator the program used.
         t.process(b"\x1b]11;?\x07\x1b]10;?\x1b\\\x1b[?996n");
         assert_eq!(
@@ -1179,5 +1174,48 @@ mod tests {
         assert_eq!(report, b"\x1b[?997;2n");
         t.process(b"\x1b]110;?\x07\x1b]10;?\x07");
         assert_eq!(t.take_host_replies(), b"", "this client said no foreground");
+    }
+
+    #[test]
+    fn palette_queries_are_answered_from_the_users_terminal() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        // No client told its colours (`--no-colours`): xterm's defaults, as before.
+        t.process(b"\x1b]4;1;?\x07");
+        assert_eq!(t.take_host_replies(), b"\x1b]4;1;rgb:cdcd/0000/0000\x07");
+        let mut palette = vec![None; PALETTE];
+        palette[1] = Some([0xbf, 0x61, 0x6a]);
+        palette[2] = Some([0xa3, 0xbe, 0x8c]);
+        t.set_colours(&WireColours {
+            palette,
+            ..WireColours::default()
+        });
+        // Entries the client gave, with the program's terminator; others xterm's.
+        t.process(b"\x1b]4;1;?;2;?;3;?\x1b\\\x1b]4;200;?\x07");
+        assert_eq!(
+            t.take_host_replies(),
+            b"\x1b]4;1;rgb:bfbf/6161/6a6a\x1b\\\x1b]4;2;rgb:a3a3/bebe/8c8c\x1b\\\
+              \x1b]4;3;rgb:cdcd/cdcd/0000\x1b\\\x1b]4;200;rgb:ffff/0000/d7d7\x07"
+        );
+        // A colour the program set wins, and its reset brings the user's back.
+        t.process(b"\x1b]4;1;#123456\x07\x1b]4;1;?\x07\x1b]104;1\x07\x1b]4;1;?\x07");
+        assert_eq!(
+            t.take_host_replies(),
+            b"\x1b]4;1;rgb:1212/3434/5656\x07\x1b]4;1;rgb:bfbf/6161/6a6a\x07"
+        );
+        // A reattach from another terminal replaces the palette whole: an entry it did not
+        // give goes back to xterm's.
+        let mut palette = vec![None; PALETTE];
+        palette[2] = Some([0, 0, 0]);
+        t.set_colours(&WireColours {
+            palette,
+            ..WireColours::default()
+        });
+        t.process(b"\x1b]4;1;?;2;?\x07");
+        assert_eq!(
+            t.take_host_replies(),
+            b"\x1b]4;1;rgb:cdcd/0000/0000\x07\x1b]4;2;rgb:0000/0000/0000\x07"
+        );
+        // Nothing drawn changes: no row is in the palette's colours.
+        assert!(!t.live().colors_changed());
     }
 }

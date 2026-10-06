@@ -411,6 +411,7 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
 )]
 pub async fn run_client<T: ClientTerminal>(
     initial: Connection,
+    dialed_at: std::time::SystemTime,
     connector: IrohConnector,
     pref: DisplayPreference,
     initial_size: Size,
@@ -422,6 +423,9 @@ pub async fn run_client<T: ClientTerminal>(
     mut bell: Option<BellHook>,
 ) -> anyhow::Result<Option<u32>> {
     let mut conn = initial;
+    // When the connection was made, for the freeze detector: a freeze between dialing and the
+    // loop (while the terminal is probed, say) counts too.
+    let mut since = dialed_at;
     // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
     let mut attempt: u32 = 0;
     // Whether typing was shown as predicted when the last connection dropped.
@@ -440,6 +444,7 @@ pub async fn run_client<T: ClientTerminal>(
         let conn_started = Instant::now();
         match drive_connection(
             &conn,
+            since,
             &mut session,
             &mut term,
             &mut input_rx,
@@ -473,7 +478,10 @@ pub async fn run_client<T: ClientTerminal>(
                 )
                 .await
                 {
-                    ReconnectOutcome::Connected(c) => conn = c,
+                    ReconnectOutcome::Connected(c) => {
+                        conn = c;
+                        since = std::time::SystemTime::now();
+                    }
                     ReconnectOutcome::Quit => return Ok(None),
                 }
             }
@@ -524,8 +532,14 @@ enum Disposition {
 /// The client's stream is written by its own task behind a bounded queue, and frames are read by
 /// their own tasks, so nothing here waits on the network: the keyboard, and the quit escape, stay
 /// live even when the server stops reading.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one connection's collaborators: the connection and when it was made, the session, the \
+              terminal, the input and resize channels, the shutdown token and the bell hook"
+)]
 async fn drive_connection<T: ClientTerminal>(
     conn: &Connection,
+    since: std::time::SystemTime,
     session: &mut ClientSession,
     term: &mut T,
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
@@ -541,8 +555,9 @@ async fn drive_connection<T: ClientTerminal>(
     let (frame_tx, mut frame_rx) = mpsc::channel::<ServerMsg>(FRAME_QUEUE);
     let _reader = AbortOnDrop(tokio::spawn(read_frames(conn.clone(), frame_tx)));
 
-    // Wall-clock time, which keeps running while the process is frozen (see `STALE_AFTER_FREEZE`).
-    let mut last_wall = std::time::SystemTime::now();
+    // Wall-clock time, which keeps running while the process is frozen (see `STALE_AFTER_FREEZE`),
+    // from when the connection was made: a freeze before the first iteration counts.
+    let mut last_wall = since;
     // Logged on a change of 30 ms or more, to tell a slow link from a slow server in debug logs.
     let mut last_logged_rtt: Option<Duration> = None;
     loop {

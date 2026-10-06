@@ -73,13 +73,14 @@ differ), prints it, and saves it under `target/cases/`. `--replay` runs a saved 
 ## Exemptions
 
 `driver/src/exempt.rs` names each change made on purpose since the commit compared against, and
-what sets it off. Each is taken out of every case before either side sees it, read as fux-vt
-reads it, so the rest of the case is still compared. A sequence split between two output steps
-is read whole, and an ESC inside a sequence starts the next one, as in fux-vt. The driver says how
-many times each applied. Reflow is exempted without dropping resizes: from a case's first resize
-on, the case runs on the alternate screen, which resizes without reflow. Once the commit compared
-against has a change, its exemption comes off the list. Against `main` (which has the rest) only
-reflow remains, for fux-vt 0.3.1's fix: a shrink brings no history row back above the cursor.
+what sets it off. Each is taken out of every case before either side sees it, so the rest of the
+case is still compared, and the driver says how many times each applied. Once the commit compared
+against has a change, its exemption comes off the list. Against `main` only `prompt-hold` is
+listed: a key typed within 200 ms of a frame that moved the cursor to another row is shown only
+once echoed, so each keys step comes 200 ms after what came before it. The input events, the kitty
+keyboard and scheme answers and fux-vt's reflow fix are all in `main`, and every mode the user's
+terminal is kept in is compared. The palette the client tells the server changes nothing here,
+since neither side tells one.
 
 ## The planted bugs
 

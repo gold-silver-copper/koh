@@ -54,6 +54,13 @@ impl InputSeq {
     }
 }
 
+/// How often, at most, a session's PTY modes go unread while a client is attached.
+///
+/// A program that turns echo off after printing its prompt is known to the client within about
+/// this, plus the link's latency. The client keeps keys typed at a fresh prompt from showing for
+/// twice this.
+pub const TTY_TICK: Duration = Duration::from_millis(100);
+
 /// Most typed bytes in one [`ClientMsg::Input`]; the client splits a paste into several.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 

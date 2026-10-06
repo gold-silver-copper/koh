@@ -49,8 +49,12 @@ service.
    sequence can ride in a URI.
    **Typed secrets:** the client predicts typing locally; at a password prompt (the PTY reads
    lines without echo, which the server reads from its modes and tells the client) nothing typed
-   is predicted or shown, whatever trust the session had. A hostile server can of course claim
-   any modes: it already sees every key.
+   is predicted or shown, whatever trust the session had. The client's copy of the modes can lag
+   the PTY's by up to the server's 100 ms read interval (a program that prints its prompt, then
+   turns echo off): so a key typed within 200 ms of a frame that moved the cursor to another row
+   (a fresh prompt) is not predicted until the server has reflected it, and a secret typed at
+   once is not drawn either. A hostile server can of course claim any modes: it already sees
+   every key.
    **History:** the server already holds the session's history (`--scrollback`, 1,000 lines by
    default); with the scrollback view the client now holds a part of it too, in memory, for the
    connection: at most a million cells, dropped when the connection ends. A server's history
@@ -67,7 +71,8 @@ service.
    sends makes the client ask the terminal anything.
    **The user's colours:** unless `koh connect --no-colours`, the client tells the server the
    colours its terminal answered (`Colours`: foreground, background, palette 0–15, dark or light),
-   on every connection; the server answers programs' OSC 10, OSC 11 and `CSI ? 996 n` from them, so
+   on every connection; the server answers programs' OSC 10, OSC 11, OSC 4 for entries 0–15 and
+   `CSI ? 996 n` from them, so
    vim, bat and delta pick a matching theme. That tells the server the user's theme, a small
    fingerprint, to a server the user chose to connect to; the answers go to the program, never to
    the user's terminal, and a program asking a thousand times is answered from the server's copy,

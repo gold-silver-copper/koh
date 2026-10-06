@@ -187,10 +187,11 @@ fn script(recording: &Recording, dir: &Path) -> anyhow::Result<PathBuf> {
         std::fs::write(&file, output)?;
         if index > 0 {
             // Up to the test's 0x01: the server's replies to the recording's queries arrive on
-            // the same input, and must not start a step.
-            text.push_str(
-                "while [ \"$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' ')\" != 01 ]; do :; done\n",
-            );
+            // the same input, and must not start a step. Read by bash's own `read`, which stops
+            // at the 0x01: zellij asks for all 256 palette entries, 7 KiB of replies, and a
+            // byte-by-byte `dd | od` loop spent 36 s of process spawns on them (past the step's
+            // wait under load).
+            text.push_str("IFS= read -r -d $'\\001' _\n");
         }
         if let Some(resize) = step.resize {
             size = resize;
@@ -214,7 +215,7 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     let script = script(recording, dir)?;
     let script = script.to_string_lossy().into_owned();
     let secret = identity()?;
-    let server = Server::start(net, &[secret.public()], &["sh", &script]).await?;
+    let server = Server::start(net, &[secret.public()], &["bash", &script]).await?;
     let endpoint = net.endpoint(secret, false).await?;
     let connector = IrohConnector::new(endpoint, FaultNet::addr(server.id));
     let channel = connector.connect().await?;
@@ -250,6 +251,7 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     let (resize, resize_rx) = mpsc::channel(8);
     let task = tokio::spawn(run_client(
         channel,
+        std::time::SystemTime::now(),
         connector,
         DisplayPreference::Never,
         start,

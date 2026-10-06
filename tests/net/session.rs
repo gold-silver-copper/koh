@@ -220,9 +220,10 @@ fn a_program_that_stops_reading_input_never_freezes_the_client() {
                 .wait_until(WAIT, |t| t.contains("NOT_READING"))
                 .await
                 .is_some());
-            // 16 MiB: more than the PTY, the server's queue, QUIC's windows and the client's queue hold.
-            let chunk = vec![b'y'; 64 * 1024];
-            for _ in 0..256 {
+            // 16 MiB: more than the PTY, the server's queue, QUIC's windows and the client's queue
+            // hold, in reads of 1 KiB as koh's stdin reader makes them.
+            let chunk = vec![b'y'; 1024];
+            for _ in 0..16 * 1024 {
                 client.send(&chunk).await.expect("type");
             }
             assert!(
@@ -245,7 +246,11 @@ fn a_program_that_stops_reading_input_never_freezes_the_client() {
                 matches!(result, Some(Ok(None))),
                 "Ctrl-^ . must quit promptly while the server is not reading: {result:?}"
             );
-            assert!(quit_at.elapsed() < Duration::from_secs(2));
+            let took = quit_at.elapsed();
+            assert!(
+                took < Duration::from_secs(2),
+                "the quit escape took {took:?} behind the flood"
+            );
             server.stop().await;
         });
 }
@@ -393,4 +398,60 @@ fn scrollback_shows_output_that_scrolled_off_and_again_after_a_reattach() {
 /// Whether `screen` shows the first line the scrollback test wrote.
 fn oldest(screen: &str) -> bool {
     screen.lines().any(|line| line.trim_end() == "old line 0")
+}
+
+/// A client frozen between dialing and its loop (a phone asleep while the terminal is probed, at
+/// connect) reconnects as from any freeze: the freeze detector counts from the dial, not from the
+/// loop's first iteration. Found on the Android emulator, where adb's pty answers no probe and
+/// the client was stopped inside the probe's wait.
+#[test]
+fn a_freeze_between_dialing_and_the_loop_still_reconnects() {
+    crate::harness::runtime()
+        .expect("tokio runtime")
+        .block_on(async {
+            let net = clean();
+            let secret = identity().expect("OS randomness");
+            let server = Server::start(&net, &[secret.public()], &["sh"])
+                .await
+                .expect("start the server");
+            let endpoint = net.endpoint(secret, false).await.expect("bind the client");
+            let frozen = std::time::SystemTime::now()
+                .checked_sub(Duration::from_secs(30))
+                .expect("a time 30 s ago");
+            let mut client = Client::connect_on(
+                endpoint,
+                server.id,
+                Options {
+                    dialed_at: Some(frozen),
+                    ..Options::default()
+                },
+            )
+            .await
+            .expect("connect");
+            assert!(
+                client.first_connection_closes(Duration::from_secs(5)).await,
+                "the client must drop the connection it held through the freeze"
+            );
+            // And the session goes on over the new one (retyped: input during the reconnect is
+            // dropped).
+            let mut ran = false;
+            for _ in 0..75 {
+                let _ = client.send(b"echo AFTER''_FREEZE\r").await;
+                if client
+                    .wait_until(Duration::from_millis(200), |t| t.contains("AFTER_FREEZE"))
+                    .await
+                    .is_some()
+                {
+                    ran = true;
+                    break;
+                }
+            }
+            assert!(
+                ran,
+                "the reconnected client must reach the shell:\n{}",
+                client.screen()
+            );
+            let _ = client.finish().await;
+            server.stop().await;
+        });
 }

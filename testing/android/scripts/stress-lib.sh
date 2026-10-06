@@ -200,7 +200,7 @@ wait_file_contains_host() {  # <hostfile> <substr> <secs>
 }
 
 # --- malicious-peer deploy (security tests) --------------------------------------------------------
-EVIL_DIR="${KOH_EVIL_DIR:-$REPO_ROOT/testing/android/evil-peer/target/aarch64-linux-android/release}"
+EVIL_DIR="${KOH_EVIL_DIR:-$REPO_ROOT/testing/android/evil-peer/target/$ANDROID_TARGET/release}"
 EVIL_HOST="${KOH_EVIL_HOST:-$EVIL_DIR/evil-client}"
 EVIL_DEV="${KOH_EVIL_DEV:-/data/local/tmp/evil-client}"
 EVIL_SERVER_HOST="${KOH_EVIL_SERVER_HOST:-$EVIL_DIR/evil-server}"

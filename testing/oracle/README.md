@@ -83,7 +83,7 @@ reflow remains, for fux-vt 0.3.1's fix: a shrink brings no history row back abov
 
 ## The planted bugs
 
-`plants/` holds six bugs, each a patch to koh; `testing/oracle.sh --plants` applies each to a
+`plants/` holds seven bugs, each a patch to koh; `testing/oracle.sh --plants` applies each to a
 worktree of `HEAD`, builds a side from it, and runs the oracle with `HEAD` as the base. Each must
 be found:
 
@@ -95,6 +95,7 @@ be found:
 | `04-wrong-cursor` | a cursor in the last two columns is put in the one before them |
 | `05-missed-resize` | the server misses a resize that makes the screen taller |
 | `06-stale-dirty-rows` | a snapshot from the rows changed since the last takes only the first of them |
+| `07-lost-backspace` | the client decodes Backspace and never sends it |
 
 A planted bug that is no longer found means the oracle lost sight of something: fix the oracle,
 not the patch.

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::events::{check_events, InputEvent, WireColours};
 use crate::terminal::{
     HistoryReply, HistoryRequest, RowEncodings, ScreenDiff, Size, TerminalScreen,
 };
@@ -148,6 +149,16 @@ pub enum ClientMsg {
     /// The client asks for history rows it lacks (see [`HistoryRequest`]). The server answers each,
     /// one at a time, at a lower priority than frames.
     History(HistoryRequest),
+    /// Input the client decoded: keys, mouse events, focus changes, paste pieces, in order, at
+    /// most [`MAX_EVENTS`](crate::events::MAX_EVENTS). The server encodes each for the program as
+    /// it asked. It shares the input sequence numbers with [`ClientMsg::Input`].
+    Keys {
+        seq: InputSeq,
+        events: Vec<InputEvent>,
+    },
+    /// What the user's terminal said of its colours: sent after connecting, on every reconnect,
+    /// and when the terminal reports a new scheme, unless the user turned it off.
+    Colours(WireColours),
 }
 
 /// [`ClientMsg::Input`]'s bytes as a byte string. postcard encodes that exactly as it encodes a
@@ -214,12 +225,22 @@ pub enum ProtoError {
     UnknownStream,
     #[error("more than {MAX_PENDING_HISTORY} history requests waiting")]
     TooManyRequests,
+    #[error("input no terminal sends: {0}")]
+    BadInput(&'static str),
 }
 
 /// Encode one client message with its length prefix.
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
     let input = match msg {
         ClientMsg::Input { bytes, .. } => bytes.len(),
+        ClientMsg::Keys { events, .. } => {
+            check_events(events).map_err(ProtoError::BadInput)?;
+            events.iter().map(InputEvent::wire_len).sum()
+        }
+        ClientMsg::Colours(colours) => {
+            colours.check().map_err(ProtoError::BadInput)?;
+            0
+        }
         ClientMsg::Resize(_)
         | ClientMsg::Ack { .. }
         | ClientMsg::Resync
@@ -237,12 +258,13 @@ pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
     out.extend_from_slice(&[0; 4]);
     let mut out = postcard::to_extend(msg, out)?;
     let body = out.len().saturating_sub(4);
-    let Ok(len) = u32::try_from(body) else {
-        return Err(ProtoError::TooLarge {
+    let len = u32::try_from(body)
+        .ok()
+        .filter(|_| body <= MAX_CLIENT_MESSAGE)
+        .ok_or(ProtoError::TooLarge {
             len: body,
             max: MAX_CLIENT_MESSAGE,
-        });
-    };
+        })?;
     if let Some(prefix) = out.first_chunk_mut::<4>() {
         *prefix = len.to_be_bytes();
     }
@@ -292,13 +314,20 @@ impl ClientDecoder {
             return Ok(None);
         };
         let msg: ClientMsg = postcard::from_bytes(body)?;
-        if let ClientMsg::Input { bytes, .. } = &msg {
-            if bytes.len() > MAX_INPUT_BYTES {
+        match &msg {
+            ClientMsg::Input { bytes, .. } if bytes.len() > MAX_INPUT_BYTES => {
                 return Err(ProtoError::InputTooLarge {
                     len: bytes.len(),
                     max: MAX_INPUT_BYTES,
                 });
             }
+            ClientMsg::Keys { events, .. } => check_events(events).map_err(ProtoError::BadInput)?,
+            ClientMsg::Colours(colours) => colours.check().map_err(ProtoError::BadInput)?,
+            ClientMsg::Input { .. }
+            | ClientMsg::Resize(_)
+            | ClientMsg::Ack { .. }
+            | ClientMsg::Resync
+            | ClientMsg::History(_) => {}
         }
         // The header and body were just read, so `start + 4 + len` is within the buffer.
         self.start = self
@@ -689,6 +718,93 @@ mod tests {
             decode_all(&stream),
             Err(ProtoError::InputTooLarge { .. } | ProtoError::TooLarge { .. })
         ));
+    }
+
+    /// Input no terminal sends, built by hand inside a legal envelope (`encode_client` refuses to
+    /// build it): the decoder refuses it, and the server closes the connection.
+    #[test]
+    fn keys_and_colours_no_terminal_sends_are_refused() {
+        use crate::events::{
+            WireKey, WireKeyCode, WireKitty, WireMouse, WireMouseAction, MAX_EVENTS,
+            MAX_PASTE_PIECE, PALETTE,
+        };
+        let raw = |msg: &ClientMsg| {
+            let body = postcard::to_allocvec(msg).unwrap();
+            let mut stream = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+            stream.extend_from_slice(&body);
+            stream
+        };
+        let keys = |events: Vec<InputEvent>| ClientMsg::Keys {
+            seq: InputSeq(1),
+            events,
+        };
+        let key = |key, mods, kitty| InputEvent::Key(WireKey { key, mods, kitty });
+        let bad = [
+            keys(vec![key(WireKeyCode::Char('a'), 0x08, None)]),
+            keys(vec![key(WireKeyCode::F(13), 0, None)]),
+            keys(vec![key(
+                WireKeyCode::Char('a'),
+                0,
+                Some(WireKitty {
+                    code: Some(0xdfff),
+                    shifted: None,
+                    base: None,
+                    mods: 0,
+                }),
+            )]),
+            keys(vec![InputEvent::Mouse(WireMouse {
+                action: WireMouseAction::Press,
+                button: None,
+                mods: 0x10,
+                row: 0,
+                col: 0,
+            })]),
+            keys(vec![InputEvent::Paste {
+                text: "x".repeat(MAX_PASTE_PIECE + 1),
+                first: true,
+                last: true,
+            }]),
+            keys(vec![InputEvent::Focus(true); MAX_EVENTS + 1]),
+            ClientMsg::Colours(WireColours {
+                palette: vec![None; PALETTE + 1],
+                ..WireColours::default()
+            }),
+        ];
+        for msg in &bad {
+            assert!(encode_client(msg).is_err(), "{msg:?}");
+            assert!(decode_all(&raw(msg)).is_err(), "{msg:?}");
+        }
+        // A code that is no character at all does not even decode.
+        let mut body =
+            postcard::to_allocvec(&keys(vec![key(WireKeyCode::Char('a'), 0, None)])).unwrap();
+        let at = body.iter().rposition(|&b| b == b'a').unwrap();
+        body[at] = 0xff;
+        let mut stream = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+        stream.extend_from_slice(&body);
+        assert!(decode_all(&stream).is_err());
+        // What a terminal sends goes through, both ways.
+        let good = [
+            keys(vec![
+                key(WireKeyCode::Char('é'), 7, None),
+                key(WireKeyCode::F(12), 0, None),
+                InputEvent::Paste {
+                    text: "x".repeat(MAX_PASTE_PIECE),
+                    first: true,
+                    last: true,
+                },
+            ]),
+            keys(vec![InputEvent::Focus(false); MAX_EVENTS]),
+            ClientMsg::Colours(WireColours {
+                foreground: Some([1, 2, 3]),
+                background: None,
+                palette: vec![Some([0, 0, 0]); PALETTE],
+                scheme: None,
+            }),
+        ];
+        for msg in good {
+            let stream = encode_client(&msg).unwrap();
+            assert_eq!(decode_all(&stream).unwrap(), vec![msg]);
+        }
     }
 
     #[test]

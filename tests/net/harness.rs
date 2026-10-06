@@ -185,6 +185,7 @@ impl Client {
             connector,
             options.predict.unwrap_or(DisplayPreference::Never),
             Size::new(24, 80),
+            None,
             input_rx,
             resize_rx,
             term,

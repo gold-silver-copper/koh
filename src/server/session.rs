@@ -94,7 +94,7 @@ impl PtyHost {
 
 /// What a connection sends its session.
 enum ClientInput {
-    Keys(Vec<u8>),
+    Input(super::ToSession),
     Resize(Size),
     /// History rows, answered on `reply`.
     History {
@@ -143,9 +143,9 @@ impl SessionClient {
         !self.input.is_closed()
     }
 
-    /// Send keystrokes, waiting for room in the bounded queue.
-    pub async fn send_keys(&self, keys: Vec<u8>) {
-        let _ = self.input.send(ClientInput::Keys(keys)).await;
+    /// Send input, waiting for room in the bounded queue.
+    pub(crate) async fn send_input(&self, input: super::ToSession) {
+        let _ = self.input.send(ClientInput::Input(input)).await;
     }
 
     /// Send a resize to the PTY.
@@ -272,8 +272,21 @@ async fn session_task(
                 // `input_tx` is held below, so this only ends with the task.
                 if let Some(input) = input {
                     match input {
-                        ClientInput::Keys(keys) => {
-                            if !host.input(&keys) {
+                        ClientInput::Input(input) => {
+                            let keys = match input {
+                                super::ToSession::Bytes(keys) => keys,
+                                super::ToSession::Events(events) => {
+                                    let mut keys = Vec::new();
+                                    host.emu.encode_input(&events, &mut keys);
+                                    keys
+                                }
+                                // A program that subscribed to scheme changes (mode 2031) hears
+                                // of a new one on its input.
+                                super::ToSession::Colours(colours) => {
+                                    host.emu.set_colours(&colours)
+                                }
+                            };
+                            if !keys.is_empty() && !host.input(&keys) {
                                 pending_keys = keys;
                             }
                         }

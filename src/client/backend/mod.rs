@@ -17,11 +17,12 @@ pub use self::tty::Tty;
 /// The terminal the `koh` binary paints through.
 pub type DefaultBackend = Tty;
 
-/// Every mode koh may have forwarded (mouse reporting and encodings, bracketed paste, cursor and
-/// keypad keys), reset on leaving the alternate screen, so the user's shell does not get stray
-/// mouse bytes at its prompt.
+/// Every input mode koh may have set (mouse reporting and encodings, bracketed paste, focus
+/// reporting, cursor and keypad keys), reset on leaving the alternate screen, so the user's shell
+/// does not get stray mouse or focus bytes at its prompt.
 pub(crate) const RESET_FORWARDED_MODES: &[u8] =
-    b"\x1b[?9l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>";
+    b"\x1b[?9l\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\
+\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>";
 
 /// A cell's style as koh draws it, compared with the last to emit SGR only on a change.
 #[derive(PartialEq, Eq, Clone, Copy)]

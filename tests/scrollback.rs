@@ -74,6 +74,8 @@ impl Pair {
                 .filter_map(|msg| match msg {
                     ClientMsg::History(request) => Some(request),
                     ClientMsg::Input { .. }
+                    | ClientMsg::Keys { .. }
+                    | ClientMsg::Colours(_)
                     | ClientMsg::Resize(_)
                     | ClientMsg::Ack { .. }
                     | ClientMsg::Resync => None,

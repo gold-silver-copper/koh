@@ -1,6 +1,6 @@
 # Design note: answering colour queries
 
-Status: proposed, not built. Phase 4 of `koh-next-prompt.md` asks for this note before any work.
+Status: built, as below (see "As built" at the end for where it differs).
 
 ## What happens today
 
@@ -70,3 +70,17 @@ None: colour queries and their answers are not typed input.
   choice is a second check.
 - **The oracle:** exempt OSC 10 and 11 queries until the base answers them (the palette
   exemption that covered them came off once `main` had the palette).
+
+## As built
+
+- The client asks at start-up (`client::probe::queries`) and reads the answers with fux-vt's
+  decoder (`Reply::Colour`, `Reply::Palette`, new in fux-vt 0.3.2, and `Reply::Scheme`).
+  `ClientMsg::Colours` carries foreground, background, palette 0–15 and the scheme, 8 bits a
+  channel, on every connection; `koh connect --no-colours` asks and sends none.
+- The server answers OSC 10 and 11 (in xterm's form, with the program's terminator) and the scheme
+  query, `CSI ? 996 n`; fux-vt answers colours a program set itself. The palette is carried and
+  kept, but OSC 4 is still answered by fux-vt with xterm's defaults: answering it from the user's
+  palette needs a hook in fux-vt, a later step.
+- Mode 2031 is built too: the client turns scheme reports on in a terminal that answered the scheme
+  query, asks the colours again on a report and tells the server once the round's DA1 is in; the
+  server tells a program that subscribed when the scheme a client brings differs from the last.

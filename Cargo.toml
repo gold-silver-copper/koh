@@ -41,7 +41,7 @@ iroh = "=1.3.0"
 # the server's snapshots rely on to skip unchanged rows; 0.2 keeps each grapheme cluster whole in
 # one cell, with the row's text for clusters too long to hold inline; 0.3 makes its enums and
 # `Options` non-exhaustive and `Row`'s fields methods, keeps bold and dim apart, and adds CBT/CHT.
-fux-vt = "0.3.1"
+fux-vt = "0.3.2"
 unicode-width = "0.2.2"
 # The system calls koh makes beyond std, each safe to call: the server's PTYs and the session
 # launcher (a new session with the PTY as its controlling terminal), the client's terminal (raw
@@ -184,3 +184,9 @@ significant_drop_tightening = "allow"   # false-positives on single-statement lo
 duration_suboptimal_units = "allow"     # `from_secs(3600)` is clearer than a contrived larger unit
 # `const fn` on every getter is high-churn for debatable benefit; not enforced.
 missing_const_for_fn = "allow"
+
+# fux-vt decodes every byte the user types and parses every byte the program writes: optimized in
+# test and dev builds too, so their timing (the quit escape during a flood, the corpus) is the
+# shipped decoder's, not an unoptimized one's.
+[profile.dev.package.fux-vt]
+opt-level = 3

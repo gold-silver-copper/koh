@@ -203,6 +203,10 @@ fn connect() -> Command {
                 .help("Paint the remote app's hyperlinks (OSC 8) as plain text. By default they are painted as links your terminal can open, each checked first: printable ASCII only, within fux-vt's limits"),
         )
         .arg(
+            flag("no_colours", "no-colours")
+                .help("Do not tell the server your terminal's colours. By default koh asks your terminal its foreground, background, palette entries 0 to 15 and dark or light scheme, and the server answers remote programs that ask (vim, bat, delta pick their theme so); that tells the server your theme, a small fingerprint"),
+        )
+        .arg(
             Arg::new("on_bell")
                 .long("on-bell")
                 .value_name("CMD")
@@ -268,6 +272,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
             clipboard: !m.get_flag("no_clipboard"),
             hyperlinks: !m.get_flag("no_hyperlinks"),
+            colours: !m.get_flag("no_colours"),
             bell_command: m.get_one::<String>("on_bell").cloned(),
         })),
         Some(("id", m)) => Ok(Cmd::Key(KeyConfig {
@@ -420,6 +425,19 @@ mod tests {
             panic!("connect");
         };
         assert!(!c.hyperlinks && c.clipboard);
+    }
+
+    #[test]
+    fn colours_are_told_by_default_and_not_with_no_colours() {
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID]) else {
+            panic!("connect");
+        };
+        assert!(c.colours);
+        assert!(koh::client::ConnectConfig::new(c.server).colours);
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-colours"]) else {
+            panic!("connect");
+        };
+        assert!(!c.colours && c.hyperlinks);
     }
 
     #[test]

@@ -366,6 +366,7 @@ impl Remote {
             connector,
             DisplayPreference::Always,
             start,
+            None,
             input_rx,
             resize_rx,
             terminal,

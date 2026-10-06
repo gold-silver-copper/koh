@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
 use koh::predict::{DisplayPreference, Overlay};
-use koh::proto::{decode_server, encode_frame, ClientMsg, Frame, FrameNum, InputSeq, ServerMsg};
+use koh::proto::{
+    decode_server, encode_client, encode_frame, ClientDecoder, ClientMsg, Frame, FrameNum,
+    InputSeq, ServerMsg,
+};
 use koh::terminal::{FrameHold, ServerTerminal, Size, TerminalScreen, FRAME_HOLD};
 use recording::Recording;
 
@@ -344,7 +347,11 @@ impl Session {
             match msg {
                 ClientMsg::Ack { frame: acked } => self.ack(acked),
                 ClientMsg::Resync => self.base = (FrameNum::BLANK, TerminalScreen::default()),
-                ClientMsg::Input { .. } | ClientMsg::Resize(_) | ClientMsg::History(_) => {}
+                ClientMsg::Input { .. }
+                | ClientMsg::Keys { .. }
+                | ClientMsg::Colours(_)
+                | ClientMsg::Resize(_)
+                | ClientMsg::History(_) => {}
             }
         }
         if applied {
@@ -569,7 +576,7 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
             client.on_input(now, &step.keys);
         }
         while let Some(msg) = client.pop_outgoing() {
-            if let ClientMsg::Input { seq, .. } = msg {
+            if let ClientMsg::Input { seq, .. } | ClientMsg::Keys { seq, .. } = msg {
                 typed = typed.max(seq);
             }
         }
@@ -681,4 +688,82 @@ fn frame_size_histogram(corpus: &[Recording]) -> Result<(), String> {
         println!("{label:>6}: {count:>5} frames, {sum:>7} bytes ({percent}%)");
     }
     Ok(())
+}
+
+/// What the recording's program read for its keys: each key typed decoded, then encoded as the
+/// program asked at that moment, as fux's recorder made the recordings (`record.rs`, `typed`).
+fn read_by_the_program(keys: &[u8], screen: &fux_vt::Screen) -> Vec<u8> {
+    use fux_vt::keys::decode::{Decoder, Input};
+    let mut decoder = Decoder::default();
+    let mut inputs = Vec::new();
+    decoder.bytes(keys, &mut inputs);
+    decoder.timeout(&mut inputs);
+    let mut out = Vec::new();
+    for input in inputs {
+        match input {
+            Input::Key(stroke) => screen.encode_key(stroke, &mut out),
+            Input::Paste(text) => screen.encode_paste(&text, &mut out),
+            Input::PasteTooLong
+            | Input::FocusIn
+            | Input::FocusOut
+            | Input::Mouse(_)
+            | Input::Reply(_) => {}
+        }
+    }
+    out
+}
+
+/// The corpus's keys, typed on a legacy terminal, through koh: decoded by the client, sent on the
+/// wire, encoded by the server for the program in the mode its output set by then. The program
+/// gets what fux's recorder gave it: kitty's keys to nvim, helix and the rest that push flags,
+/// legacy bytes to the others.
+#[test]
+fn the_corpus_keys_reach_each_program_as_it_read_them() {
+    let corpus = corpus().expect("corpus");
+    let mut compared = 0usize;
+    let mut kitty = 0usize;
+    for recording in &corpus {
+        let size = Size::new(recording.rows, recording.cols);
+        let mut server =
+            ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK).expect("emulator");
+        let mut client = ClientSession::new(DisplayPreference::Never, size);
+        let mut wire = ClientDecoder::default();
+        let now = Instant::now();
+        for (index, (step, output)) in recording.outputs().enumerate() {
+            if let Some((rows, cols)) = step.resize {
+                server.resize(Size::new(rows, cols));
+            }
+            if !step.keys.is_empty() {
+                client.on_input(now, &step.keys);
+                if let Some(deadline) = client.deadline() {
+                    client.on_timeout(deadline);
+                }
+                let mut got = Vec::new();
+                while let Some(msg) = client.pop_outgoing() {
+                    wire.push(&encode_client(&msg).expect("encodes"));
+                    while let Some(msg) = wire.next_msg().expect("decodes") {
+                        if let ClientMsg::Keys { events, .. } = msg {
+                            server.encode_input(&events, &mut got);
+                        }
+                    }
+                }
+                let expected = read_by_the_program(&step.keys, server.live());
+                assert_eq!(
+                    got,
+                    expected,
+                    "{} step {index}: keys {:?}",
+                    recording.name,
+                    String::from_utf8_lossy(&step.keys)
+                );
+                compared = compared.saturating_add(1);
+                if server.live().kitty_keyboard_flags() != 0 {
+                    kitty = kitty.saturating_add(1);
+                }
+            }
+            server.process(output);
+            let _ = server.take_host_replies();
+        }
+    }
+    println!("{compared} steps' keys compared, {kitty} to a program in the kitty protocol");
+    assert!(compared > 100 && kitty > 10, "{compared} {kitty}");
 }

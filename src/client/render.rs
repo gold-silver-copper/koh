@@ -656,26 +656,37 @@ pub struct WindowState<'a> {
     pub bell_count: u64,
 }
 
-/// The input modes the program set, which the real terminal must mirror: keypad and cursor keys,
-/// bracketed paste and mouse reporting. The sequences are vt100 0.16's, byte for byte.
+/// The input modes the real terminal is kept in, so the client receives the input it decodes.
+///
+/// The server encodes keys, mouse events, focus changes and pastes as the program asked, so the
+/// program's own modes are not mirrored for their own sake: the keypad and cursor keys stay
+/// normal, bracketed paste and focus reporting stay on, so pastes arrive whole and focus changes
+/// at all, and mouse reporting is on while the program wants mouse events (or the scrollback view
+/// is open), always in SGR, which carries every position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InputModes {
     pub application_keypad: bool,
     pub application_cursor: bool,
     pub bracketed_paste: bool,
+    pub focus_reporting: bool,
     pub mouse_mode: MouseProtocolMode,
     pub mouse_encoding: MouseProtocolEncoding,
 }
 
 impl From<&Grid> for InputModes {
     fn from(s: &Grid) -> Self {
-        let m = s.modes();
+        let mouse_mode = s.modes().mouse_mode;
         Self {
-            application_keypad: m.application_keypad,
-            application_cursor: m.application_cursor,
-            bracketed_paste: m.bracketed_paste,
-            mouse_mode: m.mouse_mode,
-            mouse_encoding: m.mouse_encoding,
+            application_keypad: false,
+            application_cursor: false,
+            bracketed_paste: true,
+            focus_reporting: true,
+            mouse_mode,
+            mouse_encoding: if mouse_mode == MouseProtocolMode::None {
+                MouseProtocolEncoding::Default
+            } else {
+                MouseProtocolEncoding::Sgr
+            },
         }
     }
 }
@@ -716,6 +727,13 @@ impl InputModes {
                 b"\x1b[?2004h"
             } else {
                 b"\x1b[?2004l"
+            });
+        }
+        if changed(|m| m.focus_reporting) {
+            buf.extend_from_slice(if self.focus_reporting {
+                b"\x1b[?1004h"
+            } else {
+                b"\x1b[?1004l"
             });
         }
         let prev_mode = prev.map_or(Mode::None, |p| p.mouse_mode);
@@ -1070,12 +1088,44 @@ mod tests {
         // Baseline frame in default modes.
         let _ = oob_emit(&mut oob, &screen_of(b""), win("", "", "", 0));
 
-        // The remote turns on bracketed paste + mouse reporting → re-asserted to the real terminal.
-        let modes = screen_of(b"\x1b[?2004h\x1b[?1000h");
+        // The remote turns on mouse reporting → the real terminal reports the mouse, in SGR.
+        let modes = screen_of(b"\x1b[?2004h\x1b[?1000h\x1b[?1005h");
         let buf = oob_emit(&mut oob, &modes, win("", "", "", 0));
-        let s = String::from_utf8_lossy(&buf);
-        assert!(s.contains("2004"), "bracketed-paste re-asserted, got {s:?}");
-        assert!(s.contains("1000"), "mouse reporting re-asserted, got {s:?}");
+        assert_eq!(buf, b"\x1b[?1000h\x1b[?1006h");
+    }
+
+    /// The real terminal is kept where the client receives what it decodes, whatever the program
+    /// set: normal cursor and keypad keys, bracketed paste and focus reporting on, and mouse
+    /// reports in SGR while the program asks for any.
+    #[test]
+    fn the_real_terminal_reports_input_whatever_the_program_set() {
+        let keep = |bytes: &[u8]| InputModes::from(&screen_of(bytes));
+        let always = InputModes {
+            application_keypad: false,
+            application_cursor: false,
+            bracketed_paste: true,
+            focus_reporting: true,
+            mouse_mode: MouseProtocolMode::None,
+            mouse_encoding: MouseProtocolEncoding::Default,
+        };
+        assert_eq!(keep(b""), always);
+        assert_eq!(keep(b"\x1b[?1h\x1b=\x1b[?2004l\x1b[?1004l"), always);
+        for (set, mode) in [
+            (&b"\x1b[?9h"[..], MouseProtocolMode::Press),
+            (b"\x1b[?1000h\x1b[?1005h", MouseProtocolMode::PressRelease),
+            (b"\x1b[?1002h", MouseProtocolMode::ButtonMotion),
+            (b"\x1b[?1003h\x1b[?1006h", MouseProtocolMode::AnyMotion),
+        ] {
+            assert_eq!(
+                keep(set),
+                InputModes {
+                    mouse_mode: mode,
+                    mouse_encoding: MouseProtocolEncoding::Sgr,
+                    ..always
+                }
+            );
+        }
+        assert_eq!(always.formatted(), b"\x1b>\x1b[?1l\x1b[?2004h\x1b[?1004h");
     }
 
     #[test]
@@ -2038,12 +2088,27 @@ mod tests {
                 "",
             ],
         ];
+        // The program's modes as it set them, as vt100 would mirror them.
         let modes: Vec<InputModes> = seqs
             .iter()
-            .map(|s| InputModes::from(&screen_of(s)))
+            .map(|s| {
+                let m = screen_of(s).modes();
+                InputModes {
+                    application_keypad: m.application_keypad,
+                    application_cursor: m.application_cursor,
+                    bracketed_paste: m.bracketed_paste,
+                    focus_reporting: false,
+                    mouse_mode: m.mouse_mode,
+                    mouse_encoding: m.mouse_encoding,
+                }
+            })
             .collect();
         for (i, cur) in modes.iter().enumerate() {
-            assert_eq!(cur.formatted(), formatted[i].as_bytes(), "formatted {i}");
+            // vt100's, with focus reporting (which it does not mirror) reset after the paste.
+            let expected = formatted[i]
+                .replacen("2004l", "2004l\x1b[?1004l", 1)
+                .replacen("2004h", "2004h\x1b[?1004l", 1);
+            assert_eq!(cur.formatted(), expected.as_bytes(), "formatted {i}");
             for (j, prev) in modes.iter().enumerate() {
                 assert_eq!(cur.diff(*prev), diff[i][j].as_bytes(), "diff {i} from {j}");
             }

@@ -9,6 +9,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use fux_vt::keys::encode::{key_bytes, KeyMode};
+use fux_vt::keys::KeyPress;
 use fux_vt::Color;
 
 use serde::{Deserialize, Serialize};
@@ -758,6 +760,32 @@ impl PredictionEngine {
             return self.unmodelled();
         }
         self.move_cursor_to(screen, at);
+    }
+
+    /// Predict what typed key `press` does to `screen`. The key is read in its one legacy form,
+    /// the bytes a legacy terminal sends for it in normal cursor mode, whatever the user's
+    /// terminal sent: `Alt-B` is `ESC b` from a kitty-protocol terminal too. A key legacy bytes
+    /// cannot tell from another (Shift-Enter) is predicted as that other.
+    pub fn new_user_key(&mut self, press: KeyPress, screen: &dyn ScreenView) {
+        let mut bytes = Vec::with_capacity(8);
+        key_bytes(press.into(), KeyMode::legacy(false), &mut bytes);
+        for byte in bytes {
+            self.new_user_byte(byte, screen);
+        }
+    }
+
+    /// Input the predictor does not model reached the program (a mouse event, a focus change, a
+    /// paste): what it shows next is unknown.
+    pub fn new_user_other(&mut self, screen: &dyn ScreenView) {
+        if self.pref == DisplayPreference::Never {
+            return;
+        }
+        if self.password() {
+            self.become_tentative();
+            return;
+        }
+        self.cull(screen);
+        self.unmodelled();
     }
 
     /// Predict what typed `byte` does to `screen`, after culling the existing predictions.

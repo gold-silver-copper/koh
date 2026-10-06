@@ -9,7 +9,10 @@ use crate::terminal::{
 };
 use std::time::{Duration, Instant};
 
-use fux_vt::{Event, Options, Parser, Sink};
+use crate::events::{InputEvent, WireColours, PALETTE};
+use fux_vt::keys::colour::Colours;
+use fux_vt::keys::encode::{paste, PASTE_END, PASTE_START};
+use fux_vt::{Event, Options, Parser, Sink, Unhandled};
 
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
 fn title_from(bytes: &[u8]) -> String {
@@ -29,6 +32,10 @@ struct Observed {
     bell_count: u64,
     /// Query answers for the program's input, never part of the screen.
     host_replies: Vec<u8>,
+    /// What the user's terminal said of its colours, as the client last told: the program's
+    /// queries of the foreground and background (OSC 10, 11) and of the scheme (`CSI ? 996 n`) are
+    /// answered from it, unless the program set those colours itself (fux-vt answers those).
+    colours: Colours,
 }
 
 impl Sink for Observed {
@@ -47,8 +54,31 @@ impl Sink for Observed {
             {
                 self.clipboard = String::from_utf8_lossy(data).into_owned();
             }
+            // A colour no program set: the user's terminal's, if the client said it; else
+            // unanswered, as a terminal that does not know it would leave it.
+            Event::ColorQuery { number, bel } => {
+                if let Some(answer) = self.colours.answer(number, bel) {
+                    self.host_replies.extend_from_slice(&answer);
+                }
+            }
             // An oversized clipboard is dropped; `_` is for events a later fux-vt adds.
             Event::Clipboard { .. } | _ => {}
+        }
+    }
+    fn unhandled(&mut self, sequence: Unhandled<'_>) {
+        // The scheme query, `CSI ? 996 n`, which fux-vt leaves to its host.
+        if let Unhandled::Csi {
+            params,
+            intermediates: b"?",
+            action: b'n',
+        } = sequence
+        {
+            let mut groups = params.groups();
+            if groups.next() == Some(&[996][..]) && groups.next().is_none() {
+                if let Some(scheme) = self.colours.scheme {
+                    self.host_replies.extend_from_slice(scheme.report());
+                }
+            }
         }
     }
 }
@@ -78,13 +108,18 @@ pub const IDENTITY: fux_vt::Identity = fux_vt::Identity {
 ///   underline styles;
 /// - hyperlinks (OSC 8): each cell's link goes in its row on the wire, and the client paints it,
 ///   unless the user turns links off;
+/// - the kitty keyboard protocol: the client sends decoded keys and the server encodes each as
+///   the program asked ([`ServerTerminal::encode_input`]), so a program that pushed flags gets
+///   kitty's keys from any terminal;
+/// - colour scheme updates (mode 2031): a program that subscribes hears when the user's terminal
+///   reports a new scheme;
 /// - koh's [`IDENTITY`].
 ///
-/// Left off: the kitty keyboard protocol (koh forwards the keys the user's terminal sends, so a
-/// program told it may use the protocol would get keys it did not ask for); prompt marks (koh does
-/// not carry scrollback, where they are used); rectangle checksums (a program reading back its
-/// screen, which xterm refuses by default).
+/// Left off: prompt marks (koh does not carry them in its history); rectangle checksums (a
+/// program reading back its screen, which xterm refuses by default).
 pub const OPTIONS: Options = Options::new()
+    .with_kitty_keyboard(true)
+    .with_color_scheme_updates(true)
     .with_events(true)
     .with_extended_replies(true)
     .with_in_band_resize(true)
@@ -117,6 +152,12 @@ pub struct ServerTerminal {
     names: HistoryNames,
     /// How the PTY takes typed keys, as last read.
     tty: Option<TtyModes>,
+    /// A paste begun and not ended, and whether it was framed (the program had bracketed paste
+    /// set when it began).
+    paste_open: Option<bool>,
+    /// The user's terminal's palette entries 0 to 15, as the client last told. Kept for programs
+    /// that ask; fux-vt answers OSC 4 with xterm's defaults for now.
+    palette: [Option<[u8; 3]>; PALETTE],
 }
 
 impl ServerTerminal {
@@ -134,7 +175,93 @@ impl ServerTerminal {
             frame_ends: FrameEnds::default(),
             names: HistoryNames::default(),
             tty: None,
+            paste_open: None,
+            palette: [None; PALETTE],
         })
+    }
+
+    /// Append the bytes the program gets for `events`, each encoded as it asked: keys in its
+    /// keyboard mode (DECCKM, the kitty flags, modifyOtherKeys), mouse events in its tracking
+    /// mode and encoding (none if it asked for none), focus changes if it set mode 1004, and
+    /// pastes framed if it set bracketed paste when the paste began. A paste's end markers are
+    /// removed from every piece, so nothing in it can end its frame early.
+    pub fn encode_input(&mut self, events: &[InputEvent], out: &mut Vec<u8>) {
+        for event in events {
+            let screen = self.parser.screen();
+            match event {
+                InputEvent::Key(key) => screen.encode_key(key.stroke(), out),
+                InputEvent::Mouse(mouse) => {
+                    screen.encode_mouse(mouse.event(), out);
+                }
+                InputEvent::Focus(focused) => {
+                    screen.encode_focus(*focused, out);
+                }
+                InputEvent::Paste { text, first, last } => {
+                    // A paste begun without its end first ends where the next begins.
+                    if *first {
+                        if self.paste_open == Some(true) {
+                            out.extend_from_slice(PASTE_END);
+                        }
+                        self.paste_open = None;
+                    }
+                    let framed = *self.paste_open.get_or_insert_with(|| {
+                        let framed = screen.bracketed_paste();
+                        if framed {
+                            out.extend_from_slice(PASTE_START);
+                        }
+                        framed
+                    });
+                    if framed {
+                        let mut piece = Vec::with_capacity(text.len().saturating_add(12));
+                        paste(text, true, &mut piece);
+                        let inner = piece
+                            .get(PASTE_START.len()..piece.len().saturating_sub(PASTE_END.len()))
+                            .unwrap_or_default();
+                        out.extend_from_slice(inner);
+                    } else {
+                        out.extend_from_slice(text.as_bytes());
+                    }
+                    if *last {
+                        if framed {
+                            out.extend_from_slice(PASTE_END);
+                        }
+                        self.paste_open = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// What the user's terminal said of its colours, replacing what an earlier client said; the
+    /// report a program that subscribed to scheme changes (mode 2031) is owed, if the scheme
+    /// changed from one known before.
+    pub fn set_colours(&mut self, colours: &WireColours) -> Vec<u8> {
+        let colours_now = colours.colours();
+        let before = self.observed.colours.scheme;
+        self.observed.colours = colours_now;
+        self.palette = [None; PALETTE];
+        for (slot, entry) in self.palette.iter_mut().zip(&colours.palette) {
+            *slot = *entry;
+        }
+        match (before, colours_now.scheme) {
+            (Some(before), Some(now))
+                if before != now && self.parser.screen().color_scheme_updates() =>
+            {
+                now.report().to_vec()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The program's screen as it is now, its modes among it: what
+    /// [`encode_input`](Self::encode_input) encodes for.
+    pub fn live(&self) -> &fux_vt::Screen {
+        self.parser.screen()
+    }
+
+    /// The user's terminal's palette entry `index` (0 to 15), as the client last told.
+    pub fn user_palette(&self, index: usize) -> Option<[u8; 3]> {
+        self.palette.get(index).copied().flatten()
     }
 
     /// Record the shell's exit code; the next snapshot carries it to the client.
@@ -861,5 +988,196 @@ mod tests {
         }
         assert_eq!(terminal.title(), "split title");
         assert!(terminal.snapshot().screen().contents().contains("ok"));
+    }
+
+    /// The bytes a program that wrote `setup` gets for `events`, as the client decoded them from
+    /// what the user's terminal sent (`sent`).
+    fn program_gets(setup: &[u8], sent: &[u8]) -> Vec<u8> {
+        let mut t = ServerTerminal::new(24, 300, 0).expect("emulator");
+        t.process(setup);
+        let mut inputs = Vec::new();
+        let mut decoder = fux_vt::keys::decode::Decoder::default();
+        decoder.bytes(sent, &mut inputs);
+        decoder.timeout(&mut inputs);
+        let events: Vec<InputEvent> = inputs
+            .into_iter()
+            .filter_map(|input| match input {
+                fux_vt::keys::decode::Input::Key(stroke) => Some(InputEvent::Key(stroke.into())),
+                fux_vt::keys::decode::Input::Mouse(event) => Some(InputEvent::Mouse(event.into())),
+                fux_vt::keys::decode::Input::FocusIn => Some(InputEvent::Focus(true)),
+                fux_vt::keys::decode::Input::FocusOut => Some(InputEvent::Focus(false)),
+                fux_vt::keys::decode::Input::Paste(text) => Some(InputEvent::Paste {
+                    text,
+                    first: true,
+                    last: true,
+                }),
+                fux_vt::keys::decode::Input::PasteTooLong
+                | fux_vt::keys::decode::Input::Reply(_) => None,
+            })
+            .collect();
+        let mut out = Vec::new();
+        t.encode_input(&events, &mut out);
+        out
+    }
+
+    #[test]
+    fn keys_reach_a_program_as_it_asked_from_any_terminal() {
+        // Legacy bytes back to a legacy program, cursor keys in its cursor mode.
+        assert_eq!(program_gets(b"", b"ls\r\x1b[A\x01"), b"ls\r\x1b[A\x01");
+        assert_eq!(program_gets(b"\x1b[?1h", b"\x1b[A\x1bOB"), b"\x1bOA\x1bOB");
+        // A program that pushed kitty's disambiguate gets kitty's keys, from a legacy terminal:
+        // Ctrl-A and Escape are escapes, text stays text.
+        assert_eq!(program_gets(b"\x1b[>1u", b"a\x01"), b"a\x1b[97;5u");
+        assert_eq!(program_gets(b"\x1b[>1u", b"\x1b"), b"\x1b[27u");
+        // And from a kitty terminal, which tells Ctrl-I from Tab.
+        assert_eq!(
+            program_gets(b"\x1b[>1u", b"\x1b[105;5u\t"),
+            b"\x1b[105;5u\t"
+        );
+        // A legacy program gets a kitty terminal's keys as legacy bytes.
+        assert_eq!(program_gets(b"", b"\x1b[105;5u\x1b[1;5C"), b"\t\x1b[1;5C");
+        // xterm's modifyOtherKeys 2.
+        assert_eq!(program_gets(b"\x1b[>4;2m", b"\x01"), b"\x1b[27;5;97~");
+        // A pop restores the legacy keys.
+        assert_eq!(program_gets(b"\x1b[>1u\x1b[<u", b"\x01"), b"\x01");
+    }
+
+    #[test]
+    fn mouse_events_reach_a_program_in_its_mode_and_encoding() {
+        // The user's terminal reports in SGR: a press at row 5, column 10, and its release.
+        let click = b"\x1b[<0;10;5M\x1b[<0;10;5m";
+        assert_eq!(program_gets(b"", click), b"", "no mode: nothing");
+        assert_eq!(
+            program_gets(b"\x1b[?9h", click),
+            b"\x1b[M *%",
+            "X10: the press"
+        );
+        assert_eq!(
+            program_gets(b"\x1b[?1000h", click),
+            b"\x1b[M *%\x1b[M#*%",
+            "normal: press and release"
+        );
+        assert_eq!(
+            program_gets(b"\x1b[?1000h\x1b[?1006h", click),
+            b"\x1b[<0;10;5M\x1b[<0;10;5m"
+        );
+        assert_eq!(
+            program_gets(b"\x1b[?1000h\x1b[?1005h", b"\x1b[<0;100;5M"),
+            "\x1b[M \u{84}%".as_bytes(),
+            "UTF-8"
+        );
+        // A drag: motion with a button held, in 1002 and 1003 but not 1000; motion with none, in
+        // 1003 alone.
+        let drag = b"\x1b[<32;11;5M";
+        let hover = b"\x1b[<35;11;5M";
+        assert_eq!(program_gets(b"\x1b[?1000h\x1b[?1006h", drag), b"");
+        assert_eq!(
+            program_gets(b"\x1b[?1002h\x1b[?1006h", drag),
+            b"\x1b[<32;11;5M"
+        );
+        assert_eq!(program_gets(b"\x1b[?1002h\x1b[?1006h", hover), b"");
+        assert_eq!(
+            program_gets(b"\x1b[?1003h\x1b[?1006h", hover),
+            b"\x1b[<35;11;5M"
+        );
+        // The wheel.
+        assert_eq!(
+            program_gets(b"\x1b[?1000h\x1b[?1006h", b"\x1b[<65;3;4M"),
+            b"\x1b[<65;3;4M"
+        );
+        // Past 223 the default encoding carries nothing, so nothing is sent.
+        assert_eq!(program_gets(b"\x1b[?1000h", b"\x1b[<0;224;1M"), b"");
+        assert_eq!(
+            program_gets(b"\x1b[?1000h", b"\x1b[<0;223;1M"),
+            [&b"\x1b[M "[..], &[255, 33]].concat()
+        );
+    }
+
+    #[test]
+    fn focus_reaches_only_a_program_that_asked() {
+        assert_eq!(program_gets(b"", b"\x1b[I\x1b[O"), b"");
+        assert_eq!(
+            program_gets(b"\x1b[?1004h", b"\x1b[I\x1b[O"),
+            b"\x1b[I\x1b[O"
+        );
+        assert_eq!(program_gets(b"\x1b[?1004h\x1b[?1004l", b"\x1b[I"), b"");
+    }
+
+    #[test]
+    fn a_paste_cannot_end_its_bracket_and_goes_plain_to_a_program_without_one() {
+        // The client strips markers too; the server holds whatever a peer sends.
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        t.process(b"\x1b[?2004h");
+        let mut out = Vec::new();
+        let piece = |text: &str, first, last| InputEvent::Paste {
+            text: text.to_owned(),
+            first,
+            last,
+        };
+        t.encode_input(
+            &[
+                piece("a\x1b[201~b", true, false),
+                piece("\x1b[20\x1b[201~1~c", false, false),
+                piece("d\u{9b}201~", false, true),
+            ],
+            &mut out,
+        );
+        assert_eq!(out, b"\x1b[200~abcd\x1b[201~");
+        // The bracket as set when the paste began, for every piece.
+        out.clear();
+        t.encode_input(&[piece("x", true, false)], &mut out);
+        t.process(b"\x1b[?2004l");
+        t.encode_input(&[piece("y", false, true)], &mut out);
+        assert_eq!(out, b"\x1b[200~xy\x1b[201~");
+        // Unbracketed: the text as pasted.
+        out.clear();
+        t.encode_input(&[piece("a\nb", true, true)], &mut out);
+        assert_eq!(out, b"a\nb");
+        // A paste begun and never ended is closed when the next begins.
+        t.process(b"\x1b[?2004h");
+        out.clear();
+        t.encode_input(
+            &[piece("one", true, false), piece("two", true, true)],
+            &mut out,
+        );
+        assert_eq!(out, b"\x1b[200~one\x1b[201~\x1b[200~two\x1b[201~");
+    }
+
+    #[test]
+    fn colour_queries_are_answered_from_the_users_terminal() {
+        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
+        // Before any client said them, unanswered, as a terminal that does not know.
+        t.process(b"\x1b]11;?\x07\x1b]10;?\x1b\\\x1b[?996n");
+        assert_eq!(t.take_host_replies(), b"");
+        assert_eq!(
+            t.set_colours(&WireColours {
+                foreground: Some([0xdd, 0xdd, 0xdd]),
+                background: Some([0x1e, 0x1e, 0x20]),
+                palette: vec![Some([0, 0, 0])],
+                scheme: Some(crate::events::WireScheme::Dark),
+            }),
+            b"",
+            "no program subscribed"
+        );
+        assert_eq!(t.user_palette(0), Some([0, 0, 0]));
+        // With the terminator the program used.
+        t.process(b"\x1b]11;?\x07\x1b]10;?\x1b\\\x1b[?996n");
+        assert_eq!(
+            t.take_host_replies(),
+            b"\x1b]11;rgb:1e1e/1e1e/2020\x07\x1b]10;rgb:dddd/dddd/dddd\x1b\\\x1b[?997;1n"
+        );
+        // A colour the program set wins: fux-vt answers it.
+        t.process(b"\x1b]11;rgb:ff/ff/ff\x07\x1b]11;?\x07");
+        assert_eq!(t.take_host_replies(), b"\x1b]11;rgb:ffff/ffff/ffff\x07");
+        // A reattach from a light terminal: a program that subscribed (mode 2031) hears of it.
+        t.process(b"\x1b[?2031h");
+        let report = t.set_colours(&WireColours {
+            background: Some([0xff, 0xff, 0xff]),
+            scheme: Some(crate::events::WireScheme::Light),
+            ..WireColours::default()
+        });
+        assert_eq!(report, b"\x1b[?997;2n");
+        t.process(b"\x1b]110;?\x07\x1b]10;?\x07");
+        assert_eq!(t.take_host_replies(), b"", "this client said no foreground");
     }
 }

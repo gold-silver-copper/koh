@@ -88,6 +88,60 @@ fn an_oversized_client_message_closes_the_connection_only() -> anyhow::Result<()
     })
 }
 
+/// A client that sends input no terminal sends (a modifier bit no key has, a paste piece over
+/// the cap, a palette past 16 entries, a function key past F12) loses its connection, each, and
+/// the server goes on serving the good client.
+#[test]
+fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> {
+    use koh::events::{InputEvent, WireColours, WireKey, WireKeyCode, MAX_PASTE_PIECE, PALETTE};
+    crate::harness::runtime()?.block_on(async {
+        let net = net();
+        let evil = identity()?;
+        let (server, mut good) = server_under_attack(&net, evil.public()).await?;
+        let keys = |events| ClientMsg::Keys {
+            seq: InputSeq(1),
+            events,
+        };
+        let key = |key, mods| {
+            InputEvent::Key(WireKey {
+                key,
+                mods,
+                kitty: None,
+            })
+        };
+        for msg in [
+            keys(vec![key(WireKeyCode::Char('x'), 0x80)]),
+            keys(vec![key(WireKeyCode::F(99), 0)]),
+            keys(vec![InputEvent::Paste {
+                text: "x".repeat(MAX_PASTE_PIECE + 1),
+                first: true,
+                last: true,
+            }]),
+            ClientMsg::Colours(WireColours {
+                palette: vec![None; PALETTE + 1],
+                ..WireColours::default()
+            }),
+        ] {
+            // Built by hand: `encode_client` refuses to.
+            let body = postcard::to_allocvec(&msg)?;
+            let mut stream = u32::try_from(body.len())?.to_be_bytes().to_vec();
+            stream.extend_from_slice(&body);
+            let conn = admitted(&net, evil.clone(), server.id).await?;
+            raw_client_stream(&conn, &stream).await?;
+            anyhow::ensure!(
+                tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                    .await
+                    .is_ok(),
+                "the server must close a connection that sent {msg:?}"
+            );
+        }
+        assert_good_client_still_works(&mut good).await?;
+        let _ = good.finish().await;
+        server.stop().await;
+        Ok(())
+    })
+}
+
 #[test]
 fn a_client_cannot_open_a_second_stream() -> anyhow::Result<()> {
     crate::harness::runtime()?.block_on(async {

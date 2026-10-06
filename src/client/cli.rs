@@ -31,6 +31,9 @@ pub struct ConnectConfig {
     pub clipboard: bool,
     /// Paint the server's hyperlinks (OSC 8); on unless `--no-hyperlinks`.
     pub hyperlinks: bool,
+    /// Ask the user's terminal its colours and tell the server, which answers programs' colour
+    /// queries with them; on unless `--no-colours`.
+    pub colours: bool,
     /// A shell command to run on the remote bell (see [`BellHook`]).
     pub bell_command: Option<String>,
 }
@@ -45,6 +48,7 @@ impl ConnectConfig {
             relay_url: None,
             clipboard: true,
             hyperlinks: true,
+            colours: true,
             bell_command: None,
         }
     }
@@ -246,15 +250,20 @@ fn log_to_koh_log() {
 /// terminal answers within milliseconds; one that answers nothing leaves the defaults.
 const PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Ask the user's terminal what it draws (see [`super::probe`]) and paint accordingly. Its answers
-/// are read out of `input`; what was typed meanwhile goes on to the session, first, on the input
-/// returned.
+/// Ask the user's terminal what it draws, speaks and shows (see [`super::probe`]; its colours too if
+/// `colours`), and paint and listen accordingly. Its answers are read out of `input`; what was
+/// typed meanwhile goes on to the session, first, on the input returned, with the colours to tell
+/// the server (`None` if not asked).
 async fn probe_terminal<B: crate::client::KohBackend>(
     terminal: &mut BackendTerminal<B>,
     mut input: tokio::sync::mpsc::Receiver<Vec<u8>>,
-) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+    colours: bool,
+) -> (
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+    Option<crate::events::WireColours>,
+) {
     let mut replies = super::probe::Replies::default();
-    if terminal.ask(super::probe::QUERIES).is_ok() {
+    if terminal.ask(&super::probe::queries(colours)).is_ok() {
         let deadline = tokio::time::Instant::now()
             .checked_add(PROBE_WAIT)
             .unwrap_or_else(tokio::time::Instant::now);
@@ -266,10 +275,18 @@ async fn probe_terminal<B: crate::client::KohBackend>(
         }
     }
     terminal.set_underline_styles(replies.underline_styles());
+    // Scheme reports only matter while colours are told.
+    let scheme_reports = colours && replies.scheme_reports();
+    if let Err(e) = terminal.turn_on(replies.kitty(), scheme_reports) {
+        tracing::warn!(error = %e, "could not set the terminal's keyboard and scheme reports");
+    }
     tracing::debug!(
         underline_styles = replies.underline_styles(),
+        kitty = replies.kitty(),
+        scheme_reports,
         "the user's terminal"
     );
+    let told = colours.then(|| replies.colours());
     let typed = replies.typed();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
@@ -282,7 +299,7 @@ async fn probe_terminal<B: crate::client::KohBackend>(
             }
         }
     });
-    rx
+    (rx, told)
 }
 
 /// `koh connect`: the remote shell's exit code if it exited. Takes the process's terminal, stdin
@@ -313,13 +330,15 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
         let mut terminal = BackendTerminal::enter(backend, args.clipboard)
             .context("entering raw mode / alt screen")?;
         terminal.set_hyperlinks(args.hyperlinks);
-        let input_rx = probe_terminal(&mut terminal, channels.input_rx).await;
+        let (input_rx, colours) =
+            probe_terminal(&mut terminal, channels.input_rx, args.colours).await;
         let size = terminal.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
         crate::client::run_client(
             channel,
             connector,
             DisplayPreference::Always,
             size,
+            colours,
             input_rx,
             channels.resize_rx,
             terminal,
@@ -358,6 +377,7 @@ mod tests {
                 relay_url: None,
                 clipboard: false,
                 hyperlinks: false,
+                colours: false,
                 bell_command: None,
             };
             let peer = server.clone();

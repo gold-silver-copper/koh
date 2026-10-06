@@ -91,6 +91,7 @@ fn full_session_over_loopback_pty() {
                 connector,
                 DisplayPreference::Never, // predictions are overlay-only; assert on the real grid
                 Size::new(24, 80),
+                None,
                 input_rx,
                 resize_rx,
                 term,

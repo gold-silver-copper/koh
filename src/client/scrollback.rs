@@ -9,6 +9,10 @@
 
 use std::time::{Duration, Instant};
 
+use fux_vt::keys::decode::Input;
+use fux_vt::keys::encode::{key_bytes, KeyMode};
+use fux_vt::keys::mouse::{MouseAction, MouseButton, MouseEvent};
+
 use crate::terminal::{
     HistoryCache, HistoryMark, HistoryReply, HistoryRequest, TerminalScreen, MAX_HISTORY_ROWS,
 };
@@ -322,8 +326,57 @@ impl Scrollback {
         })
     }
 
-    /// Keys typed while viewing, for a screen `rows` high.
-    pub fn on_keys(&mut self, bytes: &[u8], rows: u16) -> ViewKeys {
+    /// Input decoded while viewing, for a screen `rows` high: each key in its legacy form (one
+    /// form of each, whatever the user's terminal sent), the wheel, and a paste into a search.
+    pub fn on_events(&mut self, inputs: &[Input], rows: u16) -> ViewKeys {
+        for input in inputs {
+            match input {
+                Input::Key(stroke) => {
+                    let mut bytes = Vec::with_capacity(8);
+                    key_bytes(stroke.press.into(), KeyMode::legacy(false), &mut bytes);
+                    if self.on_keys(&bytes, rows) == ViewKeys::Leave {
+                        return ViewKeys::Leave;
+                    }
+                }
+                Input::Mouse(MouseEvent {
+                    action: MouseAction::Press,
+                    button: Some(button),
+                    ..
+                }) => match button {
+                    MouseButton::WheelUp => self.step(Step::Up(WHEEL_ROWS)),
+                    MouseButton::WheelDown => self.step(Step::Down(WHEEL_ROWS)),
+                    MouseButton::Left
+                    | MouseButton::Middle
+                    | MouseButton::Right
+                    | MouseButton::WheelLeft
+                    | MouseButton::WheelRight
+                    | MouseButton::Back
+                    | MouseButton::Forward => {}
+                },
+                Input::Paste(text) => {
+                    if let Some(search) = self.search.as_mut().filter(|s| s.typing) {
+                        for c in text.chars().filter(|c| !c.is_control()) {
+                            let mut utf8 = [0; 4];
+                            let c = c.encode_utf8(&mut utf8).as_bytes();
+                            if search.query.len().saturating_add(c.len()) > MAX_QUERY {
+                                break;
+                            }
+                            search.query.extend_from_slice(c);
+                        }
+                    }
+                }
+                Input::Mouse(_)
+                | Input::PasteTooLong
+                | Input::FocusIn
+                | Input::FocusOut
+                | Input::Reply(_) => {}
+            }
+        }
+        ViewKeys::Stay
+    }
+
+    /// Keys typed while viewing, as legacy bytes, for a screen `rows` high.
+    fn on_keys(&mut self, bytes: &[u8], rows: u16) -> ViewKeys {
         let mut input = std::mem::take(&mut self.partial);
         input.extend_from_slice(bytes);
         let page = usize::from(rows.saturating_sub(1)).max(1);
@@ -483,29 +536,12 @@ fn parse_escape(bytes: &[u8]) -> Escape {
                 (b"" | b"1", b'F') | (b"4" | b"8", b'~') => Step::Bottom,
                 (b"5", b'~') => Step::PageUp,
                 (b"6", b'~') => Step::PageDown,
-                (body, b'M') if body.first() == Some(&b'<') => wheel(body),
                 _ => Step::None,
             };
             Escape::Key(step, len)
         }
         // Alt and a key, or a lone ESC followed by more keys.
         Some(_) => Escape::Key(Step::None, 2),
-    }
-}
-
-/// An SGR mouse report's step: the wheel scrolls, anything else does nothing.
-fn wheel(body: &[u8]) -> Step {
-    let button = body
-        .get(1..)
-        .unwrap_or_default()
-        .split(|&b| b == b';')
-        .next()
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|b| b.parse::<u16>().ok());
-    match button {
-        Some(b) if b & 64 != 0 && b & 1 == 0 => Step::Up(WHEEL_ROWS),
-        Some(b) if b & 64 != 0 => Step::Down(WHEEL_ROWS),
-        _ => Step::None,
     }
 }
 
@@ -532,13 +568,26 @@ mod tests {
         assert_eq!(press(&mut s, b"\x1b[A\x1bOA"), 3);
         assert_eq!(press(&mut s, b"\x1b[5~"), 27);
         assert_eq!(press(&mut s, b"\x1b[6~j"), 2);
-        assert_eq!(press(&mut s, b"\x1b[<64;10;5M"), 5, "the wheel up");
-        assert_eq!(press(&mut s, b"\x1b[<65;10;5M"), 2, "the wheel down");
+        // Mouse reports come decoded.
+        let decoded = |s: &mut Scrollback, bytes: &[u8]| {
+            let mut inputs = Vec::new();
+            fux_vt::keys::decode::Decoder::default().bytes(bytes, &mut inputs);
+            assert_eq!(s.on_events(&inputs, rows), ViewKeys::Stay);
+            s.offset().unwrap()
+        };
+        assert_eq!(decoded(&mut s, b"\x1b[<64;10;5M"), 5, "the wheel up");
+        assert_eq!(decoded(&mut s, b"\x1b[<65;10;5M"), 2, "the wheel down");
         assert_eq!(
-            press(&mut s, b"\x1b[<0;10;5M\x1b[<0;10;5m"),
+            decoded(&mut s, b"\x1b[<0;10;5M\x1b[<0;10;5m"),
             2,
             "a click does nothing"
         );
+        assert_eq!(
+            decoded(&mut s, b"\x1b[5~\x1b[1;5A"),
+            26,
+            "keys come decoded too"
+        );
+        assert_eq!(decoded(&mut s, b"\x1b[6~"), 2);
         assert_eq!(press(&mut s, b"g"), 100, "the top is the oldest row");
         assert_eq!(press(&mut s, b"k"), 100, "and no further");
         assert_eq!(press(&mut s, b"u"), 100);

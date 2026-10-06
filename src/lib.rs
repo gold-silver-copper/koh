@@ -2,7 +2,7 @@
 //! `koh connect` renders it with predictive local echo, reconnecting transparently.
 //!
 //! [`transport_iroh`] sets up endpoints, the key file and admission; [`identity`] loads identities
-//! and their reset leases; [`keycmd`] is `koh id` and `koh key`. [`proto`] is the wire protocol;
+//! and their reset leases; [`keycmd`] is `koh id` and `koh key`. [`proto`] is the wire protocol, [`events`] the input it carries;
 //! [`terminal`], [`predict`] and [`pty`] the screen, the prediction and the PTY; [`server`] hosts
 //! sessions and [`client`] renders them.
 //!
@@ -12,6 +12,7 @@
 //! The library exists so the binary, tests and fuzz targets share code; all of it is internal.
 
 pub mod client;
+pub mod events;
 pub mod identity;
 pub mod keycmd;
 pub mod log;

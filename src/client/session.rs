@@ -5,6 +5,14 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fux_vt::keys::colour::Scheme;
+use fux_vt::keys::decode::{Decoder, Input, Reply};
+use fux_vt::keys::encode::{key_bytes, paste, KeyMode, PASTE_END, PASTE_START};
+use fux_vt::keys::{KeyPress, Keystroke};
+
+use crate::events::{
+    narrow, InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE_PIECE, PALETTE,
+};
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
     decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, FrameScreen,
@@ -12,6 +20,7 @@ use crate::proto::{
 };
 use crate::terminal::{Grid, HistoryReply, RowEncodings, Size, TerminalScreen};
 
+use super::probe::COLOUR_QUERIES;
 use super::render::WindowState;
 use super::scrollback::Scrollback;
 use super::{window_state, ESCAPE_PREFIX, SCROLLBACK_KEY, SUSPEND_KEY};
@@ -21,8 +30,14 @@ use super::{window_state, ESCAPE_PREFIX, SCROLLBACK_KEY, SUSPEND_KEY};
 pub const LINK_DOWN_GRACE: Duration = HEARTBEAT.saturating_mul(3);
 
 /// The most typed bytes held while the server takes no input; past it, typing is dropped and the
-/// status line says so.
+/// status line says so. A paste is kept up to this long too.
 const MAX_QUEUED_INPUT: usize = 1024 * 1024;
+
+/// What the status line says of a paste past [`MAX_QUEUED_INPUT`], which is dropped whole.
+const PASTE_TOO_LONG: &str = "[koh] paste over 1 MiB — not sent";
+
+/// How long a notice stays on the status line.
+const NOTICE_FOR: Duration = Duration::from_secs(3);
 
 /// What [`ClientSession::on_input`] decided about a chunk of typed bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,8 +83,20 @@ pub struct ClientSession {
     /// When input was last queued or probed for, while some is unconfirmed.
     last_nudge: Option<Instant>,
     predictor: PredictionEngine,
-    /// True after the lone escape prefix, while waiting for the next byte.
-    pending_escape: bool,
+    /// What the user's terminal sends, decoded.
+    decoder: Decoder,
+    /// The escape prefix as typed, while waiting for the key after it.
+    pending_escape: Option<Keystroke>,
+    /// The user's terminal's colours, while the server is told them (not with `--no-colours`).
+    colours: Option<WireColours>,
+    /// The colours were asked again (after a new scheme) and not all are in.
+    colours_asked: bool,
+    /// Questions for the user's terminal, for the caller to write.
+    ask: Vec<u8>,
+    /// A notice for the status line, and when it was given.
+    notice: Option<(String, Instant)>,
+    /// A key's legacy bytes, as last matched against the escape prefix.
+    scratch: Vec<u8>,
     /// The history held, and the scrollback view.
     scrollback: Scrollback,
     /// When the user last typed or a frame last applied: history is fetched ahead only after a
@@ -100,7 +127,13 @@ impl ClientSession {
             last_heard: None,
             last_nudge: None,
             predictor: PredictionEngine::new(pref),
-            pending_escape: false,
+            decoder: Decoder::with_paste_limit(MAX_QUEUED_INPUT),
+            pending_escape: None,
+            colours: None,
+            colours_asked: false,
+            ask: Vec::new(),
+            notice: None,
+            scratch: Vec::with_capacity(16),
             scrollback: Scrollback::default(),
             last_activity: None,
             rows: size.rows,
@@ -110,56 +143,124 @@ impl ClientSession {
         }
     }
 
-    /// Take typed bytes: the escape prefix then `.` quits, then `Ctrl-Z` suspends, then anything
-    /// else forwards both; the rest is predicted and queued.
+    /// Take typed bytes, as the user's terminal sent them: decoded, then handled as
+    /// [`on_inputs`](Self::on_inputs) says. An incomplete sequence waits for more, or for
+    /// [`deadline`](Self::deadline).
     pub fn on_input(&mut self, now: Instant, bytes: &[u8]) -> InputOutcome {
+        let mut inputs = Vec::new();
+        self.decoder.bytes(bytes, &mut inputs);
+        self.decoder.mark(now);
+        self.on_inputs(now, inputs)
+    }
+
+    /// When an incomplete sequence typed is to be taken as it is (a lone Escape is a key once
+    /// nothing follows it for a moment): call [`on_timeout`](Self::on_timeout) then.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.decoder.deadline()
+    }
+
+    /// The [`deadline`](Self::deadline) passed: what was waiting is taken as it is.
+    pub fn on_timeout(&mut self, now: Instant) -> InputOutcome {
+        if self.decoder.deadline().is_none_or(|d| d > now) {
+            return InputOutcome::Forwarded;
+        }
+        let mut inputs = Vec::new();
+        self.decoder.timeout(&mut inputs);
+        self.on_inputs(now, inputs)
+    }
+
+    /// Take decoded input: the escape prefix (a key whose legacy byte is `Ctrl-^`, from any
+    /// terminal) then `.` quits, then `Ctrl-Z` suspends, then `[` opens the scrollback view, then
+    /// anything else forwards both; the rest is predicted and queued. The terminal's answers to
+    /// the client's own questions are taken here and go no further.
+    pub fn on_inputs(&mut self, now: Instant, inputs: Vec<Input>) -> InputOutcome {
         let mut quit = false;
         let mut suspend = false;
-        let mut fwd: Vec<u8> = Vec::with_capacity(bytes.len());
-        // Bytes for the scrollback view, which go nowhere else.
-        let mut viewed: Vec<u8> = Vec::new();
-        for &b in bytes {
-            if self.pending_escape {
-                self.pending_escape = false;
-                if b == b'.' {
-                    quit = true;
-                    break;
-                }
-                if b == SUSPEND_KEY {
-                    suspend = true;
-                    break;
-                }
-                if b == SCROLLBACK_KEY {
-                    if !self.scrollback.viewing() {
-                        self.scrollback.open();
-                        self.dirty = true;
-                    }
+        let mut fwd: Vec<InputEvent> = Vec::new();
+        // Input for the scrollback view, which goes nowhere else.
+        let mut viewed: Vec<Input> = Vec::new();
+        for input in inputs {
+            match input {
+                Input::Reply(reply) => {
+                    self.on_reply(now, reply);
                     continue;
                 }
-                if self.scrollback.viewing() {
-                    viewed.extend_from_slice(&[ESCAPE_PREFIX, b]);
-                } else {
-                    fwd.push(ESCAPE_PREFIX);
-                    fwd.push(b);
+                Input::PasteTooLong => {
+                    self.notice = Some((PASTE_TOO_LONG.to_owned(), now));
+                    self.dirty = true;
+                    continue;
                 }
-            } else if b == ESCAPE_PREFIX {
-                self.pending_escape = true;
+                Input::Key(_)
+                | Input::Paste(_)
+                | Input::FocusIn
+                | Input::FocusOut
+                | Input::Mouse(_) => {}
+            }
+            let key = match &input {
+                // The prefix is a control: a key without Ctrl can only matter after one.
+                Input::Key(stroke) if stroke.press.mods.ctrl || self.pending_escape.is_some() => {
+                    self.scratch.clear();
+                    key_bytes(
+                        stroke.press.into(),
+                        KeyMode::legacy(false),
+                        &mut self.scratch,
+                    );
+                    Some(self.scratch.as_slice())
+                }
+                Input::Key(_)
+                | Input::Paste(_)
+                | Input::PasteTooLong
+                | Input::FocusIn
+                | Input::FocusOut
+                | Input::Mouse(_)
+                | Input::Reply(_) => None,
+            };
+            if let Some(prefix) = self.pending_escape.take() {
+                match key {
+                    Some(b".") => {
+                        quit = true;
+                        break;
+                    }
+                    Some([SUSPEND_KEY]) => {
+                        suspend = true;
+                        break;
+                    }
+                    Some([SCROLLBACK_KEY]) => {
+                        if !self.scrollback.viewing() {
+                            self.scrollback.open();
+                            self.dirty = true;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                if self.scrollback.viewing() {
+                    viewed.extend([Input::Key(prefix), input]);
+                } else {
+                    fwd.push(InputEvent::Key(prefix.into()));
+                    events_of(input, &mut fwd);
+                }
+            } else if key == Some(&[ESCAPE_PREFIX]) {
+                if let Input::Key(stroke) = input {
+                    self.pending_escape = Some(stroke);
+                }
             } else if self.scrollback.viewing() {
-                viewed.push(b);
-            } else {
-                fwd.push(b);
+                viewed.push(input);
+            } else if !self.input_paused {
+                // While paused, what is typed is dropped: only the escape is looked for.
+                events_of(input, &mut fwd);
             }
         }
         if !viewed.is_empty() {
-            self.scrollback.on_keys(&viewed, self.rows);
+            self.scrollback.on_events(&viewed, self.rows);
             self.dirty = true;
         }
         if quit {
             return InputOutcome::Quit;
         }
-        // Bytes typed before `Ctrl-^ Ctrl-Z` in the same chunk still go out.
+        // Input before `Ctrl-^ Ctrl-Z` in the same read still goes out.
         if !fwd.is_empty() {
-            self.queue_input(now, &fwd);
+            self.queue_events(now, fwd);
         }
         if suspend {
             return InputOutcome::Suspend;
@@ -167,8 +268,46 @@ impl ClientSession {
         InputOutcome::Forwarded
     }
 
-    fn queue_input(&mut self, now: Instant, bytes: &[u8]) {
-        if self.queued_input.saturating_add(bytes.len()) > MAX_QUEUED_INPUT {
+    /// An answer or report from the user's terminal. A new scheme (mode 2031) asks the colours
+    /// again; once the round's last answer (DA1) is in, the server is told them.
+    fn on_reply(&mut self, now: Instant, reply: Reply) {
+        let Some(colours) = self.colours.as_mut() else {
+            return;
+        };
+        match reply {
+            Reply::Scheme(scheme) => {
+                colours.scheme = Some(match scheme {
+                    Scheme::Dark => WireScheme::Dark,
+                    Scheme::Light => WireScheme::Light,
+                });
+                if !self.colours_asked {
+                    self.colours_asked = true;
+                    self.ask.extend_from_slice(COLOUR_QUERIES);
+                    self.decoder.expect(now);
+                }
+            }
+            Reply::Colour { number: 10, rgb } => colours.foreground = Some(narrow(rgb)),
+            Reply::Colour { number: 11, rgb } => colours.background = Some(narrow(rgb)),
+            Reply::Palette { index, rgb } => {
+                if let Some(slot) = colours.palette.get_mut(usize::from(index)) {
+                    *slot = Some(narrow(rgb));
+                }
+            }
+            Reply::Attributes if self.colours_asked => {
+                self.colours_asked = false;
+                self.outgoing.push_back(ClientMsg::Colours(colours.clone()));
+            }
+            Reply::Colour { .. }
+            | Reply::Attributes
+            | Reply::Mode { .. }
+            | Reply::KittyFlags(_)
+            | Reply::UnderlineStyles => {}
+        }
+    }
+
+    fn queue_events(&mut self, now: Instant, events: Vec<InputEvent>) {
+        let size: usize = events.iter().map(InputEvent::wire_len).sum();
+        if self.queued_input.saturating_add(size) > MAX_QUEUED_INPUT {
             // The server is not taking input; queueing more would grow without bound.
             if !self.input_paused {
                 self.input_paused = true;
@@ -176,46 +315,67 @@ impl ClientSession {
             }
             return;
         }
-        // Predictions made now expire with the first input message that carries these bytes.
+        // Predictions made now expire with the first input message that carries these events.
+        let first = events.first().map_or(0, InputEvent::wire_len);
         let seq = match self.outgoing.back() {
-            Some(ClientMsg::Input { seq, bytes: queued })
-                if queued.len().saturating_add(bytes.len()) <= MAX_INPUT_BYTES =>
-            {
-                *seq
-            }
+            Some(ClientMsg::Keys {
+                seq,
+                events: queued,
+            }) if fits(queued, first) => *seq,
             _ => self.last_seq.next(),
         };
         self.predictor.set_local_frame_sent(seq.0.saturating_sub(1));
-        for &b in bytes {
-            self.predictor
-                .new_user_byte(b, self.current.screen.screen());
-        }
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            let appended = match self.outgoing.back_mut() {
-                Some(ClientMsg::Input { bytes: queued, .. }) => {
-                    let room = MAX_INPUT_BYTES.saturating_sub(queued.len());
-                    let (now_part, later) = rest.split_at(room.min(rest.len()));
-                    queued.extend_from_slice(now_part);
-                    rest = later;
-                    !now_part.is_empty()
+        for event in &events {
+            let screen = self.current.screen.screen();
+            match event {
+                InputEvent::Key(key) => self.predictor.new_user_key(key.stroke().press, screen),
+                InputEvent::Mouse(_) | InputEvent::Focus(_) | InputEvent::Paste { .. } => {
+                    self.predictor.new_user_other(screen);
                 }
-                _ => false,
-            };
-            if !appended {
-                let (now_part, later) = rest.split_at(MAX_INPUT_BYTES.min(rest.len()));
-                self.last_seq = self.last_seq.next();
-                self.outgoing.push_back(ClientMsg::Input {
-                    seq: self.last_seq,
-                    bytes: now_part.to_vec(),
-                });
-                rest = later;
             }
         }
-        self.queued_input = self.queued_input.saturating_add(bytes.len());
+        for event in events {
+            match self.outgoing.back_mut() {
+                Some(ClientMsg::Keys { events: queued, .. }) if fits(queued, event.wire_len()) => {
+                    queued.push(event);
+                }
+                _ => {
+                    self.last_seq = self.last_seq.next();
+                    self.outgoing.push_back(ClientMsg::Keys {
+                        seq: self.last_seq,
+                        events: vec![event],
+                    });
+                }
+            }
+        }
+        self.queued_input = self.queued_input.saturating_add(size);
         self.last_nudge = Some(now);
         self.last_activity = Some(now);
         self.dirty = true;
+    }
+
+    /// Questions for the user's terminal the session has (the colours again, after the terminal
+    /// reported a new scheme), for the caller to write.
+    pub fn take_questions(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.ask)
+    }
+
+    /// What the user's terminal said of its colours, to tell the server now and to keep across
+    /// reconnects; `None` if the user turned telling off (`--no-colours`) or the terminal said
+    /// nothing. Known colours are told at once.
+    pub fn set_colours(&mut self, colours: Option<WireColours>) {
+        if let Some(colours) = colours.as_ref().filter(|c| c.known()) {
+            self.outgoing.push_back(ClientMsg::Colours(colours.clone()));
+        }
+        self.colours = colours.map(|mut c| {
+            c.palette.resize(PALETTE, None);
+            c
+        });
+    }
+
+    /// The colours as last learned, for the next connection.
+    pub fn colours(&self) -> Option<WireColours> {
+        self.colours.clone()
     }
 
     /// Queue a new window size; it voids the predictions.
@@ -392,6 +552,13 @@ impl ClientSession {
             _ if self.input_paused => {
                 Some("[koh] input paused — the server is not taking input".to_owned())
             }
+            _ if self
+                .notice
+                .as_ref()
+                .is_some_and(|(_, at)| now.saturating_duration_since(*at) < NOTICE_FOR) =>
+            {
+                self.notice.as_ref().map(|(notice, _)| notice.clone())
+            }
             _ => self.scrollback.status(),
         };
         TickResult {
@@ -408,8 +575,17 @@ impl ClientSession {
     /// Take the next message for the server.
     pub fn pop_outgoing(&mut self) -> Option<ClientMsg> {
         let msg = self.outgoing.pop_front()?;
-        if let ClientMsg::Input { bytes, .. } = &msg {
-            self.queued_input = self.queued_input.saturating_sub(bytes.len());
+        let sent = match &msg {
+            ClientMsg::Input { bytes, .. } => Some(bytes.len()),
+            ClientMsg::Keys { events, .. } => Some(events.iter().map(InputEvent::wire_len).sum()),
+            ClientMsg::Resize(_)
+            | ClientMsg::Ack { .. }
+            | ClientMsg::Resync
+            | ClientMsg::History(_)
+            | ClientMsg::Colours(_) => None,
+        };
+        if let Some(sent) = sent {
+            self.queued_input = self.queued_input.saturating_sub(sent);
             if self.input_paused && self.queued_input == 0 {
                 self.input_paused = false;
                 self.dirty = true;
@@ -477,9 +653,69 @@ impl ClientSession {
     }
 }
 
+/// Whether an event of `len` bytes fits in a queued `Keys` message holding `queued`.
+fn fits(queued: &[InputEvent], len: usize) -> bool {
+    queued.len() < MAX_EVENTS
+        && queued
+            .iter()
+            .map(InputEvent::wire_len)
+            .sum::<usize>()
+            .saturating_add(len)
+            <= MAX_INPUT_BYTES
+}
+
+/// What the server gets for one decoded input. A paste goes with every end marker in it removed,
+/// as often as removing one makes another (so no piece, nor the pieces together, can end the
+/// program's bracket), in pieces of at most [`MAX_PASTE_PIECE`] bytes split between characters.
+fn events_of(input: Input, out: &mut Vec<InputEvent>) {
+    match input {
+        Input::Key(stroke) => out.push(InputEvent::Key(stroke.into())),
+        Input::Mouse(event) => out.push(InputEvent::Mouse(event.into())),
+        Input::FocusIn => out.push(InputEvent::Focus(true)),
+        Input::FocusOut => out.push(InputEvent::Focus(false)),
+        Input::Paste(text) => {
+            let mut framed = Vec::with_capacity(text.len().saturating_add(12));
+            paste(&text, true, &mut framed);
+            let inner = framed
+                .get(PASTE_START.len()..framed.len().saturating_sub(PASTE_END.len()))
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(inner);
+            let mut rest: &str = &text;
+            let mut first = true;
+            loop {
+                let mut cut = rest.len().min(MAX_PASTE_PIECE);
+                while !rest.is_char_boundary(cut) {
+                    cut = cut.saturating_sub(1);
+                }
+                let (piece, after) = rest.split_at(cut);
+                out.push(InputEvent::Paste {
+                    text: piece.to_owned(),
+                    first,
+                    last: after.is_empty(),
+                });
+                first = false;
+                rest = after;
+                if rest.is_empty() {
+                    break;
+                }
+            }
+        }
+        Input::PasteTooLong | Input::Reply(_) => {}
+    }
+}
+
+/// A key's legacy bytes, in normal cursor mode: its one form, which the escape prefix and its keys
+/// are matched against whatever the user's terminal sent.
+pub fn legacy_bytes(press: KeyPress) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8);
+    key_bytes(press.into(), KeyMode::legacy(false), &mut bytes);
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{WireKey, WireKeyCode, WireMouse};
     use crate::terminal::ServerTerminal;
 
     fn start() -> (Instant, ClientSession) {
@@ -513,18 +749,34 @@ mod tests {
         std::iter::from_fn(|| s.pop_outgoing()).collect()
     }
 
+    /// What a legacy program with nothing set gets for the input sent: keys as their legacy
+    /// bytes, pastes as their text.
     fn typed(msgs: &[ClientMsg]) -> Vec<u8> {
-        msgs.iter()
-            .filter_map(|m| match m {
-                ClientMsg::Input { bytes, .. } => Some(bytes.as_slice()),
+        let mut out = Vec::new();
+        for m in msgs {
+            match m {
+                ClientMsg::Input { bytes, .. } => out.extend_from_slice(bytes),
+                ClientMsg::Keys { events, .. } => {
+                    for event in events {
+                        match event {
+                            InputEvent::Key(key) => {
+                                out.extend_from_slice(&legacy_bytes(key.stroke().press));
+                            }
+                            InputEvent::Paste { text, .. } => {
+                                out.extend_from_slice(text.as_bytes());
+                            }
+                            InputEvent::Mouse(_) | InputEvent::Focus(_) => {}
+                        }
+                    }
+                }
                 ClientMsg::Resize(_)
                 | ClientMsg::Ack { .. }
                 | ClientMsg::Resync
-                | ClientMsg::History(_) => None,
-            })
-            .flatten()
-            .copied()
-            .collect()
+                | ClientMsg::History(_)
+                | ClientMsg::Colours(_) => {}
+            }
+        }
+        out
     }
 
     #[test]
@@ -577,25 +829,58 @@ mod tests {
         let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
         let paste: Vec<u8> = (0..200_000u32).map(|i| b'a' + (i % 26) as u8).collect();
         s.on_input(now, b"first");
-        s.on_input(now, &paste);
+        // A paste, bracketed by the terminal, goes in pieces; keys typed unbracketed, as events.
+        s.on_input(now, &[&b"\x1b[200~"[..], &paste, b"\x1b[201~"].concat());
+        s.on_input(now, &paste[..5000]);
         let msgs = drain(&mut s);
         let inputs: Vec<(InputSeq, usize)> = msgs
             .iter()
             .filter_map(|m| match m {
-                ClientMsg::Input { seq, bytes } => Some((*seq, bytes.len())),
-                ClientMsg::Resize(_)
+                ClientMsg::Keys { seq, events } => Some((*seq, events.len())),
+                ClientMsg::Input { .. }
+                | ClientMsg::Resize(_)
                 | ClientMsg::Ack { .. }
                 | ClientMsg::Resync
-                | ClientMsg::History(_) => None,
+                | ClientMsg::History(_)
+                | ClientMsg::Colours(_) => None,
             })
             .collect();
-        assert!(inputs.iter().all(|&(_, len)| len <= MAX_INPUT_BYTES));
+        assert!(inputs.iter().all(|&(_, len)| len <= MAX_EVENTS));
         let seqs: Vec<u64> = inputs.iter().map(|(seq, _)| seq.0).collect();
         assert_eq!(
             seqs,
             (1..=u64::try_from(seqs.len()).unwrap()).collect::<Vec<_>>()
         );
-        assert_eq!(typed(&msgs), [b"first".as_slice(), &paste].concat());
+        assert_eq!(
+            typed(&msgs),
+            [b"first".as_slice(), &paste, &paste[..5000]].concat()
+        );
+        let pieces: Vec<(usize, bool, bool)> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                ClientMsg::Keys { events, .. } => Some(events),
+                ClientMsg::Input { .. }
+                | ClientMsg::Resize(_)
+                | ClientMsg::Ack { .. }
+                | ClientMsg::Resync
+                | ClientMsg::History(_)
+                | ClientMsg::Colours(_) => None,
+            })
+            .flatten()
+            .filter_map(|e| match e {
+                InputEvent::Paste { text, first, last } => Some((text.len(), *first, *last)),
+                InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Focus(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            pieces,
+            [
+                (MAX_PASTE_PIECE, true, false),
+                (MAX_PASTE_PIECE, false, false),
+                (MAX_PASTE_PIECE, false, false),
+                (200_000 - 3 * MAX_PASTE_PIECE, false, true)
+            ]
+        );
     }
 
     #[test]
@@ -603,7 +888,13 @@ mod tests {
         // Queueing, not prediction, is under test; skip predicting a megabyte byte by byte.
         let now = Instant::now();
         let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
-        let chunk = vec![b'z'; MAX_INPUT_BYTES];
+        // Pastes, as a terminal in bracketed paste sends them.
+        let chunk = [
+            &b"\x1b[200~"[..],
+            &vec![b'z'; MAX_INPUT_BYTES],
+            b"\x1b[201~",
+        ]
+        .concat();
         for _ in 0..MAX_QUEUED_INPUT.div_euclid(MAX_INPUT_BYTES) {
             s.on_input(now, &chunk);
         }
@@ -910,14 +1201,205 @@ mod tests {
             drain(&mut s),
             [
                 ClientMsg::Resize(Size::new(40, 120)),
-                ClientMsg::Input {
+                ClientMsg::Keys {
                     seq: InputSeq(1),
-                    bytes: b"a".to_vec()
+                    events: vec![InputEvent::Key(WireKey {
+                        key: WireKeyCode::Char('a'),
+                        mods: 0,
+                        kitty: None,
+                    })],
                 },
                 ClientMsg::Resize(Size::new(50, 132)),
             ]
         );
         assert!(s.overlay().is_empty(), "a resize drops predictions");
         assert!(s.dirty);
+    }
+
+    /// The events sent, in order.
+    fn events(msgs: &[ClientMsg]) -> Vec<InputEvent> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                ClientMsg::Keys { events, .. } => Some(events.clone()),
+                ClientMsg::Input { .. }
+                | ClientMsg::Resize(_)
+                | ClientMsg::Ack { .. }
+                | ClientMsg::Resync
+                | ClientMsg::History(_)
+                | ClientMsg::Colours(_) => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn key(press: &str) -> InputEvent {
+        InputEvent::Key(WireKey::from(Keystroke::from(
+            press.parse::<KeyPress>().expect("a key name"),
+        )))
+    }
+
+    #[test]
+    fn a_kitty_terminals_keys_go_as_it_told_them() {
+        let (now, mut s) = start();
+        drain(&mut s);
+        // Ctrl-I and Tab, which legacy bytes cannot tell apart, and Shift-Enter.
+        s.on_input(now, b"\x1b[105;5u\t\x1b[13;2u");
+        let sent = events(&drain(&mut s));
+        assert_eq!(sent.len(), 3);
+        let InputEvent::Key(ctrl_i) = sent[0] else {
+            panic!("{sent:?}")
+        };
+        assert_eq!(ctrl_i.key, WireKeyCode::Char('i'));
+        assert_eq!(ctrl_i.mods, 4);
+        assert_eq!(sent[1], key("Tab"));
+        let InputEvent::Key(shift_enter) = sent[2] else {
+            panic!("{sent:?}")
+        };
+        assert_eq!((shift_enter.key, shift_enter.mods), (WireKeyCode::Enter, 1));
+    }
+
+    #[test]
+    fn the_escape_prefix_works_from_a_kitty_terminal() {
+        let (now, mut s) = start();
+        // Ctrl-6 is the prefix from a kitty terminal, `.` quits.
+        assert_eq!(s.on_input(now, b"\x1b[54;5u."), InputOutcome::Quit);
+        let (now, mut s) = start();
+        assert_eq!(
+            s.on_input(now, b"\x1b[54;5u\x1b[122;5u"),
+            InputOutcome::Suspend
+        );
+        // The prefix and another key: both go on, the prefix as it was typed.
+        let (now, mut s) = start();
+        drain(&mut s);
+        s.on_input(now, b"\x1b[54;5ux");
+        let sent = events(&drain(&mut s));
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1], key("x"));
+    }
+
+    #[test]
+    fn mouse_and_focus_go_as_events_and_a_lone_escape_after_its_wait() {
+        let (now, mut s) = start();
+        drain(&mut s);
+        s.on_input(now, b"\x1b[<0;10;5M\x1b[I\x1b[O");
+        let sent = events(&drain(&mut s));
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [
+                    InputEvent::Mouse(WireMouse { row: 4, col: 9, .. }),
+                    InputEvent::Focus(true),
+                    InputEvent::Focus(false)
+                ]
+            ),
+            "{sent:?}"
+        );
+        // A lone Escape may begin a sequence: it waits for its deadline, then goes.
+        s.on_input(now, b"\x1b");
+        assert_eq!(events(&drain(&mut s)), []);
+        let deadline = s.deadline().expect("waiting on the Escape");
+        assert_eq!(s.on_timeout(now), InputOutcome::Forwarded);
+        assert!(events(&drain(&mut s)).is_empty(), "not before the deadline");
+        s.on_timeout(deadline);
+        assert_eq!(events(&drain(&mut s)), [key("Escape")]);
+        assert_eq!(s.deadline(), None);
+    }
+
+    #[test]
+    fn the_scrollback_view_takes_decoded_keys_and_the_wheel() {
+        let (now, mut s) = start();
+        s.scrollback.on_mark(crate::terminal::HistoryMark {
+            newest: 1000,
+            len: 100,
+        });
+        s.on_input(now, &[ESCAPE_PREFIX, SCROLLBACK_KEY]);
+        assert!(s.view().is_some());
+        drain(&mut s);
+        // From a kitty terminal: Page Up as `CSI 5 ~`, the wheel, `q` to leave.
+        s.on_input(now, b"\x1b[5~\x1b[<64;1;1M");
+        assert_eq!(s.scrollback.offset(), Some(26));
+        s.on_input(now, b"q");
+        assert!(s.view().is_none());
+        assert!(
+            events(&drain(&mut s)).is_empty(),
+            "the view's keys go nowhere else"
+        );
+    }
+
+    #[test]
+    fn colours_are_told_on_connecting_and_again_on_a_new_scheme() {
+        let (now, mut s) = start();
+        let colours = WireColours {
+            background: Some([0x1e, 0x1e, 0x20]),
+            scheme: Some(WireScheme::Dark),
+            ..WireColours::default()
+        };
+        s.set_colours(Some(colours.clone()));
+        let sent = drain(&mut s);
+        assert_eq!(sent.get(1), Some(&ClientMsg::Colours(colours)));
+        // The terminal reports a light scheme: its colours are asked again, and told once DA1,
+        // the round's last answer, is in.
+        s.on_input(now, b"\x1b[?997;2n");
+        assert_eq!(s.take_questions(), COLOUR_QUERIES);
+        assert_eq!(drain(&mut s), []);
+        s.on_input(
+            now,
+            b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b]4;1;rgb:cd/00/00\x07\x1b[?62c",
+        );
+        let told = drain(&mut s);
+        let [ClientMsg::Colours(told)] = told.as_slice() else {
+            panic!("{told:?}")
+        };
+        assert_eq!(told.background, Some([0xff, 0xff, 0xff]));
+        assert_eq!(told.scheme, Some(WireScheme::Light));
+        assert_eq!(told.palette.get(1), Some(&Some([0xcd, 0, 0])));
+        assert_eq!(s.colours().as_ref(), Some(told));
+        // Not told, nothing is asked or sent.
+        let (now, mut s) = start();
+        s.set_colours(None);
+        s.on_input(now, b"\x1b[?997;2n");
+        assert_eq!(s.take_questions(), b"");
+        assert_eq!(drain(&mut s), [ClientMsg::Resize(Size::new(24, 80))]);
+    }
+
+    #[test]
+    fn a_paste_too_long_is_dropped_and_said() {
+        let (now, mut s) = start();
+        drain(&mut s);
+        let long = [
+            &b"\x1b[200~"[..],
+            &vec![b'x'; MAX_QUEUED_INPUT + 1],
+            b"\x1b[201~k",
+        ]
+        .concat();
+        s.on_input(now, &long);
+        assert_eq!(events(&drain(&mut s)), [key("k")]);
+        let status = s.on_tick(now, None).status.expect("a notice");
+        assert!(status.contains("paste over 1 MiB"), "{status}");
+        assert!(s
+            .on_tick(now + NOTICE_FOR, None)
+            .status
+            .is_none_or(|s| !s.contains("paste")));
+    }
+
+    /// fux-vt's decoder ends a paste at `ESC [ 201 ~`; the C1 form of it, U+009B `201~`, can be in
+    /// a paste's text, and the client removes it (as often as removing one makes another) before
+    /// the paste leaves.
+    #[test]
+    fn a_pastes_end_markers_are_removed_before_it_is_sent() {
+        let (now, mut s) = start();
+        drain(&mut s);
+        s.on_input(
+            now,
+            "\x1b[200~a\u{9b}201~b\u{9b}20\u{9b}201~1~c\x1b[201~".as_bytes(),
+        );
+        assert_eq!(
+            events(&drain(&mut s)),
+            [InputEvent::Paste {
+                text: "abc".to_owned(),
+                first: true,
+                last: true
+            }]
+        );
     }
 }

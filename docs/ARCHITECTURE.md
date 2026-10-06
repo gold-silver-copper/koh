@@ -58,10 +58,27 @@ clear error. After the handshake the server checks the allowlist and opens a bi-
 ADMIT byte, so a rejected client can tell "not authorized" from a network error. Then
 (`src/proto.rs`):
 
-- **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Input { seq,
-  bytes }` (at most 64 KiB; a paste is split), `Resize`, `Resync` when a frame's base is unknown,
-  `History { newest, count }` for scrollback rows, and `Ack { frame }`, now only a nudge (below).
+- **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Keys { seq,
+  events }`, the input the client decoded (`src/events.rs`: keys, mouse events, focus changes and
+  paste pieces, at most 512 a message), `Input { seq, bytes }`, raw bytes the server forwards as they
+  are (at most 64 KiB; the client sends none now), `Resize`, `Resync` when a frame's base is
+  unknown, `History { newest, count }` for scrollback rows, `Ack { frame }`, now only a nudge
+  (below), and `Colours`, the user's terminal's colours, on each connection unless `--no-colours`.
   `seq` numbers each input on the connection.
+- **Input is decoded on the client and encoded on the server.** The client reads what the user's
+  terminal sends with fux-vt's decoder (legacy bytes, xterm's modifiers, the kitty keyboard
+  protocol, which it pushes in a terminal that speaks it, SGR mouse reports, focus changes,
+  bracketed pastes) and sends events; the session encodes each with fux-vt for the program's modes
+  at that moment (`ServerTerminal::encode_input`: the kitty flags, modifyOtherKeys and cursor keys;
+  the mouse tracking mode and encoding; mode 1004; bracketed paste, framed once over a paste's
+  pieces with every end marker removed). A program gets what it asked for from any terminal, and a
+  reattach from another terminal changes nothing for it. The client keeps the user's terminal in
+  the modes it decodes in rather than mirroring the program's: bracketed paste and focus reporting
+  on, normal cursor keys and keypad, SGR mouse reports while the program wants the mouse.
+- **Colours.** The client asks its terminal's foreground, background, palette 0–15 and scheme at
+  start-up (and again when the terminal reports a new scheme, mode 2031) and tells the server; the
+  server's terminal answers programs' OSC 10, OSC 11 and `CSI ? 996 n` from them, and sends a
+  program that subscribed to mode 2031 the new scheme when a client brings one.
 - **Server to client: one uni stream per message**: a tag byte, then for a frame its base's number
   and the frame (`num`, `base`, `echo_ack` and a `ScreenDiff` from frame `base` to frame `num`)
   DEFLATE-compressed against the base screen's dictionary; for history rows, the rows compressed.

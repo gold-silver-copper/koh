@@ -253,6 +253,7 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
         connector,
         DisplayPreference::Never,
         start,
+        None,
         input_rx,
         resize_rx,
         terminal,
@@ -282,7 +283,10 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
             .process(output)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         if index > 0 {
-            input.send(vec![0x01]).await?;
+            // Pasted, as the user's terminal brackets it: a paste reaches the program as its
+            // bytes whatever keyboard mode the recording set (Ctrl-A typed would be `CSI 97;5u`
+            // to one that pushed kitty flags), framed or not, and the script skips the frame.
+            input.send(b"\x1b[200~\x01\x1b[201~".to_vec()).await?;
         }
         let deadline = tokio::time::Instant::now()
             .checked_add(STEP)

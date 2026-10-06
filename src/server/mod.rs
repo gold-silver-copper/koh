@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::events::{InputEvent, WireColours};
 use crate::proto::{
     encode_history, retry_after, ClientDecoder, ClientMsg, Frame, FrameEncoder, FrameNum,
     FrameScreen, InputSeq, ProtoError, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
@@ -158,11 +159,22 @@ impl EchoAck {
     }
 }
 
+/// Input for the session, in the order the client sent it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ToSession {
+    /// Raw bytes ([`ClientMsg::Input`]), DECCKM-normalized.
+    Bytes(Vec<u8>),
+    /// Decoded input ([`ClientMsg::Keys`]), which the session encodes as its program asked.
+    Events(Vec<InputEvent>),
+    /// What the user's terminal said of its colours.
+    Colours(WireColours),
+}
+
 /// The client input one read made ready for the PTY.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Drained {
-    /// Keystrokes, DECCKM-normalized, in order.
-    keys: Vec<u8>,
+    /// The input, in order; neighbours of one kind merged.
+    input: Vec<ToSession>,
     /// The last resize, clamped. Earlier ones in a read would have no visible effect, only costs.
     resize: Option<Size>,
 }
@@ -316,9 +328,21 @@ impl ServerConn {
             match msg {
                 ClientMsg::Input { seq, bytes } => {
                     self.echo.register(seq, now);
-                    self.cursor_keys
-                        .normalize_into(&bytes, app_cursor, &mut drained.keys);
+                    if !matches!(drained.input.last(), Some(ToSession::Bytes(_))) {
+                        drained.input.push(ToSession::Bytes(Vec::new()));
+                    }
+                    if let Some(ToSession::Bytes(keys)) = drained.input.last_mut() {
+                        self.cursor_keys.normalize_into(&bytes, app_cursor, keys);
+                    }
                 }
+                ClientMsg::Keys { seq, events } => {
+                    self.echo.register(seq, now);
+                    match drained.input.last_mut() {
+                        Some(ToSession::Events(queued)) => queued.extend(events),
+                        _ => drained.input.push(ToSession::Events(events)),
+                    }
+                }
+                ClientMsg::Colours(colours) => drained.input.push(ToSession::Colours(colours)),
                 ClientMsg::Resize(size) => {
                     drained.resize = Some(crate::terminal::clamp_dims(size));
                 }
@@ -685,8 +709,8 @@ pub async fn run_attached(
                     match core.drain_client(Instant::now(), app_cursor) {
                         Ok(drained) => {
                             // A full input queue stops reading, so QUIC pushes back on the client.
-                            if !drained.keys.is_empty() {
-                                session.send_keys(drained.keys).await;
+                            for input in drained.input {
+                                session.send_input(input).await;
                             }
                             if let Some(size) = drained.resize {
                                 session.send_resize(size).await;
@@ -861,7 +885,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        distinct_cells, CursorKeyNormalizer, Drained, EchoAck, ServerConn, FINAL_ACK_WAIT,
+        distinct_cells, CursorKeyNormalizer, Drained, EchoAck, ServerConn, ToSession,
+        FINAL_ACK_WAIT,
     };
     use crate::proto::{
         encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_FLOOR,
@@ -937,7 +962,7 @@ mod tests {
         assert_eq!(
             drained,
             Drained {
-                keys: b"ab\x1b[Aef".to_vec(),
+                input: vec![ToSession::Bytes(b"ab\x1b[Aef".to_vec())],
                 resize: Some(crate::terminal::clamp_dims(Size::new(65000, 1))),
             }
         );
@@ -1058,15 +1083,18 @@ mod tests {
         }]);
         let (first, rest) = bytes.split_at(3);
         conn.push_client_bytes(first);
-        assert_eq!(conn.drain_client(Instant::now(), false).unwrap().keys, b"");
+        assert_eq!(
+            conn.drain_client(Instant::now(), false).unwrap().input,
+            vec![]
+        );
         assert!(
             conn.finish_client().is_err(),
             "the stream ended inside a message"
         );
         conn.push_client_bytes(rest);
         assert_eq!(
-            conn.drain_client(Instant::now(), false).unwrap().keys,
-            b"hello"
+            conn.drain_client(Instant::now(), false).unwrap().input,
+            vec![ToSession::Bytes(b"hello".to_vec())]
         );
         assert!(conn.finish_client().is_ok());
     }

@@ -4,6 +4,10 @@
 //! captured by running the encoder, not written by hand. A change to the wire must change these
 //! bytes in the same commit, deliberately.
 
+use koh::events::{
+    InputEvent, WireButton, WireColours, WireKey, WireKeyCode, WireKitty, WireMouse,
+    WireMouseAction, WireScheme,
+};
 use koh::proto::{
     decode_frame, decode_server, encode_client, encode_frame, encode_history, ClientDecoder,
     ClientMsg, Frame, FrameNum, InputSeq, ServerMsg,
@@ -137,6 +141,45 @@ fn client_msgs() -> Vec<ClientMsg> {
             newest: 70_000,
             count: 256,
         }),
+        ClientMsg::Keys {
+            seq: InputSeq(2),
+            events: vec![
+                InputEvent::Key(WireKey {
+                    key: WireKeyCode::Char('é'),
+                    mods: 5,
+                    kitty: None,
+                }),
+                InputEvent::Key(WireKey {
+                    key: WireKeyCode::F(12),
+                    mods: 0,
+                    kitty: Some(WireKitty {
+                        code: Some(57_399),
+                        shifted: Some(65),
+                        base: None,
+                        mods: 0x84,
+                    }),
+                }),
+                InputEvent::Mouse(WireMouse {
+                    action: WireMouseAction::Release,
+                    button: Some(WireButton::WheelDown),
+                    mods: 2,
+                    row: 300,
+                    col: 7,
+                }),
+                InputEvent::Focus(true),
+                InputEvent::Paste {
+                    text: "hi".to_owned(),
+                    first: true,
+                    last: false,
+                },
+            ],
+        },
+        ClientMsg::Colours(WireColours {
+            foreground: Some([0xdd, 0xdd, 0xdd]),
+            background: None,
+            palette: vec![None, Some([0xcd, 0, 0])],
+            scheme: Some(WireScheme::Light),
+        }),
     ]
 }
 
@@ -210,7 +253,7 @@ const MODES: [&str; 8] = [
 ];
 
 /// Each of [`client_msgs`] as the client's stream carries it, length prefix included.
-const CLIENT_MSGS: [&str; 7] = [
+const CLIENT_MSGS: [&str; 9] = [
     "0000000a0001076c73202d6c610d",
     "000000cd00ac02c801000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324\
         25262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152\
@@ -222,6 +265,8 @@ const CLIENT_MSGS: [&str; 7] = [
     "0000000402f0a204",
     "0000000103",
     "0000000604f0a2048002",
+    "00000027050205000002c3a90500000f0c000101b7c003014100840101010402ac02070201030268690100",
+    "0000000e0601dddddd00020001cd00000101",
 ];
 
 /// The postcard encoding of [`scrolled_frame`].

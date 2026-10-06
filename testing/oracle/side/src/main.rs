@@ -137,7 +137,18 @@ impl Session {
             }
             "frame" => self.frame(arg()? == "1", out)?,
             "keys" => {
-                let outcome = self.client.on_input(self.now(), &unhex(arg()?)?);
+                #[allow(unused_mut)]
+                let mut outcome = self.client.on_input(self.now(), &unhex(arg()?)?);
+                // A client that decodes input holds a sequence that may go on (a lone Escape)
+                // until its deadline; one that forwarded bytes sent it at once. The step is all
+                // that was typed, so its deadline is taken as passed.
+                #[cfg(koh_input_events)]
+                if let Some(deadline) = self.client.deadline() {
+                    let flushed = self.client.on_timeout(deadline);
+                    if format!("{outcome:?}") == "Forwarded" {
+                        outcome = flushed;
+                    }
+                }
                 let _ = writeln!(out, "outcome {outcome:?}");
             }
             "tick" => {
@@ -208,6 +219,21 @@ impl Session {
     /// Deliver the client's messages to the server.
     fn drain(&mut self, out: &mut String) {
         while let Some(msg) = self.client.pop_outgoing() {
+            // Decoded input, as the bytes a client that forwarded them sent: what the user's
+            // terminal sent, each key in its one legacy form (the oracle gives both sides keys in
+            // that form). The terminal's colours go to the server alone.
+            #[cfg(koh_input_events)]
+            let msg = match msg {
+                ClientMsg::Keys { seq, events } => ClientMsg::Input {
+                    seq,
+                    bytes: events
+                        .iter()
+                        .flat_map(koh::events::InputEvent::sent_by_a_legacy_terminal)
+                        .collect(),
+                },
+                ClientMsg::Colours(_) => continue,
+                other => other,
+            };
             let line = format!("{msg:?}");
             // Scrollback requests are new (a side at an older commit has none), and change
             // nothing the user's terminal shows until the user opens the view. Acknowledgements

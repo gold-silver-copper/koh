@@ -17,7 +17,13 @@ service.
 
 1. **Malicious / compromised client** — a peer that dials the server. If it is on the allowlist it
    reaches the koh/3 data plane: it sends arbitrary input, resize, ack and resync messages and opens
-   streams.
+   streams. Input comes as raw bytes (`Input`) or decoded events (`Keys`: keys, mouse events, focus
+   changes, paste pieces); decoding refuses what no terminal sends (a modifier bit no key has, a
+   function key past F12, a kitty code that is no Unicode scalar, a paste piece over 60 KiB, more
+   than 512 events, more than 16 palette entries in `Colours`) and closes the connection. The server
+   encodes events with fux-vt for the program's modes; a paste's end markers are removed from every
+   piece, so even a hostile client cannot end a program's bracketed paste early with paste text
+   (it can type anything else, as any client can).
    **Goal it must be denied:** crash / OOM / hang the server, bypass a cap, or escape the admission
    gauntlet. The server is the high-value target (it runs a shell).
 2. **Malicious / compromised server** — a server a client dials (a wrong/typo'd node-id, or a popped
@@ -54,9 +60,26 @@ service.
    faster than the link takes: requests are answered one at a time, each once the last is
    delivered, and more than 8 waiting closes the connection.
    **Questions to the user's terminal:** the client asks it one set of questions, itself, once at
-   start-up (whether it draws underline styles, and its device attributes, `client::probe`), and
-   reads the answers out of stdin before the session starts; nothing a server sends makes the
-   client ask the terminal anything, and the answers never reach the server.
+   start-up (`client::probe`: whether it draws underline styles, whether it speaks the kitty
+   keyboard protocol, its colour scheme, its foreground, background and palette entries 0 to 15, and
+   its device attributes), and reads the answers out of stdin before the session starts. It asks
+   the colours again only when its own terminal reports a new scheme (mode 2031). Nothing a server
+   sends makes the client ask the terminal anything.
+   **The user's colours:** unless `koh connect --no-colours`, the client tells the server the
+   colours its terminal answered (`Colours`: foreground, background, palette 0–15, dark or light),
+   on every connection; the server answers programs' OSC 10, OSC 11 and `CSI ? 996 n` from them, so
+   vim, bat and delta pick a matching theme. That tells the server the user's theme, a small
+   fingerprint, to a server the user chose to connect to; the answers go to the program, never to
+   the user's terminal, and a program asking a thousand times is answered from the server's copy,
+   never by asking the user's terminal again. The underline and keyboard answers stay on the
+   client.
+   **The user's terminal's modes:** the client sets them itself and resets them on leaving and on
+   suspend: bracketed paste and focus reporting while it runs (so pastes arrive whole and focus
+   changes at all), mouse reporting in SGR while the program asks for any or the scrollback view is
+   open, kitty's disambiguate and alternate keys pushed (`CSI > 5 u`, popped with `CSI < u`) if
+   the terminal speaks the protocol, and scheme reports (mode 2031) if it reports a scheme. A
+   server's modes are no longer mirrored for their own sake: nothing it sends sets the user's
+   keyboard flags or leaves a mode set.
 3. **Network / MITM** — QUIC + TLS 1.3 (via iroh) give transport encryption and node-id
    authentication by construction (no TOFU window). Considered: replay, and connection-level tamper.
 4. **Local attacker** — another uid on the same host. Targets: the identity key file, the state dir,

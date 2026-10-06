@@ -38,6 +38,8 @@ Useful flags:
 ```sh
 --no-clipboard            # ignore the server's OSC-52 clipboard writes (on by default)
 --no-hyperlinks           # paint the server's hyperlinks as plain text (links on by default)
+--no-colours              # don't tell the server your terminal's colours (told by default, so
+                          # vim, bat and delta pick a matching theme)
 --on-bell <cmd>           # run a shell command whenever the remote bell rings
 --shell <program>         # host a program instead of the login shell (repeat to pass args)
 --key-file <path>         # use a custom identity-key path
@@ -47,6 +49,11 @@ Useful flags:
 ```
 
 Keys live under `~/.config/koh/` by default.
+
+**Keys, mouse and pastes** reach the remote program as it asked, whatever terminal you type on: the
+client decodes what your terminal sends (it turns on the kitty keyboard protocol in a terminal that
+speaks it, so Ctrl-I and Tab, or Shift-Enter and Enter, stay apart) and the server encodes each key
+for the program, kitty's encoding to nvim or helix, legacy bytes to the rest.
 
 **Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
 

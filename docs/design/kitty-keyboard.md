@@ -1,6 +1,6 @@
 # Design note: the kitty keyboard protocol
 
-Status: proposed, not built. Phase 4 of `koh-next-prompt.md` asks for this note before any work.
+Status: built, as below (see "As built" at the end for where it differs).
 
 ## What happens today
 
@@ -81,3 +81,27 @@ modifier presses predict nothing. The predictor's epoch rules do not change.
   as different keys (`:map` them to different commands and look at the screen), from a client
   whose terminal speaks the protocol and from one that does not.
 - **The oracle:** exempt keys sent to a program that pushed flags, until the base has this.
+
+## As built
+
+- The design holds, and goes further: mouse events, focus changes and pastes are decoded and
+  encoded the same way (`ClientMsg::Keys` carries `InputEvent`s: keys, mouse, focus, paste
+  pieces). A paste goes as events rather than as `Input` bytes, because the server must know it is
+  a paste to frame it once for a program with bracketed paste; the client removes its end markers
+  over the whole paste and splits it into pieces of at most 60 KiB, the server removes them again
+  from each piece and frames the whole. `Input` stays on the wire for raw bytes; the client sends
+  none.
+- The decoder and the encoders are fux-vt's (`fux_vt::keys`, 0.3.2), moved there from fux with
+  this work, beside new mouse, focus and paste encoders; fux-vt's compare suite holds each beside
+  libghostty-vt's.
+- The client stops mirroring the program's cursor-key, keypad, bracketed-paste and mouse-encoding
+  modes: the user's terminal stays in normal cursor and keypad mode with bracketed paste and focus
+  reporting on, and reports the mouse in SGR while the program wants it (or the scrollback view is
+  open). The server's cursor-key normalizer stays, for `Input` bytes.
+- The escape prefix is a key whose legacy byte is `Ctrl-^`, from either kind of terminal; a lone
+  Escape is a key once 35 ms pass without more (at once from a kitty-protocol terminal, which sends
+  it as `CSI 27 u`).
+- The predictor reads each key in its legacy form (`PredictionEngine::new_user_key`), and treats a
+  mouse event, a focus change or a paste as input it does not model.
+- The oracle compares keys in their legacy form and exempts what the server's terminal now answers
+  (`testing/oracle/driver/src/exempt.rs`).

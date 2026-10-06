@@ -1,0 +1,13 @@
+diff --git i/src/client/session.rs w/src/client/session.rs
+index fbb282e..331bad1 100644
+--- i/src/client/session.rs
++++ w/src/client/session.rs
+@@ -669,6 +669,8 @@ fn fits(queued: &[InputEvent], len: usize) -> bool {
+ /// program's bracket), in pieces of at most [`MAX_PASTE_PIECE`] bytes split between characters.
+ fn events_of(input: Input, out: &mut Vec<InputEvent>) {
+     match input {
++        // PLANTED: Backspace is never sent.
++        Input::Key(stroke) if stroke.press.key == fux_vt::keys::Key::Backspace => {}
+         Input::Key(stroke) => out.push(InputEvent::Key(stroke.into())),
+         Input::Mouse(event) => out.push(InputEvent::Mouse(event.into())),
+         Input::FocusIn => out.push(InputEvent::Focus(true)),

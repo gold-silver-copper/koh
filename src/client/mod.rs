@@ -7,7 +7,7 @@
 pub mod backend;
 pub mod cli;
 mod io;
-mod probe;
+pub mod probe;
 mod render;
 mod scrollback;
 mod session;
@@ -24,6 +24,7 @@ use crate::predict::{DisplayPreference, Overlay};
 use crate::proto::{decode_server, encode_client, ServerMsg, MAX_FRAME, SESSION_ENDED};
 use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::ALPN;
+use fux_vt::keys::decode::{Decoder, Input};
 use iroh::endpoint::{Connection, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
@@ -159,16 +160,23 @@ const fn next_attempt_after_drop(attempt: u32, dwell: Duration) -> u32 {
     }
 }
 
-/// Whether `chunk` completes the quit escape (`Ctrl-^ .`) while reconnecting, as
-/// [`ClientSession`]'s escape machine would; `pending` carries a lone prefix across chunks.
-fn escape_quit(chunk: &[u8], pending: &mut bool) -> bool {
-    for &b in chunk {
+/// Whether `chunk`, decoded by `decoder`, completes the quit escape (`Ctrl-^ .`) while
+/// reconnecting, as [`ClientSession`]'s escape machine would, whatever the terminal sent for the
+/// keys; `pending` carries a lone prefix across chunks.
+fn escape_quit(chunk: &[u8], decoder: &mut Decoder, pending: &mut bool) -> bool {
+    let mut inputs = Vec::new();
+    decoder.bytes(chunk, &mut inputs);
+    for input in inputs {
+        let Input::Key(stroke) = input else {
+            continue;
+        };
+        let key = session::legacy_bytes(stroke.press);
         if *pending {
             *pending = false;
-            if b == b'.' {
+            if key == b"." {
                 return true;
             }
-        } else if b == ESCAPE_PREFIX {
+        } else if key == [ESCAPE_PREFIX] {
             *pending = true;
         }
     }
@@ -209,6 +217,12 @@ pub trait ClientTerminal {
     fn suspend_resume(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Ask the user's terminal `questions` (the session's: its colours again, after it reported a
+    /// new scheme). Default: a no-op, for a terminal that answers nothing.
+    fn ask(&mut self, _questions: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// This process's pid, as the signal calls take it.
@@ -227,6 +241,43 @@ pub struct BackendTerminal<B: KohBackend> {
     oob: render::OutOfBand,
     /// What the terminal was last painted with, so a frame paints only what changed.
     painter: render::Painter,
+    /// What the client turned on in the user's terminal beside the input modes, which it turns
+    /// off again on leaving and on suspend: kitty's disambiguate and alternate keys, pushed, and
+    /// scheme reports (mode 2031).
+    extras: Extras,
+}
+
+/// What the client turns on in a terminal that speaks it, beside the input modes.
+#[derive(Debug, Clone, Copy, Default)]
+struct Extras {
+    kitty: bool,
+    scheme_reports: bool,
+}
+
+impl Extras {
+    /// The bytes turning them on.
+    fn on(self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.kitty {
+            out.extend_from_slice(b"\x1b[>5u");
+        }
+        if self.scheme_reports {
+            out.extend_from_slice(b"\x1b[?2031h");
+        }
+        out
+    }
+
+    /// The bytes turning them off: the push popped.
+    fn off(self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.kitty {
+            out.extend_from_slice(b"\x1b[<u");
+        }
+        if self.scheme_reports {
+            out.extend_from_slice(b"\x1b[?2031l");
+        }
+        out
+    }
 }
 
 impl<B: KohBackend> BackendTerminal<B> {
@@ -239,9 +290,20 @@ impl<B: KohBackend> BackendTerminal<B> {
             oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string())
                 .with_clipboard(clipboard_enabled),
             painter: render::Painter::default(),
+            extras: Extras::default(),
         };
         this.backend.enter_alt_screen()?;
         Ok(this)
+    }
+
+    /// The terminal speaks the kitty keyboard protocol (`kitty`) and reports its scheme
+    /// (`scheme_reports`), as the probe found: turn each on now, until the client leaves.
+    pub(crate) fn turn_on(&mut self, kitty: bool, scheme_reports: bool) -> std::io::Result<()> {
+        self.extras = Extras {
+            kitty,
+            scheme_reports,
+        };
+        self.ask(&self.extras.on())
     }
 
     /// Paint underline styles (`4:n`) if the terminal draws them (`on`), else plain underlines,
@@ -260,6 +322,15 @@ impl<B: KohBackend> BackendTerminal<B> {
     pub(crate) fn ask(&mut self, queries: &[u8]) -> std::io::Result<()> {
         self.backend.write_bytes(queries)?;
         self.backend.flush()
+    }
+
+    /// Turn off what [`turn_on`](Self::turn_on) turned on.
+    fn turn_off(&mut self) -> std::io::Result<()> {
+        let off = self.extras.off();
+        if off.is_empty() {
+            return Ok(());
+        }
+        self.ask(&off)
     }
 }
 
@@ -287,7 +358,12 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
         self.painter.invalidate();
     }
 
+    fn ask(&mut self, questions: &[u8]) -> std::io::Result<()> {
+        Self::ask(self, questions)
+    }
+
     fn suspend_resume(&mut self) -> std::io::Result<()> {
+        self.turn_off()?;
         self.backend.leave_alt_screen()?;
         self.backend.leave_raw_mode()?;
         let _ = self
@@ -299,6 +375,10 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
         // The terminal was reset meanwhile: re-assert everything on the next frame.
         self.backend.enter_raw_mode()?;
         self.backend.enter_alt_screen()?;
+        let on = self.extras.on();
+        if !on.is_empty() {
+            self.ask(&on)?;
+        }
         self.oob.invalidate();
         self.painter.invalidate();
         Ok(())
@@ -308,6 +388,7 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
 impl<B: KohBackend> Drop for BackendTerminal<B> {
     fn drop(&mut self) {
         // Best-effort: a mode left on (mouse reporting, say) would garble the user's shell.
+        let _ = self.turn_off();
         let _ = self.backend.leave_alt_screen();
         let _ = self.backend.leave_raw_mode();
     }
@@ -324,8 +405,8 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
 /// Returns the remote shell's exit code if it exited, `None` on a local quit.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the I/O shell wires up the connection, connector, prediction policy, size, the two \
-              input/resize channels, the terminal, the shutdown token and the bell hook — each a distinct \
+    reason = "the I/O shell wires up the connection, connector, prediction policy, size, the \
+              terminal's colours, the two input/resize channels, the terminal, the shutdown token and the bell hook — each a distinct \
               collaborator; bundling them into a struct would only move the list, not shorten it"
 )]
 pub async fn run_client<T: ClientTerminal>(
@@ -333,6 +414,7 @@ pub async fn run_client<T: ClientTerminal>(
     connector: IrohConnector,
     pref: DisplayPreference,
     initial_size: Size,
+    mut colours: Option<crate::events::WireColours>,
     mut input_rx: mpsc::Receiver<Vec<u8>>,
     mut resize_rx: mpsc::Receiver<()>,
     mut term: T,
@@ -351,6 +433,9 @@ pub async fn run_client<T: ClientTerminal>(
         if trusted {
             session.carry_trust();
         }
+        // Every connection tells the server the colours: a reattach may be from another
+        // terminal, whose colours replace the last.
+        session.set_colours(colours.clone());
 
         let conn_started = Instant::now();
         match drive_connection(
@@ -374,6 +459,7 @@ pub async fn run_client<T: ClientTerminal>(
             }
             Disposition::LinkLost => {
                 trusted = session.trusted();
+                colours = session.colours();
                 conn.close(0u32.into(), b"reconnecting");
                 let dwell = conn_started.elapsed();
                 attempt = next_attempt_after_drop(attempt, dwell);
@@ -392,6 +478,34 @@ pub async fn run_client<T: ClientTerminal>(
                 }
             }
         }
+    }
+}
+
+/// Act on what typed input decided: suspend now, or say the user quit (`true`).
+fn after_input<T: ClientTerminal>(
+    outcome: InputOutcome,
+    term: &mut T,
+    session: &mut ClientSession,
+    last_wall: &mut std::time::SystemTime,
+) -> std::io::Result<bool> {
+    match outcome {
+        InputOutcome::Quit => return Ok(true),
+        InputOutcome::Suspend => {
+            term.suspend_resume()?;
+            session.dirty = true;
+            // A deliberate suspend is not a freeze to reconnect after.
+            *last_wall = std::time::SystemTime::now();
+        }
+        InputOutcome::Forwarded => {}
+    }
+    Ok(false)
+}
+
+/// Sleep until `deadline`, or forever with none.
+async fn until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -479,23 +593,34 @@ async fn drive_connection<T: ClientTerminal>(
             return Ok(end_session(term, session, shutdown, code).await);
         }
 
+        // The colours again, after the terminal reported a new scheme.
+        let questions = session.take_questions();
+        if !questions.is_empty() {
+            if let Err(e) = term.ask(&questions) {
+                tracing::debug!(error = %e, "could not ask the terminal its colours");
+            }
+        }
+
         tokio::select! {
             // Keystrokes first: queued screen updates must never starve them.
             biased;
 
             maybe = input_rx.recv() => {
                 match maybe {
-                    Some(chunk) => match session.on_input(Instant::now(), &chunk) {
-                        InputOutcome::Quit => return Ok(Disposition::Quit),
-                        InputOutcome::Suspend => {
-                            term.suspend_resume()?;
-                            session.dirty = true;
-                            // A deliberate suspend is not a freeze to reconnect after.
-                            last_wall = std::time::SystemTime::now();
+                    Some(chunk) => {
+                        let outcome = session.on_input(Instant::now(), &chunk);
+                        if after_input(outcome, term, session, &mut last_wall)? {
+                            return Ok(Disposition::Quit);
                         }
-                        InputOutcome::Forwarded => {}
-                    },
+                    }
                     None => return Ok(Disposition::Quit), // input source closed
+                }
+            }
+            // A lone Escape, or a sequence cut short, is taken as typed once nothing follows.
+            () = until(session.deadline()) => {
+                let outcome = session.on_timeout(Instant::now());
+                if after_input(outcome, term, session, &mut last_wall)? {
+                    return Ok(Disposition::Quit);
                 }
             }
             () = shutdown.cancelled() => return Ok(Disposition::Quit),
@@ -639,6 +764,7 @@ async fn reconnect<T: ClientTerminal>(
 ) -> ReconnectOutcome {
     let started = Instant::now();
     let mut pending_escape = false;
+    let mut decoder = Decoder::default();
     'attempt: loop {
         // Back off before dialing once a dial failed or the last connection dropped too fast
         // (`*attempt > 0`, which the caller seeds from the connection's dwell), so a server that
@@ -664,7 +790,7 @@ async fn reconnect<T: ClientTerminal>(
                 biased;
                 maybe = input_rx.recv() => match maybe {
                     Some(chunk) => {
-                        if escape_quit(&chunk, &mut pending_escape) {
+                        if escape_quit(&chunk, &mut decoder, &mut pending_escape) {
                             return ReconnectOutcome::Quit;
                         }
                     }
@@ -729,21 +855,31 @@ mod tests {
     #[test]
     fn escape_quit_matches_the_session_machine_across_chunks() {
         // The reconnect-path escape detector must agree with `ClientSession`'s prefix machine.
+        let mut d = Decoder::default();
         let mut p = false;
-        assert!(!escape_quit(b"hello", &mut p), "plain bytes never quit");
+        assert!(
+            !escape_quit(b"hello", &mut d, &mut p),
+            "plain bytes never quit"
+        );
         assert!(!p);
         // Prefix + '.' in one chunk quits.
-        assert!(escape_quit(&[ESCAPE_PREFIX, b'.'], &mut p));
+        assert!(escape_quit(&[ESCAPE_PREFIX, b'.'], &mut d, &mut p));
         // Prefix split across chunks: state carries over, then '.' quits.
         p = false;
-        assert!(!escape_quit(&[ESCAPE_PREFIX], &mut p));
+        assert!(!escape_quit(&[ESCAPE_PREFIX], &mut d, &mut p));
         assert!(p, "a lone prefix leaves us pending");
-        assert!(escape_quit(b".", &mut p));
+        assert!(escape_quit(b".", &mut d, &mut p));
         // Prefix then a non-'.' byte does NOT quit and clears the pending state.
         p = false;
-        assert!(!escape_quit(&[ESCAPE_PREFIX, b'x'], &mut p));
+        assert!(!escape_quit(&[ESCAPE_PREFIX, b'x'], &mut d, &mut p));
         assert!(!p, "prefix + non-dot resets pending");
-        assert!(!escape_quit(b".", &mut p), "a later lone '.' must not quit");
+        assert!(
+            !escape_quit(b".", &mut d, &mut p),
+            "a later lone '.' must not quit"
+        );
+        // From a kitty-protocol terminal: Ctrl-6 (the prefix) is `CSI 54 ; 5 u`.
+        p = false;
+        assert!(escape_quit(b"\x1b[54;5u.", &mut d, &mut p));
     }
 
     #[test]
@@ -817,6 +953,7 @@ mod tests {
             backend: CaptureBackend::default(),
             oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string()),
             painter: render::Painter::default(),
+            extras: Extras::default(),
         };
         via_trait
             .render(&screen, &Overlay::empty(), Some("status"))
@@ -840,5 +977,27 @@ mod tests {
             .unwrap();
         assert_eq!(via_trait.backend.bytes, direct.bytes);
         assert_ne!(via_trait.backend.bytes, b"");
+    }
+
+    /// What the client turns on in the user's terminal it turns off again, popping its push: on
+    /// leaving (the terminal's drop) and on suspend (both call `turn_off`).
+    #[test]
+    fn the_kitty_push_and_scheme_reports_are_undone() {
+        let mut term = BackendTerminal {
+            backend: crate::client::backend::CaptureBackend::default(),
+            oob: render::OutOfBand::with_title_prefix(String::new()),
+            painter: render::Painter::default(),
+            extras: Extras::default(),
+        };
+        term.turn_on(true, true).unwrap();
+        assert_eq!(term.backend.bytes, b"\x1b[>5u\x1b[?2031h");
+        term.backend.bytes.clear();
+        term.turn_off().unwrap();
+        assert_eq!(term.backend.bytes, b"\x1b[<u\x1b[?2031l");
+        // A terminal that speaks neither is sent neither.
+        term.backend.bytes.clear();
+        term.turn_on(false, false).unwrap();
+        term.turn_off().unwrap();
+        assert_eq!(term.backend.bytes, b"");
     }
 }

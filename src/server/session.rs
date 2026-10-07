@@ -3,9 +3,9 @@
 //! A [`Registry`] task creates, reattaches, caps and reaps them, one
 //! per peer. Each session task owns its [`PtyHost`] and publishes every screen on a `watch`
 //! channel, attached or not, so a client that reconnects finds the live screen. A connection talks
-//! to its session through a [`SessionClient`], whose drop detaches.
+//! to its session through a [`SessionClient`]: its screen receiver is its attachment, so dropping
+//! it detaches.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +17,8 @@ use iroh::EndpointId;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
+
+mod sessions;
 
 /// How often a session checks its detach TTL (sooner for a shorter TTL).
 pub(crate) const REAP_INTERVAL: Duration = Duration::from_secs(5);
@@ -114,16 +116,10 @@ pub enum AttachKind {
 
 /// A connection's handle to its session: watch the screen, send input, and detach on drop.
 pub struct SessionClient {
+    /// The attachment itself: the session counts its clients by its screen receivers, so this is
+    /// never cloned, and none is made but for a client ([`start`] and [`Attach`]).
     screens: watch::Receiver<Arc<TerminalScreen>>,
     input: mpsc::Sender<ClientInput>,
-    /// Detaches the session when this client is dropped (including on a panic).
-    control: mpsc::Sender<SessionMsg>,
-}
-
-impl Drop for SessionClient {
-    fn drop(&mut self) {
-        let _ = self.control.try_send(SessionMsg::Detach);
-    }
 }
 
 impl SessionClient {
@@ -173,15 +169,31 @@ impl SessionClient {
 
 // --- the session task -------------------------------------------------------------------------
 
-/// Control messages to a session task.
-enum SessionMsg {
-    /// A connection attaches; `control` goes into its client, whose drop detaches.
-    Attach {
-        control: mpsc::Sender<Self>,
-        reply: oneshot::Sender<(SessionClient, Option<Duration>)>,
-    },
-    /// A connection detached (its [`SessionClient`] dropped).
-    Detach,
+/// A connection attaches to a session: its client, and how long the session had none.
+struct Attach(oneshot::Sender<(SessionClient, Option<Duration>)>);
+
+/// Start a session for `spec`: the sender that attaches to it, its first client, and the task that
+/// runs it. The first client exists before the task does, so the session never runs uncounted.
+fn start(
+    spec: &SessionSpec,
+) -> anyhow::Result<(
+    mpsc::Sender<Attach>,
+    SessionClient,
+    impl std::future::Future<Output = ()> + Send + 'static,
+)> {
+    let (mut host, pty_rx) = PtyHost::spawn(&spec.command, spec.scrollback, &spec.launcher)?;
+    let (screens_tx, screens) = watch::channel(Arc::new(host.snapshot()));
+    let (input, input_rx) = mpsc::channel(INPUT_QUEUE);
+    // The registry waits for each attach's answer before it sends another.
+    let (control, control_rx) = mpsc::channel(1);
+    let client = SessionClient {
+        screens,
+        input: input.clone(),
+    };
+    let task = session_task(
+        host, pty_rx, control_rx, screens_tx, input, input_rx, spec.ttl,
+    );
+    Ok((control, client, task))
 }
 
 /// Hand `take` up to `limit` items `rx` already holds, without waiting, as they come off the
@@ -204,17 +216,17 @@ async fn until(deadline: Option<std::time::Instant>) {
 }
 
 /// Run one session until its program exits and its client leaves, or its detach TTL expires.
+/// Its clients are the receivers of `screens_tx`: no other receiver may exist.
 async fn session_task(
-    peer: EndpointId,
     mut host: PtyHost,
     mut pty_rx: mpsc::Receiver<Vec<u8>>,
-    mut control: mpsc::Receiver<SessionMsg>,
+    mut control: mpsc::Receiver<Attach>,
+    screens_tx: watch::Sender<Arc<TerminalScreen>>,
+    input_tx: mpsc::Sender<ClientInput>,
+    mut input_rx: mpsc::Receiver<ClientInput>,
     ttl: Duration,
-    ended: mpsc::Sender<EndpointId>,
 ) {
-    let (screens_tx, _screens_rx) = watch::channel(Arc::new(host.snapshot()));
-    let (input_tx, mut input_rx) = mpsc::channel::<ClientInput>(INPUT_QUEUE);
-    let mut attached: usize = 0;
+    // `None` while a client is attached; the first one is, from `start`.
     let mut last_detach: Option<Instant> = None;
     let mut pending_keys: Vec<u8> = Vec::new();
     // After the program exits, its final screen is served until the client leaves.
@@ -309,51 +321,54 @@ async fn session_task(
                 }
             },
             msg = control.recv() => match msg {
-                Some(SessionMsg::Attach { control, reply }) => {
-                    let detached_for = last_detach.take().map(|t| t.elapsed());
-                    attached = attached.saturating_add(1);
+                Some(Attach(reply)) => {
+                    // No client is left, whether or not the arm below has seen it yet: an exited
+                    // session is never reattached, and the detach is dated before this attach.
+                    if screens_tx.receiver_count() == 0 {
+                        if exited {
+                            break; // the reply is dropped, so the registry starts a new session
+                        }
+                        last_detach.get_or_insert_with(Instant::now);
+                    }
+                    let since = last_detach.take();
                     let client = SessionClient {
                         screens: screens_tx.subscribe(),
                         input: input_tx.clone(),
-                        control,
                     };
-                    // If the connection is already gone, treat it as an immediate detach.
-                    if reply.send((client, detached_for)).is_err() {
-                        attached = attached.saturating_sub(1);
-                        if attached == 0 {
-                            last_detach = Some(Instant::now());
-                        }
+                    // A connection already gone drops its client: the session stays detached
+                    // since when it was, so an attach that never arrives does not renew its TTL.
+                    if reply.send((client, since.map(|t| t.elapsed()))).is_err() {
+                        last_detach = since;
                     }
                 }
-                Some(SessionMsg::Detach) => {
-                    attached = attached.saturating_sub(1);
-                    if attached == 0 {
-                        if exited {
-                            break; // the client saw the exit and left; tear down now
-                        }
-                        last_detach = Some(Instant::now());
-                    }
-                }
-                None => break, // the registry dropped: the whole server is shutting down
+                None => break, // the registry forgot this session: the server is shutting down
             },
+            // The last client left.
+            () = screens_tx.closed(), if last_detach.is_none() => {
+                if exited {
+                    break; // the client saw the exit and left; tear down now
+                }
+                last_detach = Some(Instant::now());
+            }
             _ = pending_input_retry(!pending_keys.is_empty()) => {}
             // A program may turn echo off without writing anything (a password prompt printed
             // first): the client hears of it within a tick.
-            _ = tty_tick.tick(), if !exited && attached > 0 => {
+            _ = tty_tick.tick(), if !exited && screens_tx.receiver_count() > 0 => {
                 if host.refresh_tty() && !hold.holding() {
                     screens_tx.send_replace(Arc::new(host.snapshot()));
                 }
             }
             _ = ttl_tick.tick() => {
                 let idle_expired = last_detach.is_some_and(|t| t.elapsed() >= ttl);
-                if attached == 0 && (exited || idle_expired) {
+                if screens_tx.receiver_count() == 0 && (exited || idle_expired) {
                     break;
                 }
             }
         }
     }
 
-    let _ = ended.send(peer).await;
+    // Ended: the registry sees the closed control channel, clients their closed screens and input.
+    drop((control, screens_tx, input_rx));
     tokio::task::spawn_blocking(move || host.shutdown());
 }
 
@@ -386,20 +401,16 @@ async fn reap_exit_code(host: &mut PtyHost) -> Option<u32> {
 
 // --- the registry -----------------------------------------------------------------------------
 
-/// What the registry accepts.
-enum RegMsg {
-    Attach {
-        peer: EndpointId,
-        reply: oneshot::Sender<Option<(SessionClient, AttachKind)>>,
-    },
-    /// A session task ended and removed itself.
-    Ended(EndpointId),
+/// What the registry accepts: attach `peer`.
+struct AttachReq {
+    peer: EndpointId,
+    reply: oneshot::Sender<Option<(SessionClient, AttachKind)>>,
 }
 
 /// A handle to the registry task: cheap to clone, one per accept loop.
 #[derive(Clone)]
 pub struct Registry {
-    tx: mpsc::Sender<RegMsg>,
+    tx: mpsc::Sender<AttachReq>,
     shutdown: CancellationToken,
 }
 
@@ -418,7 +429,7 @@ impl Registry {
     pub fn spawn(spec: SessionSpec) -> Self {
         let (tx, rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
-        tokio::spawn(registry_task(spec, rx, tx.clone(), shutdown.clone()));
+        tokio::spawn(registry_task(spec, rx, shutdown.clone()));
         Self { tx, shutdown }
     }
 
@@ -426,11 +437,11 @@ impl Registry {
     /// session cap and `peer` has no existing session.
     pub async fn attach(&self, peer: EndpointId) -> Option<(SessionClient, AttachKind)> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(RegMsg::Attach { peer, reply }).await.ok()?;
+        self.tx.send(AttachReq { peer, reply }).await.ok()?;
         rx.await.ok().flatten()
     }
 
-    /// Stop the registry and every session, and wait for them to tear down.
+    /// Stop the registry and every session, and wait for them to end.
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         self.tx.closed().await;
@@ -439,99 +450,24 @@ impl Registry {
 
 async fn registry_task(
     spec: SessionSpec,
-    mut rx: mpsc::Receiver<RegMsg>,
-    self_tx: mpsc::Sender<RegMsg>,
+    mut rx: mpsc::Receiver<AttachReq>,
     shutdown: CancellationToken,
 ) {
-    // Each live session's control sender, by peer.
-    let mut sessions: HashMap<EndpointId, mpsc::Sender<SessionMsg>> = HashMap::new();
-    let ended_tx = ended_sender(&self_tx);
-    // So the channel closes with the last `Registry`.
-    drop(self_tx);
+    let mut sessions = sessions::Sessions::new(spec);
     loop {
-        let msg = tokio::select! {
+        let AttachReq { peer, reply } = tokio::select! {
+            // A shutdown starts no session for a request still queued.
+            biased;
             () = shutdown.cancelled() => break,
             msg = rx.recv() => match msg {
                 Some(msg) => msg,
                 None => break,
             },
         };
-        match msg {
-            RegMsg::Attach { peer, reply } => {
-                let result = attach_in(&mut sessions, &spec, &ended_tx, peer).await;
-                let _ = reply.send(result);
-            }
-            RegMsg::Ended(peer) => {
-                sessions.remove(&peer);
-            }
-        }
+        let _ = reply.send(sessions.attach(peer).await);
     }
-    // Shutdown: dropping every control sender ends the session tasks.
-    sessions.clear();
-}
-
-/// A sender session tasks announce their end on, forwarded to the registry. Not the registry's own
-/// sender, which would keep its channel open while any session lives.
-fn ended_sender(tx: &mpsc::Sender<RegMsg>) -> mpsc::Sender<EndpointId> {
-    let (etx, mut erx) = mpsc::channel::<EndpointId>(16);
-    let tx = tx.clone();
-    tokio::spawn(async move {
-        while let Some(peer) = erx.recv().await {
-            if tx.send(RegMsg::Ended(peer)).await.is_err() {
-                break;
-            }
-        }
-    });
-    etx
-}
-
-async fn attach_in(
-    sessions: &mut HashMap<EndpointId, mpsc::Sender<SessionMsg>>,
-    spec: &SessionSpec,
-    ended: &mpsc::Sender<EndpointId>,
-    peer: EndpointId,
-) -> Option<(SessionClient, AttachKind)> {
-    if let Some(control) = sessions.get(&peer) {
-        if let Some((client, detached_for)) = attach_to(control).await {
-            return Some((client, AttachKind::Reattached { detached_for }));
-        }
-        // The session task is gone; drop the stale handle and fall through to create a new one.
-        sessions.remove(&peer);
-    }
-    if sessions.len() >= spec.max_sessions {
-        return None;
-    }
-    let (host, pty_rx) = PtyHost::spawn(&spec.command, spec.scrollback, &spec.launcher)
-        .map_err(|e| tracing::error!(error = %e, "spawning a session failed"))
-        .ok()?;
-    let (control, control_rx) = mpsc::channel(16);
-    tokio::spawn(session_task(
-        peer,
-        host,
-        pty_rx,
-        control_rx,
-        spec.ttl,
-        ended.clone(),
-    ));
-    let (client, _) = attach_to(&control).await?;
-    sessions.insert(peer, control);
-    Some((client, AttachKind::Created))
-}
-
-/// Attach to the session `control` reaches: a client handle and how long it was detached, or `None`
-/// if its task is gone.
-async fn attach_to(
-    control: &mpsc::Sender<SessionMsg>,
-) -> Option<(SessionClient, Option<Duration>)> {
-    let (reply, rx) = oneshot::channel();
-    control
-        .send(SessionMsg::Attach {
-            control: control.clone(),
-            reply,
-        })
-        .await
-        .ok()?;
-    rx.await.ok()
+    // `rx` drops only once every session has ended, which `Registry::shutdown` waits for.
+    sessions.shutdown().await;
 }
 
 #[cfg(test)]

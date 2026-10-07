@@ -377,3 +377,160 @@ fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_i
         Ok(())
     })
 }
+
+/// A single-threaded runtime, so the registry, session and forwarding tasks interleave the same
+/// way every run.
+fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
+/// A reconnect that races its exited session's teardown creates a new session, and that one stays
+/// registered: the next attach while it is live reattaches to it.
+#[test]
+fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -> anyhow::Result<()>
+{
+    current_thread_runtime()?.block_on(async {
+        let reg = registry(&["true"], 1, Duration::from_secs(30));
+        let a = peer()?;
+        let (mut c1, kind) = reg.attach(a).await.context("first attach")?;
+        anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
+        for _ in 0..100 {
+            if c1.screen().exit_code().is_some() {
+                break;
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(50), c1.next_screen()).await;
+        }
+        anyhow::ensure!(c1.screen().exit_code().is_some(), "the program exits");
+        drop(c1);
+        // Reconnect at once, racing the exited session's teardown: a new session is created.
+        let (c2, kind) = reg.attach(a).await.context("reconnect")?;
+        anyhow::ensure!(kind == AttachKind::Created, "reconnect: {kind:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // c2 is still attached to its live session, so this must reattach to it.
+        let third = attach_kind(&reg, a).await;
+        let other = attach_kind(&reg, peer()?).await;
+        drop(c2);
+        reg.shutdown().await;
+        anyhow::ensure!(
+            matches!(third, Some(AttachKind::Reattached { .. })),
+            "a second connection while c2 is live must reattach to c2's session, got {third:?}"
+        );
+        anyhow::ensure!(
+            other.is_none(),
+            "max_sessions=1 with a live session must refuse another peer, got {other:?}"
+        );
+        Ok(())
+    })
+}
+
+/// More detaches than the session's control queue holds, at once, must all count: after the TTL
+/// the session is reaped and the next attach creates a new one.
+#[test]
+fn a_burst_of_detaches_larger_than_the_control_queue_still_starts_the_ttl() -> anyhow::Result<()> {
+    current_thread_runtime()?.block_on(async {
+        let reg = registry(&["sleep", "30"], 4, Duration::from_millis(200));
+        let p = peer()?;
+        let mut clients = Vec::new();
+        for _ in 0..20 {
+            clients.push(reg.attach(p).await.context("attach")?.0);
+        }
+        drop(clients);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let kind = attach_kind(&reg, p).await;
+        reg.shutdown().await;
+        anyhow::ensure!(
+            kind == Some(AttachKind::Created),
+            "every client left 1.3 s past a 200 ms TTL, so the session is reaped; got {kind:?}"
+        );
+        Ok(())
+    })
+}
+
+/// Shutdown ends every session, even one a connection is still attached to, and waits for it.
+#[test]
+fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30));
+        let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
+        tokio::time::timeout(Duration::from_secs(5), reg.shutdown())
+            .await
+            .context("shutdown returns")?;
+        // A screen published before shutdown may still be unseen: drain it, then the end.
+        let drained = tokio::time::timeout(Duration::from_secs(1), async {
+            while client.next_screen().await.is_some() {}
+        })
+        .await;
+        anyhow::ensure!(
+            drained.is_ok(),
+            "after shutdown the held client's session has ended"
+        );
+        anyhow::ensure!(!client.can_send(), "the ended session takes no input");
+        Ok(())
+    })
+}
+
+/// A reconnect right after the program exited and its last client left never reattaches to the
+/// dead session, and is answered even when its request lands as that session ends, however the
+/// session and registry tasks interleave across worker threads.
+#[test]
+fn a_reconnect_right_after_exit_never_reattaches_the_exited_session() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let reg = registry(&["true"], 4, Duration::from_secs(30));
+            let a = peer()?;
+            let mut client = reg.attach(a).await.context("first attach")?.0;
+            for round in 0..100 {
+                for _ in 0..100 {
+                    if client.screen().exit_code().is_some() {
+                        break;
+                    }
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(50), client.next_screen()).await;
+                }
+                anyhow::ensure!(
+                    client.screen().exit_code().is_some(),
+                    "round {round}: exits"
+                );
+                drop(client);
+                let (next, kind) = tokio::time::timeout(Duration::from_secs(5), reg.attach(a))
+                    .await
+                    .with_context(|| format!("round {round}: the reconnect is answered"))?
+                    .context("reconnect")?;
+                anyhow::ensure!(
+                    kind == AttachKind::Created,
+                    "round {round}: a reconnect after exit gets a new session, got {kind:?}"
+                );
+                client = next;
+            }
+            drop(client);
+            reg.shutdown().await;
+            Ok(())
+        })
+}
+
+/// A program that exits while no client is attached ends its session: an attach before the next
+/// TTL check starts a new one, rather than reattaching to the exited one.
+#[test]
+fn a_session_whose_program_exited_while_detached_is_not_reattached() -> anyhow::Result<()> {
+    current_thread_runtime()?.block_on(async {
+        let reg = registry(&["sleep", "0.3"], 4, Duration::from_secs(30));
+        let p = peer()?;
+        let (client, kind) = reg.attach(p).await.context("attach")?;
+        anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
+        drop(client);
+        // The program exits while detached, well before the TTL's next check.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let kind = attach_kind(&reg, p).await;
+        reg.shutdown().await;
+        anyhow::ensure!(
+            kind == Some(AttachKind::Created),
+            "the exited session must not be reattached; got {kind:?}"
+        );
+        Ok(())
+    })
+}

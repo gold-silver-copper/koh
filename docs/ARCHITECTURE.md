@@ -368,10 +368,13 @@ per-connection state never lives in the session:
   `tokio::sync::watch`; each connection holds a receiver and `select!`s on it. Every connection
   wakes on one change; a burst coalesces into the latest screen; and a change landing between a
   connection's read and its wait is never lost, because the receiver keeps the latest value.
-- **Detach on drop.** A connection holds a `SessionClient`; dropping it (on return **or**
-  panic) sends the session task a detach, so a panicking connection can't pin a session. The
-  session task counts attached clients and starts the TTL only when the last one leaves; it tears
-  itself down at the TTL or once its shell exits, and tells the registry to forget it.
+- **Detach on drop.** A connection holds a `SessionClient`, whose screen receiver is its
+  attachment: the session counts its clients as its `watch` sender's receivers, so dropping one
+  (on return **or** panic) detaches with no message to lose, and a panicking connection can't pin
+  a session. The session starts the TTL when the last receiver drops; it tears itself down at the
+  TTL or once its shell exits. The registry's `Sessions` forgets a session only once its task has
+  ended (its control channel is closed), so a late end cannot unregister the session that replaced
+  it, and its shutdown ends every session, attached or not, and waits for their tasks.
 - **The bell hook.** `--on-bell <cmd>` / `ConnectConfig::bell_command` runs `sh -c` when
   the remote bell count climbs: detached (fds on `/dev/null`), `KOH_*` scrubbed except
   `KOH_BELL_COUNT` / `KOH_TITLE`, rate-limited to one spawn per second with bursts coalesced, the

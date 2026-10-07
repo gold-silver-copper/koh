@@ -1,5 +1,6 @@
-//! How the client reads a server's verdict on its connection: a rejection the server sends after
-//! the admission ack (the session cap) must fail the client fast, not be taken for a lost link.
+//! How the client reads a server's verdict on its connection: a refusal (the session cap, the
+//! allowlist) or a protocol-error close must fail the client fast, on the first dial or a redial,
+//! not be taken for a lost link.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,7 +10,7 @@ use koh::client::{run_client, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::terminal::{Size, TerminalScreen};
-use koh::transport_iroh::admission::{dial, Link};
+use koh::transport_iroh::admission::{admit, dial, refuse, Close, Link, Refusal};
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -141,50 +142,105 @@ fn run_client_at_session_capacity_fails_instead_of_redialing() -> anyhow::Result
             // The connector refused every dial: the first-dial path already fails fast.
             return Ok(());
         };
-        let statuses = Arc::new(Mutex::new(Vec::new()));
-        let term = StatusRecorder {
-            statuses: statuses.clone(),
-        };
-        let (_input_tx, input_rx) = mpsc::channel::<Vec<u8>>(8);
-        let (_resize_tx, resize_rx) = mpsc::channel::<()>(8);
-        let ran = tokio::time::timeout(
-            Duration::from_secs(10),
-            run_client(
-                first,
-                std::time::SystemTime::now(),
-                connector,
-                DisplayPreference::Never,
-                Size::new(24, 80),
-                None,
-                input_rx,
-                resize_rx,
-                term,
-                CancellationToken::new(),
-                None,
-            ),
-        )
-        .await;
+        let verdict = run_until_verdict(first, connector, "capacity").await;
         shutdown.cancel();
-        let seen: Vec<String> = statuses
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .iter()
-            .filter(|s| s.contains("reconnect"))
-            .take(3)
-            .cloned()
-            .collect();
-        match ran {
-            Err(_) => anyhow::bail!(
-                "run_client was still redialing a server at session capacity after 10 s; \
-                 banners shown: {seen:?}"
-            ),
-            Ok(Ok(code)) => anyhow::bail!("run_client returned Ok({code:?}) instead of an error"),
-            Ok(Err(e)) => {
-                let e = format!("{e:#}");
-                anyhow::ensure!(e.contains("capacity"), "the error names the cap: {e}");
-                anyhow::Ok(())
+        verdict.context("server at session capacity")
+    })
+}
+
+/// Run the client on `first` for up to 10 s; it must end with an error containing `wants`, not
+/// redial under a "reconnecting" banner.
+async fn run_until_verdict(
+    first: Link,
+    connector: IrohConnector,
+    wants: &str,
+) -> anyhow::Result<()> {
+    let statuses = Arc::new(Mutex::new(Vec::new()));
+    let term = StatusRecorder {
+        statuses: statuses.clone(),
+    };
+    let (_input_tx, input_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_resize_tx, resize_rx) = mpsc::channel::<()>(8);
+    let ran = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_client(
+            first,
+            std::time::SystemTime::now(),
+            connector,
+            DisplayPreference::Never,
+            Size::new(24, 80),
+            None,
+            input_rx,
+            resize_rx,
+            term,
+            CancellationToken::new(),
+            None,
+        ),
+    )
+    .await;
+    let seen: Vec<String> = statuses
+        .lock()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .iter()
+        .filter(|s| s.contains("reconnect"))
+        .take(3)
+        .cloned()
+        .collect();
+    match ran {
+        Err(_) => {
+            anyhow::bail!("run_client was still redialing after 10 s; banners shown: {seen:?}")
+        }
+        Ok(Ok(code)) => anyhow::bail!("run_client returned Ok({code:?}) instead of an error"),
+        Ok(Err(e)) => {
+            let e = format!("{e:#}");
+            anyhow::ensure!(e.contains(wants), "the error names {wants:?}: {e}");
+            Ok(())
+        }
+    }
+}
+
+/// A hand-rolled server that admits the first connection and ends it with `first`, then refuses
+/// every later one as not authorized (as after the client's removal from the allowlist).
+async fn admit_once_then_refuse(first: Close) -> anyhow::Result<(iroh::EndpointAddr, Link)> {
+    let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
+    let addr = loopback_addr(&server_ep);
+    tokio::spawn(async move {
+        let mut admitted = false;
+        while let Some(incoming) = server_ep.accept().await {
+            let Ok(conn) = incoming.await else { continue };
+            if admitted {
+                refuse(conn, Refusal::NotAuthorized);
+            } else if let Ok(link) = admit(conn).await {
+                admitted = true;
+                // Long enough for the client loop to take the connection.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                link.close(first);
+                Box::leak(Box::new(link));
             }
         }
-        .context("server at session capacity")
+    });
+    let client_ep = bind_endpoint_local(generate_secret_key()?, false).await?;
+    let link = dial(&client_ep, addr.clone()).await?;
+    Box::leak(Box::new(client_ep));
+    Ok((addr, link))
+}
+
+/// A redial the server refuses ends the client with the server's reason, as the first dial would.
+#[test]
+fn a_refused_redial_ends_the_client() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let (addr, first) = admit_once_then_refuse(Close::Reconnecting).await?;
+        let client_ep = bind_endpoint_local(generate_secret_key()?, false).await?;
+        run_until_verdict(first, IrohConnector::new(client_ep, addr), "not authorized").await
+    })
+}
+
+/// A protocol-error close ends the client: a redial would only break the protocol again.
+#[test]
+fn a_protocol_error_close_ends_the_client() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let (addr, first) = admit_once_then_refuse(Close::ProtocolError).await?;
+        let client_ep = bind_endpoint_local(generate_secret_key()?, false).await?;
+        run_until_verdict(first, IrohConnector::new(client_ep, addr), "protocol error").await
     })
 }

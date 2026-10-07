@@ -2137,3 +2137,69 @@ mod tests {
         assert_eq!(shown_row(&e, &screen).0, "$ l");
     }
 }
+
+#[cfg(test)]
+mod key_reparse_tests {
+    use super::*;
+
+    use fux_vt::Screen;
+    use fux_vt::keys::Key;
+
+    fn editor_on(bytes: &[u8]) -> (PredictionEngine, Screen) {
+        let mut p = fux_vt::Parser::new(24, 80, 0).expect("24x80 parser");
+        p.process(bytes).expect("process");
+        let screen = p.screen().clone();
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        e.carried = true;
+        e.set_tty(Some(TtyModes {
+            echo: false,
+            line: false,
+        }));
+        e.cull(&screen);
+        e.set_local_frame_sent(1);
+        (e, screen)
+    }
+
+    fn key(c: char) -> KeyPress {
+        KeyPress::plain(Key::Char(c))
+    }
+
+    /// Escape, then `O`, then `D`, each its own key press, are three keys, not the
+    /// application-cursor-mode Left arrow `ESC O D`: the predictor must not move the cursor
+    /// left over `c`.
+    #[test]
+    fn separate_escape_o_d_keys_are_not_a_left_arrow() {
+        let (mut e, screen) = editor_on(b"$ abc");
+        e.new_user_key(KeyPress::plain(Key::Escape), &screen);
+        e.new_user_key(key('O'), &screen);
+        e.new_user_key(key('D'), &screen);
+        let ov = e.overlay();
+        assert_ne!(
+            ov.cursor(),
+            Some((0, 4)),
+            "three separate keys (Escape, 'O', 'D') were predicted as a Left arrow"
+        );
+    }
+
+    /// Escape, then a focus event (input the predictor does not model), then `b`: the `b` is
+    /// not Alt-B. The predictor must not move the cursor back to the start of the word.
+    #[test]
+    fn escape_then_focus_event_then_b_is_not_alt_b() {
+        let (mut e, screen) = editor_on(b"$ make test");
+        e.new_user_key(KeyPress::plain(Key::Escape), &screen);
+        e.new_user_other(&screen);
+        e.new_user_key(key('b'), &screen);
+        // The focus event opened a new epoch, so the overlay hides what is predicted until the
+        // server confirms it; read the prediction itself, which is what is shown on confirm.
+        let predicted_cursor = e.cursor.as_ref().map(|c| (c.row, c.col));
+        assert_ne!(
+            predicted_cursor,
+            Some((0, 7)),
+            "Escape, a focus event, then 'b' was predicted as Alt-B (word motion)"
+        );
+        assert!(
+            e.cells.get(&(0, 11)).is_some_and(|c| c.glyph == "b"),
+            "'b' typed after a focus event is not predicted as a 'b' glyph at the cursor"
+        );
+    }
+}

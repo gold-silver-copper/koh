@@ -391,8 +391,11 @@ fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 #[test]
 fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -> anyhow::Result<()>
 {
-    current_thread_runtime()?.block_on(async {
-        let reg = registry(&["true"], 1, Duration::from_secs(30));
+    // The first session's program exits at once and leaves `marker`; its replacement's lives.
+    let marker = std::env::temp_dir().join(format!("koh-late-ended-{}", std::process::id()));
+    let script = format!("[ -e '{}' ] && exec sleep 30; : > '{0}'", marker.display());
+    let result = current_thread_runtime()?.block_on(async {
+        let reg = registry(&["sh", "-c", &script], 1, Duration::from_secs(30));
         let a = peer()?;
         let (mut c1, kind) = reg.attach(a).await.context("first attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
@@ -422,7 +425,9 @@ fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -
             "max_sessions=1 with a live session must refuse another peer, got {other:?}"
         );
         Ok(())
-    })
+    });
+    let _ = std::fs::remove_file(&marker);
+    result
 }
 
 /// More detaches than the session's control queue holds, at once, must all count: after the TTL

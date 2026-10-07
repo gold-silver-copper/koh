@@ -470,3 +470,45 @@ fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// A reconnect right after the program exited and its last client left never reattaches to the
+/// dead session, and is answered even when its request lands as that session ends, however the
+/// session and registry tasks interleave across worker threads.
+#[test]
+fn a_reconnect_right_after_exit_never_reattaches_the_exited_session() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let reg = registry(&["true"], 4, Duration::from_secs(30));
+            let a = peer()?;
+            let mut client = reg.attach(a).await.context("first attach")?.0;
+            for round in 0..300 {
+                for _ in 0..100 {
+                    if client.screen().exit_code().is_some() {
+                        break;
+                    }
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(50), client.next_screen()).await;
+                }
+                anyhow::ensure!(
+                    client.screen().exit_code().is_some(),
+                    "round {round}: exits"
+                );
+                drop(client);
+                let (next, kind) = tokio::time::timeout(Duration::from_secs(5), reg.attach(a))
+                    .await
+                    .with_context(|| format!("round {round}: the reconnect is answered"))?
+                    .context("reconnect")?;
+                anyhow::ensure!(
+                    kind == AttachKind::Created,
+                    "round {round}: a reconnect after exit gets a new session, got {kind:?}"
+                );
+                client = next;
+            }
+            drop(client);
+            reg.shutdown().await;
+            Ok(())
+        })
+}

@@ -321,6 +321,14 @@ async fn session_task(
             },
             msg = control.recv() => match msg {
                 Some(Attach(reply)) => {
+                    // The last client may have left before the arm below saw it: a detach is
+                    // ordered before any later attach all the same.
+                    if screens_tx.receiver_count() == 0 && last_detach.is_none() {
+                        if exited {
+                            break; // the reply is dropped, so the registry starts a new session
+                        }
+                        last_detach = Some(Instant::now());
+                    }
                     let detached_for = last_detach.take().map(|t| t.elapsed());
                     let client = SessionClient {
                         screens: screens_tx.subscribe(),

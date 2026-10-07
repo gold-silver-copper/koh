@@ -478,6 +478,9 @@ fn a_line_typed_during_an_outage_runs_after_the_reattach() {
                 .wait_until(WAIT, |t| t.contains("READY_ONE"))
                 .await
                 .is_some());
+            // Long enough for the server to confirm it: what is typed during an outage is sent
+            // only if all typed before it was.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             // The link goes down for a while; the client notices and shows its banner.
             net.black_hole(Duration::from_secs(4));
             client.drop_first_connection();
@@ -539,5 +542,139 @@ fn an_escape_split_across_a_link_drop_still_quits() {
                 "Ctrl-^ (before the drop) . (during the reconnect) must quit; got {result:?}"
             );
             server.stop().await;
+        });
+}
+
+/// A line typed across the moment the client notices the drop: its start went out on the dark
+/// link and was lost with it, so its end, typed at the banner, must not run alone (here
+/// `false && echo DANGEROUS` would run `echo DANGEROUS`).
+#[test]
+fn the_end_of_a_line_whose_start_was_lost_with_the_link_does_not_run() {
+    crate::harness::runtime()
+        .expect("tokio runtime")
+        .block_on(async {
+            let net = clean();
+            let secret = identity().expect("OS randomness");
+            let server = Server::start(&net, &[secret.public()], &["sh"])
+                .await
+                .expect("start the server");
+            let endpoint = net.endpoint(secret, false).await.expect("bind the client");
+            let mut client = Client::connect_on(endpoint, server.id, Options::default())
+                .await
+                .expect("connect");
+            client.send(b"echo READY''_G\r").await.expect("type");
+            assert!(client
+                .wait_until(WAIT, |t| t.contains("READY_G"))
+                .await
+                .is_some());
+            net.black_hole(Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            client.send(b"false && ").await.expect("type");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            client.drop_first_connection();
+            assert!(
+                client.wait_for(WAIT, reconnecting).await.is_some(),
+                "the client must show the reconnecting banner"
+            );
+            client.send(b"echo DANGER''OUS\r").await.expect("type");
+            // Once back, a line typed then runs: the session goes on.
+            let mut back = false;
+            for _ in 0..100 {
+                let _ = client.send(b"echo BAC''K\r").await;
+                if client
+                    .wait_until(Duration::from_millis(200), |t| t.contains("BACK"))
+                    .await
+                    .is_some()
+                {
+                    back = true;
+                    break;
+                }
+            }
+            let screen = client.screen();
+            let _ = client.finish().await;
+            server.stop().await;
+            assert!(back, "the session never came back:\n{screen}");
+            assert!(
+                !screen.lines().any(|l| l.trim_end() == "DANGEROUS"),
+                "the end of a line ran without its start:\n{screen}"
+            );
+        });
+}
+
+/// The reattach lands on a new shell (the server restarted during the outage): the scrollback
+/// view shows the new shell's history, not the rows the client held of the old one.
+#[test]
+fn after_a_server_restart_the_scrollback_is_the_new_shells() {
+    crate::harness::runtime()
+        .expect("tokio runtime")
+        .block_on(async {
+            let net = clean();
+            let client_secret = identity().expect("OS randomness");
+            let server_secret = identity().expect("OS randomness");
+            let allow = [client_secret.public()];
+            let server = Server::start_as(&net, server_secret.clone(), &allow, &["sh"])
+                .await
+                .expect("start the server");
+            let endpoint = net
+                .endpoint(client_secret, false)
+                .await
+                .expect("bind the client");
+            let mut client = Client::connect_on(endpoint, server.id, Options::default())
+                .await
+                .expect("connect");
+            client
+                .send(b"i=0; while [ $i -lt 200 ]; do echo old line $i; i=$((i+1)); done\r")
+                .await
+                .expect("send");
+            assert!(client
+                .wait_until(WAIT, |t| t.contains("old line 199"))
+                .await
+                .is_some());
+            // The old shell's history is held: the view showed it.
+            client.send(b"\x1e[g").await.expect("send");
+            assert!(client.wait_until(WAIT, oldest).await.is_some(), "the view");
+            client.send(b"q").await.expect("send");
+            // Long enough for the server to confirm the input.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // The server restarts during an outage.
+            net.black_hole(Duration::from_secs(3));
+            client.drop_first_connection();
+            server.stop().await;
+            let server = Server::start_as(&net, server_secret, &allow, &["sh"])
+                .await
+                .expect("restart the server");
+            assert!(
+                client.wait_for(WAIT, reconnecting).await.is_some(),
+                "the client must show the reconnecting banner"
+            );
+            // Typed during the outage, it runs once the client is on the new shell.
+            client
+                .send(b"i=0; while [ $i -lt 200 ]; do echo new line $i; i=$((i+1)); done\r")
+                .await
+                .expect("send");
+            let ran = client
+                .wait_until(Duration::from_secs(20), |t| t.contains("new line 199"))
+                .await
+                .is_some();
+            if !ran {
+                let st = client
+                    .wait_for(Duration::from_secs(1), |p| p.status.is_some())
+                    .await;
+                eprintln!("DBG status {:?}", st.map(|p| p.status));
+            }
+            assert!(ran, "the new shell never ran:\n{}", client.screen());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            client.send(b"\x1e[g").await.expect("send");
+            let top = client
+                .wait_until(WAIT, |t| t.contains("new line 0") || t.contains("old line"))
+                .await;
+            let screen = client.screen();
+            let _ = client.send(b"q").await;
+            let _ = client.finish().await;
+            server.stop().await;
+            assert!(
+                top.is_some_and(|p| !p.text.contains("old line")),
+                "the scrollback view shows the dead shell's rows:\n{screen}"
+            );
         });
 }

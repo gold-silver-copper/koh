@@ -296,6 +296,15 @@ impl Scrollback {
         self.outstanding.clear();
     }
 
+    /// A new connection: the history held is the last server session's, and the new one may be
+    /// another (a restarted server, an expired session), whose rows reuse the same names. It goes,
+    /// and the new connection's frames say the history again; the view stays open.
+    pub fn reconnected(&mut self) {
+        self.cache = HistoryCache::default();
+        self.mark = HistoryMark::default();
+        self.outstanding.clear();
+    }
+
     /// The screen to show for `live`: `live` scrolled back, while viewing.
     pub fn shown(&self, live: &TerminalScreen) -> Option<TerminalScreen> {
         self.view

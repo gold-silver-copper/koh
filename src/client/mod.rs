@@ -549,7 +549,7 @@ pub async fn run_client<T: ClientTerminal>(
                 net = redial(wire, &mut attempt, &mut session, &connector);
             }
             Some(Change::Dialed(Ok(Ok(conn)))) => {
-                session.attach(term.size().unwrap_or(initial_size));
+                session.attach(Instant::now(), term.size().unwrap_or(initial_size));
                 net = Net::Up(Wire::open(conn).await);
             }
             Some(Change::Dialed(failed)) => {

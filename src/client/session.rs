@@ -36,6 +36,12 @@ const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 /// What the status line says of a paste past [`MAX_QUEUED_INPUT`], which is dropped whole.
 const PASTE_TOO_LONG: &str = "[koh] paste over 1 MiB — not sent";
 
+/// The notice for what was typed during an outage and not sent: input handed to the lost
+/// connection was never confirmed, so the server may have lost it, and what came after it would
+/// run without it (`false && rm …` typed across the drop must not run `rm …`).
+const OUTAGE_INPUT_DROPPED: &str =
+    "[koh] typing during the outage not sent — keys typed as the link dropped were lost";
+
 /// How long after a frame moves the cursor to another row (a fresh prompt) a key typed is shown
 /// only once echoed: the server reads the PTY's modes at least every [`TTY_TICK`], so a program
 /// that turned echo off just after printing its prompt is heard of within about one; two leave
@@ -76,6 +82,9 @@ pub struct ClientSession {
     last_seq: InputSeq,
     /// The newest input sequence number handed to a connection.
     sent_seq: InputSeq,
+    /// At the last [`detach`](Self::detach), input handed to the lost connection was not yet
+    /// confirmed (`sent_seq` beyond its echo-ack): what is typed after it is not sent.
+    unconfirmed_at_drop: bool,
     /// Messages for the server, oldest first.
     outgoing: VecDeque<ClientMsg>,
     /// Typed bytes in `outgoing`.
@@ -161,6 +170,7 @@ impl ClientSession {
             down_since: None,
             last_seq: InputSeq::default(),
             sent_seq: InputSeq::default(),
+            unconfirmed_at_drop: false,
             outgoing: VecDeque::from([ClientMsg::Resize(size)]),
             queued_input: 0,
             input_paused: false,
@@ -181,9 +191,11 @@ impl ClientSession {
     }
 
     /// The connection was lost: what was meant for it alone (acknowledgements, resyncs and
-    /// history requests) goes with it; typed input, resizes and colours wait for the next.
+    /// history requests) goes with it; typed input, resizes and colours wait for the next. The
+    /// predictions go, and whether typing was trusted is kept as it was now, at the drop.
     pub fn detach(&mut self, now: Instant) {
         self.down_since = Some(now);
+        self.unconfirmed_at_drop |= self.sent_seq > self.link.echo_ack;
         self.outgoing.retain(|msg| {
             !matches!(
                 msg,
@@ -191,23 +203,34 @@ impl ClientSession {
             )
         });
         self.scrollback.forget_requests();
+        self.predictor = self.predictor.reattached();
         self.dirty = true;
     }
 
-    /// A new connection to the same server session, whose window is `size`: the server is told
-    /// the size and the colours first (a reattach may be from another terminal), then what was
-    /// typed meanwhile. The last screen stays up until the server repaints it.
-    pub fn attach(&mut self, size: Size) {
+    /// A new connection, whose window is `size`: the server is told the size and the colours
+    /// first (a reattach may be from another terminal), then what was typed meanwhile, unless
+    /// input handed to the lost connection was not confirmed: what followed it is dropped and
+    /// said, as the server may never have had what it follows. The last screen stays up until
+    /// the server repaints it; the history held is the server session's, and is fetched again.
+    pub fn attach(&mut self, now: Instant, size: Size) {
         self.link = Link::fresh(Arc::clone(&self.link.current.screen), self.sent_seq);
         self.down_since = None;
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Resize(_) | ClientMsg::Colours(_)));
+        if std::mem::take(&mut self.unconfirmed_at_drop) && self.queued_input > 0 {
+            self.outgoing
+                .retain(|msg| !matches!(msg, ClientMsg::Keys { .. } | ClientMsg::Input { .. }));
+            self.queued_input = 0;
+            self.input_paused = false;
+            self.notice = Some((OUTAGE_INPUT_DROPPED.to_owned(), now));
+        }
         if let Some(colours) = self.colours.as_ref().filter(|c| c.known()) {
             self.outgoing
                 .push_front(ClientMsg::Colours(colours.clone()));
         }
         self.outgoing.push_front(ClientMsg::Resize(size));
         self.rows = size.rows;
+        self.scrollback.reconnected();
         self.predictor = self.predictor.reattached();
         self.dirty = true;
     }
@@ -604,13 +627,25 @@ impl ClientSession {
     /// Advance to `now`: probe for unconfirmed input, and report the status banner.
     pub fn on_tick(&mut self, now: Instant, rtt: Option<Duration>) -> TickResult {
         if let Some(down) = self.down_since {
-            // Nothing to probe for or fetch: only the banner's clock moves.
+            // Nothing to probe for or fetch: only the banner's clock moves, with what else the
+            // status line would say after it.
+            let mut status = format!(
+                "[koh] disconnected — reconnecting… {}s (Ctrl-^ . to quit)",
+                now.saturating_duration_since(down).as_secs()
+            );
+            if self.input_paused {
+                status.push_str(" · input paused — 1 MiB is waiting to be sent");
+            } else if let Some((notice, _)) = self
+                .notice
+                .as_ref()
+                .filter(|(_, at)| now.saturating_duration_since(*at) < NOTICE_FOR)
+            {
+                status.push_str(" · ");
+                status.push_str(notice.trim_start_matches("[koh] "));
+            }
             return TickResult {
                 wait: Duration::from_secs(1),
-                status: Some(format!(
-                    "[koh] disconnected — reconnecting… {}s (Ctrl-^ . to quit)",
-                    now.saturating_duration_since(down).as_secs()
-                )),
+                status: Some(status),
             };
         }
         // Unconfirmed input may be behind a lost packet: any later one (a repeated ack, which the
@@ -1558,7 +1593,7 @@ mod tests {
         let (now, mut s) = start();
         s.on_input(now, &[ESCAPE_PREFIX]);
         s.detach(now);
-        s.attach(Size::new(24, 80));
+        s.attach(now, Size::new(24, 80));
         assert_eq!(s.on_input(now, b"."), InputOutcome::Quit);
     }
 
@@ -1574,10 +1609,20 @@ mod tests {
         }));
         s.on_input(now, b"a");
         drain(&mut s);
-        // An unconfirmed key is probed for, and a resync asked: both for this connection only.
-        s.on_tick(now + Duration::from_secs(5), None);
-        s.on_frame(now, &frame(5, 4, 0, &screen(b""), &screen(b"")));
+        // The key sent is confirmed; the one queued is probed for, and a resync asked: both for
+        // this connection only.
+        s.on_frame(now, &frame(1, 0, 1, &screen(b""), &screen(b"a")));
         s.on_input(now, b"b");
+        s.on_tick(now + Duration::from_secs(5), None);
+        s.on_frame(now, &frame(5, 4, 1, &screen(b""), &screen(b"")));
+        assert!(
+            s.outgoing
+                .iter()
+                .any(|m| matches!(m, ClientMsg::Ack { .. }))
+                && s.outgoing.iter().any(|m| matches!(m, ClientMsg::Resync)),
+            "{:?}",
+            s.outgoing
+        );
         s.detach(now);
         let status = s.on_tick(now + Duration::from_secs(2), None).status;
         assert!(
@@ -1586,7 +1631,7 @@ mod tests {
         );
         s.on_input(now, b"c");
         s.on_resize(Size::new(30, 90));
-        s.attach(Size::new(40, 100));
+        s.attach(now, Size::new(40, 100));
         let sent = drain(&mut s);
         assert!(
             matches!(
@@ -1626,7 +1671,7 @@ mod tests {
         });
         s.on_input(now, &[ESCAPE_PREFIX, SCROLLBACK_KEY]);
         s.detach(now);
-        s.attach(Size::new(24, 80));
+        s.attach(now, Size::new(24, 80));
         assert!(s.view().is_some(), "the view is still open");
         assert!(s.screen().contents().contains("kept"));
         assert!(!s.synced(), "not the new connection's screen yet");
@@ -1635,5 +1680,67 @@ mod tests {
             &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"new")),
         );
         assert!(s.synced() && s.screen().contents().contains("new"));
+    }
+
+    /// A line typed across the drop: its start went out on the lost connection unconfirmed, so
+    /// its end, typed while down, is not sent on the next (it would run without its start), and
+    /// the status line says so. Typing after the reattach goes out as ever.
+    #[test]
+    fn input_after_an_unconfirmed_send_is_not_sent_after_the_attach() {
+        let (now, mut s) = start();
+        s.on_input(now, b"false && ");
+        drain(&mut s);
+        s.detach(now);
+        s.on_input(now, b"rm -rf *\r");
+        s.attach(now, Size::new(24, 80));
+        let sent = drain(&mut s);
+        assert!(
+            matches!(sent.as_slice(), [ClientMsg::Resize(_)]),
+            "the tail is not sent: {sent:?}"
+        );
+        let status = s.on_tick(now, None).status.expect("a notice");
+        assert!(status.contains("not sent"), "{status}");
+        s.on_input(now, b"x");
+        assert_eq!(typed(&drain(&mut s)), b"x");
+    }
+
+    /// While down, the banner still says that typing is paused, and a notice given meanwhile.
+    #[test]
+    fn the_banner_carries_a_pause_and_a_notice() {
+        let (now, mut s) = start();
+        s.detach(now);
+        s.on_input(now, b"\x1b[200~");
+        s.on_inputs(now, vec![Input::PasteTooLong]);
+        let status = s.on_tick(now, None).status.expect("the banner");
+        assert!(
+            status.contains("reconnecting") && status.contains("paste over 1 MiB"),
+            "{status}"
+        );
+        s.input_paused = true;
+        let status = s.on_tick(now, None).status.expect("the banner");
+        assert!(status.contains("input paused"), "{status}");
+    }
+
+    /// Trust in predictions is the drop's: a resize while down (which voids the predictions)
+    /// does not take it away, and an untrusted session gains none from an outage.
+    #[test]
+    fn prediction_trust_is_taken_at_the_drop() {
+        let (now, mut s) = start();
+        s.detach(now);
+        s.attach(now, Size::new(24, 80));
+        assert!(
+            !s.predictor.carries_trust(),
+            "a session never confirmed carries no trust"
+        );
+        let (now, mut s) = start();
+        s.predictor.confirm_for_tests();
+        s.detach(now);
+        s.on_resize(Size::new(30, 90));
+        s.on_input(now, b"abc");
+        s.attach(now, Size::new(30, 90));
+        assert!(
+            s.predictor.carries_trust(),
+            "trust at the drop is carried across the outage"
+        );
     }
 }

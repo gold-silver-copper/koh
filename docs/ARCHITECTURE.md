@@ -332,7 +332,15 @@ holding the last screen under a `reconnecting…` banner in the meantime. One `C
 for the whole run and one loop drives it, connected or not: only what belongs to a connection (its
 frames, echo-ack and acknowledgements) is dropped (`detach`) and made anew (`attach`), so what is
 typed during the outage goes out on the new connection, and the escape keys, the scrollback view
-and the colours work and carry across it. A **wall-clock freeze
+and the colours work and carry across it. Two limits keep that safe. Input handed to the lost
+connection and not yet confirmed by its echo-ack may have been lost with it; what was typed after
+it would then run without it (`false && rm …` typed across the drop must not run `rm …`), so it is
+dropped at `attach`, and the status line says so. And the history rows held are the server
+session's, so `attach` drops them and the new connection's frames say the history again: a
+reattach may land on a new shell (the session expired, the shell exited, or the server restarted)
+whose rows reuse the same names. The client cannot tell that case from a reattach (the server's
+`AttachKind` is not on the wire), so input typed during an outage then goes to the new shell, at
+its prompt; telling the client would take a protocol change. A **wall-clock freeze
 detector** turns a multi-minute wake-up hang into a ~1–2 s reattach: if real time jumps more than
 20 s between two (≤50 ms-cadence) loop iterations, the client concludes the process was suspended,
 drops the (almost certainly dead) connection, and re-dials immediately. The first iteration

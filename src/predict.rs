@@ -299,12 +299,14 @@ impl PredictionEngine {
     }
 
     /// A fresh engine for a reconnect to the same session: the same preference, and, if typing
-    /// was being shown as it was predicted, trust from the first key once a frame shows the PTY is
-    /// not at a password prompt ([`set_tty`](Self::set_tty)).
+    /// was being shown as it was predicted (or trust was carried here and not yet given), trust
+    /// from the first key once a frame shows the PTY is not at a password prompt
+    /// ([`set_tty`](Self::set_tty)). Taken at the drop and again at the reattach, the trust is
+    /// the drop's: nothing between confirms an epoch, so nothing typed then can add to it.
     #[must_use]
     pub fn reattached(&self) -> Self {
         let mut fresh = Self::new(self.pref);
-        fresh.carried = self.prediction_epoch == self.confirmed_epoch;
+        fresh.carried = self.carried || self.prediction_epoch == self.confirmed_epoch;
         fresh
     }
 
@@ -425,6 +427,16 @@ impl PredictionEngine {
     #[cfg(test)]
     pub fn confirmed_epoch(&self) -> u64 {
         self.confirmed_epoch
+    }
+    /// Whether trust carried from a lost connection waits to be given. Test-only.
+    #[cfg(test)]
+    pub(crate) const fn carries_trust(&self) -> bool {
+        self.carried
+    }
+    /// Confirm the newest epoch, as an echo would. Test-only.
+    #[cfg(test)]
+    pub(crate) fn confirm_for_tests(&mut self) {
+        self.confirmed_epoch = self.prediction_epoch;
     }
     /// The newest local input frame number sent so far (predictions expire at this + 1).
     pub fn set_local_frame_sent(&mut self, n: u64) {

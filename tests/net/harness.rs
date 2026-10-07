@@ -35,7 +35,16 @@ impl Server {
         allow: &[EndpointId],
         command: &[&str],
     ) -> anyhow::Result<Self> {
-        let secret = generate_secret_key()?;
+        Self::start_as(net, generate_secret_key()?, allow, command).await
+    }
+
+    /// Start a server as `secret`: given the secret of a stopped one, the same server restarted.
+    pub async fn start_as(
+        net: &FaultNet,
+        secret: SecretKey,
+        allow: &[EndpointId],
+        command: &[&str],
+    ) -> anyhow::Result<Self> {
         let id = secret.public();
         let endpoint = net.endpoint(secret, true).await?;
         let config = ServeConfig {

@@ -1336,8 +1336,9 @@ pub struct ScreenDiff {
     pub title: Option<String>,
     /// New window icon name if it changed.
     pub icon: Option<String>,
-    /// New clipboard if it changed.
-    pub clipboard: Option<String>,
+    /// New clipboard if it changed (one to drop decodes as none).
+    #[serde(deserialize_with = "Clipboard::decode")]
+    pub clipboard: Option<Clipboard>,
     /// The bell count, always sent, so a change of it alone is not lost.
     pub bell_count: u64,
     /// The remote shell's exit code, set on the final (shutdown) frame.
@@ -1393,8 +1394,7 @@ impl TerminalScreen {
             resize: resized.then(|| self.size()),
             title: (self.title != base.title).then(|| self.title.clone()),
             icon: (self.icon != base.icon).then(|| self.icon.clone()),
-            clipboard: (self.clipboard != base.clipboard)
-                .then(|| self.clipboard.as_str().to_owned()),
+            clipboard: (self.clipboard != base.clipboard).then(|| self.clipboard.clone()),
             bell_count: self.bell_count,
             exit_code: self.exit_code,
             history: (self.history != base.history).then_some(self.history),
@@ -1463,12 +1463,8 @@ impl TerminalScreen {
         if let Some(icon) = &diff.icon {
             self.icon = capped_chars(icon, MAX_TITLE_LEN);
         }
-        if let Some(clipboard) = diff
-            .clipboard
-            .as_deref()
-            .and_then(|c| Clipboard::new(c.as_bytes()))
-        {
-            self.clipboard = clipboard;
+        if let Some(clipboard) = &diff.clipboard {
+            self.clipboard = clipboard.clone();
         }
         if diff.exit_code.is_some() {
             self.exit_code = diff.exit_code;
@@ -1693,9 +1689,10 @@ mod tests {
             };
             let resize = resize.map(|(rows, cols)| Size::new(rows, cols));
             let diff = ScreenDiff {
-                resize, title, icon, clipboard, bell_count, exit_code, history: None, tty: None, cursor, modes,
+                resize, title, icon, clipboard: None, bell_count, exit_code, history: None, tty: None, cursor, modes,
                 shifts, rows,
             };
+            let diff = with_wire_clipboard(&diff, clipboard.as_deref());
             let mut screen = TerminalScreen::default();
             screen.apply(&diff); // must not panic on adversarial input
             let Size { rows, cols } = screen.size();
@@ -1708,7 +1705,7 @@ mod tests {
             proptest::prop_assert!(crow < rows && ccol <= cols);
             proptest::prop_assert!(screen.title.chars().count() <= MAX_TITLE_LEN);
             proptest::prop_assert!(screen.icon.chars().count() <= MAX_TITLE_LEN);
-            let set = diff.clipboard.as_deref().and_then(|c| Clipboard::new(c.as_bytes()));
+            let set = clipboard.as_deref().and_then(|c| Clipboard::new(c.as_bytes()));
             proptest::prop_assert_eq!(screen.clipboard, set.unwrap_or_default());
         }
 
@@ -1967,6 +1964,21 @@ mod tests {
         );
     }
 
+    /// `diff` as a server sends it with `clipboard`, any string, for its clipboard, decoded.
+    fn with_wire_clipboard(diff: &ScreenDiff, clipboard: Option<&str>) -> ScreenDiff {
+        let bytes = postcard::to_allocvec(&ScreenDiff {
+            clipboard: None,
+            ..diff.clone()
+        })
+        .unwrap();
+        let at = postcard::to_allocvec(&(&diff.resize, &diff.title, &diff.icon))
+            .unwrap()
+            .len();
+        let set = postcard::to_allocvec(&clipboard).unwrap();
+        postcard::from_bytes(&[&bytes[..at], &set, &bytes[at.saturating_add(1)..]].concat())
+            .unwrap()
+    }
+
     #[test]
     fn client_apply_caps_oversized_title_and_drops_clipboard() {
         // A malicious server ships an oversized title + clipboard. The client re-applies the caps
@@ -1975,7 +1987,8 @@ mod tests {
         let mut diff = TerminalScreen::default().diff_from(&TerminalScreen::default());
         diff.title = Some("T".repeat(MAX_TITLE_LEN + 1000));
         diff.icon = Some("I".repeat(MAX_TITLE_LEN + 5));
-        diff.clipboard = Some("C".repeat(MAXIMUM_CLIPBOARD_SIZE + 1000));
+        let diff = with_wire_clipboard(&diff, Some(&"C".repeat(MAXIMUM_CLIPBOARD_SIZE + 1000)));
+        assert_eq!(diff.clipboard, None, "dropped as it is decoded");
         c.apply(&diff);
         assert_eq!(
             c.title().chars().count(),
@@ -2524,7 +2537,7 @@ mod tests {
         let base = TerminalScreen::default();
         let diff = target.diff_from(&base);
         assert_eq!(diff.icon.as_deref(), Some("myicon"));
-        assert_eq!(diff.clipboard.as_deref(), Some("aGk="));
+        assert_eq!(diff.clipboard.as_ref().map(Clipboard::as_str), Some("aGk="));
         let mut c = base.clone();
         c.apply(&diff);
         assert_eq!(c, target, "icon + clipboard reconstruct via diff/apply");

@@ -154,10 +154,11 @@ const _: () =
 
 /// The events of one `ClientMsg::Keys`, in order.
 ///
-/// Built only by [`try_push`](Self::try_push), which admits an event by its postcard encoding: so
-/// a `Keys` message of them always encodes within [`MAX_CLIENT_MESSAGE`]. Decoded, they are
-/// checked as [`try_push`](Self::try_push) checks each, and bounded by the message's length. On
-/// the wire it is the `Vec<InputEvent>` it holds.
+/// Built by [`try_push`](Self::try_push), which admits an event by its postcard encoding: so a
+/// `Keys` message of them always encodes within [`MAX_CLIENT_MESSAGE`]. Or decoded, checked as
+/// [`try_push`](Self::try_push) checks each but bounded by the frame's length alone, as the
+/// server always took them; a decoded one is never sent again. On the wire it is the
+/// `Vec<InputEvent>` it holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Events {

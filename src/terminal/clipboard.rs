@@ -1,13 +1,16 @@
 //! The clipboard a program set (OSC 52), as both ends hold it.
 
+use serde::{Deserialize, Deserializer, Serialize};
+
 /// Most bytes in a forwarded clipboard (OSC 52), as mosh caps it; a larger one is dropped.
 pub const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
 
 /// A clipboard payload: base64 within [`MAXIMUM_CLIPBOARD_SIZE`], empty if none.
 ///
-/// Made only by [`new`](Self::new), so the server's emulator, the client applying a diff and the client
-/// forwarding it to the user's terminal hold it to one rule.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Made only by [`new`](Self::new), so the server's emulator, the client decoding a diff and the
+/// client forwarding it to the user's terminal hold it to one rule. On the wire it is its string.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
 pub struct Clipboard(String);
 
 impl Clipboard {
@@ -22,6 +25,12 @@ impl Clipboard {
                 .iter()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')))
         .then(|| Self(String::from_utf8_lossy(data).into_owned()))
+    }
+
+    /// A diff's clipboard as decoded: one to drop is read as no change, whole, so what the client
+    /// holds is never a cut one.
+    pub(super) fn decode<'de, D: Deserializer<'de>>(wire: D) -> Result<Option<Self>, D::Error> {
+        Ok(Option::<String>::deserialize(wire)?.and_then(|c| Self::new(c.as_bytes())))
     }
 
     pub fn as_str(&self) -> &str {

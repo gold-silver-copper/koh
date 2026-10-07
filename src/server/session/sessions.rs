@@ -62,7 +62,14 @@ impl Sessions {
 /// Attach to the session `control` reaches: a client and how long it was detached, or `None` if
 /// its task has ended.
 async fn attach_to(control: &mpsc::Sender<Attach>) -> Option<(SessionClient, Option<Duration>)> {
-    let (reply, rx) = oneshot::channel();
+    let (reply, mut rx) = oneshot::channel();
     control.send(Attach(reply)).await.ok()?;
-    rx.await.ok()
+    // A request sent as the session ends can land after its receiver dropped what was queued, and
+    // then waits, unanswered, for the last sender, which is in `live`: the end itself answers it.
+    // A reply comes first, sent before the receiver is dropped.
+    tokio::select! {
+        biased;
+        attached = &mut rx => attached.ok(),
+        () = control.closed() => None,
+    }
 }

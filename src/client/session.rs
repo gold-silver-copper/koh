@@ -1803,4 +1803,51 @@ mod tests {
             "trust at the drop is carried across the outage"
         );
     }
+
+    /// A paste at the paste limit, with a key before it in the same read, is over the queue's
+    /// bound with nothing queued: it must not leave input paused for good.
+    #[test]
+    fn a_paste_at_the_limit_with_a_key_does_not_pause_input_for_good() {
+        let now = Instant::now();
+        let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
+        drain(&mut s);
+        s.on_input(
+            now,
+            &[&b"k\x1b[200~"[..], &vec![b'x'; MAX_QUEUED_INPUT], b"\x1b[201~"].concat(),
+        );
+        let first = drain(&mut s);
+        s.on_input(now, b"a");
+        let later = drain(&mut s);
+        assert!(
+            !later.is_empty(),
+            "typing after the paste was dropped: first read sent {} messages, \
+             input_paused = {}, queued_input = {}",
+            first.len(),
+            s.input_paused,
+            s.queued_input,
+        );
+    }
+
+    /// What the queue packs into one `Keys` message must be encodable.
+    #[test]
+    fn a_packed_keys_message_is_encodable() {
+        let now = Instant::now();
+        let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
+        drain(&mut s);
+        let one = [&b"\x1b[200~"[..], &[b'p'; 127], b"\x1b[201~"].concat();
+        for _ in 0..MAX_EVENTS {
+            s.on_input(now, &one);
+        }
+        let msg = s.pop_outgoing().expect("a message");
+        let ClientMsg::Keys { events, .. } = &msg else {
+            panic!("not keys: {msg:?}");
+        };
+        let n = events.len();
+        let encoded = crate::proto::encode_client(&msg);
+        assert!(
+            encoded.is_ok(),
+            "a Keys message of {n} events, packed by the queue, does not encode: {:?}",
+            encoded.err()
+        );
+    }
 }

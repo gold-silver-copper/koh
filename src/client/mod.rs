@@ -18,13 +18,12 @@ pub(crate) use io::spawn_client_io;
 pub use render::{InputModes, WindowState};
 pub use session::{ClientSession, InputOutcome, TickResult};
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::predict::{DisplayPreference, Overlay};
 use crate::proto::{decode_server, encode_client, ServerMsg, MAX_FRAME, SESSION_ENDED};
 use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::ALPN;
-use fux_vt::keys::decode::{Decoder, Input};
 use iroh::endpoint::{Connection, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
@@ -158,29 +157,6 @@ const fn next_attempt_after_drop(attempt: u32, dwell: Duration) -> u32 {
     } else {
         attempt.saturating_add(1)
     }
-}
-
-/// Whether `chunk`, decoded by `decoder`, completes the quit escape (`Ctrl-^ .`) while
-/// reconnecting, as [`ClientSession`]'s escape machine would, whatever the terminal sent for the
-/// keys; `pending` carries a lone prefix across chunks.
-fn escape_quit(chunk: &[u8], decoder: &mut Decoder, pending: &mut bool) -> bool {
-    let mut inputs = Vec::new();
-    decoder.bytes(chunk, &mut inputs);
-    for input in inputs {
-        let Input::Key(stroke) = input else {
-            continue;
-        };
-        let key = session::legacy_bytes(stroke.press);
-        if *pending {
-            *pending = false;
-            if key == b"." {
-                return true;
-            }
-        } else if key == [ESCAPE_PREFIX] {
-            *pending = true;
-        }
-    }
-    false
 }
 
 /// The out-of-band window state (title / icon / clipboard / bell) to mirror onto the real terminal.
@@ -397,10 +373,16 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
 /// Run a client session on `initial`, redialing through `connector` and reattaching to the same
 /// server session whenever the link drops; meanwhile the last screen stays up under a banner.
 ///
-/// The I/O shell around [`ClientSession`], which makes every protocol decision. `input_rx` carries
-/// typed bytes (its closing ends the session); `resize_rx` carries resize ticks, on which the size
-/// is read from `term` (`initial_size` if that fails). Cancelling `shutdown` (on a fatal signal)
-/// quits like the user, so the terminal is restored. `bell` runs on every remote bell.
+/// The I/O shell around [`ClientSession`], which makes every protocol decision. One session lives
+/// for the whole run, so what is typed while the link is down is kept for the next connection and
+/// read by the same escape machine. `input_rx` carries typed bytes (its closing ends the session);
+/// `resize_rx` carries resize ticks, on which the size is read from `term` (`initial_size` if that
+/// fails). Cancelling `shutdown` (on a fatal signal) quits like the user, so the terminal is
+/// restored. `bell` runs on every remote bell.
+///
+/// The client's stream is written by its own task behind a bounded queue, and frames are read by
+/// their own tasks, so nothing here waits on the network: the keyboard, and the quit escape, stay
+/// live even when the server stops reading.
 ///
 /// Returns the remote shell's exit code if it exited, `None` on a local quit.
 #[expect(
@@ -411,176 +393,52 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
 )]
 pub async fn run_client<T: ClientTerminal>(
     initial: Connection,
-    dialed_at: std::time::SystemTime,
+    dialed_at: SystemTime,
     connector: IrohConnector,
     pref: DisplayPreference,
     initial_size: Size,
-    mut colours: Option<crate::events::WireColours>,
+    colours: Option<crate::events::WireColours>,
     mut input_rx: mpsc::Receiver<Vec<u8>>,
     mut resize_rx: mpsc::Receiver<()>,
     mut term: T,
     shutdown: CancellationToken,
     mut bell: Option<BellHook>,
 ) -> anyhow::Result<Option<u32>> {
-    let mut conn = initial;
-    // When the connection was made, for the freeze detector: a freeze between dialing and the
-    // loop (while the terminal is probed, say) counts too.
-    let mut since = dialed_at;
+    let mut session = ClientSession::new(pref, term.size().unwrap_or(initial_size));
+    session.set_colours(colours);
     // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
     let mut attempt: u32 = 0;
-    // Whether typing was shown as predicted when the last connection dropped.
-    let mut trusted = false;
-    loop {
-        // A fresh session per connection: the server repaints the live screen on each attach.
-        let size = term.size().unwrap_or(initial_size);
-        let mut session = ClientSession::new(pref, size);
-        if trusted {
-            session.carry_trust();
-        }
-        // Every connection tells the server the colours: a reattach may be from another
-        // terminal, whose colours replace the last.
-        session.set_colours(colours.clone());
-
-        let conn_started = Instant::now();
-        match drive_connection(
-            &conn,
-            since,
-            &mut session,
-            &mut term,
-            &mut input_rx,
-            &mut resize_rx,
-            &shutdown,
-            bell.as_mut(),
-        )
-        .await?
-        {
-            Disposition::Quit => {
-                conn.close(0u32.into(), b"client exit");
-                return Ok(None);
-            }
-            Disposition::Ended(code) => {
-                conn.close(0u32.into(), b"client exit");
-                return Ok(code);
-            }
-            Disposition::LinkLost => {
-                trusted = session.trusted();
-                colours = session.colours();
-                conn.close(0u32.into(), b"reconnecting");
-                let dwell = conn_started.elapsed();
-                attempt = next_attempt_after_drop(attempt, dwell);
-                match reconnect(
-                    &connector,
-                    &mut term,
-                    &mut input_rx,
-                    &session,
-                    &shutdown,
-                    &mut attempt,
-                )
-                .await
-                {
-                    ReconnectOutcome::Connected(c) => {
-                        conn = c;
-                        since = std::time::SystemTime::now();
-                    }
-                    ReconnectOutcome::Quit => return Ok(None),
-                }
-            }
-        }
-    }
-}
-
-/// Act on what typed input decided: suspend now, or say the user quit (`true`).
-fn after_input<T: ClientTerminal>(
-    outcome: InputOutcome,
-    term: &mut T,
-    session: &mut ClientSession,
-    last_wall: &mut std::time::SystemTime,
-) -> std::io::Result<bool> {
-    match outcome {
-        InputOutcome::Quit => return Ok(true),
-        InputOutcome::Suspend => {
-            term.suspend_resume()?;
-            session.dirty = true;
-            // A deliberate suspend is not a freeze to reconnect after.
-            *last_wall = std::time::SystemTime::now();
-        }
-        InputOutcome::Forwarded => {}
-    }
-    Ok(false)
-}
-
-/// Sleep until `deadline`, or forever with none.
-async fn until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Why [`drive_connection`] returned: [`run_client`] decides whether to exit or reconnect.
-enum Disposition {
-    /// The user disconnected (`Ctrl-^ .`) or the input channel closed — exit, no reconnect.
-    Quit,
-    /// The server announced a clean shutdown; carry the remote shell's exit code out.
-    Ended(Option<u32>),
-    /// The connection dropped mid-session — the caller should reconnect and reattach.
-    LinkLost,
-}
-
-/// Drive one connection until it ends, and say how.
-///
-/// The client's stream is written by its own task behind a bounded queue, and frames are read by
-/// their own tasks, so nothing here waits on the network: the keyboard, and the quit escape, stay
-/// live even when the server stops reading.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one connection's collaborators: the connection and when it was made, the session, the \
-              terminal, the input and resize channels, the shutdown token and the bell hook"
-)]
-async fn drive_connection<T: ClientTerminal>(
-    conn: &Connection,
-    since: std::time::SystemTime,
-    session: &mut ClientSession,
-    term: &mut T,
-    input_rx: &mut mpsc::Receiver<Vec<u8>>,
-    resize_rx: &mut mpsc::Receiver<()>,
-    shutdown: &CancellationToken,
-    mut bell: Option<&mut BellHook>,
-) -> anyhow::Result<Disposition> {
-    let Ok(send) = conn.open_uni().await else {
-        return Ok(Disposition::LinkLost);
-    };
-    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
-    let _writer = AbortOnDrop(tokio::spawn(write_client_stream(send, writer_rx)));
-    let (frame_tx, mut frame_rx) = mpsc::channel::<ServerMsg>(FRAME_QUEUE);
-    let _reader = AbortOnDrop(tokio::spawn(read_frames(conn.clone(), frame_tx)));
-
+    let mut net = Net::Up(Wire::open(initial).await);
     // Wall-clock time, which keeps running while the process is frozen (see `STALE_AFTER_FREEZE`),
     // from when the connection was made: a freeze before the first iteration counts.
-    let mut last_wall = since;
+    let mut last_wall = dialed_at;
     // Logged on a change of 30 ms or more, to tell a slow link from a slow server in debug logs.
     let mut last_logged_rtt: Option<Duration> = None;
     loop {
         // A clock stepped backwards reads as no gap.
-        let wall_now = std::time::SystemTime::now();
+        let wall_now = SystemTime::now();
         let wall_gap = wall_now.duration_since(last_wall).unwrap_or(Duration::ZERO);
         last_wall = wall_now;
-        if looks_like_resume_from_freeze(wall_gap) {
-            tracing::info!(
-                frozen_secs = wall_gap.as_secs(),
-                "detected resume from a process freeze (suspend/screen-off); forcing a reconnect"
-            );
-            return Ok(Disposition::LinkLost);
-        }
-
-        let now = Instant::now();
-        let rtt = crate::transport_iroh::rtt(conn);
+        let rtt = if let Net::Up(wire) = &net {
+            if looks_like_resume_from_freeze(wall_gap) {
+                tracing::info!(
+                    frozen_secs = wall_gap.as_secs(),
+                    "detected resume from a process freeze (suspend/screen-off); forcing a reconnect"
+                );
+                net = redial(wire, &mut attempt, &mut session, &connector);
+                continue;
+            }
+            crate::transport_iroh::rtt(&wire.conn)
+        } else {
+            None
+        };
         if let Some(rtt) = rtt {
             if last_logged_rtt.is_none_or(|prev| prev.abs_diff(rtt) >= Duration::from_millis(30)) {
                 tracing::debug!(rtt_ms = rtt.as_millis(), "link rtt");
                 last_logged_rtt = Some(rtt);
             }
         }
+        let now = Instant::now();
         let tick = session.on_tick(now, rtt);
 
         // Repaint on new content, while a banner is up, or once more to clear a stale banner.
@@ -594,7 +452,7 @@ async fn drive_connection<T: ClientTerminal>(
             session.dirty = false;
             // Only once synced: the first synced frame primes the hook, so bells from before this
             // attach don't fire it.
-            if let Some(hook) = bell.as_deref_mut() {
+            if let Some(hook) = bell.as_mut() {
                 if session.synced() {
                     let win = session.window_state();
                     hook.prime(win.bell_count);
@@ -604,8 +462,8 @@ async fn drive_connection<T: ClientTerminal>(
         }
 
         if session.exited() {
-            let code = session.state().exit_code();
-            return Ok(end_session(term, session, shutdown, code).await);
+            end_session(&mut term, &session, &shutdown).await;
+            return Ok(net.close(session.state().exit_code()));
         }
 
         // The colours again, after the terminal reported a new scheme.
@@ -616,58 +474,53 @@ async fn drive_connection<T: ClientTerminal>(
             }
         }
 
-        tokio::select! {
+        let (writer, frames, dialing) = match &mut net {
+            Net::Up(wire) => (Some(&wire.writer_tx), Some(&mut wire.frame_rx), None),
+            Net::Down(dial) => (None, None, Some(dial)),
+        };
+        let change = tokio::select! {
             // Keystrokes first: queued screen updates must never starve them.
             biased;
 
-            maybe = input_rx.recv() => {
-                match maybe {
-                    Some(chunk) => {
-                        let outcome = session.on_input(Instant::now(), &chunk);
-                        if after_input(outcome, term, session, &mut last_wall)? {
-                            return Ok(Disposition::Quit);
-                        }
-                    }
-                    None => return Ok(Disposition::Quit), // input source closed
+            maybe = input_rx.recv() => match maybe {
+                Some(chunk) => {
+                    let outcome = session.on_input(Instant::now(), &chunk);
+                    after_input(outcome, &mut term, &mut session, &mut last_wall)?
                 }
-            }
+                None => Some(Change::Quit), // input source closed
+            },
             // A lone Escape, or a sequence cut short, is taken as typed once nothing follows.
             () = until(session.deadline()) => {
                 let outcome = session.on_timeout(Instant::now());
-                if after_input(outcome, term, session, &mut last_wall)? {
-                    return Ok(Disposition::Quit);
-                }
+                after_input(outcome, &mut term, &mut session, &mut last_wall)?
             }
-            () = shutdown.cancelled() => return Ok(Disposition::Quit),
-            permit = writer_tx.reserve(), if session.has_outgoing() => {
-                let Ok(permit) = permit else {
-                    // The writer ended: the stream, and so the connection, is gone.
-                    return Ok(closed_disposition(conn, session));
-                };
-                if let Some(msg) = session.pop_outgoing() {
-                    match encode_client(&msg) {
-                        Ok(bytes) => permit.send(bytes),
-                        Err(e) => tracing::warn!(error = %e, "dropping an unencodable message"),
+            () = shutdown.cancelled() => Some(Change::Quit),
+            permit = when(writer.map(mpsc::Sender::reserve)), if session.has_outgoing() => match permit.ok() {
+                // The writer ended: the stream, and so the connection, is gone.
+                None => Some(Change::Closed { banner: false }),
+                Some(permit) => {
+                    if let Some(msg) = session.pop_outgoing() {
+                        match encode_client(&msg) {
+                            Ok(bytes) => permit.send(bytes),
+                            Err(e) => tracing::warn!(error = %e, "dropping an unencodable message"),
+                        }
                     }
+                    None
                 }
-            }
-            frame = frame_rx.recv() => {
-                let Some(frame) = frame else {
-                    // The frame reader ended because the connection closed.
-                    let disposition = closed_disposition(conn, session);
-                    if let Disposition::Ended(code) = disposition {
-                        return Ok(end_session(term, session, shutdown, code).await);
-                    }
-                    tracing::info!(reason = ?conn.close_reason(), "link lost; will reconnect");
-                    return Ok(disposition);
-                };
-                match frame {
-                    ServerMsg::Frame { base, rows, body } => {
-                        session.on_frame_stream(Instant::now(), base, &rows, &body);
-                    }
-                    ServerMsg::History(reply) => session.on_history(&reply),
+            },
+            frame = when(frames.map(mpsc::Receiver::recv)) => match frame {
+                // The frame reader ended because the connection closed.
+                None => Some(Change::Closed { banner: true }),
+                Some(ServerMsg::Frame { base, rows, body }) => {
+                    session.on_frame_stream(Instant::now(), base, &rows, &body);
+                    None
                 }
-            }
+                Some(ServerMsg::History(reply)) => {
+                    session.on_history(&reply);
+                    None
+                }
+            },
+            dialed = when(dialing) => Some(Change::Dialed(dialed)),
             maybe = resize_rx.recv() => {
                 if maybe.is_some() {
                     term.window_resized();
@@ -675,9 +528,167 @@ async fn drive_connection<T: ClientTerminal>(
                         session.on_resize(size);
                     }
                 }
+                None
             }
-            () = tokio::time::sleep(tick.wait) => {}
+            () = tokio::time::sleep(tick.wait) => None,
+        };
+        match change {
+            None => {}
+            Some(Change::Quit) => return Ok(net.close(None)),
+            Some(Change::Closed { banner }) => {
+                let Net::Up(wire) = &net else {
+                    continue;
+                };
+                if session_ended(&wire.conn) {
+                    if banner {
+                        end_session(&mut term, &session, &shutdown).await;
+                    }
+                    return Ok(net.close(session.state().exit_code()));
+                }
+                tracing::info!(reason = ?wire.conn.close_reason(), "link lost; will reconnect");
+                net = redial(wire, &mut attempt, &mut session, &connector);
+            }
+            Some(Change::Dialed(Ok(Ok(conn)))) => {
+                session.attach(term.size().unwrap_or(initial_size));
+                net = Net::Up(Wire::open(conn).await);
+            }
+            Some(Change::Dialed(failed)) => {
+                if let Ok(Err(e)) = failed {
+                    tracing::info!(reason = %e, attempt, "reconnect dial failed");
+                } else {
+                    tracing::info!(attempt, "reconnect dial timed out");
+                }
+                attempt = attempt.saturating_add(1);
+                net = Net::Down(dial(&connector, attempt));
+            }
         }
+    }
+}
+
+/// The client's link to the server: a live connection, or a redial under way.
+enum Net<'c> {
+    Up(Wire),
+    Down(Dial<'c>),
+}
+
+impl Net<'_> {
+    /// The run is over: close the connection, if one is up, and return `code`.
+    fn close(&self, code: Option<u32>) -> Option<u32> {
+        if let Self::Up(wire) = self {
+            wire.conn.close(0u32.into(), b"client exit");
+        }
+        code
+    }
+}
+
+/// A redial: the backoff, then one dial, abandoned after [`RECONNECT_CONNECT_TIMEOUT`]. Pinned,
+/// so banner repaints and keystrokes do not restart a slow one.
+type Dial<'c> = std::pin::Pin<Box<dyn std::future::Future<Output = Dialed> + Send + 'c>>;
+
+/// A redial's result: connected, refused, or timed out.
+type Dialed = Result<anyhow::Result<Connection>, tokio::time::error::Elapsed>;
+
+/// What one turn of [`run_client`]'s loop left for it to act on.
+enum Change {
+    /// The user quit, the input channel closed, or a fatal signal came.
+    Quit,
+    /// The connection closed: the session ended (with its banner if `banner`), or the link was lost.
+    Closed { banner: bool },
+    /// A redial finished.
+    Dialed(Dialed),
+}
+
+/// A live connection: its stream writer and frame reader, which end with it.
+struct Wire {
+    conn: Connection,
+    writer_tx: mpsc::Sender<Vec<u8>>,
+    frame_rx: mpsc::Receiver<ServerMsg>,
+    _writer: AbortOnDrop<()>,
+    _reader: AbortOnDrop<()>,
+    /// When the loop took the connection, for its dwell.
+    started: Instant,
+}
+
+impl Wire {
+    /// Start the tasks writing the client's stream and reading frames on `conn`. A stream that
+    /// does not open ends the writer, which loses the link.
+    async fn open(conn: Connection) -> Self {
+        let send = conn.open_uni().await.ok();
+        let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
+        let writer = AbortOnDrop(tokio::spawn(write_client_stream(send, writer_rx)));
+        let (frame_tx, frame_rx) = mpsc::channel::<ServerMsg>(FRAME_QUEUE);
+        let reader = AbortOnDrop(tokio::spawn(read_frames(conn.clone(), frame_tx)));
+        Self {
+            conn,
+            writer_tx,
+            frame_rx,
+            _writer: writer,
+            _reader: reader,
+            started: Instant::now(),
+        }
+    }
+}
+
+/// The link on `wire` was lost: close it, detach the session, and redial.
+fn redial<'c>(
+    wire: &Wire,
+    attempt: &mut u32,
+    session: &mut ClientSession,
+    connector: &'c IrohConnector,
+) -> Net<'c> {
+    wire.conn.close(0u32.into(), b"reconnecting");
+    *attempt = next_attempt_after_drop(*attempt, wire.started.elapsed());
+    session.detach(Instant::now());
+    Net::Down(dial(connector, *attempt))
+}
+
+/// Dial again: at once after a proven connection's drop (`attempt` 0), else after a backoff, so a
+/// server that completes the handshake and at once closes is not redialed in a tight loop.
+fn dial(connector: &IrohConnector, attempt: u32) -> Dial<'_> {
+    let wait = if attempt > 0 {
+        backoff(attempt)
+    } else {
+        Duration::ZERO
+    };
+    Box::pin(async move {
+        tokio::time::sleep(wait).await;
+        tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect()).await
+    })
+}
+
+/// What `future` gives, or never without one: a select arm for one state of [`Net`].
+async fn when<F: std::future::Future>(future: Option<F>) -> F::Output {
+    match future {
+        Some(future) => future.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Act on what typed input decided: suspend now, or say the user quit.
+fn after_input<T: ClientTerminal>(
+    outcome: InputOutcome,
+    term: &mut T,
+    session: &mut ClientSession,
+    last_wall: &mut SystemTime,
+) -> std::io::Result<Option<Change>> {
+    match outcome {
+        InputOutcome::Quit => return Ok(Some(Change::Quit)),
+        InputOutcome::Suspend => {
+            term.suspend_resume()?;
+            session.dirty = true;
+            // A deliberate suspend is not a freeze to reconnect after.
+            *last_wall = SystemTime::now();
+        }
+        InputOutcome::Forwarded => {}
+    }
+    Ok(None)
+}
+
+/// Sleep until `deadline`, or forever with none.
+async fn until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -695,8 +706,12 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// Write queued messages to the client's stream until the queue or the stream closes.
-async fn write_client_stream(mut send: SendStream, mut queue: mpsc::Receiver<Vec<u8>>) {
+/// Write queued messages to the client's stream, if it opened, until the queue or the stream
+/// closes.
+async fn write_client_stream(send: Option<SendStream>, mut queue: mpsc::Receiver<Vec<u8>>) {
+    let Some(mut send) = send else {
+        return;
+    };
     while let Some(bytes) = queue.recv().await {
         if send.write_all(&bytes).await.is_err() {
             return;
@@ -725,27 +740,23 @@ async fn read_frames(conn: Connection, frames: mpsc::Sender<ServerMsg>) {
     }
 }
 
-/// What a closed connection means: the server ended the session (its shell exited), or the link was
-/// lost and the client should reconnect.
-fn closed_disposition(conn: &Connection, session: &ClientSession) -> Disposition {
+/// Whether the closed `conn` was the server ending the session (its shell exited), not the link
+/// being lost.
+fn session_ended(conn: &Connection) -> bool {
     use iroh::endpoint::{ApplicationClose, ConnectionError};
-    match conn.close_reason() {
+    matches!(
+        conn.close_reason(),
         Some(ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason }))
-            if error_code.into_inner() == 0 && reason.as_ref() == SESSION_ENDED =>
-        {
-            Disposition::Ended(session.state().exit_code())
-        }
-        _ => Disposition::LinkLost,
-    }
+            if error_code.into_inner() == 0 && reason.as_ref() == SESSION_ENDED
+    )
 }
 
-/// Paint the "session ended" banner, linger briefly so it is seen, and report the exit code.
+/// Paint the "session ended" banner and linger briefly so it is seen.
 async fn end_session<T: ClientTerminal>(
     term: &mut T,
     session: &ClientSession,
     shutdown: &CancellationToken,
-    code: Option<u32>,
-) -> Disposition {
+) {
     let _ = term.render(
         session.state(),
         &Overlay::empty(),
@@ -754,77 +765,6 @@ async fn end_session<T: ClientTerminal>(
     tokio::select! {
         () = tokio::time::sleep(Duration::from_millis(400)) => {}
         () = shutdown.cancelled() => {}
-    }
-    Disposition::Ended(code)
-}
-
-/// The result of a [`reconnect`] loop.
-enum ReconnectOutcome {
-    /// A fresh connection was established; resume the session on it.
-    Connected(Connection),
-    /// The user disconnected (`Ctrl-^ .`) or input closed while reconnecting — exit.
-    Quit,
-}
-
-/// Redial with capped exponential backoff until connected or the user quits, painting a
-/// "reconnecting…" banner over the last screen. The dial is pinned, so banner repaints and
-/// keystrokes do not restart a slow one.
-async fn reconnect<T: ClientTerminal>(
-    connector: &IrohConnector,
-    term: &mut T,
-    input_rx: &mut mpsc::Receiver<Vec<u8>>,
-    last: &ClientSession,
-    shutdown: &CancellationToken,
-    attempt: &mut u32,
-) -> ReconnectOutcome {
-    let started = Instant::now();
-    let mut pending_escape = false;
-    let mut decoder = Decoder::default();
-    'attempt: loop {
-        // Back off before dialing once a dial failed or the last connection dropped too fast
-        // (`*attempt > 0`, which the caller seeds from the connection's dwell), so a server that
-        // completes the handshake and at once closes is not redialed in a tight loop. A proven
-        // connection's drop dials at once.
-        let wait = if *attempt > 0 {
-            backoff(*attempt)
-        } else {
-            Duration::ZERO
-        };
-        let dial = async {
-            tokio::time::sleep(wait).await;
-            tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect()).await
-        };
-        tokio::pin!(dial);
-        loop {
-            let banner = format!(
-                "[koh] disconnected — reconnecting… {}s (Ctrl-^ . to quit)",
-                started.elapsed().as_secs()
-            );
-            let _ = term.render(last.state(), &Overlay::empty(), Some(banner.as_str()));
-            tokio::select! {
-                biased;
-                maybe = input_rx.recv() => match maybe {
-                    Some(chunk) => {
-                        if escape_quit(&chunk, &mut decoder, &mut pending_escape) {
-                            return ReconnectOutcome::Quit;
-                        }
-                    }
-                    None => return ReconnectOutcome::Quit, // input source closed
-                },
-                // Honor a SIGTERM/SIGINT/SIGHUP even mid-reconnect, so the terminal is restored.
-                () = shutdown.cancelled() => return ReconnectOutcome::Quit,
-                res = &mut dial => {
-                    match res {
-                        Ok(Ok(conn)) => return ReconnectOutcome::Connected(conn),
-                        Ok(Err(e)) => tracing::info!(reason = %e, attempt = *attempt, "reconnect dial failed"),
-                        Err(_) => tracing::info!(attempt = *attempt, "reconnect dial timed out"),
-                    }
-                    *attempt = (*attempt).saturating_add(1);
-                    continue 'attempt;
-                }
-                () = tokio::time::sleep(Duration::from_secs(1)) => {} // tick the banner clock
-            }
-        }
     }
 }
 
@@ -865,50 +805,6 @@ mod tests {
             assert!(!error.contains("allowlist"), "{error}");
             let _ = accept.await;
         });
-    }
-
-    #[test]
-    fn escape_quit_matches_the_session_machine_across_chunks() {
-        // The reconnect-path escape detector must agree with `ClientSession`'s prefix machine.
-        let mut d = Decoder::default();
-        let mut p = false;
-        assert!(
-            !escape_quit(b"hello", &mut d, &mut p),
-            "plain bytes never quit"
-        );
-        assert!(!p);
-        // Prefix + '.' in one chunk quits.
-        assert!(escape_quit(&[ESCAPE_PREFIX, b'.'], &mut d, &mut p));
-        // Prefix split across chunks: state carries over, then '.' quits.
-        p = false;
-        assert!(!escape_quit(&[ESCAPE_PREFIX], &mut d, &mut p));
-        assert!(p, "a lone prefix leaves us pending");
-        assert!(escape_quit(b".", &mut d, &mut p));
-        // Prefix then a non-'.' byte does NOT quit and clears the pending state.
-        p = false;
-        assert!(!escape_quit(&[ESCAPE_PREFIX, b'x'], &mut d, &mut p));
-        assert!(!p, "prefix + non-dot resets pending");
-        assert!(
-            !escape_quit(b".", &mut d, &mut p),
-            "a later lone '.' must not quit"
-        );
-        // From a kitty-protocol terminal: Ctrl-6 (the prefix) is `CSI 54 ; 5 u`.
-        p = false;
-        assert!(escape_quit(b"\x1b[54;5u.", &mut d, &mut p));
-    }
-
-    #[test]
-    fn escape_quit_and_the_session_agree_on_a_prefix_then_focus_in() {
-        // `Ctrl-^`, then a focus-in report, then '.': connected, the focus-in consumes the
-        // prefix and the '.' is typed; reconnecting must decide the same.
-        let bytes = b"\x1e\x1b[I.";
-        let mut s = ClientSession::new(DisplayPreference::Always, Size::new(24, 80));
-        let session_quits = s.on_input(Instant::now(), bytes) == session::InputOutcome::Quit;
-        let reconnect_quits = escape_quit(bytes, &mut Decoder::default(), &mut false);
-        assert_eq!(
-            reconnect_quits, session_quits,
-            "escape_quit quits={reconnect_quits}, ClientSession quits={session_quits}"
-        );
     }
 
     #[test]

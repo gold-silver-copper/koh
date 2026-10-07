@@ -464,9 +464,9 @@ fn reconnecting(painted: &crate::harness::Painted) -> bool {
         .is_some_and(|status| status.contains("reconnecting"))
 }
 
-/// A line typed while the link is down is not run after the reattach, and the status line says
-/// so: the client cannot tell its session from a new shell (an expired session, a restarted
-/// server), where keys typed at the old screen must not run. Typing after the reattach runs.
+/// A line typed while the link is down is not sent, and the status line says so: the client cannot
+/// tell its session from a new shell (an expired session, a restarted server), where keys typed at
+/// the old screen must not run. Typing after the reattach runs.
 #[test]
 fn a_line_typed_during_an_outage_is_not_run_after_the_reattach_and_the_user_is_told() {
     crate::harness::runtime()
@@ -495,17 +495,24 @@ fn a_line_typed_during_an_outage_is_not_run_after_the_reattach_and_the_user_is_t
             );
             // The user types a line while the banner is up.
             client.send(b"echo TYPED''_OFFLINE\r").await.expect("type");
-            // Back on the session, the status line says it was not sent.
+            // The status line says it is not sent.
             assert!(
                 client
-                    .wait_for(Duration::from_secs(20), |p| p
+                    .wait_for(WAIT, |p| p
                         .status
                         .as_deref()
                         .is_some_and(|s| s.contains("not sent")))
                     .await
                     .is_some(),
-                "the client must say the outage's typing was not sent; screen:\n{}",
+                "the client must say the outage's typing is not sent; screen:\n{}",
                 client.screen()
+            );
+            assert!(
+                client
+                    .wait_for(Duration::from_secs(20), |p| !reconnecting(p))
+                    .await
+                    .is_some(),
+                "the client must reattach"
             );
             client.send(b"echo TYPED''_AFTER\r").await.expect("type");
             assert!(

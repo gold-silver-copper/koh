@@ -393,6 +393,12 @@ impl ClientSession {
     }
 
     fn queue_events(&mut self, now: Instant, events: Vec<InputEvent>) {
+        if self.down_since.is_some() {
+            // Not sent, nor predicted: see `attach`. The banner says so while the typing goes on.
+            self.notice = Some((OUTAGE_INPUT_DROPPED.to_owned(), now));
+            self.dirty = true;
+            return;
+        }
         let size: usize = events.iter().map(InputEvent::wire_len).sum();
         if self.queued_input.saturating_add(size) > MAX_QUEUED_INPUT {
             // The server is not taking input; queueing more would grow without bound.

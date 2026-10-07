@@ -28,16 +28,21 @@ pub struct KeyConfig {
 
 /// Run `koh id` or `koh key`.
 pub fn run(config: KeyConfig) -> anyhow::Result<()> {
-    let key_file = crate::identity::KeyFile::locate(config.key_file, "client")?;
+    let path = config
+        .key_file
+        .map_or_else(|| crate::transport_iroh::default_key_path("client"), Ok)?;
+    // Refused before the key's directory is created or judged: an unconfirmed reset touches nothing.
+    anyhow::ensure!(
+        config.op != KeyOp::Reset { confirmed: false },
+        "reset permanently deletes {}; the next use changes the endpoint ID and requires allowlist \
+         updates. Stop active users, then repeat with --yes",
+        path.display()
+    );
+    let key_file = crate::identity::KeyFile::open(&path)?;
     match config.op {
         KeyOp::Id => println!("{}", crate::identity::load(&key_file)?.endpoint_id()),
-        KeyOp::Reset { confirmed } => {
-            anyhow::ensure!(
-                confirmed,
-                "reset permanently deletes {key_file}; the next use changes the endpoint ID and \
-                 requires allowlist updates. Stop active users, then repeat with --yes"
-            );
-            crate::identity::reset(&key_file)?;
+        KeyOp::Reset { confirmed: _ } => {
+            key_file.reset()?;
             println!(
                 "Removed {key_file}. The next use creates a new endpoint ID; update remote \
                  allowlists."
@@ -50,4 +55,26 @@ pub fn run(config: KeyConfig) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unconfirmed_reset_creates_and_judges_nothing() {
+        let root = std::env::temp_dir().join(format!("koh-keycmd-{}", std::process::id()));
+        let missing = root.join("newdir");
+        let error = run(KeyConfig {
+            op: KeyOp::Reset { confirmed: false },
+            key_file: Some(missing.join("id.key")),
+        })
+        .expect_err("refused without --yes");
+        assert!(format!("{error:#}").contains("--yes"), "{error:#}");
+        assert!(
+            !missing.exists(),
+            "an unconfirmed reset created the key's directory"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

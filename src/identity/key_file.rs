@@ -177,11 +177,18 @@ impl KeyFile {
         Ok(result.map(|()| Some(secret))?)
     }
 
-    /// Delete the key file, whatever it holds, once it passes the same check a load makes.
-    pub(super) fn remove(&self) -> anyhow::Result<()> {
-        open_private(OpenOptions::new().read(true), &self.path)
-            .and_then(|_| Ok(std::fs::remove_file(&self.path)?))
-            .with_context(|| format!("removing identity at {self}"))
+    /// Remove the key, whatever it holds, under an exclusive lease: fails while any koh process
+    /// still holds the key, and refuses only what every load refuses (a symlink, a file that is not
+    /// regular, or another user's file). The file is never opened, so a key the user cannot read
+    /// can still be reset, and a FIFO at the path is refused rather than waited on. The check and
+    /// the unlink are two steps, but only users [`KeyFile::open`] trusted can write the directory,
+    /// and an unlink never follows a link.
+    pub fn reset(&self) -> anyhow::Result<()> {
+        let _lease = self.lease(true)?;
+        let context = || format!("removing identity at {self}");
+        let meta = std::fs::symlink_metadata(&self.path).with_context(context)?;
+        check_owned(&meta, &self.path).with_context(context)?;
+        std::fs::remove_file(&self.path).with_context(context)
     }
 }
 
@@ -191,7 +198,15 @@ pub fn open_private_log(path: &Path) -> Result<File, SetupError> {
     let file = open_private(
         OpenOptions::new().write(true).create(true).mode(0o600),
         path,
-    )?;
+    )
+    .map_err(|error| {
+        // Named for what it is: the shared error speaks of a key.
+        if matches!(error, SetupError::BadKeyFile) {
+            refuse(path, "it is a symlink or not a regular file")
+        } else {
+            error
+        }
+    })?;
     file.set_len(0)?;
     Ok(file)
 }
@@ -221,28 +236,19 @@ fn open_private(options: &mut OpenOptions, path: &Path) -> Result<File, SetupErr
 /// that cannot be tightened is refused.
 fn check_private(file: &File, path: &Path) -> Result<(), SetupError> {
     let meta = file.metadata()?;
-    if !meta.is_file() {
-        tracing::warn!(path = %path.display(), "refusing an identity file that is not a regular file");
-        return Err(SetupError::BadKeyFile);
-    }
-    let refuse =
-        |why: String| std::io::Error::other(format!("refusing {}: {why}", path.display())).into();
-    let euid = fuxix::process::geteuid();
-    if meta.uid() != euid {
-        return Err(refuse(format!(
-            "it is owned by uid {}, not by uid {euid}",
-            meta.uid()
-        )));
-    }
+    check_owned(&meta, path)?;
     let mode = meta.permissions().mode();
     if mode & 0o077 != 0 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|error| {
-                refuse(format!(
-                    "mode {:o} is group/other-accessible and could not be tightened ({error}); \
-                     fix it with `chmod 600`",
-                    mode & 0o777
-                ))
+                refuse(
+                    path,
+                    &format!(
+                        "mode {:o} is group/other-accessible and could not be tightened ({error}); \
+                         fix it with `chmod 600`",
+                        mode & 0o777
+                    ),
+                )
             })?;
         tracing::warn!(
             path = %path.display(),
@@ -251,6 +257,27 @@ fn check_private(file: &File, path: &Path) -> Result<(), SetupError> {
         );
     }
     Ok(())
+}
+
+/// The part of [`check_private`] a reset also applies: a regular file (not a symlink, FIFO or
+/// device) owned by this user.
+fn check_owned(meta: &std::fs::Metadata, path: &Path) -> Result<(), SetupError> {
+    if !meta.is_file() {
+        tracing::warn!(path = %path.display(), "refusing an identity file that is not a regular file");
+        return Err(SetupError::BadKeyFile);
+    }
+    let euid = fuxix::process::geteuid();
+    if meta.uid() != euid {
+        return Err(refuse(
+            path,
+            &format!("it is owned by uid {}, not by uid {euid}", meta.uid()),
+        ));
+    }
+    Ok(())
+}
+
+fn refuse(path: &Path, why: &str) -> SetupError {
+    std::io::Error::other(format!("refusing {}: {why}", path.display())).into()
 }
 
 #[cfg(test)]
@@ -370,7 +397,7 @@ mod tests {
         let key = KeyFile::open(&link).unwrap();
         assert!(matches!(key.read_secret(), Err(SetupError::BadKeyFile)));
         assert!(load(&key).is_err(), "load refuses it too");
-        assert!(crate::identity::reset(&key).is_err(), "and so does reset");
+        assert!(key.reset().is_err(), "and so does reset");
         assert_eq!(mode_of(&target), 0o644, "the target is not re-permissioned");
         assert!(target.exists() && link.exists());
     }
@@ -459,7 +486,12 @@ mod tests {
         std::fs::write(&target, b"precious").unwrap();
         let link = dir.0.join("koh.log");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(open_private_log(&link).is_err());
+        let error = open_private_log(&link).expect_err("a symlinked log is refused");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(
+            !error.to_string().contains("key"),
+            "a log is not a key: {error}"
+        );
         assert_eq!(std::fs::read(&target).unwrap(), b"precious");
 
         let log = dir.0.join("real.log");
@@ -468,5 +500,37 @@ mod tests {
         open_private_log(&log).expect("a real log opens");
         assert_eq!(std::fs::read(&log).unwrap(), b"", "truncated");
         assert_eq!(mode_of(&log), 0o600);
+    }
+
+    #[test]
+    fn reset_removes_a_key_its_owner_cannot_read() {
+        let dir = Scratch::new("unreadable", 0o700);
+        let path = dir.0.join("id.key");
+        let key = KeyFile::open(&path).unwrap();
+        for mode in [0o000, 0o200] {
+            std::fs::write(&path, [7u8; KEY_LEN]).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            key.reset()
+                .unwrap_or_else(|error| panic!("mode {mode:o}: {error:#}"));
+            assert!(!path.exists(), "mode {mode:o}: reset left the key");
+        }
+    }
+
+    #[test]
+    fn reset_refuses_a_fifo_without_waiting_for_a_writer() {
+        let dir = Scratch::new("fifo", 0o700);
+        let path = dir.0.join("id.key");
+        let made = std::process::Command::new("mkfifo").arg(&path).status();
+        if !made.is_ok_and(|status| status.success()) {
+            return; // No mkfifo here, so nothing to test.
+        }
+        let key = KeyFile::open(&path).unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(key.reset().is_err()));
+        let refused = result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("reset blocked on the FIFO");
+        assert!(refused, "a FIFO is not a key");
+        assert!(path.exists(), "the refused FIFO is left in place");
     }
 }

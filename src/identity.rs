@@ -60,13 +60,6 @@ fn load_or_create(key: &KeyFile, create: bool) -> anyhow::Result<Identity> {
     })
 }
 
-/// Delete an identity key, whatever the file holds. Fails while any koh process still holds its
-/// lease, and refuses any path a load would refuse.
-pub fn reset(key: &KeyFile) -> anyhow::Result<()> {
-    let _lease = key.lease(true)?;
-    key.remove()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,15 +87,15 @@ mod tests {
             _lease: Some(Arc::new(key.lease(false)?)),
         };
         let clone = identity.clone();
-        anyhow::ensure!(reset(&key).is_err(), "reset while two leases are held");
+        anyhow::ensure!(key.reset().is_err(), "reset while two leases are held");
         drop(identity);
         anyhow::ensure!(
-            reset(&key).is_err(),
+            key.reset().is_err(),
             "reset while the clone's lease is held"
         );
         anyhow::ensure!(path.exists(), "a refused reset removed the key");
         drop(clone);
-        reset(&key)?;
+        key.reset()?;
         anyhow::ensure!(!path.exists(), "reset left the key in place");
         Ok(())
     }
@@ -130,7 +123,7 @@ mod tests {
         let key = KeyFile::open(&path)?;
         let identity = load(&key)?;
         drop(identity);
-        reset(&key).map_err(|e| {
+        key.reset().map_err(|e| {
             anyhow::anyhow!("load accepted {} but reset refused: {e:#}", path.display())
         })?;
         anyhow::ensure!(!path.exists(), "reset left the key in place");
@@ -144,7 +137,7 @@ mod tests {
             .err()
             .context("load accepted a 31-byte key")?;
         anyhow::ensure!(format!("{error:#}").contains("koh key reset"), "{error:#}");
-        reset(&bad_key).map_err(|e| {
+        bad_key.reset().map_err(|e| {
             anyhow::anyhow!(
                 "load told the user to reset {} but reset refused: {e:#}",
                 bad.display()

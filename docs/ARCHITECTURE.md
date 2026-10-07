@@ -405,8 +405,10 @@ The full picture is in the [threat model](THREAT_MODEL.md). In brief, the releva
 - **The identity key is protected by its file permissions**, like an SSH host key: the file is the
   raw 32-byte secret, created 0600 by a born-private atomic write, read with `O_NOFOLLOW`, refused
   unless it is this user's, and re-tightened to 0600 through the open descriptor. The key and its
-  lock pass one check, in a directory judged once (`identity::KeyFile`), so `koh key reset`
-  accepts every key `koh id` does; `$KOH_LOG` passes the same check. Anyone who can read the file
+  lock pass one check, in a directory judged once (`identity::KeyFile`), and `KeyFile::reset`
+  applies only that check's ownership half without opening the file, so `koh key reset` accepts
+  every key `koh id` does (and an unreadable one of the user's own); `$KOH_LOG` passes the same
+  check. Anyone who can read the file
   is that identity. koh keeps every file it owns under `~/.config/koh` and nowhere else.
 - The crate is `forbid(unsafe)` and forbids the panic lint family (`unwrap`/`expect`/`panic`/
   indexing/slicing), unchecked arithmetic (`arithmetic_side_effects`) and lossy `as` casts in

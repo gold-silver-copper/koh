@@ -271,9 +271,8 @@ async fn session_task(
                 } else {
                     // The program exited: publish a final screen carrying its status, whole even
                     // if it stopped mid-frame.
-                    if let Some(code) = reap_exit_code(&mut host).await {
-                        host.emu.set_exit_code(code);
-                    }
+                    let code = reap_exit_code(&mut host).await;
+                    host.emu.set_exit_code(code);
                     phase = Phase::Exited;
                     screens_tx.send_replace(Arc::new(host.snapshot()));
                 }
@@ -385,19 +384,24 @@ async fn pending_input_retry(pending: bool) {
     }
 }
 
+/// The status of a program that could not be reaped: its screen still says it ended, so its
+/// clients are told and exit with this.
+const UNKNOWN_EXIT: u32 = 255;
+
 /// The exited program's status, polled for up to a second: it is waitable a moment after EOF.
-async fn reap_exit_code(host: &mut PtyHost) -> Option<u32> {
+/// [`UNKNOWN_EXIT`] if it is not.
+async fn reap_exit_code(host: &mut PtyHost) -> u32 {
     let deadline = Instant::now().checked_add(Duration::from_secs(1));
     loop {
         match host.pty.try_wait() {
-            Ok(Some(status)) => return Some(status.code),
+            Ok(Some(status)) => return status.code,
             Ok(None) if deadline.is_none_or(|d| Instant::now() < d) => {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
-            Ok(None) => return None,
+            Ok(None) => return UNKNOWN_EXIT,
             Err(error) => {
                 tracing::warn!(%error, "waiting for PTY child status after EOF failed");
-                return None;
+                return UNKNOWN_EXIT;
             }
         }
     }

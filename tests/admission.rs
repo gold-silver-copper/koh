@@ -49,7 +49,7 @@ fn reject_surfaces_as_error() {
             let incoming = server_ep.accept().await.expect("incoming");
             let conn = incoming.await.expect("accept conn");
             // Reject: close WITHOUT opening the admission stream (mirrors the not-on-allowlist path).
-            refuse(conn, Refusal::NotAuthorized);
+            refuse(&conn, Refusal::NotAuthorized);
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
 

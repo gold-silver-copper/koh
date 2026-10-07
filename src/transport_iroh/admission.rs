@@ -140,12 +140,8 @@ impl Link {
     }
 }
 
-/// Server side: turn the peer away, before admitting it.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "taking the connection is the point: a refused one is never admitted after"
-)]
-pub fn refuse(conn: Connection, why: Refusal) {
+/// Server side: turn the peer away, before admitting it ([`admit`] takes the connection).
+pub fn refuse(conn: &Connection, why: Refusal) {
     conn.close(REFUSED.into(), why.reason());
 }
 

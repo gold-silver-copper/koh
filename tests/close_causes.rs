@@ -209,7 +209,7 @@ async fn admit_once_then_refuse(first: Close) -> anyhow::Result<(iroh::EndpointA
         while let Some(incoming) = server_ep.accept().await {
             let Ok(conn) = incoming.await else { continue };
             if admitted {
-                refuse(conn, Refusal::NotAuthorized);
+                refuse(&conn, Refusal::NotAuthorized);
             } else if let Ok(link) = admit(conn).await {
                 admitted = true;
                 // Long enough for the client loop to take the connection.

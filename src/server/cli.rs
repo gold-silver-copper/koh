@@ -285,7 +285,7 @@ pub async fn serve_endpoint(
             let peer = conn.remote_id();
             if !allow.contains(&peer) {
                 auth_event(Outcome::Rejected, &peer, "not on allowlist");
-                admission::refuse(conn, Refusal::NotAuthorized);
+                admission::refuse(&conn, Refusal::NotAuthorized);
                 return;
             }
             drop(pending_permit);
@@ -312,7 +312,7 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
     let Some((client, attach_kind)) = registry.attach(peer).await else {
         // At the session cap, which only a new peer can hit.
         warn!(peer = %peer, "refusing session: at max-sessions capacity");
-        admission::refuse(conn, Refusal::AtCapacity);
+        admission::refuse(&conn, Refusal::AtCapacity);
         return;
     };
     // Bounded, so a client that never accepts the stream cannot hold its slot. Failing, `client`

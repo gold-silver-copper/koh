@@ -1803,4 +1803,70 @@ mod tests {
             "trust at the drop is carried across the outage"
         );
     }
+
+    /// A notice left from an earlier outage is not typing during this one: input sent
+    /// unconfirmed as the link drops again, a minute later, is still said to may not have
+    /// arrived.
+    #[test]
+    fn an_old_outage_notice_does_not_hide_an_unconfirmed_send_at_a_later_drop() {
+        let (t0, mut s) = start();
+        drain(&mut s);
+        s.on_frame(
+            t0,
+            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
+        );
+        // The first outage: typing while down is not sent, and said.
+        s.detach(t0);
+        s.on_input(t0, b"x");
+        s.attach(t0, Size::new(24, 80));
+        s.on_frame(
+            t0,
+            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
+        );
+        drain(&mut s);
+        // Back up; later a line goes out and the link drops before it is confirmed.
+        let t1 = t0 + Duration::from_secs(10);
+        s.on_input(t1, b"false && ");
+        drain(&mut s);
+        let t2 = t1 + Duration::from_secs(60);
+        s.detach(t2);
+        s.attach(t2, Size::new(24, 80));
+        let status = s.on_tick(t2, None).status.expect("the banner");
+        assert!(status.contains("may not have arrived"), "{status}");
+    }
+
+    /// A paste too long during an outage does not unsay the typing dropped in it: at the attach
+    /// the status line still says the outage's typing was not sent.
+    #[test]
+    fn a_paste_too_long_during_an_outage_does_not_hide_the_typing_dropped() {
+        let (now, mut s) = start();
+        s.on_input(now, b"false && ");
+        drain(&mut s);
+        s.detach(now);
+        s.on_input(now, b"rm -rf *\r");
+        s.on_inputs(now, vec![Input::PasteTooLong]);
+        s.attach(now, Size::new(24, 80));
+        let status = s.on_tick(now, None).status.expect("the banner");
+        assert!(
+            status.contains("typing during the outage not sent"),
+            "{status}"
+        );
+    }
+
+    /// A second drop before the first frame is the same outage: input sent unconfirmed at the
+    /// first drop is still said to may not have arrived, though the second link took none.
+    #[test]
+    fn a_second_drop_before_the_first_frame_keeps_the_unconfirmed_send() {
+        let (t0, mut s) = start();
+        s.on_input(t0, b"false && ");
+        drain(&mut s);
+        s.detach(t0);
+        s.attach(t0, Size::new(24, 80));
+        drain(&mut s);
+        let t1 = t0 + Duration::from_secs(10);
+        s.detach(t1);
+        s.attach(t1, Size::new(24, 80));
+        let status = s.on_tick(t1, None).status.expect("the banner");
+        assert!(status.contains("may not have arrived"), "{status}");
+    }
 }

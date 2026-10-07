@@ -30,12 +30,13 @@ src/
 ├── proto.rs         the koh/3 wire protocol: client messages, screen frames, caps, pacing
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
 ├── predict.rs       local-echo prediction engine (overlays, epochs)
-├── transport_iroh/  iroh endpoint setup, the identity key file, path RTT, admission
+├── transport_iroh/  iroh endpoint setup, the default key path, path RTT, admission
 ├── pty.rs           PTYs over fuxix, the `__launch` launcher sessions start through, reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
 ├── client/          the connection loop + ClientSession core + predictor + render + `connect`
 │   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through fuxix::terminal)
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
+│   └── key_file.rs  KeyFile, the one owner of trust in a key path and its lock
 ├── log.rs           the `RUST_LOG` filter `serve` and `connect` install (`target=level` directives)
 └── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identity, reset it
 tests/net/           koh over a fault-injecting link between real iroh endpoints
@@ -402,8 +403,10 @@ The full picture is in the [threat model](THREAT_MODEL.md). In brief, the releva
   diff is fully validated before it is applied, with no terminal parser on the client (the
   server's fux-vt emulator is panic-free and bounded).
 - **The identity key is protected by its file permissions**, like an SSH host key: the file is the
-  raw 32-byte secret, created 0600 by a born-private atomic write, read with `O_NOFOLLOW` and
-  re-tightened to 0600 through the open descriptor. Anyone who can read the file is that identity.
+  raw 32-byte secret, created 0600 by a born-private atomic write, read with `O_NOFOLLOW`, refused
+  unless it is this user's, and re-tightened to 0600 through the open descriptor. The key and its
+  lock pass one check, in a directory judged once (`identity::KeyFile`), so `koh key reset`
+  accepts every key `koh id` does. Anyone who can read the file is that identity.
   koh keeps every file it owns under `~/.config/koh` and nowhere else.
 - The crate is `forbid(unsafe)` and forbids the panic lint family (`unwrap`/`expect`/`panic`/
   indexing/slicing), unchecked arithmetic (`arithmetic_side_effects`) and lossy `as` casts in

@@ -31,7 +31,6 @@
 //! Android scripts call `bad-version`; the fragment names are kept for older invocations.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -41,8 +40,8 @@ use koh::events::{
 use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE, MAX_INPUT_BYTES};
 use koh::terminal::Size;
 use koh::transport_iroh::{
-    admission, bind_endpoint_local, direct_addr, generate_secret_key, load_or_create_secret_key,
-    parse_endpoint_id, ALPN,
+    admission, bind_endpoint_local, direct_addr, generate_secret_key, parse_endpoint_id,
+    ALPN, KEY_LEN,
 };
 use iroh::endpoint::{Connection, SendStream};
 
@@ -51,7 +50,11 @@ const MIB: usize = 1024 * 1024;
 macro_rules! evil_secret {
     () => {
         match std::env::var_os("EVIL_KEY_FILE") {
-            Some(p) => load_or_create_secret_key(&PathBuf::from(p))?,
+            // The harness creates it with `koh id`: the raw key bytes.
+            Some(p) => iroh::SecretKey::from_bytes(
+                &<[u8; KEY_LEN]>::try_from(std::fs::read(p)?)
+                    .map_err(|_| anyhow!("$EVIL_KEY_FILE is not a koh identity key"))?,
+            ),
             None => generate_secret_key()?,
         }
     };

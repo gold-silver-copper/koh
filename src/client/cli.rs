@@ -310,8 +310,10 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     warn_if_locale_not_utf8();
 
     // Held for the session: its lease stops `koh key reset` while it may redial.
-    let identity =
-        crate::identity::load(&crate::identity::key_path(args.key_file.clone(), "client")?)?;
+    let identity = crate::identity::load(&crate::identity::KeyFile::locate(
+        args.key_file.clone(),
+        "client",
+    )?)?;
     let (endpoint, connector, channel) = dial(&args, &identity).await?;
     let dialed_at = std::time::SystemTime::now();
     let shutdown = CancellationToken::new();

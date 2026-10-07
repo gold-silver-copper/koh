@@ -101,7 +101,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     crate::log::init(std::io::stderr, tracing::Level::INFO);
     let hosting = Hosting::from_config(&args)?;
 
-    let key_file = crate::identity::key_path(args.key_file.clone(), "server")?;
+    let key_file = crate::identity::KeyFile::locate(args.key_file.clone(), "server")?;
     let identity = crate::identity::load(&key_file)?;
     let secret = identity.secret.clone();
 
@@ -136,7 +136,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
 
     eprintln!("┌─ koh server ready ──────────────────────────────────────");
     eprintln!("│ endpoint id : {id_str}");
-    eprintln!("│ key file    : {}", key_file.display());
+    eprintln!("│ key file    : {key_file}");
     eprintln!("│ alpn        : {}", String::from_utf8_lossy(ALPN));
     eprintln!(
         "│ auth        : allowlist ({} client(s))",

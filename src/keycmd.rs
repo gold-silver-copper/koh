@@ -28,31 +28,24 @@ pub struct KeyConfig {
 
 /// Run `koh id` or `koh key`.
 pub fn run(config: KeyConfig) -> anyhow::Result<()> {
-    let key_file = crate::identity::key_path(config.key_file, "client")?;
+    let key_file = crate::identity::KeyFile::locate(config.key_file, "client")?;
     match config.op {
         KeyOp::Id => println!("{}", crate::identity::load(&key_file)?.endpoint_id()),
         KeyOp::Reset { confirmed } => {
             anyhow::ensure!(
                 confirmed,
-                "reset permanently deletes {}; the next use changes the endpoint ID and requires \
-                 allowlist updates. Stop active users, then repeat with --yes",
-                key_file.display()
+                "reset permanently deletes {key_file}; the next use changes the endpoint ID and \
+                 requires allowlist updates. Stop active users, then repeat with --yes"
             );
             crate::identity::reset(&key_file)?;
             println!(
-                "Removed {}. The next use creates a new endpoint ID; update remote allowlists.",
-                key_file.display()
+                "Removed {key_file}. The next use creates a new endpoint ID; update remote \
+                 allowlists."
             );
         }
         KeyOp::Info => {
-            anyhow::ensure!(
-                key_file.exists(),
-                "no identity key at {} — run `koh id` (or `koh connect`/`koh serve`) to create one \
-                 first, or pass --key-file",
-                key_file.display()
-            );
-            let identity = crate::identity::load(&key_file)?;
-            println!("key file    : {}", key_file.display());
+            let identity = crate::identity::load_existing(&key_file)?;
+            println!("key file    : {key_file}");
             println!("endpoint id : {}", identity.endpoint_id());
         }
     }

@@ -43,7 +43,7 @@ use koh::transport_iroh::{
     admission, bind_endpoint_local, direct_addr, generate_secret_key, parse_endpoint_id,
     ALPN, KEY_LEN,
 };
-use iroh::endpoint::{Connection, SendStream};
+use iroh::endpoint::SendStream;
 
 const MIB: usize = 1024 * 1024;
 
@@ -90,8 +90,7 @@ async fn main() -> Result<()> {
     // Everything else gets admitted first, then opens the one client stream and writes crafted
     // messages on it.
     let ep = bind_endpoint_local(evil_secret!(), false).await?;
-    let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
-    admission::await_admission(&conn).await?;
+    let conn = admission::dial(&ep, direct_addr(server_id, saddr)).await?;
     eprintln!("evil-client: admitted; running attack '{attack}'");
 
     match attack {
@@ -297,7 +296,7 @@ async fn garbage(send: &mut SendStream, n: usize) -> Result<()> {
 }
 
 /// Open a second client stream: the server permits one, so this must not be grantable.
-async fn second_stream(conn: &Connection) -> Result<()> {
+async fn second_stream(conn: &admission::Link) -> Result<()> {
     let mut first = conn.open_uni().await?;
     write_msg(
         &mut first,

@@ -29,8 +29,9 @@ use super::{window_state, ESCAPE_PREFIX, SCROLLBACK_KEY, SUSPEND_KEY};
 /// frame does not flash it.
 pub const LINK_DOWN_GRACE: Duration = HEARTBEAT.saturating_mul(3);
 
-/// The most typed bytes held while the server takes no input; past it, typing is dropped and the
-/// status line says so. A paste is kept up to this long too.
+/// The most input held, as encoded, while the server takes no input: once this much is queued,
+/// typing is dropped and the status line says so, until it drains below. One read is taken whole
+/// below it, so a paste is kept up to this long too.
 const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 
 /// What the status line says of a paste past [`MAX_QUEUED_INPUT`], which is dropped whole.
@@ -91,10 +92,6 @@ pub struct ClientSession {
     unconfirmed_at_drop: bool,
     /// Messages for the server, oldest first.
     outgoing: VecDeque<ClientMsg>,
-    /// Typed bytes in `outgoing`.
-    queued_input: usize,
-    /// Typing was dropped because `outgoing` was full; cleared once it drains.
-    input_paused: bool,
     predictor: PredictionEngine,
     /// What the user's terminal sends, decoded.
     decoder: Decoder,
@@ -176,8 +173,6 @@ impl ClientSession {
             sent_seq: InputSeq::default(),
             unconfirmed_at_drop: false,
             outgoing: VecDeque::from([ClientMsg::Resize(size)]),
-            queued_input: 0,
-            input_paused: false,
             predictor: PredictionEngine::new(pref),
             decoder: Decoder::with_paste_limit(MAX_QUEUED_INPUT),
             pending_escape: None,
@@ -221,11 +216,10 @@ impl ClientSession {
         self.link = Link::fresh(Arc::clone(&self.link.current.screen), self.sent_seq);
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Resize(_) | ClientMsg::Colours(_)));
-        if self.queued_input > 0 {
-            self.outgoing
-                .retain(|msg| !matches!(msg, ClientMsg::Keys { .. } | ClientMsg::Input { .. }));
-            self.queued_input = 0;
-            self.input_paused = false;
+        let held = self.outgoing.len();
+        self.outgoing
+            .retain(|msg| !matches!(msg, ClientMsg::Keys { .. } | ClientMsg::Input { .. }));
+        if self.outgoing.len() < held {
             self.notice = Some((OUTAGE_INPUT_DROPPED.to_owned(), now));
         }
         let typed_while_down = self
@@ -279,6 +273,7 @@ impl ClientSession {
     pub fn on_inputs(&mut self, now: Instant, inputs: Vec<Input>) -> InputOutcome {
         let mut quit = false;
         let mut suspend = false;
+        let paused = self.input_paused();
         let mut fwd: Vec<InputEvent> = Vec::new();
         // Input for the scrollback view, which goes nowhere else.
         let mut viewed: Vec<Input> = Vec::new();
@@ -349,7 +344,7 @@ impl ClientSession {
                 }
             } else if self.scrollback.viewing() {
                 viewed.push(input);
-            } else if !self.input_paused {
+            } else if !paused {
                 // While paused, what is typed is dropped: only the escape is looked for.
                 events_of(input, &mut fwd);
             }
@@ -421,13 +416,9 @@ impl ClientSession {
             }
             return;
         }
-        let size: usize = events.iter().map(InputEvent::wire_len).sum();
-        if self.queued_input.saturating_add(size) > MAX_QUEUED_INPUT {
+        if self.input_paused() {
             // The server is not taking input; queueing more would grow without bound.
-            if !self.input_paused {
-                self.input_paused = true;
-                self.dirty = true;
-            }
+            self.dirty = true;
             return;
         }
         // Predictions made now expire with the first input message that carries these events.
@@ -474,7 +465,6 @@ impl ClientSession {
                 }
             }
         }
-        self.queued_input = self.queued_input.saturating_add(size);
         self.link.last_nudge = Some(now);
         self.last_activity = Some(now);
         self.dirty = true;
@@ -482,7 +472,7 @@ impl ClientSession {
 
     /// What the status line says beside the link's state: input paused, else a recent notice.
     fn aside(&self, now: Instant) -> Option<String> {
-        if self.input_paused {
+        if self.input_paused() {
             return Some("[koh] input paused — the server is not taking input".to_owned());
         }
         self.notice
@@ -725,27 +715,35 @@ impl ClientSession {
 
     /// Take the next message for the server.
     pub fn pop_outgoing(&mut self) -> Option<ClientMsg> {
+        let paused = self.input_paused();
         let msg = self.outgoing.pop_front()?;
-        let sent = match &msg {
-            ClientMsg::Input { bytes, seq } => Some((bytes.len(), *seq)),
-            ClientMsg::Keys { events, seq } => {
-                Some((events.iter().map(InputEvent::wire_len).sum(), *seq))
-            }
-            ClientMsg::Resize(_)
-            | ClientMsg::Ack { .. }
-            | ClientMsg::Resync
-            | ClientMsg::History(_)
-            | ClientMsg::Colours(_) => None,
-        };
-        if let Some((sent, seq)) = sent {
-            self.sent_seq = seq;
-            self.queued_input = self.queued_input.saturating_sub(sent);
-            if self.input_paused && self.queued_input == 0 {
-                self.input_paused = false;
-                self.dirty = true;
-            }
+        if let ClientMsg::Input { seq, .. } | ClientMsg::Keys { seq, .. } = &msg {
+            self.sent_seq = *seq;
+            self.dirty |= paused && !self.input_paused();
         }
         Some(msg)
+    }
+
+    /// The input in `outgoing`, as encoded.
+    fn queued_input(&self) -> usize {
+        self.outgoing
+            .iter()
+            .map(|msg| match msg {
+                ClientMsg::Input { bytes, .. } => bytes.len(),
+                ClientMsg::Keys { events, .. } => events.iter().map(InputEvent::wire_len).sum(),
+                ClientMsg::Resize(_)
+                | ClientMsg::Ack { .. }
+                | ClientMsg::Resync
+                | ClientMsg::History(_)
+                | ClientMsg::Colours(_) => 0,
+            })
+            .fold(0, usize::saturating_add)
+    }
+
+    /// Whether typing is dropped: the server is not taking input, and [`MAX_QUEUED_INPUT`] of it
+    /// is queued.
+    fn input_paused(&self) -> bool {
+        self.queued_input() >= MAX_QUEUED_INPUT
     }
 
     /// Whether a frame reported that the shell exited (its code is on [`state`](Self::state)).
@@ -1037,13 +1035,15 @@ mod tests {
             b"\x1b[201~",
         ]
         .concat();
-        for _ in 0..MAX_QUEUED_INPUT.div_euclid(MAX_INPUT_BYTES) {
+        for _ in 1..MAX_QUEUED_INPUT.div_euclid(MAX_INPUT_BYTES) {
             s.on_input(now, &chunk);
         }
         assert!(
             s.on_tick(now, None).status.is_none(),
-            "the queue is full, not over"
+            "the queue is not full yet"
         );
+        // Taken whole below the limit, past it.
+        s.on_input(now, &chunk);
         s.on_input(now, b"dropped");
         let status = s.on_tick(now, None).status.expect("input paused banner");
         assert!(status.contains("input paused"), "{status}");
@@ -1776,7 +1776,10 @@ mod tests {
             status.contains("reconnecting") && status.contains("paste over 1 MiB"),
             "{status}"
         );
-        s.input_paused = true;
+        s.outgoing.push_back(ClientMsg::Input {
+            seq: InputSeq(1),
+            bytes: vec![b'x'; MAX_QUEUED_INPUT],
+        });
         let status = s.on_tick(now, None).status.expect("the banner");
         assert!(status.contains("input paused"), "{status}");
     }
@@ -1813,7 +1816,12 @@ mod tests {
         drain(&mut s);
         s.on_input(
             now,
-            &[&b"k\x1b[200~"[..], &vec![b'x'; MAX_QUEUED_INPUT], b"\x1b[201~"].concat(),
+            &[
+                &b"k\x1b[200~"[..],
+                &vec![b'x'; MAX_QUEUED_INPUT],
+                b"\x1b[201~",
+            ]
+            .concat(),
         );
         let first = drain(&mut s);
         s.on_input(now, b"a");
@@ -1823,8 +1831,8 @@ mod tests {
             "typing after the paste was dropped: first read sent {} messages, \
              input_paused = {}, queued_input = {}",
             first.len(),
-            s.input_paused,
-            s.queued_input,
+            s.input_paused(),
+            s.queued_input(),
         );
     }
 

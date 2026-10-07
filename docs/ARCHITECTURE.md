@@ -143,8 +143,9 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   control and the stream limits (the server accepts one client stream; the client a handful of
   frame streams), bounds memory; a peer cannot make either end accumulate.
 - **Backpressure:** PTY input goes through a bounded writer queue. While it is full the server
-  stops reading the client's stream, QUIC flow control stops the client's writes, and the client
-  keeps at most 1 MiB of typing before dropping it with an "input paused" status line. The keyboard
+  stops reading the client's stream, QUIC flow control stops the client's writes, and once 1 MiB
+  of input is queued the client drops typing, with an "input paused" status line, until the queue
+  drains below it (a read is taken whole while it is below, so a paste may take it past). The keyboard
   loop never waits on the network, so `Ctrl-^ .` always works.
 - **The scrollback view** (`Ctrl-^ [`, `client::scrollback`): the server's history above the live
   screen, fetched as the user scrolls with the arrows, Page Up/Down, `k`/`j`, `b`/`f`, `u`/`d`,

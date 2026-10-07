@@ -457,9 +457,13 @@ fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
         tokio::time::timeout(Duration::from_secs(5), reg.shutdown())
             .await
             .context("shutdown returns")?;
-        let next = tokio::time::timeout(Duration::from_secs(1), client.next_screen()).await;
+        // A screen published before shutdown may still be unseen: drain it, then the end.
+        let drained = tokio::time::timeout(Duration::from_secs(1), async {
+            while client.next_screen().await.is_some() {}
+        })
+        .await;
         anyhow::ensure!(
-            matches!(next, Ok(None)),
+            drained.is_ok(),
             "after shutdown the held client's session has ended"
         );
         anyhow::ensure!(!client.can_send(), "the ended session takes no input");

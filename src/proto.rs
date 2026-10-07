@@ -472,9 +472,16 @@ impl Primed {
     }
 }
 
-/// [`encode_frame`] with the rows it changes and a compressor primed with their dictionary.
+/// [`encode_frame`] with the rows it changes and a compressor primed with their dictionary. A
+/// frame the client would not inflate, over [`MAX_FRAME`], is refused here instead.
 fn encode_frame_primed(frame: &Frame, rows: &[u16], primed: Primed) -> Result<Vec<u8>, ProtoError> {
     let raw = postcard::to_allocvec(frame)?;
+    if raw.len() > MAX_FRAME {
+        return Err(ProtoError::TooLarge {
+            len: raw.len(),
+            max: MAX_FRAME,
+        });
+    }
     let mut out = postcard::to_extend(&frame.base.0, vec![TAG_FRAME])?;
     out = postcard::to_extend(&rows, out)?;
     out.extend_from_slice(&primed.compress(&raw));
@@ -914,6 +921,16 @@ mod tests {
         let mut stream = vec![TAG_HISTORY];
         stream.extend_from_slice(&bomb);
         assert!(matches!(decode_server(&stream), Err(ProtoError::Inflate)));
+    }
+
+    #[test]
+    fn a_frame_the_client_would_not_inflate_is_not_encoded() {
+        let mut big = frame();
+        big.diff.title = Some("x".repeat(MAX_FRAME));
+        assert!(matches!(
+            encode_frame(&big, &TerminalScreen::default()),
+            Err(ProtoError::TooLarge { .. })
+        ));
     }
 
     #[test]

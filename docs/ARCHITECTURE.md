@@ -84,7 +84,7 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
 - **Server to client: one uni stream per message**: a tag byte, then for a frame its base's number
   and the frame (`num`, `base`, `echo_ack` and a `ScreenDiff` from frame `base` to frame `num`)
   DEFLATE-compressed against the base screen's dictionary; for history rows, the rows compressed.
-  Either inflates with a 16 MiB limit. Frame 0 is the blank default screen, which both ends always
+  Either inflates with a 16 MiB limit, and the server encodes no frame over it. Frame 0 is the blank default screen, which both ends always
   hold; real frames count from 1.
 - **Compressed against the base.** Both ends hold a frame's base screen, so the compressor starts
   from a dictionary made of it (`TerminalScreen::dictionary`): the base's rows encoded as a frame

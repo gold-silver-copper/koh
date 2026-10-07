@@ -347,13 +347,13 @@ async fn session_task(
                 }
                 None => break, // the registry forgot this session: the server is shutting down
             },
-            // The last client left, or none is left to see the exit: tear down now.
-            () = screens_tx.closed(), if !matches!(phase, Phase::Detached { .. }) => {
-                if matches!(phase, Phase::Exited) {
-                    break;
-                }
-                phase = Phase::Detached { since: Instant::now() };
-            }
+            // The last client left, or none is left to see the exit. The only teardown of an
+            // exited session, so it watches in every phase but Detached.
+            () = screens_tx.closed(), if !matches!(phase, Phase::Detached { .. }) => match phase {
+                Phase::Exited => break,
+                Phase::Attached => phase = Phase::Detached { since: Instant::now() },
+                Phase::Detached { .. } => {}
+            },
             _ = pending_input_retry(!pending_keys.is_empty()) => {}
             // A program may turn echo off without writing anything (a password prompt printed
             // first): the client hears of it within a tick.

@@ -394,6 +394,8 @@ fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -
     // The first session's program exits at once and leaves `marker`; its replacement's lives.
     let marker = std::env::temp_dir().join(format!("koh-late-ended-{}", std::process::id()));
     let script = format!("[ -e '{}' ] && exec sleep 30; : > '{0}'", marker.display());
+    // A marker left by an earlier run would keep the first session alive.
+    let _ = std::fs::remove_file(&marker);
     let result = current_thread_runtime()?.block_on(async {
         let reg = registry(&["sh", "-c", &script], 1, Duration::from_secs(30));
         let a = peer()?;
@@ -549,6 +551,61 @@ async fn await_exit(client: &mut koh::server::session::SessionClient) -> anyhow:
         let _ = tokio::time::timeout(Duration::from_millis(50), client.next_screen()).await;
     }
     anyhow::bail!("the exit code never reached the screen")
+}
+
+/// Wait, up to 5 s, until `peer` can be attached at max_sessions=1, saying how.
+async fn attach_when_a_slot_frees(
+    reg: &Registry,
+    peer: iroh::EndpointId,
+) -> Option<(koh::server::session::SessionClient, AttachKind)> {
+    for _ in 0..50 {
+        if let Some(attached) = reg.attach(peer).await {
+            return Some(attached);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+/// A session whose program exited is torn down once its last client leaves, so it frees its
+/// max_sessions slot for another peer, rather than lingering until the server shuts down.
+#[test]
+fn an_exited_session_whose_client_left_frees_its_slot() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let reg = registry(&["true"], 1, Duration::from_secs(30));
+        let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
+        await_exit(&mut client).await?;
+        drop(client);
+        let other = attach_when_a_slot_frees(&reg, peer()?).await;
+        let kind = other.as_ref().map(|(_, kind)| *kind);
+        drop(other);
+        reg.shutdown().await;
+        anyhow::ensure!(
+            kind == Some(AttachKind::Created),
+            "another peer gets the exited session's slot; got {kind:?}"
+        );
+        Ok(())
+    })
+}
+
+/// A session whose program exits while no client is attached is torn down at once, so it frees
+/// its max_sessions slot for another peer, well before its TTL.
+#[test]
+fn a_session_whose_program_exited_while_detached_frees_its_slot() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let reg = registry(&["sleep", "0.3"], 1, Duration::from_secs(30));
+        let (client, _) = reg.attach(peer()?).await.context("attach")?;
+        drop(client);
+        let other = attach_when_a_slot_frees(&reg, peer()?).await;
+        let kind = other.as_ref().map(|(_, kind)| *kind);
+        drop(other);
+        reg.shutdown().await;
+        anyhow::ensure!(
+            kind == Some(AttachKind::Created),
+            "another peer gets the exited session's slot within 5 s of a 30 s TTL; got {kind:?}"
+        );
+        Ok(())
+    })
 }
 
 /// A reconnect that lands while the old connection still holds its client (a reconnect racing

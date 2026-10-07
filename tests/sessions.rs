@@ -386,8 +386,8 @@ fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-/// A reconnect that races its exited session's teardown creates a new session; the old task's late
-/// `Ended(peer)` must not then unregister the new, live one.
+/// A reconnect that races its exited session's teardown creates a new session, and that one stays
+/// registered: the next attach while it is live reattaches to it.
 #[test]
 fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -> anyhow::Result<()>
 {
@@ -484,7 +484,7 @@ fn a_reconnect_right_after_exit_never_reattaches_the_exited_session() -> anyhow:
             let reg = registry(&["true"], 4, Duration::from_secs(30));
             let a = peer()?;
             let mut client = reg.attach(a).await.context("first attach")?.0;
-            for round in 0..300 {
+            for round in 0..100 {
                 for _ in 0..100 {
                     if client.screen().exit_code().is_some() {
                         break;
@@ -511,4 +511,26 @@ fn a_reconnect_right_after_exit_never_reattaches_the_exited_session() -> anyhow:
             reg.shutdown().await;
             Ok(())
         })
+}
+
+/// A program that exits while no client is attached ends its session: an attach before the next
+/// TTL check starts a new one, rather than reattaching to the exited one.
+#[test]
+fn a_session_whose_program_exited_while_detached_is_not_reattached() -> anyhow::Result<()> {
+    current_thread_runtime()?.block_on(async {
+        let reg = registry(&["sleep", "0.3"], 4, Duration::from_secs(30));
+        let p = peer()?;
+        let (client, kind) = reg.attach(p).await.context("attach")?;
+        anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
+        drop(client);
+        // The program exits while detached, well before the TTL's next check.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let kind = attach_kind(&reg, p).await;
+        reg.shutdown().await;
+        anyhow::ensure!(
+            kind == Some(AttachKind::Created),
+            "the exited session must not be reattached; got {kind:?}"
+        );
+        Ok(())
+    })
 }

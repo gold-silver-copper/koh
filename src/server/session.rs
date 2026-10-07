@@ -184,7 +184,8 @@ fn start(
     let (mut host, pty_rx) = PtyHost::spawn(&spec.command, spec.scrollback, &spec.launcher)?;
     let (screens_tx, screens) = watch::channel(Arc::new(host.snapshot()));
     let (input, input_rx) = mpsc::channel(INPUT_QUEUE);
-    let (control, control_rx) = mpsc::channel(16);
+    // The registry waits for each attach's answer before it sends another.
+    let (control, control_rx) = mpsc::channel(1);
     let client = SessionClient {
         screens,
         input: input.clone(),
@@ -321,21 +322,24 @@ async fn session_task(
             },
             msg = control.recv() => match msg {
                 Some(Attach(reply)) => {
-                    // The last client may have left before the arm below saw it: a detach is
-                    // ordered before any later attach all the same.
-                    if screens_tx.receiver_count() == 0 && last_detach.is_none() {
+                    // No client is left, whether or not the arm below has seen it yet: an exited
+                    // session is never reattached, and the detach is dated before this attach.
+                    if screens_tx.receiver_count() == 0 {
                         if exited {
                             break; // the reply is dropped, so the registry starts a new session
                         }
-                        last_detach = Some(Instant::now());
+                        last_detach.get_or_insert_with(Instant::now);
                     }
-                    let detached_for = last_detach.take().map(|t| t.elapsed());
+                    let since = last_detach.take();
                     let client = SessionClient {
                         screens: screens_tx.subscribe(),
                         input: input_tx.clone(),
                     };
-                    // A connection already gone drops its client, which the arm below sees.
-                    let _ = reply.send((client, detached_for));
+                    // A connection already gone drops its client: the session stays detached
+                    // since when it was, so an attach that never arrives does not renew its TTL.
+                    if reply.send((client, since.map(|t| t.elapsed()))).is_err() {
+                        last_detach = since;
+                    }
                 }
                 None => break, // the registry forgot this session: the server is shutting down
             },
@@ -452,6 +456,8 @@ async fn registry_task(
     let mut sessions = sessions::Sessions::new(spec);
     loop {
         let AttachReq { peer, reply } = tokio::select! {
+            // A shutdown starts no session for a request still queued.
+            biased;
             () = shutdown.cancelled() => break,
             msg = rx.recv() => match msg {
                 Some(msg) => msg,

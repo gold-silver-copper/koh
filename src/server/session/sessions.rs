@@ -31,7 +31,9 @@ impl Sessions {
     /// starting one failed.
     pub(super) async fn attach(&mut self, peer: EndpointId) -> Option<(SessionClient, AttachKind)> {
         self.live.retain(|_, control| !control.is_closed());
-        while self.tasks.try_join_next().is_some() {}
+        while let Some(ended) = self.tasks.try_join_next() {
+            log_panic(ended);
+        }
         if let Some(control) = self.live.get(&peer) {
             if let Some((client, detached_for)) = attach_to(control).await {
                 return Some((client, AttachKind::Reattached { detached_for }));
@@ -55,7 +57,16 @@ impl Sessions {
         } = self;
         // The control channels close, and each session task ends.
         drop(live);
-        while tasks.join_next().await.is_some() {}
+        while let Some(ended) = tasks.join_next().await {
+            log_panic(ended);
+        }
+    }
+}
+
+/// A session task that panicked is said, not reaped in silence.
+fn log_panic(ended: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = ended {
+        tracing::error!(error = %e, "a session task failed");
     }
 }
 

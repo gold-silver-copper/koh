@@ -301,8 +301,8 @@ impl PredictionEngine {
     /// A fresh engine for a reconnect to the same session: the same preference, and, if typing
     /// was being shown as it was predicted (or trust was carried here and not yet given), trust
     /// from the first key once a frame shows the PTY is not at a password prompt
-    /// ([`set_tty`](Self::set_tty)). Taken at the drop and again at the reattach, the trust is
-    /// the drop's: nothing between confirms an epoch, so nothing typed then can add to it.
+    /// ([`set_tty`](Self::set_tty)). Taken once, at an outage's first drop, the trust is the
+    /// drop's: nothing until the next frame confirms an epoch, so nothing typed then can add to it.
     #[must_use]
     pub fn reattached(&self) -> Self {
         let mut fresh = Self::new(self.pref);

@@ -36,40 +36,76 @@ const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 /// What the status line says of a paste past [`MAX_QUEUED_INPUT`], which is dropped whole.
 const PASTE_TOO_LONG: &str = "[koh] paste over 1 MiB — not sent";
 
-/// An outage and what it lost, apart from the status line, which only shows them.
-mod outage {
-    /// Said when typing was not sent. The reattach may have landed on a new shell (the session
-    /// expired, or the server restarted), which the client cannot tell from its own, and keys
-    /// typed at the old screen must not run there; nor may the end of a line whose start was lost
-    /// with the link run alone (`false && rm …` must not run `rm …`).
-    const INPUT_DROPPED: &str = "[koh] typing during the outage not sent";
+/// Said when typing was not sent. The reattach may have landed on a new shell (the session
+/// expired, or the server restarted), which the client cannot tell from its own, and keys typed at
+/// the old screen must not run there; nor may the end of a line whose start was lost with the link
+/// run alone (`false && rm …` must not run `rm …`).
+const INPUT_DROPPED: &str = "[koh] typing during the outage not sent";
 
-    /// Said when input handed to the lost connection was never confirmed: the server may not have
-    /// had it, so what is typed next may run without it.
-    const UNCONFIRMED: &str = "[koh] keys typed as the link dropped may not have arrived";
+/// Said when input handed to the lost connection was never confirmed: the server may not have had
+/// it, so what is typed next may run without it.
+const UNCONFIRMED: &str = "[koh] keys typed as the link dropped may not have arrived";
 
-    /// From the first drop to the next connection's first frame, which shows the shell it
-    /// reached; a drop meanwhile is the same outage.
-    pub(super) struct Outage {
-        pub(super) since: std::time::Instant,
-        /// What the status line says of what the outage lost.
-        said: Option<&'static str>,
+/// Said when both were lost.
+const UNCONFIRMED_AND_DROPPED: &str =
+    "[koh] keys typed as the link dropped may not have arrived · typing during the outage not sent";
+
+/// From the first drop to the next connection's first frame, which shows the shell it reached; a
+/// drop meanwhile is the same outage. It holds what was lost as facts; only the status line puts
+/// them in words.
+struct Outage {
+    since: Instant,
+    /// Input handed to the lost connection was not confirmed at the first drop.
+    unconfirmed: bool,
+    /// Typing was not sent.
+    typing_dropped: bool,
+}
+
+impl Outage {
+    /// What the status line says of what the outage lost.
+    const fn said(&self) -> Option<&'static str> {
+        match (self.unconfirmed, self.typing_dropped) {
+            (true, true) => Some(UNCONFIRMED_AND_DROPPED),
+            (true, false) => Some(UNCONFIRMED),
+            (false, true) => Some(INPUT_DROPPED),
+            (false, false) => None,
+        }
+    }
+}
+
+/// A notice for the status line, apart from the session, which can give one and show it but never
+/// read it: what a notice says decides nothing, and once [`NOTICE_FOR`] is past it is gone.
+mod notice {
+    use std::fmt;
+    use std::time::Instant;
+
+    use super::NOTICE_FOR;
+
+    #[derive(Default)]
+    pub(super) struct Notice(Option<(&'static str, Instant)>);
+
+    /// A notice as shown, which only prints.
+    pub(super) struct Shown(&'static str);
+
+    impl fmt::Display for Shown {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
     }
 
-    impl Outage {
-        /// Input handed to the lost connection was `unconfirmed` at the first drop.
-        pub(super) fn begin(since: std::time::Instant, unconfirmed: bool) -> Self {
-            let said = unconfirmed.then_some(UNCONFIRMED);
-            Self { since, said }
+    impl Notice {
+        pub(super) const fn give(&mut self, text: &'static str, now: Instant) {
+            self.0 = Some((text, now));
         }
 
-        /// Typing was not sent; said over an unconfirmed send, which it follows.
-        pub(super) const fn dropped_typing(&mut self) {
-            self.said = Some(INPUT_DROPPED);
-        }
-
-        pub(super) const fn said(&self) -> Option<&'static str> {
-            self.said
+        /// The notice, if given less than [`NOTICE_FOR`] before `now` and not saying `besides`,
+        /// which is shown already.
+        pub(super) fn shown(&self, now: Instant, besides: Option<&str>) -> Option<Shown> {
+            self.0
+                .filter(|&(text, at)| {
+                    now.saturating_duration_since(at) < NOTICE_FOR && besides != Some(text)
+                })
+                .map(|(text, _)| Shown(text))
         }
     }
 }
@@ -109,7 +145,7 @@ pub struct ClientSession {
     /// What the current connection holds.
     link: Link,
     /// The outage, until the next connection's first frame.
-    outage: Option<outage::Outage>,
+    outage: Option<Outage>,
     /// The last input sequence number used; it rises across connections.
     last_seq: InputSeq,
     /// The newest input sequence number handed to a connection.
@@ -131,8 +167,8 @@ pub struct ClientSession {
     colours_asked: bool,
     /// Questions for the user's terminal, for the caller to write.
     ask: Vec<u8>,
-    /// A notice for the status line, and when it was given: shown, never read.
-    notice: Option<(&'static str, Instant)>,
+    /// A notice for the status line.
+    notice: notice::Notice,
     /// A key's legacy bytes, as last matched against the escape prefix.
     scratch: Vec<u8>,
     /// The history held, and the scrollback view.
@@ -208,7 +244,7 @@ impl ClientSession {
             colours: None,
             colours_asked: false,
             ask: Vec::new(),
-            notice: None,
+            notice: notice::Notice::default(),
             scratch: Vec::with_capacity(16),
             scrollback: Scrollback::default(),
             last_activity: None,
@@ -227,7 +263,11 @@ impl ClientSession {
     pub fn detach(&mut self, now: Instant) {
         let outage = self.outage.get_or_insert_with(|| {
             self.predictor = self.predictor.reattached();
-            outage::Outage::begin(now, self.sent_seq > self.link.echo_ack)
+            Outage {
+                since: now,
+                unconfirmed: self.sent_seq > self.link.echo_ack,
+                typing_dropped: false,
+            }
         });
         self.outgoing.retain(|msg| {
             !matches!(
@@ -240,7 +280,7 @@ impl ClientSession {
                 .retain(|msg| !matches!(msg, ClientMsg::Keys { .. } | ClientMsg::Input { .. }));
             self.queued_input = 0;
             self.input_paused = false;
-            outage.dropped_typing();
+            outage.typing_dropped = true;
         }
         self.scrollback.forget_requests();
         self.dirty = true;
@@ -307,7 +347,7 @@ impl ClientSession {
                     continue;
                 }
                 Input::PasteTooLong => {
-                    self.notice = Some((PASTE_TOO_LONG, now));
+                    self.notice.give(PASTE_TOO_LONG, now);
                     self.dirty = true;
                     continue;
                 }
@@ -433,7 +473,7 @@ impl ClientSession {
                 .iter()
                 .any(|e| matches!(e, InputEvent::Key(_) | InputEvent::Paste { .. }))
             {
-                outage.dropped_typing();
+                outage.typing_dropped = true;
                 self.dirty = true;
             }
             return;
@@ -497,14 +537,15 @@ impl ClientSession {
         self.dirty = true;
     }
 
-    /// What the status line says beside the link's state: input paused, else a recent notice.
-    fn aside(&self, now: Instant) -> Option<String> {
+    /// What the status line says beside the link's state: input paused, else a recent notice
+    /// that is not `besides`.
+    fn aside(&self, now: Instant, besides: Option<&str>) -> Option<String> {
         if self.input_paused {
             return Some("[koh] input paused — the server is not taking input".to_owned());
         }
         self.notice
-            .filter(|(_, at)| now.saturating_duration_since(*at) < NOTICE_FOR)
-            .map(|(notice, _)| notice.to_owned())
+            .shown(now, besides)
+            .map(|shown| shown.to_string())
     }
 
     /// Questions for the user's terminal the session has (the colours again, after the terminal
@@ -620,7 +661,7 @@ impl ClientSession {
         // The outage ends with the new connection's first frame, which shows the shell it reached;
         // what it lost is said a while longer.
         if let Some(said) = self.outage.take().and_then(|o| o.said()) {
-            self.notice = Some((said, now));
+            self.notice.give(said, now);
         }
         self.link.echo_ack = self.link.echo_ack.max(frame.echo_ack);
         self.predictor
@@ -690,7 +731,7 @@ impl ClientSession {
             );
             // A notice still up from the last outage may say the same.
             let said = outage.said();
-            let aside = self.aside(now).filter(|aside| said != Some(aside.as_str()));
+            let aside = self.aside(now, said);
             for aside in said.into_iter().chain(aside.as_deref()) {
                 status.push_str(" · ");
                 status.push_str(aside.trim_start_matches("[koh] "));
@@ -732,7 +773,7 @@ impl ClientSession {
             Some(silent) if silent > LINK_DOWN_GRACE => {
                 Some(format!("[koh] link down — resuming… {}s", silent.as_secs()))
             }
-            _ => self.aside(now).or_else(|| self.scrollback.status()),
+            _ => self.aside(now, None).or_else(|| self.scrollback.status()),
         };
         TickResult {
             wait: Duration::from_millis(50),
@@ -1890,6 +1931,22 @@ mod tests {
         s.attach(Size::new(24, 80));
         let status = s.on_tick(t1, None).status.expect("the banner");
         assert!(status.contains("may not have arrived"), "{status}");
+    }
+
+    /// Typing during the outage does not unsay an unconfirmed send at the drop: an Enter pressed
+    /// to try the link leaves the half-sent line still said to may not have arrived.
+    #[test]
+    fn typing_during_the_outage_does_not_hide_an_unconfirmed_send() {
+        let (now, mut s) = start();
+        s.on_input(now, b"false && ");
+        drain(&mut s);
+        s.detach(now);
+        s.on_input(now, b"\r");
+        let status = s.on_tick(now, None).status.expect("the banner");
+        assert!(
+            status.contains("may not have arrived") && status.contains("not sent"),
+            "{status}"
+        );
     }
 
     /// What the outage lost is said on the banner all through it, and a while after the new

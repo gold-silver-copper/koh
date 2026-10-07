@@ -335,10 +335,11 @@ frames, echo-ack and acknowledgements) is dropped (`detach`) and made anew (`att
 escape keys, the scrollback view, the window size and the colours work during the outage and carry
 across it. Typed input does not: what is typed while the link is down (and the banner stays up until
 the new connection's first frame shows which shell it reached) is not taken (nor predicted), what was not yet
-sent when the link dropped is dropped, and the banner says so; else it says when input handed to the
+sent when the link dropped is dropped, and the banner says so; it also says when input handed to the
 lost connection was never confirmed, as what follows may run without it. The outage (`Outage`, from the
-first drop to that first frame; a drop meanwhile is the same outage) holds these facts, and the status line
-only shows them, for the whole outage and a few seconds after. A reattach may land on a new shell (the session expired, the shell
+first drop to that first frame; a drop meanwhile is the same outage) holds these as facts, and only the
+status line puts them in words, for the whole outage and a few seconds after. A notice on the status line
+can be given and shown but not read (`notice::Notice`), so what it says decides nothing. A reattach may land on a new shell (the session expired, the shell
 exited, or the server restarted), which the client cannot tell from its own (the server's
 `AttachKind` is not on the wire), and keys typed at the old screen must not run there; nor may the
 end of a line whose start was lost with the link run alone (`false && rm …` typed across the drop

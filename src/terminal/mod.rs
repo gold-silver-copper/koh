@@ -15,11 +15,13 @@ use fux_vt::{
 };
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
+mod clipboard;
 mod grid;
 mod history;
 mod server;
 
 pub use crate::predict::{Size, TtyModes};
+pub use clipboard::{Clipboard, MAXIMUM_CLIPBOARD_SIZE};
 pub use grid::{drawn, Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
 pub use history::{
     HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, KeptRow,
@@ -38,10 +40,6 @@ pub const MAX_DIM: u16 = 1000;
 /// Most characters in a window title or icon name, as mosh caps them; applied by the server's
 /// emulator and again by the client, which trusts nothing on the wire.
 pub(crate) const MAX_TITLE_LEN: usize = 256;
-
-/// Most bytes in a forwarded clipboard (OSC 52), as mosh caps it; a larger one is dropped. Applied
-/// at both ends.
-pub const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
 
 /// The most bytes of hyperlinks (URIs and ids) one diff carries.
 ///
@@ -155,17 +153,6 @@ fn capped_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Truncate `s` to at most `max` bytes, never splitting a scalar.
-fn capped_bytes(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    // The nearest char boundary at or below `max`.
-    s.get(..s.floor_char_boundary(max))
-        .unwrap_or("")
-        .to_string()
-}
-
 /// The screen: the cell grid plus the out-of-band channels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalScreen {
@@ -175,7 +162,7 @@ pub struct TerminalScreen {
     /// Window icon name (OSC 1).
     icon: String,
     /// The clipboard the program set (OSC 52, base64), empty if none.
-    clipboard: String,
+    clipboard: Clipboard,
     /// How many bells the program rang; the client rings when it grows.
     bell_count: u64,
     /// The program's exit code once it exited, for the client to exit with.
@@ -198,7 +185,7 @@ impl TerminalScreen {
             grid,
             title: String::new(),
             icon: String::new(),
-            clipboard: String::new(),
+            clipboard: Clipboard::NONE,
             bell_count: 0,
             exit_code: None,
             history: HistoryMark { newest: 0, len: 0 },
@@ -247,7 +234,7 @@ impl TerminalScreen {
     }
 
     /// The remote-set clipboard payload (OSC 52, base64), or empty if none.
-    pub fn clipboard(&self) -> &str {
+    pub const fn clipboard(&self) -> &Clipboard {
         &self.clipboard
     }
 
@@ -1406,7 +1393,8 @@ impl TerminalScreen {
             resize: resized.then(|| self.size()),
             title: (self.title != base.title).then(|| self.title.clone()),
             icon: (self.icon != base.icon).then(|| self.icon.clone()),
-            clipboard: (self.clipboard != base.clipboard).then(|| self.clipboard.clone()),
+            clipboard: (self.clipboard != base.clipboard)
+                .then(|| self.clipboard.as_str().to_owned()),
             bell_count: self.bell_count,
             exit_code: self.exit_code,
             history: (self.history != base.history).then_some(self.history),
@@ -1475,8 +1463,12 @@ impl TerminalScreen {
         if let Some(icon) = &diff.icon {
             self.icon = capped_chars(icon, MAX_TITLE_LEN);
         }
-        if let Some(clipboard) = &diff.clipboard {
-            self.clipboard = capped_bytes(clipboard, MAXIMUM_CLIPBOARD_SIZE);
+        if let Some(clipboard) = diff
+            .clipboard
+            .as_deref()
+            .and_then(|c| Clipboard::new(c.as_bytes()))
+        {
+            self.clipboard = clipboard;
         }
         if diff.exit_code.is_some() {
             self.exit_code = diff.exit_code;
@@ -1716,7 +1708,8 @@ mod tests {
             proptest::prop_assert!(crow < rows && ccol <= cols);
             proptest::prop_assert!(screen.title.chars().count() <= MAX_TITLE_LEN);
             proptest::prop_assert!(screen.icon.chars().count() <= MAX_TITLE_LEN);
-            proptest::prop_assert!(screen.clipboard.len() <= MAXIMUM_CLIPBOARD_SIZE);
+            let set = diff.clipboard.as_deref().and_then(|c| Clipboard::new(c.as_bytes()));
+            proptest::prop_assert_eq!(screen.clipboard, set.unwrap_or_default());
         }
 
         /// Arbitrary wire bytes that happen to decode as a `ScreenDiff` must apply without panic.
@@ -1975,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn client_apply_caps_oversized_title_and_clipboard() {
+    fn client_apply_caps_oversized_title_and_drops_clipboard() {
         // A malicious server ships an oversized title + clipboard. The client re-applies the caps
         // (it must not trust the wire even though the honest server emulator already caps them).
         let mut c = TerminalScreen::default();
@@ -1994,10 +1987,7 @@ mod tests {
             MAX_TITLE_LEN,
             "icon capped client-side"
         );
-        assert!(
-            c.clipboard().len() <= MAXIMUM_CLIPBOARD_SIZE,
-            "clipboard capped client-side"
-        );
+        assert!(c.clipboard().is_empty(), "clipboard dropped client-side");
     }
 
     #[test]
@@ -2516,19 +2506,6 @@ mod tests {
     }
 
     #[test]
-    fn capped_bytes_never_splits_utf8() {
-        // A multi-byte scalar straddling the byte budget must be dropped whole, leaving valid UTF-8.
-        let s = "a".repeat(MAXIMUM_CLIPBOARD_SIZE - 1) + "é"; // 'é' is 2 bytes, crosses the cap
-        let out = capped_bytes(&s, MAXIMUM_CLIPBOARD_SIZE);
-        assert!(out.len() <= MAXIMUM_CLIPBOARD_SIZE);
-        assert_eq!(
-            out.len(),
-            MAXIMUM_CLIPBOARD_SIZE - 1,
-            "the straddling scalar is dropped whole"
-        );
-    }
-
-    #[test]
     fn equal_screens_compare_equal() {
         let a = screen_from(24, 80, b"identical");
         let b = screen_from(24, 80, b"identical");
@@ -2542,7 +2519,7 @@ mod tests {
         emu.process(b"\x1b]1;myicon\x07\x1b]2;mytitle\x07\x1b]52;c;aGk=\x07");
         let target = emu.snapshot();
         assert_eq!(target.icon(), "myicon");
-        assert_eq!(target.clipboard(), "aGk=");
+        assert_eq!(target.clipboard().as_str(), "aGk=");
 
         let base = TerminalScreen::default();
         let diff = target.diff_from(&base);

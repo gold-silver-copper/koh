@@ -4,8 +4,8 @@
 use crate::terminal::grid::{Palette, RowCache};
 use crate::terminal::history::HistoryNames;
 use crate::terminal::{
-    clamp_dims, Grid, HistoryMark, HistoryReply, HistoryRequest, Size, TerminalScreen, TtyModes,
-    MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
+    clamp_dims, Clipboard, Grid, HistoryMark, HistoryReply, HistoryRequest, Size, TerminalScreen,
+    TtyModes, MAX_TITLE_LEN,
 };
 use std::time::{Duration, Instant};
 
@@ -27,8 +27,8 @@ fn title_from(bytes: &[u8]) -> String {
 struct Observed {
     title: String,
     icon: String,
-    /// The remote-set clipboard payload (OSC 52, base64), capped at [`MAXIMUM_CLIPBOARD_SIZE`].
-    clipboard: String,
+    /// The remote-set clipboard payload (OSC 52, base64).
+    clipboard: Clipboard,
     bell_count: u64,
     /// Query answers for the program's input, never part of the screen.
     host_replies: Vec<u8>,
@@ -47,12 +47,10 @@ impl Sink for Observed {
             Event::Title(t) => self.title = title_from(t),
             Event::IconName(n) => self.icon = title_from(n),
             Event::Bell => self.bell_count = self.bell_count.saturating_add(1),
-            // `data` is base64 already. A query (`?`) asks for the clipboard, which koh never
-            // reads, so it is not one to set.
-            Event::Clipboard { data, .. }
-                if data.len() <= MAXIMUM_CLIPBOARD_SIZE && data != b"?" =>
-            {
-                self.clipboard = String::from_utf8_lossy(data).into_owned();
+            Event::Clipboard { data, .. } => {
+                if let Some(clipboard) = Clipboard::new(data) {
+                    self.clipboard = clipboard;
+                }
             }
             // A colour no program set: the user's terminal's, if the client said it; else
             // unanswered, as a terminal that does not know it would leave it.
@@ -61,8 +59,8 @@ impl Sink for Observed {
                     self.host_replies.extend_from_slice(&answer);
                 }
             }
-            // An oversized clipboard is dropped; `_` is for events a later fux-vt adds.
-            Event::Clipboard { .. } | _ => {}
+            // Events a later fux-vt adds.
+            _ => {}
         }
     }
     fn unhandled(&mut self, sequence: Unhandled<'_>) {
@@ -811,7 +809,7 @@ mod tests {
     fn a_clipboard_query_sets_nothing() {
         let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
         t.process(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07");
-        assert_eq!(t.snapshot().clipboard(), "aGVsbG8=");
+        assert_eq!(t.snapshot().clipboard().as_str(), "aGVsbG8=");
         assert_eq!(t.take_host_replies(), b"", "nor is it answered");
     }
 
@@ -872,7 +870,7 @@ mod tests {
         assert_eq!(snap.title(), "my-title");
         assert_eq!(snap.icon(), "my-icon", "snapshot carries the icon name");
         assert_eq!(
-            snap.clipboard(),
+            snap.clipboard().as_str(),
             "aGVsbG8=",
             "snapshot carries the OSC-52 clipboard"
         );
@@ -926,9 +924,12 @@ mod tests {
     fn oversized_clipboard_is_dropped() {
         // A clipboard set above the cap must not be synced (anti-amplification).
         let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        let big = "A".repeat(MAXIMUM_CLIPBOARD_SIZE + 1);
+        let big = "A".repeat(crate::terminal::MAXIMUM_CLIPBOARD_SIZE + 1);
         t.process(format!("\x1b]52;c;{big}\x07").as_bytes());
-        assert_eq!(t.snapshot().clipboard(), "", "oversized clipboard dropped");
+        assert!(
+            t.snapshot().clipboard().is_empty(),
+            "oversized clipboard dropped"
+        );
     }
 
     #[test]

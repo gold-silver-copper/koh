@@ -90,7 +90,7 @@ and the git log.
 | KR-01 | A stalled QUIC handshake pins permits for the idle timeout | `ACCEPT_HANDSHAKE_TIMEOUT` in `src/server/cli.rs`; no automated test |
 | KR-02 | Signalling a reaped, possibly recycled PID | `tests/pty.rs::reaped_child_is_not_signaled_again` |
 | KR-06 | Key perms touched before the dir check; symlinked key followed | `src/identity/key_file.rs::a_symlinked_key_is_refused_and_its_target_left_alone`, `a_dangling_symlink_is_refused_instead_of_creating_or_missing_a_key`, `only_a_nonsticky_world_writable_directory_is_refused` |
-| KR-07 | A pre-existing loose `$KOH_LOG` is reused | `connect` in `src/client/cli.rs` fchmods the log to 0600 or disables file logging; no automated test |
+| KR-07 | A pre-existing loose `$KOH_LOG` is reused | `src/identity/key_file.rs::a_symlinked_log_is_refused_before_its_target_is_truncated` (`open_private_log` refuses a symlink or another user's file, fchmods a loose log to 0600, and truncates only after; `connect` disables file logging on refusal) |
 | K-01 | Key load races a path swap (TOCTOU) | `src/identity/key_file.rs::a_symlinked_key_is_refused_and_its_target_left_alone`, `loose_key_and_lock_files_are_tightened_through_the_descriptor` |
 | K-03 | An accept-then-close server spins the client's reconnect | `src/client/mod.rs::dwell_gate_resets_on_proven_connection_and_climbs_on_flap`, `reconnect_backoff_grows_then_caps` |
 | K-13 | `clamp_dims` is the only bound on one resize's allocation | `src/terminal/mod.rs::clamp_dims_bounds_both_extremes`, `apply_is_panic_free_and_holds_invariants` |

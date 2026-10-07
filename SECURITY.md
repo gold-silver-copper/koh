@@ -70,7 +70,7 @@ and the git log.
 | KOH-03 | Fixed public KDF salt in the passphrase handshake | Removed: there is no over-the-wire passphrase; the node-id allowlist is the only factor |
 | KOH-04 | `String::truncate` on the status line panics the client | `src/client/render.rs::status_line_truncation_is_panic_free_across_all_widths` |
 | KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_keeps_only_the_last_resize_and_concatenates_keys`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
-| KOH-06 | State dir in a world-writable shared location | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `src/transport_iroh/mod.rs::config_dir_is_xdg_then_home_and_never_elsewhere` |
+| KOH-06 | State dir in a world-writable shared location | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_directory_of_another_user_but_root_is_refused`, `src/transport_iroh/mod.rs::config_dir_is_xdg_then_home_and_never_elsewhere` |
 | KOH-07 | Fragment reassembly buffers ~39 MiB | Removed: koh/3 has no fragments; a frame is one stream read under `MAX_FRAME` (see KOH-02) |
 | KOH-08 | Stalled handshakes hold connection permits | The pending-handshake cap and the handshake and admission deadlines in `src/server/cli.rs::serve_endpoint`; no automated test (the admission-stall attack in `testing/android/scripts/stress-evil-peer.sh` exercises it on a device) |
 | KOH-10 | A SIGHUP-immune child leaks the PTY threads | `Pty`'s `Drop` and `kill_hard` send SIGKILL: `tests/pty.rs::a_child_that_ignores_sighup_dies_when_its_pty_is_dropped`, `dropping_pty_eofs_child_and_stops_writer`, `shutdown_joins_both_io_threads_without_deadlock` |
@@ -90,7 +90,7 @@ and the git log.
 | KR-01 | A stalled QUIC handshake pins permits for the idle timeout | `ACCEPT_HANDSHAKE_TIMEOUT` in `src/server/cli.rs`; no automated test |
 | KR-02 | Signalling a reaped, possibly recycled PID | `tests/pty.rs::reaped_child_is_not_signaled_again` |
 | KR-06 | Key perms touched before the dir check; symlinked key followed | `src/identity/key_file.rs::a_symlinked_key_is_refused_and_its_target_left_alone`, `a_dangling_symlink_is_refused_instead_of_creating_or_missing_a_key`, `only_a_nonsticky_world_writable_directory_is_refused` |
-| KR-07 | A pre-existing loose `$KOH_LOG` is reused | `src/identity/key_file.rs::a_symlinked_log_is_refused_before_its_target_is_truncated` (`open_private_log` refuses a symlink or another user's file, fchmods a loose log to 0600, and truncates only after; `connect` disables file logging on refusal) |
+| KR-07 | A pre-existing loose `$KOH_LOG` is reused | `src/identity/key_file.rs::a_symlinked_log_is_refused_before_its_target_is_truncated`, `a_fifo_log_or_key_is_refused_without_waiting_for_a_reader` (`open_private_log` refuses a symlink, FIFO or device before opening, or another user's file, fchmods a loose log to 0600, and truncates only after; `connect` disables file logging on refusal) |
 | K-01 | Key load races a path swap (TOCTOU) | `src/identity/key_file.rs::a_symlinked_key_is_refused_and_its_target_left_alone`, `loose_key_and_lock_files_are_tightened_through_the_descriptor` |
 | K-03 | An accept-then-close server spins the client's reconnect | `src/client/mod.rs::dwell_gate_resets_on_proven_connection_and_climbs_on_flap`, `reconnect_backoff_grows_then_caps` |
 | K-13 | `clamp_dims` is the only bound on one resize's allocation | `src/terminal/mod.rs::clamp_dims_bounds_both_extremes`, `apply_is_panic_free_and_holds_invariants` |

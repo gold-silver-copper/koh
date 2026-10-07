@@ -28,9 +28,7 @@ pub struct KeyConfig {
 
 /// Run `koh id` or `koh key`.
 pub fn run(config: KeyConfig) -> anyhow::Result<()> {
-    let path = config
-        .key_file
-        .map_or_else(|| crate::transport_iroh::default_key_path("client"), Ok)?;
+    let path = crate::identity::KeyFile::path_for(config.key_file, "client")?;
     // Refused before the key's directory is created or judged: an unconfirmed reset touches nothing.
     anyhow::ensure!(
         config.op != KeyOp::Reset { confirmed: false },
@@ -38,19 +36,23 @@ pub fn run(config: KeyConfig) -> anyhow::Result<()> {
          updates. Stop active users, then repeat with --yes",
         path.display()
     );
-    let key_file = crate::identity::KeyFile::open(&path)?;
     match config.op {
-        KeyOp::Id => println!("{}", crate::identity::load(&key_file)?.endpoint_id()),
+        KeyOp::Id => {
+            let key_file = crate::identity::KeyFile::open(&path)?;
+            println!("{}", crate::identity::load(&key_file)?.endpoint_id());
+        }
         KeyOp::Reset { confirmed: _ } => {
+            let key_file = crate::identity::KeyFile::open(&path)?;
             key_file.reset()?;
             println!(
                 "Removed {key_file}. The next use creates a new endpoint ID; update remote \
                  allowlists."
             );
         }
+        // Creates nothing, so asking about a key that is not there leaves no trace.
         KeyOp::Info => {
-            let identity = crate::identity::load_existing(&key_file)?;
-            println!("key file    : {key_file}");
+            let identity = crate::identity::load_existing(&path)?;
+            println!("key file    : {}", path.display());
             println!("endpoint id : {}", identity.endpoint_id());
         }
     }
@@ -76,5 +78,27 @@ mod tests {
             "an unconfirmed reset created the key's directory"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn info_on_a_missing_key_creates_nothing() {
+        let root = std::env::temp_dir().join(format!("koh-keycmd-info-{}", std::process::id()));
+        let missing = root.join("newdir");
+        let error = run(KeyConfig {
+            op: KeyOp::Info,
+            key_file: Some(missing.join("id.key")),
+        })
+        .expect_err("there is no key");
+        assert!(format!("{error:#}").contains("run `koh id`"), "{error:#}");
+        assert!(!root.exists(), "info created the key's directory");
+    }
+
+    #[test]
+    fn a_given_key_path_is_used_as_given() {
+        let path = PathBuf::from("some/where.key");
+        assert_eq!(
+            crate::identity::KeyFile::path_for(Some(path.clone()), "client").unwrap(),
+            path
+        );
     }
 }

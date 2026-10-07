@@ -57,6 +57,9 @@ pub enum SetupError {
     Io(#[from] std::io::Error),
     #[error("secret key file is invalid, a symlink, or not a regular file")]
     BadKeyFile,
+    /// A path koh will not use, and why: `refusing <path>: <why>`.
+    #[error("refusing {path}: {why}")]
+    Refused { path: String, why: String },
     #[error(
         "{0} is not a koh identity key (expected exactly {KEY_LEN} bytes); remove it with \
          `koh key reset --key-file {0} --yes`, which creates a new identity on next use"

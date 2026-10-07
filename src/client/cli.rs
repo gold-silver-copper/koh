@@ -221,15 +221,20 @@ fn warn_if_locale_not_utf8() {
 
 /// With `$KOH_LOG` set, log to that file at debug level (the TUI owns the terminal). It must be
 /// a private file of this user's (see [`crate::identity::open_private_log`]), as debug logs can be
-/// sensitive; failing that, nothing is logged.
+/// sensitive; failing that, nothing is logged. An empty `$KOH_LOG` is off, silently.
 fn log_to_koh_log() {
-    let Ok(path) = std::env::var("KOH_LOG") else {
+    let Some(path) = koh_log_path(std::env::var_os("KOH_LOG")) else {
         return;
     };
-    match crate::identity::open_private_log(std::path::Path::new(&path)) {
+    match crate::identity::open_private_log(&path) {
         Ok(file) => crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG),
         Err(e) => eprintln!("koh: warning: $KOH_LOG: {e}; file logging disabled"),
     }
+}
+
+/// The log file `$KOH_LOG` (given as `value`) names, if any: unset and empty both mean none.
+fn koh_log_path(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    value.filter(|path| !path.is_empty()).map(Into::into)
 }
 
 /// The longest the client waits for the user's terminal to answer its start-up questions. A local
@@ -346,6 +351,16 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_koh_log_is_off_like_an_unset_one() {
+        assert_eq!(koh_log_path(None), None);
+        assert_eq!(koh_log_path(Some("".into())), None, "KOH_LOG= logs nothing");
+        assert_eq!(
+            koh_log_path(Some("/x/koh.log".into())),
+            Some("/x/koh.log".into())
+        );
+    }
 
     #[test]
     fn redial_reuses_the_loaded_identity_without_touching_the_key_file() -> anyhow::Result<()> {

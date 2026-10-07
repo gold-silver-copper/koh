@@ -29,12 +29,22 @@ use super::{window_state, ESCAPE_PREFIX, SCROLLBACK_KEY, SUSPEND_KEY};
 /// frame does not flash it.
 pub const LINK_DOWN_GRACE: Duration = HEARTBEAT.saturating_mul(3);
 
-/// The most input held, as encoded, while the server takes no input: once this much is queued,
-/// typing is dropped and the status line says so, until it drains below. One read is taken whole
-/// below it, so a paste is kept up to this long too.
-const MAX_QUEUED_INPUT: usize = 1024 * 1024;
+/// The longest paste, in the bytes the user's terminal sent: a longer one is dropped whole.
+const MAX_PASTE: usize = 1024 * 1024;
 
-/// What the status line says of a paste past [`MAX_QUEUED_INPUT`], which is dropped whole.
+/// The most input held, as encoded, while the server takes no input: once this much is queued,
+/// typing is dropped and the status line says so, until all of it has gone. One read is taken
+/// whole below it.
+const MAX_QUEUED_INPUT: usize = 4 * MAX_PASTE;
+
+// One paste the decoder takes never pauses input alone: it encodes in at most 3 bytes a byte
+// pasted (a byte that is no UTF-8 becomes U+FFFD) and a few a piece.
+const _: () = assert!(
+    3 * MAX_PASTE + ((3 * MAX_PASTE).div_euclid(crate::events::MAX_PASTE_PIECE) + 1) * 8
+        < MAX_QUEUED_INPUT
+);
+
+/// What the status line says of a paste past [`MAX_PASTE`], which is dropped whole.
 const PASTE_TOO_LONG: &str = "[koh] paste over 1 MiB — not sent";
 
 /// The notice for what was typed during an outage and not sent. The reattach may have landed on
@@ -92,6 +102,9 @@ pub struct ClientSession {
     unconfirmed_at_drop: bool,
     /// Messages for the server, oldest first.
     outgoing: VecDeque<ClientMsg>,
+    /// The newest input queued when [`MAX_QUEUED_INPUT`] was reached: typing stays dropped while
+    /// any input up to it is queued, so a pause drops what is typed whole, not a command's start.
+    pause_until: Option<InputSeq>,
     predictor: PredictionEngine,
     /// What the user's terminal sends, decoded.
     decoder: Decoder,
@@ -173,8 +186,9 @@ impl ClientSession {
             sent_seq: InputSeq::default(),
             unconfirmed_at_drop: false,
             outgoing: VecDeque::from([ClientMsg::Resize(size)]),
+            pause_until: None,
             predictor: PredictionEngine::new(pref),
-            decoder: Decoder::with_paste_limit(MAX_QUEUED_INPUT),
+            decoder: Decoder::with_paste_limit(MAX_PASTE),
             pending_escape: None,
             colours: None,
             colours_asked: false,
@@ -464,6 +478,9 @@ impl ClientSession {
                 }
             }
         }
+        if self.input_paused() {
+            self.pause_until = Some(self.last_seq);
+        }
         self.link.last_nudge = Some(now);
         self.last_activity = Some(now);
         self.dirty = true;
@@ -723,22 +740,25 @@ impl ClientSession {
         Some(msg)
     }
 
-    /// Whether typing is dropped: the server is not taking input, and [`MAX_QUEUED_INPUT`] of it
-    /// is queued, as encoded.
+    /// Whether typing is dropped: the server is not taking input, and [`MAX_QUEUED_INPUT`] of it,
+    /// as encoded, is queued or was until now and has not all gone.
     fn input_paused(&self) -> bool {
-        self.outgoing
-            .iter()
-            .map(|msg| match msg {
-                ClientMsg::Input { bytes, .. } => bytes.len(),
-                ClientMsg::Keys { events, .. } => events.encoded_len(),
-                ClientMsg::Resize(_)
-                | ClientMsg::Ack { .. }
-                | ClientMsg::Resync
-                | ClientMsg::History(_)
-                | ClientMsg::Colours(_) => 0,
-            })
-            .fold(0, usize::saturating_add)
-            >= MAX_QUEUED_INPUT
+        let mut queued: usize = 0;
+        for (seq, len) in self.outgoing.iter().filter_map(|msg| match msg {
+            ClientMsg::Input { seq, bytes } => Some((*seq, bytes.len())),
+            ClientMsg::Keys { seq, events } => Some((*seq, events.encoded_len())),
+            ClientMsg::Resize(_)
+            | ClientMsg::Ack { .. }
+            | ClientMsg::Resync
+            | ClientMsg::History(_)
+            | ClientMsg::Colours(_) => None,
+        }) {
+            if self.pause_until.is_some_and(|until| seq <= until) {
+                return true;
+            }
+            queued = queued.saturating_add(len);
+        }
+        queued >= MAX_QUEUED_INPUT
     }
 
     /// Whether a frame reported that the shell exited (its code is on [`state`](Self::state)).
@@ -1038,6 +1058,59 @@ mod tests {
             s.on_tick(now, None).status.is_none(),
             "draining clears the banner"
         );
+    }
+
+    /// Once paused, typing stays dropped until all the queued input has gone: a message sent
+    /// below the limit does not let the end of a command through without its start.
+    #[test]
+    fn a_pause_holds_until_the_queued_input_has_gone() {
+        let now = Instant::now();
+        let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
+        drain(&mut s);
+        let chunk = [&b"\x1b[200~"[..], &vec![b'z'; 64 * 1024], b"\x1b[201~"].concat();
+        while !s.input_paused() {
+            s.on_input(now, &chunk);
+        }
+        let mut sent = Vec::new();
+        for key in b"echo hello; rm -rf x" {
+            s.on_input(now, &[*key]);
+            // The escape and a key after it are dropped too.
+            s.on_input(now, &[ESCAPE_PREFIX, *key]);
+            sent.extend(s.pop_outgoing());
+        }
+        sent.extend(drain(&mut s));
+        assert!(!s.input_paused(), "all of it went: the pause is over");
+        assert!(
+            events(&sent)
+                .iter()
+                .all(|e| matches!(e, InputEvent::Paste { .. })),
+            "typed while paused, and sent: {:?}",
+            typed(&sent)
+                .iter()
+                .filter(|b| **b != b'z')
+                .map(|b| char::from(*b))
+                .collect::<String>()
+        );
+        s.on_input(now, b"a");
+        assert_eq!(events(&drain(&mut s)), [key("a")]);
+    }
+
+    /// A paste the decoder takes, of the longest, does not pause input alone, even when every
+    /// byte becomes U+FFFD.
+    #[test]
+    fn a_paste_at_the_paste_limit_does_not_pause_input() {
+        for byte in [b'x', 0xff] {
+            let now = Instant::now();
+            let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
+            drain(&mut s);
+            s.on_input(
+                now,
+                &[&b"\x1b[200~"[..], &vec![byte; MAX_PASTE], b"\x1b[201~"].concat(),
+            );
+            assert!(s.has_outgoing(), "the paste was queued");
+            assert!(!s.input_paused(), "one paste paused input");
+            assert!(s.on_tick(now, None).status.is_none());
+        }
     }
 
     #[test]
@@ -1492,12 +1565,7 @@ mod tests {
     fn a_paste_too_long_is_dropped_and_said() {
         let (now, mut s) = start();
         drain(&mut s);
-        let long = [
-            &b"\x1b[200~"[..],
-            &vec![b'x'; MAX_QUEUED_INPUT + 1],
-            b"\x1b[201~k",
-        ]
-        .concat();
+        let long = [&b"\x1b[200~"[..], &vec![b'x'; MAX_PASTE + 1], b"\x1b[201~k"].concat();
         s.on_input(now, &long);
         assert_eq!(events(&drain(&mut s)), [key("k")]);
         let status = s.on_tick(now, None).status.expect("a notice");
@@ -1799,12 +1867,7 @@ mod tests {
         drain(&mut s);
         s.on_input(
             now,
-            &[
-                &b"k\x1b[200~"[..],
-                &vec![b'x'; MAX_QUEUED_INPUT],
-                b"\x1b[201~",
-            ]
-            .concat(),
+            &[&b"k\x1b[200~"[..], &vec![b'x'; MAX_PASTE], b"\x1b[201~"].concat(),
         );
         let first = drain(&mut s);
         s.on_input(now, b"a");

@@ -221,11 +221,11 @@ async fn keys_flood(send: &mut SendStream, mib: usize) -> Result<()> {
 async fn bad_keys(send: &mut SendStream, kind: &str) -> Result<()> {
     eprintln!("evil-client: decoded input no terminal sends ({kind})");
     let key = |key, mods, kitty| InputEvent::Key(WireKey { key, mods, kitty });
-    let keys = |events| ClientMsg::Keys {
-        seq: InputSeq(1),
-        events,
+    // `ClientMsg::Keys` (variant 5) of `InputSeq(1)`: a `ClientMsg` cannot hold these.
+    let keys = |events: Vec<InputEvent>| -> Result<Vec<u8>> {
+        Ok([&[5, 1][..], &postcard::to_allocvec(&events)?].concat())
     };
-    let msg = match kind {
+    let body = match kind {
         "mods" => keys(vec![key(WireKeyCode::Char('x'), 0x80, None)]),
         "fkey" => keys(vec![key(WireKeyCode::F(99), 0, None)]),
         "surrogate" => keys(vec![key(
@@ -244,13 +244,12 @@ async fn bad_keys(send: &mut SendStream, kind: &str) -> Result<()> {
             last: true,
         }]),
         "events" => keys(vec![InputEvent::Focus(true); MAX_EVENTS + 1]),
-        "palette" => ClientMsg::Colours(WireColours {
+        "palette" => Ok(postcard::to_allocvec(&ClientMsg::Colours(WireColours {
             palette: vec![None; PALETTE + 1],
             ..WireColours::default()
-        }),
+        }))?),
         other => return Err(anyhow!("unknown bad-keys kind '{other}'")),
-    };
-    let body = postcard::to_allocvec(&msg)?;
+    }?;
     let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(&body).await?;
@@ -271,7 +270,9 @@ async fn events_flood(send: &mut SendStream, mib: usize) -> Result<()> {
                     text: "x".repeat(MAX_PASTE_PIECE),
                     first: n == 0,
                     last: n + 1 == pieces,
-                }],
+                }]
+                .try_into()
+                .map_err(|_| anyhow!("a paste piece refused"))?,
             },
         )
         .await?;

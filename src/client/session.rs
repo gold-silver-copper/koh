@@ -11,12 +11,12 @@ use fux_vt::keys::encode::{key_bytes, paste, KeyMode, PASTE_END, PASTE_START};
 use fux_vt::keys::Keystroke;
 
 use crate::events::{
-    narrow, InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE_PIECE, PALETTE,
+    narrow, Events, InputEvent, WireColours, WireScheme, MAX_PASTE_PIECE, PALETTE,
 };
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
     decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, FrameScreen,
-    InputSeq, FRAME_WINDOW, HEARTBEAT, MAX_INPUT_BYTES, TTY_TICK, WINDOW_CELLS,
+    InputSeq, FRAME_WINDOW, HEARTBEAT, TTY_TICK, WINDOW_CELLS,
 };
 use crate::terminal::{Grid, HistoryReply, RowEncodings, Size, TerminalScreen};
 
@@ -422,12 +422,8 @@ impl ClientSession {
             return;
         }
         // Predictions made now expire with the first input message that carries these events.
-        let first = events.first().map_or(0, InputEvent::wire_len);
-        let seq = match self.outgoing.back() {
-            Some(ClientMsg::Keys {
-                seq,
-                events: queued,
-            }) if fits(queued, first) => *seq,
+        let seq = match (self.outgoing.back(), events.first()) {
+            (Some(ClientMsg::Keys { seq, events }), Some(first)) if events.admits(first) => *seq,
             _ => self.last_seq.next(),
         };
         self.predictor.set_local_frame_sent(seq.0.saturating_sub(1));
@@ -452,15 +448,18 @@ impl ClientSession {
             }
         }
         for event in events {
-            match self.outgoing.back_mut() {
-                Some(ClientMsg::Keys { events: queued, .. }) if fits(queued, event.wire_len()) => {
-                    queued.push(event);
-                }
-                _ => {
+            let refused = match self.outgoing.back_mut() {
+                Some(ClientMsg::Keys { events, .. }) => events.try_push(event),
+                _ => Err(event),
+            };
+            // A new message; an event that fits none (no terminal sends it) goes nowhere.
+            if let Err(event) = refused {
+                let mut events = Events::default();
+                if events.try_push(event).is_ok() {
                     self.last_seq = self.last_seq.next();
                     self.outgoing.push_back(ClientMsg::Keys {
                         seq: self.last_seq,
-                        events: vec![event],
+                        events,
                     });
                 }
             }
@@ -724,13 +723,14 @@ impl ClientSession {
         Some(msg)
     }
 
-    /// The input in `outgoing`, as encoded.
-    fn queued_input(&self) -> usize {
+    /// Whether typing is dropped: the server is not taking input, and [`MAX_QUEUED_INPUT`] of it
+    /// is queued, as encoded.
+    fn input_paused(&self) -> bool {
         self.outgoing
             .iter()
             .map(|msg| match msg {
                 ClientMsg::Input { bytes, .. } => bytes.len(),
-                ClientMsg::Keys { events, .. } => events.iter().map(InputEvent::wire_len).sum(),
+                ClientMsg::Keys { events, .. } => events.encoded_len(),
                 ClientMsg::Resize(_)
                 | ClientMsg::Ack { .. }
                 | ClientMsg::Resync
@@ -738,12 +738,7 @@ impl ClientSession {
                 | ClientMsg::Colours(_) => 0,
             })
             .fold(0, usize::saturating_add)
-    }
-
-    /// Whether typing is dropped: the server is not taking input, and [`MAX_QUEUED_INPUT`] of it
-    /// is queued.
-    fn input_paused(&self) -> bool {
-        self.queued_input() >= MAX_QUEUED_INPUT
+            >= MAX_QUEUED_INPUT
     }
 
     /// Whether a frame reported that the shell exited (its code is on [`state`](Self::state)).
@@ -791,17 +786,6 @@ impl ClientSession {
     pub fn screen(&self) -> &Grid {
         self.link.current.screen.screen()
     }
-}
-
-/// Whether an event of `len` bytes fits in a queued `Keys` message holding `queued`.
-fn fits(queued: &[InputEvent], len: usize) -> bool {
-    queued.len() < MAX_EVENTS
-        && queued
-            .iter()
-            .map(InputEvent::wire_len)
-            .sum::<usize>()
-            .saturating_add(len)
-            <= MAX_INPUT_BYTES
 }
 
 /// What the server gets for one decoded input. A paste goes with every end marker in it removed,
@@ -897,7 +881,7 @@ mod tests {
             match m {
                 ClientMsg::Input { bytes, .. } => out.extend_from_slice(bytes),
                 ClientMsg::Keys { events, .. } => {
-                    for event in events {
+                    for event in events.iter() {
                         match event {
                             InputEvent::Key(key) => {
                                 out.extend_from_slice(&legacy_bytes(key.stroke().press));
@@ -985,7 +969,9 @@ mod tests {
                 | ClientMsg::Colours(_) => None,
             })
             .collect();
-        assert!(inputs.iter().all(|&(_, len)| len <= MAX_EVENTS));
+        assert!(inputs
+            .iter()
+            .all(|&(_, len)| len <= crate::events::MAX_EVENTS));
         let seqs: Vec<u64> = inputs.iter().map(|(seq, _)| seq.0).collect();
         assert_eq!(
             seqs,
@@ -998,7 +984,7 @@ mod tests {
         let pieces: Vec<(usize, bool, bool)> = msgs
             .iter()
             .filter_map(|m| match m {
-                ClientMsg::Keys { events, .. } => Some(events),
+                ClientMsg::Keys { events, .. } => Some(events.iter()),
                 ClientMsg::Input { .. }
                 | ClientMsg::Resize(_)
                 | ClientMsg::Ack { .. }
@@ -1029,13 +1015,8 @@ mod tests {
         let now = Instant::now();
         let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
         // Pastes, as a terminal in bracketed paste sends them.
-        let chunk = [
-            &b"\x1b[200~"[..],
-            &vec![b'z'; MAX_INPUT_BYTES],
-            b"\x1b[201~",
-        ]
-        .concat();
-        for _ in 1..MAX_QUEUED_INPUT.div_euclid(MAX_INPUT_BYTES) {
+        let chunk = [&b"\x1b[200~"[..], &vec![b'z'; 64 * 1024], b"\x1b[201~"].concat();
+        for _ in 1..MAX_QUEUED_INPUT.div_euclid(64 * 1024) {
             s.on_input(now, &chunk);
         }
         assert!(
@@ -1350,7 +1331,9 @@ mod tests {
                         key: WireKeyCode::Char('a'),
                         mods: 0,
                         kitty: None,
-                    })],
+                    })]
+                    .try_into()
+                    .unwrap(),
                 },
                 ClientMsg::Resize(Size::new(50, 132)),
             ]
@@ -1363,7 +1346,7 @@ mod tests {
     fn events(msgs: &[ClientMsg]) -> Vec<InputEvent> {
         msgs.iter()
             .filter_map(|m| match m {
-                ClientMsg::Keys { events, .. } => Some(events.clone()),
+                ClientMsg::Keys { events, .. } => Some(events.clone().into_vec()),
                 ClientMsg::Input { .. }
                 | ClientMsg::Resize(_)
                 | ClientMsg::Ack { .. }
@@ -1829,10 +1812,9 @@ mod tests {
         assert!(
             !later.is_empty(),
             "typing after the paste was dropped: first read sent {} messages, \
-             input_paused = {}, queued_input = {}",
+             input_paused = {}",
             first.len(),
             s.input_paused(),
-            s.queued_input(),
         );
     }
 
@@ -1843,7 +1825,7 @@ mod tests {
         let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
         drain(&mut s);
         let one = [&b"\x1b[200~"[..], &[b'p'; 127], b"\x1b[201~"].concat();
-        for _ in 0..MAX_EVENTS {
+        for _ in 0..crate::events::MAX_EVENTS {
             s.on_input(now, &one);
         }
         let msg = s.pop_outgoing().expect("a message");

@@ -143,6 +143,7 @@ fn client_msgs() -> Vec<ClientMsg> {
         }),
         ClientMsg::Keys {
             seq: InputSeq(2),
+            // Refused, they would be none, which the pinned bytes catch.
             events: vec![
                 InputEvent::Key(WireKey {
                     key: WireKeyCode::Char('é'),
@@ -172,7 +173,9 @@ fn client_msgs() -> Vec<ClientMsg> {
                     first: true,
                     last: false,
                 },
-            ],
+            ]
+            .try_into()
+            .unwrap_or_default(),
         },
         ClientMsg::Colours(WireColours {
             foreground: Some([0xdd, 0xdd, 0xdd]),

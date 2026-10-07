@@ -98,9 +98,9 @@ fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> 
         let net = net();
         let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
-        let keys = |events| ClientMsg::Keys {
-            seq: InputSeq(1),
-            events,
+        // `ClientMsg::Keys` (variant 5) of `InputSeq(1)`: a `ClientMsg` cannot hold these.
+        let keys = |events: Vec<InputEvent>| -> postcard::Result<Vec<u8>> {
+            Ok([&[5, 1][..], &postcard::to_allocvec(&events)?].concat())
         };
         let key = |key, mods| {
             InputEvent::Key(WireKey {
@@ -109,21 +109,23 @@ fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> 
                 kitty: None,
             })
         };
-        for msg in [
-            keys(vec![key(WireKeyCode::Char('x'), 0x80)]),
-            keys(vec![key(WireKeyCode::F(99), 0)]),
+        for (n, body) in [
+            keys(vec![key(WireKeyCode::Char('x'), 0x80)])?,
+            keys(vec![key(WireKeyCode::F(99), 0)])?,
             keys(vec![InputEvent::Paste {
                 text: "x".repeat(MAX_PASTE_PIECE + 1),
                 first: true,
                 last: true,
-            }]),
-            ClientMsg::Colours(WireColours {
+            }])?,
+            // Built by hand: `encode_client` refuses to.
+            postcard::to_allocvec(&ClientMsg::Colours(WireColours {
                 palette: vec![None; PALETTE + 1],
                 ..WireColours::default()
-            }),
-        ] {
-            // Built by hand: `encode_client` refuses to.
-            let body = postcard::to_allocvec(&msg)?;
+            }))?,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut stream = u32::try_from(body.len())?.to_be_bytes().to_vec();
             stream.extend_from_slice(&body);
             let conn = admitted(&net, evil.clone(), server.id).await?;
@@ -132,7 +134,7 @@ fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> 
                 tokio::time::timeout(Duration::from_secs(5), conn.closed())
                     .await
                     .is_ok(),
-                "the server must close a connection that sent {msg:?}"
+                "the server must close a connection that sent bad message {n}"
             );
         }
         assert_good_client_still_works(&mut good).await?;

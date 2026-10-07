@@ -12,7 +12,7 @@
 //! The types here are the wire's own, so its encoding is pinned here and not by fux-vt's types.
 //! Decoding refuses what no terminal sends: a modifier mask with unknown bits, a function key past
 //! F12, a kitty code that is no Unicode scalar, a paste piece over [`MAX_PASTE_PIECE`] bytes, more
-//! than [`MAX_EVENTS`] events in a message, more than [`PALETTE`] palette entries ([`check_events`],
+//! than [`MAX_EVENTS`] events in a message, more than [`PALETTE`] palette entries ([`Events`],
 //! [`WireColours::check`]).
 
 use fux_vt::keys::colour::{Colours, Rgb, Scheme};
@@ -20,6 +20,8 @@ use fux_vt::keys::encode::{key_bytes, KeyMode, PASTE_END, PASTE_START};
 use fux_vt::keys::mouse::{mouse_bytes, MouseAction, MouseButton, MouseEvent};
 use fux_vt::keys::{Direction, Key, KeyPress, Keystroke, Kitty, Modifiers};
 use serde::{Deserialize, Serialize};
+
+use crate::proto::MAX_CLIENT_MESSAGE;
 
 /// Most events in one `ClientMsg::Keys`.
 pub const MAX_EVENTS: usize = 512;
@@ -142,12 +144,100 @@ pub enum WireScheme {
 /// The modifier bits a key or mouse event may carry.
 const MODS: u8 = 0b111;
 
-/// Whether `events` are within the wire's bounds: what decoding a `ClientMsg::Keys` checks.
-pub fn check_events(events: &[InputEvent]) -> Result<(), &'static str> {
-    if events.len() > MAX_EVENTS {
-        return Err("too many events");
+/// What a `ClientMsg::Keys` holds beside its events, at most: its variant (1 byte), its sequence
+/// number (a varint of at most 10) and the count of events (a varint of at most 2).
+pub const KEYS_ENVELOPE: usize = 1 + 10 + 2;
+
+// The count's varint is 2 bytes up to 16383, and one event of the longest kind always fits.
+const _: () =
+    assert!(MAX_EVENTS < 16384 && MAX_PASTE_PIECE + 16 + KEYS_ENVELOPE <= MAX_CLIENT_MESSAGE);
+
+/// The events of one `ClientMsg::Keys`, in order.
+///
+/// Built only by [`try_push`](Self::try_push), which admits an event by its postcard encoding: so
+/// a `Keys` message of them always encodes within [`MAX_CLIENT_MESSAGE`]. Decoded, they are
+/// checked as [`try_push`](Self::try_push) checks each, and bounded by the message's length. On
+/// the wire it is the `Vec<InputEvent>` it holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Events {
+    list: Vec<InputEvent>,
+    /// The encoded size of `list`.
+    #[serde(skip)]
+    body: usize,
+}
+
+impl Events {
+    /// Append `event` if it is one a terminal sends and the message stays within the wire's
+    /// bounds; else hand it back.
+    pub fn try_push(&mut self, event: InputEvent) -> Result<(), InputEvent> {
+        if !self.admits(&event) {
+            return Err(event);
+        }
+        self.body = self.body.saturating_add(encoded_len(&event));
+        self.list.push(event);
+        Ok(())
     }
-    events.iter().try_for_each(InputEvent::check)
+
+    /// Whether [`try_push`](Self::try_push) would take `event`.
+    pub fn admits(&self, event: &InputEvent) -> bool {
+        event.check().is_ok()
+            && self.list.len() < MAX_EVENTS
+            && self
+                .body
+                .saturating_add(encoded_len(event))
+                .saturating_add(KEYS_ENVELOPE)
+                <= MAX_CLIENT_MESSAGE
+    }
+
+    /// The bytes the events take on the wire.
+    pub const fn encoded_len(&self) -> usize {
+        self.body
+    }
+
+    pub fn into_vec(self) -> Vec<InputEvent> {
+        self.list
+    }
+}
+
+impl std::ops::Deref for Events {
+    type Target = [InputEvent];
+
+    fn deref(&self) -> &[InputEvent] {
+        &self.list
+    }
+}
+
+/// The events, as [`try_push`](Events::try_push) takes them, or the first it refuses.
+impl TryFrom<Vec<InputEvent>> for Events {
+    type Error = InputEvent;
+
+    fn try_from(list: Vec<InputEvent>) -> Result<Self, InputEvent> {
+        let mut events = Self::default();
+        list.into_iter()
+            .try_for_each(|event| events.try_push(event))?;
+        Ok(events)
+    }
+}
+
+impl<'de> Deserialize<'de> for Events {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let list = Vec::<InputEvent>::deserialize(deserializer)?;
+        if list.len() > MAX_EVENTS {
+            return Err(serde::de::Error::custom("too many events"));
+        }
+        list.iter()
+            .try_for_each(InputEvent::check)
+            .map_err(serde::de::Error::custom)?;
+        let body = list.iter().map(encoded_len).fold(0, usize::saturating_add);
+        Ok(Self { list, body })
+    }
+}
+
+/// The bytes `event` takes in postcard.
+fn encoded_len(event: &InputEvent) -> usize {
+    postcard::serialize_with_flavor(event, postcard::ser_flavors::Size::default())
+        .unwrap_or(usize::MAX)
 }
 
 impl InputEvent {
@@ -188,19 +278,6 @@ impl InputEvent {
             }
         }
         out
-    }
-
-    /// About how many bytes the event takes on the wire, for packing messages.
-    pub fn wire_len(&self) -> usize {
-        match self {
-            // Its variants, a character of at most 4 bytes, the modifiers; and kitty's codes
-            // as varints of at most 3 bytes.
-            Self::Key(key) if key.kitty.is_some() => 24,
-            Self::Key(_) => 8,
-            Self::Mouse(_) => 12,
-            Self::Focus(_) => 2,
-            Self::Paste { text, .. } => text.len(),
-        }
     }
 }
 
@@ -492,14 +569,11 @@ mod tests {
             },
         ];
         for event in bad {
-            assert!(
-                check_events(std::slice::from_ref(&event)).is_err(),
-                "{event:?}"
-            );
+            assert!(Events::try_from(vec![event.clone()]).is_err(), "{event:?}");
         }
         let many = vec![InputEvent::Focus(true); MAX_EVENTS + 1];
-        assert!(check_events(&many).is_err());
-        assert!(check_events(&many[..MAX_EVENTS]).is_ok());
+        assert!(Events::try_from(many.clone()).is_err());
+        assert!(Events::try_from(many[..MAX_EVENTS].to_vec()).is_ok());
         let palette = WireColours {
             palette: vec![None; PALETTE + 1],
             ..WireColours::default()

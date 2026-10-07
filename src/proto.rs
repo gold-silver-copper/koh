@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::events::{check_events, InputEvent, WireColours};
+use crate::events::{Events, WireColours};
 use crate::terminal::{
     HistoryReply, HistoryRequest, RowEncodings, ScreenDiff, Size, TerminalScreen,
 };
@@ -159,10 +159,7 @@ pub enum ClientMsg {
     /// Input the client decoded: keys, mouse events, focus changes, paste pieces, in order, at
     /// most [`MAX_EVENTS`](crate::events::MAX_EVENTS). The server encodes each for the program as
     /// it asked. It shares the input sequence numbers with [`ClientMsg::Input`].
-    Keys {
-        seq: InputSeq,
-        events: Vec<InputEvent>,
-    },
+    Keys { seq: InputSeq, events: Events },
     /// What the user's terminal said of its colours: sent after connecting, on every reconnect,
     /// and when the terminal reports a new scheme, unless the user turned it off.
     Colours(WireColours),
@@ -239,11 +236,14 @@ pub enum ProtoError {
 /// Encode one client message with its length prefix.
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
     let input = match msg {
-        ClientMsg::Input { bytes, .. } => bytes.len(),
-        ClientMsg::Keys { events, .. } => {
-            check_events(events).map_err(ProtoError::BadInput)?;
-            events.iter().map(InputEvent::wire_len).sum()
+        ClientMsg::Input { bytes, .. } if bytes.len() > MAX_INPUT_BYTES => {
+            return Err(ProtoError::InputTooLarge {
+                len: bytes.len(),
+                max: MAX_INPUT_BYTES,
+            });
         }
+        ClientMsg::Input { bytes, .. } => bytes.len(),
+        ClientMsg::Keys { events, .. } => events.encoded_len(),
         ClientMsg::Colours(colours) => {
             colours.check().map_err(ProtoError::BadInput)?;
             0
@@ -253,12 +253,6 @@ pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
         | ClientMsg::Resync
         | ClientMsg::History(_) => 0,
     };
-    if input > MAX_INPUT_BYTES {
-        return Err(ProtoError::InputTooLarge {
-            len: input,
-            max: MAX_INPUT_BYTES,
-        });
-    }
     // The body goes straight after a placeholder for its length, into one buffer sized for the
     // typed bytes plus the envelope.
     let mut out = Vec::with_capacity(input.saturating_add(ENVELOPE));
@@ -328,9 +322,9 @@ impl ClientDecoder {
                     max: MAX_INPUT_BYTES,
                 });
             }
-            ClientMsg::Keys { events, .. } => check_events(events).map_err(ProtoError::BadInput)?,
             ClientMsg::Colours(colours) => colours.check().map_err(ProtoError::BadInput)?,
             ClientMsg::Input { .. }
+            | ClientMsg::Keys { .. }
             | ClientMsg::Resize(_)
             | ClientMsg::Ack { .. }
             | ClientMsg::Resync
@@ -732,24 +726,19 @@ mod tests {
     #[test]
     fn keys_and_colours_no_terminal_sends_are_refused() {
         use crate::events::{
-            WireKey, WireKeyCode, WireKitty, WireMouse, WireMouseAction, MAX_EVENTS,
+            InputEvent, WireKey, WireKeyCode, WireKitty, WireMouse, WireMouseAction, MAX_EVENTS,
             MAX_PASTE_PIECE, PALETTE,
         };
-        let raw = |msg: &ClientMsg| {
-            let body = postcard::to_allocvec(msg).unwrap();
+        let framed = |body: Vec<u8>| {
             let mut stream = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
             stream.extend_from_slice(&body);
             stream
         };
-        let keys = |events: Vec<InputEvent>| ClientMsg::Keys {
-            seq: InputSeq(1),
-            events,
-        };
         let key = |key, mods, kitty| InputEvent::Key(WireKey { key, mods, kitty });
         let bad = [
-            keys(vec![key(WireKeyCode::Char('a'), 0x08, None)]),
-            keys(vec![key(WireKeyCode::F(13), 0, None)]),
-            keys(vec![key(
+            vec![key(WireKeyCode::Char('a'), 0x08, None)],
+            vec![key(WireKeyCode::F(13), 0, None)],
+            vec![key(
                 WireKeyCode::Char('a'),
                 0,
                 Some(WireKitty {
@@ -758,37 +747,43 @@ mod tests {
                     base: None,
                     mods: 0,
                 }),
-            )]),
-            keys(vec![InputEvent::Mouse(WireMouse {
+            )],
+            vec![InputEvent::Mouse(WireMouse {
                 action: WireMouseAction::Press,
                 button: None,
                 mods: 0x10,
                 row: 0,
                 col: 0,
-            })]),
-            keys(vec![InputEvent::Paste {
+            })],
+            vec![InputEvent::Paste {
                 text: "x".repeat(MAX_PASTE_PIECE + 1),
                 first: true,
                 last: true,
-            }]),
-            keys(vec![InputEvent::Focus(true); MAX_EVENTS + 1]),
-            ClientMsg::Colours(WireColours {
-                palette: vec![None; PALETTE + 1],
-                ..WireColours::default()
-            }),
+            }],
+            vec![InputEvent::Focus(true); MAX_EVENTS + 1],
         ];
-        for msg in &bad {
-            assert!(encode_client(msg).is_err(), "{msg:?}");
-            assert!(decode_all(&raw(msg)).is_err(), "{msg:?}");
+        for events in bad {
+            // `ClientMsg::Keys` is variant 5 (the golden test pins it), here of `InputSeq(1)`.
+            let body = [&[5, 1][..], &postcard::to_allocvec(&events).unwrap()].concat();
+            assert!(decode_all(&framed(body)).is_err(), "{events:?}");
+            assert!(Events::try_from(events).is_err());
         }
+        let colours = ClientMsg::Colours(WireColours {
+            palette: vec![None; PALETTE + 1],
+            ..WireColours::default()
+        });
+        assert!(encode_client(&colours).is_err());
+        assert!(decode_all(&framed(postcard::to_allocvec(&colours).unwrap())).is_err());
+        let keys = |events: Vec<InputEvent>| ClientMsg::Keys {
+            seq: InputSeq(1),
+            events: events.try_into().unwrap(),
+        };
         // A code that is no character at all does not even decode.
         let mut body =
             postcard::to_allocvec(&keys(vec![key(WireKeyCode::Char('a'), 0, None)])).unwrap();
         let at = body.iter().rposition(|&b| b == b'a').unwrap();
         body[at] = 0xff;
-        let mut stream = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
-        stream.extend_from_slice(&body);
-        assert!(decode_all(&stream).is_err());
+        assert!(decode_all(&framed(body)).is_err());
         // What a terminal sends goes through, both ways.
         let good = [
             keys(vec![
@@ -812,6 +807,67 @@ mod tests {
             let stream = encode_client(&msg).unwrap();
             assert_eq!(decode_all(&stream).unwrap(), vec![msg]);
         }
+    }
+
+    proptest::proptest! {
+        /// What `Events` admits encodes as a `Keys` message of any sequence number, within the
+        /// envelope it leaves room for: the queue packs only what the wire takes.
+        #[test]
+        fn admitted_events_encode_within_their_envelope(
+            events in proptest::collection::vec(input_event(), 0..700),
+        ) {
+            let mut admitted = Events::default();
+            for event in events {
+                let _ = admitted.try_push(event);
+            }
+            let len = admitted.encoded_len();
+            let msg = ClientMsg::Keys { seq: InputSeq(u64::MAX), events: admitted };
+            let body = postcard::to_stdvec(&msg).unwrap();
+            proptest::prop_assert!(body.len() <= len.saturating_add(crate::events::KEYS_ENVELOPE));
+            proptest::prop_assert!(encode_client(&msg).is_ok());
+        }
+    }
+
+    fn input_event() -> impl proptest::strategy::Strategy<Value = crate::events::InputEvent> {
+        use crate::events::{InputEvent, WireKey, WireKeyCode, WireKitty};
+        use proptest::prelude::*;
+        let kitty =
+            proptest::option::of(
+                (any::<char>(), any::<u8>()).prop_map(|(c, mods)| WireKitty {
+                    code: Some(u32::from(c)),
+                    shifted: None,
+                    base: Some(u32::from(c)),
+                    mods,
+                }),
+            );
+        // `Union` rather than `prop_oneof!`, whose expansion `allow`s a lint this crate forbids.
+        proptest::strategy::Union::new([
+            (any::<char>(), 0..8_u8, kitty)
+                .prop_map(|(c, mods, kitty)| {
+                    InputEvent::Key(WireKey {
+                        key: WireKeyCode::Char(c),
+                        mods,
+                        kitty,
+                    })
+                })
+                .boxed(),
+            any::<bool>().prop_map(InputEvent::Focus).boxed(),
+            (0..200_usize, any::<bool>())
+                .prop_map(|(n, first)| InputEvent::Paste {
+                    text: "p".repeat(n),
+                    first,
+                    last: !first,
+                })
+                .boxed(),
+            // Two bytes a character: some go over the piece's limit.
+            (0..35_000_usize)
+                .prop_map(|n| InputEvent::Paste {
+                    text: "é".repeat(n),
+                    first: true,
+                    last: true,
+                })
+                .boxed(),
+        ])
     }
 
     #[test]

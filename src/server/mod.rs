@@ -338,8 +338,8 @@ impl ServerConn {
                 ClientMsg::Keys { seq, events } => {
                     self.echo.register(seq, now);
                     match drained.input.last_mut() {
-                        Some(ToSession::Events(queued)) => queued.extend(events),
-                        _ => drained.input.push(ToSession::Events(events)),
+                        Some(ToSession::Events(queued)) => queued.extend(events.into_vec()),
+                        _ => drained.input.push(ToSession::Events(events.into_vec())),
                     }
                 }
                 ClientMsg::Colours(colours) => drained.input.push(ToSession::Colours(colours)),

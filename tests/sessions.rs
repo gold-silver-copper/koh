@@ -18,8 +18,8 @@ use koh::server::run_session;
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
 use koh::terminal::{clamp_dims, RowEncodings, Size, TerminalScreen};
-use koh::transport_iroh::admission::await_admission;
-use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
+use koh::transport_iroh::admission::{self, Close, Link};
+use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
 use tokio_util::sync::CancellationToken;
 
 /// The launcher every session in these tests starts through.
@@ -171,7 +171,7 @@ fn a_session_whose_shell_exited_is_torn_down() -> anyhow::Result<()> {
 
 /// A bare koh/3 client: writes messages, applies frames whose base it holds, and acks them.
 struct RawClient {
-    conn: iroh::endpoint::Connection,
+    conn: Link,
     send: iroh::endpoint::SendStream,
     /// Each frame's base, rows and compressed body, to inflate once its base is found.
     frames: tokio::sync::mpsc::Receiver<(FrameNum, Vec<u16>, Vec<u8>)>,
@@ -183,17 +183,10 @@ struct RawClient {
 }
 
 impl RawClient {
-    /// Connect to `addr` as `secret`, waiting for the admission ack if the server sends one.
-    async fn connect(
-        addr: iroh::EndpointAddr,
-        secret: iroh::SecretKey,
-        admitted: bool,
-    ) -> anyhow::Result<Self> {
+    /// Connect to `addr` as `secret` and await the admission ack.
+    async fn connect(addr: iroh::EndpointAddr, secret: iroh::SecretKey) -> anyhow::Result<Self> {
         let endpoint = bind_endpoint_local(secret, false).await?;
-        let conn = endpoint.connect(addr, ALPN).await?;
-        if admitted {
-            await_admission(&conn).await?;
-        }
+        let conn = admission::dial(&endpoint, addr).await?;
         let send = conn.open_uni().await?;
         let (tx, frames) = tokio::sync::mpsc::channel(64);
         let reader = conn.clone();
@@ -282,7 +275,7 @@ fn run_session_delivers_keys_and_clamped_resizes_then_kills_the_shell() -> anyho
             let conn = incoming.await?;
             run_session(conn, &["cat".to_owned()], 0, launcher()).await
         });
-        let mut client = RawClient::connect(addr, generate_secret_key()?, false).await?;
+        let mut client = RawClient::connect(addr, generate_secret_key()?).await?;
         client
             .write(&ClientMsg::Resize(Size::new(65000, 1)))
             .await?;
@@ -310,7 +303,7 @@ fn run_session_delivers_keys_and_clamped_resizes_then_kills_the_shell() -> anyho
             "the input is acknowledged as echoed: {:?}",
             client.echo_ack
         );
-        client.conn.close(0u32.into(), b"done");
+        client.conn.close(Close::ClientExit);
         tokio::time::timeout(Duration::from_secs(5), accept)
             .await
             .context("run_session returns after the connection ends")???;
@@ -341,8 +334,8 @@ fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_i
             shutdown.clone(),
         ));
         // Both connections share one client identity, so they land on ONE session.
-        let mut a = RawClient::connect(addr.clone(), secret.clone(), true).await?;
-        let mut b = RawClient::connect(addr, secret, true).await?;
+        let mut a = RawClient::connect(addr.clone(), secret.clone()).await?;
+        let mut b = RawClient::connect(addr, secret).await?;
         for _ in 0..30 {
             a.type_bytes(b"a").await?;
             a.pump(20).await?;

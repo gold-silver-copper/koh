@@ -13,7 +13,7 @@ use koh::client::{run_client, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::run_session;
 use koh::terminal::{Size, TerminalScreen};
-use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
+use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
 use tokio::sync::mpsc;
 
 /// A terminal backend that captures the latest authoritative screen as plain text, so a test
@@ -71,8 +71,8 @@ fn full_session_over_loopback_pty() {
         // A connector for the single connection this test uses. Reconnect is never triggered here:
         // dropping the input sender ends the session via Quit before any link loss.
         let connector = IrohConnector::new(client_ep.clone(), server_addr.clone());
-        let conn = client_ep
-            .connect(server_addr, ALPN)
+        let conn = connector
+            .connect()
             .await
             .expect("client connect over loopback");
 

@@ -3,7 +3,6 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
@@ -12,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
 use crate::predict::DisplayPreference;
+use crate::transport_iroh::admission::Link;
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, relay_addr,
 };
@@ -167,7 +167,7 @@ impl BellHook {
 async fn dial(
     config: &ConnectConfig,
     identity: &crate::identity::Identity,
-) -> anyhow::Result<(iroh::Endpoint, IrohConnector, iroh::endpoint::Connection)> {
+) -> anyhow::Result<(iroh::Endpoint, IrohConnector, Link)> {
     let secret = identity.secret.clone();
     let server = config.server;
     let (endpoint, target) = if let Some(addr) = config.direct {
@@ -182,15 +182,12 @@ async fn dial(
         (bind_endpoint(secret, false).await?, server.into())
     };
     let connector = IrohConnector::new(endpoint.clone(), target);
-    let first = tokio::time::timeout(Duration::from_secs(15), connector.connect())
-        .await
-        .context("timed out connecting (server unreachable or not responding)")
-        .and_then(std::convert::identity);
-    match first {
+    // The first dial fails on any error, transient or not: nothing has worked yet to retry.
+    match connector.connect().await {
         Ok(channel) => Ok((endpoint, connector, channel)),
         Err(error) => {
             close_endpoint(&endpoint).await;
-            Err(error)
+            Err(error.into())
         }
     }
 }
@@ -350,6 +347,8 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -393,17 +392,16 @@ mod tests {
                         connection.remote_id() == expected,
                         "client identity changed"
                     );
-                    admission::admit(&connection).await?;
-                    connection.closed().await;
+                    admission::admit(connection).await?.closed().await;
                 }
                 Ok::<_, anyhow::Error>(())
             };
             let client = async {
                 let (endpoint, connector, channel) = dial(&config, &identity).await?;
-                channel.close(0u32.into(), b"test reconnect");
+                channel.close(admission::Close::Reconnecting);
                 // The same connector `run_client` redials with after a link loss.
                 let channel = connector.connect().await?;
-                channel.close(0u32.into(), b"test done");
+                channel.close(admission::Close::ClientExit);
                 endpoint.close().await;
                 Ok::<_, anyhow::Error>(())
             };

@@ -55,9 +55,14 @@ from `crate::` (CI checks it), so it is a standalone terminal-prediction library
 ## The protocol (koh/3)
 
 The ALPN `koh/3` is the version check: a peer on another version fails the TLS handshake with a
-clear error. After the handshake the server checks the allowlist and opens a bi-stream carrying one
-ADMIT byte, so a rejected client can tell "not authorized" from a network error. Then
-(`src/proto.rs`):
+clear error. After the handshake the server checks the allowlist and attaches the peer's session,
+then opens a bi-stream carrying one ADMIT byte; a peer it refuses (not authorized, or the session
+cap) is closed with code 1 before the ack instead, so a refused client can tell the refusal from a
+network error. Every close koh sends and reads is in `transport_iroh::admission`: an admitted
+connection is a `Link`, which closes only with a `Close` (code 0: session ended, client exit,
+reconnecting; code 2: a protocol error), and the client reads any end, of a connection or a dial,
+as one `Disconnect`: the session ended, a verdict it stops on (a refusal, a protocol error,
+another protocol version), or a lost link it redials. Then (`src/proto.rs`):
 
 - **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Keys { seq,
   events }`, the input the client decoded (`src/events.rs`: keys, mouse events, focus changes and
@@ -329,7 +334,9 @@ The reconnect is **automatic and in-process**: the client doesn't exit when the 
 outage (e.g. a phone screen-off — Android freezes the process, so QUIC keepalives stop) is ridden
 out on the same connection thanks to a 5-minute connection idle timeout. A longer outage times the
 connection out; the client then transparently re-dials and reattaches to the same server session,
-holding the last screen under a `reconnecting…` banner in the meantime. One `ClientSession` lives
+holding the last screen under a `reconnecting…` banner in the meantime. A server's verdict is not
+a lost link: a redial it refuses (the client was taken off the allowlist, or a new session would
+pass the cap) or a protocol-error close ends the client with the server's reason. One `ClientSession` lives
 for the whole run and one loop drives it, connected or not: only what belongs to a connection (its
 frames, echo-ack and acknowledgements) is dropped (`detach`) and made anew (`attach`), so the
 escape keys, the scrollback view, the window size and the colours work during the outage and carry

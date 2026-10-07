@@ -9,8 +9,8 @@ use koh::client::{run_client, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::terminal::{Size, TerminalScreen};
-use koh::transport_iroh::admission::await_admission;
-use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
+use koh::transport_iroh::admission::{dial, Link};
+use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -53,7 +53,7 @@ fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
 async fn server_at_capacity() -> anyhow::Result<(
     iroh::EndpointAddr,
     iroh::SecretKey,
-    iroh::endpoint::Connection,
+    Link,
     iroh::Endpoint,
     CancellationToken,
 )> {
@@ -76,8 +76,7 @@ async fn server_at_capacity() -> anyhow::Result<(
         shutdown.clone(),
     ));
     let holder_ep = bind_endpoint_local(holder, false).await?;
-    let held = holder_ep.connect(addr.clone(), ALPN).await?;
-    await_admission(&held).await?;
+    let held = dial(&holder_ep, addr.clone()).await?;
     // Let the registry create the holder's session before the second peer arrives.
     tokio::time::sleep(Duration::from_millis(500)).await;
     Ok((addr, second, held, holder_ep, shutdown))
@@ -100,10 +99,10 @@ fn connect_to_a_server_at_session_capacity_is_an_error() -> anyhow::Result<()> {
                 Ok(conn) => {
                     // Show what came after the Ok: the server's close.
                     let closed = conn.closed().await;
-                    admitted.push(format!("{closed}"));
+                    admitted.push(format!("{closed:?}"));
                 }
                 Err(e) => {
-                    let e = format!("{e:#}");
+                    let e = format!("{:#}", anyhow::Error::from(e));
                     anyhow::ensure!(e.contains("capacity"), "the error names the cap: {e}");
                     errors = errors.saturating_add(1);
                 }

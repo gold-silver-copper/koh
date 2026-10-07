@@ -1,15 +1,15 @@
 //! The connection-admission barrier (`transport_iroh::admission`): a server that admits a peer
-//! unblocks the client's `await_admission`; a server that rejects (closes without admitting) makes
-//! `await_admission` return an error, so a rejected client fails fast instead of re-dialing forever.
+//! completes the client's `dial`; a server that refuses (closes without admitting) makes `dial` a
+//! fatal verdict, so a refused client fails fast instead of re-dialing forever.
 //! Hermetic loopback iroh connections.
 
 use std::time::Duration;
 
-use koh::transport_iroh::admission::{admit, await_admission};
-use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
+use koh::transport_iroh::admission::{admit, dial, refuse, Disconnect, Refusal};
+use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
 
 #[test]
-fn admit_unblocks_await_admission() {
+fn admit_completes_the_dial() {
     runtime().expect("tokio runtime").block_on(async {
         let server = bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
             .await
@@ -23,15 +23,12 @@ fn admit_unblocks_await_admission() {
         let accept = tokio::spawn(async move {
             let incoming = server_ep.accept().await.expect("incoming");
             let conn = incoming.await.expect("accept conn");
-            admit(&conn).await.expect("admit");
+            let _link = admit(conn).await.expect("admit");
             // Hold the connection briefly so the client's accept_bi sees the stream.
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
-        let conn = client.connect(addr, ALPN).await.expect("connect");
-        await_admission(&conn)
-            .await
-            .expect("client must be admitted");
+        dial(&client, addr).await.expect("client must be admitted");
         accept.await.expect("accept task");
     });
 }
@@ -52,15 +49,18 @@ fn reject_surfaces_as_error() {
             let incoming = server_ep.accept().await.expect("incoming");
             let conn = incoming.await.expect("accept conn");
             // Reject: close WITHOUT opening the admission stream (mirrors the not-on-allowlist path).
-            conn.close(1u32.into(), b"not authorized");
+            refuse(conn, Refusal::NotAuthorized);
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
-        let conn = client.connect(addr, ALPN).await.expect("connect");
-        assert!(
-            await_admission(&conn).await.is_err(),
-            "a server that closes without admitting must surface as not-admitted (not hang)"
-        );
+        match dial(&client, addr).await {
+            Err(Disconnect::Fatal(e)) => assert!(
+                format!("{e:#}").contains("server rejected the connection: not authorized"),
+                "{e:#}"
+            ),
+            Ok(_) => panic!("a server that closes without admitting must not admit"),
+            Err(e) => panic!("a refusal is a verdict, not {e:?}"),
+        }
         accept.await.expect("accept task");
     });
 }

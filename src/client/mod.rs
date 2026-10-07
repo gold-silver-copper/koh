@@ -21,10 +21,10 @@ pub use session::{ClientSession, InputOutcome, TickResult};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::predict::{DisplayPreference, Overlay};
-use crate::proto::{decode_server, encode_client, ServerMsg, MAX_FRAME, SESSION_ENDED};
+use crate::proto::{decode_server, encode_client, ServerMsg, MAX_FRAME};
 use crate::terminal::{Size, TerminalScreen};
-use crate::transport_iroh::ALPN;
-use iroh::endpoint::{Connection, SendStream};
+use crate::transport_iroh::admission::{self, Close, Disconnect, Link};
+use iroh::endpoint::SendStream;
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -41,8 +41,6 @@ pub(crate) const SUSPEND_KEY: u8 = 0x1a;
 /// After [`ESCAPE_PREFIX`], opens the scrollback view.
 pub(crate) const SCROLLBACK_KEY: u8 = b'[';
 
-/// How long a single reconnect dial may run before it is abandoned and retried.
-const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Reconnect backoff: `BASE << min(attempt, 4)`, capped at `MAX`; attempts from 1 wait 1, 2, 4, 8 s.
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(500);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(8);
@@ -75,71 +73,12 @@ impl IrohConnector {
         Self { endpoint, target }
     }
 
-    /// Connect and await the admission ack. A server that rejects us closes the connection instead,
-    /// which is an error, so a rejected client fails fast rather than redialing forever.
-    pub async fn connect(&self) -> anyhow::Result<Connection> {
-        let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
-            Ok(conn) => conn,
-            Err(e) if refused_our_alpn(&e) => {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "the server does not speak this koh protocol ({}); upgrade koh on both ends",
-                    String::from_utf8_lossy(ALPN)
-                )));
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context("connecting to server (is your id on its allowlist?)"));
-            }
-        };
-        if let Err(e) = crate::transport_iroh::admission::await_admission(&conn).await {
-            // Surface the server's own reason ("not authorized", "at session capacity"): each
-            // points at a different fix.
-            return Err(match server_close_reason(&conn) {
-                Some(reason) => anyhow::Error::new(e)
-                    .context(format!("server rejected the connection: {reason}")),
-                None => anyhow::Error::new(e)
-                    .context("server did not admit the connection (is your id on its allowlist?)"),
-            });
-        }
-        Ok(conn)
+    /// Connect and await the admission ack. A server that refuses us closes the connection
+    /// instead, which is a [`Disconnect::Fatal`], so a refused client fails fast rather than
+    /// redialing forever.
+    pub async fn connect(&self) -> Result<Link, Disconnect> {
+        admission::dial(&self.endpoint, self.target.clone()).await
     }
-}
-
-/// Whether a dial failed because the server does not serve [`ALPN`]: the TLS handshake ended with
-/// alert 120 (`no_application_protocol`), which QUIC reports as crypto error `0x178`. A server on
-/// another koh protocol version refuses us this way, and pointing at the allowlist would mislead.
-fn refused_our_alpn(error: &(dyn std::error::Error + 'static)) -> bool {
-    use iroh::endpoint::{ConnectionError, TransportErrorCode};
-    let no_alpn = TransportErrorCode::crypto(120);
-    let mut next = Some(error);
-    while let Some(e) = next {
-        match e.downcast_ref::<ConnectionError>() {
-            Some(ConnectionError::ConnectionClosed(close)) if close.error_code == no_alpn => {
-                return true;
-            }
-            Some(ConnectionError::TransportError(t)) if t.code == no_alpn => return true,
-            _ => {}
-        }
-        next = e.source();
-    }
-    false
-}
-
-/// The server's application close reason, if any: peer-controlled, so stripped of control
-/// characters and capped before it can reach the user's terminal.
-fn server_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
-    use iroh::endpoint::{ApplicationClose, ConnectionError};
-    let ConnectionError::ApplicationClosed(ApplicationClose { reason, .. }) =
-        conn.close_reason()?
-    else {
-        return None;
-    };
-    let cleaned: String = String::from_utf8_lossy(&reason)
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(80)
-        .collect();
-    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 /// The wait before redialing after `attempt` (from 1) failures.
@@ -392,7 +331,7 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
               collaborator; bundling them into a struct would only move the list, not shorten it"
 )]
 pub async fn run_client<T: ClientTerminal>(
-    initial: Connection,
+    initial: Link,
     dialed_at: SystemTime,
     connector: IrohConnector,
     pref: DisplayPreference,
@@ -428,7 +367,7 @@ pub async fn run_client<T: ClientTerminal>(
                 net = redial(wire, &mut attempt, &mut session, &connector);
                 continue;
             }
-            crate::transport_iroh::rtt(&wire.conn)
+            wire.link.rtt()
         } else {
             None
         };
@@ -539,28 +478,33 @@ pub async fn run_client<T: ClientTerminal>(
                 let Net::Up(wire) = &net else {
                     continue;
                 };
-                if session_ended(&wire.conn) {
-                    if banner {
-                        end_session(&mut term, &session, &shutdown).await;
+                match wire.link.ended() {
+                    Disconnect::Ended => {
+                        if banner {
+                            end_session(&mut term, &session, &shutdown).await;
+                        }
+                        return Ok(net.close(session.state().exit_code()));
                     }
-                    return Ok(net.close(session.state().exit_code()));
+                    Disconnect::Fatal(e) => return Err(e),
+                    Disconnect::Transient(e) => {
+                        tracing::info!(reason = %format!("{e:#}"), "link lost; will reconnect");
+                        net = redial(wire, &mut attempt, &mut session, &connector);
+                    }
                 }
-                tracing::info!(reason = ?wire.conn.close_reason(), "link lost; will reconnect");
-                net = redial(wire, &mut attempt, &mut session, &connector);
             }
-            Some(Change::Dialed(Ok(Ok(conn)))) => {
+            Some(Change::Dialed(Ok(link))) => {
                 session.attach(Instant::now(), term.size().unwrap_or(initial_size));
-                net = Net::Up(Wire::open(conn).await);
+                net = Net::Up(Wire::open(link).await);
             }
-            Some(Change::Dialed(failed)) => {
-                if let Ok(Err(e)) = failed {
-                    tracing::info!(reason = %e, attempt, "reconnect dial failed");
-                } else {
-                    tracing::info!(attempt, "reconnect dial timed out");
+            Some(Change::Dialed(Err(failed))) => match failed {
+                Disconnect::Ended => return Ok(session.state().exit_code()),
+                Disconnect::Fatal(e) => return Err(e),
+                Disconnect::Transient(e) => {
+                    tracing::info!(reason = %format!("{e:#}"), attempt, "reconnect dial failed");
+                    attempt = attempt.saturating_add(1);
+                    net = Net::Down(dial(&connector, attempt));
                 }
-                attempt = attempt.saturating_add(1);
-                net = Net::Down(dial(&connector, attempt));
-            }
+            },
         }
     }
 }
@@ -575,18 +519,18 @@ impl Net<'_> {
     /// The run is over: close the connection, if one is up, and return `code`.
     fn close(&self, code: Option<u32>) -> Option<u32> {
         if let Self::Up(wire) = self {
-            wire.conn.close(0u32.into(), b"client exit");
+            wire.link.close(Close::ClientExit);
         }
         code
     }
 }
 
-/// A redial: the backoff, then one dial, abandoned after [`RECONNECT_CONNECT_TIMEOUT`]. Pinned,
-/// so banner repaints and keystrokes do not restart a slow one.
+/// A redial: the backoff, then one dial. Pinned, so banner repaints and keystrokes do not restart a
+/// slow one.
 type Dial<'c> = std::pin::Pin<Box<dyn std::future::Future<Output = Dialed> + Send + 'c>>;
 
-/// A redial's result: connected, refused, or timed out.
-type Dialed = Result<anyhow::Result<Connection>, tokio::time::error::Elapsed>;
+/// A redial's result.
+type Dialed = Result<Link, Disconnect>;
 
 /// What one turn of [`run_client`]'s loop left for it to act on.
 enum Change {
@@ -600,7 +544,7 @@ enum Change {
 
 /// A live connection: its stream writer and frame reader, which end with it.
 struct Wire {
-    conn: Connection,
+    link: Link,
     writer_tx: mpsc::Sender<Vec<u8>>,
     frame_rx: mpsc::Receiver<ServerMsg>,
     _writer: AbortOnDrop<()>,
@@ -610,16 +554,16 @@ struct Wire {
 }
 
 impl Wire {
-    /// Start the tasks writing the client's stream and reading frames on `conn`. A stream that
+    /// Start the tasks writing the client's stream and reading frames on `link`. A stream that
     /// does not open ends the writer, which loses the link.
-    async fn open(conn: Connection) -> Self {
-        let send = conn.open_uni().await.ok();
+    async fn open(link: Link) -> Self {
+        let send = link.open_uni().await.ok();
         let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
         let writer = AbortOnDrop(tokio::spawn(write_client_stream(send, writer_rx)));
         let (frame_tx, frame_rx) = mpsc::channel::<ServerMsg>(FRAME_QUEUE);
-        let reader = AbortOnDrop(tokio::spawn(read_frames(conn.clone(), frame_tx)));
+        let reader = AbortOnDrop(tokio::spawn(read_frames(link.clone(), frame_tx)));
         Self {
-            conn,
+            link,
             writer_tx,
             frame_rx,
             _writer: writer,
@@ -636,7 +580,7 @@ fn redial<'c>(
     session: &mut ClientSession,
     connector: &'c IrohConnector,
 ) -> Net<'c> {
-    wire.conn.close(0u32.into(), b"reconnecting");
+    wire.link.close(Close::Reconnecting);
     *attempt = next_attempt_after_drop(*attempt, wire.started.elapsed());
     session.detach(Instant::now());
     Net::Down(dial(connector, *attempt))
@@ -652,7 +596,7 @@ fn dial(connector: &IrohConnector, attempt: u32) -> Dial<'_> {
     };
     Box::pin(async move {
         tokio::time::sleep(wait).await;
-        tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect()).await
+        connector.connect().await
     })
 }
 
@@ -722,8 +666,8 @@ async fn write_client_stream(send: Option<SendStream>, mut queue: mpsc::Receiver
 
 /// Accept the server's streams (frames, and history rows), each read on its own task so a stalled or
 /// reset stream never holds up a newer frame. Ends when the connection closes.
-async fn read_frames(conn: Connection, frames: mpsc::Sender<ServerMsg>) {
-    while let Ok(mut recv) = conn.accept_uni().await {
+async fn read_frames(link: Link, frames: mpsc::Sender<ServerMsg>) {
+    while let Ok(mut recv) = link.accept_uni().await {
         let frames = frames.clone();
         tokio::spawn(async move {
             // A reset (superseded) or malformed frame is simply not delivered.
@@ -738,17 +682,6 @@ async fn read_frames(conn: Connection, frames: mpsc::Sender<ServerMsg>) {
             }
         });
     }
-}
-
-/// Whether the closed `conn` was the server ending the session (its shell exited), not the link
-/// being lost.
-fn session_ended(conn: &Connection) -> bool {
-    use iroh::endpoint::{ApplicationClose, ConnectionError};
-    matches!(
-        conn.close_reason(),
-        Some(ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason }))
-            if error_code.into_inner() == 0 && reason.as_ref() == SESSION_ENDED
-    )
 }
 
 /// Paint the "session ended" banner and linger briefly so it is seen.
@@ -795,8 +728,9 @@ mod tests {
                 .await
                 .expect("bind client");
             let error = match IrohConnector::new(client, addr).connect().await {
+                Err(Disconnect::Fatal(e)) => format!("{e:#}"),
                 Ok(_) => panic!("an old-protocol server must refuse the handshake"),
-                Err(e) => format!("{e:#}"),
+                Err(e) => panic!("an old-protocol server is a verdict, not {e:?}"),
             };
             assert!(
                 error.contains("does not speak this koh protocol (koh/3)"),

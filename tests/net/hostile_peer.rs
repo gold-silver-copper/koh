@@ -7,14 +7,14 @@
 use std::time::Duration;
 
 use anyhow::Context as _;
-use iroh::endpoint::Connection;
 use iroh::{EndpointId, SecretKey};
 use koh::proto::{
     decode_server, encode_client, encode_frame, encode_history, ClientMsg, Frame, FrameNum,
     InputSeq, ServerMsg, MAX_FRAME, MAX_PENDING_HISTORY,
 };
 use koh::terminal::{ServerTerminal, TerminalScreen};
-use koh::transport_iroh::{admission, generate_secret_key, ALPN};
+use koh::transport_iroh::admission::{self, Close, Disconnect, Link};
+use koh::transport_iroh::generate_secret_key;
 
 use crate::harness::{identity, Client, Options, Server};
 use crate::link::{FaultNet, Profile};
@@ -27,20 +27,15 @@ fn net() -> FaultNet {
 
 /// Connect to `server` as `secret`, complete admission, and keep the endpoint alive; the caller
 /// then speaks koh/3 by hand.
-async fn admitted(
-    net: &FaultNet,
-    secret: SecretKey,
-    server: EndpointId,
-) -> anyhow::Result<Connection> {
+async fn admitted(net: &FaultNet, secret: SecretKey, server: EndpointId) -> anyhow::Result<Link> {
     let endpoint = net.endpoint(secret, false).await?;
-    let conn = endpoint.connect(FaultNet::addr(server), ALPN).await?;
-    admission::await_admission(&conn).await?;
+    let link = admission::dial(&endpoint, FaultNet::addr(server)).await?;
     Box::leak(Box::new(endpoint));
-    Ok(conn)
+    Ok(link)
 }
 
 /// Open the one client stream, write `bytes`, and keep it open (a real client keeps its stream).
-async fn raw_client_stream(conn: &Connection, bytes: &[u8]) -> anyhow::Result<()> {
+async fn raw_client_stream(conn: &Link, bytes: &[u8]) -> anyhow::Result<()> {
     let mut send = conn.open_uni().await?;
     send.write_all(bytes).await?;
     Box::leak(Box::new(send));
@@ -181,7 +176,7 @@ fn a_flood_of_connections_and_garbage_does_not_take_the_server_down() -> anyhow:
             let conn = admitted(&net, evil.clone(), server.id).await?;
             // A length prefix and a truncated body, over and over.
             raw_client_stream(&conn, &[0, 0, 16, 0, 1, 2, 3]).await?;
-            conn.close(0u32.into(), b"next");
+            conn.close(Close::ClientExit);
         }
         assert_good_client_still_works(&mut good).await?;
         let _ = good.finish().await;
@@ -244,8 +239,7 @@ fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_co
         Box::leak(Box::new(send));
         let closed = tokio::time::timeout(WAIT, conn.closed()).await?;
         anyhow::ensure!(
-            matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(c)
-                if c.error_code == 2u32.into()),
+            matches!(&closed, Disconnect::Fatal(e) if format!("{e:#}").contains("protocol error")),
             "closed with {closed:?}"
         );
         assert_good_client_still_works(&mut good).await?;
@@ -261,7 +255,7 @@ fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_co
 /// server's id.
 async fn evil_server<F>(net: &FaultNet, allow: EndpointId, frames: F) -> anyhow::Result<EndpointId>
 where
-    F: FnOnce(Connection) -> tokio::task::JoinHandle<()> + Send + 'static,
+    F: FnOnce(Link) -> tokio::task::JoinHandle<()> + Send + 'static,
 {
     let secret = generate_secret_key()?;
     let id = secret.public();
@@ -271,10 +265,13 @@ where
             return;
         };
         let Ok(conn) = incoming.await else { return };
-        if conn.remote_id() != allow || admission::admit(&conn).await.is_err() {
+        if conn.remote_id() != allow {
             return;
         }
-        let handle = frames(conn);
+        let Ok(link) = admission::admit(conn).await else {
+            return;
+        };
+        let handle = frames(link);
         Box::leak(Box::new(endpoint));
         let _ = handle.await;
     });
@@ -282,7 +279,7 @@ where
 }
 
 /// Send `bytes` as one frame on its own stream.
-async fn send_frame_bytes(conn: &Connection, bytes: Vec<u8>) {
+async fn send_frame_bytes(conn: &Link, bytes: Vec<u8>) {
     if let Ok(mut send) = conn.open_uni().await {
         let _ = send.write_all(&bytes).await;
         let _ = send.finish();

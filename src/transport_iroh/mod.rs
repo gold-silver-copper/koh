@@ -1,5 +1,5 @@
-//! The iroh glue: endpoint setup, the identity key's default path, dial addresses and a
-//! connection's path RTT.
+//! The iroh glue: endpoint setup, the identity key's default path, dial addresses, and how a
+//! connection is admitted and ends ([`admission`]).
 //!
 //! Everything QUIC-shaped (encryption, NAT traversal, relays, roaming, loss recovery) is iroh's.
 //! The key file itself is [`crate::identity::KeyFile`]'s.
@@ -8,8 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use iroh::endpoint::{
-    presets, AckFrequencyConfig, BindOpts, Connection, IdleTimeout, PathId, QuicTransportConfig,
-    VarInt,
+    presets, AckFrequencyConfig, BindOpts, IdleTimeout, QuicTransportConfig, VarInt,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 
@@ -302,17 +301,6 @@ pub fn parse_relay_url(s: &str) -> Result<RelayUrl, SetupError> {
     s.trim()
         .parse::<RelayUrl>()
         .map_err(|e| SetupError::Other(anyhow::anyhow!("bad relay url: {e}")))
-}
-
-/// The smoothed round-trip time of `conn`'s selected path, or `None` before any path exists.
-pub fn rtt(conn: &Connection) -> Option<Duration> {
-    let paths = conn.paths();
-    paths
-        .iter()
-        .find(iroh::endpoint::Path::is_selected)
-        .or_else(|| paths.iter().next())
-        .map(|p| p.rtt())
-        .or_else(|| conn.rtt(PathId::ZERO))
 }
 
 #[cfg(test)]

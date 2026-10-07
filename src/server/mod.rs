@@ -19,9 +19,10 @@ use crate::events::{InputEvent, WireColours};
 use crate::proto::{
     encode_history, retry_after, ClientDecoder, ClientMsg, Frame, FrameEncoder, FrameNum,
     FrameScreen, InputSeq, ProtoError, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
-    SESSION_ENDED, WINDOW_CELLS,
+    WINDOW_CELLS,
 };
 use crate::terminal::{HistoryRequest, Size, TerminalScreen};
+use crate::transport_iroh::admission::{self, Close, Link};
 use iroh::endpoint::RecvStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -617,7 +618,7 @@ fn distinct_cells(frames: &VecDeque<FrameScreen>) -> usize {
 /// client's input, sends each frame on its own stream and resets the streams of superseded ones.
 /// Returning (or panicking) detaches.
 pub async fn run_attached(
-    conn: iroh::endpoint::Connection,
+    conn: Link,
     mut session: session::SessionClient,
 ) -> anyhow::Result<SessionExit> {
     let mut core = ServerConn::default();
@@ -645,7 +646,7 @@ pub async fn run_attached(
         }
         let now = Instant::now();
         core.promote_echo(now);
-        let rtt = crate::transport_iroh::rtt(&conn);
+        let rtt = conn.rtt();
         if let Some(frame) = core.poll_frame(now, rtt) {
             // Every older frame the client has not acknowledged is superseded.
             let acked = core.acked();
@@ -673,7 +674,7 @@ pub async fn run_attached(
             }
         }
         if core.finished(now) {
-            conn.close(0u32.into(), SESSION_ENDED);
+            conn.close(Close::SessionEnded);
             break Ok(SessionExit::ShellExited);
         }
         let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
@@ -694,7 +695,7 @@ pub async fn run_attached(
                     client = Some(stream);
                 }
                 Ok(_) => {
-                    conn.close(PROTOCOL_ERROR.into(), b"a second client stream");
+                    conn.close(Close::SecondStream);
                     break Ok(SessionExit::Detached);
                 }
                 Err(e) => {
@@ -721,7 +722,7 @@ pub async fn run_attached(
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "client broke the protocol; closing");
-                            conn.close(PROTOCOL_ERROR.into(), b"protocol error");
+                            conn.close(Close::ProtocolError);
                             break Ok(SessionExit::Detached);
                         }
                     }
@@ -729,7 +730,7 @@ pub async fn run_attached(
                 Ok(None) => {
                     // The client finished its stream; a clean end only between messages.
                     if core.finish_client().is_err() {
-                        conn.close(PROTOCOL_ERROR.into(), b"protocol error");
+                        conn.close(Close::ProtocolError);
                         break Ok(SessionExit::Detached);
                     }
                     client = None;
@@ -750,9 +751,6 @@ pub async fn run_attached(
     result
 }
 
-/// The close code for a client that broke the protocol.
-const PROTOCOL_ERROR: u32 = 2;
-
 /// Read from the client's stream, if there is one.
 async fn read_client(
     stream: Option<&mut RecvStream>,
@@ -768,7 +766,7 @@ async fn read_client(
 /// Cancelling (a newer frame superseded it) resets the stream, so QUIC stops retransmitting it: at
 /// once if it is still being written, else after `grace`.
 async fn send_frame(
-    conn: iroh::endpoint::Connection,
+    conn: Link,
     num: FrameNum,
     bytes: Vec<u8>,
     cancel: CancellationToken,
@@ -829,7 +827,7 @@ async fn send_frame(
 /// own, below frames in priority, so they never delay one. Says on `delivered` once the client has
 /// them all, or they could not go.
 async fn send_history(
-    conn: iroh::endpoint::Connection,
+    conn: Link,
     reply: impl std::future::Future<Output = Option<crate::terminal::HistoryReply>>,
     delivered: tokio::sync::mpsc::Sender<()>,
     cancel: CancellationToken,
@@ -856,8 +854,8 @@ async fn send_history(
 /// The priority of history streams: below frames' (0), so QUIC sends a frame's bytes first.
 const HISTORY_PRIORITY: i32 = -1;
 
-/// Serve `conn` one session of `command`, then tear it down: the server without its accept loop,
-/// for tests.
+/// Admit `conn` and serve it one session of `command`, then tear it down: the server without its
+/// accept loop, for tests.
 pub async fn run_session(
     conn: iroh::endpoint::Connection,
     command: &[String],
@@ -873,7 +871,7 @@ pub async fn run_session(
     });
     let peer = conn.remote_id();
     if let Some((client, _)) = registry.attach(peer).await {
-        let _ = run_attached(conn, client).await?;
+        let _ = run_attached(admission::admit(conn).await?, client).await?;
     }
     registry.shutdown().await;
     Ok(())
@@ -978,7 +976,7 @@ mod tests {
 
     /// A server and a client connection on loopback, and the client's endpoint, kept alive.
     async fn loopback() -> (
-        iroh::endpoint::Connection,
+        crate::transport_iroh::admission::Link,
         iroh::endpoint::Connection,
         iroh::Endpoint,
         iroh::Endpoint,
@@ -997,7 +995,10 @@ mod tests {
             async { server.accept().await.unwrap().await.unwrap() },
             client.connect(addr, ALPN)
         );
-        (accepted, connected.unwrap(), server, client)
+        let admitted = crate::transport_iroh::admission::admit(accepted)
+            .await
+            .unwrap();
+        (admitted, connected.unwrap(), server, client)
     }
 
     #[test]

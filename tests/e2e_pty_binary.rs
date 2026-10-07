@@ -34,11 +34,7 @@ async fn loopback_server() -> anyhow::Result<(String, u16, tokio::task::JoinHand
     let task = tokio::spawn(async move {
         if let Some(incoming) = server_ep.accept().await {
             if let Ok(conn) = incoming.await {
-                // The real client binary awaits an admission ack after connect; mirror the server
-                // side so its accept_bi() completes, like `koh serve`.
-                if koh::transport_iroh::admission::admit(&conn).await.is_ok() {
-                    let _ = run_session(conn, &["sh".to_owned()], 0, launcher()).await;
-                }
+                let _ = run_session(conn, &["sh".to_owned()], 0, launcher()).await;
             }
         }
     });

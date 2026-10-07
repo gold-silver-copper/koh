@@ -7,12 +7,12 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId, SecretKey};
 use koh::client::{run_client, BellHook, ClientTerminal, IrohConnector};
 use koh::predict::{DisplayPreference, Overlay};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::terminal::{Size, TerminalScreen};
+use koh::transport_iroh::admission::{Close, Link};
 use koh::transport_iroh::generate_secret_key;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -151,7 +151,7 @@ pub struct Client {
     painted: watch::Receiver<Painted>,
     history: Arc<Mutex<Vec<Painted>>>,
     /// The first connection, so a test can cut it and watch the client reconnect.
-    first: Connection,
+    first: Link,
     task: JoinHandle<anyhow::Result<Option<u32>>>,
 }
 
@@ -239,7 +239,7 @@ impl Client {
 
     /// Cut the first connection the way an idle timeout would; the client should reconnect.
     pub fn drop_first_connection(&self) {
-        self.first.close(0u32.into(), b"simulated idle timeout");
+        self.first.close(Close::Reconnecting);
     }
 
     /// The screen the client painted last.

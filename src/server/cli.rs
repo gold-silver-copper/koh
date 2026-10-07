@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::server::audit::{auth_event, Outcome};
 use crate::server::session::{AttachKind, Registry, SessionSpec};
 use crate::server::{run_attached, SessionExit};
+use crate::transport_iroh::admission::{self, Refusal};
 use crate::transport_iroh::{bind_on, Network, ALPN};
 use tracing::{error, info, warn};
 
@@ -284,7 +285,7 @@ pub async fn serve_endpoint(
             let peer = conn.remote_id();
             if !allow.contains(&peer) {
                 auth_event(Outcome::Rejected, &peer, "not on allowlist");
-                conn.close(1u32.into(), b"not authorized");
+                admission::refuse(conn, Refusal::NotAuthorized);
                 return;
             }
             drop(pending_permit);
@@ -302,18 +303,22 @@ pub async fn serve_endpoint(
     Ok(())
 }
 
-/// Serve one allowed connection: send the admission ack, then attach its peer's session and drive
-/// it; returning detaches.
+/// Serve one allowed connection: attach its peer's session, or refuse it at the session cap, then
+/// send the admission ack and drive the session; returning detaches.
 async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry) {
     let peer = conn.remote_id();
-    // Bounded, so a client that never accepts the stream cannot hold its slot.
-    match tokio::time::timeout(
-        Duration::from_secs(3),
-        crate::transport_iroh::admission::admit(&conn),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
+    auth_event(Outcome::Accepted, &peer, "authorized; attaching session");
+    // Before the ack, so the client never takes the refusal for a lost link.
+    let Some((client, attach_kind)) = registry.attach(peer).await else {
+        // At the session cap, which only a new peer can hit.
+        warn!(peer = %peer, "refusing session: at max-sessions capacity");
+        admission::refuse(conn, Refusal::AtCapacity);
+        return;
+    };
+    // Bounded, so a client that never accepts the stream cannot hold its slot. Failing, `client`
+    // drops, which detaches.
+    let link = match tokio::time::timeout(Duration::from_secs(3), admission::admit(conn)).await {
+        Ok(Ok(link)) => link,
         Ok(Err(e)) => {
             warn!(error = %e, "admission ack failed");
             return;
@@ -322,14 +327,6 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
             warn!("admission ack timed out");
             return;
         }
-    }
-    auth_event(Outcome::Accepted, &peer, "authorized; attaching session");
-
-    let Some((client, attach_kind)) = registry.attach(peer).await else {
-        // At the session cap, which only a new peer can hit.
-        warn!(peer = %peer, "refusing session: at max-sessions capacity");
-        conn.close(1u32.into(), b"server at session capacity");
-        return;
     };
     match attach_kind {
         AttachKind::Created => {
@@ -343,7 +340,7 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
             );
         }
     }
-    match run_attached(conn, client).await {
+    match run_attached(link, client).await {
         Ok(SessionExit::Detached) => {
             info!(peer = %peer, "client detached (session retained)");
         }

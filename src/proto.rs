@@ -98,10 +98,6 @@ pub struct FrameScreen {
 /// a quiet session from a dead link.
 pub const HEARTBEAT: Duration = Duration::from_secs(3);
 
-/// The reason, with close code 0, the server closes a connection with once the hosted program
-/// exited and the client has the final frame.
-pub const SESSION_ENDED: &[u8] = b"session ended";
-
 /// The least gap the server leaves between frames.
 ///
 /// Enough to take a burst of output as one frame, little enough not to be felt. How many frames go

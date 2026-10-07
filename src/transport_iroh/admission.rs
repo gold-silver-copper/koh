@@ -190,10 +190,10 @@ async fn await_admission(conn: Connection) -> Result<Link, Disconnect> {
         Ok(_) => Err(Disconnect::Fatal(anyhow!(
             "server did not admit the connection"
         ))),
-        Err(e) => Err(match conn.close_reason() {
-            Some(reason) => verdict(anyhow::Error::new(reason).context(e)),
-            None => Disconnect::Transient(e.context("server did not admit the connection")),
-        }),
+        // The server's close says why, if it closed.
+        Err(e) => Err(verdict(conn.close_reason().map_or(e, |reason| {
+            anyhow::Error::new(reason).context("server did not admit the connection")
+        }))),
     }
 }
 
@@ -215,7 +215,7 @@ fn verdict(error: anyhow::Error) -> Disconnect {
                 format!("server rejected the connection: {said}")
             } else if code == u64::from(BROKE) {
                 format!("server closed the connection: {said} (does it run the same koh version?)")
-            } else if (code, reason.as_ref()) == widen(Close::SessionEnded.wire()) {
+            } else if code == u64::from(BYE) && reason.as_ref() == Close::SessionEnded.wire().1 {
                 return Disconnect::Ended;
             } else {
                 return Disconnect::Transient(error);
@@ -240,11 +240,6 @@ fn alpn_mismatch() -> String {
         "the server does not speak this koh protocol ({}); upgrade koh on both ends",
         String::from_utf8_lossy(ALPN)
     )
-}
-
-/// A close code and reason as a received close carries them.
-fn widen((code, reason): (u32, &'static [u8])) -> (u64, &'static [u8]) {
-    (u64::from(code), reason)
 }
 
 /// A close reason, which the peer controls: stripped of control characters and capped before it

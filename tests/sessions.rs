@@ -534,3 +534,74 @@ fn a_session_whose_program_exited_while_detached_is_not_reattached() -> anyhow::
         Ok(())
     })
 }
+
+/// Wait until `client`'s screen carries the program's exit code.
+async fn await_exit(client: &mut koh::server::session::SessionClient) -> anyhow::Result<()> {
+    for _ in 0..100 {
+        if client.screen().exit_code().is_some() {
+            return Ok(());
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(50), client.next_screen()).await;
+    }
+    anyhow::bail!("the exit code never reached the screen")
+}
+
+/// A reconnect that lands while the old connection still holds its client (a reconnect racing
+/// teardown) must not reattach a session whose program has exited.
+#[test]
+fn a_reconnect_while_the_old_client_holds_on_never_reattaches_the_exited_session(
+) -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let reg = registry(&["true"], 4, Duration::from_secs(30));
+        let a = peer()?;
+        let (mut old, kind) = reg.attach(a).await.context("first attach")?;
+        anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
+        await_exit(&mut old).await?;
+        // The old connection has not let go of its client yet.
+        let kind = attach_kind(&reg, a).await;
+        drop(old);
+        reg.shutdown().await;
+        anyhow::ensure!(
+            kind == Some(AttachKind::Created),
+            "an exited session must not be reattached; got {kind:?}"
+        );
+        Ok(())
+    })
+}
+
+/// A connection whose session has already exited when it attaches is told so: `run_attached`
+/// sends the final frame and closes with SESSION_ENDED, rather than waiting for a screen change
+/// that never comes.
+#[test]
+fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let reg = registry(&["true"], 4, Duration::from_secs(30));
+        let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
+        // The connection starts on a screen that already has the exit.
+        await_exit(&mut client).await?;
+        let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
+        let addr = loopback_addr(&server_ep);
+        let serve = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.context("incoming")?;
+            let conn = incoming.await?;
+            koh::server::run_attached(conn, client).await
+        });
+        let mut raw = RawClient::connect(addr, generate_secret_key()?, false).await?;
+        let mut ended = None;
+        for _ in 0..30 {
+            raw.pump(100).await?;
+            if serve.is_finished() {
+                ended = Some(serve.await??);
+                break;
+            }
+        }
+        let close = raw.conn.close_reason();
+        reg.shutdown().await;
+        anyhow::ensure!(
+            matches!(ended, Some(koh::server::SessionExit::ShellExited)),
+            "run_attached must end with ShellExited within 3s; ended: {}, close: {close:?}",
+            ended.is_some()
+        );
+        Ok(())
+    })
+}

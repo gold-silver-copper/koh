@@ -36,11 +36,11 @@ const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 /// What the status line says of a paste past [`MAX_QUEUED_INPUT`], which is dropped whole.
 const PASTE_TOO_LONG: &str = "[koh] paste over 1 MiB — not sent";
 
-/// The notice for what was typed during an outage and not sent: input handed to the lost
-/// connection was never confirmed, so the server may have lost it, and what came after it would
-/// run without it (`false && rm …` typed across the drop must not run `rm …`).
-const OUTAGE_INPUT_DROPPED: &str =
-    "[koh] typing during the outage not sent — keys typed as the link dropped were lost";
+/// The notice for what was typed during an outage and not sent. The reattach may have landed on
+/// a new shell (the session expired, or the server restarted), which the client cannot tell from
+/// its own, and keys typed at the old screen must not run there; nor may the end of a line whose
+/// start was lost with the link run alone (`false && rm …` must not run `rm …`).
+const OUTAGE_INPUT_DROPPED: &str = "[koh] typing during the outage not sent";
 
 /// How long after a frame moves the cursor to another row (a fresh prompt) a key typed is shown
 /// only once echoed: the server reads the PTY's modes at least every [`TTY_TICK`], so a program
@@ -82,9 +82,6 @@ pub struct ClientSession {
     last_seq: InputSeq,
     /// The newest input sequence number handed to a connection.
     sent_seq: InputSeq,
-    /// At the last [`detach`](Self::detach), input handed to the lost connection was not yet
-    /// confirmed (`sent_seq` beyond its echo-ack): what is typed after it is not sent.
-    unconfirmed_at_drop: bool,
     /// Messages for the server, oldest first.
     outgoing: VecDeque<ClientMsg>,
     /// Typed bytes in `outgoing`.
@@ -170,7 +167,6 @@ impl ClientSession {
             down_since: None,
             last_seq: InputSeq::default(),
             sent_seq: InputSeq::default(),
-            unconfirmed_at_drop: false,
             outgoing: VecDeque::from([ClientMsg::Resize(size)]),
             queued_input: 0,
             input_paused: false,
@@ -191,11 +187,10 @@ impl ClientSession {
     }
 
     /// The connection was lost: what was meant for it alone (acknowledgements, resyncs and
-    /// history requests) goes with it; typed input, resizes and colours wait for the next. The
+    /// history requests) goes with it; resizes and colours wait for the next. The
     /// predictions go, and whether typing was trusted is kept as it was now, at the drop.
     pub fn detach(&mut self, now: Instant) {
         self.down_since = Some(now);
-        self.unconfirmed_at_drop |= self.sent_seq > self.link.echo_ack;
         self.outgoing.retain(|msg| {
             !matches!(
                 msg,
@@ -208,16 +203,16 @@ impl ClientSession {
     }
 
     /// A new connection, whose window is `size`: the server is told the size and the colours
-    /// first (a reattach may be from another terminal), then what was typed meanwhile, unless
-    /// input handed to the lost connection was not confirmed: what followed it is dropped and
-    /// said, as the server may never have had what it follows. The last screen stays up until
-    /// the server repaints it; the history held is the server session's, and is fetched again.
+    /// first (a reattach may be from another terminal). Input not yet sent is dropped, and the
+    /// status line says so: the client cannot tell a reattach from a new shell, where keys typed
+    /// at the old screen must not run. The last screen stays up until the server repaints it;
+    /// the history held is the server session's, and is fetched again.
     pub fn attach(&mut self, now: Instant, size: Size) {
         self.link = Link::fresh(Arc::clone(&self.link.current.screen), self.sent_seq);
         self.down_since = None;
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Resize(_) | ClientMsg::Colours(_)));
-        if std::mem::take(&mut self.unconfirmed_at_drop) && self.queued_input > 0 {
+        if self.queued_input > 0 {
             self.outgoing
                 .retain(|msg| !matches!(msg, ClientMsg::Keys { .. } | ClientMsg::Input { .. }));
             self.queued_input = 0;
@@ -1597,11 +1592,11 @@ mod tests {
         assert_eq!(s.on_input(now, b"."), InputOutcome::Quit);
     }
 
-    /// What is typed while the link is down goes out on the next connection, after the window
-    /// size and the colours, numbered on from what the last connection took; what was meant for
-    /// the lost connection alone does not.
+    /// The next connection is told the window size and the colours; what was typed and not sent
+    /// is dropped, and the status line says so; what was meant for the lost connection alone is
+    /// not sent either.
     #[test]
-    fn input_typed_while_detached_goes_out_after_the_attach() {
+    fn input_typed_while_detached_is_dropped_at_the_attach() {
         let (now, mut s) = start();
         s.set_colours(Some(WireColours {
             background: Some([1, 2, 3]),
@@ -1642,18 +1637,21 @@ mod tests {
                         cols: 100
                     }),
                     ClientMsg::Colours(_),
-                    ClientMsg::Keys {
-                        seq: InputSeq(2),
-                        ..
-                    },
                 ]
             ),
             "{sent:?}"
         );
-        assert_eq!(typed(&sent), b"bc");
+        let status = s.on_tick(now, None).status.expect("a notice");
+        assert!(status.contains("not sent"), "{status}");
         // Nothing the dead link swallowed is probed for on the new one.
         s.on_tick(now + Duration::from_secs(10), None);
         assert_eq!(drain(&mut s), []);
+        s.on_input(now, b"d");
+        assert_eq!(
+            typed(&drain(&mut s)),
+            b"d",
+            "typing after the attach goes out"
+        );
     }
 
     /// Across a reattach the last screen stays up until the server repaints it, and the

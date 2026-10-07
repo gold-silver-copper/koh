@@ -279,8 +279,7 @@ fn a_forced_mid_session_drop_reconnects_to_the_same_shell() {
                 .is_some());
             // Kill the connection without closing the session; the client should re-dial.
             client.drop_first_connection();
-            // Retype until the reattached session runs it: what is typed as the link drops, before
-            // the client notices, may go out on the dead connection and be lost.
+            // Retype until the reattached session runs it (input during the reconnect is dropped).
             let mut ran = false;
             for _ in 0..150 {
                 let _ = client.send(b"echo MARK_T''WO\r").await;
@@ -433,14 +432,22 @@ fn a_freeze_between_dialing_and_the_loop_still_reconnects() {
                 client.first_connection_closes(Duration::from_secs(5)).await,
                 "the client must drop the connection it held through the freeze"
             );
-            // And the session goes on over the new one: what is typed now, with the old one
-            // dropped, waits for it.
-            client.send(b"echo AFTER''_FREEZE\r").await.expect("type");
-            assert!(
-                client
-                    .wait_until(Duration::from_secs(15), |t| t.contains("AFTER_FREEZE"))
+            // And the session goes on over the new one (retyped: input during the reconnect is
+            // dropped).
+            let mut ran = false;
+            for _ in 0..75 {
+                let _ = client.send(b"echo AFTER''_FREEZE\r").await;
+                if client
+                    .wait_until(Duration::from_millis(200), |t| t.contains("AFTER_FREEZE"))
                     .await
-                    .is_some(),
+                    .is_some()
+                {
+                    ran = true;
+                    break;
+                }
+            }
+            assert!(
+                ran,
                 "the reconnected client must reach the shell:\n{}",
                 client.screen()
             );
@@ -457,10 +464,11 @@ fn reconnecting(painted: &crate::harness::Painted) -> bool {
         .is_some_and(|status| status.contains("reconnecting"))
 }
 
-/// A line typed while the link is down is the user's input like any other: once the client is
-/// back on the session, the shell runs it. (mosh queues input in every network state.)
+/// A line typed while the link is down is not run after the reattach, and the status line says
+/// so: the client cannot tell its session from a new shell (an expired session, a restarted
+/// server), where keys typed at the old screen must not run. Typing after the reattach runs.
 #[test]
-fn a_line_typed_during_an_outage_runs_after_the_reattach() {
+fn a_line_typed_during_an_outage_is_not_run_after_the_reattach_and_the_user_is_told() {
     crate::harness::runtime()
         .expect("tokio runtime")
         .block_on(async {
@@ -478,9 +486,6 @@ fn a_line_typed_during_an_outage_runs_after_the_reattach() {
                 .wait_until(WAIT, |t| t.contains("READY_ONE"))
                 .await
                 .is_some());
-            // Long enough for the server to confirm it: what is typed during an outage is sent
-            // only if all typed before it was.
-            tokio::time::sleep(Duration::from_millis(500)).await;
             // The link goes down for a while; the client notices and shows its banner.
             net.black_hole(Duration::from_secs(4));
             client.drop_first_connection();
@@ -488,15 +493,32 @@ fn a_line_typed_during_an_outage_runs_after_the_reattach() {
                 client.wait_for(WAIT, reconnecting).await.is_some(),
                 "the client must show the reconnecting banner"
             );
-            // The user types a line while the banner is up, once.
+            // The user types a line while the banner is up.
             client.send(b"echo TYPED''_OFFLINE\r").await.expect("type");
-            // Once the client is back on the session, the shell runs it.
+            // Back on the session, the status line says it was not sent.
             assert!(
                 client
-                    .wait_until(Duration::from_secs(20), |t| t.contains("TYPED_OFFLINE"))
+                    .wait_for(Duration::from_secs(20), |p| p
+                        .status
+                        .as_deref()
+                        .is_some_and(|s| s.contains("not sent")))
                     .await
                     .is_some(),
-                "the line typed during the outage was dropped; screen:\n{}",
+                "the client must say the outage's typing was not sent; screen:\n{}",
+                client.screen()
+            );
+            client.send(b"echo TYPED''_AFTER\r").await.expect("type");
+            assert!(
+                client
+                    .wait_until(WAIT, |t| t.contains("TYPED_AFTER"))
+                    .await
+                    .is_some(),
+                "typing after the reattach runs; screen:\n{}",
+                client.screen()
+            );
+            assert!(
+                !client.screen().contains("TYPED_OFFLINE"),
+                "the line typed during the outage must not run; screen:\n{}",
                 client.screen()
             );
             let _ = client.finish().await;
@@ -647,21 +669,22 @@ fn after_a_server_restart_the_scrollback_is_the_new_shells() {
                 client.wait_for(WAIT, reconnecting).await.is_some(),
                 "the client must show the reconnecting banner"
             );
-            // Typed during the outage, it runs once the client is on the new shell.
+            // Once the client is on the new shell, the loop is typed there.
+            assert!(
+                client
+                    .wait_for(Duration::from_secs(20), |p| !reconnecting(p))
+                    .await
+                    .is_some(),
+                "the client must reattach to the restarted server"
+            );
             client
                 .send(b"i=0; while [ $i -lt 200 ]; do echo new line $i; i=$((i+1)); done\r")
                 .await
                 .expect("send");
             let ran = client
-                .wait_until(Duration::from_secs(20), |t| t.contains("new line 199"))
+                .wait_until(WAIT, |t| t.contains("new line 199"))
                 .await
                 .is_some();
-            if !ran {
-                let st = client
-                    .wait_for(Duration::from_secs(1), |p| p.status.is_some())
-                    .await;
-                eprintln!("DBG status {:?}", st.map(|p| p.status));
-            }
             assert!(ran, "the new shell never ran:\n{}", client.screen());
             tokio::time::sleep(Duration::from_millis(500)).await;
             client.send(b"\x1e[g").await.expect("send");

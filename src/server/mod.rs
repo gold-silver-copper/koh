@@ -619,6 +619,8 @@ pub async fn run_attached(
     let mut client: Option<RecvStream> = None;
     // The client gets exactly one stream for the connection, even after it finishes that one.
     let mut had_client_stream = false;
+    // Whether the session still publishes screens: `next_screen` ends with it.
+    let mut session_open = true;
     let mut read_buf = vec![0u8; 16 * 1024];
     let mut in_flight: VecDeque<(FrameNum, CancellationToken)> = VecDeque::new();
     // Each frame's task says here when the client has all of it: its acknowledgement. Unbounded,
@@ -673,10 +675,11 @@ pub async fn run_attached(
         let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
         let reading = client.is_some();
         tokio::select! {
-            // Not biased: a pending screen change would starve client input. None follows the exit
-            // screen, so a session that ends after it cannot cut off its final frame.
-            screen = session.next_screen(), if core.screen.exit_code().is_none() => match screen {
+            // Not biased: a pending screen change would starve client input.
+            screen = session.next_screen(), if session_open => match screen {
                 Some(screen) => core.install_snapshot(screen),
+                // A session that ends after its exit screen does not cut off the final frame.
+                None if core.screen.exit_code().is_some() => session_open = false,
                 // The server is shutting down.
                 None => break Ok(SessionExit::Detached),
             },
@@ -707,8 +710,10 @@ pub async fn run_attached(
                             if let Some(size) = drained.resize {
                                 session.send_resize(size).await;
                             }
-                            if !session.can_send() {
-                                break Ok(SessionExit::Detached); // the session ended
+                            // The session ended; after its exit screen, the final frame's ack is
+                            // still awaited, and input to the exited program goes nowhere.
+                            if !session.can_send() && core.screen.exit_code().is_none() {
+                                break Ok(SessionExit::Detached);
                             }
                         }
                         Err(e) => {

@@ -15,8 +15,8 @@ use crate::events::{
 };
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
-    decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, FrameScreen,
-    InputSeq, HEARTBEAT, MAX_INPUT_BYTES, TTY_TICK,
+    decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
+    HEARTBEAT, MAX_INPUT_BYTES, TTY_TICK,
 };
 use crate::terminal::{Grid, HistoryReply, Size, TerminalScreen};
 
@@ -505,25 +505,19 @@ impl ClientSession {
     pub fn on_frame(&mut self, now: Instant, frame: &Frame) {
         self.link.last_heard = Some(now);
         if frame.num <= self.link.current().num {
-            self.keep_late(frame);
+            self.link.keep_late(frame);
             return;
         }
-        let Some(base) = self.link.base(frame.base) else {
+        let Some(next) = self.link.applied(frame) else {
             self.outgoing.extend(self.link.refuse(frame.base));
             return;
         };
-        // The copy shares every row with the base; the frame replaces only its own.
-        let mut screen = Arc::unwrap_or_clone(base);
-        screen.apply(&frame.diff);
-        if screen.screen().cursor_position().0
+        if next.screen.screen().cursor_position().0
             != self.link.current().screen.screen().cursor_position().0
         {
             self.link.new_row_at = Some(now);
         }
-        self.link.advance(FrameScreen {
-            num: frame.num,
-            screen: Arc::new(screen),
-        });
+        self.link.advance(next);
         // The outage ends with the new connection's first frame, which shows the shell it reached.
         self.down_since = None;
         self.link.echo_ack = self.link.echo_ack.max(frame.echo_ack);
@@ -543,22 +537,6 @@ impl ClientSession {
         if self.scrollback.viewing() {
             self.dirty = true;
         }
-    }
-
-    /// Keep `frame`, older than the current one, as a base, if its base is held and it is not.
-    fn keep_late(&mut self, frame: &Frame) {
-        if self.link.holds(frame.num) {
-            return;
-        }
-        let Some(base) = self.link.base(frame.base) else {
-            return;
-        };
-        let mut screen = Arc::unwrap_or_clone(base);
-        screen.apply(&frame.diff);
-        self.link.keep(FrameScreen {
-            num: frame.num,
-            screen: Arc::new(screen),
-        });
     }
 
     /// Advance to `now`: probe for unconfirmed input, and report the status banner.

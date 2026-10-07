@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::proto::{ClientMsg, FrameNum, FrameScreen, InputSeq, FRAME_WINDOW, WINDOW_CELLS};
+use crate::proto::{ClientMsg, Frame, FrameNum, FrameScreen, InputSeq, FRAME_WINDOW, WINDOW_CELLS};
 use crate::terminal::{RowEncodings, TerminalScreen};
 
 /// One connection's frames and echo. Only [`ClientSession::new`](super::session::ClientSession::new)
@@ -68,9 +68,15 @@ impl Link {
             .map(|held| Arc::clone(&held.screen))
     }
 
-    /// Whether frame `num` is the current one or an older one.
-    pub(super) fn holds(&self, num: FrameNum) -> bool {
-        num == self.current.num || self.older.iter().any(|older| older.num == num)
+    /// `frame` applied to its base, if that is held.
+    pub(super) fn applied(&self, frame: &Frame) -> Option<FrameScreen> {
+        // The copy shares every row with the base; the frame replaces only its own.
+        let mut screen = Arc::unwrap_or_clone(self.base(frame.base)?);
+        screen.apply(&frame.diff);
+        Some(FrameScreen {
+            num: frame.num,
+            screen: Arc::new(screen),
+        })
     }
 
     /// `frame`, newer than the current one, applied: it is current, and the current one older.
@@ -79,8 +85,19 @@ impl Link {
         self.keep(previous);
     }
 
+    /// Keep `frame`, older than the current one, as a base, if its base is held and it is not:
+    /// the server, told of its delivery, may diff against it.
+    pub(super) fn keep_late(&mut self, frame: &Frame) {
+        if frame.num == self.current.num || self.older.iter().any(|old| old.num == frame.num) {
+            return;
+        }
+        if let Some(late) = self.applied(frame) {
+            self.keep(late);
+        }
+    }
+
     /// Keep `frame` among the older ones, the oldest dropped past the window.
-    pub(super) fn keep(&mut self, frame: FrameScreen) {
+    fn keep(&mut self, frame: FrameScreen) {
         self.older.push_back(frame);
         while self.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
             self.older.pop_front();

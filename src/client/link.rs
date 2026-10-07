@@ -16,8 +16,12 @@ pub(super) struct Link {
     /// The frames applied before it, oldest first: at most `FRAME_WINDOW - 1`, holding at most
     /// [`WINDOW_CELLS`] cells beyond `current`'s.
     older: VecDeque<FrameScreen>,
-    /// The last base a frame came on that was not held, for which a `Resync` was sent.
-    refused: Option<FrameNum>,
+    /// The newest base a frame came on that was not held. A frame on it, or on an older one, was
+    /// sent before the server read the `Resync` that refusal owed, which forgets them all.
+    refused: FrameNum,
+    /// A `Resync` is owed to this connection's server and not yet taken to be sent. It lives here,
+    /// beside `refused`, so the two go together: one is never dropped while the other stays.
+    resync_owed: bool,
     /// The newest input the server has reported reflected on screen.
     pub(super) echo_ack: InputSeq,
     /// When the server was last heard from; `None` until the first frame.
@@ -41,7 +45,8 @@ impl Link {
                 screen,
             },
             older: VecDeque::new(),
-            refused: None,
+            refused: FrameNum::BLANK,
+            resync_owed: false,
             echo_ack,
             last_heard: None,
             last_nudge: None,
@@ -104,11 +109,26 @@ impl Link {
         }
     }
 
-    /// A frame came on `base`, which is not held: the `Resync` to send, unless one was sent for
-    /// it. The server forgets every base at a `Resync`, so a base refused once never comes back,
-    /// and every other one asks again.
-    pub(super) fn refuse(&mut self, base: FrameNum) -> Option<ClientMsg> {
-        (self.refused.replace(base) != Some(base)).then_some(ClientMsg::Resync)
+    /// A frame came on `base`, which is not held: a `Resync` is owed, unless one was for this
+    /// base or a newer one. The server forgets every frame at a `Resync`, and numbers every later
+    /// one above all it sent before, so a base at or below one refused was sent before it read
+    /// the `Resync` and is covered by it; a newer one asks again. At most one is owed at a time,
+    /// whatever the server sends.
+    pub(super) fn refuse(&mut self, base: FrameNum) {
+        if base > self.refused {
+            self.refused = base;
+            self.resync_owed = true;
+        }
+    }
+
+    /// Whether a `Resync` is owed and not yet taken.
+    pub(super) const fn owes_resync(&self) -> bool {
+        self.resync_owed
+    }
+
+    /// The owed `Resync`, taken to be sent.
+    pub(super) fn take_resync(&mut self) -> Option<ClientMsg> {
+        std::mem::take(&mut self.resync_owed).then_some(ClientMsg::Resync)
     }
 
     /// The cells the older frames hold beyond the current one.

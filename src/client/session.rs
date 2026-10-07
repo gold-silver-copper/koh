@@ -152,18 +152,14 @@ impl ClientSession {
         }
     }
 
-    /// The connection was lost: what was meant for it alone (acknowledgements, resyncs and
-    /// history requests) goes with it; resizes and colours wait for the next. The
+    /// The connection was lost: what was meant for it alone (acknowledgements and history
+    /// requests, and the resync its link owes) goes with it; resizes and colours wait for the next. The
     /// predictions go, and whether typing was trusted is kept as it was now, at the drop.
     pub fn detach(&mut self, now: Instant) {
         self.down_since.get_or_insert(now);
         self.unconfirmed_at_drop = self.sent_seq > self.link.echo_ack;
-        self.outgoing.retain(|msg| {
-            !matches!(
-                msg,
-                ClientMsg::Ack { .. } | ClientMsg::Resync | ClientMsg::History(_)
-            )
-        });
+        self.outgoing
+            .retain(|msg| !matches!(msg, ClientMsg::Ack { .. } | ClientMsg::History(_)));
         self.scrollback.forget_requests();
         self.predictor = self.predictor.reattached();
         self.dirty = true;
@@ -487,7 +483,7 @@ impl ClientSession {
     pub fn on_frame_stream(&mut self, now: Instant, base: FrameNum, rows: &[u16], body: &[u8]) {
         self.link.last_heard = Some(now);
         let Some(screen) = self.link.base(base) else {
-            self.outgoing.extend(self.link.refuse(base));
+            self.link.refuse(base);
             return;
         };
         let dictionary = dictionary_for(base, &screen, rows, &mut self.link.encodings);
@@ -509,7 +505,7 @@ impl ClientSession {
             return;
         }
         let Some(next) = self.link.applied(frame) else {
-            self.outgoing.extend(self.link.refuse(frame.base));
+            self.link.refuse(frame.base);
             return;
         };
         if next.screen.screen().cursor_position().0
@@ -599,11 +595,14 @@ impl ClientSession {
 
     /// Whether messages are waiting for the server.
     pub fn has_outgoing(&self) -> bool {
-        !self.outgoing.is_empty()
+        self.link.owes_resync() || !self.outgoing.is_empty()
     }
 
     /// Take the next message for the server.
     pub fn pop_outgoing(&mut self) -> Option<ClientMsg> {
+        if let Some(resync) = self.link.take_resync() {
+            return Some(resync);
+        }
         let msg = self.outgoing.pop_front()?;
         let sent = match &msg {
             ClientMsg::Input { bytes, seq } => Some((bytes.len(), *seq)),
@@ -990,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_base_sends_one_resync_until_a_frame_applies() {
+    fn an_unknown_base_sends_one_resync_and_an_older_one_none() {
         let (now, mut s) = start();
         drain(&mut s);
         let blank = TerminalScreen::default();
@@ -1004,7 +1003,27 @@ mod tests {
         );
         s.on_frame(now, &frame(7, 0, 0, &blank, &one));
         assert!(s.screen().contents().contains("one"));
+        // Base 3 is older than base 4, refused: the server sent it before it read that Resync.
         s.on_frame(now, &frame(8, 3, 0, &one, &one));
+        assert_eq!(drain(&mut s), [], "covered by the resync sent");
+        s.on_frame(now, &frame(9, 8, 0, &one, &one));
+        assert_eq!(drain(&mut s), [ClientMsg::Resync], "a newer one asks again");
+    }
+
+    #[test]
+    fn a_server_never_read_from_is_owed_one_resync_at_most() {
+        // A hostile server sends frames on bases the client lacks, alternating and rising, and
+        // never reads: what the client owes it stays one message.
+        let (now, mut s) = start();
+        drain(&mut s);
+        let one = screen(b"one");
+        let mut num = 10;
+        for rise in 0..100u64 {
+            for turn in 0..100u64 {
+                num += 1;
+                s.on_frame(now, &frame(num, 3 + rise + turn % 2, 0, &one, &one));
+            }
+        }
         assert_eq!(drain(&mut s), [ClientMsg::Resync]);
     }
 
@@ -1534,7 +1553,7 @@ mod tests {
             s.outgoing
                 .iter()
                 .any(|m| matches!(m, ClientMsg::Ack { .. }))
-                && s.outgoing.iter().any(|m| matches!(m, ClientMsg::Resync)),
+                && s.link.owes_resync(),
             "{:?}",
             s.outgoing
         );

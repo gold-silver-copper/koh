@@ -4,6 +4,7 @@ use anyhow::Context as _;
 use std::sync::Arc;
 
 mod key_file;
+pub(crate) use key_file::open_private_log;
 use key_file::IdentityLease;
 pub use key_file::KeyFile;
 

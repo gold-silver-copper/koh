@@ -1,7 +1,8 @@
 //! The one owner of trust in an identity path. A [`KeyFile`] can only be made by [`KeyFile::open`],
 //! which judges the key's directory once; every file in it (the key and its lock) is opened without
-//! following a symlink and judged by [`check_private`]. Its fields are private to this module, so
-//! the code that loads or resets a key cannot reach the path to apply rules of its own.
+//! following a symlink and judged by [`check_private`], as `$KOH_LOG` is. Its fields are private to
+//! this module, so the code that loads or resets a key cannot reach the path to apply rules of its
+//! own.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{
@@ -182,6 +183,17 @@ impl KeyFile {
             .and_then(|_| Ok(std::fs::remove_file(&self.path)?))
             .with_context(|| format!("removing identity at {self}"))
     }
+}
+
+/// Open `$KOH_LOG` as a private file: never through a symlink, and only truncated once it passes
+/// the same check as a key, as debug logs can be sensitive.
+pub fn open_private_log(path: &Path) -> Result<File, SetupError> {
+    let file = open_private(
+        OpenOptions::new().write(true).create(true).mode(0o600),
+        path,
+    )?;
+    file.set_len(0)?;
+    Ok(file)
 }
 
 /// A `flock` on the identity's lock file; closing the file releases it.
@@ -438,5 +450,23 @@ mod tests {
             assert!(message.contains(&path.display().to_string()), "{message}");
             assert!(!message.contains("koh-key-v1"), "{message}");
         }
+    }
+
+    #[test]
+    fn a_symlinked_log_is_refused_before_its_target_is_truncated() {
+        let dir = Scratch::new("log", 0o700);
+        let target = dir.0.join("victim");
+        std::fs::write(&target, b"precious").unwrap();
+        let link = dir.0.join("koh.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_private_log(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"precious");
+
+        let log = dir.0.join("real.log");
+        std::fs::write(&log, b"old").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_private_log(&log).expect("a real log opens");
+        assert_eq!(std::fs::read(&log).unwrap(), b"", "truncated");
+        assert_eq!(mode_of(&log), 0o600);
     }
 }

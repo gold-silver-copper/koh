@@ -219,31 +219,17 @@ fn warn_if_locale_not_utf8() {
     }
 }
 
-/// With `$KOH_LOG` set, log to that file at debug level (the TUI owns the terminal). It is made
-/// 0600 through its descriptor, existing or not, as debug logs can be sensitive; failing that,
-/// nothing is logged.
+/// With `$KOH_LOG` set, log to that file at debug level (the TUI owns the terminal). It must be
+/// a private file of this user's (see [`crate::identity::open_private_log`]), as debug logs can be
+/// sensitive; failing that, nothing is logged.
 fn log_to_koh_log() {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let Ok(path) = std::env::var("KOH_LOG") else {
         return;
     };
-    let Ok(file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-    else {
-        return;
-    };
-    if file
-        .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .is_err()
-    {
-        eprintln!("koh: warning: could not set $KOH_LOG to 0600; file logging disabled");
-        return;
+    match crate::identity::open_private_log(std::path::Path::new(&path)) {
+        Ok(file) => crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG),
+        Err(e) => eprintln!("koh: warning: $KOH_LOG: {e}; file logging disabled"),
     }
-    crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG);
 }
 
 /// The longest the client waits for the user's terminal to answer its start-up questions. A local

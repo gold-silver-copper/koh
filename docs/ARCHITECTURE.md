@@ -36,7 +36,7 @@ src/
 ├── client/          the connection loop + ClientSession core + predictor + render + `connect`
 │   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through fuxix::terminal)
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
-│   └── key_file.rs  KeyFile, the one owner of trust in a key path and its lock
+│   └── key_file.rs  KeyFile, the one owner of trust in a key path, its lock and $KOH_LOG
 ├── log.rs           the `RUST_LOG` filter `serve` and `connect` install (`target=level` directives)
 └── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identity, reset it
 tests/net/           koh over a fault-injecting link between real iroh endpoints
@@ -406,8 +406,8 @@ The full picture is in the [threat model](THREAT_MODEL.md). In brief, the releva
   raw 32-byte secret, created 0600 by a born-private atomic write, read with `O_NOFOLLOW`, refused
   unless it is this user's, and re-tightened to 0600 through the open descriptor. The key and its
   lock pass one check, in a directory judged once (`identity::KeyFile`), so `koh key reset`
-  accepts every key `koh id` does. Anyone who can read the file is that identity.
-  koh keeps every file it owns under `~/.config/koh` and nowhere else.
+  accepts every key `koh id` does; `$KOH_LOG` passes the same check. Anyone who can read the file
+  is that identity. koh keeps every file it owns under `~/.config/koh` and nowhere else.
 - The crate is `forbid(unsafe)` and forbids the panic lint family (`unwrap`/`expect`/`panic`/
   indexing/slicing), unchecked arithmetic (`arithmetic_side_effects`) and lossy `as` casts in
   production code, with `overflow-checks` on in release too — so the panic-free-by-construction

@@ -620,6 +620,11 @@ impl PredictionEngine {
     /// known (the key may have recalled another line, or moved the cursor anywhere).
     fn unmodelled(&mut self) {
         self.become_tentative();
+        self.forget_line();
+    }
+
+    /// Where the line being typed began is no longer known.
+    fn forget_line(&mut self) {
         self.input_start = None;
         self.fresh_line = false;
     }
@@ -896,8 +901,13 @@ impl PredictionEngine {
             // Even while holding: where the line began is no longer known.
             return self.unmodelled();
         }
+        if self.holding() {
+            // The key is not predicted, so where the line began is no longer known: an Enter
+            // ends the line, and a key typed now is not in the next one's start.
+            return self.forget_line();
+        }
         let Size { rows, cols } = screen.size();
-        if self.holding() || rows == 0 || cols == 0 {
+        if rows == 0 || cols == 0 {
             return;
         }
         match edit {
@@ -2220,5 +2230,20 @@ mod key_reparse_tests {
                 );
             }
         }
+    }
+
+    /// Enter typed while a prompt hold is active is not predicted, and where the line began is
+    /// forgotten: the next line's `Ctrl-U` or `Ctrl-A` is not predicted against the old start.
+    #[test]
+    fn enter_during_a_hold_forgets_where_the_line_began() {
+        let (mut e, screen) = editor_on(b"$ abc");
+        e.input_start = Some((0, 2));
+        e.hold();
+        e.new_user_key(KeyPress::plain(Key::Enter), &screen);
+        assert_eq!(
+            (e.input_start, e.fresh_line),
+            (None, false),
+            "Enter during a hold left where the line began"
+        );
     }
 }

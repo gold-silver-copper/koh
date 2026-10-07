@@ -16,10 +16,11 @@ use crate::events::{
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
     decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, FrameScreen,
-    InputSeq, FRAME_WINDOW, HEARTBEAT, MAX_INPUT_BYTES, TTY_TICK, WINDOW_CELLS,
+    InputSeq, HEARTBEAT, MAX_INPUT_BYTES, TTY_TICK,
 };
-use crate::terminal::{Grid, HistoryReply, RowEncodings, Size, TerminalScreen};
+use crate::terminal::{Grid, HistoryReply, Size, TerminalScreen};
 
+use super::link::Link;
 use super::probe::COLOUR_QUERIES;
 use super::render::WindowState;
 use super::scrollback::Scrollback;
@@ -123,49 +124,6 @@ pub struct ClientSession {
     pub(crate) status_was_shown: bool,
 }
 
-/// What one connection holds: the frames it applied, what its server echoed, when it was heard.
-/// Only [`ClientSession::new`] and [`ClientSession::attach`] make one.
-struct Link {
-    /// The newest applied frame and its screen.
-    current: FrameScreen,
-    /// The frames applied before it, oldest first: at most `FRAME_WINDOW - 1`, holding at most
-    /// [`WINDOW_CELLS`] cells beyond `current`'s.
-    older: VecDeque<FrameScreen>,
-    /// A `Resync` was sent and no frame has applied since.
-    resync_sent: bool,
-    /// The newest input the server has reported reflected on screen.
-    echo_ack: InputSeq,
-    /// When the server was last heard from; `None` until the first frame.
-    last_heard: Option<Instant>,
-    /// When input was last queued or probed for, while some is unconfirmed.
-    last_nudge: Option<Instant>,
-    /// When the newest frame moved the cursor to another row: a fresh prompt, whose program may
-    /// still turn echo off. Keys typed within [`PROMPT_HOLD`] of it are shown only once echoed.
-    new_row_at: Option<Instant>,
-    /// Rows' encodings, kept from one frame's dictionary to the next.
-    encodings: RowEncodings,
-}
-
-impl Link {
-    /// A link on which nothing has arrived, showing `screen` until its first frame (which, on
-    /// the blank base, builds from nothing), with input up to `echo_ack` taken as handled.
-    fn fresh(screen: Arc<TerminalScreen>, echo_ack: InputSeq) -> Self {
-        Self {
-            current: FrameScreen {
-                num: FrameNum::BLANK,
-                screen,
-            },
-            older: VecDeque::new(),
-            resync_sent: false,
-            echo_ack,
-            last_heard: None,
-            last_nudge: None,
-            new_row_at: None,
-            encodings: RowEncodings::default(),
-        }
-    }
-}
-
 impl ClientSession {
     /// A session for a run, telling the server the window's `size`.
     pub fn new(pref: DisplayPreference, size: Size) -> Self {
@@ -218,7 +176,7 @@ impl ClientSession {
     /// frame shows which shell it reached. The last screen stays up until the server repaints it;
     /// the history held is the server session's, and is fetched again.
     pub fn attach(&mut self, now: Instant, size: Size) {
-        self.link = Link::fresh(Arc::clone(&self.link.current.screen), self.sent_seq);
+        self.link = Link::fresh(Arc::clone(&self.link.current().screen), self.sent_seq);
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Resize(_) | ClientMsg::Colours(_)));
         if self.queued_input > 0 {
@@ -441,7 +399,7 @@ impl ClientSession {
         };
         self.predictor.set_local_frame_sent(seq.0.saturating_sub(1));
         for event in &events {
-            let screen = self.link.current.screen.screen();
+            let screen = self.link.current().screen.screen();
             match event {
                 InputEvent::Key(key) => {
                     // At a fresh prompt the modes the client holds may be from before the program
@@ -528,22 +486,8 @@ impl ClientSession {
     /// does not inflate or decode is dropped, as a lost one would be.
     pub fn on_frame_stream(&mut self, now: Instant, base: FrameNum, rows: &[u16], body: &[u8]) {
         self.link.last_heard = Some(now);
-        let screen = if base == FrameNum::BLANK {
-            Some(Arc::default())
-        } else if base == self.link.current.num {
-            Some(Arc::clone(&self.link.current.screen))
-        } else {
-            self.link
-                .older
-                .iter()
-                .find(|older| older.num == base)
-                .map(|older| Arc::clone(&older.screen))
-        };
-        let Some(screen) = screen else {
-            if !self.link.resync_sent {
-                self.link.resync_sent = true;
-                self.outgoing.push_back(ClientMsg::Resync);
-            }
+        let Some(screen) = self.link.base(base) else {
+            self.outgoing.extend(self.link.refuse(base));
             return;
         };
         let dictionary = dictionary_for(base, &screen, rows, &mut self.link.encodings);
@@ -560,55 +504,35 @@ impl ClientSession {
     /// server may diff against it.
     pub fn on_frame(&mut self, now: Instant, frame: &Frame) {
         self.link.last_heard = Some(now);
-        if frame.num <= self.link.current.num {
+        if frame.num <= self.link.current().num {
             self.keep_late(frame);
             return;
         }
-        // The copy shares every row with the base; the frame replaces only its own.
-        let base = if frame.base == FrameNum::BLANK {
-            Some(TerminalScreen::default())
-        } else if frame.base == self.link.current.num {
-            Some(TerminalScreen::clone(&self.link.current.screen))
-        } else {
-            self.link
-                .older
-                .iter()
-                .find(|older| older.num == frame.base)
-                .map(|older| TerminalScreen::clone(&older.screen))
-        };
-        let Some(mut screen) = base else {
-            if !self.link.resync_sent {
-                self.link.resync_sent = true;
-                self.outgoing.push_back(ClientMsg::Resync);
-            }
+        let Some(base) = self.link.base(frame.base) else {
+            self.outgoing.extend(self.link.refuse(frame.base));
             return;
         };
+        // The copy shares every row with the base; the frame replaces only its own.
+        let mut screen = Arc::unwrap_or_clone(base);
         screen.apply(&frame.diff);
         if screen.screen().cursor_position().0
-            != self.link.current.screen.screen().cursor_position().0
+            != self.link.current().screen.screen().cursor_position().0
         {
             self.link.new_row_at = Some(now);
         }
-        let previous = std::mem::replace(
-            &mut self.link.current,
-            FrameScreen {
-                num: frame.num,
-                screen: Arc::new(screen),
-            },
-        );
-        self.link.older.push_back(previous);
-        while self.link.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
-            self.link.older.pop_front();
-        }
-        self.link.resync_sent = false;
+        self.link.advance(FrameScreen {
+            num: frame.num,
+            screen: Arc::new(screen),
+        });
         // The outage ends with the new connection's first frame, which shows the shell it reached.
         self.down_since = None;
         self.link.echo_ack = self.link.echo_ack.max(frame.echo_ack);
         self.predictor
             .set_local_frame_late_acked(self.link.echo_ack.0);
-        self.predictor.set_tty(self.link.current.screen.tty());
-        self.predictor.cull(self.link.current.screen.screen());
-        self.scrollback.on_mark(self.link.current.screen.history());
+        self.predictor.set_tty(self.link.current().screen.tty());
+        self.predictor.cull(self.link.current().screen.screen());
+        self.scrollback
+            .on_mark(self.link.current().screen.history());
         self.last_activity = Some(now);
         self.dirty = true;
     }
@@ -623,41 +547,18 @@ impl ClientSession {
 
     /// Keep `frame`, older than the current one, as a base, if its base is held and it is not.
     fn keep_late(&mut self, frame: &Frame) {
-        let held = |num: FrameNum| {
-            num == self.link.current.num || self.link.older.iter().any(|older| older.num == num)
-        };
-        if held(frame.num) {
+        if self.link.holds(frame.num) {
             return;
         }
-        let base = if frame.base == FrameNum::BLANK {
-            Some(TerminalScreen::default())
-        } else {
-            self.link
-                .older
-                .iter()
-                .chain(std::iter::once(&self.link.current))
-                .find(|older| older.num == frame.base)
-                .map(|older| TerminalScreen::clone(&older.screen))
-        };
-        let Some(mut screen) = base else {
+        let Some(base) = self.link.base(frame.base) else {
             return;
         };
+        let mut screen = Arc::unwrap_or_clone(base);
         screen.apply(&frame.diff);
-        self.link.older.push_back(FrameScreen {
+        self.link.keep(FrameScreen {
             num: frame.num,
             screen: Arc::new(screen),
         });
-        while self.link.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
-            self.link.older.pop_front();
-        }
-    }
-
-    /// The cells the older frames hold beyond the current one.
-    fn older_cells(&self) -> usize {
-        TerminalScreen::cells_beyond(
-            &self.link.current.screen,
-            self.link.older.iter().map(|older| &*older.screen),
-        )
     }
 
     /// Advance to `now`: probe for unconfirmed input, and report the status banner.
@@ -693,7 +594,7 @@ impl ClientSession {
                 .any(|m| matches!(m, ClientMsg::Ack { .. }))
             {
                 self.outgoing.push_back(ClientMsg::Ack {
-                    frame: self.link.current.num,
+                    frame: self.link.current().num,
                 });
             }
         }
@@ -750,22 +651,22 @@ impl ClientSession {
 
     /// Whether a frame reported that the shell exited (its code is on [`state`](Self::state)).
     pub fn exited(&self) -> bool {
-        self.link.current.screen.exit_code().is_some()
+        self.link.current().screen.exit_code().is_some()
     }
 
     /// The newest applied screen.
     pub fn state(&self) -> &TerminalScreen {
-        &self.link.current.screen
+        &self.link.current().screen
     }
 
     /// The newest frame applied.
     pub const fn applied(&self) -> FrameNum {
-        self.link.current.num
+        self.link.current().num
     }
 
     /// Whether a frame has been applied, so [`state`](Self::state) is the server's.
     pub fn synced(&self) -> bool {
-        self.link.current.num > FrameNum::BLANK
+        self.link.current().num > FrameNum::BLANK
     }
 
     /// The prediction overlay to draw over [`state`](Self::state).
@@ -776,7 +677,7 @@ impl ClientSession {
     /// The screen to show in place of [`state`](Self::state), without the overlay: the scrollback
     /// view, while it is open.
     pub fn view(&self) -> Option<TerminalScreen> {
-        self.scrollback.shown(&self.link.current.screen)
+        self.scrollback.shown(&self.link.current().screen)
     }
 
     /// The history held and the view of it.
@@ -786,12 +687,12 @@ impl ClientSession {
 
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
     pub fn window_state(&self) -> WindowState<'_> {
-        window_state(&self.link.current.screen)
+        window_state(&self.link.current().screen)
     }
 
     /// The newest applied screen's grid.
     pub fn screen(&self) -> &Grid {
-        self.link.current.screen.screen()
+        self.link.current().screen.screen()
     }
 }
 
@@ -850,6 +751,7 @@ fn events_of(input: Input, out: &mut Vec<InputEvent>) {
 mod tests {
     use super::*;
     use crate::events::{WireKey, WireKeyCode, WireMouse};
+    use crate::proto::{FRAME_WINDOW, WINDOW_CELLS};
     use crate::terminal::ServerTerminal;
     use fux_vt::keys::KeyPress;
 
@@ -1192,14 +1094,14 @@ mod tests {
                     diff: repaint.clone(),
                 },
             );
-            assert!(s.older_cells() <= WINDOW_CELLS, "after frame {n}");
+            assert!(s.link.older_cells() <= WINDOW_CELLS, "after frame {n}");
         }
         assert_eq!(
-            s.link.older.len(),
+            s.link.older().len(),
             1,
             "one largest screen besides the current one"
         );
-        assert_eq!(s.older_cells(), WINDOW_CELLS);
+        assert_eq!(s.link.older_cells(), WINDOW_CELLS);
         assert_eq!(s.state(), &big);
         drain(&mut s);
         // A frame on a dropped base still asks for a resync; one on the kept base applies.
@@ -1223,8 +1125,8 @@ mod tests {
             s.on_frame(now, &frame(n, n - 1, 0, &prev, &next));
             prev = next;
         }
-        assert_eq!(s.link.older.len(), FRAME_WINDOW - 1);
-        assert_eq!(s.older_cells(), 0);
+        assert_eq!(s.link.older().len(), FRAME_WINDOW - 1);
+        assert_eq!(s.link.older_cells(), 0);
         assert_eq!(s.state(), &prev);
     }
 
@@ -1248,10 +1150,10 @@ mod tests {
             assert_eq!(s.state(), &next);
             prev = next;
         }
-        assert_eq!(s.link.older.len(), FRAME_WINDOW - 1);
+        assert_eq!(s.link.older().len(), FRAME_WINDOW - 1);
         // Per frame, the row that scrolled off and the one written.
-        let screens =
-            std::iter::once(&*s.link.current.screen).chain(s.link.older.iter().map(|f| &*f.screen));
+        let screens = std::iter::once(&*s.link.current().screen)
+            .chain(s.link.older().iter().map(|f| &*f.screen));
         let distinct = TerminalScreen::distinct_cells(screens);
         assert!(
             distinct <= (usize::from(rows) + 2 * FRAME_WINDOW) * usize::from(cols),

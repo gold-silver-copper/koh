@@ -22,8 +22,8 @@ credit reporters who want it.
 
 **In scope** (code koh authors):
 
-- On-disk identity-key handling and local-attacker hardening (`src/transport_iroh/`,
-  `src/identity.rs`): the key file is the raw 32-byte secret, protected by its
+- On-disk identity-key handling and local-attacker hardening (`src/identity.rs`,
+  `src/identity/key_file.rs`): the key file is the raw 32-byte secret, protected by its
   permissions (0600) like an SSH host key.
 - The connection accept gauntlet / node-id allowlist authorization
   (`src/server/cli.rs`) and the admission barrier
@@ -54,7 +54,7 @@ and the git log.
 | ID | Finding | Guarded by |
 |----|---------|------------|
 | H-1 | A peer's resize allocates an unbounded grid (OOM) | `src/terminal/server.rs::server_resize_clamps_oom_and_zero`, `src/terminal/mod.rs::client_apply_clamps_oom_resize`, `clamp_dims_bounds_both_extremes`; `testing/android/scripts/sec-resize-oom-server.sh` |
-| M-1 | The identity key is written world-readable | `src/transport_iroh/mod.rs::created_key_file_is_owner_only`; `testing/android/scripts/sec-key-perms.sh` |
+| M-1 | The identity key is written world-readable | `src/identity/key_file.rs::a_created_key_is_its_raw_bytes_and_loads_back_to_the_same_identity`; `testing/android/scripts/sec-key-perms.sh` |
 | M-2 | A (0, 0) resize panics the emulator | `src/terminal/server.rs::server_resize_clamps_oom_and_zero`, `src/terminal/mod.rs::client_apply_clamps_zero_resize`; `testing/android/scripts/sec-resize-zero-panic.sh` |
 | L-1 | A server silently sets the client's clipboard (OSC 52) | Accepted since 0.13: clipboard writes are on by default, the owner's choice, and off with `--no-clipboard` (`src/args.rs::no_clipboard_turns_clipboard_writes_off`). What bounds them stays: `src/client/render.rs::out_of_band_clipboard_off_emits_nothing`, `out_of_band_rejects_non_base64_clipboard_even_when_on`, `a_clipboard_query_or_an_oversized_payload_is_never_forwarded`; `src/terminal/server.rs::a_clipboard_query_sets_nothing` |
 | L-2 | The client trusts the server's title/icon/clipboard sizes | `src/terminal/mod.rs::client_apply_caps_oversized_title_and_clipboard` |
@@ -70,15 +70,15 @@ and the git log.
 | KOH-03 | Fixed public KDF salt in the passphrase handshake | Removed: there is no over-the-wire passphrase; the node-id allowlist is the only factor |
 | KOH-04 | `String::truncate` on the status line panics the client | `src/client/render.rs::status_line_truncation_is_panic_free_across_all_widths` |
 | KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_keeps_only_the_last_resize_and_concatenates_keys`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
-| KOH-06 | State dir in a world-writable shared location | `src/transport_iroh/mod.rs::ensure_state_dir_secure_refuses_only_nonsticky_world_writable`, `config_dir_is_xdg_then_home_and_never_elsewhere` |
+| KOH-06 | State dir in a world-writable shared location | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_directory_of_another_user_but_root_is_refused`, `src/transport_iroh/mod.rs::config_dir_is_xdg_then_home_and_never_elsewhere` |
 | KOH-07 | Fragment reassembly buffers ~39 MiB | Removed: koh/3 has no fragments; a frame is one stream read under `MAX_FRAME` (see KOH-02) |
 | KOH-08 | Stalled handshakes hold connection permits | The pending-handshake cap and the handshake and admission deadlines in `src/server/cli.rs::serve_endpoint`; no automated test (the admission-stall attack in `testing/android/scripts/stress-evil-peer.sh` exercises it on a device) |
 | KOH-10 | A SIGHUP-immune child leaks the PTY threads | `Pty`'s `Drop` and `kill_hard` send SIGKILL: `tests/pty.rs::a_child_that_ignores_sighup_dies_when_its_pty_is_dropped`, `dropping_pty_eofs_child_and_stops_writer`, `shutdown_joins_both_io_threads_without_deadlock` |
 | KOH-11, KOH-13 | Passphrase handshake downgrades | Removed with the passphrase handshake |
-| KOH-12 | A pre-existing state dir is not made private | `src/transport_iroh/mod.rs::ensure_state_dir_secure_refuses_only_nonsticky_world_writable`, `created_key_file_is_owner_only` |
+| KOH-12 | A pre-existing state dir is not made private | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_missing_directory_is_created_private` |
 | KOH-14 | CLI args holding a passphrase derive `Debug` | Removed: no passphrase or other secret is a CLI argument |
 | KOH-15 | The env scrub list misses variables | Scrubbed by prefix: `src/pty.rs::scrub_removes_inherited_koh_vars` |
-| KOH-16 | A loose existing key is never re-tightened | `src/transport_iroh/mod.rs::fd_key_read_tightens_a_loose_real_key_via_the_fd` |
+| KOH-16 | A loose existing key is never re-tightened | `src/identity/key_file.rs::loose_key_and_lock_files_are_tightened_through_the_descriptor` |
 | KOH-17 | Unmaintained `atomic-polyfill` via postcard defaults | postcard's default features are off (`Cargo.toml`); `cargo deny check advisories` in CI |
 | KOH-18 | Unmaintained `paste` via iroh | Accepted, advisory-only: the ignore in [`deny.toml`](deny.toml) |
 | KOH-19 | Pre-release `ed25519-dalek` / `curve25519-dalek` | Accepted: iroh 1.0.0 still depends on them; tracked with each iroh bump |
@@ -89,9 +89,9 @@ and the git log.
 |----|---------|------------|
 | KR-01 | A stalled QUIC handshake pins permits for the idle timeout | `ACCEPT_HANDSHAKE_TIMEOUT` in `src/server/cli.rs`; no automated test |
 | KR-02 | Signalling a reaped, possibly recycled PID | `tests/pty.rs::reaped_child_is_not_signaled_again` |
-| KR-06 | Key perms touched before the dir check; symlinked key followed | `src/transport_iroh/mod.rs::load_refuses_a_symlinked_key`, `fd_key_read_does_not_follow_a_symlinked_key`, `ensure_state_dir_secure_refuses_only_nonsticky_world_writable` |
-| KR-07 | A pre-existing loose `$KOH_LOG` is reused | `connect` in `src/client/cli.rs` fchmods the log to 0600 or disables file logging; no automated test |
-| K-01 | Key load races a path swap (TOCTOU) | `src/transport_iroh/mod.rs::fd_key_read_does_not_follow_a_symlinked_key`, `fd_key_read_tightens_a_loose_real_key_via_the_fd` |
+| KR-06 | Key perms touched before the dir check; symlinked key followed | `src/identity/key_file.rs::a_symlinked_key_is_refused_and_its_target_left_alone`, `a_dangling_symlink_is_refused_instead_of_creating_or_missing_a_key`, `only_a_nonsticky_world_writable_directory_is_refused` |
+| KR-07 | A pre-existing loose `$KOH_LOG` is reused | `src/identity/key_file.rs::a_symlinked_log_is_refused_before_its_target_is_truncated`, `a_fifo_log_or_key_is_refused_without_waiting_for_a_reader` (`open_private_log` refuses a symlink, FIFO or device before opening, or another user's file, fchmods a loose log to 0600, and truncates only after; `connect` disables file logging on refusal) |
+| K-01 | Key load races a path swap (TOCTOU) | `src/identity/key_file.rs::a_symlinked_key_is_refused_and_its_target_left_alone`, `loose_key_and_lock_files_are_tightened_through_the_descriptor` |
 | K-03 | An accept-then-close server spins the client's reconnect | `src/client/mod.rs::dwell_gate_resets_on_proven_connection_and_climbs_on_flap`, `reconnect_backoff_grows_then_caps` |
 | K-13 | `clamp_dims` is the only bound on one resize's allocation | `src/terminal/mod.rs::clamp_dims_bounds_both_extremes`, `apply_is_panic_free_and_holds_invariants` |
 | K-16 | A panicking connection leaks its session | Detach on drop of `SessionClient`: `tests/sessions.rs::the_last_detach_starts_the_ttl_a_concurrent_one_does_not`, `tests/net/session.rs::connections_dropped_with_input_in_flight_do_not_hurt_the_session` |

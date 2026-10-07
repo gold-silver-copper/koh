@@ -219,31 +219,22 @@ fn warn_if_locale_not_utf8() {
     }
 }
 
-/// With `$KOH_LOG` set, log to that file at debug level (the TUI owns the terminal). It is made
-/// 0600 through its descriptor, existing or not, as debug logs can be sensitive; failing that,
-/// nothing is logged.
+/// With `$KOH_LOG` set, log to that file at debug level (the TUI owns the terminal). It must be
+/// a private file of this user's (see [`crate::identity::open_private_log`]), as debug logs can be
+/// sensitive; failing that, nothing is logged. An empty `$KOH_LOG` is off, silently.
 fn log_to_koh_log() {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let Ok(path) = std::env::var("KOH_LOG") else {
+    let Some(path) = koh_log_path(std::env::var_os("KOH_LOG")) else {
         return;
     };
-    let Ok(file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-    else {
-        return;
-    };
-    if file
-        .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .is_err()
-    {
-        eprintln!("koh: warning: could not set $KOH_LOG to 0600; file logging disabled");
-        return;
+    match crate::identity::open_private_log(&path) {
+        Ok(file) => crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG),
+        Err(e) => eprintln!("koh: warning: $KOH_LOG: {e}; file logging disabled"),
     }
-    crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG);
+}
+
+/// The log file `$KOH_LOG` (given as `value`) names, if any: unset and empty both mean none.
+fn koh_log_path(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    value.filter(|path| !path.is_empty()).map(Into::into)
 }
 
 /// The longest the client waits for the user's terminal to answer its start-up questions. A local
@@ -310,8 +301,10 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     warn_if_locale_not_utf8();
 
     // Held for the session: its lease stops `koh key reset` while it may redial.
-    let identity =
-        crate::identity::load(&crate::identity::key_path(args.key_file.clone(), "client")?)?;
+    let identity = crate::identity::load(&crate::identity::KeyFile::locate(
+        args.key_file.clone(),
+        "client",
+    )?)?;
     let (endpoint, connector, channel) = dial(&args, &identity).await?;
     let dialed_at = std::time::SystemTime::now();
     let shutdown = CancellationToken::new();
@@ -358,6 +351,16 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_koh_log_is_off_like_an_unset_one() {
+        assert_eq!(koh_log_path(None), None);
+        assert_eq!(koh_log_path(Some("".into())), None, "KOH_LOG= logs nothing");
+        assert_eq!(
+            koh_log_path(Some("/x/koh.log".into())),
+            Some("/x/koh.log".into())
+        );
+    }
 
     #[test]
     fn redial_reuses_the_loaded_identity_without_touching_the_key_file() -> anyhow::Result<()> {

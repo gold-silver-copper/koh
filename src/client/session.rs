@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use fux_vt::keys::colour::Scheme;
 use fux_vt::keys::decode::{Decoder, Input, Reply};
 use fux_vt::keys::encode::{key_bytes, paste, KeyMode, PASTE_END, PASTE_START};
-use fux_vt::keys::{KeyPress, Keystroke};
+use fux_vt::keys::Keystroke;
 
 use crate::events::{
     narrow, InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE_PIECE, PALETTE,
@@ -35,6 +35,16 @@ const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 
 /// What the status line says of a paste past [`MAX_QUEUED_INPUT`], which is dropped whole.
 const PASTE_TOO_LONG: &str = "[koh] paste over 1 MiB — not sent";
+
+/// The notice for what was typed during an outage and not sent. The reattach may have landed on
+/// a new shell (the session expired, or the server restarted), which the client cannot tell from
+/// its own, and keys typed at the old screen must not run there; nor may the end of a line whose
+/// start was lost with the link run alone (`false && rm …` must not run `rm …`).
+const OUTAGE_INPUT_DROPPED: &str = "[koh] typing during the outage not sent";
+
+/// The notice for input handed to the lost connection and never confirmed: the server may not
+/// have had it, so what is typed next may run without it.
+const SENT_AS_THE_LINK_DROPPED: &str = "[koh] keys typed as the link dropped may not have arrived";
 
 /// How long after a frame moves the cursor to another row (a fresh prompt) a key typed is shown
 /// only once echoed: the server reads the PTY's modes at least every [`TTY_TICK`], so a program
@@ -65,29 +75,26 @@ pub struct TickResult {
     pub status: Option<String>,
 }
 
-/// The client side of one connection.
+/// The client side of a run, across its connections: only its `Link` is per connection, made anew
+/// by [`attach`](Self::attach); typed input, the escape, the colours and the scrollback live on.
 pub struct ClientSession {
-    /// The newest applied frame and its screen.
-    current: FrameScreen,
-    /// The frames applied before it, oldest first: at most `FRAME_WINDOW - 1`, holding at most
-    /// [`WINDOW_CELLS`] cells beyond `current`'s.
-    older: VecDeque<FrameScreen>,
-    /// A `Resync` was sent and no frame has applied since.
-    resync_sent: bool,
-    /// The newest input the server has reported reflected on screen.
-    echo_ack: InputSeq,
-    /// The last input sequence number used.
+    /// What the current connection holds.
+    link: Link,
+    /// When the link went down, until the next connection's first frame shows which shell it reached.
+    down_since: Option<Instant>,
+    /// The last input sequence number used; it rises across connections.
     last_seq: InputSeq,
+    /// The newest input sequence number handed to a connection.
+    sent_seq: InputSeq,
+    /// At the last [`detach`](Self::detach), input handed to the lost connection was not yet
+    /// confirmed (`sent_seq` beyond its echo-ack).
+    unconfirmed_at_drop: bool,
     /// Messages for the server, oldest first.
     outgoing: VecDeque<ClientMsg>,
     /// Typed bytes in `outgoing`.
     queued_input: usize,
     /// Typing was dropped because `outgoing` was full; cleared once it drains.
     input_paused: bool,
-    /// When the server was last heard from; `None` until the first frame.
-    last_heard: Option<Instant>,
-    /// When input was last queued or probed for, while some is unconfirmed.
-    last_nudge: Option<Instant>,
     predictor: PredictionEngine,
     /// What the user's terminal sends, decoded.
     decoder: Decoder,
@@ -103,9 +110,6 @@ pub struct ClientSession {
     notice: Option<(String, Instant)>,
     /// A key's legacy bytes, as last matched against the escape prefix.
     scratch: Vec<u8>,
-    /// When the newest frame moved the cursor to another row: a fresh prompt, whose program may
-    /// still turn echo off. Keys typed within [`PROMPT_HOLD`] of it are shown only once echoed.
-    new_row_at: Option<Instant>,
     /// The history held, and the scrollback view.
     scrollback: Scrollback,
     /// When the user last typed or a frame last applied: history is fetched ahead only after a
@@ -113,28 +117,67 @@ pub struct ClientSession {
     last_activity: Option<Instant>,
     /// The window's height, for the view's pages.
     rows: u16,
-    /// Rows' encodings, kept from one frame's dictionary to the next.
-    encodings: RowEncodings,
     /// Set whenever the rendered output may have changed; cleared once the caller repaints.
     pub(crate) dirty: bool,
     /// Whether a status banner was painted last frame, so its removal repaints once more.
     pub(crate) status_was_shown: bool,
 }
 
-impl ClientSession {
-    /// A session for a new connection, telling the server the window's `size`.
-    pub fn new(pref: DisplayPreference, size: Size) -> Self {
+/// What one connection holds: the frames it applied, what its server echoed, when it was heard.
+/// Only [`ClientSession::new`] and [`ClientSession::attach`] make one.
+struct Link {
+    /// The newest applied frame and its screen.
+    current: FrameScreen,
+    /// The frames applied before it, oldest first: at most `FRAME_WINDOW - 1`, holding at most
+    /// [`WINDOW_CELLS`] cells beyond `current`'s.
+    older: VecDeque<FrameScreen>,
+    /// A `Resync` was sent and no frame has applied since.
+    resync_sent: bool,
+    /// The newest input the server has reported reflected on screen.
+    echo_ack: InputSeq,
+    /// When the server was last heard from; `None` until the first frame.
+    last_heard: Option<Instant>,
+    /// When input was last queued or probed for, while some is unconfirmed.
+    last_nudge: Option<Instant>,
+    /// When the newest frame moved the cursor to another row: a fresh prompt, whose program may
+    /// still turn echo off. Keys typed within [`PROMPT_HOLD`] of it are shown only once echoed.
+    new_row_at: Option<Instant>,
+    /// Rows' encodings, kept from one frame's dictionary to the next.
+    encodings: RowEncodings,
+}
+
+impl Link {
+    /// A link on which nothing has arrived, showing `screen` until its first frame (which, on
+    /// the blank base, builds from nothing), with input up to `echo_ack` taken as handled.
+    fn fresh(screen: Arc<TerminalScreen>, echo_ack: InputSeq) -> Self {
         Self {
-            current: FrameScreen::default(),
+            current: FrameScreen {
+                num: FrameNum::BLANK,
+                screen,
+            },
             older: VecDeque::new(),
             resync_sent: false,
-            echo_ack: InputSeq::default(),
+            echo_ack,
+            last_heard: None,
+            last_nudge: None,
+            new_row_at: None,
+            encodings: RowEncodings::default(),
+        }
+    }
+}
+
+impl ClientSession {
+    /// A session for a run, telling the server the window's `size`.
+    pub fn new(pref: DisplayPreference, size: Size) -> Self {
+        Self {
+            link: Link::fresh(Arc::default(), InputSeq::default()),
+            down_since: None,
             last_seq: InputSeq::default(),
+            sent_seq: InputSeq::default(),
+            unconfirmed_at_drop: false,
             outgoing: VecDeque::from([ClientMsg::Resize(size)]),
             queued_input: 0,
             input_paused: false,
-            last_heard: None,
-            last_nudge: None,
             predictor: PredictionEngine::new(pref),
             decoder: Decoder::with_paste_limit(MAX_QUEUED_INPUT),
             pending_escape: None,
@@ -143,14 +186,64 @@ impl ClientSession {
             ask: Vec::new(),
             notice: None,
             scratch: Vec::with_capacity(16),
-            new_row_at: None,
             scrollback: Scrollback::default(),
             last_activity: None,
             rows: size.rows,
-            encodings: RowEncodings::default(),
             dirty: true,
             status_was_shown: false,
         }
+    }
+
+    /// The connection was lost: what was meant for it alone (acknowledgements, resyncs and
+    /// history requests) goes with it; resizes and colours wait for the next. The
+    /// predictions go, and whether typing was trusted is kept as it was now, at the drop.
+    pub fn detach(&mut self, now: Instant) {
+        self.down_since.get_or_insert(now);
+        self.unconfirmed_at_drop = self.sent_seq > self.link.echo_ack;
+        self.outgoing.retain(|msg| {
+            !matches!(
+                msg,
+                ClientMsg::Ack { .. } | ClientMsg::Resync | ClientMsg::History(_)
+            )
+        });
+        self.scrollback.forget_requests();
+        self.predictor = self.predictor.reattached();
+        self.dirty = true;
+    }
+
+    /// A new connection, whose window is `size`: the server is told the size and the colours
+    /// first (a reattach may be from another terminal). Input not yet sent is dropped, and the
+    /// status line says so: the client cannot tell a reattach from a new shell, where keys typed
+    /// at the old screen must not run; nor is what is typed before the new connection's first
+    /// frame shows which shell it reached. The last screen stays up until the server repaints it;
+    /// the history held is the server session's, and is fetched again.
+    pub fn attach(&mut self, now: Instant, size: Size) {
+        self.link = Link::fresh(Arc::clone(&self.link.current.screen), self.sent_seq);
+        self.outgoing
+            .retain(|msg| !matches!(msg, ClientMsg::Resize(_) | ClientMsg::Colours(_)));
+        if self.queued_input > 0 {
+            self.outgoing
+                .retain(|msg| !matches!(msg, ClientMsg::Keys { .. } | ClientMsg::Input { .. }));
+            self.queued_input = 0;
+            self.input_paused = false;
+            self.notice = Some((OUTAGE_INPUT_DROPPED.to_owned(), now));
+        }
+        let typed_while_down = self
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice == OUTAGE_INPUT_DROPPED);
+        if std::mem::take(&mut self.unconfirmed_at_drop) && !typed_while_down {
+            self.notice = Some((SENT_AS_THE_LINK_DROPPED.to_owned(), now));
+        }
+        if let Some(colours) = self.colours.as_ref().filter(|c| c.known()) {
+            self.outgoing
+                .push_front(ClientMsg::Colours(colours.clone()));
+        }
+        self.outgoing.push_front(ClientMsg::Resize(size));
+        self.rows = size.rows;
+        self.scrollback.reconnected();
+        self.predictor = self.predictor.reattached();
+        self.dirty = true;
     }
 
     /// Take typed bytes, as the user's terminal sent them: decoded, then handled as
@@ -316,6 +409,18 @@ impl ClientSession {
     }
 
     fn queue_events(&mut self, now: Instant, events: Vec<InputEvent>) {
+        if self.down_since.is_some() {
+            // Not sent, nor predicted: see `attach`. The status line says so while the typing
+            // goes on (a focus report or the mouse is not typing).
+            if events
+                .iter()
+                .any(|e| matches!(e, InputEvent::Key(_) | InputEvent::Paste { .. }))
+            {
+                self.notice = Some((OUTAGE_INPUT_DROPPED.to_owned(), now));
+                self.dirty = true;
+            }
+            return;
+        }
         let size: usize = events.iter().map(InputEvent::wire_len).sum();
         if self.queued_input.saturating_add(size) > MAX_QUEUED_INPUT {
             // The server is not taking input; queueing more would grow without bound.
@@ -336,12 +441,13 @@ impl ClientSession {
         };
         self.predictor.set_local_frame_sent(seq.0.saturating_sub(1));
         for event in &events {
-            let screen = self.current.screen.screen();
+            let screen = self.link.current.screen.screen();
             match event {
                 InputEvent::Key(key) => {
                     // At a fresh prompt the modes the client holds may be from before the program
                     // turned echo off: the key shows only once echoed.
                     if self
+                        .link
                         .new_row_at
                         .is_some_and(|at| now.saturating_duration_since(at) < PROMPT_HOLD)
                     {
@@ -369,9 +475,20 @@ impl ClientSession {
             }
         }
         self.queued_input = self.queued_input.saturating_add(size);
-        self.last_nudge = Some(now);
+        self.link.last_nudge = Some(now);
         self.last_activity = Some(now);
         self.dirty = true;
+    }
+
+    /// What the status line says beside the link's state: input paused, else a recent notice.
+    fn aside(&self, now: Instant) -> Option<String> {
+        if self.input_paused {
+            return Some("[koh] input paused — the server is not taking input".to_owned());
+        }
+        self.notice
+            .as_ref()
+            .filter(|(_, at)| now.saturating_duration_since(*at) < NOTICE_FOR)
+            .map(|(notice, _)| notice.clone())
     }
 
     /// Questions for the user's terminal the session has (the colours again, after the terminal
@@ -393,11 +510,6 @@ impl ClientSession {
         });
     }
 
-    /// The colours as last learned, for the next connection.
-    pub fn colours(&self) -> Option<WireColours> {
-        self.colours.clone()
-    }
-
     /// Queue a new window size; it voids the predictions.
     pub fn on_resize(&mut self, size: Size) {
         // Only the last of several unsent resizes matters.
@@ -415,25 +527,26 @@ impl ClientSession {
     /// [`on_frame`](Self::on_frame) does. A frame on a base not held asks for a resync; one that
     /// does not inflate or decode is dropped, as a lost one would be.
     pub fn on_frame_stream(&mut self, now: Instant, base: FrameNum, rows: &[u16], body: &[u8]) {
-        self.last_heard = Some(now);
+        self.link.last_heard = Some(now);
         let screen = if base == FrameNum::BLANK {
             Some(Arc::default())
-        } else if base == self.current.num {
-            Some(Arc::clone(&self.current.screen))
+        } else if base == self.link.current.num {
+            Some(Arc::clone(&self.link.current.screen))
         } else {
-            self.older
+            self.link
+                .older
                 .iter()
                 .find(|older| older.num == base)
                 .map(|older| Arc::clone(&older.screen))
         };
         let Some(screen) = screen else {
-            if !self.resync_sent {
-                self.resync_sent = true;
+            if !self.link.resync_sent {
+                self.link.resync_sent = true;
                 self.outgoing.push_back(ClientMsg::Resync);
             }
             return;
         };
-        let dictionary = dictionary_for(base, &screen, rows, &mut self.encodings);
+        let dictionary = dictionary_for(base, &screen, rows, &mut self.link.encodings);
         match decode_frame_body(base, body, &dictionary) {
             Ok(frame) => self.on_frame(now, &frame),
             Err(e) => tracing::debug!(error = %e, "dropping an undecodable frame"),
@@ -446,50 +559,56 @@ impl ClientSession {
     /// that arrives after a newer one, on a base held, is kept among the older screens, as the
     /// server may diff against it.
     pub fn on_frame(&mut self, now: Instant, frame: &Frame) {
-        self.last_heard = Some(now);
-        if frame.num <= self.current.num {
+        self.link.last_heard = Some(now);
+        if frame.num <= self.link.current.num {
             self.keep_late(frame);
             return;
         }
         // The copy shares every row with the base; the frame replaces only its own.
         let base = if frame.base == FrameNum::BLANK {
             Some(TerminalScreen::default())
-        } else if frame.base == self.current.num {
-            Some(TerminalScreen::clone(&self.current.screen))
+        } else if frame.base == self.link.current.num {
+            Some(TerminalScreen::clone(&self.link.current.screen))
         } else {
-            self.older
+            self.link
+                .older
                 .iter()
                 .find(|older| older.num == frame.base)
                 .map(|older| TerminalScreen::clone(&older.screen))
         };
         let Some(mut screen) = base else {
-            if !self.resync_sent {
-                self.resync_sent = true;
+            if !self.link.resync_sent {
+                self.link.resync_sent = true;
                 self.outgoing.push_back(ClientMsg::Resync);
             }
             return;
         };
         screen.apply(&frame.diff);
-        if screen.screen().cursor_position().0 != self.current.screen.screen().cursor_position().0 {
-            self.new_row_at = Some(now);
+        if screen.screen().cursor_position().0
+            != self.link.current.screen.screen().cursor_position().0
+        {
+            self.link.new_row_at = Some(now);
         }
         let previous = std::mem::replace(
-            &mut self.current,
+            &mut self.link.current,
             FrameScreen {
                 num: frame.num,
                 screen: Arc::new(screen),
             },
         );
-        self.older.push_back(previous);
-        while self.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
-            self.older.pop_front();
+        self.link.older.push_back(previous);
+        while self.link.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
+            self.link.older.pop_front();
         }
-        self.resync_sent = false;
-        self.echo_ack = self.echo_ack.max(frame.echo_ack);
-        self.predictor.set_local_frame_late_acked(self.echo_ack.0);
-        self.predictor.set_tty(self.current.screen.tty());
-        self.predictor.cull(self.current.screen.screen());
-        self.scrollback.on_mark(self.current.screen.history());
+        self.link.resync_sent = false;
+        // The outage ends with the new connection's first frame, which shows the shell it reached.
+        self.down_since = None;
+        self.link.echo_ack = self.link.echo_ack.max(frame.echo_ack);
+        self.predictor
+            .set_local_frame_late_acked(self.link.echo_ack.0);
+        self.predictor.set_tty(self.link.current.screen.tty());
+        self.predictor.cull(self.link.current.screen.screen());
+        self.scrollback.on_mark(self.link.current.screen.history());
         self.last_activity = Some(now);
         self.dirty = true;
     }
@@ -505,7 +624,7 @@ impl ClientSession {
     /// Keep `frame`, older than the current one, as a base, if its base is held and it is not.
     fn keep_late(&mut self, frame: &Frame) {
         let held = |num: FrameNum| {
-            num == self.current.num || self.older.iter().any(|older| older.num == num)
+            num == self.link.current.num || self.link.older.iter().any(|older| older.num == num)
         };
         if held(frame.num) {
             return;
@@ -513,9 +632,10 @@ impl ClientSession {
         let base = if frame.base == FrameNum::BLANK {
             Some(TerminalScreen::default())
         } else {
-            self.older
+            self.link
+                .older
                 .iter()
-                .chain(std::iter::once(&self.current))
+                .chain(std::iter::once(&self.link.current))
                 .find(|older| older.num == frame.base)
                 .map(|older| TerminalScreen::clone(&older.screen))
         };
@@ -523,40 +643,57 @@ impl ClientSession {
             return;
         };
         screen.apply(&frame.diff);
-        self.older.push_back(FrameScreen {
+        self.link.older.push_back(FrameScreen {
             num: frame.num,
             screen: Arc::new(screen),
         });
-        while self.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
-            self.older.pop_front();
+        while self.link.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
+            self.link.older.pop_front();
         }
     }
 
     /// The cells the older frames hold beyond the current one.
     fn older_cells(&self) -> usize {
         TerminalScreen::cells_beyond(
-            &self.current.screen,
-            self.older.iter().map(|older| &*older.screen),
+            &self.link.current.screen,
+            self.link.older.iter().map(|older| &*older.screen),
         )
     }
 
     /// Advance to `now`: probe for unconfirmed input, and report the status banner.
     pub fn on_tick(&mut self, now: Instant, rtt: Option<Duration>) -> TickResult {
+        if let Some(down) = self.down_since {
+            // Nothing to probe for or fetch: only the banner's clock moves, with what else the
+            // status line would say after it.
+            let mut status = format!(
+                "[koh] disconnected — reconnecting… {}s (Ctrl-^ . to quit)",
+                now.saturating_duration_since(down).as_secs()
+            );
+            if let Some(aside) = self.aside(now) {
+                status.push_str(" · ");
+                status.push_str(aside.trim_start_matches("[koh] "));
+            }
+            return TickResult {
+                wait: Duration::from_secs(1),
+                status: Some(status),
+            };
+        }
         // Unconfirmed input may be behind a lost packet: any later one (a repeated ack, which the
         // server ignores) lets QUIC retransmit at once instead of after its probe timeout.
-        if self.echo_ack < self.last_seq
+        if self.link.echo_ack < self.last_seq
             && self
+                .link
                 .last_nudge
                 .is_some_and(|at| now.saturating_duration_since(at) >= retry_after(rtt))
         {
-            self.last_nudge = Some(now);
+            self.link.last_nudge = Some(now);
             if !self
                 .outgoing
                 .iter()
                 .any(|m| matches!(m, ClientMsg::Ack { .. }))
             {
                 self.outgoing.push_back(ClientMsg::Ack {
-                    frame: self.current.num,
+                    frame: self.link.current.num,
                 });
             }
         }
@@ -566,23 +703,14 @@ impl ClientSession {
             self.outgoing.push_back(ClientMsg::History(request));
         }
         let silent = self
+            .link
             .last_heard
             .map(|heard| now.saturating_duration_since(heard));
         let status = match silent {
             Some(silent) if silent > LINK_DOWN_GRACE => {
                 Some(format!("[koh] link down — resuming… {}s", silent.as_secs()))
             }
-            _ if self.input_paused => {
-                Some("[koh] input paused — the server is not taking input".to_owned())
-            }
-            _ if self
-                .notice
-                .as_ref()
-                .is_some_and(|(_, at)| now.saturating_duration_since(*at) < NOTICE_FOR) =>
-            {
-                self.notice.as_ref().map(|(notice, _)| notice.clone())
-            }
-            _ => self.scrollback.status(),
+            _ => self.aside(now).or_else(|| self.scrollback.status()),
         };
         TickResult {
             wait: Duration::from_millis(50),
@@ -599,15 +727,18 @@ impl ClientSession {
     pub fn pop_outgoing(&mut self) -> Option<ClientMsg> {
         let msg = self.outgoing.pop_front()?;
         let sent = match &msg {
-            ClientMsg::Input { bytes, .. } => Some(bytes.len()),
-            ClientMsg::Keys { events, .. } => Some(events.iter().map(InputEvent::wire_len).sum()),
+            ClientMsg::Input { bytes, seq } => Some((bytes.len(), *seq)),
+            ClientMsg::Keys { events, seq } => {
+                Some((events.iter().map(InputEvent::wire_len).sum(), *seq))
+            }
             ClientMsg::Resize(_)
             | ClientMsg::Ack { .. }
             | ClientMsg::Resync
             | ClientMsg::History(_)
             | ClientMsg::Colours(_) => None,
         };
-        if let Some(sent) = sent {
+        if let Some((sent, seq)) = sent {
+            self.sent_seq = seq;
             self.queued_input = self.queued_input.saturating_sub(sent);
             if self.input_paused && self.queued_input == 0 {
                 self.input_paused = false;
@@ -619,34 +750,22 @@ impl ClientSession {
 
     /// Whether a frame reported that the shell exited (its code is on [`state`](Self::state)).
     pub fn exited(&self) -> bool {
-        self.current.screen.exit_code().is_some()
+        self.link.current.screen.exit_code().is_some()
     }
 
     /// The newest applied screen.
     pub fn state(&self) -> &TerminalScreen {
-        &self.current.screen
+        &self.link.current.screen
     }
 
     /// The newest frame applied.
     pub const fn applied(&self) -> FrameNum {
-        self.current.num
+        self.link.current.num
     }
 
     /// Whether a frame has been applied, so [`state`](Self::state) is the server's.
     pub fn synced(&self) -> bool {
-        self.current.num > FrameNum::BLANK
-    }
-
-    /// Whether typing was being shown as it was predicted: the trust a reconnect to the same session
-    /// carries ([`carry_trust`](Self::carry_trust)).
-    pub fn trusted(&self) -> bool {
-        self.synced() && self.predictor.trusted()
-    }
-
-    /// Trust typing as the last connection to the same session did, once the first frame shows no
-    /// password prompt.
-    pub fn carry_trust(&mut self) {
-        self.predictor.carry_trust();
+        self.link.current.num > FrameNum::BLANK
     }
 
     /// The prediction overlay to draw over [`state`](Self::state).
@@ -657,7 +776,7 @@ impl ClientSession {
     /// The screen to show in place of [`state`](Self::state), without the overlay: the scrollback
     /// view, while it is open.
     pub fn view(&self) -> Option<TerminalScreen> {
-        self.scrollback.shown(&self.current.screen)
+        self.scrollback.shown(&self.link.current.screen)
     }
 
     /// The history held and the view of it.
@@ -667,12 +786,12 @@ impl ClientSession {
 
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
     pub fn window_state(&self) -> WindowState<'_> {
-        window_state(&self.current.screen)
+        window_state(&self.link.current.screen)
     }
 
     /// The newest applied screen's grid.
     pub fn screen(&self) -> &Grid {
-        self.current.screen.screen()
+        self.link.current.screen.screen()
     }
 }
 
@@ -727,19 +846,12 @@ fn events_of(input: Input, out: &mut Vec<InputEvent>) {
     }
 }
 
-/// A key's legacy bytes, in normal cursor mode: its one form, which the escape prefix and its keys
-/// are matched against whatever the user's terminal sent.
-pub fn legacy_bytes(press: KeyPress) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(8);
-    key_bytes(press.into(), KeyMode::legacy(false), &mut bytes);
-    bytes
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::{WireKey, WireKeyCode, WireMouse};
     use crate::terminal::ServerTerminal;
+    use fux_vt::keys::KeyPress;
 
     fn start() -> (Instant, ClientSession) {
         let now = Instant::now();
@@ -747,6 +859,13 @@ mod tests {
             now,
             ClientSession::new(DisplayPreference::Always, Size::new(24, 80)),
         )
+    }
+
+    /// A key's legacy bytes, in normal cursor mode.
+    fn legacy_bytes(press: KeyPress) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8);
+        key_bytes(press.into(), KeyMode::legacy(false), &mut bytes);
+        bytes
     }
 
     fn screen(bytes: &[u8]) -> TerminalScreen {
@@ -1061,7 +1180,7 @@ mod tests {
             assert!(s.older_cells() <= WINDOW_CELLS, "after frame {n}");
         }
         assert_eq!(
-            s.older.len(),
+            s.link.older.len(),
             1,
             "one largest screen besides the current one"
         );
@@ -1089,7 +1208,7 @@ mod tests {
             s.on_frame(now, &frame(n, n - 1, 0, &prev, &next));
             prev = next;
         }
-        assert_eq!(s.older.len(), FRAME_WINDOW - 1);
+        assert_eq!(s.link.older.len(), FRAME_WINDOW - 1);
         assert_eq!(s.older_cells(), 0);
         assert_eq!(s.state(), &prev);
     }
@@ -1114,9 +1233,10 @@ mod tests {
             assert_eq!(s.state(), &next);
             prev = next;
         }
-        assert_eq!(s.older.len(), FRAME_WINDOW - 1);
+        assert_eq!(s.link.older.len(), FRAME_WINDOW - 1);
         // Per frame, the row that scrolled off and the one written.
-        let screens = std::iter::once(&*s.current.screen).chain(s.older.iter().map(|f| &*f.screen));
+        let screens =
+            std::iter::once(&*s.link.current.screen).chain(s.link.older.iter().map(|f| &*f.screen));
         let distinct = TerminalScreen::distinct_cells(screens);
         assert!(
             distinct <= (usize::from(rows) + 2 * FRAME_WINDOW) * usize::from(cols),
@@ -1376,7 +1496,7 @@ mod tests {
         assert_eq!(told.background, Some([0xff, 0xff, 0xff]));
         assert_eq!(told.scheme, Some(WireScheme::Light));
         assert_eq!(told.palette.get(1), Some(&Some([0xcd, 0, 0])));
-        assert_eq!(s.colours().as_ref(), Some(told));
+        assert_eq!(s.colours.as_ref(), Some(told));
         // Not told, nothing is asked or sent.
         let (now, mut s) = start();
         s.set_colours(None);
@@ -1476,5 +1596,211 @@ mod tests {
             "after the hold, kernel echo is predicted again"
         );
         assert!(!s.overlay().cells().any(|(_, c)| c.glyph == "Q"));
+    }
+
+    /// `Ctrl-^`, a focus-in report, then `.`: the focus-in takes the prefix and the `.` is typed,
+    /// whether the link is up or went down between the keys; and a prefix typed before a drop
+    /// with `.` after it quits.
+    #[test]
+    fn the_escape_decides_the_same_across_a_link_drop() {
+        let (now, mut up) = start();
+        let connected = up.on_input(now, b"\x1e\x1b[I.");
+        assert_eq!(connected, InputOutcome::Forwarded);
+        let (now, mut s) = start();
+        s.on_input(now, &[ESCAPE_PREFIX]);
+        s.detach(now);
+        assert_eq!(s.on_input(now, b"\x1b[I."), connected);
+        let (now, mut s) = start();
+        s.on_input(now, &[ESCAPE_PREFIX]);
+        s.detach(now);
+        s.attach(now, Size::new(24, 80));
+        assert_eq!(s.on_input(now, b"."), InputOutcome::Quit);
+    }
+
+    /// The next connection is told the window size and the colours; what was typed and not sent
+    /// is dropped, and the status line says so; what was meant for the lost connection alone is
+    /// not sent either.
+    #[test]
+    fn input_typed_while_detached_is_dropped_at_the_attach() {
+        let (now, mut s) = start();
+        s.set_colours(Some(WireColours {
+            background: Some([1, 2, 3]),
+            ..WireColours::default()
+        }));
+        s.on_input(now, b"a");
+        drain(&mut s);
+        // The key sent is confirmed; the one queued is probed for, and a resync asked: both for
+        // this connection only.
+        s.on_frame(now, &frame(1, 0, 1, &screen(b""), &screen(b"a")));
+        s.on_input(now, b"b");
+        s.on_tick(now + Duration::from_secs(5), None);
+        s.on_frame(now, &frame(5, 4, 1, &screen(b""), &screen(b"")));
+        assert!(
+            s.outgoing
+                .iter()
+                .any(|m| matches!(m, ClientMsg::Ack { .. }))
+                && s.outgoing.iter().any(|m| matches!(m, ClientMsg::Resync)),
+            "{:?}",
+            s.outgoing
+        );
+        s.detach(now);
+        let status = s.on_tick(now + Duration::from_secs(2), None).status;
+        assert!(
+            status.is_some_and(|b| b.contains("reconnecting… 2s")),
+            "the banner says the link is down"
+        );
+        s.on_input(now, b"c");
+        s.on_resize(Size::new(30, 90));
+        s.attach(now, Size::new(40, 100));
+        let sent = drain(&mut s);
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [
+                    ClientMsg::Resize(Size {
+                        rows: 40,
+                        cols: 100
+                    }),
+                    ClientMsg::Colours(_),
+                ]
+            ),
+            "{sent:?}"
+        );
+        let status = s.on_tick(now, None).status.expect("a notice");
+        assert!(status.contains("not sent"), "{status}");
+        // Nothing the dead link swallowed is probed for on the new one.
+        s.on_tick(now + Duration::from_secs(10), None);
+        assert_eq!(drain(&mut s), []);
+        // Until the new connection's first frame, the shell it reached is not known: typing is
+        // not sent. After it, it goes out.
+        s.on_input(now, b"d");
+        assert_eq!(drain(&mut s), [], "not before the first frame");
+        s.on_frame(
+            now,
+            &frame(1, 0, 1, &TerminalScreen::default(), &screen(b"")),
+        );
+        drain(&mut s);
+        s.on_input(now, b"e");
+        assert_eq!(
+            typed(&drain(&mut s)),
+            b"e",
+            "typing after the first frame goes out"
+        );
+    }
+
+    /// Input handed to the lost connection and never confirmed may not have arrived: the status
+    /// line says so at the attach, though nothing was typed during the outage.
+    #[test]
+    fn an_unconfirmed_send_at_the_drop_is_said_at_the_attach() {
+        let (now, mut s) = start();
+        s.on_input(now, b"false && ");
+        drain(&mut s);
+        s.detach(now);
+        s.attach(now, Size::new(24, 80));
+        let status = s.on_tick(now, None).status.expect("a notice");
+        assert!(status.contains("may not have arrived"), "{status}");
+    }
+
+    /// A focus report or the mouse during an outage is not typing: no notice says it was not sent.
+    #[test]
+    fn a_focus_report_during_an_outage_is_not_called_typing() {
+        let (now, mut s) = start();
+        s.detach(now);
+        s.on_inputs(now, vec![Input::FocusIn]);
+        let status = s.on_tick(now, None).status.expect("the banner");
+        assert!(!status.contains("not sent"), "{status}");
+    }
+
+    /// Across a reattach the last screen stays up until the server repaints it, and the
+    /// scrollback view stays open.
+    #[test]
+    fn a_reattach_keeps_the_screen_and_the_scrollback_view() {
+        let (now, mut s) = start();
+        s.on_frame(
+            now,
+            &frame(9, 0, 0, &TerminalScreen::default(), &screen(b"kept")),
+        );
+        s.scrollback.on_mark(crate::terminal::HistoryMark {
+            newest: 1000,
+            len: 100,
+        });
+        s.on_input(now, &[ESCAPE_PREFIX, SCROLLBACK_KEY]);
+        s.detach(now);
+        s.attach(now, Size::new(24, 80));
+        assert!(s.view().is_some(), "the view is still open");
+        assert!(s.screen().contents().contains("kept"));
+        assert!(!s.synced(), "not the new connection's screen yet");
+        s.on_frame(
+            now,
+            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"new")),
+        );
+        assert!(s.synced() && s.screen().contents().contains("new"));
+    }
+
+    /// A line typed across the drop: its start went out on the lost connection unconfirmed, so
+    /// its end, typed while down, is not sent on the next (it would run without its start), and
+    /// the status line says so. Typing after the reattach goes out as ever.
+    #[test]
+    fn input_after_an_unconfirmed_send_is_not_sent_after_the_attach() {
+        let (now, mut s) = start();
+        s.on_input(now, b"false && ");
+        drain(&mut s);
+        s.detach(now);
+        s.on_input(now, b"rm -rf *\r");
+        s.attach(now, Size::new(24, 80));
+        let sent = drain(&mut s);
+        assert!(
+            matches!(sent.as_slice(), [ClientMsg::Resize(_)]),
+            "the tail is not sent: {sent:?}"
+        );
+        let status = s.on_tick(now, None).status.expect("a notice");
+        assert!(status.contains("not sent"), "{status}");
+        s.on_frame(
+            now,
+            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
+        );
+        drain(&mut s);
+        s.on_input(now, b"x");
+        assert_eq!(typed(&drain(&mut s)), b"x");
+    }
+
+    /// While down, the banner still says that typing is paused, and a notice given meanwhile.
+    #[test]
+    fn the_banner_carries_a_pause_and_a_notice() {
+        let (now, mut s) = start();
+        s.detach(now);
+        s.on_input(now, b"\x1b[200~");
+        s.on_inputs(now, vec![Input::PasteTooLong]);
+        let status = s.on_tick(now, None).status.expect("the banner");
+        assert!(
+            status.contains("reconnecting") && status.contains("paste over 1 MiB"),
+            "{status}"
+        );
+        s.input_paused = true;
+        let status = s.on_tick(now, None).status.expect("the banner");
+        assert!(status.contains("input paused"), "{status}");
+    }
+
+    /// Trust in predictions is the drop's: a resize while down (which voids the predictions)
+    /// does not take it away, and an untrusted session gains none from an outage.
+    #[test]
+    fn prediction_trust_is_taken_at_the_drop() {
+        let (now, mut s) = start();
+        s.detach(now);
+        s.attach(now, Size::new(24, 80));
+        assert!(
+            !s.predictor.carries_trust(),
+            "a session never confirmed carries no trust"
+        );
+        let (now, mut s) = start();
+        s.predictor.confirm_for_tests();
+        s.detach(now);
+        s.on_resize(Size::new(30, 90));
+        s.on_input(now, b"abc");
+        s.attach(now, Size::new(30, 90));
+        assert!(
+            s.predictor.carries_trust(),
+            "trust at the drop is carried across the outage"
+        );
     }
 }

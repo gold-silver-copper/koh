@@ -328,7 +328,20 @@ The reconnect is **automatic and in-process**: the client doesn't exit when the 
 outage (e.g. a phone screen-off — Android freezes the process, so QUIC keepalives stop) is ridden
 out on the same connection thanks to a 5-minute connection idle timeout. A longer outage times the
 connection out; the client then transparently re-dials and reattaches to the same server session,
-holding the last screen under a `reconnecting…` banner in the meantime. A **wall-clock freeze
+holding the last screen under a `reconnecting…` banner in the meantime. One `ClientSession` lives
+for the whole run and one loop drives it, connected or not: only what belongs to a connection (its
+frames, echo-ack and acknowledgements) is dropped (`detach`) and made anew (`attach`), so the
+escape keys, the scrollback view, the window size and the colours work during the outage and carry
+across it. Typed input does not: what is typed while the link is down (and the banner stays up until
+the new connection's first frame shows which shell it reached) is not taken (nor predicted), what was not yet
+sent when the connection is made anew is dropped, and the status line says so; it also says when
+input handed to the lost connection was never confirmed, as what follows may run without it. A reattach may land on a new shell (the session expired, the shell
+exited, or the server restarted), which the client cannot tell from its own (the server's
+`AttachKind` is not on the wire), and keys typed at the old screen must not run there; nor may the
+end of a line whose start was lost with the link run alone (`false && rm …` typed across the drop
+must not run `rm …`). Sending them would take the session's identity on the wire. The history rows
+held are the server session's too, so `attach` drops them and the new connection's frames say the
+history again. A **wall-clock freeze
 detector** turns a multi-minute wake-up hang into a ~1–2 s reattach: if real time jumps more than
 20 s between two (≤50 ms-cadence) loop iterations, the client concludes the process was suspended,
 drops the (almost certainly dead) connection, and re-dials immediately. The first iteration
@@ -359,11 +372,11 @@ launches sessions; `__launch`'s interface is fixed for the same reason. Two conn
 same peer can briefly share it, when a reconnect races the old connection's teardown, so the
 per-connection state never lives in the session:
 
-- **Echo-ack is per connection.** Input sequence numbers are per connection, so the input
-  history and the 50 ms debounce live in the per-connection `ServerConn` (`server::EchoAck`), not
-  in the session, and each frame carries its connection's own echo-ack. A session-global ack would
-  hand one connection another's numbers, and its predictor would treat every keystroke as already
-  acked.
+- **Echo-ack is per connection.** Input sequence numbers are the client's (one client's rise
+  across its reconnects; two clients' have nothing in common), so the input history and the 50 ms
+  debounce live in the per-connection `ServerConn` (`server::EchoAck`), not in the session, and
+  each frame carries its connection's own echo-ack. A session-global ack would hand one
+  connection another's numbers, and its predictor would treat every keystroke as already acked.
 - **A change wakes every connection.** The session task publishes each new screen on a
   `tokio::sync::watch`; each connection holds a receiver and `select!`s on it. Every connection
   wakes on one change; a burst coalesces into the latest screen; and a change landing between a

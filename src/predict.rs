@@ -298,15 +298,16 @@ impl PredictionEngine {
         }
     }
 
-    /// Whether the newest epoch is confirmed: typing is being shown as it is predicted.
-    pub fn trusted(&self) -> bool {
-        self.prediction_epoch == self.confirmed_epoch
-    }
-
-    /// Start trusting as the last connection to the same session did, once a frame shows the PTY
-    /// is not at a password prompt ([`set_tty`](Self::set_tty)).
-    pub fn carry_trust(&mut self) {
-        self.carried = true;
+    /// A fresh engine for a reconnect to the same session: the same preference, and, if typing
+    /// was being shown as it was predicted (or trust was carried here and not yet given), trust
+    /// from the first key once a frame shows the PTY is not at a password prompt
+    /// ([`set_tty`](Self::set_tty)). Taken at the drop and again at the reattach, the trust is
+    /// the drop's: nothing between confirms an epoch, so nothing typed then can add to it.
+    #[must_use]
+    pub fn reattached(&self) -> Self {
+        let mut fresh = Self::new(self.pref);
+        fresh.carried = self.carried || self.prediction_epoch == self.confirmed_epoch;
+        fresh
     }
 
     /// How the program's PTY takes typed keys, as a frame said.
@@ -426,6 +427,16 @@ impl PredictionEngine {
     #[cfg(test)]
     pub fn confirmed_epoch(&self) -> u64 {
         self.confirmed_epoch
+    }
+    /// Whether trust carried from a lost connection waits to be given. Test-only.
+    #[cfg(test)]
+    pub(crate) const fn carries_trust(&self) -> bool {
+        self.carried
+    }
+    /// Confirm the newest epoch, as an echo would. Test-only.
+    #[cfg(test)]
+    pub(crate) fn confirm_for_tests(&mut self) {
+        self.confirmed_epoch = self.prediction_epoch;
     }
     /// The newest local input frame number sent so far (predictions expire at this + 1).
     pub fn set_local_frame_sent(&mut self, n: u64) {
@@ -1969,7 +1980,7 @@ mod tests {
     fn editor_on(bytes: &[u8]) -> (PredictionEngine, Screen) {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         let screen = screen_of(bytes);
-        e.carry_trust();
+        e.carried = true;
         e.set_tty(Some(TtyModes {
             echo: false,
             line: false,
@@ -2094,7 +2105,7 @@ mod tests {
         assert!(e.cells.is_empty(), "nothing even kept");
         // Carried trust is not given at one either.
         let mut fresh = PredictionEngine::new(DisplayPreference::Always);
-        fresh.carry_trust();
+        fresh.carried = true;
         fresh.set_tty(Some(TtyModes {
             echo: false,
             line: true,

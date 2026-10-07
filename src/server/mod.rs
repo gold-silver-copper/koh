@@ -1473,6 +1473,34 @@ mod tests {
     }
 
     #[test]
+    fn a_delivery_of_a_frame_sent_before_a_resync_does_not_undo_it() {
+        // The client refused frame 2 (it lacked base 1) and asked for a Resync; QUIC then reports
+        // frame 2 delivered, after the Resync was read. The client never held frame 2, so the next
+        // frame must still be on the blank screen.
+        let t0 = Instant::now();
+        let later = |n| t0 + Duration::from_secs(n);
+        let mut c = ServerConn::default();
+        c.install_snapshot(Arc::new(screen(b"a")), true);
+        c.poll_frame(t0, None).unwrap();
+        c.ack(FrameNum(1), later(1));
+        c.install_snapshot(Arc::new(screen(b"a b")), true);
+        let two = c.poll_frame(later(2), None).unwrap();
+        assert_eq!(two.base, FrameNum(1));
+        c.push_client_bytes(&stream(&[ClientMsg::Resync]));
+        c.drain_client(later(3), false).unwrap();
+        c.ack(FrameNum(2), later(3));
+        c.install_snapshot(Arc::new(screen(b"a b c")), true);
+        let next = c
+            .poll_frame(later(4), None)
+            .expect("a resync forces a frame");
+        assert_eq!(
+            next.base,
+            FrameNum::BLANK,
+            "a frame on a base the client threw away"
+        );
+    }
+
+    #[test]
     fn only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored() {
         let t0 = Instant::now();
         let mut c = ServerConn::default();

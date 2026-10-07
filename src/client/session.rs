@@ -1129,6 +1129,21 @@ mod tests {
     }
 
     #[test]
+    fn each_unheld_base_asks_for_a_resync_once() {
+        // The server took a refused frame's delivery as its acknowledgement and diffs against it:
+        // a frame on that base is refused too, and must ask again, or the session freezes.
+        let (now, mut s) = start();
+        drain(&mut s);
+        let one = screen(b"one");
+        s.on_frame(now, &frame(4, 3, 0, &one, &one));
+        s.on_frame(now, &frame(5, 3, 0, &one, &one));
+        assert_eq!(drain(&mut s), [ClientMsg::Resync], "one per base");
+        s.on_frame(now, &frame(6, 5, 0, &one, &one));
+        assert_eq!(drain(&mut s), [ClientMsg::Resync], "a new base asks again");
+        assert!(!s.synced());
+    }
+
+    #[test]
     fn only_the_last_frames_are_kept_as_bases() {
         let (now, mut s) = start();
         let mut prev = TerminalScreen::default();

@@ -846,6 +846,10 @@ impl PredictionEngine {
     /// legacy terminal's bytes for it decode to, whatever the user's terminal sent: `Alt-B` from
     /// a kitty-protocol terminal is `Alt-B` too. Each key is read alone ([`edit_of`]): what was
     /// typed before it never changes what it is.
+    ///
+    /// This reads no state of its own and keeps none: a rule that looks at the key before (an
+    /// Escape then `b` taken as `Alt-B`) brings back the escape decoder the client already runs.
+    /// `key_reparse_tests::a_key_after_any_keys_is_its_edit_alone` pins it.
     pub fn new_user_key(&mut self, press: KeyPress, screen: &dyn ScreenView) {
         self.input(edit_of(press), screen);
     }
@@ -2094,5 +2098,127 @@ mod key_reparse_tests {
             e.cells.get(&(0, 11)).is_some_and(|c| c.glyph == "b"),
             "'b' typed after a focus event is not predicted as a 'b' glyph at the cursor"
         );
+    }
+
+    /// Escape, then `b`, typed as two keys with nothing between, is not Alt-B: the cursor does
+    /// not go back to the start of the word, and the `b` is typed.
+    #[test]
+    fn escape_then_b_as_two_keys_is_not_alt_b() {
+        let (mut e, screen) = editor_on(b"$ make test");
+        e.new_user_key(KeyPress::plain(Key::Escape), &screen);
+        e.new_user_key(key('b'), &screen);
+        let predicted_cursor = e.cursor.as_ref().map(|c| (c.row, c.col));
+        assert_ne!(
+            predicted_cursor,
+            Some((0, 7)),
+            "Escape then 'b' was predicted as Alt-B (word motion)"
+        );
+        assert!(
+            e.cells.get(&(0, 11)).is_some_and(|c| c.glyph == "b"),
+            "'b' typed after Escape is not predicted as a 'b' glyph at the cursor"
+        );
+    }
+
+    /// Escape, then Backspace, typed as two keys, deletes one character, not the word.
+    #[test]
+    fn escape_then_backspace_as_two_keys_deletes_one_character() {
+        let (mut e, screen) = editor_on(b"$ make test");
+        e.new_user_key(KeyPress::plain(Key::Escape), &screen);
+        e.new_user_key(KeyPress::plain(Key::Backspace), &screen);
+        let predicted_cursor = e.cursor.as_ref().map(|c| (c.row, c.col));
+        assert_eq!(
+            predicted_cursor,
+            Some((0, 10)),
+            "Escape then Backspace did not delete exactly one character"
+        );
+    }
+
+    /// The engine's state, every field a prediction depends on, as text to compare.
+    fn state(e: &PredictionEngine) -> String {
+        let cursor = e
+            .cursor
+            .as_ref()
+            .map(|c| (c.row, c.col, c.tentative_epoch, c.expiration_frame));
+        let cells: Vec<_> = e
+            .cells
+            .iter()
+            .map(|(at, c)| {
+                (
+                    *at,
+                    c.glyph.clone(),
+                    c.unknown,
+                    c.wide,
+                    c.covered,
+                    c.tentative_epoch,
+                    c.expiration_frame,
+                    c.original_contents.clone(),
+                )
+            })
+            .collect();
+        format!(
+            "{cursor:?} {cells:?} {} {} {:?} {:?} {}",
+            e.prediction_epoch, e.confirmed_epoch, e.held_through, e.input_start, e.fresh_line
+        )
+    }
+
+    /// A key typed after any keys (Escape among them) and other input does what its edit alone
+    /// does: [`PredictionEngine::new_user_key`] keeps nothing from one key to the next. Every
+    /// sequence of up to two inputs, then every key, from a set holding each key of a legacy
+    /// escape sequence (`ESC b`, `ESC DEL`, `ESC O D`, `ESC [ C`).
+    #[test]
+    fn a_key_after_any_keys_is_its_edit_alone() {
+        let alt = |c| KeyPress {
+            key: Key::Char(c),
+            mods: Modifiers {
+                ctrl: false,
+                alt: true,
+                shift: false,
+            },
+        };
+        let keys = [
+            Some(KeyPress::plain(Key::Escape)),
+            Some(key('b')),
+            Some(key('f')),
+            Some(key('O')),
+            Some(key('D')),
+            Some(key('[')),
+            Some(key('C')),
+            Some(key('\u{1b}')),
+            Some(key('\u{7f}')),
+            Some(KeyPress::plain(Key::Backspace)),
+            Some(KeyPress::plain(Key::Enter)),
+            Some(KeyPress::plain(Key::Arrow(Direction::Left))),
+            Some(alt('b')),
+            Some(alt('[')),
+            Some(alt('O')),
+            None,
+        ];
+        let prefixes = std::iter::once(Vec::new())
+            .chain(keys.iter().map(|a| vec![*a]))
+            .chain(
+                keys.iter()
+                    .flat_map(|a| keys.iter().map(move |b| vec![*a, *b])),
+            );
+        for prefix in prefixes {
+            for last in keys.iter().flatten() {
+                let (mut read, screen) = editor_on(b"$ make test");
+                let (mut alone, _) = editor_on(b"$ make test");
+                for e in [&mut read, &mut alone] {
+                    for input in &prefix {
+                        match input {
+                            Some(press) => e.new_user_key(*press, &screen),
+                            None => e.new_user_other(&screen),
+                        }
+                    }
+                }
+                read.new_user_key(*last, &screen);
+                alone.input(edit_of(*last), &screen);
+                assert_eq!(
+                    state(&read),
+                    state(&alone),
+                    "{last:?} after {prefix:?} is not what its edit alone does"
+                );
+            }
+        }
     }
 }

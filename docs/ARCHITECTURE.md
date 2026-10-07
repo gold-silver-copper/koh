@@ -386,7 +386,10 @@ per-connection state never lives in the session:
   attachment: the session counts its clients as its `watch` sender's receivers, so dropping one
   (on return **or** panic) detaches with no message to lose, and a panicking connection can't pin
   a session. The session starts the TTL when the last receiver drops; it tears itself down at the
-  TTL or once its shell exits. The registry's `Sessions` forgets a session only once its task has
+  TTL or once its shell has exited and no client is left. Its life is one `Phase` (attached,
+  detached since when, exited), and an exited session is never reattached, even while an old
+  client still holds on. A connection's final frame is the first one whose screen carries the exit
+  code. The registry's `Sessions` forgets a session only once its task has
   ended (its control channel is closed), so a late end cannot unregister the session that replaced
   it, and its shutdown ends every session, attached or not, and waits for their tasks.
 - **The bell hook.** `--on-bell <cmd>` / `ConnectConfig::bell_command` runs `sh -c` when

@@ -898,6 +898,20 @@ mod tests {
     }
 
     #[test]
+    fn escape_quit_and_the_session_agree_on_a_prefix_then_focus_in() {
+        // `Ctrl-^`, then a focus-in report, then '.': connected, the focus-in consumes the
+        // prefix and the '.' is typed; reconnecting must decide the same.
+        let bytes = b"\x1e\x1b[I.";
+        let mut s = ClientSession::new(DisplayPreference::Always, Size::new(24, 80));
+        let session_quits = s.on_input(Instant::now(), bytes) == session::InputOutcome::Quit;
+        let reconnect_quits = escape_quit(bytes, &mut Decoder::default(), &mut false);
+        assert_eq!(
+            reconnect_quits, session_quits,
+            "escape_quit quits={reconnect_quits}, ClientSession quits={session_quits}"
+        );
+    }
+
+    #[test]
     fn reconnect_backoff_grows_then_caps() {
         // 1-based attempts: 1s, 2s, 4s, 8s, then capped at 8s — never below base, never above max.
         assert_eq!(backoff(1), Duration::from_secs(1));

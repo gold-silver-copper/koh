@@ -279,7 +279,8 @@ fn a_forced_mid_session_drop_reconnects_to_the_same_shell() {
                 .is_some());
             // Kill the connection without closing the session; the client should re-dial.
             client.drop_first_connection();
-            // Retype until the reattached session runs it (input during the reconnect is dropped).
+            // Retype until the reattached session runs it: what is typed as the link drops, before
+            // the client notices, may go out on the dead connection and be lost.
             let mut ran = false;
             for _ in 0..150 {
                 let _ = client.send(b"echo MARK_T''WO\r").await;
@@ -432,26 +433,111 @@ fn a_freeze_between_dialing_and_the_loop_still_reconnects() {
                 client.first_connection_closes(Duration::from_secs(5)).await,
                 "the client must drop the connection it held through the freeze"
             );
-            // And the session goes on over the new one (retyped: input during the reconnect is
-            // dropped).
-            let mut ran = false;
-            for _ in 0..75 {
-                let _ = client.send(b"echo AFTER''_FREEZE\r").await;
-                if client
-                    .wait_until(Duration::from_millis(200), |t| t.contains("AFTER_FREEZE"))
-                    .await
-                    .is_some()
-                {
-                    ran = true;
-                    break;
-                }
-            }
+            // And the session goes on over the new one: what is typed now, with the old one
+            // dropped, waits for it.
+            client.send(b"echo AFTER''_FREEZE\r").await.expect("type");
             assert!(
-                ran,
+                client
+                    .wait_until(Duration::from_secs(15), |t| t.contains("AFTER_FREEZE"))
+                    .await
+                    .is_some(),
                 "the reconnected client must reach the shell:\n{}",
                 client.screen()
             );
             let _ = client.finish().await;
+            server.stop().await;
+        });
+}
+
+/// Whether the client is painting its "reconnecting" banner.
+fn reconnecting(painted: &crate::harness::Painted) -> bool {
+    painted
+        .status
+        .as_deref()
+        .is_some_and(|status| status.contains("reconnecting"))
+}
+
+/// A line typed while the link is down is the user's input like any other: once the client is
+/// back on the session, the shell runs it. (mosh queues input in every network state.)
+#[test]
+fn a_line_typed_during_an_outage_runs_after_the_reattach() {
+    crate::harness::runtime()
+        .expect("tokio runtime")
+        .block_on(async {
+            let net = clean();
+            let secret = identity().expect("OS randomness");
+            let server = Server::start(&net, &[secret.public()], &["sh"])
+                .await
+                .expect("start the server");
+            let endpoint = net.endpoint(secret, false).await.expect("bind the client");
+            let mut client = Client::connect_on(endpoint, server.id, Options::default())
+                .await
+                .expect("connect");
+            client.send(b"echo READY''_ONE\r").await.expect("type");
+            assert!(client
+                .wait_until(WAIT, |t| t.contains("READY_ONE"))
+                .await
+                .is_some());
+            // The link goes down for a while; the client notices and shows its banner.
+            net.black_hole(Duration::from_secs(4));
+            client.drop_first_connection();
+            assert!(
+                client.wait_for(WAIT, reconnecting).await.is_some(),
+                "the client must show the reconnecting banner"
+            );
+            // The user types a line while the banner is up, once.
+            client.send(b"echo TYPED''_OFFLINE\r").await.expect("type");
+            // Once the client is back on the session, the shell runs it.
+            assert!(
+                client
+                    .wait_until(Duration::from_secs(20), |t| t.contains("TYPED_OFFLINE"))
+                    .await
+                    .is_some(),
+                "the line typed during the outage was dropped; screen:\n{}",
+                client.screen()
+            );
+            let _ = client.finish().await;
+            server.stop().await;
+        });
+}
+
+/// `Ctrl-^ .` quits however the two keys fall around a link drop: the prefix typed while
+/// connected and the `.` typed at the reconnecting banner is still the quit escape.
+#[test]
+fn an_escape_split_across_a_link_drop_still_quits() {
+    crate::harness::runtime()
+        .expect("tokio runtime")
+        .block_on(async {
+            let net = clean();
+            let secret = identity().expect("OS randomness");
+            let server = Server::start(&net, &[secret.public()], &["sh"])
+                .await
+                .expect("start the server");
+            let endpoint = net.endpoint(secret, false).await.expect("bind the client");
+            let mut client = Client::connect_on(endpoint, server.id, Options::default())
+                .await
+                .expect("connect");
+            client.send(b"echo READY''_TWO\r").await.expect("type");
+            assert!(client
+                .wait_until(WAIT, |t| t.contains("READY_TWO"))
+                .await
+                .is_some());
+            // The prefix, while connected; give the client a moment to take it.
+            client.send(&[0x1e]).await.expect("type the prefix");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // The link drops (and stays down), then the '.'.
+            net.black_hole(Duration::from_secs(6));
+            client.drop_first_connection();
+            assert!(
+                client.wait_for(WAIT, reconnecting).await.is_some(),
+                "the client must show the reconnecting banner"
+            );
+            client.send(b".").await.expect("type the dot");
+            let result = client.exit(Duration::from_secs(3)).await;
+            assert!(
+                matches!(result, Some(Ok(None))),
+                "Ctrl-^ (before the drop) . (during the reconnect) must quit; got {result:?}"
+            );
             server.stop().await;
         });
 }

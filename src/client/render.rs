@@ -888,6 +888,7 @@ mod tests {
     use super::*;
     use crate::client::backend::CaptureBackend;
     use crate::predict::{DisplayPreference, PredictedCell, PredictionEngine};
+    use fux_vt::keys::KeyPress;
 
     fn screen_of(bytes: &[u8]) -> Grid {
         crate::terminal::TerminalScreen::from_bytes(24, 80, bytes)
@@ -1542,7 +1543,7 @@ mod tests {
         let mut emu = crate::terminal::ServerTerminal::new(6, 20, 0).unwrap();
         let mut engine = PredictionEngine::new(DisplayPreference::Always);
         engine.set_local_frame_sent(0);
-        engine.new_user_byte(b'>', emu.snapshot().screen());
+        engine.new_user_key(KeyPress::char('>'), emu.snapshot().screen());
         emu.process(b">");
         engine.set_local_frame_late_acked(1);
         engine.cull(emu.snapshot().screen());
@@ -1558,8 +1559,8 @@ mod tests {
             &Overlay::empty(),
         );
         engine.set_local_frame_sent(1);
-        for &byte in typed.as_bytes() {
-            engine.new_user_byte(byte, screen.screen());
+        for c in typed.chars() {
+            engine.new_user_key(KeyPress::char(c), screen.screen());
         }
         let overlay = engine.overlay();
         assert!(overlay.cells().count() > 0, "{typed:?} is predicted");
@@ -1998,13 +1999,13 @@ mod tests {
         let mut pe = PredictionEngine::new(DisplayPreference::Always);
         pe.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        pe.new_user_byte(b'a', &blank); // hidden (epoch 1, unconfirmed)
+        pe.new_user_key(KeyPress::char('a'), &blank); // hidden (epoch 1, unconfirmed)
         let echoed = screen_of(b"a");
         pe.set_local_frame_late_acked(1);
         pe.cull(&echoed); // confirms -> confirmed_epoch = 1
 
         pe.set_local_frame_sent(1);
-        pe.new_user_byte(b'Z', &echoed); // now visible at (0,1)
+        pe.new_user_key(KeyPress::char('Z'), &echoed); // now visible at (0,1)
         let overlay = pe.overlay();
         assert!(
             !overlay.is_empty(),

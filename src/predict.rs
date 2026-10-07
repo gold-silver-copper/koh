@@ -1281,6 +1281,7 @@ fn cursor_validity(cur: &PredCursor, screen: &dyn ScreenView, late_acked: u64) -
 mod tests {
     use super::*;
 
+    use fux_vt::keys::decode::{Decoder, Input};
     use fux_vt::Screen;
 
     impl ScreenView for Screen {
@@ -1299,6 +1300,25 @@ mod tests {
                 wide: c.is_wide(),
                 continuation: c.is_wide_continuation(),
             })
+        }
+    }
+
+    /// Type `bytes` into `e` over `screen`, read as the keys and other input they decode to.
+    fn type_bytes(e: &mut PredictionEngine, screen: &dyn ScreenView, bytes: &[u8]) {
+        let mut decoder = Decoder::default();
+        let mut input = Vec::new();
+        decoder.bytes(bytes, &mut input);
+        decoder.timeout(&mut input);
+        for input in input {
+            match input {
+                Input::Key(key) => e.new_user_key(key.press, screen),
+                Input::Paste(_)
+                | Input::PasteTooLong
+                | Input::FocusIn
+                | Input::FocusOut
+                | Input::Mouse(_)
+                | Input::Reply(_) => e.new_user_other(screen),
+            }
         }
     }
 
@@ -1354,7 +1374,7 @@ mod tests {
         };
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
-        e.new_user_byte(b'x', &blank);
+        type_bytes(&mut e, &blank, b"x");
         assert!(e.overlay().is_empty(), "hidden until confirmed");
         let mut echoed = FakeView {
             rows: vec![vec![' '; 10]; 5],
@@ -1365,7 +1385,7 @@ mod tests {
         e.cull(&echoed);
         assert_eq!(e.confirmed_epoch(), 1, "the echoed 'x' confirms the epoch");
         e.set_local_frame_sent(1);
-        e.new_user_byte(b'y', &echoed);
+        type_bytes(&mut e, &echoed, b"y");
         let ov = e.overlay();
         assert_eq!(
             ov.cell(0, 1).map(|c| c.glyph),
@@ -1487,8 +1507,8 @@ mod tests {
             // Everything shown: the check is on what the overlay holds, not on when it confirms.
             e.confirmed_epoch = u64::MAX;
             e.set_local_frame_sent(0);
-            for byte in bytes.concat() {
-                e.new_user_byte(byte, &screen);
+            for key in bytes {
+                type_bytes(&mut e, &screen, key);
                 let ov = e.overlay();
                 for ((row, col), cell) in ov.cells() {
                     let left = col.checked_sub(1).and_then(|left| ov.cell(row, left));
@@ -1516,7 +1536,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        e.new_user_byte(b'x', &blank);
+        type_bytes(&mut e, &blank, b"x");
         assert!(
             e.overlay().is_empty(),
             "the very first keystroke must be hidden until the server confirms it echoes"
@@ -1534,9 +1554,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        for &b in b"hunter2" {
-            e.new_user_byte(b, &blank);
-        }
+        type_bytes(&mut e, &blank, b"hunter2");
         assert!(
             e.overlay().is_empty(),
             "predictions must stay hidden until the server confirms it echoes"
@@ -1548,7 +1566,7 @@ mod tests {
         // After the server proves it echoes (one Correct), later typing in the confirmed epoch shows.
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
-        e.new_user_byte(b'y', &echoed); // cursor now at (0,1)
+        type_bytes(&mut e, &echoed, b"y"); // cursor now at (0,1)
         let ov = e.overlay();
         assert_eq!(
             ov.cell(0, 1).map(|c| c.glyph),
@@ -1563,7 +1581,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        e.new_user_byte(b's', &blank);
+        type_bytes(&mut e, &blank, b"s");
         assert!(e.overlay().is_empty(), "non-echoed input is never shown");
 
         let still_blank = screen_of(b"");
@@ -1579,7 +1597,7 @@ mod tests {
     fn never_mode_predicts_nothing() {
         let mut e = PredictionEngine::new(DisplayPreference::Never);
         let screen = screen_of(b"");
-        e.new_user_byte(b'x', &screen);
+        type_bytes(&mut e, &screen, b"x");
         assert!(e.overlay().is_empty());
     }
 
@@ -1591,7 +1609,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of(b"ab\x1b[1;2H"); // cursor -> row1 col2 = (0,1)
-        e.new_user_byte(b'X', &screen);
+        type_bytes(&mut e, &screen, b"X");
         assert_eq!(
             e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
             Some("X"),
@@ -1612,7 +1630,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of(b"abc\x1b[1;3H"); // cursor -> (0,2)
-        e.new_user_byte(0x7f, &screen); // backspace
+        type_bytes(&mut e, &screen, &[0x7f]); // backspace
         let (_, cols) = screen.size();
         assert_eq!(
             e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
@@ -1649,8 +1667,8 @@ mod tests {
             row: 0,
             col: u16::MAX - 1,
         });
-        e.new_user_byte(0x7f, p.screen()); // backspace — must not panic
-                                           // The two right-edge columns are unknown (mosh's `i + 2 >= width`), with no `i + 1` read.
+        type_bytes(&mut e, p.screen(), &[0x7f]); // backspace — must not panic
+                                                 // The two right-edge columns are unknown (mosh's `i + 2 >= width`), with no `i + 1` read.
         assert!(
             e.cells.get(&(0, u16::MAX - 1)).is_some_and(|c| c.unknown),
             "last column unknown at max width"
@@ -1670,7 +1688,7 @@ mod tests {
         e.set_local_frame_sent(0);
         // Confirm an initial keystroke so later predictions are in a shown epoch.
         let blank = screen_of(b"");
-        e.new_user_byte(b'a', &blank);
+        type_bytes(&mut e, &blank, b"a");
         let echoed = screen_of(b"a");
         e.set_local_frame_late_acked(1);
         e.cull(&echoed); // confirmed_epoch = 1
@@ -1678,9 +1696,9 @@ mod tests {
         // Type "bc": 'b' on frame 2 (will be confirmed), 'c' on frame 3 (stays pending), so 'c'
         // survives the cull where 'b' confirms — and can be recolored.
         e.set_local_frame_sent(1);
-        e.new_user_byte(b'b', &echoed);
+        type_bytes(&mut e, &echoed, b"b");
         e.set_local_frame_sent(2);
-        e.new_user_byte(b'c', &echoed);
+        type_bytes(&mut e, &echoed, b"c");
         assert_eq!(
             e.cells.get(&(0, 2)).map(|c| c.fg),
             Some(Color::Default),
@@ -1763,9 +1781,7 @@ mod tests {
         // column left and must NOT leave literal '[' / 'D' glyphs from the escape bytes.
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
-        for &b in b"\x1b[D" {
-            e.new_user_byte(b, &echoed); // ESC [ D
-        }
+        type_bytes(&mut e, &echoed, b"\x1b[D");
         let ov = e.overlay();
         assert_eq!(
             ov.cursor(),
@@ -1783,9 +1799,7 @@ mod tests {
         // Application-cursor-mode arrow: ESC O D must behave like ESC [ D.
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
-        for &b in b"\x1bOD" {
-            e.new_user_byte(b, &echoed); // ESC O D
-        }
+        type_bytes(&mut e, &echoed, b"\x1bOD");
         assert_eq!(e.overlay().cursor(), Some((0, 0)));
     }
 
@@ -1796,9 +1810,7 @@ mod tests {
         // (and no stray glyph in the continuation cell).
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
-        for &b in "世".as_bytes() {
-            e.new_user_byte(b, &echoed); // cursor seeds from the real screen at (0,1)
-        }
+        type_bytes(&mut e, &echoed, "世".as_bytes());
         let ov = e.overlay();
         assert_eq!(
             ov.cell(0, 1).map(|c| c.glyph),
@@ -1842,7 +1854,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of("a本b\x1b[1;1H".as_bytes());
-        e.new_user_byte(b'X', &screen);
+        type_bytes(&mut e, &screen, b"X");
         let row: Vec<_> = (0..5).map(|col| predicted_at(&e, col)).collect();
         let expected = ["X", "a", "本", ">", "b"].map(|g| Some(g.to_owned()));
         assert_eq!(row, expected);
@@ -1855,14 +1867,14 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = sized_screen_of(2, 6, "abc本\x1b[1;1H".as_bytes());
-        e.new_user_byte(b'X', &screen);
+        type_bytes(&mut e, &screen, b"X");
         assert_eq!(predicted_at(&e, 4).as_deref(), Some("U"), "its glyph");
         assert_eq!(predicted_at(&e, 5).as_deref(), Some("U"), "its right half");
         // Typed inside one, its halves part.
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of("本x\x1b[1;2H".as_bytes());
-        e.new_user_byte(b'a', &screen);
+        type_bytes(&mut e, &screen, b"a");
         assert_eq!(predicted_at(&e, 1).as_deref(), Some("a"));
         assert_eq!(
             predicted_at(&e, 2).as_deref(),
@@ -1873,7 +1885,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of("ab本c\x1b[1;3H".as_bytes());
-        e.new_user_byte(0x7f, &screen);
+        type_bytes(&mut e, &screen, &[0x7f]);
         let row: Vec<_> = (1..4).map(|col| predicted_at(&e, col)).collect();
         assert_eq!(row, ["本", ">", "c"].map(|g| Some(g.to_owned())));
     }
@@ -1883,13 +1895,9 @@ mod tests {
         // Typed over the right half of a predicted wide glyph: that glyph cannot show.
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
-        for &b in "日".as_bytes() {
-            e.new_user_byte(b, &echoed);
-        }
+        type_bytes(&mut e, &echoed, "日".as_bytes());
         e.cursor = e.cursor.clone().map(|c| PredCursor { col: 2, ..c });
-        for &b in "本".as_bytes() {
-            e.new_user_byte(b, &echoed);
-        }
+        type_bytes(&mut e, &echoed, "本".as_bytes());
         let row: Vec<_> = (1..5).map(|col| predicted_at(&e, col)).collect();
         assert_eq!(
             row,
@@ -1908,7 +1916,7 @@ mod tests {
         let screen = screen_of("x本".as_bytes());
         e.set_local_frame_sent(1);
         let epoch = e.prediction_epoch;
-        e.new_user_byte(0x7f, &screen);
+        type_bytes(&mut e, &screen, &[0x7f]);
         assert!(e.cells.is_empty(), "nothing predicted");
         assert!(e.prediction_epoch > epoch, "a new epoch");
         assert!(e.overlay().is_empty());
@@ -1954,9 +1962,7 @@ mod tests {
         for (word, accent) in [("glück", "ü"), ("faĩl", "ĩ")] {
             let (mut e, echoed) = confirm_first_keystroke();
             e.set_local_frame_sent(1);
-            for &b in word.as_bytes() {
-                e.new_user_byte(b, &echoed);
-            }
+            type_bytes(&mut e, &echoed, word.as_bytes());
             let ov = e.overlay();
             // The first typed char lands at col 1 (cursor seeded from the echoed "x"); the accent
             // is the 3rd char, so column 3.
@@ -1992,9 +1998,7 @@ mod tests {
     /// Type `keys` into `e` over `screen`, as one input frame.
     fn type_keys(e: &mut PredictionEngine, screen: &Screen, keys: &[u8]) {
         e.set_local_frame_sent(1);
-        for &b in keys {
-            e.new_user_byte(b, screen);
-        }
+        type_bytes(e, screen, keys);
     }
 
     /// Row 0 as shown: the overlay over the screen, trailing blanks trimmed; and the cursor's
@@ -2142,8 +2146,8 @@ mod tests {
 mod key_reparse_tests {
     use super::*;
 
-    use fux_vt::Screen;
     use fux_vt::keys::Key;
+    use fux_vt::Screen;
 
     fn editor_on(bytes: &[u8]) -> (PredictionEngine, Screen) {
         let mut p = fux_vt::Parser::new(24, 80, 0).expect("24x80 parser");

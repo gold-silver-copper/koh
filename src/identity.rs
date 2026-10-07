@@ -159,4 +159,46 @@ mod tests {
         anyhow::ensure!(!path.exists(), "reset left the key in place");
         Ok(())
     }
+
+    /// The rule for trusting an identity path is one rule: a key that `load` accepts (or that it
+    /// rejects with `NotAKey`, whose message says to run `koh key reset`) is one `reset` can remove.
+    #[test]
+    fn reset_accepts_every_key_path_that_load_accepts() -> anyhow::Result<()> {
+        struct TestDirectory(PathBuf);
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("koh-trust-{}", Identity::generate()?.endpoint_id())),
+        );
+        crate::transport_iroh::create_dir_private(&directory.0)?;
+        // A 0755 dir, like a default-umask ~/.config/koh: `load` trusts it (it only warns).
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o755))?;
+
+        let path = directory.0.join("identity.key");
+        std::fs::write(&path, [7u8; crate::transport_iroh::KEY_LEN])?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let identity = load(&path)?;
+        drop(identity);
+        reset(&path).map_err(|e| {
+            anyhow::anyhow!("load accepted {} but reset refused: {e:#}", path.display())
+        })?;
+        anyhow::ensure!(!path.exists(), "reset left the key in place");
+
+        // A 31-byte file: load says to run `koh key reset`, which must then work.
+        let bad = directory.0.join("short.key");
+        std::fs::write(&bad, [7u8; 31])?;
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600))?;
+        let error = load(&bad).err().context("load accepted a 31-byte key")?;
+        anyhow::ensure!(format!("{error:#}").contains("koh key reset"), "{error:#}");
+        reset(&bad).map_err(|e| {
+            anyhow::anyhow!(
+                "load told the user to reset {} but reset refused: {e:#}",
+                bad.display()
+            )
+        })?;
+        Ok(())
+    }
 }

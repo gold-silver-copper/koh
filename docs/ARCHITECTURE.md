@@ -332,8 +332,10 @@ holding the last screen under a `reconnecting…` banner in the meantime. One `C
 for the whole run and one loop drives it, connected or not: only what belongs to a connection (its
 frames, echo-ack and acknowledgements) is dropped (`detach`) and made anew (`attach`), so the
 escape keys, the scrollback view, the window size and the colours work during the outage and carry
-across it. Typed input does not: what is typed while the link is down is not taken (nor predicted),
-what was not yet sent when the connection is made anew is dropped, and the status line says so. A reattach may land on a new shell (the session expired, the shell
+across it. Typed input does not: what is typed while the link is down (and the banner stays up until
+the new connection's first frame shows which shell it reached) is not taken (nor predicted), what was not yet
+sent when the connection is made anew is dropped, and the status line says so; it also says when
+input handed to the lost connection was never confirmed, as what follows may run without it. A reattach may land on a new shell (the session expired, the shell
 exited, or the server restarted), which the client cannot tell from its own (the server's
 `AttachKind` is not on the wire), and keys typed at the old screen must not run there; nor may the
 end of a line whose start was lost with the link run alone (`false && rm …` typed across the drop

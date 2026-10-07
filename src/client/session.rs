@@ -42,6 +42,10 @@ const PASTE_TOO_LONG: &str = "[koh] paste over 1 MiB — not sent";
 /// start was lost with the link run alone (`false && rm …` must not run `rm …`).
 const OUTAGE_INPUT_DROPPED: &str = "[koh] typing during the outage not sent";
 
+/// The notice for input handed to the lost connection and never confirmed: the server may not
+/// have had it, so what is typed next may run without it.
+const SENT_AS_THE_LINK_DROPPED: &str = "[koh] keys typed as the link dropped may not have arrived";
+
 /// How long after a frame moves the cursor to another row (a fresh prompt) a key typed is shown
 /// only once echoed: the server reads the PTY's modes at least every [`TTY_TICK`], so a program
 /// that turned echo off just after printing its prompt is heard of within about one; two leave
@@ -76,12 +80,15 @@ pub struct TickResult {
 pub struct ClientSession {
     /// What the current connection holds.
     link: Link,
-    /// When the link went down, until [`attach`](Self::attach).
+    /// When the link went down, until the next connection's first frame shows which shell it reached.
     down_since: Option<Instant>,
     /// The last input sequence number used; it rises across connections.
     last_seq: InputSeq,
     /// The newest input sequence number handed to a connection.
     sent_seq: InputSeq,
+    /// At the last [`detach`](Self::detach), input handed to the lost connection was not yet
+    /// confirmed (`sent_seq` beyond its echo-ack).
+    unconfirmed_at_drop: bool,
     /// Messages for the server, oldest first.
     outgoing: VecDeque<ClientMsg>,
     /// Typed bytes in `outgoing`.
@@ -167,6 +174,7 @@ impl ClientSession {
             down_since: None,
             last_seq: InputSeq::default(),
             sent_seq: InputSeq::default(),
+            unconfirmed_at_drop: false,
             outgoing: VecDeque::from([ClientMsg::Resize(size)]),
             queued_input: 0,
             input_paused: false,
@@ -190,7 +198,8 @@ impl ClientSession {
     /// history requests) goes with it; resizes and colours wait for the next. The
     /// predictions go, and whether typing was trusted is kept as it was now, at the drop.
     pub fn detach(&mut self, now: Instant) {
-        self.down_since = Some(now);
+        self.down_since.get_or_insert(now);
+        self.unconfirmed_at_drop = self.sent_seq > self.link.echo_ack;
         self.outgoing.retain(|msg| {
             !matches!(
                 msg,
@@ -205,11 +214,11 @@ impl ClientSession {
     /// A new connection, whose window is `size`: the server is told the size and the colours
     /// first (a reattach may be from another terminal). Input not yet sent is dropped, and the
     /// status line says so: the client cannot tell a reattach from a new shell, where keys typed
-    /// at the old screen must not run. The last screen stays up until the server repaints it;
+    /// at the old screen must not run; nor is what is typed before the new connection's first
+    /// frame shows which shell it reached. The last screen stays up until the server repaints it;
     /// the history held is the server session's, and is fetched again.
     pub fn attach(&mut self, now: Instant, size: Size) {
         self.link = Link::fresh(Arc::clone(&self.link.current.screen), self.sent_seq);
-        self.down_since = None;
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Resize(_) | ClientMsg::Colours(_)));
         if self.queued_input > 0 {
@@ -218,6 +227,13 @@ impl ClientSession {
             self.queued_input = 0;
             self.input_paused = false;
             self.notice = Some((OUTAGE_INPUT_DROPPED.to_owned(), now));
+        }
+        let typed_while_down = self
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice == OUTAGE_INPUT_DROPPED);
+        if std::mem::take(&mut self.unconfirmed_at_drop) && !typed_while_down {
+            self.notice = Some((SENT_AS_THE_LINK_DROPPED.to_owned(), now));
         }
         if let Some(colours) = self.colours.as_ref().filter(|c| c.known()) {
             self.outgoing
@@ -394,9 +410,15 @@ impl ClientSession {
 
     fn queue_events(&mut self, now: Instant, events: Vec<InputEvent>) {
         if self.down_since.is_some() {
-            // Not sent, nor predicted: see `attach`. The banner says so while the typing goes on.
-            self.notice = Some((OUTAGE_INPUT_DROPPED.to_owned(), now));
-            self.dirty = true;
+            // Not sent, nor predicted: see `attach`. The status line says so while the typing
+            // goes on (a focus report or the mouse is not typing).
+            if events
+                .iter()
+                .any(|e| matches!(e, InputEvent::Key(_) | InputEvent::Paste { .. }))
+            {
+                self.notice = Some((OUTAGE_INPUT_DROPPED.to_owned(), now));
+                self.dirty = true;
+            }
             return;
         }
         let size: usize = events.iter().map(InputEvent::wire_len).sum();
@@ -456,6 +478,17 @@ impl ClientSession {
         self.link.last_nudge = Some(now);
         self.last_activity = Some(now);
         self.dirty = true;
+    }
+
+    /// What the status line says beside the link's state: input paused, else a recent notice.
+    fn aside(&self, now: Instant) -> Option<String> {
+        if self.input_paused {
+            return Some("[koh] input paused — the server is not taking input".to_owned());
+        }
+        self.notice
+            .as_ref()
+            .filter(|(_, at)| now.saturating_duration_since(*at) < NOTICE_FOR)
+            .map(|(notice, _)| notice.clone())
     }
 
     /// Questions for the user's terminal the session has (the colours again, after the terminal
@@ -568,6 +601,8 @@ impl ClientSession {
             self.link.older.pop_front();
         }
         self.link.resync_sent = false;
+        // The outage ends with the new connection's first frame, which shows the shell it reached.
+        self.down_since = None;
         self.link.echo_ack = self.link.echo_ack.max(frame.echo_ack);
         self.predictor
             .set_local_frame_late_acked(self.link.echo_ack.0);
@@ -634,15 +669,9 @@ impl ClientSession {
                 "[koh] disconnected — reconnecting… {}s (Ctrl-^ . to quit)",
                 now.saturating_duration_since(down).as_secs()
             );
-            if self.input_paused {
-                status.push_str(" · input paused — 1 MiB is waiting to be sent");
-            } else if let Some((notice, _)) = self
-                .notice
-                .as_ref()
-                .filter(|(_, at)| now.saturating_duration_since(*at) < NOTICE_FOR)
-            {
+            if let Some(aside) = self.aside(now) {
                 status.push_str(" · ");
-                status.push_str(notice.trim_start_matches("[koh] "));
+                status.push_str(aside.trim_start_matches("[koh] "));
             }
             return TickResult {
                 wait: Duration::from_secs(1),
@@ -681,17 +710,7 @@ impl ClientSession {
             Some(silent) if silent > LINK_DOWN_GRACE => {
                 Some(format!("[koh] link down — resuming… {}s", silent.as_secs()))
             }
-            _ if self.input_paused => {
-                Some("[koh] input paused — the server is not taking input".to_owned())
-            }
-            _ if self
-                .notice
-                .as_ref()
-                .is_some_and(|(_, at)| now.saturating_duration_since(*at) < NOTICE_FOR) =>
-            {
-                self.notice.as_ref().map(|(notice, _)| notice.clone())
-            }
-            _ => self.scrollback.status(),
+            _ => self.aside(now).or_else(|| self.scrollback.status()),
         };
         TickResult {
             wait: Duration::from_millis(50),
@@ -1652,12 +1671,44 @@ mod tests {
         // Nothing the dead link swallowed is probed for on the new one.
         s.on_tick(now + Duration::from_secs(10), None);
         assert_eq!(drain(&mut s), []);
+        // Until the new connection's first frame, the shell it reached is not known: typing is
+        // not sent. After it, it goes out.
         s.on_input(now, b"d");
+        assert_eq!(drain(&mut s), [], "not before the first frame");
+        s.on_frame(
+            now,
+            &frame(1, 0, 1, &TerminalScreen::default(), &screen(b"")),
+        );
+        drain(&mut s);
+        s.on_input(now, b"e");
         assert_eq!(
             typed(&drain(&mut s)),
-            b"d",
-            "typing after the attach goes out"
+            b"e",
+            "typing after the first frame goes out"
         );
+    }
+
+    /// Input handed to the lost connection and never confirmed may not have arrived: the status
+    /// line says so at the attach, though nothing was typed during the outage.
+    #[test]
+    fn an_unconfirmed_send_at_the_drop_is_said_at_the_attach() {
+        let (now, mut s) = start();
+        s.on_input(now, b"false && ");
+        drain(&mut s);
+        s.detach(now);
+        s.attach(now, Size::new(24, 80));
+        let status = s.on_tick(now, None).status.expect("a notice");
+        assert!(status.contains("may not have arrived"), "{status}");
+    }
+
+    /// A focus report or the mouse during an outage is not typing: no notice says it was not sent.
+    #[test]
+    fn a_focus_report_during_an_outage_is_not_called_typing() {
+        let (now, mut s) = start();
+        s.detach(now);
+        s.on_inputs(now, vec![Input::FocusIn]);
+        let status = s.on_tick(now, None).status.expect("the banner");
+        assert!(!status.contains("not sent"), "{status}");
     }
 
     /// Across a reattach the last screen stays up until the server repaints it, and the
@@ -1704,6 +1755,11 @@ mod tests {
         );
         let status = s.on_tick(now, None).status.expect("a notice");
         assert!(status.contains("not sent"), "{status}");
+        s.on_frame(
+            now,
+            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
+        );
+        drain(&mut s);
         s.on_input(now, b"x");
         assert_eq!(typed(&drain(&mut s)), b"x");
     }

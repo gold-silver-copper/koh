@@ -386,7 +386,9 @@ per-connection state never lives in the session:
   attachment: the session counts its clients as its `watch` sender's receivers, so dropping one
   (on return **or** panic) detaches with no message to lose, and a panicking connection can't pin
   a session. The session starts the TTL when the last receiver drops; it tears itself down at the
-  TTL or once its shell has exited and no client is left. Its life is one `Phase` (attached,
+  TTL; once its shell has exited and no client is left; or when a reconnect asks to attach after
+its shell exited, even while an old client still holds on (that client's screens end with it, and
+the reconnect gets a new session). Its life is one `Phase` (attached,
   detached since when, exited), and an exited session is never reattached, even while an old
   client still holds on. A connection's final frame is the first one whose screen carries the exit
   code. The registry's `Sessions` forgets a session only once its task has

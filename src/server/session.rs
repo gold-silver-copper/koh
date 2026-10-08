@@ -205,9 +205,9 @@ fn take_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize, mut take: impl FnMut(
 }
 
 /// Wait until `deadline`, or forever if there is none.
-async fn until(deadline: Option<std::time::Instant>) {
+async fn until(deadline: Option<Instant>) {
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(Instant::from_std(deadline)).await,
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
 }
@@ -278,7 +278,7 @@ async fn session_task(
                     screens_tx.send_replace(Arc::new(host.snapshot()));
                 }
             },
-            _ = until(hold.deadline()) => {
+            _ = until(hold.deadline().map(Instant::from_std)) => {
                 if let Some(screen) = hold.expire(&mut host.emu, std::time::Instant::now()) {
                     screens_tx.send_replace(Arc::new(screen));
                 }
@@ -365,7 +365,7 @@ async fn session_task(
             }
             // Detached for the whole TTL.
             () = until(match phase {
-                Phase::Detached { since } => since.checked_add(ttl).map(Instant::into_std),
+                Phase::Detached { since } => since.checked_add(ttl),
                 Phase::Attached | Phase::Exited => None,
             }) => break,
         }

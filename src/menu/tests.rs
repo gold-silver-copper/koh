@@ -100,6 +100,18 @@ fn the_overview_shows_both_keys_and_both_lists() {
 }
 
 #[test]
+fn one_entry_is_picked_as_1() {
+    let dir = Scratch::new("one");
+    let places = dir.places();
+    names::update(&places, List::Clients, |n| n.add("phone", id(3))).unwrap();
+    let (_, shown) = menu(&places, "q\n");
+    assert!(
+        shown.contains("1 pick") && !shown.contains("[1-1]"),
+        "{shown}"
+    );
+}
+
+#[test]
 fn a_server_added_is_saved_and_connected_to() {
     let dir = Scratch::new("add-server");
     let places = dir.places();

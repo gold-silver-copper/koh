@@ -85,7 +85,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
     fn overview(&mut self) -> anyhow::Result<Vec<Picked>> {
         writeln!(self.output, "\nkoh — this machine")?;
         for (role, label) in [("client", "you as a client"), ("server", "you as a server")] {
-            let path = self.places.key(role).display().to_string();
+            let path = tilde(self.places.key(role));
             let id = key_id(self.places, role).map_or_else(
                 || format!("none yet ({})", crate::keycmd::creates(role)),
                 names::short,
@@ -126,10 +126,10 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
                 writeln!(self.output, "{line}")?;
             }
         }
-        let pick = if entries.is_empty() {
-            String::new()
-        } else {
-            format!("[1-{}] pick   ", entries.len())
+        let pick = match entries.len() {
+            0 => String::new(),
+            1 => "1 pick   ".to_owned(),
+            n => format!("[1-{n}] pick   "),
         };
         writeln!(
             self.output,
@@ -280,7 +280,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
     /// `k`: both keys, in full and as QR codes, and resetting one.
     fn keys(&mut self) -> anyhow::Result<Option<Outcome>> {
         for role in ["client", "server"] {
-            let path = self.places.key(role).display().to_string();
+            let path = tilde(self.places.key(role));
             writeln!(self.output, "\n{role} key   {path}")?;
             match key_id(self.places, role) {
                 Some(id) => {
@@ -379,6 +379,17 @@ enum Outcome {
     Choose(Choice),
     /// The input ended mid-question.
     Quit,
+}
+
+/// `path` for the user to read, with `~` for the home directory.
+fn tilde(path: &std::path::Path) -> String {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .and_then(|home| path.strip_prefix(home).ok())
+        .map_or_else(
+            || path.display().to_string(),
+            |rest| format!("~/{}", rest.display()),
+        )
 }
 
 /// The `role` key's endpoint id, if it exists (reading it creates nothing).

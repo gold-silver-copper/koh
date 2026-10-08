@@ -11,9 +11,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
 > period: **v0.4.0–v0.4.3** were tagged during a rapid follow-up series but superseded by **0.4.4**
 > before publishing, and **v0.6.0** (encrypted-at-rest keys, vt100 containment, per-node-id authz) was
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
-> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.9.1.
+> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0 and 0.13.0 (0.12.1 is tag-only).
 
 ## [Unreleased]
+
+## [0.13.0] — 2026-10-08
 
 koh is a remote shell again, not a transport for other programs: everything that existed only
 for embedders or for fux is gone. **The wire protocol is new**: koh no longer runs mosh's State
@@ -46,10 +48,11 @@ error; upgrade both ends.
   query and in-band resize (mode 2048), keeps a program's colours (OSC 4, 10, 11) and draws them as
   RGB without changing your terminal's palette, and answers device attributes and XTVERSION as
   koh. A frame a program draws with synchronized output (DEC 2026) is no longer sent half drawn.
-- Updated `fux-vt` 0.2.0 → 0.3.0. Bold and dim can now be on together (`SGR 1;2`), as in xterm,
+- Updated `fux-vt` 0.2.0 → 0.3.4. Bold and dim can now be on together (`SGR 1;2`), as in xterm,
   where before the later one replaced the earlier; CBT (`CSI Z`) and CHT (`CSI I`) now move between
-  tab stops, as mosh's emulator does. The wire is unchanged.
-- Updated `iroh` 1.2.0 → 1.3.0, `fuxix` 0.1.2 → 0.1.5 and `tokio` 1.53.1 → 1.53.2.
+  tab stops, as mosh's emulator does; 0.3.4 brings fux's second audit's fixes (cursor moves stop at
+  the scroll margins, a resize without reflow keeps a pending wrap). The wire is unchanged.
+- Updated `iroh` 1.2.0 → 1.3.0, `fuxix` 0.1.2 → 0.1.7 and `tokio` 1.53.1 → 1.53.2.
 - **`koh serve` starts each session's program through `koh __launch`**, a hidden subcommand of
   its own binary that makes the program a session leader with the PTY as its controlling
   terminal, then becomes it. The program sees what it did before: argv verbatim, `TERM`, no
@@ -429,7 +432,8 @@ key location changed).
 - Initial release: the SSP protocol core, the terminal model, the PTY host, the local-echo predictor,
   and the iroh QUIC transport.
 
-[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/gold-silver-copper/koh/compare/v0.12.1...v0.13.0
 [0.9.1]: https://github.com/gold-silver-copper/koh/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/gold-silver-copper/koh/releases/tag/v0.9.0
 [0.8.0]: https://github.com/gold-silver-copper/koh/releases/tag/v0.8.0

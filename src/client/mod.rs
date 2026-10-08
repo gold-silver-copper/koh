@@ -7,6 +7,7 @@
 pub mod backend;
 pub mod cli;
 mod io;
+mod link;
 pub mod probe;
 mod render;
 mod scrollback;

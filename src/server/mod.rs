@@ -6,6 +6,7 @@
 
 mod audit;
 pub mod cli;
+mod held;
 pub mod session;
 
 pub use cli::{serve, ServeConfig};
@@ -19,9 +20,10 @@ use crate::events::{InputEvent, WireColours};
 use crate::proto::{
     encode_history, retry_after, ClientDecoder, ClientMsg, Frame, FrameEncoder, FrameNum,
     FrameScreen, InputSeq, ProtoError, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
-    SESSION_ENDED, WINDOW_CELLS,
+    SESSION_ENDED,
 };
 use crate::terminal::{HistoryRequest, Size, TerminalScreen};
+use held::ClientHolds;
 use iroh::endpoint::RecvStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -189,12 +191,8 @@ pub(crate) struct ServerConn {
     screen: Arc<TerminalScreen>,
     /// `screen` differs from what was last sent, or the base must be rebuilt.
     unsent_change: bool,
-    /// The newest frame the client acknowledged, and its screen. Starts as the blank frame 0.
-    acked: FrameScreen,
-    /// Frames sent since, oldest first: at most `FRAME_WINDOW`, holding at most [`WINDOW_CELLS`]
-    /// cells together unless the newest alone is more, so a client that never acknowledges cannot
-    /// make the server hold sixteen of the largest screens. The newest is always kept.
-    sent: VecDeque<FrameScreen>,
+    /// The frames the client is taken to hold, by their delivery.
+    held: ClientHolds,
     last_num: FrameNum,
     last_sent_at: Option<Instant>,
     last_sent_echo: InputSeq,
@@ -287,8 +285,7 @@ impl ServerConn {
             echo,
             screen: Arc::default(),
             unsent_change: true,
-            acked: FrameScreen::default(),
-            sent: VecDeque::new(),
+            held: ClientHolds::default(),
             last_num: FrameNum::BLANK,
             last_sent_at: None,
             last_sent_echo: InputSeq(0),
@@ -303,8 +300,7 @@ impl ServerConn {
 
     /// Install the session's latest screen. One that carries the program's exit code is final.
     fn install_snapshot(&mut self, screen: Arc<TerminalScreen>) {
-        let last_sent = &self.sent.back().unwrap_or(&self.acked).screen;
-        if screen != *last_sent {
+        if screen != self.held.newest().screen {
             self.unsent_change = true;
         }
         self.screen = screen;
@@ -380,21 +376,11 @@ impl ServerConn {
         self.decoder.finish()
     }
 
-    /// The client applied `num`, so older frames are no bases any more. An ack for a frame no longer
-    /// held is ignored.
+    /// The client has frame `num`, so older frames are no bases any more. An ack for a frame no
+    /// longer held is ignored.
     fn ack(&mut self, num: FrameNum, now: Instant) {
         self.delivered(num, now);
-        if num <= self.acked.num {
-            return;
-        }
-        let Some(pos) = self.sent.iter().position(|sent| sent.num == num) else {
-            return;
-        };
-        let mut rest = self.sent.split_off(pos);
-        if let Some(acked) = rest.pop_front() {
-            self.acked = acked;
-        }
-        self.sent = rest;
+        self.held.delivered(num);
     }
 
     /// Frame `num` was delivered at `now`: it is no longer in flight, nor are the frames before it,
@@ -455,13 +441,14 @@ impl ServerConn {
         self.echo.has_pending()
             && self
                 .screen
-                .rows_differing(&self.acked.screen)
+                .rows_differing(&self.held.base().screen)
                 .is_some_and(|rows| rows <= ECHO_ROWS)
     }
 
-    /// The client lacks a frame's base: diff against the blank screen until it acknowledges one.
+    /// The client lacks a frame's base: it is taken to hold nothing, and the next frame is on the
+    /// blank screen.
     fn resync(&mut self) {
-        self.acked = FrameScreen::default();
+        self.held.forget();
         self.unsent_change = true;
     }
 
@@ -485,7 +472,7 @@ impl ServerConn {
             .map(|at| now.saturating_duration_since(at));
         let passed = |floor: Duration| since.is_none_or(|since| since >= floor);
         let room = self.room(now, rtt, MAX_IN_FLIGHT);
-        let unacked = self.last_num > self.acked.num;
+        let unacked = self.last_num > self.held.base().num;
         let retry_due = unacked && since.is_some_and(|since| since >= retry_after(rtt));
         let heartbeat_due = since.is_none_or(|since| since >= HEARTBEAT);
         let echo = self.unsent_change
@@ -497,21 +484,17 @@ impl ServerConn {
             return None;
         }
         let num = self.last_num.next();
+        let base = self.held.base();
         let frame = Frame {
             num,
-            base: self.acked.num,
+            base: base.num,
             echo_ack: self.echo.echo_ack(),
-            diff: self.screen.diff_from(&self.acked.screen),
+            diff: self.screen.diff_from(&base.screen),
         };
-        self.sent.push_back(FrameScreen {
+        self.held.sent(FrameScreen {
             num,
             screen: Arc::clone(&self.screen),
         });
-        while self.sent.len() > FRAME_WINDOW
-            || (self.sent.len() > 1 && distinct_cells(&self.sent) > WINDOW_CELLS)
-        {
-            self.sent.pop_front();
-        }
         self.last_num = num;
         self.last_sent_at = Some(now);
         self.last_sent_echo = frame.echo_ack;
@@ -523,19 +506,16 @@ impl ServerConn {
     }
 
     /// `frame`, just polled, encoded for its stream against its base, the acknowledged screen.
+    /// [`Self::poll_frame`] made it on that base, and nothing runs between the two.
     fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>, ProtoError> {
-        let base = if frame.base == self.acked.num {
-            Arc::clone(&self.acked.screen)
-        } else {
-            // Polled frames are always on the acknowledged one; a blank base otherwise.
-            Arc::default()
-        };
-        self.encoder.encode(frame, &base)
+        let base = self.held.base();
+        debug_assert_eq!(frame.base, base.num, "encoded on another base");
+        self.encoder.encode(frame, &base.screen)
     }
 
     /// The newest frame the client has acknowledged.
     const fn acked(&self) -> FrameNum {
-        self.acked.num
+        self.held.base().num
     }
 
     /// Whether the program has application cursor keys on.
@@ -547,7 +527,7 @@ impl ServerConn {
     /// frame, or did not within [`FINAL_ACK_WAIT`].
     fn finished(&self, now: Instant) -> bool {
         self.final_frame.is_some_and(|(num, at)| {
-            self.acked.num >= num || now.saturating_duration_since(at) >= FINAL_ACK_WAIT
+            self.acked() >= num || now.saturating_duration_since(at) >= FINAL_ACK_WAIT
         })
     }
 
@@ -590,7 +570,7 @@ impl ServerConn {
                 }
             }
         }
-        if self.last_num > self.acked.num {
+        if self.last_num > self.acked() {
             let retry = self
                 .last_sent_at
                 .map_or(now, |at| at.checked_add(retry_after(rtt)).unwrap_or(now));
@@ -604,11 +584,6 @@ impl ServerConn {
         }
         wake.max(now)
     }
-}
-
-/// The cells the screens of `frames` hold in memory, a row several of them share counted once.
-fn distinct_cells(frames: &VecDeque<FrameScreen>) -> usize {
-    TerminalScreen::distinct_cells(frames.iter().map(|frame| &*frame.screen))
 }
 
 /// Drive one connection against its session: the I/O around a `ServerConn`.
@@ -888,7 +863,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        distinct_cells, CursorKeyNormalizer, Drained, EchoAck, ServerConn, ToSession,
+        held::distinct_cells, CursorKeyNormalizer, Drained, EchoAck, ServerConn, ToSession,
         FINAL_ACK_WAIT,
     };
     use crate::proto::{
@@ -1494,6 +1469,34 @@ mod tests {
     }
 
     #[test]
+    fn a_delivery_of_a_frame_sent_before_a_resync_does_not_undo_it() {
+        // The client refused frame 2 (it lacked base 1) and asked for a Resync; QUIC then reports
+        // frame 2 delivered, after the Resync was read. The client never held frame 2, so the next
+        // frame must still be on the blank screen.
+        let t0 = Instant::now();
+        let later = |n| t0 + Duration::from_secs(n);
+        let mut c = ServerConn::default();
+        c.install_snapshot(Arc::new(screen(b"a")));
+        c.poll_frame(t0, None).unwrap();
+        c.ack(FrameNum(1), later(1));
+        c.install_snapshot(Arc::new(screen(b"a b")));
+        let two = c.poll_frame(later(2), None).unwrap();
+        assert_eq!(two.base, FrameNum(1));
+        c.push_client_bytes(&stream(&[ClientMsg::Resync]));
+        c.drain_client(later(3), false).unwrap();
+        c.ack(FrameNum(2), later(3));
+        c.install_snapshot(Arc::new(screen(b"a b c")));
+        let next = c
+            .poll_frame(later(4), None)
+            .expect("a resync forces a frame");
+        assert_eq!(
+            next.base,
+            FrameNum::BLANK,
+            "a frame on a base the client threw away"
+        );
+    }
+
+    #[test]
     fn only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored() {
         let t0 = Instant::now();
         let mut c = ServerConn::default();
@@ -1501,7 +1504,7 @@ mod tests {
             c.install_snapshot(Arc::new(screen(format!("frame {n}").as_bytes())));
             c.poll_frame(t0 + Duration::from_secs(n), None).unwrap();
         }
-        assert_eq!(c.sent.len(), FRAME_WINDOW);
+        assert_eq!(c.held.window().len(), FRAME_WINDOW);
         c.ack(FrameNum(1), Instant::now()); // dropped from the window
         assert_eq!(c.acked(), FrameNum::BLANK);
         c.ack(FrameNum(3), Instant::now());
@@ -1556,12 +1559,16 @@ mod tests {
                 .expect("a heartbeat is due");
         }
         assert_eq!(
-            c.sent.len(),
+            c.held.window().len(),
             FRAME_WINDOW,
             "the window still holds every resend"
         );
-        assert!(c.sent.iter().all(|sent| Arc::ptr_eq(&sent.screen, &big)));
-        assert_eq!(distinct_cells(&c.sent), WINDOW_CELLS);
+        assert!(c
+            .held
+            .window()
+            .iter()
+            .all(|sent| Arc::ptr_eq(&sent.screen, &big)));
+        assert_eq!(distinct_cells(c.held.window()), WINDOW_CELLS);
     }
 
     #[test]
@@ -1577,9 +1584,9 @@ mod tests {
             c.poll_frame(t0 + HEARTBEAT * n, None)
                 .expect("a frame is due");
         }
-        assert_eq!(c.sent.len(), FRAME_WINDOW);
+        assert_eq!(c.held.window().len(), FRAME_WINDOW);
         let changed_rows = FRAME_WINDOW - 1;
-        assert_eq!(distinct_cells(&c.sent), (24 + changed_rows) * 80);
+        assert_eq!(distinct_cells(c.held.window()), (24 + changed_rows) * 80);
     }
 
     #[test]
@@ -1592,10 +1599,13 @@ mod tests {
             c.install_snapshot(largest(&format!("screen {n}")));
             c.poll_frame(t0 + HEARTBEAT * n, None)
                 .expect("a frame is due");
-            assert!(distinct_cells(&c.sent) <= WINDOW_CELLS, "after frame {n}");
+            assert!(
+                distinct_cells(c.held.window()) <= WINDOW_CELLS,
+                "after frame {n}"
+            );
         }
         // Only the newest is left, and it still diffs against the base the client holds.
-        assert_eq!(c.sent.len(), 1);
+        assert_eq!(c.held.window().len(), 1);
         assert_eq!(c.acked(), FrameNum::BLANK);
         let frame = c
             .poll_frame(t0 + HEARTBEAT * 20, None)

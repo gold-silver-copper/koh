@@ -15,11 +15,12 @@ use crate::events::{
 };
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
-    decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, FrameScreen,
-    InputSeq, FRAME_WINDOW, HEARTBEAT, MAX_INPUT_BYTES, TTY_TICK, WINDOW_CELLS,
+    decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
+    HEARTBEAT, MAX_INPUT_BYTES, TTY_TICK,
 };
-use crate::terminal::{Grid, HistoryReply, RowEncodings, Size, TerminalScreen};
+use crate::terminal::{Grid, HistoryReply, Size, TerminalScreen};
 
+use super::link::Link;
 use super::probe::COLOUR_QUERIES;
 use super::render::WindowState;
 use super::scrollback::Scrollback;
@@ -208,49 +209,6 @@ pub struct ClientSession {
     pub(crate) status_was_shown: bool,
 }
 
-/// What one connection holds: the frames it applied, what its server echoed, when it was heard.
-/// Only [`ClientSession::new`] and [`ClientSession::attach`] make one.
-struct Link {
-    /// The newest applied frame and its screen.
-    current: FrameScreen,
-    /// The frames applied before it, oldest first: at most `FRAME_WINDOW - 1`, holding at most
-    /// [`WINDOW_CELLS`] cells beyond `current`'s.
-    older: VecDeque<FrameScreen>,
-    /// A `Resync` was sent and no frame has applied since.
-    resync_sent: bool,
-    /// The newest input the server has reported reflected on screen.
-    echo_ack: InputSeq,
-    /// When the server was last heard from; `None` until the first frame.
-    last_heard: Option<Instant>,
-    /// When input was last queued or probed for, while some is unconfirmed.
-    last_nudge: Option<Instant>,
-    /// When the newest frame moved the cursor to another row: a fresh prompt, whose program may
-    /// still turn echo off. Keys typed within [`PROMPT_HOLD`] of it are shown only once echoed.
-    new_row_at: Option<Instant>,
-    /// Rows' encodings, kept from one frame's dictionary to the next.
-    encodings: RowEncodings,
-}
-
-impl Link {
-    /// A link on which nothing has arrived, showing `screen` until its first frame (which, on
-    /// the blank base, builds from nothing), with input up to `echo_ack` taken as handled.
-    fn fresh(screen: Arc<TerminalScreen>, echo_ack: InputSeq) -> Self {
-        Self {
-            current: FrameScreen {
-                num: FrameNum::BLANK,
-                screen,
-            },
-            older: VecDeque::new(),
-            resync_sent: false,
-            echo_ack,
-            last_heard: None,
-            last_nudge: None,
-            new_row_at: None,
-            encodings: RowEncodings::default(),
-        }
-    }
-}
-
 impl ClientSession {
     /// A session for a run, telling the server the window's `size`.
     pub fn new(pref: DisplayPreference, size: Size) -> Self {
@@ -278,12 +236,12 @@ impl ClientSession {
         }
     }
 
-    /// The connection was lost: what was meant for it alone (acknowledgements, resyncs and
-    /// history requests) goes with it; resizes and colours wait for the next. Input not yet sent
-    /// is dropped, and the status line says so: the client cannot tell a reattach from a new
-    /// shell, where keys typed at the old screen must not run. A first drop begins the outage:
-    /// the predictions go, and whether typing was trusted, or handed on unconfirmed, is kept as
-    /// it was then.
+    /// The connection was lost: what was meant for it alone (acknowledgements, history requests
+    /// and the resync its link owes) goes with it; resizes and colours wait for the next. Input
+    /// not yet sent is dropped, and the status line says so: the client cannot tell a reattach
+    /// from a new shell, where keys typed at the old screen must not run. A first drop begins the
+    /// outage: the predictions go, and whether typing was trusted, or handed on unconfirmed, is
+    /// kept as it was then.
     pub fn detach(&mut self, now: Instant) {
         let outage = self.outage.get_or_insert_with(|| {
             self.predictor = self.predictor.reattached();
@@ -293,12 +251,9 @@ impl ClientSession {
             }
             Outage::begin(now, self.sent_seq > self.link.echo_ack)
         });
-        self.outgoing.retain(|msg| {
-            !matches!(
-                msg,
-                ClientMsg::Ack { .. } | ClientMsg::Resync | ClientMsg::History(_)
-            )
-        });
+        self.outgoing
+            .retain(|msg| !matches!(msg, ClientMsg::Ack { .. } | ClientMsg::History(_)));
+        self.link.drop_resync();
         if self.queued_input > 0 {
             self.outgoing
                 .retain(|msg| !matches!(msg, ClientMsg::Keys { .. } | ClientMsg::Input { .. }));
@@ -316,7 +271,7 @@ impl ClientSession {
     /// shows which shell it reached is not sent. The last screen stays up until the server
     /// repaints it; the history held is the server session's, and is fetched again.
     pub fn attach(&mut self, size: Size) {
-        self.link = Link::fresh(Arc::clone(&self.link.current.screen), self.sent_seq);
+        self.link = Link::fresh(Arc::clone(&self.link.current().screen), self.sent_seq);
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Resize(_) | ClientMsg::Colours(_)));
         if let Some(colours) = self.colours.as_ref().filter(|c| c.known()) {
@@ -523,7 +478,7 @@ impl ClientSession {
         };
         self.predictor.set_local_frame_sent(seq.0.saturating_sub(1));
         for event in &events {
-            let screen = self.link.current.screen.screen();
+            let screen = self.link.current().screen.screen();
             match event {
                 InputEvent::Key(key) => {
                     // At a fresh prompt the modes the client holds may be from before the program
@@ -607,24 +562,15 @@ impl ClientSession {
     /// A frame's stream arrived: its body inflated against its base's dictionary, then applied as
     /// [`on_frame`](Self::on_frame) does. A frame on a base not held asks for a resync; one that
     /// does not inflate or decode is dropped, as a lost one would be.
+    ///
+    /// The frame's number is inside the body, which inflates only against its base, so a late
+    /// frame on a base not held is refused as a new one would be: a `Resync` it did not need costs
+    /// a repaint, where ignoring a new one would leave its screen unshown. Telling them apart
+    /// first would need the number in the stream's header, a change to the wire.
     pub fn on_frame_stream(&mut self, now: Instant, base: FrameNum, rows: &[u16], body: &[u8]) {
         self.link.last_heard = Some(now);
-        let screen = if base == FrameNum::BLANK {
-            Some(Arc::default())
-        } else if base == self.link.current.num {
-            Some(Arc::clone(&self.link.current.screen))
-        } else {
-            self.link
-                .older
-                .iter()
-                .find(|older| older.num == base)
-                .map(|older| Arc::clone(&older.screen))
-        };
-        let Some(screen) = screen else {
-            if !self.link.resync_sent {
-                self.link.resync_sent = true;
-                self.outgoing.push_back(ClientMsg::Resync);
-            }
+        let Some(screen) = self.link.base(base) else {
+            self.link.refuse(base);
             return;
         };
         let dictionary = dictionary_for(base, &screen, rows, &mut self.link.encodings);
@@ -641,47 +587,20 @@ impl ClientSession {
     /// server may diff against it.
     pub fn on_frame(&mut self, now: Instant, frame: &Frame) {
         self.link.last_heard = Some(now);
-        if frame.num <= self.link.current.num {
-            self.keep_late(frame);
+        if frame.num <= self.link.current().num {
+            self.link.keep_late(frame);
             return;
         }
-        // The copy shares every row with the base; the frame replaces only its own.
-        let base = if frame.base == FrameNum::BLANK {
-            Some(TerminalScreen::default())
-        } else if frame.base == self.link.current.num {
-            Some(TerminalScreen::clone(&self.link.current.screen))
-        } else {
-            self.link
-                .older
-                .iter()
-                .find(|older| older.num == frame.base)
-                .map(|older| TerminalScreen::clone(&older.screen))
-        };
-        let Some(mut screen) = base else {
-            if !self.link.resync_sent {
-                self.link.resync_sent = true;
-                self.outgoing.push_back(ClientMsg::Resync);
-            }
+        let Some(next) = self.link.applied(frame) else {
+            self.link.refuse(frame.base);
             return;
         };
-        screen.apply(&frame.diff);
-        if screen.screen().cursor_position().0
-            != self.link.current.screen.screen().cursor_position().0
+        if next.screen.screen().cursor_position().0
+            != self.link.current().screen.screen().cursor_position().0
         {
             self.link.new_row_at = Some(now);
         }
-        let previous = std::mem::replace(
-            &mut self.link.current,
-            FrameScreen {
-                num: frame.num,
-                screen: Arc::new(screen),
-            },
-        );
-        self.link.older.push_back(previous);
-        while self.link.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
-            self.link.older.pop_front();
-        }
-        self.link.resync_sent = false;
+        self.link.advance(next);
         // The outage ends with the new connection's first frame, which shows the shell it reached;
         // what it lost is said a while longer.
         for said in self.outage.take().iter().flat_map(Outage::said) {
@@ -690,9 +609,10 @@ impl ClientSession {
         self.link.echo_ack = self.link.echo_ack.max(frame.echo_ack);
         self.predictor
             .set_local_frame_late_acked(self.link.echo_ack.0);
-        self.predictor.set_tty(self.link.current.screen.tty());
-        self.predictor.cull(self.link.current.screen.screen());
-        self.scrollback.on_mark(self.link.current.screen.history());
+        self.predictor.set_tty(self.link.current().screen.tty());
+        self.predictor.cull(self.link.current().screen.screen());
+        self.scrollback
+            .on_mark(self.link.current().screen.history());
         self.last_activity = Some(now);
         self.dirty = true;
     }
@@ -703,45 +623,6 @@ impl ClientSession {
         if self.scrollback.viewing() {
             self.dirty = true;
         }
-    }
-
-    /// Keep `frame`, older than the current one, as a base, if its base is held and it is not.
-    fn keep_late(&mut self, frame: &Frame) {
-        let held = |num: FrameNum| {
-            num == self.link.current.num || self.link.older.iter().any(|older| older.num == num)
-        };
-        if held(frame.num) {
-            return;
-        }
-        let base = if frame.base == FrameNum::BLANK {
-            Some(TerminalScreen::default())
-        } else {
-            self.link
-                .older
-                .iter()
-                .chain(std::iter::once(&self.link.current))
-                .find(|older| older.num == frame.base)
-                .map(|older| TerminalScreen::clone(&older.screen))
-        };
-        let Some(mut screen) = base else {
-            return;
-        };
-        screen.apply(&frame.diff);
-        self.link.older.push_back(FrameScreen {
-            num: frame.num,
-            screen: Arc::new(screen),
-        });
-        while self.link.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
-            self.link.older.pop_front();
-        }
-    }
-
-    /// The cells the older frames hold beyond the current one.
-    fn older_cells(&self) -> usize {
-        TerminalScreen::cells_beyond(
-            &self.link.current.screen,
-            self.link.older.iter().map(|older| &*older.screen),
-        )
     }
 
     /// Advance to `now`: probe for unconfirmed input, and report the status banner.
@@ -777,7 +658,7 @@ impl ClientSession {
                 .any(|m| matches!(m, ClientMsg::Ack { .. }))
             {
                 self.outgoing.push_back(ClientMsg::Ack {
-                    frame: self.link.current.num,
+                    frame: self.link.current().num,
                 });
             }
         }
@@ -810,11 +691,14 @@ impl ClientSession {
 
     /// Whether messages are waiting for the server.
     pub fn has_outgoing(&self) -> bool {
-        !self.outgoing.is_empty()
+        self.link.owes_resync() || !self.outgoing.is_empty()
     }
 
     /// Take the next message for the server.
     pub fn pop_outgoing(&mut self) -> Option<ClientMsg> {
+        if let Some(resync) = self.link.take_resync() {
+            return Some(resync);
+        }
         let msg = self.outgoing.pop_front()?;
         let sent = match &msg {
             ClientMsg::Input { bytes, seq } => Some((bytes.len(), *seq)),
@@ -840,22 +724,22 @@ impl ClientSession {
 
     /// Whether a frame reported that the shell exited (its code is on [`state`](Self::state)).
     pub fn exited(&self) -> bool {
-        self.link.current.screen.exit_code().is_some()
+        self.link.current().screen.exit_code().is_some()
     }
 
     /// The newest applied screen.
     pub fn state(&self) -> &TerminalScreen {
-        &self.link.current.screen
+        &self.link.current().screen
     }
 
     /// The newest frame applied.
     pub const fn applied(&self) -> FrameNum {
-        self.link.current.num
+        self.link.current().num
     }
 
     /// Whether a frame has been applied, so [`state`](Self::state) is the server's.
     pub fn synced(&self) -> bool {
-        self.link.current.num > FrameNum::BLANK
+        self.link.current().num > FrameNum::BLANK
     }
 
     /// The prediction overlay to draw over [`state`](Self::state).
@@ -866,7 +750,7 @@ impl ClientSession {
     /// The screen to show in place of [`state`](Self::state), without the overlay: the scrollback
     /// view, while it is open.
     pub fn view(&self) -> Option<TerminalScreen> {
-        self.scrollback.shown(&self.link.current.screen)
+        self.scrollback.shown(&self.link.current().screen)
     }
 
     /// The history held and the view of it.
@@ -876,12 +760,12 @@ impl ClientSession {
 
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
     pub fn window_state(&self) -> WindowState<'_> {
-        window_state(&self.link.current.screen)
+        window_state(&self.link.current().screen)
     }
 
     /// The newest applied screen's grid.
     pub fn screen(&self) -> &Grid {
-        self.link.current.screen.screen()
+        self.link.current().screen.screen()
     }
 }
 
@@ -940,6 +824,7 @@ fn events_of(input: Input, out: &mut Vec<InputEvent>) {
 mod tests {
     use super::*;
     use crate::events::{WireKey, WireKeyCode, WireMouse};
+    use crate::proto::{FRAME_WINDOW, WINDOW_CELLS};
     use crate::terminal::ServerTerminal;
     use fux_vt::keys::KeyPress;
 
@@ -1200,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_base_sends_one_resync_until_a_frame_applies() {
+    fn an_unknown_base_sends_one_resync_and_an_older_one_none() {
         let (now, mut s) = start();
         drain(&mut s);
         let blank = TerminalScreen::default();
@@ -1214,8 +1099,56 @@ mod tests {
         );
         s.on_frame(now, &frame(7, 0, 0, &blank, &one));
         assert!(s.screen().contents().contains("one"));
+        // Base 3 is older than base 4, refused: the server sent it before it read that Resync.
         s.on_frame(now, &frame(8, 3, 0, &one, &one));
+        assert_eq!(drain(&mut s), [], "covered by the resync sent");
+        s.on_frame(now, &frame(9, 8, 0, &one, &one));
+        assert_eq!(drain(&mut s), [ClientMsg::Resync], "a newer one asks again");
+    }
+
+    #[test]
+    fn a_server_never_read_from_is_owed_one_resync_at_most() {
+        // A hostile server sends frames on bases the client lacks, alternating and rising, and
+        // never reads: what the client owes it stays one message.
+        let (now, mut s) = start();
+        drain(&mut s);
+        let one = screen(b"one");
+        let mut num = 10;
+        for rise in 0..100u64 {
+            for turn in 0..100u64 {
+                num += 1;
+                s.on_frame(now, &frame(num, 3 + rise + turn % 2, 0, &one, &one));
+            }
+        }
         assert_eq!(drain(&mut s), [ClientMsg::Resync]);
+    }
+
+    #[test]
+    fn each_unheld_base_asks_for_a_resync_once() {
+        // The server took a refused frame's delivery as its acknowledgement and diffs against it:
+        // a frame on that base is refused too, and must ask again, or the session freezes.
+        let (now, mut s) = start();
+        drain(&mut s);
+        let one = screen(b"one");
+        s.on_frame(now, &frame(4, 3, 0, &one, &one));
+        s.on_frame(now, &frame(5, 3, 0, &one, &one));
+        assert_eq!(drain(&mut s), [ClientMsg::Resync], "one per base");
+        s.on_frame(now, &frame(6, 5, 0, &one, &one));
+        assert_eq!(drain(&mut s), [ClientMsg::Resync], "a new base asks again");
+        assert!(!s.synced());
+    }
+
+    #[test]
+    fn a_detach_drops_the_resync_owed_to_the_lost_connection() {
+        let (now, mut s) = start();
+        drain(&mut s);
+        let one = screen(b"one");
+        s.on_frame(now, &frame(4, 3, 0, &one, &one));
+        s.detach(now);
+        assert!(
+            !drain(&mut s).contains(&ClientMsg::Resync),
+            "the resync was owed to the lost connection"
+        );
     }
 
     #[test]
@@ -1267,14 +1200,14 @@ mod tests {
                     diff: repaint.clone(),
                 },
             );
-            assert!(s.older_cells() <= WINDOW_CELLS, "after frame {n}");
+            assert!(s.link.older_cells() <= WINDOW_CELLS, "after frame {n}");
         }
         assert_eq!(
-            s.link.older.len(),
+            s.link.older().len(),
             1,
             "one largest screen besides the current one"
         );
-        assert_eq!(s.older_cells(), WINDOW_CELLS);
+        assert_eq!(s.link.older_cells(), WINDOW_CELLS);
         assert_eq!(s.state(), &big);
         drain(&mut s);
         // A frame on a dropped base still asks for a resync; one on the kept base applies.
@@ -1298,8 +1231,8 @@ mod tests {
             s.on_frame(now, &frame(n, n - 1, 0, &prev, &next));
             prev = next;
         }
-        assert_eq!(s.link.older.len(), FRAME_WINDOW - 1);
-        assert_eq!(s.older_cells(), 0);
+        assert_eq!(s.link.older().len(), FRAME_WINDOW - 1);
+        assert_eq!(s.link.older_cells(), 0);
         assert_eq!(s.state(), &prev);
     }
 
@@ -1323,10 +1256,10 @@ mod tests {
             assert_eq!(s.state(), &next);
             prev = next;
         }
-        assert_eq!(s.link.older.len(), FRAME_WINDOW - 1);
+        assert_eq!(s.link.older().len(), FRAME_WINDOW - 1);
         // Per frame, the row that scrolled off and the one written.
-        let screens =
-            std::iter::once(&*s.link.current.screen).chain(s.link.older.iter().map(|f| &*f.screen));
+        let screens = std::iter::once(&*s.link.current().screen)
+            .chain(s.link.older().iter().map(|f| &*f.screen));
         let distinct = TerminalScreen::distinct_cells(screens);
         assert!(
             distinct <= (usize::from(rows) + 2 * FRAME_WINDOW) * usize::from(cols),
@@ -1729,7 +1662,7 @@ mod tests {
             s.outgoing
                 .iter()
                 .any(|m| matches!(m, ClientMsg::Ack { .. }))
-                && s.outgoing.iter().any(|m| matches!(m, ClientMsg::Resync)),
+                && s.link.owes_resync(),
             "{:?}",
             s.outgoing
         );

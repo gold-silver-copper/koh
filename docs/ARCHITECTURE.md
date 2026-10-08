@@ -97,7 +97,11 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
 - **Delivery is the acknowledgement.** The client sends no acknowledgement per frame: when QUIC
   reports a frame's stream wholly delivered (`stopped` with no code), the server takes it as
   acknowledged. The client applies every frame it gets on a base it holds, and keeps a frame that
-  arrives after a newer one as a base, so the server may diff against any delivered frame. The
+  arrives after a newer one as a base, so the server may diff against any delivered frame. A
+  `Resync` makes the server forget every frame it took as delivered (`ClientHolds`, in
+  `src/server/held.rs`), so a delivery heard after it, of a frame sent before it, is not found; the
+  client asks again for each base it lacks newer than the last it asked for, and owes at most one
+  `Resync` at a time, held with its connection's frames (`Link`, in `src/client/link.rs`). The
   server asks the client's QUIC stack to acknowledge within 2 ms (the ACK-frequency extension)
   rather than 25. A superseded frame that was wholly written gets a round trip and that delay to
   report its delivery before its stream is reset.

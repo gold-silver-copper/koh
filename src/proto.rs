@@ -236,6 +236,15 @@ pub enum ProtoError {
     BadInput(&'static str),
 }
 
+/// Refuse `len` past `max` as [`ProtoError::TooLarge`].
+const fn at_most(len: usize, max: usize) -> Result<(), ProtoError> {
+    if len > max {
+        Err(ProtoError::TooLarge { len, max })
+    } else {
+        Ok(())
+    }
+}
+
 /// Encode one client message with its length prefix.
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
     let input = match msg {
@@ -310,12 +319,7 @@ impl ClientDecoder {
             return Ok(None);
         };
         let len = usize::try_from(u32::from_be_bytes(*len)).unwrap_or(usize::MAX);
-        if len > MAX_CLIENT_MESSAGE {
-            return Err(ProtoError::TooLarge {
-                len,
-                max: MAX_CLIENT_MESSAGE,
-            });
-        }
+        at_most(len, MAX_CLIENT_MESSAGE)?;
         let Some(body) = rest.get(..len) else {
             self.compact();
             return Ok(None);
@@ -535,12 +539,7 @@ fn inflate_with(dictionary: &[u8], body: &[u8], limit: usize) -> Option<Vec<u8>>
 /// Read a server stream: a frame's base and compressed body, which [`decode_frame_body`] inflates
 /// once the base is found, or history rows, inflated with a [`MAX_FRAME`] limit.
 pub fn decode_server(bytes: &[u8]) -> Result<ServerMsg, ProtoError> {
-    if bytes.len() > MAX_FRAME {
-        return Err(ProtoError::TooLarge {
-            len: bytes.len(),
-            max: MAX_FRAME,
-        });
-    }
+    at_most(bytes.len(), MAX_FRAME)?;
     match bytes.split_first() {
         Some((&TAG_FRAME, rest)) => {
             let (base, rest) = postcard::take_from_bytes::<u64>(rest)?;
@@ -564,12 +563,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMsg, ProtoError> {
 fn take_rows(bytes: &[u8]) -> Result<(Vec<u16>, &[u8]), ProtoError> {
     let (count, mut rest) = postcard::take_from_bytes::<u32>(bytes)?;
     let count = usize::try_from(count).unwrap_or(usize::MAX);
-    if count > usize::from(crate::terminal::MAX_DIM) {
-        return Err(ProtoError::TooLarge {
-            len: count,
-            max: usize::from(crate::terminal::MAX_DIM),
-        });
-    }
+    at_most(count, usize::from(crate::terminal::MAX_DIM))?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         let (row, after) = postcard::take_from_bytes::<u16>(rest)?;

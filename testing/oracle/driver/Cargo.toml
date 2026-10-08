@@ -9,7 +9,7 @@ license.workspace = true
 [dependencies]
 # The user's terminal, reading what each side paints: one parser for both, so a difference is
 # koh's, not the reader's.
-fux-vt = "0.3.2"
+fux-vt = "0.3.4"
 
 [lints]
 workspace = true

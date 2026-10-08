@@ -191,8 +191,6 @@ pub(crate) struct ServerConn {
     screen: Arc<TerminalScreen>,
     /// `screen` differs from what was last sent, or the base must be rebuilt.
     unsent_change: bool,
-    /// `screen` was taken after the hosted program exited.
-    final_snapshot: bool,
     /// The frames the client is taken to hold, by their delivery.
     held: ClientHolds,
     last_num: FrameNum,
@@ -287,7 +285,6 @@ impl ServerConn {
             echo,
             screen: Arc::default(),
             unsent_change: true,
-            final_snapshot: false,
             held: ClientHolds::default(),
             last_num: FrameNum::BLANK,
             last_sent_at: None,
@@ -301,15 +298,18 @@ impl ServerConn {
         }
     }
 
-    /// Install the session's latest screen (taken while the program was `alive`).
-    fn install_snapshot(&mut self, screen: Arc<TerminalScreen>, alive: bool) {
+    /// Install the session's latest screen. One that carries the program's exit code is final.
+    fn install_snapshot(&mut self, screen: Arc<TerminalScreen>) {
         if screen != self.held.newest().screen {
             self.unsent_change = true;
         }
         self.screen = screen;
-        if !alive {
-            self.final_snapshot = true;
-        }
+    }
+
+    /// The hosted program exited: the installed screen carries its exit code, and the frame that
+    /// sends it is final. Every finality check reads this.
+    fn exited(&self) -> bool {
+        self.screen.exit_code().is_some()
     }
 
     /// Append bytes read from the client's stream.
@@ -499,7 +499,7 @@ impl ServerConn {
         self.last_sent_at = Some(now);
         self.last_sent_echo = frame.echo_ack;
         self.unsent_change = false;
-        if self.final_snapshot && self.final_frame.is_none() {
+        if self.exited() && self.final_frame.is_none() {
             self.final_frame = Some((num, now));
         }
         Some(frame)
@@ -596,10 +596,12 @@ pub async fn run_attached(
     mut session: session::SessionClient,
 ) -> anyhow::Result<SessionExit> {
     let mut core = ServerConn::default();
-    core.install_snapshot(session.screen(), true);
+    core.install_snapshot(session.screen());
     let mut client: Option<RecvStream> = None;
     // The client gets exactly one stream for the connection, even after it finishes that one.
     let mut had_client_stream = false;
+    // Whether the session still publishes screens: `next_screen` ends with it.
+    let mut session_open = true;
     let mut read_buf = vec![0u8; 16 * 1024];
     let mut in_flight: VecDeque<(FrameNum, CancellationToken)> = VecDeque::new();
     // Each frame's task says here when the client has all of it: its acknowledgement. Unbounded,
@@ -655,11 +657,10 @@ pub async fn run_attached(
         let reading = client.is_some();
         tokio::select! {
             // Not biased: a pending screen change would starve client input.
-            screen = session.next_screen() => match screen {
-                Some(screen) => {
-                    let alive = screen.exit_code().is_none();
-                    core.install_snapshot(screen, alive);
-                }
+            screen = session.next_screen(), if session_open => match screen {
+                Some(screen) => core.install_snapshot(screen),
+                // A session that ends after its exit screen does not cut off the final frame.
+                None if core.exited() => session_open = false,
                 // The server is shutting down.
                 None => break Ok(SessionExit::Detached),
             },
@@ -690,8 +691,10 @@ pub async fn run_attached(
                             if let Some(size) = drained.resize {
                                 session.send_resize(size).await;
                             }
-                            if !session.can_send() {
-                                break Ok(SessionExit::Detached); // the session ended
+                            // The session ended; after its exit screen, the final frame's ack is
+                            // still awaited, and input to the exited program goes nowhere.
+                            if !session.can_send() && !core.exited() {
+                                break Ok(SessionExit::Detached);
                             }
                         }
                         Err(e) => {
@@ -1169,18 +1172,36 @@ mod tests {
     fn a_changed_snapshot_marks_an_unsent_change_and_the_exit_screen_is_final() {
         let t0 = Instant::now();
         let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"a")), true);
+        c.install_snapshot(Arc::new(screen(b"a")));
         assert!(
             c.poll_frame(t0, None).is_some(),
             "the changed screen is sent"
         );
         // Re-installing the same screen is not a change, so nothing new is due.
-        c.install_snapshot(Arc::new(screen(b"a")), true);
+        c.install_snapshot(Arc::new(screen(b"a")));
         assert!(c.poll_frame(t0, None).is_none());
         // The exit screen marks the connection final.
-        c.install_snapshot(Arc::new(screen(b"a")), false);
+        c.install_snapshot(exit_screen(3));
         let last = c.poll_frame(t0 + Duration::from_secs(1), None);
         assert!(last.is_some() || c.finished(t0 + Duration::from_secs(1) + FINAL_ACK_WAIT));
+    }
+
+    /// A blank screen carrying the program's exit `code`.
+    fn exit_screen(code: u32) -> Arc<TerminalScreen> {
+        let mut emu = crate::terminal::ServerTerminal::new(24, 80, 0).unwrap();
+        emu.set_exit_code(code);
+        Arc::new(emu.snapshot())
+    }
+
+    #[test]
+    fn a_connection_whose_first_screen_is_the_exit_screen_finishes_on_its_ack() {
+        let t0 = Instant::now();
+        let mut c = ServerConn::default();
+        c.install_snapshot(exit_screen(0));
+        let first = c.poll_frame(t0, None).expect("the exit screen is sent");
+        assert!(!c.finished(t0));
+        c.ack(first.num, t0);
+        assert!(c.finished(t0), "the first frame was the final one");
     }
 
     #[test]
@@ -1188,7 +1209,7 @@ mod tests {
         let t0 = Instant::now();
         let rtt = Some(Duration::from_millis(100));
         let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"hello")), true);
+        c.install_snapshot(Arc::new(screen(b"hello")));
         let first = c
             .poll_frame(t0, rtt)
             .expect("the first frame is due at once");
@@ -1199,7 +1220,7 @@ mod tests {
             .contains("hello"));
         c.frame_sent(first.num, 100, t0);
         assert!(c.poll_frame(t0, rtt).is_none(), "nothing changed");
-        c.install_snapshot(Arc::new(screen(b"hello world")), true);
+        c.install_snapshot(Arc::new(screen(b"hello world")));
         let inside = t0 + Duration::from_millis(1);
         assert!(c.poll_frame(inside, rtt).is_none(), "inside the floor");
         assert_eq!(c.next_wake(inside, rtt), t0 + FRAME_FLOOR);
@@ -1217,11 +1238,11 @@ mod tests {
         let rtt = Some(Duration::from_millis(50));
         let mut c = ServerConn::default();
         let [start, second, done] = t;
-        c.install_snapshot(Arc::new(screen(b"start")), true);
+        c.install_snapshot(Arc::new(screen(b"start")));
         let one = c.poll_frame(start, rtt)?;
         c.frame_sent(one.num, 100, start);
         c.ack(one.num, second);
-        c.install_snapshot(Arc::new(screen(b"start, then more")), true);
+        c.install_snapshot(Arc::new(screen(b"start, then more")));
         let two = c.poll_frame(second, rtt)?;
         c.frame_sent(two.num, 10_000, second);
         c.ack(two.num, done);
@@ -1234,10 +1255,10 @@ mod tests {
         let ms = Duration::from_millis;
         let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
         let t = t0 + Duration::from_millis(200);
-        c.install_snapshot(Arc::new(screen(b"a big repaint")), true);
+        c.install_snapshot(Arc::new(screen(b"a big repaint")));
         let big = c.poll_frame(t, rtt).expect("room for it");
         c.frame_sent(big.num, 20_000, t);
-        c.install_snapshot(Arc::new(screen(b"a big repaint, changed")), true);
+        c.install_snapshot(Arc::new(screen(b"a big repaint, changed")));
         let later = t + Duration::from_millis(30);
         assert!(
             c.poll_frame(later, rtt).is_none(),
@@ -1260,7 +1281,7 @@ mod tests {
         let ms = Duration::from_millis;
         let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
         let t = t0 + ms(200);
-        c.install_snapshot(Arc::new(screen(b"$ ")), true);
+        c.install_snapshot(Arc::new(screen(b"$ ")));
         let full = c.poll_frame(t, rtt).unwrap();
         c.frame_sent(full.num, 20_000, t);
         c.push_client_bytes(&stream(&[ClientMsg::Input {
@@ -1296,12 +1317,12 @@ mod tests {
         let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
         let mut at = t0 + ms(200);
         for n in 0..super::MAX_IN_FLIGHT {
-            c.install_snapshot(Arc::new(screen(format!("count {n}").as_bytes())), true);
+            c.install_snapshot(Arc::new(screen(format!("count {n}").as_bytes())));
             let frame = c.poll_frame(at, rtt).expect("room for it");
             c.frame_sent(frame.num, 40, at);
             at += FRAME_FLOOR;
         }
-        c.install_snapshot(Arc::new(screen(b"count more")), true);
+        c.install_snapshot(Arc::new(screen(b"count more")));
         assert!(c.poll_frame(at, rtt).is_none(), "half the window in flight");
         assert!(
             c.next_wake(at, rtt) > at,
@@ -1315,13 +1336,13 @@ mod tests {
         let ms = Duration::from_millis;
         let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
         let t = t0 + Duration::from_millis(200);
-        c.install_snapshot(Arc::new(screen(b"frame 0")), true);
+        c.install_snapshot(Arc::new(screen(b"frame 0")));
         let big = c.poll_frame(t, rtt).unwrap();
         c.frame_sent(big.num, 20_000, t);
         let mut at = t;
         for n in 1..=5 {
             at += Duration::from_millis(10);
-            c.install_snapshot(Arc::new(screen(format!("frame {n}").as_bytes())), true);
+            c.install_snapshot(Arc::new(screen(format!("frame {n}").as_bytes())));
             assert!(c.poll_frame(at, rtt).is_none(), "screen {n} waits");
         }
         c.ack(big.num, at);
@@ -1341,7 +1362,7 @@ mod tests {
         let ms = Duration::from_millis;
         let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
         let t = t0 + Duration::from_millis(200);
-        c.install_snapshot(Arc::new(screen(b"$ ")), true);
+        c.install_snapshot(Arc::new(screen(b"$ ")));
         let full = c.poll_frame(t, rtt).unwrap();
         c.frame_sent(full.num, 20_000, t);
         // The user types; the program's echo changes one row.
@@ -1350,7 +1371,7 @@ mod tests {
             bytes: b"l".to_vec(),
         }]));
         c.drain_client(t, false).unwrap();
-        c.install_snapshot(Arc::new(screen(b"$ l")), true);
+        c.install_snapshot(Arc::new(screen(b"$ l")));
         let typed = t + Duration::from_millis(1);
         let echo = c.poll_frame(typed, rtt).expect("the echo goes at once");
         assert!(applied(&screen(b"$ "), &echo)
@@ -1362,7 +1383,7 @@ mod tests {
         let lines: Vec<u8> = (0..20)
             .flat_map(|n| format!("line {n}\r\n").into_bytes())
             .collect();
-        c.install_snapshot(Arc::new(screen(&lines)), true);
+        c.install_snapshot(Arc::new(screen(&lines)));
         assert!(c
             .poll_frame(typed + Duration::from_millis(2), rtt)
             .is_none());
@@ -1372,7 +1393,7 @@ mod tests {
     fn a_quiet_connection_still_gets_a_heartbeat() {
         let t0 = Instant::now();
         let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"idle")), true);
+        c.install_snapshot(Arc::new(screen(b"idle")));
         c.poll_frame(t0, None).expect("first frame");
         // Acknowledged, so no retry is due; only the heartbeat is.
         c.ack(FrameNum(1), Instant::now());
@@ -1391,7 +1412,7 @@ mod tests {
         let rtt = Some(Duration::from_millis(200));
         let retry = retry_after(rtt);
         let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"lost?")), true);
+        c.install_snapshot(Arc::new(screen(b"lost?")));
         let first = c.poll_frame(t0, rtt).unwrap();
         let just_before = (t0 + retry).checked_sub(Duration::from_millis(1)).unwrap();
         assert!(c.poll_frame(just_before, rtt).is_none());
@@ -1412,12 +1433,12 @@ mod tests {
         let t0 = Instant::now();
         let later = |n| t0 + Duration::from_secs(n);
         let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"one")), true);
+        c.install_snapshot(Arc::new(screen(b"one")));
         let one = c.poll_frame(t0, None).unwrap();
-        c.install_snapshot(Arc::new(screen(b"one two")), true);
+        c.install_snapshot(Arc::new(screen(b"one two")));
         let two = c.poll_frame(later(1), None).unwrap();
         c.ack(FrameNum(1), Instant::now());
-        c.install_snapshot(Arc::new(screen(b"one two three")), true);
+        c.install_snapshot(Arc::new(screen(b"one two three")));
         let three = c.poll_frame(later(2), None).unwrap();
         assert_eq!(three.base, FrameNum(1));
         let client_one = applied(&TerminalScreen::default(), &one);
@@ -1425,7 +1446,7 @@ mod tests {
         // An ack for a frame older than the acknowledged one changes nothing.
         c.ack(FrameNum(2), Instant::now());
         c.ack(FrameNum(1), Instant::now());
-        c.install_snapshot(Arc::new(screen(b"four")), true);
+        c.install_snapshot(Arc::new(screen(b"four")));
         assert_eq!(c.poll_frame(later(3), None).unwrap().base, FrameNum(2));
         let _ = two;
     }
@@ -1435,7 +1456,7 @@ mod tests {
         let t0 = Instant::now();
         let later = |n| t0 + Duration::from_secs(n);
         let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"a")), true);
+        c.install_snapshot(Arc::new(screen(b"a")));
         c.poll_frame(t0, None).unwrap();
         c.ack(FrameNum(1), Instant::now());
         c.push_client_bytes(&stream(&[ClientMsg::Resync]));
@@ -1455,16 +1476,16 @@ mod tests {
         let t0 = Instant::now();
         let later = |n| t0 + Duration::from_secs(n);
         let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"a")), true);
+        c.install_snapshot(Arc::new(screen(b"a")));
         c.poll_frame(t0, None).unwrap();
         c.ack(FrameNum(1), later(1));
-        c.install_snapshot(Arc::new(screen(b"a b")), true);
+        c.install_snapshot(Arc::new(screen(b"a b")));
         let two = c.poll_frame(later(2), None).unwrap();
         assert_eq!(two.base, FrameNum(1));
         c.push_client_bytes(&stream(&[ClientMsg::Resync]));
         c.drain_client(later(3), false).unwrap();
         c.ack(FrameNum(2), later(3));
-        c.install_snapshot(Arc::new(screen(b"a b c")), true);
+        c.install_snapshot(Arc::new(screen(b"a b c")));
         let next = c
             .poll_frame(later(4), None)
             .expect("a resync forces a frame");
@@ -1480,7 +1501,7 @@ mod tests {
         let t0 = Instant::now();
         let mut c = ServerConn::default();
         for n in 0..=u64::try_from(FRAME_WINDOW).unwrap() {
-            c.install_snapshot(Arc::new(screen(format!("frame {n}").as_bytes())), true);
+            c.install_snapshot(Arc::new(screen(format!("frame {n}").as_bytes())));
             c.poll_frame(t0 + Duration::from_secs(n), None).unwrap();
         }
         assert_eq!(c.held.window().len(), FRAME_WINDOW);
@@ -1497,12 +1518,10 @@ mod tests {
         // A connection that has just sent the final frame (with the exit code) at `sent`.
         let exited = || {
             let mut c = ServerConn::default();
-            c.install_snapshot(Arc::new(screen(b"$ ")), true);
+            c.install_snapshot(Arc::new(screen(b"$ ")));
             c.poll_frame(t0, None).unwrap();
             assert!(!c.finished(t0));
-            let mut emu = crate::terminal::ServerTerminal::new(24, 80, 0).unwrap();
-            emu.set_exit_code(3);
-            c.install_snapshot(Arc::new(emu.snapshot()), false);
+            c.install_snapshot(exit_screen(3));
             let last = c.poll_frame(sent, None).expect("the final frame");
             assert!(!c.finished(sent));
             (c, last)
@@ -1533,7 +1552,7 @@ mod tests {
         // Each resend held its own copy: sixteen of a 1000x1000 screen were over 500 MB.
         let mut c = ServerConn::default();
         let big = largest("unchanged");
-        c.install_snapshot(Arc::clone(&big), true);
+        c.install_snapshot(Arc::clone(&big));
         let t0 = Instant::now();
         for n in 0..=u64::try_from(FRAME_WINDOW).unwrap() {
             c.poll_frame(t0 + HEARTBEAT * u32::try_from(n).unwrap(), None)
@@ -1561,7 +1580,7 @@ mod tests {
         let t0 = Instant::now();
         for n in 0..20_u32 {
             emu.process(format!("line {n}\r\n").as_bytes());
-            c.install_snapshot(Arc::new(emu.snapshot()), true);
+            c.install_snapshot(Arc::new(emu.snapshot()));
             c.poll_frame(t0 + HEARTBEAT * n, None)
                 .expect("a frame is due");
         }
@@ -1577,7 +1596,7 @@ mod tests {
         let mut c = ServerConn::default();
         let t0 = Instant::now();
         for n in 0..20_u32 {
-            c.install_snapshot(largest(&format!("screen {n}")), true);
+            c.install_snapshot(largest(&format!("screen {n}")));
             c.poll_frame(t0 + HEARTBEAT * n, None)
                 .expect("a frame is due");
             assert!(

@@ -339,8 +339,11 @@ frames, echo-ack and acknowledgements) is dropped (`detach`) and made anew (`att
 escape keys, the scrollback view, the window size and the colours work during the outage and carry
 across it. Typed input does not: what is typed while the link is down (and the banner stays up until
 the new connection's first frame shows which shell it reached) is not taken (nor predicted), what was not yet
-sent when the connection is made anew is dropped, and the status line says so; it also says when
-input handed to the lost connection was never confirmed, as what follows may run without it. A reattach may land on a new shell (the session expired, the shell
+sent when the link dropped is dropped, and the banner says so; it also says when input handed to the
+lost connection was never confirmed, as what follows may run without it. The outage (`Outage`, from the
+first drop to that first frame; a drop meanwhile is the same outage) holds these as facts, and only the
+status line puts them in words, for the whole outage and a few seconds after. A notice on the status line
+can be given, retired and shown but not read (`notice::Notices`), so what it says decides nothing; a new outage retires what the last one lost. A reattach may land on a new shell (the session expired, the shell
 exited, or the server restarted), which the client cannot tell from its own (the server's
 `AttachKind` is not on the wire), and keys typed at the old screen must not run there; nor may the
 end of a line whose start was lost with the link run alone (`false && rm …` typed across the drop
@@ -390,7 +393,12 @@ per-connection state never lives in the session:
   attachment: the session counts its clients as its `watch` sender's receivers, so dropping one
   (on return **or** panic) detaches with no message to lose, and a panicking connection can't pin
   a session. The session starts the TTL when the last receiver drops; it tears itself down at the
-  TTL or once its shell exits. The registry's `Sessions` forgets a session only once its task has
+  TTL; once its shell has exited and no client is left; or when a reconnect asks to attach after
+its shell exited, even while an old client still holds on (that client's screens end with it, and
+the reconnect gets a new session). Its life is one `Phase` (attached,
+  detached since when, exited), and an exited session is never reattached, even while an old
+  client still holds on. A connection's final frame is the first one whose screen carries the exit
+  code. The registry's `Sessions` forgets a session only once its task has
   ended (its control channel is closed), so a late end cannot unregister the session that replaced
   it, and its shutdown ends every session, attached or not, and waits for their tasks.
 - **The bell hook.** `--on-bell <cmd>` / `ConnectConfig::bell_command` runs `sh -c` when

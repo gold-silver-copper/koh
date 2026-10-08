@@ -310,6 +310,12 @@ impl ServerConn {
         self.screen = screen;
     }
 
+    /// The hosted program exited: the installed screen carries its exit code, and the frame that
+    /// sends it is final. Every finality check reads this.
+    fn exited(&self) -> bool {
+        self.screen.exit_code().is_some()
+    }
+
     /// Append bytes read from the client's stream.
     fn push_client_bytes(&mut self, bytes: &[u8]) {
         self.decoder.push(bytes);
@@ -510,7 +516,7 @@ impl ServerConn {
         self.last_sent_at = Some(now);
         self.last_sent_echo = frame.echo_ack;
         self.unsent_change = false;
-        if self.screen.exit_code().is_some() && self.final_frame.is_none() {
+        if self.exited() && self.final_frame.is_none() {
             self.final_frame = Some((num, now));
         }
         Some(frame)
@@ -679,7 +685,7 @@ pub async fn run_attached(
             screen = session.next_screen(), if session_open => match screen {
                 Some(screen) => core.install_snapshot(screen),
                 // A session that ends after its exit screen does not cut off the final frame.
-                None if core.screen.exit_code().is_some() => session_open = false,
+                None if core.exited() => session_open = false,
                 // The server is shutting down.
                 None => break Ok(SessionExit::Detached),
             },
@@ -712,7 +718,7 @@ pub async fn run_attached(
                             }
                             // The session ended; after its exit screen, the final frame's ack is
                             // still awaited, and input to the exited program goes nowhere.
-                            if !session.can_send() && core.screen.exit_code().is_none() {
+                            if !session.can_send() && !core.exited() {
                                 break Ok(SessionExit::Detached);
                             }
                         }

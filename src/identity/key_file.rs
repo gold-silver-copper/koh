@@ -219,6 +219,25 @@ pub fn open_private_log(path: &Path) -> Result<File, SetupError> {
     Ok(file)
 }
 
+#[cfg(test)]
+impl KeyFile {
+    /// [`reset`](Self::reset), tried again for a moment while its lock is refused. A test that
+    /// spawns a process elsewhere in the test binary gives the child a copy of every descriptor
+    /// open at that instant, a lease's lock among them, until the child execs; so a lease already
+    /// dropped can still refuse the exclusive lock briefly.
+    pub(crate) fn reset_settled(&self) -> anyhow::Result<()> {
+        let mut reset = self.reset();
+        for _ in 0..50 {
+            if reset.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            reset = self.reset();
+        }
+        reset
+    }
+}
+
 /// A `flock` on the identity's lock file; closing the file releases it.
 pub(super) struct IdentityLease {
     _lock: File,
@@ -672,7 +691,7 @@ mod tests {
         for mode in [0o000, 0o200] {
             std::fs::write(&path, [7u8; KEY_LEN]).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            key.reset()
+            key.reset_settled()
                 .unwrap_or_else(|error| panic!("mode {mode:o}: {error:#}"));
             assert!(!path.exists(), "mode {mode:o}: reset left the key");
         }

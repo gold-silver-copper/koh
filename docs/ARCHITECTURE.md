@@ -339,7 +339,7 @@ sent when the link dropped is dropped, and the banner says so; it also says when
 lost connection was never confirmed, as what follows may run without it. The outage (`Outage`, from the
 first drop to that first frame; a drop meanwhile is the same outage) holds these as facts, and only the
 status line puts them in words, for the whole outage and a few seconds after. A notice on the status line
-can be given and shown but not read (`notice::Notice`), so what it says decides nothing. A reattach may land on a new shell (the session expired, the shell
+can be given, retired and shown but not read (`notice::Notices`), so what it says decides nothing; a new outage retires what the last one lost. A reattach may land on a new shell (the session expired, the shell
 exited, or the server restarted), which the client cannot tell from its own (the server's
 `AttachKind` is not on the wire), and keys typed at the old screen must not run there; nor may the
 end of a line whose start was lost with the link run alone (`false && rm …` typed across the drop

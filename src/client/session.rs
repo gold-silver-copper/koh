@@ -24,6 +24,7 @@ use super::probe::COLOUR_QUERIES;
 use super::render::WindowState;
 use super::scrollback::Scrollback;
 use super::{window_state, ESCAPE_PREFIX, SCROLLBACK_KEY, SUSPEND_KEY};
+use outage::Outage;
 
 /// How long the server may go unheard before the "link down" banner: three heartbeats, so one late
 /// frame does not flash it.
@@ -34,78 +35,101 @@ pub const LINK_DOWN_GRACE: Duration = HEARTBEAT.saturating_mul(3);
 const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 
 /// What the status line says of a paste past [`MAX_QUEUED_INPUT`], which is dropped whole.
-const PASTE_TOO_LONG: &str = "[koh] paste over 1 MiB — not sent";
+const PASTE_TOO_LONG: &str = "paste over 1 MiB — not sent";
 
 /// Said when typing was not sent. The reattach may have landed on a new shell (the session
 /// expired, or the server restarted), which the client cannot tell from its own, and keys typed at
 /// the old screen must not run there; nor may the end of a line whose start was lost with the link
 /// run alone (`false && rm …` must not run `rm …`).
-const INPUT_DROPPED: &str = "[koh] typing during the outage not sent";
+const INPUT_DROPPED: &str = "typing during the outage not sent";
 
 /// Said when input handed to the lost connection was never confirmed: the server may not have had
 /// it, so what is typed next may run without it.
-const UNCONFIRMED: &str = "[koh] keys typed as the link dropped may not have arrived";
+const UNCONFIRMED: &str = "keys typed as the link dropped may not have arrived";
 
-/// Said when both were lost.
-const UNCONFIRMED_AND_DROPPED: &str =
-    "[koh] keys typed as the link dropped may not have arrived · typing during the outage not sent";
-
-/// From the first drop to the next connection's first frame, which shows the shell it reached; a
-/// drop meanwhile is the same outage. It holds what was lost as facts; only the status line puts
-/// them in words.
-struct Outage {
-    since: Instant,
-    /// Input handed to the lost connection was not confirmed at the first drop.
-    unconfirmed: bool,
-    /// Typing was not sent.
-    typing_dropped: bool,
+/// Put `part` on the status line `status`: after a `·`, or first, after `[koh]`.
+fn say(status: &mut String, part: &str) {
+    status.push_str(if status.is_empty() { "[koh] " } else { " · " });
+    status.push_str(part);
 }
 
-impl Outage {
-    /// What the status line says of what the outage lost.
-    const fn said(&self) -> Option<&'static str> {
-        match (self.unconfirmed, self.typing_dropped) {
-            (true, true) => Some(UNCONFIRMED_AND_DROPPED),
-            (true, false) => Some(UNCONFIRMED),
-            (false, true) => Some(INPUT_DROPPED),
-            (false, false) => None,
-        }
-    }
-}
-
-/// A notice for the status line, apart from the session, which can give one and show it but never
-/// read it: what a notice says decides nothing, and once [`NOTICE_FOR`] is past it is gone.
-mod notice {
-    use std::fmt;
+/// The outage, apart from the session, which can only begin it and say typing was dropped in it.
+mod outage {
     use std::time::Instant;
 
-    use super::NOTICE_FOR;
+    use super::{INPUT_DROPPED, UNCONFIRMED};
 
-    #[derive(Default)]
-    pub(super) struct Notice(Option<(&'static str, Instant)>);
-
-    /// A notice as shown, which only prints.
-    pub(super) struct Shown(&'static str);
-
-    impl fmt::Display for Shown {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.0)
-        }
+    /// From the first drop to the next connection's first frame, which shows the shell it
+    /// reached; a drop meanwhile is the same outage. It holds what was lost as facts; only the
+    /// status line puts them in words.
+    pub(super) struct Outage {
+        since: Instant,
+        /// Input handed to the lost connection was not confirmed at the first drop.
+        unconfirmed: bool,
+        /// Typing was not sent.
+        typing_dropped: bool,
     }
 
-    impl Notice {
-        pub(super) const fn give(&mut self, text: &'static str, now: Instant) {
-            self.0 = Some((text, now));
+    impl Outage {
+        pub(super) const fn begin(since: Instant, unconfirmed: bool) -> Self {
+            Self {
+                since,
+                unconfirmed,
+                typing_dropped: false,
+            }
         }
 
-        /// The notice, if given less than [`NOTICE_FOR`] before `now` and not saying `besides`,
-        /// which is shown already.
-        pub(super) fn shown(&self, now: Instant, besides: Option<&str>) -> Option<Shown> {
-            self.0
-                .filter(|&(text, at)| {
-                    now.saturating_duration_since(at) < NOTICE_FOR && besides != Some(text)
-                })
-                .map(|(text, _)| Shown(text))
+        pub(super) const fn dropped_typing(&mut self) {
+            self.typing_dropped = true;
+        }
+
+        /// When the first drop was.
+        pub(super) const fn since(&self) -> Instant {
+            self.since
+        }
+
+        /// What the status line says of what the outage lost.
+        pub(super) fn said(&self) -> impl Iterator<Item = &'static str> {
+            [
+                self.unconfirmed.then_some(UNCONFIRMED),
+                self.typing_dropped.then_some(INPUT_DROPPED),
+            ]
+            .into_iter()
+            .flatten()
+        }
+    }
+}
+
+/// Notices for the status line, apart from the session, which can give one, retire one and put
+/// them on the status line, but never read them: what a notice says decides nothing, and once
+/// [`NOTICE_FOR`] is past it is gone.
+mod notice {
+    use std::time::Instant;
+
+    use super::{say, NOTICE_FOR};
+
+    /// Each notice once, with when it was last given.
+    #[derive(Default)]
+    pub(super) struct Notices(Vec<(&'static str, Instant)>);
+
+    impl Notices {
+        pub(super) fn give(&mut self, text: &'static str, now: Instant) {
+            self.retire(text);
+            self.0.push((text, now));
+        }
+
+        /// Take back `text`, if given.
+        pub(super) fn retire(&mut self, text: &'static str) {
+            self.0.retain(|&(given, _)| given != text);
+        }
+
+        /// Put on `status` the notices given less than [`NOTICE_FOR`] before `now`.
+        pub(super) fn say(&self, now: Instant, status: &mut String) {
+            for &(text, at) in &self.0 {
+                if now.saturating_duration_since(at) < NOTICE_FOR {
+                    say(status, text);
+                }
+            }
         }
     }
 }
@@ -168,7 +192,7 @@ pub struct ClientSession {
     /// Questions for the user's terminal, for the caller to write.
     ask: Vec<u8>,
     /// A notice for the status line.
-    notice: notice::Notice,
+    notice: notice::Notices,
     /// A key's legacy bytes, as last matched against the escape prefix.
     scratch: Vec<u8>,
     /// The history held, and the scrollback view.
@@ -244,7 +268,7 @@ impl ClientSession {
             colours: None,
             colours_asked: false,
             ask: Vec::new(),
-            notice: notice::Notice::default(),
+            notice: notice::Notices::default(),
             scratch: Vec::with_capacity(16),
             scrollback: Scrollback::default(),
             last_activity: None,
@@ -263,11 +287,11 @@ impl ClientSession {
     pub fn detach(&mut self, now: Instant) {
         let outage = self.outage.get_or_insert_with(|| {
             self.predictor = self.predictor.reattached();
-            Outage {
-                since: now,
-                unconfirmed: self.sent_seq > self.link.echo_ack,
-                typing_dropped: false,
+            // What an earlier outage lost is not this one's.
+            for text in [UNCONFIRMED, INPUT_DROPPED] {
+                self.notice.retire(text);
             }
+            Outage::begin(now, self.sent_seq > self.link.echo_ack)
         });
         self.outgoing.retain(|msg| {
             !matches!(
@@ -279,9 +303,10 @@ impl ClientSession {
             self.outgoing
                 .retain(|msg| !matches!(msg, ClientMsg::Keys { .. } | ClientMsg::Input { .. }));
             self.queued_input = 0;
-            self.input_paused = false;
-            outage.typing_dropped = true;
+            outage.dropped_typing();
         }
+        // Nothing is queued now, so nothing is to drain before typing is taken again.
+        self.input_paused = false;
         self.scrollback.forget_requests();
         self.dirty = true;
     }
@@ -473,7 +498,7 @@ impl ClientSession {
                 .iter()
                 .any(|e| matches!(e, InputEvent::Key(_) | InputEvent::Paste { .. }))
             {
-                outage.typing_dropped = true;
+                outage.dropped_typing();
                 self.dirty = true;
             }
             return;
@@ -537,15 +562,14 @@ impl ClientSession {
         self.dirty = true;
     }
 
-    /// What the status line says beside the link's state: input paused, else a recent notice
-    /// that is not `besides`.
-    fn aside(&self, now: Instant, besides: Option<&str>) -> Option<String> {
+    /// Put on `status` what the status line says beside the link's state: input paused, else the
+    /// recent notices.
+    fn aside(&self, now: Instant, status: &mut String) {
         if self.input_paused {
-            return Some("[koh] input paused — the server is not taking input".to_owned());
+            say(status, "input paused — the server is not taking input");
+        } else {
+            self.notice.say(now, status);
         }
-        self.notice
-            .shown(now, besides)
-            .map(|shown| shown.to_string())
     }
 
     /// Questions for the user's terminal the session has (the colours again, after the terminal
@@ -660,7 +684,7 @@ impl ClientSession {
         self.link.resync_sent = false;
         // The outage ends with the new connection's first frame, which shows the shell it reached;
         // what it lost is said a while longer.
-        if let Some(said) = self.outage.take().and_then(|o| o.said()) {
+        for said in self.outage.take().iter().flat_map(Outage::said) {
             self.notice.give(said, now);
         }
         self.link.echo_ack = self.link.echo_ack.max(frame.echo_ack);
@@ -727,15 +751,12 @@ impl ClientSession {
             // lost and what else the status line would say after it.
             let mut status = format!(
                 "[koh] disconnected — reconnecting… {}s (Ctrl-^ . to quit)",
-                now.saturating_duration_since(outage.since).as_secs()
+                now.saturating_duration_since(outage.since()).as_secs()
             );
-            // A notice still up from the last outage may say the same.
-            let said = outage.said();
-            let aside = self.aside(now, said);
-            for aside in said.into_iter().chain(aside.as_deref()) {
-                status.push_str(" · ");
-                status.push_str(aside.trim_start_matches("[koh] "));
+            for said in outage.said() {
+                say(&mut status, said);
             }
+            self.aside(now, &mut status);
             return TickResult {
                 wait: Duration::from_secs(1),
                 status: Some(status),
@@ -773,7 +794,13 @@ impl ClientSession {
             Some(silent) if silent > LINK_DOWN_GRACE => {
                 Some(format!("[koh] link down — resuming… {}s", silent.as_secs()))
             }
-            _ => self.aside(now, None).or_else(|| self.scrollback.status()),
+            _ => {
+                let mut aside = String::new();
+                self.aside(now, &mut aside);
+                Some(aside)
+                    .filter(|aside| !aside.is_empty())
+                    .or_else(|| self.scrollback.status())
+            }
         };
         TickResult {
             wait: Duration::from_millis(50),
@@ -1979,5 +2006,83 @@ mod tests {
             &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
         );
         assert!(s.on_tick(t1 + NOTICE_FOR, None).status.is_none());
+    }
+
+    /// A new outage says only what it lost: what the last one lost, still on the status line,
+    /// goes at the drop, so a phrase is not said twice nor said of this outage untrue.
+    #[test]
+    fn a_new_outage_retires_what_the_last_one_lost() {
+        let (t0, mut s) = start();
+        s.on_input(t0, b"false && ");
+        drain(&mut s);
+        s.detach(t0);
+        s.on_input(t0, b"x");
+        s.attach(Size::new(24, 80));
+        s.on_frame(
+            t0,
+            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
+        );
+        drain(&mut s);
+        s.detach(t0);
+        let status = s.on_tick(t0, None).status.expect("the banner");
+        assert!(
+            !status.contains("not sent") && !status.contains("may not have arrived"),
+            "{status}"
+        );
+        s.on_input(t0, b"y");
+        let status = s.on_tick(t0, None).status.expect("the banner");
+        assert_eq!(status.matches("not sent").count(), 1, "{status}");
+    }
+
+    /// A paste too long during an outage is still said after it, beside what the outage lost.
+    #[test]
+    fn a_paste_too_long_during_an_outage_is_said_after_it() {
+        let (now, mut s) = start();
+        s.detach(now);
+        s.on_input(now, b"x");
+        s.on_inputs(now, vec![Input::PasteTooLong]);
+        s.attach(Size::new(24, 80));
+        s.on_frame(
+            now,
+            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
+        );
+        let status = s.on_tick(now, None).status.expect("a notice");
+        assert!(
+            status.contains("paste over 1 MiB") && status.contains("not sent"),
+            "{status}"
+        );
+    }
+
+    /// A pause with nothing queued ends at the drop, which drops all that is queued: typing after
+    /// the outage goes out.
+    #[test]
+    fn a_pause_with_nothing_queued_ends_at_the_drop() {
+        let (now, mut s) = start();
+        drain(&mut s);
+        s.input_paused = true;
+        s.detach(now);
+        s.attach(Size::new(24, 80));
+        s.on_frame(
+            now,
+            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
+        );
+        drain(&mut s);
+        s.on_input(now, b"x");
+        assert_eq!(typed(&drain(&mut s)), b"x");
+    }
+
+    /// A second drop in the same outage keeps the trust taken at the first: nothing between is
+    /// asked again.
+    #[test]
+    fn a_second_drop_keeps_the_trust_taken_at_the_first() {
+        let (now, mut s) = start();
+        s.detach(now);
+        s.attach(Size::new(24, 80));
+        s.predictor.confirm_for_tests();
+        s.detach(now);
+        assert!(
+            !s.predictor.carries_trust(),
+            "the trust is the first drop's"
+        );
     }
 }

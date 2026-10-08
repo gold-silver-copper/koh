@@ -83,7 +83,7 @@ impl Default for ServeConfig {
 
 /// `data` as a QR code for a dark-background terminal (dark modules drawn as the background, so a
 /// camera reads dark on light), or `None` if it is too large to encode.
-fn connect_qr(data: &str) -> Option<String> {
+pub fn connect_qr(data: &str) -> Option<String> {
     use qrcode::render::unicode::Dense1x2;
     let code = qrcode::QrCode::new(data).ok()?;
     Some(
@@ -197,7 +197,7 @@ impl Hosting {
         let allow: HashSet<EndpointId> = args.allow.iter().copied().collect();
         if allow.is_empty() {
             anyhow::bail!(
-                "no clients authorized: pass --allow <endpoint-id> (repeatable; get one from `koh id`)"
+                "no clients authorized: save one with `koh clients add <name> <endpoint-id>`, or pass --allow <endpoint-id> (get it from `koh id` on the client)"
             );
         }
         anyhow::ensure!(

@@ -681,13 +681,12 @@ pub async fn run_attached(
         let reading = client.is_some();
         tokio::select! {
             // Not biased: a pending screen change would starve client input.
-            screen = session.next_screen() => match screen {
-                Some(screen) => {
-                    let alive = screen.exit_code().is_none();
-                    core.install_snapshot(screen, alive);
-                }
-                // The server is shutting down.
-                None => break Ok(SessionExit::Detached),
+            screen = session.next_screen() => if let Some(screen) = screen {
+                let alive = screen.exit_code().is_none();
+                core.install_snapshot(screen, alive);
+            } else {
+                conn.close(Close::ShuttingDown);
+                break Ok(SessionExit::Detached);
             },
             stream = conn.accept_uni() => match stream {
                 Ok(stream) if !had_client_stream => {
@@ -870,9 +869,8 @@ pub async fn run_session(
         launcher,
     });
     let peer = conn.remote_id();
-    if let Some((client, _)) = registry.attach(peer).await {
-        let _ = run_attached(admission::admit(conn).await?, client).await?;
-    }
+    let (link, (client, _)) = admission::admit(conn, registry.attach(peer).await).await?;
+    let _ = run_attached(link, client).await?;
     registry.shutdown().await;
     Ok(())
 }
@@ -995,7 +993,7 @@ mod tests {
             async { server.accept().await.unwrap().await.unwrap() },
             client.connect(addr, ALPN)
         );
-        let admitted = crate::transport_iroh::admission::admit(accepted)
+        let (admitted, ()) = crate::transport_iroh::admission::admit(accepted, Ok(()))
             .await
             .unwrap();
         (admitted, connected.unwrap(), server, client)

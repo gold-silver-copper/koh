@@ -210,7 +210,7 @@ async fn admit_once_then_refuse(first: Close) -> anyhow::Result<(iroh::EndpointA
             let Ok(conn) = incoming.await else { continue };
             if admitted {
                 refuse(&conn, Refusal::NotAuthorized);
-            } else if let Ok(link) = admit(conn).await {
+            } else if let Ok((link, ())) = admit(conn, Ok(())).await {
                 admitted = true;
                 // Long enough for the client loop to take the connection.
                 tokio::time::sleep(Duration::from_millis(300)).await;

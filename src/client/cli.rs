@@ -392,7 +392,7 @@ mod tests {
                         connection.remote_id() == expected,
                         "client identity changed"
                     );
-                    admission::admit(connection).await?.closed().await;
+                    admission::admit(connection, Ok(())).await?.0.closed().await;
                 }
                 Ok::<_, anyhow::Error>(())
             };

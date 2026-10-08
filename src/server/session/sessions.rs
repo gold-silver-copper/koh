@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use super::{start, Attach, AttachKind, SessionClient, SessionSpec};
+use crate::transport_iroh::admission::Refusal;
 
 /// Every session task the registry started, and the ones still live, by peer.
 pub(super) struct Sessions {
@@ -27,27 +28,31 @@ impl Sessions {
         }
     }
 
-    /// Attach `peer` to its session, starting one if it has none. `None` at the session cap, or if
-    /// starting one failed.
-    pub(super) async fn attach(&mut self, peer: EndpointId) -> Option<(SessionClient, AttachKind)> {
+    /// Attach `peer` to its session, starting one if it has none: refused at the session cap, or
+    /// unavailable if starting one failed.
+    pub(super) async fn attach(
+        &mut self,
+        peer: EndpointId,
+    ) -> Result<(SessionClient, AttachKind), Refusal> {
         self.live.retain(|_, control| !control.is_closed());
         while let Some(ended) = self.tasks.try_join_next() {
             log_panic(ended);
         }
         if let Some(control) = self.live.get(&peer) {
             if let Some((client, detached_for)) = attach_to(control).await {
-                return Some((client, AttachKind::Reattached { detached_for }));
+                return Ok((client, AttachKind::Reattached { detached_for }));
             }
             // It ended a moment ago: a new one takes its place.
         } else if self.live.len() >= self.spec.max_sessions {
-            return None;
+            return Err(Refusal::AtCapacity);
         }
-        let (control, client, task) = start(&self.spec)
-            .map_err(|e| tracing::error!(error = %e, "spawning a session failed"))
-            .ok()?;
+        let (control, client, task) = start(&self.spec).map_err(|e| {
+            tracing::error!(error = %e, "spawning a session failed");
+            Refusal::Unavailable
+        })?;
         self.tasks.spawn(task);
         self.live.insert(peer, control);
-        Some((client, AttachKind::Created))
+        Ok((client, AttachKind::Created))
     }
 
     /// End every session, attached or not, and wait for their tasks.

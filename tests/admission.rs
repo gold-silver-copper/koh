@@ -23,7 +23,7 @@ fn admit_completes_the_dial() {
         let accept = tokio::spawn(async move {
             let incoming = server_ep.accept().await.expect("incoming");
             let conn = incoming.await.expect("accept conn");
-            let _link = admit(conn).await.expect("admit");
+            let _link = admit(conn, Ok(())).await.expect("admit");
             // Hold the connection briefly so the client's accept_bi sees the stream.
             tokio::time::sleep(Duration::from_millis(200)).await;
         });

@@ -18,7 +18,7 @@ use koh::server::run_session;
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
 use koh::terminal::{clamp_dims, RowEncodings, Size, TerminalScreen};
-use koh::transport_iroh::admission::{self, Close, Link};
+use koh::transport_iroh::admission::{self, Close, Link, Refusal};
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
 use tokio_util::sync::CancellationToken;
 
@@ -48,7 +48,7 @@ fn registry(command: &[&str], max_sessions: usize, ttl: Duration) -> Registry {
 
 /// Attach `peer` and say how.
 async fn attach_kind(reg: &Registry, peer: iroh::EndpointId) -> Option<AttachKind> {
-    reg.attach(peer).await.map(|(_, kind)| kind)
+    reg.attach(peer).await.ok().map(|(_, kind)| kind)
 }
 
 fn peer() -> std::io::Result<iroh::EndpointId> {
@@ -83,7 +83,7 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
             .await
             .context("A creates the one allowed session")?;
         anyhow::ensure!(
-            reg.attach(b).await.is_none(),
+            matches!(reg.attach(b).await, Err(Refusal::AtCapacity)),
             "a second distinct peer is refused at the cap"
         );
         anyhow::ensure!(

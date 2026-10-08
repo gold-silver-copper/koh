@@ -308,26 +308,22 @@ pub async fn serve_endpoint(
 async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry) {
     let peer = conn.remote_id();
     auth_event(Outcome::Accepted, &peer, "authorized; attaching session");
-    // Before the ack, so the client never takes the refusal for a lost link.
-    let Some((client, attach_kind)) = registry.attach(peer).await else {
-        // At the session cap, which only a new peer can hit.
-        warn!(peer = %peer, "refusing session: at max-sessions capacity");
-        admission::refuse(&conn, Refusal::AtCapacity);
-        return;
-    };
+    // The seat is decided before the ack, so the client never takes a refusal for a lost link.
     // Bounded, so a client that never accepts the stream cannot hold its slot. Failing, `client`
     // drops, which detaches.
-    let link = match tokio::time::timeout(Duration::from_secs(3), admission::admit(conn)).await {
-        Ok(Ok(link)) => link,
-        Ok(Err(e)) => {
-            warn!(error = %e, "admission ack failed");
-            return;
-        }
-        Err(_) => {
-            warn!("admission ack timed out");
-            return;
-        }
-    };
+    let seat = registry.attach(peer).await;
+    let (link, (client, attach_kind)) =
+        match tokio::time::timeout(Duration::from_secs(3), admission::admit(conn, seat)).await {
+            Ok(Ok(admitted)) => admitted,
+            Ok(Err(e)) => {
+                warn!(peer = %peer, error = %e, "not admitted");
+                return;
+            }
+            Err(_) => {
+                warn!("admission ack timed out");
+                return;
+            }
+        };
     match attach_kind {
         AttachKind::Created => {
             info!(peer = %peer, "started a new session");
@@ -354,6 +350,48 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that cannot seat a peer just now (draining, or its session failed to start) turns
+    /// it away as a lost link to redial, never as the session cap.
+    #[test]
+    fn a_server_that_cannot_seat_a_peer_now_is_not_at_capacity() {
+        use crate::transport_iroh::admission::{dial, Disconnect};
+        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
+        crate::test_runtime::current_thread().block_on(async {
+            for draining in [true, false] {
+                let registry = Registry::spawn(SessionSpec {
+                    command: vec!["sh".to_owned()].into(),
+                    scrollback: 0,
+                    max_sessions: 4,
+                    ttl: Duration::from_secs(1),
+                    launcher: crate::pty::Launcher::new("/nonexistent/koh"),
+                });
+                if draining {
+                    registry.clone().shutdown().await;
+                }
+                let server = bind_endpoint_local(generate_secret_key().unwrap(), true)
+                    .await
+                    .unwrap();
+                let client = bind_endpoint_local(generate_secret_key().unwrap(), false)
+                    .await
+                    .unwrap();
+                let (_, dialed) = tokio::join!(
+                    async {
+                        let conn = server.accept().await.unwrap().await.unwrap();
+                        serve_connection(conn, &registry).await;
+                    },
+                    dial(&client, loopback_addr(&server))
+                );
+                match dialed {
+                    Err(Disconnect::Transient(e)) => {
+                        assert!(format!("{e:#}").contains("server unavailable"), "{e:#}");
+                    }
+                    Err(Disconnect::Fatal(e)) => panic!("draining {draining}: fatal: {e:#}"),
+                    other => panic!("draining {draining}: {:?}", other.map(drop)),
+                }
+            }
+        });
+    }
 
     #[test]
     fn serve_config_default_matches_the_cli_defaults() {

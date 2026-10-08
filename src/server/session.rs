@@ -26,6 +26,7 @@ pub(crate) const REAP_INTERVAL: Duration = Duration::from_secs(5);
 /// How often a session reads its PTY's modes when nothing else made it: a password prompt that
 /// turned echo off after printing is known to the client within this (the wire's contract).
 use crate::proto::TTY_TICK;
+use crate::transport_iroh::admission::Refusal;
 
 /// How much input may wait for a session's PTY before a connection must stop reading its stream.
 const INPUT_QUEUE: usize = 256;
@@ -404,7 +405,7 @@ async fn reap_exit_code(host: &mut PtyHost) -> Option<u32> {
 /// What the registry accepts: attach `peer`.
 struct AttachReq {
     peer: EndpointId,
-    reply: oneshot::Sender<Option<(SessionClient, AttachKind)>>,
+    reply: oneshot::Sender<Result<(SessionClient, AttachKind), Refusal>>,
 }
 
 /// A handle to the registry task: cheap to clone, one per accept loop.
@@ -433,12 +434,15 @@ impl Registry {
         Self { tx, shutdown }
     }
 
-    /// Attach `peer` to its session, creating one if needed. `None` if the server is at its
-    /// session cap and `peer` has no existing session.
-    pub async fn attach(&self, peer: EndpointId) -> Option<(SessionClient, AttachKind)> {
+    /// Attach `peer` to its session, creating one if needed. [`Refusal::AtCapacity`] if the server
+    /// is at its session cap and `peer` has no existing session; [`Refusal::Unavailable`] if the
+    /// registry is shutting down or the session failed to start.
+    pub async fn attach(&self, peer: EndpointId) -> Result<(SessionClient, AttachKind), Refusal> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(AttachReq { peer, reply }).await.ok()?;
-        rx.await.ok().flatten()
+        if self.tx.send(AttachReq { peer, reply }).await.is_err() {
+            return Err(Refusal::Unavailable);
+        }
+        rx.await.unwrap_or(Err(Refusal::Unavailable))
     }
 
     /// Stop the registry and every session, and wait for them to end.

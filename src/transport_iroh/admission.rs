@@ -33,19 +33,26 @@ const BROKE: u32 = 2;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Why the server turns a peer away before admitting it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
     /// The peer is not on the allowlist.
+    #[error("not authorized")]
     NotAuthorized,
     /// The peer has no session and the server holds as many as it may.
+    #[error("server at session capacity")]
     AtCapacity,
+    /// The server could not seat the peer just now (it is shutting down, or its session failed to
+    /// start): a redial may find it back.
+    #[error("server unavailable")]
+    Unavailable,
 }
 
 impl Refusal {
-    const fn reason(self) -> &'static [u8] {
+    const fn wire(self) -> (u32, &'static [u8]) {
         match self {
-            Self::NotAuthorized => b"not authorized",
-            Self::AtCapacity => b"server at session capacity",
+            Self::NotAuthorized => (REFUSED, b"not authorized"),
+            Self::AtCapacity => (REFUSED, b"server at session capacity"),
+            Self::Unavailable => (BYE, b"server unavailable"),
         }
     }
 }
@@ -63,6 +70,8 @@ pub enum Close {
     SecondStream,
     /// The server: the client's stream broke the protocol.
     ProtocolError,
+    /// The server: it is shutting down, and the client may find it back.
+    ShuttingDown,
 }
 
 impl Close {
@@ -73,6 +82,7 @@ impl Close {
             Self::Reconnecting => (BYE, b"reconnecting"),
             Self::SecondStream => (BROKE, b"a second client stream"),
             Self::ProtocolError => (BROKE, b"protocol error"),
+            Self::ShuttingDown => (BYE, b"server shutting down"),
         }
     }
 }
@@ -130,29 +140,31 @@ impl Link {
     pub fn ended(&self) -> Disconnect {
         self.0.close_reason().map_or_else(
             || Disconnect::Transient(anyhow!("the link was lost")),
-            |e| verdict(e.into()),
+            |e| verdict(&e.into()),
         )
     }
 
     /// Wait for the connection to close, and say how it ended.
     pub async fn closed(&self) -> Disconnect {
-        verdict(self.0.closed().await.into())
+        verdict(&self.0.closed().await.into())
     }
 }
 
 /// Server side: turn the peer away, before admitting it ([`admit`] takes the connection).
 pub fn refuse(conn: &Connection, why: Refusal) {
-    conn.close(REFUSED.into(), why.reason());
+    let (code, reason) = why.wire();
+    conn.close(code.into(), reason);
 }
 
-/// Server side: admit the peer. Opening the stream can wait on the client, so the caller bounds it.
-pub async fn admit(conn: Connection) -> std::io::Result<Link> {
-    let (mut send, _recv) = conn.open_bi().await.map_err(std::io::Error::other)?;
-    send.write_all(&[ADMIT])
-        .await
-        .map_err(std::io::Error::other)?;
+/// Server side: admit the peer to the `seat` decided for it, or refuse it: the seat comes first, so
+/// no refusal can follow the ack. Opening the stream can wait on the client, so the caller bounds
+/// it.
+pub async fn admit<S>(conn: Connection, seat: Result<S, Refusal>) -> anyhow::Result<(Link, S)> {
+    let seat = seat.inspect_err(|why| refuse(&conn, *why))?;
+    let (mut send, _recv) = conn.open_bi().await?;
+    send.write_all(&[ADMIT]).await?;
     let _ = send.finish();
-    Ok(Link(conn))
+    Ok((Link(conn), seat))
 }
 
 /// Client side: dial `target` and await the admission ack, within [`DIAL_TIMEOUT`].
@@ -161,7 +173,7 @@ pub async fn dial(endpoint: &Endpoint, target: EndpointAddr) -> Result<Link, Dis
         let conn = endpoint
             .connect(target, ALPN)
             .await
-            .map_err(|e| verdict(anyhow::Error::new(e).context("connecting to server")))?;
+            .map_err(|e| verdict(&anyhow::Error::new(e).context("connecting to server")))?;
         await_admission(conn).await
     };
     match tokio::time::timeout(DIAL_TIMEOUT, dialed).await {
@@ -187,19 +199,20 @@ async fn await_admission(conn: Connection) -> Result<Link, Disconnect> {
             "server did not admit the connection"
         ))),
         // The server's close says why, if it closed.
-        Err(e) => Err(verdict(conn.close_reason().map_or(e, |reason| {
+        Err(e) => Err(verdict(&conn.close_reason().map_or(e, |reason| {
             anyhow::Error::new(reason).context("server did not admit the connection")
         }))),
     }
 }
 
 /// How the connection that ended with `error` ended, from the [`ConnectionError`] in its chain.
-fn verdict(error: anyhow::Error) -> Disconnect {
+fn verdict(error: &anyhow::Error) -> Disconnect {
     use ConnectionError::{ApplicationClosed, ConnectionClosed, TransportError};
     let cause = error
         .chain()
         .find_map(|e| e.downcast_ref::<ConnectionError>())
         .cloned();
+    let error = scrubbed(error);
     // The TLS handshake ended with alert 120 (`no_application_protocol`): the server is on another
     // koh protocol version, and pointing at the network would mislead.
     let no_alpn = TransportErrorCode::crypto(120);
@@ -238,14 +251,21 @@ fn alpn_mismatch() -> String {
     )
 }
 
+/// `error` remade from its chain's text with control characters stripped: a close's reason, which
+/// the peer controls, is in it, and the error can reach the user's terminal.
+fn scrubbed(error: &anyhow::Error) -> anyhow::Error {
+    let text: Vec<String> = error.chain().map(|e| clean(&e.to_string(), 160)).collect();
+    anyhow!(text.join(": "))
+}
+
 /// A close reason, which the peer controls: stripped of control characters and capped before it
 /// can reach the user's terminal.
 fn peer_reason(reason: &[u8]) -> String {
-    String::from_utf8_lossy(reason)
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(80)
-        .collect()
+    clean(&String::from_utf8_lossy(reason), 80)
+}
+
+fn clean(text: &str, cap: usize) -> String {
+    text.chars().filter(|c| !c.is_control()).take(cap).collect()
 }
 
 #[cfg(test)]
@@ -253,7 +273,7 @@ mod tests {
     use super::*;
 
     fn closed(code: u32, reason: &[u8]) -> Disconnect {
-        verdict(anyhow::Error::new(ApplicationClosed(ApplicationClose {
+        verdict(&anyhow::Error::new(ApplicationClosed(ApplicationClose {
             error_code: code.into(),
             reason: reason.to_vec().into(),
         })))
@@ -275,12 +295,13 @@ mod tests {
             Close::Reconnecting,
             Close::SecondStream,
             Close::ProtocolError,
+            Close::ShuttingDown,
         ] {
             let (code, reason) = why.wire();
             let read = closed(code, reason);
             match why {
                 Close::SessionEnded => assert!(matches!(read, Disconnect::Ended), "{why:?}"),
-                Close::ClientExit | Close::Reconnecting => {
+                Close::ClientExit | Close::Reconnecting | Close::ShuttingDown => {
                     assert!(matches!(read, Disconnect::Transient(_)), "{why:?}");
                 }
                 Close::SecondStream | Close::ProtocolError => {
@@ -289,19 +310,44 @@ mod tests {
                 }
             }
         }
-        for why in [Refusal::NotAuthorized, Refusal::AtCapacity] {
-            let e = fatal(&closed(REFUSED, why.reason())).unwrap();
-            let said = String::from_utf8_lossy(why.reason()).into_owned();
-            assert!(
-                e.contains(&format!("server rejected the connection: {said}")),
-                "{e}"
-            );
+        for why in [
+            Refusal::NotAuthorized,
+            Refusal::AtCapacity,
+            Refusal::Unavailable,
+        ] {
+            let (code, reason) = why.wire();
+            let read = closed(code, reason);
+            match why {
+                Refusal::NotAuthorized | Refusal::AtCapacity => {
+                    let e = fatal(&read).unwrap();
+                    assert!(
+                        e.contains(&format!("server rejected the connection: {why}")),
+                        "{e}"
+                    );
+                }
+                Refusal::Unavailable => assert!(matches!(read, Disconnect::Transient(_))),
+            }
         }
-        // Another code, or code 0 with another reason, is a lost link; a peer's reason is cleaned.
+        // Another code, or code 0 with another reason, is a lost link.
         assert!(matches!(closed(7, b"x"), Disconnect::Transient(_)));
         assert!(matches!(closed(BYE, b"bye"), Disconnect::Transient(_)));
-        let e = fatal(&closed(REFUSED, b"\x1b]2;owned\x07go")).unwrap();
-        assert!(e.contains("rejected the connection: ]2;ownedgo"), "{e}");
+    }
+
+    /// A peer's reason reaches the terminal with no control character, however it is read.
+    #[test]
+    fn a_peer_reason_is_cleaned_all_the_way_down() {
+        let hostile = b"\x1b]52;c;cm0gLXJmIH4K\x07\x1b]2;owned\x07go";
+        for code in [BYE, REFUSED, BROKE, 7] {
+            let (Disconnect::Fatal(e) | Disconnect::Transient(e)) = closed(code, hostile) else {
+                panic!("code {code} is not the session's end");
+            };
+            let text = format!("{e:#} {e:?}");
+            assert!(
+                !text.chars().any(|c| c == '\x1b' || c == '\x07'),
+                "{text:?}"
+            );
+            assert!(text.contains("]2;ownedgo"), "{text}");
+        }
     }
 
     #[test]
@@ -314,8 +360,15 @@ mod tests {
             (2, &b"a second client stream"[..])
         );
         assert_eq!(Close::ProtocolError.wire(), (2, &b"protocol error"[..]));
+        assert_eq!(
+            Close::ShuttingDown.wire(),
+            (0, &b"server shutting down"[..])
+        );
         assert_eq!(REFUSED, 1);
-        assert_eq!(Refusal::NotAuthorized.reason(), b"not authorized");
-        assert_eq!(Refusal::AtCapacity.reason(), b"server at session capacity");
+        assert_eq!(Refusal::NotAuthorized.wire(), (1, &b"not authorized"[..]));
+        assert_eq!(
+            Refusal::AtCapacity.wire(),
+            (1, &b"server at session capacity"[..])
+        );
     }
 }

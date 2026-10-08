@@ -268,7 +268,7 @@ where
         if conn.remote_id() != allow {
             return;
         }
-        let Ok(link) = admission::admit(conn).await else {
+        let Ok((link, ())) = admission::admit(conn, Ok(())).await else {
             return;
         };
         let handle = frames(link);

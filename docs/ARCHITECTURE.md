@@ -58,11 +58,15 @@ The ALPN `koh/3` is the version check: a peer on another version fails the TLS h
 clear error. After the handshake the server checks the allowlist and attaches the peer's session,
 then opens a bi-stream carrying one ADMIT byte; a peer it refuses (not authorized, or the session
 cap) is closed with code 1 before the ack instead, so a refused client can tell the refusal from a
-network error. Every close koh sends and reads is in `transport_iroh::admission`: an admitted
-connection is a `Link`, which closes only with a `Close` (code 0: session ended, client exit,
-reconnecting; code 2: a protocol error), and the client reads any end, of a connection or a dial,
-as one `Disconnect`: the session ended, a verdict it stops on (a refusal, a protocol error,
-another protocol version), or a lost link it redials. Then (`src/proto.rs`):
+network error, and one it cannot seat just now (the server is draining, or the session failed to
+start) with code 0, which the client redials. Every close koh sends and reads is in
+`transport_iroh::admission`: `admit` takes the attach's outcome, so the seat is decided before the
+ack; an admitted connection is a `Link`, which closes only with a `Close` (code 0: session ended,
+client exit, reconnecting, server shutting down; code 2: a protocol error), and the client reads
+any end, of a connection or a dial, as one `Disconnect`: the session ended, a verdict it stops on
+(a refusal, a protocol error, another protocol version), or a lost link it redials. Its error is
+remade from text with control characters stripped, since the peer's close reason is in it. Then
+(`src/proto.rs`):
 
 - **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Keys { seq,
   events }`, the input the client decoded (`src/events.rs`: keys, mouse events, focus changes and

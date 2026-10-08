@@ -96,7 +96,10 @@ service.
   window). Authorization is an explicit **allowlist** (off-list peers refused); at least one entry is
   required, so there is no "accept any peer" mode. This is the **single** authentication factor —
   there is no passphrase/PAKE second factor. A leaked key file is a leaked identity: protect it
-  like an SSH private key, and remove a lost machine's id from every `--allow` list. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
+  like an SSH private key, and remove a lost machine's id from every allowlist (`koh clients rm`, and
+  any `--allow`). The saved allowlist, `clients` beside the server key, is held to the key's own
+  rules (`src/identity/key_file.rs`): a symlink or another user's file is refused and a loose mode
+  tightened, since whoever can write it can let a peer in. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
   checkpoint; its outcomes are logged structured under the `koh::auth` target.
 - **Untrusted data plane:** the protocol (`src/proto.rs`) and the connection cores
   (`src/server/mod.rs`, `src/client/session.rs`) are pure and panic-free by construction. Client

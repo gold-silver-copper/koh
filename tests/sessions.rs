@@ -140,16 +140,7 @@ fn a_session_whose_shell_exited_is_torn_down() -> anyhow::Result<()> {
         let (mut client, kind) = reg.attach(peer).await.context("attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "attach: {kind:?}");
         // Wait for the final (exited) screen, then detach.
-        for _ in 0..100 {
-            if client.screen().exit_code().is_some() {
-                break;
-            }
-            let _ = tokio::time::timeout(Duration::from_millis(50), client.next_screen()).await;
-        }
-        anyhow::ensure!(
-            client.screen().exit_code().is_some(),
-            "the exit code reaches the screen"
-        );
+        await_exit(&mut client).await?;
         drop(client);
         // The session tears down once the client that saw the exit detaches; a fresh attach creates.
         let mut created = false;
@@ -392,22 +383,23 @@ fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -> anyhow::Result<()>
 {
     // The first session's program exits at once and leaves `marker`; its replacement's lives.
-    let marker = std::env::temp_dir().join(format!("koh-late-ended-{}", std::process::id()));
-    let script = format!("[ -e '{}' ] && exec sleep 30; : > '{0}'", marker.display());
+    // The path reaches `sh` as `$1`, never spliced into the script.
+    let marker =
+        RemoveOnDrop(std::env::temp_dir().join(format!("koh-late-ended-{}", std::process::id())));
+    let path = marker.0.to_str().context("a UTF-8 temp dir")?;
+    let script = r#"[ -e "$1" ] && exec sleep 30; : > "$1""#;
     // A marker left by an earlier run would keep the first session alive.
-    let _ = std::fs::remove_file(&marker);
-    let result = current_thread_runtime()?.block_on(async {
-        let reg = registry(&["sh", "-c", &script], 1, Duration::from_secs(30));
+    let _ = std::fs::remove_file(&marker.0);
+    current_thread_runtime()?.block_on(async {
+        let reg = registry(
+            &["sh", "-c", script, "sh", path],
+            1,
+            Duration::from_secs(30),
+        );
         let a = peer()?;
         let (mut c1, kind) = reg.attach(a).await.context("first attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
-        for _ in 0..100 {
-            if c1.screen().exit_code().is_some() {
-                break;
-            }
-            let _ = tokio::time::timeout(Duration::from_millis(50), c1.next_screen()).await;
-        }
-        anyhow::ensure!(c1.screen().exit_code().is_some(), "the program exits");
+        await_exit(&mut c1).await?;
         drop(c1);
         // Reconnect at once, racing the exited session's teardown: a new session is created.
         let (c2, kind) = reg.attach(a).await.context("reconnect")?;
@@ -427,9 +419,16 @@ fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -
             "max_sessions=1 with a live session must refuse another peer, got {other:?}"
         );
         Ok(())
-    });
-    let _ = std::fs::remove_file(&marker);
-    result
+    })
+}
+
+/// A file removed when this is dropped, on a panic too.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// More detaches than the session's control queue holds, at once, must all count: after the TTL
@@ -492,17 +491,9 @@ fn a_reconnect_right_after_exit_never_reattaches_the_exited_session() -> anyhow:
             let a = peer()?;
             let mut client = reg.attach(a).await.context("first attach")?.0;
             for round in 0..100 {
-                for _ in 0..100 {
-                    if client.screen().exit_code().is_some() {
-                        break;
-                    }
-                    let _ =
-                        tokio::time::timeout(Duration::from_millis(50), client.next_screen()).await;
-                }
-                anyhow::ensure!(
-                    client.screen().exit_code().is_some(),
-                    "round {round}: exits"
-                );
+                await_exit(&mut client)
+                    .await
+                    .with_context(|| format!("round {round}: exits"))?;
                 drop(client);
                 let (next, kind) = tokio::time::timeout(Duration::from_secs(5), reg.attach(a))
                     .await
@@ -553,18 +544,22 @@ async fn await_exit(client: &mut koh::server::session::SessionClient) -> anyhow:
     anyhow::bail!("the exit code never reached the screen")
 }
 
-/// Wait, up to 5 s, until `peer` can be attached at max_sessions=1, saying how.
+/// Wait, up to `within`, until `peer` can be attached at max_sessions=1, saying how.
 async fn attach_when_a_slot_frees(
     reg: &Registry,
     peer: iroh::EndpointId,
+    within: Duration,
 ) -> Option<(koh::server::session::SessionClient, AttachKind)> {
-    for _ in 0..50 {
-        if let Some(attached) = reg.attach(peer).await {
-            return Some(attached);
+    tokio::time::timeout(within, async {
+        loop {
+            if let Some(attached) = reg.attach(peer).await {
+                return attached;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    None
+    })
+    .await
+    .ok()
 }
 
 /// A session whose program exited is torn down once its last client leaves, so it frees its
@@ -576,7 +571,7 @@ fn an_exited_session_whose_client_left_frees_its_slot() -> anyhow::Result<()> {
         let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
         await_exit(&mut client).await?;
         drop(client);
-        let other = attach_when_a_slot_frees(&reg, peer()?).await;
+        let other = attach_when_a_slot_frees(&reg, peer()?, Duration::from_secs(5)).await;
         let kind = other.as_ref().map(|(_, kind)| *kind);
         drop(other);
         reg.shutdown().await;
@@ -596,13 +591,14 @@ fn a_session_whose_program_exited_while_detached_frees_its_slot() -> anyhow::Res
         let reg = registry(&["sleep", "0.3"], 1, Duration::from_secs(30));
         let (client, _) = reg.attach(peer()?).await.context("attach")?;
         drop(client);
-        let other = attach_when_a_slot_frees(&reg, peer()?).await;
+        // The program exits at 0.3 s; a teardown on a 5 s tick would miss this.
+        let other = attach_when_a_slot_frees(&reg, peer()?, Duration::from_secs(2)).await;
         let kind = other.as_ref().map(|(_, kind)| *kind);
         drop(other);
         reg.shutdown().await;
         anyhow::ensure!(
             kind == Some(AttachKind::Created),
-            "another peer gets the exited session's slot within 5 s of a 30 s TTL; got {kind:?}"
+            "another peer gets the exited session's slot within 2 s, not on a 5 s tick; got {kind:?}"
         );
         Ok(())
     })

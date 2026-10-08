@@ -20,9 +20,6 @@ use tokio_util::sync::CancellationToken;
 
 mod sessions;
 
-/// How often a session checks its detach TTL (sooner for a shorter TTL).
-pub(crate) const REAP_INTERVAL: Duration = Duration::from_secs(5);
-
 /// How often a session reads its PTY's modes when nothing else made it: a password prompt that
 /// turned echo off after printing is known to the client within this (the wire's contract).
 use crate::proto::TTY_TICK;
@@ -208,11 +205,23 @@ fn take_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize, mut take: impl FnMut(
 }
 
 /// Wait until `deadline`, or forever if there is none.
-async fn until(deadline: Option<std::time::Instant>) {
+async fn until(deadline: Option<Instant>) {
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(Instant::from_std(deadline)).await,
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
+}
+
+/// Where a session is in its life: every arm of [`session_task`] reads it, and none keeps a flag
+/// of its own.
+enum Phase {
+    /// A client is attached, or left unseen: the `closed` arm or an attach settles it.
+    Attached,
+    /// No client since `since`.
+    Detached { since: Instant },
+    /// The program exited: its final screen is served until the last client leaves, and the
+    /// session is never reattached.
+    Exited,
 }
 
 /// Run one session until its program exits and its client leaves, or its detach TTL expires.
@@ -226,21 +235,15 @@ async fn session_task(
     mut input_rx: mpsc::Receiver<ClientInput>,
     ttl: Duration,
 ) {
-    // `None` while a client is attached; the first one is, from `start`.
-    let mut last_detach: Option<Instant> = None;
+    // The first client is attached, from `start`.
+    let mut phase = Phase::Attached;
     let mut pending_keys: Vec<u8> = Vec::new();
-    // After the program exits, its final screen is served until the client leaves.
-    let mut exited = false;
 
     // A frame the program is drawing (synchronized output) is not sent half drawn.
     let mut hold = FrameHold::default();
 
     let mut tty_tick = tokio::time::interval(TTY_TICK);
     tty_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    let tick_period = ttl.min(REAP_INTERVAL).max(Duration::from_millis(1));
-    let mut ttl_tick = tokio::time::interval(tick_period);
-    ttl_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         // Retry keystrokes the PTY writer queue could not take last pass.
@@ -250,7 +253,7 @@ async fn session_task(
         let can_read_input = pending_keys.is_empty();
 
         tokio::select! {
-            chunk = pty_rx.recv(), if !exited => {
+            chunk = pty_rx.recv(), if !matches!(phase, Phase::Exited) => {
                 if let Some(chunk) = chunk {
                     host.refresh_tty();
                     host.emu.process(&chunk);
@@ -271,11 +274,11 @@ async fn session_task(
                     if let Some(code) = reap_exit_code(&mut host).await {
                         host.emu.set_exit_code(code);
                     }
-                    exited = true;
+                    phase = Phase::Exited;
                     screens_tx.send_replace(Arc::new(host.snapshot()));
                 }
             },
-            _ = until(hold.deadline()) => {
+            _ = until(hold.deadline().map(Instant::from_std)) => {
                 if let Some(screen) = hold.expire(&mut host.emu, std::time::Instant::now()) {
                     screens_tx.send_replace(Arc::new(screen));
                 }
@@ -322,48 +325,49 @@ async fn session_task(
             },
             msg = control.recv() => match msg {
                 Some(Attach(reply)) => {
-                    // No client is left, whether or not the arm below has seen it yet: an exited
-                    // session is never reattached, and the detach is dated before this attach.
-                    if screens_tx.receiver_count() == 0 {
-                        if exited {
-                            break; // the reply is dropped, so the registry starts a new session
-                        }
-                        last_detach.get_or_insert_with(Instant::now);
+                    // The one place the phase is squared with the clients: the last may have left
+                    // unseen by the arm below, and the detach is dated before this attach.
+                    if matches!(phase, Phase::Attached) && screens_tx.receiver_count() == 0 {
+                        phase = Phase::Detached { since: Instant::now() };
                     }
-                    let since = last_detach.take();
+                    let detached_for = match phase {
+                        // The reply is dropped, so the registry starts a new session.
+                        Phase::Exited => break,
+                        Phase::Attached => None,
+                        Phase::Detached { since } => Some(since.elapsed()),
+                    };
                     let client = SessionClient {
                         screens: screens_tx.subscribe(),
                         input: input_tx.clone(),
                     };
                     // A connection already gone drops its client: the session stays detached
                     // since when it was, so an attach that never arrives does not renew its TTL.
-                    if reply.send((client, since.map(|t| t.elapsed()))).is_err() {
-                        last_detach = since;
+                    if reply.send((client, detached_for)).is_ok() {
+                        phase = Phase::Attached;
                     }
                 }
                 None => break, // the registry forgot this session: the server is shutting down
             },
-            // The last client left.
-            () = screens_tx.closed(), if last_detach.is_none() => {
-                if exited {
-                    break; // the client saw the exit and left; tear down now
-                }
-                last_detach = Some(Instant::now());
-            }
+            // The last client left, or none is left to see the exit. The only teardown of an
+            // exited session, so it watches in every phase but Detached.
+            () = screens_tx.closed(), if !matches!(phase, Phase::Detached { .. }) => match phase {
+                Phase::Exited => break,
+                Phase::Attached => phase = Phase::Detached { since: Instant::now() },
+                Phase::Detached { .. } => {}
+            },
             _ = pending_input_retry(!pending_keys.is_empty()) => {}
             // A program may turn echo off without writing anything (a password prompt printed
             // first): the client hears of it within a tick.
-            _ = tty_tick.tick(), if !exited && screens_tx.receiver_count() > 0 => {
+            _ = tty_tick.tick(), if matches!(phase, Phase::Attached) => {
                 if host.refresh_tty() && !hold.holding() {
                     screens_tx.send_replace(Arc::new(host.snapshot()));
                 }
             }
-            _ = ttl_tick.tick() => {
-                let idle_expired = last_detach.is_some_and(|t| t.elapsed() >= ttl);
-                if screens_tx.receiver_count() == 0 && (exited || idle_expired) {
-                    break;
-                }
-            }
+            // Detached for the whole TTL.
+            () = until(match phase {
+                Phase::Detached { since } => since.checked_add(ttl),
+                Phase::Attached | Phase::Exited => None,
+            }) => break,
         }
     }
 

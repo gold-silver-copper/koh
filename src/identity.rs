@@ -99,7 +99,7 @@ mod tests {
         );
         anyhow::ensure!(path.exists(), "a refused reset removed the key");
         drop(clone);
-        key.reset()?;
+        key.reset_settled()?;
         anyhow::ensure!(!path.exists(), "reset left the key in place");
         Ok(())
     }
@@ -127,7 +127,7 @@ mod tests {
         let key = KeyFile::open(&path)?;
         let identity = load(&key)?;
         drop(identity);
-        key.reset().map_err(|e| {
+        key.reset_settled().map_err(|e| {
             anyhow::anyhow!("load accepted {} but reset refused: {e:#}", path.display())
         })?;
         anyhow::ensure!(!path.exists(), "reset left the key in place");
@@ -141,7 +141,7 @@ mod tests {
             .err()
             .context("load accepted a 31-byte key")?;
         anyhow::ensure!(format!("{error:#}").contains("koh key reset"), "{error:#}");
-        bad_key.reset().map_err(|e| {
+        bad_key.reset_settled().map_err(|e| {
             anyhow::anyhow!(
                 "load told the user to reset {} but reset refused: {e:#}",
                 bad.display()

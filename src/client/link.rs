@@ -17,7 +17,10 @@ pub(super) struct Link {
     /// [`WINDOW_CELLS`] cells beyond `current`'s.
     older: VecDeque<FrameScreen>,
     /// The newest base a frame came on that was not held. A frame on it, or on an older one, was
-    /// sent before the server read the `Resync` that refusal owed, which forgets them all.
+    /// sent before the server read the `Resync` that refusal owed, which forgets them all. This
+    /// holds because a `Link` is one connection's, to one server session, whose frame numbers only
+    /// rise: [`ClientSession::attach`](super::session::ClientSession::attach) makes a new one for
+    /// each connection, so numbers from another never meet it.
     refused: FrameNum,
     /// A `Resync` is owed to this connection's server and not yet taken to be sent. It lives here,
     /// beside `refused`, so the two go together: one is never dropped while the other stays.
@@ -119,6 +122,12 @@ impl Link {
             self.refused = base;
             self.resync_owed = true;
         }
+    }
+
+    /// The connection is gone: the `Resync` owed to it, and the refusal that owed it, go with it.
+    pub(super) const fn drop_resync(&mut self) {
+        self.refused = FrameNum::BLANK;
+        self.resync_owed = false;
     }
 
     /// Whether a `Resync` is owed and not yet taken.

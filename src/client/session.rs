@@ -152,14 +152,15 @@ impl ClientSession {
         }
     }
 
-    /// The connection was lost: what was meant for it alone (acknowledgements and history
-    /// requests, and the resync its link owes) goes with it; resizes and colours wait for the next. The
+    /// The connection was lost: what was meant for it alone (acknowledgements, history requests
+    /// and the resync its link owes) goes with it; resizes and colours wait for the next. The
     /// predictions go, and whether typing was trusted is kept as it was now, at the drop.
     pub fn detach(&mut self, now: Instant) {
         self.down_since.get_or_insert(now);
         self.unconfirmed_at_drop = self.sent_seq > self.link.echo_ack;
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Ack { .. } | ClientMsg::History(_)));
+        self.link.drop_resync();
         self.scrollback.forget_requests();
         self.predictor = self.predictor.reattached();
         self.dirty = true;
@@ -480,6 +481,11 @@ impl ClientSession {
     /// A frame's stream arrived: its body inflated against its base's dictionary, then applied as
     /// [`on_frame`](Self::on_frame) does. A frame on a base not held asks for a resync; one that
     /// does not inflate or decode is dropped, as a lost one would be.
+    ///
+    /// The frame's number is inside the body, which inflates only against its base, so a late
+    /// frame on a base not held is refused as a new one would be: a `Resync` it did not need costs
+    /// a repaint, where ignoring a new one would leave its screen unshown. Telling them apart
+    /// first would need the number in the stream's header, a change to the wire.
     pub fn on_frame_stream(&mut self, now: Instant, base: FrameNum, rows: &[u16], body: &[u8]) {
         self.link.last_heard = Some(now);
         let Some(screen) = self.link.base(base) else {
@@ -1040,6 +1046,19 @@ mod tests {
         s.on_frame(now, &frame(6, 5, 0, &one, &one));
         assert_eq!(drain(&mut s), [ClientMsg::Resync], "a new base asks again");
         assert!(!s.synced());
+    }
+
+    #[test]
+    fn a_detach_drops_the_resync_owed_to_the_lost_connection() {
+        let (now, mut s) = start();
+        drain(&mut s);
+        let one = screen(b"one");
+        s.on_frame(now, &frame(4, 3, 0, &one, &one));
+        s.detach(now);
+        assert!(
+            !drain(&mut s).contains(&ClientMsg::Resync),
+            "the resync was owed to the lost connection"
+        );
     }
 
     #[test]

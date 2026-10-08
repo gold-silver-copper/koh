@@ -506,11 +506,10 @@ impl ServerConn {
     }
 
     /// `frame`, just polled, encoded for its stream against its base, the acknowledged screen.
+    /// [`Self::poll_frame`] made it on that base, and nothing runs between the two.
     fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>, ProtoError> {
         let base = self.held.base();
-        if frame.base != base.num {
-            return Err(ProtoError::NotAFrame);
-        }
+        debug_assert_eq!(frame.base, base.num, "encoded on another base");
         self.encoder.encode(frame, &base.screen)
     }
 

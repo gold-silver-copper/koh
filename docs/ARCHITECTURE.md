@@ -38,7 +38,9 @@ src/
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
 │   └── key_file.rs  KeyFile, the one owner of trust in a key path, its lock and $KOH_LOG
 ├── log.rs           the `RUST_LOG` filter `serve` and `connect` install (`target=level` directives)
-└── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identity, reset it
+├── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identities, reset one
+├── names.rs         names for ids: `servers` and `clients` beside the keys, through `KeyFile`
+└── menu.rs          the menu `koh` alone opens on a terminal, over a reader and a writer
 tests/net/           koh over a fault-injecting link between real iroh endpoints
 tests/               PTYs, sessions, loopback e2e, admission, the binary on a PTY, upgrade in
                      place, key creation races, the corpus, and the Android suites (opt-in)

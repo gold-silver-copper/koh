@@ -151,7 +151,6 @@ impl KeyFile {
     /// Not a hard link, which would need no lock: Android's SELinux policy denies `link` to the
     /// shell and to apps.
     pub(super) fn create_secret(&self) -> Result<Option<SecretKey>, SetupError> {
-        use std::io::Write as _;
         let secret = crate::transport_iroh::generate_secret_key()?;
         // Held until this returns: creators take turns, so only the first finds the key absent,
         // and a reader sees no key or a whole one.
@@ -162,33 +161,61 @@ impl KeyFile {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let (tmp, mut file) = loop {
-            let tmp = self.path.with_extension(format!(
-                "tmp.{}.{:016x}",
-                std::process::id(),
-                getrandom::u64().map_err(std::io::Error::from)?
-            ));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)
-            {
-                Ok(file) => break (tmp, file),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+        publish(&self.path, &secret.to_bytes())?;
+        Ok(Some(secret))
+    }
+
+    /// The file `name` in the key's directory (a list of names, say), read as the key is: never
+    /// through a symlink, a regular file of this user's, a loose mode tightened. `None` if there is
+    /// none; refused past [`BESIDE_LIMIT`] bytes or if it is not UTF-8.
+    pub(crate) fn read_beside(&self, name: &str) -> Result<Option<String>, SetupError> {
+        use std::io::Read as _;
+        let path = self.beside(name)?;
+        let file = match open_private(OpenOptions::new().read(true), &path, Kind::Beside) {
+            Ok(file) => file,
+            Err(SetupError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None)
             }
+            Err(error) => return Err(error),
         };
-        let result = (|| {
-            file.write_all(&secret.to_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&tmp, &self.path)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(tmp);
+        let mut bytes = Vec::new();
+        let limit = u64::try_from(BESIDE_LIMIT.saturating_add(1)).unwrap_or(u64::MAX);
+        file.take(limit).read_to_end(&mut bytes)?;
+        if bytes.len() > BESIDE_LIMIT {
+            return Err(refuse(&path, "it is larger than koh writes"));
         }
-        Ok(result.map(|()| Some(secret))?)
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_not_utf8| refuse(&path, "it is not UTF-8 text"))
+    }
+
+    /// Replace the file `name` beside the key with what `update` makes of its contents (`None` if
+    /// there is none); `update` returning `None` leaves it as it is. The directory is locked
+    /// throughout, so two writers take turns and neither loses the other's change, and the new
+    /// contents are published as a key is, so a reader sees the old file or the new one whole.
+    pub(crate) fn update_beside(
+        &self,
+        name: &str,
+        update: impl FnOnce(Option<String>) -> anyhow::Result<Option<String>>,
+    ) -> anyhow::Result<()> {
+        let directory = File::open(&self.dir)?;
+        directory.lock()?;
+        if let Some(contents) = update(self.read_beside(name)?)? {
+            publish(&self.beside(name)?, contents.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// `name`'s path in the key's directory: a plain file name, never a path.
+    fn beside(&self, name: &str) -> Result<PathBuf, SetupError> {
+        let plain = !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name.contains(std::path::is_separator);
+        if !plain {
+            return Err(refuse(Path::new(name), "it is not a plain file name"));
+        }
+        Ok(self.dir.join(name))
     }
 
     /// Remove the key, whatever it holds, under an exclusive lease: fails while any koh process
@@ -204,6 +231,44 @@ impl KeyFile {
         check_owned(&meta, &self.path, Kind::Identity).with_context(context)?;
         std::fs::remove_file(&self.path).with_context(context)
     }
+}
+
+/// Most bytes a file beside the key ([`KeyFile::read_beside`]) may hold: far more than any list of
+/// names koh writes.
+pub const BESIDE_LIMIT: usize = 1024 * 1024;
+
+/// Write `bytes` to `target` as a key is created: to a born-private (0600) temporary file beside
+/// it, synced, then renamed into place, so a reader sees no file or a whole one. The caller holds
+/// the directory's lock.
+fn publish(target: &Path, bytes: &[u8]) -> Result<(), SetupError> {
+    use std::io::Write as _;
+    let (tmp, mut file) = loop {
+        let tmp = target.with_extension(format!(
+            "tmp.{}.{:016x}",
+            std::process::id(),
+            getrandom::u64().map_err(std::io::Error::from)?
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    Ok(result?)
 }
 
 /// Open `$KOH_LOG` as a private file: never through a symlink, never a FIFO or device (which could
@@ -250,6 +315,8 @@ enum Kind {
     Identity,
     /// `$KOH_LOG`.
     Log,
+    /// A file beside the key: the names of servers or clients, when servers were last reached.
+    Beside,
 }
 
 impl Kind {
@@ -257,6 +324,7 @@ impl Kind {
         match self {
             Self::Identity => "identity file",
             Self::Log => "log file",
+            Self::Beside => "koh file",
         }
     }
 
@@ -269,7 +337,7 @@ impl Kind {
         );
         match self {
             Self::Identity => SetupError::BadKeyFile,
-            Self::Log => refuse(path, "it is a symlink or not a regular file"),
+            Self::Log | Self::Beside => refuse(path, "it is a symlink or not a regular file"),
         }
     }
 }

@@ -306,6 +306,13 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
         "client",
     )?)?;
     let (endpoint, connector, channel) = dial(&args, &identity).await?;
+    // For the menu's "last connected"; failing to note it never stops the session.
+    let noted = crate::identity::KeyFile::path_for(args.key_file.clone(), "client")
+        .map_err(anyhow::Error::from)
+        .and_then(|key| crate::names::record_connected(&key, args.server));
+    if let Err(error) = noted {
+        tracing::debug!(error = %format!("{error:#}"), "noting when the server was reached");
+    }
     let dialed_at = std::time::SystemTime::now();
     let shutdown = CancellationToken::new();
     // Armed before raw mode is entered, so an install error surfaces while the terminal is cooked.

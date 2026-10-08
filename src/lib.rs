@@ -2,7 +2,8 @@
 //! `koh connect` renders it with predictive local echo, reconnecting transparently.
 //!
 //! [`transport_iroh`] sets up endpoints, the key file and admission; [`identity`] loads identities
-//! and their reset leases; [`keycmd`] is `koh id` and `koh key`. [`proto`] is the wire protocol, [`events`] the input it carries;
+//! and their reset leases; [`keycmd`] is `koh id` and `koh key`; [`names`] names the servers and clients
+//! a machine knows. [`proto`] is the wire protocol, [`events`] the input it carries;
 //! [`terminal`], [`predict`] and [`pty`] the screen, the prediction and the PTY; [`server`] hosts
 //! sessions and [`client`] renders them.
 //!
@@ -16,6 +17,8 @@ pub mod events;
 pub mod identity;
 pub mod keycmd;
 pub mod log;
+pub mod menu;
+pub mod names;
 pub mod predict;
 pub mod proto;
 pub mod pty;

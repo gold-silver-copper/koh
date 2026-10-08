@@ -16,6 +16,7 @@ use iroh::{EndpointId, RelayUrl};
 
 use koh::client::ConnectConfig;
 use koh::keycmd::{KeyConfig, KeyOp};
+use koh::names::{List, Op};
 use koh::server::cli::{
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SESSIONS, DEFAULT_SCROLLBACK, DEFAULT_SESSION_TTL_SECS,
     MAX_SCROLLBACK,
@@ -46,9 +47,32 @@ fn allow_id(value: &str) -> Result<EndpointId, BadValue> {
     parse_endpoint_id(value).map_err(|e| BadValue(format!("bad --allow id: {value}: {e}")))
 }
 
-/// The server endpoint id `koh connect` dials.
-fn server_id(value: &str) -> Result<EndpointId, BadValue> {
-    parse_endpoint_id(value).map_err(|e| BadValue(format!("parsing server endpoint id: {e}")))
+/// The server `koh connect` dials: an endpoint id, or the name of one saved in `servers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerRef {
+    Id(EndpointId),
+    Name(String),
+}
+
+/// A [`ServerRef`]: an id if it reads as one, else a name if it is one.
+fn server_ref(value: &str) -> Result<ServerRef, BadValue> {
+    match parse_endpoint_id(value) {
+        Ok(id) => Ok(ServerRef::Id(id)),
+        Err(_) if koh::names::check_name(value).is_ok() => Ok(ServerRef::Name(value.to_owned())),
+        Err(e) => Err(BadValue(format!("parsing server endpoint id: {e}"))),
+    }
+}
+
+/// A name for `koh servers` or `koh clients`.
+fn name(value: &str) -> Result<String, BadValue> {
+    koh::names::check_name(value)
+        .map(|()| value.to_owned())
+        .map_err(|e| BadValue(e.to_string()))
+}
+
+/// An endpoint id to save under a name.
+fn saved_id(value: &str) -> Result<EndpointId, BadValue> {
+    parse_endpoint_id(value).map_err(|e| BadValue(format!("bad endpoint id: {value}: {e}")))
 }
 
 /// A `--relay-url`.
@@ -60,21 +84,58 @@ fn relay_url(value: &str) -> Result<RelayUrl, BadValue> {
 #[derive(Debug)]
 pub enum Cmd {
     Serve(ServeConfig),
-    Connect(ConnectConfig),
+    Connect(ConnectArgs),
     Key(KeyConfig),
+    /// `koh servers` or `koh clients`.
+    Names {
+        list: List,
+        op: Op,
+        key_file: Option<PathBuf>,
+    },
+    /// `koh` alone: the menu on a terminal, else help.
+    Menu,
+}
+
+/// `koh connect`'s arguments: a [`ConnectConfig`] once its server is known.
+#[derive(Debug, Clone)]
+pub struct ConnectArgs {
+    pub server: ServerRef,
+    pub key_file: Option<PathBuf>,
+    pub direct: Option<SocketAddr>,
+    pub relay_url: Option<RelayUrl>,
+    pub clipboard: bool,
+    pub hyperlinks: bool,
+    pub colours: bool,
+    pub bell_command: Option<String>,
+}
+
+impl ConnectArgs {
+    /// The config for dialing `server`.
+    pub fn into_config(self, server: EndpointId) -> ConnectConfig {
+        ConnectConfig {
+            server,
+            key_file: self.key_file,
+            direct: self.direct,
+            relay_url: self.relay_url,
+            clipboard: self.clipboard,
+            hyperlinks: self.hyperlinks,
+            colours: self.colours,
+            bell_command: self.bell_command,
+        }
+    }
 }
 
 /// `koh`'s command line.
 pub fn command() -> Command {
     Command::new("koh")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("koh — a resilient peer-to-peer remote shell (mosh over iroh)")
-        .subcommand_required(true)
-        .arg_required_else_help(true)
+        .about("koh — a resilient peer-to-peer remote shell (mosh over iroh). Run alone on a terminal, it opens a menu of your keys, servers and clients")
         .subcommand(serve())
         .subcommand(connect())
         .subcommand(id())
         .subcommand(key())
+        .subcommand(names(List::Servers))
+        .subcommand(names(List::Clients))
 }
 
 /// An optional path, `--NAME <VALUE_NAME>`.
@@ -103,7 +164,7 @@ fn serve() -> Command {
                 .value_name("ENDPOINT_ID")
                 .value_parser(allow_id)
                 .action(ArgAction::Append)
-                .help("Authorize a client endpoint id (repeatable). At least one is required — koh only serves peers whose node-id is on this list"),
+                .help("Authorize a client endpoint id (repeatable), for this run, beside the clients saved with `koh clients add`. At least one client is required — koh only serves peers whose node-id is allowed"),
         )
         .arg(
             Arg::new("shell")
@@ -167,13 +228,13 @@ fn serve() -> Command {
 
 fn connect() -> Command {
     Command::new("connect")
-        .about("Connect to a koh server by its endpoint id")
+        .about("Connect to a koh server by its name or endpoint id")
         .arg(
             Arg::new("server")
                 .value_name("SERVER")
-                .value_parser(server_id)
+                .value_parser(server_ref)
                 .required(true)
-                .help("Server endpoint id to connect to"),
+                .help("The server: a name saved with `koh servers add`, or its endpoint id"),
         )
         .arg(
             path("key_file", "key-file", "KEY_FILE")
@@ -235,11 +296,91 @@ fn key() -> Command {
                 .display_order(1)
                 .help("Which identity key to operate on. Defaults to the client key path (as `koh id` uses); pass a server key explicitly to manage it"),
         )
-        .subcommand(Command::new("info").about("Print the key file and its endpoint id (never the secret)"))
+        .subcommand(
+            Command::new("info")
+                .about("Print the key files and their endpoint ids (never the secret): both keys, or the one named")
+                .arg(role()),
+        )
         .subcommand(
             Command::new("reset")
                 .about("Delete an unused identity; the next use creates a new endpoint ID")
+                .arg(role())
                 .arg(flag("yes", "yes").help("Acknowledge permanent identity loss and required allowlist updates")),
+        )
+}
+
+/// Which key, `client` (the default) or `server`.
+fn role() -> Arg {
+    Arg::new("role")
+        .value_name("KEY")
+        .value_parser(["client", "server"])
+        .conflicts_with("key_file")
+        .help("Which key: client (as `koh id` and `koh connect` use; the default) or server (as `koh serve` uses)")
+}
+
+/// `koh servers` or `koh clients`.
+fn names(list: List) -> Command {
+    let (about, key) = match list {
+        List::Servers => (
+            "List, add, remove or rename the servers this machine connects to, by name",
+            "client",
+        ),
+        List::Clients => (
+            "List, add, remove or rename the clients allowed to connect to this machine",
+            "server",
+        ),
+    };
+    Command::new(list.file())
+        .about(about)
+        .arg(
+            path("key_file", "key-file", "KEY_FILE")
+                .global(true)
+                .display_order(1)
+                .help(format!(
+                    "The {key} key whose directory holds the list (defaults to the {key} key path)"
+                )),
+        )
+        .subcommand(
+            Command::new("add")
+                .about(format!("Save a {} under a name", list.noun()))
+                .arg(
+                    Arg::new("name")
+                        .value_name("NAME")
+                        .value_parser(name)
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("id")
+                        .value_name("ENDPOINT_ID")
+                        .value_parser(saved_id)
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            Command::new("rm")
+                .about(format!("Forget a {}", list.noun()))
+                .arg(
+                    Arg::new("name")
+                        .value_name("NAME")
+                        .value_parser(name)
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            Command::new("rename")
+                .about(format!("Rename a {}", list.noun()))
+                .arg(
+                    Arg::new("old")
+                        .value_name("OLD")
+                        .value_parser(name)
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("new")
+                        .value_name("NEW")
+                        .value_parser(name)
+                        .required(true),
+                ),
         )
 }
 
@@ -262,10 +403,10 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             max_sessions: value(m, "max_sessions")?,
             launcher: koh::pty::Launcher::this_binary(),
         })),
-        Some(("connect", m)) => Ok(Cmd::Connect(ConnectConfig {
+        Some(("connect", m)) => Ok(Cmd::Connect(ConnectArgs {
             server: m
-                .get_one::<EndpointId>("server")
-                .copied()
+                .get_one::<ServerRef>("server")
+                .cloned()
                 .ok_or_else(|| missing("server"))?,
             key_file: m.get_one::<PathBuf>("key_file").cloned(),
             direct: m.get_one::<SocketAddr>("direct").copied(),
@@ -277,7 +418,9 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
         })),
         Some(("id", m)) => Ok(Cmd::Key(KeyConfig {
             op: KeyOp::Id,
+            role: "client",
             key_file: m.get_one::<PathBuf>("key_file").cloned(),
+            role_named: false,
         })),
         Some(("key", m)) => {
             let (op, sub) = match m.subcommand() {
@@ -295,9 +438,65 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                 .get_one::<PathBuf>("key_file")
                 .or_else(|| m.get_one::<PathBuf>("key_file"))
                 .cloned();
-            Ok(Cmd::Key(KeyConfig { op, key_file }))
+            let named = sub.get_one::<String>("role");
+            let role = if named.is_some_and(|r| r == "server") {
+                "server"
+            } else {
+                "client"
+            };
+            Ok(Cmd::Key(KeyConfig {
+                op,
+                role,
+                key_file,
+                role_named: named.is_some(),
+            }))
         }
-        _ => Err(missing("subcommand")),
+        Some((list @ ("servers" | "clients"), m)) => {
+            let list = if list == "servers" {
+                List::Servers
+            } else {
+                List::Clients
+            };
+            let one = |sub: &ArgMatches, id: &str| {
+                sub.get_one::<String>(id)
+                    .cloned()
+                    .ok_or_else(|| missing(id))
+            };
+            let (op, sub) = match m.subcommand() {
+                None => (Op::List, m),
+                Some(("add", sub)) => (
+                    Op::Add {
+                        name: one(sub, "name")?,
+                        id: sub
+                            .get_one::<EndpointId>("id")
+                            .copied()
+                            .ok_or_else(|| missing("id"))?,
+                    },
+                    sub,
+                ),
+                Some(("rm", sub)) => (
+                    Op::Remove {
+                        name: one(sub, "name")?,
+                    },
+                    sub,
+                ),
+                Some(("rename", sub)) => (
+                    Op::Rename {
+                        old: one(sub, "old")?,
+                        new: one(sub, "new")?,
+                    },
+                    sub,
+                ),
+                Some(_) => return Err(missing("servers or clients subcommand")),
+            };
+            let key_file = sub
+                .get_one::<PathBuf>("key_file")
+                .or_else(|| m.get_one::<PathBuf>("key_file"))
+                .cloned();
+            Ok(Cmd::Names { list, op, key_file })
+        }
+        None => Ok(Cmd::Menu),
+        Some(_) => Err(missing("subcommand")),
     }
 }
 
@@ -393,13 +592,13 @@ mod tests {
         else {
             panic!("connect");
         };
-        assert_eq!(c.server, ID.parse().unwrap());
+        assert_eq!(c.server, super::ServerRef::Id(ID.parse().unwrap()));
         assert_eq!(c.bell_command.as_deref(), Some("termux-notification"));
         assert!(
             c.clipboard && c.direct.is_none(),
             "clipboard writes on by default"
         );
-        assert!(koh::client::ConnectConfig::new(c.server).clipboard);
+        assert!(koh::client::ConnectConfig::new(ID.parse().unwrap()).clipboard);
     }
 
     #[test]
@@ -420,7 +619,7 @@ mod tests {
             panic!("connect");
         };
         assert!(c.hyperlinks);
-        assert!(koh::client::ConnectConfig::new(c.server).hyperlinks);
+        assert!(koh::client::ConnectConfig::new(ID.parse().unwrap()).hyperlinks);
         let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-hyperlinks"]) else {
             panic!("connect");
         };
@@ -433,7 +632,7 @@ mod tests {
             panic!("connect");
         };
         assert!(c.colours);
-        assert!(koh::client::ConnectConfig::new(c.server).colours);
+        assert!(koh::client::ConnectConfig::new(ID.parse().unwrap()).colours);
         let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-colours"]) else {
             panic!("connect");
         };
@@ -466,7 +665,7 @@ mod tests {
                 format!("bad --allow id: bad2: {invalid}"),
             ),
             (
-                &["koh", "connect", "bad"][..],
+                &["koh", "connect", "not/a-name"][..],
                 format!("parsing server endpoint id: {invalid}"),
             ),
             (
@@ -488,6 +687,77 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn connect_takes_a_saved_name_or_an_id() {
+        let Cmd::Connect(c) = parsed(&["koh", "connect", "laptop"]) else {
+            panic!("connect");
+        };
+        assert_eq!(c.server, super::ServerRef::Name("laptop".to_owned()));
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID]) else {
+            panic!("connect");
+        };
+        assert_eq!(c.server, super::ServerRef::Id(ID.parse().unwrap()));
+    }
+
+    #[test]
+    fn servers_and_clients_take_add_rm_and_rename() {
+        use koh::names::{List, Op};
+        let Cmd::Names { list, op, key_file } = parsed(&["koh", "servers"]) else {
+            panic!("servers");
+        };
+        assert_eq!((list, op, key_file), (List::Servers, Op::List, None));
+        let Cmd::Names { list, op, key_file } =
+            parsed(&["koh", "clients", "add", "phone", ID, "--key-file", "/k"])
+        else {
+            panic!("clients add");
+        };
+        assert_eq!(list, List::Clients);
+        assert_eq!(
+            op,
+            Op::Add {
+                name: "phone".to_owned(),
+                id: ID.parse().unwrap()
+            }
+        );
+        assert_eq!(key_file.as_deref(), Some(std::path::Path::new("/k")));
+        let Cmd::Names { op, .. } = parsed(&["koh", "servers", "rename", "a", "b"]) else {
+            panic!("servers rename");
+        };
+        assert_eq!(
+            op,
+            Op::Rename {
+                old: "a".to_owned(),
+                new: "b".to_owned()
+            }
+        );
+        assert!(command()
+            .try_get_matches_from(["koh", "servers", "add", "-x", ID])
+            .is_err());
+    }
+
+    #[test]
+    fn key_reset_names_the_key_and_defaults_to_the_client_one() {
+        let Cmd::Key(c) = parsed(&["koh", "key", "reset", "server", "--yes"]) else {
+            panic!("key reset");
+        };
+        assert_eq!((c.role, c.role_named), ("server", true));
+        let Cmd::Key(c) = parsed(&["koh", "key", "reset", "--yes"]) else {
+            panic!("key reset");
+        };
+        assert_eq!((c.role, c.role_named), ("client", false));
+        assert!(
+            command()
+                .try_get_matches_from(["koh", "key", "reset", "server", "--key-file", "/k"])
+                .is_err(),
+            "a named key and a key file at once"
+        );
+    }
+
+    #[test]
+    fn koh_alone_is_the_menu() {
+        assert!(matches!(parsed(&["koh"]), Cmd::Menu));
     }
 
     #[test]

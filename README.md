@@ -16,21 +16,30 @@ koh authorizes by endpoint id. There are no passwords or accounts.
 # On the client, print its id:
 koh id
 
-# On the server, allow that client and start a shell host:
-koh serve --allow <client-id>
+# On the server, allow that client by name, and start a shell host (it prints its own id):
+koh clients add phone <client-id>
+koh serve
 
-# On the client, connect to the server:
-koh connect <server-id>
+# On the client, save the server by name, and connect:
+koh servers add laptop <server-id>
+koh connect laptop
 ```
+
+Or run `koh` alone on a terminal for a menu of this machine's keys, the servers it connects to
+and the clients allowed here: pick one by number to connect, rename or delete it; `a` adds one,
+`k` shows both keys in full with QR codes and resets one, saying first who will lose access.
 
 Useful commands:
 
 ```sh
-koh id                    # print this machine's endpoint id
-koh serve --allow <id>    # host a shell for an allowed client
-koh connect <id>          # connect to a server id
-koh key info              # show the identity key file and its endpoint id
-koh key reset --yes       # delete the identity key; the next use creates a new endpoint id
+koh                       # on a terminal: the menu of keys, servers and clients
+koh id                    # print this machine's endpoint id (its client key's)
+koh servers               # the servers you connect to: add <name> <id>, rm <name>, rename <old> <new>
+koh clients               # the clients allowed here, likewise
+koh serve                 # host a shell for the saved clients (--allow <id> adds one for this run)
+koh connect <name|id>     # connect to a saved server, or to a server id
+koh key info              # show both identity key files and their endpoint ids
+koh key reset [client|server] --yes  # delete a key (client by default); the next use makes a new id
 ```
 
 Useful flags:
@@ -48,7 +57,10 @@ Useful flags:
 --max-sessions <n>        # limit sessions
 ```
 
-Keys live under `~/.config/koh/` by default.
+Keys live under `~/.config/koh/` by default (`client.key`, `server.key`), and the names beside
+them: `servers` beside the client key and `clients` beside the server key, one `name id` a line
+(`#` comments allowed). They are checked as the keys are, since `clients` decides who may open a
+shell: a file that is a symlink or someone else's is refused, and a loose mode is tightened.
 
 **Keys, mouse and pastes** reach the remote program as it asked, whatever terminal you type on: the
 client decodes what your terminal sends (it turns on the kitty keyboard protocol in a terminal that

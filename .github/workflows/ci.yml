@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
   schedule:
     # Weekly (Mon 06:00 UTC): re-run the advisory scan so a newly-disclosed CVE against the

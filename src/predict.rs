@@ -1285,7 +1285,7 @@ mod tests {
 
     impl ScreenView for Screen {
         fn size(&self) -> Size {
-            let (rows, cols) = Self::size(self);
+            let (rows, cols) = Self::size(self).into();
             Size { rows, cols }
         }
         fn cursor_position(&self) -> (u16, u16) {
@@ -1303,7 +1303,8 @@ mod tests {
     }
 
     fn screen_of(bytes: &[u8]) -> Screen {
-        let mut p = fux_vt::Parser::new(24, 80, 0).expect("24x80 parser");
+        let mut p = fux_vt::Parser::new(fux_vt::Size::new(24, 80).expect("nonzero size"), 0)
+            .expect("24x80 parser");
         p.process(bytes).expect("process");
         p.screen().clone()
     }
@@ -1613,7 +1614,7 @@ mod tests {
         e.set_local_frame_sent(0);
         let screen = screen_of(b"abc\x1b[1;3H"); // cursor -> (0,2)
         e.new_user_byte(0x7f, &screen); // backspace
-        let (_, cols) = screen.size();
+        let (_, cols) = screen.size().into();
         assert_eq!(
             e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
             Some("c"),
@@ -1638,7 +1639,8 @@ mod tests {
         // The unknown-column guard must be overflow-safe on a peer-controlled width.
         // At cols == u16::MAX the left-shift loop reaches i = 65534, where a naive `i + 2` overflows
         // u16 (panics under debug overflow-checks). The `i < cols - 2` form must not.
-        let p = fux_vt::Parser::new(1, u16::MAX, 0).expect("1-row parser");
+        let p = fux_vt::Parser::new(fux_vt::Size::new(1, u16::MAX).expect("nonzero size"), 0)
+            .expect("1-row parser");
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         // Predicted cursor near the right edge so the backspace runs its left-shift loop out to the
@@ -1819,7 +1821,8 @@ mod tests {
 
     /// A screen of `rows`×`cols` showing `bytes`.
     fn sized_screen_of(rows: u16, cols: u16, bytes: &[u8]) -> Screen {
-        let mut p = fux_vt::Parser::new(rows, cols, 0).expect("parser");
+        let mut p = fux_vt::Parser::new(fux_vt::Size::new(rows, cols).expect("nonzero size"), 0)
+            .expect("parser");
         p.process(bytes).expect("process");
         p.screen().clone()
     }

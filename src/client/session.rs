@@ -10,9 +10,7 @@ use fux_vt::keys::decode::{Decoder, Input, Reply};
 use fux_vt::keys::encode::{key_bytes, paste, KeyMode, PASTE_END, PASTE_START};
 use fux_vt::keys::Keystroke;
 
-use crate::events::{
-    narrow, InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE_PIECE, PALETTE,
-};
+use crate::events::{InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE_PIECE, PALETTE};
 use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
 use crate::proto::{
     decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
@@ -427,19 +425,18 @@ impl ClientSession {
                     self.decoder.expect(now);
                 }
             }
-            Reply::Colour { number: 10, rgb } => colours.foreground = Some(narrow(rgb)),
-            Reply::Colour { number: 11, rgb } => colours.background = Some(narrow(rgb)),
+            Reply::Foreground(rgb) => colours.foreground = Some(rgb.into()),
+            Reply::Background(rgb) => colours.background = Some(rgb.into()),
             Reply::Palette { index, rgb } => {
                 if let Some(slot) = colours.palette.get_mut(usize::from(index)) {
-                    *slot = Some(narrow(rgb));
+                    *slot = Some(rgb.into());
                 }
             }
             Reply::Attributes if self.colours_asked => {
                 self.colours_asked = false;
                 self.outgoing.push_back(ClientMsg::Colours(colours.clone()));
             }
-            Reply::Colour { .. }
-            | Reply::Attributes
+            Reply::Attributes
             | Reply::Mode { .. }
             | Reply::KittyFlags(_)
             | Reply::UnderlineStyles => {}

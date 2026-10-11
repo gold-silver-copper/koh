@@ -183,7 +183,7 @@ impl ClientTerminal for Readback {
 }
 
 fn parser(rows: u16, cols: u16) -> anyhow::Result<fux_vt::Parser> {
-    fux_vt::Parser::new(rows, cols, 0).map_err(|e| anyhow!("{e}"))
+    fux_vt::Parser::new(fux_vt::Size::new(rows, cols)?, 0).map_err(|e| anyhow!("{e}"))
 }
 
 /// A `sshd` of this user's on loopback, accepting one key, for the life of the run.
@@ -584,7 +584,7 @@ impl Remote {
             .parser
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .resize(rows, cols)
+            .resize(fux_vt::Size::new(rows, cols)?)
             .map_err(|e| anyhow!("{e}"))?;
         match &self.inner {
             Inner::Koh { resize, size, .. } => {

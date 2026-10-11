@@ -108,7 +108,7 @@ struct View {
 impl View {
     /// What `screen` shows. With `drawn`, as the server draws it: in the colours its program set.
     fn of(screen: &fux_vt::Screen, drawn: bool) -> Self {
-        let (rows, cols) = screen.size();
+        let (rows, cols) = screen.size().into();
         let cells = (0..rows)
             .flat_map(|row| (0..cols).map(move |col| (row, col)))
             .map(|(row, col)| {
@@ -136,9 +136,9 @@ impl View {
             })
             .collect();
         Self {
-            size: screen.size(),
+            size: screen.size().into(),
             cells,
-            hidden: screen.hide_cursor(),
+            hidden: !screen.mode(fux_vt::Mode::ShowCursor),
             cursor: screen.cursor_position(),
         }
     }
@@ -221,8 +221,12 @@ impl Session {
         Ok(Self {
             server: ServerTerminal::new(rows, cols, SCROLLBACK).map_err(|e| e.to_string())?,
             // The server's parser, with its options and scrollback.
-            expected: fux_vt::Parser::with_options(rows, cols, SCROLLBACK, koh::terminal::OPTIONS)
-                .map_err(|e| e.to_string())?,
+            expected: fux_vt::Parser::with_options(
+                fux_vt::Size::new(rows, cols).map_err(|e| e.to_string())?,
+                SCROLLBACK,
+                koh::terminal::OPTIONS,
+            )
+            .map_err(|e| e.to_string())?,
             hold: FrameHold::default(),
             frame_start: None,
             now: Instant::now(),
@@ -238,10 +242,9 @@ impl Session {
             capture,
             // A terminal that keeps hyperlinks, as the user's does.
             shown: fux_vt::Parser::with_options(
-                rows,
-                cols,
+                fux_vt::Size::new(rows, cols).map_err(|e| e.to_string())?,
                 0,
-                fux_vt::Options::new().with_hyperlinks(true),
+                fux_vt::Options::new().with(fux_vt::Feature::Hyperlinks),
             )
             .map_err(|e| e.to_string())?,
             base: (FrameNum::BLANK, TerminalScreen::default()),
@@ -255,11 +258,13 @@ impl Session {
         let size = Size::new(rows, cols);
         self.server.resize(size);
         self.expected
-            .resize(rows, cols)
+            .resize(fux_vt::Size::new(rows, cols).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
         // The user's terminal resized itself; the client hears of it and repaints everything.
         self.capture.size.set(size);
-        self.shown.resize(rows, cols).map_err(|e| e.to_string())?;
+        self.shown
+            .resize(fux_vt::Size::new(rows, cols).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
         self.client.on_resize(size);
         self.terminal.window_resized();
         Ok(())
@@ -272,11 +277,19 @@ impl Session {
         // The program already had its replies when it was recorded.
         drop(self.server.take_host_replies());
         for byte in piece {
-            let drawing = self.expected.screen().synchronized_output();
+            let drawing = self
+                .expected
+                .screen()
+                .mode(fux_vt::Mode::SynchronizedOutput);
             self.expected
                 .process(std::slice::from_ref(byte))
                 .map_err(|e| e.to_string())?;
-            if !drawing && self.expected.screen().synchronized_output() {
+            if !drawing
+                && self
+                    .expected
+                    .screen()
+                    .mode(fux_vt::Mode::SynchronizedOutput)
+            {
                 // A frame begins: the screen as it was is a whole one.
                 self.frame_start = Some((View::of(self.expected.screen(), true), self.now));
             }
@@ -289,7 +302,10 @@ impl Session {
     fn expected_view(&self) -> View {
         match &self.frame_start {
             Some((view, began))
-                if self.expected.screen().synchronized_output()
+                if self
+                    .expected
+                    .screen()
+                    .mode(fux_vt::Mode::SynchronizedOutput)
                     && self.now.saturating_duration_since(*began) < FRAME_HOLD =>
             {
                 view.clone()

@@ -163,7 +163,7 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
 - **Shutdown:** when the shell exits, the server sends the final frame (carrying the exit code),
   waits up to 1 s for its ack, then closes the connection with code 0 and reason `session ended`.
 
-`TerminalScreen` is a plain `Grid` of `fux_vt::Cell`s (with a cursor, per-row soft-wrap flags and
+`TerminalScreen` is a plain `Grid` of rows stored as `fux_vt::Cells` (with a cursor, per-row soft-wrap flags and
 the input modes the client mirrors) plus the side channels: title, icon, OSC 52 clipboard, bell count
 and exit code. The grid stores each row as its own reference-counted slice of cells, shared by every
 screen that holds the row unchanged: a snapshot shares the rows the program left alone (found by

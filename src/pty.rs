@@ -3,10 +3,9 @@
 //! it, reap it.
 
 use std::ffi::OsString;
-use std::fs::File;
-use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::io;
+use std::os::fd::OwnedFd;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,7 +95,7 @@ pub enum PtyError {
 ///
 /// `<binary> __launch PROGRAM [ARGS...]`. Only koh runs it, so it is in no usage text. Its interface
 /// is fixed: a running `koh serve` may launch through a newer binary installed over it.
-pub const LAUNCH: &str = "__launch";
+pub const LAUNCH: &str = fuxix::pty::LAUNCH;
 
 /// The binary [`Pty::spawn`] runs as the launcher.
 ///
@@ -129,42 +128,6 @@ impl Launcher {
     }
 }
 
-/// Runs `argv` through `launcher` as the leader of a new session with `slave` as its controlling
-/// terminal and its stdin, stdout and stderr; `setup` sets the environment. Once this returns the
-/// child is the program, with the pid the launcher had.
-///
-/// Starting a process in a new session needs code between `fork` and `exec`, which std allows only
-/// through `unsafe`. The launcher runs that code as a program of its own instead, and reports a
-/// failure, including its `exec` failing, on a pipe that `exec` closes: as std reports its own, so
-/// this returns only once the program runs or cannot.
-fn launch(
-    launcher: &Launcher,
-    argv: &[OsString],
-    slave: &OwnedFd,
-    setup: impl FnOnce(&mut Command),
-) -> io::Result<std::process::Child> {
-    let (mut failures, report) = io::pipe()?;
-    let mut child = {
-        let mut command = Command::new(launcher.program()?);
-        command.arg(LAUNCH).args(argv);
-        setup(&mut command);
-        command
-            .stdin(slave.try_clone()?)
-            .stdout(report)
-            .stderr(slave.try_clone()?);
-        // Dropping `command` closes this side's end of the pipe.
-        command.spawn()?
-    };
-    let mut failure = String::new();
-    let read = failures.read_to_string(&mut failure);
-    if read.is_ok() && failure.is_empty() {
-        return Ok(child);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(read.err().unwrap_or_else(|| io::Error::other(failure)))
-}
-
 /// The launcher's arguments, `PROGRAM [ARGS...]`, if this process was started as the launcher.
 ///
 /// That is `<binary> __launch PROGRAM [ARGS...]`. A binary that launches sessions checks this first,
@@ -184,44 +147,7 @@ pub fn launch_argv() -> Option<Vec<OsString>> {
 /// PTY slave and its stdout on the pipe that reports a failure. It returns only if the program
 /// could not start, with the exit status to use.
 pub fn launched(argv: &[OsString]) -> u8 {
-    // Whatever `koh serve` inherited without close-on-exec, or a thread of it opened while this
-    // launcher was being spawned, reached here: marked, it goes no further, and the program gets
-    // stdio and nothing else.
-    let marked = fuxix::io::cloexec_from(3);
-    // A close-on-exec copy, so a successful `exec` closes the pipe; the program's stdout is the PTY.
-    let report = io::stdout().as_fd().try_clone_to_owned();
-    let failure = match marked {
-        Ok(()) => become_program(argv),
-        Err(errno) => io::Error::other(format!(
-            "marking inherited descriptors close-on-exec: {errno}"
-        )),
-    };
-    if let Ok(report) = report {
-        let _ = File::from(report).write_all(failure.to_string().as_bytes());
-    }
-    127
-}
-
-/// Makes this process the leader of a new session with its stdin as the controlling terminal, then
-/// replaces it with `argv`. The error, if either fails. The spawn of the launcher cleared the
-/// signal mask, and `exec` restores default dispositions (and the SIGPIPE Rust ignores), so the
-/// program starts as it would from a shell.
-fn become_program(argv: &[OsString]) -> io::Error {
-    let Some((program, args)) = argv.split_first() else {
-        return io::Error::other("no program to run");
-    };
-    if let Err(errno) = fuxix::process::setsid() {
-        return io::Error::other(format!("setsid: {errno}"));
-    }
-    let terminal = io::stdin();
-    if let Err(errno) = fuxix::terminal::make_controlling(&terminal) {
-        return io::Error::other(format!("taking the PTY as controlling terminal: {errno}"));
-    }
-    let error = match terminal.as_fd().try_clone_to_owned() {
-        Ok(stdout) => Command::new(program).args(args).stdout(stdout).exec(),
-        Err(error) => error,
-    };
-    io::Error::other(format!("starting {}: {error}", program.to_string_lossy()))
+    fuxix::pty::launched(argv)
 }
 
 /// How long the writer waits for the terminal to take more input before it looks at `stopping`
@@ -304,17 +230,16 @@ impl Pty {
         launcher: &Launcher,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
         // fuxix serializes the allocation itself and works around macOS's PTY races.
-        let (master, slave) =
-            fuxix::pty::open(rows, cols).map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
+        let (master, slave) = fuxix::pty::open(pty_size(rows, cols).map_err(PtyError::OpenPty)?)
+            .map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
+
+        let master = OwnedFd::from(master);
 
         // Read the master before the child exists: macOS discards what a short-lived child wrote
         // if it exits before anything reads (about 3 spawns in 1000 under load).
         let reader = master.try_clone()?;
         let writer = master.try_clone()?;
-        // Both pumps wait in `poll`, never in a read or write (the clones share this flag): a write
-        // blocked on a full input queue is not woken even when the program dies.
-        fuxix::io::set_nonblocking(&master, true)
-            .map_err(|e| PtyError::OpenPty(io::Error::from(e)))?;
+        // fuxix opens the master nonblocking; both pumps wait in `poll`.
         let stopping = Arc::new(AtomicBool::new(false));
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_DEPTH);
@@ -373,14 +298,26 @@ impl Pty {
         };
 
         let argv = build_command(command, || resolve_shell(std::env::var_os("SHELL")));
-        let child = launch(launcher, &argv, &slave, |cmd| {
-            cmd.env("TERM", term);
-            scrub_koh_env(cmd);
-        })
-        .map_err(PtyError::Spawn)?;
-        // The child holds the slave now; drop ours so EOF propagates when it exits.
-        drop(slave);
-        let pid = Pid::of(&child);
+        let (child, pid) = slave
+            .spawn(
+                &launcher.program().map_err(PtyError::Spawn)?,
+                &argv,
+                |cmd| {
+                    cmd.env("TERM", term);
+                    scrub_koh_env(cmd);
+                },
+            )
+            .map_err(|error| {
+                let program = argv
+                    .first()
+                    .map(|arg| arg.to_string_lossy())
+                    .unwrap_or_default();
+                PtyError::Spawn(io::Error::new(
+                    error.kind(),
+                    format!("starting {program}: {error}"),
+                ))
+            })?;
+        let pid = Some(pid);
 
         Ok((
             Self {
@@ -433,8 +370,11 @@ impl Pty {
 
     /// Propagate a window-size change; the kernel raises `SIGWINCH` in the child.
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
-        fuxix::terminal::set_window_size(&self.master, rows, cols)
-            .map_err(|e| PtyError::Resize(e.into()))
+        fuxix::terminal::set_window_size(
+            &self.master,
+            pty_size(rows, cols).map_err(PtyError::Resize)?,
+        )
+        .map_err(|e| PtyError::Resize(e.into()))
     }
 
     /// How the child ended, if it has; it is then reaped, and never signalled again.
@@ -490,6 +430,12 @@ impl Drop for Pty {
         let _ = self.signal(Signal::Hup);
         let _ = self.signal(Signal::Kill);
     }
+}
+
+/// Validate a PTY size before passing it to the system-call layer.
+fn pty_size(rows: u16, cols: u16) -> io::Result<fuxix::terminal::Size> {
+    fuxix::terminal::Size::new(rows, cols)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PTY size must be nonzero"))
 }
 
 #[cfg(test)]

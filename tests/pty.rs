@@ -592,7 +592,9 @@ fn grow_the_pty_table() {
             if held.len() == PTY_HEADROOM {
                 break;
             }
-            if let Ok(pty) = fuxix::pty::open(24, 80) {
+            if let Some(pty) =
+                fuxix::terminal::Size::new(24, 80).and_then(|size| fuxix::pty::open(size).ok())
+            {
                 held.push(pty);
             }
         }

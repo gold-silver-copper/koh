@@ -63,7 +63,8 @@ impl KohBackend for Tty {
     }
 
     fn size(&self) -> io::Result<Size> {
-        let (mut rows, mut cols) = terminal::window_size(self.out.get_ref())?;
+        let (mut rows, mut cols) = terminal::window_size(self.out.get_ref())
+            .map_or((0, 0), |size| (size.rows.get(), size.cols.get()));
         // Over a serial line the ioctl may report zero; fall back to LINES/COLUMNS, as vim does.
         let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u16>().ok());
         if rows == 0 {

@@ -142,7 +142,7 @@ pub struct Latency {
 
 /// The `x`s below the top row of `screen`.
 fn typed(screen: &fux_vt::Screen) -> usize {
-    let (rows, cols) = screen.size();
+    let (rows, cols) = screen.size().into();
     (1..rows)
         .flat_map(|row| (0..cols).map(move |col| (row, col)))
         .filter(|&(row, col)| screen.cell(row, col).is_some_and(|c| c.contents() == "x"))
@@ -314,7 +314,7 @@ const SETTLED: Duration = Duration::from_millis(500);
 fn digest(screen: &fux_vt::Screen) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let (rows, cols) = screen.size();
+    let (rows, cols) = screen.size().into();
     for row in 0..rows {
         for col in 0..cols {
             if let Some(cell) = screen.cell(row, col) {

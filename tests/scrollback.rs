@@ -300,7 +300,11 @@ fn history_keeps_its_colours_wide_glyphs_and_links() {
     let red = top.cell(0, 0).expect("cell").attributes().foreground();
     assert_eq!(
         red,
-        fux_vt::Color::Rgb(0x12, 0x34, 0x56),
+        fux_vt::Color::Rgb(fux_vt::Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56
+        }),
         "drawn in the set colour"
     );
 }

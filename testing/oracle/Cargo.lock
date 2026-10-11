@@ -839,18 +839,18 @@ dependencies = [
 
 [[package]]
 name = "fux-vt"
-version = "0.3.3"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10583e060e0064cfff583efef60af1ef18422e467e11cee551ac55dc8c630014"
+checksum = "a6e223097c3149ac01a8dcf00e6505bf838269efdfafa4c9eebd223324297922"
 dependencies = [
  "unicode-width",
 ]
 
 [[package]]
 name = "fuxix"
-version = "0.1.6"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b06bff0c86e5bc4f5d1ecf63fc8f143f8fabc9a573443610b1db5c772e86d7fd"
+checksum = "fb60d3a960f7bcd8273614e00c4e5dfa82e4f8db00c97ffa6b9108e63c16c17b"
 dependencies = [
  "libc",
 ]
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "koh"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "clap",

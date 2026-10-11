@@ -6,9 +6,7 @@ use std::collections::HashMap;
 use std::num::{NonZeroI16, NonZeroU16};
 use std::sync::Arc;
 
-use fux_vt::{
-    Attributes, Cell, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, RowId,
-};
+use fux_vt::{Attributes, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, RowId};
 
 use super::{Shift, Shifts, MAX_SHIFTS};
 use crate::predict::{CellView, ScreenView, Size};
@@ -27,10 +25,10 @@ pub struct Modes {
 impl Modes {
     fn of(screen: &fux_vt::Screen) -> Self {
         Self {
-            hide_cursor: screen.hide_cursor(),
-            application_cursor: screen.application_cursor(),
-            application_keypad: screen.application_keypad(),
-            bracketed_paste: screen.bracketed_paste(),
+            hide_cursor: !screen.mode(fux_vt::Mode::ShowCursor),
+            application_cursor: screen.mode(fux_vt::Mode::ApplicationCursor),
+            application_keypad: screen.mode(fux_vt::Mode::ApplicationKeypad),
+            bracketed_paste: screen.mode(fux_vt::Mode::BracketedPaste),
             mouse_mode: screen.mouse_protocol_mode(),
             mouse_encoding: screen.mouse_protocol_encoding(),
         }
@@ -167,9 +165,9 @@ impl Eq for Row {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Palette {
     /// By index, the colour the program set it to; `None` where it left it alone or reset it.
-    entries: Vec<Option<(u8, u8, u8)>>,
-    foreground: Option<(u8, u8, u8)>,
-    background: Option<(u8, u8, u8)>,
+    entries: Vec<Option<fux_vt::Rgb>>,
+    foreground: Option<fux_vt::Rgb>,
+    background: Option<fux_vt::Rgb>,
 }
 
 impl Palette {
@@ -187,8 +185,8 @@ impl Palette {
     /// for the user's terminal to draw in its own. A default underline colour is the text's, and
     /// stays.
     fn draw(&self, attributes: Attributes) -> Attributes {
-        let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb(r, g, b);
-        let colour = |c: Color, default: Option<(u8, u8, u8)>| match c {
+        let rgb = Color::Rgb;
+        let colour = |c: Color, default: Option<fux_vt::Rgb>| match c {
             Color::Idx(n) => self
                 .entries
                 .get(usize::from(n))
@@ -300,7 +298,7 @@ pub(super) fn exactly(
 ) -> Arc<Cells> {
     let mut cells: Cells = row.map_or_else(Cells::default, |row| row.cells().collect());
     if cells.len() != usize::from(cols) {
-        cells.resize(usize::from(cols), Cell::default());
+        cells.resize(usize::from(cols), CellRef::default());
     }
     if let Some(palette) = palette {
         palette.recolor(&mut cells);
@@ -308,7 +306,7 @@ pub(super) fn exactly(
     Arc::new(cells)
 }
 
-/// A screen of `fux_vt::Cell`s with a cursor, soft-wrap flags and modes.
+/// A screen of rows stored as [`Cells`], with a cursor, soft-wrap flags and modes.
 ///
 /// Always exactly `rows` rows of `cols` cells. Screens share the rows they hold unchanged. The cursor column may equal `cols`
 /// while an autowrap is pending.
@@ -337,11 +335,11 @@ impl Grid {
     /// The live rows, cursor and modes of a fux-vt screen, sharing the rows `cache` holds unchanged;
     /// `cache` is left holding this snapshot's rows.
     pub(super) fn of(screen: &fux_vt::Screen, cache: &mut RowCache) -> Self {
-        let (rows, cols) = screen.size();
+        let (rows, cols) = screen.size().into();
         if let Some(grid) = Self::of_dirty(screen, cache) {
             return grid;
         }
-        let window = screen.window(0, rows, cols);
+        let window = screen.window();
         let live: Vec<fux_vt::Row<'_>> = (0..rows).filter_map(|row| window.row(row)).collect();
         let palette = Palette::of(screen);
         if palette != cache.palette {
@@ -391,8 +389,11 @@ impl Grid {
     /// the server's emulator shows them, with its cursor and modes: what a client's scrollback
     /// view at `offset` must show, built without the row cache.
     pub(super) fn window_of(screen: &fux_vt::Screen, offset: usize) -> Self {
-        let (rows, cols) = screen.size();
-        let window = screen.window(offset, rows, cols);
+        let (rows, cols) = screen.size().into();
+        let window = screen
+            .window()
+            .row(0)
+            .map_or_else(|| screen.window(), |row| row.up(offset).window());
         let palette = Palette::of(screen);
         let lines: Vec<Row> = (0..rows)
             .map(|r| {
@@ -418,7 +419,7 @@ impl Grid {
     /// the palette), for the full snapshot.
     fn of_dirty(screen: &fux_vt::Screen, cache: &mut RowCache) -> Option<Self> {
         let mark = cache.mark?;
-        let (rows, cols) = screen.size();
+        let (rows, cols) = screen.size().into();
         if screen.full_refresh_since(mark)
             || Palette::of(screen) != cache.palette
             || cache.lines.len() != usize::from(rows)

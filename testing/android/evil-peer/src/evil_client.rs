@@ -34,16 +34,16 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use iroh::endpoint::{Connection, SendStream};
 use koh::events::{
     InputEvent, WireColours, WireKey, WireKeyCode, WireKitty, MAX_EVENTS, MAX_PASTE_PIECE, PALETTE,
 };
 use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE, MAX_INPUT_BYTES};
 use koh::terminal::Size;
 use koh::transport_iroh::{
-    admission, bind_endpoint_local, direct_addr, generate_secret_key, parse_endpoint_id,
-    ALPN, KEY_LEN,
+    admission, bind_endpoint_local, direct_addr, generate_secret_key, parse_endpoint_id, ALPN,
+    KEY_LEN,
 };
-use iroh::endpoint::{Connection, SendStream};
 
 const MIB: usize = 1024 * 1024;
 
@@ -67,7 +67,10 @@ async fn main() -> Result<()> {
         "usage: evil-client <server-id> <ip:port> <attack> [args...]  (see file header for attacks)";
     let id = args.get(1).ok_or_else(|| anyhow!(usage))?;
     let addr = args.get(2).ok_or_else(|| anyhow!(usage))?;
-    let attack = args.get(3).map(String::as_str).ok_or_else(|| anyhow!(usage))?;
+    let attack = args
+        .get(3)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!(usage))?;
     let num = |i: usize, default: u64| -> u64 {
         args.get(i).and_then(|a| a.parse().ok()).unwrap_or(default)
     };
@@ -82,8 +85,13 @@ async fn main() -> Result<()> {
     if attack == "bad-alpn" || attack == "bad-version" {
         let ep = bind_endpoint_local(evil_secret!(), false).await?;
         eprintln!("evil-client: connecting with a bad ALPN (the handshake must reject us)");
-        let bad = ep.connect(direct_addr(server_id, saddr), b"koh/iroh/2").await;
-        eprintln!("evil-client: bad-ALPN connect returned {:?}", bad.map(|_| ()));
+        let bad = ep
+            .connect(direct_addr(server_id, saddr), b"koh/iroh/2")
+            .await;
+        eprintln!(
+            "evil-client: bad-ALPN connect returned {:?}",
+            bad.map(|_| ())
+        );
         return Ok(());
     }
 

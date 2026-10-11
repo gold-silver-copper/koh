@@ -37,7 +37,10 @@ async fn main() -> Result<()> {
     println!("EVIL_PORT={port}");
     eprintln!("evil-server: attack '{attack}' listening on 127.0.0.1:{port}");
 
-    let incoming = ep.accept().await.ok_or_else(|| anyhow!("endpoint closed"))?;
+    let incoming = ep
+        .accept()
+        .await
+        .ok_or_else(|| anyhow!("endpoint closed"))?;
     let conn = incoming.await?;
 
     match attack.as_str() {

@@ -146,6 +146,16 @@ pub fn clamp_dims(size: Size) -> Size {
     }
 }
 
+/// Dimensions accepted for a running terminal, shared by the emulator and kernel PTY.
+pub(crate) fn host_size(size: Size) -> fux_vt::Size {
+    use std::num::NonZeroU16;
+    let Size { rows, cols } = clamp_dims(size);
+    fux_vt::Size::from((
+        NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN),
+        NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN),
+    ))
+}
+
 /// Truncate `s` to at most `max` characters (not bytes), preserving whole scalars.
 fn capped_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {

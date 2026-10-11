@@ -137,18 +137,21 @@ impl Session {
             }
             "frame" => self.frame(arg()? == "1", out)?,
             "keys" => {
-                #[allow(unused_mut)]
-                let mut outcome = self.client.on_input(self.now(), &unhex(arg()?)?);
+                let outcome = self.client.on_input(self.now(), &unhex(arg()?)?);
                 // A client that decodes input holds a sequence that may go on (a lone Escape)
                 // until its deadline; one that forwarded bytes sent it at once. The step is all
                 // that was typed, so its deadline is taken as passed.
                 #[cfg(koh_input_events)]
-                if let Some(deadline) = self.client.deadline() {
+                let outcome = if let Some(deadline) = self.client.deadline() {
                     let flushed = self.client.on_timeout(deadline);
                     if format!("{outcome:?}") == "Forwarded" {
-                        outcome = flushed;
+                        flushed
+                    } else {
+                        outcome
                     }
-                }
+                } else {
+                    outcome
+                };
                 let _ = writeln!(out, "outcome {outcome:?}");
             }
             "tick" => {
@@ -232,7 +235,11 @@ impl Session {
                         .collect(),
                 },
                 ClientMsg::Colours(_) => continue,
-                other => other,
+                other @ (ClientMsg::Input { .. }
+                | ClientMsg::Resize(_)
+                | ClientMsg::Ack { .. }
+                | ClientMsg::Resync
+                | ClientMsg::History(_)) => other,
             };
             let line = format!("{msg:?}");
             // Scrollback requests are new (a side at an older commit has none), and change

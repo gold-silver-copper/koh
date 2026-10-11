@@ -32,6 +32,53 @@ const INPUT_QUEUE: usize = 256;
 /// stops writing cannot starve input.
 const OUTPUT_CHUNKS_PER_SNAPSHOT: usize = 64;
 
+/// One pending input batch, followed by terminal replies generated while it waits. Client
+/// input pauses while this is nonempty. Replies have a separate 64 KiB reserve; overflow
+/// drops a whole reply batch and warns once until the queue drains.
+#[derive(Default)]
+struct PendingInput {
+    bytes: Vec<u8>,
+    replies: usize,
+    overflow_reported: bool,
+}
+
+impl PendingInput {
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn reply(&mut self, bytes: &[u8]) {
+        const REPLY_BUDGET: usize = 64 * 1024;
+        if self.replies.saturating_add(bytes.len()) > REPLY_BUDGET {
+            if !self.overflow_reported {
+                tracing::warn!("PTY reply reserve full; terminal reply batch dropped");
+                self.overflow_reported = true;
+            }
+            return;
+        }
+        self.bytes.extend_from_slice(bytes);
+        self.replies = self.replies.saturating_add(bytes.len());
+    }
+
+    fn flush(&mut self, pty: &crate::pty::Pty) {
+        self.flush_with(|bytes| pty.write_owned(bytes));
+    }
+
+    fn flush_with(&mut self, write: impl FnOnce(Vec<u8>) -> Result<(), crate::pty::WriteError>) {
+        if self.is_empty() {
+            return;
+        }
+        match write(std::mem::take(&mut self.bytes)) {
+            Ok(()) => *self = Self::default(),
+            Err(crate::pty::WriteError::Full(bytes)) => self.bytes = bytes,
+            Err(crate::pty::WriteError::Closed(_)) => {
+                tracing::warn!("PTY input closed; pending input discarded");
+                *self = Self::default();
+            }
+        }
+    }
+}
+
 /// The hosted program: a process on a PTY, and its emulator.
 pub struct PtyHost {
     pub emu: ServerTerminal,
@@ -78,11 +125,11 @@ impl PtyHost {
 
     /// The client's window is now `size` (clamped).
     pub fn resize(&mut self, size: Size) {
-        let Size { rows, cols } = size;
-        if let Err(e) = self.pty.resize(rows, cols) {
-            tracing::warn!(error = %e, rows, cols, "pty resize failed");
+        let size = crate::terminal::host_size(size);
+        if let Err(e) = self.pty.resize_sized(size.nonzero().into()) {
+            tracing::warn!(error = %e, rows = size.rows(), cols = size.cols(), "pty resize failed");
         }
-        self.emu.resize(size);
+        self.emu.resize_sized(size);
     }
 
     /// Tear down; blocks joining the pump threads, so run it on `spawn_blocking`.
@@ -237,7 +284,7 @@ async fn session_task(
 ) {
     // The first client is attached, from `start`.
     let mut phase = Phase::Attached;
-    let mut pending_keys: Vec<u8> = Vec::new();
+    let mut pending = PendingInput::default();
 
     // A frame the program is drawing (synchronized output) is not sent half drawn.
     let mut hold = FrameHold::default();
@@ -247,10 +294,8 @@ async fn session_task(
 
     loop {
         // Retry keystrokes the PTY writer queue could not take last pass.
-        if !pending_keys.is_empty() && host.input(&pending_keys) {
-            pending_keys.clear();
-        }
-        let can_read_input = pending_keys.is_empty();
+        pending.flush(&host.pty);
+        let can_read_input = pending.is_empty();
 
         tokio::select! {
             chunk = pty_rx.recv(), if !matches!(phase, Phase::Exited) => {
@@ -263,7 +308,8 @@ async fn session_task(
                     let replies = host.emu.take_host_replies();
                     if !replies.is_empty() {
                         // Query answers go to the program, not the screen.
-                        let _ = host.input(&replies);
+                        pending.reply(&replies);
+                        pending.flush(&host.pty);
                     }
                     if let Some(screen) = hold.after_output(&mut host.emu, std::time::Instant::now()) {
                         screens_tx.send_replace(Arc::new(screen));
@@ -301,9 +347,8 @@ async fn session_task(
                                     host.emu.set_colours(&colours)
                                 }
                             };
-                            if !keys.is_empty() && !host.input(&keys) {
-                                pending_keys = keys;
-                            }
+                            pending.bytes = keys;
+                            pending.flush(&host.pty);
                         }
                         ClientInput::Resize(size) => {
                             host.resize(size);
@@ -311,9 +356,8 @@ async fn session_task(
                             // A program that asked for in-band resize reports (mode 2048) hears of
                             // it on its input, after anything typed before.
                             if let Some(report) = host.emu.resize_report() {
-                                if !host.input(&report) {
-                                    pending_keys.extend_from_slice(&report);
-                                }
+                                pending.reply(&report);
+                                pending.flush(&host.pty);
                             }
                             screens_tx.send_replace(Arc::new(host.snapshot()));
                         }
@@ -355,7 +399,7 @@ async fn session_task(
                 Phase::Attached => phase = Phase::Detached { since: Instant::now() },
                 Phase::Detached { .. } => {}
             },
-            _ = pending_input_retry(!pending_keys.is_empty()) => {}
+            _ = pending_input_retry(!pending.is_empty()) => {}
             // A program may turn echo off without writing anything (a password prompt printed
             // first): the client hears of it within a tick.
             _ = tty_tick.tick(), if matches!(phase, Phase::Attached) => {
@@ -476,8 +520,47 @@ async fn registry_task(
 
 #[cfg(test)]
 mod tests {
-    use super::{take_ready, OUTPUT_CHUNKS_PER_SNAPSHOT};
+    use super::{take_ready, PendingInput, OUTPUT_CHUNKS_PER_SNAPSHOT};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn replies_wait_behind_input_and_overflow_is_bounded() {
+        let mut pending = PendingInput {
+            bytes: b"typed".to_vec(),
+            ..PendingInput::default()
+        };
+        pending.flush_with(|bytes| Err(crate::pty::WriteError::Full(bytes)));
+        pending.reply(b"\x1b[1;1R");
+        pending.reply(b"\x1b[48;24;80;0;0t");
+        let expected = pending.bytes.clone();
+        for _ in 0..3 {
+            pending.reply(&vec![0; 64 * 1024]);
+        }
+        assert_eq!(
+            pending.bytes, expected,
+            "overflow discards whole reply batches"
+        );
+        assert!(pending.overflow_reported);
+        let pointer = pending.bytes.as_ptr();
+        pending.flush_with(|bytes| Err(crate::pty::WriteError::Full(bytes)));
+        assert_eq!(
+            pending.bytes.as_ptr(),
+            pointer,
+            "backpressure retains the buffer"
+        );
+        pending.flush_with(|bytes| {
+            assert_eq!(bytes, b"typed\x1b[1;1R\x1b[48;24;80;0;0t");
+            Ok(())
+        });
+        assert!(pending.is_empty());
+        assert!(!pending.overflow_reported);
+        pending.reply(b"next");
+        pending.flush_with(|bytes| Err(crate::pty::WriteError::Closed(bytes)));
+        assert!(
+            pending.is_empty(),
+            "closed writers do not retain pending input"
+        );
+    }
 
     #[test]
     fn a_burst_of_output_is_taken_in_bounded_batches_and_the_end_is_left_for_recv() {

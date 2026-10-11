@@ -15,6 +15,7 @@ mod recording;
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::io::Write as _;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -696,7 +697,8 @@ fn frame_size_histogram(corpus: &[Recording]) -> Result<(), String> {
     }
     let total: usize = bytes.iter().sum();
     let frames: usize = counts.iter().sum();
-    println!("{frames} frames, {total} bytes");
+    let mut output = std::io::stdout().lock();
+    writeln!(output, "{frames} frames, {total} bytes").map_err(|e| e.to_string())?;
     for ((bound, count), sum) in BOUNDS.iter().zip(counts).zip(bytes) {
         let label = if *bound == usize::MAX {
             "4096+".to_owned()
@@ -704,7 +706,11 @@ fn frame_size_histogram(corpus: &[Recording]) -> Result<(), String> {
             format!("<{bound}")
         };
         let percent = sum.saturating_mul(100).checked_div(total).unwrap_or(0);
-        println!("{label:>6}: {count:>5} frames, {sum:>7} bytes ({percent}%)");
+        writeln!(
+            output,
+            "{label:>6}: {count:>5} frames, {sum:>7} bytes ({percent}%)"
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }

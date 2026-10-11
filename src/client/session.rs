@@ -133,6 +133,83 @@ mod notice {
     }
 }
 
+/// Structured outgoing messages and their input-byte accounting have one owner.
+#[derive(Debug, Default)]
+struct Outgoing {
+    messages: VecDeque<ClientMsg>,
+    input_bytes: usize,
+}
+
+impl Outgoing {
+    fn iter(&self) -> impl Iterator<Item = &ClientMsg> {
+        self.messages.iter()
+    }
+    fn input_cost(msg: &ClientMsg) -> usize {
+        match msg {
+            ClientMsg::Input { bytes, .. } => bytes.len(),
+            ClientMsg::Keys { events, .. } => events.iter().map(InputEvent::wire_len).sum(),
+            ClientMsg::Resize(_)
+            | ClientMsg::Ack { .. }
+            | ClientMsg::Resync
+            | ClientMsg::History(_)
+            | ClientMsg::Colours(_) => 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+    fn back(&self) -> Option<&ClientMsg> {
+        self.messages.back()
+    }
+
+    fn push_back(&mut self, msg: ClientMsg) {
+        self.input_bytes = self.input_bytes.saturating_add(Self::input_cost(&msg));
+        self.messages.push_back(msg);
+    }
+
+    fn push_front(&mut self, msg: ClientMsg) {
+        self.input_bytes = self.input_bytes.saturating_add(Self::input_cost(&msg));
+        self.messages.push_front(msg);
+    }
+
+    fn pop_front(&mut self) -> Option<ClientMsg> {
+        let msg = self.messages.pop_front()?;
+        self.input_bytes = self.input_bytes.saturating_sub(Self::input_cost(&msg));
+        Some(msg)
+    }
+
+    fn retain(&mut self, keep: impl FnMut(&ClientMsg) -> bool) {
+        self.messages.retain(keep);
+        self.input_bytes = self.messages.iter().map(Self::input_cost).sum();
+    }
+
+    fn event(&mut self, event: InputEvent, last_seq: &mut InputSeq) {
+        let cost = event.wire_len();
+        match self.messages.back_mut() {
+            Some(ClientMsg::Keys { events, .. }) if fits(events, cost) => {
+                events.push(event);
+                self.input_bytes = self.input_bytes.saturating_add(cost);
+            }
+            _ => {
+                *last_seq = last_seq.next();
+                self.push_back(ClientMsg::Keys {
+                    seq: *last_seq,
+                    events: vec![event],
+                });
+            }
+        }
+    }
+
+    fn resize(&mut self, size: Size) {
+        if let Some(ClientMsg::Resize(queued)) = self.messages.back_mut() {
+            *queued = size;
+        } else {
+            self.push_back(ClientMsg::Resize(size));
+        }
+    }
+}
+
 /// How long after a frame moves the cursor to another row (a fresh prompt) a key typed is shown
 /// only once echoed: the server reads the PTY's modes at least every [`TTY_TICK`], so a program
 /// that turned echo off just after printing its prompt is heard of within about one; two leave
@@ -174,14 +251,16 @@ pub struct ClientSession {
     /// The newest input sequence number handed to a connection.
     sent_seq: InputSeq,
     /// Messages for the server, oldest first.
-    outgoing: VecDeque<ClientMsg>,
+    outgoing: Outgoing,
     /// Typed bytes in `outgoing`.
-    queued_input: usize,
     /// Typing was dropped because `outgoing` was full; cleared once it drains.
     input_paused: bool,
     predictor: PredictionEngine,
     /// What the user's terminal sends, decoded.
     decoder: Decoder,
+    /// An incomplete input begun before an outage must finish being decoded, but must
+    /// never be delivered to the shell reached after reconnecting.
+    stale_decode: bool,
     /// The escape prefix as typed, while waiting for the key after it.
     pending_escape: Option<Keystroke>,
     /// The user's terminal's colours, while the server is told them (not with `--no-colours`).
@@ -201,6 +280,7 @@ pub struct ClientSession {
     last_activity: Option<Instant>,
     /// The window's height, for the view's pages.
     rows: u16,
+    cols: u16,
     /// Set whenever the rendered output may have changed; cleared once the caller repaints.
     pub(crate) dirty: bool,
     /// Whether a status banner was painted last frame, so its removal repaints once more.
@@ -215,11 +295,15 @@ impl ClientSession {
             outage: None,
             last_seq: InputSeq::default(),
             sent_seq: InputSeq::default(),
-            outgoing: VecDeque::from([ClientMsg::Resize(size)]),
-            queued_input: 0,
+            outgoing: {
+                let mut queue = Outgoing::default();
+                queue.resize(size);
+                queue
+            },
             input_paused: false,
             predictor: PredictionEngine::new(pref),
             decoder: Decoder::with_paste_limit(MAX_QUEUED_INPUT),
+            stale_decode: false,
             pending_escape: None,
             colours: None,
             colours_asked: false,
@@ -229,6 +313,7 @@ impl ClientSession {
             scrollback: Scrollback::default(),
             last_activity: None,
             rows: size.rows,
+            cols: size.cols,
             dirty: true,
             status_was_shown: false,
         }
@@ -252,10 +337,13 @@ impl ClientSession {
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Ack { .. } | ClientMsg::History(_)));
         self.link.drop_resync();
-        if self.queued_input > 0 {
+        if self.decoder.deadline().is_some() {
+            self.stale_decode = true;
+            outage.dropped_typing();
+        }
+        if self.outgoing.input_bytes > 0 {
             self.outgoing
                 .retain(|msg| !matches!(msg, ClientMsg::Keys { .. } | ClientMsg::Input { .. }));
-            self.queued_input = 0;
             outage.dropped_typing();
         }
         // Nothing is queued now, so nothing is to drain before typing is taken again.
@@ -278,6 +366,7 @@ impl ClientSession {
         }
         self.outgoing.push_front(ClientMsg::Resize(size));
         self.rows = size.rows;
+        self.cols = size.cols;
         self.scrollback.reconnected();
         self.dirty = true;
     }
@@ -287,7 +376,20 @@ impl ClientSession {
     /// [`deadline`](Self::deadline).
     pub fn on_input(&mut self, now: Instant, bytes: &[u8]) -> InputOutcome {
         let mut inputs = Vec::new();
-        self.decoder.bytes(bytes, &mut inputs);
+        let mut rest = bytes;
+        // Resolve precisely the old sequence's boundary. Resetting the decoder would turn a
+        // stale paste's tail into commands; dropping the whole read would lose fresh keys too.
+        while self.stale_decode {
+            let Some((byte, tail)) = rest.split_first() else {
+                break;
+            };
+            self.decoder.bytes(std::slice::from_ref(byte), &mut inputs);
+            self.decoder.mark(now);
+            inputs.retain(|input| matches!(input, Input::Reply(_) | Input::PasteTooLong));
+            self.stale_decode = self.decoder.deadline().is_some();
+            rest = tail;
+        }
+        self.decoder.bytes(rest, &mut inputs);
         self.decoder.mark(now);
         self.on_inputs(now, inputs)
     }
@@ -305,6 +407,9 @@ impl ClientSession {
         }
         let mut inputs = Vec::new();
         self.decoder.timeout(&mut inputs);
+        if std::mem::take(&mut self.stale_decode) {
+            inputs.retain(|input| matches!(input, Input::Reply(_) | Input::PasteTooLong));
+        }
         self.on_inputs(now, inputs)
     }
 
@@ -456,7 +561,7 @@ impl ClientSession {
             return;
         }
         let size: usize = events.iter().map(InputEvent::wire_len).sum();
-        if self.queued_input.saturating_add(size) > MAX_QUEUED_INPUT {
+        if self.outgoing.input_bytes.saturating_add(size) > MAX_QUEUED_INPUT {
             // The server is not taking input; queueing more would grow without bound.
             if !self.input_paused {
                 self.input_paused = true;
@@ -495,20 +600,8 @@ impl ClientSession {
             }
         }
         for event in events {
-            match self.outgoing.back_mut() {
-                Some(ClientMsg::Keys { events: queued, .. }) if fits(queued, event.wire_len()) => {
-                    queued.push(event);
-                }
-                _ => {
-                    self.last_seq = self.last_seq.next();
-                    self.outgoing.push_back(ClientMsg::Keys {
-                        seq: self.last_seq,
-                        events: vec![event],
-                    });
-                }
-            }
+            self.outgoing.event(event, &mut self.last_seq);
         }
-        self.queued_input = self.queued_input.saturating_add(size);
         self.link.last_nudge = Some(now);
         self.last_activity = Some(now);
         self.dirty = true;
@@ -546,12 +639,9 @@ impl ClientSession {
     /// Queue a new window size; it voids the predictions.
     pub fn on_resize(&mut self, size: Size) {
         // Only the last of several unsent resizes matters.
-        if let Some(ClientMsg::Resize(queued)) = self.outgoing.back_mut() {
-            *queued = size;
-        } else {
-            self.outgoing.push_back(ClientMsg::Resize(size));
-        }
+        self.outgoing.resize(size);
         self.rows = size.rows;
+        self.cols = size.cols;
         self.predictor.reset();
         self.dirty = true;
     }
@@ -677,7 +767,7 @@ impl ClientSession {
                 self.aside(now, &mut aside);
                 Some(aside)
                     .filter(|aside| !aside.is_empty())
-                    .or_else(|| self.scrollback.status())
+                    .or_else(|| self.scrollback.status_at(self.cols))
             }
         };
         TickResult {
@@ -698,20 +788,16 @@ impl ClientSession {
         }
         let msg = self.outgoing.pop_front()?;
         let sent = match &msg {
-            ClientMsg::Input { bytes, seq } => Some((bytes.len(), *seq)),
-            ClientMsg::Keys { events, seq } => {
-                Some((events.iter().map(InputEvent::wire_len).sum(), *seq))
-            }
+            ClientMsg::Input { seq, .. } | ClientMsg::Keys { seq, .. } => Some(*seq),
             ClientMsg::Resize(_)
             | ClientMsg::Ack { .. }
             | ClientMsg::Resync
             | ClientMsg::History(_)
             | ClientMsg::Colours(_) => None,
         };
-        if let Some((sent, seq)) = sent {
+        if let Some(seq) = sent {
             self.sent_seq = seq;
-            self.queued_input = self.queued_input.saturating_sub(sent);
-            if self.input_paused && self.queued_input == 0 {
+            if self.input_paused && self.outgoing.input_bytes == 0 {
                 self.input_paused = false;
                 self.dirty = true;
             }
@@ -1543,6 +1629,76 @@ mod tests {
             .on_tick(now + NOTICE_FOR, None)
             .status
             .is_none_or(|s| !s.contains("paste")));
+    }
+
+    #[test]
+    fn incomplete_paste_times_out_as_paste_and_later_keys_are_keys() {
+        let (now, mut session) = start();
+        drain(&mut session);
+        session.on_input(now, b"\x1b[200~echo paste\n");
+        assert_eq!(events(&drain(&mut session)), []);
+        let deadline = session.deadline().expect("paste deadline");
+        session.on_timeout(deadline);
+        assert_eq!(
+            events(&drain(&mut session)),
+            [InputEvent::Paste {
+                text: "echo paste\n".into(),
+                first: true,
+                last: true,
+            }]
+        );
+        session.on_input(deadline, b"k");
+        assert_eq!(events(&drain(&mut session)), [key("k")]);
+        assert!(session.deadline().is_none());
+    }
+
+    #[test]
+    fn paste_expiring_during_an_outage_is_not_replayed() {
+        let (now, mut session) = start();
+        drain(&mut session);
+        session.on_input(now, b"\x1b[200~echo stale\n");
+        session.detach(now);
+        session.on_timeout(session.deadline().expect("paste deadline"));
+        session.attach(Size::new(24, 80));
+        assert_eq!(events(&drain(&mut session)), []);
+        let status = session.on_tick(now, None).status.expect("outage notice");
+        assert!(status.contains("not sent"), "{status}");
+    }
+
+    #[test]
+    fn paste_begun_before_an_outage_cannot_finish_into_the_reconnected_shell() {
+        let (now, mut session) = start();
+        drain(&mut session);
+        session.on_input(now, b"\x1b[200~echo stale");
+        session.detach(now);
+        session.attach(Size::new(24, 80));
+        let blank = TerminalScreen::default();
+        session.on_frame(now, &frame(1, 0, 0, &blank, &screen(b"fresh prompt")));
+        drain(&mut session);
+        session.on_input(now, b" tail\n\x1b[201~k");
+        assert_eq!(
+            events(&drain(&mut session)),
+            [key("k")],
+            "only fresh input reaches the new shell"
+        );
+        assert!(session.deadline().is_none());
+    }
+
+    #[test]
+    fn ctrl_backspace_crosses_the_wire_and_unsupported_function_keys_emit_nothing() {
+        let (now, mut session) = start();
+        drain(&mut session);
+        session.on_input(now, b"\x1b[127;5u");
+        let mut sent = events(&drain(&mut session));
+        assert!(matches!(sent.as_slice(), [InputEvent::Key(key)]
+            if key.stroke().press == fux_vt::keys::KeyPress::new(fux_vt::keys::Key::Backspace, fux_vt::keys::Modifiers::CTRL)));
+        sent.push(InputEvent::Key(
+            Keystroke::from(fux_vt::keys::KeyPress::plain(fux_vt::keys::Key::F(13))).into(),
+        ));
+        let mut server = ServerTerminal::new(24, 80, 0).expect("emulator");
+        let mut bytes = Vec::new();
+        server.encode_input(&sent, &mut bytes);
+        assert_eq!(bytes, b"\x08");
     }
 
     /// fux-vt's decoder ends a paste at `ESC [ 201 ~`; the C1 form of it, U+009B `201~`, can be in

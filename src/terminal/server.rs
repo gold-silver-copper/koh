@@ -4,7 +4,7 @@
 use crate::terminal::grid::{Palette, RowCache};
 use crate::terminal::history::HistoryNames;
 use crate::terminal::{
-    clamp_dims, Grid, HistoryMark, HistoryReply, HistoryRequest, Size, TerminalScreen, TtyModes,
+    Grid, HistoryMark, HistoryReply, HistoryRequest, Size, TerminalScreen, TtyModes,
     MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
 };
 use std::time::{Duration, Instant};
@@ -157,22 +157,13 @@ pub struct ServerTerminal {
     paste_open: Option<bool>,
 }
 
-/// The dimensions were clamped to at least one before reaching the emulator.
-fn emulator_size(rows: u16, cols: u16) -> fux_vt::Size {
-    use std::num::NonZeroU16;
-    fux_vt::Size::from((
-        NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN),
-        NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN),
-    ))
-}
-
 impl ServerTerminal {
     /// An emulator of this (clamped) size keeping `scrollback` lines. Fails only if fux-vt refuses
     /// the allocation (see [`MAX_SCROLLBACK`](crate::server::cli::MAX_SCROLLBACK)).
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Result<Self, fux_vt::Error> {
-        let Size { rows, cols } = clamp_dims(Size { rows, cols });
+        let size = super::host_size(Size { rows, cols });
         Ok(Self {
-            parser: Parser::with_options(emulator_size(rows, cols), scrollback, OPTIONS)?,
+            parser: Parser::with_options(size, scrollback, OPTIONS)?,
             observed: Observed::default(),
             exit_code: None,
             rows: RowCache::default(),
@@ -339,9 +330,12 @@ impl ServerTerminal {
     /// Resize to `size`, clamped: it comes from the peer. A refused resize keeps the size and is
     /// logged.
     pub fn resize(&mut self, size: Size) {
-        let Size { rows, cols } = clamp_dims(size);
-        if let Err(e) = self.parser.resize(emulator_size(rows, cols)) {
-            tracing::warn!(error = %e, rows, cols, "terminal emulator refused a resize");
+        self.resize_sized(super::host_size(size));
+    }
+
+    pub(crate) fn resize_sized(&mut self, size: fux_vt::Size) {
+        if let Err(e) = self.parser.resize(size) {
+            tracing::warn!(error = %e, rows = size.rows(), cols = size.cols(), "terminal emulator refused a resize");
         }
         // A reflow lays the history out afresh, its rows with new cells.
         self.names.renew();

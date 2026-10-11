@@ -113,35 +113,29 @@ impl HistoryNames {
     pub(super) fn mark(&mut self, screen: &fux_vt::Screen) -> HistoryMark {
         let len = screen.history_len();
         let rows = usize::from(screen.size().rows());
-        // History row `h` (0 the oldest) is `len - 1 - h + rows` rows from the bottom.
-        let unnamed = (0..len)
-            .take_while(|&back| {
-                rows.checked_add(back)
-                    .and_then(|offset| screen.rows().nth_back(offset))
-                    .is_some_and(|row| !self.by_row.contains_key(&row.id()))
-            })
+        // History is the prefix of retained rows. Walk its newest unnamed suffix, then
+        // give names in chronological order without rebuilding offsets into the live screen.
+        let unnamed = screen
+            .rows()
+            .take(len)
+            .rev()
+            .take_while(|row| !self.by_row.contains_key(&row.id()))
             .count();
-        for back in (0..unnamed).rev() {
-            if let Some(row) = rows
-                .checked_add(back)
-                .and_then(|offset| screen.rows().nth_back(offset))
-            {
-                self.last = self.last.saturating_add(1);
-                self.by_row.insert(row.id(), self.last);
-            }
+        for row in screen.rows().take(len).skip(len.saturating_sub(unnamed)) {
+            self.last = self.last.saturating_add(1);
+            self.by_row.insert(row.id(), self.last);
         }
         // Rows that left history keep their names in the map until it holds twice what is kept.
         let kept = len.saturating_add(rows);
         if self.by_row.len() > kept.saturating_mul(2).saturating_add(64) {
-            let present: std::collections::HashSet<RowId> = (0..kept)
-                .filter_map(|offset| screen.rows().nth_back(offset).map(|row| row.id()))
-                .collect();
+            let present: std::collections::HashSet<RowId> =
+                screen.rows().map(|row| row.id()).collect();
             self.by_row.retain(|id, _| present.contains(id));
         }
         let newest = screen
             .rows()
-            .nth_back(rows)
-            .filter(|_| len > 0)
+            .take(len)
+            .next_back()
             .and_then(|row| self.by_row.get(&row.id()).copied());
         match newest {
             Some(newest) => HistoryMark {
@@ -164,7 +158,6 @@ impl HistoryNames {
         if !mark.holds(request.newest) || count == 0 {
             return HistoryReply::default();
         }
-        let rows = usize::from(screen.size().rows());
         // Names are consecutive, so the row asked for is this many rows above the newest.
         let Some(above) = usize::try_from(mark.newest.saturating_sub(request.newest)).ok() else {
             return HistoryReply::default();
@@ -172,15 +165,14 @@ impl HistoryNames {
         let mut out = Vec::new();
         let mut cells = 0_usize;
         let mut links = 0_usize;
-        for back in 0..usize::from(count) {
-            let Some(row) = rows
-                .checked_add(above)
-                .and_then(|offset| offset.checked_add(back))
-                .filter(|&offset| offset < rows.saturating_add(screen.history_len()))
-                .and_then(|offset| screen.rows().nth_back(offset))
-            else {
-                break;
-            };
+        for (back, row) in screen
+            .rows()
+            .take(screen.history_len())
+            .rev()
+            .skip(above)
+            .take(usize::from(count))
+            .enumerate()
+        {
             let name = request
                 .newest
                 .saturating_sub(u64::try_from(back).unwrap_or(u64::MAX));

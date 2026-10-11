@@ -10,8 +10,8 @@
 use std::time::{Duration, Instant};
 
 use fux_vt::keys::decode::Input;
-use fux_vt::keys::encode::{key_bytes, KeyMode};
 use fux_vt::keys::mouse::{MouseAction, MouseButton, MouseEvent};
+use fux_vt::keys::{Direction, Key, KeyPress};
 
 use crate::terminal::{
     HistoryCache, HistoryMark, HistoryReply, HistoryRequest, TerminalScreen, MAX_HISTORY_ROWS,
@@ -47,8 +47,6 @@ pub struct Scrollback {
     mark: HistoryMark,
     /// Requests sent and not answered, oldest first: the server answers in order.
     outstanding: Vec<HistoryRequest>,
-    /// The bytes of an escape sequence split across reads.
-    partial: Vec<u8>,
     /// A search of the history, while one is typed or under way.
     search: Option<Search>,
 }
@@ -64,7 +62,7 @@ const SEARCH_STEP: usize = 4096;
 #[derive(Debug, Default)]
 struct Search {
     /// The text sought, as typed.
-    query: Vec<u8>,
+    query: String,
     /// The text is being typed: keys go to it.
     typing: bool,
     /// Looking at older rows (else newer).
@@ -76,8 +74,27 @@ struct Search {
 }
 
 impl Search {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.query).into_owned()
+    fn text(&self) -> &str {
+        &self.query
+    }
+
+    fn append(&mut self, text: &str) {
+        for c in text.chars().filter(|c| !c.is_control()) {
+            if self.query.len().saturating_add(c.len_utf8()) > MAX_QUERY {
+                break;
+            }
+            self.query.push(c);
+        }
+    }
+
+    fn editing_status(&self, cols: u16) -> String {
+        let prefix = if cols >= 18 { "[koh] search: /" } else { "/" };
+        // The painter reserves a surrounding space and clips by bytes. A UTF-8 byte bound
+        // also conservatively fits wide characters; always keep the end being edited visible.
+        let budget = usize::from(cols).saturating_sub(prefix.len().saturating_add(2));
+        let start = self.query.len().saturating_sub(budget);
+        let start = self.query.ceil_char_boundary(start);
+        format!("{prefix}{}", self.query.get(start..).unwrap_or_default())
     }
 }
 
@@ -90,7 +107,6 @@ impl Scrollback {
     /// Open the view, at the live screen.
     pub fn open(&mut self) {
         self.view = Some(0);
-        self.partial.clear();
     }
 
     /// The rows held, for tests and the status line.
@@ -152,7 +168,7 @@ impl Scrollback {
         let Some(search) = self.search.as_mut().filter(|s| !s.typing) else {
             return;
         };
-        let query = search.text();
+        let query = &search.query;
         for _ in 0..SEARCH_STEP {
             let Some(name) = search.next else {
                 return;
@@ -165,7 +181,7 @@ impl Scrollback {
             let Some(row) = self.cache.get(name) else {
                 return;
             };
-            if row.text().contains(&query) {
+            if row.text().contains(query) {
                 search.next = None;
                 search.failed = false;
                 // At the view's top: `offset` rows up, the row the newest is at offset 1.
@@ -315,10 +331,14 @@ impl Scrollback {
 
     /// The status line while viewing.
     pub fn status(&self) -> Option<String> {
+        self.status_at(u16::MAX)
+    }
+
+    pub(crate) fn status_at(&self, cols: u16) -> Option<String> {
         let offset = self.view?;
         let len = self.mark.len;
         Some(match &self.search {
-            Some(search) if search.typing => format!("[koh] search: /{}", search.text()),
+            Some(search) if search.typing => search.editing_status(cols),
             Some(search) if search.next.is_some() => {
                 format!(
                     "[koh] scrollback {offset}/{len} — searching for {:?}…",
@@ -343,9 +363,7 @@ impl Scrollback {
         for input in inputs {
             match input {
                 Input::Key(stroke) => {
-                    let mut bytes = Vec::with_capacity(8);
-                    key_bytes(stroke.press.into(), KeyMode::legacy(false), &mut bytes);
-                    if self.on_keys(&bytes, rows) == ViewKeys::Leave {
+                    if self.on_key(stroke.press, rows) == ViewKeys::Leave {
                         return ViewKeys::Leave;
                     }
                 }
@@ -366,14 +384,7 @@ impl Scrollback {
                 },
                 Input::Paste(text) => {
                     if let Some(search) = self.search.as_mut().filter(|s| s.typing) {
-                        for c in text.chars().filter(|c| !c.is_control()) {
-                            let mut utf8 = [0; 4];
-                            let c = c.encode_utf8(&mut utf8).as_bytes();
-                            if search.query.len().saturating_add(c.len()) > MAX_QUERY {
-                                break;
-                            }
-                            search.query.extend_from_slice(c);
-                        }
+                        search.append(text);
                     }
                 }
                 Input::Mouse(_)
@@ -386,85 +397,92 @@ impl Scrollback {
         ViewKeys::Stay
     }
 
-    /// Keys typed while viewing, as legacy bytes, for a screen `rows` high.
-    fn on_keys(&mut self, bytes: &[u8], rows: u16) -> ViewKeys {
-        let mut input = std::mem::take(&mut self.partial);
-        input.extend_from_slice(bytes);
+    /// Act on the key the decoder already resolved; escape sequences never enter this layer.
+    fn on_key(&mut self, press: KeyPress, rows: u16) -> ViewKeys {
+        let KeyPress { key, mods } = press;
+        if mods.alt
+            || ((!mods.is_empty())
+                && matches!(
+                    key,
+                    Key::Arrow(_) | Key::Home | Key::End | Key::PageUp | Key::PageDown
+                ))
+        {
+            return ViewKeys::Stay;
+        }
+        if let Some(search) = self.search.as_mut().filter(|s| s.typing) {
+            match key {
+                Key::Escape => self.search = None,
+                Key::Enter => self.search_from_top(true),
+                Key::Backspace => {
+                    search.query.pop();
+                }
+                Key::Char('c' | '[') if mods.ctrl => self.search = None,
+                Key::Char('h' | '?') if mods.ctrl => {
+                    search.query.pop();
+                }
+                Key::Char('m' | 'j') if mods.ctrl => self.search_from_top(true),
+                Key::Char(c) if !mods.ctrl => {
+                    let mut utf8 = [0; 4];
+                    search.append(c.encode_utf8(&mut utf8));
+                }
+                Key::Char(_)
+                | Key::Tab
+                | Key::Delete
+                | Key::Insert
+                | Key::Arrow(_)
+                | Key::Home
+                | Key::End
+                | Key::PageUp
+                | Key::PageDown
+                | Key::F(_) => {}
+            }
+            return ViewKeys::Stay;
+        }
         let page = usize::from(rows.saturating_sub(1)).max(1);
         let half = page.div_euclid(2).max(1);
-        let mut rest = input.as_slice();
-        while let Some((&byte, tail)) = rest.split_first() {
-            if let Some(search) = self.search.as_mut().filter(|s| s.typing) {
-                match byte {
-                    b'\r' | b'\n' => self.search_from_top(true),
-                    0x7f | 0x08 => {
-                        // Back a character, its UTF-8 continuation bytes with it.
-                        while search
-                            .query
-                            .pop()
-                            .is_some_and(|b| (0x80..=0xbf).contains(&b))
-                        {}
-                    }
-                    0x1b | 0x03 => self.search = None,
-                    byte if byte >= 0x20 && search.query.len() < MAX_QUERY => {
-                        search.query.push(byte);
-                    }
-                    _ => {}
-                }
-                rest = tail;
-                continue;
+        let step = match key {
+            Key::Char('c' | '[') if mods.ctrl => return self.leave(),
+            Key::Char('p' | 'y') if mods.ctrl => Step::Up(1),
+            Key::Char('n' | 'e' | 'm') if mods.ctrl => Step::Down(1),
+            Key::Char('b') if mods.ctrl => Step::Up(page),
+            Key::Char('f') if mods.ctrl => Step::Down(page),
+            Key::Char('u') if mods.ctrl => Step::Up(half),
+            Key::Char('d') if mods.ctrl => Step::Down(half),
+            Key::Char(_) if mods.ctrl => Step::None,
+            Key::Char('q') | Key::Escape => return self.leave(),
+            Key::Char('/') => {
+                self.search = Some(Search {
+                    typing: true,
+                    ..Search::default()
+                });
+                Step::None
             }
-            let (step, used) = match byte {
-                b'q' | 0x03 => return self.leave(),
-                b'/' => {
-                    self.search = Some(Search {
-                        typing: true,
-                        ..Search::default()
-                    });
-                    (Step::None, 1)
-                }
-                b'n' => {
-                    self.search_from_top(true);
-                    (Step::None, 1)
-                }
-                b'N' => {
-                    self.search_from_top(false);
-                    (Step::None, 1)
-                }
-                0x1b => match parse_escape(rest) {
-                    Escape::Partial if rest.len() == 1 => return self.leave(),
-                    Escape::Partial => {
-                        self.partial = rest.to_vec();
-                        break;
-                    }
-                    Escape::Key(step, used) => (step, used),
-                },
-                b'k' | b'y' | 0x10 | 0x19 => (Step::Up(1), 1),
-                b'j' | b'e' | 0x0e | 0x05 | b'\r' => (Step::Down(1), 1),
-                b'b' | 0x02 => (Step::Up(page), 1),
-                b'f' | b' ' | 0x06 => (Step::Down(page), 1),
-                b'u' | 0x15 => (Step::Up(half), 1),
-                b'd' | 0x04 => (Step::Down(half), 1),
-                b'g' => (Step::Top, 1),
-                b'G' => (Step::Bottom, 1),
-                _ => (Step::None, 1),
-            };
-            let step = match step {
-                Step::PageUp => Step::Up(page),
-                Step::PageDown => Step::Down(page),
-                step @ (Step::Up(_) | Step::Down(_) | Step::Top | Step::Bottom | Step::None) => {
-                    step
-                }
-            };
-            self.step(step);
-            rest = rest.get(used..).unwrap_or(tail);
-        }
+            Key::Char('n' | 'N') => {
+                self.search_from_top(key == Key::Char('n'));
+                Step::None
+            }
+            Key::Char('k' | 'y') | Key::Arrow(Direction::Up) => Step::Up(1),
+            Key::Char('j' | 'e') | Key::Enter | Key::Arrow(Direction::Down) => Step::Down(1),
+            Key::Char('b') | Key::PageUp => Step::Up(page),
+            Key::Char('f' | ' ') | Key::PageDown => Step::Down(page),
+            Key::Char('u') => Step::Up(half),
+            Key::Char('d') => Step::Down(half),
+            Key::Char('g') | Key::Home => Step::Top,
+            Key::Char('G') | Key::End => Step::Bottom,
+            Key::Char(_)
+            | Key::Tab
+            | Key::Backspace
+            | Key::Delete
+            | Key::Insert
+            | Key::Arrow(Direction::Left | Direction::Right)
+            | Key::F(_) => Step::None,
+        };
+        self.step(step);
         ViewKeys::Stay
     }
 
     fn leave(&mut self) -> ViewKeys {
         self.view = None;
-        self.partial.clear();
         self.search = None;
         ViewKeys::Leave
     }
@@ -479,7 +497,7 @@ impl Scrollback {
             Step::Down(n) => offset.saturating_sub(n),
             Step::Top => most,
             Step::Bottom => 0,
-            Step::PageUp | Step::PageDown | Step::None => *offset,
+            Step::None => *offset,
         };
     }
 
@@ -495,70 +513,79 @@ impl Scrollback {
 enum Step {
     Up(usize),
     Down(usize),
-    /// A page, which only the view knows.
-    PageUp,
-    PageDown,
     Top,
     Bottom,
     None,
 }
 
-/// An escape sequence read in the view.
-enum Escape {
-    /// Not complete in what was read.
-    Partial,
-    /// What it does, and its length.
-    Key(Step, usize),
-}
-
-/// The escape sequence at the start of `bytes` (which starts with ESC).
-fn parse_escape(bytes: &[u8]) -> Escape {
-    match bytes.get(1) {
-        None => Escape::Partial,
-        Some(b'O') => match bytes.get(2) {
-            None => Escape::Partial,
-            Some(b'A') => Escape::Key(Step::Up(1), 3),
-            Some(b'B') => Escape::Key(Step::Down(1), 3),
-            Some(b'H') => Escape::Key(Step::Top, 3),
-            Some(b'F') => Escape::Key(Step::Bottom, 3),
-            Some(_) => Escape::Key(Step::None, 3),
-        },
-        Some(b'[') => {
-            // Parameters and intermediates, then a final byte.
-            let Some(len) = bytes
-                .iter()
-                .skip(2)
-                .position(|b| (0x40..=0x7e).contains(b))
-                .map(|at| at.saturating_add(3))
-            else {
-                // A sequence longer than any key is not one; drop it.
-                return if bytes.len() > 32 {
-                    Escape::Key(Step::None, bytes.len())
-                } else {
-                    Escape::Partial
-                };
-            };
-            let body = bytes.get(2..len.saturating_sub(1)).unwrap_or_default();
-            let last = bytes.get(len.saturating_sub(1)).copied().unwrap_or(0);
-            let step = match (body, last) {
-                (b"", b'A') => Step::Up(1),
-                (b"", b'B') => Step::Down(1),
-                (b"" | b"1", b'H') | (b"1" | b"7", b'~') => Step::Top,
-                (b"" | b"1", b'F') | (b"4" | b"8", b'~') => Step::Bottom,
-                (b"5", b'~') => Step::PageUp,
-                (b"6", b'~') => Step::PageDown,
-                _ => Step::None,
-            };
-            Escape::Key(step, len)
-        }
-        // Alt and a key, or a lone ESC followed by more keys.
-        Some(_) => Escape::Key(Step::None, 2),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_keeps_whole_characters_at_capacity_for_keys_and_paste() {
+        for paste in [false, true] {
+            let mut view = viewing(100);
+            view.on_keys(b"/", 25);
+            view.on_keys(&vec![b'a'; 255], 25);
+            if paste {
+                view.on_events(&[Input::Paste("é".into())], 25);
+            } else {
+                view.on_keys("é".as_bytes(), 25);
+            }
+            assert_eq!(view.search.as_ref().unwrap().query, "a".repeat(255));
+            view.on_keys(b"\x7f", 25);
+            view.on_keys("é".as_bytes(), 25);
+            assert_eq!(
+                view.search.as_ref().unwrap().query,
+                format!("{}é", "a".repeat(254))
+            );
+            let status = view.status_at(30).unwrap();
+            assert!(status.ends_with('é'));
+            assert!(status.len() <= 28);
+            view.on_keys(b"\x7f", 25);
+            assert_eq!(view.search.as_ref().unwrap().query, "a".repeat(254));
+            view.on_keys(b"\x03", 25);
+            assert!(view.search.is_none());
+            assert!(view.viewing());
+        }
+    }
+
+    #[test]
+    fn decoded_control_aliases_keep_their_legacy_navigation_and_editing_behavior() {
+        for editing in [false, true] {
+            for (byte, character) in [(b'\r', 'm'), (0x1b, '['), (0x7f, '?')] {
+                let mut legacy = viewing(100);
+                let mut decoded = viewing(100);
+                for view in [&mut legacy, &mut decoded] {
+                    view.on_keys(b"kk", 25);
+                    if editing {
+                        view.on_keys(b"/query", 25);
+                    }
+                }
+                let expected = legacy.on_keys(&[byte], 25);
+                let actual = decoded.on_events(
+                    &[Input::Key(
+                        KeyPress::new(Key::Char(character), fux_vt::keys::Modifiers::CTRL).into(),
+                    )],
+                    25,
+                );
+                assert_eq!(actual, expected);
+                assert_eq!(decoded.offset(), legacy.offset());
+                assert_eq!(decoded.status(), legacy.status());
+            }
+        }
+    }
+
+    impl Scrollback {
+        fn on_keys(&mut self, bytes: &[u8], rows: u16) -> ViewKeys {
+            let mut decoder = fux_vt::keys::decode::Decoder::default();
+            let mut inputs = Vec::new();
+            decoder.bytes(bytes, &mut inputs);
+            decoder.timeout(&mut inputs);
+            self.on_events(&inputs, rows)
+        }
+    }
 
     fn viewing(len: u32) -> Scrollback {
         let mut s = Scrollback::default();
@@ -611,9 +638,12 @@ mod tests {
     #[test]
     fn an_escape_sequence_split_across_reads_is_read_whole() {
         let mut s = viewing(100);
-        assert_eq!(s.on_keys(b"\x1b[", 25), ViewKeys::Stay);
-        assert_eq!(s.on_keys(b"5", 25), ViewKeys::Stay);
-        assert_eq!(s.on_keys(b"~", 25), ViewKeys::Stay);
+        let mut decoder = fux_vt::keys::decode::Decoder::default();
+        for bytes in [&b"\x1b["[..], b"5", b"~"] {
+            let mut inputs = Vec::new();
+            decoder.bytes(bytes, &mut inputs);
+            assert_eq!(s.on_events(&inputs, 25), ViewKeys::Stay);
+        }
         assert_eq!(s.offset(), Some(24));
     }
 

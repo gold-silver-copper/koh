@@ -32,6 +32,11 @@ pub struct KeyConfig {
 
 /// Run `koh id` or `koh key`.
 pub fn run(config: &KeyConfig) -> anyhow::Result<()> {
+    run_with_output(config, &mut std::io::stdout().lock())
+}
+
+/// Run a key command with fallible output.
+pub fn run_with_output(config: &KeyConfig, output: &mut impl std::io::Write) -> anyhow::Result<()> {
     let path = crate::identity::KeyFile::path_for(config.key_file.clone(), config.role)?;
     // Refused before the key's directory is created or judged: an unconfirmed reset touches nothing.
     anyhow::ensure!(
@@ -44,33 +49,40 @@ pub fn run(config: &KeyConfig) -> anyhow::Result<()> {
     match config.op {
         KeyOp::Id => {
             let key_file = crate::identity::KeyFile::open(&path)?;
-            println!("{}", crate::identity::load(&key_file)?.endpoint_id());
+            writeln!(
+                output,
+                "{}",
+                crate::identity::load(&key_file)?.endpoint_id()
+            )?;
         }
         KeyOp::Reset { confirmed: _ } => {
             reset(&path)?;
-            println!(
+            writeln!(
+                output,
                 "Removed {}. The next use creates a new endpoint ID; {}",
                 path.display(),
                 who_loses_access(config.role)
-            );
+            )?;
         }
         // Creates nothing, so asking about a key that is not there leaves no trace.
         KeyOp::Info if config.key_file.is_some() || config.role_named => {
             let identity = crate::identity::load_existing(&path)?;
-            println!("key file    : {}", path.display());
-            println!("endpoint id : {}", identity.endpoint_id());
+            writeln!(output, "key file    : {}", path.display())?;
+            writeln!(output, "endpoint id : {}", identity.endpoint_id())?;
         }
         KeyOp::Info => {
             let mut found = false;
             for role in ["client", "server"] {
                 let path = crate::identity::KeyFile::path_for(None, role)?;
-                println!("{role} key  : {}", path.display());
+                writeln!(output, "{role} key  : {}", path.display())?;
                 match crate::identity::load_existing(&path) {
                     Ok(identity) => {
                         found = true;
-                        println!("endpoint id : {}", identity.endpoint_id());
+                        writeln!(output, "endpoint id : {}", identity.endpoint_id())?;
                     }
-                    Err(_none_yet) => println!("endpoint id : none yet ({})", creates(role)),
+                    Err(_none_yet) => {
+                        writeln!(output, "endpoint id : none yet ({})", creates(role))?;
+                    }
                 }
             }
             anyhow::ensure!(
@@ -108,6 +120,36 @@ pub fn creates(role: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_failure_is_an_error_without_creating_keys() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = run_with_output(
+            &KeyConfig {
+                op: KeyOp::Info,
+                role: "client",
+                key_file: None,
+                role_named: false,
+            },
+            &mut Broken,
+        )
+        .expect_err("output failure");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("I/O error")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
 
     #[test]
     fn an_unconfirmed_reset_creates_and_judges_nothing() {

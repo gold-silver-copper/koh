@@ -2,6 +2,7 @@
 //! the `--allow` list, and host each one's session. There is no "accept any peer" mode.
 
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,25 +135,40 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
         " (ephemeral; --port fixes it across restarts)".to_owned()
     };
 
-    eprintln!("┌─ koh server ready ──────────────────────────────────────");
-    eprintln!("│ endpoint id : {id_str}");
-    eprintln!("│ key file    : {key_file}");
-    eprintln!("│ alpn        : {}", String::from_utf8_lossy(ALPN));
-    eprintln!(
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "┌─ koh server ready ──────────────────────────────────────"
+    );
+    let _ = writeln!(std::io::stderr().lock(), "│ endpoint id : {id_str}");
+    let _ = writeln!(std::io::stderr().lock(), "│ key file    : {key_file}");
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "│ alpn        : {}",
+        String::from_utf8_lossy(ALPN)
+    );
+    let _ = writeln!(
+        std::io::stderr().lock(),
         "│ auth        : allowlist ({} client(s))",
         hosting.allow.len()
     );
-    eprintln!("│ udp port    : {port}{port_note}");
-    eprintln!("│ connect     : {connect_hint}");
-    eprintln!("└───────────────────────────────────────────────────────────");
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "│ udp port    : {port}{port_note}"
+    );
+    let _ = writeln!(std::io::stderr().lock(), "│ connect     : {connect_hint}");
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "└───────────────────────────────────────────────────────────"
+    );
 
     // A phone camera can read the id instead of anyone copying 64 hex digits.
     if let Some(qr) = connect_qr(&id_str) {
-        eprintln!(
+        let _ =
+            writeln!(std::io::stderr().lock(),
             "\nScan for the endpoint id (point a phone camera at it). Assumes a dark-background \
              terminal;\non a light background it renders inverted — copy the id above instead:\n"
         );
-        eprintln!("{qr}");
+        let _ = writeln!(std::io::stderr().lock(), "{qr}");
     } else {
         warn!("could not render the connect QR (endpoint id too large to encode)");
     }

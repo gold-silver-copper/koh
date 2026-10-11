@@ -124,6 +124,9 @@ suspicious = { level = "forbid", priority = -1 }
 
 # --- the panic-free set: explicit panics, lossy casts, unchecked arithmetic, silent failures ---
 # Tests may still unwrap, expect, panic and index (the keys in `clippy.toml`).
+print_stdout = "forbid"
+print_stderr = "forbid"
+dbg_macro = "forbid"
 unwrap_used = "forbid"
 expect_used = "forbid"
 panic = "forbid"

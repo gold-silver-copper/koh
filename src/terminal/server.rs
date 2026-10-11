@@ -9,7 +9,7 @@ use crate::terminal::{
 };
 use std::time::{Duration, Instant};
 
-use crate::events::{InputEvent, WireColours, PALETTE};
+use crate::events::{InputEvent, WireColours};
 use fux_vt::keys::colour::Colours;
 use fux_vt::keys::encode::{paste, PASTE_END, PASTE_START};
 use fux_vt::{Event, Options, Parser, Sink, Unhandled};
@@ -118,16 +118,16 @@ pub const IDENTITY: fux_vt::Identity = fux_vt::Identity {
 /// Left off: prompt marks (koh does not carry them in its history); rectangle checksums (a
 /// program reading back its screen, which xterm refuses by default).
 pub const OPTIONS: Options = Options::new()
-    .with_kitty_keyboard(true)
-    .with_color_scheme_updates(true)
-    .with_events(true)
-    .with_extended_replies(true)
-    .with_in_band_resize(true)
-    .with_size_reports(true)
-    .with_palette(true)
-    .with_reflow(true)
-    .with_setting_reports(true)
-    .with_hyperlinks(true)
+    .with(fux_vt::Feature::KittyKeyboard)
+    .with(fux_vt::Feature::ColorSchemeUpdates)
+    .with(fux_vt::Feature::Events)
+    .with(fux_vt::Feature::ExtendedReplies)
+    .with(fux_vt::Feature::InBandResize)
+    .with(fux_vt::Feature::SizeReports)
+    .with(fux_vt::Feature::Palette)
+    .with(fux_vt::Feature::Reflow)
+    .with(fux_vt::Feature::SettingReports)
+    .with(fux_vt::Feature::Hyperlinks)
     .with_identity(Some(IDENTITY));
 
 /// The server's terminal: the live parser, and the [`TerminalScreen`] snapshots it sends.
@@ -157,13 +157,22 @@ pub struct ServerTerminal {
     paste_open: Option<bool>,
 }
 
+/// The dimensions were clamped to at least one before reaching the emulator.
+fn emulator_size(rows: u16, cols: u16) -> fux_vt::Size {
+    use std::num::NonZeroU16;
+    fux_vt::Size::from((
+        NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN),
+        NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN),
+    ))
+}
+
 impl ServerTerminal {
     /// An emulator of this (clamped) size keeping `scrollback` lines. Fails only if fux-vt refuses
     /// the allocation (see [`MAX_SCROLLBACK`](crate::server::cli::MAX_SCROLLBACK)).
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Result<Self, fux_vt::Error> {
         let Size { rows, cols } = clamp_dims(Size { rows, cols });
         Ok(Self {
-            parser: Parser::with_options(rows, cols, scrollback, OPTIONS)?,
+            parser: Parser::with_options(emulator_size(rows, cols), scrollback, OPTIONS)?,
             observed: Observed::default(),
             exit_code: None,
             rows: RowCache::default(),
@@ -201,7 +210,7 @@ impl ServerTerminal {
                         self.paste_open = None;
                     }
                     let framed = *self.paste_open.get_or_insert_with(|| {
-                        let framed = screen.bracketed_paste();
+                        let framed = screen.mode(fux_vt::Mode::BracketedPaste);
                         if framed {
                             out.extend_from_slice(PASTE_START);
                         }
@@ -238,15 +247,17 @@ impl ServerTerminal {
         // Each entry the client gave, and none it did not: a reattaching client's palette
         // replaces the last client's whole. fux-vt answers a program's query of an entry it has
         // not set (OSC 4) with it; one the program set wins.
-        for index in 0..PALETTE {
-            let entry = colours.palette.get(index).copied().flatten();
-            if let Ok(index) = u8::try_from(index) {
-                self.parser.set_host_color(index, entry.map(Into::into));
-            }
-        }
+        self.parser.set_host_palette(std::array::from_fn(|index| {
+            colours
+                .palette
+                .get(index)
+                .copied()
+                .flatten()
+                .map(Into::into)
+        }));
         match (before, colours_now.scheme) {
             (Some(before), Some(now))
-                if before != now && self.parser.screen().color_scheme_updates() =>
+                if before != now && self.parser.screen().mode(fux_vt::Mode::ColorSchemeUpdates) =>
             {
                 now.report().to_vec()
             }
@@ -308,7 +319,7 @@ impl ServerTerminal {
 
     /// Whether the program is drawing a frame it wants shown whole (synchronized output).
     pub fn synchronized(&self) -> bool {
-        self.parser.screen().synchronized_output()
+        self.parser.screen().mode(fux_vt::Mode::SynchronizedOutput)
     }
 
     /// Whether the program began a frame since this was last asked, and the screen as it was
@@ -329,7 +340,7 @@ impl ServerTerminal {
     /// logged.
     pub fn resize(&mut self, size: Size) {
         let Size { rows, cols } = clamp_dims(size);
-        if let Err(e) = self.parser.resize(rows, cols) {
+        if let Err(e) = self.parser.resize(emulator_size(rows, cols)) {
             tracing::warn!(error = %e, rows, cols, "terminal emulator refused a resize");
         }
         // A reflow lays the history out afresh, its rows with new cells.
@@ -372,7 +383,7 @@ impl ServerTerminal {
     /// The size. Test-only.
     #[cfg(test)]
     pub fn size(&self) -> Size {
-        let (rows, cols) = self.parser.screen().size();
+        let (rows, cols) = self.parser.screen().size().into();
         Size { rows, cols }
     }
 
@@ -390,7 +401,7 @@ impl ServerTerminal {
 
     /// Whether the program has application cursor keys (DECCKM) on.
     pub fn application_cursor(&self) -> bool {
-        self.parser.screen().application_cursor()
+        self.parser.screen().mode(fux_vt::Mode::ApplicationCursor)
     }
 
     /// A snapshot of the current screen. Rows unchanged since the last snapshot share its cells.
@@ -577,7 +588,14 @@ mod tests {
         let after = emu.snapshot();
         let colour = |s: &TerminalScreen| s.screen().cell(0, 0).unwrap().attributes().foreground();
         assert_eq!(colour(&before), fux_vt::Color::Idx(1));
-        assert_eq!(colour(&after), fux_vt::Color::Rgb(0x10, 0x20, 0x30));
+        assert_eq!(
+            colour(&after),
+            fux_vt::Color::Rgb(fux_vt::Rgb {
+                r: 0x10,
+                g: 0x20,
+                b: 0x30
+            })
+        );
     }
 
     /// Output that changes rows in every way: text, rewriting a row the same, erasing, scrolling,
@@ -694,9 +712,33 @@ mod tests {
         assert_eq!(colours(&mut t, 0), (Color::Idx(1), Color::Default));
         // The row's cells do not change, only how they are drawn: the snapshot draws them anew.
         t.process(b"\x1b]4;1;#ff0000\x1b\\\x1b]10;rgb:11/22/33\x07\x1b]11;#000080\x07");
-        let navy = Color::Rgb(0, 0, 0x80);
-        assert_eq!(colours(&mut t, 0), (Color::Rgb(0xff, 0, 0), navy));
-        assert_eq!(colours(&mut t, 1), (Color::Rgb(0x11, 0x22, 0x33), navy));
+        let navy = Color::Rgb(fux_vt::Rgb {
+            r: 0,
+            g: 0,
+            b: 0x80,
+        });
+        assert_eq!(
+            colours(&mut t, 0),
+            (
+                Color::Rgb(fux_vt::Rgb {
+                    r: 0xff,
+                    g: 0,
+                    b: 0
+                }),
+                navy
+            )
+        );
+        assert_eq!(
+            colours(&mut t, 1),
+            (
+                Color::Rgb(fux_vt::Rgb {
+                    r: 0x11,
+                    g: 0x22,
+                    b: 0x33
+                }),
+                navy
+            )
+        );
         assert_eq!(
             colours(&mut t, 7).1,
             navy,
@@ -1182,7 +1224,7 @@ mod tests {
         // No client told its colours (`--no-colours`): xterm's defaults, as before.
         t.process(b"\x1b]4;1;?\x07");
         assert_eq!(t.take_host_replies(), b"\x1b]4;1;rgb:cdcd/0000/0000\x07");
-        let mut palette = vec![None; PALETTE];
+        let mut palette = vec![None; crate::events::PALETTE];
         palette[1] = Some([0xbf, 0x61, 0x6a]);
         palette[2] = Some([0xa3, 0xbe, 0x8c]);
         t.set_colours(&WireColours {
@@ -1204,7 +1246,7 @@ mod tests {
         );
         // A reattach from another terminal replaces the palette whole: an entry it did not
         // give goes back to xterm's.
-        let mut palette = vec![None; PALETTE];
+        let mut palette = vec![None; crate::events::PALETTE];
         palette[2] = Some([0, 0, 0]);
         t.set_colours(&WireColours {
             palette,

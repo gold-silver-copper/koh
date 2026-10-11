@@ -1,4 +1,4 @@
-//! The screen the server sends: a [`Grid`] of `fux_vt::Cell`s, which the server's emulator
+//! The screen the server sends: a [`Grid`] of rows stored as [`Cells`], which the server's emulator
 //! ([`ServerTerminal`]) produces, plus the title, icon, clipboard, bell count and exit code.
 //!
 //! A [`ScreenDiff`] carries the changed rows as run-length-encoded cells, the cursor and the modes.
@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use fux_vt::{
-    Attributes, Blink, Cell, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode,
+    Attributes, Blink, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode,
     UnderlineStyle,
 };
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -389,7 +389,7 @@ impl From<Color> for WireColor {
     fn from(c: Color) -> Self {
         match c {
             Color::Idx(i) => Self::Idx(i),
-            Color::Rgb(r, g, b) => Self::Rgb(r, g, b),
+            Color::Rgb(fux_vt::Rgb { r, g, b }) => Self::Rgb(r, g, b),
             Color::Default | _ => Self::Default,
         }
     }
@@ -400,7 +400,7 @@ impl From<WireColor> for Color {
         match c {
             WireColor::Default => Self::Default,
             WireColor::Idx(i) => Self::Idx(i),
-            WireColor::Rgb(r, g, b) => Self::Rgb(r, g, b),
+            WireColor::Rgb(r, g, b) => Self::Rgb(fux_vt::Rgb { r, g, b }),
         }
     }
 }
@@ -552,7 +552,7 @@ impl<'de> Deserialize<'de> for WireStyle {
     }
 }
 
-/// A cell's text on the wire: one grapheme cluster, at most [`Cell::CLUSTER_CAPACITY`] bytes of
+/// A cell's text on the wire: one grapheme cluster, at most [`fux_vt::CLUSTER_CAPACITY`] bytes of
 /// UTF-8 (or, for a run of characters, one character a cell), and no control character.
 ///
 /// The client prints a cell's text to the user's terminal as is, so it must not be able to carry
@@ -586,10 +586,10 @@ impl CellText {
     /// The most bytes kept inline.
     pub const INLINE: usize = 22;
 
-    /// `text`, or `None` if it is longer than [`Cell::CLUSTER_CAPACITY`] bytes or holds a
+    /// `text`, or `None` if it is longer than [`fux_vt::CLUSTER_CAPACITY`] bytes or holds a
     /// control character (C0, DEL or C1).
     pub fn new(text: &str) -> Option<Self> {
-        if text.len() > Cell::CLUSTER_CAPACITY {
+        if text.len() > fux_vt::CLUSTER_CAPACITY {
             return None;
         }
         Self::run(text)
@@ -705,22 +705,27 @@ impl WireCell {
     /// inline, as fux-vt cuts it; a row from fux-vt always has the room.
     fn write_to(&self, cells: &mut Cells, at: usize) -> Option<()> {
         match self.kind {
-            CellKind::Continuation => self
-                .plain_continuation()
-                .then(|| cells.set_cell(at, Cell::wide_continuation())),
+            CellKind::Continuation => self.plain_continuation().then(|| {
+                cells.set(at, CellRef::wide_continuation());
+            }),
             CellKind::Narrow | CellKind::Wide => {
-                cells.set_text(
+                cells.set(
                     at,
-                    self.text.as_str(),
-                    self.kind == CellKind::Wide,
-                    self.attributes(),
+                    CellRef::new(
+                        self.text.as_str(),
+                        self.kind == CellKind::Wide,
+                        self.attributes(),
+                    ),
                 );
                 Some(())
             }
             CellKind::Chars => {
                 let mut buf = [0; 4];
                 for (col, ch) in (at..).zip(self.text.as_str().chars()) {
-                    cells.set_text(col, ch.encode_utf8(&mut buf), false, self.attributes());
+                    cells.set(
+                        col,
+                        CellRef::new(ch.encode_utf8(&mut buf), false, self.attributes()),
+                    );
                 }
                 Some(())
             }
@@ -728,8 +733,11 @@ impl WireCell {
                 let mut buf = [0; 4];
                 for (pair, ch) in self.text.as_str().chars().enumerate() {
                     let col = pair.checked_mul(2).and_then(|c| c.checked_add(at))?;
-                    cells.set_text(col, ch.encode_utf8(&mut buf), true, self.attributes());
-                    cells.set_cell(col.checked_add(1)?, Cell::wide_continuation());
+                    cells.set(
+                        col,
+                        CellRef::new(ch.encode_utf8(&mut buf), true, self.attributes()),
+                    );
+                    cells.set(col.checked_add(1)?, CellRef::wide_continuation());
                 }
                 Some(())
             }
@@ -779,7 +787,7 @@ impl TryFrom<RawRun> for Run {
         let text = raw.cell.text.as_str();
         let fits = match raw.cell.kind {
             CellKind::Narrow | CellKind::Wide | CellKind::Continuation => {
-                text.len() <= Cell::CLUSTER_CAPACITY
+                text.len() <= fux_vt::CLUSTER_CAPACITY
             }
             CellKind::Chars | CellKind::WideChars => {
                 text.chars().count() == usize::from(raw.count.get())
@@ -1044,7 +1052,7 @@ fn seal(runs: &mut [Run], open: &mut Option<String>) {
 
 /// The row `runs` decode to, exactly `cols` cells, with its `links`, or `None` if the runs are
 /// malformed, don't cover the row exactly, or name a link the row does not have. Work is bounded
-/// by `cols`: every run is non-empty, and each cell's text by [`Cell::CLUSTER_CAPACITY`].
+/// by `cols`: every run is non-empty, and each cell's text by [`fux_vt::CLUSTER_CAPACITY`].
 fn cells_of(runs: &[Run], links: &[WireLink], cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
     if links.len() > MAX_ROW_LINKS {
         return None;
@@ -2173,7 +2181,7 @@ mod tests {
         assert_eq!(screen.screen().cell(0, 1).map(|c| c.contents()), Some("x"));
         let mutations: [fn(&mut RawDiff); 14] = [
             |d| d.rows[0].runs[0].count = 0, // empty run
-            |d| d.rows[0].runs[0].cell.text = "x".repeat(Cell::CLUSTER_CAPACITY + 1),
+            |d| d.rows[0].runs[0].cell.text = "x".repeat(fux_vt::CLUSTER_CAPACITY + 1),
             |d| d.rows[0].runs[0].cell.text = "\x1b".to_owned(), // an escape for the terminal
             |d| d.rows[0].runs[0].cell.text = "\u{9b}".to_owned(), // a C1 control
             |d| d.rows[0].runs[0].cell.kind = 3,                 // unknown kind
@@ -2363,7 +2371,7 @@ mod tests {
         for len in [
             CellText::INLINE,
             CellText::INLINE + 1,
-            Cell::CLUSTER_CAPACITY,
+            fux_vt::CLUSTER_CAPACITY,
         ] {
             let text = "x".repeat(len);
             assert_eq!(
@@ -2376,7 +2384,7 @@ mod tests {
             CellText::new(family).map(|t| t.as_str().to_owned()),
             Some(family.to_owned())
         );
-        assert!(CellText::new(&"x".repeat(Cell::CLUSTER_CAPACITY + 1)).is_none());
+        assert!(CellText::new(&"x".repeat(fux_vt::CLUSTER_CAPACITY + 1)).is_none());
         for control in ["\x1b[2J", "\x07", "\x7f", "\u{9d}", "a\nb"] {
             assert!(CellText::new(control).is_none(), "{control:?}");
         }
@@ -2429,7 +2437,7 @@ mod tests {
         );
         assert!(run(2, CellKind::WideChars, "日本").is_ok());
         assert!(run(3, CellKind::WideChars, "日本").is_err());
-        let cluster = "x".repeat(Cell::CLUSTER_CAPACITY + 1);
+        let cluster = "x".repeat(fux_vt::CLUSTER_CAPACITY + 1);
         assert!(
             run(1, CellKind::Narrow, &cluster).is_err(),
             "a cell's text is a cluster"
@@ -2672,7 +2680,11 @@ mod tests {
         );
         assert_eq!(
             s.cell(0, 6).unwrap().fgcolor(),
-            Color::Rgb(10, 20, 30),
+            Color::Rgb(fux_vt::Rgb {
+                r: 10,
+                g: 20,
+                b: 30
+            }),
             "truecolor"
         );
     }
@@ -2834,7 +2846,10 @@ mod tests {
         assert!(cell(2).hidden());
         assert!(cell(3).strikeout());
         assert!(cell(4).underline() && cell(4).underline_color() == Color::Idx(9));
-        assert_eq!(cell(5).underline_color(), Color::Rgb(1, 2, 3));
+        assert_eq!(
+            cell(5).underline_color(),
+            Color::Rgb(fux_vt::Rgb { r: 1, g: 2, b: 3 })
+        );
     }
 
     #[test]

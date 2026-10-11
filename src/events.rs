@@ -15,10 +15,11 @@
 //! than [`MAX_EVENTS`] events in a message, more than [`PALETTE`] palette entries ([`check_events`],
 //! [`WireColours::check`]).
 
-use fux_vt::keys::colour::{Colours, Rgb, Scheme};
+use fux_vt::keys::colour::{Colours, Scheme};
 use fux_vt::keys::encode::{key_bytes, KeyMode, PASTE_END, PASTE_START};
 use fux_vt::keys::mouse::{mouse_bytes, MouseAction, MouseButton, MouseEvent};
 use fux_vt::keys::{Direction, Key, KeyPress, Keystroke, Kitty, Modifiers};
+use fux_vt::Rgb;
 use serde::{Deserialize, Serialize};
 
 /// Most events in one `ClientMsg::Keys`.
@@ -354,22 +355,6 @@ impl From<MouseEvent> for WireMouse {
     }
 }
 
-/// A 16-bit colour at 8 bits a channel.
-pub fn narrow(rgb: Rgb) -> [u8; 3] {
-    let channel = |c: u16| u8::try_from(c >> 8).unwrap_or(u8::MAX);
-    [channel(rgb.r), channel(rgb.g), channel(rgb.b)]
-}
-
-/// An 8-bit colour at 16 bits a channel, each byte twice, as xterm answers it.
-pub fn widen([r, g, b]: [u8; 3]) -> Rgb {
-    let channel = |c: u8| u16::from_be_bytes([c, c]);
-    Rgb {
-        r: channel(r),
-        g: channel(g),
-        b: channel(b),
-    }
-}
-
 impl WireColours {
     /// Whether the message is within the wire's bounds.
     pub fn check(&self) -> Result<(), &'static str> {
@@ -382,8 +367,8 @@ impl WireColours {
     /// The foreground, background and scheme, as fux-vt answers programs from them.
     pub fn colours(&self) -> Colours {
         Colours {
-            foreground: self.foreground.map(widen),
-            background: self.background.map(widen),
+            foreground: self.foreground.map(Rgb::from),
+            background: self.background.map(Rgb::from),
             scheme: self.scheme.map(|s| match s {
                 WireScheme::Dark => Scheme::Dark,
                 WireScheme::Light => Scheme::Light,
@@ -508,16 +493,21 @@ mod tests {
     }
 
     #[test]
-    fn colours_narrow_and_widen_as_xterm_answers() {
+    fn colours_round_trip_and_answer_as_xterm() {
         let rgb = Rgb {
-            r: 0x1e1e,
-            g: 0xffff,
-            b: 0x0000,
+            r: 0x1e,
+            g: 0xff,
+            b: 0x00,
         };
-        assert_eq!(narrow(rgb), [0x1e, 0xff, 0x00]);
-        assert_eq!(widen([0x1e, 0xff, 0x00]), rgb);
+        assert_eq!(<[u8; 3]>::from(rgb), [0x1e, 0xff, 0x00]);
+        assert_eq!(Rgb::from([0x1e, 0xff, 0x00]), rgb);
         assert_eq!(
-            widen([0x1e, 0xff, 0]).answer(11, true),
+            Colours {
+                background: Some(rgb),
+                ..Colours::default()
+            }
+            .answer(11, true)
+            .expect("known background"),
             b"\x1b]11;rgb:1e1e/ffff/0000\x07"
         );
     }

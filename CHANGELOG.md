@@ -15,6 +15,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+### Changed
+- Updated `fux-vt` 0.3.4 → 0.4.1 and `fuxix` 0.1.7 → 0.2.0, including the test harnesses.
+  Migrated to their typed terminal APIs and fuxix's PTY launcher. The wire protocol and minimum
+  Rust version are unchanged.
+
 ## [0.13.0] — 2026-10-08
 
 koh is a remote shell again, not a transport for other programs: everything that existed only

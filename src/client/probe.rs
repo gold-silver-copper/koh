@@ -30,7 +30,7 @@
 
 use fux_vt::keys::decode::{Decoder, Input, Reply};
 
-use crate::events::{narrow, WireColours, WireScheme, PALETTE};
+use crate::events::{WireColours, WireScheme, PALETTE};
 
 /// The questions, ending with primary device attributes: underline styles, the kitty flags and
 /// the scheme. The colours are asked too unless they are not told ([`queries`]).
@@ -145,16 +145,16 @@ impl Replies {
                         fux_vt::keys::colour::Scheme::Light => WireScheme::Light,
                     });
                 }
-                Reply::Colour { number: 10, rgb } => self.colours.foreground = Some(narrow(rgb)),
-                Reply::Colour { number: 11, rgb } => self.colours.background = Some(narrow(rgb)),
+                Reply::Foreground(rgb) => self.colours.foreground = Some(rgb.into()),
+                Reply::Background(rgb) => self.colours.background = Some(rgb.into()),
                 Reply::Palette { index, rgb } if usize::from(index) < PALETTE => {
                     self.colours.palette.resize(PALETTE, None);
                     if let Some(slot) = self.colours.palette.get_mut(usize::from(index)) {
-                        *slot = Some(narrow(rgb));
+                        *slot = Some(rgb.into());
                     }
                 }
                 Reply::Attributes => self.done = true,
-                Reply::Colour { .. } | Reply::Palette { .. } | Reply::Mode { .. } => {}
+                Reply::Palette { .. } | Reply::Mode { .. } => {}
             }
         }
     }

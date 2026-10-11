@@ -1354,7 +1354,8 @@ mod tests {
         paint_frame(&mut painter, &screen, &Overlay::empty(), None);
         let painted = paint_frame(&mut painter, &screen, &narrow, None);
         assert_eq!(painted, framed(&format!("\x1b[1;1H{PLAIN}a \x1b[m"), "1;2"));
-        let mut terminal = fux_vt::Parser::new(24, 80, 0).unwrap();
+        let mut terminal =
+            fux_vt::Parser::new(fux_vt::Size::new(24, 80).expect("nonzero size"), 0).unwrap();
         terminal
             .process(render_to_string(&screen, &Overlay::empty(), None).as_bytes())
             .unwrap();
@@ -1364,7 +1365,8 @@ mod tests {
             &Overlay::empty(),
             None,
         );
-        let mut echoed = fux_vt::Parser::new(24, 80, 0).unwrap();
+        let mut echoed =
+            fux_vt::Parser::new(fux_vt::Size::new(24, 80).expect("nonzero size"), 0).unwrap();
         echoed.process(echo.as_bytes()).unwrap();
         assert_eq!(shown(&terminal), shown(&echoed));
     }
@@ -1390,7 +1392,8 @@ mod tests {
         };
         let expected = [Some("\u{1f44d}".to_owned()), Some("\u{1f3fd}".to_owned())];
         // Painted whole.
-        let mut terminal = fux_vt::Parser::new(6, 20, 0).unwrap();
+        let mut terminal =
+            fux_vt::Parser::new(fux_vt::Size::new(6, 20).expect("nonzero size"), 0).unwrap();
         paint_into(
             &mut Painter::default(),
             &mut terminal,
@@ -1400,7 +1403,8 @@ mod tests {
         assert_eq!(looks(&terminal), expected);
         // Painted as a change: the two cells after one another on a row painted before.
         let mut painter = Painter::default();
-        let mut terminal = fux_vt::Parser::new(6, 20, 0).unwrap();
+        let mut terminal =
+            fux_vt::Parser::new(fux_vt::Size::new(6, 20).expect("nonzero size"), 0).unwrap();
         paint_into(&mut painter, &mut terminal, &at(b"ab"), &Overlay::empty());
         paint_into(&mut painter, &mut terminal, &two, &Overlay::empty());
         assert_eq!(looks(&terminal), expected);
@@ -1424,14 +1428,31 @@ mod tests {
         for osc in ["\x1b]4", "\x1b]10", "\x1b]11", "\x1b]104", "\x1b]11"] {
             assert!(!painted.contains(osc), "{osc:?} sent: {painted:?}");
         }
-        let options = fux_vt::Options::new().with_palette(true);
-        let mut terminal = fux_vt::Parser::with_options(6, 20, 0, options).unwrap();
+        let options = fux_vt::Options::new().with(fux_vt::Feature::Palette);
+        let mut terminal = fux_vt::Parser::with_options(
+            fux_vt::Size::new(6, 20).expect("nonzero size"),
+            0,
+            options,
+        )
+        .unwrap();
         terminal.process(&backend.bytes).unwrap();
         assert!(!terminal.screen().colors_changed(), "the user's palette");
         let cell = terminal.screen().cell(0, 0).unwrap();
         assert_eq!(
             (cell.contents(), cell.fgcolor(), cell.bgcolor()),
-            ("R", Color::Rgb(0xff, 0, 0), Color::Rgb(0, 0, 0x80))
+            (
+                "R",
+                Color::Rgb(fux_vt::Rgb {
+                    r: 0xff,
+                    g: 0,
+                    b: 0
+                }),
+                Color::Rgb(fux_vt::Rgb {
+                    r: 0,
+                    g: 0,
+                    b: 0x80
+                })
+            )
         );
     }
 
@@ -1462,8 +1483,13 @@ mod tests {
             painted.contains("\x1b]8;id=x;https://example.org/\x1b\\link\x1b]8;;\x1b\\b"),
             "{painted:?}"
         );
-        let options = fux_vt::Options::new().with_hyperlinks(true);
-        let mut terminal = fux_vt::Parser::with_options(6, 20, 0, options).unwrap();
+        let options = fux_vt::Options::new().with(fux_vt::Feature::Hyperlinks);
+        let mut terminal = fux_vt::Parser::with_options(
+            fux_vt::Size::new(6, 20).expect("nonzero size"),
+            0,
+            options,
+        )
+        .unwrap();
         terminal.process(&bytes).unwrap();
         let link = |col| {
             terminal
@@ -1550,7 +1576,8 @@ mod tests {
         let screen = emu.snapshot();
 
         let mut painter = Painter::default();
-        let mut terminal = fux_vt::Parser::new(6, 20, 0).unwrap();
+        let mut terminal =
+            fux_vt::Parser::new(fux_vt::Size::new(6, 20).expect("nonzero size"), 0).unwrap();
         paint_into(
             &mut painter,
             &mut terminal,
@@ -1579,7 +1606,8 @@ mod tests {
             engine.confirmed_epoch() >= confirmed,
             "{typed:?}: nothing killed"
         );
-        let mut whole = fux_vt::Parser::new(6, 20, 0).unwrap();
+        let mut whole =
+            fux_vt::Parser::new(fux_vt::Size::new(6, 20).expect("nonzero size"), 0).unwrap();
         paint_into(
             &mut Painter::default(),
             &mut whole,
@@ -1907,7 +1935,7 @@ mod tests {
     /// one.
     fn shown(terminal: &fux_vt::Parser) -> (Vec<Option<Look>>, (u16, u16)) {
         let screen = terminal.screen();
-        let (rows, cols) = screen.size();
+        let (rows, cols) = screen.size().into();
         let cells = (0..rows)
             .flat_map(|row| (0..cols).map(move |col| (row, col)))
             .map(|(row, col)| {
@@ -1951,8 +1979,8 @@ mod tests {
             let size = if larger { Size::new(8, 30) } else { Size::new(rows, cols) };
             let mut emu = crate::terminal::ServerTerminal::new(rows, cols, 0).unwrap();
             let mut painter = Painter::default();
-            let mut incremental = fux_vt::Parser::new(size.rows, size.cols, 0).unwrap();
-            let mut whole = fux_vt::Parser::new(size.rows, size.cols, 0).unwrap();
+            let mut incremental = fux_vt::Parser::new(fux_vt::Size::new(size.rows, size.cols).expect("nonzero size"), 0).unwrap();
+            let mut whole = fux_vt::Parser::new(fux_vt::Size::new(size.rows, size.cols).expect("nonzero size"), 0).unwrap();
             for (pieces, status, predictions, whole_glyphs) in steps {
                 for piece in pieces {
                     emu.process(PIECES[piece].as_bytes());

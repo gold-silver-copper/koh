@@ -264,7 +264,7 @@ pub trait KohBackend {
 fn write_underline_color(out: &mut (impl KohBackend + ?Sized), color: Color) -> io::Result<()> {
     match color {
         Color::Idx(i) => write!(out, "\x1b[58;5;{i}m"),
-        Color::Rgb(r, g, b) => write!(out, "\x1b[58;2;{r};{g};{b}m"),
+        Color::Rgb(fux_vt::Rgb { r, g, b }) => write!(out, "\x1b[58;2;{r};{g};{b}m"),
         Color::Default | _ => Ok(()),
     }
 }
@@ -285,7 +285,7 @@ fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool)
             let lead = if fg { 38 } else { 48 };
             write!(out, "\x1b[{lead};5;{i}m")
         }
-        Color::Rgb(r, g, b) => {
+        Color::Rgb(fux_vt::Rgb { r, g, b }) => {
             let lead = if fg { 38 } else { 48 };
             write!(out, "\x1b[{lead};2;{r};{g};{b}m")
         }
@@ -381,7 +381,7 @@ mod tests {
             b"\x1b[38;5;196m"
         );
         assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Rgb(0, 0, 255), true)),
+            emit(|b| write_sgr_color(b, Color::Rgb(fux_vt::Rgb { r: 0, g: 0, b: 255 }), true)),
             b"\x1b[38;2;0;0;255m"
         );
         assert_eq!(
@@ -431,7 +431,7 @@ mod tests {
         let style = CellStyle {
             fg: Color::Idx(1),
             bg: Color::Default,
-            underline_color: Color::Rgb(1, 2, 3),
+            underline_color: Color::Rgb(fux_vt::Rgb { r: 1, g: 2, b: 3 }),
             bold: false,
             dim: false,
             italic: false,

@@ -83,10 +83,14 @@ struct Terminal {
 
 impl Terminal {
     fn new(rows: u16, cols: u16) -> Result<Self, String> {
-        let mut options = Options::default();
-        options.events = true;
+        let options = Options::default().with(fux_vt::Feature::Events);
         Ok(Self {
-            parser: Parser::with_options(rows, cols, 0, options).map_err(|e| e.to_string())?,
+            parser: Parser::with_options(
+                fux_vt::Size::new(rows, cols).map_err(|e| e.to_string())?,
+                0,
+                options,
+            )
+            .map_err(|e| e.to_string())?,
             told: Told::default(),
         })
     }
@@ -101,7 +105,7 @@ impl Terminal {
 /// The first difference between what `a` and `b` showed, as `name`s, if there is one.
 fn screens(a: &Terminal, b: &Terminal, names: (&str, &str)) -> Option<String> {
     let (sa, sb) = (a.parser.screen(), b.parser.screen());
-    let (rows, cols) = sa.size();
+    let (rows, cols) = sa.size().into();
     for row in 0..rows {
         for col in 0..cols {
             let look = |screen: &fux_vt::Screen| {
@@ -131,14 +135,15 @@ fn screens(a: &Terminal, b: &Terminal, names: (&str, &str)) -> Option<String> {
     }
     let modes = |s: &fux_vt::Screen| {
         (
-            s.hide_cursor(),
-            (!s.hide_cursor()).then(|| s.cursor_position()),
+            !s.mode(fux_vt::Mode::ShowCursor),
+            s.mode(fux_vt::Mode::ShowCursor)
+                .then(|| s.cursor_position()),
             s.mouse_protocol_mode(),
             s.mouse_protocol_encoding(),
-            s.bracketed_paste(),
-            s.focus_reporting(),
-            s.application_cursor(),
-            s.application_keypad(),
+            s.mode(fux_vt::Mode::BracketedPaste),
+            s.mode(fux_vt::Mode::FocusReporting),
+            s.mode(fux_vt::Mode::ApplicationCursor),
+            s.mode(fux_vt::Mode::ApplicationKeypad),
         )
     };
     let (ma, mb) = (modes(sa), modes(sb));
@@ -178,8 +183,12 @@ pub fn difference(
     for (index, ((step, pa), pb)) in case.steps.iter().zip(&a.steps).zip(&b.steps).enumerate() {
         if let Step::Resize(rows, cols) = step {
             // The user's terminal resized before the client painted.
-            ta.parser.resize(*rows, *cols).map_err(|e| e.to_string())?;
-            tb.parser.resize(*rows, *cols).map_err(|e| e.to_string())?;
+            ta.parser
+                .resize(fux_vt::Size::new(*rows, *cols).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            tb.parser
+                .resize(fux_vt::Size::new(*rows, *cols).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
         }
         ta.read(&pa.paint)?;
         tb.read(&pb.paint)?;

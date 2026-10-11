@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use fux_vt::{Cell, Cells, RowId};
+use fux_vt::{CellRef, Cells, RowId};
 use serde::{Deserialize, Serialize};
 
 use super::grid::{exactly, Palette, RowLinks};
@@ -112,19 +112,19 @@ impl HistoryNames {
     /// the first named one, and costs the rows that entered.
     pub(super) fn mark(&mut self, screen: &fux_vt::Screen) -> HistoryMark {
         let len = screen.history_len();
-        let rows = usize::from(screen.size().0);
+        let rows = usize::from(screen.size().rows());
         // History row `h` (0 the oldest) is `len - 1 - h + rows` rows from the bottom.
         let unnamed = (0..len)
             .take_while(|&back| {
                 rows.checked_add(back)
-                    .and_then(|offset| screen.row_from_bottom(offset))
+                    .and_then(|offset| screen.rows().nth_back(offset))
                     .is_some_and(|row| !self.by_row.contains_key(&row.id()))
             })
             .count();
         for back in (0..unnamed).rev() {
             if let Some(row) = rows
                 .checked_add(back)
-                .and_then(|offset| screen.row_from_bottom(offset))
+                .and_then(|offset| screen.rows().nth_back(offset))
             {
                 self.last = self.last.saturating_add(1);
                 self.by_row.insert(row.id(), self.last);
@@ -134,12 +134,13 @@ impl HistoryNames {
         let kept = len.saturating_add(rows);
         if self.by_row.len() > kept.saturating_mul(2).saturating_add(64) {
             let present: std::collections::HashSet<RowId> = (0..kept)
-                .filter_map(|offset| screen.row_from_bottom(offset).map(|row| row.id()))
+                .filter_map(|offset| screen.rows().nth_back(offset).map(|row| row.id()))
                 .collect();
             self.by_row.retain(|id, _| present.contains(id));
         }
         let newest = screen
-            .row_from_bottom(rows)
+            .rows()
+            .nth_back(rows)
             .filter(|_| len > 0)
             .and_then(|row| self.by_row.get(&row.id()).copied());
         match newest {
@@ -163,7 +164,7 @@ impl HistoryNames {
         if !mark.holds(request.newest) || count == 0 {
             return HistoryReply::default();
         }
-        let rows = usize::from(screen.size().0);
+        let rows = usize::from(screen.size().rows());
         // Names are consecutive, so the row asked for is this many rows above the newest.
         let Some(above) = usize::try_from(mark.newest.saturating_sub(request.newest)).ok() else {
             return HistoryReply::default();
@@ -176,7 +177,7 @@ impl HistoryNames {
                 .checked_add(above)
                 .and_then(|offset| offset.checked_add(back))
                 .filter(|&offset| offset < rows.saturating_add(screen.history_len()))
-                .and_then(|offset| screen.row_from_bottom(offset))
+                .and_then(|offset| screen.rows().nth_back(offset))
             else {
                 break;
             };
@@ -239,9 +240,9 @@ impl KeptRow {
         }
         let mut cells = Cells::clone(&self.cells);
         if cols > 0 && cells.get(cols).is_some_and(|c| c.is_wide_continuation()) {
-            cells.set_cell(cols.saturating_sub(1), Cell::default());
+            cells.set(cols.saturating_sub(1), CellRef::default());
         }
-        cells.resize(cols, Cell::default());
+        cells.resize(cols, CellRef::default());
         Arc::new(cells)
     }
 
@@ -609,8 +610,8 @@ mod tests {
     #[test]
     fn a_row_is_fitted_to_the_screen_without_halving_a_wide_glyph() {
         let mut cells = Cells::new(4);
-        cells.set_text(2, "日", true, fux_vt::Attributes::default());
-        cells.set_cell(3, Cell::wide_continuation());
+        cells.set(2, CellRef::new("日", true, fux_vt::Attributes::default()));
+        cells.set(3, CellRef::wide_continuation());
         let kept = KeptRow {
             cells: Arc::new(cells),
             wrapped: false,

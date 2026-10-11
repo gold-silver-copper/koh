@@ -124,7 +124,7 @@ fn difference(shown: &fux_vt::Screen, expected: &fux_vt::Screen) -> Option<Strin
             expected.size()
         ));
     }
-    let (rows, cols) = expected.size();
+    let (rows, cols) = expected.size().into();
     for row in 0..rows {
         for col in 0..cols {
             let look = |screen: &fux_vt::Screen| {
@@ -157,10 +157,15 @@ fn difference(shown: &fux_vt::Screen, expected: &fux_vt::Screen) -> Option<Strin
             }
         }
     }
-    if shown.hide_cursor() != expected.hide_cursor() {
-        return Some(format!("cursor hidden {}", shown.hide_cursor()));
+    if shown.mode(fux_vt::Mode::ShowCursor) != expected.mode(fux_vt::Mode::ShowCursor) {
+        return Some(format!(
+            "cursor hidden {}",
+            !shown.mode(fux_vt::Mode::ShowCursor)
+        ));
     }
-    if !expected.hide_cursor() && shown.cursor_position() != expected.cursor_position() {
+    if expected.mode(fux_vt::Mode::ShowCursor)
+        && shown.cursor_position() != expected.cursor_position()
+    {
         return Some(format!(
             "cursor at {:?}, expected {:?}",
             shown.cursor_position(),
@@ -227,10 +232,9 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     // A terminal that keeps hyperlinks, as the user's does.
     let shown = Arc::new(Mutex::new(
         fux_vt::Parser::with_options(
-            start.rows,
-            start.cols,
+            fux_vt::Size::new(start.rows, start.cols)?,
             0,
-            fux_vt::Options::new().with_hyperlinks(true),
+            fux_vt::Options::new().with(fux_vt::Feature::Hyperlinks),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?,
     ));
@@ -263,21 +267,24 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
         None,
     ));
     // The server's parser, with its options; the harness's server keeps no scrollback.
-    let mut expected =
-        fux_vt::Parser::with_options(start.rows, start.cols, 0, koh::terminal::OPTIONS)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut expected = fux_vt::Parser::with_options(
+        fux_vt::Size::new(start.rows, start.cols)?,
+        0,
+        koh::terminal::OPTIONS,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut result = Ok(());
     for (index, (step, output)) in recording.outputs().enumerate() {
         if let Some((rows, cols)) = step.resize {
             expected
-                .resize(rows, cols)
+                .resize(fux_vt::Size::new(rows, cols)?)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             // The user's terminal resizes, then the client hears of it.
             *shared.size.lock().unwrap_or_else(PoisonError::into_inner) = Size::new(rows, cols);
             shown
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .resize(rows, cols)
+                .resize(fux_vt::Size::new(rows, cols)?)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             resize.send(()).await?;
         }
@@ -324,7 +331,7 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
         };
         if let Some(difference) = last {
             let rows = |screen: &fux_vt::Screen| {
-                let (_, cols) = screen.size();
+                let (_, cols) = screen.size().into();
                 (0..4u16)
                     .map(|row| {
                         (0..cols)

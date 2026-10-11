@@ -1,13 +1,13 @@
 # The oracle: koh beside a commit
 
 `testing/oracle.sh` holds koh to what it did at a commit: by default the merge base with
-`origin/main`, so that work which changes how koh diffs, encodes or paints can show it changed
+the upstream default branch (`origin/HEAD`, falling back to `origin/master`), so that work which changes how koh diffs, encodes or paints can show it changed
 nothing the user sees. koh at the working tree and koh at the commit get the same sessions, and
 everything a user's terminal would show is compared after every step. Any difference fails, shrunk
 to the smallest case that shows it and saved to replay. It is modelled on fux's `diff/oracle`.
 
 ```sh
-testing/oracle.sh                    # against the merge base with origin/main
+testing/oracle.sh                    # against the merge base with the upstream default branch
 testing/oracle.sh 6c79280            # against any commit
 testing/oracle.sh --cases 20000 --seed 7
 testing/oracle.sh --no-recordings    # random sessions only
@@ -16,6 +16,9 @@ testing/oracle.sh --plants           # show it finds each planted bug
 ```
 
 ## How it runs
+
+The baseline must contain a committed `testing/oracle/Cargo.lock`; both sides build with
+`--locked`. An explicit reference works even when no default remote branch is available.
 
 Two processes, one per side: `koh-oracle-side` (`side/`) is built at the working tree and, from a
 worktree of the commit (`target/trees/SHA`), at the commit, each with its own lockfile and target
@@ -75,17 +78,18 @@ differ), prints it, and saves it under `target/cases/`. `--replay` runs a saved 
 `driver/src/exempt.rs` names each change made on purpose since the commit compared against, and
 what sets it off. Each is taken out of every case before either side sees it, so the rest of the
 case is still compared, and the driver says how many times each applied. Once the commit compared
-against has a change, its exemption comes off the list. Against `main` only `prompt-hold` is
+against has a change, its exemption comes off the list. Against `master` only `prompt-hold` is
 listed: a key typed within 200 ms of a frame that moved the cursor to another row is shown only
 once echoed, so each keys step comes 200 ms after what came before it. The input events, the kitty
-keyboard and scheme answers and fux-vt's reflow fix are all in `main`, and every mode the user's
+keyboard and scheme answers and fux-vt's reflow fix are all in `master`, and every mode the user's
 terminal is kept in is compared. The palette the client tells the server changes nothing here,
 since neither side tells one.
 
 ## The planted bugs
 
 `plants/` holds seven bugs, each a patch to koh; `testing/oracle.sh --plants` applies each to a
-worktree of `HEAD`, builds a side from it, and runs the oracle with `HEAD` as the base. Each must
+worktree of `HEAD` plus the working tree’s tracked edits, builds a side from it, and compares
+it with the unmodified working tree. An oracle error does not count as detecting a bug. Each must
 be found:
 
 | Patch | The bug |

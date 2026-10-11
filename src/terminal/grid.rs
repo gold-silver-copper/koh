@@ -101,16 +101,19 @@ impl RowLinks {
         let mut links = Self::default();
         for col in 0..usize::from(cols) {
             let index = row.link(col).map_or(0, |link| {
-                let link = Link {
-                    uri: link.uri().to_owned(),
-                    id: link.id().unwrap_or_default().to_owned(),
-                };
-                let at = links.table.iter().position(|l| *l == link).or_else(|| {
-                    (links.table.len() < MAX_ROW_LINKS).then(|| {
-                        links.table.push(link);
-                        links.table.len().saturating_sub(1)
-                    })
-                });
+                let at = links
+                    .table
+                    .iter()
+                    .position(|l| l.uri == link.uri() && l.id == link.id().unwrap_or_default())
+                    .or_else(|| {
+                        (links.table.len() < MAX_ROW_LINKS).then(|| {
+                            links.table.push(Link {
+                                uri: link.uri().to_owned(),
+                                id: link.id().unwrap_or_default().to_owned(),
+                            });
+                            links.table.len().saturating_sub(1)
+                        })
+                    });
                 at.and_then(|at| u16::try_from(at.saturating_add(1)).ok())
                     .unwrap_or(0)
             });

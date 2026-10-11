@@ -4,6 +4,7 @@
 mod args;
 
 use std::io::IsTerminal as _;
+use std::io::Write as _;
 
 use crate::args::{Cmd, ConnectArgs, ServerRef};
 use koh::names::{List, Places};
@@ -21,7 +22,7 @@ fn main() -> std::process::ExitCode {
         Ok(cmd) => cmd,
         Err(e) => match args::bad_value(&e) {
             Some(bad) => {
-                eprintln!("koh: {bad}");
+                let _ = writeln!(std::io::stderr().lock(), "koh: {bad}");
                 return std::process::ExitCode::FAILURE;
             }
             None => e.exit(),
@@ -43,7 +44,7 @@ fn main() -> std::process::ExitCode {
         Ok(Some(code)) => std::process::ExitCode::from(exit_status(code)),
         Ok(None) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("koh: {e:#}");
+            let _ = writeln!(std::io::stderr().lock(), "koh: {e:#}");
             std::process::ExitCode::FAILURE
         }
     }

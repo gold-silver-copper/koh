@@ -62,6 +62,200 @@ fn external_signal_retains_shell_style_exit_status() {
 
 use koh::pty::Pty;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn teardown_reaps_children_even_when_the_caller_does_not_wait() {
+    current_thread().expect("runtime").block_on(async {
+        for shutdown in [true, false, true, false] {
+            let (pty, mut rx) = Pty::spawn(
+                24,
+                80,
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo $$; exec sleep 60".into(),
+                ],
+                "xterm-256color",
+                &launcher(),
+            )
+            .expect("spawn");
+            let mut output = String::new();
+            let pid: u32 = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    output.push_str(&String::from_utf8_lossy(
+                        &rx.recv().await.expect("pid output"),
+                    ));
+                    if let Some((line, _)) = output.split_once('\n') {
+                        break line.trim().parse().expect("pid");
+                    }
+                }
+            })
+            .await
+            .expect("pid deadline");
+            // Keep the receiver alive but unread: teardown must not depend on its consumer.
+            if shutdown {
+                tokio::task::spawn_blocking(move || pty.shutdown())
+                    .await
+                    .expect("shutdown");
+            } else {
+                drop(pty);
+            }
+            let status = format!("/proc/{pid}/status");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while std::path::Path::new(&status).exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("child must be reaped, not merely killed");
+        }
+    });
+}
+
+#[test]
+fn shutdown_does_not_need_a_consumer_for_flooded_output() {
+    current_thread().expect("runtime").block_on(async {
+        let (pty, _unread) = Pty::spawn(
+            24,
+            80,
+            &["/bin/sh".into(), "-c".into(), "exec yes".into()],
+            "xterm-256color",
+            &launcher(),
+        )
+        .expect("spawn flood");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || pty.shutdown()),
+        )
+        .await
+        .expect("unread output must not wedge shutdown")
+        .expect("shutdown");
+    });
+}
+
+#[test]
+fn stopped_reader_applies_backpressure_and_resumes_in_order() {
+    current_thread().expect("runtime").block_on(async {
+        use fuxix::process::{kill, Pid, Signal};
+        use koh::pty::WriteError;
+        let (pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "stty raw -echo; echo $$; exec cat".into(),
+            ],
+            "xterm-256color",
+            &launcher(),
+        )
+        .expect("spawn");
+        let mut line = String::new();
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                line.push_str(&String::from_utf8_lossy(&rx.recv().await.expect("pid")));
+                if let Some((digits, _)) = line.split_once('\n') {
+                    break Pid::from_raw(digits.trim().parse().expect("pid digits"))
+                        .expect("valid pid");
+                }
+            }
+        })
+        .await
+        .expect("pid deadline");
+        kill(pid, Signal::Stop).expect("stop reader");
+        let mut expected = Vec::new();
+        let pending = loop {
+            let bytes = format!("{:08}:\x1b[1;1R\x1b[48;24;80;0;0t", expected.len())
+                .repeat(128)
+                .into_bytes();
+            match pty.write_owned(bytes.clone()) {
+                Ok(()) => expected.extend_from_slice(&bytes),
+                Err(WriteError::Full(bytes)) => break bytes,
+                Err(WriteError::Closed(_)) => panic!("reader is stopped, not closed"),
+            }
+            assert!(
+                expected.len() < 2 * 1024 * 1024,
+                "byte budget must bound input"
+            );
+        };
+        assert_ne!(expected.len(), 0);
+        kill(pid, Signal::Cont).expect("resume reader");
+        let mut retry = pending;
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let pointer = retry.as_ptr();
+                match pty.write_owned(retry) {
+                    Ok(()) => break,
+                    Err(WriteError::Full(bytes)) => {
+                        assert_eq!(bytes.as_ptr(), pointer, "retry keeps the allocation");
+                        retry = bytes;
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    Err(WriteError::Closed(_)) => panic!("live reader closed"),
+                }
+            }
+            // The final batch was made from the number of bytes already accepted.
+            expected.extend_from_slice(
+                format!("{:08}:\x1b[1;1R\x1b[48;24;80;0;0t", expected.len())
+                    .repeat(128)
+                    .as_bytes(),
+            );
+            while received.len() < expected.len() {
+                received.extend_from_slice(&rx.recv().await.expect("echoed input"));
+            }
+        })
+        .await
+        .expect("input resumes without deadlock");
+        assert_eq!(
+            received, expected,
+            "input and terminal replies preserve order"
+        );
+        drop(rx);
+        tokio::task::spawn_blocking(move || pty.shutdown())
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn host_normalizes_dimensions_for_both_the_emulator_and_pty() {
+    current_thread().expect("runtime").block_on(async {
+        let (mut host, mut rx) = koh::server::session::PtyHost::spawn(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "stty -echo; echo READY; read x; stty size".into(),
+            ],
+            0,
+            &launcher(),
+        )
+        .expect("host");
+        let mut output = String::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output.contains("READY") {
+                output.push_str(&String::from_utf8_lossy(&rx.recv().await.expect("ready")));
+            }
+        })
+        .await
+        .expect("ready deadline");
+        let raw = koh::terminal::Size::new(0, u16::MAX);
+        let normalized = koh::terminal::clamp_dims(raw);
+        host.resize(raw);
+        assert_eq!(host.snapshot().screen().size(), normalized);
+        assert!(host.input(b"\n"));
+        let output = all_output(rx).await;
+        assert!(
+            output.contains(&format!("{} {}", normalized.rows, normalized.cols)),
+            "{output:?}"
+        );
+        tokio::task::spawn_blocking(move || host.shutdown())
+            .await
+            .expect("shutdown");
+    });
+}
+
 #[test]
 #[expect(
     clippy::match_wild_err_arm,

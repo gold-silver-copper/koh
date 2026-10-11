@@ -19,6 +19,23 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - Updated `fux-vt` 0.3.4 → 0.4.1 and `fuxix` 0.1.7 → 0.2.0, including the test harnesses.
   Migrated to their typed terminal APIs and fuxix's PTY launcher. The wire protocol and minimum
   Rust version are unchanged.
+- PTY input is bounded by bytes, including in-flight writes; backpressure retains pending
+  buffers and terminal replies stay behind earlier input. Reply overflow is bounded and logged.
+- Hyperlink snapshots allocate strings only for distinct links in a row. Terminal dimensions
+  are normalized once for the hosted emulator and PTY, and history traversal uses retained rows.
+- CI checks the standalone benchmark, oracle and hostile-peer harnesses, with an oracle smoke
+  comparison on each change and longer corpus/planted-bug checks weekly.
+
+### Fixed
+- Forced PTY shutdown and ordinary drops reap children. Shutdown also stops pump threads when
+  a program leaves input unread or the output receiver is full.
+- Unwritable CLI output returns an error instead of panicking; diagnostic output is best effort.
+- Scrollback search keeps UTF-8 characters whole at its limit, handles decoded keys directly,
+  and keeps the end of a long query visible.
+- An incomplete paste begun before an outage cannot finish into a reconnected shell. Fresh
+  keys after its end marker remain usable.
+- The oracle honors an explicit reference without resolving a default first, follows the
+  upstream default branch, and builds the baseline with its committed harness lockfile.
 
 ## [0.13.0] — 2026-10-08
 

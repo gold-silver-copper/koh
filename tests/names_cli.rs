@@ -12,6 +12,37 @@ use std::time::Duration;
 
 use koh::pty::{Launcher, Pty};
 
+#[cfg(target_os = "linux")]
+#[test]
+fn unwritable_stdout_and_stderr_do_not_panic() {
+    let home = Home::new("failed-output").expect("scratch home");
+    for discard_diagnostics in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_koh"));
+        command
+            .args(["key", "info"])
+            .env("HOME", &home.0)
+            .env("XDG_CONFIG_HOME", home.0.join(".config"))
+            .stdout(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .expect("full"),
+            );
+        if discard_diagnostics {
+            command.stderr(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .expect("full"),
+            );
+        }
+        let output = command.output().expect("run koh");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+        assert!(!home.koh_dir().exists(), "info must not create identities");
+    }
+}
+
 /// A home of its own, removed afterwards; its koh directory is `<home>/.config/koh`.
 struct Home(PathBuf);
 

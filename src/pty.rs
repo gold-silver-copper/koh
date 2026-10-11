@@ -4,13 +4,13 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use fuxix::poll::{Events, PollFd};
@@ -22,9 +22,44 @@ use tokio::sync::mpsc;
 const READ_CHUNK: usize = 8192;
 /// Bound on the output channel (chunks); a full one slows the reader.
 const OUTPUT_CHANNEL_DEPTH: usize = 512;
-/// Bound on the input channel (chunks). Full only when the program stopped reading its input,
-/// which [`Pty::write_input`] reports instead of blocking.
-const WRITE_CHANNEL_DEPTH: usize = 1024;
+/// Input retained by the writer, including its in-flight write. Each chunk also costs at
+/// least 64 bytes, bounding the queue's allocation overhead for many tiny writes.
+const WRITE_BUDGET: usize = 1024 * 1024;
+
+/// A write the PTY did not take; its allocation stays with the caller for a retry.
+#[derive(Debug)]
+pub enum WriteError {
+    Full(Vec<u8>),
+    Closed(Vec<u8>),
+}
+
+struct InputChunk {
+    bytes: Vec<u8>,
+    budget: Arc<AtomicUsize>,
+    charge: usize,
+}
+
+impl Drop for InputChunk {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.charge, Ordering::AcqRel);
+    }
+}
+
+fn reserve_input(budget: &AtomicUsize, len: usize) -> bool {
+    let mut used = budget.load(Ordering::Acquire);
+    loop {
+        let Some(next) = used
+            .checked_add(len.max(64))
+            .filter(|&next| next <= WRITE_BUDGET)
+        else {
+            return false;
+        };
+        match budget.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => used = current,
+        }
+    }
+}
 
 /// How the program ended: its exit code, which for a signal is 128 plus its number, as a shell
 /// reports it, and the signal, if one ended it.
@@ -198,24 +233,82 @@ fn write_while_running(fd: &OwnedFd, bytes: &[u8], stopping: &AtomicBool) -> boo
     true
 }
 
-/// A program running on a PTY. Dropping it ends the writer thread, which writes an EOT (Ctrl-D)
-/// as it goes, and signals the program.
-pub struct Pty {
-    master: OwnedFd,
-    /// To the writer thread. Keystrokes and query replies share it, so they stay in order.
-    writer_tx: SyncSender<Vec<u8>>,
+/// An unreaped child. The PID is valid only while this owner exists.
+struct RunningChild {
     child: std::process::Child,
-    /// The child's pid; `None` only if the system reported one that is not a valid pid.
-    pid: Option<Pid>,
-    /// Set once the child is reaped. Its PID may then be recycled, so nothing signals it; an
-    /// unreaped zombie still holds its PID, so signalling that is harmless.
-    reaped: AtomicBool,
-    /// The pump threads, for [`Pty::shutdown`] to join.
-    reader_handle: Option<std::thread::JoinHandle<()>>,
-    writer_handle: Option<std::thread::JoinHandle<()>>,
-    /// Set while the session is being torn down: the writer thread gives up whatever the program
-    /// left unread, so a join never waits on a write that can no longer complete.
+    pid: Pid,
+}
+
+impl RunningChild {
+    fn signal(&self, signal: Signal) -> io::Result<()> {
+        fuxix::process::kill(self.pid, signal).map_err(io::Error::from)
+    }
+}
+
+/// Initialize before spawning any child, so a thread-creation failure cannot orphan one.
+/// Poll all transferred children: one uninterruptible child must not delay reaping the others.
+fn reaper() -> io::Result<std::sync::mpsc::Sender<RunningChild>> {
+    static REAPER: OnceLock<io::Result<std::sync::mpsc::Sender<RunningChild>>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<RunningChild>();
+            std::thread::Builder::new()
+                .name("koh-child-reaper".into())
+                .spawn(move || {
+                    let mut children: Vec<RunningChild> = Vec::new();
+                    loop {
+                        let received = if children.is_empty() {
+                            rx.recv()
+                                .map_err(|_closed| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                        } else {
+                            rx.recv_timeout(Duration::from_millis(20))
+                        };
+                        match received {
+                            Ok(child) => children.push(child),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                        children.retain_mut(|running| match running.child.try_wait() {
+                            Ok(Some(_)) => false,
+                            Ok(None) => true,
+                            Err(error) => {
+                                tracing::warn!(%error, "could not reap PTY child; retrying");
+                                true
+                            }
+                        });
+                    }
+                })?;
+            Ok(tx)
+        })
+        .as_ref()
+        .cloned()
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+}
+
+/// Pump ownership also covers startup errors before a Pty has been constructed.
+#[derive(Default)]
+struct Pumps {
+    reader: Option<std::thread::JoinHandle<()>>,
+    writer: Option<std::thread::JoinHandle<()>>,
     stopping: Arc<AtomicBool>,
+}
+
+impl Drop for Pumps {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A program running on a PTY. Dropping it signals the child and transfers its reaping
+/// responsibility to a background worker; [`Pty::shutdown`] also joins the pump threads.
+pub struct Pty {
+    master: fuxix::pty::Master,
+    /// Keystrokes and query replies share this queue, so they stay in order.
+    writer_tx: Sender<InputChunk>,
+    write_budget: Arc<AtomicUsize>,
+    running: Option<RunningChild>,
+    reaper: std::sync::mpsc::Sender<RunningChild>,
+    pumps: Pumps,
 }
 
 impl Pty {
@@ -229,64 +322,77 @@ impl Pty {
         term: &str,
         launcher: &Launcher,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
+        let reaper = reaper()?;
         // fuxix serializes the allocation itself and works around macOS's PTY races.
         let (master, slave) = fuxix::pty::open(pty_size(rows, cols).map_err(PtyError::OpenPty)?)
             .map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
 
-        let master = OwnedFd::from(master);
-
         // Read the master before the child exists: macOS discards what a short-lived child wrote
         // if it exits before anything reads (about 3 spawns in 1000 under load).
-        let reader = master.try_clone()?;
-        let writer = master.try_clone()?;
+        let reader = master.as_fd().try_clone_to_owned()?;
+        let writer = master.as_fd().try_clone_to_owned()?;
         // fuxix opens the master nonblocking; both pumps wait in `poll`.
-        let stopping = Arc::new(AtomicBool::new(false));
+        let mut pumps = Pumps::default();
+        let stopping = Arc::clone(&pumps.stopping);
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_DEPTH);
-        let reader_handle = std::thread::Builder::new()
-            .name("koh-pty-reader".into())
-            .spawn(move || {
-                // Each read lands in the buffer that is sent on, so a chunk is never copied.
-                let mut buf = vec![0u8; READ_CHUNK];
-                loop {
-                    let mut waiting = [PollFd::new(&reader, Events::IN)];
-                    match fuxix::poll::poll(&mut waiting, None) {
-                        Ok(_) => {}
-                        Err(errno) if errno == Errno::INTR => continue,
-                        Err(errno) => {
-                            tracing::debug!(error = %errno, "pty reader stopping");
-                            break;
-                        }
-                    }
-                    match fuxix::io::read(&reader, &mut buf) {
-                        Ok(0) => break, // EOF: the slave closed (macOS)
-                        Ok(n) => {
-                            let mut chunk = std::mem::replace(&mut buf, vec![0u8; READ_CHUNK]);
-                            chunk.truncate(n);
-                            if tx.blocking_send(chunk).is_err() {
-                                break; // receiver dropped: session over
+        pumps.reader = Some(
+            std::thread::Builder::new()
+                .name("koh-pty-reader".into())
+                .spawn(move || {
+                    // Each read lands in the buffer that is sent on, so a chunk is never copied.
+                    let mut buf = vec![0u8; READ_CHUNK];
+                    while !stopping.load(Ordering::SeqCst) {
+                        let mut waiting = [PollFd::new(&reader, Events::IN)];
+                        match fuxix::poll::poll(&mut waiting, Some(WRITE_POLL_INTERVAL)) {
+                            Ok(_) => {}
+                            Err(errno) if errno == Errno::INTR => continue,
+                            Err(errno) => {
+                                tracing::debug!(error = %errno, "pty reader stopping");
+                                break;
                             }
                         }
-                        Err(errno) if errno == Errno::AGAIN || errno == Errno::INTR => {}
-                        // Linux reports the slave closing as EIO.
-                        Err(errno) => {
-                            tracing::debug!(error = %errno, "pty reader stopping");
-                            break;
+                        match fuxix::io::read(&reader, &mut buf) {
+                            Ok(0) => break, // EOF: the slave closed (macOS)
+                            Ok(n) => {
+                                let mut chunk = std::mem::replace(&mut buf, vec![0u8; READ_CHUNK]);
+                                chunk.truncate(n);
+                                loop {
+                                    if stopping.load(Ordering::SeqCst) {
+                                        return;
+                                    }
+                                    match tx.try_send(chunk) {
+                                        Ok(()) => break,
+                                        Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                        Err(mpsc::error::TrySendError::Full(pending)) => {
+                                            chunk = pending;
+                                            std::thread::sleep(Duration::from_millis(10));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(errno) if errno == Errno::AGAIN || errno == Errno::INTR => {}
+                            // Linux reports the slave closing as EIO.
+                            Err(errno) => {
+                                tracing::debug!(error = %errno, "pty reader stopping");
+                                break;
+                            }
                         }
                     }
-                }
-            })?;
+                })?,
+        );
 
         // `recv` yields every queued chunk before it sees the sender dropped, so pending input is
         // written before the EOT.
-        let (writer_tx, writer_rx) = sync_channel::<Vec<u8>>(WRITE_CHANNEL_DEPTH);
-        let writer_handle = {
-            let stopping = Arc::clone(&stopping);
+        let (writer_tx, writer_rx) = channel::<InputChunk>();
+        let write_budget = Arc::new(AtomicUsize::new(0));
+        pumps.writer = Some({
+            let stopping = Arc::clone(&pumps.stopping);
             std::thread::Builder::new()
                 .name("koh-pty-writer".into())
                 .spawn(move || {
                     while let Ok(chunk) = writer_rx.recv() {
-                        if !write_while_running(&writer, &chunk, &stopping) {
+                        if !write_while_running(&writer, &chunk.bytes, &stopping) {
                             break; // master closed, child gone, or teardown
                         }
                     }
@@ -295,7 +401,7 @@ impl Pty {
                     // and the child is signalled on drop regardless.
                     write_while_running(&writer, b"\n\x04", &stopping);
                 })?
-        };
+        });
 
         let argv = build_command(command, || resolve_shell(std::env::var_os("SHELL")));
         let (child, pid) = slave
@@ -317,45 +423,87 @@ impl Pty {
                     format!("starting {program}: {error}"),
                 ))
             })?;
-        let pid = Some(pid);
-
         Ok((
             Self {
                 master,
                 writer_tx,
-                child,
-                pid,
-                reaped: AtomicBool::new(false),
-                reader_handle: Some(reader_handle),
-                writer_handle: Some(writer_handle),
-                stopping,
+                write_budget,
+                running: Some(RunningChild { child, pid }),
+                reaper,
+                pumps,
             },
             rx,
         ))
     }
 
-    /// Tear the session down and join both pump threads. Dropping the `Pty` signals the child, so
-    /// the reader sees EOF, and closes the writer's channel, so neither join can hang.
+    /// Stop both pumps and reap the child. Call on a blocking worker. After one second,
+    /// an unusually slow exit is handed to the background reaper rather than blocking teardown.
     pub fn shutdown(mut self) {
-        let reader = self.reader_handle.take();
-        let writer = self.writer_handle.take();
-        drop(self);
+        self.stop();
+        let deadline = std::time::Instant::now().checked_add(Duration::from_secs(1));
+        while self.running.is_some() {
+            match self.try_wait() {
+                Ok(Some(_)) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "PTY shutdown wait failed");
+                    break;
+                }
+                Ok(None) => {}
+            }
+            if deadline.is_none_or(|end| std::time::Instant::now() >= end) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let reader = self.pumps.reader.take();
+        let writer = self.pumps.writer.take();
+        drop(self); // closes the writer channel and transfers any unreaped child
         for handle in [writer, reader].into_iter().flatten() {
             let _ = handle.join();
         }
     }
 
+    fn stop(&self) {
+        self.pumps.stopping.store(true, Ordering::SeqCst);
+        let _ = self.signal(Signal::Hup);
+        let _ = self.signal(Signal::Kill);
+    }
+
     /// Queue `data` for the program, without blocking. [`io::ErrorKind::WouldBlock`] if the queue
     /// is full (the program stopped reading), [`io::ErrorKind::BrokenPipe`] if the writer is gone.
     pub fn write_input(&self, data: &[u8]) -> io::Result<()> {
-        match self.writer_tx.try_send(data.to_vec()) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "pty writer queue full (child not draining its input)",
-            )),
-            Err(TrySendError::Disconnected(_)) => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+        if data.is_empty() {
+            return Ok(());
         }
+        if !reserve_input(&self.write_budget, data.len()) {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        self.send_reserved(data.to_vec())
+            .map_err(|_closed| io::ErrorKind::BrokenPipe.into())
+    }
+
+    /// Queue an owned buffer, returning it unchanged on backpressure or closure.
+    pub fn write_owned(&self, bytes: Vec<u8>) -> Result<(), WriteError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if !reserve_input(&self.write_budget, bytes.len()) {
+            return Err(WriteError::Full(bytes));
+        }
+        self.send_reserved(bytes).map_err(WriteError::Closed)
+    }
+
+    fn send_reserved(&self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
+        self.writer_tx
+            .send(InputChunk {
+                charge: bytes.len().max(64),
+                bytes,
+                budget: Arc::clone(&self.write_budget),
+            })
+            .map_err(|error| {
+                let mut chunk = error.0;
+                std::mem::take(&mut chunk.bytes)
+            })
     }
 
     /// How the PTY takes typed keys now, as the program set it: echo and line mode. `None` if the
@@ -370,34 +518,30 @@ impl Pty {
 
     /// Propagate a window-size change; the kernel raises `SIGWINCH` in the child.
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
-        fuxix::terminal::set_window_size(
-            &self.master,
-            pty_size(rows, cols).map_err(PtyError::Resize)?,
-        )
-        .map_err(|e| PtyError::Resize(e.into()))
+        self.resize_sized(pty_size(rows, cols).map_err(PtyError::Resize)?)
+    }
+
+    pub(crate) fn resize_sized(&self, size: fuxix::terminal::Size) -> Result<(), PtyError> {
+        fuxix::terminal::set_window_size(&self.master, size).map_err(|e| PtyError::Resize(e.into()))
     }
 
     /// How the child ended, if it has; it is then reaped, and never signalled again.
     pub fn try_wait(&mut self) -> std::io::Result<Option<Exit>> {
-        if self.reaped.load(Ordering::SeqCst) {
+        let Some(running) = &mut self.running else {
             return Ok(None);
-        }
-        let r = self.child.try_wait().map(|status| {
-            status.map(|status| {
-                let signal = status.signal();
-                Exit {
-                    code: signal.map_or_else(
-                        || u32::try_from(status.code().unwrap_or_default()).unwrap_or(u32::MAX),
-                        |signal| 128_u32.saturating_add(u32::try_from(signal).unwrap_or(u32::MAX)),
-                    ),
-                    signal,
-                }
-            })
-        });
-        if matches!(r, Ok(Some(_))) {
-            self.reaped.store(true, Ordering::SeqCst);
-        }
-        r
+        };
+        let Some(status) = running.child.try_wait()? else {
+            return Ok(None);
+        };
+        self.running = None; // the PID can now be reused; discard the ability to signal it
+        let signal = status.signal();
+        Ok(Some(Exit {
+            code: signal.map_or_else(
+                || u32::try_from(status.code().unwrap_or_default()).unwrap_or(u32::MAX),
+                |signal| 128_u32.saturating_add(u32::try_from(signal).unwrap_or(u32::MAX)),
+            ),
+            signal,
+        }))
     }
 
     /// Terminate the child with SIGHUP, as a terminal hanging up would. No-op once the child is
@@ -408,27 +552,21 @@ impl Pty {
 
     /// Send `signal` to the child, unless it has been reaped (its PID may be recycled).
     fn signal(&self, signal: Signal) -> io::Result<()> {
-        if self.reaped.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        match self.pid {
-            Some(pid) => fuxix::process::kill(pid, signal).map_err(io::Error::from),
-            None => Ok(()),
-        }
+        self.running
+            .as_ref()
+            .map_or(Ok(()), |child| child.signal(signal))
     }
 }
 
 impl Drop for Pty {
-    /// Whether dropped after [`shutdown`](Pty::shutdown) or on an error path, the child must die
-    /// so the reader thread cannot block forever on a slave it keeps open. The threads are not
-    /// joined here: that could block a tokio worker; `shutdown` joins them.
     fn drop(&mut self) {
-        // What the program has not read by now it never will: the writer stops at its next look.
-        self.stopping.store(true, Ordering::SeqCst);
-        // SIGHUP first, for a clean exit, then SIGKILL for a program that ignores it. Neither once
-        // the child is reaped (see `signal`).
-        let _ = self.signal(Signal::Hup);
-        let _ = self.signal(Signal::Kill);
+        self.stop();
+        if let Some(child) = self.running.take() {
+            // The initialized worker lives for the process lifetime and never blocks on a child.
+            if let Err(error) = self.reaper.send(child) {
+                tracing::error!(%error, "PTY child reaper stopped unexpectedly");
+            }
+        }
     }
 }
 

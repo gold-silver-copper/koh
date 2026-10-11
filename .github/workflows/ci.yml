@@ -23,6 +23,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  harnesses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            testing/bench -> target
+            testing/oracle -> target
+            testing/android/evil-peer -> target
+      - name: Check standalone harnesses
+        run: |
+          for manifest in testing/bench/Cargo.toml testing/oracle/Cargo.toml testing/android/evil-peer/Cargo.toml; do
+            cargo fmt --manifest-path "$manifest" --all --check
+            cargo clippy --manifest-path "$manifest" --all-targets --locked -- -D warnings
+          done
+      - name: Oracle smoke against the base commit
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          if [ -n "$PR_BASE" ]; then
+            base=$PR_BASE
+          elif [ -n "$PUSH_BASE" ] && git cat-file -e "$PUSH_BASE^{commit}" 2>/dev/null; then
+            base=$PUSH_BASE
+          else
+            base=$(git rev-parse HEAD^)
+          fi
+          testing/oracle.sh "$base" --cases 80 --seed 7 --no-recordings
+      - name: Weekly oracle corpus and planted bugs
+        if: github.event_name == 'schedule'
+        run: |
+          testing/oracle.sh HEAD^ --cases 2000 --seed 23
+          testing/oracle.sh --plants
+
   # The same green gate enforced locally — format, lints (warnings are errors), the layering guard,
   # the full test suite, and broken-doc-link detection — on BOTH supported desktop OSes.
   gate:

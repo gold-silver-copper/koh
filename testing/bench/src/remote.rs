@@ -410,6 +410,7 @@ impl Remote {
             argv,
             "xterm-256color",
             &Launcher::new(&setup.koh),
+            &koh::pty::Reaper::start()?,
         )
         .map_err(|e| anyhow!("{e}"))?;
         let pty = Arc::new(pty);
@@ -642,7 +643,7 @@ impl Remote {
                 }
                 drop(proxy);
                 if let Ok(pty) = Arc::try_unwrap(pty) {
-                    let _ = tokio::task::spawn_blocking(move || pty.shutdown()).await;
+                    let _ = tokio::task::spawn_blocking(move || pty.close()).await;
                 }
             }
         }

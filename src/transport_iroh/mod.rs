@@ -241,12 +241,6 @@ pub fn configure(
     builder
 }
 
-/// Bind an endpoint with n0's relays and DNS discovery, so a bare endpoint id is dialable. `accept`
-/// lets it accept connections (the server).
-pub async fn bind_endpoint(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
-    bind_on(secret, accept, &Network::N0, None).await
-}
-
 /// Bind an endpoint with no relay and no discovery, dialed by id and socket address (LAN,
 /// loopback, tests).
 pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
@@ -281,20 +275,6 @@ pub(crate) async fn close_endpoint(endpoint: &Endpoint) -> bool {
 /// A peer's address from its id and a direct socket address.
 pub fn direct_addr(id: EndpointId, addr: SocketAddr) -> EndpointAddr {
     EndpointAddr::new(id).with_ip_addr(addr)
-}
-
-/// A peer's address from its id and the relay it uses.
-pub fn relay_addr(id: EndpointId, relay: RelayUrl) -> EndpointAddr {
-    EndpointAddr::new(id).with_relay_url(relay)
-}
-
-/// Bind an endpoint whose only relay is `relay` (self-hosted), with no discovery.
-pub async fn bind_endpoint_with_relay(
-    secret: SecretKey,
-    accept: bool,
-    relay: RelayUrl,
-) -> Result<Endpoint, SetupError> {
-    bind_on(secret, accept, &Network::Relay(relay), None).await
 }
 
 /// Parse a relay URL string (e.g. `https://relay.example:3340`).

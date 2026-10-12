@@ -12,9 +12,7 @@ use tokio::signal::unix::SignalKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
-use crate::transport_iroh::{
-    bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, relay_addr,
-};
+use crate::transport_iroh::{bind_on, close_endpoint, Network};
 
 /// The clap-free form of `koh connect`'s arguments.
 #[derive(Debug, Clone)]
@@ -170,17 +168,18 @@ async fn dial(
 ) -> anyhow::Result<(iroh::Endpoint, IrohConnector, iroh::endpoint::Connection)> {
     let secret = identity.secret.clone();
     let server = config.server;
-    let (endpoint, target) = if let Some(addr) = config.direct {
-        (
-            bind_endpoint_local(secret, false).await?,
-            direct_addr(server, addr),
-        )
-    } else if let Some(relay) = config.relay_url.clone() {
-        let endpoint = bind_endpoint_with_relay(secret, false, relay.clone()).await?;
-        (endpoint, relay_addr(server, relay))
-    } else {
-        (bind_endpoint(secret, false).await?, server.into())
+    let (network, target) = match (config.direct, config.relay_url.clone()) {
+        (Some(addr), _) => (
+            Network::Local,
+            iroh::EndpointAddr::new(server).with_ip_addr(addr),
+        ),
+        (None, Some(relay)) => (
+            Network::Relay(relay.clone()),
+            iroh::EndpointAddr::new(server).with_relay_url(relay),
+        ),
+        (None, None) => (Network::N0, server.into()),
     };
+    let endpoint = bind_on(secret, false, &network, None).await?;
     let connector = IrohConnector::new(endpoint.clone(), target);
     let first = tokio::time::timeout(Duration::from_secs(15), connector.connect())
         .await
@@ -189,15 +188,10 @@ async fn dial(
     match first {
         Ok(channel) => Ok((endpoint, connector, channel)),
         Err(error) => {
-            close_endpoint(&endpoint).await;
+            let _ = close_endpoint(&endpoint).await;
             Err(error)
         }
     }
-}
-
-/// Close `endpoint`, waiting a bounded time for the server to see it.
-async fn close_endpoint(endpoint: &iroh::Endpoint) {
-    crate::transport_iroh::close_endpoint(endpoint).await;
 }
 
 /// Warn if the locale does not look UTF-8, which koh assumes; mosh refuses to run instead.
@@ -356,7 +350,7 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
         .await
     }
     .await;
-    close_endpoint(&endpoint).await;
+    let _ = close_endpoint(&endpoint).await;
     drop(identity);
     super::io::first_error(result, tasks.shutdown().await)
 }

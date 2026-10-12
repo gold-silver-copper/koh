@@ -437,32 +437,8 @@ driving a real terminal, and the predictor reads screens through `predict::Scree
 
 ## Security internals
 
-The full picture is in the [threat model](THREAT_MODEL.md). In brief, the relevant boundaries:
-
-- **Authorization** is a node-id allowlist, the *sole* gate; the peer's Ed25519 node-id is
-  authenticated by iroh's QUIC + TLS 1.3 handshake *by construction* (no TOFU window — the client
-  pins the id it dialed). There is no "accept any peer" mode and no passphrase/PAKE second factor.
-  The saved clients are read at every connection, so `koh clients rm` takes effect at once, and a
-  session is served only to an `Authorized` connection, which only the accept loop's allowlist
-  check makes.
-- **The data plane treats every authorized peer as untrusted**: a resize is clamped to `[2, 1000]`
-  before any grid allocation; client messages and frames are size-capped and frames inflate under a
-  limit; each end keeps a fixed window of screens; QUIC stream limits and flow control bound what is
-  in flight; the QUIC handshake and the 1-byte admission ack are deadline-bounded; and a screen
-  diff is fully validated before it is applied, with no terminal parser on the client (the
-  server's fux-vt emulator is panic-free and bounded).
-- **The identity key is protected by its file permissions**, like an SSH host key: the file is the
-  raw 32-byte secret, created 0600 by a born-private atomic write, read with `O_NOFOLLOW`, refused
-  unless it is this user's, and re-tightened to 0600 through the open descriptor. The key and its
-  lock pass one check, in a directory judged once (`identity::KeyFile`), and `KeyFile::reset`
-  applies only that check's ownership half without opening the file, so `koh key reset` accepts
-  every key `koh id` does (and an unreadable one of the user's own); `$KOH_LOG` passes the same
-  check. Anyone who can read the file
-  is that identity. koh keeps every file it owns under `~/.config/koh` and nowhere else.
-- The crate is `forbid(unsafe)` and forbids the panic lint family (`unwrap`/`expect`/`panic`/
-  indexing/slicing), unchecked arithmetic (`arithmetic_side_effects`) and lossy `as` casts in
-  production code, with `overflow-checks` on in release too — so the panic-free-by-construction
-  property holds against adversarial input.
+The trust boundaries and the defenses at each are in the [threat model](THREAT_MODEL.md); each
+finding fixed, with the tests that guard it, is in [SECURITY.md](../SECURITY.md).
 
 ## Testing tiers
 

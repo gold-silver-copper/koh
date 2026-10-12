@@ -682,53 +682,17 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
     })
 }
 
-/// A program that cannot start is not reported as the server being full.
+/// A program that cannot start is not reported as the server being full: the connection is
+/// closed saying the session could not start.
 #[test]
 fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(
-            &["/nonexistent/koh-test-program"],
-            4,
-            Duration::from_secs(30),
-        );
-        let refused = reg.attach(peer()?).await.err();
-        reg.shutdown().await;
-        anyhow::ensure!(
-            refused == Some(koh::server::session::Refused::Failed),
-            "{refused:?}"
-        );
-        Ok(())
-    })
-}
-
-/// The allowlist decides who gets a shell, through `koh serve`'s own accept loop: an id on
-/// neither list is refused, a client saved while the server runs is let in at its next
-/// connection, and one removed is refused from then on, the server never restarted.
-#[test]
-fn the_allowlist_is_checked_at_every_connection() -> anyhow::Result<()> {
-    use koh::names::{List, Places};
-    use std::os::unix::fs::DirBuilderExt as _;
-    runtime()?.block_on(async {
-        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("koh-allowlist-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-        let places = Places {
-            client_key: dir.join("client.key"),
-            server_key: dir.join("server.key"),
-        };
-        let (given, saved, stranger) = (
-            generate_secret_key()?,
-            generate_secret_key()?,
-            generate_secret_key()?,
-        );
+        let secret = generate_secret_key()?;
         let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
         let addr = loopback_addr(&server_ep);
         let config = ServeConfig {
-            allow: vec![given.public()],
-            saved_clients: Some(places.clone()),
-            command: vec!["cat".to_owned()],
-            scrollback: 0,
+            allow: vec![secret.public()],
+            command: vec!["/nonexistent/koh-test-program".to_owned()],
             launcher: launcher(),
             ..ServeConfig::default()
         };
@@ -738,32 +702,16 @@ fn the_allowlist_is_checked_at_every_connection() -> anyhow::Result<()> {
             Hosting::from_config(&config)?,
             shutdown.clone(),
         ));
-        let admitted = |secret: &iroh::SecretKey| {
-            let (addr, secret) = (addr.clone(), secret.clone());
-            async move { RawClient::connect(addr, secret, true).await.is_ok() }
-        };
-        let given_in = admitted(&given).await;
-        let stranger_in = admitted(&stranger).await;
-        let saved_before = admitted(&saved).await;
-        koh::names::update(&places, List::Clients, |names| {
-            names.add("phone", saved.public())
-        })?;
-        let saved_in = admitted(&saved).await;
-        koh::names::update(&places, List::Clients, |names| {
-            names.remove("phone").map(drop)
-        })?;
-        let removed_in = admitted(&saved).await;
+        // The connection is admitted, then closed with the reason.
+        let endpoint = bind_endpoint_local(secret, false).await?;
+        let conn = endpoint.connect(addr, ALPN).await?;
+        let closed = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
-        let _ = std::fs::remove_dir_all(&dir);
-        anyhow::ensure!(given_in, "an id given for the run is let in");
-        anyhow::ensure!(!stranger_in, "an id on neither list is refused");
-        anyhow::ensure!(!saved_before, "a client not yet saved is refused");
-        anyhow::ensure!(saved_in, "a client saved while the server runs is let in");
-        anyhow::ensure!(
-            !removed_in,
-            "a client removed while the server runs is refused"
-        );
+        let reason = closed
+            .context("the server closes the connection")?
+            .to_string();
+        anyhow::ensure!(reason.contains("could not start"), "{reason}");
         Ok(())
     })
 }

@@ -90,7 +90,7 @@ and the git log.
 | A-1 | A full input queue froze a connection, leaking its session attachment and permit | The connection never waits inside its loop (`src/server/mod.rs::run_attached`): `tests/net/hostile_peer.rs::a_full_session_queue_does_not_stop_the_frames` |
 | A-2 | Frames a client never takes grew the server's in-flight list | `src/bounded.rs`, and `clippy.toml`'s ban on unbounded queues: `src/server/mod.rs::frames_a_client_never_takes_are_forgotten` |
 | A-3 | Links left off a frame made the two ends' dictionaries differ | The server holds the screen as sent: `src/server/mod.rs::links_left_off_a_frame_go_in_a_later_one` |
-| A-4 | The allowlist check had no test; `koh clients rm` needed a restart | `tests/sessions.rs::the_allowlist_is_checked_at_every_connection` |
+| A-4 | The allowlist check had no test; `koh clients rm` needed a restart | `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server` |
 | A-5 | Hostile-server tests that could not fail | `tests/net/hostile_peer.rs::client_survives` quits the client through the escape |
 | A-6 | A hostile frame could allocate before its counts were checked | `src/bounded.rs::a_sequence_past_its_bound_is_refused_before_it_is_read`, the wire's `at_most` bounds |
 | A-7 | A flood of input starved the client's frames | The client's loop is unbiased: `tests/net/session.rs::a_flood_of_typing_does_not_starve_the_frames` |

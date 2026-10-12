@@ -377,3 +377,78 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
         assert!(Path::new(&connected(&home)).exists());
     });
 }
+
+/// Clients added and removed with `koh clients` take effect at a running server's next connection,
+/// with no restart: a lost machine's key is refused at once.
+#[test]
+fn clients_added_and_removed_take_effect_on_a_running_server() {
+    use koh::transport_iroh::admission::await_admission;
+    use koh::transport_iroh::{bind_endpoint_local, direct_addr, parse_endpoint_id, ALPN};
+    let home = Home::new("live-allowlist").unwrap();
+    let me = home.koh(&["id"]).unwrap();
+    let me = String::from_utf8_lossy(&me.stdout).trim().to_owned();
+    home.koh(&["clients", "add", "other", &some_id(4)]).unwrap();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_koh"))
+        .args(["serve", "--local", "--shell", "sh"])
+        .env("HOME", &home.0)
+        .env("XDG_CONFIG_HOME", home.0.join(".config"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = server.stderr.take().unwrap();
+    let (seen, banner) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = seen.send(line);
+        }
+    });
+    let (mut id, mut port) = (None, None);
+    while id.is_none() || port.is_none() {
+        let line = banner
+            .recv_timeout(Duration::from_secs(20))
+            .expect("banner");
+        if let Some(rest) = line.split_once("endpoint id : ").map(|(_, r)| r) {
+            id = Some(parse_endpoint_id(rest).unwrap());
+        }
+        if let Some(rest) = line.split_once("udp port    : ").map(|(_, r)| r) {
+            port = rest
+                .split_whitespace()
+                .next()
+                .and_then(|p| p.parse::<u16>().ok());
+        }
+    }
+    let at = direct_addr(id.unwrap(), ([127, 0, 0, 1], port.unwrap()).into());
+    let key = std::fs::read(home.koh_dir().join("client.key")).unwrap();
+    let secret = iroh::SecretKey::from_bytes(&key.try_into().unwrap());
+    let admitted = || {
+        let (at, secret) = (at.clone(), secret.clone());
+        async move {
+            let endpoint = bind_endpoint_local(secret, false).await?;
+            let conn = endpoint.connect(at, ALPN).await?;
+            await_admission(&conn).await?;
+            conn.close(0u32.into(), b"done");
+            anyhow::Ok(())
+        }
+    };
+    let outcomes = runtime().unwrap().block_on(async {
+        let before = admitted().await.is_ok();
+        home.koh(&["clients", "add", "me", &me]).unwrap();
+        let added = admitted().await.is_ok();
+        home.koh(&["clients", "rm", "me"]).unwrap();
+        let removed = admitted().await.is_ok();
+        (before, added, removed)
+    });
+    let _ = server.kill();
+    let _ = server.wait();
+    assert_eq!(
+        outcomes,
+        (false, true, false),
+        "(before it was saved, once saved, once removed)"
+    );
+}

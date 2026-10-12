@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context as _};
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
-use koh::predict::{DisplayPreference, Overlay};
+use koh::predict::Overlay;
 use koh::proto::{decode_server, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg};
 use koh::terminal::{ServerTerminal, Size, TerminalScreen};
 
@@ -217,7 +217,7 @@ fn paint(workload: &Workload, frames: &[Vec<u8>]) -> anyhow::Result<usize> {
         size: Rc::new(Cell::new(size)),
     };
     let mut terminal = BackendTerminal::enter(sink.clone(), false)?;
-    let mut client = ClientSession::new(DisplayPreference::Never, size);
+    let mut client = ClientSession::new(size);
     let now = Instant::now();
     for bytes in frames {
         // As the client takes a frame's stream: inflated against its base's dictionary, then

@@ -3,8 +3,6 @@
 
 use std::time::Duration;
 
-use koh::predict::DisplayPreference;
-
 use crate::harness::{identity, Client, Options, Server};
 use crate::link::{FaultNet, Profile};
 
@@ -25,11 +23,7 @@ async fn predicting_session(net: &FaultNet) -> anyhow::Result<(Server, Client)> 
     let secret = identity()?;
     let server = Server::start(net, &[secret.public()], &["sh"]).await?;
     let endpoint = net.endpoint(secret, false).await?;
-    let options = Options {
-        predict: Some(DisplayPreference::Always),
-        ..Options::default()
-    };
-    let client = Client::connect_on(endpoint, server.id, options).await?;
+    let client = Client::connect_on(endpoint, server.id, Options::default()).await?;
     Ok((server, client))
 }
 

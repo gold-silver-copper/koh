@@ -15,7 +15,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use koh::client::ClientSession;
-use koh::predict::DisplayPreference;
 use koh::proto::{decode_server, encode_history, ClientMsg, Frame, FrameNum, InputSeq, ServerMsg};
 use koh::terminal::{ServerTerminal, Size, TerminalScreen};
 use recording::Recording;
@@ -42,7 +41,7 @@ impl Pair {
     fn new(rows: u16, cols: u16) -> Result<Self, String> {
         Ok(Self {
             server: ServerTerminal::new(rows, cols, SCROLLBACK).map_err(|e| e.to_string())?,
-            client: ClientSession::new(DisplayPreference::Never, Size::new(rows, cols)),
+            client: ClientSession::new(Size::new(rows, cols)),
             sent: TerminalScreen::default(),
             num: 0,
             now: Instant::now(),

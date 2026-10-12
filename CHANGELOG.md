@@ -23,6 +23,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - `koh serve` reads the saved clients at every connection: `koh clients rm` takes effect at once.
 - A session's program is hung up and given a second to exit (a shell saves its history) before it
   is killed.
+- More keys in one read than anyone types (a paste into a terminal without bracketed paste, a
+  program writing to the client's terminal) are sent but not predicted one by one, which cost a
+  screenful of work each.
 - Updated `fux-vt` 0.3.4 → 0.4.1 and `fuxix` 0.1.7 → 0.2.0, including the test harnesses.
   Migrated to their typed terminal APIs and fuxix's PTY launcher. The wire protocol and minimum
   Rust version are unchanged.
@@ -39,8 +42,6 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - Frames a client never took made the server's list of frames in flight grow for good.
 - More than 1 MiB of hyperlinks on a screen left the client and server compressing frames against
   different dictionaries, so frames failed to decode.
-- A program that exited with a background job still holding its terminal kept its session open
-  until the job ended.
 - Quitting a program on the alternate screen, or a reattach at the same window size, renamed every
   history row, so the client fetched its history again.
 - A paste cut off by a reconnect left the program's bracketed paste open.
@@ -52,7 +53,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - A session's program that could not start was reported as the server being at capacity, and
   starting one held up every other peer's attach.
 - Keys typed in the same read after leaving the scrollback view, or after `Ctrl-^ Ctrl-Z`, were
-  lost; a resize could wait behind a stream of frames.
+  lost; a resize could wait behind a stream of frames, and a flood of input starved the frames.
 - Forced PTY shutdown and ordinary drops reap children. Shutdown also stops pump threads when
   a program leaves input unread or the output receiver is full.
 - Unwritable CLI output returns an error instead of panicking; diagnostic output is best effort.

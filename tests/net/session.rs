@@ -255,6 +255,49 @@ fn a_program_that_stops_reading_input_never_freezes_the_client() {
         });
 }
 
+/// Keystrokes that never stop coming do not starve the frames: the client still shows the
+/// program's output while the user's terminal floods it with input.
+#[test]
+fn a_flood_of_typing_does_not_starve_the_frames() {
+    crate::harness::runtime()
+        .expect("tokio runtime")
+        .block_on(async {
+            let net = clean();
+            let (server, mut client) = session(
+                &net,
+                &[
+                    "sh",
+                    "-c",
+                    "stty raw -echo; cat >/dev/null & i=0; while :; do echo TICK $i; i=$((i+1)); sleep 0.05; done",
+                ],
+            )
+            .await
+            .expect("start a session");
+            assert!(client
+                .wait_until(WAIT, |t| t.contains("TICK 1"))
+                .await
+                .is_some());
+            let printed = |t: &str| {
+                t.lines()
+                    .filter_map(|line| line.trim().strip_prefix("TICK ")?.parse::<u32>().ok())
+                    .max()
+            };
+            let before = printed(&client.screen()).unwrap_or(0);
+            let chunk = vec![b'y'; 1024];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while tokio::time::Instant::now() < deadline {
+                client.send(&chunk).await.expect("type");
+            }
+            let during = printed(&client.screen()).unwrap_or(0);
+            server.stop().await;
+            assert!(
+                during >= before + 20,
+                "the program's output stopped reaching the client while it was typed at: TICK \
+                 {before} then {during}"
+            );
+        });
+}
+
 #[test]
 fn a_forced_mid_session_drop_reconnects_to_the_same_shell() {
     crate::harness::runtime()

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use koh::client::{run_client, BackendTerminal, ClientTerminal, IrohConnector, KohBackend};
-use koh::predict::{DisplayPreference, Overlay};
+use koh::predict::Overlay;
 use koh::terminal::{Size, TerminalScreen};
 use recording::Recording;
 use tokio::sync::{mpsc, watch};
@@ -257,7 +257,6 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
         channel,
         std::time::SystemTime::now(),
         connector,
-        DisplayPreference::Never,
         start,
         None,
         input_rx,

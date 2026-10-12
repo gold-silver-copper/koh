@@ -93,6 +93,7 @@ and the git log.
 | A-4 | The allowlist check had no test; `koh clients rm` needed a restart | `tests/sessions.rs::the_allowlist_is_checked_at_every_connection` |
 | A-5 | Hostile-server tests that could not fail | `tests/net/hostile_peer.rs::client_survives` quits the client through the escape |
 | A-6 | A hostile frame could allocate before its counts were checked | `src/bounded.rs::a_sequence_past_its_bound_is_refused_before_it_is_read`, the wire's `at_most` bounds |
+| A-7 | A flood of input starved the client's frames | The client's loop is unbiased: `tests/net/session.rs::a_flood_of_typing_does_not_starve_the_frames` |
 
 **Review follow-ups (KR-, K-, KB-, KC-, KS-, S-, AR-).**
 

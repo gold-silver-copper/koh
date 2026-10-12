@@ -8,9 +8,7 @@ use std::io;
 use super::backend::{CellStyle, KohBackend};
 use crate::predict::Overlay;
 use crate::terminal::{Grid, Link, Size, MAXIMUM_CLIPBOARD_SIZE};
-use fux_vt::{
-    Blink, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, UnderlineStyle,
-};
+use fux_vt::{Blink, CellRef, Cells, Color, MouseProtocolMode, UnderlineStyle};
 use unicode_width::UnicodeWidthStr as _;
 
 /// What the terminal was last painted with, so the next frame paints only what changed.
@@ -656,115 +654,32 @@ pub struct WindowState<'a> {
     pub bell_count: u64,
 }
 
-/// The input modes the real terminal is kept in, so the client receives the input it decodes.
+/// The input modes the real terminal is kept in, so the client receives the input it decodes, set
+/// on the first frame and after a resume.
 ///
 /// The server encodes keys, mouse events, focus changes and pastes as the program asked, so the
 /// program's own modes are not mirrored for their own sake: the keypad and cursor keys stay
 /// normal, bracketed paste and focus reporting stay on, so pastes arrive whole and focus changes
-/// at all, and mouse reporting is on while the program wants mouse events (or the scrollback view
-/// is open), always in SGR, which carries every position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct InputModes {
-    pub application_keypad: bool,
-    pub application_cursor: bool,
-    pub bracketed_paste: bool,
-    pub focus_reporting: bool,
-    pub mouse_mode: MouseProtocolMode,
-    pub mouse_encoding: MouseProtocolEncoding,
-}
+/// at all. Only mouse reporting follows the program ([`mouse_modes`]).
+const INPUT_MODES: &[u8] = b"\x1b>\x1b[?1l\x1b[?2004h\x1b[?1004h";
 
-impl From<&Grid> for InputModes {
-    fn from(s: &Grid) -> Self {
-        let mouse_mode = s.modes().mouse_mode;
-        Self {
-            application_keypad: false,
-            application_cursor: false,
-            bracketed_paste: true,
-            focus_reporting: true,
-            mouse_mode,
-            mouse_encoding: if mouse_mode == MouseProtocolMode::None {
-                MouseProtocolEncoding::Default
-            } else {
-                MouseProtocolEncoding::Sgr
-            },
-        }
-    }
-}
-
-impl InputModes {
-    /// Sequences setting every mode (the first frame, after a resume).
-    pub fn formatted(self) -> Vec<u8> {
-        self.sequences(None)
-    }
-
-    /// Sequences taking a terminal at `prev` to these modes.
-    pub fn diff(self, prev: Self) -> Vec<u8> {
-        self.sequences(Some(prev))
-    }
-
-    /// The sequences taking a terminal at `prev` (unknown if `None`) to these modes.
-    fn sequences(self, prev: Option<Self>) -> Vec<u8> {
-        use MouseProtocolEncoding as Enc;
-        use MouseProtocolMode as Mode;
-        let mut buf = Vec::new();
-        let changed = |get: fn(&Self) -> bool| prev.is_none_or(|p| get(&p) != get(&self));
-        if changed(|m| m.application_keypad) {
-            buf.extend_from_slice(if self.application_keypad {
-                b"\x1b="
-            } else {
-                b"\x1b>"
-            });
-        }
-        if changed(|m| m.application_cursor) {
-            buf.extend_from_slice(if self.application_cursor {
-                b"\x1b[?1h"
-            } else {
-                b"\x1b[?1l"
-            });
-        }
-        if changed(|m| m.bracketed_paste) {
-            buf.extend_from_slice(if self.bracketed_paste {
-                b"\x1b[?2004h"
-            } else {
-                b"\x1b[?2004l"
-            });
-        }
-        if changed(|m| m.focus_reporting) {
-            buf.extend_from_slice(if self.focus_reporting {
-                b"\x1b[?1004h"
-            } else {
-                b"\x1b[?1004l"
-            });
-        }
-        let prev_mode = prev.map_or(Mode::None, |p| p.mouse_mode);
-        if self.mouse_mode != prev_mode {
-            match self.mouse_mode {
-                Mode::Press => buf.extend_from_slice(b"\x1b[?9h"),
-                Mode::PressRelease => buf.extend_from_slice(b"\x1b[?1000h"),
-                Mode::ButtonMotion => buf.extend_from_slice(b"\x1b[?1002h"),
-                Mode::AnyMotion => buf.extend_from_slice(b"\x1b[?1003h"),
-                Mode::None | _ => buf.extend_from_slice(match prev_mode {
-                    Mode::Press => b"\x1b[?9l",
-                    Mode::PressRelease => b"\x1b[?1000l",
-                    Mode::ButtonMotion => b"\x1b[?1002l",
-                    Mode::AnyMotion => b"\x1b[?1003l",
-                    Mode::None | _ => b"",
-                }),
-            }
-        }
-        let prev_enc = prev.map_or(Enc::Default, |p| p.mouse_encoding);
-        if self.mouse_encoding != prev_enc {
-            match self.mouse_encoding {
-                Enc::Utf8 => buf.extend_from_slice(b"\x1b[?1005h"),
-                Enc::Sgr => buf.extend_from_slice(b"\x1b[?1006h"),
-                Enc::Default | _ => buf.extend_from_slice(match prev_enc {
-                    Enc::Utf8 => b"\x1b[?1005l",
-                    Enc::Sgr => b"\x1b[?1006l",
-                    Enc::Default | _ => b"",
-                }),
-            }
-        }
-        buf
+/// The bytes taking the real terminal's mouse reporting from `prev` to `mouse`: on while the
+/// program wants mouse events (or the scrollback view is open), always in SGR, which carries every
+/// position.
+fn mouse_modes(prev: MouseProtocolMode, mouse: MouseProtocolMode) -> Vec<u8> {
+    use MouseProtocolMode as Mode;
+    let number = |mode| match mode {
+        Mode::Press => "9",
+        Mode::PressRelease => "1000",
+        Mode::ButtonMotion => "1002",
+        Mode::AnyMotion => "1003",
+        Mode::None | _ => "",
+    };
+    match (prev == Mode::None, mouse == Mode::None) {
+        _ if prev == mouse => Vec::new(),
+        (true, false) => format!("\x1b[?{}h\x1b[?1006h", number(mouse)).into_bytes(),
+        (false, true) => format!("\x1b[?{}l\x1b[?1006l", number(prev)).into_bytes(),
+        _ => format!("\x1b[?{}h", number(mouse)).into_bytes(),
     }
 }
 
@@ -784,8 +699,8 @@ pub(super) struct OutOfBand {
     title_initialized: bool,
     last_title: String,
     last_icon: String,
-    /// Previous frame's input modes, to diff against the current frame.
-    prev_modes: Option<InputModes>,
+    /// The mouse reporting last set; `None` until the input modes are set.
+    mouse: Option<MouseProtocolMode>,
     /// The server's clipboard and bell as last seen: `None` until the first frame after the client
     /// started, whose are taken as they are, so neither what was copied nor what rang before it
     /// reaches the user's terminal.
@@ -821,7 +736,7 @@ impl OutOfBand {
         self.title_initialized = false;
         self.last_title.clear();
         self.last_icon.clear();
-        self.prev_modes = None;
+        self.mouse = None;
     }
 
     /// The first frame of the run arrived, with `win`: what it shows of the clipboard and bell is
@@ -837,7 +752,7 @@ impl OutOfBand {
     pub(super) fn emit(
         &mut self,
         backend: &mut impl KohBackend,
-        modes: InputModes,
+        mouse: MouseProtocolMode,
         win: WindowState<'_>,
     ) -> io::Result<()> {
         self.emit_window_title(backend, win.title, win.icon)?;
@@ -861,14 +776,14 @@ impl OutOfBand {
                 seen.bell = win.bell_count;
             }
         }
-        let mode_bytes = match self.prev_modes {
-            Some(prev) => modes.diff(prev),
-            None => modes.formatted(),
+        let mode_bytes = match self.mouse {
+            Some(prev) => mouse_modes(prev, mouse),
+            None => [INPUT_MODES, &mouse_modes(MouseProtocolMode::None, mouse)].concat(),
         };
         if !mode_bytes.is_empty() {
             backend.write_input_modes(&mode_bytes)?;
         }
-        self.prev_modes = Some(modes);
+        self.mouse = Some(mouse);
         Ok(())
     }
 
@@ -912,7 +827,7 @@ impl OutOfBand {
 mod tests {
     use super::*;
     use crate::client::backend::CaptureBackend;
-    use crate::predict::{DisplayPreference, PredictedCell, PredictionEngine};
+    use crate::predict::{PredictedCell, PredictionEngine};
 
     fn screen_of(bytes: &[u8]) -> Grid {
         crate::terminal::TerminalScreen::from_bytes(24, 80, bytes)
@@ -962,7 +877,7 @@ mod tests {
     /// Run one `OutOfBand::emit` into a fresh capture backend and return the emitted bytes.
     fn oob_emit(oob: &mut OutOfBand, screen: &Grid, win: WindowState<'_>) -> Vec<u8> {
         let mut backend = CaptureBackend::default();
-        oob.emit(&mut backend, InputModes::from(screen), win)
+        oob.emit(&mut backend, screen.modes().mouse_mode, win)
             .unwrap();
         backend.bytes
     }
@@ -1152,33 +1067,19 @@ mod tests {
     /// reports in SGR while the program asks for any.
     #[test]
     fn the_real_terminal_reports_input_whatever_the_program_set() {
-        let keep = |bytes: &[u8]| InputModes::from(&screen_of(bytes));
-        let always = InputModes {
-            application_keypad: false,
-            application_cursor: false,
-            bracketed_paste: true,
-            focus_reporting: true,
-            mouse_mode: MouseProtocolMode::None,
-            mouse_encoding: MouseProtocolEncoding::Default,
+        let mut oob = OutOfBand::default();
+        let mut emit = |bytes: &[u8]| {
+            String::from_utf8(oob_emit(&mut oob, &screen_of(bytes), win("", "", "", 0))).unwrap()
         };
-        assert_eq!(keep(b""), always);
-        assert_eq!(keep(b"\x1b[?1h\x1b=\x1b[?2004l\x1b[?1004l"), always);
-        for (set, mode) in [
-            (&b"\x1b[?9h"[..], MouseProtocolMode::Press),
-            (b"\x1b[?1000h\x1b[?1005h", MouseProtocolMode::PressRelease),
-            (b"\x1b[?1002h", MouseProtocolMode::ButtonMotion),
-            (b"\x1b[?1003h\x1b[?1006h", MouseProtocolMode::AnyMotion),
-        ] {
-            assert_eq!(
-                keep(set),
-                InputModes {
-                    mouse_mode: mode,
-                    mouse_encoding: MouseProtocolEncoding::Sgr,
-                    ..always
-                }
-            );
-        }
-        assert_eq!(always.formatted(), b"\x1b>\x1b[?1l\x1b[?2004h\x1b[?1004h");
+        assert_eq!(
+            emit(b"\x1b[?1h\x1b=\x1b[?2004l"),
+            "\x1b>\x1b[?1l\x1b[?2004h\x1b[?1004h"
+        );
+        assert_eq!(emit(b"\x1b[?9h"), "\x1b[?9h\x1b[?1006h");
+        assert_eq!(emit(b"\x1b[?1003h\x1b[?1005h"), "\x1b[?1003h");
+        assert_eq!(emit(b"\x1b[?1002h"), "\x1b[?1002h");
+        assert_eq!(emit(b""), "\x1b[?1002l\x1b[?1006l");
+        assert_eq!(emit(b"\x1b[?1000h"), "\x1b[?1000h\x1b[?1006h");
     }
 
     #[test]
@@ -1619,7 +1520,7 @@ mod tests {
     /// cursor included, and the echo confirms every prediction.
     fn predicted_typing_shows_the_echo(before: &str, typed: &str, echo: &str) {
         let mut emu = crate::terminal::ServerTerminal::new(6, 20, 0).unwrap();
-        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        let mut engine = PredictionEngine::default();
         engine.set_local_frame_sent(0);
         engine.type_bytes(b">", emu.snapshot().screen());
         emu.process(b">");
@@ -2074,7 +1975,7 @@ mod tests {
         // A predicted glyph (once the server has confirmed it echoes) must appear in the output.
         // Predictions are epoch-gated and hidden until confirmed, so confirm a first keystroke,
         // then a subsequent typed char becomes visible and should render.
-        let mut pe = PredictionEngine::new(DisplayPreference::Always);
+        let mut pe = PredictionEngine::default();
         pe.set_local_frame_sent(0);
         let blank = screen_of(b"");
         pe.type_bytes(b"a", &blank); // hidden (epoch 1, unconfirmed)
@@ -2093,104 +1994,5 @@ mod tests {
         let s = render_to_string(&echoed, &overlay, None);
         assert!(s.contains('Z'), "predicted glyph not rendered");
         assert!(!s.contains("\x1b[4m"), "predictions are not underlined");
-    }
-
-    // --- InputModes emits vt100 0.16's input-mode bytes ---
-
-    #[test]
-    fn input_modes_formatted_and_diff_match_the_vt100_oracle() {
-        // Reference bytes from vt100 0.16.2's `input_mode_formatted` / `input_mode_diff`: the local
-        // terminal must see exactly these.
-        let seqs: [&[u8]; 6] = [
-            b"",
-            b"\x1b[?2004h",
-            b"\x1b[?1000h\x1b[?1006h",
-            b"\x1b[?1003h\x1b[?1005h\x1b[?1h\x1b=",
-            b"\x1b[?1002h\x1b[?2004h",
-            b"\x1b[?9h",
-        ];
-        let formatted: [&str; 6] = [
-            "\x1b>\x1b[?1l\x1b[?2004l",
-            "\x1b>\x1b[?1l\x1b[?2004h",
-            "\x1b>\x1b[?1l\x1b[?2004l\x1b[?1000h\x1b[?1006h",
-            "\x1b=\x1b[?1h\x1b[?2004l\x1b[?1003h\x1b[?1005h",
-            "\x1b>\x1b[?1l\x1b[?2004h\x1b[?1002h",
-            "\x1b>\x1b[?1l\x1b[?2004l\x1b[?9h",
-        ];
-        let diff: [[&str; 6]; 6] = [
-            [
-                "",
-                "\x1b[?2004l",
-                "\x1b[?1000l\x1b[?1006l",
-                "\x1b>\x1b[?1l\x1b[?1003l\x1b[?1005l",
-                "\x1b[?2004l\x1b[?1002l",
-                "\x1b[?9l",
-            ],
-            [
-                "\x1b[?2004h",
-                "",
-                "\x1b[?2004h\x1b[?1000l\x1b[?1006l",
-                "\x1b>\x1b[?1l\x1b[?2004h\x1b[?1003l\x1b[?1005l",
-                "\x1b[?1002l",
-                "\x1b[?2004h\x1b[?9l",
-            ],
-            [
-                "\x1b[?1000h\x1b[?1006h",
-                "\x1b[?2004l\x1b[?1000h\x1b[?1006h",
-                "",
-                "\x1b>\x1b[?1l\x1b[?1000h\x1b[?1006h",
-                "\x1b[?2004l\x1b[?1000h\x1b[?1006h",
-                "\x1b[?1000h\x1b[?1006h",
-            ],
-            [
-                "\x1b=\x1b[?1h\x1b[?1003h\x1b[?1005h",
-                "\x1b=\x1b[?1h\x1b[?2004l\x1b[?1003h\x1b[?1005h",
-                "\x1b=\x1b[?1h\x1b[?1003h\x1b[?1005h",
-                "",
-                "\x1b=\x1b[?1h\x1b[?2004l\x1b[?1003h\x1b[?1005h",
-                "\x1b=\x1b[?1h\x1b[?1003h\x1b[?1005h",
-            ],
-            [
-                "\x1b[?2004h\x1b[?1002h",
-                "\x1b[?1002h",
-                "\x1b[?2004h\x1b[?1002h\x1b[?1006l",
-                "\x1b>\x1b[?1l\x1b[?2004h\x1b[?1002h\x1b[?1005l",
-                "",
-                "\x1b[?2004h\x1b[?1002h",
-            ],
-            [
-                "\x1b[?9h",
-                "\x1b[?2004l\x1b[?9h",
-                "\x1b[?9h\x1b[?1006l",
-                "\x1b>\x1b[?1l\x1b[?9h\x1b[?1005l",
-                "\x1b[?2004l\x1b[?9h",
-                "",
-            ],
-        ];
-        // The program's modes as it set them, as vt100 would mirror them.
-        let modes: Vec<InputModes> = seqs
-            .iter()
-            .map(|s| {
-                let m = screen_of(s).modes();
-                InputModes {
-                    application_keypad: m.application_keypad,
-                    application_cursor: m.application_cursor,
-                    bracketed_paste: m.bracketed_paste,
-                    focus_reporting: false,
-                    mouse_mode: m.mouse_mode,
-                    mouse_encoding: m.mouse_encoding,
-                }
-            })
-            .collect();
-        for (i, cur) in modes.iter().enumerate() {
-            // vt100's, with focus reporting (which it does not mirror) reset after the paste.
-            let expected = formatted[i]
-                .replacen("2004l", "2004l\x1b[?1004l", 1)
-                .replacen("2004h", "2004h\x1b[?1004l", 1);
-            assert_eq!(cur.formatted(), expected.as_bytes(), "formatted {i}");
-            for (j, prev) in modes.iter().enumerate() {
-                assert_eq!(cur.diff(*prev), diff[i][j].as_bytes(), "diff {i} from {j}");
-            }
-        }
     }
 }

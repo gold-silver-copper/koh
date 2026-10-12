@@ -140,43 +140,33 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
         " (ephemeral; --port fixes it across restarts)".to_owned()
     };
 
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "┌─ koh server ready ──────────────────────────────────────"
-    );
-    let _ = writeln!(std::io::stderr().lock(), "│ endpoint id : {id_str}");
-    let _ = writeln!(std::io::stderr().lock(), "│ key file    : {key_file}");
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "│ alpn        : {}",
-        String::from_utf8_lossy(ALPN)
-    );
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "│ auth        : allowlist ({} client(s))",
-        hosting.allow.now()?.len()
-    );
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "│ udp port    : {port}{port_note}"
-    );
-    let _ = writeln!(std::io::stderr().lock(), "│ connect     : {connect_hint}");
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "└───────────────────────────────────────────────────────────"
-    );
-
+    let clients = hosting.allow.now()?.len();
+    let alpn = String::from_utf8_lossy(ALPN);
     // A phone camera can read the id instead of anyone copying 64 hex digits.
-    if let Some(qr) = connect_qr(&id_str) {
-        let _ =
-            writeln!(std::io::stderr().lock(),
-            "\nScan for the endpoint id (point a phone camera at it). Assumes a dark-background \
-             terminal;\non a light background it renders inverted — copy the id above instead:\n"
-        );
-        let _ = writeln!(std::io::stderr().lock(), "{qr}");
-    } else {
-        warn!("could not render the connect QR (endpoint id too large to encode)");
-    }
+    let qr = connect_qr(&id_str).map_or_else(
+        || {
+            warn!("could not render the connect QR (endpoint id too large to encode)");
+            String::new()
+        },
+        |qr| {
+            format!(
+                "\nScan for the endpoint id (point a phone camera at it). Assumes a \
+                 dark-background terminal;\non a light background it renders inverted — copy \
+                 the id above instead:\n\n{qr}\n"
+            )
+        },
+    );
+    let banner = format!(
+        "┌─ koh server ready ──────────────────────────────────────\n\
+         │ endpoint id : {id_str}\n\
+         │ key file    : {key_file}\n\
+         │ alpn        : {alpn}\n\
+         │ auth        : allowlist ({clients} client(s))\n\
+         │ udp port    : {port}{port_note}\n\
+         │ connect     : {connect_hint}\n\
+         └───────────────────────────────────────────────────────────\n{qr}"
+    );
+    let _ = std::io::stderr().lock().write_all(banner.as_bytes());
 
     // What protects the link, iroh's choice: so an operator sees post-quantum KEX is not on.
     info!(

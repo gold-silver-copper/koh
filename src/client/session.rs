@@ -11,7 +11,7 @@ use fux_vt::keys::Keystroke;
 
 use crate::bounded::Bounded;
 use crate::events::{InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE, PALETTE};
-use crate::predict::{DisplayPreference, Overlay, PredictionEngine};
+use crate::predict::{Overlay, PredictionEngine};
 use crate::proto::{
     decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
     HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
@@ -137,11 +137,12 @@ mod notice {
 /// messages as fit; the rest are one of a kind at a time, or few.
 const OUTGOING: usize = 1024;
 
-/// Messages for the server, oldest first, and the bytes of input among them.
+/// Messages for the server, oldest first, the bytes of input among them, and the newest's.
 #[derive(Debug, Default)]
 struct Outgoing {
     messages: Bounded<ClientMsg, OUTGOING>,
     input_bytes: usize,
+    newest_bytes: usize,
 }
 
 impl Outgoing {
@@ -170,32 +171,54 @@ impl Outgoing {
         let queued = self.messages.push_back(msg).is_ok();
         if queued {
             self.input_bytes = self.input_bytes.saturating_add(cost);
+            self.newest_bytes = cost;
         }
         queued
     }
 
-    /// Queue `msg` first, dropping the newest if the queue is full.
-    fn push_front(&mut self, msg: ClientMsg) {
-        self.messages.push_front_evicting(msg);
-        self.input_bytes = self.messages.iter().map(Self::input_cost).sum();
+    /// Queue `first` before what is queued.
+    fn put_first(&mut self, first: impl IntoIterator<Item = ClientMsg>) {
+        let mut rest = std::mem::take(self);
+        for msg in first {
+            self.push_back(msg);
+        }
+        while let Some(msg) = rest.pop_front() {
+            self.push_back(msg);
+        }
     }
 
     fn pop_front(&mut self) -> Option<ClientMsg> {
         let msg = self.messages.pop_front()?;
         self.input_bytes = self.input_bytes.saturating_sub(Self::input_cost(&msg));
+        if self.messages.is_empty() {
+            self.newest_bytes = 0;
+        }
         Some(msg)
     }
 
     fn retain(&mut self, keep: impl FnMut(&ClientMsg) -> bool) {
         self.messages.retain(keep);
         self.input_bytes = self.messages.iter().map(Self::input_cost).sum();
+        self.newest_bytes = self.messages.back().map_or(0, Self::input_cost);
+    }
+
+    /// Whether an event of `cost` bytes fits in the newest message, if it is `Keys`: at most
+    /// [`MAX_EVENTS`] events, and its variant, sequence number and count beside them within
+    /// [`MAX_CLIENT_MESSAGE`].
+    fn fits(&self, events: &[InputEvent], cost: usize) -> bool {
+        const ENVELOPE: usize = 16;
+        events.len() < MAX_EVENTS
+            && ENVELOPE
+                .saturating_add(self.newest_bytes)
+                .saturating_add(cost)
+                <= MAX_CLIENT_MESSAGE
     }
 
     /// The message an event of `cost` bytes goes in: the last one queued if it has room, else a
     /// new one after `last_seq`.
     fn seq_for(&self, cost: usize, last_seq: InputSeq) -> InputSeq {
         match self.messages.back() {
-            Some(ClientMsg::Keys { seq, events }) if fits(events, cost) => *seq,
+            Some(ClientMsg::Keys { seq, events }) if self.fits(events, cost) => *seq,
             _ => last_seq.next(),
         }
     }
@@ -203,10 +226,12 @@ impl Outgoing {
     /// Queue `event`, of `cost` bytes, as [`seq_for`](Self::seq_for) says, unless the queue is
     /// full; whether it was.
     fn event(&mut self, event: InputEvent, cost: usize, last_seq: &mut InputSeq) -> bool {
+        let room = matches!(self.messages.back(), Some(ClientMsg::Keys { events, .. }) if self.fits(events, cost));
         match self.messages.back_mut() {
-            Some(ClientMsg::Keys { events, .. }) if fits(events, cost) => {
+            Some(ClientMsg::Keys { events, .. }) if room => {
                 events.push(event);
                 self.input_bytes = self.input_bytes.saturating_add(cost);
+                self.newest_bytes = self.newest_bytes.saturating_add(cost);
                 true
             }
             _ => {
@@ -222,12 +247,12 @@ impl Outgoing {
         }
     }
 
+    /// Queue the window's `size`, in place of one queued last; dropped if the queue is full.
     fn resize(&mut self, size: Size) {
         if let Some(ClientMsg::Resize(queued)) = self.messages.back_mut() {
             *queued = size;
-        } else if !self.push_back(ClientMsg::Resize(size)) {
-            // Only the last size matters: it takes the place of the newest message.
-            self.push_front(ClientMsg::Resize(size));
+        } else {
+            self.push_back(ClientMsg::Resize(size));
         }
     }
 }
@@ -237,6 +262,9 @@ impl Outgoing {
 /// that turned echo off just after printing its prompt is heard of within about one; two leave
 /// room for the link's jitter.
 const PROMPT_HOLD: Duration = TTY_TICK.saturating_mul(2);
+
+/// Most keys in one read predicted one by one: a person types far fewer between two reads.
+const TYPED_KEYS: usize = 32;
 
 /// How long a notice stays on the status line.
 const NOTICE_FOR: Duration = Duration::from_secs(3);
@@ -310,7 +338,7 @@ pub struct ClientSession {
 
 impl ClientSession {
     /// A session for a run, telling the server the window's `size`.
-    pub fn new(pref: DisplayPreference, size: Size) -> Self {
+    pub fn new(size: Size) -> Self {
         Self {
             link: Link::fresh(Arc::default(), InputSeq::default()),
             outage: None,
@@ -322,7 +350,7 @@ impl ClientSession {
                 queue
             },
             input_paused: false,
-            predictor: PredictionEngine::new(pref),
+            predictor: PredictionEngine::default(),
             decoder: Decoder::with_paste_limit(MAX_PASTE),
             stale_decode: false,
             pending_escape: None,
@@ -381,11 +409,10 @@ impl ClientSession {
         self.link = Link::fresh(Arc::clone(&self.link.current().screen), self.sent_seq);
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Resize(_) | ClientMsg::Colours(_)));
-        if let Some(colours) = self.colours.as_ref().filter(|c| c.known()) {
-            self.outgoing
-                .push_front(ClientMsg::Colours(colours.clone()));
-        }
-        self.outgoing.push_front(ClientMsg::Resize(size));
+        let colours = self.colours.as_ref().filter(|c| c.known()).cloned();
+        self.outgoing.put_first(
+            std::iter::once(ClientMsg::Resize(size)).chain(colours.map(ClientMsg::Colours)),
+        );
         self.rows = size.rows;
         self.cols = size.cols;
         self.scrollback.reconnected();
@@ -586,13 +613,18 @@ impl ClientSession {
             }
             return;
         }
-        for event in events {
+        // More keys in one read than anyone types come from a paste or a program writing to the
+        // user's terminal: what they do is not predicted, but taken as one unmodelled input.
+        let burst = events.len() > TYPED_KEYS;
+        for (n, event) in events.into_iter().enumerate() {
             let cost = event.encoded_len();
             // Predictions made now expire with the input message that carries the event.
             let seq = self.outgoing.seq_for(cost, self.last_seq);
             self.predictor.set_local_frame_sent(seq.0.saturating_sub(1));
             let screen = self.link.current().screen.screen();
             match &event {
+                _ if burst && n > 0 => {}
+                InputEvent::Key(_) if burst => self.predictor.new_user_other(screen),
                 InputEvent::Key(key) => {
                     // At a fresh prompt the modes the client holds may be from before the program
                     // turned echo off: the key shows only once echoed.
@@ -861,19 +893,6 @@ impl ClientSession {
     }
 }
 
-/// Whether an event of `cost` bytes fits in a queued `Keys` message holding `queued`, beside the
-/// message's variant, sequence number and count.
-fn fits(queued: &[InputEvent], cost: usize) -> bool {
-    const ENVELOPE: usize = 16;
-    queued.len() < MAX_EVENTS
-        && queued
-            .iter()
-            .map(InputEvent::encoded_len)
-            .fold(ENVELOPE, usize::saturating_add)
-            .saturating_add(cost)
-            <= MAX_CLIENT_MESSAGE
-}
-
 /// What the server gets for one decoded input.
 fn events_of(input: Input, out: &mut Vec<InputEvent>) {
     match input {
@@ -896,10 +915,7 @@ mod tests {
 
     fn start() -> (Instant, ClientSession) {
         let now = Instant::now();
-        (
-            now,
-            ClientSession::new(DisplayPreference::Always, Size::new(24, 80)),
-        )
+        (now, ClientSession::new(Size::new(24, 80)))
     }
 
     /// A key's legacy bytes, in normal cursor mode.
@@ -1008,7 +1024,7 @@ mod tests {
     #[test]
     fn input_is_numbered_in_order_and_a_paste_goes_whole() {
         let now = Instant::now();
-        let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
+        let mut s = ClientSession::new(Size::new(24, 80));
         let paste: Vec<u8> = (0..200_000u32).map(|i| b'a' + (i % 26) as u8).collect();
         s.on_input(now, b"first");
         // A paste, bracketed by the terminal, goes whole; keys typed unbracketed, as events.
@@ -1063,7 +1079,7 @@ mod tests {
     fn typing_past_the_queue_limit_is_dropped_and_reported_until_it_drains() {
         // Queueing, not prediction, is under test.
         let now = Instant::now();
-        let mut s = ClientSession::new(DisplayPreference::Never, Size::new(24, 80));
+        let mut s = ClientSession::new(Size::new(24, 80));
         // An empty queue takes a whole paste of the most a paste may be, as a terminal sends it.
         let paste = [&b"\x1b[200~"[..], &vec![b'z'; MAX_PASTE], b"\x1b[201~"].concat();
         s.on_input(now, &paste);
@@ -1077,6 +1093,22 @@ mod tests {
             s.on_tick(now, None).status.is_none(),
             "draining clears the banner"
         );
+    }
+
+    #[test]
+    fn a_burst_of_keys_in_one_read_is_sent_but_not_predicted() {
+        // A person types a key or a few between two reads; a burst is a paste or a program
+        // writing to the terminal, and predicting it key by key costs a screenful each.
+        let (now, mut s) = start();
+        drain(&mut s);
+        s.predictor.confirm_for_tests();
+        let burst = vec![b'y'; TYPED_KEYS + 1];
+        s.on_input(now, &burst);
+        assert!(s.overlay().is_empty(), "a burst is not predicted");
+        s.predictor.confirm_for_tests();
+        s.on_input(now, b"x");
+        assert!(!s.overlay().is_empty(), "a typed key is");
+        assert_eq!(typed(&drain(&mut s)), [burst.as_slice(), b"x"].concat());
     }
 
     #[test]
@@ -1690,7 +1722,7 @@ mod tests {
             line: true,
         });
         let t0 = Instant::now();
-        let mut s = ClientSession::new(DisplayPreference::Always, Size::new(24, 80));
+        let mut s = ClientSession::new(Size::new(24, 80));
         let mut server = ServerTerminal::new(24, 80, 0).expect("emulator");
         server.set_tty(echoing);
         server.process(b"$ ");

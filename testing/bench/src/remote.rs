@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
 use koh::client::{run_client, BackendTerminal, ClientTerminal, IrohConnector, KohBackend};
-use koh::predict::{DisplayPreference, Overlay};
+use koh::predict::Overlay;
 use koh::pty::{Launcher, Pty};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::terminal::{Size, TerminalScreen};
@@ -365,7 +365,6 @@ impl Remote {
             channel,
             std::time::SystemTime::now(),
             connector,
-            DisplayPreference::Always,
             start,
             None,
             input_rx,

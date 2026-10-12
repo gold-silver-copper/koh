@@ -1,9 +1,9 @@
 diff --git i/src/client/session.rs w/src/client/session.rs
-index fbb282e..331bad1 100644
+index 677626e..da12354 100644
 --- i/src/client/session.rs
 +++ w/src/client/session.rs
-@@ -669,6 +669,8 @@ fn fits(queued: &[InputEvent], len: usize) -> bool {
- /// program's bracket), in pieces of at most [`MAX_PASTE_PIECE`] bytes split between characters.
+@@ -896,6 +896,8 @@ impl ClientSession {
+ /// What the server gets for one decoded input.
  fn events_of(input: Input, out: &mut Vec<InputEvent>) {
      match input {
 +        // PLANTED: Backspace is never sent.

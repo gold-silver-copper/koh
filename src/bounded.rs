@@ -58,14 +58,6 @@ impl<T, const N: usize> Bounded<T, N> {
         self.0.push_back(item);
     }
 
-    /// Add `item` at the front, dropping the newest to make room.
-    pub fn push_front_evicting(&mut self, item: T) {
-        if self.is_full() {
-            self.0.pop_back();
-        }
-        self.0.push_front(item);
-    }
-
     pub fn pop_front(&mut self) -> Option<T> {
         self.0.pop_front()
     }

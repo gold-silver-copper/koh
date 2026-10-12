@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
-use koh::predict::{DisplayPreference, Overlay};
+use koh::predict::Overlay;
 use koh::proto::{
     decode_server, encode_client, encode_frame, ClientDecoder, ClientMsg, Frame, FrameNum,
     InputSeq, ServerMsg,
@@ -232,7 +232,7 @@ impl Session {
             hold: FrameHold::default(),
             frame_start: None,
             now: Instant::now(),
-            client: ClientSession::new(DisplayPreference::Never, size),
+            client: ClientSession::new(size),
             terminal: {
                 // The user's terminal draws underline styles, as the one reading the paint does.
                 let mut terminal =
@@ -572,7 +572,7 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
     let size = Size::new(recording.rows, recording.cols);
     let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK)
         .map_err(|e| e.to_string())?;
-    let mut client = ClientSession::new(DisplayPreference::Always, size);
+    let mut client = ClientSession::new(size);
     let mut sent = TerminalScreen::default();
     let mut num = FrameNum::BLANK;
     let mut typed = InputSeq::default();
@@ -751,7 +751,7 @@ fn the_corpus_keys_reach_each_program_as_it_read_them() {
         let size = Size::new(recording.rows, recording.cols);
         let mut server =
             ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK).expect("emulator");
-        let mut client = ClientSession::new(DisplayPreference::Never, size);
+        let mut client = ClientSession::new(size);
         let mut wire = ClientDecoder::default();
         let now = Instant::now();
         for (index, (step, output)) in recording.outputs().enumerate() {

@@ -682,27 +682,6 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
     })
 }
 
-/// A program that exits with a background job still holding its terminal ends the session: the
-/// job keeps the PTY's output from ending, so the exit is found by waiting for the program.
-#[test]
-fn a_program_that_exits_leaving_a_job_on_its_terminal_ends_the_session() -> anyhow::Result<()> {
-    runtime()?.block_on(async {
-        let reg = registry(
-            &["sh", "-c", "sleep 30 & exit 3"],
-            4,
-            Duration::from_secs(30),
-        );
-        let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
-        let exited = await_exit(&mut client).await;
-        let code = client.screen().exit_code();
-        drop(client);
-        reg.shutdown().await;
-        exited?;
-        anyhow::ensure!(code == Some(3), "the program's status: {code:?}");
-        Ok(())
-    })
-}
-
 /// A program that cannot start is not reported as the server being full.
 #[test]
 fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {

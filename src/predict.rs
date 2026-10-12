@@ -72,15 +72,6 @@ pub trait ScreenView {
     fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>>;
 }
 
-/// When predictions are drawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DisplayPreference {
-    /// Always render predictions.
-    Always,
-    /// Never predict (the plain, non-speculative path).
-    Never,
-}
-
 /// A speculative cell for the renderer to draw, as is, on top of the authoritative grid.
 ///
 /// Only concrete guesses become one: a cell the predictor knows changed but not to what is left
@@ -223,7 +214,6 @@ enum Validity {
 /// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) and [`cull`](Self::cull) on a
 /// frame; [`overlay`](Self::overlay) to render.
 pub struct PredictionEngine {
-    pref: DisplayPreference,
     cells: BTreeMap<(u16, u16), PredCell>,
     cursor: Option<PredCursor>,
     prediction_epoch: u64,
@@ -246,11 +236,10 @@ pub struct PredictionEngine {
     fresh_line: bool,
 }
 
-impl PredictionEngine {
-    /// A predictor displaying per `pref`.
-    pub fn new(pref: DisplayPreference) -> Self {
+impl Default for PredictionEngine {
+    /// A predictor that has seen nothing.
+    fn default() -> Self {
         Self {
-            pref,
             cells: BTreeMap::new(),
             cursor: None,
             // One epoch ahead of the confirmed one, so the first keystroke stays hidden until the
@@ -267,17 +256,20 @@ impl PredictionEngine {
             fresh_line: false,
         }
     }
+}
 
-    /// A fresh engine for a reconnect to the same session: the same preference, and, if typing
-    /// was being shown as it was predicted (or trust was carried here and not yet given), trust
+impl PredictionEngine {
+    /// A fresh engine for a reconnect to the same session: if typing was being shown as it was
+    /// predicted (or trust was carried here and not yet given), trust
     /// from the first key once a frame shows the PTY is not at a password prompt
     /// ([`set_tty`](Self::set_tty)). Taken once, at an outage's first drop, the trust is the
     /// drop's: nothing until the next frame confirms an epoch, so nothing typed then can add to it.
     #[must_use]
     pub fn reattached(&self) -> Self {
-        let mut fresh = Self::new(self.pref);
-        fresh.carried = self.carried || self.prediction_epoch == self.confirmed_epoch;
-        fresh
+        Self {
+            carried: self.carried || self.prediction_epoch == self.confirmed_epoch,
+            ..Self::default()
+        }
     }
 
     /// How the program's PTY takes typed keys, as a frame said.
@@ -760,9 +752,6 @@ impl PredictionEngine {
     /// The key is read as what it is, whatever the user's terminal sent for it: `Alt-B` from a
     /// kitty-protocol terminal is a legacy one's, and a control is its letter with Ctrl.
     pub fn new_user_key(&mut self, press: KeyPress, screen: &dyn ScreenView) {
-        if self.pref == DisplayPreference::Never {
-            return;
-        }
         if self.password() {
             // Nothing typed at a password prompt is predicted, nor shown.
             self.become_tentative();
@@ -838,9 +827,6 @@ impl PredictionEngine {
     /// Input the predictor does not model reached the program (a mouse event, a focus change, a
     /// paste): what it shows next is unknown.
     pub fn new_user_other(&mut self, screen: &dyn ScreenView) {
-        if self.pref == DisplayPreference::Never {
-            return;
-        }
         if self.password() {
             self.become_tentative();
             return;
@@ -953,9 +939,6 @@ impl PredictionEngine {
     }
 
     pub fn cull(&mut self, screen: &dyn ScreenView) {
-        if self.pref == DisplayPreference::Never {
-            return;
-        }
         let size = screen.size();
         // Reset predictions on a genuine resize, but not on the very first cull.
         if let Some(prev) = self.last_size {
@@ -1055,7 +1038,7 @@ impl PredictionEngine {
 
     /// What to draw now: the predictions in confirmed epochs, unless predictions are off.
     pub fn overlay(&self) -> Overlay<'_> {
-        if self.pref == DisplayPreference::Never || self.password() {
+        if self.password() {
             return Overlay::empty();
         }
         let mut ov = Overlay::empty();
@@ -1253,7 +1236,7 @@ mod tests {
             rows: vec![vec![' '; 10]; 5],
             cursor: (0, 0),
         };
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         e.type_bytes(b"x", &blank);
         assert!(e.overlay().is_empty(), "hidden until confirmed");
@@ -1285,10 +1268,10 @@ mod tests {
             bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
         ) {
             let fake = FakeView { rows: vec![vec![' '; 80]; 24], cursor: (0, 0) };
-            let mut pf = PredictionEngine::new(DisplayPreference::Always);
+            let mut pf = PredictionEngine::default();
             pf.set_local_frame_sent(0);
             pf.type_bytes(&bytes, &fake);
-            let mut pe = PredictionEngine::new(DisplayPreference::Always);
+            let mut pe = PredictionEngine::default();
             pe.set_local_frame_sent(0);
             pe.type_bytes(&bytes, &screen_of(b"ready prompt $ "));
             let _ = pe.overlay();
@@ -1308,9 +1291,11 @@ mod tests {
             start in 0u16..12,
         ) {
             let screen = sized_screen_of(3, 12, format!("本x日 ab本\x1b[1;{}H", start.saturating_add(1)).as_bytes());
-            let mut e = PredictionEngine::new(DisplayPreference::Always);
             // Everything shown: the check is on what the overlay holds, not on when it confirms.
-            e.confirmed_epoch = u64::MAX;
+            let mut e = PredictionEngine {
+                confirmed_epoch: u64::MAX,
+                ..PredictionEngine::default()
+            };
             e.set_local_frame_sent(0);
             for key in bytes {
                 e.type_bytes(key, &screen);
@@ -1338,7 +1323,7 @@ mod tests {
     /// and ack frame 1, cull (advancing `confirmed_epoch`). Returns the engine ready for
     /// subsequent typing to be *visible*.
     fn confirm_first_keystroke() -> (PredictionEngine, Screen) {
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
         e.type_bytes(b"x", &blank);
@@ -1356,7 +1341,7 @@ mod tests {
     fn predictions_hidden_until_server_confirms_echo() {
         // P0 (security): a secret typed before ANY server confirmation must never be drawn,
         // even with Display::Always.
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
         e.type_bytes(b"hunter2", &blank);
@@ -1383,7 +1368,7 @@ mod tests {
     #[test]
     fn no_echo_keeps_secret_hidden_and_cleans_up() {
         // Password-prompt style: the server never echoes -> never shown, then culled away.
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
         e.type_bytes(b"s", &blank);
@@ -1399,19 +1384,11 @@ mod tests {
     }
 
     #[test]
-    fn never_mode_predicts_nothing() {
-        let mut e = PredictionEngine::new(DisplayPreference::Never);
-        let screen = screen_of(b"");
-        e.type_bytes(b"x", &screen);
-        assert!(e.overlay().is_empty());
-    }
-
-    #[test]
     fn insert_mode_shifts_row_right() {
         // Screen "ab" with the cursor on 'b' (col 1). Typing 'X' should INSERT before 'b',
         // shifting the tail right — not overwrite 'b'. (Inspect predicted cells directly; the
         // epoch gate hides them from overlay() until confirmed, but the shift populates cells.)
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         let screen = screen_of(b"ab\x1b[1;2H"); // cursor -> row1 col2 = (0,1)
         e.type_bytes(b"X", &screen);
@@ -1432,7 +1409,7 @@ mod tests {
         // Screen "abc" cursor on 'c' (col 2). Backspace deletes 'b': 'c' shifts left to col 1,
         // and the last TWO columns become unknown (content scrolled in from off-screen; mosh marks
         // the cell unknown when `i + 2 >= width`, so both edge columns, not just the last one).
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         let screen = screen_of(b"abc\x1b[1;3H"); // cursor -> (0,2)
         e.type_bytes(&[0x7f], &screen); // backspace
@@ -1463,7 +1440,7 @@ mod tests {
         // u16 (panics under debug overflow-checks). The `i < cols - 2` form must not.
         let p = fux_vt::Parser::new(fux_vt::Size::new(1, u16::MAX).expect("nonzero size"), 0)
             .expect("1-row parser");
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         // Predicted cursor near the right edge so the backspace runs its left-shift loop out to the
         // final column (where the overflow would occur).
@@ -1490,7 +1467,7 @@ mod tests {
         // mosh "match rest of row to the actual renditions": when a predicted cell confirms with a
         // concrete on-screen color, the still-pending predicted cells to its right adopt that color
         // (so they don't flash a guessed rendition before their own frame confirms).
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         // Confirm an initial keystroke so later predictions are in a shown epoch.
         let blank = screen_of(b"");
@@ -1530,9 +1507,11 @@ mod tests {
         // the real screen position so a *confirmed-but-stale* predicted cursor — one that would
         // otherwise keep being drawn at a position the killed predictions had moved it to — is
         // displaced. Built from raw state to isolate exactly that condition.
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
-        e.confirmed_epoch = 1;
-        e.prediction_epoch = 2;
+        let mut e = PredictionEngine {
+            confirmed_epoch: 1,
+            prediction_epoch: 2,
+            ..PredictionEngine::default()
+        };
         e.set_local_frame_sent(5);
         e.set_local_frame_late_acked(5);
         // A CONFIRMED (epoch 1 <= confirmed 1) cursor at a stale column, still Pending (expiration
@@ -1658,7 +1637,7 @@ mod tests {
 
     #[test]
     fn inserting_before_a_wide_glyph_moves_it_whole() {
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         let screen = screen_of("a本b\x1b[1;1H".as_bytes());
         e.type_bytes(b"X", &screen);
@@ -1671,14 +1650,14 @@ mod tests {
     #[test]
     fn a_wide_glyph_split_by_a_shift_is_unknown() {
         // Pushed to the edge, its right half would leave the screen.
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         let screen = sized_screen_of(2, 6, "abc本\x1b[1;1H".as_bytes());
         e.type_bytes(b"X", &screen);
         assert_eq!(predicted_at(&e, 4).as_deref(), Some("U"), "its glyph");
         assert_eq!(predicted_at(&e, 5).as_deref(), Some("U"), "its right half");
         // Typed inside one, its halves part.
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         let screen = screen_of("本x\x1b[1;2H".as_bytes());
         e.type_bytes(b"a", &screen);
@@ -1689,7 +1668,7 @@ mod tests {
             "the moved right half"
         );
         // Deleting before one moves it left, whole.
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         e.set_local_frame_sent(0);
         let screen = screen_of("ab本c\x1b[1;3H".as_bytes());
         e.type_bytes(&[0x7f], &screen);
@@ -1791,7 +1770,7 @@ mod tests {
 
     /// A predictor trusted at a line editor (no kernel echo, no line mode), on `bytes`' screen.
     fn editor_on(bytes: &[u8]) -> (PredictionEngine, Screen) {
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         let screen = screen_of(bytes);
         e.carried = true;
         e.set_tty(Some(TtyModes {
@@ -1915,8 +1894,10 @@ mod tests {
         assert!(e.overlay().is_empty());
         assert!(e.cells.is_empty(), "nothing even kept");
         // Carried trust is not given at one either.
-        let mut fresh = PredictionEngine::new(DisplayPreference::Always);
-        fresh.carried = true;
+        let mut fresh = PredictionEngine {
+            carried: true,
+            ..PredictionEngine::default()
+        };
         fresh.set_tty(Some(TtyModes {
             echo: false,
             line: true,
@@ -1927,7 +1908,7 @@ mod tests {
 
     #[test]
     fn kernel_echo_is_trusted_from_the_first_key() {
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         let screen = screen_of(b"");
         e.set_tty(Some(TtyModes {
             echo: true,
@@ -1936,7 +1917,7 @@ mod tests {
         type_keys(&mut e, &screen, b"hi");
         assert_eq!(shown_row(&e, &screen), ("hi".to_owned(), Some(2)));
         // Without echo known, the first key waits for the server, as before.
-        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        let mut e = PredictionEngine::default();
         type_keys(&mut e, &screen, b"hi");
         assert!(e.overlay().is_empty());
     }

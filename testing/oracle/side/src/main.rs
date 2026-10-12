@@ -31,7 +31,6 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
-use koh::predict::DisplayPreference;
 use koh::proto::{decode_frame, encode_frame, ClientMsg, Frame, FrameNum, InputSeq};
 use koh::terminal::{ServerTerminal, Size, TerminalScreen};
 
@@ -103,7 +102,10 @@ impl Session {
         });
         Ok(Self {
             server: ServerTerminal::new(rows, cols, SCROLLBACK).map_err(|e| e.to_string())?,
-            client: ClientSession::new(DisplayPreference::Always, size),
+            #[cfg(koh_display_preference)]
+            client: ClientSession::new(koh::predict::DisplayPreference::Always, size),
+            #[cfg(not(koh_display_preference))]
+            client: ClientSession::new(size),
             terminal,
             capture,
             base: (FrameNum::BLANK, TerminalScreen::default()),

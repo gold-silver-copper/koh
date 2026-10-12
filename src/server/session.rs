@@ -216,7 +216,7 @@ struct Attach(oneshot::Sender<Attached>);
 /// How many attaches may wait for one session; past them, one is refused as at capacity.
 const CONTROL_QUEUE: usize = 8;
 
-/// How long after the program exited, or its PTY's output ended, the session waits for the other.
+/// How long after the program's output ended the session waits to see it exit.
 const ENDING_GRACE: Duration = Duration::from_secs(1);
 
 /// Start a session for `spec`, answering `first` once its program started: the sender that
@@ -257,17 +257,6 @@ fn start(
     (control, task)
 }
 
-/// Hand `take` up to `limit` items `rx` already holds, without waiting, as they come off the
-/// channel. An end of the channel is left for the next `recv` to report.
-fn take_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize, mut take: impl FnMut(T)) {
-    for _ in 0..limit {
-        let Ok(item) = rx.try_recv() else {
-            break;
-        };
-        take(item);
-    }
-}
-
 /// Wait until `deadline`, or forever if there is none.
 async fn until(deadline: Option<Instant>) {
     match deadline {
@@ -288,40 +277,13 @@ enum Phase {
     Exited,
 }
 
-/// What has been seen of the program's end: its exit, and its PTY's output ending, which a
-/// background job holding the PTY can put off for good, or a program closing its terminal can
-/// bring first. Both, or either for [`ENDING_GRACE`], end the session.
-#[derive(Default)]
-struct Ending {
-    exit: Option<crate::pty::Exit>,
-    eof: bool,
-    since: Option<Instant>,
-}
-
-impl Ending {
-    /// Look for the program's exit; `eof` if its output ended.
-    fn look(&mut self, host: &mut PtyHost, eof: bool) {
-        self.eof |= eof;
-        if self.exit.is_none() {
-            match host.pty.try_wait() {
-                Ok(exit) => self.exit = exit,
-                Err(error) => tracing::warn!(%error, "waiting for the session's program failed"),
-            }
-        }
-        if self.eof || self.exit.is_some() {
-            self.since.get_or_insert_with(Instant::now);
-        }
-    }
-
-    /// When the session ends whatever else is seen.
-    fn deadline(&self) -> Option<Instant> {
-        self.since?.checked_add(ENDING_GRACE)
-    }
-
-    /// Whether the session ends now.
-    fn over(&self) -> bool {
-        (self.eof && self.exit.is_some()) || self.deadline().is_some_and(|at| Instant::now() >= at)
-    }
+/// The program's exit, if it has exited: reaped then.
+fn exit_of(host: &mut PtyHost) -> Option<crate::pty::Exit> {
+    host.pty
+        .try_wait()
+        .map_err(|error| tracing::warn!(%error, "waiting for the session's program failed"))
+        .ok()
+        .flatten()
 }
 
 /// Run one session until its program exits and its client leaves, or its detach TTL expires.
@@ -338,7 +300,10 @@ async fn session_task(
     // The first client is attached, from `start`.
     let mut phase = Phase::Attached;
     let mut pending = PendingInput::default();
-    let mut ending = Ending::default();
+    // When the program's output ended, and its exit once seen: it is looked for at every tick, for
+    // at most `ENDING_GRACE`, never waited on, as a program that closed its terminal may run on.
+    let mut ended: Option<Instant> = None;
+    let mut exit: Option<crate::pty::Exit> = None;
 
     // A frame the program is drawing (synchronized output) is not sent half drawn.
     let mut hold = FrameHold::default();
@@ -347,10 +312,13 @@ async fn session_task(
     tty_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
-        if !matches!(phase, Phase::Exited) && ending.over() {
+        let grace_over = ended
+            .and_then(|at| at.checked_add(ENDING_GRACE))
+            .is_some_and(|at| Instant::now() >= at);
+        if !matches!(phase, Phase::Exited) && ended.is_some() && (exit.is_some() || grace_over) {
             // The program ended: publish a final screen carrying its status, whole even if it
             // stopped mid-frame.
-            if let Some(exit) = ending.exit {
+            if let Some(exit) = exit {
                 host.emu.set_exit_code(exit.code);
             }
             phase = Phase::Exited;
@@ -362,13 +330,15 @@ async fn session_task(
         let running = !matches!(phase, Phase::Exited);
 
         tokio::select! {
-            chunk = pty_rx.recv(), if running && !ending.eof => {
+            chunk = pty_rx.recv(), if running && ended.is_none() => {
                 if let Some(chunk) = chunk {
                     host.refresh_tty();
                     host.emu.process(&chunk);
-                    take_ready(&mut pty_rx, OUTPUT_CHUNKS_PER_SNAPSHOT, |more| {
+                    // What is already read, without waiting; the channel's end is left for `recv`.
+                    for _ in 0..OUTPUT_CHUNKS_PER_SNAPSHOT {
+                        let Ok(more) = pty_rx.try_recv() else { break };
                         host.emu.process(&more);
-                    });
+                    }
                     let replies = host.emu.take_host_replies();
                     if !replies.is_empty() {
                         // Query answers go to the program, not the screen.
@@ -379,7 +349,8 @@ async fn session_task(
                         screens_tx.send_replace(Arc::new(screen));
                     }
                 } else {
-                    ending.look(&mut host, true);
+                    ended = Some(Instant::now());
+                    exit = exit_of(&mut host);
                 }
             },
             _ = until(hold.deadline().map(Instant::from_std)) => {
@@ -387,7 +358,7 @@ async fn session_task(
                     screens_tx.send_replace(Arc::new(screen));
                 }
             },
-            () = until(ending.deadline()), if running => {}
+            () = until(ended.and_then(|at| at.checked_add(ENDING_GRACE))), if running => {}
             input = input_rx.recv(), if can_read_input => {
                 // `input_tx` is held below, so this only ends with the task.
                 match input {
@@ -459,11 +430,12 @@ async fn session_task(
                 Phase::Detached { .. } => {}
             },
             _ = pending_input_retry(!pending.is_empty()) => {}
-            // The program may exit with a background job still holding its PTY; and it may turn
-            // echo off without writing anything (a password prompt printed first), which the
-            // client hears of within a tick.
+            // A program may turn echo off without writing anything (a password prompt printed
+            // first): the client hears of it within a tick.
             _ = tty_tick.tick(), if running => {
-                ending.look(&mut host, false);
+                if ended.is_some() && exit.is_none() {
+                    exit = exit_of(&mut host);
+                }
                 if matches!(phase, Phase::Attached) && host.refresh_tty() && !hold.holding() {
                     screens_tx.send_replace(Arc::new(host.snapshot()));
                 }
@@ -577,8 +549,7 @@ async fn registry_task(
 
 #[cfg(test)]
 mod tests {
-    use super::{take_ready, PendingInput, OUTPUT_CHUNKS_PER_SNAPSHOT};
-    use tokio::sync::mpsc;
+    use super::PendingInput;
 
     #[test]
     fn replies_wait_behind_input_and_overflow_is_bounded() {
@@ -617,31 +588,5 @@ mod tests {
             pending.is_empty(),
             "closed writers do not retain pending input"
         );
-    }
-
-    #[test]
-    fn a_burst_of_output_is_taken_in_bounded_batches_and_the_end_is_left_for_recv() {
-        let (tx, mut rx) = mpsc::channel::<usize>(512);
-        for n in 0..100 {
-            tx.try_send(n).unwrap();
-        }
-        let taken = |rx: &mut mpsc::Receiver<usize>| {
-            let mut taken = Vec::new();
-            take_ready(rx, OUTPUT_CHUNKS_PER_SNAPSHOT, |n| taken.push(n));
-            taken
-        };
-        assert_eq!(
-            taken(&mut rx),
-            (0..OUTPUT_CHUNKS_PER_SNAPSHOT).collect::<Vec<_>>()
-        );
-        drop(tx);
-        assert_eq!(
-            taken(&mut rx),
-            (OUTPUT_CHUNKS_PER_SNAPSHOT..100).collect::<Vec<_>>()
-        );
-        // The channel's end is not swallowed: the session loop's `recv` still sees it and reaps
-        // the program.
-        assert_eq!(taken(&mut rx), Vec::<usize>::new());
-        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
     }
 }

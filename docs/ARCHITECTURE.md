@@ -245,8 +245,8 @@ seeding, input queueing), `on_frame`, `on_resize` and `on_tick` (the link-down a
 banners), with the outgoing messages taken from a queue. The server's **`ServerConn`**
 (`server/mod.rs`) decodes the client's stream, tracks the echo-ack, and decides which frame to
 send against which base. None of it touches tokio, iroh or a terminal, and time is an argument, so
-both are deterministically unit-testable. The shells own the `tokio::select!` (the client's kept
-`biased` for input priority), a writer task for the client's stream, a task per frame stream, and
+both are deterministically unit-testable. The shells own the `tokio::select!` (unbiased, so a flood of
+keystrokes or of frames starves neither), a writer task for the client's stream, a task per frame stream, and
 the rendering.
 
 On the server side, **PTY writes are non-blocking**: a dedicated `koh-pty-writer` thread drains a
@@ -260,9 +260,9 @@ so a query reply can't overtake the keystroke that triggered it.
 
 **A session's lifecycle.** The registry never waits on a session: a new one forks and execs its
 program on a blocking worker and answers the attach itself, so one slow start holds up no other
-peer, and a program that cannot start is refused as such, not as a full server. A session ends
-when its program has exited and its PTY's output has ended, or one of them a second after the
-other: a background job left holding the terminal cannot keep a dead shell's session open. The
+peer, and a program that cannot start is refused as such, not as a full server. Once the PTY's
+output ends, the session looks for its program's exit at each tick for up to a second, never
+waiting on it. The
 program (`pty::Running`) is the only holder of its pid; teardown hangs it up and hands it to a
 reaper thread, which kills it only if it outlives a second's grace, so a shell saves its history.
 
@@ -320,12 +320,12 @@ predicted until the server has reflected it (`PredictionEngine::hold`). Kernel e
 from the first key otherwise. Otherwise (a line editor, a full-screen program) the epoch logic decides: the first key
 of an epoch stays hidden until the server's echo confirms it, and a mispredict kills its epoch. A
 reconnect to the same session carries the trust it had, given once the first frame shows no
-password prompt. Prediction is **always on** in koh (`DisplayPreference::
-Always`), so keystrokes engage on every link. Predictions are drawn plain, not underlined,
+password prompt. Prediction is **always on** in koh, so keystrokes engage on every link. Predictions are drawn plain, not underlined,
 and a cell it knows changed but not to what is not drawn at all, so the real cell shows.
 
 The port faithfully implements epoch-gated confirmation and no-echo suppression. It predicts
-decoded keys, whatever bytes the user's terminal sent for them: ASCII printables (with insert-mode
+typed keys, whatever bytes the user's terminal sent for them (more than 32 in one read are a
+paste or a program writing to the terminal, not typing, and are not predicted): ASCII printables (with insert-mode
 row shift), backspace, Enter, the left/right arrow keys (not under kernel echo, which echoes them
 as `^[[D`), the line
 editor's keys where the guess is sure (`Ctrl-W` and `Alt-Backspace` back to a word's boundary,
@@ -512,8 +512,6 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   table past what its tests hold at once: an open that finds the table full while another PTY is
   being freed fails with ENXIO (the table grows 16 slots at a time and never shrinks), which its
   many short-lived PTYs hit on a fresh machine.
-- **`tests/e2e_loopback.rs`** — the whole loop over loopback: scripted keystroke → client → iroh →
-  server → PTY-hosted `sh` → fux-vt → iroh → client render.
 - **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** attached to an allocated PTY (so
   `isatty()` is true and raw mode runs for real), driven by scripted keystrokes with rendered
   frames read back from the master, connected with `--direct` to an in-process server; the

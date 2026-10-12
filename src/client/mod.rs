@@ -16,12 +16,12 @@ mod session;
 pub use backend::{DefaultBackend, KohBackend};
 pub use cli::{connect, BellHook, ConnectConfig};
 pub(crate) use io::spawn_client_io;
-pub use render::{InputModes, WindowState};
+pub use render::WindowState;
 pub use session::{ClientSession, InputOutcome, TickResult};
 
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::predict::{DisplayPreference, Overlay};
+use crate::predict::Overlay;
 use crate::proto::{decode_server, encode_client, ServerMsg, MAX_FRAME, SESSION_ENDED};
 use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::ALPN;
@@ -324,7 +324,7 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
     ) -> std::io::Result<()> {
         self.oob.emit(
             &mut self.backend,
-            InputModes::from(state.screen()),
+            state.screen().modes().mouse_mode,
             window_state(state),
         )?;
         self.painter
@@ -395,7 +395,7 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
 /// Returns the remote shell's exit code if it exited, `None` on a local quit.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the I/O shell wires up the connection, connector, prediction policy, size, the \
+    reason = "the I/O shell wires up the connection, connector, size, the \
               terminal's colours, the two input/resize channels, the terminal, the shutdown token and the bell hook — each a distinct \
               collaborator; bundling them into a struct would only move the list, not shorten it"
 )]
@@ -403,7 +403,6 @@ pub async fn run_client<T: ClientTerminal>(
     initial: Connection,
     dialed_at: SystemTime,
     connector: IrohConnector,
-    pref: DisplayPreference,
     initial_size: Size,
     colours: Option<crate::events::WireColours>,
     mut input_rx: mpsc::Receiver<Vec<u8>>,
@@ -412,7 +411,7 @@ pub async fn run_client<T: ClientTerminal>(
     shutdown: CancellationToken,
     mut bell: Option<BellHook>,
 ) -> anyhow::Result<Option<u32>> {
-    let mut session = ClientSession::new(pref, term.size().unwrap_or(initial_size));
+    let mut session = ClientSession::new(term.size().unwrap_or(initial_size));
     session.set_colours(colours);
     // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
     let mut attempt: u32 = 0;
@@ -488,9 +487,7 @@ pub async fn run_client<T: ClientTerminal>(
             Net::Down(dial) => (None, None, Some(dial)),
         };
         let change = tokio::select! {
-            // Keystrokes first: queued screen updates must never starve them.
-            biased;
-
+            // Not biased: a flood of keystrokes must not starve frames, nor frames keystrokes.
             maybe = input_rx.recv() => match maybe {
                 Some(chunk) => {
                     let outcome = session.on_input(Instant::now(), &chunk);
@@ -517,7 +514,6 @@ pub async fn run_client<T: ClientTerminal>(
                     None
                 }
             },
-            // Before frames, which may never run out.
             maybe = resize_rx.recv() => {
                 if maybe.is_some() {
                     term.window_resized();
@@ -899,47 +895,6 @@ mod tests {
         // ...but a multi-second-to-minutes suspend (phone screen-off) forces a proactive reconnect.
         assert!(looks_like_resume_from_freeze(STALE_AFTER_FREEZE));
         assert!(looks_like_resume_from_freeze(Duration::from_secs(300)));
-    }
-
-    #[test]
-    fn backend_terminal_render_through_the_trait_matches_render_directly() {
-        // `ClientTerminal` for `BackendTerminal` is a pure delegation —
-        // the bytes are identical to calling the out-of-band ledger and `render::render` by hand.
-        use crate::client::backend::CaptureBackend;
-        let screen = TerminalScreen::from_bytes(
-            24,
-            80,
-            b"\x1b]2;the title\x1b\\\x1b[?2004hhello \x1b[31mred\x1b[m\x07",
-        );
-        // Through the trait.
-        let mut via_trait = BackendTerminal {
-            backend: CaptureBackend::default(),
-            oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string()),
-            painter: render::Painter::default(),
-            extras: Extras::default(),
-        };
-        via_trait
-            .render(&screen, &Overlay::empty(), Some("status"))
-            .unwrap();
-        // By hand.
-        let mut direct = CaptureBackend::default();
-        let mut oob = render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string());
-        oob.emit(
-            &mut direct,
-            InputModes::from(screen.screen()),
-            window_state(&screen),
-        )
-        .unwrap();
-        render::Painter::default()
-            .render(
-                &mut direct,
-                screen.screen(),
-                &Overlay::empty(),
-                Some("status"),
-            )
-            .unwrap();
-        assert_eq!(via_trait.backend.bytes, direct.bytes);
-        assert_ne!(via_trait.backend.bytes, b"");
     }
 
     /// What the client turns on in the user's terminal it turns off again, popping its push: on

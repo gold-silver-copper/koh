@@ -12,7 +12,6 @@ use tokio::signal::unix::SignalKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
-use crate::predict::DisplayPreference;
 use crate::transport_iroh::{
     bind_endpoint, bind_endpoint_local, bind_endpoint_with_relay, direct_addr, relay_addr,
 };
@@ -346,7 +345,6 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
             channel,
             dialed_at,
             connector,
-            DisplayPreference::Always,
             size,
             colours,
             input_rx,

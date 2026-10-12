@@ -468,6 +468,20 @@ mod tests {
         CellKind, CellText, ServerTerminal, Size, WireCell, WireColor, WireStyle, MAX_ROW_LINKS,
     };
 
+    /// Request 0: at most `count` rows up to `newest`.
+    const fn ask(newest: u64, count: u16) -> HistoryRequest {
+        HistoryRequest {
+            id: 0,
+            newest,
+            count,
+        }
+    }
+
+    /// The reply to request 0 holding `rows`.
+    fn reply(rows: Vec<HistoryRow>) -> HistoryReply {
+        HistoryReply { id: 0, rows }
+    }
+
     fn lines(emu: &mut ServerTerminal, from: usize, to: usize) {
         for n in from..to {
             emu.process(format!("line {n}\r\n").as_bytes());
@@ -496,11 +510,7 @@ mod tests {
         lines(&mut emu, 10, 13);
         let later = emu.snapshot().history();
         assert_eq!((later.newest - mark.newest, later.len), (3, 10));
-        let reply = emu.history(HistoryRequest {
-            id: 0,
-            newest: later.newest,
-            count: 10,
-        });
+        let reply = emu.history(ask(later.newest, 10));
         let texts: Vec<String> = reply.rows.iter().map(text).collect();
         assert_eq!(
             texts,
@@ -515,33 +525,26 @@ mod tests {
         let mut emu = ServerTerminal::new(4, 20, 1000).unwrap();
         lines(&mut emu, 0, 600);
         let mark = emu.snapshot().history();
-        let ask = |emu: &mut ServerTerminal, newest, count| {
-            emu.history(HistoryRequest {
-                id: 0,
-                newest,
-                count,
-            })
-            .rows
-            .len()
-        };
+        let rows =
+            |emu: &mut ServerTerminal, newest, count| emu.history(ask(newest, count)).rows.len();
         assert_eq!(
-            ask(&mut emu, mark.newest, u16::MAX),
+            rows(&mut emu, mark.newest, u16::MAX),
             usize::from(MAX_HISTORY_ROWS)
         );
-        assert_eq!(ask(&mut emu, mark.newest, 0), 0);
+        assert_eq!(rows(&mut emu, mark.newest, 0), 0);
         assert_eq!(
-            ask(&mut emu, mark.newest.saturating_add(1), 5),
+            rows(&mut emu, mark.newest.saturating_add(1), 5),
             0,
             "not yet named"
         );
-        assert_eq!(ask(&mut emu, 0, 5), 0, "never named");
+        assert_eq!(rows(&mut emu, 0, 5), 0, "never named");
         let oldest = mark.oldest().unwrap();
         assert_eq!(
-            ask(&mut emu, oldest.saturating_add(2), 50),
+            rows(&mut emu, oldest.saturating_add(2), 50),
             3,
             "the oldest three"
         );
-        assert_eq!(ask(&mut emu, u64::MAX, u16::MAX), 0);
+        assert_eq!(rows(&mut emu, u64::MAX, u16::MAX), 0);
     }
 
     #[test]
@@ -552,11 +555,7 @@ mod tests {
             emu.process(b"\r\n");
         }
         let mark = emu.snapshot().history();
-        let reply = emu.history(HistoryRequest {
-            id: 0,
-            newest: mark.newest,
-            count: MAX_HISTORY_ROWS,
-        });
+        let reply = emu.history(ask(mark.newest, MAX_HISTORY_ROWS));
         let cells: usize = reply
             .rows
             .iter()
@@ -577,11 +576,7 @@ mod tests {
             after.oldest().unwrap() > before.newest,
             "{before:?} {after:?}"
         );
-        let reply = emu.history(HistoryRequest {
-            id: 0,
-            newest: before.newest,
-            count: 5,
-        });
+        let reply = emu.history(ask(before.newest, 5));
         assert!(reply.rows.is_empty(), "old names are gone");
     }
 
@@ -609,25 +604,14 @@ mod tests {
         newest: 10_000,
         len: 10_000,
     };
-    const ALL: HistoryRequest = HistoryRequest {
-        id: 0,
-        newest: 10_000,
-        count: u16::MAX,
-    };
+    const ALL: HistoryRequest = ask(10_000, u16::MAX);
 
     #[test]
     fn only_the_rows_asked_for_are_kept() {
         let mut cache = HistoryCache::default();
-        let asked = HistoryRequest {
-            id: 0,
-            newest: 20,
-            count: 2,
-        };
+        let asked = ask(20, 2);
         let rows = (17..=22).map(|name| row(name, 4)).collect();
-        assert_eq!(
-            cache.insert(&HistoryReply { id: 0, rows }, asked, MARK, 20..=20),
-            Some(2)
-        );
+        assert_eq!(cache.insert(&reply(rows), asked, MARK, 20..=20), Some(2));
         assert!(cache.holds(19) && cache.holds(20));
         assert!(!cache.holds(18) && !cache.holds(21));
     }
@@ -635,11 +619,8 @@ mod tests {
     #[test]
     fn the_cache_keeps_only_rows_the_history_holds() {
         let mut cache = HistoryCache::default();
-        let reply = HistoryReply {
-            id: 0,
-            rows: vec![row(0, 5), row(1, 5), row(10_000, 5), row(10_001, 5)],
-        };
-        assert_eq!(cache.insert(&reply, ALL, MARK, 1..=1), Some(2));
+        let all = reply(vec![row(0, 5), row(1, 5), row(10_000, 5), row(10_001, 5)]);
+        assert_eq!(cache.insert(&all, ALL, MARK, 1..=1), Some(2));
         assert!(cache.holds(1) && cache.holds(10_000) && !cache.holds(10_001));
         cache.retain(HistoryMark {
             newest: 10_005,
@@ -667,25 +648,15 @@ mod tests {
             }],
             ..row(3, 4)
         };
-        let too_many = HistoryReply {
-            id: 0,
-            rows: (1..=u64::from(MAX_HISTORY_ROWS) + 1)
+        let too_many = reply(
+            (1..=u64::from(MAX_HISTORY_ROWS) + 1)
                 .map(|n| row(n, 1))
                 .collect(),
-        };
-        let too_many_cells = HistoryReply {
-            id: 0,
-            rows: (1..=100).map(|n| row(n, 1000)).collect(),
-        };
+        );
+        let too_many_cells = reply((1..=100).map(|n| row(n, 1000)).collect());
         for reply in [
-            HistoryReply {
-                id: 0,
-                rows: vec![row(1, 3), too_wide],
-            },
-            HistoryReply {
-                id: 0,
-                rows: vec![row(1, 3), bad_link],
-            },
+            reply(vec![row(1, 3), too_wide]),
+            reply(vec![row(1, 3), bad_link]),
             too_many,
             too_many_cells,
         ] {
@@ -725,14 +696,8 @@ mod tests {
                         row
                     })
                     .collect();
-                let asked = HistoryRequest {
-                    id: 0,
-                    newest: name,
-                    count: u16::try_from(per_reply).unwrap(),
-                };
-                cache
-                    .insert(&HistoryReply { id: 0, rows }, asked, MARK, 2..=2)
-                    .unwrap();
+                let asked = ask(name, u16::try_from(per_reply).unwrap());
+                cache.insert(&reply(rows), asked, MARK, 2..=2).unwrap();
                 assert!(cache.bytes() <= HISTORY_CACHE_BYTES);
                 // The rows just asked for are kept for the caller to read, however far.
                 assert!(cache.holds(name));

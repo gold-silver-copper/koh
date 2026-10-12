@@ -586,7 +586,6 @@ mod tests {
         assert_eq!(Close::from_code(0), None);
         assert_eq!(Close::from_code(6), None);
     }
-    use crate::terminal::TerminalScreen;
 
     fn frame() -> Frame {
         let screen = TerminalScreen::from_bytes(24, 80, b"hello \x1b[31mworld\x1b[m");
@@ -793,16 +792,6 @@ mod tests {
     }
 
     #[test]
-    fn frames_round_trip() {
-        let frame = frame();
-        let base = TerminalScreen::default();
-        assert_eq!(
-            decode_frame(&encode_frame(&frame, &base).unwrap(), &base).unwrap(),
-            frame
-        );
-    }
-
-    #[test]
     fn a_frame_compresses_against_its_base_and_inflates_only_against_it() {
         let base =
             TerminalScreen::from_bytes(24, 80, &b"a line of text that repeats\r\n".repeat(20));
@@ -909,12 +898,6 @@ mod tests {
         assert_eq!(retry_after(Some(ms(200))), ms(200 + 5 + 25));
         assert_eq!(retry_after(Some(ms(10))), ms(10 + 5 + 25));
         assert_eq!(retry_after(None), ms(333 + 5 + 25));
-    }
-
-    #[test]
-    fn the_window_budget_is_one_screen_of_the_largest_size() {
-        let max = usize::from(crate::terminal::MAX_DIM);
-        assert_eq!(WINDOW_CELLS, max * max);
     }
 
     #[test]

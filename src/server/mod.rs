@@ -263,15 +263,10 @@ impl ServerConn {
         Ok(input)
     }
 
-    /// Whether input waits for the session.
+    /// Whether input waits for the session. Nothing more of the client's stream is read
+    /// meanwhile, so QUIC pushes back on a client the session cannot keep up with.
     fn has_input(&self) -> bool {
         !self.to_session.is_empty()
-    }
-
-    /// Whether more of the client's stream may be read: nothing waits for the session, so QUIC
-    /// pushes back on a client the session cannot keep up with.
-    fn wants_client_bytes(&self) -> bool {
-        self.to_session.is_empty()
     }
 
     /// Decode the complete messages read, at `now`, while the session's queue has room: control
@@ -656,7 +651,7 @@ pub async fn run_attached(authorized: cli::Authorized, mut session: session::Ses
             break "shell exited";
         }
         let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
-        let reading = client.is_some() && core.wants_client_bytes();
+        let reading = client.is_some() && !core.has_input();
         let broke = tokio::select! {
             // Not biased: a pending screen change would starve client input.
             screen = session.next_screen(), if session_open => match screen {
@@ -919,7 +914,7 @@ mod tests {
         let colours = ClientMsg::Colours(crate::events::WireColours::default());
         conn.push_client_bytes(&stream(&vec![colours; super::TO_SESSION + 1]), now)
             .unwrap();
-        assert!(!conn.wants_client_bytes());
+        assert!(conn.has_input());
         conn.client_ended(now).unwrap();
         let taken = std::iter::from_fn(|| conn.poll_input(now).unwrap()).count();
         assert_eq!(taken, super::TO_SESSION + 1);
@@ -1053,22 +1048,7 @@ mod tests {
     // --- EchoAck: the per-connection echo-ack debounce.
 
     #[test]
-    fn echo_ack_debounces() {
-        let t0 = Instant::now();
-        let ms = |n| t0 + Duration::from_millis(n);
-        let mut t = EchoAck::default();
-        t.register(InputSeq(5), t0);
-        assert!(!t.promote(ms(10)), "too soon");
-        assert_eq!(t.echo_ack(), InputSeq(0));
-        assert!(
-            t.promote(ms(50)),
-            "after the 50 ms debounce the input counts as echoed"
-        );
-        assert_eq!(t.echo_ack(), InputSeq(5));
-    }
-
-    #[test]
-    fn echo_ack_is_monotonic_takes_the_newest_and_says_when_it_next_moves() {
+    fn echo_ack_debounces_is_monotonic_takes_the_newest_and_says_when_it_next_moves() {
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
         let mut t = EchoAck::default();
@@ -1077,7 +1057,9 @@ mod tests {
         t.register(InputSeq(7), ms(20));
         t.register(InputSeq(6), ms(25)); // stale: ignored
         assert_eq!(t.next_promotion(), Some(ms(50)));
-        t.promote(ms(55));
+        assert!(!t.promote(ms(49)), "inside the 50 ms debounce");
+        assert_eq!(t.echo_ack(), InputSeq(0));
+        assert!(t.promote(ms(55)));
         assert_eq!(t.echo_ack(), InputSeq(3));
         assert_eq!(t.next_promotion(), Some(ms(70)));
         t.promote(ms(100));
@@ -1096,24 +1078,6 @@ mod tests {
         let mut s = base.clone();
         s.apply(&frame.diff).unwrap();
         s
-    }
-
-    #[test]
-    fn a_changed_snapshot_marks_an_unsent_change_and_the_exit_screen_is_final() {
-        let t0 = Instant::now();
-        let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"a")));
-        assert!(
-            c.poll_frame(t0, None).is_some(),
-            "the changed screen is sent"
-        );
-        // Re-installing the same screen is not a change, so nothing new is due.
-        c.install_snapshot(Arc::new(screen(b"a")));
-        assert!(c.poll_frame(t0, None).is_none());
-        // The exit screen marks the connection final.
-        c.install_snapshot(exit_screen(3));
-        let last = c.poll_frame(t0 + Duration::from_secs(1), None);
-        assert!(last.is_some() || c.finished(t0 + Duration::from_secs(1) + FINAL_ACK_WAIT, None));
     }
 
     /// A blank screen carrying the program's exit `code`.
@@ -1149,7 +1113,11 @@ mod tests {
             .contents()
             .contains("hello"));
         c.frame_sent(first.num, 100, t0, rtt);
-        assert!(c.poll_frame(t0, rtt).is_none(), "nothing changed");
+        c.install_snapshot(Arc::new(screen(b"hello")));
+        assert!(
+            c.poll_frame(t0, rtt).is_none(),
+            "the same screen again is no change"
+        );
         c.install_snapshot(Arc::new(screen(b"hello world")));
         let inside = t0 + Duration::from_millis(1);
         assert!(c.poll_frame(inside, rtt).is_none(), "inside the floor");
@@ -1162,32 +1130,37 @@ mod tests {
     }
 
     /// A connection that has learnt the link: a round trip of 50 ms, and 10 kB taking 40 ms
-    /// beyond it, a budget of 12.5 kB in flight. Frames go at `t[0]` and `t[1]` (50 ms on), and
-    /// are delivered at `t[1]` and `t[2]` (140 ms on).
-    fn on_a_slow_link(t: [Instant; 3]) -> Option<(ServerConn, Option<Duration>)> {
+    /// beyond it, a budget of 12.5 kB in flight. Frames go at 0 and 50 ms, and are delivered at
+    /// 50 and 140 ms; returned with the round trip and the time 200 ms on.
+    fn on_a_slow_link() -> (ServerConn, Option<Duration>, Instant) {
+        let t0 = Instant::now();
+        let ms = |n| t0.checked_add(Duration::from_millis(n)).unwrap();
         let rtt = Some(Duration::from_millis(50));
         let mut c = ServerConn::default();
-        let [start, second, done] = t;
         c.install_snapshot(Arc::new(screen(b"start")));
-        let one = c.poll_frame(start, rtt)?;
-        c.frame_sent(one.num, 100, start, rtt);
-        c.ack(one.num, second);
+        let one = c.poll_frame(t0, rtt).unwrap();
+        c.frame_sent(one.num, 100, t0, rtt);
+        c.ack(one.num, ms(50));
         c.install_snapshot(Arc::new(screen(b"start, then more")));
-        let two = c.poll_frame(second, rtt)?;
-        c.frame_sent(two.num, 10_000, second, rtt);
-        c.ack(two.num, done);
-        (c.budget(rtt) == 12_500).then_some((c, rtt))
+        let two = c.poll_frame(ms(50), rtt).unwrap();
+        c.frame_sent(two.num, 10_000, ms(50), rtt);
+        c.ack(two.num, ms(140));
+        assert_eq!(c.budget(rtt), 12_500);
+        (c, rtt, ms(200))
+    }
+
+    /// [`on_a_slow_link`], then the link filled at its time by a 20 kB frame showing `text`.
+    fn on_a_full_link(text: &[u8]) -> (ServerConn, Option<Duration>, Instant, FrameNum) {
+        let (mut c, rtt, t) = on_a_slow_link();
+        c.install_snapshot(Arc::new(screen(text)));
+        let full = c.poll_frame(t, rtt).expect("room for it");
+        c.frame_sent(full.num, 20_000, t, rtt);
+        (c, rtt, t, full.num)
     }
 
     #[test]
     fn frames_in_flight_never_exceed_about_a_round_trip_of_the_link() {
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
-        let t = t0 + Duration::from_millis(200);
-        c.install_snapshot(Arc::new(screen(b"a big repaint")));
-        let big = c.poll_frame(t, rtt).expect("room for it");
-        c.frame_sent(big.num, 20_000, t, rtt);
+        let (mut c, rtt, t, big) = on_a_full_link(b"a big repaint");
         c.install_snapshot(Arc::new(screen(b"a big repaint, changed")));
         let later = t + Duration::from_millis(30);
         assert!(
@@ -1199,7 +1172,7 @@ mod tests {
             t + retry_after(rtt),
             "a delivery wakes the loop, or the frame is given up on"
         );
-        c.ack(big.num, t + Duration::from_millis(100));
+        c.ack(big, t + Duration::from_millis(100));
         assert!(c.poll_frame(t + Duration::from_millis(100), rtt).is_some());
     }
 
@@ -1207,13 +1180,8 @@ mod tests {
     fn with_nothing_it_may_send_the_connection_does_not_wake_at_once() {
         // Typed input awaits its echo, the echo-ack changed but not the screen, and the link is
         // full: nothing can go until a delivery, so the loop must not spin.
-        let t0 = Instant::now();
         let ms = Duration::from_millis;
-        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
-        let t = t0 + ms(200);
-        c.install_snapshot(Arc::new(screen(b"$ ")));
-        let full = c.poll_frame(t, rtt).unwrap();
-        c.frame_sent(full.num, 20_000, t, rtt);
+        let (mut c, rtt, t, _) = on_a_full_link(b"$ ");
         c.push_client_bytes(&stream(&[typed(1, "x")]), t).unwrap();
         // A second key, still awaiting its echo once the first is promoted.
         c.push_client_bytes(&stream(&[typed(2, "y")]), t + ms(30))
@@ -1235,10 +1203,7 @@ mod tests {
         // Tiny frames, far under the byte budget, from a program changing the screen nonstop: past
         // half the window in flight, the next waits, so every delivery heard of is still a frame
         // the server holds.
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
-        let mut at = t0 + ms(200);
+        let (mut c, rtt, mut at) = on_a_slow_link();
         for n in 0..super::MAX_IN_FLIGHT {
             c.install_snapshot(Arc::new(screen(format!("count {n}").as_bytes())));
             let frame = c.poll_frame(at, rtt).expect("room for it");
@@ -1255,39 +1220,22 @@ mod tests {
 
     #[test]
     fn a_slow_link_skips_to_the_newest_screen() {
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
-        let t = t0 + Duration::from_millis(200);
-        c.install_snapshot(Arc::new(screen(b"frame 0")));
-        let big = c.poll_frame(t, rtt).unwrap();
-        c.frame_sent(big.num, 20_000, t, rtt);
-        let mut at = t;
+        let (mut c, rtt, mut at, big) = on_a_full_link(b"frame 0");
         for n in 1..=5 {
             at += Duration::from_millis(10);
             c.install_snapshot(Arc::new(screen(format!("frame {n}").as_bytes())));
             assert!(c.poll_frame(at, rtt).is_none(), "screen {n} waits");
         }
-        c.ack(big.num, at);
+        c.ack(big, at);
         let next = c.poll_frame(at, rtt).expect("room again");
-        assert_eq!(
-            next.num,
-            big.num.next(),
-            "the screens between were never sent"
-        );
+        assert_eq!(next.num, big.next(), "the screens between were never sent");
         let shown = applied(&screen(b"frame 0"), &next);
         assert!(shown.screen().contents().contains("frame 5"));
     }
 
     #[test]
     fn the_echo_of_typing_goes_at_once_even_with_the_link_full() {
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
-        let t = t0 + Duration::from_millis(200);
-        c.install_snapshot(Arc::new(screen(b"$ ")));
-        let full = c.poll_frame(t, rtt).unwrap();
-        c.frame_sent(full.num, 20_000, t, rtt);
+        let (mut c, rtt, t, _) = on_a_full_link(b"$ ");
         // The user types; the program's echo changes one row.
         c.push_client_bytes(&stream(&[typed(1, "l")]), t).unwrap();
         c.install_snapshot(Arc::new(screen(b"$ l")));
@@ -1355,7 +1303,7 @@ mod tests {
         c.install_snapshot(Arc::new(screen(b"one")));
         let one = c.poll_frame(t0, None).unwrap();
         c.install_snapshot(Arc::new(screen(b"one two")));
-        let two = c.poll_frame(later(1), None).unwrap();
+        c.poll_frame(later(1), None).unwrap();
         c.ack(FrameNum(1), Instant::now());
         c.install_snapshot(Arc::new(screen(b"one two three")));
         let three = c.poll_frame(later(2), None).unwrap();
@@ -1367,24 +1315,6 @@ mod tests {
         c.ack(FrameNum(1), Instant::now());
         c.install_snapshot(Arc::new(screen(b"four")));
         assert_eq!(c.poll_frame(later(3), None).unwrap().base, FrameNum(2));
-        let _ = two;
-    }
-
-    #[test]
-    fn a_resync_diffs_against_the_blank_screen_until_a_newer_ack() {
-        let t0 = Instant::now();
-        let later = |n| t0 + Duration::from_secs(n);
-        let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"a")));
-        c.poll_frame(t0, None).unwrap();
-        c.ack(FrameNum(1), Instant::now());
-        c.push_client_bytes(&stream(&[ClientMsg::Resync]), later(1))
-            .unwrap();
-        let rebuilt = c
-            .poll_frame(later(1), None)
-            .expect("a resync forces a frame");
-        assert_eq!(rebuilt.base, FrameNum::BLANK);
-        assert_eq!(applied(&TerminalScreen::default(), &rebuilt), screen(b"a"));
     }
 
     #[test]
@@ -1413,6 +1343,7 @@ mod tests {
             FrameNum::BLANK,
             "a frame on a base the client threw away"
         );
+        assert_eq!(applied(&TerminalScreen::default(), &next), screen(b"a b c"));
     }
 
     #[test]

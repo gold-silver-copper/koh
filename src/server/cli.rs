@@ -589,16 +589,12 @@ async fn serve_connection(authorized: Authorized, registry: &Registry) {
     }
     auth_event(Outcome::Accepted, &peer, "authorized; session attached");
     match attach_kind {
-        AttachKind::Created => {
-            info!(peer = %peer, "started a new session");
-        }
-        AttachKind::Reattached { detached_for } => {
-            info!(
-                peer = %peer,
-                detached_secs = detached_for.map(|d| d.as_secs()),
-                "reattaching to this peer's existing session"
-            );
-        }
+        AttachKind::Created => info!(peer = %peer, "started a new session"),
+        AttachKind::Reattached { detached_for } => info!(
+            peer = %peer,
+            detached_secs = detached_for.map(|d| d.as_secs()),
+            "reattaching to this peer's existing session"
+        ),
     }
     run_attached(authorized, client).await;
 }

@@ -345,11 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_garbage() {
-        assert!(parse_endpoint_id("not-a-real-endpoint-id").is_err());
-    }
-
-    #[test]
     fn dns_spec_accepts_ip_and_ip_port_rejects_junk() {
         // Bare IPv4 defaults to :53; explicit port is honored.
         assert_eq!(

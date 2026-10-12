@@ -238,11 +238,15 @@ impl From<Keystroke> for WireKey {
         Self {
             key,
             mods: bits_of(stroke.press.mods),
-            kitty: stroke.kitty.map(|k| WireKitty {
-                code: k.code,
-                shifted: k.shifted,
-                base: k.base,
-                mods: k.mods,
+            // A code no key has (a terminal's garbage) is dropped, as the wire refuses it.
+            kitty: stroke.kitty.map(|k| {
+                let scalar = |c: Option<u32>| c.filter(|&c| char::from_u32(c).is_some());
+                WireKitty {
+                    code: scalar(k.code),
+                    shifted: scalar(k.shifted),
+                    base: scalar(k.base),
+                    mods: k.mods,
+                }
             }),
         }
     }
@@ -381,6 +385,23 @@ mod tests {
             assert_eq!(wire.check(), Ok(()));
             assert_eq!(wire.stroke(), stroke);
         }
+        // A code no key has, from a terminal's garbage, is dropped, not sent to be refused (with
+        // every key sent beside it).
+        let garbage = Keystroke {
+            kitty: Some(Kitty {
+                code: Some(0x11_0000),
+                shifted: Some(0xd800),
+                base: Some(1096),
+                mods: 4,
+            }),
+            ..strokes[2]
+        };
+        let wire = WireKey::from(garbage);
+        assert_eq!(wire.check(), Ok(()));
+        assert_eq!(
+            wire.kitty.map(|k| (k.code, k.shifted, k.base)),
+            Some((None, None, Some(1096)))
+        );
         let mouse = MouseEvent {
             action: MouseAction::Motion,
             button: Some(MouseButton::Right),

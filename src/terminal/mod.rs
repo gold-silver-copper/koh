@@ -1694,8 +1694,8 @@ mod tests {
 
     /// Scroll-heavy output: text, line feeds at the bottom, scroll regions, scrolling up and down,
     /// reverse index, inserted and deleted lines (counts out of range too, as in mosh's
-    /// emulation-multiline-scroll), erasing.
-    const SCROLL_PIECES: [&str; 16] = [
+    /// emulation-multiline-scroll), erasing, and a lone combining mark (one crashed mosh).
+    const SCROLL_PIECES: [&str; 18] = [
         "text",
         "\r\n",
         "\r\nmore",
@@ -1712,6 +1712,8 @@ mod tests {
         "\x1b[K",
         "\x1b[2J",
         "日本",
+        "\u{302}",
+        "\x1b[1J\u{302}",
     ];
 
     proptest::proptest! {

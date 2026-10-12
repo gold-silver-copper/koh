@@ -54,6 +54,7 @@ fn external_signal_retains_shell_style_exit_status() {
 }
 
 use koh::pty::Pty;
+use koh::terminal::TtyModes;
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -261,8 +262,45 @@ fn write_input_takes_shared_ref_and_preserves_order() {
         pty.write(b"ORDER_".to_vec()).expect("first enqueue");
         pty.write(b"AB_CD\n".to_vec()).expect("second enqueue");
         let in_order = read_until(&mut rx, "ORDER_AB_CD").await;
+        // `cat` leaves the terminal as the kernel set it up: echoing, a line at a time. The
+        // predictor shows typing at once only on that word.
+        let modes = pty.tty_modes();
         drop(pty);
         in_order.expect("FIFO ordering of two enqueues should yield ORDER_AB_CD");
+        assert_eq!(
+            modes,
+            Some(TtyModes {
+                echo: true,
+                line: true
+            })
+        );
+    });
+}
+
+#[test]
+fn a_password_prompt_without_echo_is_read_so() {
+    current_thread().expect("tokio runtime").block_on(async {
+        let (pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "stty -echo; echo RE''ADY; cat".to_owned(),
+            ],
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn sh");
+        read_until(&mut rx, "READY").await.expect("stty ran");
+        assert_eq!(
+            pty.tty_modes(),
+            Some(TtyModes {
+                echo: false,
+                line: true
+            })
+        );
     });
 }
 

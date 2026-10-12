@@ -511,6 +511,32 @@ fn reconnecting(painted: &crate::harness::Painted) -> bool {
         .is_some_and(|status| status.contains("reconnecting"))
 }
 
+/// The client reads keys while it redials: the escape typed at the reconnecting banner quits.
+#[test]
+fn the_escape_quits_at_the_reconnecting_banner() {
+    koh_testkit::multi_thread(4)
+        .expect("tokio runtime")
+        .block_on(async {
+            let net = clean();
+            let (server, mut client) = session(&net, &["sh"]).await.expect("start a session");
+            client.send(b"echo RE''ADY\r").await.expect("type");
+            assert!(client
+                .wait_until(WAIT, |t| t.contains("READY"))
+                .await
+                .is_some());
+            net.black_hole(Duration::from_secs(6));
+            client.drop_first_connection();
+            assert!(
+                client.wait_for(WAIT, reconnecting).await.is_some(),
+                "the client must show the reconnecting banner"
+            );
+            client.send(b"\x1e.").await.expect("type the escape");
+            let result = client.exit(Duration::from_secs(3)).await;
+            server.stop().await;
+            assert!(matches!(result, Some(Ok(None))), "{result:?}");
+        });
+}
+
 /// The reattach lands on a new shell (the server restarted during the outage): the scrollback
 /// view shows the new shell's history, not the rows the client held of the old one.
 #[test]

@@ -903,6 +903,20 @@ mod tests {
         assert!(ServerTerminal::new(MAX_DIM, MAX_DIM, history).is_ok());
     }
 
+    /// The emulator clamps a resize itself, behind the clamp at the protocol: a hostile size
+    /// never reaches fux-vt, and the smallest grid still takes wide glyphs.
+    #[test]
+    fn a_resize_is_clamped_by_the_emulator_too() {
+        use crate::terminal::{MAX_DIM, MIN_DIM};
+        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
+        assert!(t.resize(Size::new(65000, 0)));
+        assert_eq!(t.size(), Size::new(MAX_DIM, MIN_DIM));
+        t.resize(Size::new(0, 0));
+        assert_eq!(t.size(), Size::new(MIN_DIM, MIN_DIM));
+        t.process("日本語\u{1f468}\u{200d}\u{1f469}x\r\n日".as_bytes());
+        assert_eq!(t.snapshot().size(), Size::new(MIN_DIM, MIN_DIM));
+    }
+
     #[test]
     fn unterminated_control_strings_are_bounded_and_recover() {
         // fux-vt retains no DCS/APC/PM/SOS payload and caps a pending OSC at its payload limit, so

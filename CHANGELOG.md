@@ -54,6 +54,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
   only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
+- A kitty-protocol key whose code is no Unicode scalar (a terminal's garbage) no longer makes a
+  message the client cannot send, losing the keys typed with it: the code is dropped.
 - A typo in the saved `clients` file disconnected every saved client and refused their redials;
   the last list read well is now kept.
 - A server at capacity, or whose program could not start, left the client redialing forever with

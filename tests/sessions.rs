@@ -447,6 +447,73 @@ fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Resul
     })
 }
 
+/// A reconnect that lands as a session whose program exited is ending, however the session and
+/// registry tasks interleave across worker threads, is answered: by that session, still showing
+/// the exit, or by a new one. A client that left without the final screen always finds it.
+#[test]
+fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Result<()> {
+    koh_testkit::multi_thread(4)?.block_on(async {
+        let reg = registry(&["true"], 4, Duration::from_secs(30))?;
+        let a = peer()?;
+        let mut client = reg.attach(a).await.context("first attach")?.0;
+        // An acknowledgement the reconnect overtook ends the session it reattached to, once the
+        // reconnect was shown the exit: the next reconnect finds a new session.
+        let mut ending = false;
+        for round in 0..100 {
+            await_exit(&mut client)
+                .await
+                .with_context(|| format!("round {round}: exits"))?;
+            // Every other round the client has the final screen just as the reconnect is asked.
+            let acknowledged = round % 2 == 0;
+            let ended = async {
+                if acknowledged {
+                    client.ended().await;
+                }
+            };
+            let (attached, ()) = tokio::join!(
+                tokio::time::timeout(Duration::from_secs(5), reg.attach(a)),
+                ended
+            );
+            drop(client);
+            let (next, kind) = attached
+                .with_context(|| format!("round {round}: the reconnect is answered"))?
+                .context("reconnect")?;
+            let shown = next.screen().exit_code();
+            anyhow::ensure!(
+                match kind {
+                    AttachKind::Created => acknowledged || ending,
+                    AttachKind::Reattached { .. } => shown == Some(0),
+                },
+                "round {round}: acknowledged {acknowledged}, got {kind:?} showing exit {shown:?}"
+            );
+            ending = acknowledged && kind != AttachKind::Created;
+            client = next;
+        }
+        drop(client);
+        reg.shutdown().await;
+        Ok(())
+    })
+}
+
+/// A session whose program exited, left before any client had its final screen, is kept for the
+/// TTL and then reaped: the next attach starts a new one.
+#[test]
+fn an_exited_session_no_client_saw_end_is_reaped_after_the_ttl() -> anyhow::Result<()> {
+    koh_testkit::current_thread()?.block_on(async {
+        let reg = registry(&["true"], 4, Duration::from_millis(200))?;
+        let a = peer()?;
+        let (mut client, _) = reg.attach(a).await.context("attach")?;
+        await_exit(&mut client).await?;
+        drop(client);
+        // Past the TTL, by time: polling would attach, and an attach restarts it.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let kind = attach_kind(&reg, a).await;
+        reg.shutdown().await;
+        anyhow::ensure!(kind == Some(AttachKind::Created), "{kind:?}");
+        Ok(())
+    })
+}
+
 /// A peer removed from the allowlist has its session ended, its program hung up.
 #[test]
 fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {

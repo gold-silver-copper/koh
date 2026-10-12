@@ -145,13 +145,16 @@ impl Scrollback {
         }
     }
 
-    /// History rows arrived: keep them. A malformed answer is dropped whole.
+    /// History rows arrived, the answer to the oldest request outstanding: keep the rows it asked
+    /// for. An answer to nothing, and a malformed one, are dropped whole.
     pub fn on_reply(&mut self, reply: &HistoryReply) {
-        if !self.outstanding.is_empty() {
-            self.outstanding.remove(0);
+        if self.outstanding.is_empty() {
+            tracing::debug!("dropping history rows nobody asked for");
+            return;
         }
+        let asked = self.outstanding.remove(0);
         let near = self.focus();
-        if self.cache.insert(reply, self.mark, near).is_none() {
+        if self.cache.insert(reply, asked, self.mark, near).is_none() {
             tracing::debug!("dropping malformed history rows");
         }
         self.advance_search();

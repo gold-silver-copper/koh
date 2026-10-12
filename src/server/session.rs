@@ -106,9 +106,12 @@ impl PtyHost {
         self.emu.snapshot()
     }
 
-    /// Read the PTY's modes into the emulator, for the next snapshot; whether they changed.
+    /// Read the PTY's modes into the emulator, for the next snapshot; whether they changed. Modes
+    /// that cannot be read leave the last ones.
     pub fn refresh_tty(&mut self) -> bool {
-        self.emu.set_tty(self.pty.tty_modes())
+        self.pty
+            .tty_modes()
+            .is_some_and(|tty| self.emu.set_tty(tty))
     }
 
     /// The client's window is now `size` (clamped); whether that changed the size.

@@ -131,7 +131,10 @@ mod tests {
     fn controls_are_escaped_on_stderr_and_in_log_lines() {
         let hostile = "refused\u{1b}]52;c;aGk=\u{7}\nkoh::auth outcome=\"accepted\"\u{9b}2J";
         let shown = Clean::new(hostile).to_string();
-        assert!(!shown.chars().any(|c| c.is_control() && c != '\n'), "{shown:?}");
+        assert!(
+            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            "{shown:?}"
+        );
         assert!(shown.contains("\\u{1b}]52"), "{shown:?}");
 
         let mut out = Vec::new();
@@ -140,7 +143,10 @@ mod tests {
         let line = String::from_utf8(out).unwrap();
         assert_eq!(line.matches('\n').count(), 1, "{line:?}");
         assert!(line.ends_with('\n'));
-        assert!(!line.chars().any(|c| c.is_control() && c != '\n'), "{line:?}");
+        assert!(
+            !line.chars().any(|c| c.is_control() && c != '\n'),
+            "{line:?}"
+        );
     }
 
     #[test]

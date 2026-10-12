@@ -23,7 +23,7 @@ pub use crate::predict::{Size, TtyModes};
 pub use grid::{drawn, Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
 pub use history::{
     HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, KeptRow,
-    HISTORY_CACHE_CELLS, MAX_HISTORY_CELLS, MAX_HISTORY_ROWS,
+    HISTORY_CACHE_BYTES, MAX_HISTORY_CELLS, MAX_HISTORY_ROWS,
 };
 pub use server::{FrameHold, ServerTerminal, FRAME_HOLD, IDENTITY, OPTIONS};
 
@@ -327,25 +327,31 @@ impl TerminalScreen {
     /// carries them; at most [`DICTIONARY_BYTES`] in all, the last of it kept.
     ///
     /// A changed row then compresses against what it was, and the header against the base's.
-    /// What it costs follows the rows the frame changes, not the screen's size, and `encodings`
-    /// keeps rows' encodings from one dictionary to the next. A row this screen lacks is left out.
+    /// Built from the end, as only the last window's worth can be reached, so what it costs is
+    /// bounded by that window whatever rows a frame names, and `encodings` keeps rows' encodings
+    /// from one dictionary to the next. A row this screen lacks is left out.
     pub fn dictionary(&self, rows: &[u16], encodings: &mut RowEncodings) -> Vec<u8> {
-        let mut out = Vec::new();
         // First the rows just above the cursor and its own, which a new line most often repeats
         // (a prompt, the line of output before), then the changed rows, nearest the frame.
         let cursor = self.grid.cursor_position().0;
         let context =
             (cursor.saturating_sub(DICTIONARY_CONTEXT)..=cursor).filter(|row| !rows.contains(row));
-        for row in context.chain(rows.iter().copied()) {
+        let order: Vec<u16> = context.chain(rows.iter().copied()).collect();
+        let mut pieces: Vec<Vec<u8>> = postcard::to_allocvec(&self.header()).into_iter().collect();
+        let mut len = pieces.first().map_or(0, Vec::len);
+        for &row in order.iter().rev() {
+            if len >= DICTIONARY_BYTES {
+                break;
+            }
             if let Some(parts) = self.grid.row_parts(row) {
-                encodings.append(row, parts, &mut out);
+                let mut piece = Vec::new();
+                encodings.append(row, parts, &mut piece);
+                len = len.saturating_add(piece.len());
+                pieces.push(piece);
             }
         }
         encodings.done();
-        if let Ok(header) = postcard::to_allocvec(&self.header()) {
-            out.extend_from_slice(&header);
-        }
-        // Only the last window's worth can be reached.
+        let mut out: Vec<u8> = pieces.into_iter().rev().flatten().collect();
         let excess = out.len().saturating_sub(DICTIONARY_BYTES);
         out.split_off(excess)
     }

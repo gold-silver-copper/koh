@@ -1717,10 +1717,10 @@ mod tests {
     fn a_key_at_a_fresh_prompt_waits_for_its_echo() {
         use crate::predict::TtyModes;
         use crate::terminal::ServerTerminal;
-        let echoing = Some(TtyModes {
+        let echoing = TtyModes {
             echo: true,
             line: true,
-        });
+        };
         let t0 = Instant::now();
         let mut s = ClientSession::new(Size::new(24, 80));
         let mut server = ServerTerminal::new(24, 80, 0).expect("emulator");

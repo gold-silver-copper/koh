@@ -744,32 +744,30 @@ async fn write_client_stream(send: Option<SendStream>, mut queue: mpsc::Receiver
 /// Accept the server's streams (frames, and history rows), each read on its own task so a stalled or
 /// reset stream never holds up a newer frame. Ends when the connection closes.
 ///
-/// At most [`FRAME_QUEUE`] streams are read or wait to be applied at once: past them, no stream
-/// is accepted, so QUIC's stream limit stops the server opening more, and a server faster than the
-/// client cannot make it hold more frames than that.
+/// At most [`FRAME_QUEUE`] streams are read or wait to be applied at once, together: a reader
+/// takes its slot in `frames` before it reads. Past them, no stream is accepted, so QUIC's stream
+/// limit stops the server opening more, and a server faster than the client cannot make it hold
+/// more frames than that.
 async fn read_frames(conn: Connection, frames: mpsc::Sender<ServerMsg>) {
-    let readers = std::sync::Arc::new(tokio::sync::Semaphore::new(FRAME_QUEUE));
     loop {
-        let Ok(permit) = std::sync::Arc::clone(&readers).acquire_owned().await else {
+        let Ok(slot) = frames.clone().reserve_owned().await else {
             return;
         };
         let Ok(mut recv) = conn.accept_uni().await else {
             return;
         };
-        let frames = frames.clone();
         #[expect(
             clippy::disallowed_methods,
-            reason = "each holds one of the readers' permits"
+            reason = "each holds one of the frames' slots"
         )]
         tokio::spawn(async move {
-            let _permit = permit;
             // A reset (superseded) or malformed frame is simply not delivered.
             let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
                 return;
             };
             match decode_server(&bytes) {
                 Ok(msg) => {
-                    let _ = frames.send(msg).await;
+                    slot.send(msg);
                 }
                 Err(e) => tracing::debug!(error = %e, "dropping an undecodable frame"),
             }

@@ -120,8 +120,9 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   newest name and a count (at most 256 rows); the server answers one request at a time, each on a
   stream below frames in priority, the next only once the last is delivered, so history never
   delays a frame or outruns the link. A named row's cells never change, so a row the client holds
-  is never sent again. The client keeps at most `HISTORY_CACHE_CELLS` (a million) cells of history,
-  dropping the rows farthest from its view; the server queues at most 8 requests, and one more is
+  is never sent again. The client keeps at most `HISTORY_CACHE_BYTES` (64 MiB, counting links and
+  each row's overhead) of history, and only replies it asked for, dropping the rows farthest from
+  its view; the server queues at most 8 requests, and one more is
   a protocol error.
 - **Bases are acknowledged frames.** The server diffs against the newest frame delivered, so a lost
   frame only delays the screen until the next one. When the server sends a

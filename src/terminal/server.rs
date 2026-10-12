@@ -141,6 +141,8 @@ pub struct ServerTerminal {
     exit_code: Option<u32>,
     /// The last snapshot's rows, which the next one shares where they are unchanged.
     rows: RowCache,
+    /// [`RowCache::palettes`] at the last snapshot.
+    palettes: u64,
     /// The screen as it was when the program last began a frame (synchronized output), a whole
     /// one, until taken.
     frame_start: Option<TerminalScreen>,
@@ -164,6 +166,7 @@ impl ServerTerminal {
             observed: Observed::default(),
             exit_code: None,
             rows: RowCache::default(),
+            palettes: 0,
             frame_start: None,
             frame_began: false,
             frame_ends: FrameEnds::default(),
@@ -310,9 +313,10 @@ impl ServerTerminal {
         true
     }
 
-    /// The PTY's modes, read by its owner, for the next snapshot; whether they changed.
-    pub fn set_tty(&mut self, tty: Option<TtyModes>) -> bool {
-        std::mem::replace(&mut self.tty, tty) != tty
+    /// The PTY's modes, read by its owner, for the next snapshot; whether they changed. Once known
+    /// they stay known: a diff cannot say "unknown again", so a client would keep the old ones.
+    pub fn set_tty(&mut self, tty: TtyModes) -> bool {
+        self.tty.replace(tty) != Some(tty)
     }
 
     /// The screen scrolled `offset` rows back into history, as this emulator shows it: what a
@@ -368,9 +372,15 @@ impl ServerTerminal {
     }
 
     /// A snapshot of the current screen. Rows unchanged since the last snapshot share its cells.
+    /// A new palette names the history afresh, as its rows are drawn in it: a client's copies, in
+    /// the old one, are then rows the history no longer holds.
     pub fn snapshot(&mut self) -> TerminalScreen {
+        let grid = Grid::of(self.parser.screen(), &mut self.rows);
+        if std::mem::replace(&mut self.palettes, self.rows.palettes()) != self.palettes {
+            self.names.renew();
+        }
         TerminalScreen {
-            grid: Grid::of(self.parser.screen(), &mut self.rows),
+            grid,
             title: self.observed.title.clone(),
             icon: self.observed.icon.clone(),
             clipboard: self.observed.clipboard.clone(),
@@ -539,6 +549,22 @@ mod tests {
     use super::*;
     use crate::terminal::Grid;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_palette_change_names_the_history_afresh() {
+        // A client's copies of history rows were drawn in the old palette: new names make them
+        // rows the history no longer holds, so the client asks again.
+        let mut emu = ServerTerminal::new(4, 20, 100).unwrap();
+        for n in 0..10 {
+            emu.process(format!("line {n}\r\n").as_bytes());
+        }
+        let before = emu.snapshot().history();
+        emu.process(b"\x1b]4;1;rgb:00/00/00\x07");
+        let after = emu.snapshot().history();
+        assert_eq!(after.len, before.len);
+        assert!(after.oldest() > Some(before.newest), "{before:?} {after:?}");
+        assert_eq!(emu.snapshot().history(), after, "named once per palette");
+    }
 
     #[test]
     fn a_palette_change_redraws_rows_that_did_not_change() {

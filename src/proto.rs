@@ -666,6 +666,7 @@ mod tests {
         let key = |key, mods, kitty| InputEvent::Key(WireKey { key, mods, kitty });
         let bad = [
             keys(vec![key(WireKeyCode::Char('a'), 0x08, None)]),
+            keys(vec![key(WireKeyCode::F(0), 0, None)]),
             keys(vec![key(WireKeyCode::F(13), 0, None)]),
             keys(vec![key(
                 WireKeyCode::Char('a'),
@@ -673,6 +674,16 @@ mod tests {
                 Some(WireKitty {
                     code: Some(0xdfff),
                     shifted: None,
+                    base: None,
+                    mods: 0,
+                }),
+            )]),
+            keys(vec![key(
+                WireKeyCode::Char('a'),
+                0,
+                Some(WireKitty {
+                    code: None,
+                    shifted: Some(0x11_0000),
                     base: None,
                     mods: 0,
                 }),

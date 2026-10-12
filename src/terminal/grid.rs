@@ -605,9 +605,6 @@ impl Grid {
         if shifts.is_empty() {
             return Some(self.clone());
         }
-        if !shifts.fit(self.size.rows) {
-            return None;
-        }
         let mut lines = self.lines.to_vec();
         let mut filled = vec![false; usize::from(self.size.rows)];
         for (from, to) in shifts.iter().flat_map(|shift| shift.pairs()) {

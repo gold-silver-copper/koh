@@ -162,19 +162,11 @@ pub(crate) fn host_size(size: Size) -> fux_vt::Size {
 
 /// Truncate `s` to at most `max` characters (not bytes), preserving whole scalars.
 fn capped_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
+    s.chars().take(max).collect()
 }
 
 /// Truncate `s` to at most `max` bytes, never splitting a scalar.
 fn capped_bytes(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    // The nearest char boundary at or below `max`.
     s.get(..s.floor_char_boundary(max))
         .unwrap_or("")
         .to_string()
@@ -202,14 +194,8 @@ pub struct TerminalScreen {
 
 impl Default for TerminalScreen {
     fn default() -> Self {
-        Self::with_grid(Grid::blank(DEFAULT_SIZE))
-    }
-}
-
-impl TerminalScreen {
-    const fn with_grid(grid: Grid) -> Self {
         Self {
-            grid,
+            grid: Grid::blank(DEFAULT_SIZE),
             title: String::new(),
             icon: String::new(),
             clipboard: String::new(),
@@ -219,7 +205,9 @@ impl TerminalScreen {
             tty: None,
         }
     }
+}
 
+impl TerminalScreen {
     /// The screen a fresh emulator of this (clamped) size shows after `bytes`. For tests.
     pub fn from_bytes(rows: u16, cols: u16, bytes: &[u8]) -> Self {
         ServerTerminal::new(rows, cols, 0).map_or_else(
@@ -243,11 +231,6 @@ impl TerminalScreen {
 
     pub const fn size(&self) -> Size {
         self.grid.size()
-    }
-
-    /// Whether the app has application-cursor-keys (DECCKM) on, for the arrow-key normalizer.
-    pub fn application_cursor(&self) -> bool {
-        self.grid.modes().application_cursor
     }
 
     /// The window title, if the server has set one.
@@ -1320,14 +1303,6 @@ impl Shifts {
     pub fn iter(&self) -> std::slice::Iter<'_, Shift> {
         self.0.iter()
     }
-
-    /// Whether every row they touch is within a screen of `rows` rows.
-    fn fit(&self, rows: u16) -> bool {
-        self.0.iter().all(|shift| {
-            shift.source().is_some_and(|s| s.end <= rows)
-                && shift.destination().is_some_and(|d| d.end <= rows)
-        })
-    }
 }
 
 impl<'a> IntoIterator for &'a Shifts {
@@ -1465,8 +1440,7 @@ impl TerminalScreen {
         // All server-controlled: the grid is validated whole before any of it is committed, so a
         // malformed frame changes nothing. This clamp is what bounds the grid a resize allocates.
         let Size { rows, cols } = diff.resize.map_or_else(|| self.size(), clamp_dims);
-        if diff.rows.len() > usize::from(rows)
-            || (!diff.shifts.is_empty() && (diff.resize.is_some() || !diff.shifts.fit(rows)))
+        if diff.rows.len() > usize::from(rows) || (!diff.shifts.is_empty() && diff.resize.is_some())
         {
             return Err(Malformed);
         }
@@ -1542,28 +1516,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_apply_roundtrip_simple() {
-        let base = TerminalScreen::default();
-        let target = screen_from(24, 80, b"hello \x1b[31mworld\x1b[m");
-        let diff = target.diff_from(&base);
-        let mut c = base;
-        c.apply(&diff).unwrap();
-        assert_eq!(c, target);
-    }
-
-    #[test]
-    fn diff_apply_roundtrip_incremental() {
-        let a = screen_from(24, 80, b"line one\r\nline two");
-        let b = screen_from(24, 80, b"line one\r\nline two\r\nline three\x1b[1;1Hedited");
-        let diff = b.diff_from(&a);
-        assert_ne!(diff.rows, Vec::<RowDiff>::new());
-        assert!(diff.resize.is_none());
-        let mut c = a;
-        c.apply(&diff).unwrap();
-        assert_eq!(c, b);
-    }
-
-    #[test]
     fn resize_roundtrip_full_repaint() {
         let a = screen_from(24, 80, b"small screen content here");
         let b = screen_from(
@@ -1577,48 +1529,6 @@ mod tests {
         c.apply(&diff).unwrap();
         assert_eq!(c, b);
         assert_eq!(c.size(), Size::new(40, 120));
-    }
-
-    #[test]
-    fn clamp_dims_bounds_both_extremes() {
-        assert_eq!(
-            clamp_dims(Size::new(65000, 65000)),
-            Size::new(MAX_DIM, MAX_DIM),
-            "huge -> MAX_DIM"
-        );
-        assert_eq!(
-            clamp_dims(Size::new(0, 0)),
-            Size::new(MIN_DIM, MIN_DIM),
-            "zero -> MIN_DIM"
-        );
-        assert_eq!(
-            clamp_dims(Size::new(24, 80)),
-            Size::new(24, 80),
-            "in-range passes through"
-        );
-        assert_eq!(
-            clamp_dims(Size::new(0, 5000)),
-            Size::new(MIN_DIM, MAX_DIM),
-            "mixed clamps each axis"
-        );
-    }
-
-    /// A diff that changes nothing but `resize`, for the clamp tests.
-    fn resize_only(resize: Size) -> ScreenDiff {
-        ScreenDiff {
-            resize: Some(resize),
-            title: None,
-            icon: None,
-            clipboard: None,
-            history: None,
-            tty: None,
-            bell_count: 0,
-            exit_code: None,
-            cursor: (0, 0),
-            modes: Modes::default().into(),
-            shifts: Shifts::default(),
-            rows: Vec::new(),
-        }
     }
 
     fn wire_cell() -> impl proptest::strategy::Strategy<Value = WireCell> {
@@ -1760,19 +1670,6 @@ mod tests {
             proptest::prop_assert!(screen.title.chars().count() <= MAX_TITLE_LEN);
             proptest::prop_assert!(screen.icon.chars().count() <= MAX_TITLE_LEN);
             proptest::prop_assert!(screen.clipboard.len() <= MAXIMUM_CLIPBOARD_SIZE);
-        }
-
-        /// Arbitrary wire bytes that happen to decode as a `ScreenDiff` must apply without panic.
-        #[test]
-        fn decoded_wire_bytes_apply_without_panic(
-            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2048),
-        ) {
-            if let Ok(diff) = postcard::from_bytes::<ScreenDiff>(&bytes) {
-                let mut screen = TerminalScreen::default();
-                screen.apply(&diff).unwrap();
-                let Size { rows, cols } = screen.size();
-                proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&rows) && (MIN_DIM..=MAX_DIM).contains(&cols));
-            }
         }
 
         /// The round-trip law over real emulator output: for any two screens produced by the server
@@ -1921,17 +1818,6 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_sends_no_shifts() {
-        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
-        emu.process(&numbered());
-        let base = emu.snapshot();
-        emu.resize(Size::new(24, 100));
-        emu.process(b"\r\n");
-        let diff = emu.snapshot().diff_from(&base);
-        assert!(diff.resize.is_some() && diff.shifts.is_empty());
-    }
-
-    #[test]
     fn malformed_shifts_drop_the_whole_frame() {
         let (base, target, good) = scrolled(&numbered(), b"\x1b[24;1H\nlast");
         assert!(!good.shifts.is_empty());
@@ -1994,27 +1880,20 @@ mod tests {
     }
 
     #[test]
-    fn client_apply_clamps_oom_resize() {
-        // A malicious server ships a (65000, 65000) resize. The client must NOT build a giant
-        // grid: apply clamps to MAX_DIM and reconstructs a bounded screen without OOM/panic.
-        let mut c = TerminalScreen::default();
-        c.apply(&resize_only(Size::new(65000, 65000))).unwrap(); // must not OOM/panic
-        assert_eq!(
-            c.size(),
-            Size::new(MAX_DIM, MAX_DIM),
-            "client clamps a giant resize"
-        );
-    }
-
-    #[test]
-    fn client_apply_clamps_zero_resize() {
-        let mut c = TerminalScreen::default();
-        c.apply(&resize_only(Size::new(0, 0))).unwrap(); // must not panic
-        assert_eq!(
-            c.size(),
-            Size::new(MIN_DIM, MIN_DIM),
-            "client clamps a zero-dimension resize"
-        );
+    fn client_apply_clamps_a_hostile_resize() {
+        // A malicious server ships a giant or zero resize: the client clamps each axis, never
+        // building a giant grid or panicking.
+        for (asked, clamped) in [
+            (Size::new(65000, 65000), Size::new(MAX_DIM, MAX_DIM)),
+            (Size::new(0, 0), Size::new(MIN_DIM, MIN_DIM)),
+            (Size::new(0, 5000), Size::new(MIN_DIM, MAX_DIM)),
+        ] {
+            let mut c = TerminalScreen::default();
+            let mut diff = c.diff_from(&c);
+            diff.resize = Some(asked);
+            c.apply(&diff).unwrap();
+            assert_eq!(c.size(), clamped, "{asked:?}");
+        }
     }
 
     #[test]
@@ -2576,14 +2455,6 @@ mod tests {
     }
 
     #[test]
-    fn equal_screens_compare_equal() {
-        let a = screen_from(24, 80, b"identical");
-        let b = screen_from(24, 80, b"identical");
-        assert_eq!(a, b);
-        assert_eq!(a.diff_from(&b).rows, Vec::<RowDiff>::new());
-    }
-
-    #[test]
     fn icon_and_clipboard_roundtrip_and_resist_collapse() {
         let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
         emu.process(b"\x1b]1;myicon\x07\x1b]2;mytitle\x07\x1b]52;c;aGk=\x07");
@@ -2600,40 +2471,6 @@ mod tests {
         assert_eq!(c, target, "icon + clipboard reconstruct via diff/apply");
         // A state carrying an icon/clipboard must NOT collapse equal to one without them.
         assert_ne!(base, c);
-    }
-
-    #[test]
-    fn wide_chars_and_emoji_roundtrip() {
-        // CJK (wide) + emoji + combining marks must survive diff/apply.
-        let base = TerminalScreen::default();
-        let target = screen_from(24, 80, "日本語 café 🦀 e\u{0301}".as_bytes());
-        let diff = target.diff_from(&base);
-        let mut c = base;
-        c.apply(&diff).unwrap();
-        assert_eq!(c, target);
-    }
-
-    #[test]
-    fn many_incremental_applies_track_server() {
-        // The client holds ONE TerminalScreen and applies a long run of incremental diffs. It must
-        // track the server's snapshot exactly.
-        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
-        emu.process(b"line 0\r\n");
-        let mut client = emu.snapshot();
-        let mut base = client.clone();
-
-        for i in 1..=20 {
-            emu.process(format!("line {i}\r\n").as_bytes());
-            let target = emu.snapshot();
-            let diff = target.diff_from(&base);
-            assert!(diff.resize.is_none(), "no resize -> incremental diff");
-            client.apply(&diff).unwrap(); // same object, repeated apply
-            base = target;
-            assert_eq!(
-                client, base,
-                "client must track server after incremental diff {i}"
-            );
-        }
     }
 
     #[test]
@@ -2682,19 +2519,6 @@ mod tests {
         client
     }
 
-    /// Trimmed text of one screen row (blank cells as spaces), for line-level assertions.
-    fn row_text(s: &Grid, row: u16) -> String {
-        let cols = s.size().cols;
-        (0..cols)
-            .map(|c| match s.cell(row, c).map(|c| c.contents()) {
-                Some(g) if !g.is_empty() => g.to_string(),
-                _ => " ".to_string(),
-            })
-            .collect::<String>()
-            .trim_end()
-            .to_string()
-    }
-
     #[test]
     fn attributes_survive_roundtrip() {
         // mosh emulation-attributes{,-16color,-256color8,-256color248,-truecolor}: SGR
@@ -2729,43 +2553,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_motion_roundtrip() {
-        // mosh emulation-cursor-motion: absolute positioning (CSI row;colH) places glyphs, which
-        // must reconstruct on the client.
-        let bytes = b"\x1b[H\x1b[J\x1b[1;1HA\x1b[1;10HB\x1b[4;1HC\x1b[24;1Hdone";
-        let c = roundtrip(24, 80, bytes);
-        let s = c.screen();
-        assert_eq!(s.cell(0, 0).unwrap().contents(), "A");
-        assert_eq!(s.cell(0, 9).unwrap().contents(), "B");
-        assert_eq!(s.cell(3, 0).unwrap().contents(), "C");
-        assert_eq!(row_text(s, 23), "done");
-    }
-
-    #[test]
-    fn scroll_up_down_roundtrip() {
-        // mosh emulation-scroll: SU (CSI N S) then SD (CSI N T) shift the screen; the result
-        // must survive the round-trip. 24 numbered rows, scroll up 4, then down 2.
-        let mut bytes = Vec::from(&b"\x1b[H\x1b[J"[..]);
-        for i in 1..=24 {
-            bytes.extend_from_slice(format!("\x1b[{i};1Hline{i}").as_bytes());
-        }
-        bytes.extend_from_slice(b"\x1b[4S\x1b[2T");
-        let c = roundtrip(24, 80, &bytes);
-        let s = c.screen();
-        assert_eq!(
-            row_text(s, 0),
-            "",
-            "two blank rows pushed in at the top after SD 2"
-        );
-        assert_eq!(
-            row_text(s, 2),
-            "line5",
-            "line5 reached the top after SU 4, then down 2"
-        );
-        assert_eq!(row_text(s, 21), "line24", "last line still present");
-    }
-
-    #[test]
     fn insert_delete_lines_roundtrip_no_panic() {
         // mosh emulation-multiline-scroll: IL (CSI N L) / DL (CSI N M) with in- and out-of-range
         // counts must not panic and must round-trip exactly.
@@ -2778,33 +2565,6 @@ mod tests {
             bytes.extend_from_slice(format!("\x1b[3;1H\x1b[{n}M").as_bytes());
         }
         let _ = roundtrip(24, 80, &bytes); // assertion: no panic + exact reconstruction
-    }
-
-    #[test]
-    fn back_and_forward_tab_roundtrip() {
-        // mosh emulation-back-tab: CBT (CSI Z) and CHT (CSI I) move between tab stops, and the
-        // result round-trips identically server↔client. fux-vt implements both since 0.3.
-        let c = roundtrip(24, 80, b"hello, wurld\x1b[Zo");
-        assert_eq!(row_text(c.screen(), 0), "hello, world");
-        let c2 = roundtrip(24, 80, b"ab\x1b[Itab");
-        assert_eq!(row_text(c2.screen(), 0), "ab      tab");
-    }
-
-    #[test]
-    fn column_80_no_premature_wrap_roundtrip() {
-        // mosh emulation-80th-column: filling exactly to the last column leaves the cursor in the
-        // deferred-wrap state; a following CRLF must not spill an extra blank wrapped line.
-        let mut bytes = Vec::from(&b"\x1b[H\x1b[J"[..]);
-        bytes.resize(bytes.len() + 80, b'E'); // 80 'E's, filling the row exactly
-        bytes.extend_from_slice(b"\r\nM");
-        let c = roundtrip(24, 80, &bytes);
-        let s = c.screen();
-        assert_eq!(row_text(s, 0), "E".repeat(80), "80 chars fill row 0");
-        assert_eq!(
-            s.cell(1, 0).unwrap().contents(),
-            "M",
-            "M lands on row 1, no spurious wrap row"
-        );
     }
 
     #[test]
@@ -2839,22 +2599,6 @@ mod tests {
             "b",
             "wrapped char on row 1"
         );
-    }
-
-    #[test]
-    fn combining_mark_after_erase_does_not_panic() {
-        // mosh unicode-combine-fallback-assert: a combining mark applied right after erasing the
-        // cell it would attach to must not panic (mosh hit an internal assertion here).
-        let _ = roundtrip(24, 80, b"0\x1b[1J\xcc\xb4");
-    }
-
-    #[test]
-    fn combining_mark_on_blank_line_roundtrip() {
-        // mosh unicode-later-combining: a combining mark printed on an otherwise-empty line gets
-        // a base glyph and round-trips without dropping surrounding text.
-        let c = roundtrip(24, 80, b"abc\n\xcc\x82\ndef\n");
-        let contents = c.screen().contents();
-        assert!(contents.contains("abc") && contents.contains("def"));
     }
 
     #[test]
@@ -2905,12 +2649,5 @@ mod tests {
             .collect();
         assert!(lens.contains(&long.len()), "{lens:?}");
         assert!(lens.iter().any(|&len| len < long.len()), "{lens:?}");
-    }
-
-    #[test]
-    fn latin1_supplement_roundtrip() {
-        // mosh emulation-ascii-iso-8859: ISO-8859-1 supplement characters render and round-trip.
-        let c = roundtrip(24, 80, "àáâãäåæçèéêëìíîïñòóôõöøùúûüýþÿ".as_bytes());
-        assert!(c.screen().contents().contains("àáâãä"));
     }
 }

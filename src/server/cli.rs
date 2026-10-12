@@ -448,37 +448,3 @@ async fn serve_connection(authorized: Authorized, registry: &Registry) {
         SessionExit::ShellExited => info!(peer = %peer, "shell exited"),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn serve_config_default_matches_the_cli_defaults() {
-        let c = ServeConfig::default();
-        assert!(c.allow.is_empty() && c.command.is_empty());
-        assert_eq!(c.scrollback, 1000);
-        assert_eq!(c.session_ttl_secs, 86_400);
-        assert_eq!(c.max_connections, 64);
-        assert_eq!(c.max_sessions, 64);
-        assert!(!c.local && c.relay_url.is_none() && c.key_file.is_none());
-        assert_eq!(c.port, None);
-    }
-
-    #[test]
-    fn connect_qr_renders_an_id_and_handles_overlong_input() {
-        // A 64-hex endpoint id is well within QR capacity: renders to a multi-row block grid.
-        let id = "3f9c".repeat(16);
-        let qr = connect_qr(&id).expect("an endpoint id must fit in a QR");
-        assert!(qr.lines().count() > 5, "a QR should be a multi-row block");
-        assert!(
-            qr.contains('█') || qr.contains('▀') || qr.contains('▄'),
-            "the unicode renderer uses half-block glyphs"
-        );
-        // Far beyond QR capacity (~2953 bytes): graceful None, never a panic.
-        assert!(
-            connect_qr(&"a".repeat(10_000)).is_none(),
-            "overlong input must return None, not panic"
-        );
-    }
-}

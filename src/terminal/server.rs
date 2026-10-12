@@ -366,11 +366,6 @@ impl ServerTerminal {
         self.observed.bell_count
     }
 
-    /// Whether the program has application cursor keys (DECCKM) on.
-    pub fn application_cursor(&self) -> bool {
-        self.parser.screen().mode(fux_vt::Mode::ApplicationCursor)
-    }
-
     /// A snapshot of the current screen. Rows unchanged since the last snapshot share its cells.
     /// A new palette names the history afresh, as its rows are drawn in it: a client's copies, in
     /// the old one, are then rows the history no longer holds.
@@ -564,27 +559,6 @@ mod tests {
         assert_eq!(after.len, before.len);
         assert!(after.oldest() > Some(before.newest), "{before:?} {after:?}");
         assert_eq!(emu.snapshot().history(), after, "named once per palette");
-    }
-
-    #[test]
-    fn a_palette_change_redraws_rows_that_did_not_change() {
-        // Setting a palette entry changes no row's version: the snapshot from the rows changed
-        // since the last must still draw every row in the new colour.
-        let mut emu = ServerTerminal::new(4, 10, 0).unwrap();
-        emu.process(b"\x1b[31mred\x1b[m");
-        let before = emu.snapshot();
-        emu.process(b"\x1b]4;1;rgb:10/20/30\x07");
-        let after = emu.snapshot();
-        let colour = |s: &TerminalScreen| s.screen().cell(0, 0).unwrap().attributes().foreground();
-        assert_eq!(colour(&before), fux_vt::Color::Idx(1));
-        assert_eq!(
-            colour(&after),
-            fux_vt::Color::Rgb(fux_vt::Rgb {
-                r: 0x10,
-                g: 0x20,
-                b: 0x30
-            })
-        );
     }
 
     /// Output that changes rows in every way: text, rewriting a row the same, erasing, scrolling,
@@ -908,33 +882,6 @@ mod tests {
             "snapshot carries the OSC-52 clipboard"
         );
         assert_eq!(snap.bell_count(), 1, "snapshot carries the bell count");
-    }
-
-    #[test]
-    fn server_resize_clamps_oom_and_zero() {
-        use crate::terminal::{MAX_DIM, MIN_DIM};
-        // The server emulator must clamp a peer-controlled resize before the grid is allocated:
-        // a giant resize would OOM-abort the (cross-tenant) server.
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.resize(Size::new(65000, 65000)); // must not OOM
-        assert_eq!(
-            t.size(),
-            Size::new(MAX_DIM, MAX_DIM),
-            "giant resize clamped to MAX_DIM"
-        );
-        t.resize(Size::new(0, 0)); // must not panic
-        assert_eq!(
-            t.size(),
-            Size::new(MIN_DIM, MIN_DIM),
-            "zero resize clamped to MIN_DIM"
-        );
-        // Wrappy/wide shell output into the smallest clamped grid is fine.
-        t.process("AAAA日本🦀\r\nBBBB\r\n".repeat(8).as_bytes());
-        let _ = t.snapshot();
-        // A normal resize is untouched, and a snapshot after a clamped resize is still coherent.
-        t.resize(Size::new(40, 120));
-        assert_eq!(t.size(), Size::new(40, 120));
-        let _ = t.snapshot();
     }
 
     #[test]

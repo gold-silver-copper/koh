@@ -154,8 +154,7 @@ impl KeyFile {
         let secret = crate::transport_iroh::generate_secret_key()?;
         // Held until this returns: creators take turns, so only the first finds the key absent,
         // and a reader sees no key or a whole one.
-        let directory = File::open(&self.dir)?;
-        directory.lock()?;
+        let _locked = self.lock_dir()?;
         match std::fs::symlink_metadata(&self.path) {
             Ok(_) => return self.read_secret(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -198,12 +197,27 @@ impl KeyFile {
         name: &str,
         update: impl FnOnce(Option<String>) -> anyhow::Result<Option<String>>,
     ) -> anyhow::Result<()> {
-        let directory = File::open(&self.dir)?;
-        directory.lock()?;
+        let _locked = self.lock_dir()?;
         if let Some(contents) = update(self.read_beside(name)?)? {
             publish(&self.beside(name)?, contents.as_bytes())?;
         }
         Ok(())
+    }
+
+    /// The directory's lock, held until dropped: a private file in it, which no other user can
+    /// open, and so hold to hang koh, as they could the directory itself.
+    fn lock_dir(&self) -> Result<File, SetupError> {
+        let lock = open_private(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600),
+            &self.dir.join(".koh-dir-lock"),
+            Kind::Beside,
+        )?;
+        lock.lock()?;
+        Ok(lock)
     }
 
     /// `name`'s path in the key's directory: a plain file name, never a path.

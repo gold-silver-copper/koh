@@ -64,11 +64,22 @@ pub struct Places {
 }
 
 impl Places {
-    /// The given key paths, or the default ones.
+    /// The given key paths, or the default ones. With one given and no default place (no `$HOME`,
+    /// as for a system service), the other is beside it, so `--key-file` alone is enough.
     pub fn new(client_key: Option<PathBuf>, server_key: Option<PathBuf>) -> anyhow::Result<Self> {
+        let beside = |given: &Option<PathBuf>, role: &str| {
+            given
+                .as_ref()
+                .map(|path| path.with_file_name(format!("{role}.key")))
+        };
+        let (client_beside, server_beside) =
+            (beside(&server_key, "client"), beside(&client_key, "server"));
+        let resolve = |key: Option<PathBuf>, beside: Option<PathBuf>, role: &str| {
+            KeyFile::path_for(key, role).or_else(|error| beside.ok_or(error))
+        };
         Ok(Self {
-            client_key: KeyFile::path_for(client_key, "client")?,
-            server_key: KeyFile::path_for(server_key, "server")?,
+            client_key: resolve(client_key, client_beside, "client")?,
+            server_key: resolve(server_key, server_beside, "server")?,
         })
     }
 

@@ -185,8 +185,12 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     }
 }
 
+/// How often a connected client is checked against the allowlist.
+const REVOKE_CHECK: Duration = Duration::from_secs(2);
+
 /// Who may connect: the ids allowed for this run, and the clients saved beside the server key,
-/// read afresh for every connection, so `koh clients rm` takes effect at once.
+/// read afresh for every connection and every [`REVOKE_CHECK`] of one, so `koh clients rm` takes
+/// effect at once.
 #[derive(Clone)]
 pub struct Allowlist {
     given: Arc<HashSet<EndpointId>>,
@@ -202,6 +206,16 @@ impl Allowlist {
             allowed.extend(names.entries().map(|(_, id)| id));
         }
         Ok(allowed)
+    }
+
+    /// Return once `peer` may no longer connect, checking every [`REVOKE_CHECK`].
+    async fn revoked(&self, peer: EndpointId) {
+        loop {
+            tokio::time::sleep(REVOKE_CHECK).await;
+            if !self.allows(peer).await {
+                return;
+            }
+        }
     }
 
     /// Whether `peer` may connect now. A list that cannot be read admits only the given ids.
@@ -305,8 +319,13 @@ pub async fn serve_endpoint(
     // handshake, which is cheap.
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(hosting.max_connections));
     // A smaller cap on connections not yet admitted, so peers that stall their handshakes cannot
-    // hold every connection permit. Admission releases it.
-    let pending_cap = hosting.max_connections.div_ceil(4).max(4);
+    // hold every connection permit: below the total, unless it is 1. Admission releases it.
+    let pending_cap = hosting
+        .max_connections
+        .div_ceil(4)
+        .max(4)
+        .min(hosting.max_connections.saturating_sub(1))
+        .max(1);
     let handshake_limit = Arc::new(tokio::sync::Semaphore::new(pending_cap));
 
     loop {
@@ -358,7 +377,14 @@ pub async fn serve_endpoint(
                 return;
             }
             drop(pending_permit);
-            serve_connection(Authorized(conn), &sessions).await;
+            // Removing the client from the allowlist cuts it off, not just its next connection.
+            tokio::select! {
+                () = serve_connection(Authorized(conn.clone()), &sessions) => {}
+                () = allow.revoked(peer) => {
+                    auth_event(Outcome::Rejected, &peer, "removed from the allowlist");
+                    conn.close(1u32.into(), b"not authorized");
+                }
+            }
         });
     }
 

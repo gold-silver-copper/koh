@@ -207,6 +207,15 @@ fn overwriting_a_name_asks_first() {
         saved(&places, List::Servers),
         [("laptop".to_owned(), id(2))]
     );
+    // A replacement that cannot be saved (the id is another name's) leaves the old one.
+    names::update(&places, List::Servers, |n| n.add("desk", id(3))).unwrap();
+    let typed = format!("a\ns\nlaptop\n{}\ny\nq\n", id(3));
+    let (_, shown) = menu(&places, &typed);
+    assert!(shown.contains("already saved as"), "{shown}");
+    assert_eq!(
+        saved(&places, List::Servers),
+        [("laptop".to_owned(), id(2)), ("desk".to_owned(), id(3))]
+    );
 }
 
 #[test]

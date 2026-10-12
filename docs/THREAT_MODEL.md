@@ -120,8 +120,11 @@ service.
   `catch_unwind` or pre-filters control strings.
 - **Process / local:** `forbid(unsafe)` crate-wide; the identity key is the raw secret, protected
   by its permissions like an SSH host key: written `0600` (born-private atomic write), read with
-  `O_NOFOLLOW`, and re-tightened to 0600 through the open descriptor; a state dir another user can
-  write is refused; `KOH_*` env scrubbed before exec'ing the shell; PTY kill gated against pid reuse.
+  `O_NOFOLLOW`, and re-tightened to 0600 through the open descriptor; a state dir owned by another
+  user (but root), or world-writable without the sticky bit, is refused, and a group-accessible one
+  is warned about (members of its group could rename or delete the files in it); the directory's
+  lock is a private file in it, which no other user can hold; `KOH_*` env scrubbed before exec'ing
+  the shell; PTY kill gated against pid reuse.
 
 The detailed finding history lives in [SECURITY.md's audit trail](../SECURITY.md#audit-trail).
 

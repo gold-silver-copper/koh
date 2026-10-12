@@ -432,23 +432,30 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
             let endpoint = bind_endpoint_local(secret, false).await?;
             let conn = endpoint.connect(at, ALPN).await?;
             await_admission(&conn).await?;
-            conn.close(0u32.into(), b"done");
-            anyhow::Ok(())
+            anyhow::Ok((endpoint, conn))
         }
     };
     let outcomes = runtime().unwrap().block_on(async {
         let before = admitted().await.is_ok();
         home.koh(&["clients", "add", "me", &me]).unwrap();
-        let added = admitted().await.is_ok();
+        let live = admitted().await;
+        let added = live.is_ok();
         home.koh(&["clients", "rm", "me"]).unwrap();
+        // The connection it already had is cut off too.
+        let cut_off = match &live {
+            Ok((_, conn)) => tokio::time::timeout(Duration::from_secs(10), conn.closed())
+                .await
+                .is_ok(),
+            Err(_) => false,
+        };
         let removed = admitted().await.is_ok();
-        (before, added, removed)
+        (before, added, cut_off, removed)
     });
     let _ = server.kill();
     let _ = server.wait();
     assert_eq!(
         outcomes,
-        (false, true, false),
-        "(before it was saved, once saved, once removed)"
+        (false, true, true, false),
+        "(before it was saved, once saved, its live connection once removed, once removed)"
     );
 }

@@ -781,7 +781,8 @@ mod tests {
         );
         assert_eq!(decode_frame(&against_base, &base).unwrap(), frame);
         // Another screen's dictionary inflates to something else, or nothing.
-        assert!(decode_frame(&against_base, &target).map_or(true, |f| f != frame));
+        let other = TerminalScreen::from_bytes(24, 80, b"another screen");
+        assert!(decode_frame(&against_base, &other).map_or(true, |f| f != frame));
         // A frame naming another base than its stream's is refused.
         let mut lying = against_base;
         lying[1] = 9;

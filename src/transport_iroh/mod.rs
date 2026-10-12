@@ -48,7 +48,7 @@ const CLIENT_ACK_DELAY: Duration = Duration::from_millis(2);
 
 /// The ALPN, which is the protocol version ([`crate::proto`]): a peer on another fails the TLS
 /// handshake instead of misparsing mid-session.
-pub const ALPN: &[u8] = b"koh/4";
+pub const ALPN: &[u8] = b"koh/5";
 
 /// Errors from endpoint/identity setup.
 #[derive(Debug, thiserror::Error)]

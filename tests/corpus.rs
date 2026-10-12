@@ -332,7 +332,10 @@ impl Session {
         };
         self.client
             .on_frame_stream(Instant::now(), base, &rows, &body);
-        let applied = self.client.applied() == frame.num;
+        let applied = self
+            .sent
+            .back()
+            .is_some_and(|(_, screen)| self.client.state() == screen);
         // Delivered: the server takes that as the acknowledgement (or the client's own `Ack`, a
         // nudge, below).
         self.ack(frame.num);
@@ -349,7 +352,7 @@ impl Session {
         if applied {
             self.replayed.applied = self.replayed.applied.saturating_add(1);
             self.terminal
-                .render(self.client.state(), &Overlay::empty(), None)
+                .render(self.client.state(), &Overlay::default(), None)
                 .map_err(|e| e.to_string())?;
             let painted = std::mem::take(&mut *self.capture.painted.borrow_mut());
             self.shown.process(&painted).map_err(|e| e.to_string())?;
@@ -496,6 +499,12 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
     let size = Size::new(recording.rows, recording.cols);
     let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK)
         .map_err(|e| e.to_string())?;
+    // The PTY's modes as an interactive program sets them, a line editor's included: keys are
+    // echoed by the program, a key at a time.
+    server.set_tty(koh::terminal::TtyModes {
+        echo: false,
+        line: false,
+    });
     let mut client = ClientSession::new(size);
     let mut sent = TerminalScreen::default();
     let mut num = FrameNum::BLANK;
@@ -527,8 +536,8 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
         let before: Vec<((u16, u16), String)> = client
             .overlay()
             .cells()
-            .filter(|(_, c)| !c.covered)
-            .map(|(at, c)| (at, c.glyph.to_owned()))
+            .filter(|(_, c)| !c.covered())
+            .map(|(at, c)| (at, c.text().to_owned()))
             .collect();
         server.process(output);
         let screen = server.snapshot();
@@ -553,10 +562,11 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
         );
         for ((row, col), c) in client.overlay().cells() {
             let shown = cell(client.state(), row, col);
-            if !c.covered && shown != c.glyph {
+            if !c.covered() && shown != c.text() {
                 into.disagreeing.push(format!(
                     "{} step {index}: ({row}, {col}) guessed {:?}, the server shows {shown:?}",
-                    recording.name, c.glyph
+                    recording.name,
+                    c.text()
                 ));
             }
         }

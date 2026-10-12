@@ -1,4 +1,4 @@
-//! The koh/4 encoding.
+//! The koh/5 encoding.
 //!
 //! What the client sends, built here by hand, is pinned: the expected bytes were captured by
 //! running the encoder, and a change to the wire must change them in the same commit,
@@ -103,7 +103,7 @@ fn history_reply() -> Result<HistoryReply, fux_vt::Error> {
 /// The modes for every mouse mode (with the default encoding) and every mouse encoding (with
 /// press/release reporting).
 fn modes() -> Vec<WireModes> {
-    let sequences: [&[u8]; 8] = [
+    let sequences: [&[u8]; 9] = [
         b"",
         b"\x1b[?9h",
         b"\x1b[?1000h",
@@ -112,6 +112,7 @@ fn modes() -> Vec<WireModes> {
         b"\x1b[?1000h\x1b[?1005h",
         b"\x1b[?1000h\x1b[?1006h",
         b"\x1b[?1h\x1b=\x1b[?2004h\x1b[?25l",
+        b"\x1b[?1049h",
     ];
     sequences
         .iter()
@@ -201,15 +202,16 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The postcard encoding of each of [`modes`].
-const MODES: [&str; 8] = [
-    "000000000000",
-    "000000000100",
-    "000000000200",
-    "000000000300",
-    "000000000400",
-    "000000000201",
-    "000000000202",
-    "010101010000",
+const MODES: [&str; 9] = [
+    "00000000000000",
+    "00000000010000",
+    "00000000020000",
+    "00000000030000",
+    "00000000040000",
+    "00000000020100",
+    "00000000020200",
+    "01010101000000",
+    "00000000000001",
 ];
 
 /// Each of [`client_msgs`] as the client's stream carries it, length prefix included.
@@ -256,7 +258,7 @@ fn frames_and_history_round_trip_through_their_streams() {
 
 /// The protocol these bytes are pinned for. A change to them is a new protocol: bump the ALPN
 /// (`koh::transport_iroh::ALPN`) and this with it.
-const PINNED_FOR: &[u8] = b"koh/4";
+const PINNED_FOR: &[u8] = b"koh/5";
 
 #[test]
 fn client_messages_encode_as_pinned() {

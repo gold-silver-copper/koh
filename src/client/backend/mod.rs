@@ -7,7 +7,7 @@
 use std::fmt;
 use std::io;
 
-use fux_vt::{Blink, Color, UnderlineStyle};
+use fux_vt::{Attributes, Blink, Color, UnderlineStyle};
 
 use crate::terminal::{Link, Size};
 
@@ -24,42 +24,25 @@ pub(crate) const RESET_FORWARDED_MODES: &[u8] =
     b"\x1b[?9l\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\
 \x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>";
 
-/// A cell's style as koh draws it, compared with the last to emit SGR only on a change.
-#[derive(PartialEq, Eq, Clone, Copy)]
-pub struct CellStyle {
-    pub fg: Color,
-    pub bg: Color,
-    pub underline_color: Color,
-    pub bold: bool,
-    pub dim: bool,
-    pub italic: bool,
-    pub underline: UnderlineStyle,
-    pub inverse: bool,
-    pub hidden: bool,
-    pub strikeout: bool,
-    pub blink: Blink,
-}
-
-impl CellStyle {
-    /// This style as a terminal draws it: an underline's style only if `styles` (the terminal
-    /// draws them), else a plain underline. A terminal that does not know `4:n` draws no underline
-    /// at all, or reads the colon as a semicolon (underline and italic).
-    #[must_use]
-    pub fn drawn(self, styles: bool) -> Self {
-        let underline = match self.underline {
-            UnderlineStyle::None => UnderlineStyle::None,
-            style @ (UnderlineStyle::Double
-            | UnderlineStyle::Curly
-            | UnderlineStyle::Dotted
-            | UnderlineStyle::Dashed)
-                if styles =>
-            {
-                style
-            }
-            UnderlineStyle::Single | _ => UnderlineStyle::Single,
-        };
-        Self { underline, ..self }
-    }
+/// `style` as a terminal draws it: underline styles only where it `styles` them.
+///
+/// Elsewhere a styled underline is a plain one: a terminal that does not know `4:n` draws no
+/// underline at all, or reads the colon as a semicolon (underline and italic).
+#[must_use]
+pub fn drawn(style: Attributes, styles: bool) -> Attributes {
+    let underline = match style.underline_style() {
+        UnderlineStyle::None => UnderlineStyle::None,
+        kind @ (UnderlineStyle::Double
+        | UnderlineStyle::Curly
+        | UnderlineStyle::Dotted
+        | UnderlineStyle::Dashed)
+            if styles =>
+        {
+            kind
+        }
+        UnderlineStyle::Single | _ => UnderlineStyle::Single,
+    };
+    style.with_underline_style(underline)
 }
 
 /// The terminal `koh connect` paints on. Output is buffered until [`flush`](Self::flush), once per
@@ -107,28 +90,34 @@ pub trait KohBackend {
         Ok(())
     }
 
-    /// Enter the alternate screen and hide the cursor.
+    /// Save the window title (XTWINOPS 22), enter the alternate screen and hide the cursor.
     fn enter_alt_screen(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[?1049h\x1b[?25l")?;
+        self.write_bytes(b"\x1b[22;0t\x1b[?1049h\x1b[?25l")?;
         self.flush()
     }
 
-    /// Reset the forwarded modes, show the cursor and leave the alternate screen: the user's
-    /// terminal as it was.
+    /// Reset the forwarded modes, show the cursor, leave the alternate screen and restore the
+    /// window title saved on entering it: the user's terminal as it was.
     fn leave_alt_screen(&mut self) -> io::Result<()> {
         self.write_bytes(RESET_FORWARDED_MODES)?;
-        self.write_bytes(b"\x1b[?25h\x1b[?1049l")?;
+        self.write_bytes(b"\x1b[?25h\x1b[?1049l\x1b[23;0t")?;
         self.flush()
     }
 
-    /// Open a synchronized-output frame (DEC 2026) and hide the cursor, so the frame shows at once.
+    /// Open a synchronized-output frame (DEC 2026), hide the cursor and turn autowrap off, so the
+    /// frame shows at once and no glyph, the last column's included, can wrap or scroll.
     fn begin_frame(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[?2026h\x1b[?25l")
+        self.write_bytes(b"\x1b[?2026h\x1b[?25l\x1b[?7l")
     }
 
-    /// Close the synchronized-output frame.
+    /// Turn autowrap back on, as the user's shell expects it, and close the frame.
     fn end_frame(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[?2026l")
+        self.write_bytes(b"\x1b[?7h\x1b[?2026l")
+    }
+
+    /// Erase the whole terminal in the default style.
+    fn clear(&mut self) -> io::Result<()> {
+        self.write_bytes(b"\x1b[m\x1b[2J")
     }
 
     /// Move the cursor to a 0-based `(row, col)` (emitted as the 1-based CUP sequence).
@@ -157,20 +146,20 @@ pub trait KohBackend {
     }
 
     /// Set a whole style: reset, then each attribute, then the colours.
-    fn set_style(&mut self, style: CellStyle) -> io::Result<()> {
+    fn set_style(&mut self, style: Attributes) -> io::Result<()> {
         self.reset_sgr()?; // clears everything (incl. colors), then re-apply
-        if style.bold {
+        if style.bold() {
             self.write_bytes(b"\x1b[1m")?;
         }
-        if style.dim {
+        if style.dim() {
             self.write_bytes(b"\x1b[2m")?;
         }
-        if style.italic {
+        if style.italic() {
             self.write_bytes(b"\x1b[3m")?;
         }
-        match style.underline {
+        match style.underline_style() {
             UnderlineStyle::None => {}
-            // Kitty's `4:n`, only where the terminal draws it (see `CellStyle::drawn`).
+            // Kitty's `4:n`, only where the terminal draws it (see `drawn`).
             UnderlineStyle::Double => self.write_bytes(b"\x1b[4:2m")?,
             UnderlineStyle::Curly => self.write_bytes(b"\x1b[4:3m")?,
             UnderlineStyle::Dotted => self.write_bytes(b"\x1b[4:4m")?,
@@ -178,34 +167,29 @@ pub trait KohBackend {
             // A style fux-vt adds later is drawn plain.
             UnderlineStyle::Single | _ => self.write_bytes(b"\x1b[4m")?,
         }
-        if style.inverse {
+        if style.inverse() {
             self.write_bytes(b"\x1b[7m")?;
         }
-        if style.hidden {
+        if style.hidden() {
             self.write_bytes(b"\x1b[8m")?;
         }
-        if style.strikeout {
+        if style.strikeout() {
             self.write_bytes(b"\x1b[9m")?;
         }
-        match style.blink {
+        match style.blink() {
             Blink::Slow => self.write_bytes(b"\x1b[5m")?,
             Blink::Rapid => self.write_bytes(b"\x1b[6m")?,
             Blink::None | _ => {}
         }
-        write_sgr_color(self, style.fg, true)?;
-        write_sgr_color(self, style.bg, false)?;
+        write_sgr_color(self, style.foreground(), true)?;
+        write_sgr_color(self, style.background(), false)?;
         // Only when set: a terminal that does not know SGR 58 may read its parameters as others.
-        write_underline_color(self, style.underline_color)
+        write_underline_color(self, style.underline_color())
     }
 
     /// Reset all SGR attributes (`ESC [ m`, the zero-parameter form).
     fn reset_sgr(&mut self) -> io::Result<()> {
         self.write_bytes(b"\x1b[m")
-    }
-
-    /// Turn on reverse video (`ESC [ 7 m`), for the status line.
-    fn set_reverse(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[7m")
     }
 
     /// Print a glyph at the cursor.
@@ -417,42 +401,35 @@ mod tests {
 
     #[test]
     fn frame_and_screen_control_bytes() {
-        assert_eq!(emit(KohBackend::begin_frame), b"\x1b[?2026h\x1b[?25l");
-        assert_eq!(emit(KohBackend::end_frame), b"\x1b[?2026l");
-        assert_eq!(emit(KohBackend::enter_alt_screen), b"\x1b[?1049h\x1b[?25l");
+        assert_eq!(
+            emit(KohBackend::begin_frame),
+            b"\x1b[?2026h\x1b[?25l\x1b[?7l"
+        );
+        assert_eq!(emit(KohBackend::end_frame), b"\x1b[?7h\x1b[?2026l");
+        // The user's title is saved on entering, and restored on leaving (exit and suspend).
+        assert_eq!(
+            emit(KohBackend::enter_alt_screen),
+            b"\x1b[22;0t\x1b[?1049h\x1b[?25l"
+        );
         // leave_alt_screen resets the forwarded-mode ledger, then shows the cursor and leaves alt.
         let bytes = emit(KohBackend::leave_alt_screen);
         assert!(bytes.starts_with(RESET_FORWARDED_MODES));
-        assert!(bytes.ends_with(b"\x1b[?25h\x1b[?1049l"));
+        assert!(bytes.ends_with(b"\x1b[?25h\x1b[?1049l\x1b[23;0t"));
     }
 
     #[test]
     fn a_style_emits_every_attribute_it_has() {
-        let style = CellStyle {
-            fg: Color::Idx(1),
-            bg: Color::Default,
-            underline_color: Color::Rgb(fux_vt::Rgb { r: 1, g: 2, b: 3 }),
-            bold: false,
-            dim: false,
-            italic: false,
-            underline: UnderlineStyle::Single,
-            inverse: false,
-            hidden: true,
-            strikeout: true,
-            blink: Blink::Rapid,
-        };
+        let plain = Attributes::new(Color::Idx(1), Color::Default);
+        let style = plain
+            .with_underline_color(Color::Rgb(fux_vt::Rgb { r: 1, g: 2, b: 3 }))
+            .with_underline_style(UnderlineStyle::Single)
+            .with_hidden(true)
+            .with_strikeout(true)
+            .with_blink(Blink::Rapid);
         assert_eq!(
             emit(|b| b.set_style(style)),
             b"\x1b[m\x1b[4m\x1b[8m\x1b[9m\x1b[6m\x1b[31m\x1b[49m\x1b[58;2;1;2;3m"
         );
-        let plain = CellStyle {
-            underline_color: Color::Default,
-            hidden: false,
-            strikeout: false,
-            blink: Blink::None,
-            underline: UnderlineStyle::None,
-            ..style
-        };
         assert_eq!(emit(|b| b.set_style(plain)), b"\x1b[m\x1b[31m\x1b[49m");
         // Each underline style, where the terminal draws them; plain where it does not.
         for (underline, sgr) in [
@@ -461,13 +438,13 @@ mod tests {
             (UnderlineStyle::Dotted, b"\x1b[4:4m"),
             (UnderlineStyle::Dashed, b"\x1b[4:5m"),
         ] {
-            let styled = CellStyle { underline, ..plain };
+            let styled = plain.with_underline_style(underline);
             assert_eq!(
-                emit(|b| b.set_style(styled.drawn(true))),
+                emit(|b| b.set_style(drawn(styled, true))),
                 [b"\x1b[m", sgr, b"\x1b[31m\x1b[49m"].concat()
             );
             assert_eq!(
-                emit(|b| b.set_style(styled.drawn(false))),
+                emit(|b| b.set_style(drawn(styled, false))),
                 b"\x1b[m\x1b[4m\x1b[31m\x1b[49m"
             );
         }

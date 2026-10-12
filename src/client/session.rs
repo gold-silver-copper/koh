@@ -14,12 +14,12 @@ use crate::events::{InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE, 
 use crate::predict::{Overlay, PredictionEngine};
 use crate::proto::{
     decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
-    HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
+    ServerMsg, HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
 };
-use crate::terminal::{Grid, HistoryReply, Size, TerminalScreen};
+use crate::terminal::{HistoryReply, Size, TerminalScreen};
 
 use super::link::Link;
-use super::probe::COLOUR_QUERIES;
+use super::probe::{self, COLOUR_QUERIES};
 use super::render::WindowState;
 use super::scrollback::Scrollback;
 use super::{window_state, ESCAPE_PREFIX, SCROLLBACK_KEY, SUSPEND_KEY};
@@ -280,6 +280,19 @@ pub enum InputOutcome {
     Forwarded,
 }
 
+/// What the user's terminal said it does, in its answers to the start-up questions
+/// ([`ClientSession::ask_terminal`]), for the caller to paint and listen by. Each only ever turns on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Found {
+    /// It draws underline styles (`4:n`).
+    pub underline_styles: bool,
+    /// It speaks the kitty keyboard protocol: push disambiguate and alternate keys.
+    pub kitty: bool,
+    /// It reports its colour scheme, and so can report changes (mode 2031), while colours are
+    /// told.
+    pub scheme_reports: bool,
+}
+
 /// What one [`ClientSession::on_tick`] produced for the connection loop.
 #[derive(Debug, Default)]
 pub struct TickResult {
@@ -314,10 +327,12 @@ pub struct ClientSession {
     pending_escape: Option<Keystroke>,
     /// The user's terminal's colours, while the server is told them (not with `--no-colours`).
     colours: Option<WireColours>,
-    /// The colours were asked again (after a new scheme) and not all are in.
+    /// The colours were asked (at start-up, or again after a new scheme) and not all are in.
     colours_asked: bool,
     /// Questions for the user's terminal, for the caller to write.
     ask: Vec<u8>,
+    /// What the user's terminal said it does, and whether that changed since last taken.
+    found: (Found, bool),
     /// A notice for the status line.
     notice: notice::Notices,
     /// A key's legacy bytes, as last matched against the escape prefix.
@@ -332,8 +347,6 @@ pub struct ClientSession {
     cols: u16,
     /// Set whenever the rendered output may have changed; cleared once the caller repaints.
     pub(crate) dirty: bool,
-    /// Whether a status banner was painted last frame, so its removal repaints once more.
-    pub(crate) status_was_shown: bool,
 }
 
 impl ClientSession {
@@ -357,6 +370,7 @@ impl ClientSession {
             colours: None,
             colours_asked: false,
             ask: Vec::new(),
+            found: (Found::default(), false),
             notice: notice::Notices::default(),
             scratch: Vec::with_capacity(16),
             scrollback: Scrollback::default(),
@@ -364,8 +378,23 @@ impl ClientSession {
             rows: size.rows,
             cols: size.cols,
             dirty: true,
-            status_was_shown: false,
         }
+    }
+
+    /// The run's first phase: ask the user's terminal, at `now`, what it draws, speaks and shows
+    /// ([`probe`](super::probe)), its colours too if `colours` (to tell the server, which answers
+    /// programs' colour queries with them). The answers come in on stdin with what is typed, and
+    /// this session's decoder, expecting them, takes them whenever they arrive: none reaches the
+    /// program. What they say is [`take_found`](Self::take_found)'s, and the colours are told
+    /// once the round's last answer (DA1) is in.
+    pub fn ask_terminal(&mut self, now: Instant, colours: bool) {
+        self.colours = colours.then(|| WireColours {
+            palette: vec![None; PALETTE],
+            ..WireColours::default()
+        });
+        self.colours_asked = colours;
+        self.ask.extend_from_slice(&probe::queries(colours));
+        self.decoder.expect(now);
     }
 
     /// The connection was lost: what was meant for it alone (acknowledgements, history requests
@@ -463,8 +492,8 @@ impl ClientSession {
 
     /// Take decoded input: the escape prefix (a key whose legacy byte is `Ctrl-^`, from any
     /// terminal) then `.` quits, then `Ctrl-Z` suspends once the rest is taken, then `[` opens the
-    /// scrollback view, then anything else forwards both; the rest goes to the view while it is
-    /// open, else is predicted and queued. The terminal's answers to the client's own questions
+    /// scrollback view, then the prefix again or `^` sends one Ctrl-^, then anything else forwards
+    /// both; the rest goes to the view while it is open, else is predicted and queued. The terminal's answers to the client's own questions
     /// are taken here and go no further.
     pub fn on_inputs(&mut self, now: Instant, inputs: Vec<Input>) -> InputOutcome {
         let mut suspend = false;
@@ -521,11 +550,15 @@ impl ClientSession {
                     }
                     _ => {}
                 }
+                // The prefix again, or `^`, is the prefix typed for itself: one Ctrl-^ goes on.
+                let literal = matches!(key, Some([ESCAPE_PREFIX | b'^']));
                 if self.scrollback.viewing() {
                     self.send_to_view(&[Input::Key(prefix), input]);
                 } else {
                     fwd.push(InputEvent::Key(prefix.into()));
-                    events_of(input, &mut fwd);
+                    if !literal {
+                        events_of(input, &mut fwd);
+                    }
                 }
             } else if key == Some(&[ESCAPE_PREFIX]) {
                 if let Input::Key(stroke) = input {
@@ -554,40 +587,63 @@ impl ClientSession {
         self.dirty = true;
     }
 
-    /// An answer or report from the user's terminal. A new scheme (mode 2031) asks the colours
-    /// again; once the round's last answer (DA1) is in, the server is told them.
+    /// An answer or report from the user's terminal. What it says it does is
+    /// [`take_found`](Self::take_found)'s; its colours are kept while they are told. A new scheme
+    /// (mode 2031) asks the colours again; once a round's last answer (DA1) is in, the server is
+    /// told them.
     fn on_reply(&mut self, now: Instant, reply: Reply) {
-        let Some(colours) = self.colours.as_mut() else {
-            return;
-        };
+        let found = &mut self.found.0;
+        let before = *found;
+        let colours = self.colours.as_mut();
         match reply {
+            Reply::UnderlineStyles => found.underline_styles = true,
+            Reply::KittyFlags(_) => found.kitty = true,
             Reply::Scheme(scheme) => {
-                colours.scheme = Some(match scheme {
-                    Scheme::Dark => WireScheme::Dark,
-                    Scheme::Light => WireScheme::Light,
-                });
-                if !self.colours_asked {
-                    self.colours_asked = true;
-                    self.ask.extend_from_slice(COLOUR_QUERIES);
-                    self.decoder.expect(now);
+                if let Some(colours) = colours {
+                    colours.scheme = Some(match scheme {
+                        Scheme::Dark => WireScheme::Dark,
+                        Scheme::Light => WireScheme::Light,
+                    });
+                    found.scheme_reports = true;
+                    if !self.colours_asked {
+                        self.colours_asked = true;
+                        self.ask.extend_from_slice(COLOUR_QUERIES);
+                        self.decoder.expect(now);
+                    }
                 }
             }
-            Reply::Foreground(rgb) => colours.foreground = Some(rgb.into()),
-            Reply::Background(rgb) => colours.background = Some(rgb.into()),
+            Reply::Foreground(rgb) => {
+                if let Some(colours) = colours {
+                    colours.foreground = Some(rgb.into());
+                }
+            }
+            Reply::Background(rgb) => {
+                if let Some(colours) = colours {
+                    colours.background = Some(rgb.into());
+                }
+            }
             Reply::Palette { index, rgb } => {
-                if let Some(slot) = colours.palette.get_mut(usize::from(index)) {
+                if let Some(slot) = colours.and_then(|c| c.palette.get_mut(usize::from(index))) {
                     *slot = Some(rgb.into());
                 }
             }
-            Reply::Attributes if self.colours_asked => {
-                self.colours_asked = false;
-                self.outgoing.push_back(ClientMsg::Colours(colours.clone()));
+            Reply::Attributes => {
+                if let Some(colours) = colours.filter(|_| self.colours_asked) {
+                    self.colours_asked = false;
+                    if colours.known() {
+                        self.outgoing.push_back(ClientMsg::Colours(colours.clone()));
+                    }
+                }
             }
-            Reply::Attributes
-            | Reply::Mode { .. }
-            | Reply::KittyFlags(_)
-            | Reply::UnderlineStyles => {}
+            Reply::Mode { .. } => {}
         }
+        self.found.1 |= self.found.0 != before;
+    }
+
+    /// What the user's terminal said it does, if that changed since last taken.
+    pub fn take_found(&mut self) -> Option<Found> {
+        let (found, changed) = &mut self.found;
+        std::mem::take(changed).then_some(*found)
     }
 
     fn queue_events(&mut self, now: Instant, events: Vec<InputEvent>) {
@@ -637,9 +693,11 @@ impl ClientSession {
                     }
                     self.predictor.new_user_key(key.stroke().press, screen);
                 }
-                InputEvent::Mouse(_) | InputEvent::Focus(_) | InputEvent::Paste(_) => {
+                InputEvent::Mouse(_) | InputEvent::Paste(_) => {
                     self.predictor.new_user_other(screen);
                 }
+                // Focus changes the screen of no line editor: the predictor never hears of it.
+                InputEvent::Focus(_) => {}
             }
             self.outgoing.event(event, cost, &mut self.last_seq);
         }
@@ -662,19 +720,6 @@ impl ClientSession {
     /// reported a new scheme), for the caller to write.
     pub fn take_questions(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.ask)
-    }
-
-    /// What the user's terminal said of its colours, to tell the server now and to keep across
-    /// reconnects; `None` if the user turned telling off (`--no-colours`) or the terminal said
-    /// nothing. Known colours are told at once.
-    pub fn set_colours(&mut self, colours: Option<WireColours>) {
-        if let Some(colours) = colours.as_ref().filter(|c| c.known()) {
-            self.outgoing.push_back(ClientMsg::Colours(colours.clone()));
-        }
-        self.colours = colours.map(|mut c| {
-            c.palette.resize(PALETTE, None);
-            c
-        });
     }
 
     /// Queue a new window size; it voids the predictions.
@@ -723,9 +768,12 @@ impl ClientSession {
             self.link.refuse(frame.base);
             return;
         };
-        if next.screen.screen().cursor_position().0
-            != self.link.current().screen.screen().cursor_position().0
-        {
+        // The cursor's row, by its index and the history's newest row: at the bottom of the
+        // screen a new line scrolls, leaving the index as it was.
+        let row = |screen: &TerminalScreen| {
+            (screen.screen().cursor_position().0, screen.history().newest)
+        };
+        if row(&next.screen) != row(&self.link.current().screen) {
             self.link.new_row_at = Some(now);
         }
         self.link.advance(next);
@@ -743,6 +791,14 @@ impl ClientSession {
             .on_mark(self.link.current().screen.history());
         self.last_activity = Some(now);
         self.dirty = true;
+    }
+
+    /// A message from the server arrived: a frame's stream, or history rows.
+    pub fn on_server(&mut self, now: Instant, msg: ServerMsg) {
+        match msg {
+            ServerMsg::Frame { base, rows, body } => self.on_frame_stream(now, base, &rows, &body),
+            ServerMsg::History(reply) => self.on_history(&reply),
+        }
     }
 
     /// History rows arrived.
@@ -856,18 +912,13 @@ impl ClientSession {
         &self.link.current().screen
     }
 
-    /// The newest frame applied.
-    pub const fn applied(&self) -> FrameNum {
-        self.link.current().num
-    }
-
     /// Whether a frame has been applied, so [`state`](Self::state) is the server's.
     pub fn synced(&self) -> bool {
         self.link.current().num > FrameNum::BLANK
     }
 
     /// The prediction overlay to draw over [`state`](Self::state).
-    pub fn overlay(&self) -> Overlay<'_> {
+    pub fn overlay(&self) -> Overlay {
         self.predictor.overlay()
     }
 
@@ -885,11 +936,6 @@ impl ClientSession {
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
     pub fn window_state(&self) -> WindowState<'_> {
         window_state(&self.link.current().screen)
-    }
-
-    /// The newest applied screen's grid.
-    pub fn screen(&self) -> &Grid {
-        self.link.current().screen.screen()
     }
 }
 
@@ -1101,6 +1147,7 @@ mod tests {
         // writing to the terminal, and predicting it key by key costs a screenful each.
         let (now, mut s) = start();
         drain(&mut s);
+        s.predictor.set_tty(Some(EDITOR));
         s.predictor.confirm_for_tests();
         let burst = vec![b'y'; TYPED_KEYS + 1];
         s.on_input(now, &burst);
@@ -1121,12 +1168,12 @@ mod tests {
         s.dirty = false;
         s.on_frame(now, &frame(1, 0, 0, &blank, &one));
         assert!(s.dirty && s.synced());
-        assert!(s.screen().contents().contains("one"));
+        assert!(s.state().screen().contents().contains("one"));
         s.on_frame(now, &frame(2, 1, 0, &one, &two));
-        assert!(s.screen().contents().contains("one two"));
+        assert!(s.state().screen().contents().contains("one two"));
         // The server takes a frame's delivery as its acknowledgement.
         assert_eq!(drain(&mut s), []);
-        assert_eq!(s.applied(), FrameNum(2));
+        assert_eq!(s.link.current().num, FrameNum(2));
     }
 
     #[test]
@@ -1141,11 +1188,11 @@ mod tests {
         // Frame 1 is delivered late; the server, told of its delivery, may diff against it.
         s.on_frame(now, &frame(1, 0, 0, &blank, &one));
         assert!(
-            s.screen().contents().contains("two"),
+            s.state().screen().contents().contains("two"),
             "the newer stays shown"
         );
         s.on_frame(now, &frame(3, 1, 0, &one, &three));
-        assert!(s.screen().contents().contains("three"));
+        assert!(s.state().screen().contents().contains("three"));
         assert_eq!(drain(&mut s), [], "no resync: frame 1 was kept");
     }
 
@@ -1158,7 +1205,7 @@ mod tests {
         s.on_frame(now, &frame(2, 0, 0, &blank, &two));
         s.on_frame(now, &frame(1, 0, 0, &blank, &one));
         s.on_frame(now, &frame(2, 0, 0, &blank, &one));
-        assert!(s.screen().contents().contains("two"));
+        assert!(s.state().screen().contents().contains("two"));
     }
 
     #[test]
@@ -1175,7 +1222,7 @@ mod tests {
             "one resync, not one per frame"
         );
         s.on_frame(now, &frame(7, 0, 0, &blank, &one));
-        assert!(s.screen().contents().contains("one"));
+        assert!(s.state().screen().contents().contains("one"));
         // Base 3 is older than base 4, refused: the server sent it before it read that Resync.
         s.on_frame(now, &frame(8, 3, 0, &one, &one));
         assert_eq!(drain(&mut s), [], "covered by the resync sent");
@@ -1246,7 +1293,7 @@ mod tests {
         let base = screen(format!("frame {oldest_kept}").as_bytes());
         s.on_frame(now, &frame(22, oldest_kept, 0, &base, &target));
         assert!(
-            s.screen().contents().contains("target"),
+            s.state().screen().contents().contains("target"),
             "a kept base applies"
         );
     }
@@ -1292,7 +1339,7 @@ mod tests {
         assert_eq!(drain(&mut s), [ClientMsg::Resync]);
         s.on_frame(now, &frame(22, 19, 0, &big, &big));
         assert_eq!(drain(&mut s), []);
-        assert_eq!(s.applied(), FrameNum(22));
+        assert_eq!(s.link.current().num, FrameNum(22));
     }
 
     #[test]
@@ -1345,28 +1392,107 @@ mod tests {
         assert!(4 * usize::from(rows) * usize::from(cols) <= WINDOW_CELLS);
     }
 
-    #[test]
-    fn a_frame_confirms_echoed_predictions() {
+    /// The PTY's modes under a line editor (readline): it echoes for itself, a key at a time.
+    const EDITOR: crate::predict::TtyModes = crate::predict::TtyModes {
+        echo: false,
+        line: false,
+    };
+
+    /// A screen at a line editor's prompt showing `bytes`, from an emulator with `scrollback`
+    /// rows of history.
+    fn at_editor(bytes: &[u8], scrollback: usize) -> TerminalScreen {
+        let mut emu = ServerTerminal::new(24, 80, scrollback).expect("emulator");
+        emu.set_tty(EDITOR);
+        emu.process(bytes);
+        emu.snapshot()
+    }
+
+    /// A session whose first keystroke at a line editor's prompt was echoed: what is typed now
+    /// shows as it is predicted. Returns the time after the echo and the screen it showed.
+    fn trusted() -> (Instant, ClientSession, TerminalScreen) {
         let (now, mut s) = start();
-        s.on_input(now, b"x");
+        let prompt = at_editor(b"", 0);
+        s.on_frame(now, &frame(1, 0, 0, &TerminalScreen::default(), &prompt));
+        let later = now + Duration::from_secs(1);
+        s.on_input(later, b"x");
         assert!(
             s.overlay().is_empty(),
             "the first keystroke stays hidden until confirmed"
         );
         assert_eq!(s.predictor.confirmed_epoch(), 0);
-        let echoed = screen(b"x");
-        let later = now + Duration::from_millis(100);
-        s.on_frame(later, &frame(1, 0, 1, &TerminalScreen::default(), &echoed));
+        let echoed = at_editor(b"x", 0);
+        s.on_frame(later, &frame(2, 1, 1, &prompt, &echoed));
         assert_eq!(
             s.predictor.confirmed_epoch(),
             1,
             "the echoed keystroke is graded correct and its epoch confirmed"
         );
+        drain(&mut s);
+        (later, s, echoed)
+    }
+
+    #[test]
+    fn a_frame_confirms_echoed_predictions() {
+        let (later, mut s, _) = trusted();
         s.on_input(later, b"y");
         assert_eq!(
-            s.overlay().cell(0, 1).map(|c| c.glyph),
+            s.overlay().cell(0, 1).map(crate::predict::Cell::text),
             Some("y"),
             "typing after a confirmed echo is shown"
+        );
+    }
+
+    /// A focus change (an alt-tab) is no edit: the predictions and the trust stay.
+    #[test]
+    fn focus_events_leave_the_predictions_alone() {
+        let (later, mut s, _) = trusted();
+        s.on_input(later, b"y");
+        let before = s.overlay();
+        let epoch = s.predictor.confirmed_epoch();
+        s.on_input(later, b"\x1b[I\x1b[O");
+        assert_eq!(s.overlay(), before);
+        assert_eq!(s.predictor.confirmed_epoch(), epoch);
+        s.on_input(later, b"z");
+        assert_eq!(
+            s.overlay().cell(0, 2).map(crate::predict::Cell::text),
+            Some("z")
+        );
+    }
+
+    /// At the bottom of the screen Enter scrolls, so the cursor's row index stays: the hold for
+    /// a fresh prompt (whose program may turn echo off a moment after drawing it) keys on the
+    /// row's history name, which the scroll changes.
+    #[test]
+    fn the_hold_engages_at_the_bottom_of_the_screen() {
+        let echoing = crate::predict::TtyModes {
+            echo: true,
+            line: true,
+        };
+        let mut emu = ServerTerminal::new(24, 80, 100).expect("emulator");
+        emu.set_tty(echoing);
+        let lines: Vec<String> = (0..30).map(|n| format!("line {n}")).collect();
+        emu.process(format!("{}\r\n$ ", lines.join("\r\n")).as_bytes());
+        let first = emu.snapshot();
+        assert_eq!(first.screen().cursor_position().0, 23, "at the bottom");
+        let (t0, mut s) = start();
+        s.on_frame(t0, &frame(1, 0, 0, &TerminalScreen::default(), &first));
+        let t1 = t0 + Duration::from_secs(1);
+        s.on_input(t1, b"x");
+        assert!(!s.overlay().is_empty(), "kernel echo shows at once");
+        drain(&mut s);
+        // Enter: the shell scrolls and prints a prompt on the same row index.
+        emu.process(b"x\r\nSecret: ");
+        let prompt = emu.snapshot();
+        assert_eq!(
+            prompt.screen().cursor_position().0,
+            23,
+            "still at the bottom"
+        );
+        s.on_frame(t1, &frame(2, 1, 1, &first, &prompt));
+        s.on_input(t1 + Duration::from_millis(10), b"Q");
+        assert!(
+            !s.overlay().cells().any(|(_, c)| c.text() == "Q"),
+            "a key typed at a fresh prompt is not shown before its echo"
         );
     }
 
@@ -1571,14 +1697,28 @@ mod tests {
     #[test]
     fn colours_are_told_on_connecting_and_again_on_a_new_scheme() {
         let (now, mut s) = start();
-        let colours = WireColours {
-            background: Some([0x1e, 0x1e, 0x20]),
-            scheme: Some(WireScheme::Dark),
-            ..WireColours::default()
-        };
-        s.set_colours(Some(colours.clone()));
+        s.ask_terminal(now, true);
+        assert_eq!(s.take_questions(), probe::queries(true));
+        // Ghostty: its colours, a dark scheme, the kitty flags, DA1 last.
+        s.on_input(
+            now,
+            b"\x1b]11;rgb:1e/1e/20\x07\x1b[?0u\x1b[?997;1n\x1b[?62;22c",
+        );
         let sent = drain(&mut s);
-        assert_eq!(sent.get(1), Some(&ClientMsg::Colours(colours)));
+        let Some(ClientMsg::Colours(told)) = sent.get(1) else {
+            panic!("{sent:?}")
+        };
+        assert_eq!(told.background, Some([0x1e, 0x1e, 0x20]));
+        assert_eq!(told.scheme, Some(WireScheme::Dark));
+        assert_eq!(
+            s.take_found(),
+            Some(Found {
+                underline_styles: false,
+                kitty: true,
+                scheme_reports: true
+            })
+        );
+        assert_eq!(s.take_found(), None, "said once");
         // The terminal reports a light scheme: its colours are asked again, and told once DA1,
         // the round's last answer, is in.
         s.on_input(now, b"\x1b[?997;2n");
@@ -1596,12 +1736,42 @@ mod tests {
         assert_eq!(told.scheme, Some(WireScheme::Light));
         assert_eq!(told.palette.get(1), Some(&Some([0xcd, 0, 0])));
         assert_eq!(s.colours.as_ref(), Some(told));
-        // Not told, nothing is asked or sent.
+        // Not told, no colour is asked or sent, nor are scheme reports turned on.
         let (now, mut s) = start();
-        s.set_colours(None);
-        s.on_input(now, b"\x1b[?997;2n");
+        s.ask_terminal(now, false);
+        assert_eq!(s.take_questions(), probe::QUERIES);
+        s.on_input(now, b"\x1b[?997;2n\x1b[?62c\x1b[?997;1n");
         assert_eq!(s.take_questions(), b"");
+        assert_eq!(s.take_found(), None);
         assert_eq!(drain(&mut s), [ClientMsg::Resize(Size::new(24, 80))]);
+    }
+
+    /// The start-up questions are the session's first phase, on the one decoder stdin has: an
+    /// answer, however late and however split (a slow terminal, a slow link), is taken as one,
+    /// and never reaches the program as keys (`ESC P 1 + r` would be Alt-P and more, which
+    /// vim's normal mode runs). Keys typed around it go on as typed.
+    #[test]
+    fn a_late_answer_to_the_start_up_questions_never_reaches_the_program() {
+        let (t0, mut s) = start();
+        s.ask_terminal(t0, false);
+        drain(&mut s);
+        let late = t0 + Duration::from_secs(10);
+        s.on_input(late, b"a\x1bP1+r536d756c");
+        s.on_input(late, b"78=1b5b343a25703125646d\x1b\\b\x1bP1$r0;4:3m\x1b\\");
+        s.on_input(late, b"\x1b[?62;22cc");
+        assert_eq!(typed(&drain(&mut s)), b"abc");
+        assert!(s.take_found().is_some_and(|found| found.underline_styles));
+    }
+
+    /// The prefix typed twice, or then `^`, sends one Ctrl-^ (vim's alternate file).
+    #[test]
+    fn the_prefix_twice_or_then_a_caret_sends_one_ctrl_caret() {
+        for keys in [[ESCAPE_PREFIX, ESCAPE_PREFIX], [ESCAPE_PREFIX, b'^']] {
+            let (now, mut s) = start();
+            drain(&mut s);
+            assert_eq!(s.on_input(now, &keys), InputOutcome::Forwarded);
+            assert_eq!(typed(&drain(&mut s)), [ESCAPE_PREFIX], "{keys:?}");
+        }
     }
 
     #[test]
@@ -1732,7 +1902,7 @@ mod tests {
         let later = t0 + Duration::from_secs(1);
         s.on_input(later, b"x");
         assert!(
-            s.overlay().cells().any(|(_, c)| c.glyph == "x"),
+            s.overlay().cells().any(|(_, c)| c.text() == "x"),
             "kernel echo is predicted from the first key"
         );
         drain(&mut s);
@@ -1744,7 +1914,7 @@ mod tests {
         s.on_input(t1 + Duration::from_millis(10), b"Q");
         drain(&mut s);
         assert!(
-            !s.overlay().cells().any(|(_, c)| c.glyph == "Q"),
+            !s.overlay().cells().any(|(_, c)| c.text() == "Q"),
             "a key typed at a fresh prompt is not shown before its echo"
         );
         // The program did echo (no password after all): once the server reflects the held key,
@@ -1755,10 +1925,10 @@ mod tests {
         s.on_frame(t2, &frame(3, 2, 2, &prompt, &echoed));
         s.on_input(t2, b"Z");
         assert!(
-            s.overlay().cells().any(|(_, c)| c.glyph == "Z"),
+            s.overlay().cells().any(|(_, c)| c.text() == "Z"),
             "after the hold, kernel echo is predicted again"
         );
-        assert!(!s.overlay().cells().any(|(_, c)| c.glyph == "Q"));
+        assert!(!s.overlay().cells().any(|(_, c)| c.text() == "Q"));
     }
 
     /// `Ctrl-^`, a focus-in report, then `.`: the focus-in takes the prefix and the `.` is typed,
@@ -1786,10 +1956,8 @@ mod tests {
     #[test]
     fn input_typed_while_detached_is_dropped_at_the_attach() {
         let (now, mut s) = start();
-        s.set_colours(Some(WireColours {
-            background: Some([1, 2, 3]),
-            ..WireColours::default()
-        }));
+        s.ask_terminal(now, true);
+        s.on_input(now, b"\x1b]11;rgb:01/02/03\x07\x1b[?62c");
         s.on_input(now, b"a");
         drain(&mut s);
         // The key sent is confirmed; the one queued is probed for, and a resync asked: both for
@@ -1891,13 +2059,13 @@ mod tests {
         s.detach(now);
         s.attach(Size::new(24, 80));
         assert!(s.view().is_some(), "the view is still open");
-        assert!(s.screen().contents().contains("kept"));
+        assert!(s.state().screen().contents().contains("kept"));
         assert!(!s.synced(), "not the new connection's screen yet");
         s.on_frame(
             now,
             &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"new")),
         );
-        assert!(s.synced() && s.screen().contents().contains("new"));
+        assert!(s.synced() && s.state().screen().contents().contains("new"));
     }
 
     /// A line typed across the drop: its start went out on the lost connection unconfirmed, so

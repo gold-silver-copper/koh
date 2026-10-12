@@ -2,15 +2,19 @@
 //! once, then confirms or corrects it when the server's frame arrives.
 //!
 //! Guesses are grouped in epochs, confirmed by the server's echo-ack, so input a program does not
-//! echo (a password) is never shown. It predicts printable ASCII, backspace, CR/LF, left/right
-//! arrows and whole UTF-8 graphemes, wide ones included; anything else opens a new epoch and waits
-//! for the server. A wrong guess is reconciled away, never left on screen. The renderer draws an
-//! [`Overlay`].
+//! echo (a password) is never shown. Only edit keys reach it, and only in a [`Context`]: on the
+//! primary screen, with the PTY's modes known and not a password prompt, so a full-screen program
+//! (or tmux's and screen's prefix keys) is never taken for a line editor. It predicts printable
+//! graphemes (wide ones included, and one glyph for a grapheme however many keys typed it),
+//! Backspace, Enter, Left and Right, and readline's line and word keys; anything else opens a new
+//! epoch and waits for the server. A guess is a real cell, with the style of the cell it copies or,
+//! for a typed glyph, of its left neighbour. A wrong guess is reconciled away, never left on
+//! screen. The renderer draws an [`Overlay`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use fux_vt::keys::{Direction, Key, KeyPress, Modifiers};
-use fux_vt::Color;
+use fux_vt::{Attributes, CellRef};
 
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
@@ -49,19 +53,6 @@ impl Size {
     }
 }
 
-/// One cell as the predictor sees it: the glyph (empty for a blank or a wide-glyph continuation),
-/// its colours, and whether it is either half of a wide glyph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CellView<'a> {
-    pub contents: &'a str,
-    pub fg: Color,
-    pub bg: Color,
-    /// The left half of a wide glyph, whose right half is the next cell.
-    pub wide: bool,
-    /// The right half of a wide glyph.
-    pub continuation: bool,
-}
-
 /// The screen the predictor reconciles against: the client's grid, or a test's. A trait, so
 /// `predict` imports nothing from `crate::` (CI checks).
 pub trait ScreenView {
@@ -69,58 +60,129 @@ pub trait ScreenView {
     /// The cursor as `(row, col)`, 0-indexed.
     fn cursor_position(&self) -> (u16, u16);
     /// The cell at `(row, col)`, or `None` when out of bounds.
-    fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>>;
+    fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>>;
+    /// Whether the alternate screen is shown, as full-screen programs (and tmux, screen) show it.
+    fn alternate(&self) -> bool;
 }
 
-/// A speculative cell for the renderer to draw, as is, on top of the authoritative grid.
+/// Which part of a glyph a cell holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Half {
+    Narrow,
+    /// A wide glyph, whose right half is the next cell.
+    Wide,
+    /// The right half of the wide glyph to its left: nothing of its own to draw.
+    Covered,
+}
+
+/// A cell as a prediction says it is: its glyph (empty for a blank), its full style, and which
+/// part of a glyph it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cell {
+    text: String,
+    attributes: Attributes,
+    half: Half,
+}
+
+impl Cell {
+    /// A copy of `cell`.
+    fn of(cell: CellRef<'_>) -> Self {
+        let half = if cell.is_wide_continuation() {
+            Half::Covered
+        } else if cell.is_wide() {
+            Half::Wide
+        } else {
+            Half::Narrow
+        };
+        Self {
+            text: cell.contents().to_owned(),
+            attributes: cell.attributes(),
+            half,
+        }
+    }
+
+    /// The cell as a screen's: a covered one as the right half of a wide glyph.
+    pub fn as_ref(&self) -> CellRef<'_> {
+        match self.half {
+            Half::Covered => CellRef::wide_continuation(),
+            Half::Narrow | Half::Wide => {
+                CellRef::new(&self.text, self.half == Half::Wide, self.attributes)
+            }
+        }
+    }
+
+    /// Its glyph: empty for a blank or a covered cell.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Its style, a covered cell's its glyph's.
+    pub const fn attributes(&self) -> Attributes {
+        self.attributes
+    }
+
+    pub fn covered(&self) -> bool {
+        self.half == Half::Covered
+    }
+}
+
+/// What to draw over the authoritative grid: the predictions shown, and the cursor.
 ///
-/// Only concrete guesses become one: a cell the predictor knows changed but not to what is left
-/// out of the [`Overlay`], so the real cell beneath shows. A wide glyph is predicted in two cells:
-/// the glyph, and the cell to its right `covered`, which the glyph draws over.
-#[derive(Clone, Copy, Debug)]
-pub struct PredictedCell<'a> {
-    /// The predicted glyph, borrowed from the engine; empty for a blank shifted in by an insert or
-    /// a backspace, and for a covered cell.
-    pub glyph: &'a str,
-    pub fg: Color,
-    pub bg: Color,
-    /// The right half of the predicted wide glyph to its left: nothing of its own to draw.
-    pub covered: bool,
-}
-
-/// The render-facing snapshot of current predictions, borrowing its glyphs from the
-/// [`PredictionEngine`] it came from.
-#[derive(Default, Debug)]
-pub struct Overlay<'a> {
-    cells: BTreeMap<(u16, u16), PredictedCell<'a>>,
+/// A wide glyph is predicted in two cells, the glyph and the covered cell to its right. A cell the
+/// predictor knows changed, but not to what, is left out, so the real cell shows.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Overlay {
+    cells: BTreeMap<(u16, u16), Cell>,
     cursor: Option<(u16, u16)>,
 }
 
-impl<'a> Overlay<'a> {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-    /// The predicted cell at `(row, col)`, if any.
-    pub fn cell(&self, row: u16, col: u16) -> Option<&PredictedCell<'a>> {
-        self.cells.get(&(row, col))
-    }
-    /// An overlay of exactly `cells` and `cursor`, for tests of what draws it.
+impl Overlay {
+    /// An overlay of exactly `cells` (their texts, wide if `wide`, in `attributes`; each wide one
+    /// covering the next cell when `covering`) and `cursor`, for tests of what draws it.
     #[cfg(test)]
-    pub(crate) fn of(
-        cells: impl IntoIterator<Item = ((u16, u16), PredictedCell<'a>)>,
+    pub(crate) fn of<'t>(
+        cells: impl IntoIterator<Item = ((u16, u16), &'t str, Attributes, bool)>,
         cursor: Option<(u16, u16)>,
     ) -> Self {
-        Self {
-            cells: cells.into_iter().collect(),
+        let mut out = Self {
+            cells: BTreeMap::new(),
             cursor,
+        };
+        for ((row, col), text, attributes, covering) in cells {
+            let wide = text.width() == 2;
+            let half = if wide && covering {
+                Half::Wide
+            } else {
+                Half::Narrow
+            };
+            let cell = |text: &str, half| Cell {
+                text: text.to_owned(),
+                attributes,
+                half,
+            };
+            out.cells.insert((row, col), cell(text, half));
+            if let Some(next) = col.checked_add(1).filter(|_| half == Half::Wide) {
+                out.cells.insert((row, next), cell("", Half::Covered));
+            }
         }
+        out
+    }
+    /// The predicted cell at `(row, col)`, if any.
+    pub fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
+        self.cells.get(&(row, col))
     }
     /// Every predicted cell, in `(row, col)` order.
-    pub fn cells(&self) -> impl Iterator<Item = ((u16, u16), &PredictedCell<'a>)> + '_ {
+    pub fn cells(&self) -> impl Iterator<Item = ((u16, u16), &Cell)> + '_ {
         self.cells.iter().map(|(&at, cell)| (at, cell))
     }
+    /// The predicted cells on `row`, by column.
+    pub fn row(&self, row: u16) -> impl Iterator<Item = (u16, &Cell)> + '_ {
+        self.cells
+            .range((row, 0)..=(row, u16::MAX))
+            .map(|(&(_, col), cell)| (col, cell))
+    }
     /// The predicted cursor position `(row, col)`, if any.
-    pub fn cursor(&self) -> Option<(u16, u16)> {
+    pub const fn cursor(&self) -> Option<(u16, u16)> {
         self.cursor
     }
     pub fn is_empty(&self) -> bool {
@@ -128,75 +190,53 @@ impl<'a> Overlay<'a> {
     }
 }
 
-/// What a prediction says a cell shows.
-#[derive(Clone)]
-struct Guess {
-    glyph: String,
-    fg: Color,
-    bg: Color,
-    /// Changed, but not known to what: never drawn.
-    unknown: bool,
-    /// The glyph is wide: the cell to its right is `covered`.
-    wide: bool,
-    /// The right half of the wide glyph to its left.
-    covered: bool,
-}
-
-impl Guess {
-    /// `glyph`, narrow or wide, in `fg` on `bg`.
-    fn glyph(glyph: String, wide: bool, fg: Color, bg: Color) -> Self {
-        Self {
-            glyph,
-            fg,
-            bg,
-            unknown: false,
-            wide,
-            covered: false,
-        }
-    }
-
-    /// The right half of a wide glyph in `fg` on `bg`.
-    fn covered(fg: Color, bg: Color) -> Self {
-        Self {
-            covered: true,
-            ..Self::glyph(String::new(), false, fg, bg)
-        }
-    }
-
-    /// A cell that changed to something not known, keeping `fg` and `bg`.
-    fn unknown(fg: Color, bg: Color) -> Self {
-        Self {
-            unknown: true,
-            ..Self::glyph(String::new(), false, fg, bg)
-        }
-    }
-}
-
+/// A prediction for one cell, stamped with when it is graded and the epoch that hides it.
 #[derive(Clone)]
 struct PredCell {
     expiration_frame: u64,
     tentative_epoch: u64,
-    glyph: String,
-    fg: Color,
-    bg: Color,
-    /// The glyph this overwrote, so a rewrite back to it cannot confirm an epoch. `None` for an
-    /// `unknown` cell, which never grades against it.
-    original_contents: Option<String>,
-    /// Changed, but not known to what: never drawn.
-    unknown: bool,
-    /// The glyph is wide: the next cell is `covered`.
-    wide: bool,
-    /// The right half of the wide glyph to its left: it confirms nothing, and is right when the
-    /// server shows a wide glyph's right half there.
-    covered: bool,
+    /// What the cell shows, or `None` when it changed to something not known: never drawn.
+    guess: Option<Cell>,
+    /// The glyph this overwrote, so a rewrite back to it cannot confirm an epoch.
+    original: String,
+    /// The typed glyph (or its right half), whose style was borrowed from its neighbour: the cell
+    /// a confirmed echo recolours.
+    typed: bool,
 }
 
+/// Where a frame showed the cursor: the only position a line can be taken to begin at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Confirmed {
+    row: u16,
+    col: u16,
+}
+
+impl Confirmed {
+    fn of(screen: &dyn ScreenView) -> Self {
+        let (row, col) = screen.cursor_position();
+        Self { row, col }
+    }
+}
+
+/// Where the predictions put the cursor, until a frame grades it.
 #[derive(Clone)]
-struct PredCursor {
+struct Guessed {
     expiration_frame: u64,
     tentative_epoch: u64,
     row: u16,
     col: u16,
+}
+
+/// What is known of the line being typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Line {
+    Unknown,
+    /// Enter was typed: the line begins where the screen shows the cursor when its first key is
+    /// typed, if no guess is pending then.
+    Fresh,
+    /// The line began at a cursor a frame showed. Keys that go to its start (`Ctrl-A`, Home,
+    /// `Ctrl-U`) are predicted only then, and Backspace and Left never past it.
+    Started(Confirmed),
 }
 
 #[derive(PartialEq, Eq)]
@@ -207,15 +247,36 @@ enum Validity {
     IncorrectOrExpired,
 }
 
+/// What a key is predicted against: a screen on the primary screen whose PTY's modes are known
+/// and are not a password prompt. Only [`PredictionEngine::context`] makes one.
+struct Context<'a> {
+    screen: &'a dyn ScreenView,
+    tty: TtyModes,
+    size: Size,
+}
+
+impl Context<'_> {
+    /// Whether the kernel echoes what is typed, so a printable key shows where the cursor is.
+    const fn kernel_echo(&self) -> bool {
+        self.tty.echo
+    }
+
+    /// Whether line editing keys may be predicted: a line editor reads keys (no kernel echo,
+    /// which edits a line its own way).
+    const fn editing(&self) -> bool {
+        !self.tty.echo
+    }
+}
+
 /// The prediction engine.
 ///
 /// Call [`set_local_frame_sent`](Self::set_local_frame_sent) before each typed key and
 /// [`new_user_key`](Self::new_user_key) for it;
-/// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) and [`cull`](Self::cull) on a
-/// frame; [`overlay`](Self::overlay) to render.
+/// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked), [`set_tty`](Self::set_tty)
+/// and [`cull`](Self::cull) on a frame; [`overlay`](Self::overlay) to render.
 pub struct PredictionEngine {
     cells: BTreeMap<(u16, u16), PredCell>,
-    cursor: Option<PredCursor>,
+    cursor: Option<Guessed>,
     prediction_epoch: u64,
     confirmed_epoch: u64,
     local_frame_sent: u64,
@@ -226,14 +287,10 @@ pub struct PredictionEngine {
     last_size: Option<Size>,
     /// How the program's PTY takes typed keys, as the newest frame said.
     tty: Option<TtyModes>,
-    /// Trust from the last connection to the same session, given once a frame shows no password
-    /// prompt.
+    /// Trust from the last connection to the same session, given once a frame shows known modes
+    /// that are not a password prompt.
     carried: bool,
-    /// Where the line being typed began, when known: the first key typed after Enter. Keys that
-    /// go to the line's start (`Ctrl-A`, Home, `Ctrl-U`) are predicted only when it is.
-    input_start: Option<(u16, u16)>,
-    /// Enter was typed and no key since: the next printable key begins a line.
-    fresh_line: bool,
+    line: Line,
 }
 
 impl Default for PredictionEngine {
@@ -252,18 +309,17 @@ impl Default for PredictionEngine {
             last_size: None,
             tty: None,
             carried: false,
-            input_start: None,
-            fresh_line: false,
+            line: Line::Unknown,
         }
     }
 }
 
 impl PredictionEngine {
     /// A fresh engine for a reconnect to the same session: if typing was being shown as it was
-    /// predicted (or trust was carried here and not yet given), trust
-    /// from the first key once a frame shows the PTY is not at a password prompt
-    /// ([`set_tty`](Self::set_tty)). Taken once, at an outage's first drop, the trust is the
-    /// drop's: nothing until the next frame confirms an epoch, so nothing typed then can add to it.
+    /// predicted (or trust was carried here and not yet given), trust from the first key once a
+    /// frame shows known modes that are not a password prompt ([`set_tty`](Self::set_tty)).
+    /// Taken once, at an outage's first drop, the trust is the drop's: nothing until the next
+    /// frame confirms an epoch, so nothing typed then can add to it.
     #[must_use]
     pub fn reattached(&self) -> Self {
         Self {
@@ -275,78 +331,68 @@ impl PredictionEngine {
     /// How the program's PTY takes typed keys, as a frame said.
     ///
     /// At a password prompt (lines read without echo) nothing is predicted and every prediction
-    /// goes: a typed secret is never shown, whatever was confirmed before. Otherwise carried trust
-    /// is given.
+    /// goes: a typed secret is never shown, whatever was confirmed before. At known modes that are
+    /// not one, carried trust is given; unknown modes give nothing.
     pub fn set_tty(&mut self, tty: Option<TtyModes>) {
         self.tty = tty;
-        if self.password() {
-            if !self.cells.is_empty() || self.cursor.is_some() {
-                self.reset();
+        match tty {
+            Some(tty) if tty.password() => {
+                if !self.cells.is_empty() || self.cursor.is_some() {
+                    self.reset();
+                }
+                self.carried = false;
             }
-            self.carried = false;
-            return;
-        }
-        if std::mem::take(&mut self.carried) {
-            self.confirmed_epoch = self.confirmed_epoch.max(self.prediction_epoch);
+            Some(_) if std::mem::take(&mut self.carried) => {
+                self.confirmed_epoch = self.confirmed_epoch.max(self.prediction_epoch);
+            }
+            Some(_) | None => {}
         }
     }
 
-    /// Whether the PTY is at a password prompt.
-    fn password(&self) -> bool {
-        self.tty.is_some_and(TtyModes::password)
-    }
-
-    /// Whether the kernel echoes what is typed, so a printable key shows where the cursor is.
-    fn kernel_echo(&self) -> bool {
-        self.tty.is_some_and(|tty| tty.echo)
+    /// What a key may be predicted against on `screen`: nothing on the alternate screen, with the
+    /// PTY's modes unknown, at a password prompt, or on an empty screen.
+    fn context<'a>(&self, screen: &'a dyn ScreenView) -> Option<Context<'a>> {
+        let size = screen.size();
+        let tty = self.tty.filter(|tty| !tty.password())?;
+        (!screen.alternate() && size.rows > 0 && size.cols > 0).then_some(Context {
+            screen,
+            tty,
+            size,
+        })
     }
 
     /// What a cell shows, predicted if there is a prediction: what a row shift copies, a wide
-    /// glyph's halves included.
-    fn guess_at(&self, screen: &dyn ScreenView, row: u16, col: u16) -> Guess {
-        if let Some(p) = self.cells.get(&(row, col)) {
-            Guess {
-                glyph: p.glyph.clone(),
-                fg: p.fg,
-                bg: p.bg,
-                unknown: p.unknown,
-                wide: p.wide,
-                covered: p.covered,
-            }
-        } else {
-            let (fg, bg) = glyph_style(screen, row, col);
-            let cell = screen.cell(row, col);
-            Guess {
-                glyph: cell_glyph(screen, row, col),
-                fg,
-                bg,
-                unknown: false,
-                wide: cell.is_some_and(|c| c.wide),
-                covered: cell.is_some_and(|c| c.continuation),
-            }
+    /// glyph's halves included. `None` if it is not known.
+    fn guess_at(&self, ctx: &Context<'_>, row: u16, col: u16) -> Option<Cell> {
+        match self.cells.get(&(row, col)) {
+            Some(p) => p.guess.clone(),
+            None => ctx.screen.cell(row, col).map(Cell::of),
         }
     }
 
     /// Predict `guess` at `(row, col)`, stamped with the next frame, the current epoch (which hides
     /// it until confirmed) and the glyph it overwrites. One place, so no caller can get the
     /// security-relevant stamps wrong.
-    fn place_cell(&mut self, screen: &dyn ScreenView, row: u16, col: u16, guess: Guess) {
+    fn place(
+        &mut self,
+        ctx: &Context<'_>,
+        (row, col): (u16, u16),
+        guess: Option<Cell>,
+        typed: bool,
+    ) {
+        let original = ctx
+            .screen
+            .cell(row, col)
+            .map(|c| c.contents().to_owned())
+            .unwrap_or_default();
         self.cells.insert(
             (row, col),
             PredCell {
                 expiration_frame: self.next_frame(),
                 tentative_epoch: self.prediction_epoch,
-                original_contents: if guess.unknown {
-                    None
-                } else {
-                    Some(cell_glyph(screen, row, col))
-                },
-                glyph: guess.glyph,
-                fg: guess.fg,
-                bg: guess.bg,
-                unknown: guess.unknown,
-                wide: guess.wide,
-                covered: guess.covered,
+                guess,
+                original,
+                typed,
             },
         );
     }
@@ -355,39 +401,31 @@ impl PredictionEngine {
     /// is not the next cell's prediction, or a right half whose glyph is not the cell to its left,
     /// was split (by a shift at the edge, or an edit inside a wide glyph) and is unknown.
     fn keep_wide_glyphs_whole(&mut self, row: u16) {
-        let known = |cell: Option<&PredCell>, pick: fn(&PredCell) -> bool| {
-            cell.is_some_and(|cell| !cell.unknown && pick(cell))
+        let half = |cells: &BTreeMap<(u16, u16), PredCell>, col: Option<u16>| {
+            col.and_then(|col| cells.get(&(row, col))?.guess.as_ref().map(|g| g.half))
         };
         let split: Vec<u16> = self
             .cells
             .range((row, 0)..=(row, u16::MAX))
-            .filter(|(_, cell)| !cell.unknown && (cell.wide || cell.covered))
-            .filter(|&(&(_, col), cell)| {
-                let whole = if cell.wide {
-                    let right = col.checked_add(1).map(|right| (row, right));
-                    known(right.and_then(|at| self.cells.get(&at)), |c| c.covered)
-                } else {
-                    let left = col.checked_sub(1).map(|left| (row, left));
-                    known(left.and_then(|at| self.cells.get(&at)), |c| c.wide)
+            .filter_map(|(&(_, col), cell)| {
+                let whole = match cell.guess.as_ref()?.half {
+                    Half::Narrow => return None,
+                    Half::Wide => half(&self.cells, col.checked_add(1)) == Some(Half::Covered),
+                    Half::Covered => half(&self.cells, col.checked_sub(1)) == Some(Half::Wide),
                 };
-                !whole
+                (!whole).then_some(col)
             })
-            .map(|(&(_, col), _)| col)
             .collect();
         for col in split {
             if let Some(cell) = self.cells.get_mut(&(row, col)) {
-                cell.glyph.clear();
-                cell.unknown = true;
-                cell.wide = false;
-                cell.covered = false;
-                cell.original_contents = None;
+                cell.guess = None;
             }
         }
     }
 
     /// The newest epoch the server confirmed echoes. Test-only.
     #[cfg(test)]
-    pub fn confirmed_epoch(&self) -> u64 {
+    pub const fn confirmed_epoch(&self) -> u64 {
         self.confirmed_epoch
     }
     /// Whether trust carried from a lost connection waits to be given. Test-only.
@@ -395,8 +433,7 @@ impl PredictionEngine {
     pub(crate) const fn carries_trust(&self) -> bool {
         self.carried
     }
-    /// Confirm the newest epoch, as an echo would. Test-only.
-    /// Type `bytes` as a legacy terminal sends them: each key decoded, then predicted.
+    /// Type `bytes` as a legacy terminal sends them: each key decoded, then predicted. Test-only.
     #[cfg(test)]
     pub(crate) fn type_bytes(&mut self, bytes: &[u8], screen: &dyn ScreenView) {
         let mut decoder = fux_vt::keys::decode::Decoder::default();
@@ -409,136 +446,33 @@ impl PredictionEngine {
             }
         }
     }
-
+    /// Confirm the newest epoch, as an echo would. Test-only.
     #[cfg(test)]
-    pub(crate) fn confirm_for_tests(&mut self) {
+    pub(crate) const fn confirm_for_tests(&mut self) {
         self.confirmed_epoch = self.prediction_epoch;
     }
     /// The newest local input frame number sent so far (predictions expire at this + 1).
-    pub fn set_local_frame_sent(&mut self, n: u64) {
+    pub const fn set_local_frame_sent(&mut self, n: u64) {
         self.local_frame_sent = n;
     }
     /// The server's echo-ack: the newest input frame reflected on screen.
-    pub fn set_local_frame_late_acked(&mut self, n: u64) {
+    pub const fn set_local_frame_late_acked(&mut self, n: u64) {
         self.late_acked = n;
     }
 
     /// The frame a prediction made now expires at: the next input frame. Saturating, so it never
     /// wraps to an expired 0.
-    fn next_frame(&self) -> u64 {
+    const fn next_frame(&self) -> u64 {
         self.local_frame_sent.saturating_add(1)
     }
 
-    fn become_tentative(&mut self) {
+    const fn become_tentative(&mut self) {
         // Saturating: wrapping below `confirmed_epoch` would show unconfirmed predictions.
         self.prediction_epoch = self.prediction_epoch.saturating_add(1);
     }
 
-    fn tentative(&self, epoch: u64) -> bool {
+    const fn tentative(&self, epoch: u64) -> bool {
         epoch > self.confirmed_epoch
-    }
-
-    /// Ensure a cursor prediction exists in the current epoch, seeded from the real cursor, and
-    /// return it.
-    fn init_cursor(&mut self, screen: &dyn ScreenView) -> &mut PredCursor {
-        let epoch = self.prediction_epoch;
-        let expiration_frame = self.next_frame();
-        let (row, col) = screen.cursor_position();
-        let cursor = self.cursor.get_or_insert(PredCursor {
-            expiration_frame,
-            tentative_epoch: epoch,
-            row,
-            col,
-        });
-        if cursor.tentative_epoch != epoch {
-            // A new epoch keeps the predicted position but restarts confirmation.
-            *cursor = PredCursor {
-                expiration_frame,
-                tentative_epoch: epoch,
-                row: cursor.row,
-                col: cursor.col,
-            };
-        }
-        cursor
-    }
-
-    fn newline_cr(&mut self, screen: &dyn ScreenView) {
-        let rows = screen.size().rows;
-        self.init_cursor(screen);
-        if let Some(c) = self.cursor.as_mut() {
-            c.col = 0;
-            if let Some(next) = c.row.checked_add(1).filter(|&next| next < rows) {
-                c.row = next;
-            }
-            // On the last row we do NOT predict a scroll (mosh deliberately avoids it).
-        }
-    }
-
-    /// Predict the cursor moving right (`dir > 0`) or left within the row, in the current epoch.
-    fn predict_arrow(&mut self, screen: &dyn ScreenView, dir: i32) {
-        self.init_cursor(screen);
-        let exp = self.next_frame();
-        let cols = screen.size().cols;
-        if let Some(c) = self.cursor.as_mut() {
-            // Right stops before the last column, left at column 0.
-            let moved = match dir.cmp(&0) {
-                std::cmp::Ordering::Greater => c.col.checked_add(1).filter(|&next| next < cols),
-                std::cmp::Ordering::Less => c.col.checked_sub(1),
-                std::cmp::Ordering::Equal => None,
-            };
-            if let Some(col) = moved {
-                c.col = col;
-                c.expiration_frame = exp;
-            }
-        }
-    }
-
-    /// Predict the grapheme `g` at the cursor and advance it by `g`'s width. A zero-width one, or
-    /// one reaching the right edge (where the terminal may wrap), opens a new epoch instead. It
-    /// overwrites, with no insert-mode shift; a wide one covers the next cell too.
-    fn predict_wide(&mut self, g: &str, screen: &dyn ScreenView) {
-        let w = u16::try_from(g.width()).unwrap_or(u16::MAX);
-        if w == 0 {
-            self.become_tentative(); // combining / zero-width: can't place safely
-            return;
-        }
-        let cols = screen.size().cols;
-        let (row, col) = {
-            let c = self.init_cursor(screen);
-            (c.row, c.col)
-        };
-        // It must end before the last column, where the terminal may wrap.
-        let Some(next_col) = col.checked_add(w).filter(|&next| next < cols) else {
-            self.become_tentative();
-            self.init_cursor(screen);
-            return;
-        };
-        let exp = self.next_frame();
-        let (fg, bg) = glyph_style(screen, row, col);
-        let wide = w == 2;
-        self.place_cell(screen, row, col, Guess::glyph(g.to_string(), wide, fg, bg));
-        if let Some(right) = col.checked_add(1).filter(|_| wide) {
-            self.place_cell(screen, row, right, Guess::covered(fg, bg));
-        }
-        self.keep_wide_glyphs_whole(row);
-        if let Some(c) = self.cursor.as_mut() {
-            c.expiration_frame = exp;
-            c.col = next_col;
-        }
-    }
-
-    /// A key not modelled: a new epoch, nothing predicted, and where the line began is no longer
-    /// known (the key may have recalled another line, or moved the cursor anywhere).
-    fn unmodelled(&mut self) {
-        self.become_tentative();
-        self.input_start = None;
-        self.fresh_line = false;
-    }
-
-    /// Whether line editing keys may be predicted: a line editor reads keys (no kernel echo, which
-    /// edits a line its own way).
-    fn editing(&self) -> bool {
-        !self.kernel_echo()
     }
 
     /// The predicted cursor's row and column, else the screen's.
@@ -548,56 +482,213 @@ impl PredictionEngine {
             .map_or_else(|| screen.cursor_position(), |c| (c.row, c.col))
     }
 
+    /// Predict the cursor at `(row, col)`, in the current epoch, graded with the next frame; a
+    /// guess made in an earlier epoch moves into this one. Every cursor prediction goes through
+    /// here.
+    fn move_cursor(&mut self, (row, col): (u16, u16)) {
+        self.cursor = Some(Guessed {
+            expiration_frame: self.next_frame(),
+            tentative_epoch: self.prediction_epoch,
+            row,
+            col,
+        });
+    }
+
+    /// The cursor to the start of the next row; on the last row it stays (mosh deliberately
+    /// predicts no scroll).
+    fn newline(&mut self, ctx: &Context<'_>) {
+        let (row, _) = self.cursor_at(ctx.screen);
+        let next = row.checked_add(1).filter(|&next| next < ctx.size.rows);
+        self.move_cursor((next.unwrap_or(row), 0));
+    }
+
+    /// The column the line being typed began at, if it began on `row`.
+    fn line_start(&self, row: u16) -> Option<u16> {
+        match self.line {
+            Line::Started(at) if at.row == row => Some(at.col),
+            Line::Started(_) | Line::Fresh | Line::Unknown => None,
+        }
+    }
+
+    /// The first key of a line was typed: it began where the screen shows the cursor, unless a
+    /// guess for the cursor is pending, when where is not known.
+    fn begin_line(&mut self, screen: &dyn ScreenView) {
+        if self.line == Line::Fresh {
+            self.line = match self.cursor {
+                None => Line::Started(Confirmed::of(screen)),
+                Some(_) => Line::Unknown,
+            };
+        }
+    }
+
+    /// A key not modelled: a new epoch, nothing predicted, and where the line began is no longer
+    /// known (the key may have recalled another line, or moved the cursor anywhere).
+    const fn unmodelled(&mut self) {
+        self.become_tentative();
+        self.line = Line::Unknown;
+    }
+
     /// The glyph `(row, col)` shows, predicted or not, or `None` if it is unknown or half of a
     /// wide glyph, where word boundaries cannot be read.
-    fn glyph_at(&self, screen: &dyn ScreenView, row: u16, col: u16) -> Option<String> {
-        let guess = self.guess_at(screen, row, col);
-        (!guess.unknown && !guess.wide && !guess.covered).then_some(guess.glyph)
+    fn glyph_at(&self, ctx: &Context<'_>, row: u16, col: u16) -> Option<String> {
+        self.guess_at(ctx, row, col)
+            .filter(|g| g.half == Half::Narrow)
+            .map(|g| g.text)
     }
 
     /// Whether the cell at `(row, col)` holds a character `word` accepts. Blank is no word.
     fn in_word(
         &self,
-        screen: &dyn ScreenView,
+        ctx: &Context<'_>,
         row: u16,
         col: u16,
         word: fn(char) -> bool,
     ) -> Option<bool> {
-        let glyph = self.glyph_at(screen, row, col)?;
+        let glyph = self.glyph_at(ctx, row, col)?;
         Some(glyph.chars().next().is_some_and(word))
     }
 
-    /// Delete the `n` cells before the cursor as a line editor does: the cursor steps back `n`,
-    /// the rest of the row shifts left, and the last cells take what was off-screen (unknown).
-    /// Nothing is predicted if a wide glyph is in the way.
-    fn delete_before(&mut self, screen: &dyn ScreenView, n: u16) {
-        let cols = screen.size().cols;
-        let (row, col) = self.cursor_at(screen);
-        let Some(to) = col.checked_sub(n).filter(|_| n > 0) else {
-            return;
+    /// Predict the grapheme `c` continues or begins, typed at the cursor as a line editor inserts
+    /// it (the rest of the row moving right), or as the kernel echoes it.
+    ///
+    /// A character that continues the glyph before the cursor (an emoji's skin tone, a combining
+    /// mark, the rest of an IME's cluster) joins it, as the terminal joins it when it is echoed:
+    /// one glyph however many keys typed it, or nothing if joining would change its width. A
+    /// glyph reaching the last column, where the terminal may wrap, opens a new epoch.
+    fn predict_glyph(&mut self, ctx: &Context<'_>, c: char) {
+        if ctx.kernel_echo() {
+            // The kernel echoes it: no need to wait for the program to prove it does.
+            self.confirmed_epoch = self.confirmed_epoch.max(self.prediction_epoch);
+        }
+        let (row, col) = self.cursor_at(ctx.screen);
+        if let Some((at, before)) = self.glyph_before(ctx, row, col) {
+            if fux_vt::continues_cluster(&before.text, c) {
+                let mut joined = before.clone();
+                joined.text.push(c);
+                if joined.text.width() != before.text.width() {
+                    return self.unmodelled();
+                }
+                self.place(ctx, (row, at), Some(joined), true);
+                return self.move_cursor((row, col));
+            }
+        }
+        let text = c.to_string();
+        let width = u16::try_from(text.width()).unwrap_or(u16::MAX);
+        let cols = ctx.size.cols;
+        let Some(end) = col
+            .checked_add(width)
+            .filter(|&end| width > 0 && end <= cols)
+        else {
+            return self.unmodelled();
         };
-        self.init_cursor(screen);
-        if (to..cols).any(|c| {
-            let g = self.guess_at(screen, row, c);
-            g.wide || g.covered
-        }) {
-            self.unmodelled();
+        // Insert mode, as a line editor renders it: shift the tail right, from the right end so
+        // each cell reads what moves into it before that is replaced. The rightmost cell takes
+        // what a wrapped line brings, unknown; a wide glyph split at the edge is unknown too.
+        for i in (end..cols).rev() {
+            let from = i.checked_sub(width).filter(|_| i.saturating_add(1) < cols);
+            let guess = from.and_then(|from| self.guess_at(ctx, row, from));
+            self.place(ctx, (row, i), guess, false);
+        }
+        // Only the typed glyph borrows its left neighbour's style; the cells it moves keep theirs.
+        let attributes = col
+            .checked_sub(1)
+            .and_then(|left| self.guess_at(ctx, row, left))
+            .filter(|left| !left.text.is_empty() || left.half == Half::Covered)
+            .map_or_else(Attributes::default, |left| left.attributes);
+        let wide = width == 2;
+        let glyph = Cell {
+            text,
+            attributes,
+            half: if wide { Half::Wide } else { Half::Narrow },
+        };
+        self.place(ctx, (row, col), Some(glyph), true);
+        if let Some(right) = col.checked_add(1).filter(|_| wide) {
+            let covered = Cell {
+                text: String::new(),
+                attributes,
+                half: Half::Covered,
+            };
+            self.place(ctx, (row, right), Some(covered), true);
+        }
+        self.keep_wide_glyphs_whole(row);
+        if end < cols {
+            self.move_cursor((row, end));
+        } else {
+            // The last column: wrap or overwrite, which is not known; hidden until confirmed.
+            self.become_tentative();
+            self.newline(ctx);
+        }
+    }
+
+    /// The glyph left of `(row, col)`, with its column: the cell before it, or the wide glyph
+    /// whose right half that is. `None` if it is unknown or blank.
+    fn glyph_before(&self, ctx: &Context<'_>, row: u16, col: u16) -> Option<(u16, Cell)> {
+        let left = col.checked_sub(1)?;
+        let cell = self.guess_at(ctx, row, left)?;
+        let (at, cell) = if cell.half == Half::Covered {
+            let at = left.checked_sub(1)?;
+            (at, self.guess_at(ctx, row, at)?)
+        } else {
+            (left, cell)
+        };
+        (!cell.text.is_empty() && cell.half != Half::Covered).then_some((at, cell))
+    }
+
+    /// Delete the `n` cells before the cursor as a line editor does: the cursor steps back `n`,
+    /// the rest of the row shifts left, wide glyphs whole, and the last cells take what was
+    /// off-screen (unknown). Nothing is predicted if a deleted cell is half a wide glyph (a line
+    /// editor deletes both halves), or the row's start is in the way.
+    fn delete_before(&mut self, ctx: &Context<'_>, n: u16) {
+        if n == 0 {
             return;
         }
+        let cols = ctx.size.cols;
+        let (row, col) = self.cursor_at(ctx.screen);
+        let Some(to) = col.checked_sub(n) else {
+            return self.unmodelled();
+        };
+        let wide = (to..col).any(|c| {
+            self.guess_at(ctx, row, c)
+                .is_none_or(|g| g.half != Half::Narrow)
+        });
+        if wide {
+            return self.unmodelled();
+        }
         for i in to..cols {
+            // The last two columns take what was off-screen, as in mosh: a wide glyph could
+            // straddle the second-to-last.
             let from = i
                 .checked_add(n)
                 .filter(|&from| from < cols.saturating_sub(1));
-            let guess = match from {
-                Some(from) => self.guess_at(screen, row, from),
-                None => Guess::unknown(Color::Default, Color::Default),
-            };
-            self.place_cell(screen, row, i, guess);
+            let guess = from.and_then(|from| self.guess_at(ctx, row, from));
+            self.place(ctx, (row, i), guess, false);
         }
-        let exp = self.next_frame();
-        if let Some(c) = self.cursor.as_mut() {
-            c.col = to;
-            c.expiration_frame = exp;
+        self.keep_wide_glyphs_whole(row);
+        self.move_cursor((row, to));
+    }
+
+    /// Backspace: the cell before the cursor deleted, never past where the line began.
+    fn predict_backspace(&mut self, ctx: &Context<'_>) {
+        let (row, col) = self.cursor_at(ctx.screen);
+        if self.line_start(row).is_some_and(|start| col <= start) {
+            return self.unmodelled();
+        }
+        self.delete_before(ctx, 1);
+    }
+
+    /// Left or Right (`right`): the cursor one column over, within the row (Right stops before
+    /// the last column), and Left never past where the line began.
+    fn predict_arrow(&mut self, ctx: &Context<'_>, right: bool) {
+        let (row, col) = self.cursor_at(ctx.screen);
+        let to = if right {
+            col.checked_add(1).filter(|&next| next < ctx.size.cols)
+        } else {
+            col.checked_sub(1)
+                .filter(|&prev| self.line_start(row).is_none_or(|start| prev >= start))
+        };
+        match to {
+            Some(to) => self.move_cursor((row, to)),
+            None => self.unmodelled(),
         }
     }
 
@@ -605,27 +696,27 @@ impl PredictionEngine {
     /// back over what is not a word, then over the word. Predicted only when the word is bounded
     /// on its left by a cell that is not one, after where the line began if that is known, so a
     /// prompt is never taken for the line.
-    fn predict_kill_word(&mut self, screen: &dyn ScreenView, word: fn(char) -> bool) {
-        if !self.editing() {
+    fn predict_kill_word(&mut self, ctx: &Context<'_>, word: fn(char) -> bool) {
+        if !ctx.editing() {
             return self.unmodelled();
         }
-        let (row, col) = self.cursor_at(screen);
-        let floor = self
-            .input_start
-            .filter(|(r, _)| *r == row)
-            .map_or(0, |(_, c)| c);
+        let (row, col) = self.cursor_at(ctx.screen);
+        let start = self.line_start(row);
         let mut at = col;
         let mut seen_word = false;
         loop {
-            let Some(prev) = at.checked_sub(1).filter(|&p| p >= floor) else {
+            let Some(prev) = at
+                .checked_sub(1)
+                .filter(|&p| start.is_none_or(|start| p >= start))
+            else {
                 // Reached the line's start (or the row's): sure only if where the line began is
                 // known, and something was deleted.
-                if self.input_start.is_some() && at < col {
+                if start.is_some() && at < col {
                     break;
                 }
                 return self.unmodelled();
             };
-            match self.in_word(screen, row, prev, word) {
+            match self.in_word(ctx, row, prev, word) {
                 None => return self.unmodelled(),
                 Some(true) => seen_word = true,
                 Some(false) if seen_word => break,
@@ -633,79 +724,60 @@ impl PredictionEngine {
             }
             at = prev;
         }
-        let n = col.saturating_sub(at);
-        if n == 0 {
-            return self.unmodelled();
-        }
-        self.delete_before(screen, n);
+        self.delete_before(ctx, col.saturating_sub(at));
     }
 
     /// `Ctrl-U`: delete from where the line began to the cursor, if that is known.
-    fn predict_kill_line(&mut self, screen: &dyn ScreenView) {
-        let (row, col) = self.cursor_at(screen);
-        match self.input_start.filter(|(r, c)| *r == row && *c <= col) {
-            Some((_, start)) if self.editing() => {
-                self.delete_before(screen, col.saturating_sub(start));
-            }
+    fn predict_kill_line(&mut self, ctx: &Context<'_>) {
+        let (row, col) = self.cursor_at(ctx.screen);
+        match self.line_start(row).filter(|&start| start <= col) {
+            Some(start) if ctx.editing() => self.delete_before(ctx, col.saturating_sub(start)),
             _ => self.unmodelled(),
         }
     }
 
-    /// Move the predicted cursor to `col` on its row.
-    fn move_cursor_to(&mut self, screen: &dyn ScreenView, col: u16) {
-        self.init_cursor(screen);
-        let exp = self.next_frame();
-        if let Some(c) = self.cursor.as_mut() {
-            c.col = col;
-            c.expiration_frame = exp;
-        }
-    }
-
     /// `Ctrl-A`, Home: the cursor to where the line began, if that is known.
-    fn predict_line_start(&mut self, screen: &dyn ScreenView) {
-        let (row, _) = self.cursor_at(screen);
-        match self.input_start.filter(|(r, _)| *r == row) {
-            Some((_, start)) if self.editing() => self.move_cursor_to(screen, start),
+    fn predict_line_start(&mut self, ctx: &Context<'_>) {
+        let (row, _) = self.cursor_at(ctx.screen);
+        match self.line_start(row) {
+            Some(start) if ctx.editing() => self.move_cursor((row, start)),
             _ => self.unmodelled(),
         }
     }
 
     /// `Ctrl-E`, End: the cursor past the last character of its row, if the line ends on it (the
     /// row is not soft-wrapped into the next) and that is at or after the cursor.
-    fn predict_line_end(&mut self, screen: &dyn ScreenView) {
-        let cols = screen.size().cols;
-        let (row, col) = self.cursor_at(screen);
+    fn predict_line_end(&mut self, ctx: &Context<'_>) {
+        let cols = ctx.size.cols;
+        let (row, col) = self.cursor_at(ctx.screen);
         let mut end = 0_u16;
         for c in 0..cols {
             // Typing and deleting leave the last two columns unknown (what an edit pushed off or
             // pulled in): blank unless the line nearly fills the row.
             let edge = c >= cols.saturating_sub(2);
-            match self.glyph_at(screen, row, c) {
+            match self.glyph_at(ctx, row, c) {
                 None if edge => {}
                 None => return self.unmodelled(),
                 Some(g) if !is_blank(&g) => end = c.saturating_add(1),
                 Some(_) => {}
             }
         }
-        if !self.editing() || end < col || end >= cols {
+        if !ctx.editing() || end < col || end >= cols {
             return self.unmodelled();
         }
-        self.move_cursor_to(screen, end);
+        self.move_cursor((row, end));
     }
 
     /// `Alt-B` (back) or `Alt-F` (`forward`): the cursor over what is not alphanumeric, then over
     /// a word, as readline moves; predicted only when it stops inside the row, and inside the line
     /// if where it began is known.
-    fn predict_word_motion(&mut self, screen: &dyn ScreenView, forward: bool) {
-        if !self.editing() {
+    fn predict_word_motion(&mut self, ctx: &Context<'_>, forward: bool) {
+        if !ctx.editing() {
             return self.unmodelled();
         }
-        let cols = screen.size().cols;
-        let (row, col) = self.cursor_at(screen);
-        let floor = self
-            .input_start
-            .filter(|(r, _)| *r == row)
-            .map_or(0, |(_, c)| c);
+        let cols = ctx.size.cols;
+        let (row, col) = self.cursor_at(ctx.screen);
+        let start = self.line_start(row);
         let mut at = col;
         let mut seen_word = false;
         loop {
@@ -713,23 +785,21 @@ impl PredictionEngine {
             let next = if forward {
                 Some(at).filter(|&a| a < cols.saturating_sub(1))
             } else {
-                at.checked_sub(1).filter(|&p| p >= floor)
+                at.checked_sub(1)
+                    .filter(|&p| start.is_none_or(|start| p >= start))
             };
             let Some(cell) = next else {
-                if !forward && self.input_start.is_some() && seen_word {
+                if !forward && start.is_some() && seen_word {
                     break;
                 }
                 return self.unmodelled();
             };
-            match self.in_word(screen, row, cell, char::is_alphanumeric) {
+            match self.in_word(ctx, row, cell, char::is_alphanumeric) {
                 None => return self.unmodelled(),
                 Some(true) => seen_word = true,
                 Some(false) if seen_word => break,
                 Some(false)
-                    if forward
-                        && self
-                            .glyph_at(screen, row, cell)
-                            .is_some_and(|g| is_blank(&g)) =>
+                    if forward && self.glyph_at(ctx, row, cell).is_some_and(|g| is_blank(&g)) =>
                 {
                     // Past the line's end: readline stops at it; where that is, is not sure.
                     return self.unmodelled();
@@ -745,59 +815,62 @@ impl PredictionEngine {
         if at == col {
             return self.unmodelled();
         }
-        self.move_cursor_to(screen, at);
+        self.move_cursor((row, at));
     }
 
-    /// Predict what typed key `press` does to `screen`, after culling the existing predictions.
+    /// Predict what the edit key `press` does to `screen`, after culling the existing predictions.
     /// The key is read as what it is, whatever the user's terminal sent for it: `Alt-B` from a
     /// kitty-protocol terminal is a legacy one's, and a control is its letter with Ctrl.
+    ///
+    /// Where the line begins is tracked whatever is predicted: Enter begins a line, whose first
+    /// printable key says where.
     pub fn new_user_key(&mut self, press: KeyPress, screen: &dyn ScreenView) {
-        if self.password() {
-            // Nothing typed at a password prompt is predicted, nor shown.
-            self.become_tentative();
-            return;
-        }
         self.cull(screen);
-        if self.holding() {
-            return;
-        }
-        let Size { rows, cols } = screen.size();
-        if rows == 0 || cols == 0 {
-            return;
-        }
         let Modifiers { alt, ctrl, .. } = press.mods;
+        let printable = match (press.key, alt, ctrl) {
+            (Key::Char(c), false, false) if !c.is_control() => Some(c),
+            _ => None,
+        };
+        if printable.is_some() {
+            self.begin_line(screen);
+        }
+        let ctx = self.context(screen);
+        let Some(ctx) = ctx.filter(|_| !self.holding()) else {
+            self.become_tentative();
+            self.line = match (press.key, alt, ctrl) {
+                (Key::Enter, false, false) => Line::Fresh,
+                _ if printable.is_some() => self.line,
+                _ => Line::Unknown,
+            };
+            return;
+        };
         match (press.key, alt, ctrl) {
             (Key::Char(c), false, true) => match c.to_ascii_lowercase() {
-                'w' => self.predict_kill_word(screen, |c| !c.is_whitespace()),
-                'u' => self.predict_kill_line(screen),
-                'a' => self.predict_line_start(screen),
-                'e' => self.predict_line_end(screen),
-                'h' => self.predict_backspace(screen),
-                'j' | 'm' => self.predict_enter(screen),
+                'w' => self.predict_kill_word(&ctx, |c| !c.is_whitespace()),
+                'u' => self.predict_kill_line(&ctx),
+                'a' => self.predict_line_start(&ctx),
+                'e' => self.predict_line_end(&ctx),
+                'h' => self.predict_backspace(&ctx),
+                'j' | 'm' => self.predict_enter(&ctx),
                 _ => self.unmodelled(),
             },
-            (Key::Char('b'), true, false) => self.predict_word_motion(screen, false),
-            (Key::Char('f'), true, false) => self.predict_word_motion(screen, true),
+            (Key::Char('b'), true, false) => self.predict_word_motion(&ctx, false),
+            (Key::Char('f'), true, false) => self.predict_word_motion(&ctx, true),
             (Key::Backspace, true, false) => {
-                self.predict_kill_word(screen, char::is_alphanumeric);
+                self.predict_kill_word(&ctx, char::is_alphanumeric);
             }
-            (Key::Char(c), false, false) if c.is_ascii_graphic() || c == ' ' => {
-                self.predict_printable(c, screen);
-            }
-            (Key::Char(c), false, false) if !c.is_control() => {
-                self.predict_wide(c.encode_utf8(&mut [0; 4]), screen);
-            }
-            (Key::Backspace, false, false) => self.predict_backspace(screen),
-            (Key::Enter, false, false) => self.predict_enter(screen),
+            (Key::Char(c), false, false) if !c.is_control() => self.predict_glyph(&ctx, c),
+            (Key::Backspace, false, false) => self.predict_backspace(&ctx),
+            (Key::Enter, false, false) => self.predict_enter(&ctx),
             // The kernel echoes an arrow as `^[[D`: only a line editor moves the cursor.
-            (Key::Arrow(Direction::Right), false, false) if self.editing() => {
-                self.predict_arrow(screen, 1);
+            (Key::Arrow(Direction::Right), false, false) if ctx.editing() => {
+                self.predict_arrow(&ctx, true);
             }
-            (Key::Arrow(Direction::Left), false, false) if self.editing() => {
-                self.predict_arrow(screen, -1);
+            (Key::Arrow(Direction::Left), false, false) if ctx.editing() => {
+                self.predict_arrow(&ctx, false);
             }
-            (Key::Home, false, false) => self.predict_line_start(screen),
-            (Key::End, false, false) => self.predict_line_end(screen),
+            (Key::Home, false, false) => self.predict_line_start(&ctx),
+            (Key::End, false, false) => self.predict_line_end(&ctx),
             // Anything else is not predicted.
             _ => self.unmodelled(),
         }
@@ -807,13 +880,13 @@ impl PredictionEngine {
     /// key whose echo is in doubt. The client may not yet know the PTY's modes as they are now (a
     /// program that printed a prompt may turn echo off a moment after), and a key typed at a
     /// password prompt must never be shown. Predictions already made stand.
-    pub fn hold(&mut self) {
+    pub const fn hold(&mut self) {
         self.held_through = Some(self.next_frame());
         self.become_tentative();
     }
 
     /// Whether a held key is not yet reflected on the screen.
-    fn holding(&mut self) -> bool {
+    const fn holding(&mut self) -> bool {
         match self.held_through {
             Some(held) if self.late_acked < held => true,
             Some(_) => {
@@ -824,276 +897,133 @@ impl PredictionEngine {
         }
     }
 
-    /// Input the predictor does not model reached the program (a mouse event, a focus change, a
-    /// paste): what it shows next is unknown.
+    /// Input the predictor does not model reached the program (a mouse event, a paste): what it
+    /// shows next is unknown.
     pub fn new_user_other(&mut self, screen: &dyn ScreenView) {
-        if self.password() {
-            self.become_tentative();
-            return;
-        }
         self.cull(screen);
         self.unmodelled();
     }
 
-    /// Predict the printable ASCII `c` typed at the cursor, as a line editor inserts it.
-    fn predict_printable(&mut self, ch: char, screen: &dyn ScreenView) {
-        let cols = screen.size().cols;
-        if self.kernel_echo() {
-            // The kernel echoes it: no need to wait for the program to prove it does.
-            self.confirmed_epoch = self.confirmed_epoch.max(self.prediction_epoch);
-        }
-        if std::mem::take(&mut self.fresh_line) {
-            let c = self.init_cursor(screen);
-            self.input_start = Some((c.row, c.col));
-        }
-        let col = self.init_cursor(screen).col;
-        if col >= cols.saturating_sub(1) {
-            // Last column is ambiguous (wrap vs. overwrite); hide until confirmed.
-            self.become_tentative();
-        }
-        let (row, col) = {
-            let c = self.init_cursor(screen);
-            (c.row, c.col)
-        };
-        // Insert mode, as a line editor renders it: shift the tail right, from the right end
-        // so each cell reads its left neighbour's content before it moves. A wide glyph
-        // moves with its right half; one split at the edge is unknown.
-        for (left, i) in (col..cols).zip((col..cols).skip(1)).rev() {
-            let guess = self.guess_at(screen, row, left);
-            // The rightmost cell takes content pushed off-screen -> unknown.
-            let guess = if i.checked_add(1) == Some(cols) || guess.unknown {
-                Guess::unknown(guess.fg, guess.bg)
-            } else {
-                guess
-            };
-            self.place_cell(screen, row, i, guess);
-        }
-        let (fg, bg) = glyph_style(screen, row, col);
-        let typed = Guess::glyph(ch.to_string(), false, fg, bg);
-        self.place_cell(screen, row, col, typed);
-        self.keep_wide_glyphs_whole(row);
-        let exp = self.next_frame();
-        if let Some(c) = self.cursor.as_mut() {
-            c.expiration_frame = exp;
-            // Advance unless on the last column.
-            if let Some(next) = c.col.checked_add(1).filter(|&next| next < cols) {
-                c.col = next;
-            } else {
-                self.become_tentative();
-                self.newline_cr(screen);
-            }
-        }
-    }
-
-    /// Predict Backspace: the cursor steps back one column and the rest of the row shifts left.
-    fn predict_backspace(&mut self, screen: &dyn ScreenView) {
-        let cols = screen.size().cols;
-        // Backspace over a wide glyph deletes both its halves, which is not modelled: a new
-        // epoch, nothing predicted.
-        let (row, col) = self
-            .cursor
-            .as_ref()
-            .map_or_else(|| screen.cursor_position(), |c| (c.row, c.col));
-        if let Some(prev) = col.checked_sub(1) {
-            let deleted = self.guess_at(screen, row, prev);
-            if deleted.wide || deleted.covered {
-                self.become_tentative();
-                return;
-            }
-        }
-        // Backspace: step the cursor back one column.
-        let exp = self.next_frame();
-        let (row, col, do_pred) = {
-            let c = self.init_cursor(screen);
-            if let Some(prev) = c.col.checked_sub(1) {
-                c.col = prev;
-                c.expiration_frame = exp;
-                (c.row, c.col, true)
-            } else {
-                (c.row, c.col, false)
-            }
-        };
-        if do_pred {
-            // Shift the tail left, from the left so each cell reads its neighbour before it
-            // moves. The last two columns take what was off-screen, so they are unknown,
-            // as in mosh: a wide glyph could straddle the second-to-last.
-            for i in col..cols {
-                // `i < cols - 2` is mosh's `i + 2 < width` without overflow.
-                let right = i.checked_add(1).filter(|_| i < cols.saturating_sub(2));
-                let guess = match right {
-                    Some(right) => self.guess_at(screen, row, right),
-                    None => Guess::unknown(Color::Default, Color::Default),
-                };
-                self.place_cell(screen, row, i, guess);
-            }
-            self.keep_wide_glyphs_whole(row);
-        }
-    }
-
-    /// Predict Enter: a scroll cannot be predicted cleanly, so a new epoch, and the cursor moves.
-    fn predict_enter(&mut self, screen: &dyn ScreenView) {
+    /// Enter: a scroll cannot be predicted cleanly, so a new epoch, the cursor to the next row,
+    /// and a line begun.
+    fn predict_enter(&mut self, ctx: &Context<'_>) {
         self.become_tentative();
-        self.newline_cr(screen);
-        self.input_start = None;
-        self.fresh_line = true;
+        self.newline(ctx);
+        self.line = Line::Fresh;
     }
 
+    /// Grade the predictions against `screen`, a frame's: confirmed ones go (the screen shows
+    /// them), a wrong one takes its epoch with it, or every prediction if its epoch was shown.
     pub fn cull(&mut self, screen: &dyn ScreenView) {
         let size = screen.size();
         // Reset predictions on a genuine resize, but not on the very first cull.
-        if let Some(prev) = self.last_size {
-            if prev != size {
-                self.last_size = Some(size);
-                self.reset();
-                return;
-            }
+        if self
+            .last_size
+            .replace(size)
+            .is_some_and(|prev| prev != size)
+        {
+            return self.reset();
         }
-        self.last_size = Some(size);
-        let Size { rows, cols } = size;
-
         let late = self.late_acked;
-        let confirmed = self.confirmed_epoch;
-
         let mut to_remove: Vec<(u16, u16)> = Vec::new();
         let mut kill_epochs: BTreeSet<u64> = BTreeSet::new();
+        let mut max_confirm = self.confirmed_epoch;
         let mut kill_all = false;
-        let mut max_confirm = confirmed;
-        // As mosh does, a confirmed cell's actual colours recolour the pending predictions right of
-        // it, so they don't show a guessed colour until their own frame: `(row, from_col, fg, bg)`,
+        // As mosh does, a confirmed cell's style recolours the pending typed glyphs right of it,
+        // so they don't show a guessed style until their own frame: `(row, from_col, style)`,
         // applied after this pass.
-        let mut rendition_runs: Vec<(u16, u16, Color, Color)> = Vec::new();
+        let mut restyle: Vec<(u16, u16, Attributes)> = Vec::new();
 
         for (&(row, col), cell) in &self.cells {
-            let v = cell_validity(cell, screen, row, col, rows, cols, late);
-            match v {
+            match cell_validity(cell, screen, row, col, late) {
                 Validity::Pending => {}
                 Validity::Correct => {
-                    if cell.tentative_epoch > max_confirm {
-                        max_confirm = cell.tentative_epoch;
+                    max_confirm = max_confirm.max(cell.tentative_epoch);
+                    if let Some(actual) = screen.cell(row, col) {
+                        restyle.push((row, col, actual.attributes()));
                     }
-                    let (afg, abg) = screen
-                        .cell(row, col)
-                        .map_or((Color::Default, Color::Default), |c| (c.fg, c.bg));
-                    rendition_runs.push((row, col, afg, abg));
                     to_remove.push((row, col));
                 }
-                Validity::CorrectNoCredit => {
+                Validity::CorrectNoCredit => to_remove.push((row, col)),
+                Validity::IncorrectOrExpired if self.tentative(cell.tentative_epoch) => {
+                    kill_epochs.insert(cell.tentative_epoch);
                     to_remove.push((row, col));
                 }
+                // A shown guess was wrong: everything goes.
                 Validity::IncorrectOrExpired => {
-                    if self.tentative(cell.tentative_epoch) {
-                        kill_epochs.insert(cell.tentative_epoch);
-                        to_remove.push((row, col));
-                    } else {
-                        kill_all = true;
-                    }
+                    kill_all = true;
+                    break;
                 }
             }
         }
-
         if kill_all {
-            self.reset();
-            return;
+            return self.reset();
         }
-
         self.confirmed_epoch = max_confirm;
         for k in &to_remove {
             self.cells.remove(k);
         }
-        // In order, so the rightmost confirmed cell's colours win, as in mosh.
-        for &(row, from_col, fg, bg) in &rendition_runs {
+        // In order, so the rightmost confirmed cell's style wins, as in mosh.
+        for &(row, from_col, attributes) in &restyle {
             for (_, cell) in self.cells.range_mut((row, from_col)..=(row, u16::MAX)) {
-                cell.fg = fg;
-                cell.bg = bg;
+                if let (true, Some(guess)) = (cell.typed, cell.guess.as_mut()) {
+                    guess.attributes = attributes;
+                }
             }
         }
         if !kill_epochs.is_empty() {
             self.cells
                 .retain(|_, c| !kill_epochs.contains(&c.tentative_epoch));
+            self.discard_line();
             self.become_tentative();
             // As mosh's kill_epoch: a new cursor at the real position, in the new (hidden) epoch,
             // so the killed epoch's cursor is not drawn.
-            let (crow, ccol) = screen.cursor_position();
-            self.cursor = Some(PredCursor {
-                expiration_frame: self.next_frame(),
-                tentative_epoch: self.prediction_epoch,
-                row: crow,
-                col: ccol,
-            });
+            self.move_cursor(screen.cursor_position());
         }
 
         if let Some(c) = &self.cursor {
-            let cv = cursor_validity(c, screen, late);
-            match cv {
-                Validity::IncorrectOrExpired => {
-                    self.reset();
-                }
+            match cursor_validity(c, screen, late) {
+                Validity::IncorrectOrExpired => self.reset(),
                 Validity::Pending => {}
-                Validity::Correct | Validity::CorrectNoCredit => {
-                    self.cursor = None; // resolved
-                }
+                Validity::Correct | Validity::CorrectNoCredit => self.cursor = None,
             }
         }
     }
 
-    /// What to draw now: the predictions in confirmed epochs, unless predictions are off.
-    pub fn overlay(&self) -> Overlay<'_> {
-        if self.password() {
-            return Overlay::empty();
+    /// What to draw now: the predictions in confirmed epochs, unless at a password prompt.
+    pub fn overlay(&self) -> Overlay {
+        if self.tty.is_some_and(TtyModes::password) {
+            return Overlay::default();
         }
-        let mut ov = Overlay::empty();
-        for (&(row, col), cell) in &self.cells {
-            if self.tentative(cell.tentative_epoch) {
-                continue; // hidden until its epoch is confirmed
-            }
-            if cell.unknown {
-                // Show the real cell, not a guess.
-                continue;
-            }
-            ov.cells.insert(
-                (row, col),
-                PredictedCell {
-                    glyph: &cell.glyph,
-                    fg: cell.fg,
-                    bg: cell.bg,
-                    covered: cell.covered,
-                },
-            );
+        let cells = self
+            .cells
+            .iter()
+            .filter(|(_, cell)| !self.tentative(cell.tentative_epoch))
+            .filter_map(|(&at, cell)| Some((at, cell.guess.clone()?)))
+            .collect();
+        let cursor = self
+            .cursor
+            .as_ref()
+            .filter(|c| !self.tentative(c.tentative_epoch))
+            .map(|c| (c.row, c.col));
+        Overlay { cells, cursor }
+    }
+
+    /// Where the line began is no longer sure once the guesses made on it are discarded; a line
+    /// only begun (Enter typed) still begins at the next confirmed cursor.
+    fn discard_line(&mut self) {
+        if matches!(self.line, Line::Started(_)) {
+            self.line = Line::Unknown;
         }
-        if let Some(c) = &self.cursor {
-            if !self.tentative(c.tentative_epoch) {
-                ov.cursor = Some((c.row, c.col));
-            }
-        }
-        ov
     }
 
     /// Drop all predictions and open a fresh epoch (after a mispredict or a resize).
     pub fn reset(&mut self) {
         self.cells.clear();
         self.cursor = None;
+        self.discard_line();
         self.become_tentative();
     }
-}
-
-fn cell_glyph(screen: &dyn ScreenView, row: u16, col: u16) -> String {
-    screen
-        .cell(row, col)
-        .filter(|c| !c.contents.is_empty())
-        .map(|c| c.contents.to_string())
-        .unwrap_or_default()
-}
-
-fn glyph_style(screen: &dyn ScreenView, row: u16, col: u16) -> (Color, Color) {
-    // The colours of the neighbour to the left if it has content, else the defaults.
-    if let Some(left) = col.checked_sub(1) {
-        if let Some(c) = screen.cell(row, left) {
-            if !c.contents.is_empty() {
-                return (c.fg, c.bg);
-            }
-        }
-    }
-    (Color::Default, Color::Default)
 }
 
 fn is_blank(s: &str) -> bool {
@@ -1105,58 +1035,50 @@ fn cell_validity(
     screen: &dyn ScreenView,
     row: u16,
     col: u16,
-    rows: u16,
-    cols: u16,
     late_acked: u64,
 ) -> Validity {
-    if row >= rows || col >= cols {
+    let Some(actual) = screen.cell(row, col) else {
         return Validity::IncorrectOrExpired;
-    }
+    };
     if late_acked < cell.expiration_frame {
         return Validity::Pending;
     }
-    if cell.unknown {
+    let Some(guess) = &cell.guess else {
         // We never predicted a concrete glyph here, so it can never *confirm* an epoch.
         return Validity::CorrectNoCredit;
-    }
-    if cell.covered {
+    };
+    if guess.half == Half::Covered {
         // A wide glyph's right half says nothing of its own: right when the server shows one here,
         // never credit (its glyph, to the left, is graded).
-        return if screen.cell(row, col).is_some_and(|c| c.continuation) {
+        return if actual.is_wide_continuation() {
             Validity::CorrectNoCredit
         } else {
             Validity::IncorrectOrExpired
         };
     }
-    if is_blank(&cell.glyph) {
+    if is_blank(&guess.text) {
         return Validity::CorrectNoCredit; // too easy to falsely match
     }
-    let actual = cell_glyph(screen, row, col);
-    if actual == cell.glyph {
-        if cell.original_contents.as_deref() == Some(actual.as_str()) {
-            Validity::CorrectNoCredit // it already looked like this earlier; no credit
-        } else {
-            Validity::Correct
-        }
-    } else {
+    if actual.contents() != guess.text {
         Validity::IncorrectOrExpired
+    } else if cell.original == guess.text {
+        Validity::CorrectNoCredit // it already looked like this earlier; no credit
+    } else {
+        Validity::Correct
     }
 }
 
-fn cursor_validity(cur: &PredCursor, screen: &dyn ScreenView, late_acked: u64) -> Validity {
+fn cursor_validity(cur: &Guessed, screen: &dyn ScreenView, late_acked: u64) -> Validity {
     let Size { rows, cols } = screen.size();
     if cur.row >= rows || cur.col >= cols {
         return Validity::IncorrectOrExpired;
     }
-    if late_acked >= cur.expiration_frame {
-        let (arow, acol) = screen.cursor_position();
-        if arow == cur.row && acol == cur.col {
-            Validity::Correct
-        } else {
-            Validity::IncorrectOrExpired
-        }
-    } else {
+    if late_acked < cur.expiration_frame {
         Validity::Pending
+    } else if screen.cursor_position() == (cur.row, cur.col) {
+        Validity::Correct
+    } else {
+        Validity::IncorrectOrExpired
     }
 }
 
@@ -1164,7 +1086,7 @@ fn cursor_validity(cur: &PredCursor, screen: &dyn ScreenView, late_acked: u64) -
 mod tests {
     use super::*;
 
-    use fux_vt::Screen;
+    use fux_vt::{Color, Screen};
 
     impl ScreenView for Screen {
         fn size(&self) -> Size {
@@ -1174,20 +1096,35 @@ mod tests {
         fn cursor_position(&self) -> (u16, u16) {
             Self::cursor_position(self)
         }
-        fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>> {
-            Self::cell(self, row, col).map(|c| CellView {
-                contents: if c.has_contents() { c.contents() } else { "" },
-                fg: c.fgcolor(),
-                bg: c.bgcolor(),
-                wide: c.is_wide(),
-                continuation: c.is_wide_continuation(),
-            })
+        fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>> {
+            Self::cell(self, row, col)
+        }
+        fn alternate(&self) -> bool {
+            self.mode(fux_vt::Mode::AlternateScreen)
         }
     }
 
+    /// The PTY's modes under a line editor (readline): it echoes for itself, a key at a time.
+    const EDITOR: TtyModes = TtyModes {
+        echo: false,
+        line: false,
+    };
+
+    /// A predictor that has seen nothing but the PTY's modes, a line editor's.
+    fn engine() -> PredictionEngine {
+        let mut e = PredictionEngine::default();
+        e.set_tty(Some(EDITOR));
+        e
+    }
+
     fn screen_of(bytes: &[u8]) -> Screen {
-        let mut p = fux_vt::Parser::new(fux_vt::Size::new(24, 80).expect("nonzero size"), 0)
-            .expect("24x80 parser");
+        sized_screen_of(24, 80, bytes)
+    }
+
+    /// A screen of `rows`×`cols` showing `bytes`.
+    fn sized_screen_of(rows: u16, cols: u16, bytes: &[u8]) -> Screen {
+        let mut p = fux_vt::Parser::new(fux_vt::Size::new(rows, cols).expect("nonzero size"), 0)
+            .expect("parser");
         p.process(bytes).expect("process");
         p.screen().clone()
     }
@@ -1208,7 +1145,7 @@ mod tests {
         fn cursor_position(&self) -> (u16, u16) {
             self.cursor
         }
-        fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>> {
+        fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>> {
             // Leak-free static strs for the tiny alphabet the test uses.
             let ch = *self.rows.get(row as usize)?.get(col as usize)?;
             let contents: &'static str = match ch {
@@ -1217,14 +1154,16 @@ mod tests {
                 'y' => "y",
                 _ => "?",
             };
-            Some(CellView {
-                contents,
-                fg: Color::Default,
-                bg: Color::Default,
-                wide: false,
-                continuation: false,
-            })
+            Some(CellRef::new(contents, false, Attributes::default()))
         }
+        fn alternate(&self) -> bool {
+            false
+        }
+    }
+
+    /// The glyph predicted shown at `(row, col)`.
+    fn shown_at(e: &PredictionEngine, row: u16, col: u16) -> Option<String> {
+        e.overlay().cell(row, col).map(|c| c.text().to_owned())
     }
 
     #[test]
@@ -1236,7 +1175,7 @@ mod tests {
             rows: vec![vec![' '; 10]; 5],
             cursor: (0, 0),
         };
-        let mut e = PredictionEngine::default();
+        let mut e = engine();
         e.set_local_frame_sent(0);
         e.type_bytes(b"x", &blank);
         assert!(e.overlay().is_empty(), "hidden until confirmed");
@@ -1250,9 +1189,8 @@ mod tests {
         assert_eq!(e.confirmed_epoch(), 1, "the echoed 'x' confirms the epoch");
         e.set_local_frame_sent(1);
         e.type_bytes(b"y", &echoed);
-        let ov = e.overlay();
         assert_eq!(
-            ov.cell(0, 1).map(|c| c.glyph),
+            shown_at(&e, 0, 1).as_deref(),
             Some("y"),
             "typing after confirmation is visible over the fake view"
         );
@@ -1268,10 +1206,10 @@ mod tests {
             bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
         ) {
             let fake = FakeView { rows: vec![vec![' '; 80]; 24], cursor: (0, 0) };
-            let mut pf = PredictionEngine::default();
+            let mut pf = engine();
             pf.set_local_frame_sent(0);
             pf.type_bytes(&bytes, &fake);
-            let mut pe = PredictionEngine::default();
+            let mut pe = engine();
             pe.set_local_frame_sent(0);
             pe.type_bytes(&bytes, &screen_of(b"ready prompt $ "));
             let _ = pe.overlay();
@@ -1294,7 +1232,7 @@ mod tests {
             // Everything shown: the check is on what the overlay holds, not on when it confirms.
             let mut e = PredictionEngine {
                 confirmed_epoch: u64::MAX,
-                ..PredictionEngine::default()
+                ..engine()
             };
             e.set_local_frame_sent(0);
             for key in bytes {
@@ -1303,14 +1241,14 @@ mod tests {
                 for ((row, col), cell) in ov.cells() {
                     let left = col.checked_sub(1).and_then(|left| ov.cell(row, left));
                     let right = col.checked_add(1).and_then(|right| ov.cell(row, right));
-                    if cell.covered {
+                    if cell.covered() {
                         proptest::prop_assert!(
-                            left.is_some_and(|l| !l.covered && l.glyph.width() == 2),
+                            left.is_some_and(|l| !l.covered() && l.text().width() == 2),
                             "a covered cell at {col} follows no wide glyph"
                         );
-                    } else if cell.glyph.width() == 2 {
+                    } else if cell.text().width() == 2 {
                         proptest::prop_assert!(
-                            right.is_some_and(|r| r.covered),
+                            right.is_some_and(Cell::covered),
                             "a wide glyph at {col} covers nothing"
                         );
                     }
@@ -1323,7 +1261,7 @@ mod tests {
     /// and ack frame 1, cull (advancing `confirmed_epoch`). Returns the engine ready for
     /// subsequent typing to be *visible*.
     fn confirm_first_keystroke() -> (PredictionEngine, Screen) {
-        let mut e = PredictionEngine::default();
+        let mut e = engine();
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
         e.type_bytes(b"x", &blank);
@@ -1339,12 +1277,10 @@ mod tests {
 
     #[test]
     fn predictions_hidden_until_server_confirms_echo() {
-        // P0 (security): a secret typed before ANY server confirmation must never be drawn,
-        // even with Display::Always.
-        let mut e = PredictionEngine::default();
+        // P0 (security): a secret typed before ANY server confirmation must never be drawn.
+        let mut e = engine();
         e.set_local_frame_sent(0);
-        let blank = screen_of(b"");
-        e.type_bytes(b"hunter2", &blank);
+        e.type_bytes(b"hunter2", &screen_of(b""));
         assert!(
             e.overlay().is_empty(),
             "predictions must stay hidden until the server confirms it echoes"
@@ -1353,13 +1289,11 @@ mod tests {
 
     #[test]
     fn confirmed_echo_makes_subsequent_typing_visible() {
-        // After the server proves it echoes (one Correct), later typing in the confirmed epoch shows.
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
         e.type_bytes(b"y", &echoed); // cursor now at (0,1)
-        let ov = e.overlay();
         assert_eq!(
-            ov.cell(0, 1).map(|c| c.glyph),
+            shown_at(&e, 0, 1).as_deref(),
             Some("y"),
             "typing after confirmation must be visible"
         );
@@ -1368,19 +1302,25 @@ mod tests {
     #[test]
     fn no_echo_keeps_secret_hidden_and_cleans_up() {
         // Password-prompt style: the server never echoes -> never shown, then culled away.
-        let mut e = PredictionEngine::default();
+        let mut e = engine();
         e.set_local_frame_sent(0);
-        let blank = screen_of(b"");
-        e.type_bytes(b"s", &blank);
+        e.type_bytes(b"s", &screen_of(b""));
         assert!(e.overlay().is_empty(), "non-echoed input is never shown");
-
-        let still_blank = screen_of(b"");
         e.set_local_frame_late_acked(1);
-        e.cull(&still_blank);
+        e.cull(&screen_of(b""));
         assert!(
             e.overlay().is_empty(),
             "non-echoed input must not leave a predicted glyph"
         );
+    }
+
+    /// What is predicted at `(0, col)`: the glyph, `U` for unknown, `>` for a covered cell.
+    fn predicted_at(e: &PredictionEngine, col: u16) -> Option<String> {
+        e.cells.get(&(0, col)).map(|c| match &c.guess {
+            None => "U".to_owned(),
+            Some(g) if g.covered() => ">".to_owned(),
+            Some(g) => g.text.clone(),
+        })
     }
 
     #[test]
@@ -1388,17 +1328,16 @@ mod tests {
         // Screen "ab" with the cursor on 'b' (col 1). Typing 'X' should INSERT before 'b',
         // shifting the tail right — not overwrite 'b'. (Inspect predicted cells directly; the
         // epoch gate hides them from overlay() until confirmed, but the shift populates cells.)
-        let mut e = PredictionEngine::default();
+        let mut e = engine();
         e.set_local_frame_sent(0);
-        let screen = screen_of(b"ab\x1b[1;2H"); // cursor -> row1 col2 = (0,1)
-        e.type_bytes(b"X", &screen);
+        e.type_bytes(b"X", &screen_of(b"ab\x1b[1;2H"));
         assert_eq!(
-            e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
+            predicted_at(&e, 1).as_deref(),
             Some("X"),
             "typed char at col"
         );
         assert_eq!(
-            e.cells.get(&(0, 2)).map(|c| c.glyph.as_str()),
+            predicted_at(&e, 2).as_deref(),
             Some("b"),
             "tail shifted right"
         );
@@ -1409,96 +1348,97 @@ mod tests {
         // Screen "abc" cursor on 'c' (col 2). Backspace deletes 'b': 'c' shifts left to col 1,
         // and the last TWO columns become unknown (content scrolled in from off-screen; mosh marks
         // the cell unknown when `i + 2 >= width`, so both edge columns, not just the last one).
-        let mut e = PredictionEngine::default();
+        let mut e = engine();
         e.set_local_frame_sent(0);
-        let screen = screen_of(b"abc\x1b[1;3H"); // cursor -> (0,2)
-        e.type_bytes(&[0x7f], &screen); // backspace
-        let (_, cols) = screen.size().into();
+        e.type_bytes(&[0x7f], &screen_of(b"abc\x1b[1;3H"));
         assert_eq!(
-            e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
+            predicted_at(&e, 1).as_deref(),
             Some("c"),
             "tail shifted left"
         );
-        assert!(
-            e.cells.get(&(0, cols - 1)).is_some_and(|c| c.unknown),
-            "the last column is marked unknown after a mid-line backspace"
+        assert_eq!(
+            predicted_at(&e, 79).as_deref(),
+            Some("U"),
+            "the last column"
         );
-        assert!(
-            e.cells.get(&(0, cols - 2)).is_some_and(|c| c.unknown),
-            "the second-to-last column is unknown too (mosh's `i + 2 >= width`)"
+        assert_eq!(
+            predicted_at(&e, 78).as_deref(),
+            Some("U"),
+            "the second-to-last"
         );
-        assert!(
-            e.cells.get(&(0, cols - 3)).is_some_and(|c| !c.unknown),
-            "the third-to-last column is still a concrete shifted cell, not unknown"
+        assert_eq!(
+            predicted_at(&e, 77).as_deref(),
+            Some(""),
+            "a blank moved in"
         );
     }
 
     #[test]
     fn insert_mode_backspace_does_not_overflow_at_max_width() {
-        // The unknown-column guard must be overflow-safe on a peer-controlled width.
-        // At cols == u16::MAX the left-shift loop reaches i = 65534, where a naive `i + 2` overflows
-        // u16 (panics under debug overflow-checks). The `i < cols - 2` form must not.
+        // The unknown-column guard must be overflow-safe on a peer-controlled width: at
+        // cols == u16::MAX a naive `i + 2` overflows u16. The predicted cursor is near the right
+        // edge so the backspace runs its shift out to the final column.
         let p = fux_vt::Parser::new(fux_vt::Size::new(1, u16::MAX).expect("nonzero size"), 0)
             .expect("1-row parser");
-        let mut e = PredictionEngine::default();
+        let mut e = engine();
         e.set_local_frame_sent(0);
-        // Predicted cursor near the right edge so the backspace runs its left-shift loop out to the
-        // final column (where the overflow would occur).
-        e.cursor = Some(PredCursor {
-            expiration_frame: 1,
-            tentative_epoch: 1,
-            row: 0,
-            col: u16::MAX - 1,
-        });
-        e.type_bytes(&[0x7f], p.screen()); // backspace — must not panic
-                                           // The two right-edge columns are unknown (mosh's `i + 2 >= width`), with no `i + 1` read.
-        assert!(
-            e.cells.get(&(0, u16::MAX - 1)).is_some_and(|c| c.unknown),
-            "last column unknown at max width"
-        );
-        assert!(
-            e.cells.get(&(0, u16::MAX - 2)).is_some_and(|c| c.unknown),
-            "second-to-last column unknown at max width"
-        );
+        e.move_cursor((0, u16::MAX - 1));
+        e.type_bytes(&[0x7f], p.screen());
+        assert_eq!(predicted_at(&e, u16::MAX - 1).as_deref(), Some("U"));
+        assert_eq!(predicted_at(&e, u16::MAX - 2).as_deref(), Some("U"));
     }
 
     #[test]
-    fn correct_grade_recolors_rest_of_row_pending_predictions() {
-        // mosh "match rest of row to the actual renditions": when a predicted cell confirms with a
-        // concrete on-screen color, the still-pending predicted cells to its right adopt that color
-        // (so they don't flash a guessed rendition before their own frame confirms).
-        let mut e = PredictionEngine::default();
-        e.set_local_frame_sent(0);
-        // Confirm an initial keystroke so later predictions are in a shown epoch.
-        let blank = screen_of(b"");
-        e.type_bytes(b"a", &blank);
-        let echoed = screen_of(b"a");
-        e.set_local_frame_late_acked(1);
-        e.cull(&echoed); // confirmed_epoch = 1
-
-        // Type "bc": 'b' on frame 2 (will be confirmed), 'c' on frame 3 (stays pending), so 'c'
-        // survives the cull where 'b' confirms — and can be recolored.
+    fn correct_grade_restyles_the_pending_typed_glyphs_right_of_it() {
+        // mosh "match rest of row to the actual renditions": when a typed glyph confirms in a
+        // style, the still-pending typed glyphs to its right take that whole style (so they don't
+        // flash a guessed one before their own frame confirms).
+        let (mut e, echoed) = confirm_first_keystroke();
+        // 'b' on frame 2 (will be confirmed), 'c' on frame 3 (stays pending).
         e.set_local_frame_sent(1);
         e.type_bytes(b"b", &echoed);
         e.set_local_frame_sent(2);
         e.type_bytes(b"c", &echoed);
-        assert_eq!(
-            e.cells.get(&(0, 2)).map(|c| c.fg),
-            Some(Color::Default),
-            "'c' starts with the default (guessed) foreground"
-        );
-
-        // The server echoes 'b' in a *colored* rendition (red fg) and acks frame 2; 'c' (frame 3)
-        // is still pending. Grading 'b' Correct must repaint the rest of the row — col 2's pending
-        // 'c' — with 'b''s actual red foreground.
-        let colored = screen_of(b"a\x1b[31mb");
+        let style = |e: &PredictionEngine| e.overlay().cell(0, 2).map(Cell::attributes);
+        assert_eq!(style(&e), Some(Attributes::default()), "guessed");
+        // The server echoes 'b' bold red and acks frame 2.
+        let colored = screen_of(b"x\x1b[1;31mb");
         e.set_local_frame_late_acked(2);
         e.cull(&colored);
+        let confirmed = colored.cell(0, 1).map(|c| c.attributes());
+        assert!(confirmed.is_some_and(|a| a.bold() && a.foreground() == Color::Idx(1)));
+        assert_eq!(style(&e), confirmed, "'c' takes 'b''s whole style");
+    }
+
+    /// The cells a line editor moves keep every attribute they have, and only the typed glyph
+    /// borrows its left neighbour's, hidden included, as the echo will show them.
+    #[test]
+    fn predicted_cells_keep_their_style() {
+        let screen = screen_of(b"\x1b[8ma\x1b[m\x1b[1;4;7;31mbc\x1b[m\x1b[1;2H");
+        let (mut e, _) = confirm_first_keystroke();
+        e.set_local_frame_sent(1);
+        e.type_bytes(b"X", &screen);
+        let at = |col| {
+            e.overlay()
+                .cell(0, col)
+                .map(|c| (c.text().to_owned(), c.attributes()))
+        };
+        let real = |col| screen.cell(0, col).map(|c| c.attributes());
+        assert_eq!(at(1).map(|(t, _)| t).as_deref(), Some("X"));
         assert_eq!(
-            e.cells.get(&(0, 2)).map(|c| c.fg),
-            Some(Color::Idx(1)),
-            "the pending 'c' adopted the confirmed 'b' cell's actual red foreground"
+            at(1).map(|(_, a)| a),
+            real(0),
+            "the typed glyph: its neighbour's, hidden"
         );
+        assert!(at(1).is_some_and(|(_, a)| a.hidden()));
+        for (col, from) in [(2, 1), (3, 2)] {
+            assert_eq!(
+                at(col).map(|(_, a)| a),
+                real(from),
+                "column {col} moved whole"
+            );
+        }
+        assert!(at(2).is_some_and(|(_, a)| a.bold() && a.inverse() && a.underline()));
     }
 
     #[test]
@@ -1510,13 +1450,13 @@ mod tests {
         let mut e = PredictionEngine {
             confirmed_epoch: 1,
             prediction_epoch: 2,
-            ..PredictionEngine::default()
+            ..engine()
         };
         e.set_local_frame_sent(5);
         e.set_local_frame_late_acked(5);
         // A CONFIRMED (epoch 1 <= confirmed 1) cursor at a stale column, still Pending (expiration
         // far ahead of late_acked) so the validation pass won't resolve it — it would keep drawing.
-        e.cursor = Some(PredCursor {
+        e.cursor = Some(Guessed {
             expiration_frame: 99,
             tentative_epoch: 1,
             row: 0,
@@ -1528,36 +1468,25 @@ mod tests {
             PredCell {
                 expiration_frame: 5,
                 tentative_epoch: 2,
-                glyph: "Q".to_string(),
-                fg: Color::Default,
-                bg: Color::Default,
-                original_contents: Some(String::new()),
-                unknown: false,
-                wide: false,
-                covered: false,
+                guess: Some(Cell {
+                    text: "Q".to_owned(),
+                    attributes: Attributes::default(),
+                    half: Half::Narrow,
+                }),
+                original: String::new(),
+                typed: true,
             },
         );
         let blank = screen_of(b"");
-        assert_eq!(
-            e.overlay().cursor(),
-            Some((0, 9)),
-            "the stale confirmed cursor is drawn before the kill"
-        );
+        assert_eq!(e.overlay().cursor(), Some((0, 9)), "drawn before the kill");
         // The frame has no 'Q' at (0,3) -> epoch 2 is killed; the real cursor is at (0,0).
         e.cull(&blank);
         assert!(
             e.overlay().cursor().is_none(),
             "after kill_epoch the stale predicted cursor is displaced; the real cursor shows through"
         );
-        let c = e
-            .cursor
-            .as_ref()
-            .expect("kill_epoch re-seeds a cursor rather than clearing it");
-        assert_eq!(
-            (c.row, c.col),
-            (0, 0),
-            "the re-seeded cursor sits at the real screen position"
-        );
+        let c = e.cursor.as_ref().expect("kill_epoch re-seeds a cursor");
+        assert_eq!((c.row, c.col), (0, 0), "at the real screen position");
     }
 
     #[test]
@@ -1568,15 +1497,8 @@ mod tests {
         e.set_local_frame_sent(1);
         e.type_bytes(b"\x1b[D", &echoed);
         let ov = e.overlay();
-        assert_eq!(
-            ov.cursor(),
-            Some((0, 0)),
-            "left arrow predicts the cursor one col left"
-        );
-        assert!(
-            ov.cell(0, 0).is_none() && ov.cell(0, 1).is_none(),
-            "arrow escape bytes must not be drawn as literal glyphs"
-        );
+        assert_eq!(ov.cursor(), Some((0, 0)));
+        assert!(ov.cell(0, 0).is_none() && ov.cell(0, 1).is_none());
     }
 
     #[test]
@@ -1597,70 +1519,59 @@ mod tests {
         e.set_local_frame_sent(1);
         e.type_bytes("世".as_bytes(), &echoed);
         let ov = e.overlay();
-        assert_eq!(
-            ov.cell(0, 1).map(|c| c.glyph),
-            Some("世"),
-            "the wide grapheme is predicted at the cursor column"
-        );
+        assert_eq!(ov.cell(0, 1).map(Cell::text), Some("世"));
+        assert!(ov
+            .cell(0, 2)
+            .is_some_and(|c| c.covered() && c.text().is_empty()));
+        assert_eq!(ov.cursor(), Some((0, 3)));
+    }
+
+    /// An emoji with a skin tone, typed in one keystroke or two (an IME commits it as two
+    /// characters), is one glyph, as the terminal joins it when it is echoed.
+    #[test]
+    fn a_grapheme_typed_in_pieces_is_one_glyph() {
+        let (mut e, echoed) = confirm_first_keystroke();
+        e.set_local_frame_sent(1);
+        e.type_bytes("\u{1f44d}\u{1f3fd}a".as_bytes(), &echoed);
+        let ov = e.overlay();
+        assert_eq!(ov.cell(0, 1).map(Cell::text), Some("\u{1f44d}\u{1f3fd}"));
+        assert!(ov.cell(0, 2).is_some_and(Cell::covered));
+        assert_eq!(ov.cell(0, 3).map(Cell::text), Some("a"));
+        assert_eq!(ov.cursor(), Some((0, 4)));
+        // A joiner that would make the glyph wider is not guessed at all.
+        let (mut e, echoed) = confirm_first_keystroke();
+        e.set_local_frame_sent(1);
+        let epoch = e.prediction_epoch;
+        e.type_bytes("\u{2764}\u{fe0f}".as_bytes(), &echoed);
         assert!(
-            ov.cell(0, 2)
-                .is_some_and(|c| c.covered && c.glyph.is_empty()),
-            "the continuation cell of a wide char is covered, with no predicted glyph of its own"
+            e.prediction_epoch > epoch,
+            "the heart's widening opened a new epoch"
         );
-        assert_eq!(
-            ov.cursor(),
-            Some((0, 3)),
-            "cursor advances by two cells for a double-width char"
-        );
-    }
-
-    /// A screen of `rows`×`cols` showing `bytes`.
-    fn sized_screen_of(rows: u16, cols: u16, bytes: &[u8]) -> Screen {
-        let mut p = fux_vt::Parser::new(fux_vt::Size::new(rows, cols).expect("nonzero size"), 0)
-            .expect("parser");
-        p.process(bytes).expect("process");
-        p.screen().clone()
-    }
-
-    /// What is predicted at `(0, col)`: the glyph, `U` for unknown, `>` for a covered cell.
-    fn predicted_at(e: &PredictionEngine, col: u16) -> Option<String> {
-        e.cells.get(&(0, col)).map(|c| {
-            if c.unknown {
-                "U".to_owned()
-            } else if c.covered {
-                ">".to_owned()
-            } else {
-                c.glyph.clone()
-            }
-        })
+        assert!(shown_at(&e, 0, 1).is_none_or(|g| g == "\u{2764}"));
     }
 
     #[test]
     fn inserting_before_a_wide_glyph_moves_it_whole() {
-        let mut e = PredictionEngine::default();
+        let mut e = engine();
         e.set_local_frame_sent(0);
-        let screen = screen_of("a本b\x1b[1;1H".as_bytes());
-        e.type_bytes(b"X", &screen);
+        e.type_bytes(b"X", &screen_of("a本b\x1b[1;1H".as_bytes()));
         let row: Vec<_> = (0..5).map(|col| predicted_at(&e, col)).collect();
         let expected = ["X", "a", "本", ">", "b"].map(|g| Some(g.to_owned()));
         assert_eq!(row, expected);
-        assert!(e.cells.get(&(0, 2)).is_some_and(|c| c.wide));
     }
 
     #[test]
     fn a_wide_glyph_split_by_a_shift_is_unknown() {
         // Pushed to the edge, its right half would leave the screen.
-        let mut e = PredictionEngine::default();
+        let mut e = engine();
         e.set_local_frame_sent(0);
-        let screen = sized_screen_of(2, 6, "abc本\x1b[1;1H".as_bytes());
-        e.type_bytes(b"X", &screen);
+        e.type_bytes(b"X", &sized_screen_of(2, 6, "abc本\x1b[1;1H".as_bytes()));
         assert_eq!(predicted_at(&e, 4).as_deref(), Some("U"), "its glyph");
         assert_eq!(predicted_at(&e, 5).as_deref(), Some("U"), "its right half");
         // Typed inside one, its halves part.
-        let mut e = PredictionEngine::default();
+        let mut e = engine();
         e.set_local_frame_sent(0);
-        let screen = screen_of("本x\x1b[1;2H".as_bytes());
-        e.type_bytes(b"a", &screen);
+        e.type_bytes(b"a", &screen_of("本x\x1b[1;2H".as_bytes()));
         assert_eq!(predicted_at(&e, 1).as_deref(), Some("a"));
         assert_eq!(
             predicted_at(&e, 2).as_deref(),
@@ -1668,41 +1579,31 @@ mod tests {
             "the moved right half"
         );
         // Deleting before one moves it left, whole.
-        let mut e = PredictionEngine::default();
+        let mut e = engine();
         e.set_local_frame_sent(0);
-        let screen = screen_of("ab本c\x1b[1;3H".as_bytes());
-        e.type_bytes(&[0x7f], &screen);
+        e.type_bytes(&[0x7f], &screen_of("ab本c\x1b[1;3H".as_bytes()));
         let row: Vec<_> = (1..4).map(|col| predicted_at(&e, col)).collect();
         assert_eq!(row, ["本", ">", "c"].map(|g| Some(g.to_owned())));
     }
 
     #[test]
-    fn a_wide_glyph_typed_over_another_wide_glyph_s_half_leaves_no_half() {
-        // Typed over the right half of a predicted wide glyph: that glyph cannot show.
+    fn a_wide_glyph_typed_inside_another_leaves_neither_half_of_that_one() {
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
         e.type_bytes("日".as_bytes(), &echoed);
-        e.cursor = e.cursor.clone().map(|c| PredCursor { col: 2, ..c });
+        e.move_cursor((0, 2));
         e.type_bytes("本".as_bytes(), &echoed);
         let row: Vec<_> = (1..5).map(|col| predicted_at(&e, col)).collect();
-        assert_eq!(
-            row,
-            ["U", "本", ">"]
-                .map(|g| Some(g.to_owned()))
-                .into_iter()
-                .chain([None])
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(row, ["U", "本", ">", "U"].map(|g| Some(g.to_owned())));
     }
 
     #[test]
     fn backspace_over_a_wide_glyph_is_not_predicted() {
         // A line editor deletes both halves: not modelled, so a new epoch and nothing predicted.
         let (mut e, _) = confirm_first_keystroke();
-        let screen = screen_of("x本".as_bytes());
         e.set_local_frame_sent(1);
         let epoch = e.prediction_epoch;
-        e.type_bytes(&[0x7f], &screen);
+        e.type_bytes(&[0x7f], &screen_of("x本".as_bytes()));
         assert!(e.cells.is_empty(), "nothing predicted");
         assert!(e.prediction_epoch > epoch, "a new epoch");
         assert!(e.overlay().is_empty());
@@ -1713,70 +1614,44 @@ mod tests {
         let covered = PredCell {
             expiration_frame: 1,
             tentative_epoch: 1,
-            glyph: String::new(),
-            fg: Color::Default,
-            bg: Color::Default,
-            original_contents: Some(String::new()),
-            unknown: false,
-            wide: false,
-            covered: true,
+            guess: Some(Cell {
+                text: String::new(),
+                attributes: Attributes::default(),
+                half: Half::Covered,
+            }),
+            original: String::new(),
+            typed: true,
         };
         let wide = screen_of("x本".as_bytes());
         let narrow = screen_of(b"xab");
-        assert!(
-            cell_validity(&covered, &wide, 0, 2, 24, 80, 1) == Validity::CorrectNoCredit,
-            "a right half where it was predicted: right, but no credit"
-        );
-        assert!(
-            cell_validity(&covered, &narrow, 0, 2, 24, 80, 1) == Validity::IncorrectOrExpired,
-            "a narrow glyph where a right half was predicted: wrong"
-        );
-        assert!(
-            cell_validity(&covered, &narrow, 0, 2, 24, 80, 0) == Validity::Pending,
-            "before its frame"
-        );
+        assert!(cell_validity(&covered, &wide, 0, 2, 1) == Validity::CorrectNoCredit);
+        assert!(cell_validity(&covered, &narrow, 0, 2, 1) == Validity::IncorrectOrExpired);
+        assert!(cell_validity(&covered, &narrow, 0, 2, 0) == Validity::Pending);
     }
 
     #[test]
     fn prediction_reassembles_multibyte_utf8_no_stray_byte() {
         // mosh prediction-unicode regression: typing "glück" must predict 'ü', and "faĩl" 'ĩ' —
-        // NOT the low byte of the code point (mosh, being char/byte based, would briefly draw the
-        // low 8 bits: a raw 0xFC, or ')' for ĩ's 0x129 & 0xFF = 0x29, before the server corrected
-        // it). koh reassembles the whole UTF-8 grapheme before predicting, so the predicted
-        // glyph is always the real character. (`)` is the meaningful char-level artifact; ü's raw
-        // 0xFC can't even exist in a Rust `String`, so reassembly itself is the guarantee.)
+        // NOT the low byte of the code point. koh reassembles the whole UTF-8 grapheme before
+        // predicting, so the predicted glyph is always the real character.
         for (word, accent) in [("glück", "ü"), ("faĩl", "ĩ")] {
             let (mut e, echoed) = confirm_first_keystroke();
             e.set_local_frame_sent(1);
             e.type_bytes(word.as_bytes(), &echoed);
-            let ov = e.overlay();
-            // The first typed char lands at col 1 (cursor seeded from the echoed "x"); the accent
-            // is the 3rd char, so column 3.
-            assert_eq!(
-                ov.cell(0, 3).map(|c| c.glyph),
-                Some(accent),
-                "{word}: accented char must be predicted as the real grapheme"
+            assert_eq!(shown_at(&e, 0, 3).as_deref(), Some(accent), "{word}");
+            assert!(
+                e.overlay().cells().all(|(_, c)| c.text() != ")"),
+                "{word}: ĩ must not collapse to its low byte ')'"
             );
-            for col in 0..80u16 {
-                if let Some(cell) = ov.cell(0, col) {
-                    assert_ne!(
-                        cell.glyph, ")",
-                        "{word}: ĩ must not collapse to its low byte ')'"
-                    );
-                }
-            }
         }
     }
 
-    /// A predictor trusted at a line editor (no kernel echo, no line mode), on `bytes`' screen.
+    /// A predictor trusted at a line editor, on `bytes`' screen.
     fn editor_on(bytes: &[u8]) -> (PredictionEngine, Screen) {
         let mut e = PredictionEngine::default();
         let screen = screen_of(bytes);
         e.carried = true;
-        e.set_tty(Some(TtyModes {
-            echo: false,
-            line: false,
-        }));
+        e.set_tty(Some(EDITOR));
         e.cull(&screen);
         (e, screen)
     }
@@ -1793,8 +1668,11 @@ mod tests {
         let ov = e.overlay();
         let text: String = (0..80)
             .map(|col| match ov.cell(0, col) {
-                Some(cell) => cell.glyph.to_owned(),
-                None => cell_glyph(screen, 0, col),
+                Some(cell) => cell.text().to_owned(),
+                None => screen
+                    .cell(0, col)
+                    .map(|c| c.contents().to_owned())
+                    .unwrap_or_default(),
             })
             .map(|g| if g.is_empty() { " ".to_owned() } else { g })
             .collect();
@@ -1831,7 +1709,7 @@ mod tests {
         assert!(e.overlay().is_empty(), "where the line began is not known");
         // Typed after Enter, the line's start is known.
         let (mut e, screen) = editor_on(b"$ ");
-        e.fresh_line = true;
+        e.line = Line::Fresh;
         type_keys(&mut e, &screen, b"echo hi");
         assert_eq!(shown_row(&e, &screen), ("$ echo hi".to_owned(), Some(9)));
         type_keys(&mut e, &screen, &[0x01]);
@@ -1840,6 +1718,47 @@ mod tests {
         assert_eq!(shown_row(&e, &screen).1, Some(9), "Ctrl-E");
         type_keys(&mut e, &screen, &[0x15]);
         assert_eq!(shown_row(&e, &screen), ("$".to_owned(), Some(2)), "Ctrl-U");
+    }
+
+    /// The line begins where a frame shows the cursor, never where a guess put it: after Enter
+    /// the prompt is drawn where the guess put the cursor, so a key typed before the frame that
+    /// shows it leaves the line's start unknown, and Ctrl-A is not predicted into the prompt.
+    #[test]
+    fn the_line_begins_at_a_confirmed_cursor_not_a_guessed_one() {
+        let (mut e, screen) = editor_on(b"$ ls");
+        type_keys(&mut e, &screen, b"\r");
+        type_keys(&mut e, &screen, b"x");
+        type_keys(&mut e, &screen, &[0x01]);
+        assert_eq!(
+            e.line,
+            Line::Unknown,
+            "a guess was pending at the first key"
+        );
+        // The frame shows the new prompt; the line begins after it, where the screen says.
+        let (mut e, screen) = editor_on(b"$ ls");
+        type_keys(&mut e, &screen, b"\r");
+        let prompt = screen_of(b"$ ls\r\nfile\r\n$ ");
+        e.set_local_frame_late_acked(2);
+        e.cull(&prompt);
+        e.set_local_frame_sent(2);
+        e.type_bytes(b"ab\x01", &prompt);
+        assert_eq!(e.line, Line::Started(Confirmed { row: 2, col: 2 }));
+        // A discarded guess takes the line's start with it.
+        e.reset();
+        assert_eq!(e.line, Line::Unknown);
+    }
+
+    #[test]
+    fn backspace_and_left_never_go_past_where_the_line_began() {
+        let (mut e, screen) = editor_on(b"$ ");
+        e.line = Line::Started(Confirmed { row: 0, col: 2 });
+        for key in [&b"\x7f"[..], b"\x1b[D", b"\x08"] {
+            let epoch = e.prediction_epoch;
+            type_keys(&mut e, &screen, key);
+            assert!(e.overlay().is_empty(), "{key:?}");
+            assert!(e.prediction_epoch > epoch, "{key:?} opened a new epoch");
+            e.line = Line::Started(Confirmed { row: 0, col: 2 });
+        }
     }
 
     #[test]
@@ -1874,8 +1793,7 @@ mod tests {
     fn a_csi_with_parameters_is_read_whole_and_draws_nothing() {
         let (mut e, screen) = editor_on(b"$ ab");
         type_keys(&mut e, &screen, b"\x1b[3~\x1b[1;5C");
-        let (text, _) = shown_row(&e, &screen);
-        assert_eq!(text, "$ ab", "no '~' or 'C' drawn");
+        assert_eq!(shown_row(&e, &screen).0, "$ ab", "no '~' or 'C' drawn");
     }
 
     #[test]
@@ -1885,10 +1803,11 @@ mod tests {
         assert!(!e.overlay().is_empty(), "trusted at the shell");
         // sudo turns echo off and reads a line: whatever was trusted, nothing shows.
         let prompt = screen_of(b"$ sudo\r\n[sudo] password for me: ");
-        e.set_tty(Some(TtyModes {
+        let password = TtyModes {
             echo: false,
             line: true,
-        }));
+        };
+        e.set_tty(Some(password));
         e.cull(&prompt);
         type_keys(&mut e, &prompt, b"hunter2");
         assert!(e.overlay().is_empty());
@@ -1898,12 +1817,24 @@ mod tests {
             carried: true,
             ..PredictionEngine::default()
         };
-        fresh.set_tty(Some(TtyModes {
-            echo: false,
-            line: true,
-        }));
+        fresh.set_tty(Some(password));
         type_keys(&mut fresh, &prompt, b"hunter2");
         assert!(fresh.overlay().is_empty());
+    }
+
+    /// Modes not known are not a password prompt's, nor anything else's: carried trust waits
+    /// for known ones.
+    #[test]
+    fn unknown_modes_give_no_carried_trust() {
+        let mut e = PredictionEngine {
+            carried: true,
+            ..PredictionEngine::default()
+        };
+        e.set_tty(None);
+        assert!(e.carries_trust(), "still carried");
+        e.set_tty(Some(EDITOR));
+        assert!(!e.carries_trust(), "given");
+        assert_eq!(e.confirmed_epoch, e.prediction_epoch);
     }
 
     #[test]
@@ -1916,10 +1847,20 @@ mod tests {
         }));
         type_keys(&mut e, &screen, b"hi");
         assert_eq!(shown_row(&e, &screen), ("hi".to_owned(), Some(2)));
-        // Without echo known, the first key waits for the server, as before.
+        // Without the modes known, nothing is predicted at all.
         let mut e = PredictionEngine::default();
         type_keys(&mut e, &screen, b"hi");
-        assert!(e.overlay().is_empty());
+        assert!(e.overlay().is_empty() && e.cells.is_empty());
+    }
+
+    /// tmux's and screen's prefix (Ctrl-A) and vim's keys are not a line editor's: on the
+    /// alternate screen nothing is predicted, however trusted the session.
+    #[test]
+    fn nothing_is_predicted_on_the_alternate_screen() {
+        let (mut e, _) = editor_on(b"$ ");
+        let tmux = screen_of(b"\x1b[?1049h$ ls");
+        type_keys(&mut e, &tmux, b"\x01c");
+        assert!(e.overlay().is_empty() && e.cells.is_empty());
     }
 
     #[test]

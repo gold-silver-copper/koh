@@ -236,7 +236,7 @@ fn paint(workload: &Workload, frames: &[Vec<u8>]) -> anyhow::Result<usize> {
             terminal.window_resized();
         }
         while client.pop_outgoing().is_some() {}
-        terminal.render(client.state(), &Overlay::empty(), None)?;
+        terminal.render(client.state(), &Overlay::default(), None)?;
     }
     let painted = *sink.bytes.borrow();
     Ok(painted)

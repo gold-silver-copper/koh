@@ -1195,6 +1195,7 @@ pub struct WireModes {
     pub bracketed_paste: bool,
     pub mouse_mode: WireMouseMode,
     pub mouse_encoding: WireMouseEncoding,
+    pub alternate: bool,
 }
 
 impl From<Modes> for WireModes {
@@ -1206,6 +1207,7 @@ impl From<Modes> for WireModes {
             bracketed_paste: m.bracketed_paste,
             mouse_mode: m.mouse_mode.into(),
             mouse_encoding: m.mouse_encoding.into(),
+            alternate: m.alternate,
         }
     }
 }
@@ -1219,6 +1221,7 @@ impl From<WireModes> for Modes {
             bracketed_paste: m.bracketed_paste,
             mouse_mode: m.mouse_mode.into(),
             mouse_encoding: m.mouse_encoding.into(),
+            alternate: m.alternate,
         }
     }
 }
@@ -1651,6 +1654,7 @@ mod tests {
                 bracketed_paste: modes.3,
                 mouse_mode,
                 mouse_encoding,
+                alternate: false,
             };
             let resize = resize.map(|(rows, cols)| Size::new(rows, cols));
             let diff = ScreenDiff {
@@ -2012,6 +2016,7 @@ mod tests {
         bracketed_paste: bool,
         mouse_mode: u8,
         mouse_encoding: u8,
+        alternate: bool,
     }
 
     #[derive(Clone, Serialize)]
@@ -2058,6 +2063,7 @@ mod tests {
                 bracketed_paste: false,
                 mouse_mode: 4,
                 mouse_encoding: 2,
+                alternate: false,
             },
             shifts: Vec::new(),
             rows: vec![RawRow {

@@ -86,7 +86,7 @@ impl ClientTerminal for Readback {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay<'_>,
+        overlay: &Overlay,
         status: Option<&str>,
     ) -> std::io::Result<()> {
         self.terminal.render(state, overlay, status)?;
@@ -258,7 +258,7 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
         std::time::SystemTime::now(),
         connector,
         start,
-        None,
+        false,
         input_rx,
         resize_rx,
         terminal,

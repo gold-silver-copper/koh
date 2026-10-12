@@ -8,7 +8,7 @@ pub mod backend;
 pub mod cli;
 mod io;
 mod link;
-pub mod probe;
+mod probe;
 mod render;
 mod scrollback;
 mod session;
@@ -17,7 +17,7 @@ pub use backend::{DefaultBackend, KohBackend};
 pub use cli::{connect, BellHook, ConnectConfig};
 pub(crate) use io::spawn_client_io;
 pub use render::WindowState;
-pub use session::{ClientSession, InputOutcome, TickResult};
+pub use session::{ClientSession, Found, InputOutcome, TickResult};
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,10 +25,11 @@ use crate::predict::Overlay;
 use crate::proto::{decode_server, encode_client, ServerMsg, MAX_FRAME, SESSION_ENDED};
 use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::ALPN;
-use iroh::endpoint::{Connection, SendStream};
+use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 /// Prefixed to the mirrored window title, as mosh prefixes `[mosh] `.
 const KOH_TITLE_PREFIX: &str = "[koh] ";
@@ -178,7 +179,7 @@ pub trait ClientTerminal {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay<'_>,
+        overlay: &Overlay,
         status: Option<&str>,
     ) -> std::io::Result<()>;
 
@@ -189,16 +190,27 @@ pub trait ClientTerminal {
     /// paints everything. Default: a no-op, for a terminal that paints everything every time.
     fn window_resized(&mut self) {}
 
-    /// Suspend the client (`Ctrl-^ Ctrl-Z`): restore the user's terminal, stop the process with
-    /// SIGTSTP, and once it is foregrounded take the terminal back. Blocks while stopped. Default:
-    /// a no-op, so a test terminal never stops the test process.
-    fn suspend_resume(&mut self) -> std::io::Result<()> {
+    /// Suspend the client (`Ctrl-^ Ctrl-Z`): restore the user's terminal and stop the process with
+    /// SIGTSTP; whether it did, so the caller waits for SIGCONT before [`resume`](Self::resume).
+    /// Default: nothing, so a test terminal never stops the test process.
+    fn suspend(&mut self) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
+    /// Take the terminal back after a [`suspend`](Self::suspend): it was reset meanwhile.
+    fn resume(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 
-    /// Ask the user's terminal `questions` (the session's: its colours again, after it reported a
-    /// new scheme). Default: a no-op, for a terminal that answers nothing.
+    /// Ask the user's terminal `questions` (the session's: what it does at start-up, its colours
+    /// again after it reported a new scheme). Default: a no-op, for a terminal that answers
+    /// nothing.
     fn ask(&mut self, _questions: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// The user's terminal said what it does: paint and listen by it. Default: a no-op.
+    fn found(&mut self, _found: Found) -> std::io::Result<()> {
         Ok(())
     }
 
@@ -227,23 +239,25 @@ pub struct BackendTerminal<B: KohBackend> {
     /// off again on leaving and on suspend: kitty's disambiguate and alternate keys, pushed, and
     /// scheme reports (mode 2031).
     extras: Extras,
+    /// What was on when the client suspended, to turn on at the resume.
+    suspended: Extras,
 }
 
 /// What the client turns on in a terminal that speaks it, beside the input modes.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Extras {
     kitty: bool,
     scheme_reports: bool,
 }
 
 impl Extras {
-    /// The bytes turning them on.
-    fn on(self) -> Vec<u8> {
+    /// The bytes turning on what `self` has and `was` has not.
+    fn on(self, was: Self) -> Vec<u8> {
         let mut out = Vec::new();
-        if self.kitty {
+        if self.kitty && !was.kitty {
             out.extend_from_slice(b"\x1b[>5u");
         }
-        if self.scheme_reports {
+        if self.scheme_reports && !was.scheme_reports {
             out.extend_from_slice(b"\x1b[?2031h");
         }
         out
@@ -273,19 +287,17 @@ impl<B: KohBackend> BackendTerminal<B> {
                 .with_clipboard(clipboard_enabled),
             painter: render::Painter::default(),
             extras: Extras::default(),
+            suspended: Extras::default(),
         };
         this.backend.enter_alt_screen()?;
         Ok(this)
     }
 
-    /// The terminal speaks the kitty keyboard protocol (`kitty`) and reports its scheme
-    /// (`scheme_reports`), as the probe found: turn each on now, until the client leaves.
-    pub(crate) fn turn_on(&mut self, kitty: bool, scheme_reports: bool) -> std::io::Result<()> {
-        self.extras = Extras {
-            kitty,
-            scheme_reports,
-        };
-        self.ask(&self.extras.on())
+    /// Turn on, until the client leaves, what `want` has and is not on yet.
+    fn turn_on(&mut self, want: Extras) -> std::io::Result<()> {
+        let on = want.on(self.extras);
+        self.extras = want;
+        self.ask(&on)
     }
 
     /// Paint underline styles (`4:n`) if the terminal draws them (`on`), else plain underlines,
@@ -302,16 +314,16 @@ impl<B: KohBackend> BackendTerminal<B> {
 
     /// Ask the user's terminal `queries` (written and flushed now).
     pub(crate) fn ask(&mut self, queries: &[u8]) -> std::io::Result<()> {
+        if queries.is_empty() {
+            return Ok(());
+        }
         self.backend.write_bytes(queries)?;
         self.backend.flush()
     }
 
     /// Turn off what [`turn_on`](Self::turn_on) turned on.
     fn turn_off(&mut self) -> std::io::Result<()> {
-        let off = self.extras.off();
-        if off.is_empty() {
-            return Ok(());
-        }
+        let off = std::mem::take(&mut self.extras).off();
         self.ask(&off)
     }
 }
@@ -320,7 +332,7 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay<'_>,
+        overlay: &Overlay,
         status: Option<&str>,
     ) -> std::io::Result<()> {
         self.oob.emit(
@@ -344,26 +356,39 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
         Self::ask(self, questions)
     }
 
+    fn found(&mut self, found: Found) -> std::io::Result<()> {
+        self.painter.set_underline_styles(found.underline_styles);
+        self.turn_on(Extras {
+            kitty: found.kitty,
+            scheme_reports: found.scheme_reports,
+        })
+    }
+
     fn prime(&mut self, win: WindowState<'_>) {
         self.oob.prime(win);
     }
 
-    fn suspend_resume(&mut self) -> std::io::Result<()> {
+    fn suspend(&mut self) -> std::io::Result<bool> {
+        // Off until turned on again at the resume, so a failure meanwhile does not turn them off
+        // twice.
+        self.suspended = self.extras;
         self.turn_off()?;
-        // Off until turned on again, so a failure meanwhile does not turn them off twice.
-        let extras = std::mem::take(&mut self.extras);
         self.backend.leave_alt_screen()?;
         self.backend.leave_raw_mode()?;
         let _ = self
             .backend
             .write_bytes("\n[koh suspended — run `fg` to resume]\n".as_bytes());
         let _ = self.backend.flush();
-        // Returns once the user foregrounds the job again.
         fuxix::process::kill(own_pid()?, fuxix::process::Signal::Tstp)?;
-        // The terminal was reset meanwhile: re-assert everything on the next frame.
+        Ok(true)
+    }
+
+    fn resume(&mut self) -> std::io::Result<()> {
+        // The terminal was reset meanwhile: everything is asserted again on the next frame.
         self.backend.enter_raw_mode()?;
         self.backend.enter_alt_screen()?;
-        self.turn_on(extras.kitty, extras.scheme_reports)?;
+        let extras = std::mem::take(&mut self.suspended);
+        self.turn_on(extras)?;
         self.oob.invalidate();
         self.painter.invalidate();
         Ok(())
@@ -383,45 +408,52 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
 /// server session whenever the link drops; meanwhile the last screen stays up under a banner.
 ///
 /// The I/O shell around [`ClientSession`], which makes every protocol decision. One session lives
-/// for the whole run, so what is typed while the link is down is kept for the next connection and
-/// read by the same escape machine. `input_rx` carries typed bytes (its closing ends the session);
-/// `resize_rx` carries resize ticks, on which the size is read from `term` (`initial_size` if that
-/// fails). Cancelling `shutdown` (on a fatal signal) quits like the user, so the terminal is
-/// restored. `bell` runs on every remote bell.
+/// for the whole run, its first phase asking the user's terminal what it does (its colours too if
+/// `colours`), so stdin has one decoder from start to end and what is typed while the link is down
+/// is read by the same escape machine. `input_rx` carries typed bytes (its closing ends the
+/// session); `resize_rx` carries resize ticks, on which the size is read from `term`
+/// (`initial_size` if that fails). Cancelling `shutdown` (on a fatal signal) quits like the user,
+/// so the terminal is restored. `bell` runs on every remote bell.
 ///
-/// The client's stream is written by its own task behind a bounded queue, and frames are read by
-/// their own tasks, so nothing here waits on the network: the keyboard, and the quit escape, stay
-/// live even when the server stops reading.
+/// The client's stream is opened and written by its own task behind a bounded queue, and frames
+/// are read by their own tasks, so nothing here waits on the network outside the one `select!`:
+/// the keyboard, the quit escape and signals stay live even when the server grants no stream or
+/// stops reading.
 ///
 /// Returns the remote shell's exit code if it exited, `None` on a local quit.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the I/O shell wires up the connection, connector, size, the \
-              terminal's colours, the two input/resize channels, the terminal, the shutdown token and the bell hook — each a distinct \
-              collaborator; bundling them into a struct would only move the list, not shorten it"
+    reason = "the I/O shell wires up the connection, connector, size, whether colours are told, \
+              the two input/resize channels, the terminal, the shutdown token and the bell hook — \
+              each a distinct collaborator; bundling them into a struct would only move the list, \
+              not shorten it"
 )]
 pub async fn run_client<T: ClientTerminal>(
     initial: Connection,
     dialed_at: SystemTime,
     connector: IrohConnector,
     initial_size: Size,
-    colours: Option<crate::events::WireColours>,
+    colours: bool,
     mut input_rx: mpsc::Receiver<Vec<u8>>,
-    mut resize_rx: mpsc::Receiver<()>,
+    resize_rx: mpsc::Receiver<()>,
     mut term: T,
     shutdown: CancellationToken,
     mut bell: Option<BellHook>,
 ) -> anyhow::Result<Option<u32>> {
     let mut session = ClientSession::new(term.size().unwrap_or(initial_size));
-    session.set_colours(colours);
+    session.ask_terminal(Instant::now(), colours);
+    // `None` once the resize ticks end, so a closed channel is not polled again.
+    let mut resize_rx = Some(resize_rx);
     // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
     let mut attempt: u32 = 0;
-    let mut net = Net::Up(Wire::open(initial).await);
+    let mut net = Net::Up(Wire::open(initial));
     // Wall-clock time, which keeps running while the process is frozen (see `STALE_AFTER_FREEZE`),
     // from when the connection was made: a freeze before the first iteration counts.
     let mut last_wall = dialed_at;
     // Logged on a change of 30 ms or more, to tell a slow link from a slow server in debug logs.
     let mut last_logged_rtt: Option<Duration> = None;
+    // The status line as last painted: painted again only when it changes.
+    let mut shown_status: Option<String> = None;
     loop {
         // A clock stepped backwards reads as no gap.
         let wall_now = SystemTime::now();
@@ -449,14 +481,13 @@ pub async fn run_client<T: ClientTerminal>(
         let now = Instant::now();
         let tick = session.on_tick(now, rtt);
 
-        // Repaint on new content, while a banner is up, or once more to clear a stale banner.
-        let status_now = tick.status.is_some();
-        if session.dirty || status_now || session.status_was_shown {
+        // Repaint on new content, or when the status line says something else.
+        if session.dirty || tick.status != shown_status {
             match session.view() {
-                Some(view) => term.render(&view, &Overlay::empty(), tick.status.as_deref())?,
+                Some(view) => term.render(&view, &Overlay::default(), tick.status.as_deref())?,
                 None => term.render(session.state(), &session.overlay(), tick.status.as_deref())?,
             }
-            session.status_was_shown = status_now;
+            shown_status = tick.status;
             session.dirty = false;
             // Only once synced: the first synced frame primes the hook and the mirroring, so bells
             // and a clipboard from before this attach reach neither.
@@ -472,15 +503,16 @@ pub async fn run_client<T: ClientTerminal>(
 
         if session.exited() {
             end_session(&mut term, &session, &shutdown).await;
-            return Ok(net.close(session.state().exit_code()));
+            return Ok(session.state().exit_code());
         }
 
-        // The colours again, after the terminal reported a new scheme.
+        // What the user's terminal said it does, and the questions the session has for it.
+        if let Some(found) = session.take_found() {
+            term.found(found)?;
+        }
         let questions = session.take_questions();
-        if !questions.is_empty() {
-            if let Err(e) = term.ask(&questions) {
-                tracing::debug!(error = %e, "could not ask the terminal its colours");
-            }
+        if let Err(e) = term.ask(&questions) {
+            tracing::debug!(error = %e, "could not ask the terminal");
         }
 
         let (writer, frames, dialing) = match &mut net {
@@ -490,21 +522,17 @@ pub async fn run_client<T: ClientTerminal>(
         let change = tokio::select! {
             // Not biased: a flood of keystrokes must not starve frames, nor frames keystrokes.
             maybe = input_rx.recv() => match maybe {
-                Some(chunk) => {
-                    let outcome = session.on_input(Instant::now(), &chunk);
-                    after_input(outcome, &mut term, &mut session, &mut last_wall)?
-                }
+                Some(chunk) => session.on_input(Instant::now(), &chunk).into(),
                 None => Some(Change::Quit), // input source closed
             },
             // A lone Escape, or a sequence cut short, is taken as typed once nothing follows.
-            () = until(session.deadline()) => {
-                let outcome = session.on_timeout(Instant::now());
-                after_input(outcome, &mut term, &mut session, &mut last_wall)?
+            () = when(session.deadline().map(|at| tokio::time::sleep_until(at.into()))) => {
+                session.on_timeout(Instant::now()).into()
             }
             () = shutdown.cancelled() => Some(Change::Quit),
             permit = when(writer.map(mpsc::Sender::reserve)), if session.has_outgoing() => match permit.ok() {
                 // The writer ended: the stream, and so the connection, is gone.
-                None => Some(Change::Closed { banner: false }),
+                None => Some(Change::Closed),
                 Some(permit) => {
                     if let Some(msg) = session.pop_outgoing() {
                         match encode_client(&msg) {
@@ -515,24 +543,23 @@ pub async fn run_client<T: ClientTerminal>(
                     None
                 }
             },
-            maybe = resize_rx.recv() => {
-                if maybe.is_some() {
-                    term.window_resized();
-                    if let Ok(size) = term.size() {
-                        session.on_resize(size);
+            maybe = when(resize_rx.as_mut().map(mpsc::Receiver::recv)) => {
+                match maybe {
+                    Some(()) => {
+                        term.window_resized();
+                        if let Ok(size) = term.size() {
+                            session.on_resize(size);
+                        }
                     }
+                    None => resize_rx = None,
                 }
                 None
             }
             frame = when(frames.map(mpsc::Receiver::recv)) => match frame {
                 // The frame reader ended because the connection closed.
-                None => Some(Change::Closed { banner: true }),
-                Some(ServerMsg::Frame { base, rows, body }) => {
-                    session.on_frame_stream(Instant::now(), base, &rows, &body);
-                    None
-                }
-                Some(ServerMsg::History(reply)) => {
-                    session.on_history(&reply);
+                None => Some(Change::Closed),
+                Some(msg) => {
+                    session.on_server(Instant::now(), msg);
                     None
                 }
             },
@@ -541,23 +568,43 @@ pub async fn run_client<T: ClientTerminal>(
         };
         match change {
             None => {}
-            Some(Change::Quit) => return Ok(net.close(None)),
-            Some(Change::Closed { banner }) => {
-                let Net::Up(wire) = &net else {
+            Some(Change::Quit) => return Ok(None),
+            Some(Change::Suspend) => {
+                if !suspend(&mut term, &shutdown).await? {
+                    return Ok(None);
+                }
+                // A window resized while the client was stopped sent it no SIGWINCH.
+                term.window_resized();
+                if let Ok(size) = term.size() {
+                    session.on_resize(size);
+                }
+                session.dirty = true;
+                shown_status = None;
+                // A deliberate suspend is not a freeze to reconnect after.
+                last_wall = SystemTime::now();
+            }
+            Some(Change::Closed) => {
+                let Net::Up(wire) = &mut net else {
                     continue;
                 };
                 if session_ended(&wire.conn) {
-                    if banner {
-                        end_session(&mut term, &session, &shutdown).await;
-                    }
-                    return Ok(net.close(session.state().exit_code()));
+                    // What the reader still has was sent before the close: the last frame says
+                    // how the program exited, whichever end noticed the close first.
+                    let drained = async {
+                        while let Some(msg) = wire.frame_rx.recv().await {
+                            session.on_server(Instant::now(), msg);
+                        }
+                    };
+                    let _ = tokio::time::timeout(Duration::from_secs(1), drained).await;
+                    end_session(&mut term, &session, &shutdown).await;
+                    return Ok(session.state().exit_code());
                 }
                 tracing::info!(reason = ?wire.conn.close_reason(), "link lost; will reconnect");
                 net = redial(wire, &mut attempt, &mut session, &connector);
             }
             Some(Change::Dialed(Ok(Ok(conn)))) => {
                 session.attach(term.size().unwrap_or(initial_size));
-                net = Net::Up(Wire::open(conn).await);
+                net = Net::Up(Wire::open(conn));
             }
             Some(Change::Dialed(failed)) => {
                 if let Ok(Err(e)) = failed {
@@ -575,20 +622,30 @@ pub async fn run_client<T: ClientTerminal>(
     }
 }
 
+/// Suspend the client on `term`, and once the process is continued take the terminal back.
+/// Whether to go on: a fatal signal while it waits (the stop may never come, in a process group
+/// with no job control) quits instead.
+async fn suspend<T: ClientTerminal>(
+    term: &mut T,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<bool> {
+    use tokio::signal::unix::{signal, SignalKind};
+    // Listening before the stop, so the SIGCONT that ends it is not missed.
+    let mut continued = signal(SignalKind::from_raw(fuxix::process::Signal::Cont.raw()))?;
+    if term.suspend()? {
+        tokio::select! {
+            _ = continued.recv() => {}
+            () = shutdown.cancelled() => return Ok(false),
+        }
+    }
+    term.resume()?;
+    Ok(true)
+}
+
 /// The client's link to the server: a live connection, or a redial under way.
 enum Net<'c> {
     Up(Wire),
     Down(Dial<'c>),
-}
-
-impl Net<'_> {
-    /// The run is over: close the connection, if one is up, and return `code`.
-    fn close(&self, code: Option<u32>) -> Option<u32> {
-        if let Self::Up(wire) = self {
-            wire.conn.close(0u32.into(), b"client exit");
-        }
-        code
-    }
 }
 
 /// A redial: the backoff, then one dial, abandoned after [`RECONNECT_CONNECT_TIMEOUT`]. Pinned,
@@ -602,28 +659,40 @@ type Dialed = Result<anyhow::Result<Connection>, tokio::time::error::Elapsed>;
 enum Change {
     /// The user quit, the input channel closed, or a fatal signal came.
     Quit,
-    /// The connection closed: the session ended (with its banner if `banner`), or the link was lost.
-    Closed { banner: bool },
+    /// The user typed the suspend escape.
+    Suspend,
+    /// The connection closed: the session ended, or the link was lost.
+    Closed,
     /// A redial finished.
     Dialed(Dialed),
 }
 
-/// A live connection: its stream writer and frame reader, which end with it.
+impl From<InputOutcome> for Option<Change> {
+    fn from(outcome: InputOutcome) -> Self {
+        match outcome {
+            InputOutcome::Quit => Some(Change::Quit),
+            InputOutcome::Suspend => Some(Change::Suspend),
+            InputOutcome::Forwarded => None,
+        }
+    }
+}
+
+/// A live connection: its stream writer and frame reader, which end with it, and it with them.
 struct Wire {
     conn: Connection,
     writer_tx: mpsc::Sender<Vec<u8>>,
     frame_rx: mpsc::Receiver<ServerMsg>,
-    _writer: AbortOnDrop<()>,
-    _reader: AbortOnDrop<()>,
+    _writer: AbortOnDropHandle<()>,
+    _reader: AbortOnDropHandle<()>,
     /// When the loop took the connection, for its dwell.
     started: Instant,
 }
 
 impl Wire {
-    /// Start the tasks writing the client's stream and reading frames on `conn`. A stream that
-    /// does not open ends the writer, which loses the link.
-    async fn open(conn: Connection) -> Self {
-        let send = conn.open_uni().await.ok();
+    /// Start the tasks opening and writing the client's stream and reading frames on `conn`. The
+    /// stream is opened by the writer, so a server that grants none holds up nothing else; one
+    /// that fails to open ends the writer, which loses the link.
+    fn open(conn: Connection) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
         let (frame_tx, frame_rx) = mpsc::channel::<ServerMsg>(FRAME_QUEUE);
         #[expect(
@@ -631,8 +700,8 @@ impl Wire {
             reason = "a writer and a reader a connection"
         )]
         let (writer, reader) = (
-            AbortOnDrop(tokio::spawn(write_client_stream(send, writer_rx))),
-            AbortOnDrop(tokio::spawn(read_frames(conn.clone(), frame_tx))),
+            AbortOnDropHandle::new(tokio::spawn(write_client_stream(conn.clone(), writer_rx))),
+            AbortOnDropHandle::new(tokio::spawn(read_frames(conn.clone(), frame_tx))),
         );
         Self {
             conn,
@@ -642,6 +711,13 @@ impl Wire {
             _reader: reader,
             started: Instant::now(),
         }
+    }
+}
+
+impl Drop for Wire {
+    /// The run, or this connection, is over: the server is told at once, not at the idle timeout.
+    fn drop(&mut self) {
+        self.conn.close(0u32.into(), b"client exit");
     }
 }
 
@@ -672,43 +748,10 @@ fn dial(connector: &IrohConnector, attempt: u32) -> Dial<'_> {
     })
 }
 
-/// What `future` gives, or never without one: a select arm for one state of [`Net`].
+/// What `future` gives, or never without one: a select arm for a state that may not be.
 async fn when<F: std::future::Future>(future: Option<F>) -> F::Output {
     match future {
         Some(future) => future.await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Act on what typed input decided: suspend now, or say the user quit.
-fn after_input<T: ClientTerminal>(
-    outcome: InputOutcome,
-    term: &mut T,
-    session: &mut ClientSession,
-    last_wall: &mut SystemTime,
-) -> std::io::Result<Option<Change>> {
-    match outcome {
-        InputOutcome::Quit => return Ok(Some(Change::Quit)),
-        InputOutcome::Suspend => {
-            term.suspend_resume()?;
-            // A window resized while the client was stopped sent it no SIGWINCH.
-            term.window_resized();
-            if let Ok(size) = term.size() {
-                session.on_resize(size);
-            }
-            session.dirty = true;
-            // A deliberate suspend is not a freeze to reconnect after.
-            *last_wall = SystemTime::now();
-        }
-        InputOutcome::Forwarded => {}
-    }
-    Ok(None)
-}
-
-/// Sleep until `deadline`, or forever with none.
-async fn until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
         None => std::future::pending().await,
     }
 }
@@ -718,19 +761,10 @@ const WRITER_QUEUE: usize = 64;
 /// How many decoded frames may wait for the connection loop.
 const FRAME_QUEUE: usize = 16;
 
-/// Aborts a task when dropped, so a connection's helper tasks end with it.
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Write queued messages to the client's stream, if it opened, until the queue or the stream
-/// closes.
-async fn write_client_stream(send: Option<SendStream>, mut queue: mpsc::Receiver<Vec<u8>>) {
-    let Some(mut send) = send else {
+/// Open the client's stream on `conn` and write queued messages to it, until the queue or the
+/// stream closes.
+async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>>) {
+    let Ok(mut send) = conn.open_uni().await else {
         return;
     };
     while let Some(bytes) = queue.recv().await {
@@ -794,7 +828,7 @@ async fn end_session<T: ClientTerminal>(
 ) {
     let _ = term.render(
         session.state(),
-        &Overlay::empty(),
+        &Overlay::default(),
         Some("[koh] session ended"),
     );
     tokio::select! {
@@ -835,7 +869,7 @@ mod tests {
                 Err(e) => format!("{e:#}"),
             };
             assert!(
-                error.contains("does not speak this koh protocol (koh/4)"),
+                error.contains("does not speak this koh protocol (koh/5)"),
                 "{error}"
             );
             assert!(!error.contains("allowlist"), "{error}");
@@ -908,16 +942,105 @@ mod tests {
             oob: render::OutOfBand::with_title_prefix(String::new()),
             painter: render::Painter::default(),
             extras: Extras::default(),
+            suspended: Extras::default(),
         };
-        term.turn_on(true, true).unwrap();
+        let both = Found {
+            underline_styles: false,
+            kitty: true,
+            scheme_reports: true,
+        };
+        term.found(Found {
+            scheme_reports: false,
+            ..both
+        })
+        .unwrap();
+        // Told again, with more: only what is new is turned on, so one push is popped.
+        term.found(both).unwrap();
         assert_eq!(term.backend.bytes, b"\x1b[>5u\x1b[?2031h");
         term.backend.bytes.clear();
         term.turn_off().unwrap();
         assert_eq!(term.backend.bytes, b"\x1b[<u\x1b[?2031l");
         // A terminal that speaks neither is sent neither.
         term.backend.bytes.clear();
-        term.turn_on(false, false).unwrap();
+        term.found(Found::default()).unwrap();
         term.turn_off().unwrap();
         assert_eq!(term.backend.bytes, b"");
+    }
+
+    /// A terminal that shows nothing, of a fixed size.
+    struct Blind;
+
+    impl ClientTerminal for Blind {
+        fn render(
+            &mut self,
+            _: &TerminalScreen,
+            _: &Overlay,
+            _: Option<&str>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> std::io::Result<Size> {
+            Ok(Size::new(24, 80))
+        }
+    }
+
+    /// A server that admits the client and grants it no stream to write on: the keyboard stays
+    /// the client's, and the quit escape ends it at once.
+    #[test]
+    fn a_server_granting_no_streams_cannot_block_quit() -> anyhow::Result<()> {
+        use crate::transport_iroh::{
+            admission, bind_endpoint_local, generate_secret_key, loopback_addr,
+        };
+        use iroh::endpoint::{QuicTransportConfig, VarInt};
+        crate::test_runtime::current_thread().block_on(async {
+            let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(generate_secret_key()?)
+                .alpns(vec![ALPN.to_vec()])
+                .transport_config(
+                    QuicTransportConfig::builder()
+                        .max_concurrent_uni_streams(VarInt::from_u32(0))
+                        .build(),
+                )
+                .bind()
+                .await?;
+            let addr = loopback_addr(&server);
+            let accept = tokio::spawn(async move {
+                if let Some(incoming) = server.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        if admission::admit(&conn).await.is_ok() {
+                            conn.closed().await;
+                        }
+                    }
+                }
+                server
+            });
+            let client = bind_endpoint_local(generate_secret_key()?, false).await?;
+            let connector = IrohConnector::new(client, addr);
+            let conn = connector.connect().await?;
+            let (input, input_rx) = mpsc::channel(8);
+            let (_resize, resize_rx) = mpsc::channel(1);
+            let run = tokio::spawn(run_client(
+                conn,
+                SystemTime::now(),
+                connector,
+                Size::new(24, 80),
+                false,
+                input_rx,
+                resize_rx,
+                Blind,
+                CancellationToken::new(),
+                None,
+            ));
+            // Keys that need the stream, then the quit escape.
+            input.send(b"ls\r".to_vec()).await?;
+            input.send(vec![ESCAPE_PREFIX, b'.']).await?;
+            let quit = tokio::time::timeout(Duration::from_secs(5), run).await;
+            assert!(
+                matches!(quit, Ok(Ok(Ok(None)))),
+                "the client did not quit: {quit:?}"
+            );
+            let _ = tokio::time::timeout(Duration::from_secs(5), accept).await;
+            Ok(())
+        })
     }
 }

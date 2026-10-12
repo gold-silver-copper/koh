@@ -544,8 +544,11 @@ fn after_a_server_restart_the_scrollback_is_the_new_shells() {
             client.send(b"\x1e[g").await.expect("send");
             assert!(client.wait_until(WAIT, oldest).await.is_some(), "the view");
             client.send(b"q").await.expect("send");
-            // Long enough for the server to confirm the input.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // The view is closed: the live screen shows again.
+            assert!(client
+                .wait_until(WAIT, |t| t.contains("old line 199"))
+                .await
+                .is_some());
             // The server restarts during an outage.
             net.black_hole(Duration::from_secs(3));
             client.drop_first_connection();
@@ -574,7 +577,6 @@ fn after_a_server_restart_the_scrollback_is_the_new_shells() {
                 .await
                 .is_some();
             assert!(ran, "the new shell never ran:\n{}", client.screen());
-            tokio::time::sleep(Duration::from_millis(500)).await;
             client.send(b"\x1e[g").await.expect("send");
             let top = client
                 .wait_until(WAIT, |t| t.contains("new line 0") || t.contains("old line"))

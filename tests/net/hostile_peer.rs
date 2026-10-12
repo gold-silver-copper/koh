@@ -281,7 +281,6 @@ fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_co
         let mut send = conn.open_uni().await?;
         let lines = "i=0; while [ $i -lt 300 ]; do echo line $i; i=$((i+1)); done\r";
         send.write_all(&encode_client(&typed(lines))?).await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
         // As many as may wait, each for every row there could be: answered, each within the bound.
         let mut asks = Vec::new();
         for name in 1..=u64::try_from(MAX_PENDING_HISTORY)? {

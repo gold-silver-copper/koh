@@ -121,11 +121,15 @@ fn input_arrives_exactly_once_and_in_order_under_loss() -> anyhow::Result<()> {
             .is_some());
         let dir = koh_testkit::scratch!("input")?;
         let out = dir.join("typed.txt");
+        // The process that says READY becomes `cat`, so once it shows, typed lines go to cat's stdin,
+        // not the shell.
         client
-            .send(format!("cat > '{}'\r", out.display()).as_bytes())
+            .send(format!("(echo RE''ADY >&2; exec cat) > '{}'\r", out.display()).as_bytes())
             .await?;
-        // Let the shell start `cat` before typing lines, so they go to cat's stdin, not the shell.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        anyhow::ensure!(client
+            .wait_until(WAIT, |t| t.contains("READY"))
+            .await
+            .is_some());
         let expected: Vec<String> = (0..300).map(|i| format!("line-{i:04}")).collect();
         for line in &expected {
             client.send(format!("{line}\r").as_bytes()).await?;

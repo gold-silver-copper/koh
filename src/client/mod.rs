@@ -21,10 +21,11 @@ pub use session::{ClientSession, Found, InputOutcome, TickResult};
 
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::log::Peer;
 use crate::predict::Overlay;
-use crate::proto::{decode_server, encode_client, ServerMsg, MAX_FRAME, SESSION_ENDED};
+use crate::proto::{decode_server, encode_client, Close, ServerMsg, MAX_FRAME};
 use crate::terminal::{Size, TerminalScreen};
-use crate::transport_iroh::ALPN;
+use crate::transport_iroh::{closed_because, ALPN, PROTOCOL};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
@@ -77,41 +78,35 @@ impl IrohConnector {
         Self { endpoint, target }
     }
 
-    /// Connect and await the admission ack. A server that rejects us closes the connection instead,
-    /// a [`Refused`] error, so a rejected client fails fast rather than redialing forever.
+    /// Connect and await the admission ack, which the server sends once the client has a session.
+    /// A server that will not have us for good closes the connection instead, a [`Refused`]
+    /// error, so the client fails fast rather than redialing forever; one that cannot have us now
+    /// (at capacity, say) closes it saying so, an error that is its [`Close`].
     pub async fn connect(&self) -> anyhow::Result<Connection> {
         let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
             Ok(conn) => conn,
-            Err(e) if refused_our_alpn(&e) => {
-                return Err(Refused(format!(
-                    "the server does not speak this koh protocol ({}); upgrade koh on both ends",
-                    String::from_utf8_lossy(ALPN)
-                ))
-                .into());
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context("connecting to server (is your id on its allowlist?)"));
-            }
+            Err(e) if refused_our_alpn(&e) => return Err(Refused::OtherProtocol.into()),
+            Err(e) => anyhow::bail!("connecting to server: {}", Peer(e)),
         };
         if let Err(e) = crate::transport_iroh::admission::await_admission(&conn).await {
-            // Surface the server's own reason ("not authorized"), alone: the stream error under it
-            // repeats the raw bytes.
-            return Err(match server_close_reason(&conn) {
-                Some(reason) => Refused(format!("server rejected the connection: {reason}")).into(),
-                None => anyhow::Error::new(e)
-                    .context("server did not admit the connection (is your id on its allowlist?)"),
+            return Err(match closed_because(&conn) {
+                Some(Close::NotAuthorized) => Refused::NotAuthorized.into(),
+                Some(why) => why.into(),
+                None => anyhow::anyhow!("server did not admit the connection: {}", Peer(e)),
             });
         }
         Ok(conn)
     }
 }
 
-/// The server refused us for good (not on its allowlist, another protocol version): redialing
-/// cannot help, so the client exits with the reason.
+/// The server refused us for good: redialing cannot help, so the client exits saying why.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct Refused(String);
+pub enum Refused {
+    #[error("server rejected the connection: {}", Close::NotAuthorized)]
+    NotAuthorized,
+    #[error("the server does not speak this koh protocol ({PROTOCOL}); upgrade koh on both ends")]
+    OtherProtocol,
+}
 
 /// Whether a dial failed because the server does not serve [`ALPN`]: the TLS handshake ended with
 /// alert 120 (`no_application_protocol`), which QUIC reports as crypto error `0x178`. A server on
@@ -131,18 +126,6 @@ fn refused_our_alpn(error: &(dyn std::error::Error + 'static)) -> bool {
         next = e.source();
     }
     false
-}
-
-/// The server's application close reason, if any, capped (it is escaped where it is printed).
-fn server_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
-    use iroh::endpoint::{ApplicationClose, ConnectionError};
-    let ConnectionError::ApplicationClosed(ApplicationClose { reason, .. }) =
-        conn.close_reason()?
-    else {
-        return None;
-    };
-    let reason: String = String::from_utf8_lossy(&reason).chars().take(80).collect();
-    (!reason.is_empty()).then_some(reason)
 }
 
 /// The wait before redialing after `attempt` (from 1) failures.
@@ -555,7 +538,7 @@ pub async fn run_client<T: ClientTerminal>(
                 }
                 None
             }
-            frame = when(frames.map(mpsc::Receiver::recv)) => match frame {
+            frame = when(frames.map(mpsc::Receiver::recv)) => match frame.map(|received| received.msg) {
                 // The frame reader ended because the connection closed.
                 None => Some(Change::Closed),
                 Some(msg) => {
@@ -595,8 +578,8 @@ pub async fn run_client<T: ClientTerminal>(
                     // What the reader still has was sent before the close: the last frame says
                     // how the program exited, whichever end noticed the close first.
                     let drained = async {
-                        while let Some(msg) = wire.frame_rx.recv().await {
-                            session.on_server(Instant::now(), msg);
+                        while let Some(received) = wire.frame_rx.recv().await {
+                            session.on_server(Instant::now(), received.msg);
                         }
                     };
                     let _ = tokio::time::timeout(Duration::from_secs(1), drained).await;
@@ -614,6 +597,10 @@ pub async fn run_client<T: ClientTerminal>(
                 if let Ok(Err(e)) = failed {
                     if e.is::<Refused>() {
                         return Err(e);
+                    }
+                    // Refused for now (at capacity, say): redialing may do, and the banner says why.
+                    if let Some(why) = e.downcast_ref::<Close>() {
+                        session.refused(why.text());
                     }
                     tracing::info!(reason = %e, attempt, "reconnect dial failed");
                 } else {
@@ -692,7 +679,7 @@ impl From<InputOutcome> for Option<Change> {
 struct Wire {
     conn: Connection,
     writer_tx: mpsc::Sender<Vec<u8>>,
-    frame_rx: mpsc::Receiver<ServerMsg>,
+    frame_rx: mpsc::Receiver<Received>,
     _writer: AbortOnDropHandle<()>,
     _reader: AbortOnDropHandle<()>,
     /// When the loop took the connection, for its dwell.
@@ -705,7 +692,7 @@ impl Wire {
     /// that fails to open ends the writer, which loses the link.
     fn open(conn: Connection) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
-        let (frame_tx, frame_rx) = mpsc::channel::<ServerMsg>(FRAME_QUEUE);
+        let (frame_tx, frame_rx) = mpsc::channel::<Received>(FRAME_QUEUE);
         #[expect(
             clippy::disallowed_methods,
             reason = "a writer and a reader a connection"
@@ -786,14 +773,27 @@ async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>
     let _ = send.finish();
 }
 
+/// Most bytes of the server's streams the client holds at once, read or being read, and not yet
+/// taken by the connection loop: two of the largest.
+const FRAME_BYTES: usize = MAX_FRAME.saturating_mul(2);
+
+/// A message from the server, holding its stream's share of [`FRAME_BYTES`] until the loop takes
+/// it.
+struct Received {
+    msg: ServerMsg,
+    _bytes: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
 /// Accept the server's streams (frames, and history rows), each read on its own task so a stalled or
 /// reset stream never holds up a newer frame. Ends when the connection closes.
 ///
 /// At most [`FRAME_QUEUE`] streams are read or wait to be applied at once, together: a reader
 /// takes its slot in `frames` before it reads. Past them, no stream is accepted, so QUIC's stream
-/// limit stops the server opening more, and a server faster than the client cannot make it hold
-/// more frames than that.
-async fn read_frames(conn: Connection, frames: mpsc::Sender<ServerMsg>) {
+/// limit stops the server opening more. Together they hold at most [`FRAME_BYTES`]: a reader takes
+/// its share as its bytes come, and waits for one, as QUIC's flow control makes the server; a frame
+/// the server superseded is reset meanwhile, which frees its share.
+async fn read_frames(conn: Connection, frames: mpsc::Sender<Received>) {
+    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(FRAME_BYTES));
     loop {
         let Ok(slot) = frames.clone().reserve_owned().await else {
             return;
@@ -801,21 +801,37 @@ async fn read_frames(conn: Connection, frames: mpsc::Sender<ServerMsg>) {
         let Ok(mut recv) = conn.accept_uni().await else {
             return;
         };
+        let budget = std::sync::Arc::clone(&budget);
         #[expect(
             clippy::disallowed_methods,
             reason = "each holds one of the frames' slots"
         )]
         tokio::spawn(async move {
-            // A reset (superseded) or malformed frame is simply not delivered.
-            let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
-                return;
-            };
+            let mut bytes = Vec::new();
+            let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
+            // A reset (superseded), oversized or malformed stream is simply not delivered.
+            while let Some(chunk) = recv.read_chunk(MAX_FRAME).await.ok()? {
+                let share = u32::try_from(chunk.len()).ok()?;
+                let more = std::sync::Arc::clone(&budget)
+                    .acquire_many_owned(share)
+                    .await
+                    .ok()?;
+                match held.as_mut() {
+                    Some(held) => held.merge(more),
+                    None => held = Some(more),
+                }
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() > MAX_FRAME {
+                    return None;
+                }
+            }
             match decode_server(&bytes) {
                 Ok(msg) => {
-                    slot.send(msg);
+                    slot.send(Received { msg, _bytes: held });
                 }
                 Err(e) => tracing::debug!(error = %e, "dropping an undecodable frame"),
             }
+            Some(())
         });
     }
 }
@@ -823,12 +839,7 @@ async fn read_frames(conn: Connection, frames: mpsc::Sender<ServerMsg>) {
 /// Whether the closed `conn` was the server ending the session (its shell exited), not the link
 /// being lost.
 fn session_ended(conn: &Connection) -> bool {
-    use iroh::endpoint::{ApplicationClose, ConnectionError};
-    matches!(
-        conn.close_reason(),
-        Some(ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason }))
-            if error_code.into_inner() == 0 && reason.as_ref() == SESSION_ENDED
-    )
+    closed_because(conn) == Some(Close::SessionEnded)
 }
 
 /// Paint the "session ended" banner and linger briefly so it is seen.
@@ -875,16 +886,56 @@ mod tests {
             let client = bind_endpoint_local(generate_secret_key().expect("OS randomness"), false)
                 .await
                 .expect("bind client");
-            let error = match IrohConnector::new(client, addr).connect().await {
-                Ok(_) => panic!("an old-protocol server must refuse the handshake"),
-                Err(e) => format!("{e:#}"),
+            let Err(error) = IrohConnector::new(client, addr).connect().await else {
+                panic!("an old-protocol server must refuse the handshake");
             };
             assert!(
-                error.contains("does not speak this koh protocol (koh/5)"),
-                "{error}"
+                matches!(error.downcast_ref(), Some(Refused::OtherProtocol)),
+                "{error:#}"
             );
-            assert!(!error.contains("allowlist"), "{error}");
+            assert!(format!("{error:#}").contains(PROTOCOL), "{error:#}");
             let _ = accept.await;
+        });
+    }
+
+    #[test]
+    fn a_refusal_is_for_good_only_when_not_authorized() {
+        crate::test_runtime::current_thread().block_on(async {
+            // A server that closes the connection instead of admitting it, saying why.
+            use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
+            let server = bind_endpoint_local(generate_secret_key().unwrap(), true)
+                .await
+                .unwrap();
+            let addr = loopback_addr(&server);
+            let client = bind_endpoint_local(generate_secret_key().unwrap(), false)
+                .await
+                .unwrap();
+            let connector = IrohConnector::new(client, addr);
+            for why in [
+                Close::AtCapacity,
+                Close::CouldNotStart,
+                Close::NotAuthorized,
+            ] {
+                let (refusing, dialed) = tokio::join!(
+                    async {
+                        let conn = server.accept().await.unwrap().await.unwrap();
+                        crate::transport_iroh::close(&conn, why);
+                        conn.closed().await
+                    },
+                    connector.connect()
+                );
+                drop(refusing);
+                let Err(error) = dialed else {
+                    panic!("{why:?}: admitted");
+                };
+                if why == Close::NotAuthorized {
+                    assert!(error.is::<Refused>(), "{why:?}: {error:#}");
+                } else {
+                    // Transient: redialed, and the banner says why.
+                    assert!(!error.is::<Refused>(), "{why:?}: {error:#}");
+                    assert_eq!(error.downcast_ref::<Close>(), Some(&why));
+                }
+            }
         });
     }
 

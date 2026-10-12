@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
 use koh::predict::Overlay;
 use koh::proto::{
-    decode_server, encode_client, encode_frame, ClientDecoder, ClientMsg, Frame, FrameNum,
+    decode_server, encode_client, ClientDecoder, ClientMsg, Frame, FrameEncoder, FrameNum,
     InputSeq, ServerMsg,
 };
 use koh::terminal::{FrameHold, ServerTerminal, Size, TerminalScreen, FRAME_HOLD};
@@ -312,7 +312,9 @@ impl Session {
             diff: screen.diff_from(&self.base.1),
         };
         self.next = self.next.next();
-        let bytes = encode_frame(&frame, &self.base.1).map_err(|e| e.to_string())?;
+        let bytes = FrameEncoder::default()
+            .encode(&frame, &self.base.1)
+            .map_err(|e| e.to_string())?;
         self.replayed.frames = self.replayed.frames.saturating_add(1);
         self.replayed.wire_bytes = self
             .replayed

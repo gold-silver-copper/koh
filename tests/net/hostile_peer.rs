@@ -11,8 +11,8 @@ use anyhow::Context as _;
 use iroh::endpoint::Connection;
 use iroh::{EndpointId, SecretKey};
 use koh::proto::{
-    decode_server, encode_client, encode_frame, encode_history, ClientMsg, Frame, FrameNum,
-    InputSeq, ServerMsg, MAX_FRAME, MAX_PENDING_HISTORY,
+    decode_server, encode_client, ClientMsg, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg,
+    MAX_FRAME, MAX_PENDING_HISTORY,
 };
 use koh::terminal::{ServerTerminal, TerminalScreen};
 use koh::transport_iroh::{admission, generate_secret_key, ALPN};
@@ -286,6 +286,7 @@ fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_co
         let mut asks = Vec::new();
         for name in 1..=u64::try_from(MAX_PENDING_HISTORY)? {
             asks.extend(encode_client(&ClientMsg::History(HistoryRequest {
+                id: 0,
                 newest: name * 100,
                 count: u16::MAX,
             }))?);
@@ -311,6 +312,7 @@ fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_co
         let mut flood = Vec::new();
         for _ in 0..100 {
             flood.extend(encode_client(&ClientMsg::History(HistoryRequest {
+                id: 0,
                 newest: 1,
                 count: 1,
             }))?);
@@ -418,7 +420,7 @@ fn frames_on_unknown_bases_leave_the_client_running() -> anyhow::Result<()> {
                         echo_ack: InputSeq(0),
                         diff,
                     };
-                    if let Ok(bytes) = encode_frame(&frame, &base) {
+                    if let Ok(bytes) = FrameEncoder::default().encode(&frame, &base) {
                         send_frame_bytes(&conn, bytes).await;
                     }
                 }
@@ -477,7 +479,7 @@ fn a_servers_hostile_links_are_shown_as_text_or_dropped() -> anyhow::Result<()> 
                     for row in &mut diff.rows {
                         links(row);
                     }
-                    encode_frame(
+                    FrameEncoder::default().encode(
                         &Frame {
                             num: FrameNum(num),
                             base: FrameNum::BLANK,
@@ -571,7 +573,7 @@ fn hostile_history_rows_leave_the_client_running() -> anyhow::Result<()> {
                     newest: 1_000_000,
                     len: 1_000_000,
                 });
-                if let Ok(bytes) = encode_frame(
+                if let Ok(bytes) = FrameEncoder::default().encode(
                     &Frame {
                         num: FrameNum(1),
                         base: FrameNum::BLANK,
@@ -584,7 +586,11 @@ fn hostile_history_rows_leave_the_client_running() -> anyhow::Result<()> {
                 }
                 let newest = emu.snapshot().history().newest;
                 let real = emu
-                    .history(koh::terminal::HistoryRequest { newest, count: 1 })
+                    .history(koh::terminal::HistoryRequest {
+                        id: 0,
+                        newest,
+                        count: 1,
+                    })
                     .rows;
                 let Some(template) = real.into_iter().next() else {
                     return;
@@ -600,7 +606,9 @@ fn hostile_history_rows_leave_the_client_running() -> anyhow::Result<()> {
                     let rows: Vec<HistoryRow> = (0..300)
                         .map(|n| wide(1_000_000 - round * 300 - n))
                         .collect();
-                    if let Ok(bytes) = encode_history(&HistoryReply { rows }) {
+                    if let Ok(bytes) =
+                        FrameEncoder::default().encode_history(&HistoryReply { id: 0, rows })
+                    {
                         send_frame_bytes(&conn, bytes).await;
                     }
                 }

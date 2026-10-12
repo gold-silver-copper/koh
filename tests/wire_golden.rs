@@ -12,8 +12,8 @@ use koh::events::{
     WireMouseAction, WireScheme,
 };
 use koh::proto::{
-    decode_frame, decode_server, encode_client, encode_frame, encode_history, ClientDecoder,
-    ClientMsg, Frame, FrameNum, InputSeq, ServerMsg,
+    decode_frame, decode_server, encode_client, ClientDecoder, ClientMsg, Frame, FrameEncoder,
+    FrameNum, InputSeq, ServerMsg,
 };
 use koh::terminal::{
     HistoryReply, HistoryRequest, ServerTerminal, Size, TerminalScreen, WireModes,
@@ -95,6 +95,7 @@ fn history_reply() -> Result<HistoryReply, fux_vt::Error> {
     emu.process(b"\x1b[6;1H\r\nscrolled in\r\n");
     let mark = emu.snapshot().history();
     Ok(emu.history(HistoryRequest {
+        id: 0,
         newest: mark.newest,
         count: 5,
     }))
@@ -134,6 +135,7 @@ fn client_msgs() -> Vec<ClientMsg> {
         },
         ClientMsg::Resync,
         ClientMsg::History(HistoryRequest {
+            id: 300,
             newest: 70_000,
             count: 256,
         }),
@@ -220,7 +222,7 @@ const CLIENT_MSGS: [&str; 8] = [
     "0000000500e807e807",
     "0000000401f0a204",
     "0000000102",
-    "0000000603f0a2048002",
+    "0000000803ac02f0a2048002",
     "00000025040205000002c3a90500000f0c000101b7c003014100840101010402ac0207020103026869",
     "000000cf04ac020103c8017878787878787878787878787878787878787878787878787878787878787878787878\
         78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878\
@@ -240,12 +242,16 @@ fn frames_and_history_round_trip_through_their_streams() {
         let raw = postcard::to_allocvec(&frame).expect("encodes");
         assert_eq!(postcard::from_bytes::<Frame>(&raw).expect("decodes"), frame);
         // A stream inflates only against its base's dictionary.
-        let stream = encode_frame(&frame, &base).expect("encodes");
+        let stream = FrameEncoder::default()
+            .encode(&frame, &base)
+            .expect("encodes");
         assert_eq!(decode_frame(&stream, &base).expect("decodes"), frame);
     }
     let reply = history_reply().expect("reply");
     assert_eq!(reply.rows.len(), 2, "two rows scrolled off");
-    let encoded = encode_history(&reply).expect("encodes");
+    let encoded = FrameEncoder::default()
+        .encode_history(&reply)
+        .expect("encodes");
     assert_eq!(
         decode_server(&encoded).expect("decodes"),
         ServerMsg::History(reply)

@@ -22,6 +22,16 @@ fn title_from(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Whether `data` is base64: its alphabet, then at most two `=` of padding.
+fn is_base64(data: &[u8]) -> bool {
+    let text = data
+        .strip_suffix(b"==")
+        .or_else(|| data.strip_suffix(b"="))
+        .unwrap_or(data);
+    text.iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
 /// What the emulator reports beside the grid: fux-vt's [`Event`]s and the replies to queries.
 #[derive(Default)]
 struct Observed {
@@ -47,12 +57,12 @@ impl Sink for Observed {
             Event::Title(t) => self.title = title_from(t),
             Event::IconName(n) => self.icon = title_from(n),
             Event::Bell => self.bell_count = self.bell_count.saturating_add(1),
-            // `data` is base64 already. A query (`?`) asks for the clipboard, which koh never
-            // reads, so it is not one to set.
+            // Kept only as base64 within its cap, as the client checks it, so both ends hold the
+            // same: a query (`?`), which asks for the clipboard koh never reads, is not one.
             Event::Clipboard { data, .. }
-                if data.len() <= MAXIMUM_CLIPBOARD_SIZE && data != b"?" =>
+                if data.len() <= MAXIMUM_CLIPBOARD_SIZE && is_base64(data) =>
             {
-                self.clipboard = String::from_utf8_lossy(data).into_owned();
+                self.clipboard = data.iter().copied().map(char::from).collect();
             }
             // A colour no program set: the user's terminal's, if the client said it; else
             // unanswered, as a terminal that does not know it would leave it.
@@ -813,9 +823,10 @@ mod tests {
     }
 
     #[test]
-    fn a_clipboard_query_sets_nothing() {
+    fn only_base64_sets_the_clipboard_and_a_query_sets_nothing() {
         let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
-        t.process(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07");
+        // Bytes no base64 holds, which lossy UTF-8 would have tripled.
+        t.process(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07\x1b]52;c;\xff\xfe=x\x07");
         assert_eq!(t.snapshot().clipboard(), "aGVsbG8=");
         assert_eq!(t.take_host_replies(), b"", "nor is it answered");
     }

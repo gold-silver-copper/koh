@@ -22,7 +22,7 @@ mod server;
 pub use crate::predict::{Size, TtyModes};
 pub use grid::{drawn, Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
 pub use history::{
-    HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, HistoryTicket, KeptRow,
+    HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, KeptRow,
     HISTORY_CACHE_BYTES, MAX_HISTORY_CELLS, MAX_HISTORY_ROWS,
 };
 pub use server::{FrameHold, ServerTerminal, FRAME_HOLD, IDENTITY, OPTIONS};

@@ -1,11 +1,12 @@
-//! The koh/4 wire protocol.
+//! The koh/5 wire protocol.
 //!
 //! After admission the client opens one uni stream and writes [`ClientMsg`]s on it, each a 4-byte
 //! big-endian length followed by its postcard encoding. The server sends every screen update as a
 //! [`Frame`] on its own uni stream: a tag, the base's number, then the postcard encoding
-//! DEFLATE-compressed against the base screen ([`encode_frame`]); history rows go the same way,
-//! without a base. Frames diff against a frame the client has (its delivery is its
-//! acknowledgement), so a lost or reset frame only delays the screen until the next one.
+//! DEFLATE-compressed against the base screen ([`FrameEncoder`]); history rows go the same way,
+//! without a base, each reply naming the request it answers. Frames diff against a frame the
+//! client has (its delivery is its acknowledgement), so a lost or reset frame only delays the
+//! screen until the next one. Why a connection closed is its close code ([`Close`]).
 //!
 //! Everything here is pure: the connection loops move bytes, this module turns them into messages
 //! and rejects anything oversized or malformed.
@@ -96,9 +97,60 @@ pub struct FrameScreen {
 /// a quiet session from a dead link.
 pub const HEARTBEAT: Duration = Duration::from_secs(3);
 
-/// The reason, with close code 0, the server closes a connection with once the hosted program
-/// exited and the client has the final frame.
-pub const SESSION_ENDED: &[u8] = b"session ended";
+/// Why a connection was closed: its QUIC application close code.
+///
+/// The code is the only part read; the reason bytes a peer chooses are never shown, only
+/// [`Close::text`]. Code 0 is none of these: an endpoint closing (a server restarting) uses it.
+/// Only `NotAuthorized` is for good: a client redials after the others but `SessionEnded`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Close {
+    NotAuthorized = 1,
+    ProtocolError = 2,
+    /// The hosted program exited, and the client was sent its final screen.
+    SessionEnded = 3,
+    /// The server holds its most sessions, none of them the client's.
+    AtCapacity = 4,
+    /// The session's program could not start, or the server is shutting down.
+    CouldNotStart = 5,
+}
+
+impl Close {
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
+    /// The reason close code `code` gives, if it is one of these.
+    pub const fn from_code(code: u64) -> Option<Self> {
+        Some(match code {
+            1 => Self::NotAuthorized,
+            2 => Self::ProtocolError,
+            3 => Self::SessionEnded,
+            4 => Self::AtCapacity,
+            5 => Self::CouldNotStart,
+            _ => return None,
+        })
+    }
+
+    /// What it says, for a person.
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::NotAuthorized => "not authorized (is this client on the server's allowlist?)",
+            Self::ProtocolError => "protocol error",
+            Self::SessionEnded => "session ended",
+            Self::AtCapacity => "server at session capacity",
+            Self::CouldNotStart => "server could not start a session",
+        }
+    }
+}
+
+impl std::fmt::Display for Close {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text())
+    }
+}
+
+impl std::error::Error for Close {}
 
 /// The least gap the server leaves between frames.
 ///
@@ -146,7 +198,8 @@ pub enum ClientMsg {
     /// [`FrameNum::BLANK`].
     Resync,
     /// The client asks for history rows it lacks (see [`HistoryRequest`]). The server answers each,
-    /// one at a time, at a lower priority than frames.
+    /// with no rows if it holds none, one at a time and at a lower priority than frames; the
+    /// reply carries the request's id.
     History(HistoryRequest),
     /// Input the client decoded: keys, mouse events, focus changes and pastes, in order, at most
     /// [`MAX_EVENTS`](crate::events::MAX_EVENTS). The server encodes each for the program as it
@@ -319,25 +372,8 @@ pub enum ServerMsg {
 const TAG_FRAME: u8 = 0;
 const TAG_HISTORY: u8 = 1;
 
-/// Encode a frame for its stream: its tag, its base's number, the rows it changes, then the frame
-/// compressed against `base`, the screen of frame `frame.base`.
-///
-/// The compressor starts from a dictionary of the rows the frame changes as `base` has them
-/// ([`TerminalScreen::dictionary`]), so a changed row compresses against what it was: a ticking
-/// clock or a typed character costs a few bytes. Both ends hold the base screen, the stream names
-/// the rows, and the client refuses a frame whose base it does not hold, so the dictionaries cannot
-/// disagree. The blank screen's dictionary is empty.
-pub fn encode_frame(frame: &Frame, base: &TerminalScreen) -> Result<Vec<u8>, ProtoError> {
-    FrameEncoder::default().encode(frame, base)
-}
-
-/// [`encode_frame`] with the dictionary already made.
-pub fn encode_frame_with(frame: &Frame, dictionary: &[u8]) -> Result<Vec<u8>, ProtoError> {
-    encode_frame_compressed(frame, &changed_rows(frame), &mut compressor(), dictionary)
-}
-
-/// Encodes frames for the server and the scoreboard alike, keeping rows' encodings for the next
-/// frame's dictionary, and one compressor, reset for each frame rather than made anew.
+/// Encodes the server's streams, keeping rows' encodings for the next frame's dictionary, and one
+/// compressor, reset for each stream rather than made anew.
 pub struct FrameEncoder {
     encodings: RowEncodings,
     compressor: Box<CompressorOxide>,
@@ -353,17 +389,31 @@ impl Default for FrameEncoder {
 }
 
 impl FrameEncoder {
-    /// `frame` encoded for its stream; `base` is the screen of frame `frame.base`.
+    /// `frame` encoded for its stream: its tag, its base's number, the rows it changes, then the
+    /// frame compressed against `base`, the screen of frame `frame.base`.
+    ///
+    /// The compressor starts from a dictionary of the rows the frame changes as `base` has them
+    /// ([`TerminalScreen::dictionary`]), so a changed row compresses against what it was: a
+    /// ticking clock or a typed character costs a few bytes. Both ends hold the base screen, the
+    /// stream names the rows, and the client refuses a frame whose base it does not hold, so the
+    /// dictionaries cannot disagree. The blank screen's dictionary is empty.
     pub fn encode(&mut self, frame: &Frame, base: &TerminalScreen) -> Result<Vec<u8>, ProtoError> {
-        let rows = changed_rows(frame);
+        let rows: Vec<u16> = frame.diff.rows.iter().map(|row| row.row).collect();
         let dictionary = dictionary_for(frame.base, base, &rows, &mut self.encodings);
-        encode_frame_compressed(frame, &rows, &mut self.compressor, &dictionary)
+        let raw = postcard::to_allocvec(frame)?;
+        let mut out = postcard::to_extend(&frame.base.0, vec![TAG_FRAME])?;
+        out = postcard::to_extend(&rows, out)?;
+        out.extend_from_slice(&compress(&mut self.compressor, &dictionary, &raw));
+        Ok(out)
     }
-}
 
-/// The rows `frame` changes, in its order.
-fn changed_rows(frame: &Frame) -> Vec<u16> {
-    frame.diff.rows.iter().map(|row| row.row).collect()
+    /// History rows encoded for their stream.
+    pub fn encode_history(&mut self, reply: &HistoryReply) -> Result<Vec<u8>, ProtoError> {
+        let raw = postcard::to_allocvec(reply)?;
+        let mut out = vec![TAG_HISTORY];
+        out.extend_from_slice(&compress(&mut self.compressor, &[], &raw));
+        Ok(out)
+    }
 }
 
 /// The dictionary a frame on `base`, whose screen is `screen`, changing `rows`, is compressed
@@ -404,28 +454,6 @@ fn compress(compressor: &mut CompressorOxide, dictionary: &[u8], raw: &[u8]) -> 
         true
     });
     out
-}
-
-/// A frame's stream: the rows it changes, then the frame compressed after their dictionary.
-fn encode_frame_compressed(
-    frame: &Frame,
-    rows: &[u16],
-    compressor: &mut CompressorOxide,
-    dictionary: &[u8],
-) -> Result<Vec<u8>, ProtoError> {
-    let raw = postcard::to_allocvec(frame)?;
-    let mut out = postcard::to_extend(&frame.base.0, vec![TAG_FRAME])?;
-    out = postcard::to_extend(&rows, out)?;
-    out.extend_from_slice(&compress(compressor, dictionary, &raw));
-    Ok(out)
-}
-
-/// Encode history rows for their stream.
-pub fn encode_history(reply: &HistoryReply) -> Result<Vec<u8>, ProtoError> {
-    let raw = postcard::to_allocvec(reply)?;
-    let mut out = vec![TAG_HISTORY];
-    out.extend_from_slice(&compress(&mut compressor(), &[], &raw));
-    Ok(out)
 }
 
 /// What [`compress`] compressed after `dictionary`, at most `limit` bytes of it, or `None`
@@ -542,6 +570,22 @@ pub fn decode_frame(bytes: &[u8], screen: &TerminalScreen) -> Result<Frame, Prot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_frame(frame: &Frame, base: &TerminalScreen) -> Result<Vec<u8>, ProtoError> {
+        FrameEncoder::default().encode(frame, base)
+    }
+
+    #[test]
+    fn close_codes_round_trip_and_0_is_none_of_them() {
+        for code in 1..=5 {
+            assert_eq!(
+                Close::from_code(code).map(|c| u64::from(c.code())),
+                Some(code)
+            );
+        }
+        assert_eq!(Close::from_code(0), None);
+        assert_eq!(Close::from_code(6), None);
+    }
     use crate::terminal::TerminalScreen;
 
     fn frame() -> Frame {
@@ -772,7 +816,15 @@ mod tests {
             diff: target.diff_from(&base),
         };
         let against_base = encode_frame(&frame, &base).unwrap();
-        let alone = encode_frame_with(&frame, &[]).unwrap();
+        // On the blank base, whose dictionary is empty.
+        let alone = encode_frame(
+            &Frame {
+                base: FrameNum::BLANK,
+                ..frame.clone()
+            },
+            &base,
+        )
+        .unwrap();
         assert!(
             against_base.len() < alone.len(),
             "{} against the base, {} alone",

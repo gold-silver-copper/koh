@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use koh::client::ClientSession;
-use koh::proto::{decode_server, encode_history, ClientMsg, Frame, FrameNum, InputSeq, ServerMsg};
+use koh::proto::{decode_server, ClientMsg, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg};
 use koh::terminal::{ServerTerminal, Size, TerminalScreen};
 use recording::Recording;
 
@@ -86,7 +86,9 @@ impl Pair {
             for request in requests {
                 let reply = self.server.history(request);
                 self.history_rows = self.history_rows.saturating_add(reply.rows.len());
-                let bytes = encode_history(&reply).map_err(|e| e.to_string())?;
+                let bytes = FrameEncoder::default()
+                    .encode_history(&reply)
+                    .map_err(|e| e.to_string())?;
                 self.history_bytes = self
                     .history_bytes
                     .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));

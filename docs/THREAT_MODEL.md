@@ -8,15 +8,21 @@ look; pair it with [`SECURITY.md`](../SECURITY.md).
 
 A mosh-like remote shell over [iroh](https://iroh.computer) (peer-to-peer QUIC). The **server** spawns
 a real shell in a PTY and sends its screen to a **client** as frames over QUIC streams.
-There is **no listening port**: a server is reachable only via its non-enumerable Ed25519 **node-id**
-(through relays + NAT hole-punching), and only peers on its **allowlist** are admitted. It is a
+A peer finds a server by its Ed25519 **node-id** (through relays + NAT hole-punching), and only peers
+on its **allowlist** are admitted. The node-id is not enumerable, but the server's UDP port is open
+like any listener's: anyone who can reach it can start QUIC handshakes, as iroh answers a
+ClientHello whatever its server name. So handshakes under way are capped, 2 from one address (an
+IPv6 /64 counts as one) and a quarter of `--max-connections` in all (at least 4, and below the
+total), the oldest given up for a new one; each has 10 s; and the warnings they cause are said at
+most once every 10 s. A flood of stalled handshakes therefore cannot hold every slot, and an
+allowed client's dial still gets one. It is a
 **single-operator** tool for connecting a small set of machines you control — not a multi-user network
 service.
 
 ## Attacker models
 
 1. **Malicious / compromised client** — a peer that dials the server. If it is on the allowlist it
-   reaches the koh/4 data plane: it sends arbitrary input, resize, ack and resync messages and opens
+   reaches the koh/5 data plane: it sends arbitrary input, resize, ack and resync messages and opens
    streams. Input comes as decoded events (`Keys`: keys, mouse events, focus changes, whole
    pastes); decoding refuses what no terminal sends (a modifier bit no key has, a function key past
    F12, a kitty code that is no Unicode scalar, a paste over 1 MiB, more than 512 events, more than

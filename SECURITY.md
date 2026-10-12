@@ -54,10 +54,10 @@ and the git log.
 
 | ID | Finding | Guarded by |
 |----|---------|------------|
-| H-1 | A peer's resize allocates an unbounded grid (OOM) | `tests/sessions.rs::a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server`, `tests/pty.rs::host_normalizes_dimensions_for_both_the_emulator_and_pty`, `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`; `testing/android/scripts/sec-resize-oom-server.sh` |
+| H-1 | A peer's resize allocates an unbounded grid (OOM) | `tests/sessions.rs::a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server`, `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`; `testing/android/scripts/sec-resize-oom-server.sh` |
 | M-1 | The identity key is written world-readable | `src/identity/key_file.rs::a_created_key_is_its_raw_bytes_and_loads_back_to_the_same_identity`; `testing/android/scripts/sec-key-perms.sh` |
-| M-2 | A (0, 0) resize panics the emulator | `tests/pty.rs::host_normalizes_dimensions_for_both_the_emulator_and_pty`, `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`; `testing/android/scripts/sec-resize-zero-panic.sh` |
-| L-1 | A server silently sets the client's clipboard (OSC 52) | Accepted since 0.13: clipboard writes are on by default, the owner's choice, and off with `--no-clipboard` (`src/args.rs::no_clipboard_turns_clipboard_writes_off`). What bounds them stays: `src/client/render.rs::out_of_band_clipboard_off_emits_nothing`, `out_of_band_rejects_non_base64_clipboard_even_when_on`, `a_clipboard_query_or_an_oversized_payload_is_never_forwarded`; `src/terminal/server.rs::a_clipboard_query_sets_nothing` |
+| M-2 | A (0, 0) resize panics the emulator | `tests/sessions.rs::a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server`, `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`; `testing/android/scripts/sec-resize-zero-panic.sh` |
+| L-1 | A server silently sets the client's clipboard (OSC 52) | Accepted since 0.13: clipboard writes are on by default, the owner's choice, and off with `--no-clipboard` (`src/args.rs::no_clipboard_turns_clipboard_writes_off`). What bounds them stays: `src/client/render.rs::out_of_band_clipboard_off_emits_nothing`, `out_of_band_rejects_non_base64_clipboard_even_when_on`, `a_clipboard_query_or_an_oversized_payload_is_never_forwarded`; `src/terminal/server.rs::only_base64_sets_the_clipboard_and_a_query_sets_nothing` |
 | L-2 | The client trusts the server's title/icon/clipboard sizes | `src/terminal/mod.rs::client_apply_caps_oversized_title_and_clipboard` |
 | L-3 | No cap on connections, handshakes or sessions | `tests/sessions.rs::max_sessions_refuses_a_new_peer_but_allows_a_reattach`, `tests/net/hostile_peer.rs::a_flood_of_connections_and_garbage_does_not_take_the_server_down` |
 | L-4 | `KOH_*` variables leak into the spawned shell | `src/pty.rs::scrub_removes_inherited_koh_vars`; `testing/android/scripts/sec-env-leak.sh` |
@@ -70,10 +70,10 @@ and the git log.
 | KOH-02 | Decompression amplification on apply | `src/proto.rs::an_inflate_bomb_is_rejected`, `oversized_client_messages_are_rejected_before_buffering`, `tests/net/hostile_peer.rs::an_oversized_or_bomb_frame_leaves_the_client_running`, `an_oversized_client_message_closes_the_connection_only` |
 | KOH-03 | Fixed public KDF salt in the passphrase handshake | Removed: there is no over-the-wire passphrase; the node-id allowlist is the only factor |
 | KOH-04 | `String::truncate` on the status line panics the client | `src/client/render.rs::status_line_truncation_is_panic_free_across_all_widths` |
-| KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_queues_the_session_input_in_order_merging_neighbours`, `a_full_queue_for_the_session_leaves_the_rest_undecoded`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
+| KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_queues_the_session_input_in_order_merging_neighbours`, `input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
 | KOH-06 | State dir in a world-writable shared location | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_directory_of_another_user_but_root_is_refused`, `src/transport_iroh/mod.rs::config_dir_is_xdg_then_home_and_never_elsewhere` |
 | KOH-07 | Fragment reassembly buffers ~39 MiB | Removed: koh/4 has no fragments; a frame is one stream read under `MAX_FRAME` (see KOH-02) |
-| KOH-08 | Stalled handshakes hold connection permits | The pending-handshake cap and the handshake and admission deadlines in `src/server/cli.rs::serve_endpoint`; no automated test (the admission-stall attack in `testing/android/scripts/stress-evil-peer.sh` exercises it on a device) |
+| KOH-08 | Stalled handshakes hold connection permits | The handshake and admission deadlines, and the pending-handshake cap, which gives up the oldest for a new one and caps each address: `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room`; the admission-stall attack in `testing/android/scripts/stress-evil-peer.sh` exercises it on a device |
 | KOH-10 | A SIGHUP-immune child leaks the PTY threads | `Pty`'s `Drop` hangs the program up and the reaper kills it after a second's grace: `tests/pty.rs::a_child_that_ignores_sighup_dies_when_its_pty_is_dropped`, `a_hung_up_program_has_time_to_exit_before_it_is_killed`, `dropping_pty_eofs_child_and_stops_writer`, `shutdown_joins_both_io_threads_without_deadlock` |
 | KOH-11, KOH-13 | Passphrase handshake downgrades | Removed with the passphrase handshake |
 | KOH-12 | A pre-existing state dir is not made private | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_missing_directory_is_created_private` |
@@ -96,6 +96,25 @@ and the git log.
 | A-6 | A hostile frame could allocate before its counts were checked | `src/bounded.rs::a_sequence_past_its_bound_is_refused_before_it_is_read`, the wire's `at_most` bounds |
 | A-7 | A flood of input starved the client's frames | The client's loop is unbiased: `tests/net/session.rs::a_flood_of_typing_does_not_starve_the_frames` |
 
+**Audits of 2026-10-12: server, protocol and shared state (B-).**
+
+| ID | Finding | Guarded by |
+|----|---------|------------|
+| B-1 | A `clients` file that could not be read disconnected every saved client | One reader keeps the list last read well: `src/server/cli.rs::a_saved_list_that_cannot_be_read_keeps_the_last_one` |
+| B-2 | Removing a client left its session running | `tests/sessions.rs::ending_a_peers_session_ends_it_at_once` |
+| B-3 | Log lines could interleave; a peer's text could start a line or reorder one | `src/log.rs::a_log_line_is_written_whole_in_one_write`, `a_peers_text_is_one_line_of_printable_ascii`; close reasons are codes, never text: `src/proto.rs::close_codes_round_trip_and_0_is_none_of_them` |
+| B-4 | A refusal after admission was retried for ever; a capacity close could look permanent | `src/client/mod.rs::a_refusal_is_for_good_only_when_not_authorized`, `tests/sessions.rs::a_program_that_cannot_start_is_refused_as_such` |
+| B-5 | The final screen could miss the program's last output | `src/server/session.rs::the_program_ends_once_its_exit_is_known_and_its_output_drained` |
+| B-6 | A reconnect after the program exited got a fresh shell | `tests/sessions.rs::a_reconnect_after_exit_sees_the_exit_until_a_client_has_it` |
+| B-7 | A lost or reordered history reply stalled scrollback | `src/client/scrollback.rs::replies_pair_with_their_requests_by_id_in_any_order` |
+| B-8 | A search could loop on history rows it fetched and lost | `src/client/scrollback.rs::a_search_through_more_history_than_the_cache_holds_finishes` |
+| B-9 | A double SIGHUP skipped the drain | `src/lib.rs::a_double_sighup_still_drains_and_a_later_signal_forces` |
+| B-10 | Anyone who reaches the UDP port could block allowed clients' dials | `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room` |
+| B-11 | The server kept a clipboard of up to 3 times its cap | `src/terminal/server.rs::only_base64_sets_the_clipboard_and_a_query_sets_nothing` |
+| B-12 | A hard-linked key could be truncated through `$KOH_LOG` | `src/identity/key_file.rs::a_hard_linked_key_or_log_is_refused_and_left_whole` |
+| B-13 | Queued client messages waited for more bytes; a clean end with some left was an error | `src/server/mod.rs::input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends` |
+| B-14 | An old connection's input could interleave with a reconnect's | Input is numbered by attachment, and only the newest's reaches the program: `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` |
+
 **Review follow-ups (KR-, K-, KB-, KC-, KS-, S-, AR-).**
 
 | ID | Finding | Guarded by |
@@ -114,8 +133,8 @@ and the git log.
 | KC-IO-01 | Client teardown owns and joins every producer | `src/client/io.rs::idle_input_poll_cancels_and_joins_without_waiting_for_a_byte`, `dropping_public_tasks_cancels_both_producers` |
 | KC-IO-02 | The input producer does not transform bytes | `src/client/io.rs::input_producer_forwards_bytes_exactly` |
 | KS-01, KS-04 | Shared sessions across peers; their unwind guard | Removed with the generic session host: one PTY per peer, and K-16's detach on drop |
-| KS-02 | Echo-ack per connection, not per session | `tests/sessions.rs::echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_input` |
-| KS-03 | A screen change wakes every attached connection | The session's `watch` channel: `tests/sessions.rs::echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_input` keeps two connections on one session receiving frames |
+| KS-02 | Echo-ack per connection, not per session | `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` |
+| KS-03 | A screen change wakes every attached connection | The session's `watch` channel: `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` keeps two connections on one session receiving frames |
 | S-04 | Per-cell `String` allocation on repaint | Performance only; nothing to guard |
 | S-07 | One place states the prediction-cell invariants | `PredictionEngine::place_cell`; the prediction tests in `src/predict.rs` |
 | AR-02 | `predict` and `proto` import direction | CI's layering-guard step (`.github/workflows/ci.yml`) |

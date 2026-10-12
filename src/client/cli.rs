@@ -200,10 +200,10 @@ fn warn_if_locale_not_utf8() {
     });
     if !looks_utf8 {
         let shown = locale.as_deref().unwrap_or("(unset)");
-        crate::log::stderr(&crate::log::Clean::new(format_args!(
+        crate::log::stderr(format_args!(
             "koh: warning: locale {shown} does not look UTF-8; non-ASCII output may be garbled. \
              Set e.g. LANG=en_US.UTF-8."
-        )));
+        ));
     }
 }
 
@@ -217,9 +217,9 @@ fn log_to_koh_log() {
     match crate::identity::open_private_log(&path) {
         Ok(file) => crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG),
         Err(e) => {
-            crate::log::stderr(&crate::log::Clean::new(format_args!(
+            crate::log::stderr(format_args!(
                 "koh: warning: $KOH_LOG: {e}; file logging disabled"
-            )));
+            ));
         }
     }
 }

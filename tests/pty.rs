@@ -196,37 +196,6 @@ fn stopped_reader_applies_backpressure_and_resumes_in_order() {
 }
 
 #[test]
-fn host_normalizes_dimensions_for_both_the_emulator_and_pty() {
-    current_thread().expect("runtime").block_on(async {
-        let (mut host, mut rx) = koh::server::session::PtyHost::spawn(
-            &[
-                "/bin/sh".into(),
-                "-c".into(),
-                "stty -echo; echo READY; read x; stty size".into(),
-            ],
-            0,
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("host");
-        read_until(&mut rx, "READY").await.expect("ready");
-        let raw = koh::terminal::Size::new(0, u16::MAX);
-        let normalized = koh::terminal::clamp_dims(raw);
-        host.resize(raw);
-        assert_eq!(host.snapshot().screen().size(), normalized);
-        assert!(host.pty.write(b"\n".to_vec()).is_ok());
-        let output = all_output(rx).await;
-        assert!(
-            output.contains(&format!("{} {}", normalized.rows, normalized.cols)),
-            "{output:?}"
-        );
-        tokio::task::spawn_blocking(move || host.close())
-            .await
-            .expect("shutdown");
-    });
-}
-
-#[test]
 #[expect(
     clippy::match_wild_err_arm,
     reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"

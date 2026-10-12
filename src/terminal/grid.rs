@@ -351,12 +351,12 @@ impl Grid {
     /// `cache` is left holding this snapshot's rows.
     pub(super) fn of(screen: &fux_vt::Screen, cache: &mut RowCache) -> Self {
         let (rows, cols) = screen.size().into();
-        if let Some(grid) = Self::of_dirty(screen, cache) {
+        let palette = Palette::of(screen);
+        if let Some(grid) = Self::of_dirty(screen, cache, palette.as_ref()) {
             return grid;
         }
         let window = screen.window();
         let live: Vec<fux_vt::Row<'_>> = (0..rows).filter_map(|row| window.row(row)).collect();
-        let palette = Palette::of(screen);
         if palette != cache.palette {
             *cache = RowCache {
                 palette,
@@ -433,11 +433,15 @@ impl Grid {
     /// contents did (fux-vt says so): a snapshot's cost then follows what changed, not the screen's
     /// size. `None` when the screen changed otherwise (a scroll, resize, reset, a switch of screens,
     /// the palette), for the full snapshot.
-    fn of_dirty(screen: &fux_vt::Screen, cache: &mut RowCache) -> Option<Self> {
+    fn of_dirty(
+        screen: &fux_vt::Screen,
+        cache: &mut RowCache,
+        palette: Option<&Palette>,
+    ) -> Option<Self> {
         let mark = cache.mark?;
         let (rows, cols) = screen.size().into();
         if screen.full_refresh_since(mark)
-            || Palette::of(screen) != cache.palette
+            || palette != cache.palette.as_ref()
             || cache.lines.len() != usize::from(rows)
             || cache
                 .lines

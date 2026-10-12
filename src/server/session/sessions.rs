@@ -7,7 +7,8 @@ use iroh::EndpointId;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::task::JoinSet;
 
-use super::{start, Attach, Refused, SessionSpec};
+use super::{start, Attach, SessionSpec};
+use crate::proto::Close;
 
 /// Every session task the registry started, and the ones still live, by peer.
 pub(super) struct Sessions {
@@ -39,14 +40,14 @@ impl Sessions {
             Some(control) => match control.try_send(attach) {
                 Ok(()) => return,
                 Err(TrySendError::Full(Attach(reply))) => {
-                    let _ = reply.send(Err(Refused::Full));
+                    let _ = reply.send(Err(Close::AtCapacity));
                     return;
                 }
                 // It ended a moment ago: a new one takes its place.
                 Err(TrySendError::Closed(attach)) => attach,
             },
             None if self.live.len() >= self.spec.max_sessions => {
-                let _ = attach.0.send(Err(Refused::Full));
+                let _ = attach.0.send(Err(Close::AtCapacity));
                 return;
             }
             None => attach,
@@ -54,6 +55,11 @@ impl Sessions {
         let (control, task) = start(&self.spec, &self.reaper, attach);
         self.tasks.spawn(task);
         self.live.insert(peer, control);
+    }
+
+    /// End `peer`'s session, if it has one: its control channel closes, and it ends.
+    pub(super) fn end(&mut self, peer: EndpointId) {
+        self.live.remove(&peer);
     }
 
     /// End every session, attached or not, and wait for their tasks.

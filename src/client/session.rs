@@ -67,6 +67,8 @@ mod outage {
         unconfirmed: bool,
         /// Typing was not sent.
         typing_dropped: bool,
+        /// Why the server last refused a redial, if it said.
+        refused: Option<&'static str>,
     }
 
     impl Outage {
@@ -75,7 +77,12 @@ mod outage {
                 since,
                 unconfirmed,
                 typing_dropped: false,
+                refused: None,
             }
+        }
+
+        pub(super) const fn refused(&mut self, why: &'static str) {
+            self.refused = Some(why);
         }
 
         pub(super) const fn dropped_typing(&mut self) {
@@ -92,6 +99,7 @@ mod outage {
             [
                 self.unconfirmed.then_some(UNCONFIRMED),
                 self.typing_dropped.then_some(INPUT_DROPPED),
+                self.refused,
             ]
             .into_iter()
             .flatten()
@@ -427,6 +435,14 @@ impl ClientSession {
         // Nothing is queued now, so nothing is to drain before typing is taken again.
         self.input_paused = false;
         self.scrollback.forget_requests();
+        self.dirty = true;
+    }
+
+    /// A redial was refused for now, the server said `why`: the banner says it too.
+    pub fn refused(&mut self, why: &'static str) {
+        if let Some(outage) = self.outage.as_mut() {
+            outage.refused(why);
+        }
         self.dirty = true;
     }
 

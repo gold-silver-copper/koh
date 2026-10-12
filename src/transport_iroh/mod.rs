@@ -13,6 +13,8 @@ use iroh::endpoint::{
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 
+use crate::proto::Close;
+
 pub mod admission;
 
 /// The connection idle timeout is 5 minutes, not iroh's ~30 s, so a short suspend (Android
@@ -46,17 +48,31 @@ fn koh_transport_config(accept: bool) -> QuicTransportConfig {
 /// How soon the server asks the client's QUIC stack to acknowledge what it got.
 const CLIENT_ACK_DELAY: Duration = Duration::from_millis(2);
 
-/// The ALPN, which is the protocol version ([`crate::proto`]): a peer on another fails the TLS
-/// handshake instead of misparsing mid-session.
-pub const ALPN: &[u8] = b"koh/5";
+/// The protocol's name and version ([`crate::proto`]), its ALPN.
+pub const PROTOCOL: &str = "koh/5";
+
+/// The ALPN, [`PROTOCOL`]: a peer on another fails the TLS handshake instead of misparsing
+/// mid-session.
+pub const ALPN: &[u8] = PROTOCOL.as_bytes();
+
+/// Close `conn` saying why, by its code alone ([`Close`]).
+pub fn close(conn: &Connection, why: Close) {
+    conn.close(why.code().into(), b"");
+}
+
+/// Why the peer closed `conn`, if it did with one of koh's codes.
+pub fn closed_because(conn: &Connection) -> Option<Close> {
+    let iroh::endpoint::ConnectionError::ApplicationClosed(close) = conn.close_reason()? else {
+        return None;
+    };
+    Close::from_code(close.error_code.into_inner())
+}
 
 /// Errors from endpoint/identity setup.
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("secret key file is invalid, a symlink, or not a regular file")]
-    BadKeyFile,
     /// A path koh will not use, and why: `refusing <path>: <why>`.
     #[error("refusing {path}: {why}")]
     Refused { path: String, why: String },

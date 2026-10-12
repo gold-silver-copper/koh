@@ -353,10 +353,7 @@ impl Kind {
             "refusing a {} that is a symlink or not a regular file",
             self.name()
         );
-        match self {
-            Self::Identity => SetupError::BadKeyFile,
-            Self::Log | Self::Beside => refuse(path, "it is a symlink or not a regular file"),
-        }
+        refuse(path, "it is a symlink or not a regular file")
     }
 }
 
@@ -382,12 +379,22 @@ fn open_private(options: &mut OpenOptions, path: &Path, kind: Kind) -> Result<Fi
     Ok(file)
 }
 
-/// The one rule for a private file: a regular file of this user's, readable by no one else. A
-/// loose mode, say from a permissive backup, is tightened to 0600 through the descriptor; a file
+/// The one rule for a private file: a regular file of this user's, under this one name (a hard
+/// link is another way in, and a truncation through it would reach this file), readable by no one
+/// else. A loose mode, say from a permissive backup, is tightened to 0600 through the descriptor; a file
 /// that cannot be tightened, or that stays loose (a filesystem that ignores chmod), is refused.
 fn check_private(file: &File, path: &Path, kind: Kind) -> Result<(), SetupError> {
     let meta = file.metadata()?;
     check_owned(&meta, path, kind)?;
+    if meta.nlink() != 1 {
+        return Err(refuse(
+            path,
+            &format!(
+                "it has {} hard links, so another name reaches it",
+                meta.nlink()
+            ),
+        ));
+    }
     let mode = meta.permissions().mode();
     if mode & 0o077 != 0 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -582,7 +589,7 @@ mod tests {
         let link = dir.join("server.key");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let key = KeyFile::open(&link).unwrap();
-        assert!(matches!(key.read_secret(), Err(SetupError::BadKeyFile)));
+        assert!(matches!(key.read_secret(), Err(SetupError::Refused { .. })));
         assert!(load(&key).is_err(), "load refuses it too");
         assert!(key.reset().is_err(), "and so does reset");
         assert_eq!(mode_of(&target), 0o644, "the target is not re-permissioned");
@@ -598,7 +605,7 @@ mod tests {
         for result in [load(&key), load_existing(&link)] {
             let error = result.err().expect("refused");
             assert!(
-                matches!(error.downcast_ref(), Some(SetupError::BadKeyFile)),
+                matches!(error.downcast_ref(), Some(SetupError::Refused { .. })),
                 "{error:#}"
             );
         }
@@ -730,6 +737,20 @@ mod tests {
     }
 
     #[test]
+    fn a_hard_linked_key_or_log_is_refused_and_left_whole() {
+        let dir = scratch("hardlink", 0o700);
+        let path = dir.join("id.key");
+        let key = KeyFile::open(&path).unwrap();
+        let secret = load(&key).unwrap().secret.to_bytes();
+        // `$KOH_LOG` pointed at the key by another name: truncating it would destroy the key.
+        let log = dir.join("koh.log");
+        std::fs::hard_link(&path, &log).unwrap();
+        assert!(open_private_log(&log).is_err());
+        assert!(load(&key).is_err(), "nor is the key itself used");
+        assert_eq!(std::fs::read(&path).unwrap(), secret);
+    }
+
+    #[test]
     fn a_fifo_log_or_key_is_refused_without_waiting_for_a_reader() {
         let dir = scratch("fifo-log", 0o700);
         let path = dir.join("koh.log");
@@ -752,7 +773,7 @@ mod tests {
         assert!(log.to_string().starts_with("refusing "), "{log}");
         let load = load.expect_err("a FIFO key is refused");
         assert!(
-            matches!(load.downcast_ref(), Some(SetupError::BadKeyFile)),
+            matches!(load.downcast_ref(), Some(SetupError::Refused { .. })),
             "{load:#}"
         );
     }

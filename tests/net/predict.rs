@@ -127,27 +127,18 @@ fn a_trusted_session_shows_nothing_typed_at_real_password_prompts() -> anyhow::R
             .wait_until(WAIT, |t| t.matches("trusted").count() >= 2)
             .await
             .is_some());
-        // Each prompt reads a line without echo, and is known by its last line; a missing program
-        // just prints its marker.
-        let prompts: [(&[u8], &str); 4] = [
+        // Each prompt reads a line without echo, and is known by its last line; a missing bash just
+        // prints its marker. Never a real `sudo` or `passwd`: a wrong password there is a failed
+        // login on the machine running the tests, and enough of them lock the account.
+        let prompts: [(&[u8], &str); 2] = [
             // bash's `read -s`.
             (
                 b"command -v bash >/dev/null && bash -c 'read -s -p \"Secret: \" x'; echo DO''NE0\r",
                 "Secret:",
             ),
-            // sudo's own prompt (a wrong password; -k forgets any cached one).
-            (
-                b"command -v sudo >/dev/null && timeout 20 sudo -k -p 'Password: ' true; echo DO''NE1\r",
-                "Password:",
-            ),
-            // passwd, through PAM.
-            (
-                b"command -v passwd >/dev/null && timeout 20 passwd; echo DO''NE2\r",
-                "assword:",
-            ),
             // ssh's prompt, as readpassphrase draws it: echo off, then the prompt.
             (
-                b"stty -echo; printf \"me@host's password: \"; read x; stty echo; echo DO''NE3\r",
+                b"stty -echo; printf \"me@host's password: \"; read x; stty echo; echo DO''NE1\r",
                 "password:",
             ),
         ];
@@ -166,11 +157,6 @@ fn a_trusted_session_shows_nothing_typed_at_real_password_prompts() -> anyhow::R
                 prompted.push(n);
                 type_slowly(&client, secret).await?;
                 type_slowly(&client, b"\r").await?;
-                // sudo and passwd ask again after a wrong password: end them.
-                tokio::time::sleep(Duration::from_secs(4)).await;
-                if !client.screen().contains(&marker) {
-                    client.send(b"\x03").await?;
-                }
             }
             anyhow::ensure!(
                 client
@@ -182,9 +168,8 @@ fn a_trusted_session_shows_nothing_typed_at_real_password_prompts() -> anyhow::R
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        eprintln!("prompts shown: {prompted:?}");
         anyhow::ensure!(
-            prompted.contains(&0) || prompted.contains(&3),
+            !prompted.is_empty(),
             "no prompt was ever shown: {prompted:?}"
         );
         for painted in client.history() {

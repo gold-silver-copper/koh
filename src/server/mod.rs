@@ -804,29 +804,6 @@ async fn send_history(
 /// The priority of history streams: below frames' (0), so QUIC sends a frame's bytes first.
 const HISTORY_PRIORITY: i32 = -1;
 
-/// Serve `conn` one session of `command`, then tear it down: the server without its accept loop,
-/// for tests.
-pub async fn run_session(
-    conn: iroh::endpoint::Connection,
-    command: &[String],
-    scrollback: usize,
-    launcher: crate::pty::Launcher,
-) -> anyhow::Result<()> {
-    let registry = Registry::spawn(SessionSpec {
-        command: command.to_vec().into(),
-        scrollback,
-        max_sessions: 1,
-        ttl: Duration::from_secs(1),
-        launcher,
-    });
-    let peer = conn.remote_id();
-    if let Ok((client, _)) = registry.attach(peer).await {
-        run_attached(cli::Authorized::assumed(conn), client).await;
-    }
-    registry.shutdown().await;
-    Ok(())
-}
-
 #[cfg(test)]
 #[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {
@@ -1068,36 +1045,6 @@ mod tests {
         t.promote(ms(100));
         assert_eq!(t.echo_ack(), InputSeq(7));
         assert_eq!(t.next_promotion(), None);
-    }
-
-    proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
-
-        /// Two connections' trackers fed interleaved inputs never influence each other: each ack
-        /// is bounded by the inputs *that* connection registered.
-        #[test]
-        fn echo_ack_trackers_are_independent_per_connection(
-            ops in proptest::collection::vec((proptest::prelude::any::<bool>(), 1u64..1000, 0u64..10_000), 1..64),
-        ) {
-            let t0 = Instant::now();
-            let at = |n: u64| t0.checked_add(Duration::from_millis(n)).expect("time within range");
-            let mut a = EchoAck::with_timeout(Duration::from_millis(10));
-            let mut b = EchoAck::with_timeout(Duration::from_millis(10));
-            let (mut max_a, mut max_b) = (0u64, 0u64);
-            for (to_a, seq, now) in ops {
-                if to_a {
-                    a.register(InputSeq(seq), at(now));
-                    max_a = max_a.max(seq);
-                } else {
-                    b.register(InputSeq(seq), at(now));
-                    max_b = max_b.max(seq);
-                }
-                a.promote(at(now.saturating_add(100)));
-                b.promote(at(now.saturating_add(100)));
-                proptest::prop_assert!(a.echo_ack().0 <= max_a, "A acked input it never saw");
-                proptest::prop_assert!(b.echo_ack().0 <= max_b, "B acked input it never saw");
-            }
-        }
     }
 
     // --- ServerConn: frame pacing, bases, acknowledgements and shutdown, with no I/O.

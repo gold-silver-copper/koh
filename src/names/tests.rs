@@ -3,17 +3,17 @@ use std::os::unix::fs::PermissionsExt as _;
 
 const A: &str = "d12841817cf7b0e8b357ae293f8a0c7d911d9661b06833a8365a1b3e7f83febf";
 
-fn id(seed: u8) -> EndpointId {
+pub fn id(seed: u8) -> EndpointId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
 /// A key directory of its own, removed afterwards.
-struct Scratch(PathBuf);
+pub struct Scratch(pub PathBuf);
 
 impl Scratch {
-    fn new(tag: &str) -> Self {
+    pub fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "koh-names-{tag}-{}-{:016x}",
+            "koh-{tag}-{}-{:016x}",
             std::process::id(),
             getrandom::u64().unwrap()
         ));
@@ -22,7 +22,7 @@ impl Scratch {
         Self(dir)
     }
 
-    fn places(&self) -> Places {
+    pub fn places(&self) -> Places {
         Places {
             client_key: self.0.join("client.key"),
             server_key: self.0.join("server.key"),
@@ -165,27 +165,6 @@ fn a_loose_list_is_tightened() {
         .is_some());
     let mode = std::fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
-}
-
-#[test]
-fn a_list_another_user_owns_is_refused() {
-    // Needs a file this user does not own: /etc/passwd is root's, unless we are root.
-    if fuxix::process::geteuid() == 0 {
-        return;
-    }
-    let dir = Scratch::new("foreign");
-    let Ok(meta) = std::fs::metadata("/etc/passwd") else {
-        return;
-    };
-    if std::os::unix::fs::MetadataExt::uid(&meta) != 0 {
-        return;
-    }
-    // A hard link keeps the owner; it needs the same filesystem, so skip if it fails.
-    if std::fs::hard_link("/etc/passwd", dir.0.join("clients")).is_err() {
-        return;
-    }
-    let error = format!("{:#}", load(&dir.places(), List::Clients).unwrap_err());
-    assert!(error.contains("owned by uid 0"), "{error}");
 }
 
 #[test]

@@ -1,9 +1,10 @@
 #![no_main]
-//! Fuzz the server's encoding of what a client sends: the first part of the input as the
+//! Fuzz the server's handling of what a client sends: the first part of the input as the
 //! program's output (setting any keyboard, mouse, focus and paste modes), the rest as the client's
-//! message stream, every `Keys` message's events encoded for the program by
-//! `ServerTerminal::encode_input`. A hostile client controls the events; the server must never
-//! panic, and a framed paste must hold no end marker but its own.
+//! message stream: every `Keys` message's events encoded for the program by
+//! `ServerTerminal::encode_input`, resizes (any size, as a hostile client sends) and history
+//! requests. A hostile client controls all of it; the server must never panic, and a framed paste
+//! must hold no end marker but its own.
 
 use koh::proto::{ClientDecoder, ClientMsg};
 use koh::terminal::ServerTerminal;
@@ -14,7 +15,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let (output, stream) = rest.split_at(usize::from(cut).min(rest.len()));
-    let Ok(mut t) = ServerTerminal::new(24, 80, 0) else {
+    let Ok(mut t) = ServerTerminal::new(24, 80, 100) else {
         return;
     };
     t.process(output);
@@ -26,17 +27,26 @@ fuzz_target!(|data: &[u8]| {
         match msg {
             ClientMsg::Keys { events, .. } => t.encode_input(&events, &mut out),
             ClientMsg::Colours(colours) => out.extend(t.set_colours(&colours)),
-            _ => {}
+            ClientMsg::Resize(size) => {
+                if t.resize(size) {
+                    out.extend(t.resize_report().unwrap_or_default());
+                }
+            }
+            ClientMsg::History(request) => {
+                let _ = t.history(request);
+                let _ = t.snapshot();
+            }
+            ClientMsg::Ack { .. } | ClientMsg::Resync => {}
         }
     }
     // No key, mouse or focus encoding is `ESC [ 201 ~`, and pieces lose their markers: so every
     // end marker closes a paste the server opened, and no paste holds one.
     let mut open = false;
     let mut at = 0usize;
-    while let Some(i) = out
-        .get(at..)
-        .and_then(|o| o.windows(6).position(|w| w == b"\x1b[200~" || w == b"\x1b[201~"))
-    {
+    while let Some(i) = out.get(at..).and_then(|o| {
+        o.windows(6)
+            .position(|w| w == b"\x1b[200~" || w == b"\x1b[201~")
+    }) {
         let start = at + i;
         if out.get(start + 4) == Some(&b'0') {
             assert!(!open, "a paste opened inside another");

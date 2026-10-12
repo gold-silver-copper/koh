@@ -266,11 +266,16 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
             match self.confirm(&question)? {
                 None => return Ok(Some(Outcome::Quit)),
                 Some(false) => return self.say("kept"),
+                // One change, so a replacement that cannot be saved loses nothing.
                 Some(true) => {
-                    let remove = names::Op::Remove { name: name.clone() };
-                    if let Some(outcome) = self.act(list, remove)? {
-                        return Ok(Some(outcome));
-                    }
+                    let replaced = names::update(self.places, list, |names| {
+                        names.remove(&name)?;
+                        names.add(&name, id)
+                    });
+                    return match replaced {
+                        Ok(()) => self.say(&format!("replaced {name} ({})", names::short(id))),
+                        Err(error) => self.say(&format!("koh: {error:#}")),
+                    };
                 }
             }
         }

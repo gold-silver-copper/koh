@@ -236,6 +236,8 @@ pub(super) struct RowCache {
     /// The palette the rows were drawn in. A new palette changes no row's version, so it starts
     /// the cache over.
     palette: Option<Palette>,
+    /// How many palettes the rows were drawn in, one after another.
+    palettes: u64,
     /// By live index, the id and version of the row the snapshot took there.
     ids: Vec<(RowId, u64)>,
     /// The snapshot's rows, which the next one shares whole when no row changed.
@@ -245,6 +247,12 @@ pub(super) struct RowCache {
 }
 
 impl RowCache {
+    /// How many palettes the rows were drawn in, one after another: a change means every row,
+    /// history's too, looks different.
+    pub(super) const fn palettes(&self) -> u64 {
+        self.palettes
+    }
+
     /// The cached row for the live row `live` at `index`, if it is what it holds: its own row
     /// found by id (at the same index, else by `by_id`, built on first need), at the cached version
     /// or, at another version, with the same cells and no links.
@@ -348,6 +356,7 @@ impl Grid {
         if palette != cache.palette {
             *cache = RowCache {
                 palette,
+                palettes: cache.palettes.saturating_add(1),
                 ..RowCache::default()
             };
         }
@@ -595,9 +604,6 @@ impl Grid {
     pub(super) fn shifted(&self, shifts: &Shifts) -> Option<Self> {
         if shifts.is_empty() {
             return Some(self.clone());
-        }
-        if !shifts.fit(self.size.rows) {
-            return None;
         }
         let mut lines = self.lines.to_vec();
         let mut filled = vec![false; usize::from(self.size.rows)];

@@ -7,8 +7,10 @@
     expect(clippy::disallowed_methods, reason = "tests spawn freely")
 )]
 
+mod spawn;
+
 use std::io::{BufRead as _, BufReader};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -33,7 +35,8 @@ fn a_server_whose_binary_was_removed_still_starts_sessions() {
         let installed = dir.join("koh");
         std::fs::copy(env!("CARGO_BIN_EXE_koh"), &installed).expect("install a copy of koh");
         let client_key = dir.join("client.key");
-        let id = Command::new(env!("CARGO_BIN_EXE_koh"))
+        let id = spawn::command(env!("CARGO_BIN_EXE_koh"))
+            .expect("spawn koh")
             .arg("id")
             .arg("--key-file")
             .arg(&client_key)
@@ -41,7 +44,8 @@ fn a_server_whose_binary_was_removed_still_starts_sessions() {
             .expect("koh id");
         let client_id = String::from_utf8_lossy(&id.stdout).trim().to_owned();
 
-        let mut server = Command::new(&installed)
+        let mut server = spawn::command(&installed)
+            .expect("spawn koh")
             .args(["serve", "--local", "--allow", &client_id, "--shell", "sh"])
             .arg("--key-file")
             .arg(dir.join("server.key"))
@@ -81,6 +85,7 @@ fn a_server_whose_binary_was_removed_still_starts_sessions() {
             ],
             "xterm-256color",
             &Launcher::new(env!("CARGO_BIN_EXE_koh")),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn the client");
         let seen = Arc::new(Mutex::new(String::new()));

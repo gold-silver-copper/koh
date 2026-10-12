@@ -60,12 +60,16 @@ impl KeyFile {
     /// directory.
     pub fn open_existing(path: &Path) -> anyhow::Result<Option<Self>> {
         let (name, parent) = split(path)?;
-        match std::fs::metadata(parent) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        }
-        let key = Self::judge(path, name, parent)?;
+        let key = match Self::judge(path, name, parent) {
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None)
+            }
+            judged => judged?,
+        };
         match std::fs::symlink_metadata(&key.path) {
             Ok(_) => Ok(Some(key)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -154,8 +158,7 @@ impl KeyFile {
         let secret = crate::transport_iroh::generate_secret_key()?;
         // Held until this returns: creators take turns, so only the first finds the key absent,
         // and a reader sees no key or a whole one.
-        let directory = File::open(&self.dir)?;
-        directory.lock()?;
+        let _locked = self.lock_dir()?;
         match std::fs::symlink_metadata(&self.path) {
             Ok(_) => return self.read_secret(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -198,12 +201,27 @@ impl KeyFile {
         name: &str,
         update: impl FnOnce(Option<String>) -> anyhow::Result<Option<String>>,
     ) -> anyhow::Result<()> {
-        let directory = File::open(&self.dir)?;
-        directory.lock()?;
+        let _locked = self.lock_dir()?;
         if let Some(contents) = update(self.read_beside(name)?)? {
             publish(&self.beside(name)?, contents.as_bytes())?;
         }
         Ok(())
+    }
+
+    /// The directory's lock, held until dropped: a private file in it, which no other user can
+    /// open, and so hold to hang koh, as they could the directory itself.
+    fn lock_dir(&self) -> Result<File, SetupError> {
+        let lock = open_private(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600),
+            &self.dir.join(".koh-dir-lock"),
+            Kind::Beside,
+        )?;
+        lock.lock()?;
+        Ok(lock)
     }
 
     /// `name`'s path in the key's directory: a plain file name, never a path.
@@ -728,6 +746,7 @@ mod tests {
     fn a_fifo_log_or_key_is_refused_without_waiting_for_a_reader() {
         let dir = Scratch::new("fifo-log", 0o700);
         let path = dir.0.join("koh.log");
+        #[expect(clippy::disallowed_methods, reason = "mkfifo, to plant a FIFO")]
         let made = std::process::Command::new("mkfifo").arg(&path).status();
         if !made.is_ok_and(|status| status.success()) {
             return; // No mkfifo here, so nothing to test.
@@ -769,6 +788,7 @@ mod tests {
     fn reset_refuses_a_fifo_without_waiting_for_a_writer() {
         let dir = Scratch::new("fifo", 0o700);
         let path = dir.0.join("id.key");
+        #[expect(clippy::disallowed_methods, reason = "mkfifo, to plant a FIFO")]
         let made = std::process::Command::new("mkfifo").arg(&path).status();
         if !made.is_ok_and(|status| status.success()) {
             return; // No mkfifo here, so nothing to test.

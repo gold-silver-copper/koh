@@ -13,6 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use miniz_oxide::deflate::core::CompressorOxide;
 use serde::{Deserialize, Serialize};
 
 use crate::events::{check_events, InputEvent, WireColours};
@@ -189,6 +190,8 @@ pub enum ProtoError {
     NotAFrame,
     #[error("a server stream of an unknown kind")]
     UnknownStream,
+    #[error("a frame's rows out of order or repeated")]
+    Unordered,
     #[error("more than {MAX_PENDING_HISTORY} history requests waiting")]
     TooManyRequests,
     #[error("input no terminal sends: {0}")]
@@ -325,29 +328,28 @@ const TAG_HISTORY: u8 = 1;
 /// the rows, and the client refuses a frame whose base it does not hold, so the dictionaries cannot
 /// disagree. The blank screen's dictionary is empty.
 pub fn encode_frame(frame: &Frame, base: &TerminalScreen) -> Result<Vec<u8>, ProtoError> {
-    let rows = changed_rows(frame);
-    encode_frame_primed(
-        frame,
-        &rows,
-        Primed::new(&dictionary_for(
-            frame.base,
-            base,
-            &rows,
-            &mut RowEncodings::default(),
-        )),
-    )
+    FrameEncoder::default().encode(frame, base)
 }
 
 /// [`encode_frame`] with the dictionary already made.
 pub fn encode_frame_with(frame: &Frame, dictionary: &[u8]) -> Result<Vec<u8>, ProtoError> {
-    encode_frame_primed(frame, &changed_rows(frame), Primed::new(dictionary))
+    encode_frame_compressed(frame, &changed_rows(frame), &mut compressor(), dictionary)
 }
 
 /// Encodes frames for the server and the scoreboard alike, keeping rows' encodings for the next
-/// frame's dictionary.
-#[derive(Debug, Default)]
+/// frame's dictionary, and one compressor, reset for each frame rather than made anew.
 pub struct FrameEncoder {
     encodings: RowEncodings,
+    compressor: Box<CompressorOxide>,
+}
+
+impl Default for FrameEncoder {
+    fn default() -> Self {
+        Self {
+            encodings: RowEncodings::default(),
+            compressor: Box::new(compressor()),
+        }
+    }
 }
 
 impl FrameEncoder {
@@ -355,7 +357,7 @@ impl FrameEncoder {
     pub fn encode(&mut self, frame: &Frame, base: &TerminalScreen) -> Result<Vec<u8>, ProtoError> {
         let rows = changed_rows(frame);
         let dictionary = dictionary_for(frame.base, base, &rows, &mut self.encodings);
-        encode_frame_primed(frame, &rows, Primed::new(&dictionary))
+        encode_frame_compressed(frame, &rows, &mut self.compressor, &dictionary)
     }
 }
 
@@ -379,42 +381,42 @@ pub fn dictionary_for(
     }
 }
 
-/// A compressor that has taken a dictionary in, to compress a frame after it.
-#[derive(Clone)]
-pub struct Primed(miniz_oxide::deflate::core::CompressorOxide);
-
-impl Primed {
-    /// A compressor primed with `dictionary`.
-    pub fn new(dictionary: &[u8]) -> Self {
-        use miniz_oxide::deflate::core::{
-            compress_to_output, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush,
-        };
-        let flags = create_comp_flags_from_zip_params(COMPRESSION_LEVEL.into(), -15, 0);
-        let mut compressor = CompressorOxide::new(flags);
-        if !dictionary.is_empty() {
-            let _ = compress_to_output(&mut compressor, dictionary, TDEFLFlush::Sync, |_| true);
-        }
-        Self(compressor)
-    }
-
-    /// `raw` compressed as if it followed the dictionary.
-    fn compress(mut self, raw: &[u8]) -> Vec<u8> {
-        use miniz_oxide::deflate::core::{compress_to_output, TDEFLFlush};
-        let mut out = Vec::with_capacity(raw.len().div_euclid(2).saturating_add(64));
-        let _ = compress_to_output(&mut self.0, raw, TDEFLFlush::Finish, |bytes| {
-            out.extend_from_slice(bytes);
-            true
-        });
-        out
-    }
+/// A raw DEFLATE compressor at [`COMPRESSION_LEVEL`].
+fn compressor() -> CompressorOxide {
+    use miniz_oxide::deflate::core::create_comp_flags_from_zip_params;
+    CompressorOxide::new(create_comp_flags_from_zip_params(
+        COMPRESSION_LEVEL.into(),
+        -15,
+        0,
+    ))
 }
 
-/// [`encode_frame`] with the rows it changes and a compressor primed with their dictionary.
-fn encode_frame_primed(frame: &Frame, rows: &[u16], primed: Primed) -> Result<Vec<u8>, ProtoError> {
+/// `raw` compressed as if it followed `dictionary`, by `compressor` reset first.
+fn compress(compressor: &mut CompressorOxide, dictionary: &[u8], raw: &[u8]) -> Vec<u8> {
+    use miniz_oxide::deflate::core::{compress_to_output, TDEFLFlush};
+    compressor.reset();
+    if !dictionary.is_empty() {
+        let _ = compress_to_output(compressor, dictionary, TDEFLFlush::Sync, |_| true);
+    }
+    let mut out = Vec::with_capacity(raw.len().div_euclid(2).saturating_add(64));
+    let _ = compress_to_output(compressor, raw, TDEFLFlush::Finish, |bytes| {
+        out.extend_from_slice(bytes);
+        true
+    });
+    out
+}
+
+/// A frame's stream: the rows it changes, then the frame compressed after their dictionary.
+fn encode_frame_compressed(
+    frame: &Frame,
+    rows: &[u16],
+    compressor: &mut CompressorOxide,
+    dictionary: &[u8],
+) -> Result<Vec<u8>, ProtoError> {
     let raw = postcard::to_allocvec(frame)?;
     let mut out = postcard::to_extend(&frame.base.0, vec![TAG_FRAME])?;
     out = postcard::to_extend(&rows, out)?;
-    out.extend_from_slice(&primed.compress(&raw));
+    out.extend_from_slice(&compress(compressor, dictionary, &raw));
     Ok(out)
 }
 
@@ -422,11 +424,11 @@ fn encode_frame_primed(frame: &Frame, rows: &[u16], primed: Primed) -> Result<Ve
 pub fn encode_history(reply: &HistoryReply) -> Result<Vec<u8>, ProtoError> {
     let raw = postcard::to_allocvec(reply)?;
     let mut out = vec![TAG_HISTORY];
-    out.extend_from_slice(&Primed::new(&[]).compress(&raw));
+    out.extend_from_slice(&compress(&mut compressor(), &[], &raw));
     Ok(out)
 }
 
-/// What [`Primed`] compressed after `dictionary`, at most `limit` bytes of it, or `None`
+/// What [`compress`] compressed after `dictionary`, at most `limit` bytes of it, or `None`
 /// if `body` is corrupt or inflates past the limit. The dictionary is the window the body's
 /// back-references reach into; nothing reaches before it.
 fn inflate_with(dictionary: &[u8], body: &[u8], limit: usize) -> Option<Vec<u8>> {
@@ -491,15 +493,19 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMsg, ProtoError> {
     }
 }
 
-/// The rows a frame's stream names, and what follows: a count, at most [`MAX_DIM`], then each row.
-/// Read one by one, so a hostile count allocates nothing it does not carry.
+/// The rows a frame's stream names, and what follows: a count, at most [`MAX_DIM`], then each row,
+/// strictly ascending, as a diff lists them. Read one by one, so a hostile count allocates nothing
+/// it does not carry, and a row named twice (whose dictionary would repeat it) is refused.
 fn take_rows(bytes: &[u8]) -> Result<(Vec<u16>, &[u8]), ProtoError> {
     let (count, mut rest) = postcard::take_from_bytes::<u32>(bytes)?;
     let count = usize::try_from(count).unwrap_or(usize::MAX);
     at_most(count, usize::from(crate::terminal::MAX_DIM))?;
-    let mut rows = Vec::with_capacity(count);
+    let mut rows: Vec<u16> = Vec::with_capacity(count);
     for _ in 0..count {
         let (row, after) = postcard::take_from_bytes::<u16>(rest)?;
+        if rows.last().is_some_and(|&last| last >= row) {
+            return Err(ProtoError::Unordered);
+        }
         rows.push(row);
         rest = after;
     }
@@ -660,6 +666,7 @@ mod tests {
         let key = |key, mods, kitty| InputEvent::Key(WireKey { key, mods, kitty });
         let bad = [
             keys(vec![key(WireKeyCode::Char('a'), 0x08, None)]),
+            keys(vec![key(WireKeyCode::F(0), 0, None)]),
             keys(vec![key(WireKeyCode::F(13), 0, None)]),
             keys(vec![key(
                 WireKeyCode::Char('a'),
@@ -667,6 +674,16 @@ mod tests {
                 Some(WireKitty {
                     code: Some(0xdfff),
                     shifted: None,
+                    base: None,
+                    mods: 0,
+                }),
+            )]),
+            keys(vec![key(
+                WireKeyCode::Char('a'),
+                0,
+                Some(WireKitty {
+                    code: None,
+                    shifted: Some(0x11_0000),
                     base: None,
                     mods: 0,
                 }),
@@ -802,6 +819,19 @@ mod tests {
         }
         assert!(decode_frame(b"not deflate at all", &base).is_err());
         assert!(decode_frame(b"\x07unknown", &base).is_err());
+    }
+
+    #[test]
+    fn a_frame_naming_a_row_twice_or_out_of_order_is_refused() {
+        // `[5; 1000]` would have the dictionary repeat one row a thousand times.
+        for rows in [vec![5_u16; 1000], vec![5, 5], vec![6, 5]] {
+            let mut bytes = postcard::to_extend(&9_u64, vec![TAG_FRAME]).unwrap();
+            bytes = postcard::to_extend(&rows, bytes).unwrap();
+            assert!(
+                matches!(decode_server(&bytes), Err(ProtoError::Unordered)),
+                "{rows:?}"
+            );
+        }
     }
 
     #[test]

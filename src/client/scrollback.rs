@@ -14,7 +14,8 @@ use fux_vt::keys::mouse::{MouseAction, MouseButton, MouseEvent};
 use fux_vt::keys::{Direction, Key, KeyPress};
 
 use crate::terminal::{
-    HistoryCache, HistoryMark, HistoryReply, HistoryRequest, TerminalScreen, MAX_HISTORY_ROWS,
+    HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryTicket, TerminalScreen,
+    MAX_HISTORY_ROWS,
 };
 
 /// Most history requests a client has unanswered: enough to keep rows coming while one is
@@ -46,7 +47,7 @@ pub struct Scrollback {
     /// The history as the newest screen showed it.
     mark: HistoryMark,
     /// Requests sent and not answered, oldest first: the server answers in order.
-    outstanding: Vec<HistoryRequest>,
+    outstanding: Vec<HistoryTicket>,
     /// A search of the history, while one is typed or under way.
     search: Option<Search>,
 }
@@ -145,13 +146,16 @@ impl Scrollback {
         }
     }
 
-    /// History rows arrived: keep them. A malformed answer is dropped whole.
+    /// History rows arrived, the answer to the oldest request outstanding: keep the rows it asked
+    /// for. An answer to nothing, and a malformed one, are dropped whole.
     pub fn on_reply(&mut self, reply: &HistoryReply) {
-        if !self.outstanding.is_empty() {
-            self.outstanding.remove(0);
+        if self.outstanding.is_empty() {
+            tracing::debug!("dropping history rows nobody asked for");
+            return;
         }
+        let asked = self.outstanding.remove(0);
         let near = self.focus();
-        if self.cache.insert(reply, self.mark, near).is_none() {
+        if self.cache.insert(reply, asked, self.mark, near).is_none() {
             tracing::debug!("dropping malformed history rows");
         }
         self.advance_search();
@@ -233,8 +237,7 @@ impl Scrollback {
         }
         // A search under way asks for the rows it is waiting on first.
         if let Some(request) = self.search_request() {
-            self.outstanding.push(request);
-            return Some(request);
+            return Some(self.send(request));
         }
         let rows_u64 = u64::from(rows);
         let (newest, span) = match self.view {
@@ -267,12 +270,17 @@ impl Scrollback {
             .take_while(|&name| !self.cache.holds(name) && !self.asked(name))
             .take(usize::from(MAX_HISTORY_ROWS))
             .count();
-        let request = HistoryRequest {
+        Some(self.send(HistoryRequest {
             newest: missing,
             count: u16::try_from(run).unwrap_or(MAX_HISTORY_ROWS),
-        };
-        self.outstanding.push(request);
-        Some(request)
+        }))
+    }
+
+    /// `request`, sent: its ticket is kept until the answer.
+    fn send(&mut self, request: HistoryRequest) -> HistoryRequest {
+        let (request, ticket) = request.ask();
+        self.outstanding.push(ticket);
+        request
     }
 
     /// The rows a search waits on, if it does and they are not asked for.
@@ -302,9 +310,7 @@ impl Scrollback {
 
     /// Whether an unanswered request covers the row named `name`.
     fn asked(&self, name: u64) -> bool {
-        self.outstanding.iter().any(|request| {
-            name <= request.newest && request.newest.saturating_sub(name) < u64::from(request.count)
-        })
+        self.outstanding.iter().any(|ticket| ticket.covers(name))
     }
 
     /// The connection was lost: requests on it will not be answered.

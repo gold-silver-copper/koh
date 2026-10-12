@@ -1,14 +1,12 @@
 //! The `koh connect` command: dial the server and run [`crate::client::run_client`] on the real
 //! terminal.
 
-use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
-use tokio::signal::unix::SignalKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
@@ -127,6 +125,10 @@ impl BellHook {
         title: &str,
         parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     ) -> std::process::Command {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the user's own --on-bell command"
+        )]
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg(&self.command).env_clear();
         for (k, v) in parent_env {
@@ -206,11 +208,10 @@ fn warn_if_locale_not_utf8() {
     });
     if !looks_utf8 {
         let shown = locale.as_deref().unwrap_or("(unset)");
-        let _ =
-            writeln!(std::io::stderr().lock(),
+        crate::log::stderr(&crate::log::Clean::new(format_args!(
             "koh: warning: locale {shown} does not look UTF-8; non-ASCII output may be garbled. \
              Set e.g. LANG=en_US.UTF-8."
-        );
+        )));
     }
 }
 
@@ -224,10 +225,9 @@ fn log_to_koh_log() {
     match crate::identity::open_private_log(&path) {
         Ok(file) => crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG),
         Err(e) => {
-            let _ = writeln!(
-                std::io::stderr().lock(),
+            crate::log::stderr(&crate::log::Clean::new(format_args!(
                 "koh: warning: $KOH_LOG: {e}; file logging disabled"
-            );
+            )));
         }
     }
 }
@@ -317,15 +317,7 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     let dialed_at = std::time::SystemTime::now();
     let shutdown = CancellationToken::new();
     // Armed before raw mode is entered, so an install error surfaces while the terminal is cooked.
-    crate::cancel_on_signals(
-        &shutdown,
-        &[
-            SignalKind::terminate(),
-            SignalKind::interrupt(),
-            SignalKind::hangup(),
-        ],
-    )
-    .context("installing the signal handlers")?;
+    crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
     let (channels, tasks) = super::spawn_client_io()?;
     let result = async {
         let backend = DefaultBackend::new().context("acquiring the terminal")?;

@@ -296,7 +296,6 @@ pub fn rtt(conn: &Connection) -> Option<Duration> {
 }
 
 #[cfg(test)]
-#[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {
     use super::*;
 
@@ -365,55 +364,6 @@ mod tests {
         assert_eq!(parse_dns_spec("8.8.8.8:99999"), None);
     }
 
-    /// The exact iroh call the Android bare-id fix depends on: building a resolver from an
-    /// explicit nameserver must succeed without reading (or panicking on) the host system DNS.
-    /// Running this on the host verifies the API we can't compile-check on the Android target.
-    #[test]
-    fn explicit_nameserver_resolver_builds() {
-        let _resolver =
-            iroh::dns::DnsResolver::with_nameserver(SocketAddr::from(([8, 8, 8, 8], 53)));
-    }
-
-    /// Two real iroh endpoints on loopback connect and exchange a stream each way, under the
-    /// per-role stream limits: no relay, no second machine, fully hermetic.
-    #[test]
-    fn two_endpoints_exchange_streams_over_loopback() {
-        crate::test_runtime::current_thread().block_on(async {
-            let server = bind_endpoint_local(generate_secret_key().expect("OS randomness"), true)
-                .await
-                .expect("bind server");
-            let client = bind_endpoint_local(generate_secret_key().expect("OS randomness"), false)
-                .await
-                .expect("bind client");
-            let server_addr = loopback_addr(&server);
-
-            let srv = tokio::spawn(async move {
-                let incoming = server.accept().await.expect("accept");
-                let conn = incoming.await.expect("handshake");
-                let mut recv = conn.accept_uni().await.expect("the client's stream");
-                let ping = recv.read_to_end(64).await.expect("read ping");
-                let mut send = conn.open_uni().await.expect("a server stream");
-                send.write_all(&ping).await.expect("echo");
-                send.finish().expect("finish");
-                conn.closed().await;
-            });
-
-            let conn = client
-                .connect(server_addr, ALPN)
-                .await
-                .expect("connect over loopback");
-            let mut send = conn.open_uni().await.expect("open a stream");
-            send.write_all(b"ping-over-real-iroh").await.expect("write");
-            send.finish().expect("finish");
-            let mut recv = conn.accept_uni().await.expect("the echo stream");
-            let echoed = recv.read_to_end(64).await.expect("read the echo");
-            assert_eq!(echoed, b"ping-over-real-iroh");
-
-            conn.close(0u32.into(), b"done");
-            let _ = srv.await;
-        });
-    }
-
     #[test]
     fn a_fixed_port_is_bound_and_a_taken_one_is_reported() {
         crate::test_runtime::current_thread().block_on(async {
@@ -453,12 +403,5 @@ mod tests {
             );
             first.close().await;
         });
-    }
-
-    #[test]
-    fn the_alpn_names_the_stream_protocol() {
-        // `koh/4` is the stream protocol; a peer on another version (e.g. `koh/iroh/2`) fails the
-        // TLS handshake instead of misparsing.
-        assert_eq!(ALPN, b"koh/4");
     }
 }

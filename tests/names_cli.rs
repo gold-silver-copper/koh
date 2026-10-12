@@ -6,8 +6,10 @@
 //! directory and the user's own `~/.config/koh` is never read or written.
 #![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 
+mod spawn;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +20,7 @@ use koh::pty::{Launcher, Pty};
 fn unwritable_stdout_and_stderr_do_not_panic() {
     let home = Home::new("failed-output").expect("scratch home");
     for discard_diagnostics in [false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_koh"));
+        let mut command = spawn::command(env!("CARGO_BIN_EXE_koh")).expect("spawn koh");
         command
             .args(["key", "info"])
             .env("HOME", &home.0)
@@ -64,7 +66,7 @@ impl Home {
 
     /// `koh args…` in this home, its stdin closed.
     fn koh(&self, args: &[&str]) -> anyhow::Result<Output> {
-        Ok(Command::new(env!("CARGO_BIN_EXE_koh"))
+        Ok(spawn::command(env!("CARGO_BIN_EXE_koh"))?
             .args(args)
             .env("HOME", &self.0)
             .env("XDG_CONFIG_HOME", self.0.join(".config"))
@@ -232,7 +234,8 @@ fn serve_without_allow_allows_the_saved_clients() {
     assert!(!out.status.success(), "no clients: {}", text(&out));
     assert!(text(&out).contains("koh clients add"), "{}", text(&out));
     home.koh(&["clients", "add", "phone", &some_id(3)]).unwrap();
-    let mut server = Command::new(env!("CARGO_BIN_EXE_koh"))
+    let mut server = spawn::command(env!("CARGO_BIN_EXE_koh"))
+        .expect("spawn koh")
         .args(["serve", "--local", "--shell", "sh"])
         .env("HOME", &home.0)
         .env("XDG_CONFIG_HOME", home.0.join(".config"))
@@ -307,8 +310,15 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
     home.koh(&["servers", "add", "laptop", &some_id(1)])
         .unwrap();
     runtime().unwrap().block_on(async {
-        let (mut menu, output) = Pty::spawn(24, 80, &home.argv(&[]), "xterm-256color", &launcher())
-            .expect("spawn koh on a PTY");
+        let (mut menu, output) = Pty::spawn(
+            24,
+            80,
+            &home.argv(&[]),
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn koh on a PTY");
         let buf = capture(output);
         wait_for(&buf, "koh — this machine", 10).await.unwrap();
         wait_for(&buf, "1  laptop", 5).await.unwrap();
@@ -348,21 +358,34 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
             .find(|s| s.is_ipv4())
             .map(std::net::SocketAddr::port)
             .unwrap();
-        let task = tokio::spawn(async move {
-            if let Some(incoming) = server.accept().await {
-                if let Ok(conn) = incoming.await {
-                    if koh::transport_iroh::admission::admit(&conn).await.is_ok() {
-                        let _ =
-                            koh::server::run_session(conn, &["sh".to_owned()], 0, launcher()).await;
-                    }
-                }
-            }
-        });
+        // The server allows this home's client, as `koh serve` would.
+        let me = home.koh(&["id"]).unwrap();
+        let config = koh::server::ServeConfig {
+            allow: vec![koh::transport_iroh::parse_endpoint_id(
+                String::from_utf8_lossy(&me.stdout).trim(),
+            )
+            .unwrap()],
+            command: vec!["sh".to_owned()],
+            launcher: launcher(),
+            ..koh::server::ServeConfig::default()
+        };
+        let task = tokio::spawn(koh::server::cli::serve_endpoint(
+            server,
+            koh::server::cli::Hosting::from_config(&config).unwrap(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         home.koh(&["servers", "add", "box", &id]).unwrap();
         let direct = format!("127.0.0.1:{port}");
         let argv = home.argv(&["connect", "box", "--direct", &direct]);
-        let (client, output) =
-            Pty::spawn(24, 80, &argv, "xterm-256color", &launcher()).expect("spawn the client");
+        let (client, output) = Pty::spawn(
+            24,
+            80,
+            &argv,
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn the client");
         let buf = capture(output);
         tokio::time::sleep(Duration::from_millis(2000)).await;
         client.write(b"echo by''_name\r".to_vec()).unwrap();
@@ -388,7 +411,8 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
     let me = home.koh(&["id"]).unwrap();
     let me = String::from_utf8_lossy(&me.stdout).trim().to_owned();
     home.koh(&["clients", "add", "other", &some_id(4)]).unwrap();
-    let mut server = Command::new(env!("CARGO_BIN_EXE_koh"))
+    let mut server = spawn::command(env!("CARGO_BIN_EXE_koh"))
+        .expect("spawn koh")
         .args(["serve", "--local", "--shell", "sh"])
         .env("HOME", &home.0)
         .env("XDG_CONFIG_HOME", home.0.join(".config"))
@@ -432,23 +456,30 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
             let endpoint = bind_endpoint_local(secret, false).await?;
             let conn = endpoint.connect(at, ALPN).await?;
             await_admission(&conn).await?;
-            conn.close(0u32.into(), b"done");
-            anyhow::Ok(())
+            anyhow::Ok((endpoint, conn))
         }
     };
     let outcomes = runtime().unwrap().block_on(async {
         let before = admitted().await.is_ok();
         home.koh(&["clients", "add", "me", &me]).unwrap();
-        let added = admitted().await.is_ok();
+        let live = admitted().await;
+        let added = live.is_ok();
         home.koh(&["clients", "rm", "me"]).unwrap();
+        // The connection it already had is cut off too.
+        let cut_off = match &live {
+            Ok((_, conn)) => tokio::time::timeout(Duration::from_secs(10), conn.closed())
+                .await
+                .is_ok(),
+            Err(_) => false,
+        };
         let removed = admitted().await.is_ok();
-        (before, added, removed)
+        (before, added, cut_off, removed)
     });
     let _ = server.kill();
     let _ = server.wait();
     assert_eq!(
         outcomes,
-        (false, true, false),
-        "(before it was saved, once saved, once removed)"
+        (false, true, true, false),
+        "(before it was saved, once saved, its live connection once removed, once removed)"
     );
 }

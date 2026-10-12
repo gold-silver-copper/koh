@@ -14,3 +14,5 @@ mod keys;
 mod link;
 mod predict;
 mod session;
+#[path = "../spawn/mod.rs"]
+mod spawn;

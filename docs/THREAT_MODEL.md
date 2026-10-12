@@ -103,8 +103,8 @@ service.
   checkpoint; its outcomes are logged structured under the `koh::auth` target.
 - **Untrusted data plane:** the protocol (`src/proto.rs`) and the connection cores
   (`src/server/mod.rs`, `src/client/session.rs`) are pure and panic-free by construction. Client
-  messages are length-capped (64 KiB of input each) and a frame is read and inflated with a 16 MiB
-  limit; each end keeps at most 16 recent screens, holding at most one screen of the largest size
+  messages are length-capped (about 1.06 MiB each, `MAX_CLIENT_MESSAGE`: a 1 MiB paste plus
+  64 KiB) and a frame is read and inflated with a 16 MiB limit; each end keeps at most 16 recent screens, holding at most one screen of the largest size
   beyond the one it needs (a row several share counted once), whatever the peer sends or withholds; QUIC
   stream limits and flow control bound what a peer can have in flight; and resize dimensions are
   clamped before any grid allocation.
@@ -120,11 +120,13 @@ service.
   `catch_unwind` or pre-filters control strings.
 - **Process / local:** `forbid(unsafe)` crate-wide; the identity key is the raw secret, protected
   by its permissions like an SSH host key: written `0600` (born-private atomic write), read with
-  `O_NOFOLLOW`, and re-tightened to 0600 through the open descriptor; a state dir another user can
-  write is refused; `KOH_*` env scrubbed before exec'ing the shell; PTY kill gated against pid reuse.
+  `O_NOFOLLOW`, and re-tightened to 0600 through the open descriptor; a state dir owned by another
+  user (but root), or world-writable without the sticky bit, is refused, and a group-accessible one
+  is warned about (members of its group could rename or delete the files in it); the directory's
+  lock is a private file in it, which no other user can hold; `KOH_*` env scrubbed before exec'ing
+  the shell; PTY kill gated against pid reuse.
 
-The detailed finding history (security audit + the K-/AR-/CR- review series) lives in the git log and
-the inline `KOH-`/`KR-`/`K-`/`AR-` rationale tags.
+The detailed finding history lives in [SECURITY.md's audit trail](../SECURITY.md#audit-trail).
 
 ## Non-goals (where koh does NOT match a hardened multi-user service)
 
@@ -136,4 +138,4 @@ the inline `KOH-`/`KR-`/`K-`/`AR-` rationale tags.
 - **No post-quantum key exchange yet:** transport crypto is inherited from iroh; koh is a policy-taker.
 - **Transport crypto is not koh's:** QUIC/TLS/KEX correctness is iroh/rustls/ring's responsibility.
 - **Not a substitute for ssh** where independent audit, compliance, or a multi-user/jail model is
-  required — see the README's comparison.
+  required.

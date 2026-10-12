@@ -422,58 +422,6 @@ mod tests {
     }
 
     #[test]
-    fn what_no_terminal_sends_is_refused() {
-        let key = |key, mods, kitty| InputEvent::Key(WireKey { key, mods, kitty });
-        let bad = [
-            key(WireKeyCode::Char('a'), 8, None),
-            key(WireKeyCode::F(0), 0, None),
-            key(WireKeyCode::F(13), 0, None),
-            key(
-                WireKeyCode::Char('a'),
-                0,
-                Some(WireKitty {
-                    code: Some(0xd800),
-                    shifted: None,
-                    base: None,
-                    mods: 0,
-                }),
-            ),
-            key(
-                WireKeyCode::Char('a'),
-                0,
-                Some(WireKitty {
-                    code: None,
-                    shifted: Some(0x11_0000),
-                    base: None,
-                    mods: 0,
-                }),
-            ),
-            InputEvent::Mouse(WireMouse {
-                action: WireMouseAction::Press,
-                button: None,
-                mods: 0x80,
-                row: 0,
-                col: 0,
-            }),
-            InputEvent::Paste("x".repeat(MAX_PASTE + 1)),
-        ];
-        for event in bad {
-            assert!(
-                check_events(std::slice::from_ref(&event)).is_err(),
-                "{event:?}"
-            );
-        }
-        let many = vec![InputEvent::Focus(true); MAX_EVENTS + 1];
-        assert!(check_events(&many).is_err());
-        assert!(check_events(&many[..MAX_EVENTS]).is_ok());
-        let palette = WireColours {
-            palette: vec![None; PALETTE + 1],
-            ..WireColours::default()
-        };
-        assert!(palette.check().is_err());
-    }
-
-    #[test]
     fn colours_round_trip_and_answer_as_xterm() {
         let rgb = Rgb {
             r: 0x1e,

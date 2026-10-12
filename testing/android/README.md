@@ -30,7 +30,8 @@ Note: `koh id` only prints the public key and never binds an endpoint, so the te
 ## Constraints (by design)
 
 - **Opt-in:** nothing runs unless `KOH_ANDROID_EMULATOR=1` **and** an emulator/device is connected.
-  Otherwise every entry point prints `SKIP` and exits 0 — it never affects `cargo test` or CI.
+  Otherwise every entry point prints `SKIP` and exits 0. Nothing here runs under `cargo test` or CI;
+  run the scripts directly.
 - **Does not touch koh's sources** — this is pure out-of-band test infra (and `testing/` is excluded from
   the published crate).
 - Idempotent and headless.
@@ -86,21 +87,15 @@ emulator -avd koh_test -no-window -no-audio -no-boot-anim -no-snapshot \
 # 2. Run the suite (builds + pushes + asserts)
 KOH_ANDROID_EMULATOR=1 sh testing/android/scripts/run.sh
 
-# …or via cargo (same thing, gated):
-KOH_ANDROID_EMULATOR=1 cargo test --test android_emulator -- --ignored --nocapture
-
 # 3. Shut the emulator down
 adb emu kill
 ```
 
 Individual tests are runnable on their own (e.g. `KOH_ANDROID_EMULATOR=1 sh
 testing/android/scripts/test-dns-resolver.sh`); run on their own they push the binary as built, so
-build first after a change. See `.env.example` for all knobs. `PROMPT.md` is the original task
-brief that generated this tier.
+build first after a change. See `.env.example` for all knobs.
 
-The security suite (`run-security.sh`, or `cargo test --test android_security -- --ignored`) runs the
-same way; `GREEN-security-run.txt` is a recorded passing run and `RED-security-run.txt` one against
-the build before the 0.3.1 security fixes.
+The security suite runs the same way: `KOH_ANDROID_EMULATOR=1 sh testing/android/scripts/run-security.sh`.
 
 ### Run times
 
@@ -126,8 +121,8 @@ and anything using evil-peer if it cannot be built.
 ## Stress suite
 
 A heavier, comprehensive suite that hammers koh on the emulator under load, churn, and adverse
-conditions — monitoring for crashes, panics, leaks, and resilience failures. Opt-in and CI-safe
-exactly like the smoke tests; pick intensity with `KOH_STRESS_LEVEL` (`quick`, the default, or
+conditions — monitoring for crashes, panics, leaks, and resilience failures. Opt-in exactly like
+the smoke tests; pick intensity with `KOH_STRESS_LEVEL` (`quick`, the default, or
 `full` for a soak).
 
 ```sh
@@ -135,8 +130,6 @@ exactly like the smoke tests; pick intensity with `KOH_STRESS_LEVEL` (`quick`, t
 KOH_ANDROID_EMULATOR=1 sh testing/android/scripts/run-stress.sh
 # heavy soak
 KOH_ANDROID_EMULATOR=1 KOH_STRESS_LEVEL=full sh testing/android/scripts/run-stress.sh
-# or via cargo
-KOH_ANDROID_EMULATOR=1 cargo test --test android_stress -- --ignored --nocapture
 # one dimension
 KOH_ANDROID_EMULATOR=1 sh testing/android/scripts/stress-throughput.sh
 ```
@@ -164,26 +157,9 @@ The opt-in tests self-SKIP (exit 0) unless enabled: `KOH_STRESS_NETEM=1` (netem 
 reach the internet). Do not `adb root` for them: it restarts the device shell as uid 0, and koh then
 refuses the harness's key files, which belong to the shell user.
 
-### Migrated from the old `testing/tier2/` (Docker network-realism scaffolding)
-
-`tier2/` was stale, never-run Docker scaffolding (it referenced the pre-rename `rmosh-server`/
-`rmosh-client` binaries). Its coverage now lives here:
-
-- **OS-level chaos** (`tier2/scripts/netem.sh`) → `stress-netem` — the same `tc netem`
-  delay±jitter/loss/reorder/duplicate, run beneath the real QUIC stack on the device.
-- **Relay path** (server + client meet only via a relay) → `stress-relay-discovery` — a bare-id
-  connection over the public relay (the path the Android DNS fix exists for).
-- **Roaming / outage resilience** → `stress-roaming` — a transient total network outage mid-session
-  (the single-host analogue of "the network went away and came back").
-
-What a **single emulator can't** faithfully reproduce, by design — and where it's covered instead:
-
-- **True roaming / QUIC connection migration** (the client's *source IP* changing while the server
-  stays reachable) needs two network paths. One emulator over loopback has one. `stress-roaming`
-  covers the user-facing resilience (session survives the outage); a literal IP-change migration
-  needs two hosts (or the old Docker multi-network setup).
-- **NAT-traversal hole-punching** needs a real NAT topology; the relay *path* is exercised by
-  `stress-relay-discovery`, but punching through to a direct path isn't single-host-reproducible.
+A single emulator over loopback has one network path, so true QUIC connection migration (the
+client's source IP changing) and NAT hole-punching need two hosts; `stress-roaming` and
+`stress-relay-discovery` cover the outage and relay path.
 
 Notes on the harness (learned the hard way against a real emulator):
 - All cross-process assertions read the **server log** or sample `/proc`: the client prints nothing
@@ -203,10 +179,7 @@ Notes on the harness (learned the hard way against a real emulator):
 ```
 testing/android/
 ├── README.md              # this file
-├── PROMPT.md              # the task brief
 ├── .env.example           # KOH_ANDROID_EMULATOR + SDK/NDK paths + knobs
-├── GREEN-security-run.txt # a recorded passing security run
-├── RED-security-run.txt   # the security run against koh 0.3.0, before its fixes
 ├── evil-peer/             # the malicious-peer harness (evil-client, evil-server); not published
 └── scripts/
     ├── lib.sh             # shared helpers (skip gate, build/push, adb run + exit-code capture)
@@ -234,7 +207,7 @@ testing/android/
     ├── stress-reattach-continuity.sh
     ├── stress-client-signals.sh
     ├── stress-netem.sh            # opt-in (KOH_STRESS_NETEM=1): tc delay/jitter/loss/reorder/dup
-    ├── stress-roaming.sh          # opt-in (KOH_STRESS_NETEM=1): total-outage resilience (ex-tier2 roam)
+    ├── stress-roaming.sh          # opt-in (KOH_STRESS_NETEM=1): total-outage resilience
     ├── stress-relay-discovery.sh  # opt-in (KOH_ANDROID_NET=1): real DNS via relay
     └── run-stress.sh      # stress orchestrator: guard → build → push → run all stress tests → tally
 ```

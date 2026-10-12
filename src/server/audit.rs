@@ -1,6 +1,6 @@
 //! Admission decisions as structured events, as sshd logs them: always the fields `event`,
-//! `outcome`, `peer` and `reason` under the `koh::auth` target, so fail2ban and the like match
-//! fields, not prose.
+//! `outcome`, `peer` and `reason` under the `koh::auth` target. There is no address to ban: a peer
+//! may come through a relay, and a new endpoint id costs nothing, so the allowlist is the gate.
 
 use iroh::EndpointId;
 

@@ -1,39 +1,5 @@
 use super::*;
-use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
-
-fn id(seed: u8) -> EndpointId {
-    iroh::SecretKey::from_bytes(&[seed; 32]).public()
-}
-
-/// A key directory of its own, removed afterwards.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "koh-menu-{tag}-{}-{:016x}",
-            std::process::id(),
-            getrandom::u64().unwrap()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Self(dir)
-    }
-
-    fn places(&self) -> Places {
-        Places {
-            client_key: self.0.join("client.key"),
-            server_key: self.0.join("server.key"),
-        }
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::names::tests::{id, Scratch};
 
 /// The menu given `typed`, and what it chose and printed.
 fn menu(places: &Places, typed: &str) -> (Choice, String) {
@@ -206,6 +172,15 @@ fn overwriting_a_name_asks_first() {
     assert_eq!(
         saved(&places, List::Servers),
         [("laptop".to_owned(), id(2))]
+    );
+    // A replacement that cannot be saved (the id is another name's) leaves the old one.
+    names::update(&places, List::Servers, |n| n.add("desk", id(3))).unwrap();
+    let typed = format!("a\ns\nlaptop\n{}\ny\nq\n", id(3));
+    let (_, shown) = menu(&places, &typed);
+    assert!(shown.contains("already saved as"), "{shown}");
+    assert_eq!(
+        saved(&places, List::Servers),
+        [("laptop".to_owned(), id(2)), ("desk".to_owned(), id(3))]
     );
 }
 

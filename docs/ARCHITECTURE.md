@@ -1,8 +1,7 @@
 # koh architecture
 
 How koh is built. The [README](../README.md) covers what it does and how to use it; this is the
-internals. Pair it with the [threat model](THREAT_MODEL.md) and the porting-research notes under
-[`research/`](research/).
+internals. Pair it with the [threat model](THREAT_MODEL.md).
 
 ## The one idea
 
@@ -28,22 +27,30 @@ src/
 ├── args.rs          the command line (clap's builder API) and the config structs it produces
 ├── lib.rs           crate root: module declarations + the architecture overview
 ├── proto.rs         the koh/4 wire protocol: client messages, screen frames, caps, pacing
+├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
+├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
+│   └── history.rs   scrollback rows, named for the wire
 ├── predict.rs       local-echo prediction engine (overlays, epochs)
 ├── transport_iroh/  iroh endpoint setup, the default key path, path RTT, admission
 ├── pty.rs           PTYs over fuxix, the `__launch` launcher sessions start through, reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
+│   ├── held.rs      the frames the server takes the client to hold
+│   └── audit.rs     admission decisions as structured `koh::auth` events
 ├── client/          the connection loop + ClientSession core + predictor + render + `connect`
+│   ├── scrollback.rs the scrollback view (`Ctrl-^ [`)
+│   ├── probe.rs     the start-up questions to the user's terminal and their replies
 │   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through fuxix::terminal)
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
 │   └── key_file.rs  KeyFile, the one owner of trust in a key path, its lock and $KOH_LOG
 ├── log.rs           the `RUST_LOG` filter `serve` and `connect` install (`target=level` directives)
 ├── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identities, reset one
 ├── names.rs         names for ids: `servers` and `clients` beside the keys, through `KeyFile`
-└── menu.rs          the menu `koh` alone opens on a terminal, over a reader and a writer
+├── menu.rs          the menu `koh` alone opens on a terminal, over a reader and a writer
+└── test_runtime.rs  tokio runtimes for async unit tests
 tests/net/           koh over a fault-injecting link between real iroh endpoints
-tests/               PTYs, sessions, loopback e2e, admission, the binary on a PTY, upgrade in
-                     place, key creation races, the corpus, and the Android suites (opt-in)
+tests/               PTYs, sessions, scrollback, the binary on a PTY, names, upgrade in place,
+                     key creation races, wire goldens and the corpus
 testing/corpus/      113 real programs' output (from fux), replayed by tests, oracle and bench
 testing/oracle/      koh at the working tree beside koh at a commit (`testing/oracle.sh`)
 testing/bench/       the scoreboard: koh beside mosh and ssh (`testing/scoreboard.sh`)
@@ -113,8 +120,9 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   newest name and a count (at most 256 rows); the server answers one request at a time, each on a
   stream below frames in priority, the next only once the last is delivered, so history never
   delays a frame or outruns the link. A named row's cells never change, so a row the client holds
-  is never sent again. The client keeps at most `HISTORY_CACHE_CELLS` (a million) cells of history,
-  dropping the rows farthest from its view; the server queues at most 8 requests, and one more is
+  is never sent again. The client keeps at most `HISTORY_CACHE_BYTES` (64 MiB, counting links and
+  each row's overhead) of history, and only replies it asked for, dropping the rows farthest from
+  its view; the server queues at most 8 requests, and one more is
   a protocol error.
 - **Bases are acknowledged frames.** The server diffs against the newest frame delivered, so a lost
   frame only delays the screen until the next one. When the server sends a
@@ -416,7 +424,10 @@ its shell exited, even while an old client still holds on (that client's screens
 the reconnect gets a new session). Its life is one `Phase` (attached,
   detached since when, exited), and an exited session is never reattached, even while an old
   client still holds on. A connection's final frame is the first one whose screen carries the exit
-  code. The registry's `Sessions` forgets a session only once its task has
+  code, and an ended session always has one: its exit is looked for at every tick, not only once
+  its terminal closed, and a program that closed its terminal and ran on ends it as hung up (129),
+  which teardown makes true. Teardown is awaited, and `serve` drains the reaper before it exits,
+  so a program that ignores SIGHUP is killed rather than left running. The registry's `Sessions` forgets a session only once its task has
   ended (its control channel is closed), so a late end cannot unregister the session that replaced
   it, and its shutdown ends every session, attached or not, and waits for their tasks.
 - **The bell hook.** `--on-bell <cmd>` / `ConnectConfig::bell_command` runs `sh -c` when
@@ -438,7 +449,19 @@ driving a real terminal, and the predictor reads screens through `predict::Scree
 ## Security internals
 
 The trust boundaries and the defenses at each are in the [threat model](THREAT_MODEL.md); each
-finding fixed, with the tests that guard it, is in [SECURITY.md](../SECURITY.md).
+finding fixed, with the tests that guard it, is in [SECURITY.md](../SECURITY.md). Two rules hold by
+construction rather than by care at each call:
+
+- **What a peer chose is escaped where it is written.** koh writes outside the session only to its
+  stderr and its log. `log::stderr` takes only `log::Clean` text, `std::io::stderr` is banned
+  elsewhere (`clippy.toml`), and the log's writer escapes control characters inside each event. An
+  error chain holding a server's close reason, or a log field holding a client's, can't reach a
+  terminal or forge a line.
+- **What a server makes the client keep is bounded by bytes, and asked for.** The history cache
+  counts each row's links and overhead (`KeptRow::bytes`) against `HISTORY_CACHE_BYTES`, and keeps
+  only rows the oldest outstanding request covers. A frame's rows are strictly ascending, and its
+  dictionary is built from the end, stopping at its window. Frame readers take their slot in the
+  frame queue before reading, so streams read and frames waiting share one bound.
 
 ## Testing tiers
 
@@ -457,8 +480,10 @@ deterministically:
   backpressure and shutdown; `proto` round-trips, size caps, truncation and inflate bombs.
 - **Terminal / predictor** — diff+resize, predict→confirm→clear, predict→no-echo→suppress.
 - **Property tests and fuzzing** on the attacker-reachable parsers — assert never-panic and bounded.
-  Coverage-guided fuzz targets: `screen_apply` (the structured diff), `server_process` and
-  `proto_decode` (both directions of the wire).
+  Coverage-guided fuzz targets (`fuzz/fuzz_targets/`): `screen_apply` (the structured diff),
+  `history_apply` (scrollback), `proto_decode` (both directions of the wire), `server_process`
+  (the hosted program's output), `server_input` and `client_input` (the user's input on each side)
+  and `probe_replies` (the terminal's start-up replies).
 - **The corpus** (`tests/corpus.rs`) — 113 recordings of real programs (`testing/corpus/`, from
   fux: shells, editors, pagers, TUIs, compilers, claude) through the whole pipeline in PTY-sized
   pieces with their resizes: snapshot, frame, encoder and decoder, `ClientSession`, koh's own
@@ -483,8 +508,9 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
 - **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs, started through
   the `koh` binary's `__launch`: output streaming and teardown, exit statuses, the
   reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its
-  terminal; the session registry's attach/reattach/cap/TTL/teardown; `run_session` and the
-  per-connection echo-ack over loopback iroh. On macOS `tests/pty.rs` first grows the kernel's PTY
+  terminal; the session registry's attach/reattach/cap/TTL/teardown; the real accept loop
+  (`serve_endpoint`, its allowlist and admission) and the per-connection echo-ack over loopback
+  iroh. On macOS `tests/pty.rs` first grows the kernel's PTY
   table past what its tests hold at once: an open that finds the table full while another PTY is
   being freed fails with ENXIO (the table grows 16 slots at a time and never shrinks), which its
   many short-lived PTYs hit on a fresh machine.
@@ -499,15 +525,15 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
 Two harnesses sit beside the tests, each its own Cargo workspace:
 
 - **The oracle** (`testing/oracle.sh`, [`testing/oracle/`](../testing/oracle/README.md)) runs koh
-  at the working tree and koh at a commit (the merge base with `origin/main` by default) on the
-  same sessions (the corpus, and random output, keystrokes, lost frames, time and resizes) and
-  compares what the user's terminal would show, the replies and the client's messages after every
-  step, reporting each side's frame bytes. A difference is shrunk and saved. It finds each of five
-  planted bugs (`testing/oracle.sh --plants`).
+  at the working tree and koh at a commit (by default the merge base with `origin/HEAD`, else
+  `origin/master`) on the same sessions (the corpus, and random output, keystrokes, lost frames,
+  time and resizes) and compares what the user's terminal would show, the replies and the client's
+  messages after every step, reporting each side's frame bytes. A difference is shrunk and saved.
+  It finds each of seven planted bugs (`testing/oracle.sh --plants`).
 - **The scoreboard** (`testing/scoreboard.sh`, [`testing/bench/`](../testing/bench/README.md))
-  writes [`SCOREBOARD.md`](SCOREBOARD.md): koh beside mosh and ssh by bytes on the wire for each
-  recording and synthetic workload, keystroke latency beside a flood on three links, server memory
-  per session and instructions retired.
+  measures koh beside mosh and ssh by bytes on the wire for each recording and synthetic workload,
+  keystroke latency beside a flood on three links, server memory per session and instructions
+  retired.
 
 Terminal I/O is behind `ClientTerminal`, so the same session loop runs against the real terminal
 (binary) or a capturing mock (tests). One layer down, `client::backend::KohBackend`'s provided
@@ -516,7 +542,7 @@ methods emit all the ANSI, so the bytes are pinned by tests against a capturing 
 ### Tier 2 — Android emulator: runtime, network realism, resilience ([`testing/android/`](../testing/android/))
 
 The layer a single in-process test can't reach: the **real `koh` binary on a real Android OS**,
-driven over `adb`. Opt-in (`KOH_ANDROID_EMULATOR=1`), never part of `cargo test`. A **smoke** suite
+driven over `adb` by scripts run directly, never part of `cargo test`. A **smoke** suite
 proves the Android iroh/DNS path binds without the `ndk-context` panic (a runtime-only bug
 cross-compilation can't catch); a **stress** suite hammers koh under load, churn, and adverse
 conditions (connection churn, concurrent sessions, throughput + memory-longevity leak checks, signal

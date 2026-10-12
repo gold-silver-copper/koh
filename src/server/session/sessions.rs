@@ -15,14 +15,16 @@ pub(super) struct Sessions {
     live: HashMap<EndpointId, mpsc::Sender<Attach>>,
     tasks: JoinSet<()>,
     spec: SessionSpec,
+    reaper: crate::pty::Reaper,
 }
 
 impl Sessions {
-    pub(super) fn new(spec: SessionSpec) -> Self {
+    pub(super) fn new(spec: SessionSpec, reaper: crate::pty::Reaper) -> Self {
         Self {
             live: HashMap::new(),
             tasks: JoinSet::new(),
             spec,
+            reaper,
         }
     }
 
@@ -49,7 +51,7 @@ impl Sessions {
             }
             None => attach,
         };
-        let (control, task) = start(&self.spec, attach);
+        let (control, task) = start(&self.spec, &self.reaper, attach);
         self.tasks.spawn(task);
         self.live.insert(peer, control);
     }

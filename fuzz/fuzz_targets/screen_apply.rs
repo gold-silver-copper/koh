@@ -55,7 +55,8 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     if let Some(shifts) = shifts(data) {
-        let scrolled = TerminalScreen::from_bytes(24, 80, "prior 日本\r\n\r\nscrolled\r\n".as_bytes());
+        let scrolled =
+            TerminalScreen::from_bytes(24, 80, "prior 日本\r\n\r\nscrolled\r\n".as_bytes());
         let mut diff = scrolled.diff_from(&prior);
         diff.shifts = shifts;
         let mut screen = prior;

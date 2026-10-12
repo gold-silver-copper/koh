@@ -60,11 +60,7 @@ impl PendingInput {
         self.replies = self.replies.saturating_add(bytes.len());
     }
 
-    fn flush(&mut self, pty: &crate::pty::Pty) {
-        self.flush_with(|bytes| pty.write(bytes));
-    }
-
-    fn flush_with(&mut self, write: impl FnOnce(Vec<u8>) -> Result<(), crate::pty::WriteError>) {
+    fn flush(&mut self, write: impl FnOnce(Vec<u8>) -> Result<(), crate::pty::WriteError>) {
         if self.is_empty() {
             return;
         }
@@ -86,18 +82,20 @@ pub struct PtyHost {
 }
 
 impl PtyHost {
-    /// Start `command` (empty for the login shell) through `launcher` at the default size; the host
-    /// and a receiver of its output. Blocks until the program starts.
+    /// Start `command` (empty for the login shell) through `launcher` at the default size, left to
+    /// `reaper` once closed; the host and a receiver of its output. Blocks until the program starts.
     pub fn spawn(
         command: &[String],
         scrollback: usize,
         launcher: &crate::pty::Launcher,
+        reaper: &crate::pty::Reaper,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let Size { rows, cols } = DEFAULT_SIZE;
         let emu = ServerTerminal::new(rows, cols, scrollback)
             .context("creating the terminal emulator")?;
-        let (pty, pty_rx) = crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", launcher)
-            .context("spawning shell")?;
+        let (pty, pty_rx) =
+            crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", launcher, reaper)
+                .context("spawning shell")?;
         Ok((Self { emu, pty }, pty_rx))
     }
 
@@ -106,9 +104,12 @@ impl PtyHost {
         self.emu.snapshot()
     }
 
-    /// Read the PTY's modes into the emulator, for the next snapshot; whether they changed.
+    /// Read the PTY's modes into the emulator, for the next snapshot; whether they changed. Modes
+    /// that cannot be read leave the last ones.
     pub fn refresh_tty(&mut self) -> bool {
-        self.emu.set_tty(self.pty.tty_modes())
+        self.pty
+            .tty_modes()
+            .is_some_and(|tty| self.emu.set_tty(tty))
     }
 
     /// The client's window is now `size` (clamped); whether that changed the size.
@@ -123,9 +124,10 @@ impl PtyHost {
         true
     }
 
-    /// Tear down; blocks joining the pump threads, so run it on `spawn_blocking`.
-    pub fn shutdown(self) {
-        self.pty.shutdown();
+    /// End it ([`Pty::close`](crate::pty::Pty::close)); blocks joining the pump threads, so run it
+    /// on `spawn_blocking`.
+    pub fn close(self) {
+        self.pty.close();
     }
 }
 
@@ -216,13 +218,15 @@ struct Attach(oneshot::Sender<Attached>);
 /// How many attaches may wait for one session; past them, one is refused as at capacity.
 const CONTROL_QUEUE: usize = 8;
 
-/// How long after the program's output ended the session waits to see it exit.
+/// How long the session waits, once the program's output ended or it exited, for the other: its
+/// exit, or the rest of its output.
 const ENDING_GRACE: Duration = Duration::from_secs(1);
 
-/// Start a session for `spec`, answering `first` once its program started: the sender that
-/// attaches to it, and the task that runs it.
+/// Start a session for `spec`, its program left to `reaper` once closed, answering `first` once it
+/// started: the sender that attaches to it, and the task that runs it.
 fn start(
     spec: &SessionSpec,
+    reaper: &crate::pty::Reaper,
     first: Attach,
 ) -> (
     mpsc::Sender<Attach>,
@@ -231,11 +235,13 @@ fn start(
     let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
     let command = Arc::clone(&spec.command);
     let (scrollback, ttl, launcher) = (spec.scrollback, spec.ttl, spec.launcher.clone());
+    let reaper = reaper.clone();
     let task = async move {
         // Forking and the program's exec block, and must hold up no other session.
-        let spawned =
-            tokio::task::spawn_blocking(move || PtyHost::spawn(&command, scrollback, &launcher))
-                .await;
+        let spawned = tokio::task::spawn_blocking(move || {
+            PtyHost::spawn(&command, scrollback, &launcher, &reaper)
+        })
+        .await;
         let (mut host, pty_rx) = match spawned.map_err(anyhow::Error::from).and_then(|s| s) {
             Ok(spawned) => spawned,
             Err(e) => {
@@ -300,10 +306,13 @@ async fn session_task(
     // The first client is attached, from `start`.
     let mut phase = Phase::Attached;
     let mut pending = PendingInput::default();
-    // When the program's output ended, and its exit once seen: it is looked for at every tick, for
-    // at most `ENDING_GRACE`, never waited on, as a program that closed its terminal may run on.
-    let mut ended: Option<Instant> = None;
+    // Whether the program's output ended, and its exit once seen: looked for at every tick, never
+    // waited on, as a program that closed its terminal may run on, and a job it left in the
+    // background may hold its terminal open after it exited. Once either is seen (`ending`), the
+    // other has `ENDING_GRACE`.
+    let mut output_ended = false;
     let mut exit: Option<crate::pty::Exit> = None;
+    let mut ending: Option<Instant> = None;
 
     // A frame the program is drawing (synchronized output) is not sent half drawn.
     let mut hold = FrameHold::default();
@@ -312,25 +321,27 @@ async fn session_task(
     tty_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
-        let grace_over = ended
+        if ending.is_none() && (output_ended || exit.is_some()) {
+            ending = Some(Instant::now());
+        }
+        let grace_over = ending
             .and_then(|at| at.checked_add(ENDING_GRACE))
             .is_some_and(|at| Instant::now() >= at);
-        if !matches!(phase, Phase::Exited) && ended.is_some() && (exit.is_some() || grace_over) {
+        if !matches!(phase, Phase::Exited) && ((output_ended && exit.is_some()) || grace_over) {
             // The program ended: publish a final screen carrying its status, whole even if it
-            // stopped mid-frame.
-            if let Some(exit) = exit {
-                host.emu.set_exit_code(exit.code);
-            }
+            // stopped mid-frame. There always is one, so a client always sees the end.
+            host.emu
+                .set_exit_code(exit.unwrap_or(crate::pty::Exit::HungUp).code());
             phase = Phase::Exited;
             screens_tx.send_replace(Arc::new(host.snapshot()));
         }
         // Retry keystrokes the PTY writer queue could not take last pass.
-        pending.flush(&host.pty);
+        pending.flush(|bytes| host.pty.write(bytes));
         let can_read_input = pending.is_empty();
         let running = !matches!(phase, Phase::Exited);
 
         tokio::select! {
-            chunk = pty_rx.recv(), if running && ended.is_none() => {
+            chunk = pty_rx.recv(), if running && !output_ended => {
                 if let Some(chunk) = chunk {
                     host.refresh_tty();
                     host.emu.process(&chunk);
@@ -343,14 +354,14 @@ async fn session_task(
                     if !replies.is_empty() {
                         // Query answers go to the program, not the screen.
                         pending.reply(&replies);
-                        pending.flush(&host.pty);
+                        pending.flush(|bytes| host.pty.write(bytes));
                     }
                     if let Some(screen) = hold.after_output(&mut host.emu, std::time::Instant::now()) {
                         screens_tx.send_replace(Arc::new(screen));
                     }
                 } else {
-                    ended = Some(Instant::now());
-                    exit = exit_of(&mut host);
+                    output_ended = true;
+                    exit = exit.or_else(|| exit_of(&mut host));
                 }
             },
             _ = until(hold.deadline().map(Instant::from_std)) => {
@@ -358,19 +369,19 @@ async fn session_task(
                     screens_tx.send_replace(Arc::new(screen));
                 }
             },
-            () = until(ended.and_then(|at| at.checked_add(ENDING_GRACE))), if running => {}
+            () = until(ending.and_then(|at| at.checked_add(ENDING_GRACE))), if running => {}
             input = input_rx.recv(), if can_read_input => {
                 // `input_tx` is held below, so this only ends with the task.
                 match input {
                     Some(ClientInput::Input(super::ToSession::Events(events))) => {
                         host.emu.encode_input(&events, &mut pending.bytes);
-                        pending.flush(&host.pty);
+                        pending.flush(|bytes| host.pty.write(bytes));
                     }
                     // A program that subscribed to scheme changes (mode 2031) hears of a new one
                     // on its input.
                     Some(ClientInput::Input(super::ToSession::Colours(colours))) => {
                         pending.bytes = host.emu.set_colours(&colours);
-                        pending.flush(&host.pty);
+                        pending.flush(|bytes| host.pty.write(bytes));
                     }
                     Some(ClientInput::Input(super::ToSession::Resize(size))) => {
                         if host.resize(size) {
@@ -379,7 +390,7 @@ async fn session_task(
                             // it on its input, after anything typed before.
                             if let Some(report) = host.emu.resize_report() {
                                 pending.reply(&report);
-                                pending.flush(&host.pty);
+                                pending.flush(|bytes| host.pty.write(bytes));
                             }
                             screens_tx.send_replace(Arc::new(host.snapshot()));
                         }
@@ -424,18 +435,17 @@ async fn session_task(
             },
             // The last client left, or none is left to see the exit. The only teardown of an
             // exited session, so it watches in every phase but Detached.
-            () = screens_tx.closed(), if !matches!(phase, Phase::Detached { .. }) => match phase {
-                Phase::Exited => break,
-                Phase::Attached => phase = Phase::Detached { since: Instant::now() },
-                Phase::Detached { .. } => {}
-            },
+            () = screens_tx.closed(), if !matches!(phase, Phase::Detached { .. }) => {
+                if matches!(phase, Phase::Exited) {
+                    break;
+                }
+                phase = Phase::Detached { since: Instant::now() };
+            }
             _ = pending_input_retry(!pending.is_empty()) => {}
             // A program may turn echo off without writing anything (a password prompt printed
             // first): the client hears of it within a tick.
             _ = tty_tick.tick(), if running => {
-                if ended.is_some() && exit.is_none() {
-                    exit = exit_of(&mut host);
-                }
+                exit = exit.or_else(|| exit_of(&mut host));
                 if matches!(phase, Phase::Attached) && host.refresh_tty() && !hold.holding() {
                     screens_tx.send_replace(Arc::new(host.snapshot()));
                 }
@@ -449,8 +459,9 @@ async fn session_task(
     }
 
     // Ended: the registry sees the closed control channel, clients their closed screens and input.
+    // The teardown is awaited, so the registry's shutdown waits for every program's hang-up.
     drop((control, screens_tx, input_rx));
-    tokio::task::spawn_blocking(move || host.shutdown());
+    let _ = tokio::task::spawn_blocking(move || host.close()).await;
 }
 
 /// A short wait before retrying pending keystrokes; never, with none pending.
@@ -475,6 +486,8 @@ struct AttachReq {
 pub struct Registry {
     tx: mpsc::Sender<AttachReq>,
     shutdown: CancellationToken,
+    /// What every session's program is left to once closed.
+    reaper: crate::pty::Reaper,
 }
 
 /// What the registry hosts, and the session TTL.
@@ -491,13 +504,19 @@ pub struct SessionSpec {
 const ATTACH_TRIES: usize = 3;
 
 impl Registry {
-    /// Spawn the registry task.
-    pub fn spawn(spec: SessionSpec) -> Self {
+    /// Spawn the registry task, and the reaper its sessions' programs are left to: failing to
+    /// start that fails here, before any session.
+    pub fn spawn(spec: SessionSpec) -> std::io::Result<Self> {
+        let reaper = crate::pty::Reaper::start()?;
         let (tx, rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
         #[expect(clippy::disallowed_methods, reason = "one registry a server")]
-        tokio::spawn(registry_task(spec, rx, shutdown.clone()));
-        Self { tx, shutdown }
+        tokio::spawn(registry_task(spec, reaper.clone(), rx, shutdown.clone()));
+        Ok(Self {
+            tx,
+            shutdown,
+            reaper,
+        })
     }
 
     /// Attach `peer` to its session, creating one if it has none.
@@ -516,10 +535,13 @@ impl Registry {
         Err(Refused::Failed)
     }
 
-    /// Stop the registry and every session, and wait for them to end.
+    /// Stop the registry and every session, and wait for them to end and their programs to be
+    /// reaped, each killed once its grace is over.
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         self.tx.closed().await;
+        let reaper = self.reaper;
+        let _ = tokio::task::spawn_blocking(move || reaper.drain()).await;
     }
 }
 
@@ -527,10 +549,11 @@ impl Registry {
 /// other peer.
 async fn registry_task(
     spec: SessionSpec,
+    reaper: crate::pty::Reaper,
     mut rx: mpsc::Receiver<AttachReq>,
     shutdown: CancellationToken,
 ) {
-    let mut sessions = sessions::Sessions::new(spec);
+    let mut sessions = sessions::Sessions::new(spec, reaper);
     loop {
         let AttachReq { peer, reply } = tokio::select! {
             // A shutdown starts no session for a request still queued.
@@ -557,7 +580,7 @@ mod tests {
             bytes: b"typed".to_vec(),
             ..PendingInput::default()
         };
-        pending.flush_with(|bytes| Err(crate::pty::WriteError::Full(bytes)));
+        pending.flush(|bytes| Err(crate::pty::WriteError::Full(bytes)));
         pending.reply(b"\x1b[1;1R");
         pending.reply(b"\x1b[48;24;80;0;0t");
         let expected = pending.bytes.clone();
@@ -570,20 +593,20 @@ mod tests {
         );
         assert!(pending.overflow_reported);
         let pointer = pending.bytes.as_ptr();
-        pending.flush_with(|bytes| Err(crate::pty::WriteError::Full(bytes)));
+        pending.flush(|bytes| Err(crate::pty::WriteError::Full(bytes)));
         assert_eq!(
             pending.bytes.as_ptr(),
             pointer,
             "backpressure retains the buffer"
         );
-        pending.flush_with(|bytes| {
+        pending.flush(|bytes| {
             assert_eq!(bytes, b"typed\x1b[1;1R\x1b[48;24;80;0;0t");
             Ok(())
         });
         assert!(pending.is_empty());
         assert!(!pending.overflow_reported);
         pending.reply(b"next");
-        pending.flush_with(|bytes| Err(crate::pty::WriteError::Closed(bytes)));
+        pending.flush(|bytes| Err(crate::pty::WriteError::Closed(bytes)));
         assert!(
             pending.is_empty(),
             "closed writers do not retain pending input"

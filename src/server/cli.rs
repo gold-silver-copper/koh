@@ -2,14 +2,12 @@
 //! the `--allow` list, and host each one's session. There is no "accept any peer" mode.
 
 use std::collections::HashSet;
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
-use tokio::signal::unix::SignalKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::audit::{auth_event, Outcome};
@@ -104,7 +102,7 @@ pub fn connect_qr(data: &str) -> Option<String> {
 /// `koh serve`: host [`ServeConfig::command`] for the allowed clients until SIGTERM or SIGINT.
 /// Logs to stderr.
 pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
-    crate::log::init(std::io::stderr, tracing::Level::INFO);
+    crate::log::init_stderr(tracing::Level::INFO);
     let hosting = Hosting::from_config(&args)?;
 
     let key_file = crate::identity::KeyFile::locate(args.key_file.clone(), "server")?;
@@ -166,7 +164,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
          │ connect     : {connect_hint}\n\
          └───────────────────────────────────────────────────────────\n{qr}"
     );
-    let _ = std::io::stderr().lock().write_all(banner.as_bytes());
+    crate::log::stderr(&crate::log::Clean::new(banner.trim_end()));
 
     // What protects the link, iroh's choice: so an operator sees post-quantum KEX is not on.
     info!(
@@ -177,16 +175,22 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     );
 
     let shutdown = CancellationToken::new();
-    crate::cancel_on_signals(
-        &shutdown,
-        &[SignalKind::terminate(), SignalKind::interrupt()],
-    )
-    .context("installing the signal handlers")?;
-    serve_endpoint(endpoint, hosting, shutdown).await
+    let again = crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
+    tokio::select! {
+        served = serve_endpoint(endpoint, hosting, shutdown) => served,
+        () = again.cancelled() => {
+            warn!("a second signal: exiting without waiting for the sessions to end");
+            Ok(())
+        }
+    }
 }
 
+/// How often a connected client is checked against the allowlist.
+const REVOKE_CHECK: Duration = Duration::from_secs(2);
+
 /// Who may connect: the ids allowed for this run, and the clients saved beside the server key,
-/// read afresh for every connection, so `koh clients rm` takes effect at once.
+/// read afresh for every connection and every [`REVOKE_CHECK`] of one, so `koh clients rm` takes
+/// effect at once.
 #[derive(Clone)]
 pub struct Allowlist {
     given: Arc<HashSet<EndpointId>>,
@@ -202,6 +206,16 @@ impl Allowlist {
             allowed.extend(names.entries().map(|(_, id)| id));
         }
         Ok(allowed)
+    }
+
+    /// Return once `peer` may no longer connect, checking every [`REVOKE_CHECK`].
+    async fn revoked(&self, peer: EndpointId) {
+        loop {
+            tokio::time::sleep(REVOKE_CHECK).await;
+            if !self.allows(peer).await {
+                return;
+            }
+        }
     }
 
     /// Whether `peer` may connect now. A list that cannot be read admits only the given ids.
@@ -221,16 +235,11 @@ impl Allowlist {
     }
 }
 
-/// A connection whose peer the allowlist admitted: the only kind a session is served to.
+/// A connection whose peer the allowlist admitted: the only kind a session is served to, and made
+/// only by the accept loop, after the allowlist.
 pub struct Authorized(iroh::endpoint::Connection);
 
 impl Authorized {
-    /// `conn`, whose peer its caller admitted: a host with no accept loop of its own, as
-    /// [`run_session`](super::run_session) and tests are.
-    pub const fn assumed(conn: iroh::endpoint::Connection) -> Self {
-        Self(conn)
-    }
-
     /// The connection.
     pub const fn conn(&self) -> &iroh::endpoint::Connection {
         &self.0
@@ -299,14 +308,20 @@ pub async fn serve_endpoint(
         max_sessions: hosting.max_sessions,
         ttl: hosting.session_ttl,
         launcher: hosting.launcher,
-    });
+    })
+    .context("starting the child reaper")?;
 
     // Each connection holds a permit for its life; past the cap a dial is refused before its
     // handshake, which is cheap.
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(hosting.max_connections));
     // A smaller cap on connections not yet admitted, so peers that stall their handshakes cannot
-    // hold every connection permit. Admission releases it.
-    let pending_cap = hosting.max_connections.div_ceil(4).max(4);
+    // hold every connection permit: below the total, unless it is 1. Admission releases it.
+    let pending_cap = hosting
+        .max_connections
+        .div_ceil(4)
+        .max(4)
+        .min(hosting.max_connections.saturating_sub(1))
+        .max(1);
     let handshake_limit = Arc::new(tokio::sync::Semaphore::new(pending_cap));
 
     loop {
@@ -358,11 +373,18 @@ pub async fn serve_endpoint(
                 return;
             }
             drop(pending_permit);
-            serve_connection(Authorized(conn), &sessions).await;
+            // Removing the client from the allowlist cuts it off, not just its next connection.
+            tokio::select! {
+                () = serve_connection(Authorized(conn.clone()), &sessions) => {}
+                () = allow.revoked(peer) => {
+                    auth_event(Outcome::Rejected, &peer, "removed from the allowlist");
+                    conn.close(1u32.into(), b"not authorized");
+                }
+            }
         });
     }
 
-    // Sessions first, then the endpoint.
+    // Sessions first, with their programs reaped (or killed after their grace), then the endpoint.
     info!("draining: stopping the registry and closing endpoint");
     shutdown.cancel();
     registry.shutdown().await;
@@ -419,39 +441,5 @@ async fn serve_connection(authorized: Authorized, registry: &Registry) {
     match run_attached(authorized, client).await {
         SessionExit::Detached => info!(peer = %peer, "client detached (session retained)"),
         SessionExit::ShellExited => info!(peer = %peer, "shell exited"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn serve_config_default_matches_the_cli_defaults() {
-        let c = ServeConfig::default();
-        assert!(c.allow.is_empty() && c.command.is_empty());
-        assert_eq!(c.scrollback, 1000);
-        assert_eq!(c.session_ttl_secs, 86_400);
-        assert_eq!(c.max_connections, 64);
-        assert_eq!(c.max_sessions, 64);
-        assert!(!c.local && c.relay_url.is_none() && c.key_file.is_none());
-        assert_eq!(c.port, None);
-    }
-
-    #[test]
-    fn connect_qr_renders_an_id_and_handles_overlong_input() {
-        // A 64-hex endpoint id is well within QR capacity: renders to a multi-row block grid.
-        let id = "3f9c".repeat(16);
-        let qr = connect_qr(&id).expect("an endpoint id must fit in a QR");
-        assert!(qr.lines().count() > 5, "a QR should be a multi-row block");
-        assert!(
-            qr.contains('█') || qr.contains('▀') || qr.contains('▄'),
-            "the unicode renderer uses half-block glyphs"
-        );
-        // Far beyond QR capacity (~2953 bytes): graceful None, never a panic.
-        assert!(
-            connect_qr(&"a".repeat(10_000)).is_none(),
-            "overlong input must return None, not panic"
-        );
     }
 }

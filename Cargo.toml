@@ -16,20 +16,9 @@ description = "koh — a resilient peer-to-peer remote shell over iroh, with pre
 readme = "README.md"
 keywords = ["mosh", "shell", "terminal", "iroh", "p2p"]
 categories = ["command-line-utilities", "network-programming"]
-# Keep the published .crate lean: the porting-research notes, the test infra, the integration tests,
-# and the dev/CI tooling aren't needed to build or use koh. COPYING (the license) and CHANGELOG.md
-# DO ship.
-exclude = [
-    "docs/",
-    "testing/",
-    "tests/",
-    "fuzz/",
-    ".github/",
-    "clippy.toml",
-    "deny.toml",
-    # the self-contained HTML slide deck (docs only, ~1.6 MB) — not needed to build or use koh.
-    "koh-presentation.html",
-]
+# What the published .crate holds, and nothing else: the code, the license, and what a user reads.
+# An allow-list, so a stray file in the checkout (notes, prompts) can never ship.
+include = ["/src/**", "/README.md", "/COPYING", "/CHANGELOG.md", "/SECURITY.md"]
 
 [dependencies]
 # transport (pinned: iroh API churns; see README). iroh 1.0 brings its own QUIC backend (noq, a
@@ -162,6 +151,7 @@ arithmetic_side_effects = "forbid"
 # Unbounded queues and unaccounted tasks (the lists are in `clippy.toml`).
 disallowed_types = "deny"
 disallowed_methods = "deny"
+disallowed_macros = "deny"
 lossy_float_literal = "deny"
 float_cmp_const = "deny"
 rc_buffer = "deny"

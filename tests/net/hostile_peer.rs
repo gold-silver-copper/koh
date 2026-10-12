@@ -447,6 +447,8 @@ fn a_bad_admission_byte_is_rejected_not_treated_as_admitted() -> anyhow::Result<
                         let _ = send.write_all(&[0u8]).await; // 0 != ADMIT
                         let _ = send.finish();
                     }
+                    // The hostile server's pacing: it keeps the connection up, so the client must
+                    // refuse the byte itself rather than see a close.
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }

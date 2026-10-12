@@ -1093,4 +1093,105 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_secs(5), accept).await;
         });
     }
+
+    /// A real server, admitting the one client, that runs `serve` on the connection.
+    async fn loopback<F, Fut>(serve: F) -> (Connection, IrohConnector)
+    where
+        F: FnOnce(Connection) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        use crate::transport_iroh::{admission, bind_endpoint_local, generate_secret_key};
+        let key = || generate_secret_key().expect("OS randomness");
+        let server = bind_endpoint_local(key(), true)
+            .await
+            .expect("bind the server");
+        let addr = crate::transport_iroh::loopback_addr(&server);
+        tokio::spawn(async move {
+            if let Some(incoming) = server.accept().await {
+                if let Ok(conn) = incoming.await {
+                    if admission::admit(&conn).await.is_ok() {
+                        serve(conn.clone()).await;
+                        conn.closed().await;
+                    }
+                }
+            }
+            drop(server);
+        });
+        let client = bind_endpoint_local(key(), false)
+            .await
+            .expect("bind the client");
+        let connector = IrohConnector::new(client, addr);
+        (connector.connect().await.expect("admitted"), connector)
+    }
+
+    #[test]
+    fn large_server_streams_take_turns_and_give_them_back() {
+        // More large streams than the client has slots, each dropped as garbage: a turn kept by
+        // a dropped stream would leave readers holding every slot, and the reply after them would
+        // never come.
+        crate::test_runtime::current_thread().block_on(async {
+            let (conn, _connector) = loopback(|conn| async move {
+                for _ in 0..20 {
+                    let mut send = conn.open_uni().await.expect("a stream");
+                    send.write_all(&vec![0xff; 1 << 20]).await.expect("written");
+                    send.finish().expect("finished");
+                }
+                let reply = crate::terminal::HistoryReply {
+                    id: 7,
+                    rows: Vec::new(),
+                };
+                let bytes = crate::proto::FrameEncoder::default()
+                    .encode_history(&reply)
+                    .expect("encoded");
+                let mut send = conn.open_uni().await.expect("a stream");
+                send.write_all(&bytes).await.expect("written");
+                send.finish().expect("finished");
+            })
+            .await;
+            let (tx, mut rx) = mpsc::channel(FRAME_QUEUE);
+            tokio::spawn(read_frames(conn, tx));
+            let got = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                .await
+                .expect("the reply after the large streams never came")
+                .expect("the reader ended");
+            assert!(matches!(got.msg, ServerMsg::History(ref reply) if reply.id == 7));
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_closed_resize_channel_does_not_spin_the_loop() {
+        /// This thread's CPU time so far, in clock ticks: the loop runs on it (one-thread runtime).
+        fn cpu_ticks() -> u64 {
+            let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("stat");
+            let fields: Vec<&str> = stat.rsplit(") ").next().unwrap().split(' ').collect();
+            fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+        }
+        crate::test_runtime::current_thread().block_on(async {
+            let (conn, connector) = loopback(|_| async {}).await;
+            let (input, input_rx) = mpsc::channel(8);
+            let (resize, resize_rx) = mpsc::channel(1);
+            drop(resize);
+            let run = tokio::spawn(run_client(
+                conn,
+                SystemTime::now(),
+                connector,
+                Size::new(24, 80),
+                false,
+                input_rx,
+                resize_rx,
+                Blind,
+                CancellationToken::new(),
+                None,
+            ));
+            let before = cpu_ticks();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let used = cpu_ticks() - before;
+            input.send(vec![ESCAPE_PREFIX, b'.']).await.expect("typed");
+            let quit = tokio::time::timeout(Duration::from_secs(5), run).await;
+            assert!(matches!(quit, Ok(Ok(Ok(None)))), "{quit:?}");
+            // A spinning loop takes the whole second (100 ticks); an idle one a few.
+            assert!(used < 30, "the loop spun: {used} ticks of CPU in a second");
+        });
+    }
 }

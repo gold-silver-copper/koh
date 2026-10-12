@@ -43,6 +43,7 @@ async fn converges(profile: Profile, seed: u64, outage: bool) -> anyhow::Result<
         .is_some());
     client.send(b"clear; seq 1 30''00; echo E''ND\r").await?;
     if outage {
+        // Fault timing, not a wait: the outage starts while the output is still streaming.
         tokio::time::sleep(Duration::from_millis(50)).await;
         net.black_hole(Duration::from_secs(2));
     }

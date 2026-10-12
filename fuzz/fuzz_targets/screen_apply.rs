@@ -50,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
     let prior = TerminalScreen::from_bytes(24, 80, "prior 日本 \x1b[31mscreen\x1b[m".as_bytes());
     if let Ok(diff) = postcard::from_bytes::<ScreenDiff>(data) {
         for mut screen in [TerminalScreen::default(), prior.clone()] {
-            screen.apply(&diff); // must never panic — the libFuzzer assertion
+            let _ = screen.apply(&diff); // must never panic — the libFuzzer assertion
             check(&screen);
         }
     }
@@ -59,7 +59,7 @@ fuzz_target!(|data: &[u8]| {
         let mut diff = scrolled.diff_from(&prior);
         diff.shifts = shifts;
         let mut screen = prior;
-        screen.apply(&diff);
+        let _ = screen.apply(&diff);
         check(&screen);
     }
 });

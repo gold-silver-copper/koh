@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 mod sessions;
 
-/// How often a session reads its PTY's modes when nothing else made it: a password prompt that
-/// turned echo off after printing is known to the client within this (the wire's contract).
+// How often a session reads its PTY's modes when nothing else made it: a password prompt that
+// turned echo off after printing is known to the client within this (the wire's contract).
 use crate::proto::TTY_TICK;
 
 /// How much input may wait for a session's PTY before a connection must stop reading its stream.
@@ -61,7 +61,7 @@ impl PendingInput {
     }
 
     fn flush(&mut self, pty: &crate::pty::Pty) {
-        self.flush_with(|bytes| pty.write_owned(bytes));
+        self.flush_with(|bytes| pty.write(bytes));
     }
 
     fn flush_with(&mut self, write: impl FnOnce(Vec<u8>) -> Result<(), crate::pty::WriteError>) {
@@ -87,7 +87,7 @@ pub struct PtyHost {
 
 impl PtyHost {
     /// Start `command` (empty for the login shell) through `launcher` at the default size; the host
-    /// and a receiver of its output.
+    /// and a receiver of its output. Blocks until the program starts.
     pub fn spawn(
         command: &[String],
         scrollback: usize,
@@ -111,25 +111,16 @@ impl PtyHost {
         self.emu.set_tty(self.pty.tty_modes())
     }
 
-    /// Queue keystrokes for the program; `false` if its queue is full, and the caller retries.
-    pub fn input(&mut self, bytes: &[u8]) -> bool {
-        match self.pty.write_input(bytes) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-            Err(e) => {
-                tracing::warn!(error = %e, "pty write failed");
-                true // the program is gone; there is no one to deliver to
-            }
+    /// The client's window is now `size` (clamped); whether that changed the size.
+    pub fn resize(&mut self, size: Size) -> bool {
+        if !self.emu.resize(size) {
+            return false;
         }
-    }
-
-    /// The client's window is now `size` (clamped).
-    pub fn resize(&mut self, size: Size) {
         let size = crate::terminal::host_size(size);
-        if let Err(e) = self.pty.resize_sized(size.nonzero().into()) {
+        if let Err(e) = self.pty.resize(size.rows(), size.cols()) {
             tracing::warn!(error = %e, rows = size.rows(), cols = size.cols(), "pty resize failed");
         }
-        self.emu.resize_sized(size);
+        true
     }
 
     /// Tear down; blocks joining the pump threads, so run it on `spawn_blocking`.
@@ -139,9 +130,8 @@ impl PtyHost {
 }
 
 /// What a connection sends its session.
-enum ClientInput {
+pub(crate) enum ClientInput {
     Input(super::ToSession),
-    Resize(Size),
     /// History rows, answered on `reply`.
     History {
         request: HistoryRequest,
@@ -158,10 +148,24 @@ pub enum AttachKind {
     Reattached { detached_for: Option<Duration> },
 }
 
+/// Why [`Registry::attach`] gave no session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Refused {
+    /// The server holds its most sessions, none of them this peer's.
+    #[error("server at session capacity")]
+    Full,
+    /// The session's program could not start, or the server is shutting down.
+    #[error("server could not start a session")]
+    Failed,
+}
+
+/// What an attach gets.
+type Attached = Result<(SessionClient, AttachKind), Refused>;
+
 /// A connection's handle to its session: watch the screen, send input, and detach on drop.
 pub struct SessionClient {
     /// The attachment itself: the session counts its clients by its screen receivers, so this is
-    /// never cloned, and none is made but for a client ([`start`] and [`Attach`]).
+    /// never cloned, and none is made but for a client.
     screens: watch::Receiver<Arc<TerminalScreen>>,
     input: mpsc::Sender<ClientInput>,
 }
@@ -178,19 +182,9 @@ impl SessionClient {
         self.screens.borrow().clone()
     }
 
-    /// Whether the session still takes input: `false` once it ended.
-    pub fn can_send(&self) -> bool {
-        !self.input.is_closed()
-    }
-
-    /// Send input, waiting for room in the bounded queue.
-    pub(crate) async fn send_input(&self, input: super::ToSession) {
-        let _ = self.input.send(ClientInput::Input(input)).await;
-    }
-
-    /// Send a resize to the PTY.
-    pub async fn send_resize(&self, size: Size) {
-        let _ = self.input.send(ClientInput::Resize(size)).await;
+    /// Where the connection's input goes, apart from the screens it watches.
+    pub(crate) fn input(&self) -> SessionInput {
+        self.input.clone()
     }
 
     /// The history rows `request` asks for, or `None` if the session ended. The future holds no
@@ -211,44 +205,56 @@ impl SessionClient {
     }
 }
 
+/// A session's bounded input queue, as a connection writes it: room for one input at a time.
+pub(crate) type SessionInput = mpsc::Sender<ClientInput>;
+
 // --- the session task -------------------------------------------------------------------------
 
-/// A connection attaches to a session: its client, and how long the session had none.
-struct Attach(oneshot::Sender<(SessionClient, Option<Duration>)>);
+/// A connection attaches to a session, which answers it.
+struct Attach(oneshot::Sender<Attached>);
 
-/// Start a session for `spec`: the sender that attaches to it, its first client, and the task that
-/// runs it. The first client exists before the task does, so the session never runs uncounted.
+/// How many attaches may wait for one session; past them, one is refused as at capacity.
+const CONTROL_QUEUE: usize = 8;
+
+/// How long after the program's output ended the session waits to see it exit.
+const ENDING_GRACE: Duration = Duration::from_secs(1);
+
+/// Start a session for `spec`, answering `first` once its program started: the sender that
+/// attaches to it, and the task that runs it.
 fn start(
     spec: &SessionSpec,
-) -> anyhow::Result<(
+    first: Attach,
+) -> (
     mpsc::Sender<Attach>,
-    SessionClient,
     impl std::future::Future<Output = ()> + Send + 'static,
-)> {
-    let (mut host, pty_rx) = PtyHost::spawn(&spec.command, spec.scrollback, &spec.launcher)?;
-    let (screens_tx, screens) = watch::channel(Arc::new(host.snapshot()));
-    let (input, input_rx) = mpsc::channel(INPUT_QUEUE);
-    // The registry waits for each attach's answer before it sends another.
-    let (control, control_rx) = mpsc::channel(1);
-    let client = SessionClient {
-        screens,
-        input: input.clone(),
-    };
-    let task = session_task(
-        host, pty_rx, control_rx, screens_tx, input, input_rx, spec.ttl,
-    );
-    Ok((control, client, task))
-}
-
-/// Hand `take` up to `limit` items `rx` already holds, without waiting, as they come off the
-/// channel. An end of the channel is left for the next `recv` to report.
-fn take_ready<T>(rx: &mut mpsc::Receiver<T>, limit: usize, mut take: impl FnMut(T)) {
-    for _ in 0..limit {
-        let Ok(item) = rx.try_recv() else {
-            break;
+) {
+    let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
+    let command = Arc::clone(&spec.command);
+    let (scrollback, ttl, launcher) = (spec.scrollback, spec.ttl, spec.launcher.clone());
+    let task = async move {
+        // Forking and the program's exec block, and must hold up no other session.
+        let spawned =
+            tokio::task::spawn_blocking(move || PtyHost::spawn(&command, scrollback, &launcher))
+                .await;
+        let (mut host, pty_rx) = match spawned.map_err(anyhow::Error::from).and_then(|s| s) {
+            Ok(spawned) => spawned,
+            Err(e) => {
+                tracing::error!(error = %e, "spawning a session failed");
+                let _ = first.0.send(Err(Refused::Failed));
+                return;
+            }
         };
-        take(item);
-    }
+        let (screens_tx, screens) = watch::channel(Arc::new(host.snapshot()));
+        let (input, input_rx) = mpsc::channel(INPUT_QUEUE);
+        let client = SessionClient {
+            screens,
+            input: input.clone(),
+        };
+        // A requester already gone drops its client, which the session sees as a detach.
+        let _ = first.0.send(Ok((client, AttachKind::Created)));
+        session_task(host, pty_rx, control_rx, screens_tx, input, input_rx, ttl).await;
+    };
+    (control, task)
 }
 
 /// Wait until `deadline`, or forever if there is none.
@@ -271,6 +277,15 @@ enum Phase {
     Exited,
 }
 
+/// The program's exit, if it has exited: reaped then.
+fn exit_of(host: &mut PtyHost) -> Option<crate::pty::Exit> {
+    host.pty
+        .try_wait()
+        .map_err(|error| tracing::warn!(%error, "waiting for the session's program failed"))
+        .ok()
+        .flatten()
+}
+
 /// Run one session until its program exits and its client leaves, or its detach TTL expires.
 /// Its clients are the receivers of `screens_tx`: no other receiver may exist.
 async fn session_task(
@@ -285,6 +300,10 @@ async fn session_task(
     // The first client is attached, from `start`.
     let mut phase = Phase::Attached;
     let mut pending = PendingInput::default();
+    // When the program's output ended, and its exit once seen: it is looked for at every tick, for
+    // at most `ENDING_GRACE`, never waited on, as a program that closed its terminal may run on.
+    let mut ended: Option<Instant> = None;
+    let mut exit: Option<crate::pty::Exit> = None;
 
     // A frame the program is drawing (synchronized output) is not sent half drawn.
     let mut hold = FrameHold::default();
@@ -293,18 +312,33 @@ async fn session_task(
     tty_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
+        let grace_over = ended
+            .and_then(|at| at.checked_add(ENDING_GRACE))
+            .is_some_and(|at| Instant::now() >= at);
+        if !matches!(phase, Phase::Exited) && ended.is_some() && (exit.is_some() || grace_over) {
+            // The program ended: publish a final screen carrying its status, whole even if it
+            // stopped mid-frame.
+            if let Some(exit) = exit {
+                host.emu.set_exit_code(exit.code);
+            }
+            phase = Phase::Exited;
+            screens_tx.send_replace(Arc::new(host.snapshot()));
+        }
         // Retry keystrokes the PTY writer queue could not take last pass.
         pending.flush(&host.pty);
         let can_read_input = pending.is_empty();
+        let running = !matches!(phase, Phase::Exited);
 
         tokio::select! {
-            chunk = pty_rx.recv(), if !matches!(phase, Phase::Exited) => {
+            chunk = pty_rx.recv(), if running && ended.is_none() => {
                 if let Some(chunk) = chunk {
                     host.refresh_tty();
                     host.emu.process(&chunk);
-                    take_ready(&mut pty_rx, OUTPUT_CHUNKS_PER_SNAPSHOT, |more| {
+                    // What is already read, without waiting; the channel's end is left for `recv`.
+                    for _ in 0..OUTPUT_CHUNKS_PER_SNAPSHOT {
+                        let Ok(more) = pty_rx.try_recv() else { break };
                         host.emu.process(&more);
-                    });
+                    }
                     let replies = host.emu.take_host_replies();
                     if !replies.is_empty() {
                         // Query answers go to the program, not the screen.
@@ -315,13 +349,8 @@ async fn session_task(
                         screens_tx.send_replace(Arc::new(screen));
                     }
                 } else {
-                    // The program exited: publish a final screen carrying its status, whole even
-                    // if it stopped mid-frame.
-                    if let Some(code) = reap_exit_code(&mut host).await {
-                        host.emu.set_exit_code(code);
-                    }
-                    phase = Phase::Exited;
-                    screens_tx.send_replace(Arc::new(host.snapshot()));
+                    ended = Some(Instant::now());
+                    exit = exit_of(&mut host);
                 }
             },
             _ = until(hold.deadline().map(Instant::from_std)) => {
@@ -329,29 +358,22 @@ async fn session_task(
                     screens_tx.send_replace(Arc::new(screen));
                 }
             },
+            () = until(ended.and_then(|at| at.checked_add(ENDING_GRACE))), if running => {}
             input = input_rx.recv(), if can_read_input => {
                 // `input_tx` is held below, so this only ends with the task.
-                if let Some(input) = input {
-                    match input {
-                        ClientInput::Input(input) => {
-                            let keys = match input {
-                                super::ToSession::Bytes(keys) => keys,
-                                super::ToSession::Events(events) => {
-                                    let mut keys = Vec::new();
-                                    host.emu.encode_input(&events, &mut keys);
-                                    keys
-                                }
-                                // A program that subscribed to scheme changes (mode 2031) hears
-                                // of a new one on its input.
-                                super::ToSession::Colours(colours) => {
-                                    host.emu.set_colours(&colours)
-                                }
-                            };
-                            pending.bytes = keys;
-                            pending.flush(&host.pty);
-                        }
-                        ClientInput::Resize(size) => {
-                            host.resize(size);
+                match input {
+                    Some(ClientInput::Input(super::ToSession::Events(events))) => {
+                        host.emu.encode_input(&events, &mut pending.bytes);
+                        pending.flush(&host.pty);
+                    }
+                    // A program that subscribed to scheme changes (mode 2031) hears of a new one
+                    // on its input.
+                    Some(ClientInput::Input(super::ToSession::Colours(colours))) => {
+                        pending.bytes = host.emu.set_colours(&colours);
+                        pending.flush(&host.pty);
+                    }
+                    Some(ClientInput::Input(super::ToSession::Resize(size))) => {
+                        if host.resize(size) {
                             host.refresh_tty();
                             // A program that asked for in-band resize reports (mode 2048) hears of
                             // it on its input, after anything typed before.
@@ -361,10 +383,11 @@ async fn session_task(
                             }
                             screens_tx.send_replace(Arc::new(host.snapshot()));
                         }
-                        ClientInput::History { request, reply } => {
-                            let _ = reply.send(host.emu.history(request));
-                        }
                     }
+                    Some(ClientInput::History { request, reply }) => {
+                        let _ = reply.send(host.emu.history(request));
+                    }
+                    None => {}
                 }
             },
             msg = control.recv() => match msg {
@@ -375,8 +398,12 @@ async fn session_task(
                         phase = Phase::Detached { since: Instant::now() };
                     }
                     let detached_for = match phase {
-                        // The reply is dropped, so the registry starts a new session.
-                        Phase::Exited => break,
+                        // Closed first, so the requester, asking again, finds this session gone
+                        // and gets a new one.
+                        Phase::Exited => {
+                            control.close();
+                            break;
+                        }
                         Phase::Attached => None,
                         Phase::Detached { since } => Some(since.elapsed()),
                     };
@@ -386,7 +413,10 @@ async fn session_task(
                     };
                     // A connection already gone drops its client: the session stays detached
                     // since when it was, so an attach that never arrives does not renew its TTL.
-                    if reply.send((client, detached_for)).is_ok() {
+                    if reply
+                        .send(Ok((client, AttachKind::Reattached { detached_for })))
+                        .is_ok()
+                    {
                         phase = Phase::Attached;
                     }
                 }
@@ -402,8 +432,11 @@ async fn session_task(
             _ = pending_input_retry(!pending.is_empty()) => {}
             // A program may turn echo off without writing anything (a password prompt printed
             // first): the client hears of it within a tick.
-            _ = tty_tick.tick(), if matches!(phase, Phase::Attached) => {
-                if host.refresh_tty() && !hold.holding() {
+            _ = tty_tick.tick(), if running => {
+                if ended.is_some() && exit.is_none() {
+                    exit = exit_of(&mut host);
+                }
+                if matches!(phase, Phase::Attached) && host.refresh_tty() && !hold.holding() {
                     screens_tx.send_replace(Arc::new(host.snapshot()));
                 }
             }
@@ -429,30 +462,12 @@ async fn pending_input_retry(pending: bool) {
     }
 }
 
-/// The exited program's status, polled for up to a second: it is waitable a moment after EOF.
-async fn reap_exit_code(host: &mut PtyHost) -> Option<u32> {
-    let deadline = Instant::now().checked_add(Duration::from_secs(1));
-    loop {
-        match host.pty.try_wait() {
-            Ok(Some(status)) => return Some(status.code),
-            Ok(None) if deadline.is_none_or(|d| Instant::now() < d) => {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-            Ok(None) => return None,
-            Err(error) => {
-                tracing::warn!(%error, "waiting for PTY child status after EOF failed");
-                return None;
-            }
-        }
-    }
-}
-
 // --- the registry -----------------------------------------------------------------------------
 
-/// What the registry accepts: attach `peer`.
+/// What the registry accepts: attach `peer`, answered on `reply`.
 struct AttachReq {
     peer: EndpointId,
-    reply: oneshot::Sender<Option<(SessionClient, AttachKind)>>,
+    reply: oneshot::Sender<Attached>,
 }
 
 /// A handle to the registry task: cheap to clone, one per accept loop.
@@ -472,21 +487,33 @@ pub struct SessionSpec {
     pub launcher: crate::pty::Launcher,
 }
 
+/// How often an attach is tried: one that reached a session as it ended is tried again.
+const ATTACH_TRIES: usize = 3;
+
 impl Registry {
     /// Spawn the registry task.
     pub fn spawn(spec: SessionSpec) -> Self {
         let (tx, rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
+        #[expect(clippy::disallowed_methods, reason = "one registry a server")]
         tokio::spawn(registry_task(spec, rx, shutdown.clone()));
         Self { tx, shutdown }
     }
 
-    /// Attach `peer` to its session, creating one if needed. `None` if the server is at its
-    /// session cap and `peer` has no existing session.
-    pub async fn attach(&self, peer: EndpointId) -> Option<(SessionClient, AttachKind)> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(AttachReq { peer, reply }).await.ok()?;
-        rx.await.ok().flatten()
+    /// Attach `peer` to its session, creating one if it has none.
+    pub async fn attach(&self, peer: EndpointId) -> Attached {
+        for _ in 0..ATTACH_TRIES {
+            let (reply, rx) = oneshot::channel();
+            self.tx
+                .send(AttachReq { peer, reply })
+                .await
+                .map_err(|_closed| Refused::Failed)?;
+            // Unanswered: the session ended as it got the attach, and the registry now knows.
+            if let Ok(attached) = rx.await {
+                return attached;
+            }
+        }
+        Err(Refused::Failed)
     }
 
     /// Stop the registry and every session, and wait for them to end.
@@ -496,6 +523,8 @@ impl Registry {
     }
 }
 
+/// Route attaches to sessions; it never waits on one, so a session starting or ending holds up no
+/// other peer.
 async fn registry_task(
     spec: SessionSpec,
     mut rx: mpsc::Receiver<AttachReq>,
@@ -512,7 +541,7 @@ async fn registry_task(
                 None => break,
             },
         };
-        let _ = reply.send(sessions.attach(peer).await);
+        sessions.attach(peer, Attach(reply));
     }
     // `rx` drops only once every session has ended, which `Registry::shutdown` waits for.
     sessions.shutdown().await;
@@ -520,8 +549,7 @@ async fn registry_task(
 
 #[cfg(test)]
 mod tests {
-    use super::{take_ready, PendingInput, OUTPUT_CHUNKS_PER_SNAPSHOT};
-    use tokio::sync::mpsc;
+    use super::PendingInput;
 
     #[test]
     fn replies_wait_behind_input_and_overflow_is_bounded() {
@@ -560,31 +588,5 @@ mod tests {
             pending.is_empty(),
             "closed writers do not retain pending input"
         );
-    }
-
-    #[test]
-    fn a_burst_of_output_is_taken_in_bounded_batches_and_the_end_is_left_for_recv() {
-        let (tx, mut rx) = mpsc::channel::<usize>(512);
-        for n in 0..100 {
-            tx.try_send(n).unwrap();
-        }
-        let taken = |rx: &mut mpsc::Receiver<usize>| {
-            let mut taken = Vec::new();
-            take_ready(rx, OUTPUT_CHUNKS_PER_SNAPSHOT, |n| taken.push(n));
-            taken
-        };
-        assert_eq!(
-            taken(&mut rx),
-            (0..OUTPUT_CHUNKS_PER_SNAPSHOT).collect::<Vec<_>>()
-        );
-        drop(tx);
-        assert_eq!(
-            taken(&mut rx),
-            (OUTPUT_CHUNKS_PER_SNAPSHOT..100).collect::<Vec<_>>()
-        );
-        // The channel's end is not swallowed: the session loop's `recv` still sees it and reaps
-        // the program.
-        assert_eq!(taken(&mut rx), Vec::<usize>::new());
-        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
     }
 }

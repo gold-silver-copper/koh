@@ -147,7 +147,7 @@ run_client_attack "garbage on the input stream"   garbage 30000
   && ok "[garbage] server rejected the malformed stream and closed the connection" \
   || bad "[garbage] no protocol-error close logged for the garbage"
 
-# bad-version: koh/3's ALPN *is* its version, so a wrong one must be refused by the TLS handshake —
+# bad-version: koh/4's ALPN *is* its version, so a wrong one must be refused by the TLS handshake —
 # the evil client never reaches the data plane at all.
 echo "  -- client attack: bad protocol version (the ALPN is the version)"
 BV_OUT="$(adb $ADB_SERIAL shell "$EVIL_ENV $EVIL_DEV $SERVER_ID $ADDR bad-version" 2>&1 || true)"

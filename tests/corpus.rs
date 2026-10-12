@@ -9,6 +9,7 @@
 //! the server diffs against the newest frame the client acknowledged, as koh's protocol does;
 //! the newest frame of each step is resent until it arrives, as the server's retries do, so the
 //! client must converge on every step's screen.
+#![expect(clippy::disallowed_types, reason = "tests queue freely")]
 
 #[path = "../testing/corpus/recording.rs"]
 mod recording;
@@ -21,7 +22,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
-use koh::predict::{DisplayPreference, Overlay};
+use koh::predict::Overlay;
 use koh::proto::{
     decode_server, encode_client, encode_frame, ClientDecoder, ClientMsg, Frame, FrameNum,
     InputSeq, ServerMsg,
@@ -231,7 +232,7 @@ impl Session {
             hold: FrameHold::default(),
             frame_start: None,
             now: Instant::now(),
-            client: ClientSession::new(DisplayPreference::Never, size),
+            client: ClientSession::new(size),
             terminal: {
                 // The user's terminal draws underline styles, as the one reading the paint does.
                 let mut terminal =
@@ -364,8 +365,7 @@ impl Session {
             match msg {
                 ClientMsg::Ack { frame: acked } => self.ack(acked),
                 ClientMsg::Resync => self.base = (FrameNum::BLANK, TerminalScreen::default()),
-                ClientMsg::Input { .. }
-                | ClientMsg::Keys { .. }
+                ClientMsg::Keys { .. }
                 | ClientMsg::Colours(_)
                 | ClientMsg::Resize(_)
                 | ClientMsg::History(_) => {}
@@ -572,7 +572,7 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
     let size = Size::new(recording.rows, recording.cols);
     let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK)
         .map_err(|e| e.to_string())?;
-    let mut client = ClientSession::new(DisplayPreference::Always, size);
+    let mut client = ClientSession::new(size);
     let mut sent = TerminalScreen::default();
     let mut num = FrameNum::BLANK;
     let mut typed = InputSeq::default();
@@ -596,7 +596,7 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
             client.on_input(now, &step.keys);
         }
         while let Some(msg) = client.pop_outgoing() {
-            if let ClientMsg::Input { seq, .. } | ClientMsg::Keys { seq, .. } = msg {
+            if let ClientMsg::Keys { seq, .. } = msg {
                 typed = typed.max(seq);
             }
         }
@@ -751,7 +751,7 @@ fn the_corpus_keys_reach_each_program_as_it_read_them() {
         let size = Size::new(recording.rows, recording.cols);
         let mut server =
             ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK).expect("emulator");
-        let mut client = ClientSession::new(DisplayPreference::Never, size);
+        let mut client = ClientSession::new(size);
         let mut wire = ClientDecoder::default();
         let now = Instant::now();
         for (index, (step, output)) in recording.outputs().enumerate() {

@@ -4,6 +4,7 @@
 //! each spawns a real child + PTY + two pump threads, and running them alongside the ~100 inline
 //! unit/property tests in one massively-parallel binary starved the PTY reader thread under load
 //! (a flaky timeout). A dedicated binary runs only these few in parallel, so they stay reliable.
+#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 
 use std::time::Duration;
 
@@ -48,7 +49,6 @@ fn external_signal_retains_shell_style_exit_status() {
         loop {
             if let Some(status) = pty.try_wait().expect("wait child") {
                 assert_eq!(status.code, 137);
-                assert_eq!(status.signal, Some(fuxix::process::Signal::Kill.raw()));
                 break;
             }
             assert!(
@@ -169,7 +169,7 @@ fn stopped_reader_applies_backpressure_and_resumes_in_order() {
             let bytes = format!("{:08}:\x1b[1;1R\x1b[48;24;80;0;0t", expected.len())
                 .repeat(128)
                 .into_bytes();
-            match pty.write_owned(bytes.clone()) {
+            match pty.write(bytes.clone()) {
                 Ok(()) => expected.extend_from_slice(&bytes),
                 Err(WriteError::Full(bytes)) => break bytes,
                 Err(WriteError::Closed(_)) => panic!("reader is stopped, not closed"),
@@ -186,7 +186,7 @@ fn stopped_reader_applies_backpressure_and_resumes_in_order() {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let pointer = retry.as_ptr();
-                match pty.write_owned(retry) {
+                match pty.write(retry) {
                     Ok(()) => break,
                     Err(WriteError::Full(bytes)) => {
                         assert_eq!(bytes.as_ptr(), pointer, "retry keeps the allocation");
@@ -244,7 +244,7 @@ fn host_normalizes_dimensions_for_both_the_emulator_and_pty() {
         let normalized = koh::terminal::clamp_dims(raw);
         host.resize(raw);
         assert_eq!(host.snapshot().screen().size(), normalized);
-        assert!(host.input(b"\n"));
+        assert!(host.pty.write(b"\n".to_vec()).is_ok());
         let output = all_output(rx).await;
         assert!(
             output.contains(&format!("{} {}", normalized.rows, normalized.cols)),
@@ -310,7 +310,8 @@ fn interactive_shell_echoes_input() {
             Pty::spawn(24, 80, &[], "xterm-256color", &launcher()).expect("spawn shell");
         // Give the shell a moment to start, then type a command that prints a marker.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        pty.write_input(b"printf KOH_MARKER_OK\n").expect("write");
+        pty.write(b"printf KOH_MARKER_OK\n".to_vec())
+            .expect("write");
 
         let mut collected = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -328,7 +329,6 @@ fn interactive_shell_echoes_input() {
         };
         // Resize should not error while the shell is live.
         let _ = pty.resize(40, 120);
-        let _ = pty.kill();
         assert!(
             found,
             "did not observe the marker in shell output: {}",
@@ -350,8 +350,8 @@ fn write_input_takes_shared_ref_and_preserves_order() {
         let (pty, mut rx) =
             Pty::spawn(24, 80, &[], "xterm-256color", &launcher()).expect("spawn shell");
         tokio::time::sleep(Duration::from_millis(300)).await;
-        pty.write_input(b"printf ORDER_").expect("first enqueue");
-        pty.write_input(b"AB_CD\n").expect("second enqueue");
+        pty.write(b"printf ORDER_".to_vec()).expect("first enqueue");
+        pty.write(b"AB_CD\n".to_vec()).expect("second enqueue");
 
         let mut collected = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -448,7 +448,7 @@ fn shutdown_returns_while_the_program_leaves_its_input_unread() {
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let chunk = vec![b'x'; 4096];
         let mut queued = 0;
-        while queued < 256 && pty.write_input(&chunk).is_ok() {
+        while queued < 256 && pty.write(chunk.clone()).is_ok() {
             queued += 1;
         }
         // Let the writer thread fill the terminal's input queue and block.
@@ -498,10 +498,8 @@ fn reaped_child_is_not_signaled_again() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(reaped, "the one-shot child must exit and be reaped");
-        // After reaping, every kill path is gated and must be a safe no-op (never signaling a PID we no
-        // longer own).
-        assert!(pty.kill().is_ok(), "kill() after reap is a gated no-op");
-        pty.shutdown(); // consumes; Drop is reaped-gated; must not panic
+        // After reaping, teardown signals nothing (never a PID no longer the program's).
+        pty.shutdown();
     });
 }
 
@@ -793,4 +791,47 @@ fn grow_the_pty_table() {
             }
         }
     }
+}
+
+/// A hung-up program has a moment to exit on its own, as a shell saving its history does, before
+/// it is killed.
+#[test]
+fn a_hung_up_program_has_time_to_exit_before_it_is_killed() {
+    current_thread().expect("tokio runtime").block_on(async {
+        let saved = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("koh-hangup-{}", std::process::id()));
+        let _ = std::fs::remove_file(&saved);
+        let script = format!(
+            "trap 'sleep 0.3; echo saved > {}; exit 0' HUP; echo READY; while :; do sleep 0.05; done",
+            saved.display()
+        );
+        let (pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &["/bin/sh".to_owned(), "-c".to_owned(), script],
+            "xterm-256color",
+            &launcher(),
+        )
+        .expect("spawn sh");
+        let mut out = String::new();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !out.contains("READY") {
+                let Some(chunk) = rx.recv().await else { break };
+                out.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await
+        .expect("the child reports it is ready");
+        tokio::task::spawn_blocking(move || pty.shutdown())
+            .await
+            .expect("shutdown");
+        let written = tokio::time::timeout(Duration::from_secs(5), async {
+            while !saved.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let _ = std::fs::remove_file(&saved);
+        assert!(written.is_ok(), "the program was killed before its hangup handler finished");
+    });
 }

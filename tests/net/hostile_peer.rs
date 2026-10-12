@@ -1,4 +1,4 @@
-//! Hostile peers on koh/3, both directions.
+//! Hostile peers on koh/4, both directions.
 //!
 //! A malicious client (admitted, so on the allowlist) throws malformed and oversized traffic at a
 //! real server; a malicious server throws it at a real client. Neither may crash, hang or grow the
@@ -26,7 +26,7 @@ fn net() -> FaultNet {
 }
 
 /// Connect to `server` as `secret`, complete admission, and keep the endpoint alive; the caller
-/// then speaks koh/3 by hand.
+/// then speaks koh/4 by hand.
 async fn admitted(
     net: &FaultNet,
     secret: SecretKey,
@@ -37,6 +37,28 @@ async fn admitted(
     admission::await_admission(&conn).await?;
     Box::leak(Box::new(endpoint));
     Ok(conn)
+}
+
+/// The client typed `text`, as its first input.
+fn typed(text: &str) -> ClientMsg {
+    use koh::events::{InputEvent, WireKey, WireKeyCode};
+    let key = |c| match c {
+        '\r' => WireKeyCode::Enter,
+        c => WireKeyCode::Char(c),
+    };
+    ClientMsg::Keys {
+        seq: InputSeq(1),
+        events: text
+            .chars()
+            .map(|c| {
+                InputEvent::Key(WireKey {
+                    key: key(c),
+                    mods: 0,
+                    kitty: None,
+                })
+            })
+            .collect(),
+    }
 }
 
 /// Open the one client stream, write `bytes`, and keep it open (a real client keeps its stream).
@@ -80,7 +102,12 @@ fn an_oversized_client_message_closes_the_connection_only() -> anyhow::Result<()
             .context("MAX_FRAME fits u32")?
             .to_be_bytes();
         raw_client_stream(&conn, &huge).await?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        anyhow::ensure!(
+            tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                .await
+                .is_ok(),
+            "the server must close a connection that announced an oversized message"
+        );
         assert_good_client_still_works(&mut good).await?;
         let _ = good.finish().await;
         server.stop().await;
@@ -93,7 +120,7 @@ fn an_oversized_client_message_closes_the_connection_only() -> anyhow::Result<()
 /// the server goes on serving the good client.
 #[test]
 fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> {
-    use koh::events::{InputEvent, WireColours, WireKey, WireKeyCode, MAX_PASTE_PIECE, PALETTE};
+    use koh::events::{InputEvent, WireColours, WireKey, WireKeyCode, MAX_PASTE, PALETTE};
     crate::harness::runtime()?.block_on(async {
         let net = net();
         let evil = identity()?;
@@ -112,11 +139,7 @@ fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> 
         for msg in [
             keys(vec![key(WireKeyCode::Char('x'), 0x80)]),
             keys(vec![key(WireKeyCode::F(99), 0)]),
-            keys(vec![InputEvent::Paste {
-                text: "x".repeat(MAX_PASTE_PIECE + 1),
-                first: true,
-                last: true,
-            }]),
+            keys(vec![InputEvent::Paste("x".repeat(MAX_PASTE + 1))]),
             ClientMsg::Colours(WireColours {
                 palette: vec![None; PALETTE + 1],
                 ..WireColours::default()
@@ -142,6 +165,68 @@ fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> 
     })
 }
 
+/// A session whose program stops reading, its input queue then filled, does not stop its
+/// connection: the server stops reading the client, and only that, so frames of what the program
+/// prints still go out.
+#[test]
+fn a_full_session_queue_does_not_stop_the_frames() -> anyhow::Result<()> {
+    use koh::events::{InputEvent, WireColours, MAX_PASTE};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    crate::harness::runtime()?.block_on(async {
+        let net = net();
+        let evil = identity()?;
+        let printing = "stty raw -echo; while :; do echo tick; sleep 0.05; done";
+        let server = Server::start(&net, &[evil.public()], &["sh", "-c", printing]).await?;
+        let conn = admitted(&net, evil, server.id).await?;
+        let frames = std::sync::Arc::new(AtomicUsize::new(0));
+        let reader = {
+            let (conn, frames) = (conn.clone(), frames.clone());
+            tokio::spawn(async move {
+                while let Ok(mut recv) = conn.accept_uni().await {
+                    let frames = frames.clone();
+                    tokio::spawn(async move {
+                        if recv.read_to_end(MAX_FRAME).await.is_ok() {
+                            frames.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            })
+        };
+        let mut send = conn.open_uni().await?;
+        let mut messages = Vec::new();
+        // Two pastes fill the PTY and what waits for it; then the session's queue fills.
+        for seq in 1..=2 {
+            messages.push(encode_client(&ClientMsg::Keys {
+                seq: InputSeq(seq),
+                events: vec![InputEvent::Paste("x".repeat(MAX_PASTE))],
+            })?);
+        }
+        for _ in 0..2000 {
+            messages.push(encode_client(&ClientMsg::Colours(WireColours::default()))?);
+        }
+        let writer = tokio::spawn(async move {
+            for message in messages {
+                if send.write_all(&message).await.is_err() {
+                    return;
+                }
+            }
+            Box::leak(Box::new(send));
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let before = frames.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after = frames.load(Ordering::Relaxed);
+        writer.abort();
+        reader.abort();
+        server.stop().await;
+        anyhow::ensure!(
+            after >= before + 10,
+            "frames stopped while the session's queue was full: {before} then {after}"
+        );
+        Ok(())
+    })
+}
+
 #[test]
 fn a_client_cannot_open_a_second_stream() -> anyhow::Result<()> {
     crate::harness::runtime()?.block_on(async {
@@ -149,14 +234,7 @@ fn a_client_cannot_open_a_second_stream() -> anyhow::Result<()> {
         let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
         let conn = admitted(&net, evil, server.id).await?;
-        raw_client_stream(
-            &conn,
-            &encode_client(&ClientMsg::Input {
-                seq: InputSeq(1),
-                bytes: b"echo hi\r".to_vec(),
-            })?,
-        )
-        .await?;
+        raw_client_stream(&conn, &encode_client(&typed("echo hi\r"))?).await?;
         // The server permits one uni stream from the client, so a second never opens: QUIC's
         // stream-count flow control is the bound, before any koh code runs.
         let second = tokio::time::timeout(Duration::from_secs(2), conn.open_uni()).await;
@@ -201,11 +279,7 @@ fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_co
         let conn = admitted(&net, evil, server.id).await?;
         let mut send = conn.open_uni().await?;
         let lines = "i=0; while [ $i -lt 300 ]; do echo line $i; i=$((i+1)); done\r";
-        send.write_all(&encode_client(&ClientMsg::Input {
-            seq: InputSeq(1),
-            bytes: lines.as_bytes().to_vec(),
-        })?)
-        .await?;
+        send.write_all(&encode_client(&typed(lines))?).await?;
         tokio::time::sleep(Duration::from_secs(2)).await;
         // As many as may wait, each for every row there could be: answered, each within the bound.
         let mut asks = Vec::new();
@@ -292,17 +366,14 @@ async fn send_frame_bytes(conn: &Connection, bytes: Vec<u8>) {
 /// A client running against a hand-rolled server survives its frames without crashing or hanging.
 async fn client_survives(net: &FaultNet, good: SecretKey, evil: EndpointId) -> anyhow::Result<()> {
     let endpoint = net.endpoint(good, false).await?;
-    let mut client = Client::connect_on(endpoint, evil, Options::default()).await?;
-    // A crash would abort the client task; a hang would trip this wait. Neither must happen.
+    let client = Client::connect_on(endpoint, evil, Options::default()).await?;
+    // A crash would end the client loop, a hang keep it from quitting. Neither may happen.
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let quit = client.quit(Duration::from_secs(5)).await;
     anyhow::ensure!(
-        client
-            .wait_until(Duration::from_secs(1), |_| false)
-            .await
-            .is_none(),
-        "the client painted nothing it should have; it must simply keep running"
+        matches!(quit, Some(Ok(None))),
+        "the client did not keep running under the hostile server's frames: {quit:?}"
     );
-    client.abort();
     Ok(())
 }
 

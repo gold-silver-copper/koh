@@ -23,13 +23,19 @@ const READ_CHUNK: usize = 8192;
 /// Bound on the output channel (chunks); a full one slows the reader.
 const OUTPUT_CHANNEL_DEPTH: usize = 512;
 /// Input retained by the writer, including its in-flight write. Each chunk also costs at
-/// least 64 bytes, bounding the queue's allocation overhead for many tiny writes.
+/// least 64 bytes, bounding the queue's allocation overhead for many tiny writes. An empty queue
+/// takes one chunk of any size: a whole paste goes in one write.
 const WRITE_BUDGET: usize = 1024 * 1024;
 
+/// How long a hung-up program has to exit, saving its history, before it is killed.
+const HANGUP_GRACE: Duration = Duration::from_secs(1);
+
 /// A write the PTY did not take; its allocation stays with the caller for a retry.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WriteError {
+    #[error("the PTY's input queue is full")]
     Full(Vec<u8>),
+    #[error("the PTY's input is closed")]
     Closed(Vec<u8>),
 }
 
@@ -50,7 +56,7 @@ fn reserve_input(budget: &AtomicUsize, len: usize) -> bool {
     loop {
         let Some(next) = used
             .checked_add(len.max(64))
-            .filter(|&next| next <= WRITE_BUDGET)
+            .filter(|&next| used == 0 || next <= WRITE_BUDGET)
         else {
             return false;
         };
@@ -62,11 +68,10 @@ fn reserve_input(budget: &AtomicUsize, len: usize) -> bool {
 }
 
 /// How the program ended: its exit code, which for a signal is 128 plus its number, as a shell
-/// reports it, and the signal, if one ended it.
+/// reports it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Exit {
     pub code: u32,
-    pub signal: Option<i32>,
 }
 
 /// The argv for `command`, taken verbatim (no splitting, so a path with a space works); empty means
@@ -79,13 +84,11 @@ fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> Vec<O
     }
 }
 
-/// Remove every inherited `KOH_*` variable from `cmd`: they configure koh, not the hosted program,
-/// and matching the prefix cannot miss one added later.
-fn scrub_koh_env(cmd: &mut Command) {
-    for (key, _) in std::env::vars_os() {
-        if is_koh_env_key(&key) {
-            cmd.env_remove(&key);
-        }
+/// Remove each `KOH_*` variable of the `inherited` from `cmd`: they configure koh, not the hosted
+/// program, and matching the prefix cannot miss one added later.
+fn scrub_koh_env(cmd: &mut Command, inherited: impl Iterator<Item = OsString>) {
+    for key in inherited.filter(|key| is_koh_env_key(key)) {
+        cmd.env_remove(key);
     }
 }
 
@@ -233,29 +236,81 @@ fn write_while_running(fd: &OwnedFd, bytes: &[u8], stopping: &AtomicBool) -> boo
     true
 }
 
-/// An unreaped child. The PID is valid only while this owner exists.
-struct RunningChild {
+/// The program, until it is reaped: owning it is the right to signal its pid, which is no longer
+/// its own once reaped.
+struct Running {
     child: std::process::Child,
     pid: Pid,
 }
 
-impl RunningChild {
+impl Running {
     fn signal(&self, signal: Signal) -> io::Result<()> {
         fuxix::process::kill(self.pid, signal).map_err(io::Error::from)
     }
+
+    /// How it ended, if it has; reaped then.
+    fn try_wait(&mut self) -> io::Result<Option<Exit>> {
+        let Some(status) = self.child.try_wait()? else {
+            return Ok(None);
+        };
+        let code = status.signal().map_or_else(
+            || u32::try_from(status.code().unwrap_or_default()).unwrap_or(u32::MAX),
+            |signal| 128_u32.saturating_add(u32::try_from(signal).unwrap_or(u32::MAX)),
+        );
+        Ok(Some(Exit { code }))
+    }
+
+    /// Hang up, as a terminal closing does, and leave it to `reaper`, which kills it if it
+    /// outlives [`HANGUP_GRACE`].
+    fn hang_up(self, reaper: &Sender<Stopping>) {
+        let _ = self.signal(Signal::Hup);
+        let kill_at = std::time::Instant::now().checked_add(HANGUP_GRACE);
+        if let Err(error) = reaper.send(Stopping {
+            running: self,
+            kill_at,
+        }) {
+            tracing::error!(%error, "PTY child reaper stopped unexpectedly");
+        }
+    }
 }
 
-/// Initialize before spawning any child, so a thread-creation failure cannot orphan one.
-/// Poll all transferred children: one uninterruptible child must not delay reaping the others.
-fn reaper() -> io::Result<std::sync::mpsc::Sender<RunningChild>> {
-    static REAPER: OnceLock<io::Result<std::sync::mpsc::Sender<RunningChild>>> = OnceLock::new();
+/// A hung-up program, waited for until reaped, and killed at `kill_at`.
+struct Stopping {
+    running: Running,
+    kill_at: Option<std::time::Instant>,
+}
+
+impl Stopping {
+    /// Whether it is reaped; killed first if its grace is over.
+    fn reaped(&mut self) -> bool {
+        if self
+            .kill_at
+            .is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            let _ = self.running.signal(Signal::Kill);
+            self.kill_at = None;
+        }
+        match self.running.try_wait() {
+            Ok(exit) => exit.is_some(),
+            Err(error) => {
+                tracing::warn!(%error, "could not reap PTY child; retrying");
+                false
+            }
+        }
+    }
+}
+
+/// The thread that reaps hung-up programs, polling them all, so one that does not exit delays
+/// none of the others. Started before any child, so failing to start it orphans none.
+fn reaper() -> io::Result<Sender<Stopping>> {
+    static REAPER: OnceLock<io::Result<Sender<Stopping>>> = OnceLock::new();
     REAPER
         .get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<RunningChild>();
+            let (tx, rx) = channel::<Stopping>();
             std::thread::Builder::new()
                 .name("koh-child-reaper".into())
                 .spawn(move || {
-                    let mut children: Vec<RunningChild> = Vec::new();
+                    let mut children: Vec<Stopping> = Vec::new();
                     loop {
                         let received = if children.is_empty() {
                             rx.recv()
@@ -268,14 +323,7 @@ fn reaper() -> io::Result<std::sync::mpsc::Sender<RunningChild>> {
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         }
-                        children.retain_mut(|running| match running.child.try_wait() {
-                            Ok(Some(_)) => false,
-                            Ok(None) => true,
-                            Err(error) => {
-                                tracing::warn!(%error, "could not reap PTY child; retrying");
-                                true
-                            }
-                        });
+                        children.retain_mut(|child| !child.reaped());
                     }
                 })?;
             Ok(tx)
@@ -285,7 +333,7 @@ fn reaper() -> io::Result<std::sync::mpsc::Sender<RunningChild>> {
         .map_err(|error| io::Error::new(error.kind(), error.to_string()))
 }
 
-/// Pump ownership also covers startup errors before a Pty has been constructed.
+/// The pump threads, stopped when this drops: also before the [`Pty`] exists, on a failed start.
 #[derive(Default)]
 struct Pumps {
     reader: Option<std::thread::JoinHandle<()>>,
@@ -299,15 +347,16 @@ impl Drop for Pumps {
     }
 }
 
-/// A program running on a PTY. Dropping it signals the child and transfers its reaping
-/// responsibility to a background worker; [`Pty::shutdown`] also joins the pump threads.
+/// A program running on a PTY. Dropping it stops the pumps and hangs the program up, leaving it
+/// to the reaper; [`Pty::shutdown`] also joins the pumps.
 pub struct Pty {
     master: fuxix::pty::Master,
     /// Keystrokes and query replies share this queue, so they stay in order.
     writer_tx: Sender<InputChunk>,
     write_budget: Arc<AtomicUsize>,
-    running: Option<RunningChild>,
-    reaper: std::sync::mpsc::Sender<RunningChild>,
+    /// The program, until reaped.
+    running: Option<Running>,
+    reaper: Sender<Stopping>,
     pumps: Pumps,
 }
 
@@ -323,9 +372,10 @@ impl Pty {
         launcher: &Launcher,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
         let reaper = reaper()?;
+        let size = pty_size(rows, cols).map_err(PtyError::OpenPty)?;
         // fuxix serializes the allocation itself and works around macOS's PTY races.
-        let (master, slave) = fuxix::pty::open(pty_size(rows, cols).map_err(PtyError::OpenPty)?)
-            .map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
+        let (master, slave) =
+            fuxix::pty::open(size).map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
 
         // Read the master before the child exists: macOS discards what a short-lived child wrote
         // if it exits before anything reads (about 3 spawns in 1000 under load).
@@ -382,8 +432,6 @@ impl Pty {
                 })?,
         );
 
-        // `recv` yields every queued chunk before it sees the sender dropped, so pending input is
-        // written before the EOT.
         let (writer_tx, writer_rx) = channel::<InputChunk>();
         let write_budget = Arc::new(AtomicUsize::new(0));
         pumps.writer = Some({
@@ -396,10 +444,6 @@ impl Pty {
                             break; // master closed, child gone, or teardown
                         }
                     }
-                    // A newline then EOT: a terminal in canonical mode takes EOT as end of input
-                    // only at the start of a line. Ctrl-D is VEOF unless the program changed it,
-                    // and the child is signalled on drop regardless.
-                    write_while_running(&writer, b"\n\x04", &stopping);
                 })?
         });
 
@@ -410,7 +454,7 @@ impl Pty {
                 &argv,
                 |cmd| {
                     cmd.env("TERM", term);
-                    scrub_koh_env(cmd);
+                    scrub_koh_env(cmd, std::env::vars_os().map(|(key, _)| key));
                 },
             )
             .map_err(|error| {
@@ -428,7 +472,7 @@ impl Pty {
                 master,
                 writer_tx,
                 write_budget,
-                running: Some(RunningChild { child, pid }),
+                running: Some(Running { child, pid }),
                 reaper,
                 pumps,
             },
@@ -436,64 +480,25 @@ impl Pty {
         ))
     }
 
-    /// Stop both pumps and reap the child. Call on a blocking worker. After one second,
-    /// an unusually slow exit is handed to the background reaper rather than blocking teardown.
+    /// Hang the program up and join the pumps. Blocks while they notice, so call it on a blocking
+    /// worker; the reaper waits for the program.
     pub fn shutdown(mut self) {
-        self.stop();
-        let deadline = std::time::Instant::now().checked_add(Duration::from_secs(1));
-        while self.running.is_some() {
-            match self.try_wait() {
-                Ok(Some(_)) => break,
-                Err(error) => {
-                    tracing::warn!(%error, "PTY shutdown wait failed");
-                    break;
-                }
-                Ok(None) => {}
-            }
-            if deadline.is_none_or(|end| std::time::Instant::now() >= end) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        let reader = self.pumps.reader.take();
-        let writer = self.pumps.writer.take();
-        drop(self); // closes the writer channel and transfers any unreaped child
-        for handle in [writer, reader].into_iter().flatten() {
+        let pumps = [self.pumps.writer.take(), self.pumps.reader.take()];
+        drop(self);
+        for handle in pumps.into_iter().flatten() {
             let _ = handle.join();
         }
     }
 
-    fn stop(&self) {
-        self.pumps.stopping.store(true, Ordering::SeqCst);
-        let _ = self.signal(Signal::Hup);
-        let _ = self.signal(Signal::Kill);
-    }
-
-    /// Queue `data` for the program, without blocking. [`io::ErrorKind::WouldBlock`] if the queue
-    /// is full (the program stopped reading), [`io::ErrorKind::BrokenPipe`] if the writer is gone.
-    pub fn write_input(&self, data: &[u8]) -> io::Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        if !reserve_input(&self.write_budget, data.len()) {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-        self.send_reserved(data.to_vec())
-            .map_err(|_closed| io::ErrorKind::BrokenPipe.into())
-    }
-
-    /// Queue an owned buffer, returning it unchanged on backpressure or closure.
-    pub fn write_owned(&self, bytes: Vec<u8>) -> Result<(), WriteError> {
+    /// Queue `bytes` for the program, without blocking; on backpressure or closure, they come
+    /// back unchanged.
+    pub fn write(&self, bytes: Vec<u8>) -> Result<(), WriteError> {
         if bytes.is_empty() {
             return Ok(());
         }
         if !reserve_input(&self.write_budget, bytes.len()) {
             return Err(WriteError::Full(bytes));
         }
-        self.send_reserved(bytes).map_err(WriteError::Closed)
-    }
-
-    fn send_reserved(&self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
         self.writer_tx
             .send(InputChunk {
                 charge: bytes.len().max(64),
@@ -502,7 +507,7 @@ impl Pty {
             })
             .map_err(|error| {
                 let mut chunk = error.0;
-                std::mem::take(&mut chunk.bytes)
+                WriteError::Closed(std::mem::take(&mut chunk.bytes))
             })
     }
 
@@ -516,61 +521,35 @@ impl Pty {
         })
     }
 
-    /// Propagate a window-size change; the kernel raises `SIGWINCH` in the child.
+    /// Propagate a window-size change to `rows`×`cols`; the kernel raises `SIGWINCH` in the child.
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
-        self.resize_sized(pty_size(rows, cols).map_err(PtyError::Resize)?)
-    }
-
-    pub(crate) fn resize_sized(&self, size: fuxix::terminal::Size) -> Result<(), PtyError> {
+        let size = pty_size(rows, cols).map_err(PtyError::Resize)?;
         fuxix::terminal::set_window_size(&self.master, size).map_err(|e| PtyError::Resize(e.into()))
     }
 
-    /// How the child ended, if it has; it is then reaped, and never signalled again.
-    pub fn try_wait(&mut self) -> std::io::Result<Option<Exit>> {
+    /// How the program ended, if it has; it is then reaped, and never signalled again.
+    pub fn try_wait(&mut self) -> io::Result<Option<Exit>> {
         let Some(running) = &mut self.running else {
             return Ok(None);
         };
-        let Some(status) = running.child.try_wait()? else {
-            return Ok(None);
-        };
-        self.running = None; // the PID can now be reused; discard the ability to signal it
-        let signal = status.signal();
-        Ok(Some(Exit {
-            code: signal.map_or_else(
-                || u32::try_from(status.code().unwrap_or_default()).unwrap_or(u32::MAX),
-                |signal| 128_u32.saturating_add(u32::try_from(signal).unwrap_or(u32::MAX)),
-            ),
-            signal,
-        }))
-    }
-
-    /// Terminate the child with SIGHUP, as a terminal hanging up would. No-op once the child is
-    /// reaped, so we never SIGHUP a recycled PID.
-    pub fn kill(&self) -> io::Result<()> {
-        self.signal(Signal::Hup)
-    }
-
-    /// Send `signal` to the child, unless it has been reaped (its PID may be recycled).
-    fn signal(&self, signal: Signal) -> io::Result<()> {
-        self.running
-            .as_ref()
-            .map_or(Ok(()), |child| child.signal(signal))
+        let exit = running.try_wait()?;
+        if exit.is_some() {
+            self.running = None;
+        }
+        Ok(exit)
     }
 }
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        self.stop();
-        if let Some(child) = self.running.take() {
-            // The initialized worker lives for the process lifetime and never blocks on a child.
-            if let Err(error) = self.reaper.send(child) {
-                tracing::error!(%error, "PTY child reaper stopped unexpectedly");
-            }
+        self.pumps.stopping.store(true, Ordering::SeqCst);
+        if let Some(running) = self.running.take() {
+            running.hang_up(&self.reaper);
         }
     }
 }
 
-/// Validate a PTY size before passing it to the system-call layer.
+/// `rows`×`cols`, which a PTY must have nonzero.
 fn pty_size(rows: u16, cols: u16) -> io::Result<fuxix::terminal::Size> {
     fuxix::terminal::Size::new(rows, cols)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PTY size must be nonzero"))
@@ -626,28 +605,18 @@ mod tests {
 
     #[test]
     fn scrub_removes_inherited_koh_vars() {
-        // KOH_* vars set in the server's environment must not reach the spawned shell. A
-        // `Command` inherits the parent env, so the scrub must remove an *inherited* var
-        // explicitly: `get_envs` lists it as removed (`None`).
-        std::env::set_var("KOH_SCRUB_TEST", "topsecret-unit");
-        std::env::set_var("KOH_DNS", "1.1.1.1");
+        // KOH_* vars in the server's environment must not reach the spawned shell. A `Command`
+        // inherits the parent env, so the scrub removes each explicitly: `get_envs` lists it as
+        // removed (`None`).
+        let inherited = ["KOH_SCRUB_TEST", "KOH_DNS", "PATH"].map(OsString::from);
         let mut cmd = Command::new("/bin/sh");
-        scrub_koh_env(&mut cmd);
+        scrub_koh_env(&mut cmd, inherited.into_iter());
         let removed: Vec<_> = cmd
             .get_envs()
             .filter(|(_, value)| value.is_none())
             .map(|(key, _)| key.to_owned())
             .collect();
-        assert!(
-            removed.iter().any(|key| key == "KOH_SCRUB_TEST"),
-            "an inherited KOH_* var must be scrubbed from the child env"
-        );
-        assert!(
-            removed.iter().any(|key| key == "KOH_DNS"),
-            "operational KOH_* vars are scrubbed too"
-        );
-        std::env::remove_var("KOH_SCRUB_TEST");
-        std::env::remove_var("KOH_DNS");
+        assert_eq!(removed, ["KOH_DNS", "KOH_SCRUB_TEST"]);
     }
 
     // The real-PTY / real-shell tests (spawn + stream + teardown) live in `tests/pty.rs` — a

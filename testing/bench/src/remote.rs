@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
 use koh::client::{run_client, BackendTerminal, ClientTerminal, IrohConnector, KohBackend};
-use koh::predict::{DisplayPreference, Overlay};
+use koh::predict::Overlay;
 use koh::pty::{Launcher, Pty};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::terminal::{Size, TerminalScreen};
@@ -365,7 +365,6 @@ impl Remote {
             channel,
             std::time::SystemTime::now(),
             connector,
-            DisplayPreference::Always,
             start,
             None,
             input_rx,
@@ -431,7 +430,7 @@ impl Remote {
                         .unwrap_or_else(PoisonError::into_inner)
                         .process_with_replies(&chunk, |reply| replies.extend_from_slice(reply));
                     if !replies.is_empty() {
-                        let _ = pty.write_input(&replies);
+                        let _ = pty.write(replies);
                     }
                     paints_tx.send_modify(|n| *n = n.wrapping_add(1));
                 }
@@ -574,7 +573,7 @@ impl Remote {
     pub async fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
         match &self.inner {
             Inner::Koh { input, .. } => Ok(input.send(bytes.to_vec()).await?),
-            Inner::Pty { pty, .. } => Ok(pty.write_input(bytes)?),
+            Inner::Pty { pty, .. } => Ok(pty.write(bytes.to_vec())?),
         }
     }
 
@@ -637,7 +636,6 @@ impl Remote {
                 reader,
                 mosh_pid,
             } => {
-                let _ = pty.kill();
                 reader.abort();
                 if let Some(pid) = mosh_pid {
                     kill(pid);

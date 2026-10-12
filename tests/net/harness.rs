@@ -10,7 +10,7 @@ use std::time::Duration;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId, SecretKey};
 use koh::client::{run_client, BellHook, ClientTerminal, IrohConnector};
-use koh::predict::{DisplayPreference, Overlay};
+use koh::predict::Overlay;
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::terminal::{Size, TerminalScreen};
 use koh::transport_iroh::generate_secret_key;
@@ -79,8 +79,6 @@ pub struct Painted {
 #[derive(Default)]
 pub struct Options {
     pub bell: Option<BellHook>,
-    /// Whether to predict; `None` is `DisplayPreference::Never`.
-    pub predict: Option<DisplayPreference>,
     /// When the client says it dialed; `None` is now. Earlier, as though the client were frozen
     /// between dialing and running its loop.
     pub dialed_at: Option<std::time::SystemTime>,
@@ -198,7 +196,6 @@ impl Client {
             channel,
             options.dialed_at.unwrap_or_else(std::time::SystemTime::now),
             connector,
-            options.predict.unwrap_or(DisplayPreference::Never),
             Size::new(24, 80),
             None,
             input_rx,
@@ -286,6 +283,13 @@ impl Client {
                 return None;
             }
         }
+    }
+
+    /// Type the quit escape and wait up to `within` for the loop to return, as only a live one
+    /// does on it.
+    pub async fn quit(self, within: Duration) -> Option<anyhow::Result<Option<u32>>> {
+        self.send(&[0x1e, b'.']).await.ok()?;
+        self.exit(within).await
     }
 
     /// End the client (as if its input closed) and return what `run_client` returned.

@@ -393,6 +393,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             allow: m
                 .get_many::<EndpointId>("allow")
                 .map_or_else(Vec::new, |ids| ids.copied().collect()),
+            saved_clients: None,
             command: strings(m, "shell"),
             scrollback: value(m, "scrollback")?,
             session_ttl_secs: value(m, "session_ttl_secs")?,

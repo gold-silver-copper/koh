@@ -16,7 +16,7 @@ use crate::server::audit::{auth_event, Outcome};
 use crate::server::session::{AttachKind, Registry, SessionSpec};
 use crate::server::{run_attached, SessionExit};
 use crate::transport_iroh::{bind_on, Network, ALPN};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Deadline on the QUIC handshake, so a stalled dial cannot hold its permits for the 5-minute idle
 /// timeout; a real handshake takes far less, even on a slow mobile link.
@@ -28,8 +28,12 @@ const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct ServeConfig {
     /// The secret-key file; `None` for the default server key path.
     pub key_file: Option<PathBuf>,
-    /// The client endpoint ids allowed in; at least one.
+    /// The client endpoint ids allowed in for this run, beside `saved_clients`; at least one
+    /// client between them.
     pub allow: Vec<EndpointId>,
+    /// Where the clients saved with `koh clients add` are, read afresh for every connection; `None`
+    /// for none.
+    pub saved_clients: Option<crate::names::Places>,
     /// The program each session runs, as argv, verbatim; empty for the login shell.
     pub command: Vec<String>,
     /// Scrollback lines each session's emulator keeps, at most [`MAX_SCROLLBACK`].
@@ -69,6 +73,7 @@ impl Default for ServeConfig {
         Self {
             key_file: None,
             allow: Vec::new(),
+            saved_clients: None,
             command: Vec::new(),
             scrollback: DEFAULT_SCROLLBACK,
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
@@ -135,43 +140,33 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
         " (ephemeral; --port fixes it across restarts)".to_owned()
     };
 
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "┌─ koh server ready ──────────────────────────────────────"
-    );
-    let _ = writeln!(std::io::stderr().lock(), "│ endpoint id : {id_str}");
-    let _ = writeln!(std::io::stderr().lock(), "│ key file    : {key_file}");
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "│ alpn        : {}",
-        String::from_utf8_lossy(ALPN)
-    );
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "│ auth        : allowlist ({} client(s))",
-        hosting.allow.len()
-    );
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "│ udp port    : {port}{port_note}"
-    );
-    let _ = writeln!(std::io::stderr().lock(), "│ connect     : {connect_hint}");
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "└───────────────────────────────────────────────────────────"
-    );
-
+    let clients = hosting.allow.now()?.len();
+    let alpn = String::from_utf8_lossy(ALPN);
     // A phone camera can read the id instead of anyone copying 64 hex digits.
-    if let Some(qr) = connect_qr(&id_str) {
-        let _ =
-            writeln!(std::io::stderr().lock(),
-            "\nScan for the endpoint id (point a phone camera at it). Assumes a dark-background \
-             terminal;\non a light background it renders inverted — copy the id above instead:\n"
-        );
-        let _ = writeln!(std::io::stderr().lock(), "{qr}");
-    } else {
-        warn!("could not render the connect QR (endpoint id too large to encode)");
-    }
+    let qr = connect_qr(&id_str).map_or_else(
+        || {
+            warn!("could not render the connect QR (endpoint id too large to encode)");
+            String::new()
+        },
+        |qr| {
+            format!(
+                "\nScan for the endpoint id (point a phone camera at it). Assumes a \
+                 dark-background terminal;\non a light background it renders inverted — copy \
+                 the id above instead:\n\n{qr}\n"
+            )
+        },
+    );
+    let banner = format!(
+        "┌─ koh server ready ──────────────────────────────────────\n\
+         │ endpoint id : {id_str}\n\
+         │ key file    : {key_file}\n\
+         │ alpn        : {alpn}\n\
+         │ auth        : allowlist ({clients} client(s))\n\
+         │ udp port    : {port}{port_note}\n\
+         │ connect     : {connect_hint}\n\
+         └───────────────────────────────────────────────────────────\n{qr}"
+    );
+    let _ = std::io::stderr().lock().write_all(banner.as_bytes());
 
     // What protects the link, iroh's choice: so an operator sees post-quantum KEX is not on.
     info!(
@@ -190,9 +185,61 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     serve_endpoint(endpoint, hosting, shutdown).await
 }
 
+/// Who may connect: the ids allowed for this run, and the clients saved beside the server key,
+/// read afresh for every connection, so `koh clients rm` takes effect at once.
+#[derive(Clone)]
+pub struct Allowlist {
+    given: Arc<HashSet<EndpointId>>,
+    saved: Option<Arc<crate::names::Places>>,
+}
+
+impl Allowlist {
+    /// The clients who may connect now: the given, and the saved as the file says now.
+    fn now(&self) -> anyhow::Result<HashSet<EndpointId>> {
+        let mut allowed = HashSet::clone(&self.given);
+        if let Some(places) = &self.saved {
+            let names = crate::names::load(places, crate::names::List::Clients)?;
+            allowed.extend(names.entries().map(|(_, id)| id));
+        }
+        Ok(allowed)
+    }
+
+    /// Whether `peer` may connect now. A list that cannot be read admits only the given ids.
+    async fn allows(&self, peer: EndpointId) -> bool {
+        let this = self.clone();
+        match tokio::task::spawn_blocking(move || this.now())
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|now| now)
+        {
+            Ok(now) => now.contains(&peer),
+            Err(e) => {
+                warn!(error = %e, "could not read the saved clients");
+                self.given.contains(&peer)
+            }
+        }
+    }
+}
+
+/// A connection whose peer the allowlist admitted: the only kind a session is served to.
+pub struct Authorized(iroh::endpoint::Connection);
+
+impl Authorized {
+    /// `conn`, whose peer its caller admitted: a host with no accept loop of its own, as
+    /// [`run_session`](super::run_session) and tests are.
+    pub const fn assumed(conn: iroh::endpoint::Connection) -> Self {
+        Self(conn)
+    }
+
+    /// The connection.
+    pub const fn conn(&self) -> &iroh::endpoint::Connection {
+        &self.0
+    }
+}
+
 /// A validated [`ServeConfig`]: who may connect, what each session runs, and the limits.
 pub struct Hosting {
-    allow: HashSet<EndpointId>,
+    allow: Allowlist,
     command: Arc<[String]>,
     scrollback: usize,
     session_ttl: Duration,
@@ -210,8 +257,11 @@ impl Hosting {
             args.scrollback
         );
         anyhow::ensure!(args.max_sessions >= 1, "max_sessions must be at least 1");
-        let allow: HashSet<EndpointId> = args.allow.iter().copied().collect();
-        if allow.is_empty() {
+        let allow = Allowlist {
+            given: Arc::new(args.allow.iter().copied().collect()),
+            saved: args.saved_clients.clone().map(Arc::new),
+        };
+        if allow.now()?.is_empty() {
             anyhow::bail!(
                 "no clients authorized: save one with `koh clients add <name> <endpoint-id>`, or pass --allow <endpoint-id> (get it from `koh id` on the client)"
             );
@@ -242,7 +292,7 @@ pub async fn serve_endpoint(
     hosting: Hosting,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let allow = Arc::new(hosting.allow);
+    let allow = hosting.allow;
     let registry = Registry::spawn(SessionSpec {
         command: hosting.command,
         scrollback: hosting.scrollback,
@@ -283,6 +333,10 @@ pub async fn serve_endpoint(
         };
         let allow = allow.clone();
         let sessions = registry.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a task a connection, each holding a permit"
+        )]
         tokio::spawn(async move {
             let _permit = permit;
             let pending_permit = pending_permit;
@@ -298,13 +352,13 @@ pub async fn serve_endpoint(
                 }
             };
             let peer = conn.remote_id();
-            if !allow.contains(&peer) {
+            if !allow.allows(peer).await {
                 auth_event(Outcome::Rejected, &peer, "not on allowlist");
                 conn.close(1u32.into(), b"not authorized");
                 return;
             }
             drop(pending_permit);
-            serve_connection(conn, &sessions).await;
+            serve_connection(Authorized(conn), &sessions).await;
         });
     }
 
@@ -320,12 +374,13 @@ pub async fn serve_endpoint(
 
 /// Serve one allowed connection: send the admission ack, then attach its peer's session and drive
 /// it; returning detaches.
-async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry) {
+async fn serve_connection(authorized: Authorized, registry: &Registry) {
+    let conn = authorized.conn();
     let peer = conn.remote_id();
     // Bounded, so a client that never accepts the stream cannot hold its slot.
     match tokio::time::timeout(
         Duration::from_secs(3),
-        crate::transport_iroh::admission::admit(&conn),
+        crate::transport_iroh::admission::admit(conn),
     )
     .await
     {
@@ -341,11 +396,13 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
     }
     auth_event(Outcome::Accepted, &peer, "authorized; attaching session");
 
-    let Some((client, attach_kind)) = registry.attach(peer).await else {
-        // At the session cap, which only a new peer can hit.
-        warn!(peer = %peer, "refusing session: at max-sessions capacity");
-        conn.close(1u32.into(), b"server at session capacity");
-        return;
+    let (client, attach_kind) = match registry.attach(peer).await {
+        Ok(attached) => attached,
+        Err(refused) => {
+            warn!(peer = %peer, reason = %refused, "refusing session");
+            conn.close(1u32.into(), refused.to_string().as_bytes());
+            return;
+        }
     };
     match attach_kind {
         AttachKind::Created => {
@@ -359,14 +416,9 @@ async fn serve_connection(conn: iroh::endpoint::Connection, registry: &Registry)
             );
         }
     }
-    match run_attached(conn, client).await {
-        Ok(SessionExit::Detached) => {
-            info!(peer = %peer, "client detached (session retained)");
-        }
-        Ok(SessionExit::ShellExited) => {
-            info!(peer = %peer, "shell exited");
-        }
-        Err(e) => error!(error = %e, "session loop error"),
+    match run_attached(authorized, client).await {
+        SessionExit::Detached => info!(peer = %peer, "client detached (session retained)"),
+        SessionExit::ShellExited => info!(peer = %peer, "shell exited"),
     }
 }
 

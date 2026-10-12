@@ -4,6 +4,7 @@
 //!
 //! Every run has its own `HOME` and `XDG_CONFIG_HOME`, so the keys and lists live in a scratch
 //! directory and the user's own `~/.config/koh` is never read or written.
+#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -311,7 +312,7 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
         let buf = capture(output);
         wait_for(&buf, "koh — this machine", 10).await.unwrap();
         wait_for(&buf, "1  laptop", 5).await.unwrap();
-        menu.write_input(b"q\n").unwrap();
+        menu.write(b"q\n".to_vec()).unwrap();
         let mut exited = false;
         for _ in 0..50 {
             if menu.try_wait().ok().flatten().is_some() {
@@ -320,7 +321,7 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let _ = menu.kill();
+        drop(menu);
         assert!(exited, "q left the menu; captured:\n{}", captured(&buf));
     });
 }
@@ -364,15 +365,90 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
             Pty::spawn(24, 80, &argv, "xterm-256color", &launcher()).expect("spawn the client");
         let buf = capture(output);
         tokio::time::sleep(Duration::from_millis(2000)).await;
-        client.write_input(b"echo by''_name\r").unwrap();
+        client.write(b"echo by''_name\r".to_vec()).unwrap();
         let seen = wait_for(&buf, "by_name", 15).await;
-        let _ = client.write_input(&[0x1e, b'.']);
+        let _ = client.write(vec![0x1e, b'.']);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = client.kill();
+        drop(client);
         task.abort();
         seen.unwrap();
         let noted = std::fs::read_to_string(connected(&home)).unwrap();
         assert!(noted.starts_with(&id), "the connect is noted: {noted:?}");
         assert!(Path::new(&connected(&home)).exists());
     });
+}
+
+/// Clients added and removed with `koh clients` take effect at a running server's next connection,
+/// with no restart: a lost machine's key is refused at once.
+#[test]
+fn clients_added_and_removed_take_effect_on_a_running_server() {
+    use koh::transport_iroh::admission::await_admission;
+    use koh::transport_iroh::{bind_endpoint_local, direct_addr, parse_endpoint_id, ALPN};
+    let home = Home::new("live-allowlist").unwrap();
+    let me = home.koh(&["id"]).unwrap();
+    let me = String::from_utf8_lossy(&me.stdout).trim().to_owned();
+    home.koh(&["clients", "add", "other", &some_id(4)]).unwrap();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_koh"))
+        .args(["serve", "--local", "--shell", "sh"])
+        .env("HOME", &home.0)
+        .env("XDG_CONFIG_HOME", home.0.join(".config"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = server.stderr.take().unwrap();
+    let (seen, banner) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = seen.send(line);
+        }
+    });
+    let (mut id, mut port) = (None, None);
+    while id.is_none() || port.is_none() {
+        let line = banner
+            .recv_timeout(Duration::from_secs(20))
+            .expect("banner");
+        if let Some(rest) = line.split_once("endpoint id : ").map(|(_, r)| r) {
+            id = Some(parse_endpoint_id(rest).unwrap());
+        }
+        if let Some(rest) = line.split_once("udp port    : ").map(|(_, r)| r) {
+            port = rest
+                .split_whitespace()
+                .next()
+                .and_then(|p| p.parse::<u16>().ok());
+        }
+    }
+    let at = direct_addr(id.unwrap(), ([127, 0, 0, 1], port.unwrap()).into());
+    let key = std::fs::read(home.koh_dir().join("client.key")).unwrap();
+    let secret = iroh::SecretKey::from_bytes(&key.try_into().unwrap());
+    let admitted = || {
+        let (at, secret) = (at.clone(), secret.clone());
+        async move {
+            let endpoint = bind_endpoint_local(secret, false).await?;
+            let conn = endpoint.connect(at, ALPN).await?;
+            await_admission(&conn).await?;
+            conn.close(0u32.into(), b"done");
+            anyhow::Ok(())
+        }
+    };
+    let outcomes = runtime().unwrap().block_on(async {
+        let before = admitted().await.is_ok();
+        home.koh(&["clients", "add", "me", &me]).unwrap();
+        let added = admitted().await.is_ok();
+        home.koh(&["clients", "rm", "me"]).unwrap();
+        let removed = admitted().await.is_ok();
+        (before, added, removed)
+    });
+    let _ = server.kill();
+    let _ = server.wait();
+    assert_eq!(
+        outcomes,
+        (false, true, false),
+        "(before it was saved, once saved, once removed)"
+    );
 }

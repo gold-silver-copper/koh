@@ -24,7 +24,6 @@
 //! Then `end`. An error ends the process, which the driver reports as a difference.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
@@ -32,7 +31,6 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
-use koh::predict::DisplayPreference;
 use koh::proto::{decode_frame, encode_frame, ClientMsg, Frame, FrameNum, InputSeq};
 use koh::terminal::{ServerTerminal, Size, TerminalScreen};
 
@@ -76,7 +74,7 @@ struct Session {
     capture: Capture,
     /// The newest frame the client acknowledged, the next frame's base.
     base: (FrameNum, TerminalScreen),
-    sent: VecDeque<(FrameNum, TerminalScreen)>,
+    sent: Vec<(FrameNum, TerminalScreen)>,
     next: FrameNum,
     /// The newest input the server received, which frames acknowledge as echoed.
     echoed: InputSeq,
@@ -91,13 +89,27 @@ impl Session {
             painted: Rc::default(),
             size: Rc::new(Cell::new(size)),
         };
+        let mut terminal =
+            BackendTerminal::enter(capture.clone(), false).map_err(|e| e.to_string())?;
+        // Nothing seen yet, as a commit before the client primed what the first frame shows: a
+        // bell or clipboard in it reaches the terminal on both sides.
+        #[cfg(koh_prime)]
+        terminal.prime(koh::client::WindowState {
+            title: "",
+            icon: "",
+            clipboard: "",
+            bell_count: 0,
+        });
         Ok(Self {
             server: ServerTerminal::new(rows, cols, SCROLLBACK).map_err(|e| e.to_string())?,
-            client: ClientSession::new(DisplayPreference::Always, size),
-            terminal: BackendTerminal::enter(capture.clone(), false).map_err(|e| e.to_string())?,
+            #[cfg(koh_display_preference)]
+            client: ClientSession::new(koh::predict::DisplayPreference::Always, size),
+            #[cfg(not(koh_display_preference))]
+            client: ClientSession::new(size),
+            terminal,
             capture,
             base: (FrameNum::BLANK, TerminalScreen::default()),
-            sent: VecDeque::new(),
+            sent: Vec::new(),
             next: FrameNum::BLANK.next(),
             echoed: InputSeq::default(),
             start: Instant::now(),
@@ -191,9 +203,9 @@ impl Session {
         #[cfg(not(koh_frame_base))]
         let bytes = encode_frame(&frame).map_err(|e| e.to_string())?;
         let _ = writeln!(out, "bytes {}", bytes.len());
-        self.sent.push_back((frame.num, screen));
-        while self.sent.len() > WINDOW {
-            self.sent.pop_front();
+        self.sent.push((frame.num, screen));
+        if self.sent.len() > WINDOW {
+            self.sent.remove(0);
         }
         if !dropped {
             #[cfg(koh_frame_base)]
@@ -211,37 +223,45 @@ impl Session {
     /// The client has frame `frame`: the frames before it are no bases any more.
     fn ack(&mut self, frame: FrameNum) {
         if let Some(at) = self.sent.iter().position(|(num, _)| *num == frame) {
-            let mut newer = self.sent.split_off(at);
-            if let Some(base) = newer.pop_front() {
+            let mut newer = self.sent.split_off(at).into_iter();
+            if let Some(base) = newer.next() {
                 self.base = base;
             }
-            self.sent = newer;
+            self.sent = newer.collect();
         }
     }
 
     /// Deliver the client's messages to the server.
     fn drain(&mut self, out: &mut String) {
         while let Some(msg) = self.client.pop_outgoing() {
-            // Decoded input, as the bytes a client that forwarded them sent: what the user's
-            // terminal sent, each key in its one legacy form (the oracle gives both sides keys in
-            // that form). The terminal's colours go to the server alone.
+            // The terminal's colours go to the server alone.
             #[cfg(koh_input_events)]
-            let msg = match msg {
-                ClientMsg::Keys { seq, events } => ClientMsg::Input {
-                    seq,
-                    bytes: events
-                        .iter()
-                        .flat_map(koh::events::InputEvent::sent_by_a_legacy_terminal)
-                        .collect(),
-                },
-                ClientMsg::Colours(_) => continue,
-                other @ (ClientMsg::Input { .. }
-                | ClientMsg::Resize(_)
-                | ClientMsg::Ack { .. }
-                | ClientMsg::Resync
-                | ClientMsg::History(_)) => other,
+            if matches!(msg, ClientMsg::Colours(_)) {
+                continue;
+            }
+            // Decoded input, printed as the bytes a client that forwarded them sent: what the
+            // user's terminal sent, each key in its one legacy form (the oracle gives both sides
+            // keys in that form), as a commit before decoded input printed its `Input`.
+            #[cfg(koh_input_events)]
+            let typed = if let ClientMsg::Keys { seq, events } = &msg {
+                let bytes: Vec<u8> = events
+                    .iter()
+                    .flat_map(koh::events::InputEvent::sent_by_a_legacy_terminal)
+                    .collect();
+                Some((*seq, bytes))
+            } else {
+                None
             };
-            let line = format!("{msg:?}");
+            #[cfg(not(koh_input_events))]
+            let typed = if let ClientMsg::Input { seq, bytes } = &msg {
+                Some((*seq, bytes.clone()))
+            } else {
+                None
+            };
+            let line = match &typed {
+                Some((seq, bytes)) => format!("Input {{ seq: {seq:?}, bytes: {bytes:?} }}"),
+                None => format!("{msg:?}"),
+            };
             // Scrollback requests are new (a side at an older commit has none), and change
             // nothing the user's terminal shows until the user opens the view. Acknowledgements
             // are the transport's business: a later commit takes a frame's delivery as one and
@@ -251,10 +271,10 @@ impl Session {
             }
             // Matched with `if let`, not `match`, so the side builds against a commit whose
             // messages are fewer or more.
-            if let ClientMsg::Ack { frame } = msg {
-                self.ack(frame);
-            } else if let ClientMsg::Input { seq, .. } = msg {
+            if let Some((seq, _)) = typed {
                 self.echoed = seq;
+            } else if let ClientMsg::Ack { frame } = msg {
+                self.ack(frame);
             } else if matches!(msg, ClientMsg::Resync) {
                 self.base = (FrameNum::BLANK, TerminalScreen::default());
             }

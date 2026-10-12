@@ -1,4 +1,4 @@
-//! The koh/3 wire protocol.
+//! The koh/4 wire protocol.
 //!
 //! After admission the client opens one uni stream and writes [`ClientMsg`]s on it, each a 4-byte
 //! big-endian length followed by its postcard encoding. The server sends every screen update as a
@@ -39,7 +39,7 @@ impl FrameNum {
     }
 }
 
-/// An input sequence number: which [`ClientMsg::Input`] on this connection. The first is 1; 0
+/// An input sequence number: which [`ClientMsg::Keys`] on this connection. The first is 1; 0
 /// means "no input yet".
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -61,11 +61,8 @@ impl InputSeq {
 /// twice this.
 pub const TTY_TICK: Duration = Duration::from_millis(100);
 
-/// Most typed bytes in one [`ClientMsg::Input`]; the client splits a paste into several.
-pub const MAX_INPUT_BYTES: usize = 64 * 1024;
-
-/// Most bytes in one encoded client message: the largest `Input` plus room for its envelope.
-pub const MAX_CLIENT_MESSAGE: usize = MAX_INPUT_BYTES + 64;
+/// Most bytes in one encoded client message: a whole paste, and a full message of keys beside it.
+pub const MAX_CLIENT_MESSAGE: usize = crate::events::MAX_PASTE + 64 * 1024;
 
 /// Most bytes in a frame, both compressed on the stream and inflated. A full repaint of a
 /// 1000×1000 screen with varied styles is several MiB.
@@ -138,12 +135,6 @@ const COMPRESSION_LEVEL: u8 = 6;
 /// A message on the client's stream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// Typed bytes, at most [`MAX_INPUT_BYTES`].
-    Input {
-        seq: InputSeq,
-        #[serde(with = "byte_string")]
-        bytes: Vec<u8>,
-    },
     /// The client's window is now this size.
     Resize(Size),
     /// The client applied `frame`; later frames may diff against it. A frame's delivery already
@@ -156,49 +147,19 @@ pub enum ClientMsg {
     /// The client asks for history rows it lacks (see [`HistoryRequest`]). The server answers each,
     /// one at a time, at a lower priority than frames.
     History(HistoryRequest),
-    /// Input the client decoded: keys, mouse events, focus changes, paste pieces, in order, at
-    /// most [`MAX_EVENTS`](crate::events::MAX_EVENTS). The server encodes each for the program as
-    /// it asked. It shares the input sequence numbers with [`ClientMsg::Input`].
+    /// Input the client decoded: keys, mouse events, focus changes and pastes, in order, at most
+    /// [`MAX_EVENTS`](crate::events::MAX_EVENTS). The server encodes each for the program as it
+    /// asked.
     Keys {
         seq: InputSeq,
+        #[serde(
+            deserialize_with = "crate::bounded::at_most::<{ crate::events::MAX_EVENTS }, _, _>"
+        )]
         events: Vec<InputEvent>,
     },
     /// What the user's terminal said of its colours: sent after connecting, on every reconnect,
     /// and when the terminal reports a new scheme, unless the user turned it off.
     Colours(WireColours),
-}
-
-/// [`ClientMsg::Input`]'s bytes as a byte string. postcard encodes that exactly as it encodes a
-/// `Vec<u8>` (a varint length, then the bytes), but decodes it with one copy rather than byte by
-/// byte.
-mod byte_string {
-    use serde::{de, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(bytes)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        deserializer.deserialize_byte_buf(Bytes)
-    }
-
-    struct Bytes;
-
-    impl de::Visitor<'_> for Bytes {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("a byte string")
-        }
-
-        fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
-            Ok(bytes.to_vec())
-        }
-
-        fn visit_byte_buf<E: de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
-            Ok(bytes)
-        }
-    }
 }
 
 /// A screen update: the change from frame `base` to frame `num`.
@@ -216,8 +177,6 @@ pub struct Frame {
 pub enum ProtoError {
     #[error("message of {len} bytes exceeds the {max}-byte limit")]
     TooLarge { len: usize, max: usize },
-    #[error("input of {len} bytes exceeds the {max}-byte limit")]
-    InputTooLarge { len: usize, max: usize },
     #[error("stream ended inside a message")]
     Truncated,
     #[error("malformed message: {0}")]
@@ -247,32 +206,16 @@ const fn at_most(len: usize, max: usize) -> Result<(), ProtoError> {
 
 /// Encode one client message with its length prefix.
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
-    let input = match msg {
-        ClientMsg::Input { bytes, .. } => bytes.len(),
-        ClientMsg::Keys { events, .. } => {
-            check_events(events).map_err(ProtoError::BadInput)?;
-            events.iter().map(InputEvent::wire_len).sum()
-        }
-        ClientMsg::Colours(colours) => {
-            colours.check().map_err(ProtoError::BadInput)?;
-            0
-        }
+    match msg {
+        ClientMsg::Keys { events, .. } => check_events(events).map_err(ProtoError::BadInput)?,
+        ClientMsg::Colours(colours) => colours.check().map_err(ProtoError::BadInput)?,
         ClientMsg::Resize(_)
         | ClientMsg::Ack { .. }
         | ClientMsg::Resync
-        | ClientMsg::History(_) => 0,
-    };
-    if input > MAX_INPUT_BYTES {
-        return Err(ProtoError::InputTooLarge {
-            len: input,
-            max: MAX_INPUT_BYTES,
-        });
+        | ClientMsg::History(_) => {}
     }
-    // The body goes straight after a placeholder for its length, into one buffer sized for the
-    // typed bytes plus the envelope.
-    let mut out = Vec::with_capacity(input.saturating_add(ENVELOPE));
-    out.extend_from_slice(&[0; 4]);
-    let mut out = postcard::to_extend(msg, out)?;
+    // The body goes straight after a placeholder for its length.
+    let out = postcard::to_extend(msg, vec![0; 4])?;
     let body = out.len().saturating_sub(4);
     let len = u32::try_from(body)
         .ok()
@@ -281,15 +224,12 @@ pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
             len: body,
             max: MAX_CLIENT_MESSAGE,
         })?;
+    let mut out = out;
     if let Some(prefix) = out.first_chunk_mut::<4>() {
         *prefix = len.to_be_bytes();
     }
     Ok(out)
 }
-
-/// Room for a client message beside its typed bytes: the length prefix, the variant and the
-/// varints of the sequence number and the byte count.
-const ENVELOPE: usize = 32;
 
 /// Splits the client's stream back into messages, however its bytes arrive.
 #[derive(Debug, Default)]
@@ -326,16 +266,9 @@ impl ClientDecoder {
         };
         let msg: ClientMsg = postcard::from_bytes(body)?;
         match &msg {
-            ClientMsg::Input { bytes, .. } if bytes.len() > MAX_INPUT_BYTES => {
-                return Err(ProtoError::InputTooLarge {
-                    len: bytes.len(),
-                    max: MAX_INPUT_BYTES,
-                });
-            }
             ClientMsg::Keys { events, .. } => check_events(events).map_err(ProtoError::BadInput)?,
             ClientMsg::Colours(colours) => colours.check().map_err(ProtoError::BadInput)?,
-            ClientMsg::Input { .. }
-            | ClientMsg::Resize(_)
+            ClientMsg::Resize(_)
             | ClientMsg::Ack { .. }
             | ClientMsg::Resync
             | ClientMsg::History(_) => {}
@@ -629,16 +562,16 @@ mod tests {
     #[test]
     fn client_messages_round_trip_whatever_the_chunking() {
         let msgs = vec![
-            ClientMsg::Input {
+            ClientMsg::Keys {
                 seq: InputSeq(1),
-                bytes: b"ls -la\r".to_vec(),
+                events: vec![InputEvent::Focus(true)],
             },
             ClientMsg::Resize(Size::new(50, 132)),
             ClientMsg::Ack { frame: FrameNum(9) },
             ClientMsg::Resync,
-            ClientMsg::Input {
+            ClientMsg::Keys {
                 seq: InputSeq(2),
-                bytes: vec![0x1b; MAX_INPUT_BYTES],
+                events: vec![InputEvent::Paste("\x1b".repeat(crate::events::MAX_PASTE))],
             },
         ];
         let stream: Vec<u8> = msgs
@@ -691,14 +624,11 @@ mod tests {
 
     #[test]
     fn oversized_client_messages_are_rejected_before_buffering() {
-        let too_long = ClientMsg::Input {
+        let too_long = ClientMsg::Keys {
             seq: InputSeq(1),
-            bytes: vec![b'a'; MAX_INPUT_BYTES + 1],
+            events: vec![InputEvent::Paste("a".repeat(MAX_CLIENT_MESSAGE)); 1],
         };
-        assert!(matches!(
-            encode_client(&too_long),
-            Err(ProtoError::InputTooLarge { .. })
-        ));
+        assert!(encode_client(&too_long).is_err());
         // A header announcing more than the cap is refused as soon as the header arrives.
         let mut decoder = ClientDecoder::default();
         let len = u32::try_from(MAX_CLIENT_MESSAGE + 1).unwrap();
@@ -707,18 +637,6 @@ mod tests {
             decoder.next_msg(),
             Err(ProtoError::TooLarge { .. })
         ));
-        // A hand-built Input over the byte cap, inside a legal envelope, is refused too.
-        let body = postcard::to_allocvec(&ClientMsg::Input {
-            seq: InputSeq(1),
-            bytes: vec![b'a'; MAX_INPUT_BYTES + 10],
-        })
-        .unwrap();
-        let mut stream = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
-        stream.extend_from_slice(&body);
-        assert!(matches!(
-            decode_all(&stream),
-            Err(ProtoError::InputTooLarge { .. } | ProtoError::TooLarge { .. })
-        ));
     }
 
     /// Input no terminal sends, built by hand inside a legal envelope (`encode_client` refuses to
@@ -726,8 +644,8 @@ mod tests {
     #[test]
     fn keys_and_colours_no_terminal_sends_are_refused() {
         use crate::events::{
-            WireKey, WireKeyCode, WireKitty, WireMouse, WireMouseAction, MAX_EVENTS,
-            MAX_PASTE_PIECE, PALETTE,
+            WireKey, WireKeyCode, WireKitty, WireMouse, WireMouseAction, MAX_EVENTS, MAX_PASTE,
+            PALETTE,
         };
         let raw = |msg: &ClientMsg| {
             let body = postcard::to_allocvec(msg).unwrap();
@@ -760,11 +678,7 @@ mod tests {
                 row: 0,
                 col: 0,
             })]),
-            keys(vec![InputEvent::Paste {
-                text: "x".repeat(MAX_PASTE_PIECE + 1),
-                first: true,
-                last: true,
-            }]),
+            keys(vec![InputEvent::Paste("x".repeat(MAX_PASTE + 1))]),
             keys(vec![InputEvent::Focus(true); MAX_EVENTS + 1]),
             ClientMsg::Colours(WireColours {
                 palette: vec![None; PALETTE + 1],
@@ -788,11 +702,7 @@ mod tests {
             keys(vec![
                 key(WireKeyCode::Char('é'), 7, None),
                 key(WireKeyCode::F(12), 0, None),
-                InputEvent::Paste {
-                    text: "x".repeat(MAX_PASTE_PIECE),
-                    first: true,
-                    last: true,
-                },
+                InputEvent::Paste("x".repeat(MAX_PASTE)),
             ]),
             keys(vec![InputEvent::Focus(false); MAX_EVENTS]),
             ClientMsg::Colours(WireColours {

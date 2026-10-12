@@ -1,0 +1,14 @@
+# The harnesses under testing/ are held to koh's test allowances (`../clippy.toml`), not to its
+# bans on unbounded queues and unaccounted tasks, which are for what koh ships.
+# Test code is allowed to panic: a failed `unwrap`/`expect`/`assert` in a test
+# IS the test failing. These keys relax the panic-prevention restriction lints
+# (forbidden in Cargo.toml)
+# inside `#[cfg(test)]` modules and `#[test]` functions. Anything else, including
+# helper functions in the integration tests, stays panic-free.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true
+
+allow-print-in-tests = true

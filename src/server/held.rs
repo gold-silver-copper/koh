@@ -3,8 +3,7 @@
 //! a `Resync` (the client lacked a frame's base) forgets all of it at once: a delivery heard after
 //! the forget is of a frame sent before it, which is no longer found.
 
-use std::collections::VecDeque;
-
+use crate::bounded::Bounded;
 use crate::proto::{FrameNum, FrameScreen, FRAME_WINDOW, WINDOW_CELLS};
 use crate::terminal::TerminalScreen;
 
@@ -17,7 +16,7 @@ pub(super) struct ClientHolds {
     /// Frames sent since, oldest first: at most `FRAME_WINDOW`, holding at most [`WINDOW_CELLS`]
     /// cells together unless the newest alone is more, so a client that never acknowledges cannot
     /// make the server hold sixteen of the largest screens. The newest is always kept.
-    sent: VecDeque<FrameScreen>,
+    sent: Bounded<FrameScreen, FRAME_WINDOW>,
 }
 
 impl ClientHolds {
@@ -33,10 +32,8 @@ impl ClientHolds {
 
     /// `frame` was sent.
     pub(super) fn sent(&mut self, frame: FrameScreen) {
-        self.sent.push_back(frame);
-        while self.sent.len() > FRAME_WINDOW
-            || (self.sent.len() > 1 && distinct_cells(&self.sent) > WINDOW_CELLS)
-        {
+        self.sent.push_evicting(frame);
+        while self.sent.len() > 1 && distinct_cells(&self.sent) > WINDOW_CELLS {
             self.sent.pop_front();
         }
     }
@@ -44,14 +41,15 @@ impl ClientHolds {
     /// Frame `num` was delivered, so it is the base and older frames are no bases any more. A
     /// frame no longer held, or sent before the last [`forget`](Self::forget), is ignored.
     pub(super) fn delivered(&mut self, num: FrameNum) {
-        let Some(pos) = self.sent.iter().position(|sent| sent.num == num) else {
+        if !self.sent.iter().any(|sent| sent.num == num) {
             return;
-        };
-        let mut rest = self.sent.split_off(pos);
-        if let Some(acked) = rest.pop_front() {
-            self.acked = acked;
         }
-        self.sent = rest;
+        while let Some(sent) = self.sent.pop_front() {
+            if sent.num == num {
+                self.acked = sent;
+                break;
+            }
+        }
     }
 
     /// The client holds nothing: diff against the blank screen until a frame sent from now on is
@@ -62,12 +60,12 @@ impl ClientHolds {
 
     /// The frames sent and not yet delivered.
     #[cfg(test)]
-    pub(super) const fn window(&self) -> &VecDeque<FrameScreen> {
+    pub(super) const fn window(&self) -> &Bounded<FrameScreen, FRAME_WINDOW> {
         &self.sent
     }
 }
 
 /// The cells the screens of `frames` hold in memory, a row several of them share counted once.
-pub(super) fn distinct_cells(frames: &VecDeque<FrameScreen>) -> usize {
+pub(super) fn distinct_cells(frames: &Bounded<FrameScreen, FRAME_WINDOW>) -> usize {
     TerminalScreen::distinct_cells(frames.iter().map(|frame| &*frame.screen))
 }

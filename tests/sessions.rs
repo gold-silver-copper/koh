@@ -1,8 +1,9 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/3 client.
+//! loopback iroh with a minimal koh/4 client.
 //!
 //! Every session's program starts through the `koh` binary's `__launch`, as `koh serve`'s do; unit
 //! tests cannot reach a binary, so these live here.
+#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -48,7 +49,7 @@ fn registry(command: &[&str], max_sessions: usize, ttl: Duration) -> Registry {
 
 /// Attach `peer` and say how.
 async fn attach_kind(reg: &Registry, peer: iroh::EndpointId) -> Option<AttachKind> {
-    reg.attach(peer).await.map(|(_, kind)| kind)
+    reg.attach(peer).await.ok().map(|(_, kind)| kind)
 }
 
 fn peer() -> std::io::Result<iroh::EndpointId> {
@@ -83,7 +84,7 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
             .await
             .context("A creates the one allowed session")?;
         anyhow::ensure!(
-            reg.attach(b).await.is_none(),
+            reg.attach(b).await.is_err(),
             "a second distinct peer is refused at the cap"
         );
         anyhow::ensure!(
@@ -160,7 +161,7 @@ fn a_session_whose_shell_exited_is_torn_down() -> anyhow::Result<()> {
     })
 }
 
-/// A bare koh/3 client: writes messages, applies frames whose base it holds, and acks them.
+/// A bare koh/4 client: writes messages, applies frames whose base it holds, and acks them.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -219,9 +220,27 @@ impl RawClient {
 
     async fn type_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.last_seq = self.last_seq.next();
-        let msg = ClientMsg::Input {
+        let mut decoder = fux_vt::keys::decode::Decoder::default();
+        let mut inputs = Vec::new();
+        decoder.bytes(bytes, &mut inputs);
+        decoder.timeout(&mut inputs);
+        let events = inputs
+            .into_iter()
+            .filter_map(|input| match input {
+                fux_vt::keys::decode::Input::Key(key) => {
+                    Some(koh::events::InputEvent::Key(key.into()))
+                }
+                fux_vt::keys::decode::Input::Paste(_)
+                | fux_vt::keys::decode::Input::PasteTooLong
+                | fux_vt::keys::decode::Input::FocusIn
+                | fux_vt::keys::decode::Input::FocusOut
+                | fux_vt::keys::decode::Input::Mouse(_)
+                | fux_vt::keys::decode::Input::Reply(_) => None,
+            })
+            .collect();
+        let msg = ClientMsg::Keys {
             seq: self.last_seq,
-            bytes: bytes.to_vec(),
+            events,
         };
         self.write(&msg).await
     }
@@ -249,7 +268,7 @@ impl RawClient {
             }
             let base = base_screen;
             let mut next = base.clone();
-            next.apply(&frame.diff);
+            next.apply(&frame.diff)?;
             self.screens.insert(frame.num, next);
             self.newest = frame.num;
             self.echo_ack = self.echo_ack.max(frame.echo_ack);
@@ -472,7 +491,6 @@ fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
             drained.is_ok(),
             "after shutdown the held client's session has ended"
         );
-        anyhow::ensure!(!client.can_send(), "the ended session takes no input");
         Ok(())
     })
 }
@@ -552,7 +570,7 @@ async fn attach_when_a_slot_frees(
 ) -> Option<(koh::server::session::SessionClient, AttachKind)> {
     tokio::time::timeout(within, async {
         loop {
-            if let Some(attached) = reg.attach(peer).await {
+            if let Ok(attached) = reg.attach(peer).await {
                 return attached;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -641,8 +659,8 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
         let addr = loopback_addr(&server_ep);
         let serve = tokio::spawn(async move {
             let incoming = server_ep.accept().await.context("incoming")?;
-            let conn = incoming.await?;
-            koh::server::run_attached(conn, client).await
+            let conn = koh::server::cli::Authorized::assumed(incoming.await?);
+            anyhow::Ok(koh::server::run_attached(conn, client).await)
         });
         let mut raw = RawClient::connect(addr, generate_secret_key()?, false).await?;
         let mut ended = None;
@@ -660,6 +678,40 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
             "run_attached must end with ShellExited within 3s; ended: {}, close: {close:?}",
             ended.is_some()
         );
+        Ok(())
+    })
+}
+
+/// A program that cannot start is not reported as the server being full: the connection is
+/// closed saying the session could not start.
+#[test]
+fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let secret = generate_secret_key()?;
+        let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
+        let addr = loopback_addr(&server_ep);
+        let config = ServeConfig {
+            allow: vec![secret.public()],
+            command: vec!["/nonexistent/koh-test-program".to_owned()],
+            launcher: launcher(),
+            ..ServeConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let server = tokio::spawn(serve_endpoint(
+            server_ep,
+            Hosting::from_config(&config)?,
+            shutdown.clone(),
+        ));
+        // The connection is admitted, then closed with the reason.
+        let endpoint = bind_endpoint_local(secret, false).await?;
+        let conn = endpoint.connect(addr, ALPN).await?;
+        let closed = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+        let reason = closed
+            .context("the server closes the connection")?
+            .to_string();
+        anyhow::ensure!(reason.contains("could not start"), "{reason}");
         Ok(())
     })
 }

@@ -10,3 +10,14 @@ allow-indexing-slicing-in-tests = true
 allow-dbg-in-tests = true
 
 allow-print-in-tests = true
+
+# Every queue has a bound (`koh::bounded::Bounded`), and every task spawned says what bounds how
+# many run at once, in an `#[expect(clippy::disallowed_methods, reason = …)]`.
+disallowed-types = [
+    { path = "std::collections::VecDeque", reason = "use koh::bounded::Bounded: every queue has a bound" },
+]
+disallowed-methods = [
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "use a bounded channel" },
+    { path = "tokio::spawn", reason = "say what bounds the tasks spawned here, in the expectation's reason" },
+    { path = "tokio::task::spawn", reason = "say what bounds the tasks spawned here, in the expectation's reason" },
+]

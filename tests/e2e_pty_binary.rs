@@ -8,6 +8,7 @@
 //!
 //! Unlike the mock-terminal e2e, this exercises the actual binary: argument parsing, raw-mode
 //! lifecycle, the renderer, and stdin passthrough — the real terminal path.
+#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -117,14 +118,14 @@ fn real_client_binary_renders_over_pty() {
 
         // Type a command with a distinctive marker; it round-trips to `sh` and back as a frame.
         client
-            .write_input(b"echo koh_pty_marker\r")
+            .write(b"echo koh_pty_marker\r".to_vec())
             .expect("write keystrokes");
         let seen = wait_for(&buf, 0, "koh_pty_marker", 15).await;
 
         // Disconnect via the escape sequence (Ctrl-^ then '.'), then ensure teardown.
-        let _ = client.write_input(&[0x1e, b'.']);
+        let _ = client.write(vec![0x1e, b'.']);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = client.kill();
+        drop(client);
         server_task.abort();
         let _ = std::fs::remove_file(&key_path);
         seen.expect("real client binary rendered the marker over the PTY");
@@ -159,7 +160,7 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
         )
         .expect("spawn bash");
         let buf = capture(output);
-        let type_ = |bytes: &[u8]| bash.write_input(bytes).expect("type");
+        let type_ = |bytes: &[u8]| bash.write(bytes.to_vec()).expect("type");
 
         let mut at = wait_for(&buf, 0, "job$ ", 10)
             .await
@@ -202,7 +203,7 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
             .unwrap_or_else(|e| panic!("{e}"));
         type_(b"exit\r");
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = bash.kill();
+        drop(bash);
         server_task.abort();
         let _ = std::fs::remove_file(&key_path);
     });
@@ -315,7 +316,7 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         // A variable only this session holds, and an answer only a remote shell computes.
         client
-            .write_input(b"X=kept; echo before_${X}_$((6*7))\r")
+            .write(b"X=kept; echo before_${X}_$((6*7))\r".to_vec())
             .expect("type");
         let at = wait_for(&buf, 0, "before_kept_42", 20)
             .await
@@ -331,7 +332,7 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
         let mut seen = Err(String::new());
         for _ in 0..15 {
             client
-                .write_input(b"echo after_${X:-fresh}_$((6*7))\r")
+                .write(b"echo after_${X:-fresh}_$((6*7))\r".to_vec())
                 .expect("type");
             seen = wait_for(&buf, at, "after_fresh_42", 2).await;
             if seen.is_ok() {
@@ -339,9 +340,9 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
             }
         }
 
-        let _ = client.write_input(&[0x1e, b'.']);
+        let _ = client.write(vec![0x1e, b'.']);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = client.kill();
+        drop(client);
         let stopped = stop(server);
         let _ = std::fs::remove_dir_all(&dir);
         stopped.expect("stop the restarted server");

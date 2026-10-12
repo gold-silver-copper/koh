@@ -65,15 +65,15 @@ and the git log.
 
 | ID | Finding | Guarded by |
 |----|---------|------------|
-| KOH-01 | Received states bounded by count, not bytes | Replaced by koh/3's fixed window of 16 frames per end: `src/client/session.rs::only_the_last_frames_are_kept_as_bases`, `src/server/mod.rs::only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored`, `tests/net/hostile_peer.rs::frames_with_unknown_bases_never_grow_the_client` |
+| KOH-01 | Received states bounded by count, not bytes | Replaced by koh/4's fixed window of 16 frames per end: `src/client/session.rs::only_the_last_frames_are_kept_as_bases`, `src/server/mod.rs::only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored`, `tests/net/hostile_peer.rs::frames_with_unknown_bases_never_grow_the_client` |
 | KOH-02 | Decompression amplification on apply | `src/proto.rs::an_inflate_bomb_is_rejected`, `oversized_client_messages_are_rejected_before_buffering`, `tests/net/hostile_peer.rs::an_oversized_or_bomb_frame_never_grows_the_client`, `an_oversized_client_message_closes_the_connection_only` |
 | KOH-03 | Fixed public KDF salt in the passphrase handshake | Removed: there is no over-the-wire passphrase; the node-id allowlist is the only factor |
 | KOH-04 | `String::truncate` on the status line panics the client | `src/client/render.rs::status_line_truncation_is_panic_free_across_all_widths` |
-| KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_keeps_only_the_last_resize_and_concatenates_keys`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
+| KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_queues_the_session_input_in_order_merging_neighbours`, `a_full_queue_for_the_session_leaves_the_rest_undecoded`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
 | KOH-06 | State dir in a world-writable shared location | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_directory_of_another_user_but_root_is_refused`, `src/transport_iroh/mod.rs::config_dir_is_xdg_then_home_and_never_elsewhere` |
-| KOH-07 | Fragment reassembly buffers ~39 MiB | Removed: koh/3 has no fragments; a frame is one stream read under `MAX_FRAME` (see KOH-02) |
+| KOH-07 | Fragment reassembly buffers ~39 MiB | Removed: koh/4 has no fragments; a frame is one stream read under `MAX_FRAME` (see KOH-02) |
 | KOH-08 | Stalled handshakes hold connection permits | The pending-handshake cap and the handshake and admission deadlines in `src/server/cli.rs::serve_endpoint`; no automated test (the admission-stall attack in `testing/android/scripts/stress-evil-peer.sh` exercises it on a device) |
-| KOH-10 | A SIGHUP-immune child leaks the PTY threads | `Pty`'s `Drop` and `kill_hard` send SIGKILL: `tests/pty.rs::a_child_that_ignores_sighup_dies_when_its_pty_is_dropped`, `dropping_pty_eofs_child_and_stops_writer`, `shutdown_joins_both_io_threads_without_deadlock` |
+| KOH-10 | A SIGHUP-immune child leaks the PTY threads | `Pty`'s `Drop` hangs the program up and the reaper kills it after a second's grace: `tests/pty.rs::a_child_that_ignores_sighup_dies_when_its_pty_is_dropped`, `a_hung_up_program_has_time_to_exit_before_it_is_killed`, `dropping_pty_eofs_child_and_stops_writer`, `shutdown_joins_both_io_threads_without_deadlock` |
 | KOH-11, KOH-13 | Passphrase handshake downgrades | Removed with the passphrase handshake |
 | KOH-12 | A pre-existing state dir is not made private | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_missing_directory_is_created_private` |
 | KOH-14 | CLI args holding a passphrase derive `Debug` | Removed: no passphrase or other secret is a CLI argument |
@@ -81,7 +81,19 @@ and the git log.
 | KOH-16 | A loose existing key is never re-tightened | `src/identity/key_file.rs::loose_key_and_lock_files_are_tightened_through_the_descriptor` |
 | KOH-17 | Unmaintained `atomic-polyfill` via postcard defaults | postcard's default features are off (`Cargo.toml`); `cargo deny check advisories` in CI |
 | KOH-18 | Unmaintained `paste` via iroh | Accepted, advisory-only: the ignore in [`deny.toml`](deny.toml) |
-| KOH-19 | Pre-release `ed25519-dalek` / `curve25519-dalek` | Accepted: iroh 1.0.0 still depends on them; tracked with each iroh bump |
+| KOH-19 | Pre-release `ed25519-dalek` / `curve25519-dalek` | Accepted: iroh still depends on pre-1.0 releases of them; tracked with each iroh bump |
+
+**Audit of 2026-10-11 (A-).**
+
+| ID | Finding | Guarded by |
+|----|---------|------------|
+| A-1 | A full input queue froze a connection, leaking its session attachment and permit | The connection never waits inside its loop (`src/server/mod.rs::run_attached`): `tests/net/hostile_peer.rs::a_full_session_queue_does_not_stop_the_frames` |
+| A-2 | Frames a client never takes grew the server's in-flight list | `src/bounded.rs`, and `clippy.toml`'s ban on unbounded queues: `src/server/mod.rs::frames_a_client_never_takes_are_forgotten` |
+| A-3 | Links left off a frame made the two ends' dictionaries differ | The server holds the screen as sent: `src/server/mod.rs::links_left_off_a_frame_go_in_a_later_one` |
+| A-4 | The allowlist check had no test; `koh clients rm` needed a restart | `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server` |
+| A-5 | Hostile-server tests that could not fail | `tests/net/hostile_peer.rs::client_survives` quits the client through the escape |
+| A-6 | A hostile frame could allocate before its counts were checked | `src/bounded.rs::a_sequence_past_its_bound_is_refused_before_it_is_read`, the wire's `at_most` bounds |
+| A-7 | A flood of input starved the client's frames | The client's loop is unbiased: `tests/net/session.rs::a_flood_of_typing_does_not_starve_the_frames` |
 
 **Review follow-ups (KR-, K-, KB-, KC-, KS-, S-, AR-).**
 

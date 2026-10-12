@@ -45,9 +45,13 @@ pub const MAXIMUM_CLIPBOARD_SIZE: usize = 16 * 1024;
 
 /// The most bytes of hyperlinks (URIs and ids) one diff carries.
 ///
-/// A screen's links are a few KiB (fux-vt keeps at most 4 MiB a screen); the server leaves off a row's links past this, and the
-/// client drops a frame that carries more, so a hostile server cannot make the client keep much.
+/// A screen's links are a few KiB (fux-vt keeps at most 4 MiB a screen); the server leaves off a
+/// row's links past this, holding the screen as the client has it, so they go in a later frame,
+/// and the client drops a frame that carries more, so a hostile server cannot make it keep much.
 pub const MAX_LINK_BYTES: usize = 1 << 20;
+
+/// [`MAX_DIM`], as a count of the wire's sequences: rows, and runs in a row.
+pub(crate) const DIM: usize = MAX_DIM as usize;
 
 /// Most bytes of a run's text: a character, of at most 4 bytes, for each cell of the widest row.
 pub const MAX_RUN_TEXT: usize = 4 * MAX_DIM as usize;
@@ -876,25 +880,31 @@ impl TryFrom<RawLink> for WireLink {
 pub struct RowDiff {
     pub row: u16,
     pub wrapped: bool,
+    #[serde(deserialize_with = "crate::bounded::at_most::<DIM, _, _>")]
     pub runs: Vec<Run>,
     /// The row's distinct hyperlinks, at most [`MAX_ROW_LINKS`].
+    #[serde(deserialize_with = "crate::bounded::at_most::<MAX_ROW_LINKS, _, _>")]
     pub links: Vec<WireLink>,
 }
 
 impl RowDiff {
     /// The row `row` of `cells` with `links`, if they fit in what is left of `budget`, the link
-    /// bytes the diff may still carry; past it, the row goes without its links.
+    /// bytes the diff may still carry; past it, the row goes without its links, and `dropped` says
+    /// so.
     fn of(
         row: u16,
         cells: &Cells,
         wrapped: bool,
         links: Option<&RowLinks>,
         budget: &mut usize,
+        dropped: &mut bool,
     ) -> Self {
         let links = links.filter(|links| {
             let fits = links.bytes() <= *budget;
             if fits {
                 *budget = budget.saturating_sub(links.bytes());
+            } else {
+                *dropped = true;
             }
             fits
         });
@@ -1324,36 +1334,11 @@ impl<'a> IntoIterator for &'a Shifts {
 }
 
 impl<'de> Deserialize<'de> for Shifts {
+    /// At most [`MAX_SHIFTS`], so a hostile length costs nothing, then checked.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_seq(ShiftsVisitor)
-    }
-}
-
-/// Reads at most [`MAX_SHIFTS`] shifts, so a hostile length costs nothing, then checks them.
-struct ShiftsVisitor;
-
-impl<'de> de::Visitor<'de> for ShiftsVisitor {
-    type Value = Shifts;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "at most {MAX_SHIFTS} row shifts within the screen, no two sharing a row"
-        )
-    }
-
-    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Shifts, A::Error> {
-        let mut shifts = Vec::new();
-        while let Some(shift) = seq.next_element()? {
-            if shifts.len() == MAX_SHIFTS {
-                return Err(de::Error::invalid_length(
-                    MAX_SHIFTS.saturating_add(1),
-                    &self,
-                ));
-            }
-            shifts.push(shift);
-        }
-        Shifts::new(shifts).ok_or_else(|| de::Error::invalid_value(de::Unexpected::Seq, &self))
+        let shifts = crate::bounded::at_most::<MAX_SHIFTS, _, _>(deserializer)?;
+        Self::new(shifts)
+            .ok_or_else(|| de::Error::custom("row shifts outside the screen, or two sharing a row"))
     }
 }
 
@@ -1385,12 +1370,36 @@ pub struct ScreenDiff {
     /// inserted or deleted line. Never with a resize.
     pub shifts: Shifts,
     /// Every row that differs from the base once shifted (or from blank after a resize), whole.
+    #[serde(deserialize_with = "crate::bounded::at_most::<DIM, _, _>")]
     pub rows: Vec<RowDiff>,
 }
+
+/// A diff that is malformed for the screen it is applied to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a screen diff malformed for its base")]
+pub struct Malformed;
 
 impl TerminalScreen {
     /// The diff that turns `base` into `self`.
     pub fn diff_from(&self, base: &Self) -> ScreenDiff {
+        self.diff_and_sent(base).0
+    }
+
+    /// The diff that turns `base` into `self`, and the screen the diff turns `base` into, if not
+    /// `self`: a diff carries at most [`MAX_LINK_BYTES`] of links, and rows past them go without.
+    pub(crate) fn diff_and_sent(&self, base: &Self) -> (ScreenDiff, Option<Self>) {
+        let mut dropped = false;
+        let diff = self.diff_dropping(base, &mut dropped);
+        let sent = dropped.then(|| {
+            let mut sent = base.clone();
+            // A diff made from `base` applies to it.
+            let _ = sent.apply(&diff);
+            sent
+        });
+        (diff, sent)
+    }
+
+    fn diff_dropping(&self, base: &Self, dropped: &mut bool) -> ScreenDiff {
         let resized = self.size() != base.size();
         let rows = self.size().rows;
         // Rows that only moved are found by the cells they share with the base, and moved rather
@@ -1418,7 +1427,16 @@ impl TerminalScreen {
             } else {
                 self.grid.row_eq(base_grid, r)
             };
-            (!same).then(|| RowDiff::of(r, cells, wrapped, self.grid.row_links(r), &mut budget))
+            (!same).then(|| {
+                RowDiff::of(
+                    r,
+                    cells,
+                    wrapped,
+                    self.grid.row_links(r),
+                    &mut budget,
+                    dropped,
+                )
+            })
         });
         ScreenDiff {
             resize: resized.then(|| self.size()),
@@ -1437,14 +1455,14 @@ impl TerminalScreen {
     }
 
     /// Apply `diff`, a diff against this screen. A malformed diff changes nothing.
-    pub fn apply(&mut self, diff: &ScreenDiff) {
+    pub fn apply(&mut self, diff: &ScreenDiff) -> Result<(), Malformed> {
         // All server-controlled: the grid is validated whole before any of it is committed, so a
         // malformed frame changes nothing. This clamp is what bounds the grid a resize allocates.
         let Size { rows, cols } = diff.resize.map_or_else(|| self.size(), clamp_dims);
         if diff.rows.len() > usize::from(rows)
             || (!diff.shifts.is_empty() && (diff.resize.is_some() || !diff.shifts.fit(rows)))
         {
-            return;
+            return Err(Malformed);
         }
         // A hostile server's links are bounded: more than a diff may carry drops the frame.
         let link_bytes = diff
@@ -1453,14 +1471,14 @@ impl TerminalScreen {
             .map(RowDiff::link_bytes)
             .fold(0_usize, usize::saturating_add);
         if link_bytes > MAX_LINK_BYTES {
-            return;
+            return Err(Malformed);
         }
         // Every row decodes before any is committed, in the diff's order. At most `rows × cols`
         // cells, which the clamp bounds.
         let mut staged = Vec::with_capacity(diff.rows.len());
         for row in &diff.rows {
             let Some(cells) = (row.row < rows).then(|| row.decode(cols)).flatten() else {
-                return;
+                return Err(Malformed);
             };
             staged.push(cells);
         }
@@ -1469,7 +1487,7 @@ impl TerminalScreen {
         } else {
             // Rows move as shared cells, never copied.
             let Some(moved) = self.grid.shifted(&diff.shifts) else {
-                return;
+                return Err(Malformed);
             };
             moved
         };
@@ -1505,6 +1523,7 @@ impl TerminalScreen {
         if diff.tty.is_some() {
             self.tty = diff.tty;
         }
+        Ok(())
     }
 }
 
@@ -1522,7 +1541,7 @@ mod tests {
         let target = screen_from(24, 80, b"hello \x1b[31mworld\x1b[m");
         let diff = target.diff_from(&base);
         let mut c = base;
-        c.apply(&diff);
+        c.apply(&diff).unwrap();
         assert_eq!(c, target);
     }
 
@@ -1534,7 +1553,7 @@ mod tests {
         assert_ne!(diff.rows, Vec::<RowDiff>::new());
         assert!(diff.resize.is_none());
         let mut c = a;
-        c.apply(&diff);
+        c.apply(&diff).unwrap();
         assert_eq!(c, b);
     }
 
@@ -1549,7 +1568,7 @@ mod tests {
         let diff = b.diff_from(&a);
         assert_eq!(diff.resize, Some(Size::new(40, 120)));
         let mut c = a;
-        c.apply(&diff);
+        c.apply(&diff).unwrap();
         assert_eq!(c, b);
         assert_eq!(c.size(), Size::new(40, 120));
     }
@@ -1723,7 +1742,7 @@ mod tests {
                 shifts, rows,
             };
             let mut screen = TerminalScreen::default();
-            screen.apply(&diff); // must not panic on adversarial input
+            let _ = screen.apply(&diff); // must not panic on adversarial input
             let Size { rows, cols } = screen.size();
             proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&rows), "rows {rows} escaped the clamp");
             proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&cols), "cols {cols} escaped the clamp");
@@ -1744,7 +1763,7 @@ mod tests {
         ) {
             if let Ok(diff) = postcard::from_bytes::<ScreenDiff>(&bytes) {
                 let mut screen = TerminalScreen::default();
-                screen.apply(&diff);
+                screen.apply(&diff).unwrap();
                 let Size { rows, cols } = screen.size();
                 proptest::prop_assert!((MIN_DIM..=MAX_DIM).contains(&rows) && (MIN_DIM..=MAX_DIM).contains(&cols));
             }
@@ -1768,7 +1787,7 @@ mod tests {
             emu.process(&second);
             let target = emu.snapshot();
             let mut client = base.clone();
-            client.apply(&target.diff_from(&base));
+            client.apply(&target.diff_from(&base)).unwrap();
             proptest::prop_assert_eq!(client, target);
         }
     }
@@ -1815,7 +1834,7 @@ mod tests {
                 let base = &frames[frames.len().saturating_sub(back)];
                 let diff = target.diff_from(base);
                 let mut client = base.clone();
-                client.apply(&diff);
+                client.apply(&diff).unwrap();
                 proptest::prop_assert_eq!(&client, &target);
                 // Every shifted row is shared with the base, not copied, unless the diff also carries
                 // it (its wrap flag changed).
@@ -1837,7 +1856,7 @@ mod tests {
         let target = emu.snapshot();
         let diff = target.diff_from(&base);
         let mut client = base.clone();
-        client.apply(&diff);
+        client.apply(&diff).unwrap();
         assert_eq!(client, target);
         (base, target, diff)
     }
@@ -1924,7 +1943,7 @@ mod tests {
             let mut diff = good.clone();
             mutate(&mut diff);
             let mut c = base.clone();
-            c.apply(&diff);
+            let _ = c.apply(&diff);
             if i == 3 {
                 assert_ne!(c, target, "the shifts matter");
             } else {
@@ -1973,7 +1992,7 @@ mod tests {
         // A malicious server ships a (65000, 65000) resize. The client must NOT build a giant
         // grid: apply clamps to MAX_DIM and reconstructs a bounded screen without OOM/panic.
         let mut c = TerminalScreen::default();
-        c.apply(&resize_only(Size::new(65000, 65000))); // must not OOM/panic
+        c.apply(&resize_only(Size::new(65000, 65000))).unwrap(); // must not OOM/panic
         assert_eq!(
             c.size(),
             Size::new(MAX_DIM, MAX_DIM),
@@ -1984,7 +2003,7 @@ mod tests {
     #[test]
     fn client_apply_clamps_zero_resize() {
         let mut c = TerminalScreen::default();
-        c.apply(&resize_only(Size::new(0, 0))); // must not panic
+        c.apply(&resize_only(Size::new(0, 0))).unwrap(); // must not panic
         assert_eq!(
             c.size(),
             Size::new(MIN_DIM, MIN_DIM),
@@ -2001,7 +2020,7 @@ mod tests {
         diff.title = Some("T".repeat(MAX_TITLE_LEN + 1000));
         diff.icon = Some("I".repeat(MAX_TITLE_LEN + 5));
         diff.clipboard = Some("C".repeat(MAXIMUM_CLIPBOARD_SIZE + 1000));
-        c.apply(&diff);
+        c.apply(&diff).unwrap();
         assert_eq!(
             c.title().chars().count(),
             MAX_TITLE_LEN,
@@ -2041,12 +2060,12 @@ mod tests {
             let mut diff = good.clone();
             mutate(&mut diff);
             let mut c = base.clone();
-            c.apply(&diff);
+            c.apply(&diff).unwrap_err();
             assert_eq!(c, base, "mutation {i} must drop the frame");
         }
         // The unmutated diff applies.
         let mut c = base;
-        c.apply(&good);
+        c.apply(&good).unwrap();
         assert_eq!(c, target);
     }
 
@@ -2070,7 +2089,7 @@ mod tests {
             let mut diff = good.clone();
             mutate(&mut diff);
             let mut c = base.clone();
-            c.apply(&diff);
+            c.apply(&diff).unwrap_err();
             assert_eq!(c, base, "mutation {i} must drop the whole frame");
         }
     }
@@ -2186,7 +2205,7 @@ mod tests {
         // `apply`.
         let good = decode_raw(&raw_two_by_two()).expect("a well-formed diff decodes");
         let mut screen = TerminalScreen::default();
-        screen.apply(&good);
+        screen.apply(&good).unwrap();
         assert_eq!(screen.size(), Size::new(2, 2));
         assert_eq!(screen.screen().cell(0, 1).map(|c| c.contents()), Some("x"));
         let mutations: [fn(&mut RawDiff); 14] = [
@@ -2219,7 +2238,7 @@ mod tests {
     fn a_row_naming_a_link_it_lacks_or_too_many_links_changes_nothing() {
         let good = decode_raw(&raw_two_by_two()).expect("a well-formed diff decodes");
         let mut screen = TerminalScreen::default();
-        screen.apply(&good);
+        screen.apply(&good).unwrap();
         let link = screen.screen().link(0, 0).cloned();
         assert_eq!(
             link.map(|l| (l.uri, l.id)),
@@ -2252,9 +2271,13 @@ mod tests {
         for (i, mutate) in mutations.iter().enumerate() {
             let mut raw = raw_two_by_two();
             mutate(&mut raw);
-            let diff = decode_raw(&raw).expect("decodes");
+            // Too many links in a row is refused as it is decoded; the rest as it is applied.
+            let Ok(diff) = decode_raw(&raw) else {
+                assert_eq!(i, 1, "mutation {i} does not decode");
+                continue;
+            };
             let mut screen = TerminalScreen::default();
-            screen.apply(&diff);
+            screen.apply(&diff).unwrap_err();
             assert_eq!(
                 screen,
                 TerminalScreen::default(),
@@ -2300,7 +2323,7 @@ mod tests {
         assert_eq!(after.grid.cursor_position(), (4, 4));
         // A client applying a frame that carries no row keeps sharing its base's.
         let mut client = before.clone();
-        client.apply(&after.diff_from(&before));
+        client.apply(&after.diff_from(&before)).unwrap();
         assert!(client.grid.shares_all_rows(&before.grid));
         assert_eq!(client, after);
         // A changed row: its own list, the base's untouched.
@@ -2308,7 +2331,7 @@ mod tests {
         let changed = emu.snapshot();
         assert!(!changed.grid.shares_all_rows(&after.grid));
         let mut client = after.clone();
-        client.apply(&changed.diff_from(&after));
+        client.apply(&changed.diff_from(&after)).unwrap();
         assert!(!client.grid.shares_all_rows(&after.grid));
         assert_eq!(client, changed);
         assert_eq!(after.screen().contents(), "one\ntwo");
@@ -2342,7 +2365,7 @@ mod tests {
                 let target = emu.snapshot();
                 // As a client has it: applied to the last frame, sharing its rows.
                 let mut applied = frames.last().cloned().unwrap_or_default();
-                applied.apply(&target.diff_from(frames.last().unwrap()));
+                applied.apply(&target.diff_from(frames.last().unwrap())).unwrap();
                 frames.push(target);
                 frames.push(applied);
             }
@@ -2366,7 +2389,7 @@ mod tests {
         let diff = target.diff_from(&base);
         assert_eq!(diff.rows.len(), 1);
         let mut client = base.clone();
-        client.apply(&diff);
+        client.apply(&diff).unwrap();
         assert_eq!(client, target);
         for row in (0..24).filter(|&row| row != 1) {
             assert!(client.grid.row_shared(&base.grid, row), "row {row}");
@@ -2485,14 +2508,14 @@ mod tests {
             "a cluster of several characters goes as a cell of its own"
         );
         let mut client = TerminalScreen::default();
-        client.apply(&diff);
+        client.apply(&diff).unwrap();
         assert_eq!(client, target);
         // A run of characters that overruns the row drops the frame.
         let mut long = diff.clone();
         long.rows[0].runs[0].count = NonZeroU16::new(13).unwrap();
         long.rows[0].runs[0].cell.text = CellText::run(&"a".repeat(13)).unwrap();
         let mut client = TerminalScreen::default();
-        client.apply(&long);
+        client.apply(&long).unwrap_err();
         assert_eq!(client, TerminalScreen::default());
     }
 
@@ -2567,7 +2590,7 @@ mod tests {
         assert_eq!(diff.icon.as_deref(), Some("myicon"));
         assert_eq!(diff.clipboard.as_deref(), Some("aGk="));
         let mut c = base.clone();
-        c.apply(&diff);
+        c.apply(&diff).unwrap();
         assert_eq!(c, target, "icon + clipboard reconstruct via diff/apply");
         // A state carrying an icon/clipboard must NOT collapse equal to one without them.
         assert_ne!(base, c);
@@ -2580,7 +2603,7 @@ mod tests {
         let target = screen_from(24, 80, "日本語 café 🦀 e\u{0301}".as_bytes());
         let diff = target.diff_from(&base);
         let mut c = base;
-        c.apply(&diff);
+        c.apply(&diff).unwrap();
         assert_eq!(c, target);
     }
 
@@ -2598,7 +2621,7 @@ mod tests {
             let target = emu.snapshot();
             let diff = target.diff_from(&base);
             assert!(diff.resize.is_none(), "no resize -> incremental diff");
-            client.apply(&diff); // same object, repeated apply
+            client.apply(&diff).unwrap(); // same object, repeated apply
             base = target;
             assert_eq!(
                 client, base,
@@ -2622,7 +2645,7 @@ mod tests {
         assert_eq!(diff.exit_code, Some(42));
 
         let mut c = base.clone();
-        c.apply(&diff);
+        c.apply(&diff).unwrap();
         assert_eq!(c.exit_code(), Some(42));
         assert_ne!(
             base, c,
@@ -2645,7 +2668,7 @@ mod tests {
         let base = TerminalScreen::default();
         let diff = target.diff_from(&base);
         let mut client = base;
-        client.apply(&diff);
+        client.apply(&diff).unwrap();
         assert_eq!(
             client, target,
             "client must reconstruct the server screen exactly"
@@ -2788,7 +2811,9 @@ mod tests {
         emu.process(&[b'a'; 80]); // frame N: fill to col 80 -> deferred-wrap state
         let frame_n = emu.snapshot();
         let mut client = TerminalScreen::default();
-        client.apply(&frame_n.diff_from(&TerminalScreen::default()));
+        client
+            .apply(&frame_n.diff_from(&TerminalScreen::default()))
+            .unwrap();
         assert_eq!(client, frame_n);
 
         emu.process(b"b"); // frame N+1: one more char forces the wrap to row 1
@@ -2798,7 +2823,7 @@ mod tests {
             diff.resize.is_none(),
             "incremental path, not a full repaint"
         );
-        client.apply(&diff);
+        client.apply(&diff).unwrap();
         assert_eq!(
             client, frame_n1,
             "wrap across frames must reconstruct incrementally"

@@ -159,6 +159,9 @@ cast_possible_wrap = "forbid"
 arithmetic_side_effects = "forbid"
 
 # --- further correctness restrictions (deny) ---
+# Unbounded queues and unaccounted tasks (the lists are in `clippy.toml`).
+disallowed_types = "deny"
+disallowed_methods = "deny"
 lossy_float_literal = "deny"
 float_cmp_const = "deny"
 rc_buffer = "deny"

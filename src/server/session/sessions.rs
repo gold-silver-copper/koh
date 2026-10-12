@@ -2,13 +2,12 @@
 //! ended, which closes its control channel: nothing outside this module can add or remove one.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use iroh::EndpointId;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::task::JoinSet;
 
-use super::{start, Attach, AttachKind, SessionClient, SessionSpec};
+use super::{start, Attach, Refused, SessionSpec};
 
 /// Every session task the registry started, and the ones still live, by peer.
 pub(super) struct Sessions {
@@ -27,27 +26,32 @@ impl Sessions {
         }
     }
 
-    /// Attach `peer` to its session, starting one if it has none. `None` at the session cap, or if
-    /// starting one failed.
-    pub(super) async fn attach(&mut self, peer: EndpointId) -> Option<(SessionClient, AttachKind)> {
+    /// Hand `attach` to `peer`'s session, which answers it, starting one if it has none. Refused
+    /// at the session cap, or when its session has too many attaches waiting.
+    pub(super) fn attach(&mut self, peer: EndpointId, attach: Attach) {
         self.live.retain(|_, control| !control.is_closed());
         while let Some(ended) = self.tasks.try_join_next() {
             log_panic(ended);
         }
-        if let Some(control) = self.live.get(&peer) {
-            if let Some((client, detached_for)) = attach_to(control).await {
-                return Some((client, AttachKind::Reattached { detached_for }));
+        let attach = match self.live.get(&peer) {
+            Some(control) => match control.try_send(attach) {
+                Ok(()) => return,
+                Err(TrySendError::Full(Attach(reply))) => {
+                    let _ = reply.send(Err(Refused::Full));
+                    return;
+                }
+                // It ended a moment ago: a new one takes its place.
+                Err(TrySendError::Closed(attach)) => attach,
+            },
+            None if self.live.len() >= self.spec.max_sessions => {
+                let _ = attach.0.send(Err(Refused::Full));
+                return;
             }
-            // It ended a moment ago: a new one takes its place.
-        } else if self.live.len() >= self.spec.max_sessions {
-            return None;
-        }
-        let (control, client, task) = start(&self.spec)
-            .map_err(|e| tracing::error!(error = %e, "spawning a session failed"))
-            .ok()?;
+            None => attach,
+        };
+        let (control, task) = start(&self.spec, attach);
         self.tasks.spawn(task);
         self.live.insert(peer, control);
-        Some((client, AttachKind::Created))
     }
 
     /// End every session, attached or not, and wait for their tasks.
@@ -67,20 +71,5 @@ impl Sessions {
 fn log_panic(ended: Result<(), tokio::task::JoinError>) {
     if let Err(e) = ended {
         tracing::error!(error = %e, "a session task failed");
-    }
-}
-
-/// Attach to the session `control` reaches: a client and how long it was detached, or `None` if
-/// its task has ended.
-async fn attach_to(control: &mpsc::Sender<Attach>) -> Option<(SessionClient, Option<Duration>)> {
-    let (reply, mut rx) = oneshot::channel();
-    control.send(Attach(reply)).await.ok()?;
-    // A request sent as the session ends can land after its receiver dropped what was queued, and
-    // then waits, unanswered, for the last sender, which is in `live`: the end itself answers it.
-    // A reply comes first, sent before the receiver is dropped.
-    tokio::select! {
-        biased;
-        attached = &mut rx => attached.ok(),
-        () = control.closed() => None,
     }
 }

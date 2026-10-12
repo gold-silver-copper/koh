@@ -80,13 +80,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
 
 /// `koh serve`, allowing the clients saved beside the server key as well as any `--allow`.
 async fn serve(mut config: koh::server::ServeConfig) -> anyhow::Result<Option<u32>> {
-    let places = Places::new(None, config.key_file.clone())?;
-    let saved = koh::names::load(&places, List::Clients)?;
-    for (_, id) in saved.entries() {
-        if !config.allow.contains(&id) {
-            config.allow.push(id);
-        }
-    }
+    config.saved_clients = Some(Places::new(None, config.key_file.clone())?);
     koh::server::serve(config).await.map(|()| None)
 }
 

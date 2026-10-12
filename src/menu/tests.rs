@@ -233,4 +233,9 @@ fn keys_show_each_id_in_full_with_a_qr_code() {
         shown.contains('▀') || shown.contains('▄') || shown.contains('█'),
         "a QR code"
     );
+    assert_eq!(
+        crate::server::cli::connect_qr(&"x".repeat(10_000)),
+        None,
+        "too long for one"
+    );
 }

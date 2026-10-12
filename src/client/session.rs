@@ -1210,6 +1210,7 @@ mod tests {
             [ClientMsg::Resync],
             "one resync, not one per frame"
         );
+        assert!(!s.synced(), "refused frames leave the client unsynced");
         s.on_frame(now, &frame(7, 0, 0, &blank, &one));
         assert!(s.state().screen().contents().contains("one"));
         // Base 3 is older than base 4, refused: the server sent it before it read that Resync.
@@ -1683,6 +1684,18 @@ mod tests {
         assert_eq!(told.scheme, Some(WireScheme::Light));
         assert_eq!(told.palette.get(1), Some(&Some([0xcd, 0, 0])));
         assert_eq!(s.colours.as_ref(), Some(told));
+        // A terminal that answers none of the colour questions (Apple's Terminal) is told
+        // nothing, and the keys around its DA1 go on.
+        let (now, mut s) = start();
+        s.ask_terminal(now, true);
+        s.on_input(now, b"a\x1b[?1;2cb");
+        assert_eq!(s.take_found(), None);
+        let sent = drain(&mut s);
+        assert!(
+            !sent.iter().any(|m| matches!(m, ClientMsg::Colours(_))),
+            "{sent:?}"
+        );
+        assert_eq!(typed(&sent), b"ab");
         // Not told, no colour is asked or sent, nor are scheme reports turned on.
         let (now, mut s) = start();
         s.ask_terminal(now, false);
@@ -1827,11 +1840,17 @@ mod tests {
         s.on_input(now, &[ESCAPE_PREFIX]);
         s.detach(now);
         assert_eq!(s.on_input(now, b"\x1b[I."), connected);
-        let (now, mut s) = start();
-        s.on_input(now, &[ESCAPE_PREFIX]);
-        s.detach(now);
-        s.attach(Size::new(24, 80));
-        assert_eq!(s.on_input(now, b"."), InputOutcome::Quit);
+        // A `.` quits typed at the reconnecting banner as after the reattach: the client reads
+        // input while it redials.
+        for reattached in [false, true] {
+            let (now, mut s) = start();
+            s.on_input(now, &[ESCAPE_PREFIX]);
+            s.detach(now);
+            if reattached {
+                s.attach(Size::new(24, 80));
+            }
+            assert_eq!(s.on_input(now, b"."), InputOutcome::Quit, "{reattached}");
+        }
     }
 
     /// The next connection is told the window size and the colours; what was typed and not sent

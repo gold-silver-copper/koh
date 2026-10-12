@@ -16,8 +16,23 @@ binary, its tests and the fuzz targets share code, and any release may change it
 ## [Unreleased]
 
 ### Changed
-- **The wire protocol is now `koh/4`**: a paste goes whole in one message (up to 1 MiB), and the
-  raw-bytes `Input` message is gone.
+- **The wire protocol is now `koh/5`**: a paste goes whole in one message (up to 1 MiB), and the
+  raw-bytes `Input` message is gone; history requests carry ids and every one is answered; a
+  refusal is a close code; screen modes say whether the alternate screen is shown; the server
+  admits a client only once it holds its session.
+- Painting is a diff of the whole terminal with autowrap off: a terminal larger or smaller than the
+  screen shows the screen clipped and nothing else, the status line repaints only when it changes,
+  switching mouse modes turns the old one off, and the window title is restored on exit and
+  suspend.
+- Prediction runs only on the primary screen with the PTY's modes known, on cells that keep their
+  style; a grapheme typed in pieces is one glyph; Backspace and Left stop where the line began,
+  which comes only from the real cursor; focus changes leave predictions alone.
+- The terminal's answers to the start-up questions are read by the session's own input decoder.
+- `Ctrl-^ Ctrl-^` or `Ctrl-^ ^` sends one Ctrl-^.
+- Removing a client with `koh clients rm` ends its session as well as its connection.
+- At most 2 handshakes are pending per address, the oldest given up for a new one; the client holds
+  at most about 40 MiB of server streams; the server keeps a clipboard only as base64 within its
+  cap; a key, list or `$KOH_LOG` file with another hard link is refused.
 - Every queue in koh has a bound, and `clippy.toml` bans unbounded ones; the wire's sequences are
   refused as they are decoded once past their bound.
 - `koh serve` reads the saved clients at every connection: `koh clients rm` takes effect at once.
@@ -38,6 +53,26 @@ binary, its tests and the fuzz targets share code, and any release may change it
   only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
+- A typo in the saved `clients` file disconnected every saved client and refused their redials;
+  the last list read well is now kept.
+- A server at capacity, or whose program could not start, left the client redialing forever with
+  no reason shown; a capacity close could also end a client for good. Both are redialed now, and
+  the banner says why; only "not authorized" ends the client.
+- A reconnect after the program exited got a fresh shell and never saw the exit; the final screen
+  could miss the program's last output; the exit status could be lost when the connection closed.
+- A double SIGHUP on a terminal's close skipped the drain; a forced exit returned 0.
+- Log lines could interleave on stderr, and a server's close reason could add lines to it.
+- A lost or late history reply stopped scrollback filling until a reconnect; a search through more
+  history than the cache holds could loop forever.
+- Anyone who could reach the UDP port could block new connections with stalled handshakes.
+- A wide glyph in the bottom-right cell scrolled the user's terminal every frame; a change to only
+  a row's hyperlinks was never painted.
+- A slow answer to the start-up questions reached the remote program as keys; a server granting no
+  stream could make the client impossible to quit; a suspend could take the terminal back before
+  the client was stopped.
+- tmux's or screen's `Ctrl-A` prefix was predicted as readline's; predicted text lost its colours;
+  the password hold missed prompts at the bottom of the screen.
+- Tests wrote under the system temp dir, and could lift the bans on starting programs.
 - A hostile server's close reason reached the user's terminal raw when the first connection was
   refused (writing the clipboard despite `--no-clipboard`); stderr and every log line now escape
   control characters, and log lines are uncoloured.

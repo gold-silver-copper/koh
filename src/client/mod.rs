@@ -570,7 +570,11 @@ pub async fn run_client<T: ClientTerminal>(
             None => {}
             Some(Change::Quit) => return Ok(None),
             Some(Change::Suspend) => {
-                if !suspend(&mut term, &shutdown).await? {
+                let Some(typed) = suspend(&mut term, &shutdown, &mut input_rx).await? else {
+                    return Ok(None);
+                };
+                // A suspend escape typed meanwhile is not taken again.
+                if session.on_input(Instant::now(), &typed) == InputOutcome::Quit {
                     return Ok(None);
                 }
                 // A window resized while the client was stopped sent it no SIGWINCH.
@@ -622,24 +626,31 @@ pub async fn run_client<T: ClientTerminal>(
     }
 }
 
-/// Suspend the client on `term`, and once the process is continued take the terminal back.
-/// Whether to go on: a fatal signal while it waits (the stop may never come, in a process group
-/// with no job control) quits instead.
+/// Suspend the client on `term`, and once the process is continued take the terminal back; what
+/// was typed meanwhile, to go on with, or `None` to quit. The stop may never come (the kernel
+/// drops it in a process group without job control): then a key typed, which a stopped process
+/// could not read, ends the wait too, as does a fatal signal or the input's end, which quit.
 async fn suspend<T: ClientTerminal>(
     term: &mut T,
     shutdown: &CancellationToken,
-) -> anyhow::Result<bool> {
+    input: &mut mpsc::Receiver<Vec<u8>>,
+) -> anyhow::Result<Option<Vec<u8>>> {
     use tokio::signal::unix::{signal, SignalKind};
     // Listening before the stop, so the SIGCONT that ends it is not missed.
     let mut continued = signal(SignalKind::from_raw(fuxix::process::Signal::Cont.raw()))?;
+    let mut typed = Vec::new();
     if term.suspend()? {
         tokio::select! {
             _ = continued.recv() => {}
-            () = shutdown.cancelled() => return Ok(false),
+            maybe = input.recv() => match maybe {
+                Some(bytes) => typed = bytes,
+                None => return Ok(None),
+            },
+            () = shutdown.cancelled() => return Ok(None),
         }
     }
     term.resume()?;
-    Ok(true)
+    Ok(Some(typed))
 }
 
 /// The client's link to the server: a live connection, or a redial under way.

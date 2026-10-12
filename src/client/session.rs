@@ -382,7 +382,7 @@ impl ClientSession {
     }
 
     /// The run's first phase: ask the user's terminal, at `now`, what it draws, speaks and shows
-    /// ([`probe`](super::probe)), its colours too if `colours` (to tell the server, which answers
+    /// (`client::probe`), its colours too if `colours` (to tell the server, which answers
     /// programs' colour queries with them). The answers come in on stdin with what is typed, and
     /// this session's decoder, expecting them, takes them whenever they arrive: none reaches the
     /// program. What they say is [`take_found`](Self::take_found)'s, and the colours are told
@@ -768,12 +768,18 @@ impl ClientSession {
             self.link.refuse(frame.base);
             return;
         };
-        // The cursor's row, by its index and the history's newest row: at the bottom of the
-        // screen a new line scrolls, leaving the index as it was.
+        // The cursor's row is another when its index changed, or when the screen scrolled: at the
+        // bottom of the screen a new line scrolls, leaving the index as it was, and names a new
+        // history row, or moves the rows (a scroll region, no scrollback kept).
+        let (now_grid, was) = (next.screen.screen(), &self.link.current().screen);
         let row = |screen: &TerminalScreen| {
             (screen.screen().cursor_position().0, screen.history().newest)
         };
-        if row(&next.screen) != row(&self.link.current().screen) {
+        if row(&next.screen) != row(was)
+            || !now_grid
+                .moves_from(was.screen(), now_grid.size().rows)
+                .is_empty()
+        {
             self.link.new_row_at = Some(now);
         }
         self.link.advance(next);
@@ -1460,15 +1466,21 @@ mod tests {
     }
 
     /// At the bottom of the screen Enter scrolls, so the cursor's row index stays: the hold for
-    /// a fresh prompt (whose program may turn echo off a moment after drawing it) keys on the
-    /// row's history name, which the scroll changes.
+    /// a fresh prompt (whose program may turn echo off a moment after drawing it) sees the
+    /// scroll, by the history row it names or, with no scrollback, by the rows it moves.
     #[test]
     fn the_hold_engages_at_the_bottom_of_the_screen() {
+        for scrollback in [100, 0] {
+            hold_at_the_bottom(scrollback);
+        }
+    }
+
+    fn hold_at_the_bottom(scrollback: usize) {
         let echoing = crate::predict::TtyModes {
             echo: true,
             line: true,
         };
-        let mut emu = ServerTerminal::new(24, 80, 100).expect("emulator");
+        let mut emu = ServerTerminal::new(24, 80, scrollback).expect("emulator");
         emu.set_tty(echoing);
         let lines: Vec<String> = (0..30).map(|n| format!("line {n}")).collect();
         emu.process(format!("{}\r\n$ ", lines.join("\r\n")).as_bytes());
@@ -1476,7 +1488,7 @@ mod tests {
         assert_eq!(first.screen().cursor_position().0, 23, "at the bottom");
         let (t0, mut s) = start();
         s.on_frame(t0, &frame(1, 0, 0, &TerminalScreen::default(), &first));
-        let t1 = t0 + Duration::from_secs(1);
+        let t1 = t0.checked_add(Duration::from_secs(1)).expect("a time");
         s.on_input(t1, b"x");
         assert!(!s.overlay().is_empty(), "kernel echo shows at once");
         drain(&mut s);
@@ -1489,10 +1501,11 @@ mod tests {
             "still at the bottom"
         );
         s.on_frame(t1, &frame(2, 1, 1, &first, &prompt));
-        s.on_input(t1 + Duration::from_millis(10), b"Q");
+        let soon = t1.checked_add(Duration::from_millis(10)).expect("a time");
+        s.on_input(soon, b"Q");
         assert!(
             !s.overlay().cells().any(|(_, c)| c.text() == "Q"),
-            "a key typed at a fresh prompt is not shown before its echo"
+            "scrollback {scrollback}: a key typed at a fresh prompt is not shown before its echo"
         );
     }
 

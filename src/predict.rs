@@ -2,7 +2,7 @@
 //! once, then confirms or corrects it when the server's frame arrives.
 //!
 //! Guesses are grouped in epochs, confirmed by the server's echo-ack, so input a program does not
-//! echo (a password) is never shown. Only edit keys reach it, and only in a [`Context`]: on the
+//! echo (a password) is never shown. Only edit keys reach it, and only in a `Context`: on the
 //! primary screen, with the PTY's modes known and not a password prompt, so a full-screen program
 //! (or tmux's and screen's prefix keys) is never taken for a line editor. It predicts printable
 //! graphemes (wide ones included, and one glyph for a grapheme however many keys typed it),
@@ -231,9 +231,10 @@ struct Guessed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Line {
     Unknown,
-    /// Enter was typed: the line begins where the screen shows the cursor when its first key is
-    /// typed, if no guess is pending then.
-    Fresh,
+    /// Enter was typed, in the input frame `.0`: the line begins where the screen shows the
+    /// cursor when its first key is typed, if the screen has reflected the Enter by then and no
+    /// guess is pending.
+    Fresh(u64),
     /// The line began at a cursor a frame showed. Keys that go to its start (`Ctrl-A`, Home,
     /// `Ctrl-U`) are predicted only then, and Backspace and Left never past it.
     Started(Confirmed),
@@ -506,17 +507,19 @@ impl PredictionEngine {
     fn line_start(&self, row: u16) -> Option<u16> {
         match self.line {
             Line::Started(at) if at.row == row => Some(at.col),
-            Line::Started(_) | Line::Fresh | Line::Unknown => None,
+            Line::Started(_) | Line::Fresh(_) | Line::Unknown => None,
         }
     }
 
-    /// The first key of a line was typed: it began where the screen shows the cursor, unless a
-    /// guess for the cursor is pending, when where is not known.
+    /// The first key of a line was typed: it began where the screen shows the cursor, unless the
+    /// screen does not show the Enter yet, or a guess for the cursor is pending, when where is
+    /// not known.
     fn begin_line(&mut self, screen: &dyn ScreenView) {
-        if self.line == Line::Fresh {
-            self.line = match self.cursor {
-                None => Line::Started(Confirmed::of(screen)),
-                Some(_) => Line::Unknown,
+        if let Line::Fresh(enter) = self.line {
+            self.line = if self.cursor.is_none() && self.late_acked >= enter {
+                Line::Started(Confirmed::of(screen))
+            } else {
+                Line::Unknown
             };
         }
     }
@@ -838,7 +841,7 @@ impl PredictionEngine {
         let Some(ctx) = ctx.filter(|_| !self.holding()) else {
             self.become_tentative();
             self.line = match (press.key, alt, ctrl) {
-                (Key::Enter, false, false) => Line::Fresh,
+                (Key::Enter, false, false) => Line::Fresh(self.next_frame()),
                 _ if printable.is_some() => self.line,
                 _ => Line::Unknown,
             };
@@ -909,7 +912,7 @@ impl PredictionEngine {
     fn predict_enter(&mut self, ctx: &Context<'_>) {
         self.become_tentative();
         self.newline(ctx);
-        self.line = Line::Fresh;
+        self.line = Line::Fresh(self.next_frame());
     }
 
     /// Grade the predictions against `screen`, a frame's: confirmed ones go (the screen shows
@@ -1709,7 +1712,7 @@ mod tests {
         assert!(e.overlay().is_empty(), "where the line began is not known");
         // Typed after Enter, the line's start is known.
         let (mut e, screen) = editor_on(b"$ ");
-        e.line = Line::Fresh;
+        e.line = Line::Fresh(0);
         type_keys(&mut e, &screen, b"echo hi");
         assert_eq!(shown_row(&e, &screen), ("$ echo hi".to_owned(), Some(9)));
         type_keys(&mut e, &screen, &[0x01]);

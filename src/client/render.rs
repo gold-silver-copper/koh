@@ -500,6 +500,11 @@ impl Painter {
                     }
                     let link = link.filter(|link| self.hyperlinks && link.safe());
                     switch_link(backend, &mut open_link, link)?;
+                    if wide && !certain(glyph) {
+                        // A terminal may draw it one cell wide: what the second showed goes.
+                        backend.print("  ")?;
+                        backend.move_to(row, col)?;
+                    }
                     backend.print(glyph)?;
                     printed = Some(glyph);
                     cursor = col
@@ -518,8 +523,8 @@ impl Painter {
 
         // The predicted cursor wins; one off the terminal is not shown.
         let (row, col) = overlay.cursor().unwrap_or_else(|| screen.cursor_position());
-        let last = |n: u16| n.saturating_sub(1);
-        backend.move_to(row.min(last(terminal.rows)), col.min(last(terminal.cols)))?;
+        let edge = |n: u16| n.saturating_sub(1);
+        backend.move_to(row.min(edge(terminal.rows)), col.min(edge(terminal.cols)))?;
         if !screen.hide_cursor() && row < terminal.rows && col <= terminal.cols {
             backend.show_cursor()?;
         }

@@ -1,8 +1,11 @@
 //! A `koh serve` whose binary is removed or replaced while it runs (an upgrade) still starts
 //! sessions: on Linux it launches them from its own image, `/proc/self/exe`, not from the path it
 //! was started from.
-#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 #![cfg(target_os = "linux")]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::disallowed_methods, reason = "tests spawn freely")
+)]
 
 use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};

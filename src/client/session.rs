@@ -1413,7 +1413,7 @@ mod tests {
         let (now, mut s) = start();
         let prompt = at_editor(b"", 0);
         s.on_frame(now, &frame(1, 0, 0, &TerminalScreen::default(), &prompt));
-        let later = now + Duration::from_secs(1);
+        let later = now.checked_add(Duration::from_secs(1)).expect("a time");
         s.on_input(later, b"x");
         assert!(
             s.overlay().is_empty(),

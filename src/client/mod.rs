@@ -987,14 +987,15 @@ mod tests {
     /// A server that admits the client and grants it no stream to write on: the keyboard stays
     /// the client's, and the quit escape ends it at once.
     #[test]
-    fn a_server_granting_no_streams_cannot_block_quit() -> anyhow::Result<()> {
+    fn a_server_granting_no_streams_cannot_block_quit() {
         use crate::transport_iroh::{
             admission, bind_endpoint_local, generate_secret_key, loopback_addr,
         };
         use iroh::endpoint::{QuicTransportConfig, VarInt};
+        let key = || generate_secret_key().expect("OS randomness");
         crate::test_runtime::current_thread().block_on(async {
             let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-                .secret_key(generate_secret_key()?)
+                .secret_key(key())
                 .alpns(vec![ALPN.to_vec()])
                 .transport_config(
                     QuicTransportConfig::builder()
@@ -1002,7 +1003,8 @@ mod tests {
                         .build(),
                 )
                 .bind()
-                .await?;
+                .await
+                .expect("bind the server");
             let addr = loopback_addr(&server);
             let accept = tokio::spawn(async move {
                 if let Some(incoming) = server.accept().await {
@@ -1014,9 +1016,11 @@ mod tests {
                 }
                 server
             });
-            let client = bind_endpoint_local(generate_secret_key()?, false).await?;
+            let client = bind_endpoint_local(key(), false)
+                .await
+                .expect("bind the client");
             let connector = IrohConnector::new(client, addr);
-            let conn = connector.connect().await?;
+            let conn = connector.connect().await.expect("admitted");
             let (input, input_rx) = mpsc::channel(8);
             let (_resize, resize_rx) = mpsc::channel(1);
             let run = tokio::spawn(run_client(
@@ -1032,15 +1036,15 @@ mod tests {
                 None,
             ));
             // Keys that need the stream, then the quit escape.
-            input.send(b"ls\r".to_vec()).await?;
-            input.send(vec![ESCAPE_PREFIX, b'.']).await?;
+            for keys in [&b"ls\r"[..], &[ESCAPE_PREFIX, b'.']] {
+                input.send(keys.to_vec()).await.expect("typed");
+            }
             let quit = tokio::time::timeout(Duration::from_secs(5), run).await;
             assert!(
                 matches!(quit, Ok(Ok(Ok(None)))),
                 "the client did not quit: {quit:?}"
             );
             let _ = tokio::time::timeout(Duration::from_secs(5), accept).await;
-            Ok(())
-        })
+        });
     }
 }

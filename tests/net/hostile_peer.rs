@@ -1,8 +1,9 @@
-//! Hostile peers on koh/4, both directions.
+//! Hostile peers on koh/5, both directions.
 //!
 //! A malicious client (admitted, so on the allowlist) throws malformed and oversized traffic at a
-//! real server; a malicious server throws it at a real client. Neither may crash, hang or grow the
-//! other's memory past the fixed frame window; a protocol violation closes the connection.
+//! real server; a malicious server throws it at a real client. Neither may crash or hang the
+//! other, and a protocol violation closes the connection. What each end keeps of the other's
+//! traffic is bounded by the unit tests of its frame window and history cache.
 
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ fn net() -> FaultNet {
 }
 
 /// Connect to `server` as `secret`, complete admission, and keep the endpoint alive; the caller
-/// then speaks koh/4 by hand.
+/// then speaks koh/5 by hand.
 async fn admitted(
     net: &FaultNet,
     secret: SecretKey,
@@ -378,7 +379,7 @@ async fn client_survives(net: &FaultNet, good: SecretKey, evil: EndpointId) -> a
 }
 
 #[test]
-fn an_oversized_or_bomb_frame_never_grows_the_client() -> anyhow::Result<()> {
+fn an_oversized_or_bomb_frame_leaves_the_client_running() -> anyhow::Result<()> {
     koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let good = identity()?;
@@ -397,7 +398,7 @@ fn an_oversized_or_bomb_frame_never_grows_the_client() -> anyhow::Result<()> {
 }
 
 #[test]
-fn frames_with_unknown_bases_never_grow_the_client() -> anyhow::Result<()> {
+fn frames_on_unknown_bases_leave_the_client_running() -> anyhow::Result<()> {
     koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let good = identity()?;
@@ -550,7 +551,7 @@ fn a_servers_hostile_links_are_shown_as_text_or_dropped() -> anyhow::Result<()> 
 }
 
 #[test]
-fn hostile_history_rows_never_grow_the_client() -> anyhow::Result<()> {
+fn hostile_history_rows_leave_the_client_running() -> anyhow::Result<()> {
     use koh::terminal::{HistoryReply, HistoryRow};
     koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();

@@ -60,10 +60,3 @@ path = "fuzz_targets/server_input.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "probe_replies"
-path = "fuzz_targets/probe_replies.rs"
-test = false
-doc = false
-bench = false

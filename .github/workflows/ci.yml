@@ -83,6 +83,11 @@ jobs:
           echo "layering edges OK"
       - name: test
         run: cargo test --locked
+      - name: test with nvim (ignored elsewhere, as it needs nvim 0.10 or later)
+        if: runner.os == 'macOS'
+        run: |
+          brew install neovim
+          cargo test --locked --test net -- --ignored nvim
       - name: docs (deny broken intra-doc links)
         # Catches renamed intra-doc links before they ship a broken docs.rs build.
         run: cargo doc --no-deps --locked
@@ -145,7 +150,7 @@ jobs:
         # Each starts from nothing (fuzz/corpus is not committed), except `server_process`, whose
         # input is a program's output: it is seeded with the recorded output of real programs.
         run: |
-          for target in screen_apply proto_decode history_apply server_input client_input probe_replies; do
+          for target in screen_apply proto_decode history_apply server_input client_input; do
             cargo +nightly fuzz run "$target" -- -max_total_time=45 -rss_limit_mb=4096
           done
           mkdir -p fuzz/corpus/server_process

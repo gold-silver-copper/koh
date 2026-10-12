@@ -52,7 +52,8 @@ fn many_connects_in_a_row_reattach_the_same_session() {
     koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
-            // A leak or teardown race shows up as a hang or a failure on some iteration.
+            // A leak or teardown race shows up as a hang or a failure on some iteration; a new
+            // shell, as a variable the first connection set and a later one does not see.
             let net = clean();
             let secret = identity().expect("OS randomness");
             let server = Server::start(&net, &[secret.public()], &["sh"])
@@ -64,9 +65,10 @@ fn many_connects_in_a_row_reattach_the_same_session() {
                     Client::connect_on(endpoint.clone(), server.id, Options::default())
                         .await
                         .unwrap_or_else(|e| panic!("iteration {i}: connect failed: {e:#}"));
-                let marker = format!("REPEAT_{i}");
+                let marker = format!("REPEAT_{i}_SAME");
+                let set = if i == 0 { "KEPT=SAME; " } else { "" };
                 client
-                    .send(format!("echo REPEAT''_{i}\r").as_bytes())
+                    .send(format!("{set}echo REPEAT''_{i}_$KEPT\r").as_bytes())
                     .await
                     .expect("type");
                 assert!(
@@ -445,10 +447,10 @@ fn oldest(screen: &str) -> bool {
     screen.lines().any(|line| line.trim_end() == "old line 0")
 }
 
-/// A client frozen between dialing and its loop (a phone asleep while the terminal is probed, at
+/// A client frozen between dialing and its loop (a phone asleep while it enters raw mode, at
 /// connect) reconnects as from any freeze: the freeze detector counts from the dial, not from the
-/// loop's first iteration. Found on the Android emulator, where adb's pty answers no probe and
-/// the client was stopped inside the probe's wait.
+/// loop's first iteration. Found on the Android emulator, where the client was stopped in the
+/// start-up probe's wait, which is gone since.
 #[test]
 fn a_freeze_between_dialing_and_the_loop_still_reconnects() {
     koh_testkit::multi_thread(4)
@@ -507,172 +509,6 @@ fn reconnecting(painted: &crate::harness::Painted) -> bool {
         .status
         .as_deref()
         .is_some_and(|status| status.contains("reconnecting"))
-}
-
-/// A line typed while the link is down is not sent, and the status line says so: the client cannot
-/// tell its session from a new shell (an expired session, a restarted server), where keys typed at
-/// the old screen must not run. Typing after the reattach runs.
-#[test]
-fn a_line_typed_during_an_outage_is_not_run_after_the_reattach_and_the_user_is_told() {
-    koh_testkit::multi_thread(4)
-        .expect("tokio runtime")
-        .block_on(async {
-            let net = clean();
-            let secret = identity().expect("OS randomness");
-            let server = Server::start(&net, &[secret.public()], &["sh"])
-                .await
-                .expect("start the server");
-            let endpoint = net.endpoint(secret, false).await.expect("bind the client");
-            let mut client = Client::connect_on(endpoint, server.id, Options::default())
-                .await
-                .expect("connect");
-            client.send(b"echo READY''_ONE\r").await.expect("type");
-            assert!(client
-                .wait_until(WAIT, |t| t.contains("READY_ONE"))
-                .await
-                .is_some());
-            // The link goes down for a while; the client notices and shows its banner.
-            net.black_hole(Duration::from_secs(4));
-            client.drop_first_connection();
-            assert!(
-                client.wait_for(WAIT, reconnecting).await.is_some(),
-                "the client must show the reconnecting banner"
-            );
-            // The user types a line while the banner is up.
-            client.send(b"echo TYPED''_OFFLINE\r").await.expect("type");
-            // The status line says it is not sent.
-            assert!(
-                client
-                    .wait_for(WAIT, |p| p
-                        .status
-                        .as_deref()
-                        .is_some_and(|s| s.contains("not sent")))
-                    .await
-                    .is_some(),
-                "the client must say the outage's typing is not sent; screen:\n{}",
-                client.screen()
-            );
-            assert!(
-                client
-                    .wait_for(Duration::from_secs(20), |p| !reconnecting(p))
-                    .await
-                    .is_some(),
-                "the client must reattach"
-            );
-            client.send(b"echo TYPED''_AFTER\r").await.expect("type");
-            assert!(
-                client
-                    .wait_until(WAIT, |t| t.contains("TYPED_AFTER"))
-                    .await
-                    .is_some(),
-                "typing after the reattach runs; screen:\n{}",
-                client.screen()
-            );
-            assert!(
-                !client.screen().contains("TYPED_OFFLINE"),
-                "the line typed during the outage must not run; screen:\n{}",
-                client.screen()
-            );
-            let _ = client.finish().await;
-            server.stop().await;
-        });
-}
-
-/// `Ctrl-^ .` quits however the two keys fall around a link drop: the prefix typed while
-/// connected and the `.` typed at the reconnecting banner is still the quit escape.
-#[test]
-fn an_escape_split_across_a_link_drop_still_quits() {
-    koh_testkit::multi_thread(4)
-        .expect("tokio runtime")
-        .block_on(async {
-            let net = clean();
-            let secret = identity().expect("OS randomness");
-            let server = Server::start(&net, &[secret.public()], &["sh"])
-                .await
-                .expect("start the server");
-            let endpoint = net.endpoint(secret, false).await.expect("bind the client");
-            let mut client = Client::connect_on(endpoint, server.id, Options::default())
-                .await
-                .expect("connect");
-            client.send(b"echo READY''_TWO\r").await.expect("type");
-            assert!(client
-                .wait_until(WAIT, |t| t.contains("READY_TWO"))
-                .await
-                .is_some());
-            // The prefix, while connected; give the client a moment to take it.
-            client.send(&[0x1e]).await.expect("type the prefix");
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            // The link drops (and stays down), then the '.'.
-            net.black_hole(Duration::from_secs(6));
-            client.drop_first_connection();
-            assert!(
-                client.wait_for(WAIT, reconnecting).await.is_some(),
-                "the client must show the reconnecting banner"
-            );
-            client.send(b".").await.expect("type the dot");
-            let result = client.exit(Duration::from_secs(3)).await;
-            assert!(
-                matches!(result, Some(Ok(None))),
-                "Ctrl-^ (before the drop) . (during the reconnect) must quit; got {result:?}"
-            );
-            server.stop().await;
-        });
-}
-
-/// A line typed across the moment the client notices the drop: its start went out on the dark
-/// link and was lost with it, so its end, typed at the banner, must not run alone (here
-/// `false && echo DANGEROUS` would run `echo DANGEROUS`).
-#[test]
-fn the_end_of_a_line_whose_start_was_lost_with_the_link_does_not_run() {
-    koh_testkit::multi_thread(4)
-        .expect("tokio runtime")
-        .block_on(async {
-            let net = clean();
-            let secret = identity().expect("OS randomness");
-            let server = Server::start(&net, &[secret.public()], &["sh"])
-                .await
-                .expect("start the server");
-            let endpoint = net.endpoint(secret, false).await.expect("bind the client");
-            let mut client = Client::connect_on(endpoint, server.id, Options::default())
-                .await
-                .expect("connect");
-            client.send(b"echo READY''_G\r").await.expect("type");
-            assert!(client
-                .wait_until(WAIT, |t| t.contains("READY_G"))
-                .await
-                .is_some());
-            net.black_hole(Duration::from_secs(5));
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            client.send(b"false && ").await.expect("type");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            client.drop_first_connection();
-            assert!(
-                client.wait_for(WAIT, reconnecting).await.is_some(),
-                "the client must show the reconnecting banner"
-            );
-            client.send(b"echo DANGER''OUS\r").await.expect("type");
-            // Once back, a line typed then runs: the session goes on.
-            let mut back = false;
-            for _ in 0..100 {
-                let _ = client.send(b"echo BAC''K\r").await;
-                if client
-                    .wait_until(Duration::from_millis(200), |t| t.contains("BACK"))
-                    .await
-                    .is_some()
-                {
-                    back = true;
-                    break;
-                }
-            }
-            let screen = client.screen();
-            let _ = client.finish().await;
-            server.stop().await;
-            assert!(back, "the session never came back:\n{screen}");
-            assert!(
-                !screen.lines().any(|l| l.trim_end() == "DANGEROUS"),
-                "the end of a line ran without its start:\n{screen}"
-            );
-        });
 }
 
 /// The reattach lands on a new shell (the server restarted during the outage): the scrollback

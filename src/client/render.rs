@@ -1288,7 +1288,7 @@ mod tests {
         let inserted = |typed: &str| -> String {
             typed
                 .chars()
-                .map(|c| format!("\x1b[{}@{c}", c.width().unwrap_or(1)))
+                .flat_map(|c| [format!("\x1b[{}@", c.width().unwrap_or(1)), c.to_string()])
                 .collect()
         };
         for (before, typed) in [

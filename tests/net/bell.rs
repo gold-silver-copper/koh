@@ -82,7 +82,7 @@ fn a_remote_bell_runs_the_hook_at_most_once_a_second() {
                 .wait_until(WAIT, |t| t.contains("BELL_BURST"))
                 .await
                 .is_some());
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            wait_for_spawns(&log, 2).await;
             let n = spawns(&log);
             assert!(
                 (2..=3).contains(&n),
@@ -157,7 +157,11 @@ fn stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do() {
                 .send(b"sleep 1; printf '\\a'; echo OUTAGE''_BELL\r")
                 .await
                 .expect("type");
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // The shell echoed the line, so it has it.
+            assert!(client
+                .wait_until(WAIT, |t| t.contains("OUTAGE''_BELL"))
+                .await
+                .is_some());
             client.drop_first_connection();
             assert!(
                 client

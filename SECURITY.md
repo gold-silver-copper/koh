@@ -66,8 +66,8 @@ and the git log.
 
 | ID | Finding | Guarded by |
 |----|---------|------------|
-| KOH-01 | Received states bounded by count, not bytes | Replaced by koh/4's fixed window of 16 frames per end: `src/client/session.rs::only_the_last_frames_are_kept_as_bases`, `src/server/mod.rs::only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored`, `tests/net/hostile_peer.rs::frames_with_unknown_bases_never_grow_the_client` |
-| KOH-02 | Decompression amplification on apply | `src/proto.rs::an_inflate_bomb_is_rejected`, `oversized_client_messages_are_rejected_before_buffering`, `tests/net/hostile_peer.rs::an_oversized_or_bomb_frame_never_grows_the_client`, `an_oversized_client_message_closes_the_connection_only` |
+| KOH-01 | Received states bounded by count, not bytes | Replaced by koh/4's fixed window of 16 frames per end: `src/client/session.rs::only_the_last_frames_are_kept_as_bases`, `src/server/mod.rs::only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored`, `tests/net/hostile_peer.rs::frames_on_unknown_bases_leave_the_client_running` |
+| KOH-02 | Decompression amplification on apply | `src/proto.rs::an_inflate_bomb_is_rejected`, `oversized_client_messages_are_rejected_before_buffering`, `tests/net/hostile_peer.rs::an_oversized_or_bomb_frame_leaves_the_client_running`, `an_oversized_client_message_closes_the_connection_only` |
 | KOH-03 | Fixed public KDF salt in the passphrase handshake | Removed: there is no over-the-wire passphrase; the node-id allowlist is the only factor |
 | KOH-04 | `String::truncate` on the status line panics the client | `src/client/render.rs::status_line_truncation_is_panic_free_across_all_widths` |
 | KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_queues_the_session_input_in_order_merging_neighbours`, `a_full_queue_for_the_session_leaves_the_rest_undecoded`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |

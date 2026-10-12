@@ -363,11 +363,11 @@ fn shutdown_returns_while_the_program_leaves_its_input_unread() {
         let drain = koh_testkit::spawn(async move { while rx.recv().await.is_some() {} });
         let chunk = vec![b'x'; 4096];
         let mut queued = 0;
+        // Until the writer's budget is full: it holds more than the terminal's input queue takes,
+        // so it is blocked on a write the program will never read.
         while queued < 256 && pty.write(chunk.clone()).is_ok() {
             queued += 1;
         }
-        // Let the writer thread fill the terminal's input queue and block.
-        tokio::time::sleep(Duration::from_millis(500)).await;
 
         tokio::time::timeout(
             Duration::from_secs(20),

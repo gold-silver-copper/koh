@@ -133,6 +133,8 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
             .context("B (concurrent, same session)")?;
         // Dropping ONE of two attached clients must not start the TTL.
         drop(a);
+        // Time must pass here: the session must outlive its TTL. (Polling would attach, and a
+        // detach restarts the TTL.)
         tokio::time::sleep(Duration::from_millis(400)).await;
         anyhow::ensure!(
             matches!(
@@ -144,6 +146,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
         // Now drop every client; after the TTL the session is reaped and a fresh attach creates one.
         drop(b);
         drop(reg.attach(peer).await.context("reattach C")?.0);
+        // Past the TTL, by time: polling would attach, and a detach restarts it.
         tokio::time::sleep(Duration::from_millis(500)).await;
         anyhow::ensure!(
             attach_kind(&reg, peer).await == Some(AttachKind::Created),
@@ -476,6 +479,7 @@ fn a_burst_of_detaches_larger_than_the_control_queue_still_starts_the_ttl() -> a
             clients.push(reg.attach(p).await.context("attach")?.0);
         }
         drop(clients);
+        // Past the TTL, by time: polling would attach, and a detach restarts it.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let kind = attach_kind(&reg, p).await;
         reg.shutdown().await;

@@ -860,29 +860,30 @@ async fn end_session<T: ClientTerminal>(
 mod tests {
     use super::*;
 
+    /// A server that will not have the client for good (another protocol, or not authorized) is
+    /// a [`Refused`]; one that cannot have it now closes saying why, and is redialed.
     #[test]
-    fn a_server_on_another_protocol_is_reported_as_such() {
+    fn a_refusal_is_for_good_only_when_not_authorized_or_on_another_protocol() {
+        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
+        let key = || generate_secret_key().expect("OS randomness");
         crate::test_runtime::current_thread().block_on(async {
+            let client = bind_endpoint_local(key(), false).await.unwrap();
             // A server that only speaks the previous protocol's ALPN refuses the TLS handshake. The
             // error must say so, not blame the allowlist.
-            use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
-            let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-                .secret_key(generate_secret_key().expect("OS randomness"))
+            let old = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(key())
                 .alpns(vec![b"koh/iroh/2".to_vec()])
                 .bind()
                 .await
-                .expect("bind old-protocol server");
-            let addr = loopback_addr(&server);
+                .unwrap();
+            let addr = loopback_addr(&old);
             let accept = tokio::spawn(async move {
-                if let Some(incoming) = server.accept().await {
+                if let Some(incoming) = old.accept().await {
                     let _ = incoming.await;
                 }
-                server
+                old
             });
-            let client = bind_endpoint_local(generate_secret_key().expect("OS randomness"), false)
-                .await
-                .expect("bind client");
-            let Err(error) = IrohConnector::new(client, addr).connect().await else {
+            let Err(error) = IrohConnector::new(client.clone(), addr).connect().await else {
                 panic!("an old-protocol server must refuse the handshake");
             };
             assert!(
@@ -891,22 +892,9 @@ mod tests {
             );
             assert!(format!("{error:#}").contains(PROTOCOL), "{error:#}");
             let _ = accept.await;
-        });
-    }
-
-    #[test]
-    fn a_refusal_is_for_good_only_when_not_authorized() {
-        crate::test_runtime::current_thread().block_on(async {
             // A server that closes the connection instead of admitting it, saying why.
-            use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
-            let server = bind_endpoint_local(generate_secret_key().unwrap(), true)
-                .await
-                .unwrap();
-            let addr = loopback_addr(&server);
-            let client = bind_endpoint_local(generate_secret_key().unwrap(), false)
-                .await
-                .unwrap();
-            let connector = IrohConnector::new(client, addr);
+            let server = bind_endpoint_local(key(), true).await.unwrap();
+            let connector = IrohConnector::new(client, loopback_addr(&server));
             for why in [
                 Close::AtCapacity,
                 Close::CouldNotStart,

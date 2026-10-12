@@ -1058,7 +1058,8 @@ mod tests {
     fn the_escape_prefix_takes_the_next_key() {
         use InputOutcome::{Forwarded, Quit, Suspend};
         const P: u8 = ESCAPE_PREFIX;
-        let cases: [(&[&[u8]], InputOutcome, &[u8]); 11] = [
+        type Case<'a> = (&'a [&'a [u8]], InputOutcome, &'a [u8]);
+        let cases: [Case; 11] = [
             (&[b"ls\r"], Forwarded, b"ls\r"),
             (&[&[P, b'.']], Quit, b""),
             (&[&[P, SUSPEND_KEY]], Suspend, b""),
@@ -1434,49 +1435,46 @@ mod tests {
     #[test]
     fn a_key_at_a_fresh_prompt_waits_for_its_echo_even_at_the_bottom_of_the_screen() {
         for (above, scrollback) in [(0, 0), (30, 100), (30, 0)] {
-            hold_at_a_fresh_prompt(above, scrollback);
+            let echoing = crate::predict::TtyModes {
+                echo: true,
+                line: true,
+            };
+            let mut emu = ServerTerminal::new(24, 80, scrollback).expect("emulator");
+            emu.set_tty(echoing);
+            let lines: Vec<String> = (0..above).map(|n| format!("line {n}")).collect();
+            emu.process(format!("{}\r\n$ ", lines.join("\r\n")).as_bytes());
+            let first = emu.snapshot();
+            let row = first.screen().cursor_position().0;
+            let (t0, mut s) = start();
+            s.on_frame(t0, &frame(1, 0, 0, &TerminalScreen::default(), &first));
+            // Long after the prompt: the kernel echoes, so the first key shows at once.
+            let t1 = t0 + Duration::from_secs(1);
+            s.on_input(t1, b"x");
+            assert!(!s.overlay().is_empty(), "kernel echo shows at once");
+            drain(&mut s);
+            // Enter: the shell prints a prompt on a new row (at the bottom, the same row index); the
+            // modes the frame carries still echo.
+            emu.process(b"x\r\nSecret: ");
+            let prompt = emu.snapshot();
+            assert_eq!(prompt.screen().cursor_position().0 == row, above > 0);
+            s.on_frame(t1, &frame(2, 1, 1, &first, &prompt));
+            s.on_input(t1 + Duration::from_millis(10), b"Q");
+            drain(&mut s);
+            let shown =
+                |s: &ClientSession, text| s.overlay().cells().any(|(_, c)| c.text() == text);
+            assert!(
+                !shown(&s, "Q"),
+                "{above} {scrollback}: shown before its echo"
+            );
+            // The program did echo (no password after all): once the server reflects the held key,
+            // and the hold is over, the next key is predicted from the first again.
+            emu.process(b"Q");
+            let echoed = emu.snapshot();
+            let t2 = t1 + PROMPT_HOLD + Duration::from_millis(1);
+            s.on_frame(t2, &frame(3, 2, 2, &prompt, &echoed));
+            s.on_input(t2, b"Z");
+            assert!(shown(&s, "Z") && !shown(&s, "Q"), "{above} {scrollback}");
         }
-    }
-
-    fn hold_at_a_fresh_prompt(above: usize, scrollback: usize) {
-        let echoing = crate::predict::TtyModes {
-            echo: true,
-            line: true,
-        };
-        let mut emu = ServerTerminal::new(24, 80, scrollback).expect("emulator");
-        emu.set_tty(echoing);
-        let lines: String = (0..above).map(|n| format!("line {n}\r\n")).collect();
-        emu.process(format!("{lines}$ ").as_bytes());
-        let first = emu.snapshot();
-        let row = first.screen().cursor_position().0;
-        let (t0, mut s) = start();
-        s.on_frame(t0, &frame(1, 0, 0, &TerminalScreen::default(), &first));
-        // Long after the prompt: the kernel echoes, so the first key shows at once.
-        let t1 = t0 + Duration::from_secs(1);
-        s.on_input(t1, b"x");
-        assert!(!s.overlay().is_empty(), "kernel echo shows at once");
-        drain(&mut s);
-        // Enter: the shell prints a prompt on a new row (at the bottom, the same row index); the
-        // modes the frame carries still echo.
-        emu.process(b"x\r\nSecret: ");
-        let prompt = emu.snapshot();
-        assert_eq!(prompt.screen().cursor_position().0 == row, above > 0);
-        s.on_frame(t1, &frame(2, 1, 1, &first, &prompt));
-        s.on_input(t1 + Duration::from_millis(10), b"Q");
-        drain(&mut s);
-        let shown = |s: &ClientSession, text| s.overlay().cells().any(|(_, c)| c.text() == text);
-        assert!(
-            !shown(&s, "Q"),
-            "{above} {scrollback}: shown before its echo"
-        );
-        // The program did echo (no password after all): once the server reflects the held key,
-        // and the hold is over, the next key is predicted from the first again.
-        emu.process(b"Q");
-        let echoed = emu.snapshot();
-        let t2 = t1 + PROMPT_HOLD + Duration::from_millis(1);
-        s.on_frame(t2, &frame(3, 2, 2, &prompt, &echoed));
-        s.on_input(t2, b"Z");
-        assert!(shown(&s, "Z") && !shown(&s, "Q"), "{above} {scrollback}");
     }
 
     #[test]

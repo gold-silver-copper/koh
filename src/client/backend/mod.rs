@@ -326,8 +326,10 @@ mod tests {
         b.bytes
     }
 
+    /// The 16 palette colours use the theme-aware 30–37 / 90–97 (40–47 / 100–107) codes, not the
+    /// fixed 256-palette `38;5;n` form, so a user's terminal theme still recolors them.
     #[test]
-    fn sgr_codes_for_the_16_palette_colors_are_exactly_30_37_90_97_and_40_47_100_107() {
+    fn sgr_colors_are_the_classic_theme_aware_codes_where_they_can_be() {
         for i in 0..16u8 {
             for (fg, low, high) in [(true, 30, 90), (false, 40, 100)] {
                 let code = if i < 8 { low + i } else { high + i - 8 };
@@ -338,57 +340,16 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn sgr_colors_match_the_classic_theme_aware_codes() {
-        // Low palette indices use the theme-aware 30–37 / 90–97 codes (not the fixed 256-palette
-        // 38;5;n form), so a user's terminal theme still recolors them.
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Idx(1), true)),
-            b"\x1b[31m"
-        );
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Idx(7), true)),
-            b"\x1b[37m"
-        );
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Idx(8), true)),
-            b"\x1b[90m"
-        );
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Idx(15), true)),
-            b"\x1b[97m"
-        );
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Idx(196), true)),
-            b"\x1b[38;5;196m"
-        );
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Rgb(fux_vt::Rgb { r: 0, g: 0, b: 255 }), true)),
-            b"\x1b[38;2;0;0;255m"
-        );
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Default, true)),
-            b"\x1b[39m"
-        );
-        // Background layer: 40–47 / 100–107 / 48;5;n / 48;2 / 49.
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Idx(1), false)),
-            b"\x1b[41m"
-        );
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Idx(8), false)),
-            b"\x1b[100m"
-        );
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Idx(196), false)),
-            b"\x1b[48;5;196m"
-        );
-        assert_eq!(
-            emit(|b| write_sgr_color(b, Color::Default, false)),
-            b"\x1b[49m"
-        );
+        let blue = Color::Rgb(fux_vt::Rgb { r: 0, g: 0, b: 255 });
+        for (color, fg, sgr) in [
+            (Color::Idx(196), true, &b"\x1b[38;5;196m"[..]),
+            (blue, true, b"\x1b[38;2;0;0;255m"),
+            (Color::Default, true, b"\x1b[39m"),
+            (Color::Idx(196), false, b"\x1b[48;5;196m"),
+            (Color::Default, false, b"\x1b[49m"),
+        ] {
+            assert_eq!(emit(|b| write_sgr_color(b, color, fg)), sgr, "{color:?}");
+        }
     }
 
     #[test]

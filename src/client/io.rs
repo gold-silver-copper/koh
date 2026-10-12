@@ -253,26 +253,10 @@ mod tests {
     }
 
     #[test]
-    fn idle_input_poll_cancels_and_joins_without_waiting_for_a_byte() {
+    fn input_producer_forwards_bytes_exactly_and_an_idle_one_cancels_at_once() {
         crate::test_runtime::current_thread().block_on(async {
-            // Client teardown owns and joins every producer.
-            let (reader, _writer) = UnixStream::pair().expect("socket pair");
-            let (sender, mut receiver) = mpsc::channel(1);
-            let cancel = CancellationToken::new();
-            let thread_cancel = cancel.clone();
-            let input = std::thread::spawn(move || read_input(reader, &sender, &thread_cancel));
-            cancel.cancel();
-            let start = Instant::now();
-            input.join().expect("join producer");
-            assert!(start.elapsed() < Duration::from_secs(1));
-            assert!(receiver.recv().await.is_none());
-        });
-    }
-
-    #[test]
-    fn input_producer_forwards_bytes_exactly() {
-        crate::test_runtime::current_thread().block_on(async {
-            // Producer framing does not transform terminal input.
+            // Producer framing does not transform terminal input; client teardown owns and joins
+            // every producer, without waiting for a byte.
             let (reader, mut writer) = UnixStream::pair().expect("socket pair");
             let (sender, mut receiver) = mpsc::channel(1);
             let cancel = CancellationToken::new();
@@ -284,7 +268,10 @@ mod tests {
                 Some(b"a\0\x1bZ".as_slice())
             );
             cancel.cancel();
+            let start = Instant::now();
             input.join().expect("join producer");
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(receiver.recv().await.is_none());
         });
     }
 

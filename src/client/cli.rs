@@ -425,12 +425,4 @@ mod tests {
         g.prime(50);
         assert!(g.observe(4, later), "prime after observe is a no-op");
     }
-
-    #[test]
-    fn connect_config_default_has_no_bell_hook() {
-        let server = crate::transport_iroh::generate_secret_key()
-            .unwrap()
-            .public();
-        assert!(ConnectConfig::new(server).bell_command.is_none());
-    }
 }

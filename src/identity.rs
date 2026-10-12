@@ -68,20 +68,11 @@ fn load_or_create(key: &KeyFile, create: bool) -> anyhow::Result<Identity> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
-    use std::path::PathBuf;
 
     #[test]
     fn cloned_leases_block_reset_until_the_last_owner_drops() -> anyhow::Result<()> {
-        struct TestDirectory(PathBuf);
-        impl Drop for TestDirectory {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let directory = TestDirectory(
-            std::env::temp_dir().join(format!("koh-lease-{}", Identity::generate()?.endpoint_id())),
-        );
-        let path = directory.0.join("identity.key");
+        let directory = crate::test_runtime::scratch("lease");
+        let path = directory.join("identity.key");
         let key = KeyFile::open(&path)?;
         // Reset must also work on a file that is not a valid key, without loading it.
         std::fs::write(&path, b"corrupt disposable key")?;
@@ -108,20 +99,11 @@ mod tests {
     /// rejects with `NotAKey`, whose message says to run `koh key reset`) is one `reset` can remove.
     #[test]
     fn reset_accepts_every_key_path_that_load_accepts() -> anyhow::Result<()> {
-        struct TestDirectory(PathBuf);
-        impl Drop for TestDirectory {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let directory = TestDirectory(
-            std::env::temp_dir().join(format!("koh-trust-{}", Identity::generate()?.endpoint_id())),
-        );
-        std::fs::create_dir(&directory.0)?;
+        let directory = crate::test_runtime::scratch("trust");
         // A 0755 dir, like a default-umask ~/.config/koh: `load` trusts it (it only warns).
-        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))?;
 
-        let path = directory.0.join("identity.key");
+        let path = directory.join("identity.key");
         std::fs::write(&path, [7u8; crate::transport_iroh::KEY_LEN])?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let key = KeyFile::open(&path)?;
@@ -133,7 +115,7 @@ mod tests {
         anyhow::ensure!(!path.exists(), "reset left the key in place");
 
         // A 31-byte file: load says to run `koh key reset`, which must then work.
-        let bad = directory.0.join("short.key");
+        let bad = directory.join("short.key");
         std::fs::write(&bad, [7u8; 31])?;
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600))?;
         let bad_key = KeyFile::open(&bad)?;

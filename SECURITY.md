@@ -46,16 +46,17 @@ credit reporters who want it.
 
 The code's comments state invariants, not finding IDs. This index maps every finding ID from koh's
 security audits and reviews to what guards it today: a test (`file::name`, from the repository
-root), or, where the mechanism is gone, what replaced it. The finding reports themselves live in [`docs/audits/`](docs/audits/)
+root; `tests/doc_limits.rs` checks each still exists), or, where the mechanism is gone, what
+replaced it. The finding reports themselves live in [`docs/audits/`](docs/audits/)
 and the git log.
 
 **Security audit v0.3.1 fixes (H-, M-, L-).**
 
 | ID | Finding | Guarded by |
 |----|---------|------------|
-| H-1 | A peer's resize allocates an unbounded grid (OOM) | `src/terminal/server.rs::server_resize_clamps_oom_and_zero`, `src/terminal/mod.rs::client_apply_clamps_oom_resize`, `clamp_dims_bounds_both_extremes`; `testing/android/scripts/sec-resize-oom-server.sh` |
+| H-1 | A peer's resize allocates an unbounded grid (OOM) | `tests/sessions.rs::a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server`, `tests/pty.rs::host_normalizes_dimensions_for_both_the_emulator_and_pty`, `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`; `testing/android/scripts/sec-resize-oom-server.sh` |
 | M-1 | The identity key is written world-readable | `src/identity/key_file.rs::a_created_key_is_its_raw_bytes_and_loads_back_to_the_same_identity`; `testing/android/scripts/sec-key-perms.sh` |
-| M-2 | A (0, 0) resize panics the emulator | `src/terminal/server.rs::server_resize_clamps_oom_and_zero`, `src/terminal/mod.rs::client_apply_clamps_zero_resize`; `testing/android/scripts/sec-resize-zero-panic.sh` |
+| M-2 | A (0, 0) resize panics the emulator | `tests/pty.rs::host_normalizes_dimensions_for_both_the_emulator_and_pty`, `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`; `testing/android/scripts/sec-resize-zero-panic.sh` |
 | L-1 | A server silently sets the client's clipboard (OSC 52) | Accepted since 0.13: clipboard writes are on by default, the owner's choice, and off with `--no-clipboard` (`src/args.rs::no_clipboard_turns_clipboard_writes_off`). What bounds them stays: `src/client/render.rs::out_of_band_clipboard_off_emits_nothing`, `out_of_band_rejects_non_base64_clipboard_even_when_on`, `a_clipboard_query_or_an_oversized_payload_is_never_forwarded`; `src/terminal/server.rs::a_clipboard_query_sets_nothing` |
 | L-2 | The client trusts the server's title/icon/clipboard sizes | `src/terminal/mod.rs::client_apply_caps_oversized_title_and_clipboard` |
 | L-3 | No cap on connections, handshakes or sessions | `tests/sessions.rs::max_sessions_refuses_a_new_peer_but_allows_a_reattach`, `tests/net/hostile_peer.rs::a_flood_of_connections_and_garbage_does_not_take_the_server_down` |
@@ -81,7 +82,7 @@ and the git log.
 | KOH-16 | A loose existing key is never re-tightened | `src/identity/key_file.rs::loose_key_and_lock_files_are_tightened_through_the_descriptor` |
 | KOH-17 | Unmaintained `atomic-polyfill` via postcard defaults | postcard's default features are off (`Cargo.toml`); `cargo deny check advisories` in CI |
 | KOH-18 | Unmaintained `paste` via iroh | Accepted, advisory-only: the ignore in [`deny.toml`](deny.toml) |
-| KOH-19 | Pre-release `ed25519-dalek` / `curve25519-dalek` | Accepted: iroh still depends on pre-1.0 releases of them; tracked with each iroh bump |
+| KOH-19 | Pre-release `ed25519-dalek` / `curve25519-dalek` | Resolved: iroh 1.3 depends on their stable releases (`ed25519-dalek` 3, `curve25519-dalek` 5 in `Cargo.lock`) |
 
 **Audit of 2026-10-11 (A-).**
 
@@ -100,12 +101,12 @@ and the git log.
 | ID | Finding | Guarded by |
 |----|---------|------------|
 | KR-01 | A stalled QUIC handshake pins permits for the idle timeout | `ACCEPT_HANDSHAKE_TIMEOUT` in `src/server/cli.rs`; no automated test |
-| KR-02 | Signalling a reaped, possibly recycled PID | `tests/pty.rs::reaped_child_is_not_signaled_again` |
+| KR-02 | Signalling a reaped, possibly recycled PID | Guarded by its type: `src/pty.rs`'s `Running` owns the pid and is the only way to signal it, and is given up when the program is reaped |
 | KR-06 | Key perms touched before the dir check; symlinked key followed | `src/identity/key_file.rs::a_symlinked_key_is_refused_and_its_target_left_alone`, `a_dangling_symlink_is_refused_instead_of_creating_or_missing_a_key`, `only_a_nonsticky_world_writable_directory_is_refused` |
 | KR-07 | A pre-existing loose `$KOH_LOG` is reused | `src/identity/key_file.rs::a_symlinked_log_is_refused_before_its_target_is_truncated`, `a_fifo_log_or_key_is_refused_without_waiting_for_a_reader` (`open_private_log` refuses a symlink, FIFO or device before opening, or another user's file, fchmods a loose log to 0600, and truncates only after; `connect` disables file logging on refusal) |
 | K-01 | Key load races a path swap (TOCTOU) | `src/identity/key_file.rs::a_symlinked_key_is_refused_and_its_target_left_alone`, `loose_key_and_lock_files_are_tightened_through_the_descriptor` |
 | K-03 | An accept-then-close server spins the client's reconnect | `src/client/mod.rs::dwell_gate_resets_on_proven_connection_and_climbs_on_flap`, `reconnect_backoff_grows_then_caps` |
-| K-13 | `clamp_dims` is the only bound on one resize's allocation | `src/terminal/mod.rs::clamp_dims_bounds_both_extremes`, `apply_is_panic_free_and_holds_invariants` |
+| K-13 | `clamp_dims` is the only bound on one resize's allocation | `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`, `apply_is_panic_free_and_holds_invariants` |
 | K-16 | A panicking connection leaks its session | Detach on drop of `SessionClient`: `tests/sessions.rs::the_last_detach_starts_the_ttl_a_concurrent_one_does_not`, `tests/net/session.rs::connections_dropped_with_input_in_flight_do_not_hurt_the_session` |
 | KB-01 | The bell hook | `src/client/cli.rs::bell_hook_fires_on_a_rise_and_rate_limits_a_burst`, `tests/net/bell.rs::a_remote_bell_runs_the_hook_at_most_once_a_second` |
 | KB-02 | The bell hook's environment and first frame | `src/client/cli.rs::bell_hook_command_scrubs_parent_koh_vars_and_exports_its_own`, `bell_hook_prime_swallows_the_count_it_is_seeded_with_but_not_later_rises`, `tests/net/bell.rs::stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do` |
@@ -113,7 +114,7 @@ and the git log.
 | KC-IO-01 | Client teardown owns and joins every producer | `src/client/io.rs::idle_input_poll_cancels_and_joins_without_waiting_for_a_byte`, `dropping_public_tasks_cancels_both_producers` |
 | KC-IO-02 | The input producer does not transform bytes | `src/client/io.rs::input_producer_forwards_bytes_exactly` |
 | KS-01, KS-04 | Shared sessions across peers; their unwind guard | Removed with the generic session host: one PTY per peer, and K-16's detach on drop |
-| KS-02 | Echo-ack per connection, not per session | `tests/sessions.rs::echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_input`, `src/server/mod.rs::echo_ack_trackers_are_independent_per_connection` |
+| KS-02 | Echo-ack per connection, not per session | `tests/sessions.rs::echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_input` |
 | KS-03 | A screen change wakes every attached connection | The session's `watch` channel: `tests/sessions.rs::echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_input` keeps two connections on one session receiving frames |
 | S-04 | Per-cell `String` allocation on repaint | Performance only; nothing to guard |
 | S-07 | One place states the prediction-cell invariants | `PredictionEngine::place_cell`; the prediction tests in `src/predict.rs` |

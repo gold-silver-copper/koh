@@ -1554,6 +1554,7 @@ dependencies = [
  "getrandom 0.4.3",
  "iroh",
  "iroh-base",
+ "koh-testkit",
  "miniz_oxide",
  "n0-watcher",
  "noq-udp",
@@ -1567,6 +1568,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
+]
+
+[[package]]
+name = "koh-testkit"
+version = "0.0.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

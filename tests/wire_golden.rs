@@ -2,8 +2,10 @@
 //!
 //! What the client sends, built here by hand, is pinned: the expected bytes were captured by
 //! running the encoder, and a change to the wire must change them in the same commit,
-//! deliberately. Frames and history rows are drawn by the emulator, whose output may improve, so
-//! they are checked to round-trip through their streams instead.
+//! deliberately, and bump the protocol's name (the ALPN), which is pinned beside them. Frames and
+//! history rows are drawn by the emulator, whose output may improve, so they are checked to
+//! round-trip through their streams instead.
+#![forbid(clippy::disallowed_methods)]
 
 use koh::events::{
     InputEvent, WireButton, WireColours, WireKey, WireKeyCode, WireKitty, WireMouse,
@@ -252,8 +254,13 @@ fn frames_and_history_round_trip_through_their_streams() {
     );
 }
 
+/// The protocol these bytes are pinned for. A change to them is a new protocol: bump the ALPN
+/// (`koh::transport_iroh::ALPN`) and this with it.
+const PINNED_FOR: &[u8] = b"koh/4";
+
 #[test]
 fn client_messages_encode_as_pinned() {
+    assert_eq!(koh::transport_iroh::ALPN, PINNED_FOR);
     let msgs = client_msgs();
     assert_eq!(msgs.len(), CLIENT_MSGS.len());
     for (msg, pinned) in msgs.iter().zip(CLIENT_MSGS) {
@@ -272,6 +279,7 @@ fn client_messages_encode_as_pinned() {
 
 #[test]
 fn modes_encode_as_pinned() {
+    assert_eq!(koh::transport_iroh::ALPN, PINNED_FOR);
     let modes = modes();
     assert_eq!(modes.len(), MODES.len());
     for (modes, pinned) in modes.iter().zip(MODES) {

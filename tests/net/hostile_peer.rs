@@ -92,7 +92,7 @@ async fn assert_good_client_still_works(client: &mut Client) -> anyhow::Result<(
 
 #[test]
 fn an_oversized_client_message_closes_the_connection_only() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
@@ -121,7 +121,7 @@ fn an_oversized_client_message_closes_the_connection_only() -> anyhow::Result<()
 #[test]
 fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> {
     use koh::events::{InputEvent, WireColours, WireKey, WireKeyCode, MAX_PASTE, PALETTE};
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
@@ -172,7 +172,7 @@ fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> 
 fn a_full_session_queue_does_not_stop_the_frames() -> anyhow::Result<()> {
     use koh::events::{InputEvent, WireColours, MAX_PASTE};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let evil = identity()?;
         let printing = "stty raw -echo; while :; do echo tick; sleep 0.05; done";
@@ -181,10 +181,10 @@ fn a_full_session_queue_does_not_stop_the_frames() -> anyhow::Result<()> {
         let frames = std::sync::Arc::new(AtomicUsize::new(0));
         let reader = {
             let (conn, frames) = (conn.clone(), frames.clone());
-            tokio::spawn(async move {
+            koh_testkit::spawn(async move {
                 while let Ok(mut recv) = conn.accept_uni().await {
                     let frames = frames.clone();
-                    tokio::spawn(async move {
+                    koh_testkit::spawn(async move {
                         if recv.read_to_end(MAX_FRAME).await.is_ok() {
                             frames.fetch_add(1, Ordering::Relaxed);
                         }
@@ -204,7 +204,7 @@ fn a_full_session_queue_does_not_stop_the_frames() -> anyhow::Result<()> {
         for _ in 0..2000 {
             messages.push(encode_client(&ClientMsg::Colours(WireColours::default()))?);
         }
-        let writer = tokio::spawn(async move {
+        let writer = koh_testkit::spawn(async move {
             for message in messages {
                 if send.write_all(&message).await.is_err() {
                     return;
@@ -229,7 +229,7 @@ fn a_full_session_queue_does_not_stop_the_frames() -> anyhow::Result<()> {
 
 #[test]
 fn a_client_cannot_open_a_second_stream() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
@@ -251,7 +251,7 @@ fn a_client_cannot_open_a_second_stream() -> anyhow::Result<()> {
 
 #[test]
 fn a_flood_of_connections_and_garbage_does_not_take_the_server_down() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
@@ -272,7 +272,7 @@ fn a_flood_of_connections_and_garbage_does_not_take_the_server_down() -> anyhow:
 fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_connection(
 ) -> anyhow::Result<()> {
     use koh::terminal::{HistoryRequest, MAX_HISTORY_ROWS};
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
@@ -340,7 +340,7 @@ where
     let secret = generate_secret_key()?;
     let id = secret.public();
     let endpoint = net.endpoint(secret, true).await?;
-    tokio::spawn(async move {
+    koh_testkit::spawn(async move {
         let Some(incoming) = endpoint.accept().await else {
             return;
         };
@@ -379,11 +379,11 @@ async fn client_survives(net: &FaultNet, good: SecretKey, evil: EndpointId) -> a
 
 #[test]
 fn an_oversized_or_bomb_frame_never_grows_the_client() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let good = identity()?;
         let evil_id = evil_server(&net, good.public(), |conn| {
-            tokio::spawn(async move {
+            koh_testkit::spawn(async move {
                 // An inflate bomb: 64 MiB of zeros deflates tiny; the client's 16 MiB limit rejects it.
                 let bomb = miniz_oxide::deflate::compress_to_vec(&vec![0u8; 4 * MAX_FRAME], 9);
                 send_frame_bytes(&conn, bomb).await;
@@ -398,11 +398,11 @@ fn an_oversized_or_bomb_frame_never_grows_the_client() -> anyhow::Result<()> {
 
 #[test]
 fn frames_with_unknown_bases_never_grow_the_client() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let good = identity()?;
         let evil_id = evil_server(&net, good.public(), |conn| {
-            tokio::spawn(async move {
+            koh_testkit::spawn(async move {
                 // 1000 frames, numbered far apart, each diffing from a base the client never holds.
                 let base = TerminalScreen::default();
                 for n in 1..=1000u64 {
@@ -431,14 +431,14 @@ fn frames_with_unknown_bases_never_grow_the_client() -> anyhow::Result<()> {
 
 #[test]
 fn a_bad_admission_byte_is_rejected_not_treated_as_admitted() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let good = identity()?;
         // A server that opens the admission stream but writes the wrong byte.
         let secret = generate_secret_key()?;
         let evil_id = secret.public();
         let endpoint = net.endpoint(secret, true).await?;
-        tokio::spawn(async move {
+        koh_testkit::spawn(async move {
             if let Some(incoming) = endpoint.accept().await {
                 if let Ok(conn) = incoming.await {
                     if let Ok((mut send, _recv)) = conn.open_bi().await {
@@ -463,11 +463,11 @@ fn a_servers_hostile_links_are_shown_as_text_or_dropped() -> anyhow::Result<()> 
     use koh::terminal::{WireLink, MAX_LINK_BYTES, MAX_ROW_LINKS};
     // Ten rows of the most and longest links are past what a diff may carry.
     const { assert!(10 * MAX_ROW_LINKS * fux_vt::URI_LIMIT > MAX_LINK_BYTES) };
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let good = identity()?;
         let evil_id = evil_server(&net, good.public(), |conn| {
-            tokio::spawn(async move {
+            koh_testkit::spawn(async move {
                 let base = TerminalScreen::default();
                 // Each frame from the blank screen, with links its rows should not have.
                 let frame = |num: u64, text: &str, links: &dyn Fn(&mut koh::terminal::RowDiff)| {
@@ -552,11 +552,11 @@ fn a_servers_hostile_links_are_shown_as_text_or_dropped() -> anyhow::Result<()> 
 #[test]
 fn hostile_history_rows_never_grow_the_client() -> anyhow::Result<()> {
     use koh::terminal::{HistoryReply, HistoryRow};
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let good = identity()?;
         let evil_id = evil_server(&net, good.public(), |conn| {
-            tokio::spawn(async move {
+            koh_testkit::spawn(async move {
                 // A screen whose history claims a million rows, then rows the client never asked
                 // for: too many, too wide, named outside the history, over and over.
                 let Ok(mut emu) = ServerTerminal::new(24, 80, 1000) else {

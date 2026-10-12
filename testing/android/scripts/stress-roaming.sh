@@ -34,7 +34,7 @@ cleanup_tc() { as_root tc qdisc del dev lo root >/dev/null 2>&1 || true; }
 allow_client_key /data/local/tmp/koh-roam.key
 start_server "" || { bad "server failed to start"; finish "stress-roaming"; }
 SPID="$(server_pid)"
-CLILOG="/tmp/koh-roam-cli-$$.log"
+CLILOG="$HOST_TMP/koh-roam-cli-$$.log"
 
 pty_connect_host_bg /data/local/tmp/koh-roam.key "$CLILOG" $((OUTAGE + 30)) ""
 w=0; CPID=""

@@ -8,15 +8,13 @@
 //!
 //! Unlike the mock-terminal e2e, this exercises the actual binary: argument parsing, raw-mode
 //! lifecycle, the renderer, and stdin passthrough — the real terminal path.
-#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
+#![forbid(clippy::disallowed_methods)]
 
-mod spawn;
-
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use koh::pty::{Launcher, Pty};
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key};
+use koh_testkit::{command, Capture};
 
 /// The `koh` binary, as the launcher every program here starts through.
 fn launcher() -> Launcher {
@@ -45,7 +43,7 @@ async fn loopback_server(
         .find(|s| s.is_ipv4())
         .map(std::net::SocketAddr::port)
         .ok_or_else(|| anyhow::anyhow!("no IPv4 socket"))?;
-    let task = tokio::spawn(async move {
+    let task = koh_testkit::spawn(async move {
         let _ = koh::server::cli::serve_endpoint(
             server_ep,
             hosting,
@@ -56,91 +54,51 @@ async fn loopback_server(
     Ok((server_id, server_port, task))
 }
 
-/// Everything `output` delivers, gathered by a background task.
-fn capture(mut output: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Arc<Mutex<Vec<u8>>> {
-    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let sink = buf.clone();
-    tokio::spawn(async move {
-        while let Some(chunk) = output.recv().await {
-            let Ok(mut all) = sink.lock() else { break };
-            all.extend_from_slice(&chunk);
-        }
-    });
-    buf
-}
-
-/// The captured text from byte `from` on.
-fn text_from(buf: &Arc<Mutex<Vec<u8>>>, from: usize) -> String {
-    buf.lock().map_or_else(
-        |_| String::new(),
-        |all| String::from_utf8_lossy(all.get(from..).unwrap_or_default()).into_owned(),
-    )
-}
-
-/// Wait up to `secs` for `needle` after byte `from`: the byte after the match, or what was captured.
-async fn wait_for(
-    buf: &Arc<Mutex<Vec<u8>>>,
-    from: usize,
-    needle: &str,
-    secs: u64,
-) -> Result<usize, String> {
-    for _ in 0..secs.saturating_mul(10) {
-        if let Some(at) = text_from(buf, from).find(needle) {
-            return Ok(from.saturating_add(at).saturating_add(needle.len()));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    Err(format!(
-        "never saw {needle:?}; captured:\n{}",
-        text_from(buf, 0)
-    ))
-}
-
 #[test]
 fn real_client_binary_renders_over_pty() {
-    runtime().expect("tokio runtime").block_on(async {
-        let key_path =
-            std::env::temp_dir().join(format!("koh-pty-test-{}.key", std::process::id()));
-        let _ = std::fs::remove_file(&key_path);
-        let (server_id, server_port, server_task) =
-            loopback_server(&key_path).await.expect("server");
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let dir = koh_testkit::scratch!("pty-test").expect("a scratch directory");
+            let key_path = dir.join("client.key");
+            let (server_id, server_port, server_task) =
+                loopback_server(&key_path).await.expect("server");
 
-        let (client, output) = Pty::spawn(
-            24,
-            80,
-            &[
-                env!("CARGO_BIN_EXE_koh").to_owned(),
-                "connect".to_owned(),
-                server_id,
-                "--direct".to_owned(),
-                format!("127.0.0.1:{server_port}"),
-                "--key-file".to_owned(),
-                key_path.display().to_string(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn client binary");
-        let buf = capture(output);
+            let (client, output) = Pty::spawn(
+                24,
+                80,
+                &[
+                    env!("CARGO_BIN_EXE_koh").to_owned(),
+                    "connect".to_owned(),
+                    server_id,
+                    "--direct".to_owned(),
+                    format!("127.0.0.1:{server_port}"),
+                    "--key-file".to_owned(),
+                    key_path.display().to_string(),
+                ],
+                "xterm-256color",
+                &launcher(),
+                &koh::pty::Reaper::start().expect("reaper"),
+            )
+            .expect("spawn client binary");
+            let buf = Capture::new(output);
 
-        // Give the binary time to connect over loopback iroh and do the initial screen sync.
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+            // Give the binary time to connect over loopback iroh and do the initial screen sync.
+            tokio::time::sleep(Duration::from_millis(2000)).await;
 
-        // Type a command with a distinctive marker; it round-trips to `sh` and back as a frame.
-        client
-            .write(b"echo koh_pty_marker\r".to_vec())
-            .expect("write keystrokes");
-        let seen = wait_for(&buf, 0, "koh_pty_marker", 15).await;
+            // Type a command with a distinctive marker; it round-trips to `sh` and back as a frame.
+            client
+                .write(b"echo koh_pty_marker\r".to_vec())
+                .expect("write keystrokes");
+            let seen = buf.wait_for(0, "koh_pty_marker", 15).await;
 
-        // Disconnect via the escape sequence (Ctrl-^ then '.'), then ensure teardown.
-        let _ = client.write(vec![0x1e, b'.']);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        drop(client);
-        server_task.abort();
-        let _ = std::fs::remove_file(&key_path);
-        seen.expect("real client binary rendered the marker over the PTY");
-    });
+            // Disconnect via the escape sequence (Ctrl-^ then '.'), then ensure teardown.
+            let _ = client.write(vec![0x1e, b'.']);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(client);
+            server_task.abort();
+            seen.expect("real client binary rendered the marker over the PTY");
+        });
 }
 
 /// `Ctrl-^ Ctrl-Z` stops the client with SIGTSTP, as a terminal's suspend key would: the job
@@ -148,83 +106,88 @@ fn real_client_binary_renders_over_pty() {
 /// make the shell report "Stopped (signal)"), and `fg` resumes the session.
 #[test]
 fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
-    runtime().expect("tokio runtime").block_on(async {
-        let key_path =
-            std::env::temp_dir().join(format!("koh-suspend-test-{}.key", std::process::id()));
-        let _ = std::fs::remove_file(&key_path);
-        let (server_id, server_port, server_task) =
-            loopback_server(&key_path).await.expect("server");
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let dir = koh_testkit::scratch!("suspend-test").expect("a scratch directory");
+            let key_path = dir.join("client.key");
+            let (server_id, server_port, server_task) =
+                loopback_server(&key_path).await.expect("server");
 
-        // An interactive bash with job control, as a user's login shell would be.
-        let (bash, output) = Pty::spawn(
-            24,
-            80,
-            &[
-                "env".to_owned(),
-                "PS1=job$ ".to_owned(),
-                "bash".to_owned(),
-                "--norc".to_owned(),
-                "--noprofile".to_owned(),
-                "-i".to_owned(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn bash");
-        let buf = capture(output);
-        let type_ = |bytes: &[u8]| bash.write(bytes.to_vec()).expect("type");
-
-        let mut at = wait_for(&buf, 0, "job$ ", 10)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        type_(
-            format!(
-                "'{}' connect {server_id} --direct 127.0.0.1:{server_port} --key-file '{}'\r",
-                env!("CARGO_BIN_EXE_koh"),
-                key_path.display()
+            // An interactive bash with job control, as a user's login shell would be.
+            let (bash, output) = Pty::spawn(
+                24,
+                80,
+                &[
+                    "env".to_owned(),
+                    "PS1=job$ ".to_owned(),
+                    "bash".to_owned(),
+                    "--norc".to_owned(),
+                    "--noprofile".to_owned(),
+                    "-i".to_owned(),
+                ],
+                "xterm-256color",
+                &launcher(),
+                &koh::pty::Reaper::start().expect("reaper"),
             )
-            .as_bytes(),
-        );
-        // Only the remote shell turns `$((6*7))` into 42, so this proves the session is up.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        type_(b"echo ready_$((6*7))\r");
-        at = wait_for(&buf, at, "ready_42", 20)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
+            .expect("spawn bash");
+            let buf = Capture::new(output);
+            let type_ = |bytes: &[u8]| bash.write(bytes.to_vec()).expect("type");
 
-        type_(&[0x1e, 0x1a]);
-        at = wait_for(&buf, at, "job$ ", 10)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        type_(b"echo status=$?\r");
-        let expected = format!("status={}", 128 + fuxix::process::Signal::Tstp.raw());
-        at = wait_for(&buf, at, &expected, 10)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
+            let mut at = buf
+                .wait_for(0, "job$ ", 10)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            type_(
+                format!(
+                    "'{}' connect {server_id} --direct 127.0.0.1:{server_port} --key-file '{}'\r",
+                    env!("CARGO_BIN_EXE_koh"),
+                    key_path.display()
+                )
+                .as_bytes(),
+            );
+            // Only the remote shell turns `$((6*7))` into 42, so this proves the session is up.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            type_(b"echo ready_$((6*7))\r");
+            at = buf
+                .wait_for(at, "ready_42", 20)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
 
-        type_(b"fg\r");
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        type_(b"echo back_$((6*7))\r");
-        at = wait_for(&buf, at, "back_42", 20)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
+            type_(&[0x1e, 0x1a]);
+            at = buf
+                .wait_for(at, "job$ ", 10)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            type_(b"echo status=$?\r");
+            let expected = format!("status={}", 128 + fuxix::process::Signal::Tstp.raw());
+            at = buf
+                .wait_for(at, &expected, 10)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
 
-        type_(&[0x1e, b'.']);
-        wait_for(&buf, at, "job$ ", 10)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        type_(b"exit\r");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        drop(bash);
-        server_task.abort();
-        let _ = std::fs::remove_file(&key_path);
-    });
+            type_(b"fg\r");
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            type_(b"echo back_$((6*7))\r");
+            at = buf
+                .wait_for(at, "back_42", 20)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+
+            type_(&[0x1e, b'.']);
+            buf.wait_for(at, "job$ ", 10)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            type_(b"exit\r");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(bash);
+            server_task.abort();
+        });
 }
 
 /// `koh id` for the key at `key`, creating it: the endpoint id, as the binary prints it.
 fn endpoint_id(key: &std::path::Path) -> anyhow::Result<String> {
-    let out = spawn::command(env!("CARGO_BIN_EXE_koh"))?
+    let out = command(env!("CARGO_BIN_EXE_koh"))?
         .args(["id", "--key-file"])
         .arg(key)
         .output()?;
@@ -238,8 +201,7 @@ fn serve_on_port(
     port: u16,
     client: &str,
 ) -> anyhow::Result<std::process::Child> {
-    use std::io::BufRead as _;
-    let mut server = spawn::command(env!("CARGO_BIN_EXE_koh"))?
+    let mut server = command(env!("CARGO_BIN_EXE_koh"))?
         .args([
             "serve",
             "--local",
@@ -254,23 +216,11 @@ fn serve_on_port(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
-    let stderr = server
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("no stderr pipe"))?;
-    let (ready, is_ready) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // Read to the end, so the server never blocks on a full pipe.
-        for line in std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-        {
-            if line.contains(&format!("udp port    : {port}")) {
-                let _ = ready.send(());
-            }
-        }
-    });
-    if is_ready.recv_timeout(Duration::from_secs(20)).is_err() {
+    let logs = koh_testkit::stderr_lines(&mut server);
+    let ready = format!("udp port    : {port}");
+    if !std::iter::from_fn(|| logs.recv_timeout(Duration::from_secs(20)).ok())
+        .any(|line| line.contains(&ready))
+    {
         let _ = server.kill();
         anyhow::bail!("the server never reported port {port}");
     }
@@ -296,79 +246,71 @@ fn stop(mut server: std::process::Child) -> anyhow::Result<()> {
 /// old server, so the client gets a fresh one.
 #[test]
 fn a_client_redials_a_local_server_restarted_on_its_port() {
-    runtime().expect("tokio runtime").block_on(async {
-        let dir = std::env::temp_dir().join(format!("koh-restart-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).expect("a test dir");
-        let (server_key, client_key) = (dir.join("server.key"), dir.join("client.key"));
-        let server_id = endpoint_id(&server_key).expect("the server's id");
-        let client_id = endpoint_id(&client_key).expect("the client's id");
-        let port = std::net::UdpSocket::bind(("0.0.0.0", 0))
-            .and_then(|socket| socket.local_addr())
-            .expect("a free port")
-            .port();
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let dir = koh_testkit::scratch!("restart-test").expect("a scratch directory");
+            let (server_key, client_key) = (dir.join("server.key"), dir.join("client.key"));
+            let server_id = endpoint_id(&server_key).expect("the server's id");
+            let client_id = endpoint_id(&client_key).expect("the client's id");
+            let port = std::net::UdpSocket::bind(("0.0.0.0", 0))
+                .and_then(|socket| socket.local_addr())
+                .expect("a free port")
+                .port();
 
-        let server = serve_on_port(&server_key, port, &client_id).expect("the server");
-        let (client, output) = Pty::spawn(
-            24,
-            80,
-            &[
-                env!("CARGO_BIN_EXE_koh").to_owned(),
-                "connect".to_owned(),
-                server_id,
-                "--direct".to_owned(),
-                format!("127.0.0.1:{port}"),
-                "--key-file".to_owned(),
-                client_key.display().to_string(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn client binary");
-        let buf = capture(output);
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        // A variable only this session holds, and an answer only a remote shell computes.
-        client
-            .write(b"X=kept; echo before_${X}_$((6*7))\r".to_vec())
-            .expect("type");
-        let at = wait_for(&buf, 0, "before_kept_42", 20)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-
-        stop(server).expect("stop the server");
-        let at = wait_for(&buf, at, "reconnecting", 20)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let server = serve_on_port(&server_key, port, &client_id).expect("the restarted server");
-
-        // Typing while the client redials is dropped, so type until the new session answers.
-        let mut seen = Err(String::new());
-        for _ in 0..15 {
+            let server = serve_on_port(&server_key, port, &client_id).expect("the server");
+            let (client, output) = Pty::spawn(
+                24,
+                80,
+                &[
+                    env!("CARGO_BIN_EXE_koh").to_owned(),
+                    "connect".to_owned(),
+                    server_id,
+                    "--direct".to_owned(),
+                    format!("127.0.0.1:{port}"),
+                    "--key-file".to_owned(),
+                    client_key.display().to_string(),
+                ],
+                "xterm-256color",
+                &launcher(),
+                &koh::pty::Reaper::start().expect("reaper"),
+            )
+            .expect("spawn client binary");
+            let buf = Capture::new(output);
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            // A variable only this session holds, and an answer only a remote shell computes.
             client
-                .write(b"echo after_${X:-fresh}_$((6*7))\r".to_vec())
+                .write(b"X=kept; echo before_${X}_$((6*7))\r".to_vec())
                 .expect("type");
-            seen = wait_for(&buf, at, "after_fresh_42", 2).await;
-            if seen.is_ok() {
-                break;
+            let at = buf
+                .wait_for(0, "before_kept_42", 20)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+
+            stop(server).expect("stop the server");
+            let at = buf
+                .wait_for(at, "reconnecting", 20)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let server =
+                serve_on_port(&server_key, port, &client_id).expect("the restarted server");
+
+            // Typing while the client redials is dropped, so type until the new session answers.
+            let mut seen = Err(String::new());
+            for _ in 0..15 {
+                client
+                    .write(b"echo after_${X:-fresh}_$((6*7))\r".to_vec())
+                    .expect("type");
+                seen = buf.wait_for(at, "after_fresh_42", 2).await;
+                if seen.is_ok() {
+                    break;
+                }
             }
-        }
 
-        let _ = client.write(vec![0x1e, b'.']);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        drop(client);
-        let stopped = stop(server);
-        let _ = std::fs::remove_dir_all(&dir);
-        stopped.expect("stop the restarted server");
-        seen.unwrap_or_else(|e| panic!("the client found the restarted server: {e}"));
-    });
-}
-
-/// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
-fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
+            let _ = client.write(vec![0x1e, b'.']);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(client);
+            stop(server).expect("stop the restarted server");
+            seen.unwrap_or_else(|e| panic!("the client found the restarted server: {e}"));
+        });
 }

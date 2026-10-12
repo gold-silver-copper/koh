@@ -17,7 +17,7 @@ fn clean() -> FaultNet {
 
 #[test]
 fn xon_xoff_does_not_wedge_the_session() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             // A ^S (XOFF) / ^Q (XON) cycle in the input must not break the session: output after it still
@@ -49,7 +49,7 @@ fn xon_xoff_does_not_wedge_the_session() {
 
 #[test]
 fn many_connects_in_a_row_reattach_the_same_session() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             // A leak or teardown race shows up as a hang or a failure on some iteration.
@@ -85,7 +85,7 @@ fn many_connects_in_a_row_reattach_the_same_session() {
 
 #[test]
 fn connections_dropped_with_input_in_flight_do_not_hurt_the_session() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             // Input arriving as or after a connection tears down must not crash the server. Each
@@ -125,7 +125,7 @@ fn connections_dropped_with_input_in_flight_do_not_hurt_the_session() {
 
 #[test]
 fn a_window_resize_reaches_the_shell() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
@@ -147,7 +147,7 @@ fn a_window_resize_reaches_the_shell() {
 
 #[test]
 fn a_detached_session_is_reattached_at_its_current_screen() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
@@ -184,7 +184,7 @@ fn a_detached_session_is_reattached_at_its_current_screen() {
 
 #[test]
 fn the_shell_exit_status_becomes_the_client_result() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
@@ -198,7 +198,7 @@ fn the_shell_exit_status_becomes_the_client_result() {
 
 #[test]
 fn a_program_that_stops_reading_input_never_freezes_the_client() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             // The program puts its terminal in raw mode and never reads. Pasting megabytes must not block
@@ -259,7 +259,7 @@ fn a_program_that_stops_reading_input_never_freezes_the_client() {
 /// program's output while the user's terminal floods it with input.
 #[test]
 fn a_flood_of_typing_does_not_starve_the_frames() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
@@ -300,7 +300,7 @@ fn a_flood_of_typing_does_not_starve_the_frames() {
 
 #[test]
 fn a_forced_mid_session_drop_reconnects_to_the_same_shell() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             // A phone screen turning off: the connection dies mid-session while the shell keeps
@@ -351,7 +351,7 @@ fn a_forced_mid_session_drop_reconnects_to_the_same_shell() {
 
 #[test]
 fn a_program_that_asked_hears_of_a_resize_on_its_input() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             // Mode 2048: the program gets `CSI 48 ; rows ; cols ; 0 ; 0 t` when it sets the mode,
@@ -391,51 +391,53 @@ fn a_program_that_asked_hears_of_a_resize_on_its_input() {
 
 #[test]
 fn scrollback_shows_output_that_scrolled_off_and_again_after_a_reattach() {
-    crate::harness::runtime().expect("runtime").block_on(async {
-        let net = FaultNet::new(Profile::default(), 7);
-        let (server, mut client) = crate::harness::session(&net, &["sh"])
-            .await
-            .expect("session");
-        client
-            .send(b"i=0; while [ $i -lt 200 ]; do echo old line $i; i=$((i+1)); done\r")
-            .await
-            .expect("send");
-        assert!(client
-            .wait_until(WAIT, |t| t.contains("old line 199"))
-            .await
-            .is_some());
-        // Ctrl-^ [ opens the view; g goes to the oldest row.
-        client.send(b"\x1e[g").await.expect("send");
-        let top = client.wait_until(WAIT, oldest).await;
-        assert!(
-            top.is_some(),
-            "the view never showed the oldest row:\n{}",
-            client.screen()
-        );
-        client.send(b"q").await.expect("send");
-        client.drop_first_connection();
-        // Once reattached, the view fetches the history afresh.
-        let mut shown = false;
-        for _ in 0..150 {
-            let _ = client.send(b"q\x1e[g").await;
-            if client
-                .wait_until(Duration::from_millis(200), oldest)
+    koh_testkit::multi_thread(4)
+        .expect("runtime")
+        .block_on(async {
+            let net = FaultNet::new(Profile::default(), 7);
+            let (server, mut client) = crate::harness::session(&net, &["sh"])
                 .await
-                .is_some()
-            {
-                shown = true;
-                break;
+                .expect("session");
+            client
+                .send(b"i=0; while [ $i -lt 200 ]; do echo old line $i; i=$((i+1)); done\r")
+                .await
+                .expect("send");
+            assert!(client
+                .wait_until(WAIT, |t| t.contains("old line 199"))
+                .await
+                .is_some());
+            // Ctrl-^ [ opens the view; g goes to the oldest row.
+            client.send(b"\x1e[g").await.expect("send");
+            let top = client.wait_until(WAIT, oldest).await;
+            assert!(
+                top.is_some(),
+                "the view never showed the oldest row:\n{}",
+                client.screen()
+            );
+            client.send(b"q").await.expect("send");
+            client.drop_first_connection();
+            // Once reattached, the view fetches the history afresh.
+            let mut shown = false;
+            for _ in 0..150 {
+                let _ = client.send(b"q\x1e[g").await;
+                if client
+                    .wait_until(Duration::from_millis(200), oldest)
+                    .await
+                    .is_some()
+                {
+                    shown = true;
+                    break;
+                }
             }
-        }
-        assert!(
-            shown,
-            "no scrollback after the reattach:\n{}",
-            client.screen()
-        );
-        let _ = client.send(b"q").await;
-        let _ = client.finish().await;
-        server.stop().await;
-    });
+            assert!(
+                shown,
+                "no scrollback after the reattach:\n{}",
+                client.screen()
+            );
+            let _ = client.send(b"q").await;
+            let _ = client.finish().await;
+            server.stop().await;
+        });
 }
 
 /// Whether `screen` shows the first line the scrollback test wrote.
@@ -449,7 +451,7 @@ fn oldest(screen: &str) -> bool {
 /// the client was stopped inside the probe's wait.
 #[test]
 fn a_freeze_between_dialing_and_the_loop_still_reconnects() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
@@ -512,7 +514,7 @@ fn reconnecting(painted: &crate::harness::Painted) -> bool {
 /// the old screen must not run. Typing after the reattach runs.
 #[test]
 fn a_line_typed_during_an_outage_is_not_run_after_the_reattach_and_the_user_is_told() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
@@ -580,7 +582,7 @@ fn a_line_typed_during_an_outage_is_not_run_after_the_reattach_and_the_user_is_t
 /// connected and the `.` typed at the reconnecting banner is still the quit escape.
 #[test]
 fn an_escape_split_across_a_link_drop_still_quits() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
@@ -622,7 +624,7 @@ fn an_escape_split_across_a_link_drop_still_quits() {
 /// `false && echo DANGEROUS` would run `echo DANGEROUS`).
 #[test]
 fn the_end_of_a_line_whose_start_was_lost_with_the_link_does_not_run() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
@@ -677,7 +679,7 @@ fn the_end_of_a_line_whose_start_was_lost_with_the_link_does_not_run() {
 /// view shows the new shell's history, not the rows the client held of the old one.
 #[test]
 fn after_a_server_restart_the_scrollback_is_the_new_shells() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();

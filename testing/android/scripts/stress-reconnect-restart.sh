@@ -13,7 +13,7 @@ require_device_or_skip
 push_binary
 
 ROUNDS="${KOH_STRESS_RECONNECT_ROUNDS:-$(scaled 2 6)}"
-HOSTLOG="/tmp/koh-rc-cli-$$.log"
+HOSTLOG="$HOST_TMP/koh-rc-cli-$$.log"
 echo "Stress: link-drop resilience — $ROUNDS round(s) of kill-server-under-a-live-client (level=$STRESS_LEVEL)"
 
 survived=0

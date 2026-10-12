@@ -1,25 +1,18 @@
 #![cfg(unix)]
-
-mod spawn;
+#![forbid(clippy::disallowed_methods)]
 
 use std::process::Stdio;
 
+use koh_testkit::command;
+
 #[test]
 fn concurrent_first_uses_publish_one_key_and_one_endpoint_id() {
-    let dir = std::env::temp_dir().join(format!(
-        "koh-public-key-race-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos()
-    ));
-    std::fs::create_dir(&dir).expect("create private state directory");
+    let dir = koh_testkit::scratch!("public-key-race").expect("a private state directory");
     let key = dir.join("id.key");
     let mut children = Vec::new();
     for _ in 0..4 {
         children.push(
-            spawn::command(env!("CARGO_BIN_EXE_koh"))
+            command(env!("CARGO_BIN_EXE_koh"))
                 .expect("spawn koh")
                 .args(["id", "--key-file"])
                 .arg(&key)
@@ -45,26 +38,13 @@ fn concurrent_first_uses_publish_one_key_and_one_endpoint_id() {
     let first = &outputs[0].stdout;
     assert!(outputs.iter().all(|output| output.stdout == *first));
     assert!(key.is_file(), "one identity key was published");
-    std::fs::remove_dir_all(dir).expect("remove test state directory");
 }
 
 #[test]
 fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirmation() {
     use std::os::unix::fs::PermissionsExt as _;
-    struct Directory(std::path::PathBuf);
-    impl Drop for Directory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let directory = Directory(std::env::temp_dir().join(format!(
-        "koh-relative-reset-{}",
-        koh::identity::Identity::generate().expect("OS randomness").endpoint_id()
-    )));
-    std::fs::create_dir(&directory.0).expect("private directory");
-    std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700))
-        .expect("private mode");
-    let path = directory.0.join("identity.key");
+    let directory = koh_testkit::scratch!("relative-reset").expect("a private directory");
+    let path = directory.join("identity.key");
     // A `koh-key-v1` (passphrase-encrypted) file: not a key koh reads, but reset must remove it.
     std::fs::write(
         &path,
@@ -73,9 +53,9 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
     .expect("disposable identity");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("key mode");
     let run = |confirmed: bool| {
-        let mut command = spawn::command(env!("CARGO_BIN_EXE_koh")).expect("spawn koh");
+        let mut command = command(env!("CARGO_BIN_EXE_koh")).expect("spawn koh");
         command
-            .current_dir(&directory.0)
+            .current_dir(&directory)
             .env_clear()
             .args(["key", "reset", "--key-file", "identity.key"])
             .stdin(Stdio::null());
@@ -87,9 +67,9 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
     assert!(!run(false).status.success());
     assert!(path.exists(), "unconfirmed reset removed key");
     // `koh id` refuses the file and points at the reset.
-    let id = spawn::command(env!("CARGO_BIN_EXE_koh"))
+    let id = command(env!("CARGO_BIN_EXE_koh"))
         .expect("spawn koh")
-        .current_dir(&directory.0)
+        .current_dir(&directory)
         .env_clear()
         .args(["id", "--key-file", "identity.key"])
         .stdin(Stdio::null())
@@ -109,8 +89,8 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
 
 #[test]
 fn tests_may_start_koh_but_never_a_program_that_authenticates() {
-    assert!(spawn::command(env!("CARGO_BIN_EXE_koh")).is_ok());
+    assert!(command(env!("CARGO_BIN_EXE_koh")).is_ok());
     for program in ["sudo", "/usr/bin/passwd", "su", "ssh"] {
-        assert!(spawn::command(program).is_err(), "{program}");
+        assert!(command(program).is_err(), "{program}");
     }
 }

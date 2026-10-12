@@ -4,26 +4,24 @@
 //!
 //! Every run has its own `HOME` and `XDG_CONFIG_HOME`, so the keys and lists live in a scratch
 //! directory and the user's own `~/.config/koh` is never read or written.
-#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
-
-mod spawn;
+#![forbid(clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use koh::pty::{Launcher, Pty};
+use koh_testkit::{command, Capture, Scratch};
 
 #[cfg(target_os = "linux")]
 #[test]
 fn unwritable_stdout_and_stderr_do_not_panic() {
     let home = Home::new("failed-output").expect("scratch home");
     for discard_diagnostics in [false, true] {
-        let mut command = spawn::command(env!("CARGO_BIN_EXE_koh")).expect("spawn koh");
+        let mut command = command(env!("CARGO_BIN_EXE_koh")).expect("spawn koh");
         command
             .args(["key", "info"])
-            .env("HOME", &home.0)
+            .env("HOME", home.0.path())
             .env("XDG_CONFIG_HOME", home.0.join(".config"))
             .stdout(
                 std::fs::OpenOptions::new()
@@ -47,15 +45,11 @@ fn unwritable_stdout_and_stderr_do_not_panic() {
 }
 
 /// A home of its own, removed afterwards; its koh directory is `<home>/.config/koh`.
-struct Home(PathBuf);
+struct Home(Scratch);
 
 impl Home {
     fn new(tag: &str) -> anyhow::Result<Self> {
-        let dir = std::env::temp_dir().join(format!(
-            "koh-names-cli-{tag}-{}-{:016x}",
-            std::process::id(),
-            getrandom::u64()?
-        ));
+        let dir = koh_testkit::scratch!(&format!("names-cli-{tag}"))?;
         std::fs::create_dir_all(dir.join(".config"))?;
         Ok(Self(dir))
     }
@@ -66,9 +60,9 @@ impl Home {
 
     /// `koh args…` in this home, its stdin closed.
     fn koh(&self, args: &[&str]) -> anyhow::Result<Output> {
-        Ok(spawn::command(env!("CARGO_BIN_EXE_koh"))?
+        Ok(command(env!("CARGO_BIN_EXE_koh"))?
             .args(args)
-            .env("HOME", &self.0)
+            .env("HOME", self.0.path())
             .env("XDG_CONFIG_HOME", self.0.join(".config"))
             .stdin(Stdio::null())
             .output()?)
@@ -87,12 +81,6 @@ impl Home {
     }
 }
 
-impl Drop for Home {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn text(out: &Output) -> String {
     format!(
         "{}{}",
@@ -108,49 +96,8 @@ fn some_id(seed: u8) -> String {
         .to_string()
 }
 
-fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-}
-
 fn launcher() -> Launcher {
     Launcher::new(env!("CARGO_BIN_EXE_koh"))
-}
-
-/// Everything `output` delivers, gathered by a background task.
-fn capture(mut output: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Arc<Mutex<Vec<u8>>> {
-    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let sink = buf.clone();
-    tokio::spawn(async move {
-        while let Some(chunk) = output.recv().await {
-            let Ok(mut all) = sink.lock() else { break };
-            all.extend_from_slice(&chunk);
-        }
-    });
-    buf
-}
-
-fn captured(buf: &Arc<Mutex<Vec<u8>>>) -> String {
-    buf.lock().map_or_else(
-        |_| String::new(),
-        |all| String::from_utf8_lossy(&all).into_owned(),
-    )
-}
-
-/// Wait up to `secs` for `needle` in what was captured.
-async fn wait_for(buf: &Arc<Mutex<Vec<u8>>>, needle: &str, secs: u64) -> Result<(), String> {
-    for _ in 0..secs.saturating_mul(10) {
-        if captured(buf).contains(needle) {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    Err(format!(
-        "never saw {needle:?}; captured:\n{}",
-        captured(buf)
-    ))
 }
 
 #[test]
@@ -234,30 +181,19 @@ fn serve_without_allow_allows_the_saved_clients() {
     assert!(!out.status.success(), "no clients: {}", text(&out));
     assert!(text(&out).contains("koh clients add"), "{}", text(&out));
     home.koh(&["clients", "add", "phone", &some_id(3)]).unwrap();
-    let mut server = spawn::command(env!("CARGO_BIN_EXE_koh"))
+    let mut server = command(env!("CARGO_BIN_EXE_koh"))
         .expect("spawn koh")
         .args(["serve", "--local", "--shell", "sh"])
-        .env("HOME", &home.0)
+        .env("HOME", home.0.path())
         .env("XDG_CONFIG_HOME", home.0.join(".config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let stderr = server.stderr.take().unwrap();
-    let (seen, banner) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::BufRead as _;
-        for line in std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-        {
-            if line.contains("auth") {
-                let _ = seen.send(line);
-            }
-        }
-    });
-    let line = banner.recv_timeout(Duration::from_secs(20));
+    let logs = koh_testkit::stderr_lines(&mut server);
+    let line = std::iter::from_fn(|| logs.recv_timeout(Duration::from_secs(20)).ok())
+        .find(|line| line.contains("auth"));
     let _ = server.kill();
     let _ = server.wait();
     let line = line.expect("the server's banner");
@@ -309,31 +245,33 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
     let home = Home::new("menu").unwrap();
     home.koh(&["servers", "add", "laptop", &some_id(1)])
         .unwrap();
-    runtime().unwrap().block_on(async {
-        let (mut menu, output) = Pty::spawn(
-            24,
-            80,
-            &home.argv(&[]),
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn koh on a PTY");
-        let buf = capture(output);
-        wait_for(&buf, "koh — this machine", 10).await.unwrap();
-        wait_for(&buf, "1  laptop", 5).await.unwrap();
-        menu.write(b"q\n".to_vec()).unwrap();
-        let mut exited = false;
-        for _ in 0..50 {
-            if menu.try_wait().ok().flatten().is_some() {
-                exited = true;
-                break;
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let (mut menu, output) = Pty::spawn(
+                24,
+                80,
+                &home.argv(&[]),
+                "xterm-256color",
+                &launcher(),
+                &koh::pty::Reaper::start().expect("reaper"),
+            )
+            .expect("spawn koh on a PTY");
+            let buf = Capture::new(output);
+            buf.wait_for(0, "koh — this machine", 10).await.unwrap();
+            buf.wait_for(0, "1  laptop", 5).await.unwrap();
+            menu.write(b"q\n".to_vec()).unwrap();
+            let mut exited = false;
+            for _ in 0..50 {
+                if menu.try_wait().ok().flatten().is_some() {
+                    exited = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        drop(menu);
-        assert!(exited, "q left the menu; captured:\n{}", captured(&buf));
-    });
+            drop(menu);
+            assert!(exited, "q left the menu; captured:\n{}", buf.text_from(0));
+        });
 }
 
 /// The path the given home's `connected` file is at, for a test that connects.
@@ -344,61 +282,63 @@ fn connected(home: &Home) -> PathBuf {
 #[test]
 fn connect_by_name_dials_the_saved_server_and_notes_it() {
     let home = Home::new("connect").unwrap();
-    runtime().unwrap().block_on(async {
-        let server = koh::transport_iroh::bind_endpoint_local(
-            koh::transport_iroh::generate_secret_key().unwrap(),
-            true,
-        )
-        .await
-        .unwrap();
-        let id = server.id().to_string();
-        let port = server
-            .bound_sockets()
-            .iter()
-            .find(|s| s.is_ipv4())
-            .map(std::net::SocketAddr::port)
-            .unwrap();
-        // The server allows this home's client, as `koh serve` would.
-        let me = home.koh(&["id"]).unwrap();
-        let config = koh::server::ServeConfig {
-            allow: vec![koh::transport_iroh::parse_endpoint_id(
-                String::from_utf8_lossy(&me.stdout).trim(),
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let server = koh::transport_iroh::bind_endpoint_local(
+                koh::transport_iroh::generate_secret_key().unwrap(),
+                true,
             )
-            .unwrap()],
-            command: vec!["sh".to_owned()],
-            launcher: launcher(),
-            ..koh::server::ServeConfig::default()
-        };
-        let task = tokio::spawn(koh::server::cli::serve_endpoint(
-            server,
-            koh::server::cli::Hosting::from_config(&config).unwrap(),
-            tokio_util::sync::CancellationToken::new(),
-        ));
-        home.koh(&["servers", "add", "box", &id]).unwrap();
-        let direct = format!("127.0.0.1:{port}");
-        let argv = home.argv(&["connect", "box", "--direct", &direct]);
-        let (client, output) = Pty::spawn(
-            24,
-            80,
-            &argv,
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn the client");
-        let buf = capture(output);
-        tokio::time::sleep(Duration::from_millis(2000)).await;
-        client.write(b"echo by''_name\r".to_vec()).unwrap();
-        let seen = wait_for(&buf, "by_name", 15).await;
-        let _ = client.write(vec![0x1e, b'.']);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        drop(client);
-        task.abort();
-        seen.unwrap();
-        let noted = std::fs::read_to_string(connected(&home)).unwrap();
-        assert!(noted.starts_with(&id), "the connect is noted: {noted:?}");
-        assert!(Path::new(&connected(&home)).exists());
-    });
+            .await
+            .unwrap();
+            let id = server.id().to_string();
+            let port = server
+                .bound_sockets()
+                .iter()
+                .find(|s| s.is_ipv4())
+                .map(std::net::SocketAddr::port)
+                .unwrap();
+            // The server allows this home's client, as `koh serve` would.
+            let me = home.koh(&["id"]).unwrap();
+            let config = koh::server::ServeConfig {
+                allow: vec![koh::transport_iroh::parse_endpoint_id(
+                    String::from_utf8_lossy(&me.stdout).trim(),
+                )
+                .unwrap()],
+                command: vec!["sh".to_owned()],
+                launcher: launcher(),
+                ..koh::server::ServeConfig::default()
+            };
+            let task = koh_testkit::spawn(koh::server::cli::serve_endpoint(
+                server,
+                koh::server::cli::Hosting::from_config(&config).unwrap(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            home.koh(&["servers", "add", "box", &id]).unwrap();
+            let direct = format!("127.0.0.1:{port}");
+            let argv = home.argv(&["connect", "box", "--direct", &direct]);
+            let (client, output) = Pty::spawn(
+                24,
+                80,
+                &argv,
+                "xterm-256color",
+                &launcher(),
+                &koh::pty::Reaper::start().expect("reaper"),
+            )
+            .expect("spawn the client");
+            let buf = Capture::new(output);
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            client.write(b"echo by''_name\r".to_vec()).unwrap();
+            let seen = buf.wait_for(0, "by_name", 15).await;
+            let _ = client.write(vec![0x1e, b'.']);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(client);
+            task.abort();
+            seen.unwrap();
+            let noted = std::fs::read_to_string(connected(&home)).unwrap();
+            assert!(noted.starts_with(&id), "the connect is noted: {noted:?}");
+            assert!(Path::new(&connected(&home)).exists());
+        });
 }
 
 /// Clients added and removed with `koh clients` take effect at a running server's next connection,
@@ -411,27 +351,17 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
     let me = home.koh(&["id"]).unwrap();
     let me = String::from_utf8_lossy(&me.stdout).trim().to_owned();
     home.koh(&["clients", "add", "other", &some_id(4)]).unwrap();
-    let mut server = spawn::command(env!("CARGO_BIN_EXE_koh"))
+    let mut server = command(env!("CARGO_BIN_EXE_koh"))
         .expect("spawn koh")
         .args(["serve", "--local", "--shell", "sh"])
-        .env("HOME", &home.0)
+        .env("HOME", home.0.path())
         .env("XDG_CONFIG_HOME", home.0.join(".config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let stderr = server.stderr.take().unwrap();
-    let (seen, banner) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::BufRead as _;
-        for line in std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-        {
-            let _ = seen.send(line);
-        }
-    });
+    let banner = koh_testkit::stderr_lines(&mut server);
     let (mut id, mut port) = (None, None);
     while id.is_none() || port.is_none() {
         let line = banner
@@ -459,22 +389,24 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
             anyhow::Ok((endpoint, conn))
         }
     };
-    let outcomes = runtime().unwrap().block_on(async {
-        let before = admitted().await.is_ok();
-        home.koh(&["clients", "add", "me", &me]).unwrap();
-        let live = admitted().await;
-        let added = live.is_ok();
-        home.koh(&["clients", "rm", "me"]).unwrap();
-        // The connection it already had is cut off too.
-        let cut_off = match &live {
-            Ok((_, conn)) => tokio::time::timeout(Duration::from_secs(10), conn.closed())
-                .await
-                .is_ok(),
-            Err(_) => false,
-        };
-        let removed = admitted().await.is_ok();
-        (before, added, cut_off, removed)
-    });
+    let outcomes = koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let before = admitted().await.is_ok();
+            home.koh(&["clients", "add", "me", &me]).unwrap();
+            let live = admitted().await;
+            let added = live.is_ok();
+            home.koh(&["clients", "rm", "me"]).unwrap();
+            // The connection it already had is cut off too.
+            let cut_off = match &live {
+                Ok((_, conn)) => tokio::time::timeout(Duration::from_secs(10), conn.closed())
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            };
+            let removed = admitted().await.is_ok();
+            (before, added, cut_off, removed)
+        });
     let _ = server.kill();
     let _ = server.wait();
     assert_eq!(

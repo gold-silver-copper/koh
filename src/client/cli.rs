@@ -439,13 +439,7 @@ mod tests {
         // keeps the rest (PATH, HOME), and gets KOH_BELL_COUNT / KOH_TITLE. The command builder takes the parent env explicitly, so
         // this needs no process-global `set_var`.
         use std::ffi::OsString;
-        let dir = std::env::temp_dir().join(format!(
-            "koh-bell-env-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::test_runtime::scratch("bell-env");
         let out = dir.join("env.txt");
         let hook = BellHook::new(format!("env > '{}'", out.display()));
         let parent_env = [
@@ -461,7 +455,6 @@ mod tests {
             .status()
             .expect("spawn env");
         let content = std::fs::read_to_string(&out).unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(status.success(), "{content}");
         assert!(content.contains("KOH_BELL_COUNT=42"), "{content}");
         assert!(content.contains("KOH_TITLE=a title"), "{content}");

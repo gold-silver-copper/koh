@@ -3,6 +3,7 @@
 //! and paged from the oldest history row down to the live screen, fetching rows as a client does,
 //! through the wire's encoding. At every page the view must show what the server's own emulator
 //! shows scrolled back as far: each row's cells, wrap flag and links.
+#![forbid(clippy::disallowed_methods)]
 
 #[path = "../testing/corpus/recording.rs"]
 #[expect(

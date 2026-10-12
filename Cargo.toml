@@ -66,6 +66,9 @@ getrandom = { version = "0.4.3", features = ["std"] }
 clap = { version = "4.6.7", features = ["string"] }
 
 [dev-dependencies]
+# What the tests share (`testkit/`): the one way they start programs and spawn tasks, scratch
+# directories under `target/`, runtimes. Path-only, so `cargo publish` drops it.
+koh-testkit = { path = "testkit" }
 # No `fork` (and so no `timeout`): no test runs a case in a subprocess.
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 # The fault-injecting test transport (`tests/net/link.rs`): iroh's custom-transport API and the

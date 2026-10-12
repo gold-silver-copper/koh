@@ -3,7 +3,7 @@
 //!
 //! Every session's program starts through the `koh` binary's `__launch`, as `koh serve`'s do; unit
 //! tests cannot reach a binary, so these live here.
-#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
+#![forbid(clippy::disallowed_methods)]
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -41,7 +41,7 @@ async fn loopback_serve(
         ..ServeConfig::default()
     };
     let shutdown = CancellationToken::new();
-    let task = tokio::spawn(serve_endpoint(
+    let task = koh_testkit::spawn(serve_endpoint(
         server_ep,
         Hosting::from_config(&config)?,
         shutdown.clone(),
@@ -54,13 +54,8 @@ fn launcher() -> Launcher {
     Launcher::new(env!("CARGO_BIN_EXE_koh"))
 }
 
-/// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
+    koh_testkit::multi_thread(2)
 }
 
 fn registry(command: &[&str], max_sessions: usize, ttl: Duration) -> std::io::Result<Registry> {
@@ -215,10 +210,10 @@ impl RawClient {
         let send = conn.open_uni().await?;
         let (tx, frames) = tokio::sync::mpsc::channel(64);
         let reader = conn.clone();
-        tokio::spawn(async move {
+        koh_testkit::spawn(async move {
             while let Ok(mut recv) = reader.accept_uni().await {
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                koh_testkit::spawn(async move {
                     if let Ok(bytes) = recv.read_to_end(MAX_FRAME).await {
                         if let Ok(ServerMsg::Frame { base, rows, body }) = decode_server(&bytes) {
                             let _ = tx.send((base, rows, body)).await;
@@ -367,7 +362,7 @@ fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_i
             ..ServeConfig::default()
         };
         let shutdown = CancellationToken::new();
-        let server = tokio::spawn(serve_endpoint(
+        let server = koh_testkit::spawn(serve_endpoint(
             server_ep,
             Hosting::from_config(&config)?,
             shutdown.clone(),
@@ -410,14 +405,6 @@ fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_i
     })
 }
 
-/// A single-threaded runtime, so the registry, session and forwarding tasks interleave the same
-/// way every run.
-fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-}
-
 /// A reconnect that races its exited session's teardown creates a new session, and that one stays
 /// registered: the next attach while it is live reattaches to it.
 #[test]
@@ -425,13 +412,11 @@ fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -
 {
     // The first session's program exits at once and leaves `marker`; its replacement's lives.
     // The path reaches `sh` as `$1`, never spliced into the script.
-    let marker =
-        RemoveOnDrop(std::env::temp_dir().join(format!("koh-late-ended-{}", std::process::id())));
-    let path = marker.0.to_str().context("a UTF-8 temp dir")?;
+    let dir = koh_testkit::scratch!("late-ended")?;
+    let marker = dir.join("marker");
+    let path = marker.to_str().context("a UTF-8 scratch dir")?;
     let script = r#"[ -e "$1" ] && exec sleep 30; : > "$1""#;
-    // A marker left by an earlier run would keep the first session alive.
-    let _ = std::fs::remove_file(&marker.0);
-    current_thread_runtime()?.block_on(async {
+    koh_testkit::current_thread()?.block_on(async {
         let reg = registry(
             &["sh", "-c", script, "sh", path],
             1,
@@ -463,20 +448,11 @@ fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -
     })
 }
 
-/// A file removed when this is dropped, on a panic too.
-struct RemoveOnDrop(std::path::PathBuf);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// More detaches than the session's control queue holds, at once, must all count: after the TTL
 /// the session is reaped and the next attach creates a new one.
 #[test]
 fn a_burst_of_detaches_larger_than_the_control_queue_still_starts_the_ttl() -> anyhow::Result<()> {
-    current_thread_runtime()?.block_on(async {
+    koh_testkit::current_thread()?.block_on(async {
         let reg = registry(&["sleep", "30"], 4, Duration::from_millis(200))?;
         let p = peer()?;
         let mut clients = Vec::new();
@@ -522,40 +498,36 @@ fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
 /// session and registry tasks interleave across worker threads.
 #[test]
 fn a_reconnect_right_after_exit_never_reattaches_the_exited_session() -> anyhow::Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let reg = registry(&["true"], 4, Duration::from_secs(30))?;
-            let a = peer()?;
-            let mut client = reg.attach(a).await.context("first attach")?.0;
-            for round in 0..100 {
-                await_exit(&mut client)
-                    .await
-                    .with_context(|| format!("round {round}: exits"))?;
-                drop(client);
-                let (next, kind) = tokio::time::timeout(Duration::from_secs(5), reg.attach(a))
-                    .await
-                    .with_context(|| format!("round {round}: the reconnect is answered"))?
-                    .context("reconnect")?;
-                anyhow::ensure!(
-                    kind == AttachKind::Created,
-                    "round {round}: a reconnect after exit gets a new session, got {kind:?}"
-                );
-                client = next;
-            }
+    koh_testkit::multi_thread(4)?.block_on(async {
+        let reg = registry(&["true"], 4, Duration::from_secs(30))?;
+        let a = peer()?;
+        let mut client = reg.attach(a).await.context("first attach")?.0;
+        for round in 0..100 {
+            await_exit(&mut client)
+                .await
+                .with_context(|| format!("round {round}: exits"))?;
             drop(client);
-            reg.shutdown().await;
-            Ok(())
-        })
+            let (next, kind) = tokio::time::timeout(Duration::from_secs(5), reg.attach(a))
+                .await
+                .with_context(|| format!("round {round}: the reconnect is answered"))?
+                .context("reconnect")?;
+            anyhow::ensure!(
+                kind == AttachKind::Created,
+                "round {round}: a reconnect after exit gets a new session, got {kind:?}"
+            );
+            client = next;
+        }
+        drop(client);
+        reg.shutdown().await;
+        Ok(())
+    })
 }
 
 /// A program that exits while no client is attached ends its session: an attach before the next
 /// TTL check starts a new one, rather than reattaching to the exited one.
 #[test]
 fn a_session_whose_program_exited_while_detached_is_not_reattached() -> anyhow::Result<()> {
-    current_thread_runtime()?.block_on(async {
+    koh_testkit::current_thread()?.block_on(async {
         let reg = registry(&["sleep", "0.3"], 4, Duration::from_secs(30))?;
         let p = peer()?;
         let (client, kind) = reg.attach(p).await.context("attach")?;
@@ -742,7 +714,7 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
             ..ServeConfig::default()
         };
         let shutdown = CancellationToken::new();
-        let server = tokio::spawn(serve_endpoint(
+        let server = koh_testkit::spawn(serve_endpoint(
             server_ep,
             Hosting::from_config(&config)?,
             shutdown.clone(),

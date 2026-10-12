@@ -8,18 +8,11 @@ pub fn id(seed: u8) -> EndpointId {
 }
 
 /// A key directory of its own, removed afterwards.
-pub struct Scratch(pub PathBuf);
+pub struct Scratch(pub koh_testkit::Scratch);
 
 impl Scratch {
     pub fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "koh-{tag}-{}-{:016x}",
-            std::process::id(),
-            getrandom::u64().unwrap()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Self(dir)
+        Self(crate::test_runtime::scratch(tag))
     }
 
     pub fn places(&self) -> Places {
@@ -27,12 +20,6 @@ impl Scratch {
             client_key: self.0.join("client.key"),
             server_key: self.0.join("server.key"),
         }
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

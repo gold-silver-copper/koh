@@ -31,12 +31,12 @@ connect_a() {  # connect_a <host-log> <n>; connects (the server's n-th attach), 
 }
 
 # First connect: creates the session (1 spawn), then detaches on quit.
-connect_a "/tmp/koh-reatt-1-$$.log" 1
+connect_a "$HOST_TMP/koh-reatt-1-$$.log" 1
 wait_file_contains "$SRV_LOG" "client detached" 10 && echo "    first client detached (session retained)" || bad "server did not detach the first client"
 sleep 2
 
 # Second connect (same key): must reattach to the SAME session — no new spawn.
-connect_a "/tmp/koh-reatt-2-$$.log" 2
+connect_a "$HOST_TMP/koh-reatt-2-$$.log" 2
 sleep 2
 
 SRV="$(cat_dev "$SRV_LOG")"
@@ -50,5 +50,5 @@ echo "    shell spawns: $spawns   'started a new session': $created   'reattachi
 [ "$reatt" -ge 1 ] && ok "server logged a reattach on the second connect" || bad "server did not log a reattach"
 assert_no_crash "$SRV" >/dev/null && ok "no panic server-side" || bad "server log shows a panic"
 
-rm -f /tmp/koh-reatt-1-$$.log /tmp/koh-reatt-2-$$.log
+rm -f $HOST_TMP/koh-reatt-1-$$.log $HOST_TMP/koh-reatt-2-$$.log
 finish "stress-reattach-continuity"

@@ -17,7 +17,7 @@ fn clean() -> FaultNet {
 /// `CSI 105 ; 5 u`), and Tab is Tab from one that does not.
 #[test]
 fn nvim_tells_ctrl_i_from_tab_from_a_kitty_terminal() {
-    if crate::spawn::command("nvim")
+    if koh_testkit::command("nvim")
         .expect("nvim may be run")
         .arg("--version")
         .output()
@@ -29,7 +29,7 @@ fn nvim_tells_ctrl_i_from_tab_from_a_kitty_terminal() {
         }
         return;
     }
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
@@ -104,7 +104,7 @@ fn nvim_tells_ctrl_i_from_tab_from_a_kitty_terminal() {
 /// `CSI 97 ; 5 u`, as it asked.
 #[test]
 fn a_reattach_from_a_legacy_terminal_keeps_the_programs_keyboard() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();

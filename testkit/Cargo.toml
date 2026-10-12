@@ -1,0 +1,23 @@
+# What koh's tests share: the one way they start a program, scratch directories under `target/`,
+# their tokio runtimes and tasks, PTY output capture and a seeded random sequence. A dev-dependency
+# of koh (and a dependency of `testing/bench`), never published. Its own workspace and lockfile, as
+# the other standalone crates have, so CI can lint it alone.
+[workspace]
+
+[package]
+name = "koh-testkit"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "sync", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+allow_attributes = "deny"
+must_use_candidate = "allow"

@@ -27,7 +27,7 @@ start_server "" || { bad "server failed to start"; finish "sec-resize-oom-server
 SPID="$(server_pid)"
 
 # A benign witness session, so we can show the cross-tenant impact (the server dying kills it too).
-WITLOG="/tmp/koh-sec-witness-$$.log"
+WITLOG="$HOST_TMP/koh-sec-witness-$$.log"
 pty_connect_host_bg /data/local/tmp/koh-witness.key "$WITLOG" 30 ""
 wait_attached /data/local/tmp/koh-witness.key 12 || bad "the witness session never attached"
 echo "    server pid=$SPID; witness attached"

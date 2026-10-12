@@ -15,6 +15,12 @@ HOST_BIN="${KOH_HOST_BIN:-$REPO_ROOT/target/$ANDROID_TARGET/release/koh}"
 DEVICE_BIN="${KOH_DEVICE_BIN:-/data/local/tmp/koh}"
 ADB_TIMEOUT="${KOH_ADB_TIMEOUT:-30}"        # cap on a single non-blocking adb shell call (seconds)
 
+# The host's scratch files go in a directory of this run's own, never the system /tmp; it is
+# removed when the script exits.
+mkdir -p "${TMPDIR:-$HOME/.cache}"
+HOST_TMP="$(mktemp -d "${TMPDIR:-$HOME/.cache}/koh-android.XXXXXX")"
+trap 'rm -rf "$HOST_TMP"' EXIT
+
 # Environment prefixed onto every device-side koh command (run_remote / run_remote_blocking inject
 # it; raw `adb shell` callers prepend it). Empty today: koh creates and opens its key files without
 # any prompt or credential. Override to pass e.g. RUST_LOG to every invocation.
@@ -138,7 +144,7 @@ kill_remote_koh() {
 # run_test <script>: run one test, showing its output as it goes. Sets TEST_RC (its exit status) and
 # TEST_SKIPPED (1 if it printed a SKIP line): a skip exits 0, and must not be counted as a pass.
 run_test() {
-  _log="$(mktemp)"; _rcf="$(mktemp)"
+  _log="$(mktemp "$HOST_TMP/log.XXXXXX")"; _rcf="$(mktemp "$HOST_TMP/rc.XXXXXX")"
   { _r=0; sh "$1" || _r=$?; echo "$_r" > "$_rcf"; } 2>&1 | tee "$_log"
   TEST_RC="$(cat "$_rcf")"
   TEST_SKIPPED=0

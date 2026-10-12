@@ -240,10 +240,14 @@ impl KeptRow {
     /// The memory the row takes, as fux-vt keeps its cells: eight bytes and the attributes each,
     /// the text of each cluster too long to keep inline (5 to 17 bytes apart, longer ones in
     /// [`Cells::text_len`]); its links' text, table and per-cell indices; and a row's fixed cost,
-    /// its allocations' headers and its entry in the cache.
+    /// its allocations' headers and its entry in the cache. Not their spare capacity, which
+    /// fux-vt's `Cells::heap_bytes` counts from its next release.
     pub fn bytes(&self) -> usize {
         const ROW_BYTES: usize = 128;
-        let cell = 8_usize.saturating_add(std::mem::size_of::<fux_vt::Attributes>());
+        // fux-vt stores a cell as 8 bytes (a u32 among them) and its attributes, aligned to 4.
+        let cell = 8_usize
+            .saturating_add(std::mem::size_of::<fux_vt::Attributes>())
+            .next_multiple_of(4);
         let apart: usize = self
             .cells
             .iter()

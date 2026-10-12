@@ -46,6 +46,11 @@ const OUTPUT_CHUNKS_PER_SNAPSHOT: usize = 64;
 /// last of what it wrote is read by then, so the final screen shows it.
 const DRAINED: Duration = TTY_TICK;
 
+/// The longest the output may go on after the exit was seen: a job left in the background writing
+/// for ever does not keep the session from ending, while a slow server still reads what an exited
+/// program left queued.
+const DRAIN_MOST: Duration = Duration::from_secs(5);
+
 /// How long the session waits, once the program's output ended with no exit seen (it closed its
 /// terminal and runs on), for the exit before it counts the program hung up.
 const ENDING_GRACE: Duration = Duration::from_secs(1);
@@ -180,7 +185,8 @@ impl PtyHost {
 }
 
 /// What is known of how the program ended, and so when the session counts it ended: its exit once
-/// known and its output drained, or, its output ended with no exit, hung up after a grace. Every
+/// known and its output drained (or [`DRAIN_MOST`] after the exit), or, its output ended with no
+/// exit, hung up after a grace. Every
 /// input is named, and the time passed in.
 #[derive(Debug, Default)]
 struct Ending {
@@ -199,7 +205,8 @@ impl Ending {
             (Some((exit, _)), Some(ended)) => Some((ended, exit)),
             (Some((exit, seen)), None) => {
                 let quiet_from = self.last_output.map_or(seen, |last| last.max(seen));
-                Some((quiet_from.checked_add(DRAINED)?, exit))
+                let drained = quiet_from.checked_add(DRAINED)?;
+                Some((drained.min(seen.checked_add(DRAIN_MOST)?), exit))
             }
             (None, Some(ended)) => Some((ended.checked_add(ENDING_GRACE)?, Exit::HungUp)),
             (None, None) => None,
@@ -276,8 +283,8 @@ impl SessionClient {
     }
 
     /// The client has the final screen: the session, its program exited, may end.
-    pub fn ended(&self) {
-        let _ = self.asks.try_send(Ask::Ended);
+    pub async fn ended(&self) {
+        let _ = self.asks.send(Ask::Ended).await;
     }
 }
 
@@ -469,6 +476,9 @@ impl Session {
                         let client = self.client();
                         if reply.send(Ok((client, AttachKind::Reattached { detached_for }))).is_ok() {
                             detached = None;
+                        } else {
+                            // Never attached: the one before is still the newest.
+                            self.attaches = self.attaches.saturating_sub(1);
                         }
                     }
                     // The registry ended this session: revoked, or the server is shutting down.
@@ -612,7 +622,7 @@ async fn registry_task(
 
 #[cfg(test)]
 mod tests {
-    use super::{Ending, Exit, PendingInput, DRAINED, ENDING_GRACE};
+    use super::{Ending, Exit, PendingInput, DRAINED, DRAIN_MOST, ENDING_GRACE};
     use tokio::time::Instant;
 
     #[test]
@@ -629,6 +639,9 @@ mod tests {
             assert_eq!(e.ended(ms(at) + DRAINED / 2), None, "still writing at {at}");
         }
         assert_eq!(e.ended(ms(230) + DRAINED), Some(Exit::Status(3)));
+        // A job left writing in the background holds it only so long.
+        e.last_output = Some(t0 + DRAIN_MOST);
+        assert_eq!(e.ended(t0 + DRAIN_MOST), Some(Exit::Status(3)));
         // Its output ended too: at once.
         e.output_ended = Some(ms(240));
         assert_eq!(e.ended(ms(240)), Some(Exit::Status(3)));

@@ -271,11 +271,13 @@ impl<T: PartialEq> LastGood<T> {
 }
 
 /// Read `list` every [`REVOKE_CHECK`], and at once when asked on `reread` (answering once it is
-/// read), publishing each change on `allowed`, until no one watches. The one reader of the list.
+/// read), publishing each change on `allowed`, until no one watches; and end in `registry` the
+/// session of each peer a change drops, connected or not. The one reader of the list.
 async fn watch_allowlist(
     list: Allowlist,
     allowed: watch::Sender<Arc<HashSet<EndpointId>>>,
     mut reread: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
+    registry: Registry,
 ) {
     let list = Arc::new(list);
     let mut last = LastGood {
@@ -298,8 +300,12 @@ async fn watch_allowlist(
             .await
             .map_err(anyhow::Error::from)
             .and_then(|read| read.map(Arc::new));
+        let before = Arc::clone(&last.value);
         if last.update(read) {
             allowed.send_replace(Arc::clone(&last.value));
+            for gone in before.difference(&last.value) {
+                registry.end(*gone).await;
+            }
         }
         for ask in asked {
             let _ = ask.send(());
@@ -397,9 +403,10 @@ const PER_SOURCE: usize = 2;
 const MOST_PENDING: usize = 256;
 
 /// The handshakes under way, oldest first, each with its address and its handle `H`: at most
-/// `cap`, the oldest given up for a new one, and at most [`PER_SOURCE`] from one address. Anyone who
-/// can reach the port can start handshakes and stall them; this way they cannot hold every slot,
-/// and an allowed client's dial still gets one.
+/// `cap`, the oldest given up for a new one, and at most [`PER_SOURCE`] from one address (one through
+/// a relay has none, so only `cap` holds it). Anyone who can reach the port can start handshakes
+/// and stall them; this way they cannot hold every slot, and an allowed client's dial still gets
+/// one, unless a flood outpaces its handshake.
 struct Pending<H> {
     cap: usize,
     under_way: Bounded<(Option<std::net::IpAddr>, H), MOST_PENDING>,
@@ -438,7 +445,12 @@ pub async fn serve_endpoint(
     let (reread, asks) = tokio::sync::mpsc::channel(64);
     let gate = Gate { allowed, reread };
     #[expect(clippy::disallowed_methods, reason = "one allowlist reader a server")]
-    tokio::spawn(watch_allowlist(hosting.allow, allowed_tx, asks));
+    tokio::spawn(watch_allowlist(
+        hosting.allow,
+        allowed_tx,
+        asks,
+        registry.clone(),
+    ));
 
     // Each connection holds a permit for its life; past the cap a dial is refused before its
     // handshake, which is cheap.
@@ -541,7 +553,6 @@ async fn admit(
         () = gate.revoked(peer) => {
             auth_event(Outcome::Rejected, &peer, "removed from the allowlist");
             close(&conn, Close::NotAuthorized);
-            registry.end(peer).await;
         }
     }
 }

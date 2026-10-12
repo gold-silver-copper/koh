@@ -773,15 +773,22 @@ async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>
     let _ = send.finish();
 }
 
-/// Most bytes of the server's streams the client holds at once, read or being read, and not yet
-/// taken by the connection loop: two of the largest.
-const FRAME_BYTES: usize = MAX_FRAME.saturating_mul(2);
+/// A server stream read past this is a large one, which needs one of [`LARGE_STREAMS`] to go on.
+const SMALL_STREAM: usize = 256 * 1024;
 
-/// A message from the server, holding its stream's share of [`FRAME_BYTES`] until the loop takes
-/// it.
+/// Most large server streams read, or waiting for the loop, at once.
+///
+/// With the small ones, the client holds at most about `LARGE_STREAMS` of [`MAX_FRAME`] and
+/// [`FRAME_QUEUE`] of twice [`SMALL_STREAM`] of the server's streams: some 40 MiB, not 16 of the
+/// largest. A large stream waits for its turn holding at most two chunks, and one that has its
+/// turn waits on nothing but its own bytes, so the turns cannot deadlock.
+const LARGE_STREAMS: usize = 2;
+
+/// A message from the server, holding its turn as a large stream, if it was one, until the loop
+/// takes it.
 struct Received {
     msg: ServerMsg,
-    _bytes: Option<tokio::sync::OwnedSemaphorePermit>,
+    _large: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Accept the server's streams (frames, and history rows), each read on its own task so a stalled or
@@ -789,11 +796,9 @@ struct Received {
 ///
 /// At most [`FRAME_QUEUE`] streams are read or wait to be applied at once, together: a reader
 /// takes its slot in `frames` before it reads. Past them, no stream is accepted, so QUIC's stream
-/// limit stops the server opening more. Together they hold at most [`FRAME_BYTES`]: a reader takes
-/// its share as its bytes come, and waits for one, as QUIC's flow control makes the server; a frame
-/// the server superseded is reset meanwhile, which frees its share.
+/// limit stops the server opening more; and of them, at most [`LARGE_STREAMS`] are large.
 async fn read_frames(conn: Connection, frames: mpsc::Sender<Received>) {
-    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(FRAME_BYTES));
+    let large = std::sync::Arc::new(tokio::sync::Semaphore::new(LARGE_STREAMS));
     loop {
         let Ok(slot) = frames.clone().reserve_owned().await else {
             return;
@@ -801,34 +806,25 @@ async fn read_frames(conn: Connection, frames: mpsc::Sender<Received>) {
         let Ok(mut recv) = conn.accept_uni().await else {
             return;
         };
-        let budget = std::sync::Arc::clone(&budget);
+        let large = std::sync::Arc::clone(&large);
         #[expect(
             clippy::disallowed_methods,
             reason = "each holds one of the frames' slots"
         )]
         tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
+            let (mut bytes, mut turn) = (Vec::new(), None);
             // A reset (superseded), oversized or malformed stream is simply not delivered.
-            while let Some(chunk) = recv.read_chunk(MAX_FRAME).await.ok()? {
-                let share = u32::try_from(chunk.len()).ok()?;
-                let more = std::sync::Arc::clone(&budget)
-                    .acquire_many_owned(share)
-                    .await
-                    .ok()?;
-                match held.as_mut() {
-                    Some(held) => held.merge(more),
-                    None => held = Some(more),
-                }
+            while let Some(chunk) = recv.read_chunk(SMALL_STREAM).await.ok()? {
                 bytes.extend_from_slice(&chunk);
+                if bytes.len() > SMALL_STREAM && turn.is_none() {
+                    turn = Some(std::sync::Arc::clone(&large).acquire_owned().await.ok()?);
+                }
                 if bytes.len() > MAX_FRAME {
                     return None;
                 }
             }
             match decode_server(&bytes) {
-                Ok(msg) => {
-                    slot.send(Received { msg, _bytes: held });
-                }
+                Ok(msg) => drop(slot.send(Received { msg, _large: turn })),
                 Err(e) => tracing::debug!(error = %e, "dropping an undecodable frame"),
             }
             Some(())

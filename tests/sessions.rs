@@ -426,7 +426,7 @@ fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Resul
             "the exited session holds its slot"
         );
         // The client has the final screen: the session ends.
-        c2.ended();
+        c2.ended().await;
         while c2.next_screen().await.is_some() {}
         let (c3, kind) = reg.attach(a).await.context("after the end")?;
         anyhow::ensure!(kind == AttachKind::Created, "after the end: {kind:?}");

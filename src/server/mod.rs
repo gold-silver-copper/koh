@@ -38,8 +38,14 @@ const ECHO_PENDING: usize = 256;
 /// Most messages for the session waiting for room in its queue, from one read of the client.
 const TO_SESSION: usize = 64;
 
-/// How long the server waits for the client to acknowledge the final frame before closing.
+/// How long the server waits for the client to acknowledge the final frame, at least.
 const FINAL_ACK_WAIT: Duration = Duration::from_secs(1);
+
+/// How long the client has to acknowledge the final frame: [`FINAL_ACK_WAIT`], or two retries on
+/// a link slower than that, so a slow link is not taken for a lost one.
+fn final_wait(rtt: Option<Duration>) -> Duration {
+    FINAL_ACK_WAIT.max(retry_after(rtt).saturating_mul(2))
+}
 
 /// Which of one connection's inputs the program has had time to show. Per connection, as input
 /// sequence numbers are.
@@ -497,12 +503,12 @@ impl ServerConn {
     }
 
     /// Whether the connection is done: the program exited and the client acknowledged the final
-    /// frame, or did not within [`FINAL_ACK_WAIT`].
-    fn finished(&self, now: Instant) -> bool {
+    /// frame, or did not within [`final_wait`].
+    fn finished(&self, now: Instant, rtt: Option<Duration>) -> bool {
         self.final_acked()
             || self
                 .final_frame
-                .is_some_and(|(_, at)| now.saturating_duration_since(at) >= FINAL_ACK_WAIT)
+                .is_some_and(|(_, at)| now.saturating_duration_since(at) >= final_wait(rtt))
     }
 
     /// Whether the client acknowledged the final frame: it has the program's end, so its session
@@ -560,7 +566,7 @@ impl ServerConn {
             wake = wake.min(promotion);
         }
         if let Some((_, at)) = self.final_frame {
-            wake = wake.min(at.checked_add(FINAL_ACK_WAIT).unwrap_or(now));
+            wake = wake.min(at.checked_add(final_wait(rtt)).unwrap_or(now));
         }
         wake.max(now)
     }
@@ -634,11 +640,15 @@ pub async fn run_attached(authorized: cli::Authorized, mut session: session::Ses
                 Err(e) => tracing::error!(error = %e, "encoding a frame failed"),
             }
         }
-        if core.finished(now) {
-            // The client has the program's end: the session need keep it no longer.
-            if core.final_acked() {
-                session.ended();
+        if core.finished(now, rtt) {
+            if !core.final_acked() {
+                // The client may not have the end: the session keeps it, and this close, as a lost
+                // link, has the client redial for it.
+                conn.close(0u32.into(), b"");
+                break "the final frame went unacknowledged (session kept)";
             }
+            // The client has the program's end: the session need keep it no longer.
+            session.ended().await;
             // Delivered is not yet read: a client closes once it has read the final frame, and a
             // close of ours before then would throw away what it had not read.
             let _ = tokio::time::timeout(FINAL_ACK_WAIT, conn.closed()).await;
@@ -660,7 +670,7 @@ pub async fn run_attached(authorized: cli::Authorized, mut session: session::Ses
                     Ok(())
                 }
                 // The session was ended: revoked, or the server is shutting down.
-                None => break "client detached (session retained)",
+                None => break "the session was ended (revoked, or the server is stopping)",
             },
             permit = input.reserve(), if core.has_input() => match permit {
                 Ok(permit) => core.poll_input(Instant::now()).map(|taken| {
@@ -671,7 +681,7 @@ pub async fn run_attached(authorized: cli::Authorized, mut session: session::Ses
                         });
                     }
                 }),
-                Err(_) => break "client detached (session retained)",
+                Err(_) => break "the session was ended (revoked, or the server is stopping)",
             },
             stream = conn.accept_uni() => match stream {
                 Ok(stream) if !had_client_stream => {
@@ -1103,7 +1113,7 @@ mod tests {
         // The exit screen marks the connection final.
         c.install_snapshot(exit_screen(3));
         let last = c.poll_frame(t0 + Duration::from_secs(1), None);
-        assert!(last.is_some() || c.finished(t0 + Duration::from_secs(1) + FINAL_ACK_WAIT));
+        assert!(last.is_some() || c.finished(t0 + Duration::from_secs(1) + FINAL_ACK_WAIT, None));
     }
 
     /// A blank screen carrying the program's exit `code`.
@@ -1119,9 +1129,9 @@ mod tests {
         let mut c = ServerConn::default();
         c.install_snapshot(exit_screen(0));
         let first = c.poll_frame(t0, None).expect("the exit screen is sent");
-        assert!(!c.finished(t0));
+        assert!(!c.finished(t0, None));
         c.ack(first.num, t0);
-        assert!(c.finished(t0), "the first frame was the final one");
+        assert!(c.finished(t0, None), "the first frame was the final one");
     }
 
     #[test]
@@ -1429,22 +1439,22 @@ mod tests {
             let mut c = ServerConn::default();
             c.install_snapshot(Arc::new(screen(b"$ ")));
             c.poll_frame(t0, None).unwrap();
-            assert!(!c.finished(t0));
+            assert!(!c.finished(t0, None));
             c.install_snapshot(exit_screen(3));
             let last = c.poll_frame(sent, None).expect("the final frame");
-            assert!(!c.finished(sent));
+            assert!(!c.finished(sent, None));
             (c, last)
         };
         let (mut acked, last) = exited();
         acked.ack(last.num, Instant::now());
-        assert!(acked.finished(sent), "acked: done at once");
+        assert!(acked.finished(sent, None), "acked: done at once");
         let (unacked, _) = exited();
         let just_before = (sent + FINAL_ACK_WAIT)
             .checked_sub(Duration::from_millis(1))
             .unwrap();
-        assert!(!unacked.finished(just_before));
+        assert!(!unacked.finished(just_before, None));
         assert!(
-            unacked.finished(sent + FINAL_ACK_WAIT),
+            unacked.finished(sent + FINAL_ACK_WAIT, None),
             "unacked: done after the wait"
         );
     }

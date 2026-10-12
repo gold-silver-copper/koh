@@ -11,11 +11,11 @@ a real shell in a PTY and sends its screen to a **client** as frames over QUIC s
 A peer finds a server by its Ed25519 **node-id** (through relays + NAT hole-punching), and only peers
 on its **allowlist** are admitted. The node-id is not enumerable, but the server's UDP port is open
 like any listener's: anyone who can reach it can start QUIC handshakes, as iroh answers a
-ClientHello whatever its server name. So handshakes under way are capped, 2 from one address (an
-IPv6 /64 counts as one) and a quarter of `--max-connections` in all (at least 4, and below the
-total), the oldest given up for a new one; each has 10 s; and the warnings they cause are said at
-most once every 10 s. A flood of stalled handshakes therefore cannot hold every slot, and an
-allowed client's dial still gets one. It is a
+ClientHello whatever its server name. So handshakes under way are capped: 2 from one IP address (an
+IPv6 /64 counts as one; a relay's are capped only in all), and a quarter of `--max-connections`
+in all (at least 4, and below the total), the oldest given up for a new one. Each has 10 s, and
+the flood is warned of at most once every 10 s. A flood of stalled handshakes therefore cannot
+hold every slot, and an allowed client's dial still gets one. It is a
 **single-operator** tool for connecting a small set of machines you control — not a multi-user network
 service.
 

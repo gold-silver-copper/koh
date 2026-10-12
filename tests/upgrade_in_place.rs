@@ -81,6 +81,7 @@ fn a_server_whose_binary_was_removed_still_starts_sessions() {
             ],
             "xterm-256color",
             &Launcher::new(env!("CARGO_BIN_EXE_koh")),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn the client");
         let seen = Arc::new(Mutex::new(String::new()));

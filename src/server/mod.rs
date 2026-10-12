@@ -804,29 +804,6 @@ async fn send_history(
 /// The priority of history streams: below frames' (0), so QUIC sends a frame's bytes first.
 const HISTORY_PRIORITY: i32 = -1;
 
-/// Serve `conn` one session of `command`, then tear it down: the server without its accept loop,
-/// for tests.
-pub async fn run_session(
-    conn: iroh::endpoint::Connection,
-    command: &[String],
-    scrollback: usize,
-    launcher: crate::pty::Launcher,
-) -> anyhow::Result<()> {
-    let registry = Registry::spawn(SessionSpec {
-        command: command.to_vec().into(),
-        scrollback,
-        max_sessions: 1,
-        ttl: Duration::from_secs(1),
-        launcher,
-    });
-    let peer = conn.remote_id();
-    if let Ok((client, _)) = registry.attach(peer).await {
-        run_attached(cli::Authorized::assumed(conn), client).await;
-    }
-    registry.shutdown().await;
-    Ok(())
-}
-
 #[cfg(test)]
 #[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {

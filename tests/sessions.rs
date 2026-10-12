@@ -15,13 +15,39 @@ use koh::proto::{
 };
 use koh::pty::Launcher;
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
-use koh::server::run_session;
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
 use koh::terminal::{clamp_dims, RowEncodings, Size, TerminalScreen};
 use koh::transport_iroh::admission::await_admission;
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 use tokio_util::sync::CancellationToken;
+
+/// The accept loop on a loopback endpoint, allowing `client` and hosting `command`: its address,
+/// the token that stops it, and its task.
+async fn loopback_serve(
+    client: iroh::EndpointId,
+    command: &[&str],
+) -> anyhow::Result<(
+    iroh::EndpointAddr,
+    CancellationToken,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)> {
+    let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
+    let addr = loopback_addr(&server_ep);
+    let config = ServeConfig {
+        allow: vec![client],
+        command: command.iter().map(|arg| (*arg).to_owned()).collect(),
+        launcher: launcher(),
+        ..ServeConfig::default()
+    };
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(serve_endpoint(
+        server_ep,
+        Hosting::from_config(&config)?,
+        shutdown.clone(),
+    ));
+    Ok((addr, shutdown, task))
+}
 
 /// The launcher every session in these tests starts through.
 fn launcher() -> Launcher {
@@ -37,7 +63,7 @@ fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-fn registry(command: &[&str], max_sessions: usize, ttl: Duration) -> Registry {
+fn registry(command: &[&str], max_sessions: usize, ttl: Duration) -> std::io::Result<Registry> {
     Registry::spawn(SessionSpec {
         command: command.iter().map(|arg| (*arg).to_owned()).collect(),
         scrollback: 0,
@@ -59,7 +85,7 @@ fn peer() -> std::io::Result<iroh::EndpointId> {
 #[test]
 fn attach_creates_then_reattaches_the_same_peer() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30));
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30))?;
         let peer = peer()?;
         let (client, kind) = reg.attach(peer).await.context("first attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
@@ -77,7 +103,7 @@ fn attach_creates_then_reattaches_the_same_peer() -> anyhow::Result<()> {
 #[test]
 fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 1, Duration::from_secs(30));
+        let reg = registry(&["sleep", "30"], 1, Duration::from_secs(30))?;
         let (a, b) = (peer()?, peer()?);
         let (a_client, _) = reg
             .attach(a)
@@ -103,7 +129,7 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
 #[test]
 fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_millis(150));
+        let reg = registry(&["sleep", "30"], 4, Duration::from_millis(150))?;
         let peer = peer()?;
         let (a, _) = reg.attach(peer).await.context("A")?;
         let (b, _) = reg
@@ -136,7 +162,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
 #[test]
 fn a_session_whose_shell_exited_is_torn_down() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sh", "-c", "exit 0"], 4, Duration::from_secs(30));
+        let reg = registry(&["sh", "-c", "exit 0"], 4, Duration::from_secs(30))?;
         let peer = peer()?;
         let (mut client, kind) = reg.attach(peer).await.context("attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "attach: {kind:?}");
@@ -283,16 +309,11 @@ impl RawClient {
 }
 
 #[test]
-fn run_session_delivers_keys_and_clamped_resizes_then_kills_the_shell() -> anyhow::Result<()> {
+fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
-        let addr = loopback_addr(&server_ep);
-        let accept = tokio::spawn(async move {
-            let incoming = server_ep.accept().await.context("incoming")?;
-            let conn = incoming.await?;
-            run_session(conn, &["cat".to_owned()], 0, launcher()).await
-        });
-        let mut client = RawClient::connect(addr, generate_secret_key()?, false).await?;
+        let secret = generate_secret_key()?;
+        let (addr, shutdown, serve) = loopback_serve(secret.public(), &["cat"]).await?;
+        let mut client = RawClient::connect(addr, secret, true).await?;
         client
             .write(&ClientMsg::Resize(Size::new(65000, 1)))
             .await?;
@@ -321,9 +342,10 @@ fn run_session_delivers_keys_and_clamped_resizes_then_kills_the_shell() -> anyho
             client.echo_ack
         );
         client.conn.close(0u32.into(), b"done");
-        tokio::time::timeout(Duration::from_secs(5), accept)
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), serve)
             .await
-            .context("run_session returns after the connection ends")???;
+            .context("the server ends its session and returns")???;
         Ok(())
     })
 }
@@ -414,7 +436,7 @@ fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -
             &["sh", "-c", script, "sh", path],
             1,
             Duration::from_secs(30),
-        );
+        )?;
         let a = peer()?;
         let (mut c1, kind) = reg.attach(a).await.context("first attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
@@ -455,7 +477,7 @@ impl Drop for RemoveOnDrop {
 #[test]
 fn a_burst_of_detaches_larger_than_the_control_queue_still_starts_the_ttl() -> anyhow::Result<()> {
     current_thread_runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_millis(200));
+        let reg = registry(&["sleep", "30"], 4, Duration::from_millis(200))?;
         let p = peer()?;
         let mut clients = Vec::new();
         for _ in 0..20 {
@@ -477,7 +499,7 @@ fn a_burst_of_detaches_larger_than_the_control_queue_still_starts_the_ttl() -> a
 #[test]
 fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30));
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30))?;
         let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
         tokio::time::timeout(Duration::from_secs(5), reg.shutdown())
             .await
@@ -505,7 +527,7 @@ fn a_reconnect_right_after_exit_never_reattaches_the_exited_session() -> anyhow:
         .enable_all()
         .build()?
         .block_on(async {
-            let reg = registry(&["true"], 4, Duration::from_secs(30));
+            let reg = registry(&["true"], 4, Duration::from_secs(30))?;
             let a = peer()?;
             let mut client = reg.attach(a).await.context("first attach")?.0;
             for round in 0..100 {
@@ -534,7 +556,7 @@ fn a_reconnect_right_after_exit_never_reattaches_the_exited_session() -> anyhow:
 #[test]
 fn a_session_whose_program_exited_while_detached_is_not_reattached() -> anyhow::Result<()> {
     current_thread_runtime()?.block_on(async {
-        let reg = registry(&["sleep", "0.3"], 4, Duration::from_secs(30));
+        let reg = registry(&["sleep", "0.3"], 4, Duration::from_secs(30))?;
         let p = peer()?;
         let (client, kind) = reg.attach(p).await.context("attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
@@ -561,7 +583,7 @@ fn a_session_ends_when_its_program_does_whatever_holds_its_terminal() -> anyhow:
         let closed = cfg!(any(target_os = "linux", target_os = "android"))
             .then_some(("exec </dev/null >/dev/null 2>&1; sleep 3600", 129));
         for (script, code) in std::iter::once(("sleep 3600 & exit 7", 7)).chain(closed) {
-            let reg = registry(&["sh", "-c", script], 4, Duration::from_secs(30));
+            let reg = registry(&["sh", "-c", script], 4, Duration::from_secs(30))?;
             let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
             await_exit(&mut client).await.context(script)?;
             anyhow::ensure!(
@@ -612,7 +634,7 @@ async fn attach_when_a_slot_frees(
 #[test]
 fn an_exited_session_whose_client_left_frees_its_slot() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["true"], 1, Duration::from_secs(30));
+        let reg = registry(&["true"], 1, Duration::from_secs(30))?;
         let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
         await_exit(&mut client).await?;
         drop(client);
@@ -633,7 +655,7 @@ fn an_exited_session_whose_client_left_frees_its_slot() -> anyhow::Result<()> {
 #[test]
 fn a_session_whose_program_exited_while_detached_frees_its_slot() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "0.3"], 1, Duration::from_secs(30));
+        let reg = registry(&["sleep", "0.3"], 1, Duration::from_secs(30))?;
         let (client, _) = reg.attach(peer()?).await.context("attach")?;
         drop(client);
         // The program exits at 0.3 s; a teardown on a 5 s tick would miss this.
@@ -655,7 +677,7 @@ fn a_session_whose_program_exited_while_detached_frees_its_slot() -> anyhow::Res
 fn a_reconnect_while_the_old_client_holds_on_never_reattaches_the_exited_session(
 ) -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["true"], 4, Duration::from_secs(30));
+        let reg = registry(&["true"], 4, Duration::from_secs(30))?;
         let a = peer()?;
         let (mut old, kind) = reg.attach(a).await.context("first attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
@@ -678,32 +700,28 @@ fn a_reconnect_while_the_old_client_holds_on_never_reattaches_the_exited_session
 #[test]
 fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["true"], 4, Duration::from_secs(30));
-        let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
-        // The connection starts on a screen that already has the exit.
-        await_exit(&mut client).await?;
-        let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
-        let addr = loopback_addr(&server_ep);
-        let serve = tokio::spawn(async move {
-            let incoming = server_ep.accept().await.context("incoming")?;
-            let conn = koh::server::cli::Authorized::assumed(incoming.await?);
-            anyhow::Ok(koh::server::run_attached(conn, client).await)
-        });
-        let mut raw = RawClient::connect(addr, generate_secret_key()?, false).await?;
-        let mut ended = None;
+        // `true` has exited by the time the connection's loop first looks.
+        let secret = generate_secret_key()?;
+        let (addr, shutdown, serve) = loopback_serve(secret.public(), &["true"]).await?;
+        let mut raw = RawClient::connect(addr, secret, true).await?;
+        let mut close = None;
         for _ in 0..30 {
             raw.pump(100).await?;
-            if serve.is_finished() {
-                ended = Some(serve.await??);
+            close = raw.conn.close_reason();
+            if close.is_some() {
                 break;
             }
         }
-        let close = raw.conn.close_reason();
-        reg.shutdown().await;
+        shutdown.cancel();
+        let _ = serve.await;
+        let ended = matches!(
+            &close,
+            Some(iroh::endpoint::ConnectionError::ApplicationClosed(c))
+                if c.reason.as_ref() == koh::proto::SESSION_ENDED
+        );
         anyhow::ensure!(
-            matches!(ended, Some(koh::server::SessionExit::ShellExited)),
-            "run_attached must end with ShellExited within 3s; ended: {}, close: {close:?}",
-            ended.is_some()
+            ended,
+            "the connection is closed as ended within 3s: {close:?}"
         );
         Ok(())
     })

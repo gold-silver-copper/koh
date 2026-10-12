@@ -22,7 +22,10 @@ fn nvim_tells_ctrl_i_from_tab_from_a_kitty_terminal() {
         .output()
         .is_err()
     {
-        eprintln!("nvim is not installed; skipped");
+        #[expect(clippy::disallowed_macros, reason = "says the test was skipped")]
+        {
+            eprintln!("nvim is not installed; skipped");
+        }
         return;
     }
     crate::harness::runtime()

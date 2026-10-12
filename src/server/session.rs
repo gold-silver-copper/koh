@@ -82,18 +82,20 @@ pub struct PtyHost {
 }
 
 impl PtyHost {
-    /// Start `command` (empty for the login shell) through `launcher` at the default size; the host
-    /// and a receiver of its output. Blocks until the program starts.
+    /// Start `command` (empty for the login shell) through `launcher` at the default size, left to
+    /// `reaper` once closed; the host and a receiver of its output. Blocks until the program starts.
     pub fn spawn(
         command: &[String],
         scrollback: usize,
         launcher: &crate::pty::Launcher,
+        reaper: &crate::pty::Reaper,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let Size { rows, cols } = DEFAULT_SIZE;
         let emu = ServerTerminal::new(rows, cols, scrollback)
             .context("creating the terminal emulator")?;
-        let (pty, pty_rx) = crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", launcher)
-            .context("spawning shell")?;
+        let (pty, pty_rx) =
+            crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", launcher, reaper)
+                .context("spawning shell")?;
         Ok((Self { emu, pty }, pty_rx))
     }
 
@@ -122,9 +124,10 @@ impl PtyHost {
         true
     }
 
-    /// Tear down; blocks joining the pump threads, so run it on `spawn_blocking`.
-    pub fn shutdown(self) {
-        self.pty.shutdown();
+    /// End it ([`Pty::close`](crate::pty::Pty::close)); blocks joining the pump threads, so run it
+    /// on `spawn_blocking`.
+    pub fn close(self) {
+        self.pty.close();
     }
 }
 
@@ -219,14 +222,11 @@ const CONTROL_QUEUE: usize = 8;
 /// exit, or the rest of its output.
 const ENDING_GRACE: Duration = Duration::from_secs(1);
 
-/// The status of a program that closed its terminal and kept running: koh hangs it up as the
-/// session ends, so it ends as by SIGHUP.
-const HUNG_UP: crate::pty::Exit = crate::pty::Exit { code: 129 };
-
-/// Start a session for `spec`, answering `first` once its program started: the sender that
-/// attaches to it, and the task that runs it.
+/// Start a session for `spec`, its program left to `reaper` once closed, answering `first` once it
+/// started: the sender that attaches to it, and the task that runs it.
 fn start(
     spec: &SessionSpec,
+    reaper: &crate::pty::Reaper,
     first: Attach,
 ) -> (
     mpsc::Sender<Attach>,
@@ -235,11 +235,13 @@ fn start(
     let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
     let command = Arc::clone(&spec.command);
     let (scrollback, ttl, launcher) = (spec.scrollback, spec.ttl, spec.launcher.clone());
+    let reaper = reaper.clone();
     let task = async move {
         // Forking and the program's exec block, and must hold up no other session.
-        let spawned =
-            tokio::task::spawn_blocking(move || PtyHost::spawn(&command, scrollback, &launcher))
-                .await;
+        let spawned = tokio::task::spawn_blocking(move || {
+            PtyHost::spawn(&command, scrollback, &launcher, &reaper)
+        })
+        .await;
         let (mut host, pty_rx) = match spawned.map_err(anyhow::Error::from).and_then(|s| s) {
             Ok(spawned) => spawned,
             Err(e) => {
@@ -328,7 +330,8 @@ async fn session_task(
         if !matches!(phase, Phase::Exited) && ((output_ended && exit.is_some()) || grace_over) {
             // The program ended: publish a final screen carrying its status, whole even if it
             // stopped mid-frame. There always is one, so a client always sees the end.
-            host.emu.set_exit_code(exit.unwrap_or(HUNG_UP).code);
+            host.emu
+                .set_exit_code(exit.unwrap_or(crate::pty::Exit::HungUp).code());
             phase = Phase::Exited;
             screens_tx.send_replace(Arc::new(host.snapshot()));
         }
@@ -458,7 +461,7 @@ async fn session_task(
     // Ended: the registry sees the closed control channel, clients their closed screens and input.
     // The teardown is awaited, so the registry's shutdown waits for every program's hang-up.
     drop((control, screens_tx, input_rx));
-    let _ = tokio::task::spawn_blocking(move || host.shutdown()).await;
+    let _ = tokio::task::spawn_blocking(move || host.close()).await;
 }
 
 /// A short wait before retrying pending keystrokes; never, with none pending.
@@ -483,6 +486,8 @@ struct AttachReq {
 pub struct Registry {
     tx: mpsc::Sender<AttachReq>,
     shutdown: CancellationToken,
+    /// What every session's program is left to once closed.
+    reaper: crate::pty::Reaper,
 }
 
 /// What the registry hosts, and the session TTL.
@@ -499,13 +504,19 @@ pub struct SessionSpec {
 const ATTACH_TRIES: usize = 3;
 
 impl Registry {
-    /// Spawn the registry task.
-    pub fn spawn(spec: SessionSpec) -> Self {
+    /// Spawn the registry task, and the reaper its sessions' programs are left to: failing to
+    /// start that fails here, before any session.
+    pub fn spawn(spec: SessionSpec) -> std::io::Result<Self> {
+        let reaper = crate::pty::Reaper::start()?;
         let (tx, rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
         #[expect(clippy::disallowed_methods, reason = "one registry a server")]
-        tokio::spawn(registry_task(spec, rx, shutdown.clone()));
-        Self { tx, shutdown }
+        tokio::spawn(registry_task(spec, reaper.clone(), rx, shutdown.clone()));
+        Ok(Self {
+            tx,
+            shutdown,
+            reaper,
+        })
     }
 
     /// Attach `peer` to its session, creating one if it has none.
@@ -524,10 +535,13 @@ impl Registry {
         Err(Refused::Failed)
     }
 
-    /// Stop the registry and every session, and wait for them to end.
+    /// Stop the registry and every session, and wait for them to end and their programs to be
+    /// reaped, each killed once its grace is over.
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         self.tx.closed().await;
+        let reaper = self.reaper;
+        let _ = tokio::task::spawn_blocking(move || reaper.drain()).await;
     }
 }
 
@@ -535,10 +549,11 @@ impl Registry {
 /// other peer.
 async fn registry_task(
     spec: SessionSpec,
+    reaper: crate::pty::Reaper,
     mut rx: mpsc::Receiver<AttachReq>,
     shutdown: CancellationToken,
 ) {
-    let mut sessions = sessions::Sessions::new(spec);
+    let mut sessions = sessions::Sessions::new(spec, reaper);
     loop {
         let AttachReq { peer, reply } = tokio::select! {
             // A shutdown starts no session for a request still queued.

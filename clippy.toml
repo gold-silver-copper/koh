@@ -22,3 +22,9 @@ disallowed-methods = [
     { path = "tokio::task::spawn", reason = "say what bounds the tasks spawned here, in the expectation's reason" },
     { path = "std::io::stderr", reason = "write through koh::log::stderr, which escapes what a peer chose" },
 ]
+# The macros that write to stderr unescaped, banned with it, in tests too: a test's message goes in
+# its assertion.
+disallowed-macros = [
+    { path = "std::eprint", reason = "write through koh::log::stderr, which escapes what a peer chose" },
+    { path = "std::eprintln", reason = "write through koh::log::stderr, which escapes what a peer chose" },
+]

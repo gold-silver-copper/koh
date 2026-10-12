@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use koh::pty::{Launcher, Pty};
-use koh::server::run_session;
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key};
 
 /// The `koh` binary, as the launcher every program here starts through.
@@ -22,8 +21,20 @@ fn launcher() -> Launcher {
     Launcher::new(env!("CARGO_BIN_EXE_koh"))
 }
 
-/// A loopback server hosting `sh` for one connection: its id and IPv4 port, and its task.
-async fn loopback_server() -> anyhow::Result<(String, u16, tokio::task::JoinHandle<()>)> {
+/// A loopback server hosting `sh` for the client whose key is at `client_key` (created if missing),
+/// as `koh serve` does: its id and IPv4 port, and its task.
+async fn loopback_server(
+    client_key: &std::path::Path,
+) -> anyhow::Result<(String, u16, tokio::task::JoinHandle<()>)> {
+    let config = koh::server::ServeConfig {
+        allow: vec![koh::transport_iroh::parse_endpoint_id(&endpoint_id(
+            client_key,
+        )?)?],
+        command: vec!["sh".to_owned()],
+        launcher: launcher(),
+        ..koh::server::ServeConfig::default()
+    };
+    let hosting = koh::server::cli::Hosting::from_config(&config)?;
     let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
     let server_id = server_ep.id().to_string();
     let server_port = server_ep
@@ -33,15 +44,12 @@ async fn loopback_server() -> anyhow::Result<(String, u16, tokio::task::JoinHand
         .map(std::net::SocketAddr::port)
         .ok_or_else(|| anyhow::anyhow!("no IPv4 socket"))?;
     let task = tokio::spawn(async move {
-        if let Some(incoming) = server_ep.accept().await {
-            if let Ok(conn) = incoming.await {
-                // The real client binary awaits an admission ack after connect; mirror the server
-                // side so its accept_bi() completes, like `koh serve`.
-                if koh::transport_iroh::admission::admit(&conn).await.is_ok() {
-                    let _ = run_session(conn, &["sh".to_owned()], 0, launcher()).await;
-                }
-            }
-        }
+        let _ = koh::server::cli::serve_endpoint(
+            server_ep,
+            hosting,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
     });
     Ok((server_id, server_port, task))
 }
@@ -89,12 +97,12 @@ async fn wait_for(
 #[test]
 fn real_client_binary_renders_over_pty() {
     runtime().expect("tokio runtime").block_on(async {
-        let (server_id, server_port, server_task) = loopback_server().await.expect("server");
         let key_path =
             std::env::temp_dir().join(format!("koh-pty-test-{}.key", std::process::id()));
         let _ = std::fs::remove_file(&key_path);
+        let (server_id, server_port, server_task) =
+            loopback_server(&key_path).await.expect("server");
 
-        // The client creates its identity key on first run, without a prompt.
         let (client, output) = Pty::spawn(
             24,
             80,
@@ -109,6 +117,7 @@ fn real_client_binary_renders_over_pty() {
             ],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn client binary");
         let buf = capture(output);
@@ -138,10 +147,11 @@ fn real_client_binary_renders_over_pty() {
 #[test]
 fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
     runtime().expect("tokio runtime").block_on(async {
-        let (server_id, server_port, server_task) = loopback_server().await.expect("server");
         let key_path =
             std::env::temp_dir().join(format!("koh-suspend-test-{}.key", std::process::id()));
         let _ = std::fs::remove_file(&key_path);
+        let (server_id, server_port, server_task) =
+            loopback_server(&key_path).await.expect("server");
 
         // An interactive bash with job control, as a user's login shell would be.
         let (bash, output) = Pty::spawn(
@@ -157,6 +167,7 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
             ],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn bash");
         let buf = capture(output);
@@ -310,6 +321,7 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
             ],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn client binary");
         let buf = capture(output);

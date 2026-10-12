@@ -508,8 +508,9 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
 - **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs, started through
   the `koh` binary's `__launch`: output streaming and teardown, exit statuses, the
   reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its
-  terminal; the session registry's attach/reattach/cap/TTL/teardown; `run_session` and the
-  per-connection echo-ack over loopback iroh. On macOS `tests/pty.rs` first grows the kernel's PTY
+  terminal; the session registry's attach/reattach/cap/TTL/teardown; the real accept loop
+  (`serve_endpoint`, its allowlist and admission) and the per-connection echo-ack over loopback
+  iroh. On macOS `tests/pty.rs` first grows the kernel's PTY
   table past what its tests hold at once: an open that finds the table full while another PTY is
   being freed fails with ENXIO (the table grows 16 slots at a time and never shrinks), which its
   many short-lived PTYs hit on a fresh machine.

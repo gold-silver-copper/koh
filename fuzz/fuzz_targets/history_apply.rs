@@ -21,7 +21,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mark = HistoryMark { newest, len };
-    let asked = HistoryRequest {
+    let request = HistoryRequest {
         newest: asked,
         count,
     };
@@ -30,7 +30,7 @@ fuzz_target!(|data: &[u8]| {
     while let Ok((reply, after)) = postcard::take_from_bytes::<HistoryReply>(rest) {
         rest = after;
         let before = cache.len();
-        if let Some(kept) = cache.insert(&reply, asked, mark, newest) {
+        if let Some(kept) = cache.insert(&reply, request.ask().1, mark, newest) {
             assert!(kept <= reply.rows.len());
             assert!(cache.len() <= before + kept);
         }

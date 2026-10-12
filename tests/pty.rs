@@ -25,6 +25,7 @@ fn external_signal_retains_shell_style_exit_status() {
             ],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn signal fixture");
         let mut output = String::new();
@@ -48,7 +49,7 @@ fn external_signal_retains_shell_style_exit_status() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = pty.try_wait().expect("wait child") {
-                assert_eq!(status.code, 137);
+                assert_eq!(status.code(), 137);
                 break;
             }
             assert!(
@@ -77,6 +78,7 @@ fn teardown_reaps_children_even_when_the_caller_does_not_wait() {
                 ],
                 "xterm-256color",
                 &launcher(),
+                &koh::pty::Reaper::start().expect("reaper"),
             )
             .expect("spawn");
             let mut output = String::new();
@@ -94,7 +96,7 @@ fn teardown_reaps_children_even_when_the_caller_does_not_wait() {
             .expect("pid deadline");
             // Keep the receiver alive but unread: teardown must not depend on its consumer.
             if shutdown {
-                tokio::task::spawn_blocking(move || pty.shutdown())
+                tokio::task::spawn_blocking(move || pty.close())
                     .await
                     .expect("shutdown");
             } else {
@@ -121,12 +123,13 @@ fn shutdown_does_not_need_a_consumer_for_flooded_output() {
             &["/bin/sh".into(), "-c".into(), "exec yes".into()],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn flood");
         tokio::time::sleep(Duration::from_millis(200)).await;
         tokio::time::timeout(
             Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || pty.shutdown()),
+            tokio::task::spawn_blocking(move || pty.close()),
         )
         .await
         .expect("unread output must not wedge shutdown")
@@ -149,6 +152,7 @@ fn stopped_reader_applies_backpressure_and_resumes_in_order() {
             ],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn");
         let mut line = String::new();
@@ -213,7 +217,7 @@ fn stopped_reader_applies_backpressure_and_resumes_in_order() {
             "input and terminal replies preserve order"
         );
         drop(rx);
-        tokio::task::spawn_blocking(move || pty.shutdown())
+        tokio::task::spawn_blocking(move || pty.close())
             .await
             .expect("shutdown");
     });
@@ -230,6 +234,7 @@ fn host_normalizes_dimensions_for_both_the_emulator_and_pty() {
             ],
             0,
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("host");
         let mut output = String::new();
@@ -250,7 +255,7 @@ fn host_normalizes_dimensions_for_both_the_emulator_and_pty() {
             output.contains(&format!("{} {}", normalized.rows, normalized.cols)),
             "{output:?}"
         );
-        tokio::task::spawn_blocking(move || host.shutdown())
+        tokio::task::spawn_blocking(move || host.close())
             .await
             .expect("shutdown");
     });
@@ -264,9 +269,15 @@ fn host_normalizes_dimensions_for_both_the_emulator_and_pty() {
 fn spawns_and_streams_output() {
     current_thread().expect("tokio runtime").block_on(async {
         // Run a one-shot command in the PTY and confirm we receive its output + reap it.
-        let (mut pty, mut rx) =
-            Pty::spawn(24, 80, &["echo".to_owned()], "xterm-256color", &launcher())
-                .expect("spawn echo");
+        let (mut pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &["echo".to_owned()],
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn echo");
         // `echo` with no args prints just a newline; assert we get *something* and EOF.
         let mut collected = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -294,7 +305,7 @@ fn spawns_and_streams_output() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let status = status.expect("the one-shot child must exit and be reaped");
-        assert_eq!(status.code, 0);
+        assert_eq!(status.code(), 0);
     });
 }
 
@@ -308,8 +319,15 @@ fn write_input_takes_shared_ref_and_preserves_order() {
         // `pty` is bound WITHOUT `mut`, proving write_input takes `&self`. Two separate enqueues must
         // reach the child in FIFO order: the concatenated marker only appears if the second chunk did
         // not overtake the first.
-        let (pty, mut rx) =
-            Pty::spawn(24, 80, &[], "xterm-256color", &launcher()).expect("spawn shell");
+        let (pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &[],
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn shell");
         tokio::time::sleep(Duration::from_millis(300)).await;
         pty.write(b"printf ORDER_".to_vec()).expect("first enqueue");
         pty.write(b"AB_CD\n".to_vec()).expect("second enqueue");
@@ -349,8 +367,15 @@ fn dropping_pty_eofs_child_and_stops_writer() {
         // then writes EOT and finishes — so the child sees EOF, exits, the slave closes, and the
         // output channel ends. If the writer thread were stuck (or never let go of its handle), the
         // channel would never close.
-        let (pty, mut rx) = Pty::spawn(24, 80, &["cat".to_owned()], "xterm-256color", &launcher())
-            .expect("spawn cat");
+        let (pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &["cat".to_owned()],
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn cat");
         tokio::time::sleep(Duration::from_millis(200)).await;
         drop(pty); // no kill(): EOF must come purely from the writer handle being dropped
 
@@ -371,15 +396,22 @@ fn shutdown_joins_both_io_threads_without_deadlock() {
         // Graceful teardown: shutdown() kills the child (so the reader's blocking read returns EOF) and
         // drops the writer sender (so the writer's recv returns), then joins BOTH pump threads. It must
         // return promptly — a hang would mean a thread never unblocked.
-        let (pty, mut rx) = Pty::spawn(24, 80, &["sh".to_owned()], "xterm-256color", &launcher())
-            .expect("spawn shell");
+        let (pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &["sh".to_owned()],
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn shell");
         // Keep the output channel drained so the reader thread never blocks on a full channel.
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         tokio::time::timeout(
             Duration::from_secs(20),
-            tokio::task::spawn_blocking(move || pty.shutdown()),
+            tokio::task::spawn_blocking(move || pty.close()),
         )
         .await
         .expect("shutdown must not deadlock (both threads must unblock and join)")
@@ -404,6 +436,7 @@ fn shutdown_returns_while_the_program_leaves_its_input_unread() {
             ],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn sleep");
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -417,7 +450,7 @@ fn shutdown_returns_while_the_program_leaves_its_input_unread() {
 
         tokio::time::timeout(
             Duration::from_secs(20),
-            tokio::task::spawn_blocking(move || pty.shutdown()),
+            tokio::task::spawn_blocking(move || pty.close()),
         )
         .await
         .expect("shutdown must not wait on a write the program will never read")
@@ -439,8 +472,15 @@ fn argv_tail_reaches_the_child() {
             .into_iter()
             .map(String::from)
             .collect();
-        let (mut pty, mut rx) =
-            Pty::spawn(24, 80, &argv, "xterm-256color", &launcher()).expect("spawn sh -c");
+        let (mut pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &argv,
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn sh -c");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -459,7 +499,8 @@ fn argv_tail_reaches_the_child() {
         }
         let status = status.expect("the child must exit and be reaped");
         assert_eq!(
-            status.code, 7,
+            status.code(),
+            7,
             "the `-c \"exit 7\"` tail must have reached sh"
         );
     });
@@ -489,6 +530,7 @@ fn short_lived_children_never_lose_their_output() {
                         &["/bin/echo".to_owned(), marker.clone()],
                         "xterm-256color",
                         &launcher(),
+                        &koh::pty::Reaper::start().expect("reaper"),
                     )
                     .expect("spawn short-lived child");
                     let mut out = Vec::new();
@@ -506,7 +548,7 @@ fn short_lived_children_never_lose_their_output() {
                         assert!(tokio::time::Instant::now() < deadline, "reap deadline");
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }
-                    pty.shutdown();
+                    pty.close();
                     (marker, out)
                 }));
             }
@@ -551,7 +593,14 @@ async fn all_output(mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> String {
 #[test]
 fn a_program_that_cannot_start_fails_the_spawn_and_is_named() {
     let missing = "/nonexistent/koh-no-such-program";
-    let result = Pty::spawn(24, 80, &[missing.to_owned()], "xterm-256color", &launcher());
+    let result = Pty::spawn(
+        24,
+        80,
+        &[missing.to_owned()],
+        "xterm-256color",
+        &launcher(),
+        &koh::pty::Reaper::start().expect("reaper"),
+    );
     let Err(error) = result else {
         panic!("a missing program must fail the spawn, not yield a dead session");
     };
@@ -575,6 +624,7 @@ fn a_descriptor_the_server_holds_without_close_on_exec_does_not_reach_the_shell(
             &["/bin/sh".to_owned(), "-c".to_owned(), script],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn sh");
         let out = all_output(rx).await;
@@ -602,6 +652,7 @@ fn the_shell_leads_its_own_session_and_owns_its_terminal() {
             ],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn sh");
         let mut rx = rx;
@@ -656,6 +707,7 @@ fn a_child_that_ignores_sighup_dies_when_its_pty_is_dropped() {
             ],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn sh");
         let mut out = String::new();
@@ -734,6 +786,7 @@ fn a_hung_up_program_has_time_to_exit_before_it_is_killed() {
             &["/bin/sh".to_owned(), "-c".to_owned(), script],
             "xterm-256color",
             &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn sh");
         let mut out = String::new();
@@ -745,7 +798,7 @@ fn a_hung_up_program_has_time_to_exit_before_it_is_killed() {
         })
         .await
         .expect("the child reports it is ready");
-        tokio::task::spawn_blocking(move || pty.shutdown())
+        tokio::task::spawn_blocking(move || pty.close())
             .await
             .expect("shutdown");
         let written = tokio::time::timeout(Duration::from_secs(5), async {

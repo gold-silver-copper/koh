@@ -168,7 +168,6 @@ fn a_trusted_session_shows_nothing_typed_at_real_password_prompts() -> anyhow::R
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        eprintln!("prompts shown: {prompted:?}");
         anyhow::ensure!(
             !prompted.is_empty(),
             "no prompt was ever shown: {prompted:?}"

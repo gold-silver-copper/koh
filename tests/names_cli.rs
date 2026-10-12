@@ -307,8 +307,15 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
     home.koh(&["servers", "add", "laptop", &some_id(1)])
         .unwrap();
     runtime().unwrap().block_on(async {
-        let (mut menu, output) = Pty::spawn(24, 80, &home.argv(&[]), "xterm-256color", &launcher())
-            .expect("spawn koh on a PTY");
+        let (mut menu, output) = Pty::spawn(
+            24,
+            80,
+            &home.argv(&[]),
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn koh on a PTY");
         let buf = capture(output);
         wait_for(&buf, "koh — this machine", 10).await.unwrap();
         wait_for(&buf, "1  laptop", 5).await.unwrap();
@@ -348,21 +355,34 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
             .find(|s| s.is_ipv4())
             .map(std::net::SocketAddr::port)
             .unwrap();
-        let task = tokio::spawn(async move {
-            if let Some(incoming) = server.accept().await {
-                if let Ok(conn) = incoming.await {
-                    if koh::transport_iroh::admission::admit(&conn).await.is_ok() {
-                        let _ =
-                            koh::server::run_session(conn, &["sh".to_owned()], 0, launcher()).await;
-                    }
-                }
-            }
-        });
+        // The server allows this home's client, as `koh serve` would.
+        let me = home.koh(&["id"]).unwrap();
+        let config = koh::server::ServeConfig {
+            allow: vec![koh::transport_iroh::parse_endpoint_id(
+                String::from_utf8_lossy(&me.stdout).trim(),
+            )
+            .unwrap()],
+            command: vec!["sh".to_owned()],
+            launcher: launcher(),
+            ..koh::server::ServeConfig::default()
+        };
+        let task = tokio::spawn(koh::server::cli::serve_endpoint(
+            server,
+            koh::server::cli::Hosting::from_config(&config).unwrap(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         home.koh(&["servers", "add", "box", &id]).unwrap();
         let direct = format!("127.0.0.1:{port}");
         let argv = home.argv(&["connect", "box", "--direct", &direct]);
-        let (client, output) =
-            Pty::spawn(24, 80, &argv, "xterm-256color", &launcher()).expect("spawn the client");
+        let (client, output) = Pty::spawn(
+            24,
+            80,
+            &argv,
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn the client");
         let buf = capture(output);
         tokio::time::sleep(Duration::from_millis(2000)).await;
         client.write(b"echo by''_name\r".to_vec()).unwrap();

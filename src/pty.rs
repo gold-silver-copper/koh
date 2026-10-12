@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use fuxix::poll::{Events, PollFd};
@@ -67,11 +67,25 @@ fn reserve_input(budget: &AtomicUsize, len: usize) -> bool {
     }
 }
 
-/// How the program ended: its exit code, which for a signal is 128 plus its number, as a shell
-/// reports it.
+/// How the program ended. Once it has, this always says how, so a session's last screen always
+/// carries a status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Exit {
-    pub code: u32,
+pub enum Exit {
+    /// It exited with this code, which for a signal is 128 plus its number, as a shell reports it.
+    Status(u32),
+    /// It closed its terminal and ran on: it is hung up as its session ends, so it ends as by
+    /// SIGHUP.
+    HungUp,
+}
+
+impl Exit {
+    /// The status a shell would report.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Status(code) => code,
+            Self::HungUp => 129,
+        }
+    }
 }
 
 /// The argv for `command`, taken verbatim (no splitting, so a path with a space works); empty means
@@ -257,15 +271,15 @@ impl Running {
             || u32::try_from(status.code().unwrap_or_default()).unwrap_or(u32::MAX),
             |signal| 128_u32.saturating_add(u32::try_from(signal).unwrap_or(u32::MAX)),
         );
-        Ok(Some(Exit { code }))
+        Ok(Some(Exit::Status(code)))
     }
 
     /// Hang up, as a terminal closing does, and leave it to `reaper`, which kills it if it
     /// outlives [`HANGUP_GRACE`].
-    fn hang_up(self, reaper: &Sender<Reap>) {
+    fn hang_up(self, reaper: &Reaper) {
         let _ = self.signal(Signal::Hup);
         let kill_at = std::time::Instant::now().checked_add(HANGUP_GRACE);
-        if let Err(error) = reaper.send(Reap::Child(Stopping {
+        if let Err(error) = reaper.0.send(Reap::Child(Stopping {
             running: self,
             kill_at,
         })) {
@@ -307,65 +321,60 @@ impl Stopping {
     }
 }
 
-/// The process's one reaper, once started.
-static REAPER: Mutex<Option<Sender<Reap>>> = Mutex::new(None);
+/// The thread that reaps hung-up programs, polling them all, so one that does not exit delays none
+/// of the others.
+///
+/// One per server, started before any child, so failing to start it orphans none and stops the
+/// server at once. Every [`Pty`] is handed it; it runs until the last of them and of its handles
+/// are gone and every program it was given is reaped.
+#[derive(Clone, Debug)]
+pub struct Reaper(Sender<Reap>);
 
-/// The thread that reaps hung-up programs, polling them all, so one that does not exit delays
-/// none of the others. Started before any child, so failing to start it orphans none, and tried
-/// again by the next child.
-fn reaper() -> io::Result<Sender<Reap>> {
-    let mut reaper = REAPER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(tx) = reaper.as_ref() {
-        return Ok(tx.clone());
-    }
-    let (tx, rx) = channel::<Reap>();
-    std::thread::Builder::new()
-        .name("koh-child-reaper".into())
-        .spawn(move || {
-            let mut children: Vec<Stopping> = Vec::new();
-            let mut drains: Vec<Sender<()>> = Vec::new();
-            loop {
-                let received = if children.is_empty() {
-                    rx.recv()
-                        .map_err(|_closed| std::sync::mpsc::RecvTimeoutError::Disconnected)
-                } else {
-                    rx.recv_timeout(Duration::from_millis(20))
-                };
-                match received {
-                    Ok(Reap::Child(child)) => children.push(child),
-                    Ok(Reap::Drain(done)) => drains.push(done),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-                children.retain_mut(|child| !child.reaped());
-                if children.is_empty() {
-                    for done in std::mem::take(&mut drains) {
-                        let _ = done.send(());
+impl Reaper {
+    /// Start the thread.
+    pub fn start() -> io::Result<Self> {
+        let (tx, rx) = channel::<Reap>();
+        std::thread::Builder::new()
+            .name("koh-child-reaper".into())
+            .spawn(move || {
+                let mut children: Vec<Stopping> = Vec::new();
+                let mut drains: Vec<Sender<()>> = Vec::new();
+                let mut open = true;
+                while open || !children.is_empty() {
+                    let received = if !open {
+                        std::thread::sleep(Duration::from_millis(20));
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    } else if children.is_empty() {
+                        rx.recv()
+                            .map_err(|_closed| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                    } else {
+                        rx.recv_timeout(Duration::from_millis(20))
+                    };
+                    match received {
+                        Ok(Reap::Child(child)) => children.push(child),
+                        Ok(Reap::Drain(done)) => drains.push(done),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => open = false,
+                    }
+                    children.retain_mut(|child| !child.reaped());
+                    if children.is_empty() {
+                        for done in std::mem::take(&mut drains) {
+                            let _ = done.send(());
+                        }
                     }
                 }
-            }
-        })?;
-    *reaper = Some(tx.clone());
-    Ok(tx)
-}
+            })?;
+        Ok(Self(tx))
+    }
 
-/// Wait until every hung-up program is reaped, each killed once its grace is over.
-///
-/// For before the process exits, which would leave one that ignores SIGHUP running. Blocks for at
-/// most a little over [`HANGUP_GRACE`].
-pub fn drain_reaper() {
-    let Some(reaper) = REAPER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-    else {
-        return;
-    };
-    let (done, drained) = channel();
-    if reaper.send(Reap::Drain(done)).is_ok() {
-        let _ = drained.recv_timeout(HANGUP_GRACE.saturating_mul(2));
+    /// Wait until every hung-up program is reaped, each killed once its grace is over: before the
+    /// process exits, which would leave one that ignores SIGHUP running. Blocks for at most a
+    /// little over [`HANGUP_GRACE`], so call it on a blocking worker.
+    pub fn drain(&self) {
+        let (done, drained) = channel();
+        if self.0.send(Reap::Drain(done)).is_ok() {
+            let _ = drained.recv_timeout(HANGUP_GRACE.saturating_mul(2));
+        }
     }
 }
 
@@ -383,8 +392,8 @@ impl Drop for Pumps {
     }
 }
 
-/// A program running on a PTY. Dropping it stops the pumps and hangs the program up, leaving it
-/// to the reaper; [`Pty::shutdown`] also joins the pumps.
+/// A program running on a PTY, ended by [`Pty::close`]. Rust cannot make a value be consumed, so
+/// a `Pty` dropped unclosed (by a panic) still stops its pumps and hangs its program up.
 pub struct Pty {
     master: fuxix::pty::Master,
     /// Keystrokes and query replies share this queue, so they stay in order.
@@ -392,7 +401,7 @@ pub struct Pty {
     write_budget: Arc<AtomicUsize>,
     /// The program, until reaped.
     running: Option<Running>,
-    reaper: Sender<Reap>,
+    reaper: Reaper,
     pumps: Pumps,
 }
 
@@ -406,8 +415,8 @@ impl Pty {
         command: &[String],
         term: &str,
         launcher: &Launcher,
+        reaper: &Reaper,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
-        let reaper = reaper()?;
         let size = pty_size(rows, cols).map_err(PtyError::OpenPty)?;
         // fuxix serializes the allocation itself and works around macOS's PTY races.
         let (master, slave) =
@@ -509,16 +518,19 @@ impl Pty {
                 writer_tx,
                 write_budget,
                 running: Some(Running { child, pid }),
-                reaper,
+                reaper: reaper.clone(),
                 pumps,
             },
             rx,
         ))
     }
 
-    /// Hang the program up and join the pumps. Blocks while they notice, so call it on a blocking
-    /// worker; the reaper waits for the program.
-    pub fn shutdown(mut self) {
+    /// End it: hang the program up, leaving it to the reaper, and join the pumps. Blocks while they
+    /// notice, so call it on a blocking worker.
+    pub fn close(mut self) {
+        if let Some(running) = self.running.take() {
+            running.hang_up(&self.reaper);
+        }
         let pumps = [self.pumps.writer.take(), self.pumps.reader.take()];
         drop(self);
         for handle in pumps.into_iter().flatten() {
@@ -578,7 +590,7 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        // The pumps stop as `pumps` drops.
+        // The net under `close`; the pumps stop as `pumps` drops.
         if let Some(running) = self.running.take() {
             running.hang_up(&self.reaper);
         }

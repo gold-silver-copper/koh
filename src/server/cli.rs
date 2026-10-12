@@ -235,16 +235,11 @@ impl Allowlist {
     }
 }
 
-/// A connection whose peer the allowlist admitted: the only kind a session is served to.
+/// A connection whose peer the allowlist admitted: the only kind a session is served to, and made
+/// only by the accept loop, after the allowlist.
 pub struct Authorized(iroh::endpoint::Connection);
 
 impl Authorized {
-    /// `conn`, whose peer its caller admitted: a host with no accept loop of its own, as
-    /// [`run_session`](super::run_session) and tests are.
-    pub const fn assumed(conn: iroh::endpoint::Connection) -> Self {
-        Self(conn)
-    }
-
     /// The connection.
     pub const fn conn(&self) -> &iroh::endpoint::Connection {
         &self.0
@@ -313,7 +308,8 @@ pub async fn serve_endpoint(
         max_sessions: hosting.max_sessions,
         ttl: hosting.session_ttl,
         launcher: hosting.launcher,
-    });
+    })
+    .context("starting the child reaper")?;
 
     // Each connection holds a permit for its life; past the cap a dial is refused before its
     // handshake, which is cheap.
@@ -392,7 +388,6 @@ pub async fn serve_endpoint(
     info!("draining: stopping the registry and closing endpoint");
     shutdown.cancel();
     registry.shutdown().await;
-    let _ = tokio::task::spawn_blocking(crate::pty::drain_reaper).await;
     if !crate::transport_iroh::close_endpoint(&endpoint).await {
         warn!("peers did not see the endpoint close in time; exiting anyway");
     }

@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
-use tokio::signal::unix::SignalKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
@@ -314,15 +313,7 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     let dialed_at = std::time::SystemTime::now();
     let shutdown = CancellationToken::new();
     // Armed before raw mode is entered, so an install error surfaces while the terminal is cooked.
-    crate::cancel_on_signals(
-        &shutdown,
-        &[
-            SignalKind::terminate(),
-            SignalKind::interrupt(),
-            SignalKind::hangup(),
-        ],
-    )
-    .context("installing the signal handlers")?;
+    crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
     let (channels, tasks) = super::spawn_client_io()?;
     let result = async {
         let backend = DefaultBackend::new().context("acquiring the terminal")?;

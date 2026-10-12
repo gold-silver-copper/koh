@@ -551,6 +551,32 @@ fn a_session_whose_program_exited_while_detached_is_not_reattached() -> anyhow::
     })
 }
 
+#[test]
+fn a_session_ends_when_its_program_does_whatever_holds_its_terminal() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        // A job left in the background keeps the terminal open after the shell exited; a program
+        // that closed its terminal runs on with none. Either way the session ends, with a status.
+        for (script, code) in [
+            ("sleep 3600 & exit 7", 7),
+            ("exec </dev/null >/dev/null 2>&1; sleep 3600", 129),
+        ] {
+            let reg = registry(&["sh", "-c", script], 4, Duration::from_secs(30));
+            let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
+            await_exit(&mut client).await.context(script)?;
+            anyhow::ensure!(
+                client.screen().exit_code() == Some(code),
+                "{script}: {:?}",
+                client.screen().exit_code()
+            );
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(5), reg.shutdown())
+                .await
+                .context("shutdown waits only for the hang-up")?;
+        }
+        Ok(())
+    })
+}
+
 /// Wait until `client`'s screen carries the program's exit code.
 async fn await_exit(client: &mut koh::server::session::SessionClient) -> anyhow::Result<()> {
     for _ in 0..100 {

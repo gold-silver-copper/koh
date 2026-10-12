@@ -60,11 +60,7 @@ impl PendingInput {
         self.replies = self.replies.saturating_add(bytes.len());
     }
 
-    fn flush(&mut self, pty: &crate::pty::Pty) {
-        self.flush_with(|bytes| pty.write(bytes));
-    }
-
-    fn flush_with(&mut self, write: impl FnOnce(Vec<u8>) -> Result<(), crate::pty::WriteError>) {
+    fn flush(&mut self, write: impl FnOnce(Vec<u8>) -> Result<(), crate::pty::WriteError>) {
         if self.is_empty() {
             return;
         }
@@ -219,8 +215,13 @@ struct Attach(oneshot::Sender<Attached>);
 /// How many attaches may wait for one session; past them, one is refused as at capacity.
 const CONTROL_QUEUE: usize = 8;
 
-/// How long after the program's output ended the session waits to see it exit.
+/// How long the session waits, once the program's output ended or it exited, for the other: its
+/// exit, or the rest of its output.
 const ENDING_GRACE: Duration = Duration::from_secs(1);
+
+/// The status of a program that closed its terminal and kept running: koh hangs it up as the
+/// session ends, so it ends as by SIGHUP.
+const HUNG_UP: crate::pty::Exit = crate::pty::Exit { code: 129 };
 
 /// Start a session for `spec`, answering `first` once its program started: the sender that
 /// attaches to it, and the task that runs it.
@@ -303,10 +304,13 @@ async fn session_task(
     // The first client is attached, from `start`.
     let mut phase = Phase::Attached;
     let mut pending = PendingInput::default();
-    // When the program's output ended, and its exit once seen: it is looked for at every tick, for
-    // at most `ENDING_GRACE`, never waited on, as a program that closed its terminal may run on.
-    let mut ended: Option<Instant> = None;
+    // Whether the program's output ended, and its exit once seen: looked for at every tick, never
+    // waited on, as a program that closed its terminal may run on, and a job it left in the
+    // background may hold its terminal open after it exited. Once either is seen (`ending`), the
+    // other has `ENDING_GRACE`.
+    let mut output_ended = false;
     let mut exit: Option<crate::pty::Exit> = None;
+    let mut ending: Option<Instant> = None;
 
     // A frame the program is drawing (synchronized output) is not sent half drawn.
     let mut hold = FrameHold::default();
@@ -315,25 +319,26 @@ async fn session_task(
     tty_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
-        let grace_over = ended
+        if ending.is_none() && (output_ended || exit.is_some()) {
+            ending = Some(Instant::now());
+        }
+        let grace_over = ending
             .and_then(|at| at.checked_add(ENDING_GRACE))
             .is_some_and(|at| Instant::now() >= at);
-        if !matches!(phase, Phase::Exited) && ended.is_some() && (exit.is_some() || grace_over) {
+        if !matches!(phase, Phase::Exited) && ((output_ended && exit.is_some()) || grace_over) {
             // The program ended: publish a final screen carrying its status, whole even if it
-            // stopped mid-frame.
-            if let Some(exit) = exit {
-                host.emu.set_exit_code(exit.code);
-            }
+            // stopped mid-frame. There always is one, so a client always sees the end.
+            host.emu.set_exit_code(exit.unwrap_or(HUNG_UP).code);
             phase = Phase::Exited;
             screens_tx.send_replace(Arc::new(host.snapshot()));
         }
         // Retry keystrokes the PTY writer queue could not take last pass.
-        pending.flush(&host.pty);
+        pending.flush(|bytes| host.pty.write(bytes));
         let can_read_input = pending.is_empty();
         let running = !matches!(phase, Phase::Exited);
 
         tokio::select! {
-            chunk = pty_rx.recv(), if running && ended.is_none() => {
+            chunk = pty_rx.recv(), if running && !output_ended => {
                 if let Some(chunk) = chunk {
                     host.refresh_tty();
                     host.emu.process(&chunk);
@@ -346,14 +351,14 @@ async fn session_task(
                     if !replies.is_empty() {
                         // Query answers go to the program, not the screen.
                         pending.reply(&replies);
-                        pending.flush(&host.pty);
+                        pending.flush(|bytes| host.pty.write(bytes));
                     }
                     if let Some(screen) = hold.after_output(&mut host.emu, std::time::Instant::now()) {
                         screens_tx.send_replace(Arc::new(screen));
                     }
                 } else {
-                    ended = Some(Instant::now());
-                    exit = exit_of(&mut host);
+                    output_ended = true;
+                    exit = exit.or_else(|| exit_of(&mut host));
                 }
             },
             _ = until(hold.deadline().map(Instant::from_std)) => {
@@ -361,19 +366,19 @@ async fn session_task(
                     screens_tx.send_replace(Arc::new(screen));
                 }
             },
-            () = until(ended.and_then(|at| at.checked_add(ENDING_GRACE))), if running => {}
+            () = until(ending.and_then(|at| at.checked_add(ENDING_GRACE))), if running => {}
             input = input_rx.recv(), if can_read_input => {
                 // `input_tx` is held below, so this only ends with the task.
                 match input {
                     Some(ClientInput::Input(super::ToSession::Events(events))) => {
                         host.emu.encode_input(&events, &mut pending.bytes);
-                        pending.flush(&host.pty);
+                        pending.flush(|bytes| host.pty.write(bytes));
                     }
                     // A program that subscribed to scheme changes (mode 2031) hears of a new one
                     // on its input.
                     Some(ClientInput::Input(super::ToSession::Colours(colours))) => {
                         pending.bytes = host.emu.set_colours(&colours);
-                        pending.flush(&host.pty);
+                        pending.flush(|bytes| host.pty.write(bytes));
                     }
                     Some(ClientInput::Input(super::ToSession::Resize(size))) => {
                         if host.resize(size) {
@@ -382,7 +387,7 @@ async fn session_task(
                             // it on its input, after anything typed before.
                             if let Some(report) = host.emu.resize_report() {
                                 pending.reply(&report);
-                                pending.flush(&host.pty);
+                                pending.flush(|bytes| host.pty.write(bytes));
                             }
                             screens_tx.send_replace(Arc::new(host.snapshot()));
                         }
@@ -427,18 +432,17 @@ async fn session_task(
             },
             // The last client left, or none is left to see the exit. The only teardown of an
             // exited session, so it watches in every phase but Detached.
-            () = screens_tx.closed(), if !matches!(phase, Phase::Detached { .. }) => match phase {
-                Phase::Exited => break,
-                Phase::Attached => phase = Phase::Detached { since: Instant::now() },
-                Phase::Detached { .. } => {}
-            },
+            () = screens_tx.closed(), if !matches!(phase, Phase::Detached { .. }) => {
+                if matches!(phase, Phase::Exited) {
+                    break;
+                }
+                phase = Phase::Detached { since: Instant::now() };
+            }
             _ = pending_input_retry(!pending.is_empty()) => {}
             // A program may turn echo off without writing anything (a password prompt printed
             // first): the client hears of it within a tick.
             _ = tty_tick.tick(), if running => {
-                if ended.is_some() && exit.is_none() {
-                    exit = exit_of(&mut host);
-                }
+                exit = exit.or_else(|| exit_of(&mut host));
                 if matches!(phase, Phase::Attached) && host.refresh_tty() && !hold.holding() {
                     screens_tx.send_replace(Arc::new(host.snapshot()));
                 }
@@ -452,8 +456,9 @@ async fn session_task(
     }
 
     // Ended: the registry sees the closed control channel, clients their closed screens and input.
+    // The teardown is awaited, so the registry's shutdown waits for every program's hang-up.
     drop((control, screens_tx, input_rx));
-    tokio::task::spawn_blocking(move || host.shutdown());
+    let _ = tokio::task::spawn_blocking(move || host.shutdown()).await;
 }
 
 /// A short wait before retrying pending keystrokes; never, with none pending.
@@ -560,7 +565,7 @@ mod tests {
             bytes: b"typed".to_vec(),
             ..PendingInput::default()
         };
-        pending.flush_with(|bytes| Err(crate::pty::WriteError::Full(bytes)));
+        pending.flush(|bytes| Err(crate::pty::WriteError::Full(bytes)));
         pending.reply(b"\x1b[1;1R");
         pending.reply(b"\x1b[48;24;80;0;0t");
         let expected = pending.bytes.clone();
@@ -573,20 +578,20 @@ mod tests {
         );
         assert!(pending.overflow_reported);
         let pointer = pending.bytes.as_ptr();
-        pending.flush_with(|bytes| Err(crate::pty::WriteError::Full(bytes)));
+        pending.flush(|bytes| Err(crate::pty::WriteError::Full(bytes)));
         assert_eq!(
             pending.bytes.as_ptr(),
             pointer,
             "backpressure retains the buffer"
         );
-        pending.flush_with(|bytes| {
+        pending.flush(|bytes| {
             assert_eq!(bytes, b"typed\x1b[1;1R\x1b[48;24;80;0;0t");
             Ok(())
         });
         assert!(pending.is_empty());
         assert!(!pending.overflow_reported);
         pending.reply(b"next");
-        pending.flush_with(|bytes| Err(crate::pty::WriteError::Closed(bytes)));
+        pending.flush(|bytes| Err(crate::pty::WriteError::Closed(bytes)));
         assert!(
             pending.is_empty(),
             "closed writers do not retain pending input"

@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
-use tokio::signal::unix::SignalKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::audit::{auth_event, Outcome};
@@ -176,12 +175,14 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     );
 
     let shutdown = CancellationToken::new();
-    crate::cancel_on_signals(
-        &shutdown,
-        &[SignalKind::terminate(), SignalKind::interrupt()],
-    )
-    .context("installing the signal handlers")?;
-    serve_endpoint(endpoint, hosting, shutdown).await
+    let again = crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
+    tokio::select! {
+        served = serve_endpoint(endpoint, hosting, shutdown) => served,
+        () = again.cancelled() => {
+            warn!("a second signal: exiting without waiting for the sessions to end");
+            Ok(())
+        }
+    }
 }
 
 /// Who may connect: the ids allowed for this run, and the clients saved beside the server key,
@@ -361,10 +362,11 @@ pub async fn serve_endpoint(
         });
     }
 
-    // Sessions first, then the endpoint.
+    // Sessions first, with their programs reaped (or killed after their grace), then the endpoint.
     info!("draining: stopping the registry and closing endpoint");
     shutdown.cancel();
     registry.shutdown().await;
+    let _ = tokio::task::spawn_blocking(crate::pty::drain_reaper).await;
     if !crate::transport_iroh::close_endpoint(&endpoint).await {
         warn!("peers did not see the endpoint close in time; exiting anyway");
     }

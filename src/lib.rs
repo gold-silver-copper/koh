@@ -30,22 +30,31 @@ pub mod transport_iroh;
 #[cfg(test)]
 mod test_runtime;
 
-/// Cancel `token` on the first of `signals` that arrives, so `koh serve` drains and `koh connect`
-/// restores the terminal instead of the process dying where it stands. Fails only if a handler
-/// cannot be installed.
+/// Cancel `token` on the first SIGTERM, SIGINT or SIGHUP, so `koh serve` drains and `koh connect`
+/// restores the terminal instead of the process dying where it stands; the token returned is
+/// cancelled on the next, when waiting longer is not wanted. Fails only if a handler cannot be
+/// installed.
 pub(crate) fn cancel_on_signals(
     token: &tokio_util::sync::CancellationToken,
-    signals: &[tokio::signal::unix::SignalKind],
-) -> std::io::Result<()> {
-    for &kind in signals {
+) -> std::io::Result<tokio_util::sync::CancellationToken> {
+    use tokio::signal::unix::SignalKind;
+    let again = tokio_util::sync::CancellationToken::new();
+    for kind in [
+        SignalKind::terminate(),
+        SignalKind::interrupt(),
+        SignalKind::hangup(),
+    ] {
         let mut signal = tokio::signal::unix::signal(kind)?;
-        let token = token.clone();
+        let (token, again) = (token.clone(), again.clone());
         #[expect(clippy::disallowed_methods, reason = "one task a signal kind")]
         tokio::spawn(async move {
-            if signal.recv().await.is_some() {
+            while signal.recv().await.is_some() {
+                if token.is_cancelled() {
+                    again.cancel();
+                }
                 token.cancel();
             }
         });
     }
-    Ok(())
+    Ok(again)
 }

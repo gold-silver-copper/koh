@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fuxix::poll::{Events, PollFd};
@@ -262,16 +262,22 @@ impl Running {
 
     /// Hang up, as a terminal closing does, and leave it to `reaper`, which kills it if it
     /// outlives [`HANGUP_GRACE`].
-    fn hang_up(self, reaper: &Sender<Stopping>) {
+    fn hang_up(self, reaper: &Sender<Reap>) {
         let _ = self.signal(Signal::Hup);
         let kill_at = std::time::Instant::now().checked_add(HANGUP_GRACE);
-        if let Err(error) = reaper.send(Stopping {
+        if let Err(error) = reaper.send(Reap::Child(Stopping {
             running: self,
             kill_at,
-        }) {
+        })) {
             tracing::error!(%error, "PTY child reaper stopped unexpectedly");
         }
     }
+}
+
+/// What the reaper is given: a hung-up program, or someone waiting until none is left.
+enum Reap {
+    Child(Stopping),
+    Drain(Sender<()>),
 }
 
 /// A hung-up program, waited for until reaped, and killed at `kill_at`.
@@ -281,7 +287,8 @@ struct Stopping {
 }
 
 impl Stopping {
-    /// Whether it is reaped; killed first if its grace is over.
+    /// Whether it is reaped, or cannot be waited for (no retry would change that); killed first if
+    /// its grace is over.
     fn reaped(&mut self) -> bool {
         if self
             .kill_at
@@ -293,44 +300,73 @@ impl Stopping {
         match self.running.try_wait() {
             Ok(exit) => exit.is_some(),
             Err(error) => {
-                tracing::warn!(%error, "could not reap PTY child; retrying");
-                false
+                tracing::warn!(%error, "could not reap PTY child");
+                true
             }
         }
     }
 }
 
+/// The process's one reaper, once started.
+static REAPER: Mutex<Option<Sender<Reap>>> = Mutex::new(None);
+
 /// The thread that reaps hung-up programs, polling them all, so one that does not exit delays
-/// none of the others. Started before any child, so failing to start it orphans none.
-fn reaper() -> io::Result<Sender<Stopping>> {
-    static REAPER: OnceLock<io::Result<Sender<Stopping>>> = OnceLock::new();
-    REAPER
-        .get_or_init(|| {
-            let (tx, rx) = channel::<Stopping>();
-            std::thread::Builder::new()
-                .name("koh-child-reaper".into())
-                .spawn(move || {
-                    let mut children: Vec<Stopping> = Vec::new();
-                    loop {
-                        let received = if children.is_empty() {
-                            rx.recv()
-                                .map_err(|_closed| std::sync::mpsc::RecvTimeoutError::Disconnected)
-                        } else {
-                            rx.recv_timeout(Duration::from_millis(20))
-                        };
-                        match received {
-                            Ok(child) => children.push(child),
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                        }
-                        children.retain_mut(|child| !child.reaped());
+/// none of the others. Started before any child, so failing to start it orphans none, and tried
+/// again by the next child.
+fn reaper() -> io::Result<Sender<Reap>> {
+    let mut reaper = REAPER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(tx) = reaper.as_ref() {
+        return Ok(tx.clone());
+    }
+    let (tx, rx) = channel::<Reap>();
+    std::thread::Builder::new()
+        .name("koh-child-reaper".into())
+        .spawn(move || {
+            let mut children: Vec<Stopping> = Vec::new();
+            let mut drains: Vec<Sender<()>> = Vec::new();
+            loop {
+                let received = if children.is_empty() {
+                    rx.recv()
+                        .map_err(|_closed| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                } else {
+                    rx.recv_timeout(Duration::from_millis(20))
+                };
+                match received {
+                    Ok(Reap::Child(child)) => children.push(child),
+                    Ok(Reap::Drain(done)) => drains.push(done),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                children.retain_mut(|child| !child.reaped());
+                if children.is_empty() {
+                    for done in std::mem::take(&mut drains) {
+                        let _ = done.send(());
                     }
-                })?;
-            Ok(tx)
-        })
-        .as_ref()
-        .cloned()
-        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+                }
+            }
+        })?;
+    *reaper = Some(tx.clone());
+    Ok(tx)
+}
+
+/// Wait until every hung-up program is reaped, each killed once its grace is over.
+///
+/// For before the process exits, which would leave one that ignores SIGHUP running. Blocks for at
+/// most a little over [`HANGUP_GRACE`].
+pub fn drain_reaper() {
+    let Some(reaper) = REAPER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    else {
+        return;
+    };
+    let (done, drained) = channel();
+    if reaper.send(Reap::Drain(done)).is_ok() {
+        let _ = drained.recv_timeout(HANGUP_GRACE.saturating_mul(2));
+    }
 }
 
 /// The pump threads, stopped when this drops: also before the [`Pty`] exists, on a failed start.
@@ -356,7 +392,7 @@ pub struct Pty {
     write_budget: Arc<AtomicUsize>,
     /// The program, until reaped.
     running: Option<Running>,
-    reaper: Sender<Stopping>,
+    reaper: Sender<Reap>,
     pumps: Pumps,
 }
 
@@ -542,7 +578,7 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        self.pumps.stopping.store(true, Ordering::SeqCst);
+        // The pumps stop as `pumps` drops.
         if let Some(running) = self.running.take() {
             running.hang_up(&self.reaper);
         }

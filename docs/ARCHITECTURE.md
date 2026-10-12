@@ -424,7 +424,10 @@ its shell exited, even while an old client still holds on (that client's screens
 the reconnect gets a new session). Its life is one `Phase` (attached,
   detached since when, exited), and an exited session is never reattached, even while an old
   client still holds on. A connection's final frame is the first one whose screen carries the exit
-  code. The registry's `Sessions` forgets a session only once its task has
+  code, and an ended session always has one: its exit is looked for at every tick, not only once
+  its terminal closed, and a program that closed its terminal and ran on ends it as hung up (129),
+  which teardown makes true. Teardown is awaited, and `serve` drains the reaper before it exits,
+  so a program that ignores SIGHUP is killed rather than left running. The registry's `Sessions` forgets a session only once its task has
   ended (its control channel is closed), so a late end cannot unregister the session that replaced
   it, and its shutdown ends every session, attached or not, and waits for their tasks.
 - **The bell hook.** `--on-bell <cmd>` / `ConnectConfig::bell_command` runs `sh -c` when
@@ -446,7 +449,19 @@ driving a real terminal, and the predictor reads screens through `predict::Scree
 ## Security internals
 
 The trust boundaries and the defenses at each are in the [threat model](THREAT_MODEL.md); each
-finding fixed, with the tests that guard it, is in [SECURITY.md](../SECURITY.md).
+finding fixed, with the tests that guard it, is in [SECURITY.md](../SECURITY.md). Two rules hold by
+construction rather than by care at each call:
+
+- **What a peer chose is escaped where it is written.** koh writes outside the session only to its
+  stderr and its log. `log::stderr` takes only `log::Clean` text, `std::io::stderr` is banned
+  elsewhere (`clippy.toml`), and the log's writer escapes control characters inside each event. An
+  error chain holding a server's close reason, or a log field holding a client's, can't reach a
+  terminal or forge a line.
+- **What a server makes the client keep is bounded by bytes, and asked for.** The history cache
+  counts each row's links and overhead (`KeptRow::bytes`) against `HISTORY_CACHE_BYTES`, and keeps
+  only rows the oldest outstanding request covers. A frame's rows are strictly ascending, and its
+  dictionary is built from the end, stopping at its window. Frame readers take their slot in the
+  frame queue before reading, so streams read and frames waiting share one bound.
 
 ## Testing tiers
 

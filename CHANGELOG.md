@@ -37,6 +37,20 @@ binary, its tests and the fuzz targets share code, and any release may change it
   comparison on each change and longer corpus/planted-bug checks weekly.
 
 ### Fixed
+- A hostile server's close reason reached the user's terminal raw when the first connection was
+  refused (writing the clipboard despite `--no-clipboard`); stderr and every log line now escape
+  control characters, and log lines are uncoloured.
+- A hostile server could make the client hold gigabytes of history through link text and
+  unrequested replies, or build a dictionary of one row a thousand times per frame.
+- A program that closed its terminal and kept running left its client waiting forever; a
+  program that ignores SIGHUP outlived `koh serve`. `koh serve` handles SIGHUP, and a second
+  signal stops it waiting.
+- `koh clients rm` left the removed client's live connection open; a refused redial retried
+  forever.
+- Another local user could hang koh by locking its key directory; the menu's replace could lose
+  the saved name; `koh serve --key-file` needed `$HOME`; with `--max-connections` up to 4, stalled
+  handshakes could hold every slot.
+- A test typed a wrong password into the real `sudo` and `passwd`.
 - A program that stopped reading its input, under a large paste, froze its connection's frames,
   and a client that left meanwhile kept its session attached and its connection slot held.
 - Frames a client never took made the server's list of frames in flight grow for good.

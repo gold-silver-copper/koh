@@ -23,7 +23,7 @@ SPID="$(server_pid)"
 # POSIX has the kernel DISCARD the self-SIGTSTP (it doesn't stop). So on-device we assert the suspend
 # CODE PATH ran (it hands the terminal back and prints the suspend notice); the kernel-stop + resume
 # is covered by the in-process unit tests.
-HLOG="/tmp/koh-sig-a-$$.log"; : > "$HLOG"
+HLOG="$HOST_TMP/koh-sig-a-$$.log"; : > "$HLOG"
 ( sleep 5; printf '\036\032'; sleep 8; printf '\036.'; sleep 2 ) \
   | to 30 adb $ADB_SERIAL shell -t -t \
       "$KENV $DEVICE_BIN connect $SERVER_ID --direct 127.0.0.1:$SERVER_PORT --key-file /data/local/tmp/koh-siga.key" \
@@ -53,7 +53,7 @@ start_server "" || { bad "server failed to restart for part (b)"; finish "stress
 SPID="$(server_pid)"
 
 # --- (b) SIGTERM graceful shutdown ------------------------------------------------------------------
-HLOGB="/tmp/koh-sig-b-$$.log"
+HLOGB="$HOST_TMP/koh-sig-b-$$.log"
 pty_connect_host_bg /data/local/tmp/koh-sigb.key "$HLOGB" 30 ""
 w=0; C2=""
 while [ "$w" -lt 12 ]; do C2="$(other_pid "$SPID")"; [ -n "$C2" ] && break; w=$((w + 1)); sleep 1; done

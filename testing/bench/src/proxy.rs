@@ -48,20 +48,7 @@ pub struct Counts {
 #[derive(Default)]
 struct State {
     counts: Counts,
-    rng: u64,
-}
-
-impl State {
-    /// True with probability `p`, from a seeded sequence (splitmix64).
-    fn chance(&mut self, p: f64) -> bool {
-        self.rng = self.rng.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.rng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        let unit = f64::from(u32::try_from(z >> 32).unwrap_or(u32::MAX)) / 4_294_967_296.0;
-        unit < p
-    }
+    rng: koh_testkit::Rng,
 }
 
 /// A running proxy: the address clients dial, and its counts.
@@ -85,7 +72,7 @@ impl Proxy {
         let inner = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         inner.connect(server).await?;
         let state = Arc::new(Mutex::new(State {
-            rng: seed,
+            rng: koh_testkit::Rng(seed),
             ..State::default()
         }));
         let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
@@ -99,7 +86,7 @@ impl Proxy {
                     let data = buf.get(..len).unwrap_or_default().to_vec();
                     {
                         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-                        if state.chance(profile.loss) {
+                        if state.rng.chance(profile.loss) {
                             continue;
                         }
                         state.counts.to_server.add(len);
@@ -124,7 +111,7 @@ impl Proxy {
                     let data = buf.get(..len).unwrap_or_default().to_vec();
                     {
                         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-                        if state.chance(profile.loss) {
+                        if state.rng.chance(profile.loss) {
                             continue;
                         }
                         state.counts.to_client.add(len);

@@ -1,8 +1,10 @@
-//! What koh writes outside the session: its stderr and its log.
+//! What koh writes outside the session, its stderr and its log, through one sink.
 //!
-//! Both may carry text a peer chose (a close reason inside an error, a client's stream error), so
-//! both escape control characters where they are written, whatever the caller formatted: [`Clean`]
-//! is the only text [`stderr`] takes, and every log line is escaped by its writer.
+//! A line is built whole, then written with one write, so lines from several threads never
+//! interleave. Text is koh's own, or a peer's: a peer's is wrapped in [`Peer`], which shows it as
+//! one line of printable ASCII. Whoever wrote it, every control character in a line, and every
+//! bidi control, is escaped where the line is written, so nothing can move the cursor, set a mode,
+//! write the clipboard, reorder what is shown, or start a line of its own in a log.
 //! `std::io::stderr` is banned elsewhere.
 //!
 //! The log is `RUST_LOG` as `target=level` directives and bare levels, else koh's own targets at a
@@ -15,47 +17,50 @@ use tracing::Level;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::MakeWriter;
 
-/// Text with every control character but newline escaped (`\u{1b}`): it cannot move the cursor,
-/// set a mode, write the clipboard or start a line in a log, whoever wrote it.
-pub struct Clean(String);
+/// Text a peer chose (a close reason inside an error, a stream error), shown as one line of
+/// printable ASCII: anything else, newlines and every non-ASCII character among it, is escaped.
+pub struct Peer<T>(pub T);
 
-impl Clean {
-    /// `text`, escaped.
-    pub fn new(text: impl fmt::Display) -> Self {
-        Self(escape(&text.to_string(), true))
-    }
-}
-
-impl fmt::Display for Clean {
+impl<T: fmt::Display> fmt::Display for Peer<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        for c in self.0.to_string().chars() {
+            if c == ' ' || c.is_ascii_graphic() {
+                f.write_fmt(format_args!("{c}"))?;
+            } else {
+                f.write_fmt(format_args!("{}", c.escape_default()))?;
+            }
+        }
+        Ok(())
     }
 }
 
-/// `text` with control characters escaped, newlines too unless `keep_newlines`.
-fn escape(text: &str, keep_newlines: bool) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() && !(keep_newlines && c == '\n') {
-                c.escape_default().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
+/// `text` as one line, or as lines if `lines`, ending in a newline: every control character but
+/// those newlines, and every bidi control, escaped.
+fn line(text: &str, lines: bool) -> String {
+    let bidi = |c: char| matches!(c, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let mut out = String::with_capacity(text.len().saturating_add(1));
+    for c in text.chars() {
+        if (c.is_control() && !(lines && c == '\n')) || bidi(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\n');
+    out
 }
 
-/// Write `text` and a newline to stderr: the only way koh writes there.
-pub fn stderr(text: &Clean) {
+/// Write `text`, koh's own (a peer's part in [`Peer`]), and a newline to stderr in one write: the
+/// only way koh writes there.
+pub fn stderr(text: impl fmt::Display) {
     #[expect(clippy::disallowed_methods, reason = "the one writer to stderr")]
     let mut err = std::io::stderr().lock();
-    let _ = writeln!(err, "{text}");
+    let _ = err.write_all(line(&text.to_string(), true).as_bytes());
 }
 
-/// Install the global subscriber: formatted events to `writer`, filtered by [`targets`].
-///
-/// A no-op if one is installed already. Uncoloured: the writer escapes every control character in
-/// an event, so a field cannot forge a line or reach the terminal the log is read on.
+/// Install the global subscriber: formatted events to `writer`, one line each, filtered by
+/// [`targets`]. A no-op if one is installed already. Uncoloured: the writer escapes every control
+/// character in an event.
 pub fn init<W>(writer: W, default: Level)
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
@@ -66,7 +71,7 @@ where
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(Escaping(writer)),
+                .with_writer(Lines(writer)),
         )
         .with(targets(default))
         .try_init();
@@ -74,30 +79,30 @@ where
 
 /// Log to stderr.
 pub fn init_stderr(default: Level) {
-    #[expect(clippy::disallowed_methods, reason = "the log's writer, which escapes")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the log's writer, one line a write"
+    )]
     init(std::io::stderr, default);
 }
 
-/// A log writer that escapes control characters in each event but its closing newline. The
-/// formatter writes an event in one piece, so a field's newline is escaped, not a line break.
-struct Escaping<M>(M);
+/// A log writer that writes each event as one line in one write. The formatter writes an event in
+/// one piece, so a field's newline is escaped, not a line break.
+struct Lines<M>(M);
 
-impl<'w, M: MakeWriter<'w>> MakeWriter<'w> for Escaping<M> {
-    type Writer = Escaping<M::Writer>;
+impl<'w, M: MakeWriter<'w>> MakeWriter<'w> for Lines<M> {
+    type Writer = Lines<M::Writer>;
 
     fn make_writer(&'w self) -> Self::Writer {
-        Escaping(self.0.make_writer())
+        Lines(self.0.make_writer())
     }
 }
 
-impl<W: std::io::Write> std::io::Write for Escaping<W> {
+impl<W: std::io::Write> std::io::Write for Lines<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let text = String::from_utf8_lossy(buf);
-        let (line, end) = text
-            .strip_suffix('\n')
-            .map_or_else(|| (text.as_ref(), ""), |line| (line, "\n"));
-        self.0.write_all(escape(line, false).as_bytes())?;
-        self.0.write_all(end.as_bytes())?;
+        let event = text.strip_suffix('\n').unwrap_or(&text);
+        self.0.write_all(line(event, false).as_bytes())?;
         Ok(buf.len())
     }
 
@@ -127,26 +132,51 @@ fn targets_from(spec: Option<&str>, default: Level) -> Targets {
 mod tests {
     use super::*;
 
+    const HOSTILE: &str =
+        "refused\u{1b}]52;c;aGk=\u{7}\nkoh::auth outcome=\"accepted\"\u{9b}2J\u{202e}gnp.exe";
+
     #[test]
-    fn controls_are_escaped_on_stderr_and_in_log_lines() {
-        let hostile = "refused\u{1b}]52;c;aGk=\u{7}\nkoh::auth outcome=\"accepted\"\u{9b}2J";
-        let shown = Clean::new(hostile).to_string();
+    fn a_peers_text_is_one_line_of_printable_ascii() {
+        let shown = Peer(HOSTILE).to_string();
         assert!(
-            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            shown.chars().all(|c| c == ' ' || c.is_ascii_graphic()),
             "{shown:?}"
         );
-        assert!(shown.contains("\\u{1b}]52"), "{shown:?}");
-
-        let mut out = Vec::new();
-        let mut log = Escaping(&mut out);
-        std::io::Write::write_all(&mut log, format!("WARN x: {hostile}\n").as_bytes()).unwrap();
-        let line = String::from_utf8(out).unwrap();
-        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
-        assert!(line.ends_with('\n'));
         assert!(
-            !line.chars().any(|c| c.is_control() && c != '\n'),
-            "{line:?}"
+            shown.contains("\\u{1b}]52") && shown.contains("\\u{202e}"),
+            "{shown:?}"
         );
+    }
+
+    #[test]
+    fn a_log_line_is_written_whole_in_one_write() {
+        /// Each write it is given, apart.
+        #[derive(Default)]
+        struct Writes(Vec<Vec<u8>>);
+        impl std::io::Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut log = Lines(Writes::default());
+        log.write_all(format!("WARN x: {HOSTILE}\n").as_bytes())
+            .unwrap();
+        let [written] = &log.0 .0[..] else {
+            panic!("{} writes", log.0 .0.len());
+        };
+        let written = String::from_utf8(written.clone()).unwrap();
+        assert_eq!(written.matches('\n').count(), 1, "{written:?}");
+        assert!(written.ends_with('\n'));
+        assert!(
+            !written.contains(['\u{1b}', '\u{9b}', '\u{202e}']),
+            "{written:?}"
+        );
+        // koh's own lines on stderr keep their breaks, and nothing else.
+        assert_eq!(line("a\nb\u{1b}", true), "a\nb\\u{1b}\n");
     }
 
     #[test]

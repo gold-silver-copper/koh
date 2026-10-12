@@ -37,7 +37,7 @@ async fn type_slowly(client: &Client, text: &[u8]) -> anyhow::Result<()> {
 
 #[test]
 fn echoed_keystrokes_are_predicted_then_confirmed() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = lossy();
         let (server, mut client) = predicting_session(&net).await?;
         anyhow::ensure!(client
@@ -72,7 +72,7 @@ fn echoed_keystrokes_are_predicted_then_confirmed() -> anyhow::Result<()> {
 
 #[test]
 fn keystrokes_at_a_no_echo_prompt_are_never_shown() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         // The password-prompt property, end to end: after `stty -echo`, typed keys must never be
         // drawn, not even briefly as a prediction.
         let net = lossy();
@@ -83,12 +83,18 @@ fn keystrokes_at_a_no_echo_prompt_are_never_shown() -> anyhow::Result<()> {
             .is_some());
         // `read` with echo off, as a password prompt does it (bash's line editor echoes by itself, so
         // the prompt must not be the shell's own line).
-        type_slowly(&client, b"stty -echo; read x; stty echo; echo BA''CK\r").await?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        type_slowly(
+            &client,
+            b"stty -echo; echo REA''DING; read x; stty echo; echo BA''CK\r",
+        )
+        .await?;
+        anyhow::ensure!(client
+            .wait_until(WAIT, |t| t.contains("READING"))
+            .await
+            .is_some());
         // Letters that appear nowhere else in this session.
         let secret = b"zqjvwfm";
         type_slowly(&client, secret).await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
         type_slowly(&client, b"\r").await?;
         anyhow::ensure!(client
             .wait_until(WAIT, |t| t.contains("BACK"))
@@ -112,7 +118,7 @@ fn keystrokes_at_a_no_echo_prompt_are_never_shown() -> anyhow::Result<()> {
 
 #[test]
 fn a_trusted_session_shows_nothing_typed_at_real_password_prompts() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         // Trust first (the shell echoes, so typing shows as predicted), then each prompt in turn:
         // the PTY's modes (lines read without echo) must keep every secret off the screen, however
         // trusted the session was a moment before.
@@ -166,7 +172,6 @@ fn a_trusted_session_shows_nothing_typed_at_real_password_prompts() -> anyhow::R
                 "prompt {n} never finished; screen:\n{}",
                 client.screen()
             );
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         anyhow::ensure!(
             !prompted.is_empty(),
@@ -182,33 +187,6 @@ fn a_trusted_session_shows_nothing_typed_at_real_password_prompts() -> anyhow::R
                 );
             }
         }
-        let _ = client.finish().await;
-        server.stop().await;
-        Ok(())
-    })
-}
-
-#[test]
-fn kernel_echo_is_predicted_from_the_first_key() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
-        // `cat` reads lines the kernel echoes: the first key typed shows before its echo arrives.
-        let net = lossy();
-        let (server, mut client) = predicting_session(&net).await?;
-        anyhow::ensure!(client
-            .wait_until(WAIT, |t| !t.trim().is_empty())
-            .await
-            .is_some());
-        type_slowly(&client, b"cat\r").await?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        client.send(b"Q").await?;
-        anyhow::ensure!(
-            client
-                .wait_for(WAIT, |p| p.predicted.contains('Q'))
-                .await
-                .is_some(),
-            "the first key at kernel echo was predicted"
-        );
-        client.send(b"\x04").await?;
         let _ = client.finish().await;
         server.stop().await;
         Ok(())

@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn an_unconfirmed_reset_creates_and_judges_nothing() {
-        let root = std::env::temp_dir().join(format!("koh-keycmd-{}", std::process::id()));
+        let root = crate::test_runtime::scratch("keycmd");
         let missing = root.join("newdir");
         let error = run(&KeyConfig {
             op: KeyOp::Reset { confirmed: false },
@@ -167,12 +167,11 @@ mod tests {
             !missing.exists(),
             "an unconfirmed reset created the key's directory"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn info_on_a_missing_key_creates_nothing() {
-        let root = std::env::temp_dir().join(format!("koh-keycmd-info-{}", std::process::id()));
+        let root = crate::test_runtime::scratch("keycmd-info");
         let missing = root.join("newdir");
         let error = run(&KeyConfig {
             op: KeyOp::Info,
@@ -182,7 +181,7 @@ mod tests {
         })
         .expect_err("there is no key");
         assert!(format!("{error:#}").contains("run `koh id`"), "{error:#}");
-        assert!(!root.exists(), "info created the key's directory");
+        assert!(!missing.exists(), "info created the key's directory");
     }
 
     #[test]

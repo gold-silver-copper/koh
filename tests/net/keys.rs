@@ -16,20 +16,14 @@ fn clean() -> FaultNet {
 /// it as different keys from a terminal that tells them apart (a kitty-protocol terminal sends
 /// `CSI 105 ; 5 u`), and Tab is Tab from one that does not.
 #[test]
+#[ignore = "needs nvim 0.10 or later; CI runs it on macOS: cargo test --test net -- --ignored nvim"]
 fn nvim_tells_ctrl_i_from_tab_from_a_kitty_terminal() {
-    if crate::spawn::command("nvim")
+    koh_testkit::command("nvim")
         .expect("nvim may be run")
         .arg("--version")
         .output()
-        .is_err()
-    {
-        #[expect(clippy::disallowed_macros, reason = "says the test was skipped")]
-        {
-            eprintln!("nvim is not installed; skipped");
-        }
-        return;
-    }
-    crate::harness::runtime()
+        .expect("nvim is installed");
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();
@@ -104,7 +98,7 @@ fn nvim_tells_ctrl_i_from_tab_from_a_kitty_terminal() {
 /// `CSI 97 ; 5 u`, as it asked.
 #[test]
 fn a_reattach_from_a_legacy_terminal_keeps_the_programs_keyboard() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = clean();

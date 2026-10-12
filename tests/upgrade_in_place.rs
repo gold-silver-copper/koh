@@ -2,19 +2,13 @@
 //! sessions: on Linux it launches them from its own image, `/proc/self/exe`, not from the path it
 //! was started from.
 #![cfg(target_os = "linux")]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::disallowed_methods, reason = "tests spawn freely")
-)]
+#![forbid(clippy::disallowed_methods)]
 
-mod spawn;
-
-use std::io::{BufRead as _, BufReader};
 use std::process::Stdio;
-use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use koh::pty::{Launcher, Pty};
+use koh_testkit::{command, Capture};
 
 /// The endpoint id and port a `koh serve --local` prints: `connect : koh connect ID --direct
 /// <this-host-ip>:PORT`.
@@ -28,108 +22,73 @@ fn parse_connect_hint(line: &str) -> Option<(String, String)> {
 
 #[test]
 fn a_server_whose_binary_was_removed_still_starts_sessions() {
-    runtime().expect("tokio runtime").block_on(async {
-        let dir = std::env::temp_dir().join(format!("koh-upgrade-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).expect("temp dir");
-        let installed = dir.join("koh");
-        std::fs::copy(env!("CARGO_BIN_EXE_koh"), &installed).expect("install a copy of koh");
-        let client_key = dir.join("client.key");
-        let id = spawn::command(env!("CARGO_BIN_EXE_koh"))
-            .expect("spawn koh")
-            .arg("id")
-            .arg("--key-file")
-            .arg(&client_key)
-            .output()
-            .expect("koh id");
-        let client_id = String::from_utf8_lossy(&id.stdout).trim().to_owned();
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let dir = koh_testkit::scratch!("upgrade").expect("a scratch directory");
+            let installed = dir.join("koh");
+            std::fs::copy(env!("CARGO_BIN_EXE_koh"), &installed).expect("install a copy of koh");
+            let client_key = dir.join("client.key");
+            let id = command(env!("CARGO_BIN_EXE_koh"))
+                .expect("spawn koh")
+                .arg("id")
+                .arg("--key-file")
+                .arg(&client_key)
+                .output()
+                .expect("koh id");
+            let client_id = String::from_utf8_lossy(&id.stdout).trim().to_owned();
 
-        let mut server = spawn::command(&installed)
-            .expect("spawn koh")
-            .args(["serve", "--local", "--allow", &client_id, "--shell", "sh"])
-            .arg("--key-file")
-            .arg(dir.join("server.key"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start koh serve");
-        // Keep draining the server's stderr (its logs), and pick the connect hint out of it.
-        let (hints, hint) = mpsc::channel();
-        let stderr = server.stderr.take().expect("server stderr");
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Some(found) = parse_connect_hint(&line) {
-                    let _ = hints.send(found);
-                }
-            }
+            let mut server = command(&installed)
+                .expect("spawn koh")
+                .args(["serve", "--local", "--allow", &client_id, "--shell", "sh"])
+                .arg("--key-file")
+                .arg(dir.join("server.key"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start koh serve");
+            // Pick the connect hint out of the server's logs.
+            let logs = koh_testkit::stderr_lines(&mut server);
+            let (server_id, port) =
+                std::iter::from_fn(|| logs.recv_timeout(Duration::from_secs(30)).ok())
+                    .find_map(|line| parse_connect_hint(&line))
+                    .expect("koh serve prints how to connect");
+
+            // The upgrade: the file the server was started from is gone.
+            std::fs::remove_file(&installed).expect("remove the installed binary");
+
+            let (client, output) = Pty::spawn(
+                24,
+                80,
+                &[
+                    env!("CARGO_BIN_EXE_koh").to_owned(),
+                    "connect".to_owned(),
+                    server_id,
+                    "--direct".to_owned(),
+                    format!("127.0.0.1:{port}"),
+                    "--key-file".to_owned(),
+                    client_key.display().to_string(),
+                ],
+                "xterm-256color",
+                &Launcher::new(env!("CARGO_BIN_EXE_koh")),
+                &koh::pty::Reaper::start().expect("reaper"),
+            )
+            .expect("spawn the client");
+            let seen = Capture::new(output);
+            // Only the remote shell turns `$((6*7))` into 42.
+            let up = seen
+                .type_until(0, "up_42", 15, || {
+                    let _ = client.write(b"echo up_$((6*7))\r".to_vec());
+                })
+                .await;
+
+            let _ = client.write(vec![0x1e, b'.']);
+            drop(client);
+            let _ = server.kill();
+            let _ = server.wait();
+            up.unwrap_or_else(|e| {
+                panic!("no session started after the server's binary was removed: {e}")
+            });
         });
-        let (server_id, port) = hint
-            .recv_timeout(Duration::from_secs(30))
-            .expect("koh serve prints how to connect");
-
-        // The upgrade: the file the server was started from is gone.
-        std::fs::remove_file(&installed).expect("remove the installed binary");
-
-        let (client, mut output) = Pty::spawn(
-            24,
-            80,
-            &[
-                env!("CARGO_BIN_EXE_koh").to_owned(),
-                "connect".to_owned(),
-                server_id,
-                "--direct".to_owned(),
-                format!("127.0.0.1:{port}"),
-                "--key-file".to_owned(),
-                client_key.display().to_string(),
-            ],
-            "xterm-256color",
-            &Launcher::new(env!("CARGO_BIN_EXE_koh")),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn the client");
-        let seen = Arc::new(Mutex::new(String::new()));
-        let sink = seen.clone();
-        tokio::spawn(async move {
-            while let Some(chunk) = output.recv().await {
-                if let Ok(mut all) = sink.lock() {
-                    all.push_str(&String::from_utf8_lossy(&chunk));
-                }
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(2000)).await;
-        // Only the remote shell turns `$((6*7))` into 42.
-        client
-            .write(b"echo up_$((6*7))\r".to_vec())
-            .expect("type into the session");
-        let mut up = false;
-        for _ in 0..150 {
-            if seen.lock().is_ok_and(|all| all.contains("up_42")) {
-                up = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        let _ = client.write(vec![0x1e, b'.']);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        drop(client);
-        let _ = server.kill();
-        let _ = server.wait();
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            up,
-            "no session started after the server's binary was removed; the client saw:\n{}",
-            seen.lock().map(|all| all.clone()).unwrap_or_default()
-        );
-    });
-}
-
-/// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
-fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
 }

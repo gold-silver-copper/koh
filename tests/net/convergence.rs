@@ -43,6 +43,7 @@ async fn converges(profile: Profile, seed: u64, outage: bool) -> anyhow::Result<
         .is_some());
     client.send(b"clear; seq 1 30''00; echo E''ND\r").await?;
     if outage {
+        // Fault timing, not a wait: the outage starts while the output is still streaming.
         tokio::time::sleep(Duration::from_millis(50)).await;
         net.black_hole(Duration::from_secs(2));
     }
@@ -72,7 +73,7 @@ async fn converges(profile: Profile, seed: u64, outage: bool) -> anyhow::Result<
 
 #[test]
 fn the_screen_converges_on_a_clean_link() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         for seed in 1..=3 {
             converges(Profile::default(), seed, false).await?;
         }
@@ -82,7 +83,7 @@ fn the_screen_converges_on_a_clean_link() -> anyhow::Result<()> {
 
 #[test]
 fn the_screen_converges_under_light_loss() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         for seed in 1..=3 {
             converges(lossy(), seed, false).await?;
         }
@@ -92,7 +93,7 @@ fn the_screen_converges_under_light_loss() -> anyhow::Result<()> {
 
 #[test]
 fn the_screen_converges_under_heavy_loss_jitter_duplication_and_reordering() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         for seed in 1..=3 {
             converges(bad(), seed, false).await?;
         }
@@ -102,7 +103,7 @@ fn the_screen_converges_under_heavy_loss_jitter_duplication_and_reordering() -> 
 
 #[test]
 fn the_screen_converges_across_an_outage() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         for seed in 1..=3 {
             converges(Profile::default(), seed, true).await?;
         }
@@ -112,22 +113,24 @@ fn the_screen_converges_across_an_outage() -> anyhow::Result<()> {
 
 #[test]
 fn input_arrives_exactly_once_and_in_order_under_loss() -> anyhow::Result<()> {
-    crate::harness::runtime()?.block_on(async {
+    koh_testkit::multi_thread(4)?.block_on(async {
         let net = FaultNet::new(bad(), 3);
         let (server, mut client) = session(&net, &["sh"]).await?;
         anyhow::ensure!(client
             .wait_until(WAIT, |t| !t.trim().is_empty())
             .await
             .is_some());
-        let dir = std::env::temp_dir().join(format!("koh-input-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
+        let dir = koh_testkit::scratch!("input")?;
         let out = dir.join("typed.txt");
+        // The process that says READY becomes `cat`, so once it shows, typed lines go to cat's stdin,
+        // not the shell.
         client
-            .send(format!("cat > '{}'\r", out.display()).as_bytes())
+            .send(format!("(echo RE''ADY >&2; exec cat) > '{}'\r", out.display()).as_bytes())
             .await?;
-        // Let the shell start `cat` before typing lines, so they go to cat's stdin, not the shell.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        anyhow::ensure!(client
+            .wait_until(WAIT, |t| t.contains("READY"))
+            .await
+            .is_some());
         let expected: Vec<String> = (0..300).map(|i| format!("line-{i:04}")).collect();
         for line in &expected {
             client.send(format!("{line}\r").as_bytes()).await?;
@@ -149,7 +152,6 @@ fn input_arrives_exactly_once_and_in_order_under_loss() -> anyhow::Result<()> {
         );
         let _ = client.finish().await;
         server.stop().await;
-        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     })
 }

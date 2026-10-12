@@ -34,7 +34,7 @@ allow_client_key /data/local/tmp/koh-evil-witness.key
 allow_client_key /data/local/tmp/koh-evil-fresh.key
 start_server "" || { bad "server failed to start"; finish "stress-evil-peer"; }
 SPID="$(server_pid)"
-WIT="/tmp/koh-evil-witness-$$.log"
+WIT="$HOST_TMP/koh-evil-witness-$$.log"
 pty_connect_host_bg /data/local/tmp/koh-evil-witness.key "$WIT" 120 ""
 wait_attached /data/local/tmp/koh-evil-witness.key 12 || bad "the benign witness never attached"
 echo "    server pid=$SPID; benign witness attached"
@@ -216,7 +216,7 @@ stop_all_koh
 if [ -x "$EVIL_SERVER_HOST" ]; then
   for atk in bad-admit stall-admit; do
     echo "  -- malicious server: $atk (koh client must refuse)"
-    ESLOG="/tmp/koh-evilsrv-$atk-$$.log"
+    ESLOG="$HOST_TMP/koh-evilsrv-$atk-$$.log"
     ( adb $ADB_SERIAL shell "$EVIL_SERVER_DEV $atk" > "$ESLOG" 2>&1 || true ) &
     EID=""; EPORT=""; w=0
     while [ "$w" -lt 12 ]; do

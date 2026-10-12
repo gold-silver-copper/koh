@@ -587,19 +587,28 @@ mod tests {
         }
     }
 
+    /// `koh connect`'s server is a saved name or an id; clipboard writes, hyperlinks and colours
+    /// are on unless turned off, as in `ConnectConfig`'s default.
     #[test]
-    fn connect_args_map_on_bell_to_bell_command() {
-        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--on-bell", "termux-notification"])
-        else {
-            panic!("connect");
+    fn connect_takes_a_server_a_bell_command_and_turns_features_off() {
+        let connect = |argv: &[&str]| {
+            let Cmd::Connect(c) = parsed(&[&["koh", "connect"][..], argv].concat()) else {
+                panic!("connect {argv:?}");
+            };
+            c
         };
+        let c = connect(&[ID, "--on-bell", "termux-notification"]);
         assert_eq!(c.server, super::ServerRef::Id(ID.parse().unwrap()));
         assert_eq!(c.bell_command.as_deref(), Some("termux-notification"));
-        assert!(
-            c.clipboard && c.direct.is_none(),
-            "clipboard writes on by default"
-        );
-        assert!(koh::client::ConnectConfig::new(ID.parse().unwrap()).clipboard);
+        assert!(c.clipboard && c.hyperlinks && c.colours && c.direct.is_none());
+        let d = koh::client::ConnectConfig::new(ID.parse().unwrap());
+        assert!(d.clipboard && d.hyperlinks && d.colours && d.bell_command.is_none());
+        let c = connect(&["laptop"]);
+        assert_eq!(c.server, super::ServerRef::Name("laptop".to_owned()));
+        let c = connect(&[ID, "--no-hyperlinks"]);
+        assert!(c.clipboard && !c.hyperlinks && c.colours);
+        let c = connect(&[ID, "--no-colours"]);
+        assert!(c.clipboard && c.hyperlinks && !c.colours);
     }
 
     #[test]
@@ -607,37 +616,11 @@ mod tests {
         let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-clipboard"]) else {
             panic!("connect");
         };
-        assert!(!c.clipboard);
+        assert!(!c.clipboard && c.hyperlinks && c.colours);
         // The old opt-in is gone, so a script that passed it hears of it.
         assert!(command()
             .try_get_matches_from(["koh", "connect", ID, "--clipboard"])
             .is_err());
-    }
-
-    #[test]
-    fn hyperlinks_are_on_by_default_and_off_with_no_hyperlinks() {
-        let Cmd::Connect(c) = parsed(&["koh", "connect", ID]) else {
-            panic!("connect");
-        };
-        assert!(c.hyperlinks);
-        assert!(koh::client::ConnectConfig::new(ID.parse().unwrap()).hyperlinks);
-        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-hyperlinks"]) else {
-            panic!("connect");
-        };
-        assert!(!c.hyperlinks && c.clipboard);
-    }
-
-    #[test]
-    fn colours_are_told_by_default_and_not_with_no_colours() {
-        let Cmd::Connect(c) = parsed(&["koh", "connect", ID]) else {
-            panic!("connect");
-        };
-        assert!(c.colours);
-        assert!(koh::client::ConnectConfig::new(ID.parse().unwrap()).colours);
-        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-colours"]) else {
-            panic!("connect");
-        };
-        assert!(!c.colours && c.hyperlinks);
     }
 
     #[test]
@@ -688,18 +671,6 @@ mod tests {
                 "{argv:?}"
             );
         }
-    }
-
-    #[test]
-    fn connect_takes_a_saved_name_or_an_id() {
-        let Cmd::Connect(c) = parsed(&["koh", "connect", "laptop"]) else {
-            panic!("connect");
-        };
-        assert_eq!(c.server, super::ServerRef::Name("laptop".to_owned()));
-        let Cmd::Connect(c) = parsed(&["koh", "connect", ID]) else {
-            panic!("connect");
-        };
-        assert_eq!(c.server, super::ServerRef::Id(ID.parse().unwrap()));
     }
 
     #[test]

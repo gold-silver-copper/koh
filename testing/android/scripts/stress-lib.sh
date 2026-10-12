@@ -156,7 +156,7 @@ pty_connect_host_bg() {  # pty_connect_host_bg <key-file> <HOST-logfile> <hold-s
 # WITHOUT needing the client to forward typed input (which is unreliable to drive over adb's PTY).
 # Point `koh serve --shell <devpath>` at it. <body> is the script body (POSIX sh).
 push_flood_script() {  # push_flood_script <devpath> <body>
-  _tmp="/tmp/koh-flood-$$-$(echo "$1" | tr -dc 'a-zA-Z0-9').sh"
+  _tmp="$HOST_TMP/koh-flood-$$-$(echo "$1" | tr -dc 'a-zA-Z0-9').sh"
   printf '#!/system/bin/sh\n%s\n' "$2" > "$_tmp"
   adb $ADB_SERIAL push "$_tmp" "$1" >/dev/null
   adb $ADB_SERIAL shell chmod 755 "$1"
@@ -233,6 +233,7 @@ finish() {  # finish <test-name>
 # A test that stops early (a command failing under `set -e`) must say so, not end silently.
 report_early_exit() {
   _status=$?
+  rm -rf "$HOST_TMP"
   if [ "$FINISHED" = 0 ] && [ "$_status" != 0 ]; then
     echo "FAIL: $(basename "$0" .sh) stopped early (status $_status) before its checks finished"
   fi

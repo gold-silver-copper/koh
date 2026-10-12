@@ -14,7 +14,7 @@ use crate::link::{Count, FaultNet, Profile};
 
 #[test]
 fn the_fault_link_is_the_only_path() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = FaultNet::new(Profile::default(), 1);
@@ -144,7 +144,7 @@ async fn measure(profile: Profile, outage: bool, seed: u64) -> anyhow::Result<Me
 #[test]
 #[ignore = "a multi-minute measurement; run explicitly"]
 fn baseline() {
-    crate::harness::runtime().expect("tokio runtime").block_on(async {
+    koh_testkit::multi_thread(4).expect("tokio runtime").block_on(async {
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     let profiles = [
         ("clean", Profile::default(), false),

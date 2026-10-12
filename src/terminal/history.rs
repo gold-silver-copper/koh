@@ -53,37 +53,27 @@ impl HistoryMark {
     }
 }
 
-/// A client's request: the rows named up to and including `newest`, at most `count` of them,
+/// A client's request `id`: the rows named up to and including `newest`, at most `count` of them,
 /// newest first in what they cover (the reply lists them oldest first).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryRequest {
+    pub id: u64,
     pub newest: u64,
     pub count: u16,
 }
 
 impl HistoryRequest {
-    /// Send this request: it, to send, and the ticket its answer is kept with.
-    pub fn ask(self) -> (Self, HistoryTicket) {
-        (self, HistoryTicket(self))
-    }
-
-    fn covers(self, name: u64) -> bool {
+    /// Whether it asks for the row named `name`.
+    pub fn covers(self, name: u64) -> bool {
         name <= self.newest && self.newest.saturating_sub(name) < u64::from(self.count)
     }
-}
 
-/// A request sent and not yet answered, as the client holds it.
-///
-/// The only way to keep history rows ([`HistoryCache::insert`] takes it), so rows nobody asked
-/// for are never kept. Made only by [`HistoryRequest::ask`], never copied, and used up by the
-/// answer.
-#[derive(Debug)]
-pub struct HistoryTicket(HistoryRequest);
-
-impl HistoryTicket {
-    /// Whether the request asked for the row named `name`.
-    pub fn covers(&self, name: u64) -> bool {
-        self.0.covers(name)
+    /// The answer that holds no rows.
+    pub fn none(self) -> HistoryReply {
+        HistoryReply {
+            id: self.id,
+            rows: Vec::new(),
+        }
     }
 }
 
@@ -113,10 +103,11 @@ impl HistoryRow {
     }
 }
 
-/// The server's answer to a [`HistoryRequest`]: the rows it still holds of those asked for,
+/// The server's answer to the [`HistoryRequest`] `id`: the rows it still holds of those asked for,
 /// oldest first, consecutive, the last the one asked for. Empty if it holds none of them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryReply {
+    pub id: u64,
     #[serde(deserialize_with = "crate::bounded::at_most::<HISTORY_ROWS, _, _>")]
     pub rows: Vec<HistoryRow>,
 }
@@ -188,12 +179,10 @@ impl HistoryNames {
     ) -> HistoryReply {
         let mark = self.mark(screen);
         let count = request.count.min(MAX_HISTORY_ROWS);
-        if !mark.holds(request.newest) || count == 0 {
-            return HistoryReply::default();
-        }
         // Names are consecutive, so the row asked for is this many rows above the newest.
-        let Some(above) = usize::try_from(mark.newest.saturating_sub(request.newest)).ok() else {
-            return HistoryReply::default();
+        let above = usize::try_from(mark.newest.saturating_sub(request.newest)).ok();
+        let Some(above) = above.filter(|_| mark.holds(request.newest) && count > 0) else {
+            return request.none();
         };
         let mut out = Vec::new();
         let mut cells = 0_usize;
@@ -232,7 +221,10 @@ impl HistoryNames {
             });
         }
         out.reverse();
-        HistoryReply { rows: out }
+        HistoryReply {
+            id: request.id,
+            rows: out,
+        }
     }
 }
 
@@ -245,26 +237,45 @@ pub struct KeptRow {
 }
 
 impl KeptRow {
-    /// The memory the row takes, at most: each cell with the longest text it may keep, its links'
-    /// text and per-cell indices, and a row's fixed cost.
+    /// The memory the row takes, as fux-vt keeps its cells: eight bytes and the attributes each,
+    /// the text of each cluster too long to keep inline (5 to 17 bytes apart, longer ones in
+    /// [`Cells::text_len`]); its links' text, table and per-cell indices; and a row's fixed cost,
+    /// its allocations' headers and its entry in the cache. Not their spare capacity, which
+    /// fux-vt's `Cells::heap_bytes` counts from its next release.
     pub fn bytes(&self) -> usize {
-        const CELL_BYTES: usize = 64;
-        const ROW_BYTES: usize = 256;
+        const ROW_BYTES: usize = 128;
+        // fux-vt stores a cell as 8 bytes (a u32 among them) and its attributes, aligned to 4.
+        let cell = 8_usize
+            .saturating_add(std::mem::size_of::<fux_vt::Attributes>())
+            .next_multiple_of(4);
+        let apart: usize = self
+            .cells
+            .iter()
+            .map(|cell| cell.contents().len())
+            .filter(|len| (5..=17).contains(len))
+            .sum();
         let links = self.links.as_ref().map_or(0, |links| {
             links
                 .table
                 .iter()
                 .map(|link| {
-                    link.uri
-                        .len()
-                        .saturating_add(link.id.len())
-                        .saturating_add(ROW_BYTES)
+                    link.len()
+                        .saturating_add(std::mem::size_of::<super::Link>())
                 })
-                .fold(links.cells.len().saturating_mul(2), usize::saturating_add)
+                .fold(
+                    links
+                        .cells
+                        .len()
+                        .saturating_mul(2)
+                        .saturating_add(ROW_BYTES),
+                    usize::saturating_add,
+                )
         });
         self.cells
             .len()
-            .saturating_mul(CELL_BYTES)
+            .saturating_mul(cell)
+            .saturating_add(apart)
+            .saturating_add(self.cells.text_len())
             .saturating_add(links)
             .saturating_add(ROW_BYTES)
     }
@@ -367,22 +378,19 @@ impl HistoryCache {
     }
 
     /// Keep `reply`'s rows that the request `asked` was for and `mark` says the history holds, then
-    /// drop the rows farthest from
-    /// `near` until the bytes held are within the bound. Returns how many rows were kept, or
-    /// `None` if the reply is malformed (then nothing of it is kept).
+    /// drop the rows farthest from the `view` until the bytes held are within the bound, but never
+    /// one the view shows or one just kept, which the caller is about to read. Returns how
+    /// many rows were kept, or `None` if the reply is malformed (then nothing of it is kept).
     ///
     /// All server-controlled: every row is decoded and checked before any is kept, the reply's
-    /// rows, cells and links are bounded, and what is kept is bounded by bytes.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "taken, not borrowed: an answer uses its request's ticket up"
-    )]
+    /// rows, cells and links are bounded, and what is kept is bounded by bytes, past the bound by
+    /// the protected rows alone.
     pub fn insert(
         &mut self,
         reply: &HistoryReply,
-        asked: HistoryTicket,
+        asked: HistoryRequest,
         mark: HistoryMark,
-        near: u64,
+        view: std::ops::RangeInclusive<u64>,
     ) -> Option<usize> {
         if reply.rows.len() > usize::from(MAX_HISTORY_ROWS) {
             return None;
@@ -409,7 +417,7 @@ impl HistoryCache {
                 },
             ));
         }
-        let mut kept = 0_usize;
+        let mut kept = Vec::with_capacity(staged.len());
         for (name, row) in staged {
             if !(asked.covers(name) && mark.holds(name)) {
                 continue;
@@ -417,24 +425,27 @@ impl HistoryCache {
             self.remove(name);
             self.bytes = self.bytes.saturating_add(row.bytes());
             self.rows.insert(name, row);
-            kept = kept.saturating_add(1);
+            kept.push(name);
         }
+        kept.sort_unstable();
+        let protected = |name: &u64| view.contains(name) || kept.binary_search(name).is_ok();
+        let near = *view.start();
         while self.bytes > HISTORY_CACHE_BYTES {
-            let first = self.rows.first_key_value().map(|(name, _)| *name);
-            let last = self.rows.last_key_value().map(|(name, _)| *name);
+            let first = self.rows.keys().find(|name| !protected(name)).copied();
+            let last = self
+                .rows
+                .keys()
+                .rev()
+                .find(|name| !protected(name))
+                .copied();
             let farthest = match (first, last) {
-                (Some(first), Some(last)) => {
-                    if near.abs_diff(first) >= near.abs_diff(last) {
-                        first
-                    } else {
-                        last
-                    }
-                }
-                _ => break,
+                (Some(first), Some(last)) if near.abs_diff(first) >= near.abs_diff(last) => first,
+                (_, Some(last)) => last,
+                (_, None) => break,
             };
             self.remove(farthest);
         }
-        Some(kept)
+        Some(kept.len())
     }
 
     /// The row named `name` as a screen row of `cols` cells, with its wrap flag and links.
@@ -456,6 +467,20 @@ mod tests {
     use crate::terminal::{
         CellKind, CellText, ServerTerminal, Size, WireCell, WireColor, WireStyle, MAX_ROW_LINKS,
     };
+
+    /// Request 0: at most `count` rows up to `newest`.
+    const fn ask(newest: u64, count: u16) -> HistoryRequest {
+        HistoryRequest {
+            id: 0,
+            newest,
+            count,
+        }
+    }
+
+    /// The reply to request 0 holding `rows`.
+    fn reply(rows: Vec<HistoryRow>) -> HistoryReply {
+        HistoryReply { id: 0, rows }
+    }
 
     fn lines(emu: &mut ServerTerminal, from: usize, to: usize) {
         for n in from..to {
@@ -485,10 +510,7 @@ mod tests {
         lines(&mut emu, 10, 13);
         let later = emu.snapshot().history();
         assert_eq!((later.newest - mark.newest, later.len), (3, 10));
-        let reply = emu.history(HistoryRequest {
-            newest: later.newest,
-            count: 10,
-        });
+        let reply = emu.history(ask(later.newest, 10));
         let texts: Vec<String> = reply.rows.iter().map(text).collect();
         assert_eq!(
             texts,
@@ -503,27 +525,26 @@ mod tests {
         let mut emu = ServerTerminal::new(4, 20, 1000).unwrap();
         lines(&mut emu, 0, 600);
         let mark = emu.snapshot().history();
-        let ask = |emu: &mut ServerTerminal, newest, count| {
-            emu.history(HistoryRequest { newest, count }).rows.len()
-        };
+        let rows =
+            |emu: &mut ServerTerminal, newest, count| emu.history(ask(newest, count)).rows.len();
         assert_eq!(
-            ask(&mut emu, mark.newest, u16::MAX),
+            rows(&mut emu, mark.newest, u16::MAX),
             usize::from(MAX_HISTORY_ROWS)
         );
-        assert_eq!(ask(&mut emu, mark.newest, 0), 0);
+        assert_eq!(rows(&mut emu, mark.newest, 0), 0);
         assert_eq!(
-            ask(&mut emu, mark.newest.saturating_add(1), 5),
+            rows(&mut emu, mark.newest.saturating_add(1), 5),
             0,
             "not yet named"
         );
-        assert_eq!(ask(&mut emu, 0, 5), 0, "never named");
+        assert_eq!(rows(&mut emu, 0, 5), 0, "never named");
         let oldest = mark.oldest().unwrap();
         assert_eq!(
-            ask(&mut emu, oldest.saturating_add(2), 50),
+            rows(&mut emu, oldest.saturating_add(2), 50),
             3,
             "the oldest three"
         );
-        assert_eq!(ask(&mut emu, u64::MAX, u16::MAX), 0);
+        assert_eq!(rows(&mut emu, u64::MAX, u16::MAX), 0);
     }
 
     #[test]
@@ -534,10 +555,7 @@ mod tests {
             emu.process(b"\r\n");
         }
         let mark = emu.snapshot().history();
-        let reply = emu.history(HistoryRequest {
-            newest: mark.newest,
-            count: MAX_HISTORY_ROWS,
-        });
+        let reply = emu.history(ask(mark.newest, MAX_HISTORY_ROWS));
         let cells: usize = reply
             .rows
             .iter()
@@ -558,10 +576,7 @@ mod tests {
             after.oldest().unwrap() > before.newest,
             "{before:?} {after:?}"
         );
-        let reply = emu.history(HistoryRequest {
-            newest: before.newest,
-            count: 5,
-        });
+        let reply = emu.history(ask(before.newest, 5));
         assert!(reply.rows.is_empty(), "old names are gone");
     }
 
@@ -589,23 +604,14 @@ mod tests {
         newest: 10_000,
         len: 10_000,
     };
-    const ALL: HistoryRequest = HistoryRequest {
-        newest: 10_000,
-        count: u16::MAX,
-    };
+    const ALL: HistoryRequest = ask(10_000, u16::MAX);
 
     #[test]
     fn only_the_rows_asked_for_are_kept() {
         let mut cache = HistoryCache::default();
-        let asked = HistoryRequest {
-            newest: 20,
-            count: 2,
-        };
+        let asked = ask(20, 2);
         let rows = (17..=22).map(|name| row(name, 4)).collect();
-        assert_eq!(
-            cache.insert(&HistoryReply { rows }, asked.ask().1, MARK, 20),
-            Some(2)
-        );
+        assert_eq!(cache.insert(&reply(rows), asked, MARK, 20..=20), Some(2));
         assert!(cache.holds(19) && cache.holds(20));
         assert!(!cache.holds(18) && !cache.holds(21));
     }
@@ -613,10 +619,8 @@ mod tests {
     #[test]
     fn the_cache_keeps_only_rows_the_history_holds() {
         let mut cache = HistoryCache::default();
-        let reply = HistoryReply {
-            rows: vec![row(0, 5), row(1, 5), row(10_000, 5), row(10_001, 5)],
-        };
-        assert_eq!(cache.insert(&reply, ALL.ask().1, MARK, 1), Some(2));
+        let all = reply(vec![row(0, 5), row(1, 5), row(10_000, 5), row(10_001, 5)]);
+        assert_eq!(cache.insert(&all, ALL, MARK, 1..=1), Some(2));
         assert!(cache.holds(1) && cache.holds(10_000) && !cache.holds(10_001));
         cache.retain(HistoryMark {
             newest: 10_005,
@@ -644,34 +648,28 @@ mod tests {
             }],
             ..row(3, 4)
         };
-        let too_many = HistoryReply {
-            rows: (1..=u64::from(MAX_HISTORY_ROWS) + 1)
+        let too_many = reply(
+            (1..=u64::from(MAX_HISTORY_ROWS) + 1)
                 .map(|n| row(n, 1))
                 .collect(),
-        };
-        let too_many_cells = HistoryReply {
-            rows: (1..=100).map(|n| row(n, 1000)).collect(),
-        };
+        );
+        let too_many_cells = reply((1..=100).map(|n| row(n, 1000)).collect());
         for reply in [
-            HistoryReply {
-                rows: vec![row(1, 3), too_wide],
-            },
-            HistoryReply {
-                rows: vec![row(1, 3), bad_link],
-            },
+            reply(vec![row(1, 3), too_wide]),
+            reply(vec![row(1, 3), bad_link]),
             too_many,
             too_many_cells,
         ] {
             let mut cache = HistoryCache::default();
-            assert_eq!(cache.insert(&reply, ALL.ask().1, MARK, 1), None);
+            assert_eq!(cache.insert(&reply, ALL, MARK, 1..=1), None);
             assert!(cache.is_empty());
         }
     }
 
     #[test]
     fn the_cache_is_bounded_by_bytes_dropping_the_rows_farthest_from_the_view() {
-        // Wide rows, and one-cell rows each carrying a reply's worth of links: either way the
-        // memory held stays bounded, however many rows a hostile server sends.
+        // Wide rows, and narrow rows each carrying a reply's worth of links, every one named by a
+        // cell: either way the memory held stays bounded, however many rows a hostile server sends.
         let links: Vec<WireLink> = (0..MAX_ROW_LINKS)
             .map(|n| WireLink {
                 uri: format!(
@@ -683,7 +681,7 @@ mod tests {
             .collect();
         for (width, per_reply, linked, replies) in [
             (1000, MAX_HISTORY_CELLS.div_euclid(1000), false, 100),
-            (1, 1, true, 200),
+            (64, 1, true, 200),
         ] {
             let mut cache = HistoryCache::default();
             let mut name = 1_u64;
@@ -693,19 +691,49 @@ mod tests {
                         name += 1;
                         let mut row = row(name, width);
                         if linked {
+                            let cell = row.runs[0].cell.clone();
+                            row.runs = (1..=64)
+                                .map(|link| Run {
+                                    count: NonZeroU16::MIN,
+                                    cell: WireCell {
+                                        link,
+                                        ..cell.clone()
+                                    },
+                                })
+                                .collect();
                             row.links = links.clone();
                         }
                         row
                     })
                     .collect();
-                cache
-                    .insert(&HistoryReply { rows }, ALL.ask().1, MARK, 2)
-                    .unwrap();
+                let asked = ask(name, u16::try_from(per_reply).unwrap());
+                cache.insert(&reply(rows), asked, MARK, 2..=2).unwrap();
                 assert!(cache.bytes() <= HISTORY_CACHE_BYTES);
+                // The rows just asked for are kept for the caller to read, however far.
+                assert!(cache.holds(name));
             }
             assert!(cache.holds(2), "the row the view is on stays");
-            assert!(!cache.holds(name), "the farthest went");
+            assert!(
+                !cache.holds(name - 2 * u64::try_from(per_reply).unwrap()),
+                "the farthest went"
+            );
         }
+    }
+
+    #[test]
+    fn a_row_with_a_link_no_cell_names_is_refused() {
+        // A hostile server could otherwise make the client keep links nothing shows.
+        let mut unnamed = row(3, 4);
+        unnamed.links = vec![WireLink {
+            uri: "https://example.org".to_owned(),
+            id: String::new(),
+        }];
+        let mut cache = HistoryCache::default();
+        assert_eq!(
+            cache.insert(&reply(vec![unnamed]), ask(3, 1), MARK, 3..=3),
+            None
+        );
+        assert!(cache.is_empty());
     }
 
     #[test]

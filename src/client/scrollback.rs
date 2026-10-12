@@ -14,8 +14,7 @@ use fux_vt::keys::mouse::{MouseAction, MouseButton, MouseEvent};
 use fux_vt::keys::{Direction, Key, KeyPress};
 
 use crate::terminal::{
-    HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryTicket, TerminalScreen,
-    MAX_HISTORY_ROWS,
+    HistoryCache, HistoryMark, HistoryReply, HistoryRequest, TerminalScreen, MAX_HISTORY_ROWS,
 };
 
 /// Most history requests a client has unanswered: enough to keep rows coming while one is
@@ -29,25 +28,21 @@ const WHEEL_ROWS: usize = 3;
 /// history is fetched ahead of need.
 pub const PREFETCH_IDLE: Duration = Duration::from_secs(2);
 
-/// What a key read in the view does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewKeys {
-    /// The view stays.
-    Stay,
-    /// The user left the view.
-    Leave,
-}
-
 /// The history a client holds, and the view of it.
 #[derive(Debug, Default)]
 pub struct Scrollback {
     cache: HistoryCache,
     /// The rows scrolled back from the live screen, while the view is open.
     view: Option<usize>,
+    /// The screen's height, as of the last request: how many rows the view shows.
+    rows: u16,
     /// The history as the newest screen showed it.
     mark: HistoryMark,
-    /// Requests sent and not answered, oldest first: the server answers in order.
-    outstanding: Vec<HistoryTicket>,
+    /// Requests sent and not answered. The server answers each, in any order, naming it; an
+    /// answer to none of them is dropped.
+    outstanding: Vec<HistoryRequest>,
+    /// The id the next request takes.
+    next_id: u64,
     /// A search of the history, while one is typed or under way.
     search: Option<Search>,
 }
@@ -75,10 +70,6 @@ struct Search {
 }
 
 impl Search {
-    fn text(&self) -> &str {
-        &self.query
-    }
-
     fn append(&mut self, text: &str) {
         for c in text.chars().filter(|c| !c.is_control()) {
             if self.query.len().saturating_add(c.len_utf8()) > MAX_QUERY {
@@ -146,16 +137,17 @@ impl Scrollback {
         }
     }
 
-    /// History rows arrived, the answer to the oldest request outstanding: keep the rows it asked
-    /// for. An answer to nothing, and a malformed one, are dropped whole.
+    /// History rows arrived, the answer to the request outstanding that they name: keep the rows
+    /// it asked for. An answer to none, and a malformed one, are dropped whole.
     pub fn on_reply(&mut self, reply: &HistoryReply) {
-        if self.outstanding.is_empty() {
+        let Some(at) = self.outstanding.iter().position(|r| r.id == reply.id) else {
             tracing::debug!("dropping history rows nobody asked for");
             return;
-        }
-        let asked = self.outstanding.remove(0);
-        let near = self.focus();
-        if self.cache.insert(reply, asked, self.mark, near).is_none() {
+        };
+        let asked = self.outstanding.swap_remove(at);
+        let top = self.focus();
+        let shown = top..=top.saturating_add(u64::from(self.rows));
+        if self.cache.insert(reply, asked, self.mark, shown).is_none() {
             tracing::debug!("dropping malformed history rows");
         }
         self.advance_search();
@@ -232,12 +224,15 @@ impl Scrollback {
     /// The next history request to send, if any: the rows the view shows and a page above them,
     /// or, idle and out of the view, the newest screenful. `rows` is the screen's height.
     pub fn next_request(&mut self, rows: u16, idle: bool) -> Option<HistoryRequest> {
+        self.rows = rows;
+        // A search that stopped on a row held, at the end of a step, goes on from it.
+        self.advance_search();
         if self.outstanding.len() >= MAX_OUTSTANDING || self.mark.len == 0 {
             return None;
         }
         // A search under way asks for the rows it is waiting on first.
-        if let Some(request) = self.search_request() {
-            return Some(self.send(request));
+        if let Some((newest, count)) = self.search_request() {
+            return Some(self.send(newest, count));
         }
         let rows_u64 = u64::from(rows);
         let (newest, span) = match self.view {
@@ -270,21 +265,23 @@ impl Scrollback {
             .take_while(|&name| !self.cache.holds(name) && !self.asked(name))
             .take(usize::from(MAX_HISTORY_ROWS))
             .count();
-        Some(self.send(HistoryRequest {
-            newest: missing,
-            count: u16::try_from(run).unwrap_or(MAX_HISTORY_ROWS),
-        }))
+        Some(self.send(missing, u16::try_from(run).unwrap_or(MAX_HISTORY_ROWS)))
     }
 
-    /// `request`, sent: its ticket is kept until the answer.
-    fn send(&mut self, request: HistoryRequest) -> HistoryRequest {
-        let (request, ticket) = request.ask();
-        self.outstanding.push(ticket);
+    /// A request for `count` rows up to `newest`, sent: it is kept until its answer.
+    fn send(&mut self, newest: u64, count: u16) -> HistoryRequest {
+        let request = HistoryRequest {
+            id: self.next_id,
+            newest,
+            count,
+        };
+        self.next_id = self.next_id.wrapping_add(1);
+        self.outstanding.push(request);
         request
     }
 
-    /// The rows a search waits on, if it does and they are not asked for.
-    fn search_request(&self) -> Option<HistoryRequest> {
+    /// The rows a search waits on, newest and count, if it does and they are not asked for.
+    fn search_request(&self) -> Option<(u64, u16)> {
         let search = self.search.as_ref()?;
         let name = search.next?;
         if self.cache.holds(name) || self.asked(name) {
@@ -293,24 +290,24 @@ impl Scrollback {
         let oldest = self.mark.oldest()?;
         if search.older {
             let count = name.saturating_sub(oldest).saturating_add(1);
-            Some(HistoryRequest {
-                newest: name,
-                count: u16::try_from(count.min(u64::from(MAX_HISTORY_ROWS))).ok()?,
-            })
+            Some((
+                name,
+                u16::try_from(count.min(u64::from(MAX_HISTORY_ROWS))).ok()?,
+            ))
         } else {
             let newest = name
                 .saturating_add(u64::from(MAX_HISTORY_ROWS).saturating_sub(1))
                 .min(self.mark.newest);
-            Some(HistoryRequest {
+            Some((
                 newest,
-                count: u16::try_from(newest.saturating_sub(name).saturating_add(1)).ok()?,
-            })
+                u16::try_from(newest.saturating_sub(name).saturating_add(1)).ok()?,
+            ))
         }
     }
 
     /// Whether an unanswered request covers the row named `name`.
     fn asked(&self, name: u64) -> bool {
-        self.outstanding.iter().any(|ticket| ticket.covers(name))
+        self.outstanding.iter().any(|asked| asked.covers(name))
     }
 
     /// The connection was lost: requests on it will not be answered.
@@ -348,13 +345,13 @@ impl Scrollback {
             Some(search) if search.next.is_some() => {
                 format!(
                     "[koh] scrollback {offset}/{len} — searching for {:?}…",
-                    search.text()
+                    search.query
                 )
             }
             Some(search) if search.failed => {
                 format!(
                     "[koh] scrollback {offset}/{len} — {:?} not found",
-                    search.text()
+                    search.query
                 )
             }
             Some(_) | None => format!(
@@ -365,14 +362,14 @@ impl Scrollback {
 
     /// Input decoded while viewing, for a screen `rows` high: each key in its legacy form (one
     /// form of each, whatever the user's terminal sent), the wheel, and a paste into a search.
-    pub fn on_events(&mut self, inputs: &[Input], rows: u16) -> ViewKeys {
+    /// Input after a key that leaves the view is not the view's.
+    pub fn on_events(&mut self, inputs: &[Input], rows: u16) {
         for input in inputs {
+            if !self.viewing() {
+                return;
+            }
             match input {
-                Input::Key(stroke) => {
-                    if self.on_key(stroke.press, rows) == ViewKeys::Leave {
-                        return ViewKeys::Leave;
-                    }
-                }
+                Input::Key(stroke) => self.on_key(stroke.press, rows),
                 Input::Mouse(MouseEvent {
                     action: MouseAction::Press,
                     button: Some(button),
@@ -400,11 +397,10 @@ impl Scrollback {
                 | Input::Reply(_) => {}
             }
         }
-        ViewKeys::Stay
     }
 
     /// Act on the key the decoder already resolved; escape sequences never enter this layer.
-    fn on_key(&mut self, press: KeyPress, rows: u16) -> ViewKeys {
+    fn on_key(&mut self, press: KeyPress, rows: u16) {
         let KeyPress { key, mods } = press;
         if mods.alt
             || ((!mods.is_empty())
@@ -413,7 +409,7 @@ impl Scrollback {
                     Key::Arrow(_) | Key::Home | Key::End | Key::PageUp | Key::PageDown
                 ))
         {
-            return ViewKeys::Stay;
+            return;
         }
         if let Some(search) = self.search.as_mut().filter(|s| s.typing) {
             match key {
@@ -442,7 +438,7 @@ impl Scrollback {
                 | Key::PageDown
                 | Key::F(_) => {}
             }
-            return ViewKeys::Stay;
+            return;
         }
         let page = usize::from(rows.saturating_sub(1)).max(1);
         let half = page.div_euclid(2).max(1);
@@ -484,13 +480,11 @@ impl Scrollback {
             | Key::F(_) => Step::None,
         };
         self.step(step);
-        ViewKeys::Stay
     }
 
-    fn leave(&mut self) -> ViewKeys {
+    fn leave(&mut self) {
         self.view = None;
         self.search = None;
-        ViewKeys::Leave
     }
 
     fn step(&mut self, step: Step) {
@@ -569,14 +563,14 @@ mod tests {
                         view.on_keys(b"/query", 25);
                     }
                 }
-                let expected = legacy.on_keys(&[byte], 25);
-                let actual = decoded.on_events(
+                legacy.on_keys(&[byte], 25);
+                decoded.on_events(
                     &[Input::Key(
                         KeyPress::new(Key::Char(character), fux_vt::keys::Modifiers::CTRL).into(),
                     )],
                     25,
                 );
-                assert_eq!(actual, expected);
+                assert_eq!(decoded.viewing(), legacy.viewing());
                 assert_eq!(decoded.offset(), legacy.offset());
                 assert_eq!(decoded.status(), legacy.status());
             }
@@ -584,12 +578,12 @@ mod tests {
     }
 
     impl Scrollback {
-        fn on_keys(&mut self, bytes: &[u8], rows: u16) -> ViewKeys {
+        fn on_keys(&mut self, bytes: &[u8], rows: u16) {
             let mut decoder = fux_vt::keys::decode::Decoder::default();
             let mut inputs = Vec::new();
             decoder.bytes(bytes, &mut inputs);
             decoder.timeout(&mut inputs);
-            self.on_events(&inputs, rows)
+            self.on_events(&inputs, rows);
         }
     }
 
@@ -605,7 +599,7 @@ mod tests {
         let mut s = viewing(100);
         let rows = 25;
         let press = |s: &mut Scrollback, keys: &[u8]| {
-            assert_eq!(s.on_keys(keys, rows), ViewKeys::Stay);
+            s.on_keys(keys, rows);
             s.offset().unwrap()
         };
         assert_eq!(press(&mut s, b"k"), 1);
@@ -616,7 +610,7 @@ mod tests {
         let decoded = |s: &mut Scrollback, bytes: &[u8]| {
             let mut inputs = Vec::new();
             fux_vt::keys::decode::Decoder::default().bytes(bytes, &mut inputs);
-            assert_eq!(s.on_events(&inputs, rows), ViewKeys::Stay);
+            s.on_events(&inputs, rows);
             s.offset().unwrap()
         };
         assert_eq!(decoded(&mut s, b"\x1b[<64;10;5M"), 5, "the wheel up");
@@ -648,7 +642,7 @@ mod tests {
         for bytes in [&b"\x1b["[..], b"5", b"~"] {
             let mut inputs = Vec::new();
             decoder.bytes(bytes, &mut inputs);
-            assert_eq!(s.on_events(&inputs, 25), ViewKeys::Stay);
+            s.on_events(&inputs, 25);
         }
         assert_eq!(s.offset(), Some(24));
     }
@@ -657,8 +651,8 @@ mod tests {
     fn q_ctrl_c_or_a_lone_escape_leaves() {
         for keys in [&b"q"[..], b"\x03", b"\x1b", b"kkq"] {
             let mut s = viewing(100);
-            assert_eq!(s.on_keys(keys, 25), ViewKeys::Leave, "{keys:?}");
-            assert!(!s.viewing());
+            s.on_keys(keys, 25);
+            assert!(!s.viewing(), "{keys:?}");
         }
     }
 
@@ -723,5 +717,89 @@ mod tests {
             len: 4,
         });
         assert_eq!(s.offset(), Some(4));
+    }
+
+    /// The rows `request` asks for, each `width` cells of `x`, but the row named `needle` of `y`.
+    fn answer(request: HistoryRequest, width: u16, needle: u64) -> HistoryReply {
+        use crate::terminal::{CellKind, CellText, HistoryRow, Run, WireCell, WireColor};
+        let row = |name: u64| HistoryRow {
+            name,
+            wrapped: false,
+            runs: vec![Run {
+                count: std::num::NonZeroU16::new(width).unwrap(),
+                cell: WireCell {
+                    text: CellText::new(if name == needle { "y" } else { "x" }).unwrap(),
+                    kind: CellKind::Narrow,
+                    fg: WireColor::Default,
+                    bg: WireColor::Default,
+                    underline_color: WireColor::Default,
+                    style: crate::terminal::WireStyle::default(),
+                    link: 0,
+                },
+            }],
+            links: Vec::new(),
+        };
+        let oldest = request
+            .newest
+            .saturating_sub(u64::from(request.count).saturating_sub(1));
+        HistoryReply {
+            id: request.id,
+            rows: (oldest..=request.newest).map(row).collect(),
+        }
+    }
+
+    #[test]
+    fn replies_pair_with_their_requests_by_id_in_any_order() {
+        // Two requests out; their answers come the other way round, with one nobody asked for
+        // between. Each keeps its own rows, and the client goes on asking.
+        let mut s = viewing(1000);
+        s.on_keys(b"g", 25);
+        let first = s.next_request(25, false).unwrap();
+        s.on_keys(b"\x1b[F", 25);
+        s.on_keys(&b"\x1b[5~".repeat(10), 25);
+        let second = s.next_request(25, false).unwrap();
+        assert_eq!(s.next_request(25, false), None, "two out");
+        s.on_reply(&answer(second, 10, 0));
+        s.on_reply(&HistoryReply {
+            id: 99,
+            ..answer(first, 10, 0)
+        });
+        assert!(
+            !s.cache().holds(first.newest),
+            "an answer to nothing is dropped"
+        );
+        s.on_reply(&answer(first, 10, 0));
+        assert!(s.cache().holds(first.newest) && s.cache().holds(second.newest));
+        // A lost answer would have held a slot; an empty one frees it.
+        s.on_keys(&b"\x1b[5~".repeat(10), 25);
+        let third = s.next_request(25, false).unwrap();
+        s.on_reply(&third.none());
+        assert!(s.next_request(25, false).is_some(), "not stalled");
+    }
+
+    #[test]
+    fn a_search_through_more_history_than_the_cache_holds_finishes() {
+        // Each row takes about 5.6 kB, so 30 000 are over twice the cache: the rows a search
+        // fetches are the farthest from the view, and were evicted before it read them, for ever.
+        const ROWS: u32 = 30_000;
+        const NEWEST: u64 = 100_000;
+        let mut s = Scrollback::default();
+        s.on_mark(HistoryMark {
+            newest: NEWEST,
+            len: ROWS,
+        });
+        s.open();
+        let needle = NEWEST - u64::from(ROWS) + 5;
+        s.on_keys(b"/y\r", 25);
+        for _ in 0..1000 {
+            let Some(request) = s.next_request(25, false) else {
+                break;
+            };
+            s.on_reply(&answer(request, 250, needle));
+        }
+        let status = s.status().unwrap();
+        assert!(!status.contains("searching"), "{status}");
+        assert!(!status.contains("not found"), "{status}");
+        assert_eq!(s.offset(), usize::try_from(NEWEST - needle + 1).ok());
     }
 }

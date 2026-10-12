@@ -16,7 +16,7 @@ push_binary
 # Kept under the 20s freeze-detector threshold so the session rides out on the same connection
 # (the longer freeze that trips proactive reconnect is exercised by stress-client-wake-reconnect).
 FREEZE="${KOH_STRESS_FREEZE_SECS:-$(scaled 8 12)}"
-CLILOG="/tmp/koh-freeze-cli-$$.log"
+CLILOG="$HOST_TMP/koh-freeze-cli-$$.log"
 echo "Stress: client freeze → resume — SIGSTOP the client for ${FREEZE}s, then SIGCONT (level=$STRESS_LEVEL)"
 
 allow_client_key /data/local/tmp/koh-freeze.key

@@ -14,12 +14,12 @@ use crate::events::{InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE, 
 use crate::predict::{Overlay, PredictionEngine};
 use crate::proto::{
     decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
-    HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
+    ServerMsg, HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
 };
-use crate::terminal::{Grid, HistoryReply, Size, TerminalScreen};
+use crate::terminal::{HistoryReply, Size, TerminalScreen};
 
 use super::link::Link;
-use super::probe::COLOUR_QUERIES;
+use super::probe::{self, COLOUR_QUERIES};
 use super::render::WindowState;
 use super::scrollback::Scrollback;
 use super::{window_state, ESCAPE_PREFIX, SCROLLBACK_KEY, SUSPEND_KEY};
@@ -67,6 +67,8 @@ mod outage {
         unconfirmed: bool,
         /// Typing was not sent.
         typing_dropped: bool,
+        /// Why the server last refused a redial, if it said.
+        refused: Option<&'static str>,
     }
 
     impl Outage {
@@ -75,7 +77,12 @@ mod outage {
                 since,
                 unconfirmed,
                 typing_dropped: false,
+                refused: None,
             }
+        }
+
+        pub(super) const fn refused(&mut self, why: &'static str) {
+            self.refused = Some(why);
         }
 
         pub(super) const fn dropped_typing(&mut self) {
@@ -92,6 +99,7 @@ mod outage {
             [
                 self.unconfirmed.then_some(UNCONFIRMED),
                 self.typing_dropped.then_some(INPUT_DROPPED),
+                self.refused,
             ]
             .into_iter()
             .flatten()
@@ -280,6 +288,19 @@ pub enum InputOutcome {
     Forwarded,
 }
 
+/// What the user's terminal said it does, in its answers to the start-up questions
+/// ([`ClientSession::ask_terminal`]), for the caller to paint and listen by. Each only ever turns on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Found {
+    /// It draws underline styles (`4:n`).
+    pub underline_styles: bool,
+    /// It speaks the kitty keyboard protocol: push disambiguate and alternate keys.
+    pub kitty: bool,
+    /// It reports its colour scheme, and so can report changes (mode 2031), while colours are
+    /// told.
+    pub scheme_reports: bool,
+}
+
 /// What one [`ClientSession::on_tick`] produced for the connection loop.
 #[derive(Debug, Default)]
 pub struct TickResult {
@@ -314,10 +335,12 @@ pub struct ClientSession {
     pending_escape: Option<Keystroke>,
     /// The user's terminal's colours, while the server is told them (not with `--no-colours`).
     colours: Option<WireColours>,
-    /// The colours were asked again (after a new scheme) and not all are in.
+    /// The colours were asked (at start-up, or again after a new scheme) and not all are in.
     colours_asked: bool,
     /// Questions for the user's terminal, for the caller to write.
     ask: Vec<u8>,
+    /// What the user's terminal said it does, and whether that changed since last taken.
+    found: (Found, bool),
     /// A notice for the status line.
     notice: notice::Notices,
     /// A key's legacy bytes, as last matched against the escape prefix.
@@ -332,8 +355,6 @@ pub struct ClientSession {
     cols: u16,
     /// Set whenever the rendered output may have changed; cleared once the caller repaints.
     pub(crate) dirty: bool,
-    /// Whether a status banner was painted last frame, so its removal repaints once more.
-    pub(crate) status_was_shown: bool,
 }
 
 impl ClientSession {
@@ -357,6 +378,7 @@ impl ClientSession {
             colours: None,
             colours_asked: false,
             ask: Vec::new(),
+            found: (Found::default(), false),
             notice: notice::Notices::default(),
             scratch: Vec::with_capacity(16),
             scrollback: Scrollback::default(),
@@ -364,8 +386,23 @@ impl ClientSession {
             rows: size.rows,
             cols: size.cols,
             dirty: true,
-            status_was_shown: false,
         }
+    }
+
+    /// The run's first phase: ask the user's terminal, at `now`, what it draws, speaks and shows
+    /// (`client::probe`), its colours too if `colours` (to tell the server, which answers
+    /// programs' colour queries with them). The answers come in on stdin with what is typed, and
+    /// this session's decoder, expecting them, takes them whenever they arrive: none reaches the
+    /// program. What they say is [`take_found`](Self::take_found)'s, and the colours are told
+    /// once the round's last answer (DA1) is in.
+    pub fn ask_terminal(&mut self, now: Instant, colours: bool) {
+        self.colours = colours.then(|| WireColours {
+            palette: vec![None; PALETTE],
+            ..WireColours::default()
+        });
+        self.colours_asked = colours;
+        self.ask.extend_from_slice(&probe::queries(colours));
+        self.decoder.expect(now);
     }
 
     /// The connection was lost: what was meant for it alone (acknowledgements, history requests
@@ -398,6 +435,14 @@ impl ClientSession {
         // Nothing is queued now, so nothing is to drain before typing is taken again.
         self.input_paused = false;
         self.scrollback.forget_requests();
+        self.dirty = true;
+    }
+
+    /// A redial was refused for now, the server said `why`: the banner says it too.
+    pub fn refused(&mut self, why: &'static str) {
+        if let Some(outage) = self.outage.as_mut() {
+            outage.refused(why);
+        }
         self.dirty = true;
     }
 
@@ -463,8 +508,8 @@ impl ClientSession {
 
     /// Take decoded input: the escape prefix (a key whose legacy byte is `Ctrl-^`, from any
     /// terminal) then `.` quits, then `Ctrl-Z` suspends once the rest is taken, then `[` opens the
-    /// scrollback view, then anything else forwards both; the rest goes to the view while it is
-    /// open, else is predicted and queued. The terminal's answers to the client's own questions
+    /// scrollback view, then the prefix again or `^` sends one Ctrl-^, then anything else forwards
+    /// both; the rest goes to the view while it is open, else is predicted and queued. The terminal's answers to the client's own questions
     /// are taken here and go no further.
     pub fn on_inputs(&mut self, now: Instant, inputs: Vec<Input>) -> InputOutcome {
         let mut suspend = false;
@@ -521,11 +566,15 @@ impl ClientSession {
                     }
                     _ => {}
                 }
+                // The prefix again, or `^`, is the prefix typed for itself: one Ctrl-^ goes on.
+                let literal = matches!(key, Some([ESCAPE_PREFIX | b'^']));
                 if self.scrollback.viewing() {
                     self.send_to_view(&[Input::Key(prefix), input]);
                 } else {
                     fwd.push(InputEvent::Key(prefix.into()));
-                    events_of(input, &mut fwd);
+                    if !literal {
+                        events_of(input, &mut fwd);
+                    }
                 }
             } else if key == Some(&[ESCAPE_PREFIX]) {
                 if let Input::Key(stroke) = input {
@@ -554,40 +603,63 @@ impl ClientSession {
         self.dirty = true;
     }
 
-    /// An answer or report from the user's terminal. A new scheme (mode 2031) asks the colours
-    /// again; once the round's last answer (DA1) is in, the server is told them.
+    /// An answer or report from the user's terminal. What it says it does is
+    /// [`take_found`](Self::take_found)'s; its colours are kept while they are told. A new scheme
+    /// (mode 2031) asks the colours again; once a round's last answer (DA1) is in, the server is
+    /// told them.
     fn on_reply(&mut self, now: Instant, reply: Reply) {
-        let Some(colours) = self.colours.as_mut() else {
-            return;
-        };
+        let found = &mut self.found.0;
+        let before = *found;
+        let colours = self.colours.as_mut();
         match reply {
+            Reply::UnderlineStyles => found.underline_styles = true,
+            Reply::KittyFlags(_) => found.kitty = true,
             Reply::Scheme(scheme) => {
-                colours.scheme = Some(match scheme {
-                    Scheme::Dark => WireScheme::Dark,
-                    Scheme::Light => WireScheme::Light,
-                });
-                if !self.colours_asked {
-                    self.colours_asked = true;
-                    self.ask.extend_from_slice(COLOUR_QUERIES);
-                    self.decoder.expect(now);
+                if let Some(colours) = colours {
+                    colours.scheme = Some(match scheme {
+                        Scheme::Dark => WireScheme::Dark,
+                        Scheme::Light => WireScheme::Light,
+                    });
+                    found.scheme_reports = true;
+                    if !self.colours_asked {
+                        self.colours_asked = true;
+                        self.ask.extend_from_slice(COLOUR_QUERIES);
+                        self.decoder.expect(now);
+                    }
                 }
             }
-            Reply::Foreground(rgb) => colours.foreground = Some(rgb.into()),
-            Reply::Background(rgb) => colours.background = Some(rgb.into()),
+            Reply::Foreground(rgb) => {
+                if let Some(colours) = colours {
+                    colours.foreground = Some(rgb.into());
+                }
+            }
+            Reply::Background(rgb) => {
+                if let Some(colours) = colours {
+                    colours.background = Some(rgb.into());
+                }
+            }
             Reply::Palette { index, rgb } => {
-                if let Some(slot) = colours.palette.get_mut(usize::from(index)) {
+                if let Some(slot) = colours.and_then(|c| c.palette.get_mut(usize::from(index))) {
                     *slot = Some(rgb.into());
                 }
             }
-            Reply::Attributes if self.colours_asked => {
-                self.colours_asked = false;
-                self.outgoing.push_back(ClientMsg::Colours(colours.clone()));
+            Reply::Attributes => {
+                if let Some(colours) = colours.filter(|_| self.colours_asked) {
+                    self.colours_asked = false;
+                    if colours.known() {
+                        self.outgoing.push_back(ClientMsg::Colours(colours.clone()));
+                    }
+                }
             }
-            Reply::Attributes
-            | Reply::Mode { .. }
-            | Reply::KittyFlags(_)
-            | Reply::UnderlineStyles => {}
+            Reply::Mode { .. } => {}
         }
+        self.found.1 |= self.found.0 != before;
+    }
+
+    /// What the user's terminal said it does, if that changed since last taken.
+    pub fn take_found(&mut self) -> Option<Found> {
+        let (found, changed) = &mut self.found;
+        std::mem::take(changed).then_some(*found)
     }
 
     fn queue_events(&mut self, now: Instant, events: Vec<InputEvent>) {
@@ -637,9 +709,11 @@ impl ClientSession {
                     }
                     self.predictor.new_user_key(key.stroke().press, screen);
                 }
-                InputEvent::Mouse(_) | InputEvent::Focus(_) | InputEvent::Paste(_) => {
+                InputEvent::Mouse(_) | InputEvent::Paste(_) => {
                     self.predictor.new_user_other(screen);
                 }
+                // Focus changes the screen of no line editor: the predictor never hears of it.
+                InputEvent::Focus(_) => {}
             }
             self.outgoing.event(event, cost, &mut self.last_seq);
         }
@@ -662,19 +736,6 @@ impl ClientSession {
     /// reported a new scheme), for the caller to write.
     pub fn take_questions(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.ask)
-    }
-
-    /// What the user's terminal said of its colours, to tell the server now and to keep across
-    /// reconnects; `None` if the user turned telling off (`--no-colours`) or the terminal said
-    /// nothing. Known colours are told at once.
-    pub fn set_colours(&mut self, colours: Option<WireColours>) {
-        if let Some(colours) = colours.as_ref().filter(|c| c.known()) {
-            self.outgoing.push_back(ClientMsg::Colours(colours.clone()));
-        }
-        self.colours = colours.map(|mut c| {
-            c.palette.resize(PALETTE, None);
-            c
-        });
     }
 
     /// Queue a new window size; it voids the predictions.
@@ -723,8 +784,17 @@ impl ClientSession {
             self.link.refuse(frame.base);
             return;
         };
-        if next.screen.screen().cursor_position().0
-            != self.link.current().screen.screen().cursor_position().0
+        // The cursor's row is another when its index changed, or when the screen scrolled: at the
+        // bottom of the screen a new line scrolls, leaving the index as it was, and names a new
+        // history row, or moves the rows (a scroll region, no scrollback kept).
+        let (now_grid, was) = (next.screen.screen(), &self.link.current().screen);
+        let row = |screen: &TerminalScreen| {
+            (screen.screen().cursor_position().0, screen.history().newest)
+        };
+        if row(&next.screen) != row(was)
+            || !now_grid
+                .moves_from(was.screen(), now_grid.size().rows)
+                .is_empty()
         {
             self.link.new_row_at = Some(now);
         }
@@ -743,6 +813,14 @@ impl ClientSession {
             .on_mark(self.link.current().screen.history());
         self.last_activity = Some(now);
         self.dirty = true;
+    }
+
+    /// A message from the server arrived: a frame's stream, or history rows.
+    pub fn on_server(&mut self, now: Instant, msg: ServerMsg) {
+        match msg {
+            ServerMsg::Frame { base, rows, body } => self.on_frame_stream(now, base, &rows, &body),
+            ServerMsg::History(reply) => self.on_history(&reply),
+        }
     }
 
     /// History rows arrived.
@@ -856,18 +934,13 @@ impl ClientSession {
         &self.link.current().screen
     }
 
-    /// The newest frame applied.
-    pub const fn applied(&self) -> FrameNum {
-        self.link.current().num
-    }
-
     /// Whether a frame has been applied, so [`state`](Self::state) is the server's.
     pub fn synced(&self) -> bool {
         self.link.current().num > FrameNum::BLANK
     }
 
     /// The prediction overlay to draw over [`state`](Self::state).
-    pub fn overlay(&self) -> Overlay<'_> {
+    pub fn overlay(&self) -> Overlay {
         self.predictor.overlay()
     }
 
@@ -885,11 +958,6 @@ impl ClientSession {
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
     pub fn window_state(&self) -> WindowState<'_> {
         window_state(&self.link.current().screen)
-    }
-
-    /// The newest applied screen's grid.
-    pub fn screen(&self) -> &Grid {
-        self.link.current().screen.screen()
     }
 }
 
@@ -948,30 +1016,30 @@ mod tests {
         std::iter::from_fn(|| s.pop_outgoing()).collect()
     }
 
-    /// What a legacy program with nothing set gets for the input sent: keys as their legacy
-    /// bytes, pastes as their text.
-    fn typed(msgs: &[ClientMsg]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for m in msgs {
-            match m {
-                ClientMsg::Keys { events, .. } => {
-                    for event in events {
-                        match event {
-                            InputEvent::Key(key) => {
-                                out.extend_from_slice(&legacy_bytes(key.stroke().press));
-                            }
-                            InputEvent::Paste(text) => {
-                                out.extend_from_slice(text.as_bytes());
-                            }
-                            InputEvent::Mouse(_) | InputEvent::Focus(_) => {}
-                        }
-                    }
-                }
+    /// The events sent, in order.
+    fn events(msgs: &[ClientMsg]) -> Vec<InputEvent> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                ClientMsg::Keys { events, .. } => Some(events.clone()),
                 ClientMsg::Resize(_)
                 | ClientMsg::Ack { .. }
                 | ClientMsg::Resync
                 | ClientMsg::History(_)
-                | ClientMsg::Colours(_) => {}
+                | ClientMsg::Colours(_) => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// What a legacy program with nothing set gets for the input sent: keys as their legacy
+    /// bytes, pastes as their text.
+    fn typed(msgs: &[ClientMsg]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for event in events(msgs) {
+            match event {
+                InputEvent::Key(key) => out.extend_from_slice(&legacy_bytes(key.stroke().press)),
+                InputEvent::Paste(text) => out.extend_from_slice(text.as_bytes()),
+                InputEvent::Mouse(_) | InputEvent::Focus(_) => {}
             }
         }
         out
@@ -983,42 +1051,36 @@ mod tests {
         assert_eq!(drain(&mut s), [ClientMsg::Resize(Size::new(24, 80))]);
     }
 
+    /// What the escape prefix and the key after it do, however the reads split them and whatever
+    /// encoding the terminal uses (legacy bytes, or kitty's for Ctrl-6, `.` and Ctrl-Z), and what
+    /// goes on to the program.
     #[test]
-    fn escape_prefix_dot_quits_and_plain_bytes_forward() {
-        let (now, mut s) = start();
-        assert_eq!(s.on_input(now, b"ls\r"), InputOutcome::Forwarded);
-        assert_eq!(typed(&drain(&mut s)), b"ls\r");
-        assert_eq!(s.on_input(now, &[ESCAPE_PREFIX, b'.']), InputOutcome::Quit);
-    }
-
-    #[test]
-    fn escape_prefix_ctrl_z_suspends_even_split_across_chunks() {
-        let (now, mut s) = start();
-        assert_eq!(
-            s.on_input(now, &[ESCAPE_PREFIX, SUSPEND_KEY]),
-            InputOutcome::Suspend
-        );
-        assert_eq!(s.on_input(now, &[ESCAPE_PREFIX]), InputOutcome::Forwarded);
-        assert_eq!(s.on_input(now, &[SUSPEND_KEY]), InputOutcome::Suspend);
-        assert_eq!(typed(&drain(&mut s)), b"");
-    }
-
-    #[test]
-    fn bytes_before_suspend_escape_are_forwarded_first() {
-        let (now, mut s) = start();
-        assert_eq!(
-            s.on_input(now, &[b'h', b'i', ESCAPE_PREFIX, SUSPEND_KEY]),
-            InputOutcome::Suspend
-        );
-        assert_eq!(typed(&drain(&mut s)), b"hi");
-    }
-
-    #[test]
-    fn lone_escape_prefix_then_other_byte_forwards_both() {
-        let (now, mut s) = start();
-        assert_eq!(s.on_input(now, &[ESCAPE_PREFIX]), InputOutcome::Forwarded);
-        assert_eq!(s.on_input(now, b"x"), InputOutcome::Forwarded);
-        assert_eq!(typed(&drain(&mut s)), [ESCAPE_PREFIX, b'x']);
+    fn the_escape_prefix_takes_the_next_key() {
+        use InputOutcome::{Forwarded, Quit, Suspend};
+        const P: u8 = ESCAPE_PREFIX;
+        type Case<'a> = (&'a [&'a [u8]], InputOutcome, &'a [u8]);
+        let cases: [Case; 11] = [
+            (&[b"ls\r"], Forwarded, b"ls\r"),
+            (&[&[P, b'.']], Quit, b""),
+            (&[&[P, SUSPEND_KEY]], Suspend, b""),
+            (&[&[P], &[SUSPEND_KEY]], Suspend, b""),
+            (&[&[b'h', b'i', P, SUSPEND_KEY]], Suspend, b"hi"),
+            // The prefix and another key: both go on, the prefix as it was typed.
+            (&[&[P], b"x"], Forwarded, &[P, b'x']),
+            // The prefix twice, or then `^`, sends one Ctrl-^ (vim's alternate file).
+            (&[&[P, P]], Forwarded, &[P]),
+            (&[&[P, b'^']], Forwarded, &[P]),
+            (&[b"\x1b[54;5u."], Quit, b""),
+            (&[b"\x1b[54;5u\x1b[122;5u"], Suspend, b""),
+            (&[b"\x1b[54;5ux"], Forwarded, &[P, b'x']),
+        ];
+        for (reads, outcome, sent) in cases {
+            let (now, mut s) = start();
+            drain(&mut s);
+            let last = reads.iter().map(|read| s.on_input(now, read)).last();
+            assert_eq!(last, Some(outcome), "{reads:?}");
+            assert_eq!(typed(&drain(&mut s)), sent, "{reads:?}");
+        }
     }
 
     #[test]
@@ -1031,30 +1093,14 @@ mod tests {
         s.on_input(now, &[&b"\x1b[200~"[..], &paste, b"\x1b[201~"].concat());
         s.on_input(now, &paste[..5000]);
         let msgs = drain(&mut s);
-        let events: Vec<&InputEvent> = msgs
-            .iter()
-            .filter_map(|m| match m {
-                ClientMsg::Keys { events, .. } => {
-                    assert!(events.len() <= MAX_EVENTS);
-                    Some(events)
-                }
-                ClientMsg::Resize(_)
-                | ClientMsg::Ack { .. }
-                | ClientMsg::Resync
-                | ClientMsg::History(_)
-                | ClientMsg::Colours(_) => None,
-            })
-            .flatten()
-            .collect();
         let seqs: Vec<u64> = msgs
             .iter()
-            .filter_map(|m| match m {
-                ClientMsg::Keys { seq, .. } => Some(seq.0),
-                ClientMsg::Resize(_)
-                | ClientMsg::Ack { .. }
-                | ClientMsg::Resync
-                | ClientMsg::History(_)
-                | ClientMsg::Colours(_) => None,
+            .filter_map(|m| {
+                let ClientMsg::Keys { seq, events } = m else {
+                    return None;
+                };
+                assert!(events.len() <= MAX_EVENTS);
+                Some(seq.0)
             })
             .collect();
         assert_eq!(
@@ -1065,7 +1111,7 @@ mod tests {
             typed(&msgs),
             [b"first".as_slice(), &paste, &paste[..5000]].concat()
         );
-        let pastes: Vec<usize> = events
+        let pastes: Vec<usize> = events(&msgs)
             .iter()
             .filter_map(|e| match e {
                 InputEvent::Paste(text) => Some(text.len()),
@@ -1101,6 +1147,7 @@ mod tests {
         // writing to the terminal, and predicting it key by key costs a screenful each.
         let (now, mut s) = start();
         drain(&mut s);
+        s.predictor.set_tty(Some(EDITOR));
         s.predictor.confirm_for_tests();
         let burst = vec![b'y'; TYPED_KEYS + 1];
         s.on_input(now, &burst);
@@ -1121,16 +1168,16 @@ mod tests {
         s.dirty = false;
         s.on_frame(now, &frame(1, 0, 0, &blank, &one));
         assert!(s.dirty && s.synced());
-        assert!(s.screen().contents().contains("one"));
+        assert!(s.state().screen().contents().contains("one"));
         s.on_frame(now, &frame(2, 1, 0, &one, &two));
-        assert!(s.screen().contents().contains("one two"));
+        assert!(s.state().screen().contents().contains("one two"));
         // The server takes a frame's delivery as its acknowledgement.
         assert_eq!(drain(&mut s), []);
-        assert_eq!(s.applied(), FrameNum(2));
+        assert_eq!(s.link.current().num, FrameNum(2));
     }
 
     #[test]
-    fn a_frame_that_arrives_after_a_newer_one_is_kept_as_a_base() {
+    fn a_frame_that_arrives_after_a_newer_one_is_kept_as_a_base_and_a_repeat_ignored() {
         let (now, mut s) = start();
         drain(&mut s);
         let blank = TerminalScreen::default();
@@ -1140,25 +1187,14 @@ mod tests {
         s.on_frame(now, &frame(2, 0, 0, &blank, &two));
         // Frame 1 is delivered late; the server, told of its delivery, may diff against it.
         s.on_frame(now, &frame(1, 0, 0, &blank, &one));
+        s.on_frame(now, &frame(2, 0, 0, &blank, &one));
         assert!(
-            s.screen().contents().contains("two"),
-            "the newer stays shown"
+            s.state().screen().contents().contains("two"),
+            "the newer stays shown, and a repeat is ignored"
         );
         s.on_frame(now, &frame(3, 1, 0, &one, &three));
-        assert!(s.screen().contents().contains("three"));
+        assert!(s.state().screen().contents().contains("three"));
         assert_eq!(drain(&mut s), [], "no resync: frame 1 was kept");
-    }
-
-    #[test]
-    fn an_older_or_repeated_frame_is_ignored() {
-        let (now, mut s) = start();
-        let blank = TerminalScreen::default();
-        let one = screen(b"one");
-        let two = screen(b"two");
-        s.on_frame(now, &frame(2, 0, 0, &blank, &two));
-        s.on_frame(now, &frame(1, 0, 0, &blank, &one));
-        s.on_frame(now, &frame(2, 0, 0, &blank, &one));
-        assert!(s.screen().contents().contains("two"));
     }
 
     #[test]
@@ -1175,12 +1211,18 @@ mod tests {
             "one resync, not one per frame"
         );
         s.on_frame(now, &frame(7, 0, 0, &blank, &one));
-        assert!(s.screen().contents().contains("one"));
+        assert!(s.state().screen().contents().contains("one"));
         // Base 3 is older than base 4, refused: the server sent it before it read that Resync.
         s.on_frame(now, &frame(8, 3, 0, &one, &one));
         assert_eq!(drain(&mut s), [], "covered by the resync sent");
+        // The server took refused frame 8's delivery as its acknowledgement: a frame on it asks
+        // again, or the session freezes.
         s.on_frame(now, &frame(9, 8, 0, &one, &one));
         assert_eq!(drain(&mut s), [ClientMsg::Resync], "a newer one asks again");
+        // A resync owed to a lost connection is not sent on the next.
+        s.on_frame(now, &frame(10, 9, 0, &one, &one));
+        s.detach(now);
+        assert!(!drain(&mut s).contains(&ClientMsg::Resync));
     }
 
     #[test]
@@ -1201,34 +1243,6 @@ mod tests {
     }
 
     #[test]
-    fn each_unheld_base_asks_for_a_resync_once() {
-        // The server took a refused frame's delivery as its acknowledgement and diffs against it:
-        // a frame on that base is refused too, and must ask again, or the session freezes.
-        let (now, mut s) = start();
-        drain(&mut s);
-        let one = screen(b"one");
-        s.on_frame(now, &frame(4, 3, 0, &one, &one));
-        s.on_frame(now, &frame(5, 3, 0, &one, &one));
-        assert_eq!(drain(&mut s), [ClientMsg::Resync], "one per base");
-        s.on_frame(now, &frame(6, 5, 0, &one, &one));
-        assert_eq!(drain(&mut s), [ClientMsg::Resync], "a new base asks again");
-        assert!(!s.synced());
-    }
-
-    #[test]
-    fn a_detach_drops_the_resync_owed_to_the_lost_connection() {
-        let (now, mut s) = start();
-        drain(&mut s);
-        let one = screen(b"one");
-        s.on_frame(now, &frame(4, 3, 0, &one, &one));
-        s.detach(now);
-        assert!(
-            !drain(&mut s).contains(&ClientMsg::Resync),
-            "the resync was owed to the lost connection"
-        );
-    }
-
-    #[test]
     fn only_the_last_frames_are_kept_as_bases() {
         let (now, mut s) = start();
         let mut prev = TerminalScreen::default();
@@ -1246,7 +1260,7 @@ mod tests {
         let base = screen(format!("frame {oldest_kept}").as_bytes());
         s.on_frame(now, &frame(22, oldest_kept, 0, &base, &target));
         assert!(
-            s.screen().contents().contains("target"),
+            s.state().screen().contents().contains("target"),
             "a kept base applies"
         );
     }
@@ -1292,7 +1306,7 @@ mod tests {
         assert_eq!(drain(&mut s), [ClientMsg::Resync]);
         s.on_frame(now, &frame(22, 19, 0, &big, &big));
         assert_eq!(drain(&mut s), []);
-        assert_eq!(s.applied(), FrameNum(22));
+        assert_eq!(s.link.current().num, FrameNum(22));
     }
 
     #[test]
@@ -1345,29 +1359,122 @@ mod tests {
         assert!(4 * usize::from(rows) * usize::from(cols) <= WINDOW_CELLS);
     }
 
-    #[test]
-    fn a_frame_confirms_echoed_predictions() {
+    /// The PTY's modes under a line editor (readline): it echoes for itself, a key at a time.
+    const EDITOR: crate::predict::TtyModes = crate::predict::TtyModes {
+        echo: false,
+        line: false,
+    };
+
+    /// A screen at a line editor's prompt showing `bytes`, from an emulator with `scrollback`
+    /// rows of history.
+    fn at_editor(bytes: &[u8], scrollback: usize) -> TerminalScreen {
+        let mut emu = ServerTerminal::new(24, 80, scrollback).expect("emulator");
+        emu.set_tty(EDITOR);
+        emu.process(bytes);
+        emu.snapshot()
+    }
+
+    /// A session whose first keystroke at a line editor's prompt was echoed: what is typed now
+    /// shows as it is predicted. Returns the time after the echo and the screen it showed.
+    fn trusted() -> (Instant, ClientSession, TerminalScreen) {
         let (now, mut s) = start();
-        s.on_input(now, b"x");
+        let prompt = at_editor(b"", 0);
+        s.on_frame(now, &frame(1, 0, 0, &TerminalScreen::default(), &prompt));
+        let later = now.checked_add(Duration::from_secs(1)).expect("a time");
+        s.on_input(later, b"x");
         assert!(
             s.overlay().is_empty(),
             "the first keystroke stays hidden until confirmed"
         );
         assert_eq!(s.predictor.confirmed_epoch(), 0);
-        let echoed = screen(b"x");
-        let later = now + Duration::from_millis(100);
-        s.on_frame(later, &frame(1, 0, 1, &TerminalScreen::default(), &echoed));
+        let echoed = at_editor(b"x", 0);
+        s.on_frame(later, &frame(2, 1, 1, &prompt, &echoed));
         assert_eq!(
             s.predictor.confirmed_epoch(),
             1,
             "the echoed keystroke is graded correct and its epoch confirmed"
         );
+        drain(&mut s);
+        (later, s, echoed)
+    }
+
+    #[test]
+    fn a_frame_confirms_echoed_predictions() {
+        let (later, mut s, _) = trusted();
         s.on_input(later, b"y");
         assert_eq!(
-            s.overlay().cell(0, 1).map(|c| c.glyph),
+            s.overlay().cell(0, 1).map(crate::predict::Cell::text),
             Some("y"),
             "typing after a confirmed echo is shown"
         );
+    }
+
+    /// A focus change (an alt-tab) is no edit: the predictions and the trust stay.
+    #[test]
+    fn focus_events_leave_the_predictions_alone() {
+        let (later, mut s, _) = trusted();
+        s.on_input(later, b"y");
+        let before = s.overlay();
+        let epoch = s.predictor.confirmed_epoch();
+        s.on_input(later, b"\x1b[I\x1b[O");
+        assert_eq!(s.overlay(), before);
+        assert_eq!(s.predictor.confirmed_epoch(), epoch);
+        s.on_input(later, b"z");
+        assert_eq!(
+            s.overlay().cell(0, 2).map(crate::predict::Cell::text),
+            Some("z")
+        );
+    }
+
+    /// A program that prints its prompt and turns echo off a moment after (bash's `read -s`) can
+    /// be shown with the modes from before: a key typed at once must not be shown, however
+    /// trusted the session; once the server could have told the new modes, keys are predicted as
+    /// before. At the bottom of the screen Enter scrolls, so the cursor's row index stays: the
+    /// hold sees the scroll, by the history row it names or, with no scrollback, by the rows it
+    /// moves.
+    #[test]
+    fn a_key_at_a_fresh_prompt_waits_for_its_echo_even_at_the_bottom_of_the_screen() {
+        for (above, scrollback) in [(0, 0), (30, 100), (30, 0)] {
+            let echoing = crate::predict::TtyModes {
+                echo: true,
+                line: true,
+            };
+            let mut emu = ServerTerminal::new(24, 80, scrollback).expect("emulator");
+            emu.set_tty(echoing);
+            let lines: Vec<String> = (0..above).map(|n| format!("line {n}")).collect();
+            emu.process(format!("{}\r\n$ ", lines.join("\r\n")).as_bytes());
+            let first = emu.snapshot();
+            let row = first.screen().cursor_position().0;
+            let (t0, mut s) = start();
+            s.on_frame(t0, &frame(1, 0, 0, &TerminalScreen::default(), &first));
+            // Long after the prompt: the kernel echoes, so the first key shows at once.
+            let t1 = t0 + Duration::from_secs(1);
+            s.on_input(t1, b"x");
+            assert!(!s.overlay().is_empty(), "kernel echo shows at once");
+            drain(&mut s);
+            // Enter: the shell prints a prompt on a new row (at the bottom, the same row index); the
+            // modes the frame carries still echo.
+            emu.process(b"x\r\nSecret: ");
+            let prompt = emu.snapshot();
+            assert_eq!(prompt.screen().cursor_position().0 == row, above > 0);
+            s.on_frame(t1, &frame(2, 1, 1, &first, &prompt));
+            s.on_input(t1 + Duration::from_millis(10), b"Q");
+            drain(&mut s);
+            let shown =
+                |s: &ClientSession, text| s.overlay().cells().any(|(_, c)| c.text() == text);
+            assert!(
+                !shown(&s, "Q"),
+                "{above} {scrollback}: shown before its echo"
+            );
+            // The program did echo (no password after all): once the server reflects the held key,
+            // and the hold is over, the next key is predicted from the first again.
+            emu.process(b"Q");
+            let echoed = emu.snapshot();
+            let t2 = t1 + PROMPT_HOLD + Duration::from_millis(1);
+            s.on_frame(t2, &frame(3, 2, 2, &prompt, &echoed));
+            s.on_input(t2, b"Z");
+            assert!(shown(&s, "Z") && !shown(&s, "Q"), "{above} {scrollback}");
+        }
     }
 
     #[test]
@@ -1459,21 +1566,6 @@ mod tests {
         assert!(s.dirty);
     }
 
-    /// The events sent, in order.
-    fn events(msgs: &[ClientMsg]) -> Vec<InputEvent> {
-        msgs.iter()
-            .filter_map(|m| match m {
-                ClientMsg::Keys { events, .. } => Some(events.clone()),
-                ClientMsg::Resize(_)
-                | ClientMsg::Ack { .. }
-                | ClientMsg::Resync
-                | ClientMsg::History(_)
-                | ClientMsg::Colours(_) => None,
-            })
-            .flatten()
-            .collect()
-    }
-
     fn key(press: &str) -> InputEvent {
         InputEvent::Key(WireKey::from(Keystroke::from(
             press.parse::<KeyPress>().expect("a key name"),
@@ -1498,25 +1590,6 @@ mod tests {
             panic!("{sent:?}")
         };
         assert_eq!((shift_enter.key, shift_enter.mods), (WireKeyCode::Enter, 1));
-    }
-
-    #[test]
-    fn the_escape_prefix_works_from_a_kitty_terminal() {
-        let (now, mut s) = start();
-        // Ctrl-6 is the prefix from a kitty terminal, `.` quits.
-        assert_eq!(s.on_input(now, b"\x1b[54;5u."), InputOutcome::Quit);
-        let (now, mut s) = start();
-        assert_eq!(
-            s.on_input(now, b"\x1b[54;5u\x1b[122;5u"),
-            InputOutcome::Suspend
-        );
-        // The prefix and another key: both go on, the prefix as it was typed.
-        let (now, mut s) = start();
-        drain(&mut s);
-        s.on_input(now, b"\x1b[54;5ux");
-        let sent = events(&drain(&mut s));
-        assert_eq!(sent.len(), 2);
-        assert_eq!(sent[1], key("x"));
     }
 
     #[test]
@@ -1571,14 +1644,28 @@ mod tests {
     #[test]
     fn colours_are_told_on_connecting_and_again_on_a_new_scheme() {
         let (now, mut s) = start();
-        let colours = WireColours {
-            background: Some([0x1e, 0x1e, 0x20]),
-            scheme: Some(WireScheme::Dark),
-            ..WireColours::default()
-        };
-        s.set_colours(Some(colours.clone()));
+        s.ask_terminal(now, true);
+        assert_eq!(s.take_questions(), probe::queries(true));
+        // Ghostty: its colours, a dark scheme, the kitty flags, DA1 last.
+        s.on_input(
+            now,
+            b"\x1b]11;rgb:1e/1e/20\x07\x1b[?0u\x1b[?997;1n\x1b[?62;22c",
+        );
         let sent = drain(&mut s);
-        assert_eq!(sent.get(1), Some(&ClientMsg::Colours(colours)));
+        let Some(ClientMsg::Colours(told)) = sent.get(1) else {
+            panic!("{sent:?}")
+        };
+        assert_eq!(told.background, Some([0x1e, 0x1e, 0x20]));
+        assert_eq!(told.scheme, Some(WireScheme::Dark));
+        assert_eq!(
+            s.take_found(),
+            Some(Found {
+                underline_styles: false,
+                kitty: true,
+                scheme_reports: true
+            })
+        );
+        assert_eq!(s.take_found(), None, "said once");
         // The terminal reports a light scheme: its colours are asked again, and told once DA1,
         // the round's last answer, is in.
         s.on_input(now, b"\x1b[?997;2n");
@@ -1596,12 +1683,31 @@ mod tests {
         assert_eq!(told.scheme, Some(WireScheme::Light));
         assert_eq!(told.palette.get(1), Some(&Some([0xcd, 0, 0])));
         assert_eq!(s.colours.as_ref(), Some(told));
-        // Not told, nothing is asked or sent.
+        // Not told, no colour is asked or sent, nor are scheme reports turned on.
         let (now, mut s) = start();
-        s.set_colours(None);
-        s.on_input(now, b"\x1b[?997;2n");
+        s.ask_terminal(now, false);
+        assert_eq!(s.take_questions(), probe::QUERIES);
+        s.on_input(now, b"\x1b[?997;2n\x1b[?62c\x1b[?997;1n");
         assert_eq!(s.take_questions(), b"");
+        assert_eq!(s.take_found(), None);
         assert_eq!(drain(&mut s), [ClientMsg::Resize(Size::new(24, 80))]);
+    }
+
+    /// The start-up questions are the session's first phase, on the one decoder stdin has: an
+    /// answer, however late and however split (a slow terminal, a slow link), is taken as one,
+    /// and never reaches the program as keys (`ESC P 1 + r` would be Alt-P and more, which
+    /// vim's normal mode runs). Keys typed around it go on as typed.
+    #[test]
+    fn a_late_answer_to_the_start_up_questions_never_reaches_the_program() {
+        let (t0, mut s) = start();
+        s.ask_terminal(t0, false);
+        drain(&mut s);
+        let late = t0 + Duration::from_secs(10);
+        s.on_input(late, b"a\x1bP1+r536d756c");
+        s.on_input(late, b"78=1b5b343a25703125646d\x1b\\b\x1bP1$r0;4:3m\x1b\\");
+        s.on_input(late, b"\x1b[?62;22cc");
+        assert_eq!(typed(&drain(&mut s)), b"abc");
+        assert!(s.take_found().is_some_and(|found| found.underline_styles));
     }
 
     #[test]
@@ -1709,58 +1815,6 @@ mod tests {
         assert_eq!(bytes, b"\x1b[200~abc\x1b[201~");
     }
 
-    /// A program that prints its prompt and turns echo off a moment after (bash's `read -s`) can
-    /// be shown with the modes from before: a key typed at once must not be shown, however
-    /// trusted the session; once the server could have told the new modes, keys are predicted as
-    /// before.
-    #[test]
-    fn a_key_at_a_fresh_prompt_waits_for_its_echo() {
-        use crate::predict::TtyModes;
-        use crate::terminal::ServerTerminal;
-        let echoing = TtyModes {
-            echo: true,
-            line: true,
-        };
-        let t0 = Instant::now();
-        let mut s = ClientSession::new(Size::new(24, 80));
-        let mut server = ServerTerminal::new(24, 80, 0).expect("emulator");
-        server.set_tty(echoing);
-        server.process(b"$ ");
-        let first = server.snapshot();
-        s.on_frame(t0, &frame(1, 0, 0, &TerminalScreen::default(), &first));
-        // Long after the prompt: the kernel echoes, so the first key shows at once.
-        let later = t0 + Duration::from_secs(1);
-        s.on_input(later, b"x");
-        assert!(
-            s.overlay().cells().any(|(_, c)| c.glyph == "x"),
-            "kernel echo is predicted from the first key"
-        );
-        drain(&mut s);
-        // The program prints a prompt on a new row; the modes the frame carries still echo.
-        server.process(b"x\r\nSecret: ");
-        let prompt = server.snapshot();
-        let t1 = later + Duration::from_millis(50);
-        s.on_frame(t1, &frame(2, 1, 1, &first, &prompt));
-        s.on_input(t1 + Duration::from_millis(10), b"Q");
-        drain(&mut s);
-        assert!(
-            !s.overlay().cells().any(|(_, c)| c.glyph == "Q"),
-            "a key typed at a fresh prompt is not shown before its echo"
-        );
-        // The program did echo (no password after all): once the server reflects the held key,
-        // and the hold is over, the next key is predicted from the first again.
-        server.process(b"Q");
-        let echoed = server.snapshot();
-        let t2 = t1 + PROMPT_HOLD + Duration::from_millis(1);
-        s.on_frame(t2, &frame(3, 2, 2, &prompt, &echoed));
-        s.on_input(t2, b"Z");
-        assert!(
-            s.overlay().cells().any(|(_, c)| c.glyph == "Z"),
-            "after the hold, kernel echo is predicted again"
-        );
-        assert!(!s.overlay().cells().any(|(_, c)| c.glyph == "Q"));
-    }
-
     /// `Ctrl-^`, a focus-in report, then `.`: the focus-in takes the prefix and the `.` is typed,
     /// whether the link is up or went down between the keys; and a prefix typed before a drop
     /// with `.` after it quits.
@@ -1786,10 +1840,8 @@ mod tests {
     #[test]
     fn input_typed_while_detached_is_dropped_at_the_attach() {
         let (now, mut s) = start();
-        s.set_colours(Some(WireColours {
-            background: Some([1, 2, 3]),
-            ..WireColours::default()
-        }));
+        s.ask_terminal(now, true);
+        s.on_input(now, b"\x1b]11;rgb:01/02/03\x07\x1b[?62c");
         s.on_input(now, b"a");
         drain(&mut s);
         // The key sent is confirmed; the one queued is probed for, and a resync asked: both for
@@ -1851,29 +1903,6 @@ mod tests {
         );
     }
 
-    /// Input handed to the lost connection and never confirmed may not have arrived: the status
-    /// line says so at the attach, though nothing was typed during the outage.
-    #[test]
-    fn an_unconfirmed_send_at_the_drop_is_said_at_the_attach() {
-        let (now, mut s) = start();
-        s.on_input(now, b"false && ");
-        drain(&mut s);
-        s.detach(now);
-        s.attach(Size::new(24, 80));
-        let status = s.on_tick(now, None).status.expect("a notice");
-        assert!(status.contains("may not have arrived"), "{status}");
-    }
-
-    /// A focus report or the mouse during an outage is not typing: no notice says it was not sent.
-    #[test]
-    fn a_focus_report_during_an_outage_is_not_called_typing() {
-        let (now, mut s) = start();
-        s.detach(now);
-        s.on_inputs(now, vec![Input::FocusIn]);
-        let status = s.on_tick(now, None).status.expect("the banner");
-        assert!(!status.contains("not sent"), "{status}");
-    }
-
     /// Across a reattach the last screen stays up until the server repaints it, and the
     /// scrollback view stays open.
     #[test]
@@ -1891,13 +1920,133 @@ mod tests {
         s.detach(now);
         s.attach(Size::new(24, 80));
         assert!(s.view().is_some(), "the view is still open");
-        assert!(s.screen().contents().contains("kept"));
+        assert!(s.state().screen().contents().contains("kept"));
         assert!(!s.synced(), "not the new connection's screen yet");
         s.on_frame(
             now,
             &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"new")),
         );
-        assert!(s.synced() && s.screen().contents().contains("new"));
+        assert!(s.synced() && s.state().screen().contents().contains("new"));
+    }
+
+    /// A step of an outage, for [`what_an_outage_lost_is_said`].
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        Type(&'static [u8]),
+        /// The connection takes what is queued.
+        Flush,
+        Down,
+        Up,
+        /// The new connection's first frame.
+        Frame,
+        PasteTooLong,
+        FocusIn,
+        /// The queue is full.
+        Pause,
+        Wait(u64),
+    }
+
+    /// What an outage lost is said, and nothing it did not lose: "may not have arrived" for input
+    /// handed to the lost connection unconfirmed, "not sent" for typing while down.
+    #[test]
+    fn what_an_outage_lost_is_said() {
+        use Step::{Down, Flush, FocusIn, Frame, PasteTooLong, Pause, Type, Up, Wait};
+        const LINE: Step = Type(b"false && ");
+        let cases: [(&[Step], &[&str], &[&str]); 10] = [
+            // Though nothing was typed during the outage.
+            (&[LINE, Flush, Down, Up], &["may not have arrived"], &[]),
+            // A focus report or the mouse is not typing.
+            (&[Down, FocusIn], &["reconnecting"], &["not sent"]),
+            // An Enter pressed to try the link does not unsay the half-sent line.
+            (
+                &[LINE, Flush, Down, Type(b"\r")],
+                &["may not have arrived", "not sent"],
+                &[],
+            ),
+            // Nor does a paste too long unsay the typing dropped, and both are said after.
+            (
+                &[LINE, Flush, Down, Type(b"rm -rf *\r"), PasteTooLong, Up],
+                &["typing during the outage not sent"],
+                &[],
+            ),
+            (
+                &[Down, Type(b"x"), PasteTooLong, Up, Frame],
+                &["paste over 1 MiB", "not sent"],
+                &["reconnecting"],
+            ),
+            // While down, the banner still says that typing is paused, and a notice given.
+            (
+                &[Down, Type(b"\x1b[200~"), PasteTooLong],
+                &["reconnecting", "paste over 1 MiB"],
+                &[],
+            ),
+            (&[Down, Pause], &["reconnecting", "input paused"], &[]),
+            // A new outage says only what it lost: what the last one lost goes at the drop.
+            (
+                &[LINE, Flush, Down, Type(b"x"), Up, Frame, Flush, Down],
+                &["reconnecting"],
+                &["not sent", "may not have arrived"],
+            ),
+            // A second drop before the first frame is the same outage.
+            (
+                &[LINE, Flush, Down, Up, Flush, Wait(10), Down, Up],
+                &["may not have arrived"],
+                &[],
+            ),
+            // A notice left from an earlier outage does not hide a later drop's unconfirmed send.
+            (
+                &[
+                    Frame,
+                    Down,
+                    Type(b"x"),
+                    Up,
+                    Frame,
+                    Flush,
+                    Wait(10),
+                    LINE,
+                    Flush,
+                    Wait(60),
+                    Down,
+                    Up,
+                ],
+                &["may not have arrived"],
+                &[],
+            ),
+        ];
+        for (steps, said, unsaid) in cases {
+            let (mut now, mut s) = start();
+            drain(&mut s);
+            for step in steps {
+                match *step {
+                    Type(bytes) => {
+                        s.on_input(now, bytes);
+                    }
+                    Flush => {
+                        drain(&mut s);
+                    }
+                    Down => s.detach(now),
+                    Up => s.attach(Size::new(24, 80)),
+                    Frame => s.on_frame(now, &frame(1, 0, 0, &screen(b""), &screen(b""))),
+                    PasteTooLong => {
+                        s.on_inputs(now, vec![Input::PasteTooLong]);
+                    }
+                    FocusIn => {
+                        s.on_inputs(now, vec![Input::FocusIn]);
+                    }
+                    Pause => s.input_paused = true,
+                    Wait(secs) => now += Duration::from_secs(secs),
+                }
+            }
+            let status = s.on_tick(now, None).status.expect("a status");
+            assert!(
+                said.iter().all(|p| status.contains(p)),
+                "{steps:?}: {status}"
+            );
+            assert!(
+                !unsaid.iter().any(|p| status.contains(p)),
+                "{steps:?}: {status}"
+            );
+        }
     }
 
     /// A line typed across the drop: its start went out on the lost connection unconfirmed, so
@@ -1927,25 +2076,9 @@ mod tests {
         assert_eq!(typed(&drain(&mut s)), b"x");
     }
 
-    /// While down, the banner still says that typing is paused, and a notice given meanwhile.
-    #[test]
-    fn the_banner_carries_a_pause_and_a_notice() {
-        let (now, mut s) = start();
-        s.detach(now);
-        s.on_input(now, b"\x1b[200~");
-        s.on_inputs(now, vec![Input::PasteTooLong]);
-        let status = s.on_tick(now, None).status.expect("the banner");
-        assert!(
-            status.contains("reconnecting") && status.contains("paste over 1 MiB"),
-            "{status}"
-        );
-        s.input_paused = true;
-        let status = s.on_tick(now, None).status.expect("the banner");
-        assert!(status.contains("input paused"), "{status}");
-    }
-
     /// Trust in predictions is the drop's: a resize while down (which voids the predictions)
-    /// does not take it away, and an untrusted session gains none from an outage.
+    /// does not take it away, an untrusted session gains none from an outage, and a second drop
+    /// in the same outage keeps the trust taken at the first.
     #[test]
     fn prediction_trust_is_taken_at_the_drop() {
         let (now, mut s) = start();
@@ -1954,6 +2087,12 @@ mod tests {
         assert!(
             !s.predictor.carries_trust(),
             "a session never confirmed carries no trust"
+        );
+        s.predictor.confirm_for_tests();
+        s.detach(now);
+        assert!(
+            !s.predictor.carries_trust(),
+            "the trust is the first drop's"
         );
         let (now, mut s) = start();
         s.predictor.confirm_for_tests();
@@ -1964,88 +2103,6 @@ mod tests {
         assert!(
             s.predictor.carries_trust(),
             "trust at the drop is carried across the outage"
-        );
-    }
-
-    /// A notice left from an earlier outage is not typing during this one: input sent
-    /// unconfirmed as the link drops again, a minute later, is still said to may not have
-    /// arrived.
-    #[test]
-    fn an_old_outage_notice_does_not_hide_an_unconfirmed_send_at_a_later_drop() {
-        let (t0, mut s) = start();
-        drain(&mut s);
-        s.on_frame(
-            t0,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
-        // The first outage: typing while down is not sent, and said.
-        s.detach(t0);
-        s.on_input(t0, b"x");
-        s.attach(Size::new(24, 80));
-        s.on_frame(
-            t0,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
-        drain(&mut s);
-        // Back up; later a line goes out and the link drops before it is confirmed.
-        let t1 = t0 + Duration::from_secs(10);
-        s.on_input(t1, b"false && ");
-        drain(&mut s);
-        let t2 = t1 + Duration::from_secs(60);
-        s.detach(t2);
-        s.attach(Size::new(24, 80));
-        let status = s.on_tick(t2, None).status.expect("the banner");
-        assert!(status.contains("may not have arrived"), "{status}");
-    }
-
-    /// A paste too long during an outage does not unsay the typing dropped in it: at the attach
-    /// the status line still says the outage's typing was not sent.
-    #[test]
-    fn a_paste_too_long_during_an_outage_does_not_hide_the_typing_dropped() {
-        let (now, mut s) = start();
-        s.on_input(now, b"false && ");
-        drain(&mut s);
-        s.detach(now);
-        s.on_input(now, b"rm -rf *\r");
-        s.on_inputs(now, vec![Input::PasteTooLong]);
-        s.attach(Size::new(24, 80));
-        let status = s.on_tick(now, None).status.expect("the banner");
-        assert!(
-            status.contains("typing during the outage not sent"),
-            "{status}"
-        );
-    }
-
-    /// A second drop before the first frame is the same outage: input sent unconfirmed at the
-    /// first drop is still said to may not have arrived, though the second link took none.
-    #[test]
-    fn a_second_drop_before_the_first_frame_keeps_the_unconfirmed_send() {
-        let (t0, mut s) = start();
-        s.on_input(t0, b"false && ");
-        drain(&mut s);
-        s.detach(t0);
-        s.attach(Size::new(24, 80));
-        drain(&mut s);
-        let t1 = t0 + Duration::from_secs(10);
-        s.detach(t1);
-        s.attach(Size::new(24, 80));
-        let status = s.on_tick(t1, None).status.expect("the banner");
-        assert!(status.contains("may not have arrived"), "{status}");
-    }
-
-    /// Typing during the outage does not unsay an unconfirmed send at the drop: an Enter pressed
-    /// to try the link leaves the half-sent line still said to may not have arrived.
-    #[test]
-    fn typing_during_the_outage_does_not_hide_an_unconfirmed_send() {
-        let (now, mut s) = start();
-        s.on_input(now, b"false && ");
-        drain(&mut s);
-        s.detach(now);
-        s.on_input(now, b"\r");
-        let status = s.on_tick(now, None).status.expect("the banner");
-        assert!(
-            status.contains("may not have arrived") && status.contains("not sent"),
-            "{status}"
         );
     }
 
@@ -2081,51 +2138,6 @@ mod tests {
         assert!(s.on_tick(t1 + NOTICE_FOR, None).status.is_none());
     }
 
-    /// A new outage says only what it lost: what the last one lost, still on the status line,
-    /// goes at the drop, so a phrase is not said twice nor said of this outage untrue.
-    #[test]
-    fn a_new_outage_retires_what_the_last_one_lost() {
-        let (t0, mut s) = start();
-        s.on_input(t0, b"false && ");
-        drain(&mut s);
-        s.detach(t0);
-        s.on_input(t0, b"x");
-        s.attach(Size::new(24, 80));
-        s.on_frame(
-            t0,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
-        drain(&mut s);
-        s.detach(t0);
-        let status = s.on_tick(t0, None).status.expect("the banner");
-        assert!(
-            !status.contains("not sent") && !status.contains("may not have arrived"),
-            "{status}"
-        );
-        s.on_input(t0, b"y");
-        let status = s.on_tick(t0, None).status.expect("the banner");
-        assert_eq!(status.matches("not sent").count(), 1, "{status}");
-    }
-
-    /// A paste too long during an outage is still said after it, beside what the outage lost.
-    #[test]
-    fn a_paste_too_long_during_an_outage_is_said_after_it() {
-        let (now, mut s) = start();
-        s.detach(now);
-        s.on_input(now, b"x");
-        s.on_inputs(now, vec![Input::PasteTooLong]);
-        s.attach(Size::new(24, 80));
-        s.on_frame(
-            now,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
-        let status = s.on_tick(now, None).status.expect("a notice");
-        assert!(
-            status.contains("paste over 1 MiB") && status.contains("not sent"),
-            "{status}"
-        );
-    }
-
     /// A pause with nothing queued ends at the drop, which drops all that is queued: typing after
     /// the outage goes out.
     #[test]
@@ -2142,20 +2154,5 @@ mod tests {
         drain(&mut s);
         s.on_input(now, b"x");
         assert_eq!(typed(&drain(&mut s)), b"x");
-    }
-
-    /// A second drop in the same outage keeps the trust taken at the first: nothing between is
-    /// asked again.
-    #[test]
-    fn a_second_drop_keeps_the_trust_taken_at_the_first() {
-        let (now, mut s) = start();
-        s.detach(now);
-        s.attach(Size::new(24, 80));
-        s.predictor.confirm_for_tests();
-        s.detach(now);
-        assert!(
-            !s.predictor.carries_trust(),
-            "the trust is the first drop's"
-        );
     }
 }

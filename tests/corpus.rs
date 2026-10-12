@@ -9,14 +9,12 @@
 //! the server diffs against the newest frame the client acknowledged, as koh's protocol does;
 //! the newest frame of each step is resent until it arrives, as the server's retries do, so the
 //! client must converge on every step's screen.
-#![expect(clippy::disallowed_types, reason = "tests queue freely")]
+#![forbid(clippy::disallowed_methods)]
 
 #[path = "../testing/corpus/recording.rs"]
 mod recording;
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
-use std::io::Write as _;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -24,7 +22,7 @@ use std::time::{Duration, Instant};
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
 use koh::predict::Overlay;
 use koh::proto::{
-    decode_server, encode_client, encode_frame, ClientDecoder, ClientMsg, Frame, FrameNum,
+    decode_server, encode_client, ClientDecoder, ClientMsg, Frame, FrameEncoder, FrameNum,
     InputSeq, ServerMsg,
 };
 use koh::terminal::{FrameHold, ServerTerminal, Size, TerminalScreen, FRAME_HOLD};
@@ -35,31 +33,6 @@ const SCROLLBACK: usize = 1000;
 
 /// The most bytes one read of a PTY returns here.
 const PIECE: u64 = 2048;
-
-/// A seeded random sequence (splitmix64), so a failure names the seed that reproduces it.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    /// A number in `1..=max`.
-    fn upto(&mut self, max: u64) -> u64 {
-        self.next().checked_rem(max).unwrap_or(0).saturating_add(1)
-    }
-
-    /// True with probability `p`.
-    fn chance(&mut self, p: f64) -> bool {
-        let unit =
-            f64::from(u32::try_from(self.next() >> 32).unwrap_or(u32::MAX)) / 4_294_967_296.0;
-        unit < p
-    }
-}
 
 /// The user's terminal, as the client's backend sees it: what was painted, and its size.
 #[derive(Clone)]
@@ -122,7 +95,7 @@ impl View {
                     };
                     let mut attributes = cell.attributes();
                     if drawn {
-                        attributes = koh::terminal::drawn(attributes, screen);
+                        attributes = koh::terminal::test_support::drawn(attributes, screen);
                     }
                     let link = screen
                         .link(row, col)
@@ -208,7 +181,7 @@ struct Session {
     /// The newest frame the client acknowledged, the next frame's base.
     base: (FrameNum, TerminalScreen),
     /// Frames sent and not yet acknowledged or superseded.
-    sent: VecDeque<(FrameNum, TerminalScreen)>,
+    sent: Vec<(FrameNum, TerminalScreen)>,
     next: FrameNum,
     replayed: Replayed,
 }
@@ -250,7 +223,7 @@ impl Session {
             )
             .map_err(|e| e.to_string())?,
             base: (FrameNum::BLANK, TerminalScreen::default()),
-            sent: VecDeque::new(),
+            sent: Vec::new(),
             next: FrameNum::BLANK.next(),
             replayed: Replayed::default(),
         })
@@ -320,8 +293,8 @@ impl Session {
     fn ack(&mut self, acked: FrameNum) {
         if let Some(at) = self.sent.iter().position(|(num, _)| *num == acked) {
             let mut newer = self.sent.split_off(at);
-            if let Some(base) = newer.pop_front() {
-                self.base = base;
+            if !newer.is_empty() {
+                self.base = newer.remove(0);
             }
             self.sent = newer;
         }
@@ -337,15 +310,17 @@ impl Session {
             diff: screen.diff_from(&self.base.1),
         };
         self.next = self.next.next();
-        let bytes = encode_frame(&frame, &self.base.1).map_err(|e| e.to_string())?;
+        let bytes = FrameEncoder::default()
+            .encode(&frame, &self.base.1)
+            .map_err(|e| e.to_string())?;
         self.replayed.frames = self.replayed.frames.saturating_add(1);
         self.replayed.wire_bytes = self
             .replayed
             .wire_bytes
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        self.sent.push_back((frame.num, screen));
+        self.sent.push((frame.num, screen));
         while self.sent.len() > 16 {
-            self.sent.pop_front();
+            self.sent.remove(0);
         }
         if dropped {
             return Ok(false);
@@ -357,7 +332,10 @@ impl Session {
         };
         self.client
             .on_frame_stream(Instant::now(), base, &rows, &body);
-        let applied = self.client.applied() == frame.num;
+        let applied = self
+            .sent
+            .last()
+            .is_some_and(|(_, screen)| self.client.state() == screen);
         // Delivered: the server takes that as the acknowledgement (or the client's own `Ack`, a
         // nudge, below).
         self.ack(frame.num);
@@ -374,7 +352,7 @@ impl Session {
         if applied {
             self.replayed.applied = self.replayed.applied.saturating_add(1);
             self.terminal
-                .render(self.client.state(), &Overlay::empty(), None)
+                .render(self.client.state(), &Overlay::default(), None)
                 .map_err(|e| e.to_string())?;
             let painted = std::mem::take(&mut *self.capture.painted.borrow_mut());
             self.shown.process(&painted).map_err(|e| e.to_string())?;
@@ -390,7 +368,7 @@ impl Session {
 /// Replay `recording` with pieces and frame boundaries from `seed`, dropping each frame with
 /// probability `loss`.
 fn replay(recording: &Recording, seed: u64, loss: f64) -> Result<Replayed, String> {
-    let mut rng = Rng(seed);
+    let mut rng = koh_testkit::Rng(seed);
     let mut session = Session::new(recording.rows, recording.cols)?;
     for (index, (step, output)) in recording.outputs().enumerate() {
         let at = |e: String| format!("{} seed {seed} step {index}: {e}", recording.name);
@@ -399,7 +377,7 @@ fn replay(recording: &Recording, seed: u64, loss: f64) -> Result<Replayed, Strin
         }
         let mut rest = output;
         while !rest.is_empty() {
-            let len = usize::try_from(rng.upto(PIECE)).unwrap_or(usize::MAX);
+            let len = usize::try_from(rng.below(PIECE).saturating_add(1)).unwrap_or(usize::MAX);
             let (piece, after) = rest.split_at(len.min(rest.len()));
             rest = after;
             let sent = session.output(piece).map_err(at)?;
@@ -505,57 +483,6 @@ fn the_corpus_is_read_whole() {
     assert_eq!(nvim.steps[3].keys, b"\x17w");
 }
 
-/// Where a recording's frame bytes go: for `KOH_RECORDING`, its final screen as one frame from the
-/// blank screen, raw and compressed, and how much of the raw encoding is text. A tool, not a test.
-#[test]
-#[ignore = "an analysis: KOH_RECORDING=name cargo test --test corpus frame_bytes -- --ignored --nocapture"]
-fn frame_bytes() {
-    let Ok(name) = std::env::var("KOH_RECORDING") else {
-        return;
-    };
-    let corpus = corpus().expect("corpus");
-    if name == "all" {
-        frame_size_histogram(&corpus).expect("histogram");
-        return;
-    }
-    let recording = corpus.iter().find(|r| r.name == name).expect("recording");
-    let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK).expect("emu");
-    let mut previous = TerminalScreen::default();
-    for (num, (step, output)) in (0_u64..).zip(recording.outputs()) {
-        if let Some((rows, cols)) = step.resize {
-            server.resize(Size::new(rows, cols));
-        }
-        server.process(output);
-        let screen = server.snapshot();
-        let frame = Frame {
-            num: FrameNum(num + 1),
-            base: FrameNum(num),
-            echo_ack: InputSeq::default(),
-            diff: screen.diff_from(&previous),
-        };
-        let raw = postcard::to_allocvec(&frame).expect("raw");
-        let wire = encode_frame(&frame, &previous).expect("wire");
-        let alone = koh::proto::encode_frame_with(&frame, &[]).expect("alone");
-        let text: usize = frame
-            .diff
-            .rows
-            .iter()
-            .flat_map(|r| &r.runs)
-            .map(|r| r.cell.text.as_str().len())
-            .sum();
-        let runs: usize = frame.diff.rows.iter().map(|r| r.runs.len()).sum();
-        println!(
-            "step {num}: rows {} runs {runs} text {text} raw {} wire {} (alone {}), shifts {}",
-            frame.diff.rows.len(),
-            raw.len(),
-            wire.len(),
-            alone.len(),
-            frame.diff.shifts.iter().count()
-        );
-        previous = screen;
-    }
-}
-
 /// What the predictor did over the corpus: guesses shown, those the next screen did not bear out
 /// (a brief flash), and guesses still shown after the frame that echoes their keys that disagree
 /// with it (which must never happen).
@@ -572,6 +499,12 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
     let size = Size::new(recording.rows, recording.cols);
     let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK)
         .map_err(|e| e.to_string())?;
+    // The PTY's modes as an interactive program sets them, a line editor's included: keys are
+    // echoed by the program, a key at a time.
+    server.set_tty(koh::terminal::TtyModes {
+        echo: false,
+        line: false,
+    });
     let mut client = ClientSession::new(size);
     let mut sent = TerminalScreen::default();
     let mut num = FrameNum::BLANK;
@@ -603,8 +536,8 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
         let before: Vec<((u16, u16), String)> = client
             .overlay()
             .cells()
-            .filter(|(_, c)| !c.covered)
-            .map(|(at, c)| (at, c.glyph.to_owned()))
+            .filter(|(_, c)| !c.covered())
+            .map(|(at, c)| (at, c.text().to_owned()))
             .collect();
         server.process(output);
         let screen = server.snapshot();
@@ -629,10 +562,11 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
         );
         for ((row, col), c) in client.overlay().cells() {
             let shown = cell(client.state(), row, col);
-            if !c.covered && shown != c.glyph {
+            if !c.covered() && shown != c.text() {
                 into.disagreeing.push(format!(
                     "{} step {index}: ({row}, {col}) guessed {:?}, the server shows {shown:?}",
-                    recording.name, c.glyph
+                    recording.name,
+                    c.text()
                 ));
             }
         }
@@ -660,59 +594,6 @@ fn confirmed_guesses_never_disagree_with_the_server() {
         "{}",
         total.disagreeing.join("\n")
     );
-}
-
-/// How big koh's frames are on the recordings: each step's screen as one frame on the step
-/// before, as its stream carries it, counted by size, with the bytes each size takes.
-fn frame_size_histogram(corpus: &[Recording]) -> Result<(), String> {
-    const BOUNDS: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, usize::MAX];
-    let mut counts = [0_usize; 9];
-    let mut bytes = [0_usize; 9];
-    for recording in corpus {
-        let mut server = ServerTerminal::new(recording.rows, recording.cols, SCROLLBACK)
-            .map_err(|e| e.to_string())?;
-        let mut previous = TerminalScreen::default();
-        for (num, (step, output)) in (0_u64..).zip(recording.outputs()) {
-            if let Some((rows, cols)) = step.resize {
-                server.resize(Size::new(rows, cols));
-            }
-            server.process(output);
-            let screen = server.snapshot();
-            let frame = Frame {
-                num: FrameNum(num.saturating_add(1)),
-                base: FrameNum(num),
-                echo_ack: InputSeq::default(),
-                diff: screen.diff_from(&previous),
-            };
-            let len = encode_frame(&frame, &previous)
-                .map_err(|e| e.to_string())?
-                .len();
-            let at = BOUNDS.iter().position(|&b| len < b).unwrap_or(8);
-            if let (Some(count), Some(sum)) = (counts.get_mut(at), bytes.get_mut(at)) {
-                *count = count.saturating_add(1);
-                *sum = sum.saturating_add(len);
-            }
-            previous = screen;
-        }
-    }
-    let total: usize = bytes.iter().sum();
-    let frames: usize = counts.iter().sum();
-    let mut output = std::io::stdout().lock();
-    writeln!(output, "{frames} frames, {total} bytes").map_err(|e| e.to_string())?;
-    for ((bound, count), sum) in BOUNDS.iter().zip(counts).zip(bytes) {
-        let label = if *bound == usize::MAX {
-            "4096+".to_owned()
-        } else {
-            format!("<{bound}")
-        };
-        let percent = sum.saturating_mul(100).checked_div(total).unwrap_or(0);
-        writeln!(
-            output,
-            "{label:>6}: {count:>5} frames, {sum:>7} bytes ({percent}%)"
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(())
 }
 
 /// What the recording's program read for its keys: each key typed decoded, then encoded as the

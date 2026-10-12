@@ -1,6 +1,6 @@
 # The scoreboard
 
-`testing/scoreboard.sh` writes a scoreboard to `docs/SCOREBOARD.md` (or `--out`; it is not
+`testing/scoreboard.sh` writes a scoreboard to stdout (or the file `--out` names; it is not
 committed): koh beside mosh and plain ssh, on the corpus's 113 recordings (`testing/corpus/`) and
 on four synthetic workloads, by bytes on the wire and on the user's terminal, keystroke latency
 beside a flood, the time to a settled screen, server memory per session, and the instructions koh
@@ -12,7 +12,7 @@ It is modelled on fux's scoreboard (`fux-vt/compare/`): every number is measured
 testing/scoreboard.sh                              # everything, about 30 minutes
 testing/scoreboard.sh --recordings bash,vim-resize # two recordings, the synthetic workloads
 testing/scoreboard.sh --recordings none --skip latency
-testing/scoreboard.sh --systems koh --out /tmp/koh.md
+testing/scoreboard.sh --systems koh --out koh.md
 testing/scoreboard.sh --runs 3 --repeats 5         # the defaults: latency and settling 3 times
 testing/scoreboard.sh --profiles Mbit,kbit         # latency and settling on the slow links only
 ```

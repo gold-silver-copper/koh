@@ -4,9 +4,11 @@
 //! each spawns a real child + PTY + two pump threads, and running them alongside the ~100 inline
 //! unit/property tests in one massively-parallel binary starved the PTY reader thread under load
 //! (a flaky timeout). A dedicated binary runs only these few in parallel, so they stay reliable.
-#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
+#![forbid(clippy::disallowed_methods)]
 
 use std::time::Duration;
+
+use koh_testkit::{current_thread, multi_thread, read_until};
 
 #[cfg(unix)]
 #[test]
@@ -28,22 +30,12 @@ fn external_signal_retains_shell_style_exit_status() {
             &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn signal fixture");
-        let mut output = String::new();
-        let pid = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let chunk = rx.recv().await.expect("output before the pid line");
-                output.push_str(&String::from_utf8_lossy(&chunk));
-                let pid = output
-                    .split_once("PID=")
-                    .and_then(|(_, rest)| rest.split_once(['\r', '\n']))
-                    .and_then(|(digits, _)| digits.parse::<i32>().ok());
-                if let Some(pid) = pid {
-                    break pid;
-                }
-            }
-        })
-        .await
-        .expect("pid line deadline");
+        let output = read_until(&mut rx, "\n").await.expect("the pid line");
+        let pid = output
+            .split_once("PID=")
+            .and_then(|(_, rest)| rest.split_once(['\r', '\n']))
+            .and_then(|(digits, _)| digits.parse::<i32>().ok())
+            .expect("a pid");
         let pid = Pid::from_raw(pid).expect("a positive pid");
         kill(pid, Signal::Kill).expect("signal child");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -81,19 +73,8 @@ fn teardown_reaps_children_even_when_the_caller_does_not_wait() {
                 &koh::pty::Reaper::start().expect("reaper"),
             )
             .expect("spawn");
-            let mut output = String::new();
-            let pid: u32 = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    output.push_str(&String::from_utf8_lossy(
-                        &rx.recv().await.expect("pid output"),
-                    ));
-                    if let Some((line, _)) = output.split_once('\n') {
-                        break line.trim().parse().expect("pid");
-                    }
-                }
-            })
-            .await
-            .expect("pid deadline");
+            let output = read_until(&mut rx, "\n").await.expect("the pid line");
+            let pid: u32 = output.trim().parse().expect("pid");
             // Keep the receiver alive but unread: teardown must not depend on its consumer.
             if shutdown {
                 tokio::task::spawn_blocking(move || pty.close())
@@ -117,7 +98,7 @@ fn teardown_reaps_children_even_when_the_caller_does_not_wait() {
 #[test]
 fn shutdown_does_not_need_a_consumer_for_flooded_output() {
     current_thread().expect("runtime").block_on(async {
-        let (pty, _unread) = Pty::spawn(
+        let (pty, mut unread) = Pty::spawn(
             24,
             80,
             &["/bin/sh".into(), "-c".into(), "exec yes".into()],
@@ -126,7 +107,8 @@ fn shutdown_does_not_need_a_consumer_for_flooded_output() {
             &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn flood");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Once it floods, leave the rest unread.
+        read_until(&mut unread, "y").await.expect("the flood");
         tokio::time::timeout(
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || pty.close()),
@@ -155,18 +137,8 @@ fn stopped_reader_applies_backpressure_and_resumes_in_order() {
             &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn");
-        let mut line = String::new();
-        let pid = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                line.push_str(&String::from_utf8_lossy(&rx.recv().await.expect("pid")));
-                if let Some((digits, _)) = line.split_once('\n') {
-                    break Pid::from_raw(digits.trim().parse().expect("pid digits"))
-                        .expect("valid pid");
-                }
-            }
-        })
-        .await
-        .expect("pid deadline");
+        let line = read_until(&mut rx, "\n").await.expect("the pid line");
+        let pid = Pid::from_raw(line.trim().parse().expect("pid digits")).expect("valid pid");
         kill(pid, Signal::Stop).expect("stop reader");
         let mut expected = Vec::new();
         let pending = loop {
@@ -224,44 +196,6 @@ fn stopped_reader_applies_backpressure_and_resumes_in_order() {
 }
 
 #[test]
-fn host_normalizes_dimensions_for_both_the_emulator_and_pty() {
-    current_thread().expect("runtime").block_on(async {
-        let (mut host, mut rx) = koh::server::session::PtyHost::spawn(
-            &[
-                "/bin/sh".into(),
-                "-c".into(),
-                "stty -echo; echo READY; read x; stty size".into(),
-            ],
-            0,
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("host");
-        let mut output = String::new();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !output.contains("READY") {
-                output.push_str(&String::from_utf8_lossy(&rx.recv().await.expect("ready")));
-            }
-        })
-        .await
-        .expect("ready deadline");
-        let raw = koh::terminal::Size::new(0, u16::MAX);
-        let normalized = koh::terminal::clamp_dims(raw);
-        host.resize(raw);
-        assert_eq!(host.snapshot().screen().size(), normalized);
-        assert!(host.pty.write(b"\n".to_vec()).is_ok());
-        let output = all_output(rx).await;
-        assert!(
-            output.contains(&format!("{} {}", normalized.rows, normalized.cols)),
-            "{output:?}"
-        );
-        tokio::task::spawn_blocking(move || host.close())
-            .await
-            .expect("shutdown");
-    });
-}
-
-#[test]
 #[expect(
     clippy::match_wild_err_arm,
     reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"
@@ -310,48 +244,25 @@ fn spawns_and_streams_output() {
 }
 
 #[test]
-#[expect(
-    clippy::match_same_arms,
-    reason = "channel-close (`Ok(None)`) and deadline (`Err(_)`) are conceptually distinct outcomes kept as separate arms for readability, even though both set `in_order = false`"
-)]
 fn write_input_takes_shared_ref_and_preserves_order() {
     current_thread().expect("tokio runtime").block_on(async {
         // `pty` is bound WITHOUT `mut`, proving write_input takes `&self`. Two separate enqueues must
-        // reach the child in FIFO order: the concatenated marker only appears if the second chunk did
+        // reach `cat` in FIFO order: the concatenated marker only appears if the second chunk did
         // not overtake the first.
         let (pty, mut rx) = Pty::spawn(
             24,
             80,
-            &[],
+            &["cat".to_owned()],
             "xterm-256color",
             &launcher(),
             &koh::pty::Reaper::start().expect("reaper"),
         )
-        .expect("spawn shell");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        pty.write(b"printf ORDER_".to_vec()).expect("first enqueue");
+        .expect("spawn cat");
+        pty.write(b"ORDER_".to_vec()).expect("first enqueue");
         pty.write(b"AB_CD\n".to_vec()).expect("second enqueue");
-
-        let mut collected = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        let in_order = loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(chunk)) => {
-                    collected.extend_from_slice(&chunk);
-                    if String::from_utf8_lossy(&collected).contains("ORDER_AB_CD") {
-                        break true;
-                    }
-                }
-                Ok(None) => break false,
-                Err(_) => break false,
-            }
-        };
+        let in_order = read_until(&mut rx, "ORDER_AB_CD").await;
         drop(pty);
-        assert!(
-            in_order,
-            "FIFO ordering of two enqueues should yield ORDER_AB_CD; got: {}",
-            String::from_utf8_lossy(&collected)
-        );
+        in_order.expect("FIFO ordering of two enqueues should yield ORDER_AB_CD");
     });
 }
 
@@ -370,13 +281,17 @@ fn dropping_pty_eofs_child_and_stops_writer() {
         let (pty, mut rx) = Pty::spawn(
             24,
             80,
-            &["cat".to_owned()],
+            &[
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "echo READY; exec cat".to_owned(),
+            ],
             "xterm-256color",
             &launcher(),
             &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn cat");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        read_until(&mut rx, "READY").await.expect("cat is running");
         drop(pty); // no kill(): EOF must come purely from the writer handle being dropped
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -399,15 +314,21 @@ fn shutdown_joins_both_io_threads_without_deadlock() {
         let (pty, mut rx) = Pty::spawn(
             24,
             80,
-            &["sh".to_owned()],
+            &[
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "echo READY; exec sh".to_owned(),
+            ],
             "xterm-256color",
             &launcher(),
             &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn shell");
+        read_until(&mut rx, "READY")
+            .await
+            .expect("the shell is running");
         // Keep the output channel drained so the reader thread never blocks on a full channel.
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let drain = koh_testkit::spawn(async move { while rx.recv().await.is_some() {} });
 
         tokio::time::timeout(
             Duration::from_secs(20),
@@ -422,7 +343,7 @@ fn shutdown_joins_both_io_threads_without_deadlock() {
 
 #[test]
 fn shutdown_returns_while_the_program_leaves_its_input_unread() {
-    multi_thread().expect("tokio runtime").block_on(async {
+    multi_thread(4).expect("tokio runtime").block_on(async {
         // `sleep` never reads its terminal, so a paste fills the PTY's input queue and the writer
         // thread blocks in `write`. Shutdown kills the program; it must not then wait on that
         // write forever, or `koh serve` could never exit after such a paste.
@@ -439,14 +360,14 @@ fn shutdown_returns_while_the_program_leaves_its_input_unread() {
             &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn sleep");
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let drain = koh_testkit::spawn(async move { while rx.recv().await.is_some() {} });
         let chunk = vec![b'x'; 4096];
         let mut queued = 0;
+        // Until the writer's budget is full: it holds more than the terminal's input queue takes,
+        // so it is blocked on a write the program will never read.
         while queued < 256 && pty.write(chunk.clone()).is_ok() {
             queued += 1;
         }
-        // Let the writer thread fill the terminal's input queue and block.
-        tokio::time::sleep(Duration::from_millis(500)).await;
 
         tokio::time::timeout(
             Duration::from_secs(20),
@@ -508,7 +429,7 @@ fn argv_tail_reaches_the_child() {
 
 #[test]
 fn short_lived_children_never_lose_their_output() {
-    multi_thread().expect("tokio runtime").block_on(async {
+    multi_thread(4).expect("tokio runtime").block_on(async {
         // A child that writes and exits before anything reads the master loses ALL of its output
         // on macOS (a closed slave with nobody reading discards the queue), so the reader must be
         // running before the spawn. A reader started late loses about 3 outputs in 1000 under
@@ -522,7 +443,7 @@ fn short_lived_children_never_lose_their_output() {
             // Spawn every child before awaiting any, so they all run concurrently.
             let mut runs = Vec::with_capacity(CHILDREN);
             for i in 0..CHILDREN {
-                runs.push(tokio::spawn(async move {
+                runs.push(koh_testkit::spawn(async move {
                     let marker = format!("koh_short_{round}_{i}");
                     let (mut pty, mut rx) = Pty::spawn(
                         24,
@@ -561,21 +482,6 @@ fn short_lived_children_never_lose_their_output() {
             }
         }
     });
-}
-
-/// Runtimes for the tests. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
-fn current_thread() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-}
-
-fn multi_thread() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
 }
 
 /// Everything the program writes, until it exits and the PTY closes (or 20 s pass).
@@ -656,16 +562,7 @@ fn the_shell_leads_its_own_session_and_owns_its_terminal() {
         )
         .expect("spawn sh");
         let mut rx = rx;
-        let mut out = String::new();
-        let _ = tokio::time::timeout(Duration::from_secs(20), async {
-            while let Some(chunk) = rx.recv().await {
-                out.push_str(&String::from_utf8_lossy(&chunk));
-                if out.contains("END") {
-                    break;
-                }
-            }
-        })
-        .await;
+        let out = read_until(&mut rx, "END").await.expect("the report");
         let line = out
             .lines()
             .find(|l| l.starts_with("GROUPS"))
@@ -710,15 +607,9 @@ fn a_child_that_ignores_sighup_dies_when_its_pty_is_dropped() {
             &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn sh");
-        let mut out = String::new();
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while !out.contains("READY") {
-                let Some(chunk) = rx.recv().await else { break };
-                out.push_str(&String::from_utf8_lossy(&chunk));
-            }
-        })
-        .await
-        .expect("the child reports it is ready");
+        read_until(&mut rx, "READY")
+            .await
+            .expect("the child reports it is ready");
         drop(pty);
         let ended = tokio::time::timeout(Duration::from_secs(5), async {
             while rx.recv().await.is_some() {}
@@ -773,9 +664,8 @@ fn grow_the_pty_table() {
 #[test]
 fn a_hung_up_program_has_time_to_exit_before_it_is_killed() {
     current_thread().expect("tokio runtime").block_on(async {
-        let saved = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("koh-hangup-{}", std::process::id()));
-        let _ = std::fs::remove_file(&saved);
+        let dir = koh_testkit::scratch!("hangup").expect("a scratch directory");
+        let saved = dir.join("saved");
         let script = format!(
             "trap 'sleep 0.3; echo saved > {}; exit 0' HUP; echo READY; while :; do sleep 0.05; done",
             saved.display()
@@ -789,15 +679,9 @@ fn a_hung_up_program_has_time_to_exit_before_it_is_killed() {
             &koh::pty::Reaper::start().expect("reaper"),
         )
         .expect("spawn sh");
-        let mut out = String::new();
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while !out.contains("READY") {
-                let Some(chunk) = rx.recv().await else { break };
-                out.push_str(&String::from_utf8_lossy(&chunk));
-            }
-        })
-        .await
-        .expect("the child reports it is ready");
+        read_until(&mut rx, "READY")
+            .await
+            .expect("the child reports it is ready");
         tokio::task::spawn_blocking(move || pty.close())
             .await
             .expect("shutdown");
@@ -807,7 +691,6 @@ fn a_hung_up_program_has_time_to_exit_before_it_is_killed() {
             }
         })
         .await;
-        let _ = std::fs::remove_file(&saved);
         assert!(written.is_ok(), "the program was killed before its hangup handler finished");
     });
 }

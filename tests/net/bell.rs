@@ -13,10 +13,8 @@ use crate::link::{FaultNet, Profile};
 const WAIT: Duration = Duration::from_secs(15);
 
 /// A scratch directory and a hook that appends one line per spawn to `rang.log` in it.
-fn hook(name: &str) -> std::io::Result<(PathBuf, PathBuf, BellHook)> {
-    let dir = std::env::temp_dir().join(format!("koh-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
+fn hook(name: &str) -> std::io::Result<(koh_testkit::Scratch, PathBuf, BellHook)> {
+    let dir = koh_testkit::scratch!(name)?;
     let log = dir.join("rang.log");
     let hook = BellHook::new(format!("echo rang $KOH_BELL_COUNT >> '{}'", log.display()));
     Ok((dir, log, hook))
@@ -38,7 +36,7 @@ async fn wait_for_spawns(log: &Path, n: usize) {
 
 #[test]
 fn a_remote_bell_runs_the_hook_at_most_once_a_second() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             let net = FaultNet::new(Profile::default(), 1);
@@ -46,7 +44,7 @@ fn a_remote_bell_runs_the_hook_at_most_once_a_second() {
             let server = Server::start(&net, &[secret.public()], &["sh"])
                 .await
                 .expect("start the server");
-            let (dir, log, hook) = hook("bell-hook").expect("scratch dir");
+            let (_dir, log, hook) = hook("bell-hook").expect("scratch dir");
             let endpoint = net.endpoint(secret, false).await.expect("bind");
             let mut client = Client::connect_on(
                 endpoint,
@@ -84,7 +82,7 @@ fn a_remote_bell_runs_the_hook_at_most_once_a_second() {
                 .wait_until(WAIT, |t| t.contains("BELL_BURST"))
                 .await
                 .is_some());
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            wait_for_spawns(&log, 2).await;
             let n = spawns(&log);
             assert!(
                 (2..=3).contains(&n),
@@ -98,13 +96,12 @@ fn a_remote_bell_runs_the_hook_at_most_once_a_second() {
 
             let _ = client.finish().await;
             server.stop().await;
-            let _ = std::fs::remove_dir_all(&dir);
         });
 }
 
 #[test]
 fn stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do() {
-    crate::harness::runtime()
+    koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
             // The bell count is cumulative per server session. A bell rung before the hooked client
@@ -132,7 +129,7 @@ fn stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do() {
             let _ = first.finish().await;
 
             // Connection #2 carries the hook and attaches to a session whose count is already 1.
-            let (dir, log, hook) = hook("bell-stale").expect("scratch dir");
+            let (_dir, log, hook) = hook("bell-stale").expect("scratch dir");
             let mut client = Client::connect_on(
                 endpoint,
                 server.id,
@@ -160,7 +157,11 @@ fn stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do() {
                 .send(b"sleep 1; printf '\\a'; echo OUTAGE''_BELL\r")
                 .await
                 .expect("type");
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // The shell echoed the line, so it has it.
+            assert!(client
+                .wait_until(WAIT, |t| t.contains("OUTAGE''_BELL"))
+                .await
+                .is_some());
             client.drop_first_connection();
             assert!(
                 client
@@ -179,6 +180,5 @@ fn stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do() {
 
             let _ = client.finish().await;
             server.stop().await;
-            let _ = std::fs::remove_dir_all(&dir);
         });
 }

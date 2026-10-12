@@ -24,6 +24,10 @@ use tokio::time::Instant;
 /// This transport's id in iroh's custom-address space ("koh").
 const TRANSPORT_ID: u64 = 0x006b_6f68;
 
+/// The packets waiting for an endpoint to read them. A full inbox drops the next packet, as a
+/// router's full queue does.
+const INBOX: usize = 8192;
+
 /// How the link treats each packet. Every endpoint's outgoing packets get the same treatment.
 #[derive(Clone, Debug, Default)]
 pub struct Profile {
@@ -67,36 +71,12 @@ struct Packet {
     data: Bytes,
 }
 
-/// SplitMix64: a small seeded generator, so a seed replays the same faults.
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let z = self.0;
-        let z = (z ^ z.wrapping_shr(30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        let z = (z ^ z.wrapping_shr(27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ z.wrapping_shr(31)
-    }
-
-    /// Uniform in `[0, 1)`, from the top 32 bits.
-    fn unit(&mut self) -> f64 {
-        let top = u32::try_from(self.next().wrapping_shr(32)).unwrap_or(u32::MAX);
-        f64::from(top) / 4_294_967_296.0
-    }
-
-    /// `true` with probability `p`.
-    fn chance(&mut self, p: f64) -> bool {
-        self.unit() < p
-    }
-}
-
 struct State {
     profile: Profile,
-    rng: SplitMix64,
+    rng: koh_testkit::Rng,
     /// Everything sent before this instant is dropped.
     outage_until: Option<Instant>,
-    inboxes: HashMap<EndpointId, mpsc::UnboundedSender<Packet>>,
+    inboxes: HashMap<EndpointId, mpsc::Sender<Packet>>,
     /// Everything sent towards each endpoint, before faults.
     sent: HashMap<EndpointId, Count>,
     /// Everything the link let through to each endpoint (duplicates counted twice).
@@ -116,7 +96,7 @@ impl FaultNet {
         Self {
             state: Arc::new(Mutex::new(State {
                 profile,
-                rng: SplitMix64(seed),
+                rng: koh_testkit::Rng(seed),
                 outage_until: None,
                 inboxes: HashMap::new(),
                 sent: HashMap::new(),
@@ -155,7 +135,7 @@ impl FaultNet {
     /// every endpoint (identity, transport config, and the ALPN when it `accept`s).
     pub async fn endpoint(&self, secret: SecretKey, accept: bool) -> anyhow::Result<Endpoint> {
         let id = secret.public();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(INBOX);
         self.lock().inboxes.insert(id, tx);
         let transport = Arc::new(LinkTransport {
             net: self.clone(),
@@ -245,12 +225,12 @@ impl FaultNet {
                 data: data.clone(),
             };
             if delay.is_zero() {
-                let _ = inbox.send(packet);
+                let _ = inbox.try_send(packet);
             } else {
                 let inbox = inbox.clone();
-                tokio::spawn(async move {
+                koh_testkit::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let _ = inbox.send(packet);
+                    let _ = inbox.try_send(packet);
                 });
             }
         }
@@ -274,7 +254,7 @@ fn endpoint_id(addr: &CustomAddr) -> io::Result<EndpointId> {
 struct LinkTransport {
     net: FaultNet,
     id: EndpointId,
-    inbox: Mutex<Option<mpsc::UnboundedReceiver<Packet>>>,
+    inbox: Mutex<Option<mpsc::Receiver<Packet>>>,
 }
 
 impl std::fmt::Debug for LinkTransport {
@@ -306,7 +286,7 @@ struct LinkEndpoint {
     net: FaultNet,
     id: EndpointId,
     local: n0_watcher::Watchable<Vec<CustomAddr>>,
-    inbox: mpsc::UnboundedReceiver<Packet>,
+    inbox: mpsc::Receiver<Packet>,
 }
 
 impl std::fmt::Debug for LinkEndpoint {

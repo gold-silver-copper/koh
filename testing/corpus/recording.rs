@@ -2,9 +2,9 @@
 //! them, each `NAME.bin` (the bytes) with its `NAME.json` (the size, and each step's keys, resize
 //! and where its output ends). They come from fux (see `SOURCE.md`).
 //!
-//! koh's corpus test includes this file by path, and so do the harness crates
-//! (`testing/oracle`, `testing/bench`), so that all of them read a recording the same way. It
-//! reads only the JSON the recordings use, and needs no dependency for it.
+//! koh's corpus tests include this file by path, and so does the scoreboard (`testing/bench`),
+//! so that all of them read a recording the same way. It reads only the JSON the recordings use,
+//! and needs no dependency for it.
 
 use std::path::Path;
 

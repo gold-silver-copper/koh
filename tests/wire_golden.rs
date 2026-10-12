@@ -1,17 +1,19 @@
-//! The koh/4 encoding.
+//! The koh/5 encoding.
 //!
 //! What the client sends, built here by hand, is pinned: the expected bytes were captured by
 //! running the encoder, and a change to the wire must change them in the same commit,
-//! deliberately. Frames and history rows are drawn by the emulator, whose output may improve, so
-//! they are checked to round-trip through their streams instead.
+//! deliberately, and bump the protocol's name (the ALPN), which is pinned beside them. Frames and
+//! history rows are drawn by the emulator, whose output may improve, so they are checked to
+//! round-trip through their streams instead.
+#![forbid(clippy::disallowed_methods)]
 
 use koh::events::{
     InputEvent, WireButton, WireColours, WireKey, WireKeyCode, WireKitty, WireMouse,
     WireMouseAction, WireScheme,
 };
 use koh::proto::{
-    decode_frame, decode_server, encode_client, encode_frame, encode_history, ClientDecoder,
-    ClientMsg, Frame, FrameNum, InputSeq, ServerMsg,
+    decode_frame, decode_server, encode_client, ClientDecoder, ClientMsg, Frame, FrameEncoder,
+    FrameNum, InputSeq, ServerMsg,
 };
 use koh::terminal::{
     HistoryReply, HistoryRequest, ServerTerminal, Size, TerminalScreen, WireModes,
@@ -93,6 +95,7 @@ fn history_reply() -> Result<HistoryReply, fux_vt::Error> {
     emu.process(b"\x1b[6;1H\r\nscrolled in\r\n");
     let mark = emu.snapshot().history();
     Ok(emu.history(HistoryRequest {
+        id: 0,
         newest: mark.newest,
         count: 5,
     }))
@@ -101,7 +104,7 @@ fn history_reply() -> Result<HistoryReply, fux_vt::Error> {
 /// The modes for every mouse mode (with the default encoding) and every mouse encoding (with
 /// press/release reporting).
 fn modes() -> Vec<WireModes> {
-    let sequences: [&[u8]; 8] = [
+    let sequences: [&[u8]; 9] = [
         b"",
         b"\x1b[?9h",
         b"\x1b[?1000h",
@@ -110,6 +113,7 @@ fn modes() -> Vec<WireModes> {
         b"\x1b[?1000h\x1b[?1005h",
         b"\x1b[?1000h\x1b[?1006h",
         b"\x1b[?1h\x1b=\x1b[?2004h\x1b[?25l",
+        b"\x1b[?1049h",
     ];
     sequences
         .iter()
@@ -131,6 +135,7 @@ fn client_msgs() -> Vec<ClientMsg> {
         },
         ClientMsg::Resync,
         ClientMsg::History(HistoryRequest {
+            id: 300,
             newest: 70_000,
             count: 256,
         }),
@@ -199,15 +204,16 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The postcard encoding of each of [`modes`].
-const MODES: [&str; 8] = [
-    "000000000000",
-    "000000000100",
-    "000000000200",
-    "000000000300",
-    "000000000400",
-    "000000000201",
-    "000000000202",
-    "010101010000",
+const MODES: [&str; 9] = [
+    "00000000000000",
+    "00000000010000",
+    "00000000020000",
+    "00000000030000",
+    "00000000040000",
+    "00000000020100",
+    "00000000020200",
+    "01010101000000",
+    "00000000000001",
 ];
 
 /// Each of [`client_msgs`] as the client's stream carries it, length prefix included.
@@ -216,7 +222,7 @@ const CLIENT_MSGS: [&str; 8] = [
     "0000000500e807e807",
     "0000000401f0a204",
     "0000000102",
-    "0000000603f0a2048002",
+    "0000000803ac02f0a2048002",
     "00000025040205000002c3a90500000f0c000101b7c003014100840101010402ac0207020103026869",
     "000000cf04ac020103c8017878787878787878787878787878787878787878787878787878787878787878787878\
         78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878\
@@ -236,12 +242,16 @@ fn frames_and_history_round_trip_through_their_streams() {
         let raw = postcard::to_allocvec(&frame).expect("encodes");
         assert_eq!(postcard::from_bytes::<Frame>(&raw).expect("decodes"), frame);
         // A stream inflates only against its base's dictionary.
-        let stream = encode_frame(&frame, &base).expect("encodes");
+        let stream = FrameEncoder::default()
+            .encode(&frame, &base)
+            .expect("encodes");
         assert_eq!(decode_frame(&stream, &base).expect("decodes"), frame);
     }
     let reply = history_reply().expect("reply");
     assert_eq!(reply.rows.len(), 2, "two rows scrolled off");
-    let encoded = encode_history(&reply).expect("encodes");
+    let encoded = FrameEncoder::default()
+        .encode_history(&reply)
+        .expect("encodes");
     assert_eq!(
         decode_server(&encoded).expect("decodes"),
         ServerMsg::History(reply)
@@ -252,8 +262,13 @@ fn frames_and_history_round_trip_through_their_streams() {
     );
 }
 
+/// The protocol these bytes are pinned for. A change to them is a new protocol: bump the ALPN
+/// (`koh::transport_iroh::ALPN`) and this with it.
+const PINNED_FOR: &[u8] = b"koh/5";
+
 #[test]
 fn client_messages_encode_as_pinned() {
+    assert_eq!(koh::transport_iroh::ALPN, PINNED_FOR);
     let msgs = client_msgs();
     assert_eq!(msgs.len(), CLIENT_MSGS.len());
     for (msg, pinned) in msgs.iter().zip(CLIENT_MSGS) {
@@ -272,6 +287,7 @@ fn client_messages_encode_as_pinned() {
 
 #[test]
 fn modes_encode_as_pinned() {
+    assert_eq!(koh::transport_iroh::ALPN, PINNED_FOR);
     let modes = modes();
     assert_eq!(modes.len(), MODES.len());
     for (modes, pinned) in modes.iter().zip(MODES) {

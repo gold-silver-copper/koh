@@ -55,7 +55,7 @@ impl Server {
         };
         let hosting = Hosting::from_config(&config)?;
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(serve_endpoint(endpoint, hosting, shutdown.clone()));
+        let task = koh_testkit::spawn(serve_endpoint(endpoint, hosting, shutdown.clone()));
         Ok(Self { id, shutdown, task })
     }
 
@@ -92,12 +92,12 @@ struct Recorder {
 }
 
 /// The glyphs a prediction overlay draws, row by row.
-fn predicted_glyphs(overlay: &Overlay<'_>, Size { rows, cols }: Size) -> String {
+fn predicted_glyphs(overlay: &Overlay, Size { rows, cols }: Size) -> String {
     let mut glyphs = String::new();
     for row in 0..rows {
         for col in 0..cols {
             if let Some(cell) = overlay.cell(row, col) {
-                glyphs.push_str(cell.glyph);
+                glyphs.push_str(cell.text());
             }
         }
     }
@@ -108,7 +108,7 @@ impl ClientTerminal for Recorder {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay<'_>,
+        overlay: &Overlay,
         status: Option<&str>,
     ) -> std::io::Result<()> {
         let painted = Painted {
@@ -192,12 +192,12 @@ impl Client {
         // waits behind no more than the real client would let pile up.
         let (input, input_rx) = mpsc::channel(64);
         let (resize, resize_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_client(
+        let task = koh_testkit::spawn(run_client(
             channel,
             options.dialed_at.unwrap_or_else(std::time::SystemTime::now),
             connector,
             Size::new(24, 80),
-            None,
+            false,
             input_rx,
             resize_rx,
             term,
@@ -330,13 +330,4 @@ pub async fn session(net: &FaultNet, command: &[&str]) -> anyhow::Result<(Server
     let server = Server::start(net, &[secret.public()], command).await?;
     let client = Client::connect(net, secret, server.id).await?;
     Ok((server, client))
-}
-
-/// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
-pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
 }

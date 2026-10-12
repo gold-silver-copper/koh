@@ -23,7 +23,7 @@ FREEZE="${KOH_STRESS_WAKE_FREEZE_SECS:-$(scaled 25 35)}"
 SPAWNS="/data/local/tmp/koh-wake-spawns"
 FLOOD="/data/local/tmp/koh-wake-shell.sh"
 KEY="/data/local/tmp/koh-wake.key"
-CLILOG="/tmp/koh-wake-cli-$$.log"
+CLILOG="$HOST_TMP/koh-wake-cli-$$.log"
 echo "Stress: wake-from-freeze reconnect — SIGSTOP the client ${FREEZE}s (> 20s detector, < 300s idle), then SIGCONT (level=$STRESS_LEVEL)"
 
 # A recording session shell: appends a line per spawn then execs a real shell, so a REUSED session

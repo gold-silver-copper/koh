@@ -3,7 +3,7 @@
 //! fetches them, in requests of the most rows one may ask for, and the compressed streams counted.
 //! In process, with no link: the bytes are those the history streams carry.
 
-use koh::proto::encode_history;
+use koh::proto::FrameEncoder;
 use koh::terminal::{HistoryRequest, ServerTerminal, Size, MAX_HISTORY_ROWS};
 
 use crate::workloads::Workload;
@@ -35,6 +35,7 @@ pub fn measure(workload: &Workload) -> anyhow::Result<History> {
     let mut newest = mark.newest;
     while newest >= oldest {
         let reply = emu.history(HistoryRequest {
+            id: 0,
             newest,
             count: MAX_HISTORY_ROWS,
         });
@@ -42,7 +43,9 @@ pub fn measure(workload: &Workload) -> anyhow::Result<History> {
             break;
         }
         history.rows = history.rows.saturating_add(reply.rows.len());
-        let bytes = encode_history(&reply).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let bytes = FrameEncoder::default()
+            .encode_history(&reply)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         history.bytes = history
             .bytes
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));

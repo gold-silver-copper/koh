@@ -8,15 +8,22 @@ look; pair it with [`SECURITY.md`](../SECURITY.md).
 
 A mosh-like remote shell over [iroh](https://iroh.computer) (peer-to-peer QUIC). The **server** spawns
 a real shell in a PTY and sends its screen to a **client** as frames over QUIC streams.
-There is **no listening port**: a server is reachable only via its non-enumerable Ed25519 **node-id**
-(through relays + NAT hole-punching), and only peers on its **allowlist** are admitted. It is a
+A peer finds a server by its Ed25519 **node-id** (through relays + NAT hole-punching), and only peers
+on its **allowlist** are admitted. The node-id is not enumerable, but the server's UDP port is open
+like any listener's: anyone who can reach it can start QUIC handshakes, as iroh answers a
+ClientHello whatever its server name. So handshakes under way are capped: 2 from one IP address (an
+IPv6 /64 counts as one; a relay's are capped only in all), that address's oldest given up for a
+new one, and a quarter of `--max-connections` in all (at least 4, and below the total), the oldest
+given up. A new handshake is never refused, and an allowed client's finishes in a round trip, so a
+flood of stalled handshakes cannot keep it out, even from its own address (the same host, a shared
+NAT). Each has 10 s, and the flood is warned of at most once every 10 s. It is a
 **single-operator** tool for connecting a small set of machines you control — not a multi-user network
 service.
 
 ## Attacker models
 
 1. **Malicious / compromised client** — a peer that dials the server. If it is on the allowlist it
-   reaches the koh/4 data plane: it sends arbitrary input, resize, ack and resync messages and opens
+   reaches the koh/5 data plane: it sends arbitrary input, resize, ack and resync messages and opens
    streams. Input comes as decoded events (`Keys`: keys, mouse events, focus changes, whole
    pastes); decoding refuses what no terminal sends (a modifier bit no key has, a function key past
    F12, a kitty code that is no Unicode scalar, a paste over 1 MiB, more than 512 events, more than
@@ -57,7 +64,8 @@ service.
    every key.
    **History:** the server already holds the session's history (`--scrollback`, 1,000 lines by
    default); with the scrollback view the client now holds a part of it too, in memory, for the
-   connection: at most a million cells, dropped when the connection ends. A server's history
+   connection: at most `HISTORY_CACHE_BYTES` (64 MiB of fux-vt's storage), only replies to requests
+   it has outstanding (matched by id), dropped when the connection ends. A server's history
    rows are decoded like a frame's rows (the same refusals), at most 256 rows and 65,536 cells a
    reply and 1 MiB of links, a malformed reply dropped whole; rows the screen's history mark does
    not name are not kept. A hostile client cannot make the server send more than its history, nor
@@ -97,9 +105,11 @@ service.
   required, so there is no "accept any peer" mode. This is the **single** authentication factor —
   there is no passphrase/PAKE second factor. A leaked key file is a leaked identity: protect it
   like an SSH private key, and remove a lost machine's id from every allowlist (`koh clients rm`,
-  which a running server heeds at the next connection, and any `--allow`, which needs a restart). The saved allowlist, `clients` beside the server key, is held to the key's own
-  rules (`src/identity/key_file.rs`): a symlink or another user's file is refused and a loose mode
-  tightened, since whoever can write it can let a peer in. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
+  which a running server heeds within 2 s, closing that peer's connection and ending its session,
+  and any `--allow`, which needs a restart). A saved list that cannot be read keeps the last one
+  read well, so a typo in it disconnects no one. The saved allowlist, `clients` beside the server key, is held to the key's own
+  rules (`src/identity/key_file.rs`): a symlink, a hard-linked file or another user's file is
+  refused and a loose mode tightened, since whoever can write it can let a peer in. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
   checkpoint; its outcomes are logged structured under the `koh::auth` target.
 - **Untrusted data plane:** the protocol (`src/proto.rs`) and the connection cores
   (`src/server/mod.rs`, `src/client/session.rs`) are pure and panic-free by construction. Client

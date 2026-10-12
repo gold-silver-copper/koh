@@ -148,7 +148,7 @@ impl ClientTerminal for Readback {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay<'_>,
+        overlay: &Overlay,
         status: Option<&str>,
     ) -> std::io::Result<()> {
         self.terminal.render(state, overlay, status)?;
@@ -366,7 +366,7 @@ impl Remote {
             std::time::SystemTime::now(),
             connector,
             start,
-            None,
+            false,
             input_rx,
             resize_rx,
             terminal,

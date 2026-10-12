@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use koh_testkit::Rng;
+
 use crate::recording::Recording;
 
 /// One step: the terminal resized first if `resize` says so, then the program wrote `output`.
@@ -97,23 +99,6 @@ impl Workload {
 /// Whether the script in `dir` logged `line`.
 pub fn logged(dir: &Path, line: &str) -> bool {
     std::fs::read_to_string(dir.join("log")).is_ok_and(|log| log.lines().any(|l| l == line))
-}
-
-/// A seeded random sequence (splitmix64).
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next().checked_rem(n).unwrap_or(0)
-    }
 }
 
 /// Words for synthetic text.

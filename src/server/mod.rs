@@ -10,35 +10,27 @@ mod held;
 pub mod session;
 
 pub use cli::{serve, ServeConfig};
-pub use session::{PtyHost, Registry, SessionSpec};
+pub use session::{Registry, SessionSpec};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::bounded::Bounded;
 use crate::events::{InputEvent, WireColours};
+use crate::log::Peer;
 use crate::proto::{
-    encode_history, retry_after, ClientDecoder, ClientMsg, Frame, FrameEncoder, FrameNum,
-    FrameScreen, InputSeq, ProtoError, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
-    SESSION_ENDED,
+    retry_after, ClientDecoder, ClientMsg, Close, Frame, FrameEncoder, FrameNum, FrameScreen,
+    InputSeq, ProtoError, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
 };
-use crate::terminal::{HistoryRequest, Size, TerminalScreen};
+use crate::terminal::{HistoryReply, HistoryRequest, Size, TerminalScreen};
+use crate::transport_iroh::close;
 use held::ClientHolds;
 use iroh::endpoint::RecvStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-/// Why an attached connection loop returned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionExit {
-    /// The client connection dropped; the session stays alive for reattach.
-    Detached,
-    /// The shell exited and the shutdown handshake completed; the session should be reaped.
-    ShellExited,
-}
-
 /// How long the program gets to show a keystroke before it counts as echoed.
-pub(crate) const ECHO_TIMEOUT: Duration = Duration::from_millis(50);
+const ECHO_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Most inputs awaiting their echo: one message each, within [`ECHO_TIMEOUT`].
 const ECHO_PENDING: usize = 256;
@@ -46,36 +38,26 @@ const ECHO_PENDING: usize = 256;
 /// Most messages for the session waiting for room in its queue, from one read of the client.
 const TO_SESSION: usize = 64;
 
-/// How long the server waits for the client to acknowledge the final frame before closing.
+/// How long the server waits for the client to acknowledge the final frame, at least.
 const FINAL_ACK_WAIT: Duration = Duration::from_secs(1);
+
+/// How long the client has to acknowledge the final frame: [`FINAL_ACK_WAIT`], or two retries on
+/// a link slower than that, so a slow link is not taken for a lost one.
+fn final_wait(rtt: Option<Duration>) -> Duration {
+    FINAL_ACK_WAIT.max(retry_after(rtt).saturating_mul(2))
+}
 
 /// Which of one connection's inputs the program has had time to show. Per connection, as input
 /// sequence numbers are.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct EchoAck {
     /// The newest input considered reflected on screen.
     acked: InputSeq,
     /// Inputs not yet promoted, with when they arrived, oldest first.
     pending: Bounded<(InputSeq, Instant), ECHO_PENDING>,
-    timeout: Duration,
-}
-
-impl Default for EchoAck {
-    fn default() -> Self {
-        Self::with_timeout(ECHO_TIMEOUT)
-    }
 }
 
 impl EchoAck {
-    /// A tracker with a custom debounce; tests use a small one.
-    pub(crate) const fn with_timeout(timeout: Duration) -> Self {
-        Self {
-            acked: InputSeq(0),
-            pending: Bounded::new(),
-            timeout,
-        }
-    }
-
     /// Input `seq` arrived at `now`. Sequence numbers only advance; a stale one is ignored. Past
     /// [`ECHO_PENDING`] waiting, the newest waits in place of the one before it.
     pub(crate) fn register(&mut self, seq: InputSeq, now: Instant) {
@@ -94,7 +76,7 @@ impl EchoAck {
     pub(crate) fn promote(&mut self, now: Instant) -> bool {
         let before = self.acked;
         while let Some(&(seq, arrived)) = self.pending.front() {
-            if now.saturating_duration_since(arrived) < self.timeout {
+            if now.saturating_duration_since(arrived) < ECHO_TIMEOUT {
                 break;
             }
             self.acked = seq;
@@ -106,7 +88,7 @@ impl EchoAck {
     /// When [`promote`](Self::promote) could next advance, or `None` if nothing is pending.
     pub(crate) fn next_promotion(&self) -> Option<Instant> {
         let (_, arrived) = self.pending.front()?;
-        arrived.checked_add(self.timeout)
+        arrived.checked_add(ECHO_TIMEOUT)
     }
 
     /// Whether input arrived within the debounce and is not yet promoted.
@@ -135,6 +117,8 @@ pub(crate) enum ToSession {
 /// echo-ack, and decides when to send which frame against which base.
 pub(crate) struct ServerConn {
     decoder: ClientDecoder,
+    /// The client finished its stream: what it left must decode whole.
+    client_ended: bool,
     echo: EchoAck,
     /// What the client sent for the session, oldest first, until the session has room. Nothing
     /// more is decoded once it is full, nor read while any waits.
@@ -223,15 +207,10 @@ impl Deliveries {
 
 impl Default for ServerConn {
     fn default() -> Self {
-        Self::with_echo(EchoAck::default())
-    }
-}
-
-impl ServerConn {
-    fn with_echo(echo: EchoAck) -> Self {
         Self {
             decoder: ClientDecoder::default(),
-            echo,
+            client_ended: false,
+            echo: EchoAck::default(),
             to_session: Bounded::default(),
             screen: Arc::default(),
             unsent_change: true,
@@ -247,7 +226,9 @@ impl ServerConn {
             deliveries: Deliveries::default(),
         }
     }
+}
 
+impl ServerConn {
     /// Install the session's latest screen. One that carries the program's exit code is final.
     fn install_snapshot(&mut self, screen: Arc<TerminalScreen>) {
         if screen != self.held.newest().screen {
@@ -262,34 +243,67 @@ impl ServerConn {
         self.screen.exit_code().is_some()
     }
 
-    /// Append bytes read from the client's stream.
-    fn push_client_bytes(&mut self, bytes: &[u8]) {
+    /// Bytes read from the client's stream, at `now`: what they complete is decoded.
+    fn push_client_bytes(&mut self, bytes: &[u8], now: Instant) -> Result<(), ProtoError> {
         self.decoder.push(bytes);
+        self.decode(now)
     }
 
-    /// Decode the complete messages read so far, at `now`, queueing what is for the session; the
-    /// rest waits in the decoder while that queue is full.
-    fn drain_client(&mut self, now: Instant) -> Result<(), ProtoError> {
-        // Room for each message is made before it is decoded.
+    /// The client finished its stream: fine between messages, a protocol error inside one, once
+    /// the messages before it are decoded.
+    fn client_ended(&mut self, now: Instant) -> Result<(), ProtoError> {
+        self.client_ended = true;
+        self.decode(now)
+    }
+
+    /// The oldest input for the session, which has room for it, decoding on behind it.
+    fn poll_input(&mut self, now: Instant) -> Result<Option<ToSession>, ProtoError> {
+        let input = self.to_session.pop_front();
+        self.decode(now)?;
+        Ok(input)
+    }
+
+    /// Whether input waits for the session. Nothing more of the client's stream is read
+    /// meanwhile, so QUIC pushes back on a client the session cannot keep up with.
+    fn has_input(&self) -> bool {
+        !self.to_session.is_empty()
+    }
+
+    /// Decode the complete messages read, at `now`, while the session's queue has room: control
+    /// messages handled at once, input queued for the session (none once the program exited).
+    fn decode(&mut self, now: Instant) -> Result<(), ProtoError> {
         while !self.to_session.is_full() {
             let Some(msg) = self.decoder.next_msg()? else {
-                break;
+                return if self.client_ended {
+                    self.decoder.finish()
+                } else {
+                    Ok(())
+                };
             };
-            match msg {
+            let input = match msg {
                 ClientMsg::Keys { seq, events } => {
                     self.echo.register(seq, now);
-                    self.for_session(ToSession::Events(events));
+                    ToSession::Events(events)
                 }
-                ClientMsg::Colours(colours) => self.for_session(ToSession::Colours(colours)),
-                ClientMsg::Resize(size) => {
-                    self.for_session(ToSession::Resize(crate::terminal::clamp_dims(size)));
+                ClientMsg::Colours(colours) => ToSession::Colours(colours),
+                ClientMsg::Resize(size) => ToSession::Resize(crate::terminal::clamp_dims(size)),
+                ClientMsg::Ack { frame } => {
+                    self.ack(frame, now);
+                    continue;
                 }
-                ClientMsg::Ack { frame } => self.ack(frame, now),
-                ClientMsg::Resync => self.resync(),
-                ClientMsg::History(request) => self
-                    .history
-                    .push_back(request)
-                    .map_err(|_full| ProtoError::TooManyRequests)?,
+                ClientMsg::Resync => {
+                    self.resync();
+                    continue;
+                }
+                ClientMsg::History(request) => {
+                    self.history
+                        .push_back(request)
+                        .map_err(|_full| ProtoError::TooManyRequests)?;
+                    continue;
+                }
+            };
+            if !self.exited() {
+                self.for_session(input);
             }
         }
         Ok(())
@@ -305,22 +319,6 @@ impl ServerConn {
                 let _ = self.to_session.push_back(input);
             }
         }
-    }
-
-    /// Whether what the client sent waits for room in the session's queue; nothing more is read
-    /// from the client meanwhile, so QUIC pushes back on it.
-    fn waiting_for_session(&self) -> bool {
-        !self.to_session.is_empty()
-    }
-
-    /// The oldest thing for the session.
-    fn next_for_session(&mut self) -> Option<ToSession> {
-        self.to_session.pop_front()
-    }
-
-    /// The program exited: what the client sends it goes nowhere.
-    fn session_gone(&mut self) {
-        self.to_session.clear();
     }
 
     /// The next history request to answer, if no answer is on its way; the caller calls
@@ -339,9 +337,16 @@ impl ServerConn {
         self.history_busy = false;
     }
 
-    /// The client's stream ended: fine between messages, a protocol error inside one.
-    fn finish_client(&self) -> Result<(), ProtoError> {
-        self.decoder.finish()
+    /// `reply` encoded for its stream, by the frames' compressor; if it cannot be, the answer
+    /// with no rows to `request`, so the client is answered whatever happens.
+    fn encode_history(&mut self, request: HistoryRequest, reply: &HistoryReply) -> Option<Vec<u8>> {
+        self.encoder
+            .encode_history(reply)
+            .or_else(|e| {
+                tracing::error!(error = %e, "encoding history rows failed");
+                self.encoder.encode_history(&request.none())
+            })
+            .ok()
     }
 
     /// The client has frame `num`, so older frames are no bases any more. An ack for a frame no
@@ -493,11 +498,18 @@ impl ServerConn {
     }
 
     /// Whether the connection is done: the program exited and the client acknowledged the final
-    /// frame, or did not within [`FINAL_ACK_WAIT`].
-    fn finished(&self, now: Instant) -> bool {
-        self.final_frame.is_some_and(|(num, at)| {
-            self.acked() >= num || now.saturating_duration_since(at) >= FINAL_ACK_WAIT
-        })
+    /// frame, or did not within [`final_wait`].
+    fn finished(&self, now: Instant, rtt: Option<Duration>) -> bool {
+        self.final_acked()
+            || self
+                .final_frame
+                .is_some_and(|(_, at)| now.saturating_duration_since(at) >= final_wait(rtt))
+    }
+
+    /// Whether the client acknowledged the final frame: it has the program's end, so its session
+    /// may end too.
+    fn final_acked(&self) -> bool {
+        self.final_frame.is_some_and(|(num, _)| self.acked() >= num)
     }
 
     /// When the loop must wake at the latest, with nothing else happening (a delivery wakes it
@@ -549,7 +561,7 @@ impl ServerConn {
             wake = wake.min(promotion);
         }
         if let Some((_, at)) = self.final_frame {
-            wake = wake.min(at.checked_add(FINAL_ACK_WAIT).unwrap_or(now));
+            wake = wake.min(at.checked_add(final_wait(rtt)).unwrap_or(now));
         }
         wake.max(now)
     }
@@ -559,15 +571,13 @@ impl ServerConn {
 /// waits on but in its `select!`.
 ///
 /// It forwards the client's input as the session takes it, sends each frame on its own stream and
-/// resets the streams of superseded ones. Returning (or panicking) detaches.
-pub async fn run_attached(
-    authorized: cli::Authorized,
-    mut session: session::SessionClient,
-) -> SessionExit {
+/// resets the streams of superseded ones, and answers history requests. Returning (or panicking)
+/// detaches.
+pub async fn run_attached(authorized: cli::Authorized, mut session: session::SessionClient) {
     let conn = authorized.conn();
     let mut core = ServerConn::default();
     core.install_snapshot(session.screen());
-    let input = session.input();
+    let input = session.input.clone();
     let mut client: Option<RecvStream> = None;
     // The client gets exactly one stream for the connection, even after it finishes that one.
     let mut had_client_stream = false;
@@ -579,19 +589,18 @@ pub async fn run_attached(
     // Each frame's task says here when the client has all of it: its acknowledgement. Bounded by
     // the frames in flight, each of which says so once.
     let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::channel::<FrameNum>(FRAME_WINDOW);
-    // History answers go one at a time; each one's task says here when it is delivered.
+    // History answers go one at a time: the request the session is answering, then the answer's
+    // task, which says here when it is delivered.
+    let mut answering: Option<(HistoryRequest, tokio::sync::oneshot::Receiver<HistoryReply>)> =
+        None;
     let (history_tx, mut history_rx) = tokio::sync::mpsc::channel::<()>(1);
     let history_cancel = CancellationToken::new();
     let _history_guard = history_cancel.clone().drop_guard();
-    let exit = loop {
-        if let Some(request) = core.next_history() {
-            #[expect(clippy::disallowed_methods, reason = "one history answer at a time")]
-            tokio::spawn(send_history(
-                conn.clone(),
-                session.history(request),
-                history_tx.clone(),
-                history_cancel.clone(),
-            ));
+    let how = loop {
+        if answering.is_none() {
+            answering = core
+                .next_history()
+                .map(|request| (request, session.history(request)));
         }
         let now = Instant::now();
         core.promote_echo(now);
@@ -626,80 +635,112 @@ pub async fn run_attached(
                 Err(e) => tracing::error!(error = %e, "encoding a frame failed"),
             }
         }
-        if core.finished(now) {
-            conn.close(0u32.into(), SESSION_ENDED);
-            break SessionExit::ShellExited;
+        if core.finished(now, rtt) {
+            if !core.final_acked() {
+                // The client may not have the end: the session keeps it, and this close, as a lost
+                // link, has the client redial for it.
+                conn.close(0u32.into(), b"");
+                break "the final frame went unacknowledged (session kept)";
+            }
+            // The client has the program's end: the session need keep it no longer.
+            session.ended().await;
+            // Delivered is not yet read: a client closes once it has read the final frame, and a
+            // close of ours before then would throw away what it had not read.
+            let _ = tokio::time::timeout(FINAL_ACK_WAIT, conn.closed()).await;
+            close(conn, Close::SessionEnded);
+            break "shell exited";
         }
         let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
-        let reading = client.is_some() && !core.waiting_for_session();
-        tokio::select! {
+        let reading = client.is_some() && !core.has_input();
+        let broke = tokio::select! {
             // Not biased: a pending screen change would starve client input.
             screen = session.next_screen(), if session_open => match screen {
-                Some(screen) => core.install_snapshot(screen),
-                // A session that ends after its exit screen does not cut off the final frame.
-                None if core.exited() => session_open = false,
-                // The server is shutting down.
-                None => break SessionExit::Detached,
-            },
-            permit = input.reserve(), if core.waiting_for_session() => match permit.ok() {
-                Some(permit) => {
-                    if let Some(input) = core.next_for_session() {
-                        permit.send(session::ClientInput::Input(input));
-                    }
+                Some(screen) => {
+                    core.install_snapshot(screen);
+                    Ok(())
                 }
-                // After its exit screen, the final frame's ack is still awaited.
-                None if core.exited() => core.session_gone(),
-                None => break SessionExit::Detached,
+                // A session that ends after its exit screen does not cut off the final frame.
+                None if core.exited() => {
+                    session_open = false;
+                    Ok(())
+                }
+                // The session was ended: revoked, or the server is shutting down.
+                None => break "the session was ended (revoked, or the server is stopping)",
+            },
+            permit = input.reserve(), if core.has_input() => match permit {
+                Ok(permit) => core.poll_input(Instant::now()).map(|taken| {
+                    if let Some(taken) = taken {
+                        permit.send(session::Input {
+                            attach: session.attach,
+                            input: taken,
+                        });
+                    }
+                }),
+                Err(_) => break "the session was ended (revoked, or the server is stopping)",
             },
             stream = conn.accept_uni() => match stream {
                 Ok(stream) if !had_client_stream => {
                     had_client_stream = true;
                     client = Some(stream);
+                    Ok(())
                 }
-                Ok(_) => {
-                    conn.close(PROTOCOL_ERROR.into(), b"a second client stream");
-                    break SessionExit::Detached;
-                }
+                Ok(_) => Err(ProtoError::UnknownStream),
                 Err(e) => {
-                    info!(reason = %e, "connection closed by peer (detaching)");
-                    break SessionExit::Detached;
+                    info!(reason = %Peer(e), "connection closed by peer (detaching)");
+                    break "client detached (session retained)";
                 }
             },
             read = read_client(client.as_mut(), &mut read_buf), if reading => match read {
-                Ok(Some(n)) => {
-                    core.push_client_bytes(read_buf.get(..n).unwrap_or_default());
-                    if let Err(e) = core.drain_client(Instant::now()) {
-                        tracing::warn!(error = %e, "client broke the protocol; closing");
-                        conn.close(PROTOCOL_ERROR.into(), b"protocol error");
-                        break SessionExit::Detached;
-                    }
-                }
+                Ok(Some(n)) => core.push_client_bytes(read_buf.get(..n).unwrap_or_default(), Instant::now()),
                 Ok(None) => {
-                    // The client finished its stream; a clean end only between messages.
-                    if core.finish_client().is_err() {
-                        conn.close(PROTOCOL_ERROR.into(), b"protocol error");
-                        break SessionExit::Detached;
-                    }
                     client = None;
+                    core.client_ended(Instant::now())
                 }
                 Err(e) => {
-                    info!(reason = %e, "client stream failed (detaching)");
-                    break SessionExit::Detached;
+                    info!(reason = %Peer(e), "client stream failed (detaching)");
+                    break "client detached (session retained)";
                 }
             },
-            Some(()) = history_rx.recv() => core.history_delivered(),
-            Some(num) = delivered_rx.recv() => core.ack(num, Instant::now()),
-            () = tokio::time::sleep_until(wake) => {}
+            answer = async {
+                match answering.as_mut() {
+                    Some((_, rx)) => rx.await,
+                    None => std::future::pending().await,
+                }
+            }, if answering.is_some() => {
+                if let Some((request, _)) = answering.take() {
+                    // The session's answer, or none: the client is answered whatever happens.
+                    let reply = answer.unwrap_or_else(|_gone| request.none());
+                    match core.encode_history(request, &reply) {
+                        Some(bytes) => {
+                            #[expect(clippy::disallowed_methods, reason = "one history answer at a time")]
+                            tokio::spawn(send_history(conn.clone(), bytes, history_tx.clone(), history_cancel.clone()));
+                        }
+                        None => core.history_delivered(),
+                    }
+                }
+                Ok(())
+            },
+            Some(()) = history_rx.recv() => {
+                core.history_delivered();
+                Ok(())
+            }
+            Some(num) = delivered_rx.recv() => {
+                core.ack(num, Instant::now());
+                Ok(())
+            }
+            () = tokio::time::sleep_until(wake) => Ok(()),
+        };
+        if let Err(e) = broke {
+            tracing::warn!(error = %e, "client broke the protocol; closing");
+            close(conn, Close::ProtocolError);
+            break "client detached (session retained)";
         }
     };
     if let Some((_, cancel)) = newest {
         cancel.cancel();
     }
-    exit
+    info!(peer = %conn.remote_id(), "{how}");
 }
-
-/// The close code for a client that broke the protocol.
-const PROTOCOL_ERROR: u32 = 2;
 
 /// Read from the client's stream, if there is one.
 async fn read_client(
@@ -773,20 +814,15 @@ async fn send_frame(
     let _ = send.reset(0u32.into());
 }
 
-/// Answer one history request: fetch the rows from the session, and send them on a stream of their
-/// own, below frames in priority, so they never delay one. Says on `delivered` once the client has
-/// them all, or they could not go.
+/// Send one history answer, `bytes`, on a stream of its own, below frames in priority, so it never
+/// delays one. Says on `delivered` once the client has it all, or it could not go.
 async fn send_history(
     conn: iroh::endpoint::Connection,
-    reply: impl std::future::Future<Output = Option<crate::terminal::HistoryReply>>,
+    bytes: Vec<u8>,
     delivered: tokio::sync::mpsc::Sender<()>,
     cancel: CancellationToken,
 ) {
     let send = async {
-        let reply = reply.await?;
-        let bytes = encode_history(&reply)
-            .map_err(|e| tracing::error!(error = %e, "encoding history rows failed"))
-            .ok()?;
         let mut send = conn.open_uni().await.ok()?;
         let _ = send.set_priority(HISTORY_PRIORITY);
         send.write_all(&bytes).await.ok()?;
@@ -844,17 +880,18 @@ mod tests {
     #[test]
     fn a_read_queues_the_session_input_in_order_merging_neighbours() {
         // Neighbouring keys go as one batch, and of neighbouring resizes only the last, clamped.
+        let now = Instant::now();
         let mut conn = ServerConn::default();
-        conn.push_client_bytes(&stream(&[
+        let read = stream(&[
             typed(1, "ab"),
             ClientMsg::Resize(Size::new(10, 20)),
             typed(2, "c"),
             typed(3, "d"),
             ClientMsg::Resize(Size::new(30, 40)),
             ClientMsg::Resize(Size::new(65000, 1)),
-        ]));
-        conn.drain_client(Instant::now()).unwrap();
-        let queued: Vec<ToSession> = std::iter::from_fn(|| conn.next_for_session()).collect();
+        ]);
+        conn.push_client_bytes(&read, now).unwrap();
+        let queued: Vec<ToSession> = std::iter::from_fn(|| conn.poll_input(now).unwrap()).collect();
         assert_eq!(
             queued,
             [
@@ -864,20 +901,23 @@ mod tests {
                 ToSession::Resize(crate::terminal::clamp_dims(Size::new(65000, 1))),
             ]
         );
-        assert!(!conn.waiting_for_session());
+        assert!(!conn.has_input());
     }
 
     #[test]
-    fn a_full_queue_for_the_session_leaves_the_rest_undecoded() {
-        // Nothing is decoded past what the session's queue holds, so a client cannot grow it.
+    fn input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends() {
+        // More than the session's queue holds: the rest waits undecoded, so a client cannot grow
+        // it, and goes on as the session takes input, with no bytes more from the client. A clean
+        // end with messages left is no error.
+        let now = Instant::now();
         let mut conn = ServerConn::default();
         let colours = ClientMsg::Colours(crate::events::WireColours::default());
-        conn.push_client_bytes(&stream(&vec![colours; super::TO_SESSION + 1]));
-        conn.drain_client(Instant::now()).unwrap();
-        assert!(conn.finish_client().is_err(), "one message is left");
-        conn.next_for_session();
-        conn.drain_client(Instant::now()).unwrap();
-        assert!(conn.finish_client().is_ok());
+        conn.push_client_bytes(&stream(&vec![colours; super::TO_SESSION + 1]), now)
+            .unwrap();
+        assert!(conn.has_input());
+        conn.client_ended(now).unwrap();
+        let taken = std::iter::from_fn(|| conn.poll_input(now).unwrap()).count();
+        assert_eq!(taken, super::TO_SESSION + 1);
     }
 
     /// A server and a client connection on loopback, and the client's endpoint, kept alive.
@@ -954,10 +994,16 @@ mod tests {
     fn history_requests_are_answered_one_at_a_time_and_too_many_waiting_is_an_error() {
         use crate::proto::{ProtoError, MAX_PENDING_HISTORY};
         use crate::terminal::HistoryRequest;
-        let ask = |newest| ClientMsg::History(HistoryRequest { newest, count: 1 });
+        let ask = |newest| {
+            ClientMsg::History(HistoryRequest {
+                id: newest,
+                newest,
+                count: 1,
+            })
+        };
         let mut conn = ServerConn::default();
-        conn.push_client_bytes(&stream(&[ask(1), ask(2)]));
-        conn.drain_client(Instant::now()).unwrap();
+        conn.push_client_bytes(&stream(&[ask(1), ask(2)]), Instant::now())
+            .unwrap();
         assert_eq!(conn.next_history().map(|r| r.newest), Some(1));
         assert_eq!(
             conn.next_history(),
@@ -971,66 +1017,38 @@ mod tests {
         let flood: Vec<ClientMsg> = (0..=u64::try_from(MAX_PENDING_HISTORY).unwrap())
             .map(ask)
             .collect();
-        conn.push_client_bytes(&stream(&flood));
         assert!(matches!(
-            conn.drain_client(Instant::now()),
+            conn.push_client_bytes(&stream(&flood), Instant::now()),
             Err(ProtoError::TooManyRequests)
         ));
     }
 
     #[test]
     fn a_partial_message_waits_and_a_truncated_stream_is_an_error() {
-        let mut conn = ServerConn::default();
+        let now = Instant::now();
         let bytes = stream(&[typed(1, "hello")]);
         let (first, rest) = bytes.split_at(3);
-        conn.push_client_bytes(first);
-        conn.drain_client(Instant::now()).unwrap();
-        assert!(!conn.waiting_for_session());
+        let mut truncated = ServerConn::default();
+        truncated.push_client_bytes(first, now).unwrap();
+        assert!(!truncated.has_input());
         assert!(
-            conn.finish_client().is_err(),
+            truncated.client_ended(now).is_err(),
             "the stream ended inside a message"
         );
-        conn.push_client_bytes(rest);
-        conn.drain_client(Instant::now()).unwrap();
+        let mut whole = ServerConn::default();
+        whole.push_client_bytes(first, now).unwrap();
+        whole.push_client_bytes(rest, now).unwrap();
+        whole.client_ended(now).unwrap();
         assert_eq!(
-            conn.next_for_session(),
+            whole.poll_input(now).unwrap(),
             Some(ToSession::Events("hello".chars().map(key).collect()))
         );
-        assert!(conn.finish_client().is_ok());
     }
 
     // --- EchoAck: the per-connection echo-ack debounce.
 
     #[test]
-    fn echo_ack_debounces() {
-        let t0 = Instant::now();
-        let ms = |n| t0 + Duration::from_millis(n);
-        let mut t = EchoAck::default();
-        t.register(InputSeq(5), t0);
-        assert!(!t.promote(ms(10)), "too soon");
-        assert_eq!(t.echo_ack(), InputSeq(0));
-        assert!(
-            t.promote(ms(50)),
-            "after the 50 ms debounce the input counts as echoed"
-        );
-        assert_eq!(t.echo_ack(), InputSeq(5));
-    }
-
-    #[test]
-    fn echo_ack_honors_an_injected_timeout() {
-        let t0 = Instant::now();
-        let ms = |n| t0 + Duration::from_millis(n);
-        let mut t = EchoAck::with_timeout(Duration::from_millis(10));
-        t.register(InputSeq(5), t0);
-        assert!(!t.promote(ms(5)));
-        assert!(t.promote(ms(11)));
-        let mut d = EchoAck::default();
-        d.register(InputSeq(5), t0);
-        assert!(!d.promote(ms(11)), "the 50 ms default has not elapsed");
-    }
-
-    #[test]
-    fn echo_ack_is_monotonic_takes_the_newest_and_says_when_it_next_moves() {
+    fn echo_ack_debounces_is_monotonic_takes_the_newest_and_says_when_it_next_moves() {
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
         let mut t = EchoAck::default();
@@ -1039,7 +1057,9 @@ mod tests {
         t.register(InputSeq(7), ms(20));
         t.register(InputSeq(6), ms(25)); // stale: ignored
         assert_eq!(t.next_promotion(), Some(ms(50)));
-        t.promote(ms(55));
+        assert!(!t.promote(ms(49)), "inside the 50 ms debounce");
+        assert_eq!(t.echo_ack(), InputSeq(0));
+        assert!(t.promote(ms(55)));
         assert_eq!(t.echo_ack(), InputSeq(3));
         assert_eq!(t.next_promotion(), Some(ms(70)));
         t.promote(ms(100));
@@ -1060,24 +1080,6 @@ mod tests {
         s
     }
 
-    #[test]
-    fn a_changed_snapshot_marks_an_unsent_change_and_the_exit_screen_is_final() {
-        let t0 = Instant::now();
-        let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"a")));
-        assert!(
-            c.poll_frame(t0, None).is_some(),
-            "the changed screen is sent"
-        );
-        // Re-installing the same screen is not a change, so nothing new is due.
-        c.install_snapshot(Arc::new(screen(b"a")));
-        assert!(c.poll_frame(t0, None).is_none());
-        // The exit screen marks the connection final.
-        c.install_snapshot(exit_screen(3));
-        let last = c.poll_frame(t0 + Duration::from_secs(1), None);
-        assert!(last.is_some() || c.finished(t0 + Duration::from_secs(1) + FINAL_ACK_WAIT));
-    }
-
     /// A blank screen carrying the program's exit `code`.
     fn exit_screen(code: u32) -> Arc<TerminalScreen> {
         let mut emu = crate::terminal::ServerTerminal::new(24, 80, 0).unwrap();
@@ -1091,9 +1093,9 @@ mod tests {
         let mut c = ServerConn::default();
         c.install_snapshot(exit_screen(0));
         let first = c.poll_frame(t0, None).expect("the exit screen is sent");
-        assert!(!c.finished(t0));
+        assert!(!c.finished(t0, None));
         c.ack(first.num, t0);
-        assert!(c.finished(t0), "the first frame was the final one");
+        assert!(c.finished(t0, None), "the first frame was the final one");
     }
 
     #[test]
@@ -1111,7 +1113,11 @@ mod tests {
             .contents()
             .contains("hello"));
         c.frame_sent(first.num, 100, t0, rtt);
-        assert!(c.poll_frame(t0, rtt).is_none(), "nothing changed");
+        c.install_snapshot(Arc::new(screen(b"hello")));
+        assert!(
+            c.poll_frame(t0, rtt).is_none(),
+            "the same screen again is no change"
+        );
         c.install_snapshot(Arc::new(screen(b"hello world")));
         let inside = t0 + Duration::from_millis(1);
         assert!(c.poll_frame(inside, rtt).is_none(), "inside the floor");
@@ -1124,32 +1130,37 @@ mod tests {
     }
 
     /// A connection that has learnt the link: a round trip of 50 ms, and 10 kB taking 40 ms
-    /// beyond it, a budget of 12.5 kB in flight. Frames go at `t[0]` and `t[1]` (50 ms on), and
-    /// are delivered at `t[1]` and `t[2]` (140 ms on).
-    fn on_a_slow_link(t: [Instant; 3]) -> Option<(ServerConn, Option<Duration>)> {
+    /// beyond it, a budget of 12.5 kB in flight. Frames go at 0 and 50 ms, and are delivered at
+    /// 50 and 140 ms; returned with the round trip and the time 200 ms on.
+    fn on_a_slow_link() -> (ServerConn, Option<Duration>, Instant) {
+        let t0 = Instant::now();
+        let ms = |n| t0.checked_add(Duration::from_millis(n)).unwrap();
         let rtt = Some(Duration::from_millis(50));
         let mut c = ServerConn::default();
-        let [start, second, done] = t;
         c.install_snapshot(Arc::new(screen(b"start")));
-        let one = c.poll_frame(start, rtt)?;
-        c.frame_sent(one.num, 100, start, rtt);
-        c.ack(one.num, second);
+        let one = c.poll_frame(t0, rtt).unwrap();
+        c.frame_sent(one.num, 100, t0, rtt);
+        c.ack(one.num, ms(50));
         c.install_snapshot(Arc::new(screen(b"start, then more")));
-        let two = c.poll_frame(second, rtt)?;
-        c.frame_sent(two.num, 10_000, second, rtt);
-        c.ack(two.num, done);
-        (c.budget(rtt) == 12_500).then_some((c, rtt))
+        let two = c.poll_frame(ms(50), rtt).unwrap();
+        c.frame_sent(two.num, 10_000, ms(50), rtt);
+        c.ack(two.num, ms(140));
+        assert_eq!(c.budget(rtt), 12_500);
+        (c, rtt, ms(200))
+    }
+
+    /// [`on_a_slow_link`], then the link filled at its time by a 20 kB frame showing `text`.
+    fn on_a_full_link(text: &[u8]) -> (ServerConn, Option<Duration>, Instant, FrameNum) {
+        let (mut c, rtt, t) = on_a_slow_link();
+        c.install_snapshot(Arc::new(screen(text)));
+        let full = c.poll_frame(t, rtt).expect("room for it");
+        c.frame_sent(full.num, 20_000, t, rtt);
+        (c, rtt, t, full.num)
     }
 
     #[test]
     fn frames_in_flight_never_exceed_about_a_round_trip_of_the_link() {
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
-        let t = t0 + Duration::from_millis(200);
-        c.install_snapshot(Arc::new(screen(b"a big repaint")));
-        let big = c.poll_frame(t, rtt).expect("room for it");
-        c.frame_sent(big.num, 20_000, t, rtt);
+        let (mut c, rtt, t, big) = on_a_full_link(b"a big repaint");
         c.install_snapshot(Arc::new(screen(b"a big repaint, changed")));
         let later = t + Duration::from_millis(30);
         assert!(
@@ -1161,7 +1172,7 @@ mod tests {
             t + retry_after(rtt),
             "a delivery wakes the loop, or the frame is given up on"
         );
-        c.ack(big.num, t + Duration::from_millis(100));
+        c.ack(big, t + Duration::from_millis(100));
         assert!(c.poll_frame(t + Duration::from_millis(100), rtt).is_some());
     }
 
@@ -1169,18 +1180,12 @@ mod tests {
     fn with_nothing_it_may_send_the_connection_does_not_wake_at_once() {
         // Typed input awaits its echo, the echo-ack changed but not the screen, and the link is
         // full: nothing can go until a delivery, so the loop must not spin.
-        let t0 = Instant::now();
         let ms = Duration::from_millis;
-        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
-        let t = t0 + ms(200);
-        c.install_snapshot(Arc::new(screen(b"$ ")));
-        let full = c.poll_frame(t, rtt).unwrap();
-        c.frame_sent(full.num, 20_000, t, rtt);
-        c.push_client_bytes(&stream(&[typed(1, "x")]));
-        c.drain_client(t).unwrap();
+        let (mut c, rtt, t, _) = on_a_full_link(b"$ ");
+        c.push_client_bytes(&stream(&[typed(1, "x")]), t).unwrap();
         // A second key, still awaiting its echo once the first is promoted.
-        c.push_client_bytes(&stream(&[typed(2, "y")]));
-        c.drain_client(t + ms(30)).unwrap();
+        c.push_client_bytes(&stream(&[typed(2, "y")]), t + ms(30))
+            .unwrap();
         let later = t + ms(60);
         c.promote_echo(later);
         assert!(
@@ -1198,10 +1203,7 @@ mod tests {
         // Tiny frames, far under the byte budget, from a program changing the screen nonstop: past
         // half the window in flight, the next waits, so every delivery heard of is still a frame
         // the server holds.
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
-        let mut at = t0 + ms(200);
+        let (mut c, rtt, mut at) = on_a_slow_link();
         for n in 0..super::MAX_IN_FLIGHT {
             c.install_snapshot(Arc::new(screen(format!("count {n}").as_bytes())));
             let frame = c.poll_frame(at, rtt).expect("room for it");
@@ -1218,42 +1220,24 @@ mod tests {
 
     #[test]
     fn a_slow_link_skips_to_the_newest_screen() {
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
-        let t = t0 + Duration::from_millis(200);
-        c.install_snapshot(Arc::new(screen(b"frame 0")));
-        let big = c.poll_frame(t, rtt).unwrap();
-        c.frame_sent(big.num, 20_000, t, rtt);
-        let mut at = t;
+        let (mut c, rtt, mut at, big) = on_a_full_link(b"frame 0");
         for n in 1..=5 {
             at += Duration::from_millis(10);
             c.install_snapshot(Arc::new(screen(format!("frame {n}").as_bytes())));
             assert!(c.poll_frame(at, rtt).is_none(), "screen {n} waits");
         }
-        c.ack(big.num, at);
+        c.ack(big, at);
         let next = c.poll_frame(at, rtt).expect("room again");
-        assert_eq!(
-            next.num,
-            big.num.next(),
-            "the screens between were never sent"
-        );
+        assert_eq!(next.num, big.next(), "the screens between were never sent");
         let shown = applied(&screen(b"frame 0"), &next);
         assert!(shown.screen().contents().contains("frame 5"));
     }
 
     #[test]
     fn the_echo_of_typing_goes_at_once_even_with_the_link_full() {
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let (mut c, rtt) = on_a_slow_link([t0, t0 + ms(50), t0 + ms(140)]).unwrap();
-        let t = t0 + Duration::from_millis(200);
-        c.install_snapshot(Arc::new(screen(b"$ ")));
-        let full = c.poll_frame(t, rtt).unwrap();
-        c.frame_sent(full.num, 20_000, t, rtt);
+        let (mut c, rtt, t, _) = on_a_full_link(b"$ ");
         // The user types; the program's echo changes one row.
-        c.push_client_bytes(&stream(&[typed(1, "l")]));
-        c.drain_client(t).unwrap();
+        c.push_client_bytes(&stream(&[typed(1, "l")]), t).unwrap();
         c.install_snapshot(Arc::new(screen(b"$ l")));
         let typed = t + Duration::from_millis(1);
         let echo = c.poll_frame(typed, rtt).expect("the echo goes at once");
@@ -1319,7 +1303,7 @@ mod tests {
         c.install_snapshot(Arc::new(screen(b"one")));
         let one = c.poll_frame(t0, None).unwrap();
         c.install_snapshot(Arc::new(screen(b"one two")));
-        let two = c.poll_frame(later(1), None).unwrap();
+        c.poll_frame(later(1), None).unwrap();
         c.ack(FrameNum(1), Instant::now());
         c.install_snapshot(Arc::new(screen(b"one two three")));
         let three = c.poll_frame(later(2), None).unwrap();
@@ -1331,24 +1315,6 @@ mod tests {
         c.ack(FrameNum(1), Instant::now());
         c.install_snapshot(Arc::new(screen(b"four")));
         assert_eq!(c.poll_frame(later(3), None).unwrap().base, FrameNum(2));
-        let _ = two;
-    }
-
-    #[test]
-    fn a_resync_diffs_against_the_blank_screen_until_a_newer_ack() {
-        let t0 = Instant::now();
-        let later = |n| t0 + Duration::from_secs(n);
-        let mut c = ServerConn::default();
-        c.install_snapshot(Arc::new(screen(b"a")));
-        c.poll_frame(t0, None).unwrap();
-        c.ack(FrameNum(1), Instant::now());
-        c.push_client_bytes(&stream(&[ClientMsg::Resync]));
-        c.drain_client(later(1)).unwrap();
-        let rebuilt = c
-            .poll_frame(later(1), None)
-            .expect("a resync forces a frame");
-        assert_eq!(rebuilt.base, FrameNum::BLANK);
-        assert_eq!(applied(&TerminalScreen::default(), &rebuilt), screen(b"a"));
     }
 
     #[test]
@@ -1365,8 +1331,8 @@ mod tests {
         c.install_snapshot(Arc::new(screen(b"a b")));
         let two = c.poll_frame(later(2), None).unwrap();
         assert_eq!(two.base, FrameNum(1));
-        c.push_client_bytes(&stream(&[ClientMsg::Resync]));
-        c.drain_client(later(3)).unwrap();
+        c.push_client_bytes(&stream(&[ClientMsg::Resync]), later(3))
+            .unwrap();
         c.ack(FrameNum(2), later(3));
         c.install_snapshot(Arc::new(screen(b"a b c")));
         let next = c
@@ -1377,6 +1343,7 @@ mod tests {
             FrameNum::BLANK,
             "a frame on a base the client threw away"
         );
+        assert_eq!(applied(&TerminalScreen::default(), &next), screen(b"a b c"));
     }
 
     #[test]
@@ -1403,22 +1370,22 @@ mod tests {
             let mut c = ServerConn::default();
             c.install_snapshot(Arc::new(screen(b"$ ")));
             c.poll_frame(t0, None).unwrap();
-            assert!(!c.finished(t0));
+            assert!(!c.finished(t0, None));
             c.install_snapshot(exit_screen(3));
             let last = c.poll_frame(sent, None).expect("the final frame");
-            assert!(!c.finished(sent));
+            assert!(!c.finished(sent, None));
             (c, last)
         };
         let (mut acked, last) = exited();
         acked.ack(last.num, Instant::now());
-        assert!(acked.finished(sent), "acked: done at once");
+        assert!(acked.finished(sent, None), "acked: done at once");
         let (unacked, _) = exited();
         let just_before = (sent + FINAL_ACK_WAIT)
             .checked_sub(Duration::from_millis(1))
             .unwrap();
-        assert!(!unacked.finished(just_before));
+        assert!(!unacked.finished(just_before, None));
         assert!(
-            unacked.finished(sent + FINAL_ACK_WAIT),
+            unacked.finished(sent + FINAL_ACK_WAIT, None),
             "unacked: done after the wait"
         );
     }

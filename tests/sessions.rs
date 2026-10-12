@@ -1,17 +1,17 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/4 client.
+//! loopback iroh with a minimal koh/5 client.
 //!
 //! Every session's program starts through the `koh` binary's `__launch`, as `koh serve`'s do; unit
 //! tests cannot reach a binary, so these live here.
-#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
+#![forbid(clippy::disallowed_methods)]
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use koh::proto::{
-    decode_frame_body, decode_server, dictionary_for, encode_client, ClientMsg, FrameNum, InputSeq,
-    ServerMsg, MAX_FRAME,
+    decode_frame_body, decode_server, dictionary_for, encode_client, ClientMsg, Close, FrameNum,
+    InputSeq, ServerMsg, MAX_FRAME,
 };
 use koh::pty::Launcher;
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
@@ -41,7 +41,7 @@ async fn loopback_serve(
         ..ServeConfig::default()
     };
     let shutdown = CancellationToken::new();
-    let task = tokio::spawn(serve_endpoint(
+    let task = koh_testkit::spawn(serve_endpoint(
         server_ep,
         Hosting::from_config(&config)?,
         shutdown.clone(),
@@ -54,13 +54,8 @@ fn launcher() -> Launcher {
     Launcher::new(env!("CARGO_BIN_EXE_koh"))
 }
 
-/// The runtime for a test. `#[tokio::test]` is not used: its expansion `allow`s
-/// `clippy::expect_used`, which koh forbids, and a `forbid` rejects that `allow`.
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
+    koh_testkit::multi_thread(2)
 }
 
 fn registry(command: &[&str], max_sessions: usize, ttl: Duration) -> std::io::Result<Registry> {
@@ -110,8 +105,8 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
             .await
             .context("A creates the one allowed session")?;
         anyhow::ensure!(
-            reg.attach(b).await.is_err(),
-            "a second distinct peer is refused at the cap"
+            matches!(reg.attach(b).await, Err(Close::AtCapacity)),
+            "a second distinct peer is refused at the cap, for now"
         );
         anyhow::ensure!(
             matches!(
@@ -138,6 +133,8 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
             .context("B (concurrent, same session)")?;
         // Dropping ONE of two attached clients must not start the TTL.
         drop(a);
+        // Time must pass here: the session must outlive its TTL. (Polling would attach, and a
+        // detach restarts the TTL.)
         tokio::time::sleep(Duration::from_millis(400)).await;
         anyhow::ensure!(
             matches!(
@@ -149,6 +146,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
         // Now drop every client; after the TTL the session is reaped and a fresh attach creates one.
         drop(b);
         drop(reg.attach(peer).await.context("reattach C")?.0);
+        // Past the TTL, by time: polling would attach, and a detach restarts it.
         tokio::time::sleep(Duration::from_millis(500)).await;
         anyhow::ensure!(
             attach_kind(&reg, peer).await == Some(AttachKind::Created),
@@ -159,35 +157,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-#[test]
-fn a_session_whose_shell_exited_is_torn_down() -> anyhow::Result<()> {
-    runtime()?.block_on(async {
-        let reg = registry(&["sh", "-c", "exit 0"], 4, Duration::from_secs(30))?;
-        let peer = peer()?;
-        let (mut client, kind) = reg.attach(peer).await.context("attach")?;
-        anyhow::ensure!(kind == AttachKind::Created, "attach: {kind:?}");
-        // Wait for the final (exited) screen, then detach.
-        await_exit(&mut client).await?;
-        drop(client);
-        // The session tears down once the client that saw the exit detaches; a fresh attach creates.
-        let mut created = false;
-        for _ in 0..100 {
-            if attach_kind(&reg, peer).await == Some(AttachKind::Created) {
-                created = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        anyhow::ensure!(
-            created,
-            "an exited session is torn down and the next attach creates a new one"
-        );
-        reg.shutdown().await;
-        Ok(())
-    })
-}
-
-/// A bare koh/4 client: writes messages, applies frames whose base it holds, and acks them.
+/// A bare koh/5 client: writes messages, applies frames whose base it holds, and acks them.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -215,10 +185,10 @@ impl RawClient {
         let send = conn.open_uni().await?;
         let (tx, frames) = tokio::sync::mpsc::channel(64);
         let reader = conn.clone();
-        tokio::spawn(async move {
+        koh_testkit::spawn(async move {
             while let Ok(mut recv) = reader.accept_uni().await {
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                koh_testkit::spawn(async move {
                     if let Ok(bytes) = recv.read_to_end(MAX_FRAME).await {
                         if let Ok(ServerMsg::Frame { base, rows, body }) = decode_server(&bytes) {
                             let _ = tx.send((base, rows, body)).await;
@@ -312,17 +282,21 @@ impl RawClient {
 fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyhow::Result<()> {
     runtime()?.block_on(async {
         let secret = generate_secret_key()?;
-        let (addr, shutdown, serve) = loopback_serve(secret.public(), &["cat"]).await?;
+        // The program sees the clamped size too, on its terminal.
+        let program = ["sh", "-c", "read l; stty size; cat"];
+        let (addr, shutdown, serve) = loopback_serve(secret.public(), &program).await?;
         let mut client = RawClient::connect(addr, secret, true).await?;
         client
             .write(&ClientMsg::Resize(Size::new(65000, 1)))
             .await?;
-        client.type_bytes(b"xy").await?;
+        client.type_bytes(b"xy\r").await?;
         let clamped = clamp_dims(Size::new(65000, 1));
+        let size = format!("{} {}", clamped.rows, clamped.cols);
         let done = |c: &RawClient| {
-            c.screen()
-                .is_some_and(|s| s.screen().contents().contains("xy") && s.size() == clamped)
-                && c.echo_ack >= InputSeq(1)
+            c.screen().is_some_and(|s| {
+                let shown = s.screen().contents();
+                shown.contains("xy") && shown.contains(&size) && s.size() == clamped
+            }) && c.echo_ack >= InputSeq(1)
         };
         for _ in 0..100 {
             client.pump(100).await?;
@@ -331,11 +305,13 @@ fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyho
             }
         }
         let screen = client.screen().context("a screen")?;
-        anyhow::ensure!(
-            screen.screen().contents().contains("xy"),
-            "input reached the program"
-        );
+        let shown = screen.screen().contents();
+        anyhow::ensure!(shown.contains("xy"), "input reached the program: {shown:?}");
         anyhow::ensure!(screen.size() == clamped, "the resize arrives clamped");
+        anyhow::ensure!(
+            shown.contains(&size),
+            "and the program's terminal is that size: {shown:?}"
+        );
         anyhow::ensure!(
             client.echo_ack == InputSeq(1),
             "the input is acknowledged as echoed: {:?}",
@@ -351,11 +327,12 @@ fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyho
 }
 
 #[test]
-fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_input(
+fn echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program(
 ) -> anyhow::Result<()> {
     runtime()?.block_on(async {
         // Two connections on ONE session (a peer's reconnect racing its old connection). A types
-        // many times, B once. Each must only ever be acked for input it sent.
+        // many times, B once. Each must only ever be acked for input it sent, and only B's, the
+        // newest attachment's, reaches the program: A's is an old connection's, sent late.
         let secret = generate_secret_key()?;
         let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
         let addr = loopback_addr(&server_ep);
@@ -367,7 +344,7 @@ fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_i
             ..ServeConfig::default()
         };
         let shutdown = CancellationToken::new();
-        let server = tokio::spawn(serve_endpoint(
+        let server = koh_testkit::spawn(serve_endpoint(
             server_ep,
             Hosting::from_config(&config)?,
             shutdown.clone(),
@@ -389,7 +366,10 @@ fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_i
         for _ in 0..50 {
             a.pump(20).await?;
             b.pump(20).await?;
-            if b.echo_ack == InputSeq(1) && a.echo_ack == a.last_seq {
+            let typed = b
+                .screen()
+                .is_some_and(|s| s.screen().contents().contains('b'));
+            if typed && b.echo_ack == InputSeq(1) && a.echo_ack == a.last_seq {
                 break;
             }
         }
@@ -404,34 +384,30 @@ fn echo_ack_is_tracked_per_connection_so_a_second_connection_sees_only_its_own_i
             a.echo_ack,
             a.last_seq
         );
+        let shown = b.screen().context("a screen")?.screen().contents();
+        anyhow::ensure!(
+            shown.contains('b') && !shown.contains('a'),
+            "only the newest attachment types: {shown:?}"
+        );
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
         Ok(())
     })
 }
 
-/// A single-threaded runtime, so the registry, session and forwarding tasks interleave the same
-/// way every run.
-fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-}
-
-/// A reconnect that races its exited session's teardown creates a new session, and that one stays
-/// registered: the next attach while it is live reattaches to it.
+/// A reconnect after the program exited (the link dropped before the final frame was acknowledged)
+/// finds its final screen and status, not a new shell, and the session holds its slot. Once a
+/// client has that screen the session ends, and the next attach starts a new one, which stays
+/// registered while it lives.
 #[test]
-fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -> anyhow::Result<()>
-{
-    // The first session's program exits at once and leaves `marker`; its replacement's lives.
+fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Result<()> {
+    // The first session's program leaves `marker` and exits 3 at once; its replacement's lives.
     // The path reaches `sh` as `$1`, never spliced into the script.
-    let marker =
-        RemoveOnDrop(std::env::temp_dir().join(format!("koh-late-ended-{}", std::process::id())));
-    let path = marker.0.to_str().context("a UTF-8 temp dir")?;
-    let script = r#"[ -e "$1" ] && exec sleep 30; : > "$1""#;
-    // A marker left by an earlier run would keep the first session alive.
-    let _ = std::fs::remove_file(&marker.0);
-    current_thread_runtime()?.block_on(async {
+    let dir = koh_testkit::scratch!("reconnect-after-exit")?;
+    let marker = dir.join("marker");
+    let path = marker.to_str().context("a UTF-8 scratch dir")?;
+    let script = r#"[ -e "$1" ] && exec sleep 30; : > "$1"; exit 3"#;
+    koh_testkit::current_thread()?.block_on(async {
         let reg = registry(
             &["sh", "-c", script, "sh", path],
             1,
@@ -442,41 +418,60 @@ fn a_late_ended_from_a_torn_down_session_does_not_unregister_its_replacement() -
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
         await_exit(&mut c1).await?;
         drop(c1);
-        // Reconnect at once, racing the exited session's teardown: a new session is created.
-        let (c2, kind) = reg.attach(a).await.context("reconnect")?;
-        anyhow::ensure!(kind == AttachKind::Created, "reconnect: {kind:?}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // c2 is still attached to its live session, so this must reattach to it.
-        let third = attach_kind(&reg, a).await;
+        let (mut c2, kind) = reg.attach(a).await.context("reconnect")?;
+        anyhow::ensure!(
+            matches!(kind, AttachKind::Reattached { .. }),
+            "reconnect: {kind:?}"
+        );
+        anyhow::ensure!(c2.screen().exit_code() == Some(3), "the exit is seen");
+        anyhow::ensure!(
+            attach_kind(&reg, peer()?).await.is_none(),
+            "the exited session holds its slot"
+        );
+        // The client has the final screen: the session ends.
+        c2.ended().await;
+        while c2.next_screen().await.is_some() {}
+        let (c3, kind) = reg.attach(a).await.context("after the end")?;
+        anyhow::ensure!(kind == AttachKind::Created, "after the end: {kind:?}");
+        // c3 is still attached to its live session, so this must reattach to it.
+        let again = attach_kind(&reg, a).await;
         let other = attach_kind(&reg, peer()?).await;
-        drop(c2);
+        drop(c3);
         reg.shutdown().await;
         anyhow::ensure!(
-            matches!(third, Some(AttachKind::Reattached { .. })),
-            "a second connection while c2 is live must reattach to c2's session, got {third:?}"
+            matches!(again, Some(AttachKind::Reattached { .. })),
+            "c3's session stays registered, got {again:?}"
         );
-        anyhow::ensure!(
-            other.is_none(),
-            "max_sessions=1 with a live session must refuse another peer, got {other:?}"
-        );
+        anyhow::ensure!(other.is_none(), "and holds the one slot, got {other:?}");
         Ok(())
     })
 }
 
-/// A file removed when this is dropped, on a panic too.
-struct RemoveOnDrop(std::path::PathBuf);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// A peer removed from the allowlist has its session ended, its program hung up.
+#[test]
+fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30))?;
+        let a = peer()?;
+        let (mut client, _) = reg.attach(a).await.context("attach")?;
+        reg.end(a).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.next_screen().await.is_some() {}
+        })
+        .await
+        .context("the session ends")?;
+        let kind = attach_kind(&reg, a).await;
+        reg.shutdown().await;
+        anyhow::ensure!(kind == Some(AttachKind::Created), "{kind:?}");
+        Ok(())
+    })
 }
 
 /// More detaches than the session's control queue holds, at once, must all count: after the TTL
 /// the session is reaped and the next attach creates a new one.
 #[test]
 fn a_burst_of_detaches_larger_than_the_control_queue_still_starts_the_ttl() -> anyhow::Result<()> {
-    current_thread_runtime()?.block_on(async {
+    koh_testkit::current_thread()?.block_on(async {
         let reg = registry(&["sleep", "30"], 4, Duration::from_millis(200))?;
         let p = peer()?;
         let mut clients = Vec::new();
@@ -484,6 +479,7 @@ fn a_burst_of_detaches_larger_than_the_control_queue_still_starts_the_ttl() -> a
             clients.push(reg.attach(p).await.context("attach")?.0);
         }
         drop(clients);
+        // Past the TTL, by time: polling would attach, and a detach restarts it.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let kind = attach_kind(&reg, p).await;
         reg.shutdown().await;
@@ -512,62 +508,6 @@ fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
         anyhow::ensure!(
             drained.is_ok(),
             "after shutdown the held client's session has ended"
-        );
-        Ok(())
-    })
-}
-
-/// A reconnect right after the program exited and its last client left never reattaches to the
-/// dead session, and is answered even when its request lands as that session ends, however the
-/// session and registry tasks interleave across worker threads.
-#[test]
-fn a_reconnect_right_after_exit_never_reattaches_the_exited_session() -> anyhow::Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let reg = registry(&["true"], 4, Duration::from_secs(30))?;
-            let a = peer()?;
-            let mut client = reg.attach(a).await.context("first attach")?.0;
-            for round in 0..100 {
-                await_exit(&mut client)
-                    .await
-                    .with_context(|| format!("round {round}: exits"))?;
-                drop(client);
-                let (next, kind) = tokio::time::timeout(Duration::from_secs(5), reg.attach(a))
-                    .await
-                    .with_context(|| format!("round {round}: the reconnect is answered"))?
-                    .context("reconnect")?;
-                anyhow::ensure!(
-                    kind == AttachKind::Created,
-                    "round {round}: a reconnect after exit gets a new session, got {kind:?}"
-                );
-                client = next;
-            }
-            drop(client);
-            reg.shutdown().await;
-            Ok(())
-        })
-}
-
-/// A program that exits while no client is attached ends its session: an attach before the next
-/// TTL check starts a new one, rather than reattaching to the exited one.
-#[test]
-fn a_session_whose_program_exited_while_detached_is_not_reattached() -> anyhow::Result<()> {
-    current_thread_runtime()?.block_on(async {
-        let reg = registry(&["sleep", "0.3"], 4, Duration::from_secs(30))?;
-        let p = peer()?;
-        let (client, kind) = reg.attach(p).await.context("attach")?;
-        anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
-        drop(client);
-        // The program exits while detached, well before the TTL's next check.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let kind = attach_kind(&reg, p).await;
-        reg.shutdown().await;
-        anyhow::ensure!(
-            kind == Some(AttachKind::Created),
-            "the exited session must not be reattached; got {kind:?}"
         );
         Ok(())
     })
@@ -611,91 +551,8 @@ async fn await_exit(client: &mut koh::server::session::SessionClient) -> anyhow:
     anyhow::bail!("the exit code never reached the screen")
 }
 
-/// Wait, up to `within`, until `peer` can be attached at max_sessions=1, saying how.
-async fn attach_when_a_slot_frees(
-    reg: &Registry,
-    peer: iroh::EndpointId,
-    within: Duration,
-) -> Option<(koh::server::session::SessionClient, AttachKind)> {
-    tokio::time::timeout(within, async {
-        loop {
-            if let Ok(attached) = reg.attach(peer).await {
-                return attached;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .ok()
-}
-
-/// A session whose program exited is torn down once its last client leaves, so it frees its
-/// max_sessions slot for another peer, rather than lingering until the server shuts down.
-#[test]
-fn an_exited_session_whose_client_left_frees_its_slot() -> anyhow::Result<()> {
-    runtime()?.block_on(async {
-        let reg = registry(&["true"], 1, Duration::from_secs(30))?;
-        let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
-        await_exit(&mut client).await?;
-        drop(client);
-        let other = attach_when_a_slot_frees(&reg, peer()?, Duration::from_secs(5)).await;
-        let kind = other.as_ref().map(|(_, kind)| *kind);
-        drop(other);
-        reg.shutdown().await;
-        anyhow::ensure!(
-            kind == Some(AttachKind::Created),
-            "another peer gets the exited session's slot; got {kind:?}"
-        );
-        Ok(())
-    })
-}
-
-/// A session whose program exits while no client is attached is torn down at once, so it frees
-/// its max_sessions slot for another peer, well before its TTL.
-#[test]
-fn a_session_whose_program_exited_while_detached_frees_its_slot() -> anyhow::Result<()> {
-    runtime()?.block_on(async {
-        let reg = registry(&["sleep", "0.3"], 1, Duration::from_secs(30))?;
-        let (client, _) = reg.attach(peer()?).await.context("attach")?;
-        drop(client);
-        // The program exits at 0.3 s; a teardown on a 5 s tick would miss this.
-        let other = attach_when_a_slot_frees(&reg, peer()?, Duration::from_secs(2)).await;
-        let kind = other.as_ref().map(|(_, kind)| *kind);
-        drop(other);
-        reg.shutdown().await;
-        anyhow::ensure!(
-            kind == Some(AttachKind::Created),
-            "another peer gets the exited session's slot within 2 s, not on a 5 s tick; got {kind:?}"
-        );
-        Ok(())
-    })
-}
-
-/// A reconnect that lands while the old connection still holds its client (a reconnect racing
-/// teardown) must not reattach a session whose program has exited.
-#[test]
-fn a_reconnect_while_the_old_client_holds_on_never_reattaches_the_exited_session(
-) -> anyhow::Result<()> {
-    runtime()?.block_on(async {
-        let reg = registry(&["true"], 4, Duration::from_secs(30))?;
-        let a = peer()?;
-        let (mut old, kind) = reg.attach(a).await.context("first attach")?;
-        anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
-        await_exit(&mut old).await?;
-        // The old connection has not let go of its client yet.
-        let kind = attach_kind(&reg, a).await;
-        drop(old);
-        reg.shutdown().await;
-        anyhow::ensure!(
-            kind == Some(AttachKind::Created),
-            "an exited session must not be reattached; got {kind:?}"
-        );
-        Ok(())
-    })
-}
-
 /// A connection whose session has already exited when it attaches is told so: `run_attached`
-/// sends the final frame and closes with SESSION_ENDED, rather than waiting for a screen change
+/// sends the final frame and closes saying the session ended, rather than waiting for a screen change
 /// that never comes.
 #[test]
 fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyhow::Result<()> {
@@ -706,7 +563,8 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
         let mut raw = RawClient::connect(addr, secret, true).await?;
         let mut close = None;
         for _ in 0..30 {
-            raw.pump(100).await?;
+            // An ack written as the server closes fails: the close is what is looked for.
+            let _ = raw.pump(100).await;
             close = raw.conn.close_reason();
             if close.is_some() {
                 break;
@@ -714,11 +572,7 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
         }
         shutdown.cancel();
         let _ = serve.await;
-        let ended = matches!(
-            &close,
-            Some(iroh::endpoint::ConnectionError::ApplicationClosed(c))
-                if c.reason.as_ref() == koh::proto::SESSION_ENDED
-        );
+        let ended = koh::transport_iroh::closed_because(&raw.conn) == Some(Close::SessionEnded);
         anyhow::ensure!(
             ended,
             "the connection is closed as ended within 3s: {close:?}"
@@ -727,8 +581,8 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
     })
 }
 
-/// A program that cannot start is not reported as the server being full: the connection is
-/// closed saying the session could not start.
+/// A program that cannot start is not reported as the server being full, nor as a refusal for
+/// good: no admission comes, and the connection is closed saying the session could not start.
 #[test]
 fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
     runtime()?.block_on(async {
@@ -742,21 +596,26 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
             ..ServeConfig::default()
         };
         let shutdown = CancellationToken::new();
-        let server = tokio::spawn(serve_endpoint(
+        let server = koh_testkit::spawn(serve_endpoint(
             server_ep,
             Hosting::from_config(&config)?,
             shutdown.clone(),
         ));
-        // The connection is admitted, then closed with the reason.
         let endpoint = bind_endpoint_local(secret, false).await?;
-        let conn = endpoint.connect(addr, ALPN).await?;
-        let closed = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
+        let dialed = tokio::time::timeout(
+            Duration::from_secs(10),
+            koh::client::IrohConnector::new(endpoint, addr).connect(),
+        )
+        .await;
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
-        let reason = closed
-            .context("the server closes the connection")?
-            .to_string();
-        anyhow::ensure!(reason.contains("could not start"), "{reason}");
+        let Err(error) = dialed.context("the server answers")? else {
+            anyhow::bail!("admitted with no session");
+        };
+        anyhow::ensure!(
+            error.downcast_ref::<Close>() == Some(&Close::CouldNotStart),
+            "{error:#}"
+        );
         Ok(())
     })
 }

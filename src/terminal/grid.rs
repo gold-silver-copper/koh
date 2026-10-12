@@ -9,7 +9,7 @@ use std::sync::Arc;
 use fux_vt::{Attributes, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, RowId};
 
 use super::{Shift, Shifts, MAX_SHIFTS};
-use crate::predict::{CellView, ScreenView, Size};
+use crate::predict::{ScreenView, Size};
 
 /// The terminal modes the client mirrors onto the real terminal (or draws with).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -20,11 +20,15 @@ pub struct Modes {
     pub bracketed_paste: bool,
     pub mouse_mode: MouseProtocolMode,
     pub mouse_encoding: MouseProtocolEncoding,
+    /// The alternate screen is shown: a full-screen program's, whose keys the client never
+    /// predicts as a line editor's.
+    pub alternate: bool,
 }
 
 impl Modes {
     fn of(screen: &fux_vt::Screen) -> Self {
         Self {
+            alternate: screen.mode(fux_vt::Mode::AlternateScreen),
             hide_cursor: !screen.mode(fux_vt::Mode::ShowCursor),
             application_cursor: screen.mode(fux_vt::Mode::ApplicationCursor),
             application_keypad: screen.mode(fux_vt::Mode::ApplicationKeypad),
@@ -236,8 +240,8 @@ pub(super) struct RowCache {
     /// The palette the rows were drawn in. A new palette changes no row's version, so it starts
     /// the cache over.
     palette: Option<Palette>,
-    /// How many palettes the rows were drawn in, one after another.
-    palettes: u64,
+    /// How many times a new palette drew a row of the history otherwise.
+    history_redrawn: u64,
     /// By live index, the id and version of the row the snapshot took there.
     ids: Vec<(RowId, u64)>,
     /// The snapshot's rows, which the next one shares whole when no row changed.
@@ -247,10 +251,10 @@ pub(super) struct RowCache {
 }
 
 impl RowCache {
-    /// How many palettes the rows were drawn in, one after another: a change means every row,
+    /// How many times a new palette drew a row of the history otherwise: a change means the
     /// history's too, looks different.
-    pub(super) const fn palettes(&self) -> u64 {
-        self.palettes
+    pub(super) const fn history_redrawn(&self) -> u64 {
+        self.history_redrawn
     }
 
     /// The cached row for the live row `live` at `index`, if it is what it holds: its own row
@@ -302,6 +306,20 @@ impl RowCache {
 
 /// A copy of `row`, cells and text, exactly `cols` wide, drawn in `palette`. A live row is exactly
 /// that wide; anything longer is cut, anything shorter padded with blank cells.
+/// Whether a row of `screen`'s history draws otherwise in palette `new` than in `old`: a program
+/// that sets a colour no row of its history uses leaves the history as it was drawn.
+fn history_redrawn(screen: &fux_vt::Screen, old: Option<&Palette>, new: Option<&Palette>) -> bool {
+    let drawn = |palette: Option<&Palette>, attributes| {
+        palette.map_or(attributes, |palette| palette.draw(attributes))
+    };
+    screen.rows().take(screen.history_len()).any(|row| {
+        row.cells().any(|cell| {
+            let attributes = cell.attributes();
+            drawn(old, attributes) != drawn(new, attributes)
+        })
+    })
+}
+
 pub(super) fn exactly(
     row: Option<&fux_vt::Row<'_>>,
     cols: u16,
@@ -347,16 +365,17 @@ impl Grid {
     /// `cache` is left holding this snapshot's rows.
     pub(super) fn of(screen: &fux_vt::Screen, cache: &mut RowCache) -> Self {
         let (rows, cols) = screen.size().into();
-        if let Some(grid) = Self::of_dirty(screen, cache) {
+        let palette = Palette::of(screen);
+        if let Some(grid) = Self::of_dirty(screen, cache, palette.as_ref()) {
             return grid;
         }
         let window = screen.window();
         let live: Vec<fux_vt::Row<'_>> = (0..rows).filter_map(|row| window.row(row)).collect();
-        let palette = Palette::of(screen);
         if palette != cache.palette {
+            let redrawn = history_redrawn(screen, cache.palette.as_ref(), palette.as_ref());
             *cache = RowCache {
                 palette,
-                palettes: cache.palettes.saturating_add(1),
+                history_redrawn: cache.history_redrawn.saturating_add(u64::from(redrawn)),
                 ..RowCache::default()
             };
         }
@@ -429,11 +448,15 @@ impl Grid {
     /// contents did (fux-vt says so): a snapshot's cost then follows what changed, not the screen's
     /// size. `None` when the screen changed otherwise (a scroll, resize, reset, a switch of screens,
     /// the palette), for the full snapshot.
-    fn of_dirty(screen: &fux_vt::Screen, cache: &mut RowCache) -> Option<Self> {
+    fn of_dirty(
+        screen: &fux_vt::Screen,
+        cache: &mut RowCache,
+        palette: Option<&Palette>,
+    ) -> Option<Self> {
         let mark = cache.mark?;
         let (rows, cols) = screen.size().into();
         if screen.full_refresh_since(mark)
-            || Palette::of(screen) != cache.palette
+            || palette != cache.palette.as_ref()
             || cache.lines.len() != usize::from(rows)
             || cache
                 .lines
@@ -504,16 +527,11 @@ impl Grid {
         self.lines.get(row) == other.lines.get(row)
     }
 
-    /// Whether `row` shows the same cells as `other`'s `other_row`, whatever their wrap flags. Rows
+    /// Whether `row` is `other`'s `other_row` whole: the same cells, links and wrap flag. Rows
     /// that share their cells compare without reading them.
-    pub fn same_cells(&self, row: u16, other: &Self, other_row: u16) -> bool {
-        match (
-            self.lines.get(usize::from(row)),
-            other.lines.get(usize::from(other_row)),
-        ) {
-            (Some(line), Some(other)) => line.shares(other) || line.cells == other.cells,
-            _ => false,
-        }
+    pub fn same_row(&self, row: u16, other: &Self, other_row: u16) -> bool {
+        let line = self.lines.get(usize::from(row));
+        line.is_some() && line == other.lines.get(usize::from(other_row))
     }
 
     /// The rows of `base` that moved to become rows of `self`, as runs of rows that moved by the same
@@ -819,13 +837,10 @@ impl ScreenView for Grid {
     fn cursor_position(&self) -> (u16, u16) {
         Self::cursor_position(self)
     }
-    fn cell(&self, row: u16, col: u16) -> Option<CellView<'_>> {
-        Self::cell(self, row, col).map(|c| CellView {
-            contents: if c.has_contents() { c.contents() } else { "" },
-            fg: c.fgcolor(),
-            bg: c.bgcolor(),
-            wide: c.is_wide(),
-            continuation: c.is_wide_continuation(),
-        })
+    fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>> {
+        Self::cell(self, row, col)
+    }
+    fn alternate(&self) -> bool {
+        self.modes.alternate
     }
 }

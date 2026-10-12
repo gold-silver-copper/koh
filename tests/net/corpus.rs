@@ -22,7 +22,7 @@ use recording::Recording;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::harness::{identity, runtime, Server};
+use crate::harness::{identity, Server};
 use crate::link::{FaultNet, Profile};
 
 /// How long a step may take to show.
@@ -86,7 +86,7 @@ impl ClientTerminal for Readback {
     fn render(
         &mut self,
         state: &TerminalScreen,
-        overlay: &Overlay<'_>,
+        overlay: &Overlay,
         status: Option<&str>,
     ) -> std::io::Result<()> {
         self.terminal.render(state, overlay, status)?;
@@ -149,7 +149,7 @@ fn difference(shown: &fux_vt::Screen, expected: &fux_vt::Screen) -> Option<Strin
             let mut b = look(expected);
             // The server draws a program's colours as RGB.
             if let Some(cell) = b.as_mut() {
-                cell.3 = koh::terminal::drawn(cell.3, expected);
+                cell.3 = koh::terminal::test_support::drawn(cell.3, expected);
             }
             let (a, b) = (look(shown), b);
             if a != b {
@@ -253,12 +253,12 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     };
     let (input, input_rx) = mpsc::channel(64);
     let (resize, resize_rx) = mpsc::channel(8);
-    let task = tokio::spawn(run_client(
+    let task = koh_testkit::spawn(run_client(
         channel,
         std::time::SystemTime::now(),
         connector,
         start,
-        None,
+        false,
         input_rx,
         resize_rx,
         terminal,
@@ -381,23 +381,24 @@ fn the_corpus_converges_over_a_lossy_link() {
         .filter(|r| !recording::DIFFERS.iter().any(|(name, _)| *name == r.name))
         .collect();
     assert!(!chosen.is_empty(), "no recording named {wanted:?}");
-    let dir = std::env::temp_dir().join(format!("koh-net-corpus-{}", std::process::id()));
-    runtime().expect("runtime").block_on(async {
-        let mut failures = Vec::new();
-        for (seed, recording) in (1u64..).zip(chosen) {
-            let net = FaultNet::new(
-                Profile {
-                    loss: 0.05,
-                    delay: Duration::from_millis(25),
-                    ..Profile::default()
-                },
-                seed,
-            );
-            if let Err(e) = replay(&net, recording, &dir.join(&recording.name)).await {
-                failures.push(format!("seed {seed}: {e:#}"));
+    let dir = koh_testkit::scratch!("net-corpus").expect("a scratch directory");
+    koh_testkit::multi_thread(4)
+        .expect("runtime")
+        .block_on(async {
+            let mut failures = Vec::new();
+            for (seed, recording) in (1u64..).zip(chosen) {
+                let net = FaultNet::new(
+                    Profile {
+                        loss: 0.05,
+                        delay: Duration::from_millis(25),
+                        ..Profile::default()
+                    },
+                    seed,
+                );
+                if let Err(e) = replay(&net, recording, &dir.join(&recording.name)).await {
+                    failures.push(format!("seed {seed}: {e:#}"));
+                }
             }
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
-    });
-    let _ = std::fs::remove_dir_all(&dir);
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        });
 }

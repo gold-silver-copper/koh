@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
@@ -60,24 +60,21 @@ impl ConnectConfig {
 pub struct BellHook {
     command: String,
     last_count: u64,
-    last_spawn_ms: Option<u64>,
+    last_spawn: Option<Instant>,
     /// Whether a count has been seen (by `prime` or `observe`); `prime` is a no-op afterwards.
     primed: bool,
-    /// The instant `observe`'s millisecond clock counts from.
-    created: std::time::Instant,
 }
 
 /// Minimum spacing between two hook spawns; a burst of bells inside it coalesces into one.
-pub const BELL_HOOK_MIN_INTERVAL_MS: u64 = 1_000;
+pub const BELL_HOOK_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 impl BellHook {
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into(),
             last_count: 0,
-            last_spawn_ms: None,
+            last_spawn: None,
             primed: false,
-            created: std::time::Instant::now(),
         }
     }
 
@@ -89,30 +86,25 @@ impl BellHook {
         }
     }
 
-    /// Note the bell count at `now_ms`; whether to fire: it rose, and the last spawn was at least
-    /// [`BELL_HOOK_MIN_INTERVAL_MS`] ago. A rise within that is absorbed, not deferred.
-    pub fn observe(&mut self, count: u64, now_ms: u64) -> bool {
+    /// Note the bell count at `now`; whether to fire: it rose, and the last spawn was at least
+    /// [`BELL_HOOK_MIN_INTERVAL`] ago. A rise within that is absorbed, not deferred.
+    pub fn observe(&mut self, count: u64, now: Instant) -> bool {
         let rose = count > self.last_count;
         self.last_count = count;
         self.primed = true;
-        if !rose {
-            return false;
-        }
-        let spaced = self
-            .last_spawn_ms
-            .is_none_or(|t| now_ms.saturating_sub(t) >= BELL_HOOK_MIN_INTERVAL_MS);
+        let spaced = rose
+            && self
+                .last_spawn
+                .is_none_or(|at| now.saturating_duration_since(at) >= BELL_HOOK_MIN_INTERVAL);
         if spaced {
-            self.last_spawn_ms = Some(now_ms);
+            self.last_spawn = Some(now);
         }
         spaced
     }
 
     /// [`observe`](Self::observe) at `now` and, if due, [`fire`](Self::fire).
-    pub fn observe_and_fire(&mut self, count: u64, title: &str, now: std::time::Instant) {
-        // Milliseconds since the hook was made, saturating after 584 million years.
-        let now_ms = u64::try_from(now.saturating_duration_since(self.created).as_millis())
-            .unwrap_or(u64::MAX);
-        if self.observe(count, now_ms) {
+    pub fn observe_and_fire(&mut self, count: u64, title: &str, now: Instant) {
+        if self.observe(count, now) {
             self.fire(count, title);
         }
     }
@@ -208,10 +200,10 @@ fn warn_if_locale_not_utf8() {
     });
     if !looks_utf8 {
         let shown = locale.as_deref().unwrap_or("(unset)");
-        crate::log::stderr(&crate::log::Clean::new(format_args!(
+        crate::log::stderr(format_args!(
             "koh: warning: locale {shown} does not look UTF-8; non-ASCII output may be garbled. \
              Set e.g. LANG=en_US.UTF-8."
-        )));
+        ));
     }
 }
 
@@ -225,9 +217,9 @@ fn log_to_koh_log() {
     match crate::identity::open_private_log(&path) {
         Ok(file) => crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG),
         Err(e) => {
-            crate::log::stderr(&crate::log::Clean::new(format_args!(
+            crate::log::stderr(format_args!(
                 "koh: warning: $KOH_LOG: {e}; file logging disabled"
-            )));
+            ));
         }
     }
 }
@@ -235,63 +227,6 @@ fn log_to_koh_log() {
 /// The log file `$KOH_LOG` (given as `value`) names, if any: unset and empty both mean none.
 fn koh_log_path(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
     value.filter(|path| !path.is_empty()).map(Into::into)
-}
-
-/// The longest the client waits for the user's terminal to answer its start-up questions. A local
-/// terminal answers within milliseconds; one that answers nothing leaves the defaults.
-const PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Ask the user's terminal what it draws, speaks and shows (see [`super::probe`]; its colours too if
-/// `colours`), and paint and listen accordingly. Its answers are read out of `input`; what was
-/// typed meanwhile goes on to the session, first, on the input returned, with the colours to tell
-/// the server (`None` if not asked).
-async fn probe_terminal<B: crate::client::KohBackend>(
-    terminal: &mut BackendTerminal<B>,
-    mut input: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    colours: bool,
-) -> (
-    tokio::sync::mpsc::Receiver<Vec<u8>>,
-    Option<crate::events::WireColours>,
-) {
-    let mut replies = super::probe::Replies::default();
-    if terminal.ask(&super::probe::queries(colours)).is_ok() {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(PROBE_WAIT)
-            .unwrap_or_else(tokio::time::Instant::now);
-        while !replies.done() {
-            match tokio::time::timeout_at(deadline, input.recv()).await {
-                Ok(Some(bytes)) => replies.push(&bytes),
-                Ok(None) | Err(_) => break,
-            }
-        }
-    }
-    terminal.set_underline_styles(replies.underline_styles());
-    // Scheme reports only matter while colours are told.
-    let scheme_reports = colours && replies.scheme_reports();
-    if let Err(e) = terminal.turn_on(replies.kitty(), scheme_reports) {
-        tracing::warn!(error = %e, "could not set the terminal's keyboard and scheme reports");
-    }
-    tracing::debug!(
-        underline_styles = replies.underline_styles(),
-        kitty = replies.kitty(),
-        scheme_reports,
-        "the user's terminal"
-    );
-    let told = colours.then(|| replies.colours());
-    let typed = replies.typed();
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    #[expect(clippy::disallowed_methods, reason = "one task a run")]
-    tokio::spawn(async move {
-        if !typed.is_empty() && tx.send(typed).await.is_err() {
-            return;
-        }
-        while let Some(bytes) = input.recv().await {
-            if tx.send(bytes).await.is_err() {
-                break;
-            }
-        }
-    });
-    (rx, told)
 }
 
 /// `koh connect`: the remote shell's exit code if it exited. Takes the process's terminal, stdin
@@ -324,16 +259,14 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
         let mut terminal = BackendTerminal::enter(backend, args.clipboard)
             .context("entering raw mode / alt screen")?;
         terminal.set_hyperlinks(args.hyperlinks);
-        let (input_rx, colours) =
-            probe_terminal(&mut terminal, channels.input_rx, args.colours).await;
         let size = terminal.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
         crate::client::run_client(
             channel,
             dialed_at,
             connector,
             size,
-            colours,
-            input_rx,
+            args.colours,
+            channels.input_rx,
             channels.resize_rx,
             terminal,
             shutdown,
@@ -420,17 +353,19 @@ mod tests {
     fn bell_hook_fires_on_a_rise_and_rate_limits_a_burst() {
         // Counts [0,1,1,2,3] at times [0,0,10,20,1500] spawn at index 1 and 4 only — the
         // first rise fires, the rises inside the 1 s window coalesce, the one past it fires.
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
         let mut h = BellHook::new("true");
         let counts = [0u64, 1, 1, 2, 3];
         let times = [0u64, 0, 10, 20, 1500];
         let fired: Vec<bool> = counts
             .iter()
             .zip(times.iter())
-            .map(|(&c, &t)| h.observe(c, t))
+            .map(|(&c, &t)| h.observe(c, at(t)))
             .collect();
         assert_eq!(fired, [false, true, false, false, true]);
         // No rise, no spawn — even long after the window.
-        assert!(!h.observe(3, 10_000));
+        assert!(!h.observe(3, at(10_000)));
     }
 
     #[test]
@@ -439,13 +374,7 @@ mod tests {
         // keeps the rest (PATH, HOME), and gets KOH_BELL_COUNT / KOH_TITLE. The command builder takes the parent env explicitly, so
         // this needs no process-global `set_var`.
         use std::ffi::OsString;
-        let dir = std::env::temp_dir().join(format!(
-            "koh-bell-env-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::test_runtime::scratch("bell-env");
         let out = dir.join("env.txt");
         let hook = BellHook::new(format!("env > '{}'", out.display()));
         let parent_env = [
@@ -461,7 +390,6 @@ mod tests {
             .status()
             .expect("spawn env");
         let content = std::fs::read_to_string(&out).unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(status.success(), "{content}");
         assert!(content.contains("KOH_BELL_COUNT=42"), "{content}");
         assert!(content.contains("KOH_TITLE=a title"), "{content}");
@@ -477,30 +405,24 @@ mod tests {
     fn bell_hook_prime_swallows_the_count_it_is_seeded_with_but_not_later_rises() {
         // The first synced frame's cumulative count is not a new bell; a later rise is.
         // Priming again is a no-op (a reconnect keeps counting from where it was).
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(5);
         let mut h = BellHook::new("true");
         h.prime(5);
-        assert!(!h.observe(5, 0), "the primed count is not a rise");
-        assert!(h.observe(6, 0), "a rise past the primed count fires");
+        assert!(!h.observe(5, t0), "the primed count is not a rise");
+        assert!(h.observe(6, t0), "a rise past the primed count fires");
         h.prime(100);
         assert!(
-            h.observe(7, 5_000),
+            h.observe(7, later),
             "a second prime is ignored once a count was seen"
         );
         // observe() alone also primes: a hook that never saw prime() keeps today's behaviour.
         let mut g = BellHook::new("true");
         assert!(
-            g.observe(3, 0),
+            g.observe(3, t0),
             "with no prime, the first rise from 0 fires"
         );
         g.prime(50);
-        assert!(g.observe(4, 5_000), "prime after observe is a no-op");
-    }
-
-    #[test]
-    fn connect_config_default_has_no_bell_hook() {
-        let server = crate::transport_iroh::generate_secret_key()
-            .unwrap()
-            .public();
-        assert!(ConnectConfig::new(server).bell_command.is_none());
+        assert!(g.observe(4, later), "prime after observe is a no-op");
     }
 }

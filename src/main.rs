@@ -21,7 +21,7 @@ fn main() -> std::process::ExitCode {
         Ok(cmd) => cmd,
         Err(e) => match args::bad_value(&e) {
             Some(bad) => {
-                koh::log::stderr(&koh::log::Clean::new(format_args!("koh: {bad}")));
+                koh::log::stderr(format_args!("koh: {bad}"));
                 return std::process::ExitCode::FAILURE;
             }
             None => e.exit(),
@@ -43,7 +43,7 @@ fn main() -> std::process::ExitCode {
         Ok(Some(code)) => std::process::ExitCode::from(exit_status(code)),
         Ok(None) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            koh::log::stderr(&koh::log::Clean::new(format_args!("koh: {e:#}")));
+            koh::log::stderr(format_args!("koh: {e:#}"));
             std::process::ExitCode::FAILURE
         }
     }

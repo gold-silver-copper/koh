@@ -368,8 +368,8 @@ impl Reaper {
     }
 
     /// Wait until every hung-up program is reaped, each killed once its grace is over: before the
-    /// process exits, which would leave one that ignores SIGHUP running. Blocks for at most a
-    /// little over [`HANGUP_GRACE`], so call it on a blocking worker.
+    /// process exits, which would leave one that ignores SIGHUP running. Blocks for at most twice
+    /// [`HANGUP_GRACE`], so call it on a blocking worker.
     pub fn drain(&self) {
         let (done, drained) = channel();
         if self.0.send(Reap::Drain(done)).is_ok() {
@@ -525,12 +525,9 @@ impl Pty {
         ))
     }
 
-    /// End it: hang the program up, leaving it to the reaper, and join the pumps. Blocks while they
-    /// notice, so call it on a blocking worker.
+    /// End it: hang the program up, leaving it to the reaper (as dropping it does), and join the
+    /// pumps. Blocks while they notice, so call it on a blocking worker.
     pub fn close(mut self) {
-        if let Some(running) = self.running.take() {
-            running.hang_up(&self.reaper);
-        }
         let pumps = [self.pumps.writer.take(), self.pumps.reader.take()];
         drop(self);
         for handle in pumps.into_iter().flatten() {
@@ -590,7 +587,7 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        // The net under `close`; the pumps stop as `pumps` drops.
+        // Closed or not; the pumps stop as `pumps` drops.
         if let Some(running) = self.running.take() {
             running.hang_up(&self.reaper);
         }

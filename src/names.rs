@@ -269,9 +269,13 @@ pub fn short(id: EndpointId) -> String {
 
 /// The list `list`, empty if its file does not exist.
 pub fn load(places: &Places, list: List) -> anyhow::Result<Names> {
-    let key = places.key_file(list)?;
+    read(&places.key_file(list)?, list, &shown(places, list))
+}
+
+/// The list `list` beside `key`, empty if its file does not exist; `shown` names it in errors.
+pub fn read(key: &KeyFile, list: List, shown: &str) -> anyhow::Result<Names> {
     let text = key.read_beside(list.file())?;
-    Names::parse(text.as_deref().unwrap_or(""), &shown(places, list))
+    Names::parse(text.as_deref().unwrap_or(""), shown)
 }
 
 /// Change the list `list` with `change`, which sees it as it is on disk now; another koh's change

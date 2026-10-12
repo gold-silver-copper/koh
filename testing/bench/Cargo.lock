@@ -1562,10 +1562,18 @@ dependencies = [
  "iroh",
  "iroh-base",
  "koh",
+ "koh-testkit",
  "n0-watcher",
  "noq-udp",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "koh-testkit"
+version = "0.0.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

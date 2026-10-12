@@ -2,7 +2,7 @@
 //! through the fault-injecting link in [`link`].
 //!
 //! One test binary, so every test shares the harness.
-#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
+#![forbid(clippy::disallowed_methods)]
 
 mod baseline;
 mod bell;
@@ -14,5 +14,3 @@ mod keys;
 mod link;
 mod predict;
 mod session;
-#[path = "../spawn/mod.rs"]
-mod spawn;

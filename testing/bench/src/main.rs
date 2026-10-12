@@ -39,7 +39,8 @@ use crate::workloads::Workload;
 /// What to run, from the command line.
 struct Args {
     koh: PathBuf,
-    out: PathBuf,
+    /// Where the scoreboard goes; stdout if not given.
+    out: Option<PathBuf>,
     recordings: Option<Vec<String>>,
     systems: Vec<System>,
     samples: usize,
@@ -64,7 +65,7 @@ const USAGE: &str = "koh-bench --koh BIN [--out FILE] [--recordings all|none|a,b
 fn args() -> anyhow::Result<Args> {
     let mut args = Args {
         koh: PathBuf::from("target/release/koh"),
-        out: PathBuf::from("docs/SCOREBOARD.md"),
+        out: None,
         recordings: None,
         systems: vec![System::Koh, System::Mosh, System::Ssh],
         samples: 100,
@@ -86,7 +87,7 @@ fn args() -> anyhow::Result<Args> {
         };
         match word.as_str() {
             "--koh" => args.koh = PathBuf::from(value()?),
-            "--out" => args.out = PathBuf::from(value()?),
+            "--out" => args.out = Some(PathBuf::from(value()?)),
             "--recordings" => {
                 let v = value()?;
                 args.recordings = match v.as_str() {
@@ -1259,13 +1260,13 @@ fn main() -> ExitCode {
         };
     }
     let result = args().and_then(|args| {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()?;
-        let out = runtime.block_on(run(&args))?;
-        std::fs::write(&args.out, out)?;
-        eprintln!("wrote {}", args.out.display());
+        let out = koh_testkit::multi_thread(4)?.block_on(run(&args))?;
+        if let Some(path) = &args.out {
+            std::fs::write(path, out)?;
+            eprintln!("wrote {}", path.display());
+        } else {
+            std::io::Write::write_all(&mut std::io::stdout(), out.as_bytes())?;
+        }
         Ok(())
     });
     match result {

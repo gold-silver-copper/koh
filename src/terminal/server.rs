@@ -22,6 +22,16 @@ fn title_from(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Whether `data` is base64: its alphabet, then at most two `=` of padding.
+fn is_base64(data: &[u8]) -> bool {
+    let text = data
+        .strip_suffix(b"==")
+        .or_else(|| data.strip_suffix(b"="))
+        .unwrap_or(data);
+    text.iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
 /// What the emulator reports beside the grid: fux-vt's [`Event`]s and the replies to queries.
 #[derive(Default)]
 struct Observed {
@@ -47,12 +57,12 @@ impl Sink for Observed {
             Event::Title(t) => self.title = title_from(t),
             Event::IconName(n) => self.icon = title_from(n),
             Event::Bell => self.bell_count = self.bell_count.saturating_add(1),
-            // `data` is base64 already. A query (`?`) asks for the clipboard, which koh never
-            // reads, so it is not one to set.
+            // Kept only as base64 within its cap, as the client checks it, so both ends hold the
+            // same: a query (`?`), which asks for the clipboard koh never reads, is not one.
             Event::Clipboard { data, .. }
-                if data.len() <= MAXIMUM_CLIPBOARD_SIZE && data != b"?" =>
+                if data.len() <= MAXIMUM_CLIPBOARD_SIZE && is_base64(data) =>
             {
-                self.clipboard = String::from_utf8_lossy(data).into_owned();
+                self.clipboard = data.iter().copied().map(char::from).collect();
             }
             // A colour no program set: the user's terminal's, if the client said it; else
             // unanswered, as a terminal that does not know it would leave it.
@@ -141,8 +151,8 @@ pub struct ServerTerminal {
     exit_code: Option<u32>,
     /// The last snapshot's rows, which the next one shares where they are unchanged.
     rows: RowCache,
-    /// [`RowCache::palettes`] at the last snapshot.
-    palettes: u64,
+    /// [`RowCache::history_redrawn`] at the last snapshot.
+    history_redrawn: u64,
     /// The screen as it was when the program last began a frame (synchronized output), a whole
     /// one, until taken.
     frame_start: Option<TerminalScreen>,
@@ -166,7 +176,7 @@ impl ServerTerminal {
             observed: Observed::default(),
             exit_code: None,
             rows: RowCache::default(),
-            palettes: 0,
+            history_redrawn: 0,
             frame_start: None,
             frame_began: false,
             frame_ends: FrameEnds::default(),
@@ -367,11 +377,15 @@ impl ServerTerminal {
     }
 
     /// A snapshot of the current screen. Rows unchanged since the last snapshot share its cells.
-    /// A new palette names the history afresh, as its rows are drawn in it: a client's copies, in
-    /// the old one, are then rows the history no longer holds.
+    /// A new palette that draws a row of the history otherwise names the history afresh: a client's
+    /// copies, in the old one, are then rows the history no longer holds. One that changes no row
+    /// of it (a colour the history never used) leaves the names, and the client's copies, alone.
     pub fn snapshot(&mut self) -> TerminalScreen {
         let grid = Grid::of(self.parser.screen(), &mut self.rows);
-        if std::mem::replace(&mut self.palettes, self.rows.palettes()) != self.palettes {
+        if std::mem::replace(&mut self.history_redrawn, self.rows.history_redrawn())
+            != self.history_redrawn
+        {
+            tracing::debug!("a new palette redraws the history: it is named afresh");
             self.names.renew();
         }
         TerminalScreen {
@@ -546,14 +560,21 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn a_palette_change_names_the_history_afresh() {
+    fn a_palette_change_names_the_history_afresh_only_if_it_redraws_it() {
         // A client's copies of history rows were drawn in the old palette: new names make them
-        // rows the history no longer holds, so the client asks again.
+        // rows the history no longer holds, so the client asks again. A colour the history never
+        // used changes none of them, so they keep their names, and the client its copies.
         let mut emu = ServerTerminal::new(4, 20, 100).unwrap();
         for n in 0..10 {
-            emu.process(format!("line {n}\r\n").as_bytes());
+            emu.process(format!("\x1b[31mline {n}\x1b[m\r\n").as_bytes());
         }
         let before = emu.snapshot().history();
+        emu.process(b"\x1b]4;5;rgb:00/00/00\x07");
+        assert_eq!(
+            emu.snapshot().history(),
+            before,
+            "colour 5 draws no history row"
+        );
         emu.process(b"\x1b]4;1;rgb:00/00/00\x07");
         let after = emu.snapshot().history();
         assert_eq!(after.len, before.len);
@@ -609,20 +630,24 @@ mod tests {
     }
 
     #[test]
-    fn answers_cursor_position_report() {
+    fn answers_reports_and_queries() {
         let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.process(b"\x1b[5;3H"); // move cursor to row 5, col 3 (1-indexed input)
-        t.process(b"\x1b[6n"); // DSR: report cursor position
-        assert_eq!(t.take_host_replies(), b"\x1b[5;3R"); // 1-indexed report
-                                                         // Drained: a second take is empty.
-        assert_eq!(t.take_host_replies(), b"");
-    }
-
-    #[test]
-    fn answers_device_attributes_and_xtversion_as_koh() {
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.process(b"\x1b[c"); // primary DA: a VT220-class terminal with ANSI colour
-        assert_eq!(t.take_host_replies(), b"\x1b[?62;22c");
+        for (asked, answer) in [
+            // DSR and DECXCPR at row 5, column 3, 1-indexed.
+            (&b"\x1b[5;3H\x1b[6n"[..], &b"\x1b[5;3R"[..]),
+            (b"\x1b[?6n", b"\x1b[?5;3R"),
+            // DECRQM: reset, set, unknown.
+            (
+                b"\x1b[?2004$p\x1b[?2004h\x1b[?2004$p\x1b[?4242$p",
+                b"\x1b[?2004;2$y\x1b[?2004;1$y\x1b[?4242;0$y",
+            ),
+            // Primary DA: a VT220-class terminal with ANSI colour.
+            (b"\x1b[c", b"\x1b[?62;22c"),
+        ] {
+            t.process(asked);
+            assert_eq!(t.take_host_replies(), answer, "{asked:?}");
+        }
+        assert_eq!(t.take_host_replies(), b"", "drained");
         // Secondary DA: koh's version as major * 10000 + minor * 100 + patch.
         let mut parts = env!("CARGO_PKG_VERSION")
             .split('.')
@@ -675,33 +700,10 @@ mod tests {
         assert_eq!(colours(&mut t, 0), (Color::Idx(1), Color::Default));
         // The row's cells do not change, only how they are drawn: the snapshot draws them anew.
         t.process(b"\x1b]4;1;#ff0000\x1b\\\x1b]10;rgb:11/22/33\x07\x1b]11;#000080\x07");
-        let navy = Color::Rgb(fux_vt::Rgb {
-            r: 0,
-            g: 0,
-            b: 0x80,
-        });
-        assert_eq!(
-            colours(&mut t, 0),
-            (
-                Color::Rgb(fux_vt::Rgb {
-                    r: 0xff,
-                    g: 0,
-                    b: 0
-                }),
-                navy
-            )
-        );
-        assert_eq!(
-            colours(&mut t, 1),
-            (
-                Color::Rgb(fux_vt::Rgb {
-                    r: 0x11,
-                    g: 0x22,
-                    b: 0x33
-                }),
-                navy
-            )
-        );
+        let rgb = |r, g, b| Color::Rgb(fux_vt::Rgb { r, g, b });
+        let navy = rgb(0, 0, 0x80);
+        assert_eq!(colours(&mut t, 0), (rgb(0xff, 0, 0), navy));
+        assert_eq!(colours(&mut t, 1), (rgb(0x11, 0x22, 0x33), navy));
         assert_eq!(
             colours(&mut t, 7).1,
             navy,
@@ -813,11 +815,20 @@ mod tests {
     }
 
     #[test]
-    fn a_clipboard_query_sets_nothing() {
+    fn only_base64_sets_the_clipboard_and_a_query_sets_nothing() {
         let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
-        t.process(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07");
+        // Bytes no base64 holds, which lossy UTF-8 would have tripled.
+        t.process(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07\x1b]52;c;\xff\xfe=x\x07");
         assert_eq!(t.snapshot().clipboard(), "aGVsbG8=");
         assert_eq!(t.take_host_replies(), b"", "nor is it answered");
+        // Nor does one over the cap (anti-amplification).
+        let big = "A".repeat(MAXIMUM_CLIPBOARD_SIZE + 1);
+        t.process(format!("\x1b]52;c;{big}\x07").as_bytes());
+        assert_eq!(
+            t.snapshot().clipboard(),
+            "aGVsbG8=",
+            "oversized one dropped"
+        );
     }
 
     #[test]
@@ -856,18 +867,6 @@ mod tests {
     }
 
     #[test]
-    fn answers_decxcpr_and_decrqm() {
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.process(b"\x1b[5;3H\x1b[?6n");
-        assert_eq!(t.take_host_replies(), b"\x1b[?5;3R");
-        t.process(b"\x1b[?2004$p\x1b[?2004h\x1b[?2004$p\x1b[?4242$p");
-        assert_eq!(
-            t.take_host_replies(),
-            b"\x1b[?2004;2$y\x1b[?2004;1$y\x1b[?4242;0$y"
-        );
-    }
-
-    #[test]
     fn title_icon_bell_clipboard_captured() {
         let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
         t.process(b"\x1b]2;my-title\x07\x07\x1b]1;my-icon\x07\x1b]52;c;aGVsbG8=\x07");
@@ -882,6 +881,10 @@ mod tests {
             "snapshot carries the OSC-52 clipboard"
         );
         assert_eq!(snap.bell_count(), 1, "snapshot carries the bell count");
+        // A runaway title is clamped to MAX_TITLE_LEN chars (mosh's parse-time cap).
+        let huge = "x".repeat(MAX_TITLE_LEN + 500);
+        t.process(format!("\x1b]2;{huge}\x07").as_bytes());
+        assert_eq!(t.title().chars().count(), MAX_TITLE_LEN);
     }
 
     #[test]
@@ -898,32 +901,6 @@ mod tests {
             "largest resize accepted"
         );
         assert!(ServerTerminal::new(MAX_DIM, MAX_DIM, history).is_ok());
-    }
-
-    #[test]
-    fn oversized_clipboard_is_dropped() {
-        // A clipboard set above the cap must not be synced (anti-amplification).
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        let big = "A".repeat(MAXIMUM_CLIPBOARD_SIZE + 1);
-        t.process(format!("\x1b]52;c;{big}\x07").as_bytes());
-        assert_eq!(t.snapshot().clipboard(), "", "oversized clipboard dropped");
-    }
-
-    #[test]
-    fn oversized_title_is_clamped() {
-        // A runaway/hostile OSC title is clamped to MAX_TITLE_LEN chars (mosh's parse-time cap),
-        // not stored unbounded.
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        let huge = "x".repeat(MAX_TITLE_LEN + 500);
-        t.process(format!("\x1b]2;{huge}\x07").as_bytes());
-        assert_eq!(
-            t.title().chars().count(),
-            MAX_TITLE_LEN,
-            "title clamped to the cap"
-        );
-        // A title within the cap is untouched.
-        t.process(b"\x1b]2;short\x07");
-        assert_eq!(t.title(), "short");
     }
 
     #[test]
@@ -1015,52 +992,36 @@ mod tests {
     #[test]
     fn mouse_events_reach_a_program_in_its_mode_and_encoding() {
         // The user's terminal reports in SGR: a press at row 5, column 10, and its release.
-        let click = b"\x1b[<0;10;5M\x1b[<0;10;5m";
-        assert_eq!(program_gets(b"", click), b"", "no mode: nothing");
-        assert_eq!(
-            program_gets(b"\x1b[?9h", click),
-            b"\x1b[M *%",
-            "X10: the press"
+        let click = &b"\x1b[<0;10;5M\x1b[<0;10;5m"[..];
+        // A drag: motion with a button held, in 1002 and 1003 but not 1000; a hover, motion with
+        // none, in 1003 alone.
+        let (drag, hover) = (&b"\x1b[<32;11;5M"[..], &b"\x1b[<35;11;5M"[..]);
+        let (sgr_1000, sgr_1002) = (
+            &b"\x1b[?1000h\x1b[?1006h"[..],
+            &b"\x1b[?1002h\x1b[?1006h"[..],
         );
-        assert_eq!(
-            program_gets(b"\x1b[?1000h", click),
-            b"\x1b[M *%\x1b[M#*%",
-            "normal: press and release"
-        );
-        assert_eq!(
-            program_gets(b"\x1b[?1000h\x1b[?1006h", click),
-            b"\x1b[<0;10;5M\x1b[<0;10;5m"
-        );
-        assert_eq!(
-            program_gets(b"\x1b[?1000h\x1b[?1005h", b"\x1b[<0;100;5M"),
-            "\x1b[M \u{84}%".as_bytes(),
-            "UTF-8"
-        );
-        // A drag: motion with a button held, in 1002 and 1003 but not 1000; motion with none, in
-        // 1003 alone.
-        let drag = b"\x1b[<32;11;5M";
-        let hover = b"\x1b[<35;11;5M";
-        assert_eq!(program_gets(b"\x1b[?1000h\x1b[?1006h", drag), b"");
-        assert_eq!(
-            program_gets(b"\x1b[?1002h\x1b[?1006h", drag),
-            b"\x1b[<32;11;5M"
-        );
-        assert_eq!(program_gets(b"\x1b[?1002h\x1b[?1006h", hover), b"");
-        assert_eq!(
-            program_gets(b"\x1b[?1003h\x1b[?1006h", hover),
-            b"\x1b[<35;11;5M"
-        );
-        // The wheel.
-        assert_eq!(
-            program_gets(b"\x1b[?1000h\x1b[?1006h", b"\x1b[<65;3;4M"),
-            b"\x1b[<65;3;4M"
-        );
-        // Past 223 the default encoding carries nothing, so nothing is sent.
-        assert_eq!(program_gets(b"\x1b[?1000h", b"\x1b[<0;224;1M"), b"");
-        assert_eq!(
-            program_gets(b"\x1b[?1000h", b"\x1b[<0;223;1M"),
-            [&b"\x1b[M "[..], &[255, 33]].concat()
-        );
+        for (mode, sent, gets) in [
+            (&b""[..], click, &b""[..]),
+            (b"\x1b[?9h", click, b"\x1b[M *%"),
+            (b"\x1b[?1000h", click, b"\x1b[M *%\x1b[M#*%"),
+            (sgr_1000, click, click),
+            (
+                b"\x1b[?1000h\x1b[?1005h",
+                b"\x1b[<0;100;5M",
+                "\x1b[M \u{84}%".as_bytes(),
+            ),
+            (sgr_1000, drag, b""),
+            (sgr_1002, drag, drag),
+            (sgr_1002, hover, b""),
+            (b"\x1b[?1003h\x1b[?1006h", hover, hover),
+            // The wheel.
+            (sgr_1000, b"\x1b[<65;3;4M", b"\x1b[<65;3;4M"),
+            // Past 223 the default encoding carries nothing, so nothing is sent.
+            (b"\x1b[?1000h", b"\x1b[<0;224;1M", b""),
+            (b"\x1b[?1000h", b"\x1b[<0;223;1M", b"\x1b[M \xff!"),
+        ] {
+            assert_eq!(program_gets(mode, sent), gets, "{mode:?} {sent:?}");
+        }
     }
 
     #[test]

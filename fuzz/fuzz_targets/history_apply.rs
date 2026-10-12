@@ -5,7 +5,8 @@
 //! Arbitrary bytes are read as a mark, the request asked, a view offset and history replies
 //! (postcard, as the stream carries them), each kept in a client's cache, and the cache shown as a
 //! scrolled-back view. Keeping must never panic, must keep only rows the request asked for and the
-//! mark holds, and must stay within the cache's byte bound however many replies come; the view
+//! mark holds, and must stay within the cache's byte bound however many replies come, but for
+//! the rows just kept and the one viewed, which it never drops; the view
 //! must be a well-formed screen.
 
 use koh::terminal::{
@@ -22,6 +23,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let mark = HistoryMark { newest, len };
     let request = HistoryRequest {
+        id: 0,
         newest: asked,
         count,
     };
@@ -30,11 +32,12 @@ fuzz_target!(|data: &[u8]| {
     while let Ok((reply, after)) = postcard::take_from_bytes::<HistoryReply>(rest) {
         rest = after;
         let before = cache.len();
-        if let Some(kept) = cache.insert(&reply, request.ask().1, mark, newest) {
+        if let Some(kept) = cache.insert(&reply, request, mark, newest..=newest) {
             assert!(kept <= reply.rows.len());
             assert!(cache.len() <= before + kept);
+            // Past the bound only by what it must not drop: the rows just kept, the one viewed.
+            assert!(cache.bytes() <= HISTORY_CACHE_BYTES || cache.len() <= kept + 1);
         }
-        assert!(cache.bytes() <= HISTORY_CACHE_BYTES);
     }
     let _ = koh::proto::decode_server(data);
     let screen = TerminalScreen::from_bytes(24, 80, b"live\r\nscreen");

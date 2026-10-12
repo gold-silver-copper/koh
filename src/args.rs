@@ -605,12 +605,18 @@ mod tests {
         assert!(d.clipboard && d.hyperlinks && d.colours && d.bell_command.is_none());
         let c = connect(&["laptop"]);
         assert_eq!(c.server, super::ServerRef::Name("laptop".to_owned()));
-        let c = connect(&[ID, "--no-clipboard"]);
-        assert!(!c.clipboard && c.hyperlinks && c.colours);
         let c = connect(&[ID, "--no-hyperlinks"]);
         assert!(c.clipboard && !c.hyperlinks && c.colours);
         let c = connect(&[ID, "--no-colours"]);
         assert!(c.clipboard && c.hyperlinks && !c.colours);
+    }
+
+    #[test]
+    fn no_clipboard_turns_clipboard_writes_off() {
+        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-clipboard"]) else {
+            panic!("connect");
+        };
+        assert!(!c.clipboard && c.hyperlinks && c.colours);
         // The old opt-in is gone, so a script that passed it hears of it.
         assert!(command()
             .try_get_matches_from(["koh", "connect", ID, "--clipboard"])

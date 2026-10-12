@@ -863,7 +863,7 @@ mod tests {
     /// A server that will not have the client for good (another protocol, or not authorized) is
     /// a [`Refused`]; one that cannot have it now closes saying why, and is redialed.
     #[test]
-    fn a_refusal_is_for_good_only_when_not_authorized_or_on_another_protocol() {
+    fn a_refusal_is_for_good_only_when_not_authorized() {
         use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
         let key = || generate_secret_key().expect("OS randomness");
         crate::test_runtime::current_thread().block_on(async {

@@ -508,8 +508,7 @@ mod tests {
     #[test]
     fn a_created_key_is_its_raw_bytes_and_loads_back_to_the_same_identity() {
         let dir = scratch("key-test", 0o700);
-        // A missing directory is created private.
-        let path = dir.join("state").join("id.key");
+        let path = dir.join("id.key");
         let key = KeyFile::open(&path).unwrap();
         let first = load(&key).expect("create a key");
         assert_eq!(
@@ -518,11 +517,19 @@ mod tests {
             "the file is the raw key"
         );
         assert_eq!(mode_of(&path), 0o600, "a created key is owner-only");
-        assert_eq!(mode_of(&dir.join("state")), 0o700);
         let second = load(&key).expect("load it back");
         assert_eq!(first.endpoint_id(), second.endpoint_id(), "round-trips");
         let id = first.endpoint_id();
         assert_eq!(parse_endpoint_id(&id.to_string()).unwrap(), id);
+    }
+
+    #[test]
+    fn a_missing_directory_is_created_private() {
+        let dir = scratch("key-perm", 0o700);
+        let path = dir.join("state").join("id.key");
+        load(&KeyFile::open(&path).unwrap()).expect("create a key");
+        assert_eq!(mode_of(&dir.join("state")), 0o700);
+        assert_eq!(mode_of(&path), 0o600);
     }
 
     #[test]
@@ -739,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fifo_log_or_key_is_refused_and_left_without_waiting_for_a_peer() {
+    fn a_fifo_log_or_key_is_refused_without_waiting_for_a_reader() {
         let dir = scratch("fifo-log", 0o700);
         let path = dir.join("koh.log");
         #[expect(clippy::disallowed_methods, reason = "mkfifo, to plant a FIFO")]

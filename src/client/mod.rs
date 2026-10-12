@@ -77,15 +77,16 @@ impl IrohConnector {
     }
 
     /// Connect and await the admission ack. A server that rejects us closes the connection instead,
-    /// which is an error, so a rejected client fails fast rather than redialing forever.
+    /// a [`Refused`] error, so a rejected client fails fast rather than redialing forever.
     pub async fn connect(&self) -> anyhow::Result<Connection> {
         let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
             Ok(conn) => conn,
             Err(e) if refused_our_alpn(&e) => {
-                return Err(anyhow::Error::new(e).context(format!(
+                return Err(Refused(format!(
                     "the server does not speak this koh protocol ({}); upgrade koh on both ends",
                     String::from_utf8_lossy(ALPN)
-                )));
+                ))
+                .into());
             }
             Err(e) => {
                 return Err(anyhow::Error::new(e)
@@ -93,11 +94,10 @@ impl IrohConnector {
             }
         };
         if let Err(e) = crate::transport_iroh::admission::await_admission(&conn).await {
-            // Surface the server's own reason ("not authorized", "at session capacity"): each
-            // points at a different fix.
+            // Surface the server's own reason ("not authorized"), alone: the stream error under it
+            // repeats the raw bytes.
             return Err(match server_close_reason(&conn) {
-                Some(reason) => anyhow::Error::new(e)
-                    .context(format!("server rejected the connection: {reason}")),
+                Some(reason) => Refused(format!("server rejected the connection: {reason}")).into(),
                 None => anyhow::Error::new(e)
                     .context("server did not admit the connection (is your id on its allowlist?)"),
             });
@@ -105,6 +105,12 @@ impl IrohConnector {
         Ok(conn)
     }
 }
+
+/// The server refused us for good (not on its allowlist, another protocol version): redialing
+/// cannot help, so the client exits with the reason.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Refused(String);
 
 /// Whether a dial failed because the server does not serve [`ALPN`]: the TLS handshake ended with
 /// alert 120 (`no_application_protocol`), which QUIC reports as crypto error `0x178`. A server on
@@ -126,8 +132,7 @@ fn refused_our_alpn(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// The server's application close reason, if any: peer-controlled, so stripped of control
-/// characters and capped before it can reach the user's terminal.
+/// The server's application close reason, if any, capped (it is escaped where it is printed).
 fn server_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
     use iroh::endpoint::{ApplicationClose, ConnectionError};
     let ConnectionError::ApplicationClosed(ApplicationClose { reason, .. }) =
@@ -135,12 +140,8 @@ fn server_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
     else {
         return None;
     };
-    let cleaned: String = String::from_utf8_lossy(&reason)
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(80)
-        .collect();
-    (!cleaned.is_empty()).then_some(cleaned)
+    let reason: String = String::from_utf8_lossy(&reason).chars().take(80).collect();
+    (!reason.is_empty()).then_some(reason)
 }
 
 /// The wait before redialing after `attempt` (from 1) failures.
@@ -560,6 +561,9 @@ pub async fn run_client<T: ClientTerminal>(
             }
             Some(Change::Dialed(failed)) => {
                 if let Ok(Err(e)) = failed {
+                    if e.is::<Refused>() {
+                        return Err(e);
+                    }
                     tracing::info!(reason = %e, attempt, "reconnect dial failed");
                 } else {
                     tracing::info!(attempt, "reconnect dial timed out");

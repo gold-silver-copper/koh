@@ -1,12 +1,61 @@
-//! The logging `koh serve` and `koh connect` install: `RUST_LOG` as `target=level` directives
-//! and bare levels, else koh's own targets at a default level.
+//! What koh writes outside the session: its stderr and its log.
+//!
+//! Both may carry text a peer chose (a close reason inside an error, a client's stream error), so
+//! both escape control characters where they are written, whatever the caller formatted: [`Clean`]
+//! is the only text [`stderr`] takes, and every log line is escaped by its writer.
+//! `std::io::stderr` is banned elsewhere.
+//!
+//! The log is `RUST_LOG` as `target=level` directives and bare levels, else koh's own targets at a
+//! default level.
+
+use std::fmt;
+use std::io::Write as _;
 
 use tracing::Level;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::MakeWriter;
 
-/// Install the global subscriber: formatted events to `writer`, filtered by [`targets`]. A no-op if
-/// one is installed already.
+/// Text with every control character but newline escaped (`\u{1b}`): it cannot move the cursor,
+/// set a mode, write the clipboard or start a line in a log, whoever wrote it.
+pub struct Clean(String);
+
+impl Clean {
+    /// `text`, escaped.
+    pub fn new(text: impl fmt::Display) -> Self {
+        Self(escape(&text.to_string(), true))
+    }
+}
+
+impl fmt::Display for Clean {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `text` with control characters escaped, newlines too unless `keep_newlines`.
+fn escape(text: &str, keep_newlines: bool) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() && !(keep_newlines && c == '\n') {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Write `text` and a newline to stderr: the only way koh writes there.
+pub fn stderr(text: &Clean) {
+    #[expect(clippy::disallowed_methods, reason = "the one writer to stderr")]
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{text}");
+}
+
+/// Install the global subscriber: formatted events to `writer`, filtered by [`targets`].
+///
+/// A no-op if one is installed already. Uncoloured: the writer escapes every control character in
+/// an event, so a field cannot forge a line or reach the terminal the log is read on.
 pub fn init<W>(writer: W, default: Level)
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
@@ -14,9 +63,47 @@ where
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     let _ = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(writer))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(Escaping(writer)),
+        )
         .with(targets(default))
         .try_init();
+}
+
+/// Log to stderr.
+pub fn init_stderr(default: Level) {
+    #[expect(clippy::disallowed_methods, reason = "the log's writer, which escapes")]
+    init(std::io::stderr, default);
+}
+
+/// A log writer that escapes control characters in each event but its closing newline. The
+/// formatter writes an event in one piece, so a field's newline is escaped, not a line break.
+struct Escaping<M>(M);
+
+impl<'w, M: MakeWriter<'w>> MakeWriter<'w> for Escaping<M> {
+    type Writer = Escaping<M::Writer>;
+
+    fn make_writer(&'w self) -> Self::Writer {
+        Escaping(self.0.make_writer())
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for Escaping<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        let (line, end) = text
+            .strip_suffix('\n')
+            .map_or_else(|| (text.as_ref(), ""), |line| (line, "\n"));
+        self.0.write_all(escape(line, false).as_bytes())?;
+        self.0.write_all(end.as_bytes())?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
 /// The filter `RUST_LOG` asks for, else `koh` at `default`.
@@ -39,6 +126,22 @@ fn targets_from(spec: Option<&str>, default: Level) -> Targets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controls_are_escaped_on_stderr_and_in_log_lines() {
+        let hostile = "refused\u{1b}]52;c;aGk=\u{7}\nkoh::auth outcome=\"accepted\"\u{9b}2J";
+        let shown = Clean::new(hostile).to_string();
+        assert!(!shown.chars().any(|c| c.is_control() && c != '\n'), "{shown:?}");
+        assert!(shown.contains("\\u{1b}]52"), "{shown:?}");
+
+        let mut out = Vec::new();
+        let mut log = Escaping(&mut out);
+        std::io::Write::write_all(&mut log, format!("WARN x: {hostile}\n").as_bytes()).unwrap();
+        let line = String::from_utf8(out).unwrap();
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+        assert!(line.ends_with('\n'));
+        assert!(!line.chars().any(|c| c.is_control() && c != '\n'), "{line:?}");
+    }
 
     #[test]
     fn the_default_covers_every_koh_target_at_its_level_only() {

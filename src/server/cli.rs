@@ -2,7 +2,6 @@
 //! the `--allow` list, and host each one's session. There is no "accept any peer" mode.
 
 use std::collections::HashSet;
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,7 +103,7 @@ pub fn connect_qr(data: &str) -> Option<String> {
 /// `koh serve`: host [`ServeConfig::command`] for the allowed clients until SIGTERM or SIGINT.
 /// Logs to stderr.
 pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
-    crate::log::init(std::io::stderr, tracing::Level::INFO);
+    crate::log::init_stderr(tracing::Level::INFO);
     let hosting = Hosting::from_config(&args)?;
 
     let key_file = crate::identity::KeyFile::locate(args.key_file.clone(), "server")?;
@@ -166,7 +165,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
          │ connect     : {connect_hint}\n\
          └───────────────────────────────────────────────────────────\n{qr}"
     );
-    let _ = std::io::stderr().lock().write_all(banner.as_bytes());
+    crate::log::stderr(&crate::log::Clean::new(banner.trim_end()));
 
     // What protects the link, iroh's choice: so an operator sees post-quantum KEX is not on.
     info!(

@@ -20,4 +20,5 @@ disallowed-methods = [
     { path = "tokio::sync::mpsc::unbounded_channel", reason = "use a bounded channel" },
     { path = "tokio::spawn", reason = "say what bounds the tasks spawned here, in the expectation's reason" },
     { path = "tokio::task::spawn", reason = "say what bounds the tasks spawned here, in the expectation's reason" },
+    { path = "std::io::stderr", reason = "write through koh::log::stderr, which escapes what a peer chose" },
 ]

@@ -556,10 +556,11 @@ fn a_session_ends_when_its_program_does_whatever_holds_its_terminal() -> anyhow:
     runtime()?.block_on(async {
         // A job left in the background keeps the terminal open after the shell exited; a program
         // that closed its terminal runs on with none. Either way the session ends, with a status.
-        for (script, code) in [
-            ("sleep 3600 & exit 7", 7),
-            ("exec </dev/null >/dev/null 2>&1; sleep 3600", 129),
-        ] {
+        // On macOS the terminal stays open while its session leader runs, whatever it closed, so
+        // the session rightly stays: only Linux reports the terminal closed.
+        let closed = cfg!(any(target_os = "linux", target_os = "android"))
+            .then_some(("exec </dev/null >/dev/null 2>&1; sleep 3600", 129));
+        for (script, code) in std::iter::once(("sleep 3600 & exit 7", 7)).chain(closed) {
             let reg = registry(&["sh", "-c", script], 4, Duration::from_secs(30));
             let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
             await_exit(&mut client).await.context(script)?;

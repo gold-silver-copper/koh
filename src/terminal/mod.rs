@@ -1518,22 +1518,6 @@ mod tests {
         TerminalScreen::from_bytes(rows, cols, bytes)
     }
 
-    #[test]
-    fn resize_roundtrip_full_repaint() {
-        let a = screen_from(24, 80, b"small screen content here");
-        let b = screen_from(
-            40,
-            120,
-            b"now a much wider and taller screen\r\nwith two lines",
-        );
-        let diff = b.diff_from(&a);
-        assert_eq!(diff.resize, Some(Size::new(40, 120)));
-        let mut c = a;
-        c.apply(&diff).unwrap();
-        assert_eq!(c, b);
-        assert_eq!(c.size(), Size::new(40, 120));
-    }
-
     fn wire_cell() -> impl proptest::strategy::Strategy<Value = WireCell> {
         use proptest::prelude::*;
         // `Union` rather than `prop_oneof!`, whose expansion `allow`s a lint this crate forbids.
@@ -1700,8 +1684,9 @@ mod tests {
     }
 
     /// Scroll-heavy output: text, line feeds at the bottom, scroll regions, scrolling up and down,
-    /// reverse index, inserted and deleted lines, erasing.
-    const SCROLL_PIECES: [&str; 14] = [
+    /// reverse index, inserted and deleted lines (counts out of range too, as in mosh's
+    /// emulation-multiline-scroll), erasing.
+    const SCROLL_PIECES: [&str; 16] = [
         "text",
         "\r\n",
         "\r\nmore",
@@ -1713,6 +1698,8 @@ mod tests {
         "\x1b[T",
         "\x1b[3;1H\x1b[2L",
         "\x1b[4;1H\x1b[M",
+        "\x1b[3;1H\x1b[26L",
+        "\x1b[3;1H\x1b[0M",
         "\x1b[K",
         "\x1b[2J",
         "日本",
@@ -1927,52 +1914,25 @@ mod tests {
     }
 
     #[test]
-    fn malformed_rows_drop_the_whole_frame() {
-        // Every malformed grid part leaves the prior screen untouched, never half-applied.
-        let base = screen_from(24, 80, b"keep me");
-        let target = screen_from(24, 80, b"changed\r\nmore");
-        let good = target.diff_from(&base);
-        let mutations: [fn(&mut ScreenDiff); 4] = [
-            |d| d.rows[0].row = 24, // row out of range
-            |d| {
-                let run = &mut d.rows[0].runs[0];
-                run.count = run.count.checked_add(1).unwrap(); // overruns the width
-            },
-            |d| {
-                if let Some(run) = d.rows[0].runs.last_mut() {
-                    run.count = NonZeroU16::new(run.count.get() - 1).unwrap(); // falls short
-                }
-            },
-            |d| d.rows[0].runs[0].cell.kind = CellKind::Continuation, // continuation with text
-        ];
-        for (i, mutate) in mutations.iter().enumerate() {
-            let mut diff = good.clone();
-            mutate(&mut diff);
-            let mut c = base.clone();
-            c.apply(&diff).unwrap_err();
-            assert_eq!(c, base, "mutation {i} must drop the frame");
-        }
-        // The unmutated diff applies.
-        let mut c = base;
-        c.apply(&good).unwrap();
-        assert_eq!(c, target);
-    }
-
-    #[test]
     fn a_malformed_last_row_drops_the_rows_before_it_too() {
-        // Every row is validated before any is committed: rows that decoded fine before the
-        // malformed one are not applied either.
+        // Every row is validated before any is committed: a malformed row leaves the prior screen
+        // untouched, never half-applied, though the rows before it decoded fine.
         let base = screen_from(24, 80, b"keep\r\nkeep\r\nkeep");
         let target = screen_from(24, 80, b"one\r\ntwo\r\nthree");
         let good = target.diff_from(&base);
         assert_eq!(good.rows.len(), 3);
-        let mutations: [fn(&mut ScreenDiff); 3] = [
-            |d| d.rows[2].row = 24,
+        let mutations: [fn(&mut ScreenDiff); 4] = [
+            |d| d.rows[2].row = 24, // row out of range
             |d| {
                 let run = &mut d.rows[2].runs[0];
-                run.count = run.count.checked_add(1).unwrap();
+                run.count = run.count.checked_add(1).unwrap(); // overruns the width
             },
-            |d| d.rows[2].runs[0].cell.kind = CellKind::Continuation,
+            |d| {
+                if let Some(run) = d.rows[2].runs.last_mut() {
+                    run.count = NonZeroU16::new(run.count.get() - 1).unwrap(); // falls short
+                }
+            },
+            |d| d.rows[2].runs[0].cell.kind = CellKind::Continuation, // continuation with text
         ];
         for (i, mutate) in mutations.iter().enumerate() {
             let mut diff = good.clone();
@@ -1981,6 +1941,10 @@ mod tests {
             c.apply(&diff).unwrap_err();
             assert_eq!(c, base, "mutation {i} must drop the whole frame");
         }
+        // The unmutated diff applies.
+        let mut c = base;
+        c.apply(&good).unwrap();
+        assert_eq!(c, target);
     }
 
     /// A [`ScreenDiff`] in the same wire shape with plain fields, to encode values the typed one
@@ -2461,45 +2425,29 @@ mod tests {
     }
 
     #[test]
-    fn icon_and_clipboard_roundtrip_and_resist_collapse() {
+    fn icon_clipboard_and_exit_code_roundtrip_and_resist_collapse() {
+        // When the shell exits, the server stamps the code. Each survives diff -> apply, and a
+        // state carrying one must NOT compare equal to one without (so it isn't collapsed).
         let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
         emu.process(b"\x1b]1;myicon\x07\x1b]2;mytitle\x07\x1b]52;c;aGk=\x07");
-        let target = emu.snapshot();
-        assert_eq!(target.icon(), "myicon");
-        assert_eq!(target.clipboard(), "aGk=");
-
+        let with_icon = emu.snapshot();
+        emu.set_exit_code(42);
+        let exited = emu.snapshot();
+        assert_eq!(exited.exit_code(), Some(42));
         let base = TerminalScreen::default();
-        let diff = target.diff_from(&base);
+        let diff = exited.diff_from(&base);
         assert_eq!(diff.icon.as_deref(), Some("myicon"));
         assert_eq!(diff.clipboard.as_deref(), Some("aGk="));
-        let mut c = base.clone();
-        c.apply(&diff).unwrap();
-        assert_eq!(c, target, "icon + clipboard reconstruct via diff/apply");
-        // A state carrying an icon/clipboard must NOT collapse equal to one without them.
-        assert_ne!(base, c);
-    }
-
-    #[test]
-    fn exit_code_propagates_through_diff_apply() {
-        // When the shell exits, the server stamps the code; it must survive diff -> apply, and a
-        // state carrying an exit code must NOT compare equal to one without (so it isn't collapsed).
-        let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
-        emu.process(b"bye");
-        emu.set_exit_code(42);
-        let target = emu.snapshot();
-        assert_eq!(target.exit_code(), Some(42));
-
-        let base = TerminalScreen::default();
-        let diff = target.diff_from(&base);
         assert_eq!(diff.exit_code, Some(42));
-
         let mut c = base.clone();
         c.apply(&diff).unwrap();
-        assert_eq!(c.exit_code(), Some(42));
-        assert_ne!(
-            base, c,
-            "a state carrying an exit code differs from one without"
+        assert_eq!(
+            c, exited,
+            "icon, clipboard and exit code reconstruct via diff/apply"
         );
+        assert_eq!((c.icon(), c.clipboard()), ("myicon", "aGk="));
+        assert_ne!(base, with_icon);
+        assert_ne!(with_icon, exited, "the exit code alone tells them apart");
     }
 
     // --- Ported mosh terminal-emulation / unicode regression tests, recast as diff/apply
@@ -2523,54 +2471,6 @@ mod tests {
             "client must reconstruct the server screen exactly"
         );
         client
-    }
-
-    #[test]
-    fn attributes_survive_roundtrip() {
-        // mosh emulation-attributes{,-16color,-256color8,-256color248,-truecolor}: SGR
-        // attributes and colors must reconstruct on the client.
-        let bytes = b"\x1b[1mB\x1b[m\x1b[4mU\x1b[m\x1b[7mR\x1b[m\x1b[3mI\x1b[m\
-                      \x1b[31mC\x1b[m\x1b[38;5;208mP\x1b[m\x1b[38;2;10;20;30mT\x1b[m";
-        let c = roundtrip(24, 80, bytes);
-        let s = c.screen();
-        assert!(s.cell(0, 0).unwrap().bold(), "bold");
-        assert!(s.cell(0, 1).unwrap().underline(), "underline");
-        assert!(s.cell(0, 2).unwrap().inverse(), "inverse");
-        assert!(s.cell(0, 3).unwrap().italic(), "italic");
-        assert_eq!(
-            s.cell(0, 4).unwrap().fgcolor(),
-            Color::Idx(1),
-            "16-color red"
-        );
-        assert_eq!(
-            s.cell(0, 5).unwrap().fgcolor(),
-            Color::Idx(208),
-            "256-color"
-        );
-        assert_eq!(
-            s.cell(0, 6).unwrap().fgcolor(),
-            Color::Rgb(fux_vt::Rgb {
-                r: 10,
-                g: 20,
-                b: 30
-            }),
-            "truecolor"
-        );
-    }
-
-    #[test]
-    fn insert_delete_lines_roundtrip_no_panic() {
-        // mosh emulation-multiline-scroll: IL (CSI N L) / DL (CSI N M) with in- and out-of-range
-        // counts must not panic and must round-trip exactly.
-        let mut bytes = Vec::from(&b"\x1b[H\x1b[J"[..]);
-        for i in 1..=24 {
-            bytes.extend_from_slice(format!("\x1b[{i};1Hrow{i}").as_bytes());
-        }
-        for n in [0u32, 1, 2, 22, 26] {
-            bytes.extend_from_slice(format!("\x1b[3;1H\x1b[{n}L").as_bytes());
-            bytes.extend_from_slice(format!("\x1b[3;1H\x1b[{n}M").as_bytes());
-        }
-        let _ = roundtrip(24, 80, &bytes); // assertion: no panic + exact reconstruction
     }
 
     #[test]
@@ -2609,14 +2509,17 @@ mod tests {
 
     #[test]
     fn grapheme_clusters_and_every_attribute_roundtrip() {
-        // Clusters fux-vt keeps whole, some too long to hold inline, and every attribute.
+        // Clusters fux-vt keeps whole, some too long to hold inline, and every attribute and
+        // colour (mosh emulation-attributes{,-16color,-256color8,-256color248,-truecolor}).
         let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
         let flag = "\u{1f1fa}\u{1f1f8}";
         let heart = "\u{2764}\u{fe0f}";
         let marked = format!("e{}", "\u{301}".repeat(40));
         let bytes = format!(
             "{family}{flag}{heart}{marked}\r\n\
-             \x1b[5mA\x1b[6mB\x1b[8mC\x1b[9mD\x1b[m\x1b[4;58;5;9mE\x1b[58;2;1;2;3mF\x1b[m"
+             \x1b[5mA\x1b[6mB\x1b[8mC\x1b[9mD\x1b[m\x1b[4;58;5;9mE\x1b[58;2;1;2;3mF\x1b[m\r\n\
+             \x1b[1mB\x1b[m\x1b[4mU\x1b[m\x1b[7mR\x1b[m\x1b[3mI\x1b[m\
+             \x1b[31mC\x1b[m\x1b[38;5;208mP\x1b[m\x1b[38;2;10;20;30mT\x1b[m"
         );
         let c = roundtrip(24, 80, bytes.as_bytes());
         let s = c.screen();
@@ -2641,6 +2544,15 @@ mod tests {
             cell(5).underline_color(),
             Color::Rgb(fux_vt::Rgb { r: 1, g: 2, b: 3 })
         );
+        let cell = |col| s.cell(2, col).expect("a cell");
+        assert!(cell(0).bold() && cell(1).underline() && cell(2).inverse() && cell(3).italic());
+        let colours = [4, 5, 6].map(|col| cell(col).fgcolor());
+        let rgb = Color::Rgb(fux_vt::Rgb {
+            r: 10,
+            g: 20,
+            b: 30,
+        });
+        assert_eq!(colours, [Color::Idx(1), Color::Idx(208), rgb]);
     }
 
     #[test]

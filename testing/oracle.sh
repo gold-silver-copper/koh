@@ -26,7 +26,10 @@ build_side_at() {
     sha=$1
     out=${2:-$1}
     tree=$target/trees/$sha
-    if [ ! -d "$tree" ]; then
+    # A cached target directory can hold the tree's directory without its worktree.
+    if [ ! -f "$tree/.git" ] || [ ! -f "$tree/Cargo.toml" ]; then
+        rm -rf "$tree"
+        git worktree prune
         mkdir -p "$target/trees"
         git worktree add --quiet --detach "$tree" "$sha"
     fi

@@ -13,7 +13,9 @@ use koh::terminal::Size;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let (split, rest) = data.split_first().map_or((1, data), |(b, r)| (usize::from(*b).max(1), r));
+    let (split, rest) = data
+        .split_first()
+        .map_or((1, data), |(b, r)| (usize::from(*b).max(1), r));
     let mut session = ClientSession::new(Size::new(24, 80));
     let now = Instant::now();
     let mut wire = ClientDecoder::default();

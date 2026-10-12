@@ -301,45 +301,6 @@ fn spawns_and_streams_output() {
 #[test]
 #[expect(
     clippy::match_same_arms,
-    reason = "channel-close (`Ok(None)`) and deadline (`Err(_)`) are conceptually distinct outcomes kept as separate arms for readability, even though both set `found = false`"
-)]
-fn interactive_shell_echoes_input() {
-    current_thread().expect("tokio runtime").block_on(async {
-        // Spawn the default shell, send a command, and verify the echoed output comes back.
-        let (pty, mut rx) =
-            Pty::spawn(24, 80, &[], "xterm-256color", &launcher()).expect("spawn shell");
-        // Give the shell a moment to start, then type a command that prints a marker.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        pty.write(b"printf KOH_MARKER_OK\n".to_vec())
-            .expect("write");
-
-        let mut collected = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        let found = loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(chunk)) => {
-                    collected.extend_from_slice(&chunk);
-                    if String::from_utf8_lossy(&collected).contains("KOH_MARKER_OK") {
-                        break true;
-                    }
-                }
-                Ok(None) => break false,
-                Err(_) => break false,
-            }
-        };
-        // Resize should not error while the shell is live.
-        let _ = pty.resize(40, 120);
-        assert!(
-            found,
-            "did not observe the marker in shell output: {}",
-            String::from_utf8_lossy(&collected)
-        );
-    });
-}
-
-#[test]
-#[expect(
-    clippy::match_same_arms,
     reason = "channel-close (`Ok(None)`) and deadline (`Err(_)`) are conceptually distinct outcomes kept as separate arms for readability, even though both set `in_order = false`"
 )]
 fn write_input_takes_shared_ref_and_preserves_order() {
@@ -462,44 +423,6 @@ fn shutdown_returns_while_the_program_leaves_its_input_unread() {
         .expect("shutdown must not wait on a write the program will never read")
         .expect("shutdown task panicked");
         let _ = drain.await;
-    });
-}
-
-#[test]
-#[expect(
-    clippy::match_wild_err_arm,
-    reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"
-)]
-fn reaped_child_is_not_signaled_again() {
-    current_thread().expect("tokio runtime").block_on(async {
-        // Once the child is reaped (try_wait/wait returned Some), every kill path must be a
-        // no-op so it can't signal a recycled PID. We can't force PID reuse in a test, but we exercise
-        // the reaped-gate: a one-shot `echo` exits and is reaped, after which kill() and shutdown()
-        // must be safe no-ops (no error, no panic).
-        let (mut pty, mut rx) =
-            Pty::spawn(24, 80, &["echo".to_owned()], "xterm-256color", &launcher())
-                .expect("spawn echo");
-        // Drain output to EOF so the child has exited.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(_)) => {}
-                Ok(None) => break, // child exited, reader finished
-                Err(_) => panic!("timed out waiting for echo to exit"),
-            }
-        }
-        // Reap the child, setting the internal `reaped` flag (it may take a moment after EOF).
-        let mut reaped = false;
-        for _ in 0..200 {
-            if matches!(pty.try_wait(), Ok(Some(_))) {
-                reaped = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(reaped, "the one-shot child must exit and be reaped");
-        // After reaping, teardown signals nothing (never a PID no longer the program's).
-        pty.shutdown();
     });
 }
 

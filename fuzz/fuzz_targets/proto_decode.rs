@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz both directions of the koh/3 wire decode: arbitrary bytes as the client's message stream
+//! Fuzz both directions of the koh/4 wire decode: arbitrary bytes as the client's message stream
 //! (the server's parser) and as a server stream (the client's parser: bounded inflate, against a
 //! dictionary for a frame, plus postcard). Both must only return errors on bad input, never
 //! panic, and never allocate past their caps.
@@ -9,7 +9,9 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // The first byte splits the rest into chunks, so the decoder sees varied read boundaries.
-    let (split, rest) = data.split_first().map_or((1, data), |(b, r)| (usize::from(*b).max(1), r));
+    let (split, rest) = data
+        .split_first()
+        .map_or((1, data), |(b, r)| (usize::from(*b).max(1), r));
     let mut decoder = ClientDecoder::default();
     'stream: for chunk in rest.chunks(split) {
         decoder.push(chunk);

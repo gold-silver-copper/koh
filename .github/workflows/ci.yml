@@ -39,9 +39,10 @@ jobs:
             testing/bench -> target
             testing/oracle -> target
             testing/android/evil-peer -> target
+            fuzz -> target
       - name: Check standalone harnesses
         run: |
-          for manifest in testing/bench/Cargo.toml testing/oracle/Cargo.toml testing/android/evil-peer/Cargo.toml; do
+          for manifest in testing/bench/Cargo.toml testing/oracle/Cargo.toml testing/android/evil-peer/Cargo.toml fuzz/Cargo.toml; do
             cargo fmt --manifest-path "$manifest" --all --check
             cargo clippy --manifest-path "$manifest" --all-targets --locked -- -D warnings
           done
@@ -145,9 +146,8 @@ jobs:
           command: check advisories
 
   # Coverage-guided fuzzing of the untrusted-input decode surfaces (the OpenSSH/OSS-Fuzz doctrine:
-  # one harness per attacker-reachable parser). Builds the harnesses, then a short smoke run that
-  # MUST stay crash-free — `screen_apply` proves the structured-diff apply never panics, and
-  # `proto_decode` proves the wire decoders only Err (never panic) on arbitrary bytes.
+  # one harness per attacker-reachable parser). Builds the harnesses, then a short smoke run of each
+  # that MUST stay crash-free.
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -158,13 +158,19 @@ jobs:
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: build fuzz targets
-        run: cargo +nightly fuzz build
-      - name: smoke (must stay crash-free)
+        # The committed lockfile, checked first: `cargo fuzz build` would update it silently.
         run: |
-          cargo +nightly fuzz run screen_apply -- -max_total_time=45 -rss_limit_mb=4096
-          cargo +nightly fuzz run proto_decode -- -max_total_time=45 -rss_limit_mb=4096
-          cargo +nightly fuzz run server_process -- -max_total_time=45 -rss_limit_mb=4096
-          cargo +nightly fuzz run history_apply -- -max_total_time=45 -rss_limit_mb=4096
-          cargo +nightly fuzz run client_input -- -max_total_time=45 -rss_limit_mb=4096
-          cargo +nightly fuzz run server_input -- -max_total_time=45 -rss_limit_mb=4096
-          cargo +nightly fuzz run probe_replies -- -max_total_time=45 -rss_limit_mb=4096
+          cargo +nightly check --locked --manifest-path fuzz/Cargo.toml --bins
+          cargo +nightly fuzz build
+      - name: smoke (must stay crash-free)
+        # Each starts from its own corpus and, for the ones that read program output, the
+        # recorded output of real programs.
+        run: |
+          for target in screen_apply proto_decode history_apply client_input probe_replies; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=45 -rss_limit_mb=4096
+          done
+          for target in server_process server_input; do
+            mkdir -p "fuzz/corpus/$target"
+            cargo +nightly fuzz run "$target" "fuzz/corpus/$target" testing/corpus -- \
+              -max_total_time=45 -rss_limit_mb=4096
+          done

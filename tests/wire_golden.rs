@@ -1,10 +1,10 @@
 //! The koh/5 encoding.
 //!
-//! What the client sends, built here by hand, is pinned: the expected bytes were captured by
-//! running the encoder, and a change to the wire must change them in the same commit,
-//! deliberately, and bump the protocol's name (the ALPN), which is pinned beside them. Frames and
-//! history rows are drawn by the emulator, whose output may improve, so they are checked to
-//! round-trip through their streams instead.
+//! Messages built here by hand from the wire types, both ways, are pinned: the expected bytes were
+//! captured by running the encoder, and a change to the wire must change them in the same commit,
+//! deliberately, and bump the protocol's name (the ALPN), which is pinned beside them. What the
+//! emulator draws may improve, so frames and history rows drawn from its output are checked only
+//! to round-trip through their streams.
 #![forbid(clippy::disallowed_methods)]
 
 use koh::events::{
@@ -16,8 +16,11 @@ use koh::proto::{
     FrameNum, InputSeq, ServerMsg,
 };
 use koh::terminal::{
-    HistoryReply, HistoryRequest, ServerTerminal, Size, TerminalScreen, WireModes,
+    CellKind, CellText, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, RowDiff, Run,
+    ScreenDiff, ServerTerminal, Shift, Shifts, Size, TerminalScreen, TtyModes, WireCell, WireColor,
+    WireLink, WireModes, WireMouseEncoding, WireMouseMode, WireStyle,
 };
+use std::num::{NonZeroI16, NonZeroU16};
 
 /// Terminal output exercising every part of a cell and of the side channels: runs, wide glyphs
 /// and their continuations, a combining mark, a cluster too long to keep inline, every colour kind
@@ -181,6 +184,149 @@ fn client_msgs() -> Vec<ClientMsg> {
     ]
 }
 
+/// One cell with `text`, of `kind`, `fg` and `style`, the rest default.
+fn cell(text: &str, kind: CellKind, fg: WireColor, style: u16) -> Option<WireCell> {
+    Some(WireCell {
+        text: CellText::new(text)?,
+        kind,
+        fg,
+        bg: WireColor::Default,
+        underline_color: WireColor::Default,
+        style: WireStyle::new(style)?,
+        link: 0,
+    })
+}
+
+/// `count` of `cell`.
+fn run(count: u16, cell: Option<WireCell>) -> Option<Run> {
+    Some(Run {
+        count: NonZeroU16::new(count)?,
+        cell: cell?,
+    })
+}
+
+/// An 8-cell row of every cell kind, every colour kind, a styled underline with its colour, a
+/// cluster too long to keep inline, and a hyperlink.
+fn wire_row(row: u16) -> Option<RowDiff> {
+    let linked = WireCell {
+        bg: WireColor::Idx(200),
+        underline_color: WireColor::Rgb(7, 8, 9),
+        link: 1,
+        ..cell(
+            "e\u{301}",
+            CellKind::Narrow,
+            WireColor::Rgb(1, 2, 3),
+            WireStyle::UNDERLINE | WireStyle::UNDERLINE_CURLY,
+        )?
+    };
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+    Some(RowDiff {
+        row,
+        wrapped: true,
+        runs: vec![
+            run(
+                3,
+                cell("abc", CellKind::Chars, WireColor::Idx(1), WireStyle::BOLD),
+            )?,
+            run(1, cell("日", CellKind::WideChars, WireColor::Default, 0))?,
+            run(1, Some(linked))?,
+            run(1, cell(family, CellKind::Wide, WireColor::Default, 0))?,
+            run(1, cell("", CellKind::Continuation, WireColor::Default, 0))?,
+        ],
+        links: vec![WireLink {
+            uri: "https://koh.example/".to_owned(),
+            id: "k".to_owned(),
+        }],
+    })
+}
+
+/// A frame from the blank screen with a resize and every side channel, and one on it that moves
+/// rows and replaces one.
+fn wire_frames() -> Option<Vec<Frame>> {
+    let full = Frame {
+        num: FrameNum(300),
+        base: FrameNum::BLANK,
+        echo_ack: InputSeq(129),
+        diff: ScreenDiff {
+            resize: Some(Size::new(3, 8)),
+            title: Some("the title".to_owned()),
+            icon: Some("the icon".to_owned()),
+            clipboard: Some("aGk=".to_owned()),
+            bell_count: 2,
+            exit_code: Some(3),
+            history: Some(HistoryMark {
+                newest: 70_000,
+                len: 2,
+            }),
+            tty: Some(TtyModes {
+                echo: true,
+                line: false,
+            }),
+            cursor: (1, 2),
+            modes: WireModes {
+                hide_cursor: true,
+                application_cursor: false,
+                application_keypad: true,
+                bracketed_paste: true,
+                mouse_mode: WireMouseMode::ButtonMotion,
+                mouse_encoding: WireMouseEncoding::Sgr,
+                alternate: false,
+            },
+            shifts: Shifts::default(),
+            rows: vec![wire_row(0)?, wire_row(2)?],
+        },
+    };
+    let moved = Frame {
+        num: FrameNum(301),
+        base: FrameNum(300),
+        echo_ack: InputSeq(130),
+        diff: ScreenDiff {
+            resize: None,
+            title: None,
+            icon: None,
+            clipboard: None,
+            exit_code: None,
+            history: None,
+            tty: None,
+            shifts: Shifts::new(vec![Shift {
+                top: 1,
+                len: NonZeroU16::new(2)?,
+                by: NonZeroI16::new(-1)?,
+            }])?,
+            rows: vec![RowDiff {
+                row: 2,
+                wrapped: false,
+                runs: vec![run(8, cell(" ", CellKind::Narrow, WireColor::Default, 0))?],
+                links: Vec::new(),
+            }],
+            ..full.diff
+        },
+    };
+    Some(vec![full, moved])
+}
+
+/// History rows, the first a whole [`wire_row`].
+fn wire_history() -> Option<HistoryReply> {
+    let RowDiff { runs, links, .. } = wire_row(0)?;
+    Some(HistoryReply {
+        id: 300,
+        rows: vec![
+            HistoryRow {
+                name: 69_999,
+                wrapped: true,
+                runs,
+                links,
+            },
+            HistoryRow {
+                name: 70_000,
+                wrapped: false,
+                runs: vec![run(2, cell("z", CellKind::Narrow, WireColor::Idx(9), 0))?],
+                links: Vec::new(),
+            },
+        ],
+    })
+}
+
 /// `hex` as bytes, or `None` if it is not an even run of hex digits.
 fn unhex(hex: &str) -> Option<Vec<u8>> {
     let digits: Vec<u8> = hex.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
@@ -231,6 +377,30 @@ const CLIENT_MSGS: [&str; 8] = [
         787878787878787878787878787878787878787878787878787878",
     "0000000e0501dddddd00020001cd00000101",
 ];
+
+/// Each of [`wire_frames`], and the header of its stream: tag, base, the rows it changes.
+const FRAMES: [(&str, &str); 2] = [
+    (
+        "ac020081010103080109746865207469746c6501087468652069636f6e010461476b3d02010301f0a2040201\
+        010001020100010103020000020001050303616263030101000001000103e697a5040000000000010365cc81\
+        000201020301c8020708098808010119f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6010000\
+        0000000100020000000000011468747470733a2f2f6b6f682e6578616d706c652f016b020105030361626303\
+        0101000001000103e697a5040000000000010365cc81000201020301c8020708098808010119f09f91a8e280\
+        8df09f91a9e2808df09f91a7e2808df09f91a60100000000000100020000000000011468747470733a2f2f6b\
+        6f682e6578616d706c652f016b",
+        "0000020002",
+    ),
+    (
+        "ad02ac0282010000000002000000010201000101030200010102010102000108012000000000000000",
+        "00ac020102",
+    ),
+];
+
+/// [`wire_history`].
+const HISTORY: &str =
+    "ac0202efa20401050303616263030101000001000103e697a5040000000000010365cc81000201020301c802\
+        0708098808010119f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a60100000000000100020000\
+        000000011468747470733a2f2f6b6f682e6578616d706c652f016bf0a204000102017a0001090000000000";
 
 #[test]
 fn frames_and_history_round_trip_through_their_streams() {
@@ -283,6 +453,50 @@ fn client_messages_encode_as_pinned() {
         assert_eq!(decoder.next_msg().expect("decodes").as_ref(), Some(msg));
         decoder.finish().expect("nothing left over");
     }
+}
+
+#[test]
+fn server_messages_encode_as_pinned() {
+    assert_eq!(koh::transport_iroh::ALPN, PINNED_FOR);
+    let frames = wire_frames().expect("frames");
+    assert_eq!(frames.len(), FRAMES.len());
+    let mut client = TerminalScreen::default();
+    for (frame, (pinned, header)) in frames.iter().zip(FRAMES) {
+        let pinned = unhex(pinned).expect("hex");
+        assert_eq!(
+            hex(&postcard::to_allocvec(frame).expect("encodes")),
+            hex(&pinned),
+            "frame {:?}: a change here is a new protocol",
+            frame.num
+        );
+        assert_eq!(
+            &postcard::from_bytes::<Frame>(&pinned).expect("decodes"),
+            frame
+        );
+        // The stream's header is pinned; the DEFLATE body after it only through decoding, as the
+        // compressor may pick other bytes for the same frame.
+        let stream = FrameEncoder::default()
+            .encode(frame, &client)
+            .expect("encodes");
+        assert!(hex(&stream).starts_with(header), "{:?}", frame.num);
+        assert_eq!(&decode_frame(&stream, &client).expect("decodes"), frame);
+        client.apply(&frame.diff).expect("a frame the client takes");
+    }
+    let reply = wire_history().expect("history");
+    let pinned = unhex(HISTORY).expect("hex");
+    assert_eq!(
+        hex(&postcard::to_allocvec(&reply).expect("encodes")),
+        hex(&pinned),
+        "history: a change here is a new protocol"
+    );
+    let stream = FrameEncoder::default()
+        .encode_history(&reply)
+        .expect("encodes");
+    assert_eq!(stream.first(), Some(&1), "the history stream's tag");
+    assert_eq!(
+        decode_server(&stream).expect("decodes"),
+        ServerMsg::History(reply)
+    );
 }
 
 #[test]

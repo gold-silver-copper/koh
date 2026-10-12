@@ -190,6 +190,31 @@ impl Capture {
     }
 }
 
+impl Capture {
+    /// Type with `write` every second until `needle` shows after byte `from`, for up to `secs`:
+    /// the byte after the match. Keys typed before a session is up are dropped, so this is how a
+    /// test waits for one, instead of sleeping; `needle` must be what only the session prints.
+    ///
+    /// # Errors
+    ///
+    /// What was captured, if `needle` never came.
+    pub async fn type_until(
+        &self,
+        from: usize,
+        needle: &str,
+        secs: u64,
+        mut write: impl FnMut(),
+    ) -> Result<usize, String> {
+        for _ in 0..secs {
+            write();
+            if let Ok(at) = self.wait_for(from, needle, 1).await {
+                return Ok(at);
+            }
+        }
+        self.wait_for(from, needle, 0).await
+    }
+}
+
 /// Read `output` until what it delivered holds `marker`, for up to 20 s: everything read.
 ///
 /// # Errors

@@ -240,8 +240,8 @@ pub(super) struct RowCache {
     /// The palette the rows were drawn in. A new palette changes no row's version, so it starts
     /// the cache over.
     palette: Option<Palette>,
-    /// How many palettes the rows were drawn in, one after another.
-    palettes: u64,
+    /// How many times a new palette drew a row of the history otherwise.
+    history_redrawn: u64,
     /// By live index, the id and version of the row the snapshot took there.
     ids: Vec<(RowId, u64)>,
     /// The snapshot's rows, which the next one shares whole when no row changed.
@@ -251,10 +251,10 @@ pub(super) struct RowCache {
 }
 
 impl RowCache {
-    /// How many palettes the rows were drawn in, one after another: a change means every row,
+    /// How many times a new palette drew a row of the history otherwise: a change means the
     /// history's too, looks different.
-    pub(super) const fn palettes(&self) -> u64 {
-        self.palettes
+    pub(super) const fn history_redrawn(&self) -> u64 {
+        self.history_redrawn
     }
 
     /// The cached row for the live row `live` at `index`, if it is what it holds: its own row
@@ -306,6 +306,20 @@ impl RowCache {
 
 /// A copy of `row`, cells and text, exactly `cols` wide, drawn in `palette`. A live row is exactly
 /// that wide; anything longer is cut, anything shorter padded with blank cells.
+/// Whether a row of `screen`'s history draws otherwise in palette `new` than in `old`: a program
+/// that sets a colour no row of its history uses leaves the history as it was drawn.
+fn history_redrawn(screen: &fux_vt::Screen, old: Option<&Palette>, new: Option<&Palette>) -> bool {
+    let drawn = |palette: Option<&Palette>, attributes| {
+        palette.map_or(attributes, |palette| palette.draw(attributes))
+    };
+    screen.rows().take(screen.history_len()).any(|row| {
+        row.cells().any(|cell| {
+            let attributes = cell.attributes();
+            drawn(old, attributes) != drawn(new, attributes)
+        })
+    })
+}
+
 pub(super) fn exactly(
     row: Option<&fux_vt::Row<'_>>,
     cols: u16,
@@ -358,9 +372,10 @@ impl Grid {
         let window = screen.window();
         let live: Vec<fux_vt::Row<'_>> = (0..rows).filter_map(|row| window.row(row)).collect();
         if palette != cache.palette {
+            let redrawn = history_redrawn(screen, cache.palette.as_ref(), palette.as_ref());
             *cache = RowCache {
                 palette,
-                palettes: cache.palettes.saturating_add(1),
+                history_redrawn: cache.history_redrawn.saturating_add(u64::from(redrawn)),
                 ..RowCache::default()
             };
         }

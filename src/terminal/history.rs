@@ -668,8 +668,8 @@ mod tests {
 
     #[test]
     fn the_cache_is_bounded_by_bytes_dropping_the_rows_farthest_from_the_view() {
-        // Wide rows, and one-cell rows each carrying a reply's worth of links: either way the
-        // memory held stays bounded, however many rows a hostile server sends.
+        // Wide rows, and narrow rows each carrying a reply's worth of links, every one named by a
+        // cell: either way the memory held stays bounded, however many rows a hostile server sends.
         let links: Vec<WireLink> = (0..MAX_ROW_LINKS)
             .map(|n| WireLink {
                 uri: format!(
@@ -681,7 +681,7 @@ mod tests {
             .collect();
         for (width, per_reply, linked, replies) in [
             (1000, MAX_HISTORY_CELLS.div_euclid(1000), false, 100),
-            (1, 1, true, 200),
+            (64, 1, true, 200),
         ] {
             let mut cache = HistoryCache::default();
             let mut name = 1_u64;
@@ -691,6 +691,16 @@ mod tests {
                         name += 1;
                         let mut row = row(name, width);
                         if linked {
+                            let cell = row.runs[0].cell.clone();
+                            row.runs = (1..=64)
+                                .map(|link| Run {
+                                    count: NonZeroU16::MIN,
+                                    cell: WireCell {
+                                        link,
+                                        ..cell.clone()
+                                    },
+                                })
+                                .collect();
                             row.links = links.clone();
                         }
                         row
@@ -708,6 +718,22 @@ mod tests {
                 "the farthest went"
             );
         }
+    }
+
+    #[test]
+    fn a_row_with_a_link_no_cell_names_is_refused() {
+        // A hostile server could otherwise make the client keep links nothing shows.
+        let mut unnamed = row(3, 4);
+        unnamed.links = vec![WireLink {
+            uri: "https://example.org".to_owned(),
+            id: String::new(),
+        }];
+        let mut cache = HistoryCache::default();
+        assert_eq!(
+            cache.insert(&reply(vec![unnamed]), ask(3, 1), MARK, 3..=3),
+            None
+        );
+        assert!(cache.is_empty());
     }
 
     #[test]

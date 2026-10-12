@@ -83,18 +83,16 @@ fn real_client_binary_renders_over_pty() {
             .expect("spawn client binary");
             let buf = Capture::new(output);
 
-            // Give the binary time to connect over loopback iroh and do the initial screen sync.
-            tokio::time::sleep(Duration::from_millis(2000)).await;
+            // A command whose output only the remote `sh` prints (its echo is split), typed until the
+            // session is up: it round-trips to `sh` and back as a frame.
+            let seen = buf
+                .type_until(0, "koh_pty_marker", 15, || {
+                    let _ = client.write(b"echo koh_pty_''marker\r".to_vec());
+                })
+                .await;
 
-            // Type a command with a distinctive marker; it round-trips to `sh` and back as a frame.
-            client
-                .write(b"echo koh_pty_marker\r".to_vec())
-                .expect("write keystrokes");
-            let seen = buf.wait_for(0, "koh_pty_marker", 15).await;
-
-            // Disconnect via the escape sequence (Ctrl-^ then '.'), then ensure teardown.
+            // Disconnect via the escape sequence (Ctrl-^ then '.').
             let _ = client.write(vec![0x1e, b'.']);
-            tokio::time::sleep(Duration::from_millis(300)).await;
             drop(client);
             server_task.abort();
             seen.expect("real client binary rendered the marker over the PTY");
@@ -146,11 +144,12 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
                 )
                 .as_bytes(),
             );
-            // Only the remote shell turns `$((6*7))` into 42, so this proves the session is up.
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            type_(b"echo ready_$((6*7))\r");
+            // Only the remote shell, which then holds R, turns this into `ready_remote_42`, so it
+            // proves the session is up.
             at = buf
-                .wait_for(at, "ready_42", 20)
+                .type_until(at, "ready_remote_42", 20, || {
+                    type_(b"R=remote; echo ready_${R}_$((6*7))\r");
+                })
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
 
@@ -167,10 +166,11 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
                 .unwrap_or_else(|e| panic!("{e}"));
 
             type_(b"fg\r");
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-            type_(b"echo back_$((6*7))\r");
+            // Only the resumed session holds R: the local shell would print `back_local`.
             at = buf
-                .wait_for(at, "back_42", 20)
+                .type_until(at, "back_remote", 20, || {
+                    type_(b"echo back_${R:-local}\r");
+                })
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
 
@@ -179,7 +179,6 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
             type_(b"exit\r");
-            tokio::time::sleep(Duration::from_millis(300)).await;
             drop(bash);
             server_task.abort();
         });
@@ -277,13 +276,11 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
             )
             .expect("spawn client binary");
             let buf = Capture::new(output);
-            tokio::time::sleep(Duration::from_millis(1500)).await;
             // A variable only this session holds, and an answer only a remote shell computes.
-            client
-                .write(b"X=kept; echo before_${X}_$((6*7))\r".to_vec())
-                .expect("type");
             let at = buf
-                .wait_for(0, "before_kept_42", 20)
+                .type_until(0, "before_kept_42", 20, || {
+                    let _ = client.write(b"X=kept; echo before_${X}_$((6*7))\r".to_vec());
+                })
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
 
@@ -308,7 +305,6 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
             }
 
             let _ = client.write(vec![0x1e, b'.']);
-            tokio::time::sleep(Duration::from_millis(300)).await;
             drop(client);
             stop(server).expect("stop the restarted server");
             seen.unwrap_or_else(|e| panic!("the client found the restarted server: {e}"));

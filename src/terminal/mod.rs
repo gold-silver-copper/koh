@@ -1060,7 +1060,9 @@ fn seal(runs: &mut [Run], open: &mut Option<String>) {
 }
 
 /// The row `runs` decode to, exactly `cols` cells, with its `links`, or `None` if the runs are
-/// malformed, don't cover the row exactly, or name a link the row does not have. Work is bounded
+/// malformed, don't cover the row exactly, name a link the row does not have, or the row has a
+/// link no cell names (the server builds a row's links from its cells, so one never does, and a
+/// hostile server could otherwise make the client hold links nothing shows). Work is bounded
 /// by `cols`: every run is non-empty, and each cell's text by [`fux_vt::CLUSTER_CAPACITY`].
 fn cells_of(runs: &[Run], links: &[WireLink], cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
     if links.len() > MAX_ROW_LINKS {
@@ -1068,13 +1070,14 @@ fn cells_of(runs: &[Run], links: &[WireLink], cols: u16) -> Option<(Cells, Optio
     }
     let mut cells = Cells::new(usize::from(cols));
     let mut linked = Vec::new();
+    let mut named = vec![false; links.len()];
     let mut at = 0_usize;
     for run in runs {
         let end = at
             .checked_add(run.cells())
             .filter(|&end| end <= usize::from(cols))?;
-        if usize::from(run.cell.link) > links.len() {
-            return None;
+        if let Some(index) = usize::from(run.cell.link).checked_sub(1) {
+            *named.get_mut(index)? = true;
         }
         match run.cell.kind {
             CellKind::Chars | CellKind::WideChars => run.cell.write_to(&mut cells, at)?,
@@ -1089,7 +1092,7 @@ fn cells_of(runs: &[Run], links: &[WireLink], cols: u16) -> Option<(Cells, Optio
         }
         at = end;
     }
-    if at != usize::from(cols) {
+    if at != usize::from(cols) || named.contains(&false) {
         return None;
     }
     let links = (!links.is_empty()).then(|| {

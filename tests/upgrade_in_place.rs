@@ -76,15 +76,14 @@ fn a_server_whose_binary_was_removed_still_starts_sessions() {
             )
             .expect("spawn the client");
             let seen = Capture::new(output);
-            tokio::time::sleep(Duration::from_millis(2000)).await;
             // Only the remote shell turns `$((6*7))` into 42.
-            client
-                .write(b"echo up_$((6*7))\r".to_vec())
-                .expect("type into the session");
-            let up = seen.wait_for(0, "up_42", 15).await;
+            let up = seen
+                .type_until(0, "up_42", 15, || {
+                    let _ = client.write(b"echo up_$((6*7))\r".to_vec());
+                })
+                .await;
 
             let _ = client.write(vec![0x1e, b'.']);
-            tokio::time::sleep(Duration::from_millis(300)).await;
             drop(client);
             let _ = server.kill();
             let _ = server.wait();

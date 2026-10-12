@@ -327,11 +327,12 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
             )
             .expect("spawn the client");
             let buf = Capture::new(output);
-            tokio::time::sleep(Duration::from_millis(2000)).await;
-            client.write(b"echo by''_name\r".to_vec()).unwrap();
-            let seen = buf.wait_for(0, "by_name", 15).await;
+            let seen = buf
+                .type_until(0, "by_name", 15, || {
+                    let _ = client.write(b"echo by''_name\r".to_vec());
+                })
+                .await;
             let _ = client.write(vec![0x1e, b'.']);
-            tokio::time::sleep(Duration::from_millis(300)).await;
             drop(client);
             task.abort();
             seen.unwrap();

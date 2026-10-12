@@ -10,13 +10,11 @@
 //! the newest frame of each step is resent until it arrives, as the server's retries do, so the
 //! client must converge on every step's screen.
 #![forbid(clippy::disallowed_methods)]
-#![expect(clippy::disallowed_types, reason = "tests queue freely")]
 
 #[path = "../testing/corpus/recording.rs"]
 mod recording;
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -183,7 +181,7 @@ struct Session {
     /// The newest frame the client acknowledged, the next frame's base.
     base: (FrameNum, TerminalScreen),
     /// Frames sent and not yet acknowledged or superseded.
-    sent: VecDeque<(FrameNum, TerminalScreen)>,
+    sent: Vec<(FrameNum, TerminalScreen)>,
     next: FrameNum,
     replayed: Replayed,
 }
@@ -225,7 +223,7 @@ impl Session {
             )
             .map_err(|e| e.to_string())?,
             base: (FrameNum::BLANK, TerminalScreen::default()),
-            sent: VecDeque::new(),
+            sent: Vec::new(),
             next: FrameNum::BLANK.next(),
             replayed: Replayed::default(),
         })
@@ -295,8 +293,8 @@ impl Session {
     fn ack(&mut self, acked: FrameNum) {
         if let Some(at) = self.sent.iter().position(|(num, _)| *num == acked) {
             let mut newer = self.sent.split_off(at);
-            if let Some(base) = newer.pop_front() {
-                self.base = base;
+            if !newer.is_empty() {
+                self.base = newer.remove(0);
             }
             self.sent = newer;
         }
@@ -320,9 +318,9 @@ impl Session {
             .replayed
             .wire_bytes
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        self.sent.push_back((frame.num, screen));
+        self.sent.push((frame.num, screen));
         while self.sent.len() > 16 {
-            self.sent.pop_front();
+            self.sent.remove(0);
         }
         if dropped {
             return Ok(false);
@@ -336,7 +334,7 @@ impl Session {
             .on_frame_stream(Instant::now(), base, &rows, &body);
         let applied = self
             .sent
-            .back()
+            .last()
             .is_some_and(|(_, screen)| self.client.state() == screen);
         // Delivered: the server takes that as the acknowledgement (or the client's own `Ack`, a
         // nudge, below).

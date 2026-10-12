@@ -60,12 +60,16 @@ impl KeyFile {
     /// directory.
     pub fn open_existing(path: &Path) -> anyhow::Result<Option<Self>> {
         let (name, parent) = split(path)?;
-        match std::fs::metadata(parent) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        }
-        let key = Self::judge(path, name, parent)?;
+        let key = match Self::judge(path, name, parent) {
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None)
+            }
+            judged => judged?,
+        };
         match std::fs::symlink_metadata(&key.path) {
             Ok(_) => Ok(Some(key)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),

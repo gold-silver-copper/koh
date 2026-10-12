@@ -66,8 +66,8 @@ pub struct RowEncodings {
     /// By the address of the row's cells (held, so not reused): the row's cells, wrap flag and
     /// links, and its encoding without its index.
     kept: HashMap<usize, RowEncoding>,
-    /// The cells the dictionary being built used.
-    used: Vec<usize>,
+    /// The entries the dictionary being built used, moved from `kept` or made: the next `kept`.
+    next: HashMap<usize, RowEncoding>,
 }
 
 #[derive(Debug)]
@@ -92,44 +92,44 @@ impl RowEncodings {
         (cells, wrapped, links): (Arc<Cells>, bool, Option<Arc<RowLinks>>),
         out: &mut Vec<u8>,
     ) {
-        let key = Arc::as_ptr(&cells).addr();
-        let hit = self.kept.get(&key).filter(|kept| {
-            kept.wrapped == wrapped
-                && match (&kept.links, &links) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                    (None, Some(_)) | (Some(_), None) => false,
-                }
-        });
         let Ok(index) = postcard::to_extend(&row, std::mem::take(out)) else {
             return;
         };
         *out = index;
-        if let Some(kept) = hit {
-            out.extend_from_slice(&kept.bytes);
+        let key = Arc::as_ptr(&cells).addr();
+        let hit = self
+            .next
+            .remove(&key)
+            .or_else(|| self.kept.remove(&key))
+            .filter(|kept| {
+                kept.wrapped == wrapped
+                    && match (&kept.links, &links) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        (None, Some(_)) | (Some(_), None) => false,
+                    }
+            });
+        let encoding = if let Some(kept) = hit {
+            kept
         } else {
             let (runs, wire_links) = runs_of(&cells, links.as_deref());
             let Ok(bytes) = postcard::to_allocvec(&(wrapped, runs, wire_links)) else {
                 return;
             };
-            out.extend_from_slice(&bytes);
-            self.kept.insert(
-                key,
-                RowEncoding {
-                    cells,
-                    wrapped,
-                    links,
-                    bytes,
-                },
-            );
-        }
-        self.used.push(key);
+            RowEncoding {
+                cells,
+                wrapped,
+                links,
+                bytes,
+            }
+        };
+        out.extend_from_slice(&encoding.bytes);
+        self.next.insert(key, encoding);
     }
 
-    /// The dictionary is built: forget the rows it did not use.
+    /// The dictionary is built: keep only the rows it used.
     fn done(&mut self) {
-        let used: std::collections::HashSet<usize> = self.used.drain(..).collect();
-        self.kept.retain(|key, _| used.contains(key));
+        self.kept = std::mem::take(&mut self.next);
     }
 }
 

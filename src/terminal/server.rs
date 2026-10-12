@@ -385,6 +385,7 @@ impl ServerTerminal {
         if std::mem::replace(&mut self.history_redrawn, self.rows.history_redrawn())
             != self.history_redrawn
         {
+            tracing::debug!("a new palette redraws the history: it is named afresh");
             self.names.renew();
         }
         TerminalScreen {

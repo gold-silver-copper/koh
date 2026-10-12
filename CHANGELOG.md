@@ -30,7 +30,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - The terminal's answers to the start-up questions are read by the session's own input decoder.
 - `Ctrl-^ Ctrl-^` or `Ctrl-^ ^` sends one Ctrl-^.
 - Removing a client with `koh clients rm` ends its session as well as its connection.
-- At most 2 handshakes are pending per address, the oldest given up for a new one; the client holds
+- At most 2 handshakes are pending per address, its oldest given up for a new one, which is never
+  refused; the client holds
   at most about 40 MiB of server streams; the server keeps a clipboard only as base64 within its
   cap; a key, list or `$KOH_LOG` file with another hard link is refused.
 - Every queue in koh has a bound, and `clippy.toml` bans unbounded ones; the wire's sequences are

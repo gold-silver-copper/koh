@@ -62,6 +62,12 @@ impl<T, const N: usize> Bounded<T, N> {
         self.0.pop_front()
     }
 
+    /// Remove the oldest item `matches`, if any.
+    pub fn take_first(&mut self, matches: impl FnMut(&T) -> bool) -> Option<T> {
+        let at = self.0.iter().position(matches)?;
+        self.0.remove(at)
+    }
+
     pub fn back_mut(&mut self) -> Option<&mut T> {
         self.0.back_mut()
     }

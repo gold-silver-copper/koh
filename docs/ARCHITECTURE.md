@@ -486,7 +486,9 @@ construction rather than by care at each call:
 - **Shutdown and handshakes.** One task counts SIGTERM, SIGINT and SIGHUP: the first drains, a
   repeat within 1 s (a double SIGHUP on a terminal's close) is the same, and a later one forces an
   exit with a nonzero status. At most 2 handshakes are pending per address (an IPv6 /64 counts as
-  one), the oldest given up for a new one, so a flood cannot hold an allowed client's room.
+  one), that address's oldest given up for a new one, and the oldest of all when all the room is
+  taken: no handshake is refused, so a flood cannot keep an allowed client out, even from its own
+  address.
 
 ## Testing tiers
 

@@ -403,33 +403,31 @@ const PER_SOURCE: usize = 2;
 const MOST_PENDING: usize = 256;
 
 /// The handshakes under way, oldest first, each with its address and its handle `H`: at most
-/// `cap`, the oldest given up for a new one, and at most [`PER_SOURCE`] from one address (one through
-/// a relay has none, so only `cap` holds it). Anyone who can reach the port can start handshakes
-/// and stall them; this way they cannot hold every slot, and an allowed client's dial still gets
-/// one, unless a flood outpaces its handshake.
+/// [`PER_SOURCE`] from one address, that address's oldest given up for a new one, and at most
+/// `cap` in all, the oldest given up (one through a relay has no address, so only `cap` holds it).
+/// Anyone who can reach the port can start handshakes and stall them; this way a new handshake is
+/// never refused, so an allowed client's dial, which finishes in a round trip, gets through a
+/// flood, even one from its own address (the same host, a shared NAT).
 struct Pending<H> {
     cap: usize,
     under_way: Bounded<(Option<std::net::IpAddr>, H), MOST_PENDING>,
 }
 
 impl<H> Pending<H> {
-    /// Room for a handshake from `source`, those `done` forgotten: `Err` if it has too many under
-    /// way, else the oldest handshake given up for it, if all the room was taken.
-    fn room(
-        &mut self,
-        source: Option<std::net::IpAddr>,
-        done: impl Fn(&H) -> bool,
-    ) -> Result<Option<H>, ()> {
+    /// Room for a handshake from `source`, those `done` forgotten: the handshake given up for it,
+    /// if any, its address's oldest when it has its share under way, else the oldest of all when
+    /// all the room is taken.
+    fn room(&mut self, source: Option<std::net::IpAddr>, done: impl Fn(&H) -> bool) -> Option<H> {
         self.under_way.retain(|(_, handle)| !done(handle));
-        let from = self.under_way.iter().filter(|(s, _)| *s == source);
-        if source.is_some() && from.count() >= PER_SOURCE {
-            return Err(());
-        }
-        Ok(if self.under_way.len() >= self.cap {
-            self.under_way.pop_front().map(|(_, oldest)| oldest)
+        let from = self.under_way.iter().filter(|(s, _)| *s == source).count();
+        let given_up = if source.is_some() && from >= PER_SOURCE {
+            self.under_way.take_first(|(s, _)| *s == source)
+        } else if self.under_way.len() >= self.cap {
+            self.under_way.pop_front()
         } else {
             None
-        })
+        };
+        given_up.map(|(_, oldest)| oldest)
     }
 }
 
@@ -487,23 +485,15 @@ pub async fn serve_endpoint(
             continue;
         };
         let source = source(&incoming.remote_addr());
-        let room = pending.room(source, tokio::task::AbortHandle::is_finished);
+        let given_up = pending.room(source, tokio::task::AbortHandle::is_finished);
         let now = std::time::Instant::now();
-        if !matches!(room, Ok(None))
+        if given_up.is_some()
             && warned.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(10))
         {
             warned = Some(now);
-            warn!(
-                "too many handshakes in flight: giving up the oldest, refusing past 2 an address"
-            );
+            warn!("too many handshakes in flight: giving up the oldest for new ones");
         }
-        match room {
-            Err(()) => {
-                incoming.refuse();
-                continue;
-            }
-            Ok(oldest) => oldest.iter().for_each(tokio::task::AbortHandle::abort),
-        }
+        given_up.iter().for_each(tokio::task::AbortHandle::abort);
         let (gate, sessions) = (gate.clone(), registry.clone());
         #[expect(
             clippy::disallowed_methods,
@@ -634,32 +624,38 @@ mod tests {
     #[test]
     fn a_handshake_flood_cannot_take_an_allowed_clients_room() {
         type Handshakes = Pending<u8>;
-        /// A handshake from `n`'s address, numbered `n`, if there is room; handshake 99 is done.
-        fn begin(pending: &mut Handshakes, from: u8, n: u8) -> Result<Option<u8>, ()> {
+        /// A handshake from `from`'s address, numbered `n`: the one given up for it, if any.
+        /// Handshake 99, the allowed client's, finishes as soon as it is under way.
+        fn begin(pending: &mut Handshakes, from: u8, n: u8) -> Option<u8> {
             let source = Some(std::net::IpAddr::from([203, 0, 113, from]));
-            let room = pending.room(source, |&h| h == 99);
-            if room.is_ok() {
-                pending.under_way.push_evicting((source, n));
-            }
-            room
+            let given_up = pending.room(source, |&h| h == 99);
+            pending.under_way.push_evicting((source, n));
+            given_up
         }
         let mut pending = Pending {
             cap: 4,
             under_way: Bounded::new(),
         };
-        // One address fills only its share.
-        assert_eq!(begin(&mut pending, 1, 1), Ok(None));
-        assert_eq!(begin(&mut pending, 1, 2), Ok(None));
-        assert_eq!(begin(&mut pending, 1, 3), Err(()), "past its share");
-        // Many fill the rest; then each new handshake gives up the oldest, and is never refused.
-        assert_eq!(begin(&mut pending, 4, 4), Ok(None));
-        assert_eq!(begin(&mut pending, 5, 5), Ok(None));
+        // One address holds only its share: a third gives up its own oldest, no one else's.
+        assert_eq!(begin(&mut pending, 1, 1), None);
+        assert_eq!(begin(&mut pending, 1, 2), None);
+        assert_eq!(begin(&mut pending, 1, 3), Some(1));
+        // Many fill the rest; then each new handshake gives up the oldest. None is refused.
+        assert_eq!(begin(&mut pending, 4, 4), None);
+        assert_eq!(begin(&mut pending, 5, 5), None);
         for n in 6..20 {
-            assert!(begin(&mut pending, n, n).is_ok_and(|oldest| oldest.is_some()));
+            assert!(begin(&mut pending, n, n).is_some());
         }
-        // The allowed client's dial gets room; once done, it is forgotten.
-        assert!(begin(&mut pending, 200, 99).is_ok());
-        assert!(begin(&mut pending, 21, 21).is_ok());
+        // The allowed client's dial gets room, even from the flood's own address: it gives up that
+        // address's oldest stalled handshake.
+        assert!(
+            begin(&mut pending, 1, 30).is_some(),
+            "all the room was taken"
+        );
+        assert!(begin(&mut pending, 1, 31).is_some());
+        assert_eq!(begin(&mut pending, 1, 99), Some(30));
+        // Done, it is forgotten, and the room it took is free.
+        assert_eq!(begin(&mut pending, 1, 32), None);
         assert!(pending.under_way.iter().all(|&(_, n)| n != 99));
     }
 }

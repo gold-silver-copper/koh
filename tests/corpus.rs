@@ -2,13 +2,16 @@
 //! carries it: the output cut into PTY-sized pieces, the resizes, then server snapshot → frame →
 //! encode → decode → client screen → paint. After every frame the client applies, a fux-vt
 //! terminal that has read every byte the client painted must show what the server's screen
-//! shows: each cell's text, halves and attributes, the cursor and whether it is shown.
+//! shows: each cell's text, halves and attributes, the cursor and whether it is shown, the mouse
+//! reporting, the title and icon, the clipboard, and a bell for each frame that rang one. The
+//! client's copy of the screen must hold the program's input modes.
 //!
 //! The server's screen here is a fux-vt parser of its own, fed the same pieces and resizes, so a
 //! fault in koh's snapshots shows as a difference too. Over a lossy link, frames are dropped and
 //! the server diffs against the newest frame the client acknowledged, as koh's protocol does;
 //! the newest frame of each step is resent until it arrives, as the server's retries do, so the
-//! client must converge on every step's screen.
+//! client must converge on every step's screen. Random sessions on small screens join the
+//! recordings, for the edges no program happened to reach.
 #![forbid(clippy::disallowed_methods)]
 
 #[path = "../testing/corpus/recording.rs"]
@@ -19,13 +22,14 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use koh::client::WindowState;
 use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
 use koh::predict::Overlay;
 use koh::proto::{
     decode_server, encode_client, ClientDecoder, ClientMsg, Frame, FrameEncoder, FrameNum,
     InputSeq, ServerMsg,
 };
-use koh::terminal::{FrameHold, ServerTerminal, Size, TerminalScreen, FRAME_HOLD};
+use koh::terminal::{FrameHold, Modes, ServerTerminal, Size, TerminalScreen, FRAME_HOLD};
 use recording::Recording;
 
 /// The scrollback a server keeps by default (`koh serve --scrollback`).
@@ -71,18 +75,50 @@ type Look = (
     Option<(String, Option<String>)>,
 );
 
-/// What a screen shows: its size, every cell, whether the cursor is hidden and where it is.
+/// The client prefixes the title it mirrors, and an icon equal to it.
+const TITLE_PREFIX: &str = "[koh] ";
+
+/// What a terminal was told beside its grid, from fux-vt's events.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Said {
+    title: String,
+    icon: String,
+    /// Whether a frame the client applied had either set: until then the user's title is left
+    /// alone.
+    named: bool,
+    clipboard: String,
+    bells: u64,
+}
+
+impl fux_vt::Sink for Said {
+    fn event(&mut self, event: fux_vt::Event<'_>) {
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        match event {
+            fux_vt::Event::Title(title) => self.title = text(title),
+            fux_vt::Event::IconName(icon) => self.icon = text(icon),
+            fux_vt::Event::Clipboard { data, .. } => self.clipboard = text(data),
+            fux_vt::Event::Bell => self.bells = self.bells.saturating_add(1),
+            fux_vt::Event::ColorQuery { .. } | _ => {}
+        }
+    }
+}
+
+/// What a screen shows: its size, every cell, whether the cursor is hidden and where it is, its
+/// modes, and what it was told beside the grid.
 #[derive(Clone, Debug, PartialEq)]
 struct View {
     size: (u16, u16),
     cells: Vec<Option<Look>>,
     hidden: bool,
     cursor: (u16, u16),
+    modes: Modes,
+    said: Said,
 }
 
 impl View {
-    /// What `screen` shows. With `drawn`, as the server draws it: in the colours its program set.
-    fn of(screen: &fux_vt::Screen, drawn: bool) -> Self {
+    /// What `screen`, told `said`, shows. With `drawn`, as the server draws it: in the colours
+    /// its program set.
+    fn of(screen: &fux_vt::Screen, drawn: bool, said: &Said) -> Self {
         let (rows, cols) = screen.size().into();
         let cells = (0..rows)
             .flat_map(|row| (0..cols).map(move |col| (row, col)))
@@ -115,6 +151,16 @@ impl View {
             cells,
             hidden: !screen.mode(fux_vt::Mode::ShowCursor),
             cursor: screen.cursor_position(),
+            modes: Modes {
+                hide_cursor: !screen.mode(fux_vt::Mode::ShowCursor),
+                application_cursor: screen.mode(fux_vt::Mode::ApplicationCursor),
+                application_keypad: screen.mode(fux_vt::Mode::ApplicationKeypad),
+                bracketed_paste: screen.mode(fux_vt::Mode::BracketedPaste),
+                mouse_mode: screen.mouse_protocol_mode(),
+                mouse_encoding: screen.mouse_protocol_encoding(),
+                alternate: screen.mode(fux_vt::Mode::AlternateScreen),
+            },
+            said: said.clone(),
         }
     }
 
@@ -144,7 +190,34 @@ impl View {
                 shown.cursor, self.cursor
             ));
         }
-        None
+        // The mouse is reported as the program asked, always in SGR; the other input modes stay
+        // the client's, which encodes keys and pastes on the server.
+        let mouse = self.modes.mouse_mode;
+        let sgr = mouse == fux_vt::MouseProtocolMode::None
+            || shown.modes.mouse_encoding == fux_vt::MouseProtocolEncoding::Sgr;
+        if shown.modes.mouse_mode != mouse || !sgr {
+            return Some(format!("mouse {:?}, expected {mouse:?}", shown.modes));
+        }
+        let (title, icon) = match &self.said {
+            Said { named: false, .. } => (String::new(), String::new()),
+            Said { title, icon, .. } if icon == title => (
+                format!("{TITLE_PREFIX}{title}"),
+                format!("{TITLE_PREFIX}{icon}"),
+            ),
+            Said { title, icon, .. } => (format!("{TITLE_PREFIX}{title}"), icon.clone()),
+        };
+        let told = (shown.said.title.as_str(), shown.said.icon.as_str());
+        if told != (title.as_str(), icon.as_str()) {
+            return Some(format!(
+                "title and icon {told:?}, expected {title:?} {icon:?}"
+            ));
+        }
+        (shown.said.clipboard != self.said.clipboard).then(|| {
+            format!(
+                "clipboard {:?}, expected {:?}",
+                shown.said.clipboard, self.said.clipboard
+            )
+        })
     }
 }
 
@@ -167,8 +240,9 @@ struct Session {
     /// When the server sends a screen, while a program draws a frame.
     hold: FrameHold,
     /// The server's screen, from a parser of its own, fed a byte at a time so that it sees exactly
-    /// where each frame begins.
+    /// where each frame begins, and what it was told beside it.
     expected: fux_vt::Parser,
+    said: Said,
     /// What the expected screen showed when the frame being drawn began, and when that was.
     frame_start: Option<(View, Instant)>,
     /// The time, which the replay moves on by a millisecond a piece.
@@ -176,8 +250,14 @@ struct Session {
     client: ClientSession,
     terminal: BackendTerminal<Capture>,
     capture: Capture,
-    /// The user's terminal, reading every painted byte.
+    /// The user's terminal, reading every painted byte, and what it was told beside the grid.
     shown: fux_vt::Parser,
+    shown_said: Said,
+    /// The bells the server's screen had rung when the client last applied a frame, and the
+    /// bells the user's terminal should have rung by then: one for each frame that rang any.
+    bells: (u64, u64),
+    /// Whether a frame the client applied had a title or icon.
+    named: bool,
     /// The newest frame the client acknowledged, the next frame's base.
     base: (FrameNum, TerminalScreen),
     /// Frames sent and not yet acknowledged or superseded.
@@ -202,16 +282,24 @@ impl Session {
                 koh::terminal::OPTIONS,
             )
             .map_err(|e| e.to_string())?,
+            said: Said::default(),
             hold: FrameHold::default(),
             frame_start: None,
             now: Instant::now(),
             client: ClientSession::new(size),
             terminal: {
-                // The user's terminal draws underline styles, as the one reading the paint does.
+                // The user's terminal draws underline styles, as the one reading the paint does,
+                // and takes the clipboard. The client came before anything was set or rang.
                 let mut terminal =
-                    BackendTerminal::enter(capture.clone(), false).map_err(|e| e.to_string())?;
+                    BackendTerminal::enter(capture.clone(), true).map_err(|e| e.to_string())?;
                 terminal.set_underline_styles(true);
                 terminal.set_hyperlinks(true);
+                terminal.prime(WindowState {
+                    title: "",
+                    icon: "",
+                    clipboard: "",
+                    bell_count: 0,
+                });
                 terminal
             },
             capture,
@@ -219,9 +307,14 @@ impl Session {
             shown: fux_vt::Parser::with_options(
                 fux_vt::Size::new(rows, cols).map_err(|e| e.to_string())?,
                 0,
-                fux_vt::Options::new().with(fux_vt::Feature::Hyperlinks),
+                fux_vt::Options::new()
+                    .with(fux_vt::Feature::Hyperlinks)
+                    .with(fux_vt::Feature::Events),
             )
             .map_err(|e| e.to_string())?,
+            shown_said: Said::default(),
+            bells: (0, 0),
+            named: false,
             base: (FrameNum::BLANK, TerminalScreen::default()),
             sent: Vec::new(),
             next: FrameNum::BLANK.next(),
@@ -257,7 +350,7 @@ impl Session {
                 .screen()
                 .mode(fux_vt::Mode::SynchronizedOutput);
             self.expected
-                .process(std::slice::from_ref(byte))
+                .process_with(std::slice::from_ref(byte), &mut self.said)
                 .map_err(|e| e.to_string())?;
             if !drawing
                 && self
@@ -266,7 +359,8 @@ impl Session {
                     .mode(fux_vt::Mode::SynchronizedOutput)
             {
                 // A frame begins: the screen as it was is a whole one.
-                self.frame_start = Some((View::of(self.expected.screen(), true), self.now));
+                self.frame_start =
+                    Some((View::of(self.expected.screen(), true, &self.said), self.now));
             }
         }
         Ok(self.hold.after_output(&mut self.server, self.now))
@@ -285,7 +379,7 @@ impl Session {
             {
                 view.clone()
             }
-            Some(_) | None => View::of(self.expected.screen(), true),
+            Some(_) | None => View::of(self.expected.screen(), true, &self.said),
         }
     }
 
@@ -355,10 +449,31 @@ impl Session {
                 .render(self.client.state(), &Overlay::default(), None)
                 .map_err(|e| e.to_string())?;
             let painted = std::mem::take(&mut *self.capture.painted.borrow_mut());
-            self.shown.process(&painted).map_err(|e| e.to_string())?;
-            let expected = self.expected_view();
-            if let Some(difference) = expected.difference(&View::of(self.shown.screen(), false)) {
+            self.shown
+                .process_with(&painted, &mut self.shown_said)
+                .map_err(|e| e.to_string())?;
+            let mut expected = self.expected_view();
+            self.named |= !(expected.said.title.is_empty() && expected.said.icon.is_empty());
+            expected.said.named = self.named;
+            let shown = View::of(self.shown.screen(), false, &self.shown_said);
+            if let Some(difference) = expected.difference(&shown) {
                 return Err(format!("frame {}: {difference}", frame.num.0));
+            }
+            let held = self.client.state().screen().modes();
+            if held != expected.modes {
+                return Err(format!(
+                    "frame {}: the client holds modes {held:?}, expected {:?}",
+                    frame.num.0, expected.modes
+                ));
+            }
+            if expected.said.bells > self.bells.0 {
+                self.bells = (expected.said.bells, self.bells.1.saturating_add(1));
+            }
+            if self.shown_said.bells != self.bells.1 {
+                return Err(format!(
+                    "frame {}: {} bells rung, expected {}",
+                    frame.num.0, self.shown_said.bells, self.bells.1
+                ));
             }
         }
         Ok(applied)
@@ -459,6 +574,108 @@ fn every_recording_converges_over_a_lossy_link() {
         total.applied,
         total.frames
     );
+}
+
+/// What a random session's program writes: text of every width, every kind of attribute and
+/// link, cursor moves, scrolling in and out of regions, inserting and deleting, erasing, the
+/// alternate screen, every input mode, the title, icon, clipboard and bell, and frames drawn in
+/// synchronized output.
+const PIECES: [&str; 49] = [
+    "ab",
+    "abcdefghijklmnopqrstuvwxyz0123",
+    "日本",
+    "e\u{301}",
+    "\u{302}",
+    "\t",
+    "\r\n",
+    "\x08",
+    "\x1b[1;31m",
+    "\x1b[4:3;58;5;9m",
+    "\x1b[2;7;38;2;1;2;3;48;5;200m",
+    "\x1b[m",
+    "\x1b]8;;https://koh.example/\x1b\\L\x1b]8;;\x1b\\",
+    "\x1b[H",
+    "\x1b[3;5H",
+    "\x1b[A",
+    "\x1b[9C",
+    "\x1bM",
+    "\x1b[2;4r",
+    "\x1b[r",
+    "\x1b[S",
+    "\x1b[2T",
+    "\x1b[L",
+    "\x1b[M",
+    "\x1b[2@",
+    "\x1b[P",
+    "\x1b[4h",
+    "\x1b[4l",
+    "\x1b[K",
+    "\x1b[1J",
+    "\x1b[2J",
+    "\x1b[?1049h",
+    "\x1b[?1049l",
+    "\x1b[?25l",
+    "\x1b[?25h",
+    "\x1b[?1h\x1b=",
+    "\x1b[?1l\x1b>",
+    "\x1b[?2004h",
+    "\x1b[?2004l",
+    "\x1b[?1002h\x1b[?1006h",
+    "\x1b[?1003h\x1b[?1005h",
+    "\x1b[?1003l",
+    "\x1b]0;both\x07",
+    "\x1b]2;title\x07\x1b]1;icon\x07",
+    "\x1b]52;c;aGk=\x07",
+    "\x1b]52;c;?\x07",
+    "\x07",
+    "\x1b[?2026h",
+    "\x1b[?2026l",
+];
+
+/// A small screen: 2 to 11 rows by 2 to 29 columns.
+fn small_size(rng: &mut koh_testkit::Rng) -> (u16, u16) {
+    let mut below = |n: u64, least: u16| {
+        u16::try_from(rng.below(n))
+            .unwrap_or(0)
+            .saturating_add(least)
+    };
+    (below(10, 2), below(28, 2))
+}
+
+/// A random session from `seed` on a small screen, sometimes resized.
+fn random_session(seed: u64) -> Recording {
+    let mut rng = koh_testkit::Rng(seed);
+    let (rows, cols) = small_size(&mut rng);
+    let (mut steps, mut bytes) = (Vec::new(), Vec::new());
+    for _ in 0..30 {
+        let resize = rng.chance(0.1).then(|| small_size(&mut rng));
+        for _ in 0..=rng.below(8) {
+            let at = rng.below(u64::try_from(PIECES.len()).unwrap_or(1));
+            let piece = PIECES.get(usize::try_from(at).unwrap_or(0)).unwrap_or(&"");
+            bytes.extend_from_slice(piece.as_bytes());
+        }
+        steps.push(recording::Step {
+            resize,
+            keys: Vec::new(),
+            end: bytes.len(),
+        });
+    }
+    Recording {
+        name: format!("random session {seed}"),
+        rows,
+        cols,
+        steps,
+        bytes,
+    }
+}
+
+#[test]
+fn random_small_sessions_read_back_as_the_server_shows_them() {
+    let sessions: Vec<Recording> = (0..200).map(random_session).collect();
+    for loss in [0.0, 0.3] {
+        let (failures, _) = replay_all(&sessions, 0, loss);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 }
 
 #[test]

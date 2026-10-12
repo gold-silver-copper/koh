@@ -657,6 +657,10 @@ mod tests {
         // inherits the parent env, so the scrub removes each explicitly: `get_envs` lists it as
         // removed (`None`).
         let inherited = ["KOH_SCRUB_TEST", "KOH_DNS", "PATH"].map(OsString::from);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "built to read its environment, never run"
+        )]
         let mut cmd = Command::new("/bin/sh");
         scrub_koh_env(&mut cmd, inherited.into_iter());
         let removed: Vec<_> = cmd

@@ -746,6 +746,7 @@ mod tests {
     fn a_fifo_log_or_key_is_refused_without_waiting_for_a_reader() {
         let dir = Scratch::new("fifo-log", 0o700);
         let path = dir.0.join("koh.log");
+        #[expect(clippy::disallowed_methods, reason = "mkfifo, to plant a FIFO")]
         let made = std::process::Command::new("mkfifo").arg(&path).status();
         if !made.is_ok_and(|status| status.success()) {
             return; // No mkfifo here, so nothing to test.
@@ -787,6 +788,7 @@ mod tests {
     fn reset_refuses_a_fifo_without_waiting_for_a_writer() {
         let dir = Scratch::new("fifo", 0o700);
         let path = dir.0.join("id.key");
+        #[expect(clippy::disallowed_methods, reason = "mkfifo, to plant a FIFO")]
         let made = std::process::Command::new("mkfifo").arg(&path).status();
         if !made.is_ok_and(|status| status.success()) {
             return; // No mkfifo here, so nothing to test.

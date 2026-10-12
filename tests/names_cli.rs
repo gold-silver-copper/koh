@@ -6,8 +6,10 @@
 //! directory and the user's own `~/.config/koh` is never read or written.
 #![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 
+mod spawn;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +20,7 @@ use koh::pty::{Launcher, Pty};
 fn unwritable_stdout_and_stderr_do_not_panic() {
     let home = Home::new("failed-output").expect("scratch home");
     for discard_diagnostics in [false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_koh"));
+        let mut command = spawn::command(env!("CARGO_BIN_EXE_koh")).expect("spawn koh");
         command
             .args(["key", "info"])
             .env("HOME", &home.0)
@@ -64,7 +66,7 @@ impl Home {
 
     /// `koh args…` in this home, its stdin closed.
     fn koh(&self, args: &[&str]) -> anyhow::Result<Output> {
-        Ok(Command::new(env!("CARGO_BIN_EXE_koh"))
+        Ok(spawn::command(env!("CARGO_BIN_EXE_koh"))?
             .args(args)
             .env("HOME", &self.0)
             .env("XDG_CONFIG_HOME", self.0.join(".config"))
@@ -232,7 +234,8 @@ fn serve_without_allow_allows_the_saved_clients() {
     assert!(!out.status.success(), "no clients: {}", text(&out));
     assert!(text(&out).contains("koh clients add"), "{}", text(&out));
     home.koh(&["clients", "add", "phone", &some_id(3)]).unwrap();
-    let mut server = Command::new(env!("CARGO_BIN_EXE_koh"))
+    let mut server = spawn::command(env!("CARGO_BIN_EXE_koh"))
+        .expect("spawn koh")
         .args(["serve", "--local", "--shell", "sh"])
         .env("HOME", &home.0)
         .env("XDG_CONFIG_HOME", home.0.join(".config"))
@@ -408,7 +411,8 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
     let me = home.koh(&["id"]).unwrap();
     let me = String::from_utf8_lossy(&me.stdout).trim().to_owned();
     home.koh(&["clients", "add", "other", &some_id(4)]).unwrap();
-    let mut server = Command::new(env!("CARGO_BIN_EXE_koh"))
+    let mut server = spawn::command(env!("CARGO_BIN_EXE_koh"))
+        .expect("spawn koh")
         .args(["serve", "--local", "--shell", "sh"])
         .env("HOME", &home.0)
         .env("XDG_CONFIG_HOME", home.0.join(".config"))

@@ -125,6 +125,10 @@ impl BellHook {
         title: &str,
         parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     ) -> std::process::Command {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the user's own --on-bell command"
+        )]
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg(&self.command).env_clear();
         for (k, v) in parent_env {

@@ -10,6 +10,8 @@
 //! lifecycle, the renderer, and stdin passthrough — the real terminal path.
 #![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 
+mod spawn;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -222,7 +224,7 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
 
 /// `koh id` for the key at `key`, creating it: the endpoint id, as the binary prints it.
 fn endpoint_id(key: &std::path::Path) -> anyhow::Result<String> {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_koh"))
+    let out = spawn::command(env!("CARGO_BIN_EXE_koh"))?
         .args(["id", "--key-file"])
         .arg(key)
         .output()?;
@@ -237,7 +239,7 @@ fn serve_on_port(
     client: &str,
 ) -> anyhow::Result<std::process::Child> {
     use std::io::BufRead as _;
-    let mut server = std::process::Command::new(env!("CARGO_BIN_EXE_koh"))
+    let mut server = spawn::command(env!("CARGO_BIN_EXE_koh"))?
         .args([
             "serve",
             "--local",

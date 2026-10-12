@@ -17,7 +17,8 @@ fn clean() -> FaultNet {
 /// `CSI 105 ; 5 u`), and Tab is Tab from one that does not.
 #[test]
 fn nvim_tells_ctrl_i_from_tab_from_a_kitty_terminal() {
-    if std::process::Command::new("nvim")
+    if crate::spawn::command("nvim")
+        .expect("nvim may be run")
         .arg("--version")
         .output()
         .is_err()

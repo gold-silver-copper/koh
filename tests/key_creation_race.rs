@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
-use std::process::{Command, Stdio};
+mod spawn;
+
+use std::process::Stdio;
 
 #[test]
 fn concurrent_first_uses_publish_one_key_and_one_endpoint_id() {
@@ -17,7 +19,8 @@ fn concurrent_first_uses_publish_one_key_and_one_endpoint_id() {
     let mut children = Vec::new();
     for _ in 0..4 {
         children.push(
-            Command::new(env!("CARGO_BIN_EXE_koh"))
+            spawn::command(env!("CARGO_BIN_EXE_koh"))
+                .expect("spawn koh")
                 .args(["id", "--key-file"])
                 .arg(&key)
                 .env_clear()
@@ -70,7 +73,7 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
     .expect("disposable identity");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("key mode");
     let run = |confirmed: bool| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_koh"));
+        let mut command = spawn::command(env!("CARGO_BIN_EXE_koh")).expect("spawn koh");
         command
             .current_dir(&directory.0)
             .env_clear()
@@ -84,7 +87,8 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
     assert!(!run(false).status.success());
     assert!(path.exists(), "unconfirmed reset removed key");
     // `koh id` refuses the file and points at the reset.
-    let id = Command::new(env!("CARGO_BIN_EXE_koh"))
+    let id = spawn::command(env!("CARGO_BIN_EXE_koh"))
+        .expect("spawn koh")
         .current_dir(&directory.0)
         .env_clear()
         .args(["id", "--key-file", "identity.key"])
@@ -101,4 +105,12 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!path.exists(), "confirmed reset retained key");
+}
+
+#[test]
+fn tests_may_start_koh_but_never_a_program_that_authenticates() {
+    assert!(spawn::command(env!("CARGO_BIN_EXE_koh")).is_ok());
+    for program in ["sudo", "/usr/bin/passwd", "su", "ssh"] {
+        assert!(spawn::command(program).is_err(), "{program}");
+    }
 }

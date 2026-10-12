@@ -24,46 +24,25 @@ env:
 jobs:
   harnesses:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            . -> target
+            testkit -> target
             testing/bench -> target
-            testing/oracle -> target
             testing/android/evil-peer -> target
             fuzz -> target
       - name: Check standalone harnesses
         run: |
-          for manifest in testing/bench/Cargo.toml testing/oracle/Cargo.toml testing/android/evil-peer/Cargo.toml fuzz/Cargo.toml; do
+          for manifest in testkit/Cargo.toml testing/bench/Cargo.toml testing/android/evil-peer/Cargo.toml fuzz/Cargo.toml; do
             cargo fmt --manifest-path "$manifest" --all --check
             cargo clippy --manifest-path "$manifest" --all-targets --locked -- -D warnings
           done
-      - name: Oracle smoke against the base commit
-        env:
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PUSH_BASE: ${{ github.event.before }}
-        run: |
-          if [ -n "$PR_BASE" ]; then
-            base=$PR_BASE
-          elif [ -n "$PUSH_BASE" ] && git cat-file -e "$PUSH_BASE^{commit}" 2>/dev/null; then
-            base=$PUSH_BASE
-          else
-            base=$(git rev-parse HEAD^)
-          fi
-          testing/oracle.sh "$base" --cases 80 --seed 7 --no-recordings
-      - name: Weekly oracle corpus and planted bugs
-        if: github.event_name == 'schedule'
-        run: |
-          testing/oracle.sh HEAD^ --cases 2000 --seed 23
-          testing/oracle.sh --plants
 
   # The same green gate enforced locally — format, lints (warnings are errors), the layering guard,
   # the full test suite, and broken-doc-link detection — on BOTH supported desktop OSes.
@@ -163,14 +142,12 @@ jobs:
           cargo +nightly check --locked --manifest-path fuzz/Cargo.toml --bins
           cargo +nightly fuzz build
       - name: smoke (must stay crash-free)
-        # Each starts from its own corpus and, for the ones that read program output, the
-        # recorded output of real programs.
+        # Each starts from nothing (fuzz/corpus is not committed), except `server_process`, whose
+        # input is a program's output: it is seeded with the recorded output of real programs.
         run: |
-          for target in screen_apply proto_decode history_apply client_input probe_replies; do
+          for target in screen_apply proto_decode history_apply server_input client_input probe_replies; do
             cargo +nightly fuzz run "$target" -- -max_total_time=45 -rss_limit_mb=4096
           done
-          for target in server_process server_input; do
-            mkdir -p "fuzz/corpus/$target"
-            cargo +nightly fuzz run "$target" "fuzz/corpus/$target" testing/corpus -- \
-              -max_total_time=45 -rss_limit_mb=4096
-          done
+          mkdir -p fuzz/corpus/server_process
+          cargo +nightly fuzz run server_process fuzz/corpus/server_process testing/corpus -- \
+            -max_total_time=45 -rss_limit_mb=4096

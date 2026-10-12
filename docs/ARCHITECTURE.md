@@ -47,12 +47,12 @@ src/
 ├── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identities, reset one
 ├── names.rs         names for ids: `servers` and `clients` beside the keys, through `KeyFile`
 ├── menu.rs          the menu `koh` alone opens on a terminal, over a reader and a writer
-└── test_runtime.rs  tokio runtimes for async unit tests
+└── test_runtime.rs  unit tests' runtime and scratch directories, through koh-testkit
 tests/net/           koh over a fault-injecting link between real iroh endpoints
 tests/               PTYs, sessions, scrollback, the binary on a PTY, names, upgrade in place,
                      key creation races, wire goldens and the corpus
-testing/corpus/      113 real programs' output (from fux), replayed by tests, oracle and bench
-testing/oracle/      koh at the working tree beside koh at a commit (`testing/oracle.sh`)
+testkit/             koh-testkit: what the tests share (starting programs, tasks, scratch dirs)
+testing/corpus/      113 real programs' output (from fux), replayed by tests and bench
 testing/bench/       the scoreboard: koh beside mosh and ssh (`testing/scoreboard.sh`)
 ```
 
@@ -522,14 +522,16 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
 - **`tests/upgrade_in_place.rs`** (Linux) — a running `koh serve` whose binary file is removed
   still starts sessions, because it launches them from `/proc/self/exe`.
 
-Two harnesses sit beside the tests, each its own Cargo workspace:
+The rules the tests keep are in their structure, not in lint lists a file can lift. Every test
+crate starts with `#![forbid(clippy::disallowed_methods)]`, so none can start a program, spawn a
+task or write to the system temp dir on its own: it does those through **`koh-testkit`**
+(`testkit/`, its own workspace), whose `command` starts only `koh` and a list of harmless tools
+(never one that authenticates, as `sudo` does), whose `spawn` runs a task on the test's runtime,
+and whose `Scratch` is a private directory under `target/`, removed on drop. It also holds the
+test runtimes, PTY output capture and the seeded random sequence the tests and the scoreboard use.
 
-- **The oracle** (`testing/oracle.sh`, [`testing/oracle/`](../testing/oracle/README.md)) runs koh
-  at the working tree and koh at a commit (by default the merge base with `origin/HEAD`, else
-  `origin/master`) on the same sessions (the corpus, and random output, keystrokes, lost frames,
-  time and resizes) and compares what the user's terminal would show, the replies and the client's
-  messages after every step, reporting each side's frame bytes. A difference is shrunk and saved.
-  It finds each of seven planted bugs (`testing/oracle.sh --plants`).
+The scoreboard sits beside the tests, in its own Cargo workspace:
+
 - **The scoreboard** (`testing/scoreboard.sh`, [`testing/bench/`](../testing/bench/README.md))
   measures koh beside mosh and ssh by bytes on the wire for each recording and synthetic workload,
   keystroke latency beside a flood on three links, server memory per session and instructions

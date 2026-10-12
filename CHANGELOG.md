@@ -33,8 +33,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
   buffers and terminal replies stay behind earlier input. Reply overflow is bounded and logged.
 - Hyperlink snapshots allocate strings only for distinct links in a row. Terminal dimensions
   are normalized once for the hosted emulator and PTY, and history traversal uses retained rows.
-- CI checks the standalone benchmark, oracle and hostile-peer harnesses, with an oracle smoke
-  comparison on each change and longer corpus/planted-bug checks weekly.
+- CI checks the standalone benchmark, test kit and hostile-peer harnesses. The tests start
+  programs, spawn tasks and make scratch directories (under `target/`, never the system temp dir)
+  only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
 - A hostile server's close reason reached the user's terminal raw when the first connection was
@@ -75,8 +76,6 @@ binary, its tests and the fuzz targets share code, and any release may change it
   and keeps the end of a long query visible.
 - An incomplete paste begun before an outage cannot finish into a reconnected shell. Fresh
   keys after its end marker remain usable.
-- The oracle honors an explicit reference without resolving a default first, follows the
-  upstream default branch, and builds the baseline with its committed harness lockfile.
 
 ## [0.13.0] — 2026-10-08
 

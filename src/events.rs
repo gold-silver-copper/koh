@@ -16,8 +16,7 @@
 //! [`WireColours::check`]).
 
 use fux_vt::keys::colour::{Colours, Scheme};
-use fux_vt::keys::encode::{key_bytes, KeyMode, PASTE_END, PASTE_START};
-use fux_vt::keys::mouse::{mouse_bytes, MouseAction, MouseButton, MouseEvent};
+use fux_vt::keys::mouse::{MouseAction, MouseButton, MouseEvent};
 use fux_vt::keys::{Direction, Key, KeyPress, Keystroke, Kitty, Modifiers};
 use fux_vt::Rgb;
 use serde::{Deserialize, Serialize};
@@ -155,32 +154,6 @@ impl InputEvent {
             Self::Paste(text) if text.len() > MAX_PASTE => Err("paste too long"),
             Self::Mouse(_) | Self::Focus(_) | Self::Paste(_) => Ok(()),
         }
-    }
-
-    /// The bytes a legacy terminal sends for the event: a key in its legacy form (normal cursor
-    /// mode), a paste bracketed, a mouse event in SGR, a focus change as `CSI I` or `CSI O`. What
-    /// koh sent before it decoded input, for comparing with it (the oracle).
-    pub fn sent_by_a_legacy_terminal(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        match self {
-            Self::Key(key) => key_bytes(key.stroke(), KeyMode::legacy(false), &mut out),
-            Self::Mouse(mouse) => {
-                mouse_bytes(
-                    mouse.event(),
-                    fux_vt::MouseProtocolMode::AnyMotion,
-                    fux_vt::MouseProtocolEncoding::Sgr,
-                    &mut out,
-                );
-            }
-            Self::Focus(true) => out.extend_from_slice(b"\x1b[I"),
-            Self::Focus(false) => out.extend_from_slice(b"\x1b[O"),
-            Self::Paste(text) => {
-                out.extend_from_slice(PASTE_START);
-                out.extend_from_slice(text.as_bytes());
-                out.extend_from_slice(PASTE_END);
-            }
-        }
-        out
     }
 
     /// The bytes the event takes on the wire, for packing messages.

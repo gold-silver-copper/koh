@@ -508,7 +508,8 @@ mod tests {
     #[test]
     fn a_created_key_is_its_raw_bytes_and_loads_back_to_the_same_identity() {
         let dir = scratch("key-test", 0o700);
-        let path = dir.join("id.key");
+        // A missing directory is created private.
+        let path = dir.join("state").join("id.key");
         let key = KeyFile::open(&path).unwrap();
         let first = load(&key).expect("create a key");
         assert_eq!(
@@ -517,19 +518,11 @@ mod tests {
             "the file is the raw key"
         );
         assert_eq!(mode_of(&path), 0o600, "a created key is owner-only");
+        assert_eq!(mode_of(&dir.join("state")), 0o700);
         let second = load(&key).expect("load it back");
         assert_eq!(first.endpoint_id(), second.endpoint_id(), "round-trips");
         let id = first.endpoint_id();
         assert_eq!(parse_endpoint_id(&id.to_string()).unwrap(), id);
-    }
-
-    #[test]
-    fn a_missing_directory_is_created_private() {
-        let dir = scratch("key-perm", 0o700);
-        let path = dir.join("state").join("id.key");
-        load(&KeyFile::open(&path).unwrap()).expect("create a key");
-        assert_eq!(mode_of(&dir.join("state")), 0o700);
-        assert_eq!(mode_of(&path), 0o600);
     }
 
     #[test]
@@ -665,24 +658,19 @@ mod tests {
     #[test]
     fn a_directory_of_another_user_but_root_is_refused() {
         let euid = 1000;
-        assert_eq!(directory_refusal(euid, 0o700, euid), None, "the user's own");
-        assert_eq!(
-            directory_refusal(0, 0o755, euid),
-            None,
-            "root's, as / and /home"
-        );
-        assert_eq!(
-            directory_refusal(0, 0o1777, euid),
-            None,
-            "root's sticky /tmp"
-        );
+        // The user's own, root's (as / and /home), root's sticky /tmp; then 0777, even root's.
+        for (owner, mode, refused) in [
+            (euid, 0o700, false),
+            (0, 0o755, false),
+            (0, 0o1777, false),
+            (euid, 0o777, true),
+            (0, 0o777, true),
+        ] {
+            let refusal = directory_refusal(owner, mode, euid);
+            assert_eq!(refusal.is_some(), refused, "{owner} {mode:o}");
+        }
         let foreign = directory_refusal(1001, 0o700, euid).expect("another user's is refused");
         assert!(foreign.contains("owned by uid 1001"), "{foreign}");
-        assert!(directory_refusal(euid, 0o777, euid).is_some(), "0777");
-        assert!(
-            directory_refusal(0, 0o777, euid).is_some(),
-            "0777, even root's"
-        );
         // A real root-owned directory: KeyFile::open judges /, without creating anything there.
         KeyFile::open(Path::new("/koh-no-such.key")).expect("/ is root's");
         assert!(!Path::new("/koh-no-such.key").exists());
@@ -751,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fifo_log_or_key_is_refused_without_waiting_for_a_reader() {
+    fn a_fifo_log_or_key_is_refused_and_left_without_waiting_for_a_peer() {
         let dir = scratch("fifo-log", 0o700);
         let path = dir.join("koh.log");
         #[expect(clippy::disallowed_methods, reason = "mkfifo, to plant a FIFO")]
@@ -764,11 +752,15 @@ mod tests {
         std::thread::spawn(move || {
             let log = open_private_log(&path).map(drop);
             let load = load(&key).map(drop);
-            done.send((log, load))
+            done.send((log, load, key.reset().is_err(), path.exists()))
         });
-        let (log, load) = result
+        let (log, load, reset_refused, left) = result
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the open blocked on the FIFO");
+        assert!(
+            reset_refused && left,
+            "a reset refuses it and leaves it in place"
+        );
         let log = log.expect_err("a FIFO log is refused");
         assert!(log.to_string().starts_with("refusing "), "{log}");
         let load = load.expect_err("a FIFO key is refused");
@@ -790,24 +782,5 @@ mod tests {
                 .unwrap_or_else(|error| panic!("mode {mode:o}: {error:#}"));
             assert!(!path.exists(), "mode {mode:o}: reset left the key");
         }
-    }
-
-    #[test]
-    fn reset_refuses_a_fifo_without_waiting_for_a_writer() {
-        let dir = scratch("fifo", 0o700);
-        let path = dir.join("id.key");
-        #[expect(clippy::disallowed_methods, reason = "mkfifo, to plant a FIFO")]
-        let made = std::process::Command::new("mkfifo").arg(&path).status();
-        if !made.is_ok_and(|status| status.success()) {
-            return; // No mkfifo here, so nothing to test.
-        }
-        let key = KeyFile::open(&path).unwrap();
-        let (done, result) = std::sync::mpsc::channel();
-        std::thread::spawn(move || done.send(key.reset().is_err()));
-        let refused = result
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("reset blocked on the FIFO");
-        assert!(refused, "a FIFO is not a key");
-        assert!(path.exists(), "the refused FIFO is left in place");
     }
 }

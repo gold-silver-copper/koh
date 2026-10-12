@@ -1279,35 +1279,12 @@ mod tests {
     }
 
     #[test]
-    fn predictions_hidden_until_server_confirms_echo() {
-        // P0 (security): a secret typed before ANY server confirmation must never be drawn.
+    fn no_echo_keeps_secret_hidden_and_cleans_up() {
+        // P0 (security): a secret typed before any server confirmation is never drawn, and one
+        // the server never echoes (a password prompt) is culled away.
         let mut e = engine();
         e.set_local_frame_sent(0);
         e.type_bytes(b"hunter2", &screen_of(b""));
-        assert!(
-            e.overlay().is_empty(),
-            "predictions must stay hidden until the server confirms it echoes"
-        );
-    }
-
-    #[test]
-    fn confirmed_echo_makes_subsequent_typing_visible() {
-        let (mut e, echoed) = confirm_first_keystroke();
-        e.set_local_frame_sent(1);
-        e.type_bytes(b"y", &echoed); // cursor now at (0,1)
-        assert_eq!(
-            shown_at(&e, 0, 1).as_deref(),
-            Some("y"),
-            "typing after confirmation must be visible"
-        );
-    }
-
-    #[test]
-    fn no_echo_keeps_secret_hidden_and_cleans_up() {
-        // Password-prompt style: the server never echoes -> never shown, then culled away.
-        let mut e = engine();
-        e.set_local_frame_sent(0);
-        e.type_bytes(b"s", &screen_of(b""));
         assert!(e.overlay().is_empty(), "non-echoed input is never shown");
         e.set_local_frame_late_acked(1);
         e.cull(&screen_of(b""));
@@ -1326,6 +1303,14 @@ mod tests {
         })
     }
 
+    /// Assert the glyphs predicted on row 0 from column `from`, as [`predicted_at`] names them.
+    fn predicted_row(e: &PredictionEngine, from: u16, glyphs: &[&str]) {
+        let cols = from..from + u16::try_from(glyphs.len()).unwrap();
+        let row: Vec<_> = cols.map(|col| predicted_at(e, col)).collect();
+        let expected: Vec<_> = glyphs.iter().map(|g| Some((*g).to_owned())).collect();
+        assert_eq!(row, expected);
+    }
+
     #[test]
     fn insert_mode_shifts_row_right() {
         // Screen "ab" with the cursor on 'b' (col 1). Typing 'X' should INSERT before 'b',
@@ -1334,16 +1319,7 @@ mod tests {
         let mut e = engine();
         e.set_local_frame_sent(0);
         e.type_bytes(b"X", &screen_of(b"ab\x1b[1;2H"));
-        assert_eq!(
-            predicted_at(&e, 1).as_deref(),
-            Some("X"),
-            "typed char at col"
-        );
-        assert_eq!(
-            predicted_at(&e, 2).as_deref(),
-            Some("b"),
-            "tail shifted right"
-        );
+        predicted_row(&e, 1, &["X", "b"]);
     }
 
     #[test]
@@ -1354,26 +1330,9 @@ mod tests {
         let mut e = engine();
         e.set_local_frame_sent(0);
         e.type_bytes(&[0x7f], &screen_of(b"abc\x1b[1;3H"));
-        assert_eq!(
-            predicted_at(&e, 1).as_deref(),
-            Some("c"),
-            "tail shifted left"
-        );
-        assert_eq!(
-            predicted_at(&e, 79).as_deref(),
-            Some("U"),
-            "the last column"
-        );
-        assert_eq!(
-            predicted_at(&e, 78).as_deref(),
-            Some("U"),
-            "the second-to-last"
-        );
-        assert_eq!(
-            predicted_at(&e, 77).as_deref(),
-            Some(""),
-            "a blank moved in"
-        );
+        predicted_row(&e, 1, &["c"]);
+        // A blank moved in, then the two unknown edge columns.
+        predicted_row(&e, 77, &["", "U", "U"]);
     }
 
     #[test]
@@ -1387,8 +1346,7 @@ mod tests {
         e.set_local_frame_sent(0);
         e.move_cursor((0, u16::MAX - 1));
         e.type_bytes(&[0x7f], p.screen());
-        assert_eq!(predicted_at(&e, u16::MAX - 1).as_deref(), Some("U"));
-        assert_eq!(predicted_at(&e, u16::MAX - 2).as_deref(), Some("U"));
+        predicted_row(&e, u16::MAX - 2, &["U", "U"]);
     }
 
     #[test]
@@ -1494,23 +1452,16 @@ mod tests {
 
     #[test]
     fn left_arrow_predicts_cursor_and_leaves_no_glyph() {
-        // After confirming a keystroke (cursor at (0,1)), a left arrow predicts the cursor one
-        // column left and must NOT leave literal '[' / 'D' glyphs from the escape bytes.
-        let (mut e, echoed) = confirm_first_keystroke();
-        e.set_local_frame_sent(1);
-        e.type_bytes(b"\x1b[D", &echoed);
-        let ov = e.overlay();
-        assert_eq!(ov.cursor(), Some((0, 0)));
-        assert!(ov.cell(0, 0).is_none() && ov.cell(0, 1).is_none());
-    }
-
-    #[test]
-    fn ss3_left_arrow_is_normalized_and_predicted() {
-        // Application-cursor-mode arrow: ESC O D must behave like ESC [ D.
-        let (mut e, echoed) = confirm_first_keystroke();
-        e.set_local_frame_sent(1);
-        e.type_bytes(b"\x1bOD", &echoed);
-        assert_eq!(e.overlay().cursor(), Some((0, 0)));
+        // After confirming a keystroke (cursor at (0,1)), a left arrow, in either cursor mode,
+        // predicts the cursor one column left and leaves no glyph from its escape bytes.
+        for arrow in [&b"\x1b[D"[..], b"\x1bOD"] {
+            let (mut e, echoed) = confirm_first_keystroke();
+            e.set_local_frame_sent(1);
+            e.type_bytes(arrow, &echoed);
+            let ov = e.overlay();
+            assert_eq!(ov.cursor(), Some((0, 0)), "{arrow:?}");
+            assert!(ov.cell(0, 0).is_none() && ov.cell(0, 1).is_none());
+        }
     }
 
     #[test]
@@ -1558,9 +1509,7 @@ mod tests {
         let mut e = engine();
         e.set_local_frame_sent(0);
         e.type_bytes(b"X", &screen_of("a本b\x1b[1;1H".as_bytes()));
-        let row: Vec<_> = (0..5).map(|col| predicted_at(&e, col)).collect();
-        let expected = ["X", "a", "本", ">", "b"].map(|g| Some(g.to_owned()));
-        assert_eq!(row, expected);
+        predicted_row(&e, 0, &["X", "a", "本", ">", "b"]);
     }
 
     #[test]
@@ -1569,24 +1518,17 @@ mod tests {
         let mut e = engine();
         e.set_local_frame_sent(0);
         e.type_bytes(b"X", &sized_screen_of(2, 6, "abc本\x1b[1;1H".as_bytes()));
-        assert_eq!(predicted_at(&e, 4).as_deref(), Some("U"), "its glyph");
-        assert_eq!(predicted_at(&e, 5).as_deref(), Some("U"), "its right half");
-        // Typed inside one, its halves part.
+        predicted_row(&e, 4, &["U", "U"]);
+        // Typed inside one, its halves part: the moved right half is unknown.
         let mut e = engine();
         e.set_local_frame_sent(0);
         e.type_bytes(b"a", &screen_of("本x\x1b[1;2H".as_bytes()));
-        assert_eq!(predicted_at(&e, 1).as_deref(), Some("a"));
-        assert_eq!(
-            predicted_at(&e, 2).as_deref(),
-            Some("U"),
-            "the moved right half"
-        );
+        predicted_row(&e, 1, &["a", "U"]);
         // Deleting before one moves it left, whole.
         let mut e = engine();
         e.set_local_frame_sent(0);
         e.type_bytes(&[0x7f], &screen_of("ab本c\x1b[1;3H".as_bytes()));
-        let row: Vec<_> = (1..4).map(|col| predicted_at(&e, col)).collect();
-        assert_eq!(row, ["本", ">", "c"].map(|g| Some(g.to_owned())));
+        predicted_row(&e, 1, &["本", ">", "c"]);
     }
 
     #[test]
@@ -1596,8 +1538,7 @@ mod tests {
         e.type_bytes("日".as_bytes(), &echoed);
         e.move_cursor((0, 2));
         e.type_bytes("本".as_bytes(), &echoed);
-        let row: Vec<_> = (1..5).map(|col| predicted_at(&e, col)).collect();
-        assert_eq!(row, ["U", "本", ">", "U"].map(|g| Some(g.to_owned())));
+        predicted_row(&e, 1, &["U", "本", ">", "U"]);
     }
 
     #[test]
@@ -1682,27 +1623,35 @@ mod tests {
         (text.trim_end().to_owned(), ov.cursor().map(|(_, c)| c))
     }
 
+    /// Ctrl-W deletes the word before the cursor, and never the prompt's; Alt-Backspace deletes
+    /// back to punctuation; a CSI with parameters (Delete, Ctrl-Right) is read whole and draws
+    /// no '~' or 'C'.
     #[test]
-    fn ctrl_w_deletes_the_word_before_the_cursor_and_never_the_prompt() {
-        let (mut e, screen) = editor_on(b"$ git commit -m msg");
-        type_keys(&mut e, &screen, &[0x17]);
-        assert_eq!(
-            shown_row(&e, &screen),
-            ("$ git commit -m".to_owned(), Some(16))
-        );
-        type_keys(&mut e, &screen, &[0x17]);
-        assert_eq!(shown_row(&e, &screen).0, "$ git commit");
+    fn line_edits_delete_as_the_line_editor_does() {
+        for (line, keys, text, col) in [
+            (
+                &b"$ git commit -m msg"[..],
+                &b"\x17"[..],
+                "$ git commit -m",
+                Some(16),
+            ),
+            (
+                b"$ git commit -m msg",
+                b"\x17\x17",
+                "$ git commit",
+                Some(13),
+            ),
+            (b"$ cd /usr/lib", b"\x1b\x7f", "$ cd /usr/", Some(10)),
+            (b"$ ab", b"\x1b[3~\x1b[1;5C", "$ ab", None),
+        ] {
+            let (mut e, screen) = editor_on(line);
+            type_keys(&mut e, &screen, keys);
+            assert_eq!(shown_row(&e, &screen), (text.to_owned(), col), "{keys:?}");
+        }
         // An empty line: the word left of the cursor is the prompt's, which is not the line's.
         let (mut e, screen) = editor_on(b"$ ");
         type_keys(&mut e, &screen, &[0x17]);
         assert!(e.overlay().is_empty(), "nothing predicted");
-    }
-
-    #[test]
-    fn alt_backspace_deletes_back_to_punctuation() {
-        let (mut e, screen) = editor_on(b"$ cd /usr/lib");
-        type_keys(&mut e, &screen, b"\x1b\x7f");
-        assert_eq!(shown_row(&e, &screen), ("$ cd /usr/".to_owned(), Some(10)));
     }
 
     #[test]
@@ -1767,36 +1716,18 @@ mod tests {
     #[test]
     fn home_end_and_word_motion_move_the_cursor_only() {
         let (mut e, screen) = editor_on(b"$ make test\x1b[2D");
-        type_keys(&mut e, &screen, b"\x1b[F");
-        assert_eq!(
-            shown_row(&e, &screen),
-            ("$ make test".to_owned(), Some(11)),
-            "End"
-        );
-        type_keys(&mut e, &screen, b"\x1bb");
-        assert_eq!(
-            shown_row(&e, &screen).1,
-            Some(7),
-            "Alt-B: the start of test"
-        );
-        type_keys(&mut e, &screen, b"\x1bb");
-        assert_eq!(
-            shown_row(&e, &screen).1,
-            Some(2),
-            "Alt-B: the start of make"
-        );
-        type_keys(&mut e, &screen, b"\x1bf");
-        assert_eq!(shown_row(&e, &screen).1, Some(6), "Alt-F: the end of make");
-        // Home with the line's start unknown: not predicted; the cursor stays where it was.
-        type_keys(&mut e, &screen, b"\x1b[1~");
-        assert_eq!(shown_row(&e, &screen).1, Some(6));
-    }
-
-    #[test]
-    fn a_csi_with_parameters_is_read_whole_and_draws_nothing() {
-        let (mut e, screen) = editor_on(b"$ ab");
-        type_keys(&mut e, &screen, b"\x1b[3~\x1b[1;5C");
-        assert_eq!(shown_row(&e, &screen).0, "$ ab", "no '~' or 'C' drawn");
+        for (keys, col, what) in [
+            (&b"\x1b[F"[..], 11, "End"),
+            (b"\x1bb", 7, "Alt-B: the start of test"),
+            (b"\x1bb", 2, "Alt-B: the start of make"),
+            (b"\x1bf", 6, "Alt-F: the end of make"),
+            // The line's start unknown: not predicted; the cursor stays where it was.
+            (b"\x1b[1~", 6, "Home"),
+        ] {
+            type_keys(&mut e, &screen, keys);
+            let shown = shown_row(&e, &screen);
+            assert_eq!(shown, ("$ make test".to_owned(), Some(col)), "{what}");
+        }
     }
 
     #[test]
@@ -1864,12 +1795,5 @@ mod tests {
         let tmux = screen_of(b"\x1b[?1049h$ ls");
         type_keys(&mut e, &tmux, b"\x01c");
         assert!(e.overlay().is_empty() && e.cells.is_empty());
-    }
-
-    #[test]
-    fn trust_carried_from_a_reconnect_shows_the_first_key() {
-        let (mut e, screen) = editor_on(b"$ ");
-        type_keys(&mut e, &screen, b"l");
-        assert_eq!(shown_row(&e, &screen).0, "$ l");
     }
 }

@@ -619,20 +619,24 @@ mod tests {
     }
 
     #[test]
-    fn answers_cursor_position_report() {
+    fn answers_reports_and_queries() {
         let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.process(b"\x1b[5;3H"); // move cursor to row 5, col 3 (1-indexed input)
-        t.process(b"\x1b[6n"); // DSR: report cursor position
-        assert_eq!(t.take_host_replies(), b"\x1b[5;3R"); // 1-indexed report
-                                                         // Drained: a second take is empty.
-        assert_eq!(t.take_host_replies(), b"");
-    }
-
-    #[test]
-    fn answers_device_attributes_and_xtversion_as_koh() {
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.process(b"\x1b[c"); // primary DA: a VT220-class terminal with ANSI colour
-        assert_eq!(t.take_host_replies(), b"\x1b[?62;22c");
+        for (asked, answer) in [
+            // DSR and DECXCPR at row 5, column 3, 1-indexed.
+            (&b"\x1b[5;3H\x1b[6n"[..], &b"\x1b[5;3R"[..]),
+            (b"\x1b[?6n", b"\x1b[?5;3R"),
+            // DECRQM: reset, set, unknown.
+            (
+                b"\x1b[?2004$p\x1b[?2004h\x1b[?2004$p\x1b[?4242$p",
+                b"\x1b[?2004;2$y\x1b[?2004;1$y\x1b[?4242;0$y",
+            ),
+            // Primary DA: a VT220-class terminal with ANSI colour.
+            (b"\x1b[c", b"\x1b[?62;22c"),
+        ] {
+            t.process(asked);
+            assert_eq!(t.take_host_replies(), answer, "{asked:?}");
+        }
+        assert_eq!(t.take_host_replies(), b"", "drained");
         // Secondary DA: koh's version as major * 10000 + minor * 100 + patch.
         let mut parts = env!("CARGO_PKG_VERSION")
             .split('.')
@@ -685,33 +689,10 @@ mod tests {
         assert_eq!(colours(&mut t, 0), (Color::Idx(1), Color::Default));
         // The row's cells do not change, only how they are drawn: the snapshot draws them anew.
         t.process(b"\x1b]4;1;#ff0000\x1b\\\x1b]10;rgb:11/22/33\x07\x1b]11;#000080\x07");
-        let navy = Color::Rgb(fux_vt::Rgb {
-            r: 0,
-            g: 0,
-            b: 0x80,
-        });
-        assert_eq!(
-            colours(&mut t, 0),
-            (
-                Color::Rgb(fux_vt::Rgb {
-                    r: 0xff,
-                    g: 0,
-                    b: 0
-                }),
-                navy
-            )
-        );
-        assert_eq!(
-            colours(&mut t, 1),
-            (
-                Color::Rgb(fux_vt::Rgb {
-                    r: 0x11,
-                    g: 0x22,
-                    b: 0x33
-                }),
-                navy
-            )
-        );
+        let rgb = |r, g, b| Color::Rgb(fux_vt::Rgb { r, g, b });
+        let navy = rgb(0, 0, 0x80);
+        assert_eq!(colours(&mut t, 0), (rgb(0xff, 0, 0), navy));
+        assert_eq!(colours(&mut t, 1), (rgb(0x11, 0x22, 0x33), navy));
         assert_eq!(
             colours(&mut t, 7).1,
             navy,
@@ -829,6 +810,14 @@ mod tests {
         t.process(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07\x1b]52;c;\xff\xfe=x\x07");
         assert_eq!(t.snapshot().clipboard(), "aGVsbG8=");
         assert_eq!(t.take_host_replies(), b"", "nor is it answered");
+        // Nor does one over the cap (anti-amplification).
+        let big = "A".repeat(MAXIMUM_CLIPBOARD_SIZE + 1);
+        t.process(format!("\x1b]52;c;{big}\x07").as_bytes());
+        assert_eq!(
+            t.snapshot().clipboard(),
+            "aGVsbG8=",
+            "oversized one dropped"
+        );
     }
 
     #[test]
@@ -867,18 +856,6 @@ mod tests {
     }
 
     #[test]
-    fn answers_decxcpr_and_decrqm() {
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.process(b"\x1b[5;3H\x1b[?6n");
-        assert_eq!(t.take_host_replies(), b"\x1b[?5;3R");
-        t.process(b"\x1b[?2004$p\x1b[?2004h\x1b[?2004$p\x1b[?4242$p");
-        assert_eq!(
-            t.take_host_replies(),
-            b"\x1b[?2004;2$y\x1b[?2004;1$y\x1b[?4242;0$y"
-        );
-    }
-
-    #[test]
     fn title_icon_bell_clipboard_captured() {
         let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
         t.process(b"\x1b]2;my-title\x07\x07\x1b]1;my-icon\x07\x1b]52;c;aGVsbG8=\x07");
@@ -893,6 +870,10 @@ mod tests {
             "snapshot carries the OSC-52 clipboard"
         );
         assert_eq!(snap.bell_count(), 1, "snapshot carries the bell count");
+        // A runaway title is clamped to MAX_TITLE_LEN chars (mosh's parse-time cap).
+        let huge = "x".repeat(MAX_TITLE_LEN + 500);
+        t.process(format!("\x1b]2;{huge}\x07").as_bytes());
+        assert_eq!(t.title().chars().count(), MAX_TITLE_LEN);
     }
 
     #[test]
@@ -909,32 +890,6 @@ mod tests {
             "largest resize accepted"
         );
         assert!(ServerTerminal::new(MAX_DIM, MAX_DIM, history).is_ok());
-    }
-
-    #[test]
-    fn oversized_clipboard_is_dropped() {
-        // A clipboard set above the cap must not be synced (anti-amplification).
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        let big = "A".repeat(MAXIMUM_CLIPBOARD_SIZE + 1);
-        t.process(format!("\x1b]52;c;{big}\x07").as_bytes());
-        assert_eq!(t.snapshot().clipboard(), "", "oversized clipboard dropped");
-    }
-
-    #[test]
-    fn oversized_title_is_clamped() {
-        // A runaway/hostile OSC title is clamped to MAX_TITLE_LEN chars (mosh's parse-time cap),
-        // not stored unbounded.
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        let huge = "x".repeat(MAX_TITLE_LEN + 500);
-        t.process(format!("\x1b]2;{huge}\x07").as_bytes());
-        assert_eq!(
-            t.title().chars().count(),
-            MAX_TITLE_LEN,
-            "title clamped to the cap"
-        );
-        // A title within the cap is untouched.
-        t.process(b"\x1b]2;short\x07");
-        assert_eq!(t.title(), "short");
     }
 
     #[test]
@@ -1026,52 +981,36 @@ mod tests {
     #[test]
     fn mouse_events_reach_a_program_in_its_mode_and_encoding() {
         // The user's terminal reports in SGR: a press at row 5, column 10, and its release.
-        let click = b"\x1b[<0;10;5M\x1b[<0;10;5m";
-        assert_eq!(program_gets(b"", click), b"", "no mode: nothing");
-        assert_eq!(
-            program_gets(b"\x1b[?9h", click),
-            b"\x1b[M *%",
-            "X10: the press"
+        let click = &b"\x1b[<0;10;5M\x1b[<0;10;5m"[..];
+        // A drag: motion with a button held, in 1002 and 1003 but not 1000; a hover, motion with
+        // none, in 1003 alone.
+        let (drag, hover) = (&b"\x1b[<32;11;5M"[..], &b"\x1b[<35;11;5M"[..]);
+        let (sgr_1000, sgr_1002) = (
+            &b"\x1b[?1000h\x1b[?1006h"[..],
+            &b"\x1b[?1002h\x1b[?1006h"[..],
         );
-        assert_eq!(
-            program_gets(b"\x1b[?1000h", click),
-            b"\x1b[M *%\x1b[M#*%",
-            "normal: press and release"
-        );
-        assert_eq!(
-            program_gets(b"\x1b[?1000h\x1b[?1006h", click),
-            b"\x1b[<0;10;5M\x1b[<0;10;5m"
-        );
-        assert_eq!(
-            program_gets(b"\x1b[?1000h\x1b[?1005h", b"\x1b[<0;100;5M"),
-            "\x1b[M \u{84}%".as_bytes(),
-            "UTF-8"
-        );
-        // A drag: motion with a button held, in 1002 and 1003 but not 1000; motion with none, in
-        // 1003 alone.
-        let drag = b"\x1b[<32;11;5M";
-        let hover = b"\x1b[<35;11;5M";
-        assert_eq!(program_gets(b"\x1b[?1000h\x1b[?1006h", drag), b"");
-        assert_eq!(
-            program_gets(b"\x1b[?1002h\x1b[?1006h", drag),
-            b"\x1b[<32;11;5M"
-        );
-        assert_eq!(program_gets(b"\x1b[?1002h\x1b[?1006h", hover), b"");
-        assert_eq!(
-            program_gets(b"\x1b[?1003h\x1b[?1006h", hover),
-            b"\x1b[<35;11;5M"
-        );
-        // The wheel.
-        assert_eq!(
-            program_gets(b"\x1b[?1000h\x1b[?1006h", b"\x1b[<65;3;4M"),
-            b"\x1b[<65;3;4M"
-        );
-        // Past 223 the default encoding carries nothing, so nothing is sent.
-        assert_eq!(program_gets(b"\x1b[?1000h", b"\x1b[<0;224;1M"), b"");
-        assert_eq!(
-            program_gets(b"\x1b[?1000h", b"\x1b[<0;223;1M"),
-            [&b"\x1b[M "[..], &[255, 33]].concat()
-        );
+        for (mode, sent, gets) in [
+            (&b""[..], click, &b""[..]),
+            (b"\x1b[?9h", click, b"\x1b[M *%"),
+            (b"\x1b[?1000h", click, b"\x1b[M *%\x1b[M#*%"),
+            (sgr_1000, click, click),
+            (
+                b"\x1b[?1000h\x1b[?1005h",
+                b"\x1b[<0;100;5M",
+                "\x1b[M \u{84}%".as_bytes(),
+            ),
+            (sgr_1000, drag, b""),
+            (sgr_1002, drag, drag),
+            (sgr_1002, hover, b""),
+            (b"\x1b[?1003h\x1b[?1006h", hover, hover),
+            // The wheel.
+            (sgr_1000, b"\x1b[<65;3;4M", b"\x1b[<65;3;4M"),
+            // Past 223 the default encoding carries nothing, so nothing is sent.
+            (b"\x1b[?1000h", b"\x1b[<0;224;1M", b""),
+            (b"\x1b[?1000h", b"\x1b[<0;223;1M", b"\x1b[M \xff!"),
+        ] {
+            assert_eq!(program_gets(mode, sent), gets, "{mode:?} {sent:?}");
+        }
     }
 
     #[test]

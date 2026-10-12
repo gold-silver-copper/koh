@@ -57,9 +57,9 @@ Useful flags:
 --max-sessions <n>        # limit sessions
 ```
 
-Keys live under `~/.config/koh/` by default (`client.key`, `server.key`), and the names beside
-them: `servers` beside the client key and `clients` beside the server key, one `name id` a line
-(`#` comments allowed). They are checked as the keys are, since `clients` decides who may open a
+Keys live under `$XDG_CONFIG_HOME/koh/` (else `~/.config/koh/`) by default (`client.key`,
+`server.key`), and the names beside them: `servers` beside the client key and `clients` beside the
+server key, one `name id` a line (`#` comments allowed). They are checked as the keys are, since `clients` decides who may open a
 shell: a file that is a symlink or someone else's is refused, and a loose mode is tightened.
 
 **Keys, mouse and pastes** reach the remote program as it asked, whatever terminal you type on: the

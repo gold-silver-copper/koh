@@ -17,7 +17,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ### Changed
 - **The wire protocol is now `koh/4`**: a paste goes whole in one message (up to 1 MiB), and the
-  raw-bytes `Input` message is gone. Update client and server together.
+  raw-bytes `Input` message is gone.
 - Every queue in koh has a bound, and `clippy.toml` bans unbounded ones; the wire's sequences are
   refused as they are decoded once past their bound.
 - `koh serve` reads the saved clients at every connection: `koh clients rm` takes effect at once.
@@ -27,8 +27,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
   program writing to the client's terminal) are sent but not predicted one by one, which cost a
   screenful of work each.
 - Updated `fux-vt` 0.3.4 → 0.4.1 and `fuxix` 0.1.7 → 0.2.0, including the test harnesses.
-  Migrated to their typed terminal APIs and fuxix's PTY launcher. The wire protocol and minimum
-  Rust version are unchanged.
+  Migrated to their typed terminal APIs and fuxix's PTY launcher. The minimum Rust version is
+  unchanged.
 - PTY input is bounded by bytes, including in-flight writes; backpressure retains pending
   buffers and terminal replies stay behind earlier input. Reply overflow is bounded and logged.
 - Hyperlink snapshots allocate strings only for distinct links in a row. Terminal dimensions
@@ -70,7 +70,7 @@ koh is a remote shell again, not a transport for other programs: everything that
 for embedders or for fux is gone. **The wire protocol is new**: koh no longer runs mosh's State
 Synchronization Protocol over QUIC datagrams, but its own stream protocol, ALPN `koh/3`. A 0.12
 client and a 0.13 server (or the reverse) refuse each other at the TLS handshake with a clear
-error; upgrade both ends.
+error.
 
 ### Added
 - **Hyperlinks.** A program's OSC 8 links (`ls --hyperlink`, delta, compilers, claude) now reach
@@ -119,10 +119,7 @@ error; upgrade both ends.
 - **Breaking: identity keys are no longer encrypted at rest.** A key file is the key's 32 raw
   bytes, protected by its permissions (0600) like an SSH host key: anyone who can read it is that
   identity. koh never prompts for a passphrase; `koh key passwd`, `$KOH_KEY_PASSPHRASE` and
-  `$KOH_KEY_NEW_PASSPHRASE` are gone. **Existing key files are rejected**: run
-  `koh key reset --yes` (with `--key-file` for a non-default path) on each machine. A new client
-  key must then be added to the servers' `--allow` lists, and a new server key changes the id
-  clients dial. `argon2`, `aes-gcm` (as a direct dependency), `rpassword`, `secrecy`, `signal-hook`
+  `$KOH_KEY_NEW_PASSPHRASE` are gone. Existing key files are rejected. `argon2`, `aes-gcm` (as a direct dependency), `rpassword`, `secrecy`, `signal-hook`
   and `zeroize` are no longer dependencies.
 - **Terminal emulation is `fux-vt`, and the client runs no parser.** The server's emulator is
   `fux_vt::Parser`, a bounded, panic-free emulator; `vt100` is no longer a dependency. The screen

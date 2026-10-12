@@ -2,7 +2,7 @@
 
 koh is a young, largely single-maintainer project. It has had several internal security, quality, and
 architecture reviews, but **no external/professional audit** — please calibrate trust accordingly (see
-the [`THREAT_MODEL.md`](docs/THREAT_MODEL.md)). `forbid(unsafe)` and a denied-panic lint family shrink
+the [`THREAT_MODEL.md`](docs/THREAT_MODEL.md)). `forbid(unsafe)` and the forbidden panic lints shrink
 the surface that needs auditing, but they do not replace independent eyes.
 
 ## Reporting a vulnerability
@@ -109,7 +109,7 @@ and the git log.
 | K-16 | A panicking connection leaks its session | Detach on drop of `SessionClient`: `tests/sessions.rs::the_last_detach_starts_the_ttl_a_concurrent_one_does_not`, `tests/net/session.rs::connections_dropped_with_input_in_flight_do_not_hurt_the_session` |
 | KB-01 | The bell hook | `src/client/cli.rs::bell_hook_fires_on_a_rise_and_rate_limits_a_burst`, `tests/net/bell.rs::a_remote_bell_runs_the_hook_at_most_once_a_second` |
 | KB-02 | The bell hook's environment and first frame | `src/client/cli.rs::bell_hook_command_scrubs_parent_koh_vars_and_exports_its_own`, `bell_hook_prime_swallows_the_count_it_is_seeded_with_but_not_later_rises`, `tests/net/bell.rs::stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do` |
-| KC-01 | Predictor over a `ScreenView`; input modes byte-identical | `src/predict.rs::predictor_runs_over_a_plain_screen_view`, `src/client/render.rs::input_modes_formatted_and_diff_match_the_vt100_oracle` |
+| KC-01 | Predictor over a `ScreenView`; input modes byte-identical | `src/predict.rs::predictor_runs_over_a_plain_screen_view`, `src/client/render.rs::the_real_terminal_reports_input_whatever_the_program_set`, `out_of_band_reasserts_input_modes_on_change` |
 | KC-IO-01 | Client teardown owns and joins every producer | `src/client/io.rs::idle_input_poll_cancels_and_joins_without_waiting_for_a_byte`, `dropping_public_tasks_cancels_both_producers` |
 | KC-IO-02 | The input producer does not transform bytes | `src/client/io.rs::input_producer_forwards_bytes_exactly` |
 | KS-01, KS-04 | Shared sessions across peers; their unwind guard | Removed with the generic session host: one PTY per peer, and K-16's detach on drop |
@@ -118,7 +118,7 @@ and the git log.
 | S-04 | Per-cell `String` allocation on repaint | Performance only; nothing to guard |
 | S-07 | One place states the prediction-cell invariants | `PredictionEngine::place_cell`; the prediction tests in `src/predict.rs` |
 | AR-02 | `predict` and `proto` import direction | CI's layering-guard step (`.github/workflows/ci.yml`) |
-| AR-06 | The admission pipeline's order | `src/server/cli.rs::serve_endpoint`; `tests/admission.rs`, `tests/net/hostile_peer.rs::a_bad_admission_byte_is_rejected_not_treated_as_admitted` |
+| AR-06 | The admission pipeline's order | `src/server/cli.rs::serve_endpoint`; `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server`, `tests/net/hostile_peer.rs::a_bad_admission_byte_is_rejected_not_treated_as_admitted` |
 
 ## Please do not
 

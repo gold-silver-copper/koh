@@ -16,9 +16,8 @@ description = "koh — a resilient peer-to-peer remote shell over iroh, with pre
 readme = "README.md"
 keywords = ["mosh", "shell", "terminal", "iroh", "p2p"]
 categories = ["command-line-utilities", "network-programming"]
-# Keep the published .crate lean: the porting-research notes, the test infra, the integration tests,
-# and the dev/CI tooling aren't needed to build or use koh. COPYING (the license) and CHANGELOG.md
-# DO ship.
+# Keep the published .crate lean: the docs, the test infra, the integration tests, and the dev/CI
+# tooling aren't needed to build or use koh. COPYING (the license) and CHANGELOG.md DO ship.
 exclude = [
     "docs/",
     "testing/",
@@ -27,8 +26,6 @@ exclude = [
     ".github/",
     "clippy.toml",
     "deny.toml",
-    # the self-contained HTML slide deck (docs only, ~1.6 MB) — not needed to build or use koh.
-    "koh-presentation.html",
 ]
 
 [dependencies]

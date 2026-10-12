@@ -20,7 +20,13 @@ mod history;
 mod server;
 
 pub use crate::predict::{Size, TtyModes};
-pub use grid::{drawn, Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
+pub use grid::{Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
+
+/// What the integration tests check the client's screen against: not koh's API.
+#[doc(hidden)]
+pub mod test_support {
+    pub use super::grid::drawn;
+}
 pub use history::{
     HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, KeptRow,
     HISTORY_CACHE_BYTES, MAX_HISTORY_CELLS, MAX_HISTORY_ROWS,

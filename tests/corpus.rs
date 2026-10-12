@@ -97,7 +97,7 @@ impl View {
                     };
                     let mut attributes = cell.attributes();
                     if drawn {
-                        attributes = koh::terminal::drawn(attributes, screen);
+                        attributes = koh::terminal::test_support::drawn(attributes, screen);
                     }
                     let link = screen
                         .link(row, col)

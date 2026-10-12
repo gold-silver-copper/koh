@@ -27,7 +27,7 @@ src/
 ├── main.rs          the binary: serve / connect / id / key dispatch, and the hidden `__launch`
 ├── args.rs          the command line (clap's builder API) and the config structs it produces
 ├── lib.rs           crate root: module declarations + the architecture overview
-├── proto.rs         the koh/3 wire protocol: client messages, screen frames, caps, pacing
+├── proto.rs         the koh/4 wire protocol: client messages, screen frames, caps, pacing
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
 ├── predict.rs       local-echo prediction engine (overlays, epochs)
 ├── transport_iroh/  iroh endpoint setup, the default key path, path RTT, admission
@@ -54,18 +54,17 @@ binary) build on both. The protocol cores (`proto`, `terminal`, `predict`, `serv
 `client::ClientSession`) do no I/O and are tested with no network at all. `predict` imports nothing
 from `crate::` (CI checks it), so it is a standalone terminal-prediction library.
 
-## The protocol (koh/3)
+## The protocol (koh/4)
 
-The ALPN `koh/3` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/4` is the version check: a peer on another version fails the TLS handshake with a
 clear error. After the handshake the server checks the allowlist and opens a bi-stream carrying one
 ADMIT byte, so a rejected client can tell "not authorized" from a network error. Then
 (`src/proto.rs`):
 
 - **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Keys { seq,
   events }`, the input the client decoded (`src/events.rs`: keys, mouse events, focus changes and
-  paste pieces, at most 512 a message), `Input { seq, bytes }`, raw bytes the server forwards as they
-  are (at most 64 KiB; the client sends none now), `Resize`, `Resync` when a frame's base is
-  unknown, `History { newest, count }` for scrollback rows, `Ack { frame }`, now only a nudge
+  whole pastes of at most 1 MiB, at most 512 events a message), `Resize`, `Resync` when a frame's
+  base is unknown, `History { newest, count }` for scrollback rows, `Ack { frame }`, now only a nudge
   (below), and `Colours`, the user's terminal's colours, on each connection unless `--no-colours`.
   `seq` numbers each input on the connection.
 - **Input is decoded on the client and encoded on the server.** The client reads what the user's
@@ -73,8 +72,8 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   protocol, which it pushes in a terminal that speaks it, SGR mouse reports, focus changes,
   bracketed pastes) and sends events; the session encodes each with fux-vt for the program's modes
   at that moment (`ServerTerminal::encode_input`: the kitty flags, modifyOtherKeys and cursor keys;
-  the mouse tracking mode and encoding; mode 1004; bracketed paste, framed once over a paste's
-  pieces with every end marker removed). A program gets what it asked for from any terminal, and a
+  the mouse tracking mode and encoding; mode 1004; bracketed paste, a whole paste framed in one go
+  with every end marker removed, so no paste is ever left open). A program gets what it asked for from any terminal, and a
   reattach from another terminal changes nothing for it. The client keeps the user's terminal in
   the modes it decodes in rather than mirroring the program's: bracketed paste and focus reporting
   on, normal cursor keys and keypad, SGR mouse reports while the program wants the mouse.
@@ -148,10 +147,16 @@ ADMIT byte, so a rejected client can tell "not authorized" from a network error.
   session takes one snapshot per burst of program output rather than per read. That, plus QUIC flow
   control and the stream limits (the server accepts one client stream; the client a handful of
   frame streams), bounds memory; a peer cannot make either end accumulate.
-- **Backpressure:** PTY input goes through a bounded writer queue. While it is full the server
-  stops reading the client's stream, QUIC flow control stops the client's writes, and the client
-  keeps at most 1 MiB of typing before dropping it with an "input paused" status line. The keyboard
-  loop never waits on the network, so `Ctrl-^ .` always works.
+- **Backpressure:** PTY input goes through a writer queue of at most 1 MiB, and the session's
+  input queue holds a bounded number of messages. While they are full the connection stops reading
+  the client's stream, and only that: it goes on sending frames and heartbeats and seeing the
+  connection close. QUIC flow control stops the client's writes, and the client keeps at most
+  1 MiB of typing before dropping it with an "input paused" status line. The keyboard loop never
+  waits on the network, so `Ctrl-^ .` always works.
+- **Every queue is bounded** (`src/bounded.rs`): `clippy.toml` bans `VecDeque` and unbounded
+  channels outside it, and every task spawned says, in an `#[expect]`, what bounds how many run.
+  The wire's sequences (rows, runs, links, history rows, events, palette entries) are refused as
+  they are decoded once past their bound, before anything is allocated for them.
 - **The scrollback view** (`Ctrl-^ [`, `client::scrollback`): the server's history above the live
   screen, fetched as the user scrolls with the arrows, Page Up/Down, `k`/`j`, `b`/`f`, `u`/`d`,
   `g`/`G` or the mouse wheel (the view turns mouse reporting on), and `q` or Escape to leave. `/`
@@ -225,7 +230,9 @@ it paints a plain underline, as a terminal that does not know `4:n` would draw n
 A row also carries its hyperlinks (OSC 8): its distinct links once (at most 64, each URI and id
 within fux-vt's limits), and each cell the index of its link, so a row moved or shared keeps its
 links with it and needs no screen-wide table. A diff carries at most 1 MiB of links; the server
-leaves off a row's links past that, and the client drops a frame over it. The client paints a
+leaves off a row's links past that and holds the screen as the client will have it, so the frames
+after carry them and both ends' compression dictionaries stay the same; the client drops a frame
+over it, and refuses one malformed for its base as it refuses one on a base it lacks. The client paints a
 link with OSC 8 (with the program's id, if it gave one) unless `--no-hyperlinks`, after checking
 it again, and closes it before any cell without it and at the frame's end.
 
@@ -243,13 +250,21 @@ both are deterministically unit-testable. The shells own the `tokio::select!` (t
 the rendering.
 
 On the server side, **PTY writes are non-blocking**: a dedicated `koh-pty-writer` thread drains a
-bounded channel, so forwarding a keystroke (or a synthesized DSR/DA reply) only enqueues and never
-blocks a tokio worker on a slow child. The PTY master itself is non-blocking and both pump threads
-wait in `poll`: on Linux and Android a write blocked on a program's full input queue is never woken,
-not even once the program dies, so the writer gives up unread input as soon as the session is torn
-down instead of wedging the teardown. Both producers share
-one sender and enqueue under the session lock, so byte order is preserved (a query reply can't
-overtake the keystroke that triggered it).
+queue of at most 1 MiB, so forwarding a keystroke (or a synthesized DSR/DA reply) only enqueues and
+never blocks a tokio worker on a slow child; a write that does not fit keeps its buffer for a retry.
+The PTY master itself is non-blocking and both pump threads wait in `poll`: on Linux and Android a
+write blocked on a program's full input queue is never woken, not even once the program dies, so
+the writer gives up unread input as soon as the session is torn down instead of wedging the
+teardown. The session task owns the PTY, and keystrokes and query replies go through it in order,
+so a query reply can't overtake the keystroke that triggered it.
+
+**A session's lifecycle.** The registry never waits on a session: a new one forks and execs its
+program on a blocking worker and answers the attach itself, so one slow start holds up no other
+peer, and a program that cannot start is refused as such, not as a full server. A session ends
+when its program has exited and its PTY's output has ended, or one of them a second after the
+other: a background job left holding the terminal cannot keep a dead shell's session open. The
+program (`pty::Running`) is the only holder of its pid; teardown hangs it up and hands it to a
+reaper thread, which kills it only if it outlives a second's grace, so a shell saves its history.
 
 ## Rendering
 
@@ -309,9 +324,10 @@ password prompt. Prediction is **always on** in koh (`DisplayPreference::
 Always`), so keystrokes engage on every link. Predictions are drawn plain, not underlined,
 and a cell it knows changed but not to what is not drawn at all, so the real cell shows.
 
-The port faithfully implements epoch-gated confirmation, glitch escalation,
-and no-echo suppression. It predicts ASCII printables (with insert-mode row shift),
-backspace, CR/LF, the left/right arrow keys (CSI **and** SS3/application-cursor form), the line
+The port faithfully implements epoch-gated confirmation and no-echo suppression. It predicts
+decoded keys, whatever bytes the user's terminal sent for them: ASCII printables (with insert-mode
+row shift), backspace, Enter, the left/right arrow keys (not under kernel echo, which echoes them
+as `^[[D`), the line
 editor's keys where the guess is sure (`Ctrl-W` and `Alt-Backspace` back to a word's boundary,
 never into what is left of the line's start; `Ctrl-U`, `Ctrl-A` and Home only when where the line
 began is known, from the first key typed after Enter; `Ctrl-E` and End to the end of an unwrapped
@@ -426,6 +442,9 @@ The full picture is in the [threat model](THREAT_MODEL.md). In brief, the releva
 - **Authorization** is a node-id allowlist, the *sole* gate; the peer's Ed25519 node-id is
   authenticated by iroh's QUIC + TLS 1.3 handshake *by construction* (no TOFU window — the client
   pins the id it dialed). There is no "accept any peer" mode and no passphrase/PAKE second factor.
+  The saved clients are read at every connection, so `koh clients rm` takes effect at once, and a
+  session is served only to an `Authorized` connection, which only the accept loop's allowlist
+  check makes.
 - **The data plane treats every authorized peer as untrusted**: a resize is clamped to `[2, 1000]`
   before any grid allocation; client messages and frames are size-capped and frames inflate under a
   limit; each end keeps a fixed window of screens; QUIC stream limits and flow control bound what is

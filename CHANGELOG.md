@@ -16,6 +16,13 @@ binary, its tests and the fuzz targets share code, and any release may change it
 ## [Unreleased]
 
 ### Changed
+- **The wire protocol is now `koh/4`**: a paste goes whole in one message (up to 1 MiB), and the
+  raw-bytes `Input` message is gone. Update client and server together.
+- Every queue in koh has a bound, and `clippy.toml` bans unbounded ones; the wire's sequences are
+  refused as they are decoded once past their bound.
+- `koh serve` reads the saved clients at every connection: `koh clients rm` takes effect at once.
+- A session's program is hung up and given a second to exit (a shell saves its history) before it
+  is killed.
 - Updated `fux-vt` 0.3.4 → 0.4.1 and `fuxix` 0.1.7 → 0.2.0, including the test harnesses.
   Migrated to their typed terminal APIs and fuxix's PTY launcher. The wire protocol and minimum
   Rust version are unchanged.
@@ -27,6 +34,25 @@ binary, its tests and the fuzz targets share code, and any release may change it
   comparison on each change and longer corpus/planted-bug checks weekly.
 
 ### Fixed
+- A program that stopped reading its input, under a large paste, froze its connection's frames,
+  and a client that left meanwhile kept its session attached and its connection slot held.
+- Frames a client never took made the server's list of frames in flight grow for good.
+- More than 1 MiB of hyperlinks on a screen left the client and server compressing frames against
+  different dictionaries, so frames failed to decode.
+- A program that exited with a background job still holding its terminal kept its session open
+  until the job ended.
+- Quitting a program on the alternate screen, or a reattach at the same window size, renamed every
+  history row, so the client fetched its history again.
+- A paste cut off by a reconnect left the program's bracketed paste open.
+- Resuming from `Ctrl-^ Ctrl-Z` replayed the server's last clipboard and bell, and kept the window
+  size from before the suspend; a client's first frame forwarded the session's old clipboard and
+  bells.
+- `Esc` and then a key was predicted as `Alt` and the key; arrows were predicted under kernel
+  echo, which echoes them as `^[[D`.
+- A session's program that could not start was reported as the server being at capacity, and
+  starting one held up every other peer's attach.
+- Keys typed in the same read after leaving the scrollback view, or after `Ctrl-^ Ctrl-Z`, were
+  lost; a resize could wait behind a stream of frames.
 - Forced PTY shutdown and ordinary drops reap children. Shutdown also stops pump threads when
   a program leaves input unread or the output receiver is full.
 - Unwritable CLI output returns an error instead of panicking; diagnostic output is best effort.

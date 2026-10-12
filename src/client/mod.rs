@@ -200,6 +200,10 @@ pub trait ClientTerminal {
     fn ask(&mut self, _questions: &[u8]) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// The run's first frame arrived, showing `win`: the clipboard and bells in it are from before
+    /// the client came. Default: a no-op, for a terminal that mirrors neither.
+    fn prime(&mut self, _win: WindowState<'_>) {}
 }
 
 /// This process's pid, as the signal calls take it.
@@ -339,8 +343,14 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
         Self::ask(self, questions)
     }
 
+    fn prime(&mut self, win: WindowState<'_>) {
+        self.oob.prime(win);
+    }
+
     fn suspend_resume(&mut self) -> std::io::Result<()> {
         self.turn_off()?;
+        // Off until turned on again, so a failure meanwhile does not turn them off twice.
+        let extras = std::mem::take(&mut self.extras);
         self.backend.leave_alt_screen()?;
         self.backend.leave_raw_mode()?;
         let _ = self
@@ -352,10 +362,7 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
         // The terminal was reset meanwhile: re-assert everything on the next frame.
         self.backend.enter_raw_mode()?;
         self.backend.enter_alt_screen()?;
-        let on = self.extras.on();
-        if !on.is_empty() {
-            self.ask(&on)?;
-        }
+        self.turn_on(extras.kitty, extras.scheme_reports)?;
         self.oob.invalidate();
         self.painter.invalidate();
         Ok(())
@@ -451,11 +458,12 @@ pub async fn run_client<T: ClientTerminal>(
             }
             session.status_was_shown = status_now;
             session.dirty = false;
-            // Only once synced: the first synced frame primes the hook, so bells from before this
-            // attach don't fire it.
-            if let Some(hook) = bell.as_mut() {
-                if session.synced() {
-                    let win = session.window_state();
+            // Only once synced: the first synced frame primes the hook and the mirroring, so bells
+            // and a clipboard from before this attach reach neither.
+            if session.synced() {
+                let win = session.window_state();
+                term.prime(win);
+                if let Some(hook) = bell.as_mut() {
                     hook.prime(win.bell_count);
                     hook.observe_and_fire(win.bell_count, win.title, now);
                 }
@@ -509,6 +517,16 @@ pub async fn run_client<T: ClientTerminal>(
                     None
                 }
             },
+            // Before frames, which may never run out.
+            maybe = resize_rx.recv() => {
+                if maybe.is_some() {
+                    term.window_resized();
+                    if let Ok(size) = term.size() {
+                        session.on_resize(size);
+                    }
+                }
+                None
+            }
             frame = when(frames.map(mpsc::Receiver::recv)) => match frame {
                 // The frame reader ended because the connection closed.
                 None => Some(Change::Closed { banner: true }),
@@ -522,15 +540,6 @@ pub async fn run_client<T: ClientTerminal>(
                 }
             },
             dialed = when(dialing) => Some(Change::Dialed(dialed)),
-            maybe = resize_rx.recv() => {
-                if maybe.is_some() {
-                    term.window_resized();
-                    if let Ok(size) = term.size() {
-                        session.on_resize(size);
-                    }
-                }
-                None
-            }
             () = tokio::time::sleep(tick.wait) => None,
         };
         match change {
@@ -616,9 +625,15 @@ impl Wire {
     async fn open(conn: Connection) -> Self {
         let send = conn.open_uni().await.ok();
         let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
-        let writer = AbortOnDrop(tokio::spawn(write_client_stream(send, writer_rx)));
         let (frame_tx, frame_rx) = mpsc::channel::<ServerMsg>(FRAME_QUEUE);
-        let reader = AbortOnDrop(tokio::spawn(read_frames(conn.clone(), frame_tx)));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a writer and a reader a connection"
+        )]
+        let (writer, reader) = (
+            AbortOnDrop(tokio::spawn(write_client_stream(send, writer_rx))),
+            AbortOnDrop(tokio::spawn(read_frames(conn.clone(), frame_tx))),
+        );
         Self {
             conn,
             writer_tx,
@@ -676,6 +691,11 @@ fn after_input<T: ClientTerminal>(
         InputOutcome::Quit => return Ok(Some(Change::Quit)),
         InputOutcome::Suspend => {
             term.suspend_resume()?;
+            // A window resized while the client was stopped sent it no SIGWINCH.
+            term.window_resized();
+            if let Ok(size) = term.size() {
+                session.on_resize(size);
+            }
             session.dirty = true;
             // A deliberate suspend is not a freeze to reconnect after.
             *last_wall = SystemTime::now();
@@ -723,10 +743,26 @@ async fn write_client_stream(send: Option<SendStream>, mut queue: mpsc::Receiver
 
 /// Accept the server's streams (frames, and history rows), each read on its own task so a stalled or
 /// reset stream never holds up a newer frame. Ends when the connection closes.
+///
+/// At most [`FRAME_QUEUE`] streams are read or wait to be applied at once: past them, no stream
+/// is accepted, so QUIC's stream limit stops the server opening more, and a server faster than the
+/// client cannot make it hold more frames than that.
 async fn read_frames(conn: Connection, frames: mpsc::Sender<ServerMsg>) {
-    while let Ok(mut recv) = conn.accept_uni().await {
+    let readers = std::sync::Arc::new(tokio::sync::Semaphore::new(FRAME_QUEUE));
+    loop {
+        let Ok(permit) = std::sync::Arc::clone(&readers).acquire_owned().await else {
+            return;
+        };
+        let Ok(mut recv) = conn.accept_uni().await else {
+            return;
+        };
         let frames = frames.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "each holds one of the readers' permits"
+        )]
         tokio::spawn(async move {
+            let _permit = permit;
             // A reset (superseded) or malformed frame is simply not delivered.
             let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
                 return;
@@ -770,6 +806,7 @@ async fn end_session<T: ClientTerminal>(
 }
 
 #[cfg(test)]
+#[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {
     use super::*;
 
@@ -800,7 +837,7 @@ mod tests {
                 Err(e) => format!("{e:#}"),
             };
             assert!(
-                error.contains("does not speak this koh protocol (koh/3)"),
+                error.contains("does not speak this koh protocol (koh/4)"),
                 "{error}"
             );
             assert!(!error.contains("allowlist"), "{error}");

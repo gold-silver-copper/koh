@@ -1,4 +1,4 @@
-//! The koh/3 encoding, pinned.
+//! The koh/4 encoding, pinned.
 //!
 //! Each value below is built the same way on every commit and encoded; the expected bytes were
 //! captured by running the encoder, not written by hand. A change to the wire must change these
@@ -123,14 +123,6 @@ fn modes() -> Vec<WireModes> {
 /// One message of each kind, with varints of one and several bytes.
 fn client_msgs() -> Vec<ClientMsg> {
     vec![
-        ClientMsg::Input {
-            seq: InputSeq(1),
-            bytes: b"ls -la\r".to_vec(),
-        },
-        ClientMsg::Input {
-            seq: InputSeq(300),
-            bytes: (0..200_u8).collect(),
-        },
         ClientMsg::Resize(Size::new(50, 132)),
         ClientMsg::Resize(Size::new(1000, 1000)),
         ClientMsg::Ack {
@@ -167,12 +159,12 @@ fn client_msgs() -> Vec<ClientMsg> {
                     col: 7,
                 }),
                 InputEvent::Focus(true),
-                InputEvent::Paste {
-                    text: "hi".to_owned(),
-                    first: true,
-                    last: false,
-                },
+                InputEvent::Paste("hi".to_owned()),
             ],
+        },
+        ClientMsg::Keys {
+            seq: InputSeq(300),
+            events: vec![InputEvent::Paste("x".repeat(200))],
         },
         ClientMsg::Colours(WireColours {
             foreground: Some([0xdd, 0xdd, 0xdd]),
@@ -253,20 +245,19 @@ const MODES: [&str; 8] = [
 ];
 
 /// Each of [`client_msgs`] as the client's stream carries it, length prefix included.
-const CLIENT_MSGS: [&str; 9] = [
-    "0000000a0001076c73202d6c610d",
-    "000000cd00ac02c801000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324\
-        25262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152\
-        535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80\
-        8182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadae\
-        afb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7",
-    "0000000401328401",
-    "0000000501e807e807",
-    "0000000402f0a204",
-    "0000000103",
-    "0000000604f0a2048002",
-    "00000027050205000002c3a90500000f0c000101b7c003014100840101010402ac02070201030268690100",
-    "0000000e0601dddddd00020001cd00000101",
+const CLIENT_MSGS: [&str; 8] = [
+    "0000000400328401",
+    "0000000500e807e807",
+    "0000000401f0a204",
+    "0000000102",
+    "0000000603f0a2048002",
+    "00000025040205000002c3a90500000f0c000101b7c003014100840101010402ac0207020103026869",
+    "000000cf04ac020103c8017878787878787878787878787878787878787878787878787878787878787878787878\
+        78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878\
+        78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878\
+        78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878\
+        787878787878787878787878787878787878787878787878787878",
+    "0000000e0501dddddd00020001cd00000101",
 ];
 
 /// The postcard encoding of [`scrolled_frame`].

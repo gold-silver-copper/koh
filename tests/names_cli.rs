@@ -4,6 +4,7 @@
 //!
 //! Every run has its own `HOME` and `XDG_CONFIG_HOME`, so the keys and lists live in a scratch
 //! directory and the user's own `~/.config/koh` is never read or written.
+#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -311,7 +312,7 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
         let buf = capture(output);
         wait_for(&buf, "koh — this machine", 10).await.unwrap();
         wait_for(&buf, "1  laptop", 5).await.unwrap();
-        menu.write_input(b"q\n").unwrap();
+        menu.write(b"q\n".to_vec()).unwrap();
         let mut exited = false;
         for _ in 0..50 {
             if menu.try_wait().ok().flatten().is_some() {
@@ -320,7 +321,7 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let _ = menu.kill();
+        drop(menu);
         assert!(exited, "q left the menu; captured:\n{}", captured(&buf));
     });
 }
@@ -364,11 +365,11 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
             Pty::spawn(24, 80, &argv, "xterm-256color", &launcher()).expect("spawn the client");
         let buf = capture(output);
         tokio::time::sleep(Duration::from_millis(2000)).await;
-        client.write_input(b"echo by''_name\r").unwrap();
+        client.write(b"echo by''_name\r".to_vec()).unwrap();
         let seen = wait_for(&buf, "by_name", 15).await;
-        let _ = client.write_input(&[0x1e, b'.']);
+        let _ = client.write(vec![0x1e, b'.']);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = client.kill();
+        drop(client);
         task.abort();
         seen.unwrap();
         let noted = std::fs::read_to_string(connected(&home)).unwrap();

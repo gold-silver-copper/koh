@@ -1,11 +1,14 @@
 //! What one connection holds: the frames it applied, which are the bases the server may diff
 //! against, what its server echoed, and when it was heard.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::bounded::Bounded;
 use crate::proto::{ClientMsg, Frame, FrameNum, FrameScreen, InputSeq, FRAME_WINDOW, WINDOW_CELLS};
+
+/// Most frames held before the current one: the window, with it.
+const OLDER: usize = FRAME_WINDOW - 1;
 use crate::terminal::{RowEncodings, TerminalScreen};
 
 /// One connection's frames and echo. Only [`ClientSession::new`](super::session::ClientSession::new)
@@ -15,7 +18,7 @@ pub(super) struct Link {
     current: FrameScreen,
     /// The frames applied before it, oldest first: at most `FRAME_WINDOW - 1`, holding at most
     /// [`WINDOW_CELLS`] cells beyond `current`'s.
-    older: VecDeque<FrameScreen>,
+    older: Bounded<FrameScreen, OLDER>,
     /// The newest base a frame came on that was not held. A frame on it, or on an older one, was
     /// sent before the server read the `Resync` that refusal owed, which forgets them all. This
     /// holds because a `Link` is one connection's, to one server session, whose frame numbers only
@@ -47,7 +50,7 @@ impl Link {
                 num: FrameNum::BLANK,
                 screen,
             },
-            older: VecDeque::new(),
+            older: Bounded::default(),
             refused: FrameNum::BLANK,
             resync_owed: false,
             echo_ack,
@@ -76,11 +79,11 @@ impl Link {
             .map(|held| Arc::clone(&held.screen))
     }
 
-    /// `frame` applied to its base, if that is held.
+    /// `frame` applied to its base, if that is held and the frame is well formed for it.
     pub(super) fn applied(&self, frame: &Frame) -> Option<FrameScreen> {
         // The copy shares every row with the base; the frame replaces only its own.
         let mut screen = Arc::unwrap_or_clone(self.base(frame.base)?);
-        screen.apply(&frame.diff);
+        screen.apply(&frame.diff).ok()?;
         Some(FrameScreen {
             num: frame.num,
             screen: Arc::new(screen),
@@ -106,10 +109,8 @@ impl Link {
 
     /// Keep `frame` among the older ones, the oldest dropped past the window.
     fn keep(&mut self, frame: FrameScreen) {
-        self.older.push_back(frame);
-        while self.older.len() >= FRAME_WINDOW || self.older_cells() > WINDOW_CELLS {
-            self.older.pop_front();
-        }
+        self.older.push_evicting(frame);
+        while self.older_cells() > WINDOW_CELLS && self.older.pop_front().is_some() {}
     }
 
     /// A frame came on `base`, which is not held: a `Resync` is owed, unless one was for this
@@ -150,7 +151,7 @@ impl Link {
 
     /// The frames applied before the current one.
     #[cfg(test)]
-    pub(super) const fn older(&self) -> &VecDeque<FrameScreen> {
+    pub(super) const fn older(&self) -> &Bounded<FrameScreen, OLDER> {
         &self.older
     }
 }

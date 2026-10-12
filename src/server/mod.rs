@@ -12,10 +12,10 @@ pub mod session;
 pub use cli::{serve, ServeConfig};
 pub use session::{PtyHost, Registry, SessionSpec};
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::bounded::Bounded;
 use crate::events::{InputEvent, WireColours};
 use crate::proto::{
     encode_history, retry_after, ClientDecoder, ClientMsg, Frame, FrameEncoder, FrameNum,
@@ -37,61 +37,14 @@ pub enum SessionExit {
     ShellExited,
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-enum Ss3State {
-    #[default]
-    Ground,
-    Esc,
-    Ss3,
-}
-
-/// Rewrites SS3 arrow keys (`ESC O A..D`) as CSI (`ESC [ A..D`) for a program not in application
-/// cursor mode, so arrows work whatever mode the local terminal is in (mosh's `UserInput::input`).
-/// The state carries across chunks.
-#[derive(Default)]
-struct CursorKeyNormalizer {
-    state: Ss3State,
-}
-
-impl CursorKeyNormalizer {
-    /// Append `input`, normalized for a program whose application cursor mode is `app_cursor`, to
-    /// `out`.
-    fn normalize_into(&mut self, input: &[u8], app_cursor: bool, out: &mut Vec<u8>) {
-        // One spare byte for a held escape.
-        out.reserve(input.len().saturating_add(1));
-        for &b in input {
-            match self.state {
-                Ss3State::Ground => {
-                    if b == 0x1b {
-                        self.state = Ss3State::Esc;
-                    }
-                    out.push(b); // ESC is emitted eagerly (mosh)
-                }
-                Ss3State::Esc => {
-                    if b == b'O' {
-                        self.state = Ss3State::Ss3; // hold the 'O' pending its final byte
-                    } else {
-                        self.state = Ss3State::Ground;
-                        out.push(b);
-                    }
-                }
-                Ss3State::Ss3 => {
-                    self.state = Ss3State::Ground;
-                    // ESC went out already.
-                    out.push(if !app_cursor && (b'A'..=b'D').contains(&b) {
-                        b'['
-                    } else {
-                        b'O'
-                    });
-                    out.push(b);
-                }
-            }
-        }
-    }
-}
-
 /// How long the program gets to show a keystroke before it counts as echoed.
 pub(crate) const ECHO_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Most inputs awaiting their echo: one message each, within [`ECHO_TIMEOUT`].
+const ECHO_PENDING: usize = 256;
+
+/// Most messages for the session waiting for room in its queue, from one read of the client.
+const TO_SESSION: usize = 64;
 
 /// How long the server waits for the client to acknowledge the final frame before closing.
 const FINAL_ACK_WAIT: Duration = Duration::from_secs(1);
@@ -103,7 +56,7 @@ pub(crate) struct EchoAck {
     /// The newest input considered reflected on screen.
     acked: InputSeq,
     /// Inputs not yet promoted, with when they arrived, oldest first.
-    pending: VecDeque<(InputSeq, Instant)>,
+    pending: Bounded<(InputSeq, Instant), ECHO_PENDING>,
     timeout: Duration,
 }
 
@@ -118,16 +71,22 @@ impl EchoAck {
     pub(crate) const fn with_timeout(timeout: Duration) -> Self {
         Self {
             acked: InputSeq(0),
-            pending: VecDeque::new(),
+            pending: Bounded::new(),
             timeout,
         }
     }
 
-    /// Input `seq` arrived at `now`. Sequence numbers only advance; a stale one is ignored.
+    /// Input `seq` arrived at `now`. Sequence numbers only advance; a stale one is ignored. Past
+    /// [`ECHO_PENDING`] waiting, the newest waits in place of the one before it.
     pub(crate) fn register(&mut self, seq: InputSeq, now: Instant) {
         let newest = self.pending.back().map_or(self.acked, |(s, _)| *s);
-        if seq > newest {
-            self.pending.push_back((seq, now));
+        if seq <= newest {
+            return;
+        }
+        if let Err(input) = self.pending.push_back((seq, now)) {
+            if let Some(last) = self.pending.back_mut() {
+                last.0 = input.0;
+            }
         }
     }
 
@@ -161,32 +120,25 @@ impl EchoAck {
     }
 }
 
-/// Input for the session, in the order the client sent it.
+/// What a connection hands its session, in the order the client sent it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ToSession {
-    /// Raw bytes ([`ClientMsg::Input`]), DECCKM-normalized.
-    Bytes(Vec<u8>),
     /// Decoded input ([`ClientMsg::Keys`]), which the session encodes as its program asked.
     Events(Vec<InputEvent>),
     /// What the user's terminal said of its colours.
     Colours(WireColours),
-}
-
-/// The client input one read made ready for the PTY.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Drained {
-    /// The input, in order; neighbours of one kind merged.
-    input: Vec<ToSession>,
-    /// The last resize, clamped. Earlier ones in a read would have no visible effect, only costs.
-    resize: Option<Size>,
+    /// The client's window, clamped.
+    Resize(Size),
 }
 
 /// The server side of one connection, without I/O: it decodes the client's stream, tracks the
 /// echo-ack, and decides when to send which frame against which base.
 pub(crate) struct ServerConn {
     decoder: ClientDecoder,
-    cursor_keys: CursorKeyNormalizer,
     echo: EchoAck,
+    /// What the client sent for the session, oldest first, until the session has room. Nothing
+    /// more is decoded once it is full, nor read while any waits.
+    to_session: Bounded<ToSession, TO_SESSION>,
     /// The session's newest screen, shared with every frame that shows it.
     screen: Arc<TerminalScreen>,
     /// `screen` differs from what was last sent, or the base must be rebuilt.
@@ -198,14 +150,15 @@ pub(crate) struct ServerConn {
     last_sent_echo: InputSeq,
     /// The first frame sent after the program exited, and when.
     final_frame: Option<(FrameNum, Instant)>,
-    /// History requests not yet answered, oldest first, at most [`MAX_PENDING_HISTORY`].
-    history: VecDeque<HistoryRequest>,
+    /// History requests not yet answered, oldest first.
+    history: Bounded<HistoryRequest, MAX_PENDING_HISTORY>,
     /// An answer is on its way to the client; the next waits for it to be delivered.
     history_busy: bool,
     /// Encodes frames, primed for the base they are diffed against.
     encoder: FrameEncoder,
-    /// Frames sent and not yet delivered, oldest first: each one's number, size and when it went.
-    in_flight: VecDeque<(FrameNum, usize, Instant)>,
+    /// Frames sent and not yet delivered nor given up on, oldest first: each one's number, size and
+    /// when it went.
+    in_flight: Bounded<(FrameNum, usize, Instant), FRAME_WINDOW>,
     /// How long recent frames took to be delivered, for the link's rate.
     deliveries: Deliveries,
 }
@@ -236,15 +189,12 @@ const ECHO_FLOOR: Duration = Duration::from_millis(1);
 #[derive(Debug, Default)]
 struct Deliveries {
     /// Each recent frame's size, and how long it took, newest last.
-    samples: VecDeque<(usize, Duration)>,
+    samples: Bounded<(usize, Duration), DELIVERY_SAMPLES>,
 }
 
 impl Deliveries {
     fn record(&mut self, bytes: usize, took: Duration) {
-        self.samples.push_back((bytes, took));
-        if self.samples.len() > DELIVERY_SAMPLES {
-            self.samples.pop_front();
-        }
+        self.samples.push_evicting((bytes, took));
     }
 
     /// The bytes the link carries in a round trip of `rtt`, about: its rate times the round trip,
@@ -281,8 +231,8 @@ impl ServerConn {
     fn with_echo(echo: EchoAck) -> Self {
         Self {
             decoder: ClientDecoder::default(),
-            cursor_keys: CursorKeyNormalizer::default(),
             echo,
+            to_session: Bounded::default(),
             screen: Arc::default(),
             unsent_change: true,
             held: ClientHolds::default(),
@@ -290,10 +240,10 @@ impl ServerConn {
             last_sent_at: None,
             last_sent_echo: InputSeq(0),
             final_frame: None,
-            history: VecDeque::new(),
+            history: Bounded::default(),
             history_busy: false,
             encoder: FrameEncoder::default(),
-            in_flight: VecDeque::new(),
+            in_flight: Bounded::default(),
             deliveries: Deliveries::default(),
         }
     }
@@ -317,42 +267,60 @@ impl ServerConn {
         self.decoder.push(bytes);
     }
 
-    /// Decode the complete messages read so far, at `now`: the input and resize for the PTY.
-    fn drain_client(&mut self, now: Instant, app_cursor: bool) -> Result<Drained, ProtoError> {
-        let mut drained = Drained::default();
-        while let Some(msg) = self.decoder.next_msg()? {
+    /// Decode the complete messages read so far, at `now`, queueing what is for the session; the
+    /// rest waits in the decoder while that queue is full.
+    fn drain_client(&mut self, now: Instant) -> Result<(), ProtoError> {
+        // Room for each message is made before it is decoded.
+        while !self.to_session.is_full() {
+            let Some(msg) = self.decoder.next_msg()? else {
+                break;
+            };
             match msg {
-                ClientMsg::Input { seq, bytes } => {
-                    self.echo.register(seq, now);
-                    if !matches!(drained.input.last(), Some(ToSession::Bytes(_))) {
-                        drained.input.push(ToSession::Bytes(Vec::new()));
-                    }
-                    if let Some(ToSession::Bytes(keys)) = drained.input.last_mut() {
-                        self.cursor_keys.normalize_into(&bytes, app_cursor, keys);
-                    }
-                }
                 ClientMsg::Keys { seq, events } => {
                     self.echo.register(seq, now);
-                    match drained.input.last_mut() {
-                        Some(ToSession::Events(queued)) => queued.extend(events),
-                        _ => drained.input.push(ToSession::Events(events)),
-                    }
+                    self.for_session(ToSession::Events(events));
                 }
-                ClientMsg::Colours(colours) => drained.input.push(ToSession::Colours(colours)),
+                ClientMsg::Colours(colours) => self.for_session(ToSession::Colours(colours)),
                 ClientMsg::Resize(size) => {
-                    drained.resize = Some(crate::terminal::clamp_dims(size));
+                    self.for_session(ToSession::Resize(crate::terminal::clamp_dims(size)));
                 }
                 ClientMsg::Ack { frame } => self.ack(frame, now),
                 ClientMsg::Resync => self.resync(),
-                ClientMsg::History(request) => {
-                    if self.history.len() >= MAX_PENDING_HISTORY {
-                        return Err(ProtoError::TooManyRequests);
-                    }
-                    self.history.push_back(request);
-                }
+                ClientMsg::History(request) => self
+                    .history
+                    .push_back(request)
+                    .map_err(|_full| ProtoError::TooManyRequests)?,
             }
         }
-        Ok(drained)
+        Ok(())
+    }
+
+    /// Queue `input` for the session, merged into the last if both are events, or resizes, of
+    /// which only the last matters. The caller made room.
+    fn for_session(&mut self, input: ToSession) {
+        match (self.to_session.back_mut(), input) {
+            (Some(ToSession::Events(queued)), ToSession::Events(events)) => queued.extend(events),
+            (Some(ToSession::Resize(queued)), ToSession::Resize(size)) => *queued = size,
+            (_, input) => {
+                let _ = self.to_session.push_back(input);
+            }
+        }
+    }
+
+    /// Whether what the client sent waits for room in the session's queue; nothing more is read
+    /// from the client meanwhile, so QUIC pushes back on it.
+    fn waiting_for_session(&self) -> bool {
+        !self.to_session.is_empty()
+    }
+
+    /// The oldest thing for the session.
+    fn next_for_session(&mut self) -> Option<ToSession> {
+        self.to_session.pop_front()
+    }
+
+    /// The program exited: what the client sends it goes nowhere.
+    fn session_gone(&mut self) {
+        self.to_session.clear();
     }
 
     /// The next history request to answer, if no answer is on its way; the caller calls
@@ -393,9 +361,14 @@ impl ServerConn {
         self.in_flight.retain(|(n, _, _)| *n > num);
     }
 
-    /// Frame `num`, of `bytes` on its stream, went at `now`.
-    fn frame_sent(&mut self, num: FrameNum, bytes: usize, now: Instant) {
-        self.in_flight.push_back((num, bytes, now));
+    /// Frame `num`, of `bytes` on its stream, went at `now`. Frames given up on, which a client
+    /// that never takes them leaves undelivered for good, are forgotten, as are those past the
+    /// window of frames kept.
+    fn frame_sent(&mut self, num: FrameNum, bytes: usize, now: Instant, rtt: Option<Duration>) {
+        let given_up = retry_after(rtt);
+        self.in_flight
+            .retain(|(_, _, sent)| now.saturating_duration_since(*sent) < given_up);
+        self.in_flight.push_evicting((num, bytes, now));
     }
 
     /// The frame bytes in flight at `now`: sent, not delivered, and not given up on (a frame not
@@ -485,20 +458,21 @@ impl ServerConn {
         }
         let num = self.last_num.next();
         let base = self.held.base();
+        let (diff, sent) = self.screen.diff_and_sent(&base.screen);
         let frame = Frame {
             num,
             base: base.num,
             echo_ack: self.echo.echo_ack(),
-            diff: self.screen.diff_from(&base.screen),
+            diff,
         };
-        self.held.sent(FrameScreen {
-            num,
-            screen: Arc::clone(&self.screen),
-        });
+        // What the client will hold, which later frames diff against: the screen, unless the
+        // frame left some of its links for a later one.
+        let sent = sent.map_or_else(|| Arc::clone(&self.screen), Arc::new);
+        self.unsent_change = sent != self.screen;
+        self.held.sent(FrameScreen { num, screen: sent });
         self.last_num = num;
         self.last_sent_at = Some(now);
         self.last_sent_echo = frame.echo_ack;
-        self.unsent_change = false;
         if self.exited() && self.final_frame.is_none() {
             self.final_frame = Some((num, now));
         }
@@ -516,11 +490,6 @@ impl ServerConn {
     /// The newest frame the client has acknowledged.
     const fn acked(&self) -> FrameNum {
         self.held.base().num
-    }
-
-    /// Whether the program has application cursor keys on.
-    fn app_cursor(&self) -> bool {
-        self.screen.application_cursor()
     }
 
     /// Whether the connection is done: the program exited and the client acknowledged the final
@@ -586,33 +555,37 @@ impl ServerConn {
     }
 }
 
-/// Drive one connection against its session: the I/O around a `ServerConn`.
+/// Drive one connection against its session: the I/O around a `ServerConn`, which nothing here
+/// waits on but in its `select!`.
 ///
-/// It forwards the
-/// client's input, sends each frame on its own stream and resets the streams of superseded ones.
-/// Returning (or panicking) detaches.
+/// It forwards the client's input as the session takes it, sends each frame on its own stream and
+/// resets the streams of superseded ones. Returning (or panicking) detaches.
 pub async fn run_attached(
-    conn: iroh::endpoint::Connection,
+    authorized: cli::Authorized,
     mut session: session::SessionClient,
-) -> anyhow::Result<SessionExit> {
+) -> SessionExit {
+    let conn = authorized.conn();
     let mut core = ServerConn::default();
     core.install_snapshot(session.screen());
+    let input = session.input();
     let mut client: Option<RecvStream> = None;
     // The client gets exactly one stream for the connection, even after it finishes that one.
     let mut had_client_stream = false;
     // Whether the session still publishes screens: `next_screen` ends with it.
     let mut session_open = true;
     let mut read_buf = vec![0u8; 16 * 1024];
-    let mut in_flight: VecDeque<(FrameNum, CancellationToken)> = VecDeque::new();
-    // Each frame's task says here when the client has all of it: its acknowledgement. Unbounded,
-    // but at most one message a frame sent.
-    let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel::<FrameNum>();
+    // The newest frame sent, which the next supersedes unless the client has it.
+    let mut newest: Option<(FrameNum, CancellationToken)> = None;
+    // Each frame's task says here when the client has all of it: its acknowledgement. Bounded by
+    // the frames in flight, each of which says so once.
+    let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::channel::<FrameNum>(FRAME_WINDOW);
     // History answers go one at a time; each one's task says here when it is delivered.
     let (history_tx, mut history_rx) = tokio::sync::mpsc::channel::<()>(1);
     let history_cancel = CancellationToken::new();
     let _history_guard = history_cancel.clone().drop_guard();
-    let result = loop {
+    let exit = loop {
         if let Some(request) = core.next_history() {
+            #[expect(clippy::disallowed_methods, reason = "one history answer at a time")]
             tokio::spawn(send_history(
                 conn.clone(),
                 session.history(request),
@@ -622,19 +595,23 @@ pub async fn run_attached(
         }
         let now = Instant::now();
         core.promote_echo(now);
-        let rtt = crate::transport_iroh::rtt(&conn);
+        let rtt = crate::transport_iroh::rtt(conn);
         if let Some(frame) = core.poll_frame(now, rtt) {
-            // Every older frame the client has not acknowledged is superseded.
-            let acked = core.acked();
-            for (num, cancel) in std::mem::take(&mut in_flight) {
-                if num > acked {
+            // The frame before, unless the client has it, is superseded.
+            if let Some((num, cancel)) = newest.take() {
+                if num > core.acked() {
                     cancel.cancel();
                 }
             }
             match core.encode(&frame) {
                 Ok(bytes) => {
-                    core.frame_sent(frame.num, bytes.len(), now);
+                    core.frame_sent(frame.num, bytes.len(), now, rtt);
                     let cancel = CancellationToken::new();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a frame's task ends once it is delivered, or superseded and \
+                                  reset after a round trip"
+                    )]
                     tokio::spawn(send_frame(
                         conn.clone(),
                         frame.num,
@@ -644,17 +621,17 @@ pub async fn run_attached(
                         rtt.unwrap_or(Duration::ZERO)
                             .saturating_add(crate::proto::ACK_DELAY),
                     ));
-                    in_flight.push_back((frame.num, cancel));
+                    newest = Some((frame.num, cancel));
                 }
                 Err(e) => tracing::error!(error = %e, "encoding a frame failed"),
             }
         }
         if core.finished(now) {
             conn.close(0u32.into(), SESSION_ENDED);
-            break Ok(SessionExit::ShellExited);
+            break SessionExit::ShellExited;
         }
         let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
-        let reading = client.is_some();
+        let reading = client.is_some() && !core.waiting_for_session();
         tokio::select! {
             // Not biased: a pending screen change would starve client input.
             screen = session.next_screen(), if session_open => match screen {
@@ -662,7 +639,17 @@ pub async fn run_attached(
                 // A session that ends after its exit screen does not cut off the final frame.
                 None if core.exited() => session_open = false,
                 // The server is shutting down.
-                None => break Ok(SessionExit::Detached),
+                None => break SessionExit::Detached,
+            },
+            permit = input.reserve(), if core.waiting_for_session() => match permit.ok() {
+                Some(permit) => {
+                    if let Some(input) = core.next_for_session() {
+                        permit.send(session::ClientInput::Input(input));
+                    }
+                }
+                // After its exit screen, the final frame's ack is still awaited.
+                None if core.exited() => core.session_gone(),
+                None => break SessionExit::Detached,
             },
             stream = conn.accept_uni() => match stream {
                 Ok(stream) if !had_client_stream => {
@@ -671,50 +658,33 @@ pub async fn run_attached(
                 }
                 Ok(_) => {
                     conn.close(PROTOCOL_ERROR.into(), b"a second client stream");
-                    break Ok(SessionExit::Detached);
+                    break SessionExit::Detached;
                 }
                 Err(e) => {
                     info!(reason = %e, "connection closed by peer (detaching)");
-                    break Ok(SessionExit::Detached);
+                    break SessionExit::Detached;
                 }
             },
             read = read_client(client.as_mut(), &mut read_buf), if reading => match read {
                 Ok(Some(n)) => {
                     core.push_client_bytes(read_buf.get(..n).unwrap_or_default());
-                    let app_cursor = core.app_cursor();
-                    match core.drain_client(Instant::now(), app_cursor) {
-                        Ok(drained) => {
-                            // A full input queue stops reading, so QUIC pushes back on the client.
-                            for input in drained.input {
-                                session.send_input(input).await;
-                            }
-                            if let Some(size) = drained.resize {
-                                session.send_resize(size).await;
-                            }
-                            // The session ended; after its exit screen, the final frame's ack is
-                            // still awaited, and input to the exited program goes nowhere.
-                            if !session.can_send() && !core.exited() {
-                                break Ok(SessionExit::Detached);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "client broke the protocol; closing");
-                            conn.close(PROTOCOL_ERROR.into(), b"protocol error");
-                            break Ok(SessionExit::Detached);
-                        }
+                    if let Err(e) = core.drain_client(Instant::now()) {
+                        tracing::warn!(error = %e, "client broke the protocol; closing");
+                        conn.close(PROTOCOL_ERROR.into(), b"protocol error");
+                        break SessionExit::Detached;
                     }
                 }
                 Ok(None) => {
                     // The client finished its stream; a clean end only between messages.
                     if core.finish_client().is_err() {
                         conn.close(PROTOCOL_ERROR.into(), b"protocol error");
-                        break Ok(SessionExit::Detached);
+                        break SessionExit::Detached;
                     }
                     client = None;
                 }
                 Err(e) => {
                     info!(reason = %e, "client stream failed (detaching)");
-                    break Ok(SessionExit::Detached);
+                    break SessionExit::Detached;
                 }
             },
             Some(()) = history_rx.recv() => core.history_delivered(),
@@ -722,10 +692,10 @@ pub async fn run_attached(
             () = tokio::time::sleep_until(wake) => {}
         }
     };
-    for (_, cancel) in in_flight {
+    if let Some((_, cancel)) = newest {
         cancel.cancel();
     }
-    result
+    exit
 }
 
 /// The close code for a client that broke the protocol.
@@ -750,7 +720,7 @@ async fn send_frame(
     num: FrameNum,
     bytes: Vec<u8>,
     cancel: CancellationToken,
-    delivered: tokio::sync::mpsc::UnboundedSender<FrameNum>,
+    delivered: tokio::sync::mpsc::Sender<FrameNum>,
     grace: Duration,
 ) {
     // A frame superseded before it starts is never opened.
@@ -784,7 +754,7 @@ async fn send_frame(
         tokio::select! {
             stopped = send.stopped() => {
                 if matches!(stopped, Ok(None)) {
-                    let _ = delivered.send(num);
+                    let _ = delivered.send(num).await;
                 }
                 return;
             }
@@ -793,7 +763,7 @@ async fn send_frame(
         tokio::select! {
             stopped = send.stopped() => {
                 if matches!(stopped, Ok(None)) {
-                    let _ = delivered.send(num);
+                    let _ = delivered.send(num).await;
                 }
                 return;
             }
@@ -850,63 +820,42 @@ pub async fn run_session(
         launcher,
     });
     let peer = conn.remote_id();
-    if let Some((client, _)) = registry.attach(peer).await {
-        let _ = run_attached(conn, client).await?;
+    if let Ok((client, _)) = registry.attach(peer).await {
+        run_attached(cli::Authorized::assumed(conn), client).await;
     }
     registry.shutdown().await;
     Ok(())
 }
 
 #[cfg(test)]
+#[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{
-        held::distinct_cells, CursorKeyNormalizer, Drained, EchoAck, ServerConn, ToSession,
-        FINAL_ACK_WAIT,
-    };
+    use super::{held::distinct_cells, EchoAck, ServerConn, ToSession, FINAL_ACK_WAIT};
+    use crate::events::InputEvent;
     use crate::proto::{
         encode_client, retry_after, ClientMsg, Frame, FrameNum, InputSeq, FRAME_FLOOR,
         FRAME_WINDOW, HEARTBEAT, WINDOW_CELLS,
     };
     use crate::terminal::{Size, TerminalScreen};
 
-    /// Feed `chunks` through one normalizer at the given app-cursor mode, return the PTY bytes.
-    fn norm(chunks: &[&[u8]], app_cursor: bool) -> Vec<u8> {
-        let mut n = CursorKeyNormalizer::default();
-        let mut out = Vec::new();
-        for c in chunks {
-            n.normalize_into(c, app_cursor, &mut out);
+    /// The client typed `text`, as input `seq`.
+    fn typed(seq: u64, text: &str) -> ClientMsg {
+        ClientMsg::Keys {
+            seq: InputSeq(seq),
+            events: text.chars().map(key).collect(),
         }
-        out
     }
 
-    #[test]
-    fn ss3_arrows_rewrite_to_csi_when_not_in_application_cursor_mode() {
-        // ESC O A..D  ->  ESC [ A..D  (the app expects ANSI cursor keys).
-        assert_eq!(norm(&[b"\x1bOA"], false), b"\x1b[A");
-        assert_eq!(norm(&[b"\x1bOD"], false), b"\x1b[D");
-    }
-
-    #[test]
-    fn ss3_arrows_preserved_in_application_cursor_mode() {
-        assert_eq!(norm(&[b"\x1bOA"], true), b"\x1bOA");
-    }
-
-    #[test]
-    fn csi_arrows_and_plain_bytes_pass_through() {
-        assert_eq!(norm(&[b"\x1b[A"], false), b"\x1b[A");
-        assert_eq!(norm(&[b"ls\r"], false), b"ls\r");
-        // A bare ESC then a normal byte (e.g. vim's Escape) is untouched.
-        assert_eq!(norm(&[b"\x1bi"], false), b"\x1bi");
-    }
-
-    #[test]
-    fn ss3_sequence_split_across_chunks_normalizes() {
-        // The SS3 state carries across input chunks.
-        assert_eq!(norm(&[b"\x1b", b"O", b"A"], false), b"\x1b[A");
-        assert_eq!(norm(&[b"\x1b", b"[", b"A"], false), b"\x1b[A");
+    fn key(c: char) -> InputEvent {
+        InputEvent::Key(
+            fux_vt::keys::Keystroke::from(fux_vt::keys::KeyPress::plain(fux_vt::keys::Key::Char(
+                c,
+            )))
+            .into(),
+        )
     }
 
     fn stream(msgs: &[ClientMsg]) -> Vec<u8> {
@@ -916,42 +865,42 @@ mod tests {
     }
 
     #[test]
-    fn a_read_keeps_only_the_last_resize_and_concatenates_keys() {
-        // Several resizes in one read collapse to the last (clamped); keys stay in order.
+    fn a_read_queues_the_session_input_in_order_merging_neighbours() {
+        // Neighbouring keys go as one batch, and of neighbouring resizes only the last, clamped.
         let mut conn = ServerConn::default();
         conn.push_client_bytes(&stream(&[
-            ClientMsg::Input {
-                seq: InputSeq(1),
-                bytes: b"ab".to_vec(),
-            },
+            typed(1, "ab"),
             ClientMsg::Resize(Size::new(10, 20)),
-            ClientMsg::Input {
-                seq: InputSeq(2),
-                bytes: b"\x1bOA".to_vec(),
-            },
+            typed(2, "c"),
+            typed(3, "d"),
             ClientMsg::Resize(Size::new(30, 40)),
             ClientMsg::Resize(Size::new(65000, 1)),
-            ClientMsg::Input {
-                seq: InputSeq(3),
-                bytes: b"ef".to_vec(),
-            },
         ]));
-        let drained = conn.drain_client(Instant::now(), false).unwrap();
+        conn.drain_client(Instant::now()).unwrap();
+        let queued: Vec<ToSession> = std::iter::from_fn(|| conn.next_for_session()).collect();
         assert_eq!(
-            drained,
-            Drained {
-                input: vec![ToSession::Bytes(b"ab\x1b[Aef".to_vec())],
-                resize: Some(crate::terminal::clamp_dims(Size::new(65000, 1))),
-            }
+            queued,
+            [
+                ToSession::Events(vec![key('a'), key('b')]),
+                ToSession::Resize(Size::new(10, 20)),
+                ToSession::Events(vec![key('c'), key('d')]),
+                ToSession::Resize(crate::terminal::clamp_dims(Size::new(65000, 1))),
+            ]
         );
-        conn.push_client_bytes(&stream(&[ClientMsg::Input {
-            seq: InputSeq(4),
-            bytes: b"x".to_vec(),
-        }]));
-        assert_eq!(
-            conn.drain_client(Instant::now(), false).unwrap().resize,
-            None
-        );
+        assert!(!conn.waiting_for_session());
+    }
+
+    #[test]
+    fn a_full_queue_for_the_session_leaves_the_rest_undecoded() {
+        // Nothing is decoded past what the session's queue holds, so a client cannot grow it.
+        let mut conn = ServerConn::default();
+        let colours = ClientMsg::Colours(crate::events::WireColours::default());
+        conn.push_client_bytes(&stream(&vec![colours; super::TO_SESSION + 1]));
+        conn.drain_client(Instant::now()).unwrap();
+        assert!(conn.finish_client().is_err(), "one message is left");
+        conn.next_for_session();
+        conn.drain_client(Instant::now()).unwrap();
+        assert!(conn.finish_client().is_ok());
     }
 
     /// A server and a client connection on loopback, and the client's endpoint, kept alive.
@@ -989,7 +938,7 @@ mod tests {
                 recv.read_to_end(MAX_FRAME_TEST).await.unwrap();
                 client
             });
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             let grace = Duration::from_secs(5);
             let current = CancellationToken::new();
             tokio::spawn(send_frame(
@@ -1031,7 +980,7 @@ mod tests {
         let ask = |newest| ClientMsg::History(HistoryRequest { newest, count: 1 });
         let mut conn = ServerConn::default();
         conn.push_client_bytes(&stream(&[ask(1), ask(2)]));
-        conn.drain_client(Instant::now(), false).unwrap();
+        conn.drain_client(Instant::now()).unwrap();
         assert_eq!(conn.next_history().map(|r| r.newest), Some(1));
         assert_eq!(
             conn.next_history(),
@@ -1047,7 +996,7 @@ mod tests {
             .collect();
         conn.push_client_bytes(&stream(&flood));
         assert!(matches!(
-            conn.drain_client(Instant::now(), false),
+            conn.drain_client(Instant::now()),
             Err(ProtoError::TooManyRequests)
         ));
     }
@@ -1055,24 +1004,20 @@ mod tests {
     #[test]
     fn a_partial_message_waits_and_a_truncated_stream_is_an_error() {
         let mut conn = ServerConn::default();
-        let bytes = stream(&[ClientMsg::Input {
-            seq: InputSeq(1),
-            bytes: b"hello".to_vec(),
-        }]);
+        let bytes = stream(&[typed(1, "hello")]);
         let (first, rest) = bytes.split_at(3);
         conn.push_client_bytes(first);
-        assert_eq!(
-            conn.drain_client(Instant::now(), false).unwrap().input,
-            vec![]
-        );
+        conn.drain_client(Instant::now()).unwrap();
+        assert!(!conn.waiting_for_session());
         assert!(
             conn.finish_client().is_err(),
             "the stream ended inside a message"
         );
         conn.push_client_bytes(rest);
+        conn.drain_client(Instant::now()).unwrap();
         assert_eq!(
-            conn.drain_client(Instant::now(), false).unwrap().input,
-            vec![ToSession::Bytes(b"hello".to_vec())]
+            conn.next_for_session(),
+            Some(ToSession::Events("hello".chars().map(key).collect()))
         );
         assert!(conn.finish_client().is_ok());
     }
@@ -1164,7 +1109,7 @@ mod tests {
     /// Apply `frame` to `base`, as a client holding that base would.
     fn applied(base: &TerminalScreen, frame: &Frame) -> TerminalScreen {
         let mut s = base.clone();
-        s.apply(&frame.diff);
+        s.apply(&frame.diff).unwrap();
         s
     }
 
@@ -1218,7 +1163,7 @@ mod tests {
             .screen()
             .contents()
             .contains("hello"));
-        c.frame_sent(first.num, 100, t0);
+        c.frame_sent(first.num, 100, t0, rtt);
         assert!(c.poll_frame(t0, rtt).is_none(), "nothing changed");
         c.install_snapshot(Arc::new(screen(b"hello world")));
         let inside = t0 + Duration::from_millis(1);
@@ -1240,11 +1185,11 @@ mod tests {
         let [start, second, done] = t;
         c.install_snapshot(Arc::new(screen(b"start")));
         let one = c.poll_frame(start, rtt)?;
-        c.frame_sent(one.num, 100, start);
+        c.frame_sent(one.num, 100, start, rtt);
         c.ack(one.num, second);
         c.install_snapshot(Arc::new(screen(b"start, then more")));
         let two = c.poll_frame(second, rtt)?;
-        c.frame_sent(two.num, 10_000, second);
+        c.frame_sent(two.num, 10_000, second, rtt);
         c.ack(two.num, done);
         (c.budget(rtt) == 12_500).then_some((c, rtt))
     }
@@ -1257,7 +1202,7 @@ mod tests {
         let t = t0 + Duration::from_millis(200);
         c.install_snapshot(Arc::new(screen(b"a big repaint")));
         let big = c.poll_frame(t, rtt).expect("room for it");
-        c.frame_sent(big.num, 20_000, t);
+        c.frame_sent(big.num, 20_000, t, rtt);
         c.install_snapshot(Arc::new(screen(b"a big repaint, changed")));
         let later = t + Duration::from_millis(30);
         assert!(
@@ -1283,18 +1228,12 @@ mod tests {
         let t = t0 + ms(200);
         c.install_snapshot(Arc::new(screen(b"$ ")));
         let full = c.poll_frame(t, rtt).unwrap();
-        c.frame_sent(full.num, 20_000, t);
-        c.push_client_bytes(&stream(&[ClientMsg::Input {
-            seq: InputSeq(1),
-            bytes: b"x".to_vec(),
-        }]));
-        c.drain_client(t, false).unwrap();
+        c.frame_sent(full.num, 20_000, t, rtt);
+        c.push_client_bytes(&stream(&[typed(1, "x")]));
+        c.drain_client(t).unwrap();
         // A second key, still awaiting its echo once the first is promoted.
-        c.push_client_bytes(&stream(&[ClientMsg::Input {
-            seq: InputSeq(2),
-            bytes: b"y".to_vec(),
-        }]));
-        c.drain_client(t + ms(30), false).unwrap();
+        c.push_client_bytes(&stream(&[typed(2, "y")]));
+        c.drain_client(t + ms(30)).unwrap();
         let later = t + ms(60);
         c.promote_echo(later);
         assert!(
@@ -1319,7 +1258,7 @@ mod tests {
         for n in 0..super::MAX_IN_FLIGHT {
             c.install_snapshot(Arc::new(screen(format!("count {n}").as_bytes())));
             let frame = c.poll_frame(at, rtt).expect("room for it");
-            c.frame_sent(frame.num, 40, at);
+            c.frame_sent(frame.num, 40, at, rtt);
             at += FRAME_FLOOR;
         }
         c.install_snapshot(Arc::new(screen(b"count more")));
@@ -1338,7 +1277,7 @@ mod tests {
         let t = t0 + Duration::from_millis(200);
         c.install_snapshot(Arc::new(screen(b"frame 0")));
         let big = c.poll_frame(t, rtt).unwrap();
-        c.frame_sent(big.num, 20_000, t);
+        c.frame_sent(big.num, 20_000, t, rtt);
         let mut at = t;
         for n in 1..=5 {
             at += Duration::from_millis(10);
@@ -1364,13 +1303,10 @@ mod tests {
         let t = t0 + Duration::from_millis(200);
         c.install_snapshot(Arc::new(screen(b"$ ")));
         let full = c.poll_frame(t, rtt).unwrap();
-        c.frame_sent(full.num, 20_000, t);
+        c.frame_sent(full.num, 20_000, t, rtt);
         // The user types; the program's echo changes one row.
-        c.push_client_bytes(&stream(&[ClientMsg::Input {
-            seq: InputSeq(1),
-            bytes: b"l".to_vec(),
-        }]));
-        c.drain_client(t, false).unwrap();
+        c.push_client_bytes(&stream(&[typed(1, "l")]));
+        c.drain_client(t).unwrap();
         c.install_snapshot(Arc::new(screen(b"$ l")));
         let typed = t + Duration::from_millis(1);
         let echo = c.poll_frame(typed, rtt).expect("the echo goes at once");
@@ -1379,7 +1315,7 @@ mod tests {
             .contents()
             .contains("$ l"));
         // A large change is not an echo, typed or not: it waits for room.
-        c.frame_sent(echo.num, 100, typed);
+        c.frame_sent(echo.num, 100, typed, rtt);
         let lines: Vec<u8> = (0..20)
             .flat_map(|n| format!("line {n}\r\n").into_bytes())
             .collect();
@@ -1460,7 +1396,7 @@ mod tests {
         c.poll_frame(t0, None).unwrap();
         c.ack(FrameNum(1), Instant::now());
         c.push_client_bytes(&stream(&[ClientMsg::Resync]));
-        c.drain_client(later(1), false).unwrap();
+        c.drain_client(later(1)).unwrap();
         let rebuilt = c
             .poll_frame(later(1), None)
             .expect("a resync forces a frame");
@@ -1483,7 +1419,7 @@ mod tests {
         let two = c.poll_frame(later(2), None).unwrap();
         assert_eq!(two.base, FrameNum(1));
         c.push_client_bytes(&stream(&[ClientMsg::Resync]));
-        c.drain_client(later(3), false).unwrap();
+        c.drain_client(later(3)).unwrap();
         c.ack(FrameNum(2), later(3));
         c.install_snapshot(Arc::new(screen(b"a b c")));
         let next = c
@@ -1614,5 +1550,59 @@ mod tests {
         // An acknowledgement of a dropped frame is ignored, as one past the window is.
         c.ack(FrameNum(3), Instant::now());
         assert_eq!(c.acked(), FrameNum::BLANK);
+    }
+
+    #[test]
+    fn frames_a_client_never_takes_are_forgotten() {
+        // A client that never accepts a frame's stream leaves every frame undelivered; the
+        // server forgets them past the window, or it would hold one more each retry, for good.
+        let mut c = ServerConn::default();
+        let t0 = Instant::now();
+        let rtt = Some(Duration::from_millis(50));
+        for n in 0..1000_u32 {
+            c.install_snapshot(Arc::new(screen(format!("frame {n}").as_bytes())));
+            let at = t0 + Duration::from_millis(u64::from(n));
+            if let Some(frame) = c.poll_frame(at, rtt) {
+                c.frame_sent(frame.num, 100, at, rtt);
+            }
+        }
+        assert!(c.in_flight.len() <= FRAME_WINDOW, "{}", c.in_flight.len());
+    }
+
+    #[test]
+    fn links_left_off_a_frame_go_in_a_later_one() {
+        // More links than a diff carries: the frame leaves some off, the server holds the screen
+        // as the client has it, and the next frames carry the rest, until the client has all.
+        let mut out = Vec::new();
+        for row in 0..12 {
+            for col in 0..64 {
+                out.extend_from_slice(
+                    format!(
+                        "\x1b]8;;https://koh.example/{row}/{col}/{}\x1b\\x\x1b]8;;\x1b\\",
+                        "a".repeat(2000)
+                    )
+                    .as_bytes(),
+                );
+            }
+            out.extend_from_slice(b"\r\n");
+        }
+        let server = Arc::new(TerminalScreen::from_bytes(24, 80, &out));
+        let mut c = ServerConn::default();
+        c.install_snapshot(Arc::clone(&server));
+        let mut client = TerminalScreen::default();
+        let t0 = Instant::now();
+        for n in 0..10_u32 {
+            let at = t0 + HEARTBEAT * n;
+            let Some(frame) = c.poll_frame(at, None) else {
+                continue;
+            };
+            client = applied(&client, &frame);
+            c.ack(frame.num, at);
+            if client == *server {
+                assert!(n > 0, "the first frame could not carry every link");
+                return;
+            }
+        }
+        panic!("the client never got every link");
     }
 }

@@ -48,7 +48,7 @@ const CLIENT_ACK_DELAY: Duration = Duration::from_millis(2);
 
 /// The ALPN, which is the protocol version ([`crate::proto`]): a peer on another fails the TLS
 /// handshake instead of misparsing mid-session.
-pub const ALPN: &[u8] = b"koh/3";
+pub const ALPN: &[u8] = b"koh/4";
 
 /// Errors from endpoint/identity setup.
 #[derive(Debug, thiserror::Error)]
@@ -316,6 +316,7 @@ pub fn rtt(conn: &Connection) -> Option<Duration> {
 }
 
 #[cfg(test)]
+#[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {
     use super::*;
 
@@ -476,8 +477,8 @@ mod tests {
 
     #[test]
     fn the_alpn_names_the_stream_protocol() {
-        // `koh/3` is the stream protocol; a peer on another version (e.g. `koh/iroh/2`) fails the
+        // `koh/4` is the stream protocol; a peer on another version (e.g. `koh/iroh/2`) fails the
         // TLS handshake instead of misparsing.
-        assert_eq!(ALPN, b"koh/3");
+        assert_eq!(ALPN, b"koh/4");
     }
 }

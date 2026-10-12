@@ -184,6 +184,7 @@ fn send_chunk(
 }
 
 #[cfg(test)]
+#[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {
     use super::*;
     use std::io::Write;

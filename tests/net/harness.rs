@@ -288,6 +288,13 @@ impl Client {
         }
     }
 
+    /// Type the quit escape and wait up to `within` for the loop to return, as only a live one
+    /// does on it.
+    pub async fn quit(self, within: Duration) -> Option<anyhow::Result<Option<u32>>> {
+        self.send(&[0x1e, b'.']).await.ok()?;
+        self.exit(within).await
+    }
+
     /// End the client (as if its input closed) and return what `run_client` returned.
     pub async fn finish(self) -> Option<anyhow::Result<Option<u32>>> {
         drop(self.input);

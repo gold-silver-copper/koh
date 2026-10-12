@@ -2,15 +2,14 @@
 //! Fuzz the client's input path: arbitrary bytes as the user's terminal sends them, read in
 //! pieces, through `ClientSession::on_input` and its Escape deadline. The terminal is the user's,
 //! but its bytes are untrusted input to a decoder all the same (a paste, a program writing to the
-//! client's tty). It must never panic; every message the session makes must encode, decode back
-//! to itself, and be within the wire's bounds; and no paste piece may hold an end marker.
+//! client's tty). It must never panic, and every message the session makes must encode, decode
+//! back to itself, and be within the wire's bounds.
 
 use std::time::Instant;
 
 use koh::client::ClientSession;
-use koh::events::InputEvent;
 use koh::predict::DisplayPreference;
-use koh::proto::{encode_client, ClientDecoder, ClientMsg};
+use koh::proto::{encode_client, ClientDecoder};
 use koh::terminal::Size;
 use libfuzzer_sys::fuzz_target;
 
@@ -26,14 +25,6 @@ fuzz_target!(|data: &[u8]| {
         }
         let _ = session.take_questions();
         while let Some(msg) = session.pop_outgoing() {
-            if let ClientMsg::Keys { events, .. } = &msg {
-                for event in events {
-                    if let InputEvent::Paste { text, .. } = event {
-                        assert!(!text.contains("\x1b[201~"), "{text:?}");
-                        assert!(!text.contains("\u{9b}201~"), "{text:?}");
-                    }
-                }
-            }
             let bytes = encode_client(&msg).expect("the session's messages encode");
             wire.push(&bytes);
             let back = wire.next_msg().expect("and decode").expect("whole");

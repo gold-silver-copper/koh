@@ -9,8 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fux_vt::keys::encode::{key_bytes, KeyMode};
-use fux_vt::keys::KeyPress;
+use fux_vt::keys::{Direction, Key, KeyPress, Modifiers};
 use fux_vt::Color;
 
 use serde::{Deserialize, Serialize};
@@ -217,26 +216,10 @@ enum Validity {
     IncorrectOrExpired,
 }
 
-/// Where typed input is in an escape sequence, so its bytes are not predicted as glyphs.
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum EscState {
-    /// Not mid-escape.
-    Ground,
-    /// Saw `ESC`.
-    Esc,
-    /// Saw `ESC [` (also covers `ESC O` after normalization) — awaiting the final byte, with
-    /// these parameter bytes so far.
-    Csi,
-}
-
-/// Most parameter bytes of an escape sequence the predictor reads; a longer one is not a key it
-/// predicts.
-const MAX_CSI_PARAMS: usize = 8;
-
 /// The prediction engine.
 ///
-/// Call [`set_local_frame_sent`](Self::set_local_frame_sent) before typed
-/// bytes and [`new_user_byte`](Self::new_user_byte) for each;
+/// Call [`set_local_frame_sent`](Self::set_local_frame_sent) before each typed key and
+/// [`new_user_key`](Self::new_user_key) for it;
 /// [`set_local_frame_late_acked`](Self::set_local_frame_late_acked) and [`cull`](Self::cull) on a
 /// frame; [`overlay`](Self::overlay) to render.
 pub struct PredictionEngine {
@@ -251,19 +234,11 @@ pub struct PredictionEngine {
     /// has reflected it, so no held key shows and nothing is guessed from a model that lacks it.
     held_through: Option<u64>,
     last_size: Option<Size>,
-    last_byte: u8,
-    /// Where input is in an escape sequence (for arrow keys).
-    esc: EscState,
-    /// A partial UTF-8 sequence, and the length its lead byte announced (0 when none).
-    utf8_buf: Vec<u8>,
-    utf8_need: usize,
     /// How the program's PTY takes typed keys, as the newest frame said.
     tty: Option<TtyModes>,
     /// Trust from the last connection to the same session, given once a frame shows no password
     /// prompt.
     carried: bool,
-    /// The parameter bytes of the escape sequence being read.
-    csi: Vec<u8>,
     /// Where the line being typed began, when known: the first key typed after Enter. Keys that
     /// go to the line's start (`Ctrl-A`, Home, `Ctrl-U`) are predicted only when it is.
     input_start: Option<(u16, u16)>,
@@ -286,13 +261,8 @@ impl PredictionEngine {
             late_acked: 0,
             held_through: None,
             last_size: None,
-            last_byte: 0,
-            esc: EscState::Ground,
-            utf8_buf: Vec::new(),
-            utf8_need: 0,
             tty: None,
             carried: false,
-            csi: Vec::new(),
             input_start: None,
             fresh_line: false,
         }
@@ -434,6 +404,20 @@ impl PredictionEngine {
         self.carried
     }
     /// Confirm the newest epoch, as an echo would. Test-only.
+    /// Type `bytes` as a legacy terminal sends them: each key decoded, then predicted.
+    #[cfg(test)]
+    pub(crate) fn type_bytes(&mut self, bytes: &[u8], screen: &dyn ScreenView) {
+        let mut decoder = fux_vt::keys::decode::Decoder::default();
+        let mut inputs = Vec::new();
+        decoder.bytes(bytes, &mut inputs);
+        decoder.timeout(&mut inputs);
+        for input in inputs {
+            if let fux_vt::keys::decode::Input::Key(key) = input {
+                self.new_user_key(key.press, screen);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn confirm_for_tests(&mut self) {
         self.confirmed_epoch = self.prediction_epoch;
@@ -616,11 +600,6 @@ impl PredictionEngine {
                 Some(from) => self.guess_at(screen, row, from),
                 None => Guess::unknown(Color::Default, Color::Default),
             };
-            let guess = if guess.unknown {
-                Guess::unknown(guess.fg, guess.bg)
-            } else {
-                guess
-            };
             self.place_cell(screen, row, i, guess);
         }
         let exp = self.next_frame();
@@ -777,15 +756,61 @@ impl PredictionEngine {
         self.move_cursor_to(screen, at);
     }
 
-    /// Predict what typed key `press` does to `screen`. The key is read in its one legacy form,
-    /// the bytes a legacy terminal sends for it in normal cursor mode, whatever the user's
-    /// terminal sent: `Alt-B` is `ESC b` from a kitty-protocol terminal too. A key legacy bytes
-    /// cannot tell from another (Shift-Enter) is predicted as that other.
+    /// Predict what typed key `press` does to `screen`, after culling the existing predictions.
+    /// The key is read as what it is, whatever the user's terminal sent for it: `Alt-B` from a
+    /// kitty-protocol terminal is a legacy one's, and a control is its letter with Ctrl.
     pub fn new_user_key(&mut self, press: KeyPress, screen: &dyn ScreenView) {
-        let mut bytes = Vec::with_capacity(8);
-        key_bytes(press.into(), KeyMode::legacy(false), &mut bytes);
-        for byte in bytes {
-            self.new_user_byte(byte, screen);
+        if self.pref == DisplayPreference::Never {
+            return;
+        }
+        if self.password() {
+            // Nothing typed at a password prompt is predicted, nor shown.
+            self.become_tentative();
+            return;
+        }
+        self.cull(screen);
+        if self.holding() {
+            return;
+        }
+        let Size { rows, cols } = screen.size();
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let Modifiers { alt, ctrl, .. } = press.mods;
+        match (press.key, alt, ctrl) {
+            (Key::Char(c), false, true) => match c.to_ascii_lowercase() {
+                'w' => self.predict_kill_word(screen, |c| !c.is_whitespace()),
+                'u' => self.predict_kill_line(screen),
+                'a' => self.predict_line_start(screen),
+                'e' => self.predict_line_end(screen),
+                'h' => self.predict_backspace(screen),
+                'j' | 'm' => self.predict_enter(screen),
+                _ => self.unmodelled(),
+            },
+            (Key::Char('b'), true, false) => self.predict_word_motion(screen, false),
+            (Key::Char('f'), true, false) => self.predict_word_motion(screen, true),
+            (Key::Backspace, true, false) => {
+                self.predict_kill_word(screen, char::is_alphanumeric);
+            }
+            (Key::Char(c), false, false) if c.is_ascii_graphic() || c == ' ' => {
+                self.predict_printable(c, screen);
+            }
+            (Key::Char(c), false, false) if !c.is_control() => {
+                self.predict_wide(c.encode_utf8(&mut [0; 4]), screen);
+            }
+            (Key::Backspace, false, false) => self.predict_backspace(screen),
+            (Key::Enter, false, false) => self.predict_enter(screen),
+            // The kernel echoes an arrow as `^[[D`: only a line editor moves the cursor.
+            (Key::Arrow(Direction::Right), false, false) if self.editing() => {
+                self.predict_arrow(screen, 1);
+            }
+            (Key::Arrow(Direction::Left), false, false) if self.editing() => {
+                self.predict_arrow(screen, -1);
+            }
+            (Key::Home, false, false) => self.predict_line_start(screen),
+            (Key::End, false, false) => self.predict_line_end(screen),
+            // Anything else is not predicted.
+            _ => self.unmodelled(),
         }
     }
 
@@ -824,221 +849,107 @@ impl PredictionEngine {
         self.unmodelled();
     }
 
-    /// Predict what typed `byte` does to `screen`, after culling the existing predictions.
-    pub fn new_user_byte(&mut self, byte: u8, screen: &dyn ScreenView) {
-        if self.pref == DisplayPreference::Never {
-            return;
+    /// Predict the printable ASCII `c` typed at the cursor, as a line editor inserts it.
+    fn predict_printable(&mut self, ch: char, screen: &dyn ScreenView) {
+        let cols = screen.size().cols;
+        if self.kernel_echo() {
+            // The kernel echoes it: no need to wait for the program to prove it does.
+            self.confirmed_epoch = self.confirmed_epoch.max(self.prediction_epoch);
         }
-        if self.password() {
-            // Nothing typed at a password prompt is predicted, nor shown.
-            self.become_tentative();
-            return;
+        if std::mem::take(&mut self.fresh_line) {
+            let c = self.init_cursor(screen);
+            self.input_start = Some((c.row, c.col));
         }
-        self.cull(screen);
-        if self.holding() {
-            return;
-        }
-
-        let mut byte = byte;
-        if self.last_byte == 0x1b && byte == b'O' {
-            byte = b'['; // application-cursor-mode arrow normalization
-        }
-        self.last_byte = byte;
-
-        let Size { rows, cols } = screen.size();
-        if rows == 0 || cols == 0 {
-            return;
-        }
-
-        // Before escapes: a continuation byte is never an escape's final byte.
-        if self.utf8_need > 0 {
-            if (0x80..=0xbf).contains(&byte) {
-                self.utf8_buf.push(byte);
-                if self.utf8_buf.len() >= self.utf8_need {
-                    let decoded = std::str::from_utf8(&self.utf8_buf).ok().map(str::to_string);
-                    self.utf8_buf.clear();
-                    self.utf8_need = 0;
-                    match decoded {
-                        Some(s) => self.predict_wide(&s, screen),
-                        None => self.become_tentative(),
-                    }
-                }
-                return;
-            }
-            // Malformed: drop the partial grapheme and take this byte afresh.
-            self.utf8_buf.clear();
-            self.utf8_need = 0;
+        let col = self.init_cursor(screen).col;
+        if col >= cols.saturating_sub(1) {
+            // Last column is ambiguous (wrap vs. overwrite); hide until confirmed.
             self.become_tentative();
         }
-
-        // Swallow escape sequences, predicting the keys modelled (`ESC O x` became `ESC [ x`).
-        match self.esc {
-            EscState::Esc => {
-                self.esc = EscState::Ground;
-                match byte {
-                    b'[' => {
-                        self.esc = EscState::Csi;
-                        self.csi.clear();
-                    }
-                    b'b' => self.predict_word_motion(screen, false),
-                    b'f' => self.predict_word_motion(screen, true),
-                    0x7f | 0x08 => self.predict_kill_word(screen, char::is_alphanumeric),
-                    _ => self.unmodelled(), // an escape we don't model -> wait for the server
-                }
-                return;
-            }
-            EscState::Csi => {
-                if (0x20..=0x3f).contains(&byte) && self.csi.len() < MAX_CSI_PARAMS {
-                    self.csi.push(byte);
-                    return;
-                }
-                self.esc = EscState::Ground;
-                let params = std::mem::take(&mut self.csi);
-                match (params.as_slice(), byte) {
-                    (b"", b'C') => self.predict_arrow(screen, 1),  // right
-                    (b"", b'D') => self.predict_arrow(screen, -1), // left
-                    (b"" | b"1", b'H') | (b"1" | b"7", b'~') => self.predict_line_start(screen),
-                    (b"" | b"1", b'F') | (b"4" | b"8", b'~') => self.predict_line_end(screen),
-                    // Anything else is not predicted.
-                    _ => self.unmodelled(),
-                }
-                return;
-            }
-            EscState::Ground => {}
-        }
-        if byte == 0x1b {
-            self.esc = EscState::Esc;
-            return;
-        }
-
-        // A UTF-8 lead byte (>= 0x80) starts a 2-4 byte grapheme; buffer it and await the rest.
-        if byte >= 0x80 {
-            self.utf8_need = match byte {
-                0xc0..=0xdf => 2,
-                0xe0..=0xef => 3,
-                0xf0..=0xf7 => 4,
-                _ => 0, // stray continuation or invalid lead -> nothing concrete to predict
+        let (row, col) = {
+            let c = self.init_cursor(screen);
+            (c.row, c.col)
+        };
+        // Insert mode, as a line editor renders it: shift the tail right, from the right end
+        // so each cell reads its left neighbour's content before it moves. A wide glyph
+        // moves with its right half; one split at the edge is unknown.
+        for (left, i) in (col..cols).zip((col..cols).skip(1)).rev() {
+            let guess = self.guess_at(screen, row, left);
+            // The rightmost cell takes content pushed off-screen -> unknown.
+            let guess = if i.checked_add(1) == Some(cols) || guess.unknown {
+                Guess::unknown(guess.fg, guess.bg)
+            } else {
+                guess
             };
-            if self.utf8_need >= 2 {
-                self.utf8_buf.clear();
-                self.utf8_buf.push(byte);
+            self.place_cell(screen, row, i, guess);
+        }
+        let (fg, bg) = glyph_style(screen, row, col);
+        let typed = Guess::glyph(ch.to_string(), false, fg, bg);
+        self.place_cell(screen, row, col, typed);
+        self.keep_wide_glyphs_whole(row);
+        let exp = self.next_frame();
+        if let Some(c) = self.cursor.as_mut() {
+            c.expiration_frame = exp;
+            // Advance unless on the last column.
+            if let Some(next) = c.col.checked_add(1).filter(|&next| next < cols) {
+                c.col = next;
             } else {
                 self.become_tentative();
-            }
-            return;
-        }
-
-        match byte {
-            0x20..=0x7e => {
-                if self.kernel_echo() {
-                    // The kernel echoes it: no need to wait for the program to prove it does.
-                    self.confirmed_epoch = self.confirmed_epoch.max(self.prediction_epoch);
-                }
-                if std::mem::take(&mut self.fresh_line) {
-                    let c = self.init_cursor(screen);
-                    self.input_start = Some((c.row, c.col));
-                }
-                let col = self.init_cursor(screen).col;
-                if col >= cols.saturating_sub(1) {
-                    // Last column is ambiguous (wrap vs. overwrite); hide until confirmed.
-                    self.become_tentative();
-                }
-                let (row, col) = {
-                    let c = self.init_cursor(screen);
-                    (c.row, c.col)
-                };
-                // Insert mode, as a line editor renders it: shift the tail right, from the right end
-                // so each cell reads its left neighbour's content before it moves. A wide glyph
-                // moves with its right half; one split at the edge is unknown.
-                for (left, i) in (col..cols).zip((col..cols).skip(1)).rev() {
-                    let guess = self.guess_at(screen, row, left);
-                    // The rightmost cell takes content pushed off-screen -> unknown.
-                    let guess = if i.checked_add(1) == Some(cols) || guess.unknown {
-                        Guess::unknown(guess.fg, guess.bg)
-                    } else {
-                        guess
-                    };
-                    self.place_cell(screen, row, i, guess);
-                }
-                let (fg, bg) = glyph_style(screen, row, col);
-                let typed = Guess::glyph((byte as char).to_string(), false, fg, bg);
-                self.place_cell(screen, row, col, typed);
-                self.keep_wide_glyphs_whole(row);
-                let exp = self.next_frame();
-                if let Some(c) = self.cursor.as_mut() {
-                    c.expiration_frame = exp;
-                    // Advance unless on the last column.
-                    if let Some(next) = c.col.checked_add(1).filter(|&next| next < cols) {
-                        c.col = next;
-                    } else {
-                        self.become_tentative();
-                        self.newline_cr(screen);
-                    }
-                }
-            }
-            0x7f | 0x08 => {
-                // Backspace over a wide glyph deletes both its halves, which is not modelled: a new
-                // epoch, nothing predicted.
-                let (row, col) = self
-                    .cursor
-                    .as_ref()
-                    .map_or_else(|| screen.cursor_position(), |c| (c.row, c.col));
-                if let Some(prev) = col.checked_sub(1) {
-                    let deleted = self.guess_at(screen, row, prev);
-                    if deleted.wide || deleted.covered {
-                        self.become_tentative();
-                        return;
-                    }
-                }
-                // Backspace: step the cursor back one column.
-                let exp = self.next_frame();
-                let (row, col, do_pred) = {
-                    let c = self.init_cursor(screen);
-                    if let Some(prev) = c.col.checked_sub(1) {
-                        c.col = prev;
-                        c.expiration_frame = exp;
-                        (c.row, c.col, true)
-                    } else {
-                        (c.row, c.col, false)
-                    }
-                };
-                if do_pred {
-                    // Shift the tail left, from the left so each cell reads its neighbour before it
-                    // moves. The last two columns take what was off-screen, so they are unknown,
-                    // as in mosh: a wide glyph could straddle the second-to-last.
-                    for i in col..cols {
-                        // `i < cols - 2` is mosh's `i + 2 < width` without overflow.
-                        let right = i.checked_add(1).filter(|_| i < cols.saturating_sub(2));
-                        let guess = match right {
-                            Some(right) => self.guess_at(screen, row, right),
-                            None => Guess::unknown(Color::Default, Color::Default),
-                        };
-                        let guess = if guess.unknown {
-                            Guess::unknown(guess.fg, guess.bg)
-                        } else {
-                            guess
-                        };
-                        self.place_cell(screen, row, i, guess);
-                    }
-                    self.keep_wide_glyphs_whole(row);
-                }
-            }
-            0x0d | 0x0a => {
-                // A scroll cannot be predicted cleanly: a new epoch, and the cursor moves.
-                self.become_tentative();
                 self.newline_cr(screen);
-                self.input_start = None;
-                self.fresh_line = true;
-            }
-            0x17 => self.predict_kill_word(screen, |c| !c.is_whitespace()), // Ctrl-W
-            0x15 => self.predict_kill_line(screen),                         // Ctrl-U
-            0x01 => self.predict_line_start(screen),                        // Ctrl-A
-            0x05 => self.predict_line_end(screen),                          // Ctrl-E
-            _ => {
-                // Other controls: a new epoch, nothing predicted.
-                self.unmodelled();
             }
         }
+    }
+
+    /// Predict Backspace: the cursor steps back one column and the rest of the row shifts left.
+    fn predict_backspace(&mut self, screen: &dyn ScreenView) {
+        let cols = screen.size().cols;
+        // Backspace over a wide glyph deletes both its halves, which is not modelled: a new
+        // epoch, nothing predicted.
+        let (row, col) = self
+            .cursor
+            .as_ref()
+            .map_or_else(|| screen.cursor_position(), |c| (c.row, c.col));
+        if let Some(prev) = col.checked_sub(1) {
+            let deleted = self.guess_at(screen, row, prev);
+            if deleted.wide || deleted.covered {
+                self.become_tentative();
+                return;
+            }
+        }
+        // Backspace: step the cursor back one column.
+        let exp = self.next_frame();
+        let (row, col, do_pred) = {
+            let c = self.init_cursor(screen);
+            if let Some(prev) = c.col.checked_sub(1) {
+                c.col = prev;
+                c.expiration_frame = exp;
+                (c.row, c.col, true)
+            } else {
+                (c.row, c.col, false)
+            }
+        };
+        if do_pred {
+            // Shift the tail left, from the left so each cell reads its neighbour before it
+            // moves. The last two columns take what was off-screen, so they are unknown,
+            // as in mosh: a wide glyph could straddle the second-to-last.
+            for i in col..cols {
+                // `i < cols - 2` is mosh's `i + 2 < width` without overflow.
+                let right = i.checked_add(1).filter(|_| i < cols.saturating_sub(2));
+                let guess = match right {
+                    Some(right) => self.guess_at(screen, row, right),
+                    None => Guess::unknown(Color::Default, Color::Default),
+                };
+                self.place_cell(screen, row, i, guess);
+            }
+            self.keep_wide_glyphs_whole(row);
+        }
+    }
+
+    /// Predict Enter: a scroll cannot be predicted cleanly, so a new epoch, and the cursor moves.
+    fn predict_enter(&mut self, screen: &dyn ScreenView) {
+        self.become_tentative();
+        self.newline_cr(screen);
+        self.input_start = None;
+        self.fresh_line = true;
     }
 
     pub fn cull(&mut self, screen: &dyn ScreenView) {
@@ -1178,18 +1089,7 @@ impl PredictionEngine {
     pub fn reset(&mut self) {
         self.cells.clear();
         self.cursor = None;
-        self.reset_decoder();
         self.become_tentative();
-    }
-
-    /// Forget a partial escape sequence or grapheme, which would misread the next byte after a
-    /// resize.
-    fn reset_decoder(&mut self) {
-        self.esc = EscState::Ground;
-        self.csi.clear();
-        self.utf8_buf.clear();
-        self.utf8_need = 0;
-        self.last_byte = 0;
     }
 }
 
@@ -1355,7 +1255,7 @@ mod tests {
         };
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
-        e.new_user_byte(b'x', &blank);
+        e.type_bytes(b"x", &blank);
         assert!(e.overlay().is_empty(), "hidden until confirmed");
         let mut echoed = FakeView {
             rows: vec![vec![' '; 10]; 5],
@@ -1366,7 +1266,7 @@ mod tests {
         e.cull(&echoed);
         assert_eq!(e.confirmed_epoch(), 1, "the echoed 'x' confirms the epoch");
         e.set_local_frame_sent(1);
-        e.new_user_byte(b'y', &echoed);
+        e.type_bytes(b"y", &echoed);
         let ov = e.overlay();
         assert_eq!(
             ov.cell(0, 1).map(|c| c.glyph),
@@ -1375,99 +1275,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn malformed_utf8_midgrapheme_resets_without_panicking() {
-        // A lead byte announcing a multi-byte grapheme followed by a NON-continuation byte must
-        // reset the UTF-8 accumulator (no concrete prediction, fall back to the server's echo) and
-        // must never panic or mis-draw the bytes as literal glyphs.
-        let mut pe = PredictionEngine::new(DisplayPreference::Always);
-        pe.set_local_frame_sent(0);
-        let screen = screen_of(b"");
-        pe.new_user_byte(0xE4, &screen); // lead byte of a 3-byte sequence
-        pe.new_user_byte(b'A', &screen); // not a continuation -> reset
-        assert!(
-            pe.utf8_buf.is_empty(),
-            "the UTF-8 accumulator must reset after a malformed sequence"
-        );
-        let _ = pe.overlay();
-    }
-
-    #[test]
-    fn reset_clears_partial_decoder_state() {
-        // A resize calls reset() mid-stream. If it lands right after a UTF-8 lead byte (or inside an
-        // escape sequence), those partial bytes must NOT survive reset() to mis-decode the next typed
-        // byte: reset() clears the decoder (esc / utf8_buf / utf8_need / last_byte) along with the
-        // prediction cells and cursor.
-        let mut pe = PredictionEngine::new(DisplayPreference::Always);
-        pe.set_local_frame_sent(0);
-        let screen = screen_of(b"");
-        // Mid-grapheme: feed the lead byte of a 2-byte sequence, leaving a continuation outstanding.
-        pe.new_user_byte(0xC3, &screen);
-        assert_eq!(
-            pe.utf8_buf,
-            vec![0xC3],
-            "the lead byte is buffered awaiting its continuation"
-        );
-        assert_eq!(pe.utf8_need, 2);
-
-        pe.reset(); // a resize lands here
-
-        assert!(
-            pe.utf8_buf.is_empty(),
-            "reset must drop the partial UTF-8 buffer"
-        );
-        assert_eq!(pe.utf8_need, 0, "reset must clear the awaited-byte count");
-        assert_eq!(
-            pe.last_byte, 0,
-            "reset must clear the arrow-decode last-byte state"
-        );
-        assert!(
-            matches!(pe.esc, EscState::Ground),
-            "reset must return the escape state machine to Ground"
-        );
-
-        // The next byte now decodes cleanly as ASCII, not as a stray continuation of the dropped
-        // grapheme.
-        pe.new_user_byte(b'A', &screen);
-        assert!(
-            pe.utf8_buf.is_empty(),
-            "the post-reset byte decodes cleanly"
-        );
-        let _ = pe.overlay();
-    }
-
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
 
-        /// Feeding ARBITRARY byte streams (escape bytes, partial UTF-8, arrows interleaved) to the
-        /// byte-at-a-time predictor against a fixed screen must never panic and must keep the UTF-8
-        /// accumulator bounded (<= 4 bytes). The predictor is a stateful decoder over local input —
-        /// exactly the shape that fuzzes well — and a 1.4k-LOC module with no prior property coverage.
+        /// Whatever keys arbitrary bytes decode to, predicting them over a fake view or an
+        /// emulator's screen never panics.
         #[test]
-        fn prop_new_user_byte_is_panic_free_and_utf8_bounded(
+        fn prop_predicting_any_keys_is_panic_free(
             bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
         ) {
             let fake = FakeView { rows: vec![vec![' '; 80]; 24], cursor: (0, 0) };
             let mut pf = PredictionEngine::new(DisplayPreference::Always);
             pf.set_local_frame_sent(0);
-            for &b in &bytes {
-                pf.new_user_byte(b, &fake);
-                proptest::prop_assert!(pf.utf8_buf.len() <= 4, "utf8 accumulator over the fake view");
-            }
+            pf.type_bytes(&bytes, &fake);
             let mut pe = PredictionEngine::new(DisplayPreference::Always);
             pe.set_local_frame_sent(0);
-            let screen = screen_of(b"ready prompt $ ");
-            let mut now = 0u64;
-            for b in &bytes {
-                pe.new_user_byte(*b, &screen); // must not panic on any byte sequence
-                now = now.saturating_add(1);
-                proptest::prop_assert!(
-                    pe.utf8_buf.len() <= 4,
-                    "UTF-8 accumulator grew past 4 bytes: {}",
-                    pe.utf8_buf.len()
-                );
-            }
-            let _ = pe.overlay(); // must not panic on the accumulated prediction set
+            pe.type_bytes(&bytes, &screen_of(b"ready prompt $ "));
+            let _ = pe.overlay();
         }
 
         /// Whatever is typed over a screen of wide glyphs, a wide glyph the overlay shows has the
@@ -1488,8 +1312,8 @@ mod tests {
             // Everything shown: the check is on what the overlay holds, not on when it confirms.
             e.confirmed_epoch = u64::MAX;
             e.set_local_frame_sent(0);
-            for byte in bytes.concat() {
-                e.new_user_byte(byte, &screen);
+            for key in bytes {
+                e.type_bytes(key, &screen);
                 let ov = e.overlay();
                 for ((row, col), cell) in ov.cells() {
                     let left = col.checked_sub(1).and_then(|left| ov.cell(row, left));
@@ -1517,7 +1341,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        e.new_user_byte(b'x', &blank);
+        e.type_bytes(b"x", &blank);
         assert!(
             e.overlay().is_empty(),
             "the very first keystroke must be hidden until the server confirms it echoes"
@@ -1535,9 +1359,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        for &b in b"hunter2" {
-            e.new_user_byte(b, &blank);
-        }
+        e.type_bytes(b"hunter2", &blank);
         assert!(
             e.overlay().is_empty(),
             "predictions must stay hidden until the server confirms it echoes"
@@ -1549,7 +1371,7 @@ mod tests {
         // After the server proves it echoes (one Correct), later typing in the confirmed epoch shows.
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
-        e.new_user_byte(b'y', &echoed); // cursor now at (0,1)
+        e.type_bytes(b"y", &echoed); // cursor now at (0,1)
         let ov = e.overlay();
         assert_eq!(
             ov.cell(0, 1).map(|c| c.glyph),
@@ -1564,7 +1386,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        e.new_user_byte(b's', &blank);
+        e.type_bytes(b"s", &blank);
         assert!(e.overlay().is_empty(), "non-echoed input is never shown");
 
         let still_blank = screen_of(b"");
@@ -1580,7 +1402,7 @@ mod tests {
     fn never_mode_predicts_nothing() {
         let mut e = PredictionEngine::new(DisplayPreference::Never);
         let screen = screen_of(b"");
-        e.new_user_byte(b'x', &screen);
+        e.type_bytes(b"x", &screen);
         assert!(e.overlay().is_empty());
     }
 
@@ -1592,7 +1414,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of(b"ab\x1b[1;2H"); // cursor -> row1 col2 = (0,1)
-        e.new_user_byte(b'X', &screen);
+        e.type_bytes(b"X", &screen);
         assert_eq!(
             e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
             Some("X"),
@@ -1613,7 +1435,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of(b"abc\x1b[1;3H"); // cursor -> (0,2)
-        e.new_user_byte(0x7f, &screen); // backspace
+        e.type_bytes(&[0x7f], &screen); // backspace
         let (_, cols) = screen.size().into();
         assert_eq!(
             e.cells.get(&(0, 1)).map(|c| c.glyph.as_str()),
@@ -1651,7 +1473,7 @@ mod tests {
             row: 0,
             col: u16::MAX - 1,
         });
-        e.new_user_byte(0x7f, p.screen()); // backspace — must not panic
+        e.type_bytes(&[0x7f], p.screen()); // backspace — must not panic
                                            // The two right-edge columns are unknown (mosh's `i + 2 >= width`), with no `i + 1` read.
         assert!(
             e.cells.get(&(0, u16::MAX - 1)).is_some_and(|c| c.unknown),
@@ -1672,7 +1494,7 @@ mod tests {
         e.set_local_frame_sent(0);
         // Confirm an initial keystroke so later predictions are in a shown epoch.
         let blank = screen_of(b"");
-        e.new_user_byte(b'a', &blank);
+        e.type_bytes(b"a", &blank);
         let echoed = screen_of(b"a");
         e.set_local_frame_late_acked(1);
         e.cull(&echoed); // confirmed_epoch = 1
@@ -1680,9 +1502,9 @@ mod tests {
         // Type "bc": 'b' on frame 2 (will be confirmed), 'c' on frame 3 (stays pending), so 'c'
         // survives the cull where 'b' confirms — and can be recolored.
         e.set_local_frame_sent(1);
-        e.new_user_byte(b'b', &echoed);
+        e.type_bytes(b"b", &echoed);
         e.set_local_frame_sent(2);
-        e.new_user_byte(b'c', &echoed);
+        e.type_bytes(b"c", &echoed);
         assert_eq!(
             e.cells.get(&(0, 2)).map(|c| c.fg),
             Some(Color::Default),
@@ -1765,9 +1587,7 @@ mod tests {
         // column left and must NOT leave literal '[' / 'D' glyphs from the escape bytes.
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
-        for &b in b"\x1b[D" {
-            e.new_user_byte(b, &echoed); // ESC [ D
-        }
+        e.type_bytes(b"\x1b[D", &echoed);
         let ov = e.overlay();
         assert_eq!(
             ov.cursor(),
@@ -1785,9 +1605,7 @@ mod tests {
         // Application-cursor-mode arrow: ESC O D must behave like ESC [ D.
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
-        for &b in b"\x1bOD" {
-            e.new_user_byte(b, &echoed); // ESC O D
-        }
+        e.type_bytes(b"\x1bOD", &echoed);
         assert_eq!(e.overlay().cursor(), Some((0, 0)));
     }
 
@@ -1798,9 +1616,7 @@ mod tests {
         // (and no stray glyph in the continuation cell).
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
-        for &b in "世".as_bytes() {
-            e.new_user_byte(b, &echoed); // cursor seeds from the real screen at (0,1)
-        }
+        e.type_bytes("世".as_bytes(), &echoed);
         let ov = e.overlay();
         assert_eq!(
             ov.cell(0, 1).map(|c| c.glyph),
@@ -1845,7 +1661,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of("a本b\x1b[1;1H".as_bytes());
-        e.new_user_byte(b'X', &screen);
+        e.type_bytes(b"X", &screen);
         let row: Vec<_> = (0..5).map(|col| predicted_at(&e, col)).collect();
         let expected = ["X", "a", "本", ">", "b"].map(|g| Some(g.to_owned()));
         assert_eq!(row, expected);
@@ -1858,14 +1674,14 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = sized_screen_of(2, 6, "abc本\x1b[1;1H".as_bytes());
-        e.new_user_byte(b'X', &screen);
+        e.type_bytes(b"X", &screen);
         assert_eq!(predicted_at(&e, 4).as_deref(), Some("U"), "its glyph");
         assert_eq!(predicted_at(&e, 5).as_deref(), Some("U"), "its right half");
         // Typed inside one, its halves part.
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of("本x\x1b[1;2H".as_bytes());
-        e.new_user_byte(b'a', &screen);
+        e.type_bytes(b"a", &screen);
         assert_eq!(predicted_at(&e, 1).as_deref(), Some("a"));
         assert_eq!(
             predicted_at(&e, 2).as_deref(),
@@ -1876,7 +1692,7 @@ mod tests {
         let mut e = PredictionEngine::new(DisplayPreference::Always);
         e.set_local_frame_sent(0);
         let screen = screen_of("ab本c\x1b[1;3H".as_bytes());
-        e.new_user_byte(0x7f, &screen);
+        e.type_bytes(&[0x7f], &screen);
         let row: Vec<_> = (1..4).map(|col| predicted_at(&e, col)).collect();
         assert_eq!(row, ["本", ">", "c"].map(|g| Some(g.to_owned())));
     }
@@ -1886,13 +1702,9 @@ mod tests {
         // Typed over the right half of a predicted wide glyph: that glyph cannot show.
         let (mut e, echoed) = confirm_first_keystroke();
         e.set_local_frame_sent(1);
-        for &b in "日".as_bytes() {
-            e.new_user_byte(b, &echoed);
-        }
+        e.type_bytes("日".as_bytes(), &echoed);
         e.cursor = e.cursor.clone().map(|c| PredCursor { col: 2, ..c });
-        for &b in "本".as_bytes() {
-            e.new_user_byte(b, &echoed);
-        }
+        e.type_bytes("本".as_bytes(), &echoed);
         let row: Vec<_> = (1..5).map(|col| predicted_at(&e, col)).collect();
         assert_eq!(
             row,
@@ -1911,7 +1723,7 @@ mod tests {
         let screen = screen_of("x本".as_bytes());
         e.set_local_frame_sent(1);
         let epoch = e.prediction_epoch;
-        e.new_user_byte(0x7f, &screen);
+        e.type_bytes(&[0x7f], &screen);
         assert!(e.cells.is_empty(), "nothing predicted");
         assert!(e.prediction_epoch > epoch, "a new epoch");
         assert!(e.overlay().is_empty());
@@ -1957,9 +1769,7 @@ mod tests {
         for (word, accent) in [("glück", "ü"), ("faĩl", "ĩ")] {
             let (mut e, echoed) = confirm_first_keystroke();
             e.set_local_frame_sent(1);
-            for &b in word.as_bytes() {
-                e.new_user_byte(b, &echoed);
-            }
+            e.type_bytes(word.as_bytes(), &echoed);
             let ov = e.overlay();
             // The first typed char lands at col 1 (cursor seeded from the echoed "x"); the accent
             // is the 3rd char, so column 3.
@@ -1995,9 +1805,7 @@ mod tests {
     /// Type `keys` into `e` over `screen`, as one input frame.
     fn type_keys(e: &mut PredictionEngine, screen: &Screen, keys: &[u8]) {
         e.set_local_frame_sent(1);
-        for &b in keys {
-            e.new_user_byte(b, screen);
-        }
+        e.type_bytes(keys, screen);
     }
 
     /// Row 0 as shown: the overlay over the screen, trailing blanks trimmed; and the cursor's

@@ -287,6 +287,7 @@ async fn probe_terminal<B: crate::client::KohBackend>(
     let told = colours.then(|| replies.colours());
     let typed = replies.typed();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
+    #[expect(clippy::disallowed_methods, reason = "one task a run")]
     tokio::spawn(async move {
         if !typed.is_empty() && tx.send(typed).await.is_err() {
             return;

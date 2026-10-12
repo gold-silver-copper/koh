@@ -9,6 +9,7 @@
 //! the server diffs against the newest frame the client acknowledged, as koh's protocol does;
 //! the newest frame of each step is resent until it arrives, as the server's retries do, so the
 //! client must converge on every step's screen.
+#![expect(clippy::disallowed_types, reason = "tests queue freely")]
 
 #[path = "../testing/corpus/recording.rs"]
 mod recording;
@@ -364,8 +365,7 @@ impl Session {
             match msg {
                 ClientMsg::Ack { frame: acked } => self.ack(acked),
                 ClientMsg::Resync => self.base = (FrameNum::BLANK, TerminalScreen::default()),
-                ClientMsg::Input { .. }
-                | ClientMsg::Keys { .. }
+                ClientMsg::Keys { .. }
                 | ClientMsg::Colours(_)
                 | ClientMsg::Resize(_)
                 | ClientMsg::History(_) => {}
@@ -596,7 +596,7 @@ fn guesses(recording: &Recording, into: &mut Guesses) -> Result<(), String> {
             client.on_input(now, &step.keys);
         }
         while let Some(msg) = client.pop_outgoing() {
-            if let ClientMsg::Input { seq, .. } | ClientMsg::Keys { seq, .. } = msg {
+            if let ClientMsg::Keys { seq, .. } = msg {
                 typed = typed.max(seq);
             }
         }

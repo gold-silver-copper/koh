@@ -16,14 +16,14 @@ service.
 ## Attacker models
 
 1. **Malicious / compromised client** — a peer that dials the server. If it is on the allowlist it
-   reaches the koh/3 data plane: it sends arbitrary input, resize, ack and resync messages and opens
-   streams. Input comes as raw bytes (`Input`) or decoded events (`Keys`: keys, mouse events, focus
-   changes, paste pieces); decoding refuses what no terminal sends (a modifier bit no key has, a
-   function key past F12, a kitty code that is no Unicode scalar, a paste piece over 60 KiB, more
-   than 512 events, more than 16 palette entries in `Colours`) and closes the connection. The server
-   encodes events with fux-vt for the program's modes; a paste's end markers are removed from every
-   piece, so even a hostile client cannot end a program's bracketed paste early with paste text
-   (it can type anything else, as any client can).
+   reaches the koh/4 data plane: it sends arbitrary input, resize, ack and resync messages and opens
+   streams. Input comes as decoded events (`Keys`: keys, mouse events, focus changes, whole
+   pastes); decoding refuses what no terminal sends (a modifier bit no key has, a function key past
+   F12, a kitty code that is no Unicode scalar, a paste over 1 MiB, more than 512 events, more than
+   16 palette entries in `Colours`) and closes the connection, refusing a sequence past its bound
+   before allocating for it. The server encodes events with fux-vt for the program's modes; a paste
+   is framed whole with its end markers removed, so even a hostile client cannot end a program's
+   bracketed paste early, nor leave one open (it can type anything else, as any client can).
    **Goal it must be denied:** crash / OOM / hang the server, bypass a cap, or escape the admission
    gauntlet. The server is the high-value target (it runs a shell).
 2. **Malicious / compromised server** — a server a client dials (a wrong/typo'd node-id, or a popped
@@ -96,8 +96,8 @@ service.
   window). Authorization is an explicit **allowlist** (off-list peers refused); at least one entry is
   required, so there is no "accept any peer" mode. This is the **single** authentication factor —
   there is no passphrase/PAKE second factor. A leaked key file is a leaked identity: protect it
-  like an SSH private key, and remove a lost machine's id from every allowlist (`koh clients rm`, and
-  any `--allow`). The saved allowlist, `clients` beside the server key, is held to the key's own
+  like an SSH private key, and remove a lost machine's id from every allowlist (`koh clients rm`,
+  which a running server heeds at the next connection, and any `--allow`, which needs a restart). The saved allowlist, `clients` beside the server key, is held to the key's own
   rules (`src/identity/key_file.rs`): a symlink or another user's file is refused and a loose mode
   tightened, since whoever can write it can let a peer in. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
   checkpoint; its outcomes are logged structured under the `koh::auth` target.

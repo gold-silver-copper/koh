@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::events::{InputEvent, WireColours};
 use fux_vt::keys::colour::Colours;
-use fux_vt::keys::encode::{paste, PASTE_END, PASTE_START};
+use fux_vt::keys::encode::paste;
 use fux_vt::{Event, Options, Parser, Sink, Unhandled};
 
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
@@ -152,9 +152,6 @@ pub struct ServerTerminal {
     names: HistoryNames,
     /// How the PTY takes typed keys, as last read.
     tty: Option<TtyModes>,
-    /// A paste begun and not ended, and whether it was framed (the program had bracketed paste
-    /// set when it began).
-    paste_open: Option<bool>,
 }
 
 impl ServerTerminal {
@@ -172,16 +169,15 @@ impl ServerTerminal {
             frame_ends: FrameEnds::default(),
             names: HistoryNames::default(),
             tty: None,
-            paste_open: None,
         })
     }
 
     /// Append the bytes the program gets for `events`, each encoded as it asked: keys in its
     /// keyboard mode (DECCKM, the kitty flags, modifyOtherKeys), mouse events in its tracking
     /// mode and encoding (none if it asked for none), focus changes if it set mode 1004, and
-    /// pastes framed if it set bracketed paste when the paste began. A paste's end markers are
-    /// removed from every piece, so nothing in it can end its frame early.
-    pub fn encode_input(&mut self, events: &[InputEvent], out: &mut Vec<u8>) {
+    /// pastes framed if it set bracketed paste, their end markers removed, so nothing in one can
+    /// end its frame early.
+    pub fn encode_input(&self, events: &[InputEvent], out: &mut Vec<u8>) {
         for event in events {
             let screen = self.parser.screen();
             match event {
@@ -192,37 +188,8 @@ impl ServerTerminal {
                 InputEvent::Focus(focused) => {
                     screen.encode_focus(*focused, out);
                 }
-                InputEvent::Paste { text, first, last } => {
-                    // A paste begun without its end first ends where the next begins.
-                    if *first {
-                        if self.paste_open == Some(true) {
-                            out.extend_from_slice(PASTE_END);
-                        }
-                        self.paste_open = None;
-                    }
-                    let framed = *self.paste_open.get_or_insert_with(|| {
-                        let framed = screen.mode(fux_vt::Mode::BracketedPaste);
-                        if framed {
-                            out.extend_from_slice(PASTE_START);
-                        }
-                        framed
-                    });
-                    if framed {
-                        let mut piece = Vec::with_capacity(text.len().saturating_add(12));
-                        paste(text, true, &mut piece);
-                        let inner = piece
-                            .get(PASTE_START.len()..piece.len().saturating_sub(PASTE_END.len()))
-                            .unwrap_or_default();
-                        out.extend_from_slice(inner);
-                    } else {
-                        out.extend_from_slice(text.as_bytes());
-                    }
-                    if *last {
-                        if framed {
-                            out.extend_from_slice(PASTE_END);
-                        }
-                        self.paste_open = None;
-                    }
+                InputEvent::Paste(text) => {
+                    paste(text, screen.mode(fux_vt::Mode::BracketedPaste), out);
                 }
             }
         }
@@ -327,18 +294,20 @@ impl ServerTerminal {
         std::mem::take(&mut self.observed.host_replies)
     }
 
-    /// Resize to `size`, clamped: it comes from the peer. A refused resize keeps the size and is
-    /// logged.
-    pub fn resize(&mut self, size: Size) {
-        self.resize_sized(super::host_size(size));
-    }
-
-    pub(crate) fn resize_sized(&mut self, size: fux_vt::Size) {
+    /// Resize to `size`, clamped: it comes from the peer. Whether that changed the size; a
+    /// refused resize keeps the size and is logged.
+    pub fn resize(&mut self, size: Size) -> bool {
+        let size = super::host_size(size);
+        if self.parser.screen().size() == size {
+            return false;
+        }
         if let Err(e) = self.parser.resize(size) {
             tracing::warn!(error = %e, rows = size.rows(), cols = size.cols(), "terminal emulator refused a resize");
+            return false;
         }
         // A reflow lays the history out afresh, its rows with new cells.
         self.names.renew();
+        true
     }
 
     /// The PTY's modes, read by its owner, for the next snapshot; whether they changed.
@@ -1038,11 +1007,7 @@ mod tests {
                 fux_vt::keys::decode::Input::Mouse(event) => Some(InputEvent::Mouse(event.into())),
                 fux_vt::keys::decode::Input::FocusIn => Some(InputEvent::Focus(true)),
                 fux_vt::keys::decode::Input::FocusOut => Some(InputEvent::Focus(false)),
-                fux_vt::keys::decode::Input::Paste(text) => Some(InputEvent::Paste {
-                    text,
-                    first: true,
-                    last: true,
-                }),
+                fux_vt::keys::decode::Input::Paste(text) => Some(InputEvent::Paste(text)),
                 fux_vt::keys::decode::Input::PasteTooLong
                 | fux_vt::keys::decode::Input::Reply(_) => None,
             })
@@ -1137,42 +1102,31 @@ mod tests {
 
     #[test]
     fn a_paste_cannot_end_its_bracket_and_goes_plain_to_a_program_without_one() {
-        // The client strips markers too; the server holds whatever a peer sends.
         let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
         t.process(b"\x1b[?2004h");
+        let paste = |text: &str| InputEvent::Paste(text.to_owned());
         let mut out = Vec::new();
-        let piece = |text: &str, first, last| InputEvent::Paste {
-            text: text.to_owned(),
-            first,
-            last,
-        };
         t.encode_input(
-            &[
-                piece("a\x1b[201~b", true, false),
-                piece("\x1b[20\x1b[201~1~c", false, false),
-                piece("d\u{9b}201~", false, true),
-            ],
+            &[paste("a\x1b[201~b\x1b[20\x1b[201~1~cd\u{9b}201~")],
             &mut out,
         );
         assert_eq!(out, b"\x1b[200~abcd\x1b[201~");
-        // The bracket as set when the paste began, for every piece.
-        out.clear();
-        t.encode_input(&[piece("x", true, false)], &mut out);
-        t.process(b"\x1b[?2004l");
-        t.encode_input(&[piece("y", false, true)], &mut out);
-        assert_eq!(out, b"\x1b[200~xy\x1b[201~");
         // Unbracketed: the text as pasted.
+        t.process(b"\x1b[?2004l");
         out.clear();
-        t.encode_input(&[piece("a\nb", true, true)], &mut out);
+        t.encode_input(&[paste("a\nb")], &mut out);
         assert_eq!(out, b"a\nb");
-        // A paste begun and never ended is closed when the next begins.
+        // A paste is whole: what follows it is never inside its bracket.
         t.process(b"\x1b[?2004h");
         out.clear();
-        t.encode_input(
-            &[piece("one", true, false), piece("two", true, true)],
-            &mut out,
+        let key = InputEvent::Key(
+            fux_vt::keys::Keystroke::from(fux_vt::keys::KeyPress::plain(fux_vt::keys::Key::Char(
+                'k',
+            )))
+            .into(),
         );
-        assert_eq!(out, b"\x1b[200~one\x1b[201~\x1b[200~two\x1b[201~");
+        t.encode_input(&[paste("a"), key], &mut out);
+        assert_eq!(out, b"\x1b[200~a\x1b[201~k");
     }
 
     #[test]
@@ -1253,5 +1207,33 @@ mod tests {
         );
         // Nothing drawn changes: no row is in the palette's colours.
         assert!(!t.live().colors_changed());
+    }
+
+    #[test]
+    fn history_keeps_its_names_through_the_alternate_screen_and_a_resize_to_the_same_size() {
+        // The client caches history rows by name: a visit to the alternate screen (which has no
+        // history), or a resize that changes nothing, must not rename them all.
+        let mut t = ServerTerminal::new(24, 80, 1000).expect("emulator");
+        for n in 0..300 {
+            t.process(format!("line {n}\r\n").as_bytes());
+        }
+        let before = t.snapshot().history();
+        assert!(before.len > 200, "{before:?}");
+        t.process(b"\x1b[?1049h");
+        t.snapshot();
+        t.process(b"\x1b[?1049l");
+        assert_eq!(t.snapshot().history(), before, "after the alternate screen");
+        assert!(!t.resize(Size::new(24, 80)));
+        assert_eq!(
+            t.snapshot().history(),
+            before,
+            "after a resize to the same size"
+        );
+        assert!(t.resize(Size::new(24, 60)));
+        assert_ne!(
+            t.snapshot().history().newest,
+            before.newest,
+            "a reflow renames"
+        );
     }
 }

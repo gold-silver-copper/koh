@@ -11,7 +11,7 @@
 //!
 //! The types here are the wire's own, so its encoding is pinned here and not by fux-vt's types.
 //! Decoding refuses what no terminal sends: a modifier mask with unknown bits, a function key past
-//! F12, a kitty code that is no Unicode scalar, a paste piece over [`MAX_PASTE_PIECE`] bytes, more
+//! F12, a kitty code that is no Unicode scalar, a paste over [`MAX_PASTE`] bytes, more
 //! than [`MAX_EVENTS`] events in a message, more than [`PALETTE`] palette entries ([`check_events`],
 //! [`WireColours::check`]).
 
@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 /// Most events in one `ClientMsg::Keys`.
 pub const MAX_EVENTS: usize = 512;
 
-/// Most bytes of one paste piece: a longer paste goes in pieces, in order, each its own message.
-pub const MAX_PASTE_PIECE: usize = 60 * 1024;
+/// Most bytes of a paste, which goes whole in one message: a longer one is not sent.
+pub const MAX_PASTE: usize = 1024 * 1024;
 
 /// Palette entries the client asks its terminal and tells the server: 0 to 15, the ones themes
 /// change.
@@ -41,14 +41,9 @@ pub enum InputEvent {
     Mouse(WireMouse),
     /// The user's terminal gained (`true`) or lost focus.
     Focus(bool),
-    /// A piece of a bracketed paste, its end markers already removed by the client: `first`
-    /// begins the paste, `last` ends it. The server frames the whole paste once, for a program
-    /// that set bracketed paste.
-    Paste {
-        text: String,
-        first: bool,
-        last: bool,
-    },
+    /// A whole paste, its end markers already removed by the client. The server frames it, for a
+    /// program that set bracketed paste.
+    Paste(String),
 }
 
 /// A key, its modifiers (Shift 1, Alt 2, Ctrl 4), and what a kitty-protocol terminal said beyond
@@ -130,6 +125,7 @@ pub enum WireButton {
 pub struct WireColours {
     pub foreground: Option<[u8; 3]>,
     pub background: Option<[u8; 3]>,
+    #[serde(deserialize_with = "crate::bounded::at_most::<PALETTE, _, _>")]
     pub palette: Vec<Option<[u8; 3]>>,
     pub scheme: Option<WireScheme>,
 }
@@ -156,8 +152,8 @@ impl InputEvent {
         match self {
             Self::Key(key) => key.check(),
             Self::Mouse(mouse) if mouse.mods & !MODS != 0 => Err("unknown modifier bits"),
-            Self::Paste { text, .. } if text.len() > MAX_PASTE_PIECE => Err("paste piece too long"),
-            Self::Mouse(_) | Self::Focus(_) | Self::Paste { .. } => Ok(()),
+            Self::Paste(text) if text.len() > MAX_PASTE => Err("paste too long"),
+            Self::Mouse(_) | Self::Focus(_) | Self::Paste(_) => Ok(()),
         }
     }
 
@@ -178,30 +174,19 @@ impl InputEvent {
             }
             Self::Focus(true) => out.extend_from_slice(b"\x1b[I"),
             Self::Focus(false) => out.extend_from_slice(b"\x1b[O"),
-            Self::Paste { text, first, last } => {
-                if *first {
-                    out.extend_from_slice(PASTE_START);
-                }
+            Self::Paste(text) => {
+                out.extend_from_slice(PASTE_START);
                 out.extend_from_slice(text.as_bytes());
-                if *last {
-                    out.extend_from_slice(PASTE_END);
-                }
+                out.extend_from_slice(PASTE_END);
             }
         }
         out
     }
 
-    /// About how many bytes the event takes on the wire, for packing messages.
-    pub fn wire_len(&self) -> usize {
-        match self {
-            // Its variants, a character of at most 4 bytes, the modifiers; and kitty's codes
-            // as varints of at most 3 bytes.
-            Self::Key(key) if key.kitty.is_some() => 24,
-            Self::Key(_) => 8,
-            Self::Mouse(_) => 12,
-            Self::Focus(_) => 2,
-            Self::Paste { text, .. } => text.len(),
-        }
+    /// The bytes the event takes on the wire, for packing messages.
+    pub fn encoded_len(&self) -> usize {
+        postcard::serialize_with_flavor(self, postcard::ser_flavors::Size::default())
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -470,11 +455,7 @@ mod tests {
                 row: 0,
                 col: 0,
             }),
-            InputEvent::Paste {
-                text: "x".repeat(MAX_PASTE_PIECE + 1),
-                first: true,
-                last: true,
-            },
+            InputEvent::Paste("x".repeat(MAX_PASTE + 1)),
         ];
         for event in bad {
             assert!(

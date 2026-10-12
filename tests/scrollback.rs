@@ -73,8 +73,7 @@ impl Pair {
             let requests: Vec<_> = std::iter::from_fn(|| self.client.pop_outgoing())
                 .filter_map(|msg| match msg {
                     ClientMsg::History(request) => Some(request),
-                    ClientMsg::Input { .. }
-                    | ClientMsg::Keys { .. }
+                    ClientMsg::Keys { .. }
                     | ClientMsg::Colours(_)
                     | ClientMsg::Resize(_)
                     | ClientMsg::Ack { .. }

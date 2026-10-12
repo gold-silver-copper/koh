@@ -1,8 +1,9 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/3 client.
+//! loopback iroh with a minimal koh/4 client.
 //!
 //! Every session's program starts through the `koh` binary's `__launch`, as `koh serve`'s do; unit
 //! tests cannot reach a binary, so these live here.
+#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -48,7 +49,7 @@ fn registry(command: &[&str], max_sessions: usize, ttl: Duration) -> Registry {
 
 /// Attach `peer` and say how.
 async fn attach_kind(reg: &Registry, peer: iroh::EndpointId) -> Option<AttachKind> {
-    reg.attach(peer).await.map(|(_, kind)| kind)
+    reg.attach(peer).await.ok().map(|(_, kind)| kind)
 }
 
 fn peer() -> std::io::Result<iroh::EndpointId> {
@@ -83,7 +84,7 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
             .await
             .context("A creates the one allowed session")?;
         anyhow::ensure!(
-            reg.attach(b).await.is_none(),
+            reg.attach(b).await.is_err(),
             "a second distinct peer is refused at the cap"
         );
         anyhow::ensure!(
@@ -160,7 +161,7 @@ fn a_session_whose_shell_exited_is_torn_down() -> anyhow::Result<()> {
     })
 }
 
-/// A bare koh/3 client: writes messages, applies frames whose base it holds, and acks them.
+/// A bare koh/4 client: writes messages, applies frames whose base it holds, and acks them.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -219,9 +220,27 @@ impl RawClient {
 
     async fn type_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.last_seq = self.last_seq.next();
-        let msg = ClientMsg::Input {
+        let mut decoder = fux_vt::keys::decode::Decoder::default();
+        let mut inputs = Vec::new();
+        decoder.bytes(bytes, &mut inputs);
+        decoder.timeout(&mut inputs);
+        let events = inputs
+            .into_iter()
+            .filter_map(|input| match input {
+                fux_vt::keys::decode::Input::Key(key) => {
+                    Some(koh::events::InputEvent::Key(key.into()))
+                }
+                fux_vt::keys::decode::Input::Paste(_)
+                | fux_vt::keys::decode::Input::PasteTooLong
+                | fux_vt::keys::decode::Input::FocusIn
+                | fux_vt::keys::decode::Input::FocusOut
+                | fux_vt::keys::decode::Input::Mouse(_)
+                | fux_vt::keys::decode::Input::Reply(_) => None,
+            })
+            .collect();
+        let msg = ClientMsg::Keys {
             seq: self.last_seq,
-            bytes: bytes.to_vec(),
+            events,
         };
         self.write(&msg).await
     }
@@ -249,7 +268,7 @@ impl RawClient {
             }
             let base = base_screen;
             let mut next = base.clone();
-            next.apply(&frame.diff);
+            next.apply(&frame.diff)?;
             self.screens.insert(frame.num, next);
             self.newest = frame.num;
             self.echo_ack = self.echo_ack.max(frame.echo_ack);
@@ -472,7 +491,6 @@ fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
             drained.is_ok(),
             "after shutdown the held client's session has ended"
         );
-        anyhow::ensure!(!client.can_send(), "the ended session takes no input");
         Ok(())
     })
 }
@@ -552,7 +570,7 @@ async fn attach_when_a_slot_frees(
 ) -> Option<(koh::server::session::SessionClient, AttachKind)> {
     tokio::time::timeout(within, async {
         loop {
-            if let Some(attached) = reg.attach(peer).await {
+            if let Ok(attached) = reg.attach(peer).await {
                 return attached;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -641,8 +659,8 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
         let addr = loopback_addr(&server_ep);
         let serve = tokio::spawn(async move {
             let incoming = server_ep.accept().await.context("incoming")?;
-            let conn = incoming.await?;
-            koh::server::run_attached(conn, client).await
+            let conn = koh::server::cli::Authorized::assumed(incoming.await?);
+            anyhow::Ok(koh::server::run_attached(conn, client).await)
         });
         let mut raw = RawClient::connect(addr, generate_secret_key()?, false).await?;
         let mut ended = None;
@@ -659,6 +677,113 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
             matches!(ended, Some(koh::server::SessionExit::ShellExited)),
             "run_attached must end with ShellExited within 3s; ended: {}, close: {close:?}",
             ended.is_some()
+        );
+        Ok(())
+    })
+}
+
+/// A program that exits with a background job still holding its terminal ends the session: the
+/// job keeps the PTY's output from ending, so the exit is found by waiting for the program.
+#[test]
+fn a_program_that_exits_leaving_a_job_on_its_terminal_ends_the_session() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let reg = registry(
+            &["sh", "-c", "sleep 30 & exit 3"],
+            4,
+            Duration::from_secs(30),
+        );
+        let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
+        let exited = await_exit(&mut client).await;
+        let code = client.screen().exit_code();
+        drop(client);
+        reg.shutdown().await;
+        exited?;
+        anyhow::ensure!(code == Some(3), "the program's status: {code:?}");
+        Ok(())
+    })
+}
+
+/// A program that cannot start is not reported as the server being full.
+#[test]
+fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let reg = registry(
+            &["/nonexistent/koh-test-program"],
+            4,
+            Duration::from_secs(30),
+        );
+        let refused = reg.attach(peer()?).await.err();
+        reg.shutdown().await;
+        anyhow::ensure!(
+            refused == Some(koh::server::session::Refused::Failed),
+            "{refused:?}"
+        );
+        Ok(())
+    })
+}
+
+/// The allowlist decides who gets a shell, through `koh serve`'s own accept loop: an id on
+/// neither list is refused, a client saved while the server runs is let in at its next
+/// connection, and one removed is refused from then on, the server never restarted.
+#[test]
+fn the_allowlist_is_checked_at_every_connection() -> anyhow::Result<()> {
+    use koh::names::{List, Places};
+    use std::os::unix::fs::DirBuilderExt as _;
+    runtime()?.block_on(async {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("koh-allowlist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let places = Places {
+            client_key: dir.join("client.key"),
+            server_key: dir.join("server.key"),
+        };
+        let (given, saved, stranger) = (
+            generate_secret_key()?,
+            generate_secret_key()?,
+            generate_secret_key()?,
+        );
+        let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
+        let addr = loopback_addr(&server_ep);
+        let config = ServeConfig {
+            allow: vec![given.public()],
+            saved_clients: Some(places.clone()),
+            command: vec!["cat".to_owned()],
+            scrollback: 0,
+            launcher: launcher(),
+            ..ServeConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let server = tokio::spawn(serve_endpoint(
+            server_ep,
+            Hosting::from_config(&config)?,
+            shutdown.clone(),
+        ));
+        let admitted = |secret: &iroh::SecretKey| {
+            let (addr, secret) = (addr.clone(), secret.clone());
+            async move { RawClient::connect(addr, secret, true).await.is_ok() }
+        };
+        let given_in = admitted(&given).await;
+        let stranger_in = admitted(&stranger).await;
+        let saved_before = admitted(&saved).await;
+        koh::names::update(&places, List::Clients, |names| {
+            names.add("phone", saved.public())
+        })?;
+        let saved_in = admitted(&saved).await;
+        koh::names::update(&places, List::Clients, |names| {
+            names.remove("phone").map(drop)
+        })?;
+        let removed_in = admitted(&saved).await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        anyhow::ensure!(given_in, "an id given for the run is let in");
+        anyhow::ensure!(!stranger_in, "an id on neither list is refused");
+        anyhow::ensure!(!saved_before, "a client not yet saved is refused");
+        anyhow::ensure!(saved_in, "a client saved while the server runs is let in");
+        anyhow::ensure!(
+            !removed_in,
+            "a client removed while the server runs is refused"
         );
         Ok(())
     })

@@ -5,6 +5,7 @@
 //! the entire path: scripted keystroke → client → input stream → server → PTY → shell echo →
 //! fux-vt → frame stream → client render, on the plain loopback path with no fault link in
 //! between (the `net` tests add one).
+#![expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

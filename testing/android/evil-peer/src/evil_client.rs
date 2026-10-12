@@ -1,5 +1,5 @@
 //! A deliberately-MALICIOUS koh CLIENT for the emulator suite. It authenticates (or deliberately
-//! fails to) like a real client, then sends crafted koh/3 traffic a stock peer never would, to
+//! fails to) like a real client, then sends crafted koh/4 traffic a stock peer never would, to
 //! exercise koh's server-side defenses. Every attack reuses koh's PUBLIC `proto`/`transport_iroh`
 //! code, so the malicious client allocates almost nothing — the SERVER is the one that must stay
 //! bounded. The equivalent CI tests live in `tests/net/hostile_peer.rs`; this is the on-device
@@ -27,7 +27,7 @@
 //!   stall-admission          connect but never accept the admission ack  (3s admission timeout)
 //!
 //! `empty-frags`, `partial-frags` and `bad-version` are accepted as aliases of `garbage` /
-//! `bad-alpn`, the nearest koh/3 attacks: koh/3 has no fragments and the ALPN is the version. The
+//! `bad-alpn`, the nearest koh/4 attacks: koh/4 has no fragments and the ALPN is the version. The
 //! Android scripts call `bad-version`; the fragment names are kept for older invocations.
 
 use std::net::SocketAddr;
@@ -36,9 +36,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use iroh::endpoint::{Connection, SendStream};
 use koh::events::{
-    InputEvent, WireColours, WireKey, WireKeyCode, WireKitty, MAX_EVENTS, MAX_PASTE_PIECE, PALETTE,
+    InputEvent, WireColours, WireKey, WireKeyCode, WireKitty, MAX_EVENTS, MAX_PASTE, PALETTE,
 };
-use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE, MAX_INPUT_BYTES};
+use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE};
 use koh::terminal::Size;
 use koh::transport_iroh::{
     admission, bind_endpoint_local, direct_addr, generate_secret_key, parse_endpoint_id, ALPN,
@@ -162,12 +162,21 @@ async fn bomb(send: &mut SendStream) -> Result<()> {
     Ok(())
 }
 
-/// A single well-framed message whose input body is over the per-input cap.
+/// A key typed: `c`.
+fn key(c: char) -> InputEvent {
+    InputEvent::Key(WireKey {
+        key: WireKeyCode::Char(c),
+        mods: 0,
+        kitty: None,
+    })
+}
+
+/// A single well-framed message whose paste is over the paste cap.
 async fn oversized(send: &mut SendStream) -> Result<()> {
-    eprintln!("evil-client: one input message over the {MAX_INPUT_BYTES}-byte cap");
-    let msg = ClientMsg::Input {
+    eprintln!("evil-client: one paste over the {MAX_PASTE}-byte cap");
+    let msg = ClientMsg::Keys {
         seq: InputSeq(1),
-        bytes: vec![b'a'; MAX_INPUT_BYTES + 4096],
+        events: vec![InputEvent::Paste("a".repeat(MAX_PASTE + 4096))],
     };
     // Encode by hand: `encode_client` refuses to build an over-cap message, which is the point.
     let body = postcard::to_allocvec(&msg)?;
@@ -183,9 +192,9 @@ async fn accumulate(send: &mut SendStream, n: u64) -> Result<()> {
     for seq in 1..=n {
         write_msg(
             send,
-            &ClientMsg::Input {
+            &ClientMsg::Keys {
                 seq: InputSeq(seq),
-                bytes: b"a".to_vec(),
+                events: vec![key('a')],
             },
         )
         .await?;
@@ -206,17 +215,22 @@ async fn resize_flood(send: &mut SendStream, n: usize) -> Result<()> {
     Ok(())
 }
 
-/// A big paste, split into capped input messages: the PTY write queue and QUIC flow control bound it.
+/// About `mib` MiB of typed keys, in full messages: the PTY write queue and QUIC flow control bound
+/// them.
 async fn keys_flood(send: &mut SendStream, mib: usize) -> Result<()> {
-    eprintln!("evil-client: a {mib} MiB paste in capped messages");
-    let chunk = vec![b'x'; MAX_INPUT_BYTES];
-    let count = mib * MIB / MAX_INPUT_BYTES;
-    for seq in 1..=count as u64 {
+    eprintln!("evil-client: {mib} MiB of keys in full messages");
+    let events = vec![key('x'); MAX_EVENTS];
+    let size = encode_client(&ClientMsg::Keys {
+        seq: InputSeq(1),
+        events: events.clone(),
+    })?
+    .len();
+    for seq in 1..=(mib * MIB / size) as u64 {
         write_msg(
             send,
-            &ClientMsg::Input {
+            &ClientMsg::Keys {
                 seq: InputSeq(seq),
-                bytes: chunk.clone(),
+                events: events.clone(),
             },
         )
         .await?;
@@ -246,11 +260,7 @@ async fn bad_keys(send: &mut SendStream, kind: &str) -> Result<()> {
                 mods: 0,
             }),
         )]),
-        "paste" => keys(vec![InputEvent::Paste {
-            text: "x".repeat(MAX_PASTE_PIECE + 1),
-            first: true,
-            last: true,
-        }]),
+        "paste" => keys(vec![InputEvent::Paste("x".repeat(MAX_PASTE + 1))]),
         "events" => keys(vec![InputEvent::Focus(true); MAX_EVENTS + 1]),
         "palette" => ClientMsg::Colours(WireColours {
             palette: vec![None; PALETTE + 1],
@@ -265,21 +275,16 @@ async fn bad_keys(send: &mut SendStream, kind: &str) -> Result<()> {
     Ok(())
 }
 
-/// A big paste as valid paste events, as fast as QUIC takes them: the server frames and strips
-/// each piece, and the PTY write queue and flow control bound it.
+/// `mib` whole pastes of the most a paste may be, as fast as QUIC takes them: the server frames
+/// and strips each, and the PTY write queue and flow control bound them.
 async fn events_flood(send: &mut SendStream, mib: usize) -> Result<()> {
-    eprintln!("evil-client: a {mib} MiB paste as paste events");
-    let pieces = mib * MIB / MAX_PASTE_PIECE;
-    for n in 0..pieces {
+    eprintln!("evil-client: {mib} pastes of {MAX_PASTE} bytes");
+    for n in 0..mib {
         write_msg(
             send,
             &ClientMsg::Keys {
                 seq: InputSeq(n as u64 + 1),
-                events: vec![InputEvent::Paste {
-                    text: "x".repeat(MAX_PASTE_PIECE),
-                    first: n == 0,
-                    last: n + 1 == pieces,
-                }],
+                events: vec![InputEvent::Paste("x".repeat(MAX_PASTE))],
             },
         )
         .await?;
@@ -309,9 +314,9 @@ async fn second_stream(conn: &Connection) -> Result<()> {
     let mut first = conn.open_uni().await?;
     write_msg(
         &mut first,
-        &ClientMsg::Input {
+        &ClientMsg::Keys {
             seq: InputSeq(1),
-            bytes: b"echo hi\r".to_vec(),
+            events: "echo hi".chars().map(key).collect(),
         },
     )
     .await?;

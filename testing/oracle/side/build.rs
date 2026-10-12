@@ -1,7 +1,8 @@
 //! What koh at this tree does, for a side that builds at any commit: `koh_frame_base` when it
 //! compresses frames against their base (`encode_frame(frame, base)`), and `koh_delivery_ack`
 //! when the server takes a frame's delivery as its acknowledgement (the client sends none), and
-//! `koh_input_events` when the client decodes input and sends it as events (`ClientMsg::Keys`).
+//! `koh_input_events` when the client decodes input and sends it as events (`ClientMsg::Keys`),
+//! and `koh_prime` when its terminal takes what the first frame shows as seen (`prime`).
 
 fn main() {
     let proto = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../src/proto.rs");
@@ -9,6 +10,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(koh_frame_base)");
     println!("cargo::rustc-check-cfg=cfg(koh_delivery_ack)");
     println!("cargo::rustc-check-cfg=cfg(koh_input_events)");
+    println!("cargo::rustc-check-cfg=cfg(koh_prime)");
     let source = std::fs::read_to_string(&proto).unwrap_or_default();
     if source.contains("pub fn encode_frame(frame: &Frame, base: &TerminalScreen)") {
         println!("cargo::rustc-cfg=koh_frame_base");
@@ -18,5 +20,13 @@ fn main() {
     }
     if source.contains("Colours(WireColours)") {
         println!("cargo::rustc-cfg=koh_input_events");
+    }
+    let client = proto.with_file_name("client/mod.rs");
+    println!("cargo::rerun-if-changed={}", client.display());
+    if std::fs::read_to_string(&client)
+        .unwrap_or_default()
+        .contains("fn prime(&mut self")
+    {
+        println!("cargo::rustc-cfg=koh_prime");
     }
 }

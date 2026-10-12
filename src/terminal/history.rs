@@ -20,6 +20,9 @@ use super::{cells_of, link_bytes, runs_of, Run, WireLink, MAX_DIM, MAX_LINK_BYTE
 /// Most rows one [`HistoryRequest`] asks for, and one reply carries.
 pub const MAX_HISTORY_ROWS: u16 = 256;
 
+/// [`MAX_HISTORY_ROWS`], as a count of a reply's rows.
+const HISTORY_ROWS: usize = MAX_HISTORY_ROWS as usize;
+
 /// Most cells one reply carries: [`MAX_HISTORY_ROWS`] rows of a wide screen. Past it the server
 /// stops adding rows, and the client asks again for the rest.
 pub const MAX_HISTORY_CELLS: usize = 256 * 256;
@@ -64,7 +67,9 @@ pub struct HistoryRequest {
 pub struct HistoryRow {
     pub name: u64,
     pub wrapped: bool,
+    #[serde(deserialize_with = "crate::bounded::at_most::<{ super::DIM }, _, _>")]
     pub runs: Vec<Run>,
+    #[serde(deserialize_with = "crate::bounded::at_most::<{ super::MAX_ROW_LINKS }, _, _>")]
     pub links: Vec<WireLink>,
 }
 
@@ -86,6 +91,7 @@ impl HistoryRow {
 /// oldest first, consecutive, the last the one asked for. Empty if it holds none of them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryReply {
+    #[serde(deserialize_with = "crate::bounded::at_most::<HISTORY_ROWS, _, _>")]
     pub rows: Vec<HistoryRow>,
 }
 
@@ -126,8 +132,9 @@ impl HistoryNames {
             self.by_row.insert(row.id(), self.last);
         }
         // Rows that left history keep their names in the map until it holds twice what is kept.
+        // Not on the alternate screen, which has no history: the primary's comes back with it.
         let kept = len.saturating_add(rows);
-        if self.by_row.len() > kept.saturating_mul(2).saturating_add(64) {
+        if len > 0 && self.by_row.len() > kept.saturating_mul(2).saturating_add(64) {
             let present: std::collections::HashSet<RowId> =
                 screen.rows().map(|row| row.id()).collect();
             self.by_row.retain(|id, _| present.contains(id));
@@ -286,7 +293,8 @@ impl HistoryCache {
     }
 
     /// Drop the rows the history no longer holds by `mark`. An empty history (the alternate
-    /// screen has none) drops nothing: the rows come back with the primary screen.
+    /// screen has none) drops nothing: the rows come back, under their names, with the primary
+    /// screen.
     pub fn retain(&mut self, mark: HistoryMark) {
         let Some(oldest) = mark.oldest() else {
             return;

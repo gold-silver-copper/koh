@@ -8,7 +8,51 @@
 
 use std::time::Duration;
 
+use koh::pty::{Exit, Pty, PtyError};
+use koh::terminal::TtyModes;
 use koh_testkit::{current_thread, multi_thread, read_until};
+use tokio::sync::mpsc::Receiver;
+
+/// `argv` on a 24×80 PTY, through [`launcher`]: the PTY, and what the program prints.
+fn spawn(argv: &[String]) -> Result<(Pty, Receiver<Vec<u8>>), PtyError> {
+    Pty::spawn(
+        24,
+        80,
+        argv,
+        "xterm-256color",
+        &launcher(),
+        &koh::pty::Reaper::start()?,
+    )
+}
+
+/// `sh -c script` on a PTY, as [`spawn`] starts it.
+fn sh(script: &str) -> Result<(Pty, Receiver<Vec<u8>>), PtyError> {
+    spawn(&["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()])
+}
+
+/// Everything the program writes until it exits and the PTY closes, if that is within 20 s.
+async fn drain(mut rx: Receiver<Vec<u8>>) -> Option<String> {
+    let mut collected = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(chunk) = rx.recv().await {
+            collected.extend_from_slice(&chunk);
+        }
+    })
+    .await
+    .ok()?;
+    Some(String::from_utf8_lossy(&collected).into_owned())
+}
+
+/// How the program exited, once it is reaped, if that is within 5 s.
+async fn exit(pty: &mut Pty) -> Option<Exit> {
+    for _ in 0..500 {
+        if let Some(status) = pty.try_wait().ok()? {
+            return Some(status);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
 
 #[cfg(unix)]
 #[test]
@@ -17,19 +61,8 @@ fn external_signal_retains_shell_style_exit_status() {
         use fuxix::process::{kill, Pid, Signal};
 
         // The shell prints its own pid, so the test can signal it from outside like any other process.
-        let (mut pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &[
-                "/bin/sh".to_owned(),
-                "-c".to_owned(),
-                "echo PID=$$; while :; do sleep 1; done".to_owned(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn signal fixture");
+        let (mut pty, mut rx) =
+            sh("echo PID=$$; while :; do sleep 1; done").expect("spawn signal fixture");
         let output = read_until(&mut rx, "\n").await.expect("the pid line");
         let pid = output
             .split_once("PID=")
@@ -38,42 +71,16 @@ fn external_signal_retains_shell_style_exit_status() {
             .expect("a pid");
         let pid = Pid::from_raw(pid).expect("a positive pid");
         kill(pid, Signal::Kill).expect("signal child");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(status) = pty.try_wait().expect("wait child") {
-                assert_eq!(status.code(), 137);
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "signal status deadline"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        assert_eq!(exit(&mut pty).await.map(Exit::code), Some(137));
     });
 }
-
-use koh::pty::Pty;
-use koh::terminal::TtyModes;
 
 #[cfg(target_os = "linux")]
 #[test]
 fn teardown_reaps_children_even_when_the_caller_does_not_wait() {
     current_thread().expect("runtime").block_on(async {
         for shutdown in [true, false, true, false] {
-            let (pty, mut rx) = Pty::spawn(
-                24,
-                80,
-                &[
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    "echo $$; exec sleep 60".into(),
-                ],
-                "xterm-256color",
-                &launcher(),
-                &koh::pty::Reaper::start().expect("reaper"),
-            )
-            .expect("spawn");
+            let (pty, mut rx) = sh("echo $$; exec sleep 60").expect("spawn");
             let output = read_until(&mut rx, "\n").await.expect("the pid line");
             let pid: u32 = output.trim().parse().expect("pid");
             // Keep the receiver alive but unread: teardown must not depend on its consumer.
@@ -99,15 +106,7 @@ fn teardown_reaps_children_even_when_the_caller_does_not_wait() {
 #[test]
 fn shutdown_does_not_need_a_consumer_for_flooded_output() {
     current_thread().expect("runtime").block_on(async {
-        let (pty, mut unread) = Pty::spawn(
-            24,
-            80,
-            &["/bin/sh".into(), "-c".into(), "exec yes".into()],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn flood");
+        let (pty, mut unread) = sh("exec yes").expect("spawn flood");
         // Once it floods, leave the rest unread.
         read_until(&mut unread, "y").await.expect("the flood");
         tokio::time::timeout(
@@ -125,19 +124,7 @@ fn stopped_reader_applies_backpressure_and_resumes_in_order() {
     current_thread().expect("runtime").block_on(async {
         use fuxix::process::{kill, Pid, Signal};
         use koh::pty::WriteError;
-        let (pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &[
-                "/bin/sh".into(),
-                "-c".into(),
-                "stty raw -echo; echo $$; exec cat".into(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn");
+        let (pty, mut rx) = sh("stty raw -echo; echo $$; exec cat").expect("spawn");
         let line = read_until(&mut rx, "\n").await.expect("the pid line");
         let pid = Pid::from_raw(line.trim().parse().expect("pid digits")).expect("valid pid");
         kill(pid, Signal::Stop).expect("stop reader");
@@ -196,51 +183,22 @@ fn stopped_reader_applies_backpressure_and_resumes_in_order() {
     });
 }
 
+/// A one-shot program's output streams to the end, and its exit status is reaped: `echo`'s
+/// newline, and the status `sh -c "exit 7"` exits with only if both `-c` and the script reached it
+/// as separate arguments.
 #[test]
-#[expect(
-    clippy::match_wild_err_arm,
-    reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"
-)]
-fn spawns_and_streams_output() {
+fn a_programs_output_streams_and_its_exit_status_is_reaped() {
     current_thread().expect("tokio runtime").block_on(async {
-        // Run a one-shot command in the PTY and confirm we receive its output + reap it.
-        let (mut pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &["echo".to_owned()],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn echo");
-        // `echo` with no args prints just a newline; assert we get *something* and EOF.
-        let mut collected = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(chunk)) => collected.extend_from_slice(&chunk),
-                Ok(None) => break, // channel closed: child exited and reader finished
-                Err(_) => panic!("timed out waiting for pty output"),
-            }
+        for (argv, printed, code) in [(&["echo"][..], "\n", 0), (&["sh", "-c", "exit 7"], "", 7)] {
+            let argv: Vec<String> = argv.iter().map(|&arg| arg.to_owned()).collect();
+            let (mut pty, rx) = spawn(&argv).expect("spawn");
+            let output = drain(rx).await;
+            assert!(
+                output.as_deref().is_some_and(|out| out.contains(printed)),
+                "{argv:?} printed {output:?}"
+            );
+            assert_eq!(exit(&mut pty).await.map(Exit::code), Some(code));
         }
-        // `echo` prints a newline (CR/LF in a pty).
-        assert!(
-            collected.contains(&b'\n'),
-            "expected a newline from echo, got {collected:?}"
-        );
-        // Child should be reapable. After EOF there's a benign race between the reader closing the
-        // channel and the exit status becoming collectible, so poll `try_wait` (the same pattern the
-        // reap test below uses) rather than a single blocking call.
-        let mut status = None;
-        for _ in 0..200 {
-            if let Ok(Some(s)) = pty.try_wait() {
-                status = Some(s);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let status = status.expect("the one-shot child must exit and be reaped");
-        assert_eq!(status.code(), 0);
     });
 }
 
@@ -250,15 +208,7 @@ fn write_input_takes_shared_ref_and_preserves_order() {
         // `pty` is bound WITHOUT `mut`, proving write_input takes `&self`. Two separate enqueues must
         // reach `cat` in FIFO order: the concatenated marker only appears if the second chunk did
         // not overtake the first.
-        let (pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &["cat".to_owned()],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn cat");
+        let (pty, mut rx) = spawn(&["cat".to_owned()]).expect("spawn cat");
         pty.write(b"ORDER_".to_vec()).expect("first enqueue");
         pty.write(b"AB_CD\n".to_vec()).expect("second enqueue");
         let in_order = read_until(&mut rx, "ORDER_AB_CD").await;
@@ -282,19 +232,7 @@ fn write_input_takes_shared_ref_and_preserves_order() {
 #[test]
 fn a_hosted_program_gets_the_tests_home_and_no_history_file() {
     current_thread().expect("tokio runtime").block_on(async {
-        let (_pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &[
-                "sh".to_owned(),
-                "-c".to_owned(),
-                r#"echo "H=$HOME F=$HISTFILE E=[$ENV]""#.to_owned(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn sh");
+        let (_pty, mut rx) = sh(r#"echo "H=$HOME F=$HISTFILE E=[$ENV]""#).expect("spawn sh");
         let shown = read_until(&mut rx, "]").await.expect("the shell ran");
         let home = koh_testkit::home!();
         assert!(
@@ -307,19 +245,7 @@ fn a_hosted_program_gets_the_tests_home_and_no_history_file() {
 #[test]
 fn a_password_prompt_without_echo_is_read_so() {
     current_thread().expect("tokio runtime").block_on(async {
-        let (pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &[
-                "sh".to_owned(),
-                "-c".to_owned(),
-                "stty -echo; echo RE''ADY; cat".to_owned(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn sh");
+        let (pty, mut rx) = sh("stty -echo; echo RE''ADY; cat").expect("spawn sh");
         read_until(&mut rx, "READY").await.expect("stty ran");
         assert_eq!(
             pty.tty_modes(),
@@ -331,41 +257,26 @@ fn a_password_prompt_without_echo_is_read_so() {
     });
 }
 
+/// Dropping the `Pty` ends its program, and so the output channel: `cat` on the EOF the writer
+/// thread writes once its sender is dropped (if it were stuck, or kept its handle, the channel would
+/// never close), and a program that ignores SIGHUP (`sleep` inherits it) on the SIGKILL `Drop`
+/// follows up with.
 #[test]
-#[expect(
-    clippy::needless_continue,
-    clippy::match_wild_err_arm,
-    reason = "the explicit `continue` documents the drain-and-keep-reading intent; the `Err(_)` deadline arm panics because a timeout here IS the test failing"
-)]
-fn dropping_pty_eofs_child_and_stops_writer() {
+fn dropping_a_pty_ends_its_program() {
     current_thread().expect("tokio runtime").block_on(async {
-        // `cat` blocks reading stdin. Dropping the Pty drops the writer-thread sender; the writer thread
-        // then writes EOT and finishes — so the child sees EOF, exits, the slave closes, and the
-        // output channel ends. If the writer thread were stuck (or never let go of its handle), the
-        // channel would never close.
-        let (pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &[
-                "/bin/sh".to_owned(),
-                "-c".to_owned(),
-                "echo READY; exec cat".to_owned(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn cat");
-        read_until(&mut rx, "READY").await.expect("cat is running");
-        drop(pty); // no kill(): EOF must come purely from the writer handle being dropped
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(_)) => continue, // drain any echoed bytes
-                Ok(None) => break, // channel closed: child EOF'd + exited; writer thread ended
-                Err(_) => panic!("dropping Pty did not EOF the child (writer stuck?)"),
-            }
+        for script in [
+            "echo READY; exec cat",
+            "trap '' HUP; echo READY; exec sleep 30",
+        ] {
+            let (pty, mut rx) = sh(script).expect("spawn sh");
+            read_until(&mut rx, "READY")
+                .await
+                .expect("the program runs");
+            drop(pty);
+            assert!(
+                drain(rx).await.is_some(),
+                "{script:?} outlived its dropped PTY"
+            );
         }
     });
 }
@@ -376,19 +287,7 @@ fn shutdown_joins_both_io_threads_without_deadlock() {
         // Graceful teardown: shutdown() kills the child (so the reader's blocking read returns EOF) and
         // drops the writer sender (so the writer's recv returns), then joins BOTH pump threads. It must
         // return promptly — a hang would mean a thread never unblocked.
-        let (pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &[
-                "/bin/sh".to_owned(),
-                "-c".to_owned(),
-                "echo READY; exec sh".to_owned(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn shell");
+        let (pty, mut rx) = sh("echo READY; exec sh").expect("spawn shell");
         read_until(&mut rx, "READY")
             .await
             .expect("the shell is running");
@@ -412,19 +311,7 @@ fn shutdown_returns_while_the_program_leaves_its_input_unread() {
         // `sleep` never reads its terminal, so a paste fills the PTY's input queue and the writer
         // thread blocks in `write`. Shutdown kills the program; it must not then wait on that
         // write forever, or `koh serve` could never exit after such a paste.
-        let (pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &[
-                "sh".to_owned(),
-                "-c".to_owned(),
-                "stty raw -echo; sleep 60".to_owned(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn sleep");
+        let (pty, mut rx) = sh("stty raw -echo; sleep 60").expect("spawn sleep");
         let drain = koh_testkit::spawn(async move { while rx.recv().await.is_some() {} });
         let chunk = vec![b'x'; 4096];
         let mut queued = 0;
@@ -446,53 +333,6 @@ fn shutdown_returns_while_the_program_leaves_its_input_unread() {
 }
 
 #[test]
-#[expect(
-    clippy::match_wild_err_arm,
-    reason = "a timeout in this test IS the test failing; panicking on the `Err(_)` deadline arm is the intended assertion"
-)]
-fn argv_tail_reaches_the_child() {
-    current_thread().expect("tokio runtime").block_on(async {
-        // The argument tail must reach the program verbatim: `sh -c "exit 7"` exits 7 only if both
-        // `-c` and the script arrived as separate argv entries.
-        let argv: Vec<String> = ["sh", "-c", "exit 7"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let (mut pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &argv,
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn sh -c");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => panic!("timed out waiting for the child to exit"),
-            }
-        }
-        let mut status = None;
-        for _ in 0..200 {
-            if let Ok(Some(s)) = pty.try_wait() {
-                status = Some(s);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let status = status.expect("the child must exit and be reaped");
-        assert_eq!(
-            status.code(),
-            7,
-            "the `-c \"exit 7\"` tail must have reached sh"
-        );
-    });
-}
-
-#[test]
 fn short_lived_children_never_lose_their_output() {
     multi_thread(4).expect("tokio runtime").block_on(async {
         // A child that writes and exits before anything reads the master loses ALL of its output
@@ -510,30 +350,12 @@ fn short_lived_children_never_lose_their_output() {
             for i in 0..CHILDREN {
                 runs.push(koh_testkit::spawn(async move {
                     let marker = format!("koh_short_{round}_{i}");
-                    let (mut pty, mut rx) = Pty::spawn(
-                        24,
-                        80,
-                        &["/bin/echo".to_owned(), marker.clone()],
-                        "xterm-256color",
-                        &launcher(),
-                        &koh::pty::Reaper::start().expect("reaper"),
-                    )
-                    .expect("spawn short-lived child");
-                    let mut out = Vec::new();
-                    tokio::time::timeout(Duration::from_secs(20), async {
-                        while let Some(chunk) = rx.recv().await {
-                            out.extend_from_slice(&chunk);
-                        }
-                    })
-                    .await
-                    .expect("output EOF deadline");
+                    let (mut pty, rx) = spawn(&["/bin/echo".to_owned(), marker.clone()])
+                        .expect("spawn short-lived child");
+                    let out = drain(rx).await.expect("output EOF deadline");
                     // Reap the child (as the session drain task does in production), so thousands of
                     // runs don't pile up zombies and exhaust the process table.
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                    while pty.try_wait().expect("wait child").is_none() {
-                        assert!(tokio::time::Instant::now() < deadline, "reap deadline");
-                        tokio::time::sleep(Duration::from_millis(2)).await;
-                    }
+                    exit(&mut pty).await.expect("reaped");
                     pty.close();
                     (marker, out)
                 }));
@@ -541,7 +363,7 @@ fn short_lived_children_never_lose_their_output() {
             for run in runs {
                 let (marker, out) = run.await.expect("child task");
                 assert!(
-                    String::from_utf8_lossy(&out).contains(&marker),
+                    out.contains(&marker),
                     "a short-lived child's output was lost: expected {marker}, got {out:?}"
                 );
             }
@@ -549,29 +371,10 @@ fn short_lived_children_never_lose_their_output() {
     });
 }
 
-/// Everything the program writes, until it exits and the PTY closes (or 20 s pass).
-async fn all_output(mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> String {
-    let mut collected = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(20), async {
-        while let Some(chunk) = rx.recv().await {
-            collected.extend_from_slice(&chunk);
-        }
-    })
-    .await;
-    String::from_utf8_lossy(&collected).into_owned()
-}
-
 #[test]
 fn a_program_that_cannot_start_fails_the_spawn_and_is_named() {
     let missing = "/nonexistent/koh-no-such-program";
-    let result = Pty::spawn(
-        24,
-        80,
-        &[missing.to_owned()],
-        "xterm-256color",
-        &launcher(),
-        &koh::pty::Reaper::start().expect("reaper"),
-    );
+    let result = spawn(&[missing.to_owned()]);
     let Err(error) = result else {
         panic!("a missing program must fail the spawn, not yield a dead session");
     };
@@ -589,16 +392,8 @@ fn a_descriptor_the_server_holds_without_close_on_exec_does_not_reach_the_shell(
         let leaked = fuxix::io::duplicate_inheritable(&file).expect("an inheritable copy");
         let fd = leaked.as_raw_fd();
         let script = format!("if [ -e /dev/fd/{fd} ]; then echo HAS_FD; else echo NO_FD; fi");
-        let (_pty, rx) = Pty::spawn(
-            24,
-            80,
-            &["/bin/sh".to_owned(), "-c".to_owned(), script],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn sh");
-        let out = all_output(rx).await;
+        let (_pty, rx) = sh(&script).expect("spawn sh");
+        let out = drain(rx).await.unwrap_or_default();
         assert!(
             out.contains("NO_FD"),
             "descriptor {fd} reached the shell: {out:?}"
@@ -612,20 +407,9 @@ fn the_shell_leads_its_own_session_and_owns_its_terminal() {
     current_thread().expect("tokio runtime").block_on(async {
         // `ps` reports the shell's process group and its terminal's foreground group; the shell
         // stays alive (`sleep`) so its session can be read from outside.
-        let (pty, rx) = Pty::spawn(
-            24,
-            80,
-            &[
-                "/bin/sh".to_owned(),
-                "-c".to_owned(),
-                "echo GROUPS $$ $(ps -o pgid= -p $$) $(ps -o tpgid= -p $$) END; sleep 30"
-                    .to_owned(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn sh");
+        let (pty, rx) =
+            sh("echo GROUPS $$ $(ps -o pgid= -p $$) $(ps -o tpgid= -p $$) END; sleep 30")
+                .expect("spawn sh");
         let mut rx = rx;
         let out = read_until(&mut rx, "END").await.expect("the report");
         let line = out
@@ -651,39 +435,6 @@ fn the_shell_leads_its_own_session_and_owns_its_terminal() {
             "the shell leads its own session"
         );
         drop(pty);
-    });
-}
-
-#[test]
-fn a_child_that_ignores_sighup_dies_when_its_pty_is_dropped() {
-    current_thread().expect("tokio runtime").block_on(async {
-        // `sleep` inherits the ignored SIGHUP, so only the SIGKILL `Drop` follows up with ends it;
-        // until something does, it holds the slave open and the output channel never ends.
-        let (pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &[
-                "/bin/sh".to_owned(),
-                "-c".to_owned(),
-                "trap '' HUP; echo READY; exec sleep 30".to_owned(),
-            ],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
-        .expect("spawn sh");
-        read_until(&mut rx, "READY")
-            .await
-            .expect("the child reports it is ready");
-        drop(pty);
-        let ended = tokio::time::timeout(Duration::from_secs(5), async {
-            while rx.recv().await.is_some() {}
-        })
-        .await;
-        assert!(
-            ended.is_ok(),
-            "a SIGHUP-immune child outlived its dropped PTY"
-        );
     });
 }
 
@@ -735,14 +486,7 @@ fn a_hung_up_program_has_time_to_exit_before_it_is_killed() {
             "trap 'sleep 0.3; echo saved > {}; exit 0' HUP; echo READY; while :; do sleep 0.05; done",
             saved.display()
         );
-        let (pty, mut rx) = Pty::spawn(
-            24,
-            80,
-            &["/bin/sh".to_owned(), "-c".to_owned(), script],
-            "xterm-256color",
-            &launcher(),
-            &koh::pty::Reaper::start().expect("reaper"),
-        )
+        let (pty, mut rx) = sh(&script)
         .expect("spawn sh");
         read_until(&mut rx, "READY")
             .await

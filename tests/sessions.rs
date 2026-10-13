@@ -513,6 +513,84 @@ fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Resu
     })
 }
 
+/// A program that never reads its input holds up no resize: the typing waits for it to read, the
+/// window does not.
+#[test]
+fn a_resize_waits_for_no_typing_the_program_has_not_read() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let secret = generate_secret_key()?;
+        let (addr, shutdown, serve) = loopback_serve(secret.public(), &["sleep", "30"]).await?;
+        let mut client = RawClient::connect(addr, secret).await?;
+        // More than the PTY's writer takes, so the session keeps the rest waiting, then a key.
+        for _ in 0..2 {
+            client.last_seq = client.last_seq.next();
+            let paste = koh::events::InputEvent::Paste("x".repeat(1000 * 1024));
+            client
+                .write(&ClientMsg::Keys {
+                    seq: client.last_seq,
+                    events: vec![paste],
+                })
+                .await?;
+        }
+        client.type_bytes(b"y").await?;
+        let size = Size::new(30, 100);
+        client.write(&ClientMsg::Resize(size)).await?;
+        let resized = |c: &RawClient| c.screen().is_some_and(|s| s.size() == size);
+        for _ in 0..50 {
+            client.pump(100).await?;
+            if resized(&client) {
+                break;
+            }
+        }
+        let shown = resized(&client);
+        client.conn.close(0u32.into(), b"done");
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
+        anyhow::ensure!(
+            shown,
+            "the resize waited behind typing the program never read"
+        );
+        Ok(())
+    })
+}
+
+/// A program that prints its prompt and then turns echo off, as PAM does, is told without echo
+/// moments after the prompt, not a tick later: until then the client may show what is typed.
+#[test]
+fn echo_turned_off_after_a_prompt_is_told_at_once() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let program = ["sh", "-c", "printf 'pw: '; stty -echo; exec sleep 30"];
+        let mut took = Vec::new();
+        for _ in 0..20 {
+            let reg = registry(&program, 1, Duration::from_secs(30), |_| true)?;
+            let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
+            let mut prompted = None;
+            let told = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(screen) = client.next_screen().await {
+                    let now = std::time::Instant::now();
+                    if screen.screen().contents().contains("pw:") {
+                        prompted.get_or_insert(now);
+                    }
+                    if screen.tty().is_some_and(|tty| !tty.echo) {
+                        return Some(now);
+                    }
+                }
+                None
+            })
+            .await;
+            drop(client);
+            reg.shutdown().await;
+            let told = told.ok().flatten().context("echo never told off")?;
+            took.push(told.saturating_duration_since(prompted.unwrap_or(told)));
+        }
+        // The middle of the twenty.
+        took.sort_unstable();
+        let median = took.get(10).copied().unwrap_or_default();
+        anyhow::ensure!(median < koh::proto::TTY_TICK / 4, "{took:?}");
+        Ok(())
+    })
+}
+
 /// A peer removed from the allowlist has its session ended, its program hung up, and starts no
 /// other: an attach the registry takes once the list no longer allows it is refused, even one on its
 /// way as the peer was removed. Allowed again, it gets a new session.

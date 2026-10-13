@@ -104,8 +104,6 @@ pub(crate) enum ToSession {
     Events(Vec<InputEvent>),
     /// What the user's terminal said of its colours.
     Colours(WireColours),
-    /// The client's window, clamped.
-    Resize(Size),
 }
 
 impl ToSession {
@@ -113,7 +111,7 @@ impl ToSession {
     fn bytes(&self) -> usize {
         match self {
             Self::Events(events) => events.iter().map(InputEvent::encoded_len).sum(),
-            Self::Colours(_) | Self::Resize(_) => 0,
+            Self::Colours(_) => 0,
         }
     }
 }
@@ -131,6 +129,9 @@ pub(crate) struct ServerConn {
     to_session: Bounded<ToSession, TO_SESSION>,
     /// The bytes of input in `to_session`.
     held_input: usize,
+    /// The client's newest window (clamped), until the session takes it: never queued behind
+    /// input, so a resize does not wait for a program to read what was typed before it.
+    window: Option<Size>,
     /// The session's newest screen, shared with every frame that shows it.
     screen: Arc<TerminalScreen>,
     /// `screen` is what was last sent, and the base needs no rebuilding.
@@ -266,7 +267,12 @@ impl ServerConn {
                     ToSession::Events(events)
                 }
                 ClientMsg::Colours(colours) => ToSession::Colours(colours),
-                ClientMsg::Resize(size) => ToSession::Resize(crate::terminal::clamp_dims(size)),
+                ClientMsg::Resize(size) => {
+                    if !self.exited() {
+                        self.window = Some(crate::terminal::clamp_dims(size));
+                    }
+                    continue;
+                }
                 ClientMsg::Ack { frame } => {
                     self.ack(frame, now);
                     continue;
@@ -289,13 +295,12 @@ impl ServerConn {
         Ok(())
     }
 
-    /// Queue `input` for the session, merged into the last if both are events, or resizes, of
-    /// which only the last matters. The caller made room.
+    /// Queue `input` for the session, merged into the last if both are events. The caller made
+    /// room.
     fn for_session(&mut self, input: ToSession) {
         self.held_input = self.held_input.saturating_add(input.bytes());
         match (self.to_session.back_mut(), input) {
             (Some(ToSession::Events(queued)), ToSession::Events(events)) => queued.extend(events),
-            (Some(ToSession::Resize(queued)), ToSession::Resize(size)) => *queued = size,
             (_, input) => {
                 let _ = self.to_session.push_back(input);
             }
@@ -568,6 +573,10 @@ pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: sessio
                 .next_history()
                 .map(|request| (request, session.history(request)));
         }
+        if let Some(size) = core.window.take() {
+            // Taken at the next pass if the session's asks are full.
+            core.window = (!session.resize(size)).then_some(size);
+        }
         let now = Instant::now();
         core.echo.promote(now);
         let rtt = crate::transport_iroh::rtt(conn);
@@ -838,30 +847,28 @@ mod tests {
     }
 
     #[test]
-    fn a_read_queues_the_session_input_in_order_merging_neighbours() {
-        // Neighbouring keys go as one batch, and of neighbouring resizes only the last, clamped.
+    fn a_read_queues_the_typing_merged_and_keeps_the_newest_window_beside_it() {
+        // Keys typed around resizes go as one batch: a resize waits for no typing, and of several
+        // only the newest, clamped, matters.
         let now = Instant::now();
         let mut conn = ServerConn::default();
         let read = stream(&[
             typed(1, "ab"),
             ClientMsg::Resize(Size::new(10, 20)),
             typed(2, "c"),
-            typed(3, "d"),
             ClientMsg::Resize(Size::new(30, 40)),
             ClientMsg::Resize(Size::new(65000, 1)),
         ]);
         conn.push_client_bytes(&read, now).unwrap();
+        assert_eq!(
+            conn.window.take(),
+            Some(crate::terminal::clamp_dims(Size::new(65000, 1)))
+        );
         let queued: Vec<ToSession> = std::iter::from_fn(|| conn.poll_input(now).unwrap()).collect();
         assert_eq!(
             queued,
-            [
-                ToSession::Events(vec![key('a'), key('b')]),
-                ToSession::Resize(Size::new(10, 20)),
-                ToSession::Events(vec![key('c'), key('d')]),
-                ToSession::Resize(crate::terminal::clamp_dims(Size::new(65000, 1))),
-            ]
+            [ToSession::Events(vec![key('a'), key('b'), key('c')])]
         );
-        assert!(conn.to_session.is_empty());
     }
 
     #[test]

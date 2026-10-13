@@ -29,7 +29,7 @@ fn a_server_whose_binary_was_removed_still_starts_sessions() {
             let installed = dir.join("koh");
             std::fs::copy(env!("CARGO_BIN_EXE_koh"), &installed).expect("install a copy of koh");
             let client_key = dir.join("client.key");
-            let id = command(env!("CARGO_BIN_EXE_koh"))
+            let id = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
                 .expect("spawn koh")
                 .arg("id")
                 .arg("--key-file")
@@ -38,7 +38,7 @@ fn a_server_whose_binary_was_removed_still_starts_sessions() {
                 .expect("koh id");
             let client_id = String::from_utf8_lossy(&id.stdout).trim().to_owned();
 
-            let mut server = command(&installed)
+            let mut server = command(&installed, &koh_testkit::home!())
                 .expect("spawn koh")
                 .args(["serve", "--local", "--allow", &client_id, "--shell", "sh"])
                 .arg("--key-file")
@@ -71,7 +71,7 @@ fn a_server_whose_binary_was_removed_still_starts_sessions() {
                     client_key.display().to_string(),
                 ],
                 "xterm-256color",
-                &Launcher::new(env!("CARGO_BIN_EXE_koh")),
+                &Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!()),
                 &koh::pty::Reaper::start().expect("reaper"),
             )
             .expect("spawn the client");

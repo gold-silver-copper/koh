@@ -2,9 +2,10 @@
 //!
 //! Every koh test crate starts with `#![forbid(clippy::disallowed_methods)]`, so no file can lift
 //! the bans on starting a program, spawning a task or writing to the system temp dir. A test does
-//! those here: it starts programs through [`command`], whose list never holds one that
-//! authenticates; it spawns tasks through [`spawn`], on a runtime from [`current_thread`] or
-//! [`multi_thread`]; and it writes files in a [`Scratch`] directory under `target/`.
+//! those here: it starts programs through [`command`], in a home of its own ([`home!`]), whose
+//! list never holds one that authenticates; it spawns tasks through [`spawn`], on a runtime from
+//! [`current_thread`] or [`multi_thread`]; and it writes files in a [`Scratch`] directory under
+//! `target/`.
 
 use std::ffi::OsStr;
 use std::future::Future;
@@ -29,10 +30,13 @@ const HARMLESS: &[&str] = &["nvim"];
 /// `passwd` do, since a test that typed a wrong password into one would be a failed login on the
 /// machine running the tests.
 ///
+/// It and everything it starts, a shell `koh serve` hosts too, run with `home` as their home, no
+/// history file, no `ENV` script and a plain prompt: a test never reads or writes the user's files.
+///
 /// # Errors
 ///
 /// `PermissionDenied` for a program off the list.
-pub fn command(program: impl AsRef<OsStr>) -> io::Result<Command> {
+pub fn command(program: impl AsRef<OsStr>, home: &Path) -> io::Result<Command> {
     let program = program.as_ref();
     let name = Path::new(program).file_name().and_then(OsStr::to_str);
     if name == Some("koh") || name.is_some_and(|name| HARMLESS.contains(&name)) {
@@ -40,7 +44,13 @@ pub fn command(program: impl AsRef<OsStr>) -> io::Result<Command> {
             clippy::disallowed_methods,
             reason = "the tests' one way to start a program"
         )]
-        Ok(Command::new(program))
+        let mut command = Command::new(program);
+        command
+            .env("HOME", home)
+            .env("HISTFILE", "/dev/null")
+            .env("ENV", "")
+            .env("PS1", "$ ");
+        Ok(command)
     } else {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -136,6 +146,25 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// The home the programs a test starts get, `koh-home` under `root`, private (0700): never the
+/// user's, whose shell history and startup files a hosted shell would otherwise read and write.
+pub fn home(root: impl AsRef<Path>) -> PathBuf {
+    let home = root.as_ref().join("koh-home");
+    let _ = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&home);
+    home
+}
+
+/// The integration test's [`home`], under its `CARGO_TARGET_TMPDIR`.
+#[macro_export]
+macro_rules! home {
+    () => {
+        $crate::home(env!("CARGO_TARGET_TMPDIR"))
+    };
 }
 
 /// A [`Scratch`] directory under the integration test's `CARGO_TARGET_TMPDIR`.

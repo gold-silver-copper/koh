@@ -18,7 +18,7 @@ fn clean() -> FaultNet {
 #[test]
 #[ignore = "needs nvim 0.10 or later; CI runs it on macOS: cargo test --test net -- --ignored nvim"]
 fn nvim_tells_ctrl_i_from_tab_from_a_kitty_terminal() {
-    koh_testkit::command("nvim")
+    koh_testkit::command("nvim", &koh_testkit::home!())
         .expect("nvim may be run")
         .arg("--version")
         .output()

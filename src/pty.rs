@@ -152,9 +152,18 @@ pub const LAUNCH: &str = fuxix::pty::LAUNCH;
 /// The binary [`Pty::spawn`] runs as the launcher.
 ///
 /// The default is the running binary, which must hand a [`LAUNCH`] invocation to [`launched`], as
-/// the `koh` binary does. Tests run a test harness, so they name the `koh` binary explicitly.
+/// the `koh` binary does. Tests run a test harness, so they name the `koh` binary, and with it a
+/// home of their own ([`isolated`](Self::isolated)): a shell a test hosts never reads or writes the
+/// user's files.
 #[derive(Clone, Debug, Default)]
-pub struct Launcher(Option<PathBuf>);
+pub struct Launcher(Option<Isolated>);
+
+/// A launcher binary other than the running one, and the home the programs it launches get.
+#[derive(Clone, Debug)]
+struct Isolated {
+    binary: PathBuf,
+    home: PathBuf,
+}
 
 impl Launcher {
     /// The running binary.
@@ -162,20 +171,34 @@ impl Launcher {
         Self(None)
     }
 
-    /// The binary at `path`.
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self(Some(path.into()))
+    /// The binary at `binary`, launching programs with `home` as their home, no history file, no
+    /// `ENV` script and a plain prompt.
+    pub fn isolated(binary: impl Into<PathBuf>, home: impl Into<PathBuf>) -> Self {
+        Self(Some(Isolated {
+            binary: binary.into(),
+            home: home.into(),
+        }))
     }
 
     /// The file to run. On Linux and Android the running binary is its image, even once its file
     /// is replaced (an upgrade) or removed.
     fn program(&self) -> io::Result<PathBuf> {
         match &self.0 {
-            Some(path) => Ok(path.clone()),
+            Some(isolated) => Ok(isolated.binary.clone()),
             None if cfg!(any(target_os = "linux", target_os = "android")) => {
                 Ok(PathBuf::from("/proc/self/exe"))
             }
             None => std::env::current_exe(),
+        }
+    }
+
+    /// Give `cmd` the isolated home, if this launcher has one.
+    fn isolate(&self, cmd: &mut Command) {
+        if let Some(Isolated { home, .. }) = &self.0 {
+            cmd.env("HOME", home)
+                .env("HISTFILE", "/dev/null")
+                .env("ENV", "")
+                .env("PS1", "$ ");
         }
     }
 }
@@ -500,6 +523,7 @@ impl Pty {
                 |cmd| {
                     cmd.env("TERM", term);
                     scrub_koh_env(cmd, std::env::vars_os().map(|(key, _)| key));
+                    launcher.isolate(cmd);
                 },
             )
             .map_err(|error| {

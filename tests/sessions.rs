@@ -51,7 +51,7 @@ async fn loopback_serve(
 
 /// The launcher every session in these tests starts through.
 fn launcher() -> Launcher {
-    Launcher::new(env!("CARGO_BIN_EXE_koh"))
+    Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!())
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {

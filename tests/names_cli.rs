@@ -18,7 +18,8 @@ use koh_testkit::{command, Capture, Scratch};
 fn unwritable_stdout_and_stderr_do_not_panic() {
     let home = Home::new("failed-output").expect("scratch home");
     for discard_diagnostics in [false, true] {
-        let mut command = command(env!("CARGO_BIN_EXE_koh")).expect("spawn koh");
+        let mut command =
+            command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!()).expect("spawn koh");
         command
             .args(["key", "info"])
             .env("HOME", home.0.path())
@@ -60,7 +61,7 @@ impl Home {
 
     /// `koh args…` in this home, its stdin closed.
     fn koh(&self, args: &[&str]) -> anyhow::Result<Output> {
-        Ok(command(env!("CARGO_BIN_EXE_koh"))?
+        Ok(command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())?
             .args(args)
             .env("HOME", self.0.path())
             .env("XDG_CONFIG_HOME", self.0.join(".config"))
@@ -97,7 +98,7 @@ fn some_id(seed: u8) -> String {
 }
 
 fn launcher() -> Launcher {
-    Launcher::new(env!("CARGO_BIN_EXE_koh"))
+    Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!())
 }
 
 #[test]
@@ -181,7 +182,7 @@ fn serve_without_allow_allows_the_saved_clients() {
     assert!(!out.status.success(), "no clients: {}", text(&out));
     assert!(text(&out).contains("koh clients add"), "{}", text(&out));
     home.koh(&["clients", "add", "phone", &some_id(3)]).unwrap();
-    let mut server = command(env!("CARGO_BIN_EXE_koh"))
+    let mut server = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
         .expect("spawn koh")
         .args(["serve", "--local", "--shell", "sh"])
         .env("HOME", home.0.path())
@@ -352,7 +353,7 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
     let me = home.koh(&["id"]).unwrap();
     let me = String::from_utf8_lossy(&me.stdout).trim().to_owned();
     home.koh(&["clients", "add", "other", &some_id(4)]).unwrap();
-    let mut server = command(env!("CARGO_BIN_EXE_koh"))
+    let mut server = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
         .expect("spawn koh")
         .args(["serve", "--local", "--shell", "sh"])
         .env("HOME", home.0.path())

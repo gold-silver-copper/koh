@@ -277,6 +277,33 @@ fn write_input_takes_shared_ref_and_preserves_order() {
     });
 }
 
+/// A shell a test hosts never reads or writes the user's files: its home is the test's, and it
+/// keeps no history file and reads no `ENV` script.
+#[test]
+fn a_hosted_program_gets_the_tests_home_and_no_history_file() {
+    current_thread().expect("tokio runtime").block_on(async {
+        let (_pty, mut rx) = Pty::spawn(
+            24,
+            80,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                r#"echo "H=$HOME F=$HISTFILE E=[$ENV]""#.to_owned(),
+            ],
+            "xterm-256color",
+            &launcher(),
+            &koh::pty::Reaper::start().expect("reaper"),
+        )
+        .expect("spawn sh");
+        let shown = read_until(&mut rx, "]").await.expect("the shell ran");
+        let home = koh_testkit::home!();
+        assert!(
+            shown.contains(&format!("H={} F=/dev/null E=[]", home.display())),
+            "{shown}"
+        );
+    });
+}
+
 #[test]
 fn a_password_prompt_without_echo_is_read_so() {
     current_thread().expect("tokio runtime").block_on(async {
@@ -665,7 +692,7 @@ fn a_child_that_ignores_sighup_dies_when_its_pty_is_dropped() {
 fn launcher() -> koh::pty::Launcher {
     static GROWN: std::sync::Once = std::sync::Once::new();
     GROWN.call_once(grow_the_pty_table);
-    koh::pty::Launcher::new(env!("CARGO_BIN_EXE_koh"))
+    koh::pty::Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!())
 }
 
 /// How many PTYs [`grow_the_pty_table`] opens: well past what these tests hold at once (about 30).

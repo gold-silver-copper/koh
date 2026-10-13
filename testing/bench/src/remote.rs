@@ -47,6 +47,8 @@ impl System {
 /// running `sshd` and the key it accepts.
 pub struct Setup {
     pub koh: PathBuf,
+    /// The home the programs koh hosts get: never the user's.
+    pub home: PathBuf,
     pub sshd: Option<Sshd>,
     /// Whether mosh and ssh connect straight to their servers, with no proxy (and no counts): in
     /// a namespace, where netem is the link and a proxy would put each packet through it twice.
@@ -333,7 +335,7 @@ impl Remote {
             allow: vec![client_id],
             command: program.to_vec(),
             scrollback: 1000,
-            launcher: Launcher::new(&setup.koh),
+            launcher: Launcher::isolated(&setup.koh, &setup.home),
             ..ServeConfig::default()
         };
         let hosting = Hosting::from_config(&config)?;
@@ -409,7 +411,7 @@ impl Remote {
             cols,
             argv,
             "xterm-256color",
-            &Launcher::new(&setup.koh),
+            &Launcher::isolated(&setup.koh, &setup.home),
             &koh::pty::Reaper::start()?,
         )
         .map_err(|e| anyhow!("{e}"))?;

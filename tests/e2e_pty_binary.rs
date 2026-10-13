@@ -18,7 +18,7 @@ use koh_testkit::{command, Capture};
 
 /// The `koh` binary, as the launcher every program here starts through.
 fn launcher() -> Launcher {
-    Launcher::new(env!("CARGO_BIN_EXE_koh"))
+    Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!())
 }
 
 /// A loopback server hosting `sh` for the client whose key is at `client_key` (created if missing),
@@ -186,7 +186,7 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
 
 /// `koh id` for the key at `key`, creating it: the endpoint id, as the binary prints it.
 fn endpoint_id(key: &std::path::Path) -> anyhow::Result<String> {
-    let out = command(env!("CARGO_BIN_EXE_koh"))?
+    let out = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())?
         .args(["id", "--key-file"])
         .arg(key)
         .output()?;
@@ -200,7 +200,7 @@ fn serve_on_port(
     port: u16,
     client: &str,
 ) -> anyhow::Result<std::process::Child> {
-    let mut server = command(env!("CARGO_BIN_EXE_koh"))?
+    let mut server = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())?
         .args([
             "serve",
             "--local",

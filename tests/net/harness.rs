@@ -50,7 +50,7 @@ impl Server {
         let config = ServeConfig {
             allow: allow.to_vec(),
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
-            launcher: koh::pty::Launcher::new(env!("CARGO_BIN_EXE_koh")),
+            launcher: koh::pty::Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!()),
             ..ServeConfig::default()
         };
         let hosting = Hosting::from_config(&config)?;

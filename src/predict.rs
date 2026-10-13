@@ -257,11 +257,6 @@ struct Context<'a> {
 }
 
 impl Context<'_> {
-    /// Whether the kernel echoes what is typed, so a printable key shows where the cursor is.
-    const fn kernel_echo(&self) -> bool {
-        self.tty.echo
-    }
-
     /// Whether line editing keys may be predicted: a line editor reads keys (no kernel echo,
     /// which edits a line its own way).
     const fn editing(&self) -> bool {
@@ -559,7 +554,7 @@ impl PredictionEngine {
     /// one glyph however many keys typed it, or nothing if joining would change its width. A
     /// glyph reaching the last column, where the terminal may wrap, opens a new epoch.
     fn predict_glyph(&mut self, ctx: &Context<'_>, c: char) {
-        if ctx.kernel_echo() {
+        if ctx.tty.echo {
             // The kernel echoes it: no need to wait for the program to prove it does.
             self.confirmed_epoch = self.confirmed_epoch.max(self.prediction_epoch);
         }

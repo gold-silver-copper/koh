@@ -238,21 +238,11 @@ impl Palette {
 
 /// The colours cells use that a palette draws otherwise: indexed ones, and the default foreground
 /// and background.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct Uses {
-    indexed: [bool; 256],
+    indexed: std::collections::BTreeSet<u8>,
     foreground: bool,
     background: bool,
-}
-
-impl Default for Uses {
-    fn default() -> Self {
-        Self {
-            indexed: [false; 256],
-            foreground: false,
-            background: false,
-        }
-    }
 }
 
 impl Uses {
@@ -265,11 +255,7 @@ impl Uses {
                 (attributes.underline_color(), None),
             ] {
                 match (colour, default) {
-                    (Color::Idx(n), _) => {
-                        if let Some(used) = self.indexed.get_mut(usize::from(n)) {
-                            *used = true;
-                        }
-                    }
+                    (Color::Idx(n), _) => drop(self.indexed.insert(n)),
                     (Color::Default, Some(used)) => *used = true,
                     (Color::Default | Color::Rgb(..) | _, _) => {}
                 }
@@ -282,11 +268,11 @@ impl Uses {
     pub(super) fn drawn_otherwise(&self, old: Option<&Palette>, new: Option<&Palette>) -> bool {
         let fg = |p: Option<&Palette>| p.and_then(|p| p.foreground);
         let bg = |p: Option<&Palette>| p.and_then(|p| p.background);
-        let entry = |p: Option<&Palette>, n: usize| p.and_then(|p| p.entries.get(n).copied()?);
+        let entry =
+            |p: Option<&Palette>, n: u8| p.and_then(|p| p.entries.get(usize::from(n)).copied()?);
         (self.foreground && fg(old) != fg(new))
             || (self.background && bg(old) != bg(new))
-            || (self.indexed.iter().enumerate())
-                .any(|(n, &used)| used && entry(old, n) != entry(new, n))
+            || (self.indexed.iter()).any(|&n| entry(old, n) != entry(new, n))
     }
 }
 

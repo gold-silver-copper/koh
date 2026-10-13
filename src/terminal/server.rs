@@ -16,10 +16,7 @@ use fux_vt::{Event, Options, Parser, Sink, Unhandled};
 
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
 fn title_from(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .chars()
-        .take(MAX_TITLE_LEN)
-        .collect()
+    super::capped_chars(&String::from_utf8_lossy(bytes), MAX_TITLE_LEN)
 }
 
 /// Whether `data` is base64: its alphabet, then at most two `=` of padding.

@@ -32,14 +32,6 @@ fn decode_frame(stream: &[u8], screen: &TerminalScreen) -> Option<Frame> {
     decode_frame_body(base, &body, &dictionary).ok()
 }
 
-/// A stream that must hold history rows, read as the client reads it.
-fn decode_history_stream(stream: &[u8]) -> Option<HistoryReply> {
-    let ServerMsg::History(body) = decode_server(stream).ok()? else {
-        return None;
-    };
-    decode_history(&body).ok()
-}
-
 /// Terminal output exercising every part of a cell and of the side channels: runs, wide glyphs
 /// and their continuations, a combining mark, a cluster too long to keep inline, every colour kind
 /// on both layers and as an underline's colour, every style bit and both blinks, curly, double and
@@ -440,7 +432,8 @@ fn frames_and_history_round_trip_through_their_streams() {
     let encoded = FrameEncoder::default()
         .encode_history(&reply)
         .expect("encodes");
-    assert_eq!(decode_history_stream(&encoded), Some(reply));
+    assert!(matches!(decode_server(&encoded), Ok(ServerMsg::History(_))));
+    assert_eq!(decode_history(&encoded[1..]).ok(), Some(reply));
     assert!(
         decode_frame(&encoded, &TerminalScreen::default()).is_none(),
         "history rows are not a frame"
@@ -508,7 +501,7 @@ fn server_messages_encode_as_pinned() {
         .encode_history(&reply)
         .expect("encodes");
     assert_eq!(stream.first(), Some(&1), "the history stream's tag");
-    assert_eq!(decode_history_stream(&stream), Some(reply));
+    assert_eq!(decode_history(&stream[1..]).ok(), Some(reply));
 }
 
 #[test]

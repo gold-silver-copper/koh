@@ -95,16 +95,6 @@ impl EchoAck {
         let (_, arrived) = self.pending.front()?;
         arrived.checked_add(ECHO_TIMEOUT)
     }
-
-    /// Whether input arrived within the debounce and is not yet promoted.
-    pub(crate) fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    /// The current echo-ack.
-    pub(crate) const fn echo_ack(&self) -> InputSeq {
-        self.acked
-    }
 }
 
 /// What a connection hands its session, in the order the client sent it.
@@ -396,7 +386,7 @@ impl ServerConn {
     /// Whether the screen's change is small and the user typed in the last echo debounce: a frame
     /// that likely carries the program's echo, which goes at once.
     fn carries_echo(&self) -> bool {
-        self.echo.has_pending()
+        !self.echo.pending.is_empty()
             && self
                 .screen
                 .rows_differing(&self.held.base().screen)
@@ -438,7 +428,7 @@ impl ServerConn {
         let frame = Frame {
             num,
             base: base.num,
-            echo_ack: self.echo.echo_ack(),
+            echo_ack: self.echo.acked,
             diff,
         };
         // What the client will hold, which later frames diff against: the screen, unless the
@@ -474,7 +464,7 @@ impl ServerConn {
     /// Whether the screen or the echo-ack changed since the last frame, or the base must be
     /// rebuilt.
     fn changed(&self) -> bool {
-        !self.screen_sent || self.echo.echo_ack() != self.last_sent_echo
+        !self.screen_sent || self.echo.acked != self.last_sent_echo
     }
 
     /// When the newest frame, unacknowledged, is resent as a new one: once it is given up on.
@@ -903,12 +893,25 @@ mod tests {
     }
 
     #[test]
-    fn input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends() {
+    fn a_stream_decodes_whole_messages_as_the_session_takes_them_even_after_it_ends() {
+        // A partial message waits; a stream that ends inside one is an error.
+        let now = Instant::now();
+        let bytes = stream(&[typed(1, "hello")]);
+        let (first, rest) = bytes.split_at(3);
+        let mut conn = ServerConn::default();
+        conn.push_client_bytes(first, now).unwrap();
+        assert!(conn.to_session.is_empty());
+        assert!(conn.client_ended(now).is_err(), "ended inside a message");
+        let mut conn = ServerConn::default();
+        conn.push_client_bytes(first, now).unwrap();
+        conn.push_client_bytes(rest, now).unwrap();
+        assert_eq!(
+            conn.poll_input(now).unwrap(),
+            Some(ToSession::Events("hello".chars().map(key).collect()))
+        );
         // More than the session's queue holds: the rest waits undecoded, so a client cannot grow
         // it, and goes on as the session takes input, with no bytes more from the client. A clean
         // end with messages left is no error.
-        let now = Instant::now();
-        let mut conn = ServerConn::default();
         let colours = ClientMsg::Colours(crate::events::WireColours::default());
         conn.push_client_bytes(&stream(&vec![colours; super::TO_SESSION + 1]), now)
             .unwrap();
@@ -1021,28 +1024,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_partial_message_waits_and_a_truncated_stream_is_an_error() {
-        let now = Instant::now();
-        let bytes = stream(&[typed(1, "hello")]);
-        let (first, rest) = bytes.split_at(3);
-        let mut truncated = ServerConn::default();
-        truncated.push_client_bytes(first, now).unwrap();
-        assert!(truncated.to_session.is_empty());
-        assert!(
-            truncated.client_ended(now).is_err(),
-            "the stream ended inside a message"
-        );
-        let mut whole = ServerConn::default();
-        whole.push_client_bytes(first, now).unwrap();
-        whole.push_client_bytes(rest, now).unwrap();
-        whole.client_ended(now).unwrap();
-        assert_eq!(
-            whole.poll_input(now).unwrap(),
-            Some(ToSession::Events("hello".chars().map(key).collect()))
-        );
-    }
-
     // --- EchoAck: the per-connection echo-ack debounce.
 
     #[test]
@@ -1056,12 +1037,12 @@ mod tests {
         t.register(InputSeq(6), ms(25)); // stale: ignored
         assert_eq!(t.next_promotion(), Some(ms(50)));
         assert!(!t.promote(ms(49)), "inside the 50 ms debounce");
-        assert_eq!(t.echo_ack(), InputSeq(0));
+        assert_eq!(t.acked, InputSeq(0));
         assert!(t.promote(ms(55)));
-        assert_eq!(t.echo_ack(), InputSeq(3));
+        assert_eq!(t.acked, InputSeq(3));
         assert_eq!(t.next_promotion(), Some(ms(70)));
         t.promote(ms(100));
-        assert_eq!(t.echo_ack(), InputSeq(7));
+        assert_eq!(t.acked, InputSeq(7));
         assert_eq!(t.next_promotion(), None);
     }
 

@@ -163,7 +163,7 @@ pub(crate) fn host_size(size: Size) -> fux_vt::Size {
 }
 
 /// Truncate `s` to at most `max` characters (not bytes), preserving whole scalars.
-fn capped_chars(s: &str, max: usize) -> String {
+pub(super) fn capped_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 

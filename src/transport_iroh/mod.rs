@@ -376,15 +376,22 @@ mod tests {
     #[test]
     fn a_fixed_port_is_bound_and_a_taken_one_is_reported() {
         crate::test_runtime::current_thread().block_on(async {
-            // A port the OS just handed out, so almost surely free.
-            let port = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-                .and_then(|socket| socket.local_addr())
-                .expect("a free port")
-                .port();
+            // A port the OS just handed out, so almost surely free; another taken meanwhile is
+            // tried again with the next.
             let secret = generate_secret_key().expect("OS randomness");
-            let first = bind_on(secret.clone(), true, &Network::Local, Some(port))
-                .await
-                .expect("bind the port");
+            let mut found = None;
+            for _ in 0..5 {
+                let port = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                    .and_then(|socket| socket.local_addr())
+                    .expect("a free port")
+                    .port();
+                if let Ok(first) = bind_on(secret.clone(), true, &Network::Local, Some(port)).await
+                {
+                    found = Some((port, first));
+                    break;
+                }
+            }
+            let (port, first) = found.expect("bind a free port");
             let bound = first.bound_sockets();
             assert!(
                 bound.iter().any(|s| s.is_ipv4() && s.port() == port),

@@ -45,6 +45,19 @@ pub fn drawn(style: Attributes, styles: bool) -> Attributes {
     style.with_underline_style(underline)
 }
 
+/// Text for an OSC sequence, without the control characters that would end it early.
+///
+/// C0 and C1 both go. Only [`OscText::new`] makes one, so a title a server chose reaches the
+/// terminal only stripped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OscText(String);
+
+impl OscText {
+    pub fn new(text: &str) -> Self {
+        Self(text.chars().filter(|c| !c.is_control()).collect())
+    }
+}
+
 /// The terminal `koh connect` paints on. Output is buffered until [`flush`](Self::flush), once per
 /// frame.
 pub trait KohBackend {
@@ -199,13 +212,13 @@ pub trait KohBackend {
     }
 
     /// Set the window title and icon name together (`OSC 0`).
-    fn set_window_title(&mut self, title: &str) -> io::Result<()> {
-        write!(self, "\x1b]0;{title}\x07")
+    fn set_window_title(&mut self, title: &OscText) -> io::Result<()> {
+        write!(self, "\x1b]0;{}\x07", title.0)
     }
 
     /// Set the icon name (`OSC 1`) and the window title (`OSC 2`).
-    fn set_window_icon_and_title(&mut self, icon: &str, title: &str) -> io::Result<()> {
-        write!(self, "\x1b]1;{icon}\x07\x1b]2;{title}\x07")
+    fn set_window_icon_and_title(&mut self, icon: &OscText, title: &OscText) -> io::Result<()> {
+        write!(self, "\x1b]1;{}\x07\x1b]2;{}\x07", icon.0, title.0)
     }
 
     /// Set the clipboard (`OSC 52`) to `base64`, which the caller validated.
@@ -420,9 +433,12 @@ mod tests {
 
     #[test]
     fn out_of_band_escapes() {
-        assert_eq!(emit(|b| b.set_window_title("x")), b"\x1b]0;x\x07");
         assert_eq!(
-            emit(|b| b.set_window_icon_and_title("i", "t")),
+            emit(|b| b.set_window_title(&OscText::new("x\x07\u{9c}"))),
+            b"\x1b]0;x\x07"
+        );
+        assert_eq!(
+            emit(|b| b.set_window_icon_and_title(&OscText::new("i"), &OscText::new("t"))),
             b"\x1b]1;i\x07\x1b]2;t\x07"
         );
         assert_eq!(emit(|b| b.set_clipboard("aGk=")), b"\x1b]52;c;aGk=\x07");

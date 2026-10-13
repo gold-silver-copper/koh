@@ -6,7 +6,7 @@
 
 use std::io;
 
-use super::backend::{drawn, KohBackend};
+use super::backend::{drawn, KohBackend, OscText};
 use crate::predict::Overlay;
 use crate::terminal::{Grid, Link, Size, MAXIMUM_CLIPBOARD_SIZE};
 use fux_vt::{Attributes, CellRef, Cells, Color, MouseProtocolMode};
@@ -534,11 +534,6 @@ impl Painter {
     }
 }
 
-/// `t` without control characters, which would break the OSC sequence it goes in.
-fn sanitize_osc(t: &str) -> String {
-    t.chars().filter(|c| !c.is_control()).collect()
-}
-
 /// Whether `s` is non-empty base64, as a clipboard set must be to be forwarded.
 fn is_base64_payload(s: &str) -> bool {
     !s.is_empty()
@@ -718,11 +713,11 @@ impl OutOfBand {
         // The icon is prefixed only if equal to the title, which keeps them equal (mosh's
         // `prefix_window_title`).
         let icon_eq_title = icon == title;
-        let t = format!("{}{}", self.title_prefix, sanitize_osc(title));
+        let t = OscText::new(&format!("{}{title}", self.title_prefix));
         let ic = if icon_eq_title {
-            format!("{}{}", self.title_prefix, sanitize_osc(icon))
+            t.clone()
         } else {
-            sanitize_osc(icon)
+            OscText::new(icon)
         };
         if ic == t {
             backend.set_window_title(&t)

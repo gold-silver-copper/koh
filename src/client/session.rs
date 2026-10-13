@@ -151,6 +151,9 @@ struct Outgoing {
     messages: Bounded<ClientMsg, OUTGOING>,
     input_bytes: usize,
     newest_bytes: usize,
+    /// How many resizes were sent on the connection, and the newest unsent on the control stream.
+    resizes: u32,
+    control: Option<ClientMsg>,
 }
 
 impl Outgoing {
@@ -161,7 +164,7 @@ impl Outgoing {
     fn input_cost(msg: &ClientMsg) -> usize {
         match msg {
             ClientMsg::Keys { events, .. } => events.iter().map(InputEvent::encoded_len).sum(),
-            ClientMsg::Resize(_)
+            ClientMsg::Resize { .. }
             | ClientMsg::Ack { .. }
             | ClientMsg::Resync
             | ClientMsg::History(_)
@@ -186,7 +189,12 @@ impl Outgoing {
 
     /// Queue `first` before what is queued.
     fn put_first(&mut self, first: impl IntoIterator<Item = ClientMsg>) {
-        let mut rest = std::mem::take(self);
+        let mut rest = Self {
+            resizes: self.resizes,
+            control: self.control.take(),
+            ..std::mem::take(self)
+        };
+        (self.resizes, self.control) = (rest.resizes, rest.control.take());
         for msg in first {
             self.push_back(msg);
         }
@@ -256,13 +264,26 @@ impl Outgoing {
         }
     }
 
-    /// Queue the window's `size`, in place of one queued last; dropped if the queue is full.
+    /// Queue the window's `size`, in place of one queued last (dropped if the queue is full), and
+    /// keep it for the control stream.
     fn resize(&mut self, size: Size) {
-        if let Some(ClientMsg::Resize(queued)) = self.messages.back_mut() {
-            *queued = size;
+        let window = self.window(size);
+        if let Some(queued @ ClientMsg::Resize { .. }) = self.messages.back_mut() {
+            *queued = window;
         } else {
-            self.push_back(ClientMsg::Resize(size));
+            self.push_back(window);
         }
+    }
+
+    /// The window's `size` as the next resize, kept for the control stream.
+    fn window(&mut self, size: Size) -> ClientMsg {
+        self.resizes = self.resizes.saturating_add(1);
+        let window = ClientMsg::Resize {
+            n: self.resizes,
+            size,
+        };
+        self.control = Some(window.clone());
+        window
     }
 }
 
@@ -453,11 +474,11 @@ impl ClientSession {
     pub fn attach(&mut self, size: Size) {
         self.link = Link::fresh(Arc::clone(&self.link.current().screen), self.sent_seq);
         self.outgoing
-            .retain(|msg| !matches!(msg, ClientMsg::Resize(_) | ClientMsg::Colours(_)));
+            .retain(|msg| !matches!(msg, ClientMsg::Resize { .. } | ClientMsg::Colours(_)));
         let colours = self.colours.as_ref().filter(|c| c.known()).cloned();
-        self.outgoing.put_first(
-            std::iter::once(ClientMsg::Resize(size)).chain(colours.map(ClientMsg::Colours)),
-        );
+        let window = self.outgoing.window(size);
+        self.outgoing
+            .put_first(std::iter::once(window).chain(colours.map(ClientMsg::Colours)));
         self.rows = size.rows;
         self.cols = size.cols;
         self.scrollback.reconnected();
@@ -919,7 +940,7 @@ impl ClientSession {
 
     /// Whether messages are waiting for the server on `stream`.
     pub fn has_outgoing_on(&self, stream: Stream) -> bool {
-        (stream == Stream::Control && self.link.owes_resync())
+        (stream == Stream::Control && (self.link.owes_resync() || self.outgoing.control.is_some()))
             || self.outgoing.iter().any(|msg| msg.stream() == stream)
     }
 
@@ -931,6 +952,11 @@ impl ClientSession {
     /// Take the next message for the server on `stream`: a control message never waits behind
     /// input the server has not taken.
     pub fn pop_outgoing_on(&mut self, stream: Stream) -> Option<ClientMsg> {
+        if stream == Stream::Control && !self.link.owes_resync() {
+            if let Some(window) = self.outgoing.control.take() {
+                return Some(window);
+            }
+        }
         self.pop(|msg| msg.stream() == stream)
     }
 
@@ -1039,7 +1065,7 @@ mod tests {
         msgs.iter()
             .filter_map(|m| match m {
                 ClientMsg::Keys { events, .. } => Some(events.clone()),
-                ClientMsg::Resize(_)
+                ClientMsg::Resize { .. }
                 | ClientMsg::Ack { .. }
                 | ClientMsg::Resync
                 | ClientMsg::History(_)
@@ -1580,7 +1606,10 @@ mod tests {
         assert_eq!(
             drain(&mut s),
             [
-                ClientMsg::Resize(Size::new(40, 120)),
+                ClientMsg::Resize {
+                    n: 3,
+                    size: Size::new(40, 120)
+                },
                 ClientMsg::Keys {
                     seq: InputSeq(1),
                     events: vec![InputEvent::Key(WireKey {
@@ -1589,7 +1618,10 @@ mod tests {
                         kitty: None,
                     })],
                 },
-                ClientMsg::Resize(Size::new(50, 132)),
+                ClientMsg::Resize {
+                    n: 4,
+                    size: Size::new(50, 132)
+                },
             ]
         );
         assert!(s.overlay().is_empty(), "a resize drops predictions");
@@ -1732,7 +1764,13 @@ mod tests {
         s.on_input(now, b"\x1b[?997;2n\x1b[?62c\x1b[?997;1n");
         assert_eq!(s.take_questions(), b"");
         assert_eq!(s.take_found(), None);
-        assert_eq!(drain(&mut s), [ClientMsg::Resize(Size::new(24, 80))]);
+        assert_eq!(
+            drain(&mut s),
+            [ClientMsg::Resize {
+                n: 1,
+                size: Size::new(24, 80)
+            }]
+        );
     }
 
     /// The start-up questions are the session's first phase, on the one decoder stdin has: an
@@ -1920,10 +1958,13 @@ mod tests {
             matches!(
                 sent.as_slice(),
                 [
-                    ClientMsg::Resize(Size {
-                        rows: 40,
-                        cols: 100
-                    }),
+                    ClientMsg::Resize {
+                        size: Size {
+                            rows: 40,
+                            cols: 100
+                        },
+                        ..
+                    },
                     ClientMsg::Colours(_),
                 ]
             ),
@@ -2111,7 +2152,7 @@ mod tests {
         s.attach(Size::new(24, 80));
         let sent = drain(&mut s);
         assert!(
-            matches!(sent.as_slice(), [ClientMsg::Resize(_)]),
+            matches!(sent.as_slice(), [ClientMsg::Resize { .. }]),
             "the tail is not sent: {sent:?}"
         );
         let status = s.on_tick(now, None).status.expect("a notice");

@@ -20,7 +20,7 @@ use crate::events::{InputEvent, WireColours};
 use crate::log::Peer;
 use crate::proto::{
     retry_after, ClientDecoder, ClientMsg, Close, Frame, FrameEncoder, FrameNum, FrameScreen,
-    InputSeq, ProtoError, Stream, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
+    InputSeq, ProtoError, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
 };
 use crate::terminal::{HistoryReply, HistoryRequest, Size, TerminalScreen};
 use crate::transport_iroh::close;
@@ -104,6 +104,15 @@ pub(crate) enum ToSession {
     Events(Vec<InputEvent>),
     /// What the user's terminal said of its colours.
     Colours(WireColours),
+    /// The client's window, among its input so nothing typed after it overtakes it.
+    Resize(Window),
+}
+
+/// The client's window, clamped, and the number of the resize that sent it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Window {
+    pub(crate) n: u32,
+    pub(crate) size: Size,
 }
 
 impl ToSession {
@@ -111,7 +120,7 @@ impl ToSession {
     fn bytes(&self) -> usize {
         match self {
             Self::Events(events) => events.iter().map(InputEvent::encoded_len).sum(),
-            Self::Colours(_) => 0,
+            Self::Colours(_) | Self::Resize(_) => 0,
         }
     }
 }
@@ -141,7 +150,9 @@ pub(crate) struct ServerConn {
     held_input: usize,
     /// The client's newest window (clamped), until the session takes it: never queued behind
     /// input, so a resize does not wait for a program to read what was typed before it.
-    window: Option<Size>,
+    window: Option<Window>,
+    /// The number of the newest resize taken: one no newer is a copy or out of date.
+    resized: u32,
     /// The session's newest screen, shared with every frame that shows it.
     screen: Arc<TerminalScreen>,
     /// `screen` is what was last sent, and the base needs no rebuilding.
@@ -288,7 +299,8 @@ impl ServerConn {
                         None => break,
                     },
                 };
-                if msg.stream() == Stream::Input && !room {
+                // A resize is applied wherever it comes from: only what the session takes waits.
+                if matches!(msg, ClientMsg::Keys { .. } | ClientMsg::Colours(_)) && !room {
                     stream.waiting = Some(msg);
                     break;
                 }
@@ -306,11 +318,19 @@ impl ServerConn {
                 ToSession::Events(events)
             }
             ClientMsg::Colours(colours) => ToSession::Colours(colours),
-            ClientMsg::Resize(size) => {
-                if !self.exited() {
-                    self.window = Some(crate::terminal::clamp_dims(size));
+            // Taken from whichever stream brings it first: beside the input, for the session at
+            // once, and among it, so nothing typed after it overtakes it.
+            ClientMsg::Resize { n, size } => {
+                if n <= self.resized || self.exited() {
+                    return Ok(());
                 }
-                return Ok(());
+                self.resized = n;
+                let window = Window {
+                    n,
+                    size: crate::terminal::clamp_dims(size),
+                };
+                self.window = Some(window);
+                ToSession::Resize(window)
             }
             ClientMsg::Ack { frame } => {
                 self.ack(frame, now);
@@ -333,12 +353,14 @@ impl ServerConn {
         Ok(())
     }
 
-    /// Queue `input` for the session, merged into the last if both are events. The caller made
-    /// room.
+    /// Queue `input` for the session, merged into the last if both are events, or resizes, of
+    /// which only the newest matters.
     fn for_session(&mut self, input: ToSession) {
+        // A resize the queue has no room for went beside it, ahead of what waits.
         self.held_input = self.held_input.saturating_add(input.bytes());
         match (self.to_session.back_mut(), input) {
             (Some(ToSession::Events(queued)), ToSession::Events(events)) => queued.extend(events),
+            (Some(ToSession::Resize(queued)), ToSession::Resize(window)) => *queued = window,
             (_, input) => {
                 let _ = self.to_session.push_back(input);
             }
@@ -611,9 +633,9 @@ pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: sessio
                 .next_history()
                 .map(|request| (request, session.history(request)));
         }
-        if let Some(size) = core.window.take() {
+        if let Some(window) = core.window.take() {
             // Taken at the next pass if the session's asks are full.
-            core.window = (!session.resize(size)).then_some(size);
+            core.window = (!session.resize(window)).then_some(window);
         }
         let now = Instant::now();
         core.echo.promote(now);
@@ -903,27 +925,42 @@ mod tests {
     }
 
     #[test]
-    fn a_read_queues_the_typing_merged_and_keeps_the_newest_window_beside_it() {
-        // Keys typed around resizes go as one batch: a resize waits for no typing, and of several
-        // only the newest, clamped, matters.
+    fn a_read_queues_input_and_resizes_in_order_and_keeps_the_newest_window_beside_them() {
+        // Neighbouring keys go as one batch, and of neighbouring resizes only the newest, clamped:
+        // in order, so nothing typed after a resize overtakes it, and beside, so it waits for none.
         let now = Instant::now();
         let mut conn = ServerConn::default();
+        let resize = |n, rows, cols| ClientMsg::Resize {
+            n,
+            size: Size::new(rows, cols),
+        };
         let read = stream(&[
             typed(1, "ab"),
-            ClientMsg::Resize(Size::new(10, 20)),
+            resize(1, 10, 20),
             typed(2, "c"),
-            ClientMsg::Resize(Size::new(30, 40)),
-            ClientMsg::Resize(Size::new(65000, 1)),
+            resize(2, 30, 40),
+            resize(3, 65000, 1),
+            resize(2, 30, 40),
         ]);
         conn.push_client_bytes(0, &read, now).unwrap();
-        assert_eq!(
-            conn.window.take(),
-            Some(crate::terminal::clamp_dims(Size::new(65000, 1)))
-        );
+        let newest = super::Window {
+            n: 3,
+            size: crate::terminal::clamp_dims(Size::new(65000, 1)),
+        };
+        assert_eq!(conn.window, Some(newest), "an older resize is no newer");
         let queued: Vec<ToSession> = std::iter::from_fn(|| conn.poll_input(now).unwrap()).collect();
+        let first = super::Window {
+            n: 1,
+            size: Size::new(10, 20),
+        };
         assert_eq!(
             queued,
-            [ToSession::Events(vec![key('a'), key('b'), key('c')])]
+            [
+                ToSession::Events(vec![key('a'), key('b')]),
+                ToSession::Resize(first),
+                ToSession::Events(vec![key('c')]),
+                ToSession::Resize(newest),
+            ]
         );
     }
 
@@ -952,12 +989,18 @@ mod tests {
         };
         let control = [
             ClientMsg::History(ask),
-            ClientMsg::Resize(Size::new(30, 100)),
+            ClientMsg::Resize {
+                n: 1,
+                size: Size::new(30, 100),
+            },
         ];
         conn.push_client_bytes(1, &stream(&control), now).unwrap();
         assert!(conn.wants_bytes(1));
         assert_eq!(conn.next_history(), Some(ask));
-        assert_eq!(conn.window, Some(Size::new(30, 100)));
+        assert_eq!(
+            conn.window.map(|window| window.size),
+            Some(Size::new(30, 100))
+        );
         conn.poll_input(now).unwrap();
         assert!(conn.wants_bytes(0), "taken: read on");
     }

@@ -50,7 +50,7 @@ const DRAINED: Duration = TTY_TICK;
 /// tick. Output that is no echo of typing waits for that read before it is sent: a password prompt
 /// printed just before echo goes off (PAM's order) is never told with echo on, which the client
 /// would trust to show what is typed at it.
-const TTY_SETTLE: Duration = Duration::from_millis(5);
+const TTY_SETTLE: Duration = Duration::from_millis(10);
 
 /// The longest the output may go on after the exit was seen: a job left in the background writing
 /// for ever does not keep the session from ending, while a slow server still reads what an exited
@@ -111,6 +111,8 @@ impl PendingInput {
 struct PtyHost {
     emu: ServerTerminal,
     pty: crate::pty::Pty,
+    /// The attachment and number of the newest resize applied.
+    resized: (u64, u32),
 }
 
 impl PtyHost {
@@ -128,7 +130,14 @@ impl PtyHost {
         let (pty, pty_rx) =
             crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", launcher, reaper)
                 .context("spawning shell")?;
-        Ok((Self { emu, pty }, pty_rx))
+        Ok((
+            Self {
+                emu,
+                pty,
+                resized: (0, 0),
+            },
+            pty_rx,
+        ))
     }
 
     /// Read the PTY's modes into the emulator, for the next snapshot; whether they changed. Modes
@@ -165,8 +174,9 @@ impl PtyHost {
             .flatten()
     }
 
-    /// Queue what the program gets of `input` from the client in `pending`.
-    fn apply(&mut self, input: super::ToSession, pending: &mut PendingInput) {
+    /// Queue what the program gets of `input` from attachment `attach` in `pending`; whether the
+    /// screen changed. A resize is applied once, whichever way it came first, and never one older.
+    fn apply(&mut self, attach: u64, input: super::ToSession, pending: &mut PendingInput) -> bool {
         match input {
             super::ToSession::Events(events) => self.emu.encode_input(&events, &mut pending.bytes),
             // A program that subscribed to scheme changes (mode 2031) hears of a new one on its
@@ -174,7 +184,13 @@ impl PtyHost {
             super::ToSession::Colours(colours) => {
                 pending.bytes.extend(self.emu.set_colours(&colours));
             }
+            super::ToSession::Resize(window) if (attach, window.n) > self.resized => {
+                self.resized = (attach, window.n);
+                return self.resize(window.size, pending);
+            }
+            super::ToSession::Resize(_) => {}
         }
+        false
     }
 }
 
@@ -232,7 +248,7 @@ enum Ask {
     Ended,
     /// The window of attachment `attach` is now `size` (clamped): asked beside input, so a
     /// resize never waits behind typing the program has not taken.
-    Resize { attach: u64, size: Size },
+    Resize { attach: u64, window: super::Window },
 }
 
 /// Whether [`Registry::attach`] created a fresh session or reattached to a running one.
@@ -280,9 +296,9 @@ impl SessionClient {
     }
 
     /// The client's window is now `size` (clamped); `false` if the session cannot take it yet.
-    pub(super) fn resize(&self, size: Size) -> bool {
+    pub(super) fn resize(&self, window: super::Window) -> bool {
         let attach = self.attach;
-        self.asks.try_send(Ask::Resize { attach, size }).is_ok()
+        self.asks.try_send(Ask::Resize { attach, window }).is_ok()
     }
 
     /// The client has the final screen: the session, its program exited, may end.
@@ -489,8 +505,8 @@ impl Session {
                 // The session holds a sender, so this never ends. Taken while the program cannot,
                 // too, and dropped: an old attachment's, or any once the program exited.
                 Some(Input { attach, input }) = input_rx.recv(), if pending.is_empty() || exited => {
-                    if attach == self.attaches && !exited {
-                        self.host.apply(input, &mut pending);
+                    if attach == self.attaches && !exited && self.host.apply(attach, input, &mut pending) {
+                        self.publish();
                     }
                 },
                 Some(ask) = asks_rx.recv() => match ask {
@@ -499,8 +515,9 @@ impl Session {
                     }
                     Ask::Ended if exited => break,
                     Ask::Ended => {}
-                    Ask::Resize { attach, size } => {
-                        if attach == self.attaches && !exited && self.host.resize(size, &mut pending) {
+                    Ask::Resize { attach, window } => {
+                        let input = super::ToSession::Resize(window);
+                        if attach == self.attaches && !exited && self.host.apply(attach, input, &mut pending) {
                             self.publish();
                         }
                     }

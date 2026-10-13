@@ -146,8 +146,9 @@ async fn write_msg(send: &mut SendStream, msg: &ClientMsg) -> Result<()> {
 /// clamp_dims: an oversized or zero terminal geometry, sent many times.
 async fn resize(send: &mut SendStream, rows: u16, cols: u16) -> Result<()> {
     eprintln!("evil-client: injecting resize({rows}, {cols})");
-    for _ in 0..30 {
-        write_msg(send, &ClientMsg::Resize(Size::new(rows, cols))).await?;
+    for n in 1..=30 {
+        let size = Size::new(rows, cols);
+        write_msg(send, &ClientMsg::Resize { n, size }).await?;
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
     Ok(())
@@ -210,7 +211,15 @@ async fn resize_flood(send: &mut SendStream, n: usize) -> Result<()> {
     eprintln!("evil-client: {n} resize messages (the server must coalesce)");
     for k in 0..n {
         let (rows, cols) = if k % 2 == 0 { (1000, 1000) } else { (2, 2) };
-        write_msg(send, &ClientMsg::Resize(Size::new(rows, cols))).await?;
+        let n = u32::try_from(k).unwrap_or(u32::MAX).saturating_add(1);
+        write_msg(
+            send,
+            &ClientMsg::Resize {
+                n,
+                size: Size::new(rows, cols),
+            },
+        )
+        .await?;
     }
     Ok(())
 }

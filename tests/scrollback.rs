@@ -77,7 +77,7 @@ impl Pair {
                     ClientMsg::History(request) => Some(request),
                     ClientMsg::Keys { .. }
                     | ClientMsg::Colours(_)
-                    | ClientMsg::Resize(_)
+                    | ClientMsg::Resize { .. }
                     | ClientMsg::Ack { .. }
                     | ClientMsg::Resync => None,
                 })

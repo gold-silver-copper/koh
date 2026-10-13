@@ -44,7 +44,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
   programs still get SIGHUP's default. Turned-away peers are logged at most once every 10 s.
 - Frames land on slow links: a frame is given up only once the client has acknowledged nothing for
   a retry interval, the link's rate is what deliveries prove, and the client keeps the base the
-  server diffs against however many frames pass. Output that is no echo of typing waits 5 ms for
+  server diffs against however many frames pass. Output that is no echo of typing waits 10 ms for
   the PTY's modes to be read again, so a prompt printed just before echo goes off (PAM's order) is
   never told with echo on.
 - A title or icon reaches the terminal only through `OscText`, stripped of every C0 and C1

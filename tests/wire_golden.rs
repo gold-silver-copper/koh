@@ -141,8 +141,14 @@ fn modes() -> Vec<WireModes> {
 /// One message of each kind, with varints of one and several bytes.
 fn client_msgs() -> Vec<ClientMsg> {
     vec![
-        ClientMsg::Resize(Size::new(50, 132)),
-        ClientMsg::Resize(Size::new(1000, 1000)),
+        ClientMsg::Resize {
+            n: 1,
+            size: Size::new(50, 132),
+        },
+        ClientMsg::Resize {
+            n: 70_000,
+            size: Size::new(1000, 1000),
+        },
         ClientMsg::Ack {
             frame: FrameNum(70_000),
         },
@@ -374,8 +380,8 @@ const MODES: [&str; 9] = [
 
 /// Each of [`client_msgs`] as the client's stream carries it, length prefix included.
 const CLIENT_MSGS: [&str; 8] = [
-    "0000000400328401",
-    "0000000500e807e807",
+    "000000050001328401",
+    "0000000800f0a204e807e807",
     "0000000401f0a204",
     "0000000102",
     "0000000803ac02f0a2048002",

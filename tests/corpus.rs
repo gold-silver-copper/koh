@@ -439,7 +439,7 @@ impl Session {
                 ClientMsg::Resync => self.base = (FrameNum::BLANK, TerminalScreen::default()),
                 ClientMsg::Keys { .. }
                 | ClientMsg::Colours(_)
-                | ClientMsg::Resize(_)
+                | ClientMsg::Resize { .. }
                 | ClientMsg::History(_) => {}
             }
         }

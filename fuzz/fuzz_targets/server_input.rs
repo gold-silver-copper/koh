@@ -27,7 +27,7 @@ fuzz_target!(|data: &[u8]| {
         match msg {
             ClientMsg::Keys { events, .. } => t.encode_input(&events, &mut out),
             ClientMsg::Colours(colours) => out.extend(t.set_colours(&colours)),
-            ClientMsg::Resize(size) => {
+            ClientMsg::Resize { size, .. } => {
                 if t.resize(size) {
                     out.extend(t.resize_report().unwrap_or_default());
                 }

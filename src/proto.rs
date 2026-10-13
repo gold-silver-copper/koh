@@ -189,8 +189,10 @@ const COMPRESSION_LEVEL: u8 = 6;
 /// A message on the client's stream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// The client's window is now this size.
-    Resize(Size),
+    /// The client's window is now `size`: its `n`th resize on the connection. It goes on both
+    /// streams: on the control one, to wait for no input, and among the input, so nothing typed
+    /// after it overtakes it. The server applies each `n` once, and none older than one applied.
+    Resize { n: u32, size: Size },
     /// The client applied `frame`; later frames may diff against it. A frame's delivery already
     /// says so, so the client sends this only to nudge: a later packet that lets QUIC detect a lost
     /// one and retransmit it at once.
@@ -229,8 +231,8 @@ impl ClientMsg {
     /// The stream it goes on.
     pub const fn stream(&self) -> Stream {
         match self {
-            Self::Keys { .. } | Self::Colours(_) => Stream::Input,
-            Self::Resize(_) | Self::Ack { .. } | Self::Resync | Self::History(_) => Stream::Control,
+            Self::Keys { .. } | Self::Colours(_) | Self::Resize { .. } => Stream::Input,
+            Self::Ack { .. } | Self::Resync | Self::History(_) => Stream::Control,
         }
     }
 }
@@ -283,7 +285,7 @@ impl ClientMsg {
         match self {
             Self::Keys { events, .. } => check_events(events),
             Self::Colours(colours) => colours.check(),
-            Self::Resize(_) | Self::Ack { .. } | Self::Resync | Self::History(_) => Ok(()),
+            Self::Resize { .. } | Self::Ack { .. } | Self::Resync | Self::History(_) => Ok(()),
         }
         .map_err(ProtoError::BadInput)
     }
@@ -624,7 +626,10 @@ mod tests {
                 seq: InputSeq(1),
                 events: vec![InputEvent::Focus(true)],
             },
-            ClientMsg::Resize(Size::new(50, 132)),
+            ClientMsg::Resize {
+                n: 1,
+                size: Size::new(50, 132),
+            },
             ClientMsg::Ack { frame: FrameNum(9) },
             ClientMsg::Resync,
             ClientMsg::Keys {
@@ -652,7 +657,11 @@ mod tests {
 
     #[test]
     fn a_read_of_many_tiny_messages_decodes_them_all_and_leaves_the_buffer_empty() {
-        let resize = encode_client(&ClientMsg::Resize(Size::new(1, 2))).unwrap();
+        let resize = encode_client(&ClientMsg::Resize {
+            n: 1,
+            size: Size::new(1, 2),
+        })
+        .unwrap();
         let count = (16 * 1024_usize).div_euclid(resize.len());
         let mut decoder = ClientDecoder::default();
         decoder.push(&resize.repeat(count));
@@ -664,7 +673,13 @@ mod tests {
         );
         let mut decoded = 1;
         while let Some(msg) = decoder.next_msg().unwrap() {
-            assert_eq!(msg, ClientMsg::Resize(Size::new(1, 2)));
+            assert_eq!(
+                msg,
+                ClientMsg::Resize {
+                    n: 1,
+                    size: Size::new(1, 2)
+                }
+            );
             decoded += 1;
         }
         assert_eq!(decoded, count);
@@ -676,7 +691,10 @@ mod tests {
         decoder.push(&resize[3..]);
         assert_eq!(
             decoder.next_msg().unwrap(),
-            Some(ClientMsg::Resize(Size::new(1, 2)))
+            Some(ClientMsg::Resize {
+                n: 1,
+                size: Size::new(1, 2)
+            })
         );
     }
 
@@ -787,7 +805,11 @@ mod tests {
 
     #[test]
     fn truncated_and_garbage_client_streams_are_errors() {
-        let stream = encode_client(&ClientMsg::Resize(Size::new(1, 2))).unwrap();
+        let stream = encode_client(&ClientMsg::Resize {
+            n: 1,
+            size: Size::new(1, 2),
+        })
+        .unwrap();
         for cut in 1..stream.len() {
             assert!(
                 matches!(decode_all(&stream[..cut]), Err(ProtoError::Truncated)),

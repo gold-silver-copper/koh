@@ -304,7 +304,10 @@ fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyho
         let (addr, shutdown, serve) = loopback_serve(secret.public(), &program).await?;
         let mut client = RawClient::connect(addr, secret).await?;
         client
-            .write(&ClientMsg::Resize(Size::new(65000, 1)))
+            .write(&ClientMsg::Resize {
+                n: 1,
+                size: Size::new(65000, 1),
+            })
             .await?;
         client.type_bytes(b"xy\r").await?;
         let clamped = clamp_dims(Size::new(65000, 1));
@@ -538,7 +541,7 @@ fn a_resize_waits_for_no_typing_the_program_has_not_read() -> anyhow::Result<()>
             anyhow::Ok(())
         });
         let size = Size::new(30, 100);
-        client.write(&ClientMsg::Resize(size)).await?;
+        client.write(&ClientMsg::Resize { n: 1, size }).await?;
         let resized = |c: &RawClient| c.screen().is_some_and(|s| s.size() == size);
         for _ in 0..50 {
             client.pump(100).await?;

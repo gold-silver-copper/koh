@@ -698,9 +698,19 @@ mod tests {
             ..row(3, 4)
         };
         let too_many_cells = reply((1..=100).map(|n| row(n, 1000)).collect());
+        // A link no cell names: a hostile server could otherwise make the client keep links
+        // nothing shows.
+        let unnamed_link = HistoryRow {
+            links: vec![WireLink {
+                uri: "https://example.org".to_owned(),
+                id: String::new(),
+            }],
+            ..row(3, 4)
+        };
         for reply in [
             reply(vec![row(1, 3), too_wide]),
             reply(vec![row(1, 3), bad_link]),
+            reply(vec![unnamed_link]),
             too_many_cells,
         ] {
             let mut cache = HistoryCache::default();
@@ -761,22 +771,6 @@ mod tests {
                 "the farthest went"
             );
         }
-    }
-
-    #[test]
-    fn a_row_with_a_link_no_cell_names_is_refused() {
-        // A hostile server could otherwise make the client keep links nothing shows.
-        let mut unnamed = row(3, 4);
-        unnamed.links = vec![WireLink {
-            uri: "https://example.org".to_owned(),
-            id: String::new(),
-        }];
-        let mut cache = HistoryCache::default();
-        assert_eq!(
-            cache.insert(&reply(vec![unnamed]), ask(3, 1), MARK, 3..=3),
-            None
-        );
-        assert!(cache.is_empty());
     }
 
     #[test]

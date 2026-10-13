@@ -329,14 +329,20 @@ impl ServerTerminal {
     /// The screen scrolled `offset` rows back into history, as this emulator shows it: what a
     /// client's scrollback view at `offset` must show. For tests.
     pub fn window(&self, offset: usize) -> TerminalScreen {
+        let grid = Grid::window_of(self.parser.screen(), offset);
+        self.screen(grid, HistoryMark::default())
+    }
+
+    /// `grid` and `history` with the side channels and modes as they are now.
+    fn screen(&self, grid: Grid, history: HistoryMark) -> TerminalScreen {
         TerminalScreen {
-            grid: Grid::window_of(self.parser.screen(), offset),
+            grid,
             title: self.observed.title.clone(),
             icon: self.observed.icon.clone(),
             clipboard: self.observed.clipboard.clone(),
             bell_count: self.observed.bell_count,
             exit_code: self.exit_code,
-            history: HistoryMark::default(),
+            history,
             tty: self.tty,
         }
     }
@@ -385,16 +391,8 @@ impl ServerTerminal {
             self.names.renew();
         }
         let grid = Grid::of(self.parser.screen(), palette, &mut self.rows);
-        TerminalScreen {
-            grid,
-            title: self.observed.title.clone(),
-            icon: self.observed.icon.clone(),
-            clipboard: self.observed.clipboard.clone(),
-            bell_count: self.observed.bell_count,
-            exit_code: self.exit_code,
-            history: self.names.mark(self.parser.screen()),
-            tty: self.tty,
-        }
+        let history = self.names.mark(self.parser.screen());
+        self.screen(grid, history)
     }
 }
 

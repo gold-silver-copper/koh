@@ -148,38 +148,34 @@ pub trait KohBackend {
     /// Set a whole style: reset, then each attribute, then the colours.
     fn set_style(&mut self, style: Attributes) -> io::Result<()> {
         self.reset_sgr()?; // clears everything (incl. colors), then re-apply
-        if style.bold() {
-            self.write_bytes(b"\x1b[1m")?;
-        }
-        if style.dim() {
-            self.write_bytes(b"\x1b[2m")?;
-        }
-        if style.italic() {
-            self.write_bytes(b"\x1b[3m")?;
-        }
-        match style.underline_style() {
-            UnderlineStyle::None => {}
+        let underline: &[u8] = match style.underline_style() {
+            UnderlineStyle::None => b"",
             // Kitty's `4:n`, only where the terminal draws it (see `drawn`).
-            UnderlineStyle::Double => self.write_bytes(b"\x1b[4:2m")?,
-            UnderlineStyle::Curly => self.write_bytes(b"\x1b[4:3m")?,
-            UnderlineStyle::Dotted => self.write_bytes(b"\x1b[4:4m")?,
-            UnderlineStyle::Dashed => self.write_bytes(b"\x1b[4:5m")?,
+            UnderlineStyle::Double => b"\x1b[4:2m",
+            UnderlineStyle::Curly => b"\x1b[4:3m",
+            UnderlineStyle::Dotted => b"\x1b[4:4m",
+            UnderlineStyle::Dashed => b"\x1b[4:5m",
             // A style fux-vt adds later is drawn plain.
-            UnderlineStyle::Single | _ => self.write_bytes(b"\x1b[4m")?,
-        }
-        if style.inverse() {
-            self.write_bytes(b"\x1b[7m")?;
-        }
-        if style.hidden() {
-            self.write_bytes(b"\x1b[8m")?;
-        }
-        if style.strikeout() {
-            self.write_bytes(b"\x1b[9m")?;
-        }
-        match style.blink() {
-            Blink::Slow => self.write_bytes(b"\x1b[5m")?,
-            Blink::Rapid => self.write_bytes(b"\x1b[6m")?,
-            Blink::None | _ => {}
+            UnderlineStyle::Single | _ => b"\x1b[4m",
+        };
+        let blink: &[u8] = match style.blink() {
+            Blink::Slow => b"\x1b[5m",
+            Blink::Rapid => b"\x1b[6m",
+            Blink::None | _ => b"",
+        };
+        for (on, sgr) in [
+            (style.bold(), &b"\x1b[1m"[..]),
+            (style.dim(), b"\x1b[2m"),
+            (style.italic(), b"\x1b[3m"),
+            (true, underline),
+            (style.inverse(), b"\x1b[7m"),
+            (style.hidden(), b"\x1b[8m"),
+            (style.strikeout(), b"\x1b[9m"),
+            (true, blink),
+        ] {
+            if on && !sgr.is_empty() {
+                self.write_bytes(sgr)?;
+            }
         }
         write_sgr_color(self, style.foreground(), true)?;
         write_sgr_color(self, style.background(), false)?;

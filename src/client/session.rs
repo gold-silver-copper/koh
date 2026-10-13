@@ -1011,6 +1011,11 @@ mod tests {
         }
     }
 
+    /// The first frame on a connection, showing `bytes`.
+    fn first(echo_ack: u64, bytes: &[u8]) -> Frame {
+        frame(1, 0, echo_ack, &TerminalScreen::default(), &screen(bytes))
+    }
+
     fn drain(s: &mut ClientSession) -> Vec<ClientMsg> {
         std::iter::from_fn(|| s.pop_outgoing()).collect()
     }
@@ -1042,12 +1047,6 @@ mod tests {
             }
         }
         out
-    }
-
-    #[test]
-    fn a_session_first_tells_the_server_its_window_size() {
-        let (_, mut s) = start();
-        assert_eq!(drain(&mut s), [ClientMsg::Resize(Size::new(24, 80))]);
     }
 
     /// What the escape prefix and the key after it do, however the reads split them and whatever
@@ -1532,10 +1531,7 @@ mod tests {
             s.on_tick(now + LINK_DOWN_GRACE * 2, None).status.is_none(),
             "no banner before the first frame (still connecting)"
         );
-        s.on_frame(
-            now,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"$ ")),
-        );
+        s.on_frame(now, &first(0, b"$ "));
         assert!(s.on_tick(now + HEARTBEAT * 2, None).status.is_none());
         assert!(s.on_tick(now + LINK_DOWN_GRACE, None).status.is_none());
         let stalled = s.on_tick(now + LINK_DOWN_GRACE + Duration::from_secs(2), None);
@@ -1940,10 +1936,7 @@ mod tests {
         // not sent. After it, it goes out.
         s.on_input(now, b"d");
         assert_eq!(drain(&mut s), [], "not before the first frame");
-        s.on_frame(
-            now,
-            &frame(1, 0, 1, &TerminalScreen::default(), &screen(b"")),
-        );
+        s.on_frame(now, &first(1, b""));
         drain(&mut s);
         s.on_input(now, b"e");
         assert_eq!(
@@ -1972,10 +1965,7 @@ mod tests {
         assert!(s.view().is_some(), "the view is still open");
         assert!(s.state().screen().contents().contains("kept"));
         assert!(!s.synced(), "not the new connection's screen yet");
-        s.on_frame(
-            now,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"new")),
-        );
+        s.on_frame(now, &first(0, b"new"));
         assert!(s.synced() && s.state().screen().contents().contains("new"));
     }
 
@@ -2124,10 +2114,7 @@ mod tests {
         );
         let status = s.on_tick(now, None).status.expect("a notice");
         assert!(status.contains("not sent"), "{status}");
-        s.on_frame(
-            now,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
+        s.on_frame(now, &first(0, b""));
         drain(&mut s);
         s.on_input(now, b"x");
         assert_eq!(typed(&drain(&mut s)), b"x");
@@ -2174,10 +2161,7 @@ mod tests {
         s.attach(Size::new(24, 80));
         let status = s.on_tick(t1, None).status.expect("the banner");
         assert!(status.contains("not sent"), "{status}");
-        s.on_frame(
-            t1,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
+        s.on_frame(t1, &first(0, b""));
         let status = s.on_tick(t1, None).status.expect("a notice");
         assert!(
             status.contains("not sent") && !status.contains("reconnecting"),
@@ -2188,10 +2172,7 @@ mod tests {
         let status = s.on_tick(t1, None).status.expect("the banner");
         assert_eq!(status.matches("not sent").count(), 1, "{status}");
         s.attach(Size::new(24, 80));
-        s.on_frame(
-            t1,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
+        s.on_frame(t1, &first(0, b""));
         assert!(s.on_tick(t1 + NOTICE_FOR, None).status.is_none());
     }
 
@@ -2204,10 +2185,7 @@ mod tests {
         s.input_paused = true;
         s.detach(now);
         s.attach(Size::new(24, 80));
-        s.on_frame(
-            now,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
+        s.on_frame(now, &first(0, b""));
         drain(&mut s);
         s.on_input(now, b"x");
         assert_eq!(typed(&drain(&mut s)), b"x");

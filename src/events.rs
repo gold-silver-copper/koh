@@ -333,10 +333,9 @@ impl From<MouseEvent> for WireMouse {
 impl WireColours {
     /// Whether the message is within the wire's bounds.
     pub fn check(&self) -> Result<(), &'static str> {
-        if self.palette.len() > PALETTE {
-            return Err("too many palette entries");
-        }
-        Ok(())
+        (self.palette.len() <= PALETTE)
+            .then_some(())
+            .ok_or("too many palette entries")
     }
 
     /// The foreground, background and scheme, as fux-vt answers programs from them.

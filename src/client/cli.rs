@@ -300,15 +300,10 @@ mod tests {
                 .find(std::net::SocketAddr::is_ipv4)
                 .context("server IPv4 socket")?;
             let config = ConnectConfig {
-                server: server.id(),
                 // Any attempt to reload instead of reusing `identity` would fail here.
                 key_file: Some("/nonexistent/koh-redial-test.key".into()),
                 direct: Some(([127, 0, 0, 1], socket.port()).into()),
-                relay_url: None,
-                clipboard: false,
-                hyperlinks: false,
-                colours: false,
-                bell_command: None,
+                ..ConnectConfig::new(server.id())
             };
             let peer = server.clone();
             let accept = async move {

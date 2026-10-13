@@ -222,35 +222,33 @@ impl Outgoing {
                 <= MAX_CLIENT_MESSAGE
     }
 
-    /// The message an event of `cost` bytes goes in: the last one queued if it has room, else a
-    /// new one after `last_seq`.
-    fn seq_for(&self, cost: usize, last_seq: InputSeq) -> InputSeq {
-        match self.messages.back() {
-            Some(ClientMsg::Keys { seq, events }) if self.fits(events, cost) => *seq,
-            _ => last_seq.next(),
-        }
-    }
-
-    /// Queue `event`, of `cost` bytes, as [`seq_for`](Self::seq_for) says, unless the queue is
-    /// full; whether it was.
-    fn event(&mut self, event: InputEvent, cost: usize, last_seq: &mut InputSeq) -> bool {
+    /// Queue `event`, of `cost` bytes, in the last message queued if it has room, else in a new
+    /// one after `last_seq`: the message's number, or `None` if the queue is full.
+    #[must_use]
+    fn event(
+        &mut self,
+        event: InputEvent,
+        cost: usize,
+        last_seq: &mut InputSeq,
+    ) -> Option<InputSeq> {
         let room = matches!(self.messages.back(), Some(ClientMsg::Keys { events, .. }) if self.fits(events, cost));
         match self.messages.back_mut() {
-            Some(ClientMsg::Keys { events, .. }) if room => {
+            Some(ClientMsg::Keys { seq, events }) if room => {
                 events.push(event);
                 self.input_bytes = self.input_bytes.saturating_add(cost);
                 self.newest_bytes = self.newest_bytes.saturating_add(cost);
-                true
+                Some(*seq)
             }
             _ => {
-                let queued = self.push_back(ClientMsg::Keys {
-                    seq: last_seq.next(),
+                let seq = last_seq.next();
+                self.push_back(ClientMsg::Keys {
+                    seq,
                     events: vec![event],
-                });
-                if queued {
-                    *last_seq = last_seq.next();
-                }
-                queued
+                })
+                .then(|| {
+                    *last_seq = seq;
+                    seq
+                })
             }
         }
     }
@@ -265,8 +263,8 @@ impl Outgoing {
     }
 }
 
-/// How long after a frame moves the cursor to another row (a fresh prompt) a key typed is shown
-/// only once echoed: the server reads the PTY's modes at least every [`TTY_TICK`], so a program
+/// How long after a frame shows the program's output at the cursor (a fresh prompt) a key typed is
+/// shown only once echoed: the server reads the PTY's modes at least every [`TTY_TICK`], so a program
 /// that turned echo off just after printing its prompt is heard of within about one; two leave
 /// room for the link's jitter.
 const PROMPT_HOLD: Duration = TTY_TICK.saturating_mul(2);
@@ -423,10 +421,9 @@ impl ClientSession {
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Ack { .. } | ClientMsg::History(_)));
         self.link.drop_resync();
-        if self.decoder.deadline().is_some() {
-            self.stale_decode = true;
-            outage.dropped_typing();
-        }
+        // What the decoder holds is said dropped once decoded, if it is typing: a terminal's
+        // answer cut by the drop is not.
+        self.stale_decode = self.decoder.deadline().is_some();
         if self.outgoing.input_bytes > 0 {
             self.outgoing
                 .retain(|msg| !matches!(msg, ClientMsg::Keys { .. }));
@@ -478,7 +475,7 @@ impl ClientSession {
             };
             self.decoder.bytes(std::slice::from_ref(byte), &mut inputs);
             self.decoder.mark(now);
-            inputs.retain(|input| matches!(input, Input::Reply(_) | Input::PasteTooLong));
+            self.drop_stale(now, &mut inputs);
             self.stale_decode = self.decoder.deadline().is_some();
             rest = tail;
         }
@@ -501,9 +498,25 @@ impl ClientSession {
         let mut inputs = Vec::new();
         self.decoder.timeout(&mut inputs);
         if std::mem::take(&mut self.stale_decode) {
-            inputs.retain(|input| matches!(input, Input::Reply(_) | Input::PasteTooLong));
+            self.drop_stale(now, &mut inputs);
         }
         self.on_inputs(now, inputs)
+    }
+
+    /// Drop what was decoded of input begun before the drop, but the terminal's answers, and say
+    /// so if it was typing.
+    fn drop_stale(&mut self, now: Instant, inputs: &mut Vec<Input>) {
+        if inputs
+            .iter()
+            .any(|input| matches!(input, Input::Key(_) | Input::Paste(_)))
+        {
+            match &mut self.outage {
+                Some(outage) => outage.dropped_typing(),
+                None => self.notice.give(INPUT_DROPPED, now),
+            }
+            self.dirty = true;
+        }
+        inputs.retain(|input| matches!(input, Input::Reply(_) | Input::PasteTooLong));
     }
 
     /// Take decoded input: the escape prefix (a key whose legacy byte is `Ctrl-^`, from any
@@ -515,9 +528,9 @@ impl ClientSession {
         let mut suspend = false;
         let mut fwd: Vec<InputEvent> = Vec::new();
         for input in inputs {
-            match input {
+            let key = match &input {
                 Input::Reply(reply) => {
-                    self.on_reply(now, reply);
+                    self.on_reply(now, *reply);
                     continue;
                 }
                 Input::PasteTooLong => {
@@ -525,13 +538,6 @@ impl ClientSession {
                     self.dirty = true;
                     continue;
                 }
-                Input::Key(_)
-                | Input::Paste(_)
-                | Input::FocusIn
-                | Input::FocusOut
-                | Input::Mouse(_) => {}
-            }
-            let key = match &input {
                 // The prefix is a control: a key without Ctrl can only matter after one.
                 Input::Key(stroke) if stroke.press.mods.ctrl || self.pending_escape.is_some() => {
                     self.scratch.clear();
@@ -544,11 +550,9 @@ impl ClientSession {
                 }
                 Input::Key(_)
                 | Input::Paste(_)
-                | Input::PasteTooLong
                 | Input::FocusIn
                 | Input::FocusOut
-                | Input::Mouse(_)
-                | Input::Reply(_) => None,
+                | Input::Mouse(_) => None,
             };
             if let Some(prefix) = self.pending_escape.take() {
                 match key {
@@ -689,33 +693,39 @@ impl ClientSession {
         // user's terminal: what they do is not predicted, but taken as one unmodelled input.
         let burst = events.len() > TYPED_KEYS;
         for (n, event) in events.into_iter().enumerate() {
+            // What the predictor hears of it: a key it models, input it does not (`Some(None)`),
+            // or nothing (focus changes the screen of no line editor).
+            let key = match &event {
+                InputEvent::Key(key) if !burst => Some(Some(key.stroke().press)),
+                InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_) => Some(None),
+                InputEvent::Focus(_) => None,
+            };
             let cost = event.encoded_len();
+            let Some(seq) = self.outgoing.event(event, cost, &mut self.last_seq) else {
+                // No room: this and the rest are dropped, never sent around a hole.
+                self.input_paused = true;
+                break;
+            };
             // Predictions made now expire with the input message that carries the event.
-            let seq = self.outgoing.seq_for(cost, self.last_seq);
             self.predictor.set_local_frame_sent(seq.0.saturating_sub(1));
             let screen = self.link.current().screen.screen();
-            match &event {
+            match key {
                 _ if burst && n > 0 => {}
-                InputEvent::Key(_) if burst => self.predictor.new_user_other(screen),
-                InputEvent::Key(key) => {
+                Some(Some(press)) => {
                     // At a fresh prompt the modes the client holds may be from before the program
                     // turned echo off: the key shows only once echoed.
                     if self
                         .link
-                        .new_row_at
+                        .output_at
                         .is_some_and(|at| now.saturating_duration_since(at) < PROMPT_HOLD)
                     {
                         self.predictor.hold();
                     }
-                    self.predictor.new_user_key(key.stroke().press, screen);
+                    self.predictor.new_user_key(press, screen);
                 }
-                InputEvent::Mouse(_) | InputEvent::Paste(_) => {
-                    self.predictor.new_user_other(screen);
-                }
-                // Focus changes the screen of no line editor: the predictor never hears of it.
-                InputEvent::Focus(_) => {}
+                Some(None) => self.predictor.new_user_other(screen),
+                None => {}
             }
-            self.outgoing.event(event, cost, &mut self.last_seq);
         }
         self.link.last_nudge = Some(now);
         self.last_activity = Some(now);
@@ -784,19 +794,23 @@ impl ClientSession {
             self.link.refuse(frame.base);
             return;
         };
-        // The cursor's row is another when its index changed, or when the screen scrolled: at the
-        // bottom of the screen a new line scrolls, leaving the index as it was, and names a new
-        // history row, or moves the rows (a scroll region, no scrollback kept).
+        // The program's output at the cursor, maybe a prompt that turns echo off a moment after
+        // the modes the frame carries: the cursor on another row (its index changed, or the
+        // screen scrolled: at the bottom a new line scrolls, leaving the index as it was, and
+        // names a new history row, or moves the rows), or its row written when every key typed
+        // was already shown echoed (PAM prints its prompt, then turns echo off).
         let (now_grid, was) = (next.screen().screen(), &self.link.current().screen);
         let row = |screen: &TerminalScreen| {
             (screen.screen().cursor_position().0, screen.history().newest)
         };
+        let (cursor_row, _) = row(next.screen());
         if row(next.screen()) != row(was)
             || !now_grid
                 .moves_from(was.screen(), now_grid.size().rows)
                 .is_empty()
+            || (self.link.echo_ack >= self.last_seq && !now_grid.row_eq(was.screen(), cursor_row))
         {
-            self.link.new_row_at = Some(now);
+            self.link.output_at = Some(now);
         }
         self.link.advance(next);
         // The outage ends with the new connection's first frame, which shows the shell it reached;
@@ -906,20 +920,12 @@ impl ClientSession {
             return Some(resync);
         }
         let msg = self.outgoing.pop_front()?;
-        let sent = match &msg {
-            ClientMsg::Keys { seq, .. } => Some(*seq),
-            ClientMsg::Resize(_)
-            | ClientMsg::Ack { .. }
-            | ClientMsg::Resync
-            | ClientMsg::History(_)
-            | ClientMsg::Colours(_) => None,
-        };
-        if let Some(seq) = sent {
-            self.sent_seq = seq;
-            if self.input_paused && self.outgoing.input_bytes == 0 {
-                self.input_paused = false;
-                self.dirty = true;
-            }
+        if let ClientMsg::Keys { seq, .. } = &msg {
+            self.sent_seq = *seq;
+        }
+        if self.input_paused && self.outgoing.input_bytes == 0 {
+            self.input_paused = false;
+            self.dirty = true;
         }
         Some(msg)
     }
@@ -1139,6 +1145,19 @@ mod tests {
             s.on_tick(now, None).status.is_none(),
             "draining clears the banner"
         );
+        // A queue full of messages takes no key: none is predicted that is not sent, typing
+        // pauses, and once the queue drains what is typed goes as ever.
+        let (now, mut s) = start();
+        s.predictor.set_tty(Some(EDITOR));
+        s.predictor.confirm_for_tests();
+        while s.outgoing.push_back(ClientMsg::Resync) {}
+        s.on_input(now, b"x");
+        assert!(s.overlay().is_empty(), "predicted, not sent");
+        let status = s.on_tick(now, None).status.expect("input paused banner");
+        assert!(status.contains("input paused"), "{status}");
+        assert_eq!(typed(&drain(&mut s)), b"");
+        s.on_input(now, b"y");
+        assert_eq!(typed(&drain(&mut s)), b"y");
     }
 
     #[test]
@@ -1440,15 +1459,23 @@ mod tests {
         );
     }
 
-    /// A program that prints its prompt and turns echo off a moment after (bash's `read -s`) can
-    /// be shown with the modes from before: a key typed at once must not be shown, however
-    /// trusted the session; once the server could have told the new modes, keys are predicted as
-    /// before. At the bottom of the screen Enter scrolls, so the cursor's row index stays: the
-    /// hold sees the scroll, by the history row it names or, with no scrollback, by the rows it
-    /// moves.
+    /// A program that prints its prompt and turns echo off a moment after (bash's `read -s`, or
+    /// PAM's prompt on the row it was run from) can be shown with the modes from before: a key
+    /// typed at once must not be shown, however trusted the session; once the server could have
+    /// told the new modes, keys are predicted as before. At the bottom of the screen Enter
+    /// scrolls, so the cursor's row index stays: the hold sees the scroll, by the history row it
+    /// names or, with no scrollback, by the rows it moves.
     #[test]
     fn a_key_at_a_fresh_prompt_waits_for_its_echo_even_at_the_bottom_of_the_screen() {
-        for (above, scrollback) in [(0, 0), (30, 100), (30, 0)] {
+        // Each: the rows above the prompt, the scrollback, and the prompt the program prints
+        // once the key typed is echoed and acknowledged.
+        for (above, scrollback, prompt) in [
+            (0, 0, &b"\r\nSecret: "[..]),
+            (30, 100, b"\r\nSecret: "),
+            (30, 0, b"\r\nSecret: "),
+            // `sudo` run: its prompt on the row it was run from.
+            (0, 0, b" Secret: "),
+        ] {
             let echoing = crate::predict::TtyModes {
                 echo: true,
                 line: true,
@@ -1466,12 +1493,16 @@ mod tests {
             s.on_input(t1, b"x");
             assert!(!s.overlay().is_empty(), "kernel echo shows at once");
             drain(&mut s);
-            // Enter: the shell prints a prompt on a new row (at the bottom, the same row index); the
-            // modes the frame carries still echo.
-            emu.process(b"x\r\nSecret: ");
+            emu.process(b"x");
+            let echoed = emu.snapshot();
+            s.on_frame(t1, &frame(2, 1, 1, &first, &echoed));
+            // The program prints a prompt, on a new row (at the bottom, the same row index) or on
+            // the cursor's; the modes the frame carries still echo.
+            emu.process(prompt);
+            let same_row = above > 0 || !prompt.contains(&b'\n');
             let prompt = emu.snapshot();
-            assert_eq!(prompt.screen().cursor_position().0 == row, above > 0);
-            s.on_frame(t1, &frame(2, 1, 1, &first, &prompt));
+            assert_eq!(prompt.screen().cursor_position().0 == row, same_row);
+            s.on_frame(t1, &frame(3, 2, 1, &echoed, &prompt));
             s.on_input(t1 + Duration::from_millis(10), b"Q");
             drain(&mut s);
             let shown =
@@ -1485,7 +1516,7 @@ mod tests {
             emu.process(b"Q");
             let echoed = emu.snapshot();
             let t2 = t1 + PROMPT_HOLD + Duration::from_millis(1);
-            s.on_frame(t2, &frame(3, 2, 2, &prompt, &echoed));
+            s.on_frame(t2, &frame(4, 3, 2, &prompt, &echoed));
             s.on_input(t2, b"Z");
             assert!(shown(&s, "Z") && !shown(&s, "Q"), "{above} {scrollback}");
         }
@@ -1984,7 +2015,14 @@ mod tests {
     fn what_an_outage_lost_is_said() {
         use Step::{Down, Flush, FocusIn, Frame, PasteTooLong, Pause, Type, Up, Wait};
         const LINE: Step = Type(b"false && ");
-        let cases: [(&[Step], &[&str], &[&str]); 10] = [
+        let cases: [(&[Step], &[&str], &[&str]); 12] = [
+            // A terminal's answer cut by the drop is not typing; a key cut by it is.
+            (
+                &[Type(b"\x1b[?62;"), Down, Type(b"22c")],
+                &["reconnecting"],
+                &["not sent"],
+            ),
+            (&[Type(b"\x1b[1;5"), Down, Type(b"A")], &["not sent"], &[]),
             // Though nothing was typed during the outage.
             (&[LINE, Flush, Down, Up], &["may not have arrived"], &[]),
             // A focus report or the mouse is not typing.

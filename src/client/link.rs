@@ -52,9 +52,10 @@ pub(super) struct Link {
     pub(super) last_heard: Option<Instant>,
     /// When input was last queued or probed for, while some is unconfirmed.
     pub(super) last_nudge: Option<Instant>,
-    /// When the newest frame moved the cursor to another row: a fresh prompt, whose program may
-    /// still turn echo off. Keys typed within `PROMPT_HOLD` of it are shown only once echoed.
-    pub(super) new_row_at: Option<Instant>,
+    /// When the newest frame showed the program's own output at the cursor: a fresh prompt, whose
+    /// program may still turn echo off. Keys typed within `PROMPT_HOLD` of it are shown only once
+    /// echoed.
+    pub(super) output_at: Option<Instant>,
     /// Rows' encodings, kept from one frame's dictionary to the next.
     pub(super) encodings: RowEncodings,
 }
@@ -75,7 +76,7 @@ impl Link {
             echo_ack,
             last_heard: None,
             last_nudge: None,
-            new_row_at: None,
+            output_at: None,
             encodings: RowEncodings::default(),
         }
     }

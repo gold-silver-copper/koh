@@ -670,24 +670,38 @@ impl PredictionEngine {
         self.move_cursor((row, to));
     }
 
-    /// Backspace: the cell before the cursor deleted, never past where the line began.
+    /// Whether Backspace or Left may step back from `(row, col)`: never past where the line began
+    /// if that is known, else only over a glyph this line's own guesses typed, so the prompt
+    /// before a line whose start is not known (just connected, or after Up or Tab) is never
+    /// taken for it.
+    fn may_step_back(&self, row: u16, col: u16) -> bool {
+        match self.line_start(row) {
+            Some(start) => col > start,
+            None => col
+                .checked_sub(1)
+                .and_then(|left| self.cells.get(&(row, left)))
+                .is_some_and(|cell| cell.typed),
+        }
+    }
+
+    /// Backspace: the cell before the cursor deleted, as [`may_step_back`](Self::may_step_back)
+    /// allows.
     fn predict_backspace(&mut self, ctx: &Context<'_>) {
         let (row, col) = self.cursor_at(ctx.screen);
-        if self.line_start(row).is_some_and(|start| col <= start) {
+        if !self.may_step_back(row, col) {
             return self.unmodelled();
         }
         self.delete_before(ctx, 1);
     }
 
     /// Left or Right (`right`): the cursor one column over, within the row (Right stops before
-    /// the last column), and Left never past where the line began.
+    /// the last column), and Left as [`may_step_back`](Self::may_step_back) allows.
     fn predict_arrow(&mut self, ctx: &Context<'_>, right: bool) {
         let (row, col) = self.cursor_at(ctx.screen);
         let to = if right {
             col.checked_add(1).filter(|&next| next < ctx.size.cols)
         } else {
-            col.checked_sub(1)
-                .filter(|&prev| self.line_start(row).is_none_or(|start| prev >= start))
+            col.checked_sub(1).filter(|_| self.may_step_back(row, col))
         };
         match to {
             Some(to) => self.move_cursor((row, to)),
@@ -1331,6 +1345,7 @@ mod tests {
         // the cell unknown when `i + 2 >= width`, so both edge columns, not just the last one).
         let mut e = engine();
         e.set_local_frame_sent(0);
+        e.line = Line::Started(Confirmed { row: 0, col: 0 });
         e.type_bytes(&[0x7f], &screen_of(b"abc\x1b[1;3H"));
         predicted_row(&e, 1, &["c"]);
         // A blank moved in, then the two unknown edge columns.
@@ -1347,6 +1362,7 @@ mod tests {
         let mut e = engine();
         e.set_local_frame_sent(0);
         e.move_cursor((0, u16::MAX - 1));
+        e.line = Line::Started(Confirmed { row: 0, col: 0 });
         e.type_bytes(&[0x7f], p.screen());
         predicted_row(&e, u16::MAX - 2, &["U", "U"]);
     }
@@ -1459,6 +1475,7 @@ mod tests {
         for arrow in [&b"\x1b[D"[..], b"\x1bOD"] {
             let (mut e, echoed) = confirm_first_keystroke();
             e.set_local_frame_sent(1);
+            e.line = Line::Started(Confirmed { row: 0, col: 0 });
             e.type_bytes(arrow, &echoed);
             let ov = e.overlay();
             assert_eq!(ov.cursor(), Some((0, 0)), "{arrow:?}");
@@ -1529,6 +1546,7 @@ mod tests {
         // Deleting before one moves it left, whole.
         let mut e = engine();
         e.set_local_frame_sent(0);
+        e.line = Line::Started(Confirmed { row: 0, col: 0 });
         e.type_bytes(&[0x7f], &screen_of("ab本c\x1b[1;3H".as_bytes()));
         predicted_row(&e, 1, &["本", ">", "c"]);
     }
@@ -1712,6 +1730,16 @@ mod tests {
             assert!(e.overlay().is_empty(), "{key:?}");
             assert!(e.prediction_epoch > epoch, "{key:?} opened a new epoch");
             e.line = Line::Started(Confirmed { row: 0, col: 2 });
+            // Where the line began is not known: only over what its own guesses typed.
+            let (mut e, screen) = editor_on(b"$ ");
+            type_keys(&mut e, &screen, key);
+            assert!(e.overlay().is_empty(), "{key:?} into the prompt");
+            let (mut e, screen) = editor_on(b"$ ");
+            type_keys(&mut e, &screen, b"ab");
+            for col in [3, 2, 2] {
+                type_keys(&mut e, &screen, key);
+                assert_eq!(shown_row(&e, &screen).1, Some(col), "{key:?}");
+            }
         }
     }
 

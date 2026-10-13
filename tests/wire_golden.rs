@@ -517,3 +517,64 @@ fn modes_encode_as_pinned() {
         );
     }
 }
+
+/// The hand-built messages, as the fuzz targets read their input: CI's fuzz job starts each target
+/// from them (in `$KOH_FUZZ_SEEDS/<target>/`, when that is set) instead of from nothing. Each seed
+/// must reach the code it seeds: the client stream decodes whole, every diff applies.
+#[test]
+fn the_wire_messages_seed_the_fuzzers() {
+    let client: Vec<u8> = client_msgs()
+        .iter()
+        .flat_map(|msg| encode_client(msg).expect("encodes"))
+        .collect();
+    let mut decoder = ClientDecoder::default();
+    decoder.push(&client);
+    while decoder.next_msg().expect("decodes").is_some() {}
+    decoder.finish().expect("whole");
+
+    let frames = wire_frames().expect("frames");
+    let reply = wire_history().expect("history");
+    let mut screen = TerminalScreen::default();
+    let mut streams = Vec::new();
+    for frame in &frames {
+        streams.push(
+            FrameEncoder::default()
+                .encode(frame, &screen)
+                .expect("encodes"),
+        );
+        screen.apply(&frame.diff).expect("applies");
+    }
+    streams.push(
+        FrameEncoder::default()
+            .encode_history(&reply)
+            .expect("encodes"),
+    );
+    // What history_apply reads first: the mark, the request and the view's offset.
+    let header =
+        postcard::to_allocvec(&(70_000_u64, 2_u32, 70_000_u64, 2_u16, 1_u16)).expect("encodes");
+    let seeds = [
+        // The first byte splits the rest into reads of that many bytes.
+        ("proto_decode", [&[255][..], &client].concat()),
+        ("server_input", [&[0][..], &client].concat()),
+        (
+            "history_apply",
+            [header, postcard::to_allocvec(&reply).expect("encodes")].concat(),
+        ),
+    ]
+    .into_iter()
+    .chain(streams.into_iter().map(|stream| ("proto_decode", stream)))
+    .chain(frames.iter().map(|frame| {
+        (
+            "screen_apply",
+            postcard::to_allocvec(&frame.diff).expect("encodes"),
+        )
+    }));
+    let Some(root) = std::env::var_os("KOH_FUZZ_SEEDS") else {
+        return;
+    };
+    for (n, (target, seed)) in seeds.enumerate() {
+        let dir = std::path::Path::new(&root).join(target);
+        std::fs::create_dir_all(&dir).expect("the target's corpus");
+        std::fs::write(dir.join(format!("wire-{n}")), seed).expect("a seed");
+    }
+}

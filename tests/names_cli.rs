@@ -8,6 +8,7 @@
 
 mod common;
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -179,13 +180,42 @@ fn serve_without_allow_allows_the_saved_clients() {
     assert!(!out.status.success(), "no clients: {}", text(&out));
     assert!(text(&out).contains("koh clients add"), "{}", text(&out));
     home.koh(&["clients", "add", "phone", &some_id(3)]).unwrap();
-    let (_server, banner) = serve(
-        home.command(&["serve", "--local", "--shell", "sh"])
-            .unwrap(),
-    )
-    .unwrap();
-    let line = banner.iter().find(|line| line.contains("auth")).unwrap();
-    assert!(line.contains("allowlist (1 client(s))"), "{line}");
+    // A hang-up drains the server, unless it was started ignoring them (`nohup`, which only Linux
+    // reports): then a logout leaves it running, and SIGTERM still drains it.
+    for nohup in [false, cfg!(target_os = "linux")] {
+        let koh = env!("CARGO_BIN_EXE_koh");
+        let mut server = command([koh, "nohup"][usize::from(nohup)], &koh_testkit::home!())
+            .expect("spawn koh")
+            .args(nohup.then_some(koh))
+            .args(["serve", "--local", "--shell", "sh"])
+            .env("HOME", home.0.path())
+            .env("XDG_CONFIG_HOME", home.0.join(".config"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let logs = koh_testkit::stderr_lines(&mut server);
+        let next = |what: &str| {
+            std::iter::from_fn(|| logs.recv_timeout(Duration::from_secs(20)).ok())
+                .find(|line| line.contains(what))
+        };
+        let banner = next("auth");
+        let pid = fuxix::process::Pid::of(&server).unwrap();
+        fuxix::process::kill(pid, fuxix::process::Signal::Hup).unwrap();
+        let hung_up = next(["shutting down", "SIGHUP ignored"][usize::from(nohup)]);
+        if nohup {
+            fuxix::process::kill(pid, fuxix::process::Signal::Term).unwrap();
+        }
+        let drained = next("draining");
+        let _ = server.kill();
+        let _ = server.wait();
+        let banner = banner.expect("the server's banner");
+        assert!(banner.contains("allowlist (1 client(s))"), "{banner}");
+        let hung_up = hung_up.expect("the hang-up seen");
+        assert!(nohup || hung_up.contains("SIGHUP"), "{hung_up}");
+        assert!(drained.is_some(), "nohup {nohup}: never drained");
+    }
 }
 
 #[test]
@@ -203,6 +233,17 @@ fn key_info_shows_both_keys_and_reset_names_the_one() {
         "{said}"
     );
     assert!(said.contains("none yet (`koh serve` creates it)"), "{said}");
+    // A server key that is there but no key is said so, not taken for none.
+    let server_key = home.koh_dir().join("server.key");
+    std::fs::write(&server_key, [7; 31]).unwrap();
+    std::fs::set_permissions(&server_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = home.koh(&["key", "info"]).unwrap();
+    let said = text(&out);
+    assert!(
+        !out.status.success() && said.contains("koh key reset"),
+        "{said}"
+    );
+    std::fs::remove_file(&server_key).unwrap();
     let out = home.koh(&["key", "reset", "client"]).unwrap();
     assert!(
         !out.status.success() && text(&out).contains("--yes"),
@@ -282,7 +323,6 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
 /// with no restart: a lost machine's key is refused at once.
 #[test]
 fn clients_added_and_removed_take_effect_on_a_running_server() {
-    use koh::transport_iroh::admission::await_admission;
     use koh::transport_iroh::{bind_endpoint_local, direct_addr, parse_endpoint_id, ALPN};
     let home = Home::new("live-allowlist").unwrap();
     let me = home.koh(&["id"]).unwrap();
@@ -304,7 +344,7 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
         async move {
             let endpoint = bind_endpoint_local(secret, false).await?;
             let conn = endpoint.connect(at, ALPN).await?;
-            await_admission(&conn).await?;
+            conn.accept_uni().await?;
             anyhow::Ok((endpoint, conn))
         }
     };
@@ -313,7 +353,12 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
         .block_on(async {
             let before = admitted().await.is_ok();
             home.koh(&["clients", "add", "me", &me]).unwrap();
-            let live = admitted().await;
+            // Seen at the next read of the list, within two seconds.
+            let mut live = admitted().await;
+            let seen = tokio::time::Instant::now() + Duration::from_secs(10);
+            while live.is_err() && tokio::time::Instant::now() < seen {
+                live = admitted().await;
+            }
             let added = live.is_ok();
             home.koh(&["clients", "rm", "me"]).unwrap();
             // The connection it already had is cut off too.

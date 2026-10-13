@@ -2,6 +2,7 @@
 //! the `--allow` list, and host each one's session. There is no "accept any peer" mode.
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use crate::identity::KeyFile;
 use crate::log::Peer;
 use crate::names::List;
 use crate::proto::Close;
-use crate::server::audit::{auth_event, Outcome};
+use crate::server::audit::{auth_event, Outcome, Throttle};
 use crate::server::run_attached;
 use crate::server::session::{AttachKind, Registry, SessionSpec};
 use crate::transport_iroh::{bind_on, close, Network, PROTOCOL};
@@ -38,7 +39,7 @@ pub struct ServeConfig {
     /// Where the clients saved with `koh clients add` are, read again every [`REVOKE_CHECK`];
     /// `None` for none.
     pub saved_clients: Option<crate::names::Places>,
-    /// The program each session runs, as argv, verbatim; empty for the login shell.
+    /// The program each session runs, as argv, verbatim; empty for `$SHELL`.
     pub command: Vec<String>,
     /// Scrollback lines each session's emulator keeps, at most [`MAX_SCROLLBACK`].
     pub scrollback: u64,
@@ -51,10 +52,10 @@ pub struct ServeConfig {
     /// The UDP port to bind (IPv4 and IPv6); `None` for ephemeral ports. A fixed port lets a client
     /// dialing `--direct <ip:port>` redial a restarted server.
     pub port: Option<u16>,
-    /// Most connections handled at once (at least 1).
-    pub max_connections: u32,
-    /// Most live sessions, one per peer (at least 1).
-    pub max_sessions: u32,
+    /// Most connections handled at once.
+    pub max_connections: NonZeroU32,
+    /// Most live sessions, one per peer.
+    pub max_sessions: NonZeroU32,
     /// The binary each session's program starts through: by default the running one, which hands
     /// `__launch` to [`crate::pty::launched`].
     pub launcher: crate::pty::Launcher,
@@ -65,9 +66,9 @@ pub const DEFAULT_SCROLLBACK: u64 = 1000;
 /// The CLI's default for `--session-ttl-secs`: a day, to close the laptop and reopen it later.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
 /// The CLI's default for `--max-connections`.
-pub const DEFAULT_MAX_CONNECTIONS: u32 = 64;
+pub const DEFAULT_MAX_CONNECTIONS: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
 /// The CLI's default for `--max-sessions`.
-pub const DEFAULT_MAX_SESSIONS: u32 = 64;
+pub const DEFAULT_MAX_SESSIONS: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
 /// Upper bound on `scrollback`. fux-vt caps a buffer at 64 Mi cells, which must hold the history
 /// and a `MAX_DIM × MAX_DIM` screen: `(65_000 + 1000) × 1000 < 64 Mi`.
 pub const MAX_SCROLLBACK: u64 = 65_000;
@@ -109,6 +110,9 @@ pub fn connect_qr(data: &str) -> Option<String> {
 /// Logs to stderr.
 pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     crate::log::init_stderr(tracing::Level::INFO);
+    // Before the banner, so a signal once it shows is handled.
+    let shutdown = CancellationToken::new();
+    let forced = crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
     let hosting = Hosting::from_config(&args)?;
 
     let key_file = crate::identity::KeyFile::locate(args.key_file.clone(), "server")?;
@@ -179,8 +183,6 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
         "transport crypto posture"
     );
 
-    let shutdown = CancellationToken::new();
-    let forced = crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
     tokio::select! {
         served = serve_endpoint(endpoint, hosting, shutdown) => served,
         () = forced.cancelled() => {
@@ -189,9 +191,12 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     }
 }
 
-/// How often the saved clients are read again: one removed from them is cut off, its session
-/// ended, within this.
+/// How soon a client removed from the saved clients, or added to them, is seen: one removed is
+/// cut off, its session ended, within this.
 pub const REVOKE_CHECK: Duration = Duration::from_secs(2);
+
+/// How long after a read that drops a client the list is read again, to confirm it.
+const CONFIRM: Duration = Duration::from_millis(500);
 
 /// Who may connect: the ids given for this run, and the clients saved beside the server key.
 pub struct Allowlist {
@@ -201,38 +206,14 @@ pub struct Allowlist {
     saved: Option<(KeyFile, String)>,
 }
 
-/// Who may connect now, as [`watch_allowlist`] publishes it, never an error; and a way to have it
-/// read at once, for a peer not on it yet (one `koh clients add` just saved).
-#[derive(Clone)]
-struct Gate {
-    allowed: watch::Receiver<Arc<HashSet<EndpointId>>>,
-    reread: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
-}
+/// Who may connect now, as [`watch_allowlist`] publishes it.
+type Allowed = watch::Receiver<Arc<HashSet<EndpointId>>>;
 
-impl Gate {
-    /// Whether `peer` may connect: on the list, or on it once it is read again.
-    async fn allows(&self, peer: EndpointId) -> bool {
-        if self.allowed.borrow().contains(&peer) {
-            return true;
-        }
-        let (read, done) = tokio::sync::oneshot::channel();
-        if self.reread.send(read).await.is_ok() {
-            let _ = done.await;
-        }
-        self.allowed.borrow().contains(&peer)
-    }
-
-    /// Return once `peer` is no longer allowed. Never if the list stops being published: the
-    /// server is then shutting down, which ends the connection anyway.
-    async fn revoked(mut self, peer: EndpointId) {
-        if self
-            .allowed
-            .wait_for(|now| !now.contains(&peer))
-            .await
-            .is_err()
-        {
-            std::future::pending::<()>().await;
-        }
+/// Return once `peer` is no longer allowed. Never if the list stops being published: the server is
+/// then shutting down, which ends the connection anyway.
+async fn revoked(mut allowed: Allowed, peer: EndpointId) {
+    if allowed.wait_for(|now| !now.contains(&peer)).await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -248,79 +229,73 @@ impl Allowlist {
     }
 }
 
-/// A value replaced only by a successful read: a list that cannot be read (a typo, an editor
-/// writing it in place) is not an empty one, and locks no one out.
-struct LastGood<T> {
-    value: T,
+/// What reads of the list have settled. A read that fails (a typo) keeps the list as it was. One
+/// that drops a client is taken only once the next read, [`CONFIRM`] later, agrees: an editor
+/// saving the list leaves it missing or empty for a moment, which must lock no one out.
+#[derive(Default)]
+struct Settling {
+    /// A read that dropped a client, waiting for the next to agree.
+    dropping: Option<HashSet<EndpointId>>,
     /// The last read failed, and said so.
     failing: bool,
 }
 
-impl<T: PartialEq> LastGood<T> {
-    /// Take what a read gave; whether the value changed. A failure keeps the last value, and is
-    /// warned of once until a read succeeds again.
-    fn update(&mut self, read: anyhow::Result<T>) -> bool {
-        let failed = read.as_ref().err().map(|e| format!("{e:#}"));
-        if let Some(error) = failed.filter(|_| !std::mem::replace(&mut self.failing, true)) {
-            warn!(%error, "could not read the saved clients; keeping the list last read");
+impl Settling {
+    /// What the list allowing `now` is to become after `read`, if it changes. A failure is warned
+    /// of once until a read succeeds again.
+    fn settle(
+        &mut self,
+        now: &HashSet<EndpointId>,
+        read: anyhow::Result<HashSet<EndpointId>>,
+    ) -> Option<HashSet<EndpointId>> {
+        if let Some(error) = read.as_ref().err().filter(|_| !self.failing) {
+            warn!(error = %format!("{error:#}"), "could not read the saved clients; keeping the list last read");
         }
-        let Ok(value) = read else { return false };
-        self.failing = false;
-        std::mem::replace(&mut self.value, value) != self.value
+        self.failing = read.is_err();
+        let (read, dropping) = (read.ok()?, self.dropping.take());
+        if !now.is_subset(&read) && dropping.as_ref() != Some(&read) {
+            self.dropping = Some(read);
+            return None;
+        }
+        (*now != read).then_some(read)
     }
 }
 
-/// Read `list` every [`REVOKE_CHECK`], and at once when asked on `reread` (answering once it is
-/// read), publishing each change on `allowed`, until no one watches; and end in `registry` the
-/// session of each peer a change drops, connected or not. The one reader of the list.
+/// Read `list` again and again, publishing each change on `allowed`, until no one watches; and end
+/// in `registry` the session of each peer a change drops, connected or not. The one reader of the
+/// list: every [`REVOKE_CHECK`], [`CONFIRM`] included, so a removal is seen within it.
 async fn watch_allowlist(
     list: Allowlist,
     allowed: watch::Sender<Arc<HashSet<EndpointId>>>,
-    mut reread: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
     registry: Registry,
 ) {
     let list = Arc::new(list);
-    let mut last = LastGood {
-        value: allowed.borrow().clone(),
-        failing: false,
-    };
+    let mut settling = Settling::default();
     loop {
-        let mut asked = Vec::new();
+        let wait = if settling.dropping.is_some() {
+            CONFIRM
+        } else {
+            REVOKE_CHECK.saturating_sub(CONFIRM)
+        };
         tokio::select! {
             () = allowed.closed() => return,
-            () = tokio::time::sleep(REVOKE_CHECK) => {}
-            Some(ask) = reread.recv() => asked.push(ask),
-        }
-        // Every ask made before this read is answered by it; one made during it, by the next.
-        while let Ok(ask) = reread.try_recv() {
-            asked.push(ask);
+            () = tokio::time::sleep(wait) => {}
         }
         let reading = Arc::clone(&list);
         let read = tokio::task::spawn_blocking(move || reading.read())
             .await
             .map_err(anyhow::Error::from)
-            .and_then(|read| read.map(Arc::new));
-        let before = Arc::clone(&last.value);
-        if last.update(read) {
-            allowed.send_replace(Arc::clone(&last.value));
-            for gone in before.difference(&last.value) {
-                registry.end(*gone).await;
+            .and_then(|read| read);
+        let now = allowed.borrow().clone();
+        if let Some(next) = settling.settle(&now, read) {
+            let gone: Vec<_> = now.difference(&next).copied().collect();
+            // Published first: the registry refuses an attach the list no longer allows, so none
+            // can start a session after the end below.
+            allowed.send_replace(Arc::new(next));
+            for peer in gone {
+                registry.end(peer).await;
             }
         }
-        for ask in asked {
-            let _ = ask.send(());
-        }
-    }
-}
-
-/// A connection whose peer the allowlist admitted: the only kind a session is served to, and made
-/// only by the accept loop, after the allowlist.
-pub struct Authorized(iroh::endpoint::Connection);
-
-impl Authorized {
-    /// The connection.
-    pub const fn conn(&self) -> &iroh::endpoint::Connection {
-        &self.0
     }
 }
 
@@ -341,7 +316,6 @@ impl Hosting {
             "scrollback {} exceeds the maximum of {MAX_SCROLLBACK}",
             args.scrollback
         );
-        anyhow::ensure!(args.max_sessions >= 1, "max_sessions must be at least 1");
         let saved = args
             .saved_clients
             .as_ref()
@@ -360,10 +334,6 @@ impl Hosting {
                 "no clients authorized: save one with `koh clients add <name> <endpoint-id>`, or pass --allow <endpoint-id> (get it from `koh id` on the client)"
             );
         }
-        anyhow::ensure!(
-            args.max_connections >= 1,
-            "max_connections must be at least 1"
-        );
         Ok(Self {
             allow,
             allowed,
@@ -371,63 +341,157 @@ impl Hosting {
                 command: args.command.clone().into(),
                 scrollback: usize::try_from(args.scrollback)
                     .context("scrollback does not fit in usize")?,
-                max_sessions: usize::try_from(args.max_sessions)
+                max_sessions: usize::try_from(args.max_sessions.get())
                     .context("max_sessions does not fit in usize")?,
                 ttl: Duration::from_secs(args.session_ttl_secs),
                 launcher: args.launcher.clone(),
             },
-            max_connections: usize::try_from(args.max_connections)
+            max_connections: usize::try_from(args.max_connections.get())
                 .context("max_connections does not fit in usize")?,
         })
     }
 }
 
-/// Where a handshake comes from, for the cap on each: an IPv4 address, or an IPv6 /64 (one host's
-/// share). `None` through a relay, where an address says nothing.
-fn source(addr: &iroh::endpoint::IncomingAddr) -> Option<std::net::IpAddr> {
-    let iroh::endpoint::IncomingAddr::Ip(at) = addr else {
-        return None;
-    };
-    Some(match at.ip() {
-        std::net::IpAddr::V6(v6) => {
-            std::net::Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX)).into()
-        }
-        v4 @ std::net::IpAddr::V4(_) => v4,
-    })
+/// Where a handshake comes from, for the cap on each: an IPv4 address, or an IPv6 /48 (one site's
+/// share: a /64 a host, a site has 65k of them). None through a relay, where an address says
+/// nothing; built from nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceKey(std::net::IpAddr);
+
+impl SourceKey {
+    fn of(addr: &iroh::endpoint::IncomingAddr) -> Option<Self> {
+        let iroh::endpoint::IncomingAddr::Ip(at) = addr else {
+            return None;
+        };
+        Some(Self(match at.ip() {
+            std::net::IpAddr::V6(v6) => {
+                std::net::Ipv6Addr::from(u128::from(v6) & !(u128::MAX >> 48)).into()
+            }
+            v4 @ std::net::IpAddr::V4(_) => v4,
+        }))
+    }
 }
 
-/// Most handshakes one address has under way at once; past them its next is refused.
+/// Most handshakes one address has under way at once; past them its oldest is given up.
 const PER_SOURCE: usize = 2;
 
-/// Most handshakes under way at once, whatever the connection limit.
+/// Most handshakes under way at once.
 const MOST_PENDING: usize = 256;
 
 /// The handshakes under way, oldest first, each with its address and its handle `H`: at most
-/// [`PER_SOURCE`] from one address, that address's oldest given up for a new one, and at most
-/// `cap` in all, the oldest given up (one through a relay has no address, so only `cap` holds it).
-/// Anyone who can reach the port can start handshakes and stall them; this way a new handshake is
-/// never refused, so an allowed client's dial, which finishes in a round trip, gets through a
-/// flood, even one from its own address (the same host, a shared NAT).
-struct Pending<H> {
-    cap: usize,
-    under_way: Bounded<(Option<std::net::IpAddr>, H), MOST_PENDING>,
-}
+/// [`PER_SOURCE`] from one address, that address's oldest given up for a new one, and at most `N`
+/// in all, the oldest given up (one through a relay has no address, so only `N` holds it). Anyone
+/// who can reach the port can start handshakes and stall them; this way a new handshake is never
+/// refused, so an allowed client's dial, which finishes in a round trip, gets through a flood, even
+/// one from its own address (the same host, a shared NAT). They hold no connection permit, so
+/// stalled ones never keep a connection out.
+struct Pending<H, const N: usize = MOST_PENDING>(Bounded<(Option<SourceKey>, H), N>);
 
-impl<H> Pending<H> {
-    /// Room for a handshake from `source`, those `done` forgotten: the handshake given up for it,
-    /// if any, its address's oldest when it has its share under way, else the oldest of all when
-    /// all the room is taken.
-    fn room(&mut self, source: Option<std::net::IpAddr>, done: impl Fn(&H) -> bool) -> Option<H> {
-        self.under_way.retain(|(_, handle)| !done(handle));
-        let from = self.under_way.iter().filter(|(s, _)| *s == source).count();
-        let given_up = if source.is_some() && from >= PER_SOURCE {
-            self.under_way.take_first(|(s, _)| *s == source)
-        } else if self.under_way.len() >= self.cap {
-            self.under_way.pop_front()
+impl<H, const N: usize> Pending<H, N> {
+    /// Forget those `done`; then whether a handshake from `source` would give one up for its room.
+    fn crowded(&mut self, source: Option<SourceKey>, done: impl Fn(&H) -> bool) -> bool {
+        self.0.retain(|(_, handle)| !done(handle));
+        self.0.is_full() || self.has_share(source)
+    }
+
+    fn has_share(&self, source: Option<SourceKey>) -> bool {
+        source.is_some() && self.0.iter().filter(|(s, _)| *s == source).count() >= PER_SOURCE
+    }
+
+    /// Room for a handshake from `source`: the one given up for it, if any, its address's oldest
+    /// when it has its share under way, else the oldest of all when all the room is taken.
+    fn room(&mut self, source: Option<SourceKey>) -> Option<H> {
+        let given_up = if self.has_share(source) {
+            self.0.take_first(|(s, _)| *s == source)
+        } else if self.0.is_full() {
+            self.0.pop_front()
         } else {
             None
         };
         given_up.map(|(_, oldest)| oldest)
+    }
+}
+
+/// What a finished handshake needs to be admitted, cloned for each.
+#[derive(Clone)]
+struct Gate {
+    allowed: Allowed,
+    registry: Registry,
+    /// One permit a connection, held for its life.
+    connections: Arc<tokio::sync::Semaphore>,
+    /// Peers turned away (not allowed, or no room), said at most every few seconds: anyone can
+    /// make a new id and dial.
+    turned_away: Arc<Throttle>,
+}
+
+impl Gate {
+    /// Serve `conn` on a task of its own if its peer is allowed (the handshake authenticated its
+    /// id) and there is room for it; else close it saying why.
+    fn admit(self, conn: iroh::endpoint::Connection) {
+        let peer = conn.remote_id();
+        let why = if !self.allowed.borrow().contains(&peer) {
+            if self.turned_away.ready() {
+                auth_event(Outcome::Rejected, &peer, "not on allowlist");
+            }
+            Close::NotAuthorized
+        } else if let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a task a connection, each holding a permit"
+            )]
+            drop(tokio::spawn(serve_connection(
+                conn,
+                self.allowed,
+                self.registry,
+                permit,
+            )));
+            return;
+        } else {
+            if self.turned_away.ready() {
+                warn!(peer = %peer, "refusing connection: at max-connections capacity");
+            }
+            Close::AtCapacity
+        };
+        close(&conn, why);
+    }
+}
+
+/// Serve the session of `conn`'s peer to it until it detaches, or the peer is removed from the
+/// list, which ends its session too. The registry attaches no peer the list no longer allows: one
+/// removed as this connection was admitted starts no session. Holds `permit` throughout.
+async fn serve_connection(
+    conn: iroh::endpoint::Connection,
+    allowed: Allowed,
+    registry: Registry,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _permit = permit;
+    let peer = conn.remote_id();
+    let (client, attach_kind) = match registry.attach(peer).await {
+        Ok(attached) => attached,
+        Err(refused) => {
+            warn!(peer = %peer, reason = %refused, "refusing session");
+            close(&conn, refused);
+            return;
+        }
+    };
+    auth_event(Outcome::Accepted, &peer, "authorized; session attached");
+    match attach_kind {
+        AttachKind::Created => info!(peer = %peer, "started a new session"),
+        AttachKind::Reattached { detached_for } => info!(
+            peer = %peer,
+            detached_secs = detached_for.map(|d| d.as_secs()),
+            "reattaching to this peer's existing session"
+        ),
+    }
+    // Its first frame tells the client it was admitted. The session is the proof the peer is allowed:
+    // the registry attaches no other.
+    tokio::select! {
+        () = run_attached(&conn, client) => {}
+        () = revoked(allowed, peer) => {
+            auth_event(Outcome::Rejected, &peer, "removed from the allowlist");
+            close(&conn, Close::NotAuthorized);
+        }
     }
 }
 
@@ -438,34 +502,20 @@ pub async fn serve_endpoint(
     hosting: Hosting,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let registry = Registry::spawn(hosting.spec).context("starting the child reaper")?;
     let (allowed_tx, allowed) = watch::channel(Arc::new(hosting.allowed));
-    let (reread, asks) = tokio::sync::mpsc::channel(64);
-    let gate = Gate { allowed, reread };
+    let allows = allowed.clone();
+    let registry = Registry::spawn(hosting.spec, move |peer| allows.borrow().contains(peer))
+        .context("starting the child reaper")?;
     #[expect(clippy::disallowed_methods, reason = "one allowlist reader a server")]
-    tokio::spawn(watch_allowlist(
-        hosting.allow,
-        allowed_tx,
-        asks,
-        registry.clone(),
-    ));
-
-    // Each connection holds a permit for its life; past the cap a dial is refused before its
-    // handshake, which is cheap.
-    let conn_limit = Arc::new(tokio::sync::Semaphore::new(hosting.max_connections));
-    // A smaller cap on handshakes under way, so stalled ones cannot hold every connection permit:
-    // below the total, unless it is 1.
-    let mut pending = Pending {
-        cap: hosting
-            .max_connections
-            .div_ceil(4)
-            .max(4)
-            .min(hosting.max_connections.saturating_sub(1))
-            .clamp(1, MOST_PENDING),
-        under_way: Bounded::new(),
+    tokio::spawn(watch_allowlist(hosting.allow, allowed_tx, registry.clone()));
+    let gate = Gate {
+        allowed,
+        registry: registry.clone(),
+        connections: Arc::new(tokio::sync::Semaphore::new(hosting.max_connections)),
+        turned_away: Arc::default(),
     };
-    // A flood is warned of at most once every 10 s.
-    let mut warned: Option<std::time::Instant> = None;
+    let mut pending: Pending<_> = Pending(Bounded::new());
+    let flood = Throttle::default();
 
     loop {
         let incoming = tokio::select! {
@@ -476,41 +526,40 @@ pub async fn serve_endpoint(
                 None => break, // endpoint closed
             },
         };
-        // In order: a connection permit, room for a handshake, the handshake within its deadline,
-        // the allowlist (the handshake authenticated the peer's id), the session, then the
-        // admission ack.
-        let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
-            warn!("refusing connection: at max-connections capacity");
-            incoming.refuse();
-            continue;
+        // In order: room for the handshake, the handshake within its deadline, the allowlist, a
+        // connection permit, then the session.
+        let source = SourceKey::of(&incoming.remote_addr());
+        // When room would cost a handshake under way, an address must first show it can be
+        // answered (a QUIC retry, one round trip), which a spoofed one never does: only real
+        // addresses crowd out others.
+        let crowded = pending.crowded(source, tokio::task::AbortHandle::is_finished);
+        let incoming = if crowded && source.is_some() && !incoming.remote_addr_validated() {
+            match incoming.retry() {
+                Ok(()) => continue,
+                Err(validated) => validated.into_incoming(),
+            }
+        } else {
+            incoming
         };
-        let source = source(&incoming.remote_addr());
-        let given_up = pending.room(source, tokio::task::AbortHandle::is_finished);
-        let now = std::time::Instant::now();
-        if given_up.is_some()
-            && warned.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(10))
-        {
-            warned = Some(now);
+        let given_up = pending.room(source);
+        if given_up.is_some() && flood.ready() {
             warn!("too many handshakes in flight: giving up the oldest for new ones");
         }
         given_up.iter().for_each(tokio::task::AbortHandle::abort);
-        let (gate, sessions) = (gate.clone(), registry.clone());
+        let gate = gate.clone();
         #[expect(
             clippy::disallowed_methods,
-            reason = "a handshake under way, at most `pending.cap`, then a task a connection, each \
-                      holding a permit"
+            reason = "a handshake under way, at most `MOST_PENDING`"
         )]
         let handshake = tokio::spawn(async move {
             match tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT, incoming).await {
-                Ok(Ok(conn)) => drop(tokio::spawn(admit(conn, gate, sessions, permit))),
+                Ok(Ok(conn)) => gate.admit(conn),
                 // Anyone can start one: said quietly, as a flood would say it often.
                 Ok(Err(e)) => debug!(error = %Peer(e), "incoming handshake failed"),
                 Err(_) => debug!("incoming handshake timed out (a stalled QUIC handshake)"),
             }
         });
-        pending
-            .under_way
-            .push_evicting((source, handshake.abort_handle()));
+        pending.0.push_evicting((source, handshake.abort_handle()));
     }
 
     // Sessions first, with their programs reaped (or killed after their grace), then the endpoint.
@@ -523,119 +572,73 @@ pub async fn serve_endpoint(
     Ok(())
 }
 
-/// Admit `conn` if its peer is allowed, then serve it until it detaches, or the peer is removed
-/// from the list, which ends its session too. Holds `permit` throughout.
-async fn admit(
-    conn: iroh::endpoint::Connection,
-    gate: Gate,
-    registry: Registry,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) {
-    let _permit = permit;
-    let peer = conn.remote_id();
-    if !gate.allows(peer).await {
-        auth_event(Outcome::Rejected, &peer, "not on allowlist");
-        close(&conn, Close::NotAuthorized);
-        return;
-    }
-    tokio::select! {
-        () = serve_connection(Authorized(conn.clone()), &registry) => {}
-        () = gate.revoked(peer) => {
-            auth_event(Outcome::Rejected, &peer, "removed from the allowlist");
-            close(&conn, Close::NotAuthorized);
-        }
-    }
-}
-
-/// Serve one allowed connection: attach its peer's session, send the admission ack, then drive
-/// it; returning detaches. The ack waits for the session, so a client is admitted only to one.
-async fn serve_connection(authorized: Authorized, registry: &Registry) {
-    let conn = authorized.conn();
-    let peer = conn.remote_id();
-    let (client, attach_kind) = match registry.attach(peer).await {
-        Ok(attached) => attached,
-        Err(refused) => {
-            warn!(peer = %peer, reason = %refused, "refusing session");
-            close(conn, refused);
-            return;
-        }
-    };
-    // Bounded, so a client that never accepts the stream cannot hold its slot.
-    match tokio::time::timeout(
-        Duration::from_secs(3),
-        crate::transport_iroh::admission::admit(conn),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            warn!(error = %Peer(e), "admission ack failed");
-            return;
-        }
-        Err(_) => {
-            warn!("admission ack timed out");
-            return;
-        }
-    }
-    auth_event(Outcome::Accepted, &peer, "authorized; session attached");
-    match attach_kind {
-        AttachKind::Created => info!(peer = %peer, "started a new session"),
-        AttachKind::Reattached { detached_for } => info!(
-            peer = %peer,
-            detached_secs = detached_for.map(|d| d.as_secs()),
-            "reattaching to this peer's existing session"
-        ),
-    }
-    run_attached(authorized, client).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_saved_list_that_cannot_be_read_keeps_the_last_one() {
-        let dir = crate::test_runtime::scratch("last-good");
+    fn only_a_removal_two_reads_agree_on_drops_a_saved_client() {
+        let dir = crate::test_runtime::scratch("settled");
         let places = crate::names::Places::new(None, Some(dir.join("server.key"))).unwrap();
-        let client = crate::transport_iroh::generate_secret_key()
-            .unwrap()
-            .public();
+        let id = || {
+            crate::transport_iroh::generate_secret_key()
+                .unwrap()
+                .public()
+        };
+        let (laptop, phone) = (id(), id());
         let clients = dir.join("clients");
-        std::fs::write(&clients, format!("laptop {client}\n")).unwrap();
+        let both = format!("laptop {laptop}\nphone {phone}\n");
+        std::fs::write(&clients, &both).unwrap();
         let hosting = Hosting::from_config(&ServeConfig {
             saved_clients: Some(places),
             ..ServeConfig::default()
         })
         .unwrap();
-        let mut last = LastGood {
-            value: hosting.allowed,
-            failing: false,
+        let (mut allowed, mut settling) = (hosting.allowed, Settling::default());
+        // The list as `text`, or gone: the clients it drops once that is settled, if it changes.
+        let mut read = |text: Option<&str>| {
+            match text {
+                Some(text) => std::fs::write(&clients, text).unwrap(),
+                None => std::fs::remove_file(&clients).unwrap(),
+            }
+            let next = settling.settle(&allowed, hosting.allow.read())?;
+            let gone: Vec<_> = allowed.difference(&next).copied().collect();
+            allowed = next;
+            Some(gone)
         };
-        // A typo while editing it: everyone saved stays allowed.
-        std::fs::write(&clients, format!("laptop {client} oops\n")).unwrap();
-        assert!(!last.update(hosting.allow.read()));
-        assert!(last.value.contains(&client) && last.failing);
-        // Removed for real: gone.
-        std::fs::write(&clients, "# nobody\n").unwrap();
-        assert!(last.update(hosting.allow.read()));
-        assert!(!last.value.contains(&client) && !last.failing);
+        // An editor saving it: a typo, then emptied or gone a moment, then whole. No one is cut off.
+        let typo = format!("laptop {laptop} oops\n");
+        for saving in [
+            [Some(&*typo), Some(&*both)],
+            [Some(""), Some(&*both)],
+            [None, Some(&*both)],
+        ] {
+            for text in saving {
+                assert_eq!(read(text), None, "{text:?}");
+            }
+        }
+        // Removed for real: the next read agrees, and only then is it dropped.
+        let one = format!("laptop {laptop}\n");
+        assert_eq!(read(Some(&one)), None);
+        assert_eq!(read(Some(&one)), Some(vec![phone]));
+        // One added is let in at once.
+        assert_eq!(read(Some(&both)), Some(vec![]));
     }
 
     #[test]
     fn a_handshake_flood_cannot_take_an_allowed_clients_room() {
-        type Handshakes = Pending<u8>;
+        type Handshakes = Pending<u8, 4>;
         /// A handshake from `from`'s address, numbered `n`: the one given up for it, if any.
         /// Handshake 99, the allowed client's, finishes as soon as it is under way.
         fn begin(pending: &mut Handshakes, from: u8, n: u8) -> Option<u8> {
-            let source = Some(std::net::IpAddr::from([203, 0, 113, from]));
-            let given_up = pending.room(source, |&h| h == 99);
-            pending.under_way.push_evicting((source, n));
+            let source = Some(SourceKey(std::net::IpAddr::from([203, 0, 113, from])));
+            let crowded = pending.crowded(source, |&h| h == 99);
+            let given_up = pending.room(source);
+            assert_eq!(crowded, given_up.is_some(), "{n}");
+            pending.0.push_evicting((source, n));
             given_up
         }
-        let mut pending = Pending {
-            cap: 4,
-            under_way: Bounded::new(),
-        };
+        let mut pending = Pending(Bounded::new());
         // One address holds only its share: a third gives up its own oldest, no one else's.
         assert_eq!(begin(&mut pending, 1, 1), None);
         assert_eq!(begin(&mut pending, 1, 2), None);
@@ -656,6 +659,6 @@ mod tests {
         assert_eq!(begin(&mut pending, 1, 99), Some(30));
         // Done, it is forgotten, and the room it took is free.
         assert_eq!(begin(&mut pending, 1, 32), None);
-        assert!(pending.under_way.iter().all(|&(_, n)| n != 99));
+        assert!(pending.0.iter().all(|&(_, n)| n != 99));
     }
 }

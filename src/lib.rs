@@ -1,7 +1,7 @@
 //! The library behind the `koh` remote shell: `koh serve` hosts a PTY for allowlisted peers and
 //! `koh connect` renders it with predictive local echo, reconnecting transparently.
 //!
-//! [`transport_iroh`] sets up endpoints and admission; [`identity`] loads identities
+//! [`transport_iroh`] sets up endpoints; [`identity`] loads identities
 //! and their reset leases; [`keycmd`] is `koh id` and `koh key`; [`names`] names the servers and clients
 //! a machine knows. [`proto`] is the wire protocol, [`events`] the input it carries;
 //! [`terminal`], [`predict`] and [`pty`] the screen, the prediction and the PTY; [`server`] hosts
@@ -32,12 +32,20 @@ mod test_runtime;
 
 /// Cancel `token` on the first SIGTERM, SIGINT or SIGHUP, so `koh serve` drains and `koh connect`
 /// restores the terminal instead of the process dying where it stands; the token returned is
-/// cancelled on a later one ([`Shutdown`]), when waiting longer is not wanted. Fails only if a
-/// handler cannot be installed.
+/// cancelled on a later one ([`Shutdown`]), when waiting longer is not wanted. A SIGHUP ignored as
+/// the process started (`nohup`) stays ignored. Fails only if a handler cannot be installed.
 pub(crate) fn cancel_on_signals(
     token: &tokio_util::sync::CancellationToken,
 ) -> std::io::Result<tokio_util::sync::CancellationToken> {
     use tokio::signal::unix::{signal, SignalKind};
+    // Read before the handler replaces it: the lowest bit of the `SigIgn` mask Linux and Android show
+    // (elsewhere, never). The handler is installed even so: a program started later gets SIGHUP's
+    // default at its `exec`, as a hosted shell must to hang up with its session.
+    let nohup = std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+        let mask = status.lines().find_map(|line| line.strip_prefix("SigIgn:"));
+        mask.and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .is_some_and(|mask| mask & 1 == 1)
+    });
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
@@ -47,12 +55,18 @@ pub(crate) fn cancel_on_signals(
     tokio::spawn(async move {
         let mut shutdown = Shutdown::default();
         loop {
-            tokio::select! {
-                Some(()) = term.recv() => {}
-                Some(()) = int.recv() => {}
-                Some(()) = hup.recv() => {}
+            let name = tokio::select! {
+                Some(()) = term.recv() => "SIGTERM",
+                Some(()) = int.recv() => "SIGINT",
+                Some(()) = hup.recv() => if nohup {
+                    tracing::info!("SIGHUP ignored, as it was when koh started (nohup)");
+                    continue;
+                } else {
+                    "SIGHUP"
+                },
                 else => return,
-            }
+            };
+            tracing::info!(signal = name, "shutting down");
             match shutdown.signal(std::time::Instant::now()) {
                 Shutdown::Draining(_) => draining.cancel(),
                 Shutdown::Forced => force.cancel(),

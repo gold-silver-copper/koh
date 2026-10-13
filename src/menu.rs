@@ -86,10 +86,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
         writeln!(self.output, "\nkoh — this machine")?;
         for (role, label) in [("client", "you as a client"), ("server", "you as a server")] {
             let path = tilde(self.places.key(role));
-            let id = key_id(self.places, role).map_or_else(
-                || format!("none yet ({})", crate::keycmd::creates(role)),
-                names::short,
-            );
+            let id = key_id(self.places, role).map_or_else(|shown| shown, names::short);
             writeln!(self.output, "  {label}   {id}   {path}")?;
         }
         let now = SystemTime::now();
@@ -288,13 +285,13 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
             let path = tilde(self.places.key(role));
             writeln!(self.output, "\n{role} key   {path}")?;
             match key_id(self.places, role) {
-                Some(id) => {
+                Ok(id) => {
                     writeln!(self.output, "  id   {id}")?;
                     if let Some(qr) = crate::server::cli::connect_qr(&id.to_string()) {
                         writeln!(self.output, "{qr}")?;
                     }
                 }
-                None => writeln!(self.output, "  none yet ({})", crate::keycmd::creates(role))?,
+                Err(shown) => writeln!(self.output, "  {shown}")?,
             }
         }
         writeln!(self.output, "\n  r reset a key   b back")?;
@@ -397,11 +394,14 @@ fn tilde(path: &std::path::Path) -> String {
         )
 }
 
-/// The `role` key's endpoint id, if it exists (reading it creates nothing).
-fn key_id(places: &Places, role: &str) -> Option<EndpointId> {
-    crate::identity::load_existing(places.key(role))
-        .ok()
-        .map(|identity| identity.endpoint_id())
+/// The `role` key's endpoint id, or what to show instead: none yet, or why it cannot be loaded.
+/// Reading it creates nothing.
+fn key_id(places: &Places, role: &str) -> Result<EndpointId, String> {
+    match crate::identity::load_existing(places.key(role)) {
+        Ok(Some(identity)) => Ok(identity.endpoint_id()),
+        Ok(None) => Err(format!("none yet ({})", crate::keycmd::creates(role))),
+        Err(error) => Err(format!("cannot be loaded: {error:#}")),
+    }
 }
 
 #[cfg(test)]

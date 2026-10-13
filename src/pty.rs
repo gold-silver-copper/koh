@@ -114,16 +114,15 @@ pub(crate) fn is_koh_env_key(key: &std::ffi::OsStr) -> bool {
 /// The session shell when the caller didn't pass `--shell`: `shell_env` (`$SHELL`) if set, else
 /// `/bin/sh`, which does **not** exist on Android, where it is `/system/bin/sh`.
 fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
-    if let Some(sh) = shell_env {
-        if !sh.is_empty() {
-            return sh.to_string_lossy().into_owned();
-        }
-    }
-    if cfg!(target_os = "android") {
-        "/system/bin/sh".to_string()
+    let platform = if cfg!(target_os = "android") {
+        "/system/bin/sh"
     } else {
-        "/bin/sh".to_string()
-    }
+        "/bin/sh"
+    };
+    shell_env.filter(|sh| !sh.is_empty()).map_or_else(
+        || platform.to_owned(),
+        |sh| sh.to_string_lossy().into_owned(),
+    )
 }
 
 /// What failed in a PTY: allocation, the spawn, the pump threads, or a resize.
@@ -360,24 +359,22 @@ impl Reaper {
         std::thread::Builder::new()
             .name("koh-child-reaper".into())
             .spawn(move || {
+                use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
+                const POLL: Duration = Duration::from_millis(20);
                 let mut children: Vec<Stopping> = Vec::new();
                 let mut drains: Vec<Sender<()>> = Vec::new();
-                let mut open = true;
-                while open || !children.is_empty() {
-                    let received = if !open {
-                        std::thread::sleep(Duration::from_millis(20));
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    } else if children.is_empty() {
-                        rx.recv()
-                            .map_err(|_closed| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                loop {
+                    let received = if children.is_empty() {
+                        rx.recv().map_err(|_closed| Disconnected)
                     } else {
-                        rx.recv_timeout(Duration::from_millis(20))
+                        rx.recv_timeout(POLL)
                     };
                     match received {
                         Ok(Reap::Child(child)) => children.push(child),
                         Ok(Reap::Drain(done)) => drains.push(done),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => open = false,
+                        Err(Timeout) => {}
+                        Err(Disconnected) if children.is_empty() => return,
+                        Err(Disconnected) => std::thread::sleep(POLL),
                     }
                     children.retain_mut(|child| !child.reaped());
                     if children.is_empty() {
@@ -429,7 +426,7 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Allocate a `rows`×`cols` PTY and start `command` (argv, verbatim; empty for the login shell)
+    /// Allocate a `rows`×`cols` PTY and start `command` (argv, verbatim; empty for `$SHELL`)
     /// on it through `launcher`, with `TERM` set. Returns it and a receiver of its output, which
     /// ends when the program closes the PTY.
     pub fn spawn(

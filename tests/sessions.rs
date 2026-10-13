@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/5 client.
+//! loopback iroh with a minimal koh/6 client.
 //!
 //! Every session's program starts through the `koh` binary's `__launch`, as `koh serve`'s do; unit
 //! tests cannot reach a binary, so these live here.
@@ -18,7 +18,6 @@ use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
 use koh::terminal::{clamp_dims, RowEncodings, Size, TerminalScreen};
-use koh::transport_iroh::admission::await_admission;
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 use tokio_util::sync::CancellationToken;
 
@@ -58,14 +57,21 @@ fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     koh_testkit::multi_thread(2)
 }
 
-fn registry(command: &[&str], max_sessions: usize, ttl: Duration) -> std::io::Result<Registry> {
-    Registry::spawn(SessionSpec {
+/// A registry attaching the peers `allows` allows.
+fn registry(
+    command: &[&str],
+    max_sessions: usize,
+    ttl: Duration,
+    allows: impl Fn(&iroh::EndpointId) -> bool + Send + 'static,
+) -> std::io::Result<Registry> {
+    let spec = SessionSpec {
         command: command.iter().map(|arg| (*arg).to_owned()).collect(),
         scrollback: 0,
         max_sessions,
         ttl,
         launcher: launcher(),
-    })
+    };
+    Registry::spawn(spec, allows)
 }
 
 /// Attach `peer` and say how.
@@ -80,7 +86,7 @@ fn peer() -> std::io::Result<iroh::EndpointId> {
 #[test]
 fn attach_creates_then_reattaches_the_same_peer() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30))?;
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30), |_| true)?;
         let peer = peer()?;
         let (client, kind) = reg.attach(peer).await.context("first attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
@@ -98,7 +104,7 @@ fn attach_creates_then_reattaches_the_same_peer() -> anyhow::Result<()> {
 #[test]
 fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 1, Duration::from_secs(30))?;
+        let reg = registry(&["sleep", "30"], 1, Duration::from_secs(30), |_| true)?;
         let (a, b) = (peer()?, peer()?);
         let (a_client, _) = reg
             .attach(a)
@@ -139,7 +145,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
         let mut sessions = Vec::new();
         let mut held = Vec::new();
         for (case, command, attached, kept, reaped) in cases {
-            let reg = registry(command, 4, TTL)?;
+            let reg = registry(command, 4, TTL, |_| true)?;
             let peer = peer()?;
             let mut clients = Vec::new();
             for _ in 0..attached {
@@ -167,7 +173,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-/// A bare koh/5 client: writes messages, applies frames whose base it holds, and acks them.
+/// A bare koh/6 client: writes messages, applies frames whose base it holds, and acks them.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -181,17 +187,10 @@ struct RawClient {
 }
 
 impl RawClient {
-    /// Connect to `addr` as `secret`, waiting for the admission ack if the server sends one.
-    async fn connect(
-        addr: iroh::EndpointAddr,
-        secret: iroh::SecretKey,
-        admitted: bool,
-    ) -> anyhow::Result<Self> {
+    /// Connect to `addr` as `secret`, and wait for the first frame, which admits it.
+    async fn connect(addr: iroh::EndpointAddr, secret: iroh::SecretKey) -> anyhow::Result<Self> {
         let endpoint = bind_endpoint_local(secret, false).await?;
         let conn = endpoint.connect(addr, ALPN).await?;
-        if admitted {
-            await_admission(&conn).await?;
-        }
         let send = conn.open_uni().await?;
         let (tx, frames) = tokio::sync::mpsc::channel(64);
         let reader = conn.clone();
@@ -207,7 +206,7 @@ impl RawClient {
                 });
             }
         });
-        Ok(Self {
+        let mut client = Self {
             conn,
             send,
             frames,
@@ -216,7 +215,15 @@ impl RawClient {
             echo_ack: InputSeq(0),
             last_seq: InputSeq(0),
             _endpoint: endpoint,
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while client.newest == FrameNum::BLANK {
+                client.pump(20).await?;
+            }
+            anyhow::Ok(client)
         })
+        .await
+        .context("no frame came")?
     }
 
     async fn write(&mut self, msg: &ClientMsg) -> anyhow::Result<()> {
@@ -295,7 +302,7 @@ fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyho
         // The program sees the clamped size too, on its terminal.
         let program = ["sh", "-c", "read l; stty size; cat"];
         let (addr, shutdown, serve) = loopback_serve(secret.public(), &program).await?;
-        let mut client = RawClient::connect(addr, secret, true).await?;
+        let mut client = RawClient::connect(addr, secret).await?;
         client
             .write(&ClientMsg::Resize(Size::new(65000, 1)))
             .await?;
@@ -360,8 +367,8 @@ fn echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the
             shutdown.clone(),
         ));
         // Both connections share one client identity, so they land on ONE session.
-        let mut a = RawClient::connect(addr.clone(), secret.clone(), true).await?;
-        let mut b = RawClient::connect(addr, secret, true).await?;
+        let mut a = RawClient::connect(addr.clone(), secret.clone()).await?;
+        let mut b = RawClient::connect(addr, secret).await?;
         for _ in 0..30 {
             a.type_bytes(b"a").await?;
             a.pump(20).await?;
@@ -422,6 +429,7 @@ fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Resul
             &["sh", "-c", script, "sh", path],
             1,
             Duration::from_secs(30),
+            |_| true,
         )?;
         let a = peer()?;
         let (mut c1, kind) = reg.attach(a).await.context("first attach")?;
@@ -463,7 +471,7 @@ fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Resul
 #[test]
 fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Result<()> {
     koh_testkit::multi_thread(4)?.block_on(async {
-        let reg = registry(&["true"], 4, Duration::from_secs(30))?;
+        let reg = registry(&["true"], 4, Duration::from_secs(30), |_| true)?;
         let a = peer()?;
         let mut client = reg.attach(a).await.context("first attach")?.0;
         // An acknowledgement the reconnect overtook ends the session it reattached to, once the
@@ -505,14 +513,25 @@ fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Resu
     })
 }
 
-/// A peer removed from the allowlist has its session ended, its program hung up.
+/// A peer removed from the allowlist has its session ended, its program hung up, and starts no
+/// other: an attach the registry takes once the list no longer allows it is refused, even one on its
+/// way as the peer was removed. Allowed again, it gets a new session.
 #[test]
 fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30))?;
+        let allowed = std::sync::Arc::new(AtomicBool::new(true));
+        let allows = std::sync::Arc::clone(&allowed);
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30), move |_| {
+            allows.load(Relaxed)
+        })?;
         let a = peer()?;
         let (mut client, _) = reg.attach(a).await.context("attach")?;
+        allowed.store(false, Relaxed);
+        let refused = reg.attach(a).await.err();
+        anyhow::ensure!(refused == Some(Close::NotAuthorized), "{refused:?}");
         reg.end(a).await;
+        allowed.store(true, Relaxed);
         tokio::time::timeout(Duration::from_secs(5), async {
             while client.next_screen().await.is_some() {}
         })
@@ -529,7 +548,7 @@ fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
 #[test]
 fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30))?;
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30), |_| true)?;
         let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
         tokio::time::timeout(Duration::from_secs(5), reg.shutdown())
             .await
@@ -557,7 +576,7 @@ fn a_session_ends_when_its_program_does_whatever_holds_its_terminal() -> anyhow:
         let closed = cfg!(any(target_os = "linux", target_os = "android"))
             .then_some(("exec </dev/null >/dev/null 2>&1; sleep 3600", 129));
         for (script, code) in std::iter::once(("sleep 3600 & exit 7", 7)).chain(closed) {
-            let reg = registry(&["sh", "-c", script], 4, Duration::from_secs(30))?;
+            let reg = registry(&["sh", "-c", script], 4, Duration::from_secs(30), |_| true)?;
             let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
             await_exit(&mut client).await.context(script)?;
             anyhow::ensure!(
@@ -594,7 +613,7 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
         // `true` has exited by the time the connection's loop first looks.
         let secret = generate_secret_key()?;
         let (addr, shutdown, serve) = loopback_serve(secret.public(), &["true"]).await?;
-        let mut raw = RawClient::connect(addr, secret, true).await?;
+        let mut raw = RawClient::connect(addr, secret).await?;
         let mut close = None;
         for _ in 0..30 {
             // An ack written as the server closes fails: the close is what is looked for.
@@ -616,7 +635,7 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
 }
 
 /// A program that cannot start is not reported as the server being full, nor as a refusal for
-/// good: no admission comes, and the connection is closed saying the session could not start.
+/// good: no frame comes, and the connection is closed saying the session could not start.
 #[test]
 fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
     runtime()?.block_on(async {
@@ -650,6 +669,107 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
             error.downcast_ref::<Close>() == Some(&Close::CouldNotStart),
             "{error:#}"
         );
+        Ok(())
+    })
+}
+
+/// A UDP relay on loopback to `server`, from a socket of its own: each datagram waits `delay` (the
+/// link's latency, which is what is tested), and the server's are dropped unless `answers`, so a
+/// handshake through it stalls. Its address.
+async fn relay(
+    server: std::net::SocketAddr,
+    delay: Duration,
+    answers: bool,
+) -> std::io::Result<std::net::SocketAddr> {
+    use std::sync::{Arc, OnceLock};
+    let bind = || tokio::net::UdpSocket::bind("127.0.0.1:0");
+    let (near, far) = (Arc::new(bind().await?), Arc::new(bind().await?));
+    let (at, client) = (near.local_addr()?, Arc::new(OnceLock::new()));
+    for (from, out, outward) in [
+        (Arc::clone(&near), Arc::clone(&far), true),
+        (far, near, false),
+    ] {
+        let client = Arc::clone(&client);
+        koh_testkit::spawn(async move {
+            let mut buf = vec![0; 65_536];
+            while let Ok((n, sender)) = from.recv_from(&mut buf).await {
+                let to = if outward {
+                    let _ = client.set(sender);
+                    Some(server)
+                } else {
+                    client.get().copied().filter(|_| answers)
+                };
+                let (out, bytes) = (Arc::clone(&out), buf.get(..n).unwrap_or_default().to_vec());
+                koh_testkit::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Some(to) = to {
+                        let _ = out.send_to(&bytes, to).await;
+                    }
+                });
+            }
+        });
+    }
+    Ok(at)
+}
+
+/// A flood of handshakes that never finish, from the allowed client's own address, takes neither
+/// the one connection a server allows (`--max-connections 1`) nor the room for the client's own
+/// handshake, which takes several round trips of 100 ms: the flood is asked to show it gets the
+/// server's answers (a QUIC retry), and it never does, as a spoofed address could not.
+#[test]
+fn an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes() -> anyhow::Result<()>
+{
+    koh_testkit::multi_thread(3)?.block_on(async {
+        let good = generate_secret_key()?;
+        let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
+        let addr = loopback_addr(&server_ep);
+        let config = ServeConfig {
+            allow: vec![good.public()],
+            command: vec!["sleep".to_owned(), "30".to_owned()],
+            launcher: launcher(),
+            max_connections: std::num::NonZeroU32::MIN,
+            ..ServeConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let serving = koh_testkit::spawn(serve_endpoint(
+            server_ep,
+            Hosting::from_config(&config)?,
+            shutdown.clone(),
+        ));
+        let server = *addr.ip_addrs().next().context("a loopback address")?;
+        let at = move |relayed| koh::transport_iroh::direct_addr(addr.id, relayed);
+        let stalled = bind_endpoint_local(generate_secret_key()?, false).await?;
+        let black_hole = at(relay(server, Duration::ZERO, false).await?);
+        // Some 200 dials a second, each stalled: the flood's rate, which is what is tested.
+        let flood = || {
+            let (stalled, black_hole) = (stalled.clone(), black_hole.clone());
+            async move {
+                for _ in 0..10_000 {
+                    let (endpoint, to) = (stalled.clone(), black_hole.clone());
+                    koh_testkit::spawn(async move { endpoint.connect(to, ALPN).await });
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        // Under way before the client dials, and while it does.
+        let _ = tokio::time::timeout(Duration::from_millis(500), flood()).await;
+        let flood = koh_testkit::spawn(flood());
+        let near = bind_endpoint_local(good, false).await?;
+        let far = at(relay(server, Duration::from_millis(50), true).await?);
+        let admitted = tokio::time::timeout(Duration::from_secs(20), async {
+            for _ in 0..3 {
+                // Its first frame admits it.
+                if let Ok(conn) = near.connect(far.clone(), ALPN).await {
+                    return conn.accept_uni().await.is_ok();
+                }
+            }
+            false
+        });
+        let admitted = admitted.await;
+        flood.abort();
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+        anyhow::ensure!(admitted == Ok(true), "the allowed client never got in");
         Ok(())
     })
 }

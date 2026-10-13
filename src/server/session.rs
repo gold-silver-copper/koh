@@ -108,7 +108,7 @@ struct PtyHost {
 }
 
 impl PtyHost {
-    /// Start `command` (empty for the login shell) through `launcher` at the default size, left to
+    /// Start `command` (empty for `$SHELL`) through `launcher` at the default size, left to
     /// `reaper` once closed; the host and a receiver of its output. Blocks until the program starts.
     fn spawn(
         command: &[String],
@@ -411,6 +411,8 @@ impl Session {
                 self.publish();
                 exited = true;
                 pending = PendingInput::default();
+                // Its output is read no more: a job left writing stops the reader, not wakes it.
+                pty_rx.close();
             }
             if !exited {
                 pending.flush(|bytes| self.host.pty.write(bytes));
@@ -546,14 +548,22 @@ pub struct SessionSpec {
 const ATTACH_TRIES: usize = 3;
 
 impl Registry {
-    /// Spawn the registry task, and the reaper its sessions' programs are left to: failing to
-    /// start that fails here, before any session.
-    pub fn spawn(spec: SessionSpec) -> std::io::Result<Self> {
+    /// Spawn the registry task, attaching only the peers `allows` allows when it takes their
+    /// attach, and the reaper its sessions' programs are left to: failing to start that fails
+    /// here, before any session.
+    pub fn spawn(
+        spec: SessionSpec,
+        allows: impl Fn(&EndpointId) -> bool + Send + 'static,
+    ) -> std::io::Result<Self> {
         let reaper = crate::pty::Reaper::start()?;
         let (tx, rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
         #[expect(clippy::disallowed_methods, reason = "one registry a server")]
-        tokio::spawn(registry_task(spec, reaper.clone(), rx, shutdown.clone()));
+        tokio::spawn(registry_task(
+            sessions::Sessions::new(spec, reaper.clone(), Box::new(allows)),
+            rx,
+            shutdown.clone(),
+        ));
         Ok(Self {
             tx,
             shutdown,
@@ -595,17 +605,16 @@ impl Registry {
 /// Route attaches to sessions; it never waits on one, so a session starting or ending holds up no
 /// other peer.
 async fn registry_task(
-    spec: SessionSpec,
-    reaper: crate::pty::Reaper,
+    mut sessions: sessions::Sessions,
     mut rx: mpsc::Receiver<Request>,
     shutdown: CancellationToken,
 ) {
-    let mut sessions = sessions::Sessions::new(spec, reaper);
     loop {
         let request = tokio::select! {
             // A shutdown starts no session for a request still queued.
             biased;
             () = shutdown.cancelled() => break,
+            () = sessions.ended() => continue,
             msg = rx.recv() => match msg {
                 Some(msg) => msg,
                 None => break,

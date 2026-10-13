@@ -1790,10 +1790,7 @@ mod tests {
         let spread: Vec<(u16, u16, i16)> = (0..=MAX_SHIFTS)
             .map(|i| (u16::try_from(i * 3).unwrap(), 1, 1))
             .collect();
-        assert!(
-            with(&spread[..MAX_SHIFTS]).is_ok(),
-            "the most shifts allowed"
-        );
+        assert!(with(&spread[..MAX_SHIFTS]).is_ok(), "the most shifts");
         let bad: [&[(u16, u16, i16)]; 8] = [
             &[(0, 1, 0)],              // a zero offset
             &[(0, 0, 1)],              // an empty shift
@@ -1836,20 +1833,9 @@ mod tests {
         diff.icon = Some("I".repeat(MAX_TITLE_LEN + 5));
         diff.clipboard = Some("C".repeat(MAXIMUM_CLIPBOARD_SIZE + 1000));
         c.apply(&diff).unwrap();
-        assert_eq!(
-            c.title().chars().count(),
-            MAX_TITLE_LEN,
-            "title capped client-side"
-        );
-        assert_eq!(
-            c.icon().chars().count(),
-            MAX_TITLE_LEN,
-            "icon capped client-side"
-        );
-        assert!(
-            c.clipboard().len() <= MAXIMUM_CLIPBOARD_SIZE,
-            "clipboard capped client-side"
-        );
+        let (title, icon) = (c.title().chars().count(), c.icon().chars().count());
+        assert_eq!((title, icon), (MAX_TITLE_LEN, MAX_TITLE_LEN));
+        assert!(c.clipboard().len() <= MAXIMUM_CLIPBOARD_SIZE);
     }
 
     #[test]
@@ -2021,10 +2007,7 @@ mod tests {
         for (i, mutate) in mutations.iter().enumerate() {
             let mut raw = raw_two_by_two();
             mutate(&mut raw);
-            assert!(
-                decode_raw(&raw).is_err(),
-                "mutation {i} must fail to decode"
-            );
+            assert!(decode_raw(&raw).is_err(), "mutation {i}");
         }
     }
 
@@ -2072,11 +2055,7 @@ mod tests {
             };
             let mut screen = TerminalScreen::default();
             screen.apply(&diff).unwrap_err();
-            assert_eq!(
-                screen,
-                TerminalScreen::default(),
-                "mutation {i} changed the screen"
-            );
+            assert_eq!(screen, TerminalScreen::default(), "mutation {i}");
         }
     }
 
@@ -2101,10 +2080,7 @@ mod tests {
         let before = emu.snapshot();
         emu.process(b"\r\nscrolled");
         let after = emu.snapshot();
-        assert_eq!(
-            TerminalScreen::distinct_cells([&before, &after]),
-            (24 + 1) * 80
-        );
+        assert_eq!(TerminalScreen::distinct_cells([&before, &after]), 25 * 80);
         assert_eq!(after.screen().row(0), before.screen().row(1));
     }
 
@@ -2198,22 +2174,22 @@ mod tests {
     #[test]
     fn cell_text_holds_what_a_cell_holds() {
         // Inline, just past inline, and a whole cluster.
-        for len in [
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        let lens = [
             CellText::INLINE,
             CellText::INLINE + 1,
             fux_vt::CLUSTER_CAPACITY,
-        ] {
-            let text = "x".repeat(len);
+        ];
+        for text in lens
+            .map(|len| "x".repeat(len))
+            .into_iter()
+            .chain([family.to_owned()])
+        {
             assert_eq!(
                 CellText::new(&text).map(|t| t.as_str().to_owned()),
                 Some(text)
             );
         }
-        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
-        assert_eq!(
-            CellText::new(family).map(|t| t.as_str().to_owned()),
-            Some(family.to_owned())
-        );
         assert!(CellText::new(&"x".repeat(fux_vt::CLUSTER_CAPACITY + 1)).is_none());
         for control in ["\x1b[2J", "\x07", "\x7f", "\u{9d}", "a\nb"] {
             assert!(CellText::new(control).is_none(), "{control:?}");
@@ -2256,26 +2232,23 @@ mod tests {
     #[test]
     fn a_run_s_text_must_fit_its_kind() {
         let run = |count, kind, text| postcard::from_bytes::<Run>(&wire_run(count, kind, text));
-        assert!(run(3, CellKind::Chars, "abc").is_ok());
-        assert!(
-            run(2, CellKind::Chars, "abc").is_err(),
-            "more characters than cells"
-        );
-        assert!(
-            run(4, CellKind::Chars, "abc").is_err(),
-            "fewer characters than cells"
-        );
-        assert!(run(2, CellKind::WideChars, "日本").is_ok());
-        assert!(run(3, CellKind::WideChars, "日本").is_err());
+        // A run's characters match its cells; a cell's text is a cluster, a run's may be longer.
         let cluster = "x".repeat(fux_vt::CLUSTER_CAPACITY + 1);
-        assert!(
-            run(1, CellKind::Narrow, &cluster).is_err(),
-            "a cell's text is a cluster"
-        );
-        assert!(
-            run(129, CellKind::Chars, &"x".repeat(129)).is_ok(),
-            "a run's may be longer"
-        );
+        for (count, kind, text, ok) in [
+            (3, CellKind::Chars, "abc", true),
+            (2, CellKind::Chars, "abc", false),
+            (4, CellKind::Chars, "abc", false),
+            (2, CellKind::WideChars, "日本", true),
+            (3, CellKind::WideChars, "日本", false),
+            (1, CellKind::Narrow, &cluster, false),
+            (129, CellKind::Chars, &"x".repeat(129), true),
+        ] {
+            assert_eq!(
+                run(count, kind, text).is_ok(),
+                ok,
+                "{count} {kind:?} {text}"
+            );
+        }
     }
 
     #[test]
@@ -2333,36 +2306,32 @@ mod tests {
                 "step {n}"
             );
         }
-        assert!(
-            kept.kept.len() <= 10,
-            "only the newest dictionary's rows are kept"
-        );
+        assert!(kept.kept.len() <= 10, "only the newest dictionary's rows");
     }
 
     #[test]
     fn identical_cells_are_run_length_encoded() {
         let target = TerminalScreen::from_bytes(24, 80, b"ab");
         let diff = target.diff_from(&TerminalScreen::default());
-        assert_eq!(diff.rows.len(), 1, "only the changed row is sent");
-        assert_eq!(
-            diff.rows[0].runs.len(),
-            2,
-            "'ab' as a run of characters, then one run of 78 blanks"
-        );
-        assert_eq!(diff.rows[0].runs[0].cell.kind, CellKind::Chars);
-        assert_eq!(diff.rows[0].runs[1].count.get(), 78);
+        // Only the changed row: 'ab' as a run of characters, then one run of 78 blanks.
+        let [row] = &diff.rows[..] else {
+            panic!("{:?}", diff.rows)
+        };
+        let runs: Vec<_> = row
+            .runs
+            .iter()
+            .map(|r| (r.cell.kind, r.count.get()))
+            .collect();
+        assert_eq!(runs, [(CellKind::Chars, 2), (CellKind::Narrow, 78)]);
     }
 
     #[test]
     fn capped_bytes_never_splits_utf8() {
         // A multi-byte scalar straddling the byte budget must be dropped whole, leaving valid UTF-8.
         let s = "a".repeat(MAXIMUM_CLIPBOARD_SIZE - 1) + "é"; // 'é' is 2 bytes, crosses the cap
-        let out = capped_bytes(&s, MAXIMUM_CLIPBOARD_SIZE);
-        assert!(out.len() <= MAXIMUM_CLIPBOARD_SIZE);
         assert_eq!(
-            out.len(),
-            MAXIMUM_CLIPBOARD_SIZE - 1,
-            "the straddling scalar is dropped whole"
+            capped_bytes(&s, MAXIMUM_CLIPBOARD_SIZE).len(),
+            MAXIMUM_CLIPBOARD_SIZE - 1
         );
     }
 
@@ -2383,10 +2352,7 @@ mod tests {
         assert_eq!(diff.exit_code, Some(42));
         let mut c = base.clone();
         c.apply(&diff).unwrap();
-        assert_eq!(
-            c, exited,
-            "icon, clipboard and exit code reconstruct via diff/apply"
-        );
+        assert_eq!(c, exited);
         assert_eq!((c.icon(), c.clipboard()), ("myicon", "aGk="));
         assert_ne!(base, with_icon);
         assert_ne!(with_icon, exited, "the exit code alone tells them apart");
@@ -2408,10 +2374,7 @@ mod tests {
         let diff = target.diff_from(&base);
         let mut client = base;
         client.apply(&diff).unwrap();
-        assert_eq!(
-            client, target,
-            "client must reconstruct the server screen exactly"
-        );
+        assert_eq!(client, target, "reconstructed exactly");
         client
     }
 
@@ -2425,28 +2388,16 @@ mod tests {
         emu.process(&[b'a'; 80]); // frame N: fill to col 80 -> deferred-wrap state
         let frame_n = emu.snapshot();
         let mut client = TerminalScreen::default();
-        client
-            .apply(&frame_n.diff_from(&TerminalScreen::default()))
-            .unwrap();
+        client.apply(&frame_n.diff_from(&client.clone())).unwrap();
         assert_eq!(client, frame_n);
 
         emu.process(b"b"); // frame N+1: one more char forces the wrap to row 1
         let frame_n1 = emu.snapshot();
         let diff = frame_n1.diff_from(&frame_n);
-        assert!(
-            diff.resize.is_none(),
-            "incremental path, not a full repaint"
-        );
+        assert!(diff.resize.is_none(), "incremental, not a full repaint");
         client.apply(&diff).unwrap();
-        assert_eq!(
-            client, frame_n1,
-            "wrap across frames must reconstruct incrementally"
-        );
-        assert_eq!(
-            client.screen().cell(1, 0).unwrap().contents(),
-            "b",
-            "wrapped char on row 1"
-        );
+        assert_eq!(client, frame_n1);
+        assert_eq!(client.screen().cell(1, 0).unwrap().contents(), "b");
     }
 
     #[test]
@@ -2468,11 +2419,8 @@ mod tests {
         let cluster = |col| s.cell(0, col).map(|c| c.contents().to_owned());
         assert_eq!(cluster(0).as_deref(), Some(family));
         assert_eq!(cluster(2).as_deref(), Some(flag));
-        assert_eq!(
-            cluster(4).as_deref(),
-            Some(heart),
-            "a variation selector makes it wide"
-        );
+        // A variation selector makes it wide.
+        assert_eq!(cluster(4).as_deref(), Some(heart));
         assert!(s.cell(4, 0).is_none_or(|c| !c.is_wide()));
         assert!(s.cell(0, 4).is_some_and(|c| c.is_wide()));
         assert_eq!(cluster(6).map(|t| t.len()), Some(marked.len()));
@@ -2482,19 +2430,12 @@ mod tests {
         assert!(cell(2).hidden());
         assert!(cell(3).strikeout());
         assert!(cell(4).underline() && cell(4).underline_color() == Color::Idx(9));
-        assert_eq!(
-            cell(5).underline_color(),
-            Color::Rgb(fux_vt::Rgb { r: 1, g: 2, b: 3 })
-        );
+        let rgb = |r, g, b| Color::Rgb(fux_vt::Rgb { r, g, b });
+        assert_eq!(cell(5).underline_color(), rgb(1, 2, 3));
         let cell = |col| s.cell(2, col).expect("a cell");
         assert!(cell(0).bold() && cell(1).underline() && cell(2).inverse() && cell(3).italic());
         let colours = [4, 5, 6].map(|col| cell(col).fgcolor());
-        let rgb = Color::Rgb(fux_vt::Rgb {
-            r: 10,
-            g: 20,
-            b: 30,
-        });
-        assert_eq!(colours, [Color::Idx(1), Color::Idx(208), rgb]);
+        assert_eq!(colours, [Color::Idx(1), Color::Idx(208), rgb(10, 20, 30)]);
     }
 
     #[test]

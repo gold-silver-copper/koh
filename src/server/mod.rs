@@ -1012,11 +1012,7 @@ mod tests {
         conn.push_client_bytes(&stream(&[ask(1), ask(2)]), Instant::now())
             .unwrap();
         assert_eq!(conn.next_history().map(|r| r.newest), Some(1));
-        assert_eq!(
-            conn.next_history(),
-            None,
-            "the next waits for the last's delivery"
-        );
+        assert_eq!(conn.next_history(), None, "waits for the last's delivery");
         conn.history_busy = false;
         assert_eq!(conn.next_history().map(|r| r.newest), Some(2));
         conn.history_busy = false;
@@ -1089,27 +1085,23 @@ mod tests {
         let rtt = Some(Duration::from_millis(100));
         let mut c = ServerConn::default();
         c.install_snapshot(Arc::new(screen(b"hello")));
-        let first = c
-            .poll_frame(t0, rtt)
-            .expect("the first frame is due at once");
+        let first = c.poll_frame(t0, rtt).expect("due at once");
         assert_eq!((first.num, first.base), (FrameNum(1), FrameNum::BLANK));
-        assert!(applied(&TerminalScreen::default(), &first)
-            .screen()
-            .contents()
-            .contains("hello"));
+        assert_eq!(
+            applied(&TerminalScreen::default(), &first),
+            screen(b"hello")
+        );
         c.frame_sent(first.num, 100, t0, rtt);
         c.install_snapshot(Arc::new(screen(b"hello")));
         assert!(
             c.poll_frame(t0, rtt).is_none(),
-            "the same screen again is no change"
+            "the same screen is no change"
         );
         c.install_snapshot(Arc::new(screen(b"hello world")));
         let inside = t0 + Duration::from_millis(1);
         assert!(c.poll_frame(inside, rtt).is_none(), "inside the floor");
         assert_eq!(c.next_wake(inside, rtt), t0 + FRAME_FLOOR);
-        let second = c
-            .poll_frame(t0 + FRAME_FLOOR, rtt)
-            .expect("the floor passed, and the link has room");
+        let second = c.poll_frame(t0 + FRAME_FLOOR, rtt).expect("past the floor");
         assert_eq!(second.num, FrameNum(2));
         assert_eq!(second.base, FrameNum::BLANK, "nothing was acknowledged yet");
     }
@@ -1148,15 +1140,9 @@ mod tests {
         let (mut c, rtt, t, big) = on_a_full_link(b"a big repaint");
         c.install_snapshot(Arc::new(screen(b"a big repaint, changed")));
         let later = t + Duration::from_millis(30);
-        assert!(
-            c.poll_frame(later, rtt).is_none(),
-            "20 kB in flight, past the budget"
-        );
-        assert_eq!(
-            c.next_wake(later, rtt),
-            t + retry_after(rtt),
-            "a delivery wakes the loop, or the frame is given up on"
-        );
+        assert!(c.poll_frame(later, rtt).is_none(), "20 kB in flight");
+        // A delivery wakes the loop, or the frame is given up on.
+        assert_eq!(c.next_wake(later, rtt), t + retry_after(rtt));
         c.ack(big, t + Duration::from_millis(100));
         assert!(c.poll_frame(t + Duration::from_millis(100), rtt).is_some());
     }
@@ -1169,18 +1155,13 @@ mod tests {
         let (mut c, rtt, t, _) = on_a_full_link(b"$ ");
         c.push_client_bytes(&stream(&[typed(1, "x")]), t).unwrap();
         // A second key, still awaiting its echo once the first is promoted.
-        c.push_client_bytes(&stream(&[typed(2, "y")]), t + ms(30))
+        let typed_y = t + ms(30);
+        c.push_client_bytes(&stream(&[typed(2, "y")]), typed_y)
             .unwrap();
         let later = t + ms(60);
         c.echo.promote(later);
-        assert!(
-            c.poll_frame(later, rtt).is_none(),
-            "no room, and no new screen to echo"
-        );
-        assert!(
-            c.next_wake(later, rtt) > later,
-            "the loop sleeps until something can go"
-        );
+        assert!(c.poll_frame(later, rtt).is_none(), "no room, no new screen");
+        assert!(c.next_wake(later, rtt) > later, "sleeps until one can go");
     }
 
     #[test]
@@ -1197,10 +1178,7 @@ mod tests {
         }
         c.install_snapshot(Arc::new(screen(b"count more")));
         assert!(c.poll_frame(at, rtt).is_none(), "half the window in flight");
-        assert!(
-            c.next_wake(at, rtt) > at,
-            "and the loop sleeps until a delivery"
-        );
+        assert!(c.next_wake(at, rtt) > at, "sleeps until a delivery");
     }
 
     #[test]
@@ -1226,16 +1204,11 @@ mod tests {
         c.install_snapshot(Arc::new(screen(b"$ l")));
         let typed = t + Duration::from_millis(1);
         let echo = c.poll_frame(typed, rtt).expect("the echo goes at once");
-        assert!(applied(&screen(b"$ "), &echo)
-            .screen()
-            .contents()
-            .contains("$ l"));
+        assert_eq!(applied(&screen(b"$ "), &echo), screen(b"$ l"));
         // A large change is not an echo, typed or not: it waits for room.
         c.frame_sent(echo.num, 100, typed, rtt);
-        let lines: Vec<u8> = (0..20)
-            .flat_map(|n| format!("line {n}\r\n").into_bytes())
-            .collect();
-        c.install_snapshot(Arc::new(screen(&lines)));
+        let lines = "a line\r\n".repeat(20);
+        c.install_snapshot(Arc::new(screen(lines.as_bytes())));
         assert!(c
             .poll_frame(typed + Duration::from_millis(2), rtt)
             .is_none());
@@ -1249,9 +1222,7 @@ mod tests {
         c.poll_frame(t0, None).expect("first frame");
         // Acknowledged, so no retry is due; only the heartbeat is.
         c.ack(FrameNum(1), Instant::now());
-        let just_before = (t0 + HEARTBEAT)
-            .checked_sub(Duration::from_millis(1))
-            .unwrap();
+        let just_before = t0 + HEARTBEAT.saturating_sub(Duration::from_millis(1));
         assert!(c.poll_frame(just_before, None).is_none());
         assert_eq!(c.next_wake(t0, None), t0 + HEARTBEAT);
         let beat = c.poll_frame(t0 + HEARTBEAT, None).expect("heartbeat");
@@ -1271,10 +1242,7 @@ mod tests {
         assert_eq!(c.next_wake(t0, rtt), t0 + retry);
         let again = c.poll_frame(t0 + retry, rtt).expect("resent");
         assert_eq!((again.num, again.base), (FrameNum(2), FrameNum::BLANK));
-        assert_eq!(
-            again.diff, first.diff,
-            "the same screen, as a frame that supersedes"
-        );
+        assert_eq!(again.diff, first.diff, "the same screen, superseding");
         // While the client acknowledges packets, the frame is still landing: it is resent only
         // once the link has gone a retry interval without one.
         let heard = t0 + retry + retry / 2;
@@ -1339,18 +1307,12 @@ mod tests {
         c.install_snapshot(Arc::new(screen(b"a b")));
         let two = c.poll_frame(later(2), None).unwrap();
         assert_eq!(two.base, FrameNum(1));
-        c.push_client_bytes(&stream(&[ClientMsg::Resync]), later(3))
-            .unwrap();
+        let resync = stream(&[ClientMsg::Resync]);
+        c.push_client_bytes(&resync, later(3)).unwrap();
         c.ack(FrameNum(2), later(3));
         c.install_snapshot(Arc::new(screen(b"a b c")));
-        let next = c
-            .poll_frame(later(4), None)
-            .expect("a resync forces a frame");
-        assert_eq!(
-            next.base,
-            FrameNum::BLANK,
-            "a frame on a base the client threw away"
-        );
+        let next = c.poll_frame(later(4), None).expect("a resync forces one");
+        assert_eq!(next.base, FrameNum::BLANK, "not the base thrown away");
         assert_eq!(applied(&TerminalScreen::default(), &next), screen(b"a b c"));
     }
 
@@ -1388,14 +1350,9 @@ mod tests {
         acked.ack(last.num, Instant::now());
         assert!(acked.finished(sent, None), "acked: done at once");
         let (unacked, _) = exited();
-        let just_before = (sent + FINAL_ACK_WAIT)
-            .checked_sub(Duration::from_millis(1))
-            .unwrap();
+        let just_before = sent + FINAL_ACK_WAIT.saturating_sub(Duration::from_millis(1));
         assert!(!unacked.finished(just_before, None));
-        assert!(
-            unacked.finished(sent + FINAL_ACK_WAIT, None),
-            "unacked: done after the wait"
-        );
+        assert!(unacked.finished(sent + FINAL_ACK_WAIT, None), "unacked");
     }
 
     /// A screen of the largest size a client may ask for, showing `text`.
@@ -1416,16 +1373,9 @@ mod tests {
             c.poll_frame(t0 + HEARTBEAT * u32::try_from(n).unwrap(), None)
                 .expect("a heartbeat is due");
         }
-        assert_eq!(
-            c.held.window().len(),
-            FRAME_WINDOW,
-            "the window still holds every resend"
-        );
-        assert!(c
-            .held
-            .window()
-            .iter()
-            .all(|sent| Arc::ptr_eq(&sent.screen, &big)));
+        let window = c.held.window();
+        assert_eq!(window.len(), FRAME_WINDOW, "every resend held");
+        assert!(window.iter().all(|sent| Arc::ptr_eq(&sent.screen, &big)));
         assert_eq!(distinct_cells(c.held.window()), WINDOW_CELLS);
     }
 
@@ -1439,8 +1389,7 @@ mod tests {
         for n in 0..20_u32 {
             emu.process(format!("line {n}\r\n").as_bytes());
             c.install_snapshot(Arc::new(emu.snapshot()));
-            c.poll_frame(t0 + HEARTBEAT * n, None)
-                .expect("a frame is due");
+            c.poll_frame(t0 + HEARTBEAT * n, None).expect("due");
         }
         assert_eq!(c.held.window().len(), FRAME_WINDOW);
         let changed_rows = FRAME_WINDOW - 1;
@@ -1455,19 +1404,13 @@ mod tests {
         let t0 = Instant::now();
         for n in 0..20_u32 {
             c.install_snapshot(largest(&format!("screen {n}")));
-            c.poll_frame(t0 + HEARTBEAT * n, None)
-                .expect("a frame is due");
-            assert!(
-                distinct_cells(c.held.window()) <= WINDOW_CELLS,
-                "after frame {n}"
-            );
+            c.poll_frame(t0 + HEARTBEAT * n, None).expect("due");
+            assert!(distinct_cells(c.held.window()) <= WINDOW_CELLS, "frame {n}");
         }
         // Only the newest is left, and it still diffs against the base the client holds.
         assert_eq!(c.held.window().len(), 1);
         assert_eq!(c.held.base().num, FrameNum::BLANK);
-        let frame = c
-            .poll_frame(t0 + HEARTBEAT * 20, None)
-            .expect("a heartbeat is due");
+        let frame = c.poll_frame(t0 + HEARTBEAT * 20, None).expect("heartbeat");
         assert_eq!(frame.base, FrameNum::BLANK);
         // An acknowledgement of a dropped frame is ignored, as one past the window is.
         c.ack(FrameNum(3), Instant::now());

@@ -66,8 +66,8 @@ and the git log.
 
 | ID | Finding | Guarded by |
 |----|---------|------------|
-| KOH-01 | Received states bounded by count, not bytes | Replaced by koh/4's fixed window of 16 frames per end: `src/client/session.rs::only_the_last_frames_are_kept_as_bases`, `src/server/mod.rs::only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored`, `tests/net/hostile_peer.rs::frames_on_unknown_bases_leave_the_client_running` |
-| KOH-02 | Decompression amplification on apply | `src/proto.rs::an_inflate_bomb_is_rejected`, `oversized_client_messages_are_rejected_before_buffering`, `tests/net/hostile_peer.rs::an_oversized_or_bomb_frame_leaves_the_client_running`, `an_oversized_client_message_closes_the_connection_only` |
+| KOH-01 | Received states bounded by count, not bytes | Replaced by koh/4's fixed window of 16 frames per end: `src/client/session.rs::only_the_last_frames_are_kept_as_bases`, `src/server/mod.rs::only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored`, `tests/net/hostile_peer.rs::hostile_frames_and_history_leave_the_client_running` |
+| KOH-02 | Decompression amplification on apply | `src/proto.rs::an_inflate_bomb_is_rejected`, `oversized_client_messages_are_rejected_before_buffering`, `tests/net/hostile_peer.rs::hostile_frames_and_history_leave_the_client_running`, `an_oversized_client_message_closes_the_connection_only` |
 | KOH-03 | Fixed public KDF salt in the passphrase handshake | Removed: there is no over-the-wire passphrase; the node-id allowlist is the only factor |
 | KOH-04 | `String::truncate` on the status line panics the client | `src/client/render.rs::status_line_truncation_is_panic_free_across_all_widths` |
 | KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_queues_the_session_input_in_order_merging_neighbours`, `input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
@@ -92,7 +92,7 @@ and the git log.
 | A-2 | Frames a client never takes grew the server's in-flight list | `src/bounded.rs`, and `clippy.toml`'s ban on unbounded queues: `src/server/mod.rs::frames_a_client_never_takes_are_forgotten` |
 | A-3 | Links left off a frame made the two ends' dictionaries differ | The server holds the screen as sent: `src/server/mod.rs::links_left_off_a_frame_go_in_a_later_one` |
 | A-4 | The allowlist check had no test; `koh clients rm` needed a restart | `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server` |
-| A-5 | Hostile-server tests that could not fail | `tests/net/hostile_peer.rs::client_survives` quits the client through the escape |
+| A-5 | Hostile-server tests that could not fail | `tests/net/hostile_peer.rs::hostile_frames_and_history_leave_the_client_running` waits for a good frame after the hostile ones, then quits the client through the escape; the hostile clients' tests check the close is `Close::ProtocolError` |
 | A-6 | A hostile frame could allocate before its counts were checked | `src/bounded.rs::a_sequence_past_its_bound_is_refused_before_it_is_read`, the wire's `at_most` bounds |
 | A-7 | A flood of input starved the client's frames | The client's loop is unbiased: `tests/net/session.rs::a_flood_of_typing_does_not_starve_the_frames` |
 
@@ -136,7 +136,7 @@ and the git log.
 | KS-02 | Echo-ack per connection, not per session | `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` |
 | KS-03 | A screen change wakes every attached connection | The session's `watch` channel: `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` keeps two connections on one session receiving frames |
 | S-04 | Per-cell `String` allocation on repaint | Performance only; nothing to guard |
-| S-07 | One place states the prediction-cell invariants | `PredictionEngine::place_cell`; the prediction tests in `src/predict.rs` |
+| S-07 | One place states the prediction-cell invariants | `PredictionEngine::place`; the prediction tests in `src/predict.rs` |
 | AR-02 | `predict` and `proto` import direction | CI's layering-guard step (`.github/workflows/ci.yml`) |
 | AR-06 | The admission pipeline's order | `src/server/cli.rs::serve_endpoint`; `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server`, `tests/net/hostile_peer.rs::a_bad_admission_byte_is_rejected_not_treated_as_admitted` |
 

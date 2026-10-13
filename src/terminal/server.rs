@@ -151,8 +151,6 @@ pub struct ServerTerminal {
     exit_code: Option<u32>,
     /// The last snapshot's rows, which the next one shares where they are unchanged.
     rows: RowCache,
-    /// [`RowCache::history_redrawn`] at the last snapshot.
-    history_redrawn: u64,
     /// The screen as it was when the program last began a frame (synchronized output), a whole
     /// one, until taken.
     frame_start: Option<TerminalScreen>,
@@ -176,7 +174,6 @@ impl ServerTerminal {
             observed: Observed::default(),
             exit_code: None,
             rows: RowCache::default(),
-            history_redrawn: 0,
             frame_start: None,
             frame_began: false,
             frame_ends: FrameEnds::default(),
@@ -344,11 +341,12 @@ impl ServerTerminal {
         }
     }
 
-    /// The history rows `request` asks for that the history still holds.
+    /// The history rows `request` asks for that the history still holds, drawn in the last
+    /// snapshot's palette, the one their names are for (a program drawing a frame may change it a
+    /// moment, and change it back before the next snapshot).
     pub fn history(&mut self, request: HistoryRequest) -> HistoryReply {
-        let screen = self.parser.screen();
-        let palette = Palette::of(screen);
-        self.names.reply(screen, palette.as_ref(), request)
+        self.names
+            .reply(self.parser.screen(), self.rows.palette(), request)
     }
 
     /// The report a program that set in-band resize (mode 2048) is sent after a resize, for its
@@ -381,13 +379,12 @@ impl ServerTerminal {
     /// copies, in the old one, are then rows the history no longer holds. One that changes no row
     /// of it (a colour the history never used) leaves the names, and the client's copies, alone.
     pub fn snapshot(&mut self) -> TerminalScreen {
-        let grid = Grid::of(self.parser.screen(), &mut self.rows);
-        if std::mem::replace(&mut self.history_redrawn, self.rows.history_redrawn())
-            != self.history_redrawn
-        {
+        let palette = Palette::of(self.parser.screen());
+        if self.names.redrawn(self.rows.palette(), palette.as_ref()) {
             tracing::debug!("a new palette redraws the history: it is named afresh");
             self.names.renew();
         }
+        let grid = Grid::of(self.parser.screen(), palette, &mut self.rows);
         TerminalScreen {
             grid,
             title: self.observed.title.clone(),
@@ -560,6 +557,29 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn history_served_while_a_frame_is_drawn_is_drawn_in_the_palette_its_names_are_for() {
+        // The program sets colour 1 for a moment inside a frame, and back before it ends: the
+        // names stand, so the rows served meanwhile must be drawn as they were named.
+        let mut emu = ServerTerminal::new(4, 20, 100).unwrap();
+        for n in 0..10 {
+            emu.process(format!("\x1b[31mline {n}\x1b[m\r\n").as_bytes());
+        }
+        let mark = emu.snapshot().history();
+        emu.process(b"\x1b[?2026h\x1b]4;1;rgb:00/00/00\x07");
+        let reply = emu.history(HistoryRequest {
+            id: 0,
+            newest: mark.newest,
+            count: 1,
+        });
+        emu.process(b"\x1b]104;1\x07\x1b[?2026l");
+        assert_eq!(emu.snapshot().history(), mark);
+        assert_eq!(
+            reply.rows[0].runs[0].cell.fg,
+            crate::terminal::WireColor::Idx(1)
+        );
+    }
+
+    #[test]
     fn a_palette_change_names_the_history_afresh_only_if_it_redraws_it() {
         // A client's copies of history rows were drawn in the old palette: new names make them
         // rows the history no longer holds, so the client asks again. A colour the history never
@@ -623,7 +643,8 @@ mod tests {
                     t.resize(Size::new(rows, cols));
                 }
                 let reused = t.snapshot();
-                let fresh = Grid::of(t.parser.screen(), &mut RowCache::default());
+                let palette = Palette::of(t.parser.screen());
+                let fresh = Grid::of(t.parser.screen(), palette, &mut RowCache::default());
                 proptest::prop_assert_eq!(reused.screen(), &fresh);
             }
         }

@@ -227,6 +227,60 @@ impl Palette {
     }
 }
 
+/// The colours cells use that a palette draws otherwise: indexed ones, and the default foreground
+/// and background.
+#[derive(Debug)]
+pub(super) struct Uses {
+    indexed: [bool; 256],
+    foreground: bool,
+    background: bool,
+}
+
+impl Default for Uses {
+    fn default() -> Self {
+        Self {
+            indexed: [false; 256],
+            foreground: false,
+            background: false,
+        }
+    }
+}
+
+impl Uses {
+    /// Add the colours `cells` use.
+    pub(super) fn add(&mut self, cells: impl Iterator<Item = Attributes>) {
+        for attributes in cells {
+            for (colour, default) in [
+                (attributes.foreground(), Some(&mut self.foreground)),
+                (attributes.background(), Some(&mut self.background)),
+                (attributes.underline_color(), None),
+            ] {
+                match (colour, default) {
+                    (Color::Idx(n), _) => {
+                        if let Some(used) = self.indexed.get_mut(usize::from(n)) {
+                            *used = true;
+                        }
+                    }
+                    (Color::Default, Some(used)) => *used = true,
+                    (Color::Default | Color::Rgb(..) | _, _) => {}
+                }
+            }
+        }
+    }
+
+    /// Whether a cell using only these colours is drawn otherwise in palette `new` than in `old`:
+    /// only the entries that differ between the two are looked at.
+    pub(super) fn drawn_otherwise(&self, old: Option<&Palette>, new: Option<&Palette>) -> bool {
+        let fg = |p: Option<&Palette>| p.and_then(|p| p.foreground);
+        let bg = |p: Option<&Palette>| p.and_then(|p| p.background);
+        let entry = |p: Option<&Palette>, n: usize| p.and_then(|p| p.entries.get(n).copied()?);
+        (self.foreground && fg(old) != fg(new))
+            || (self.background && bg(old) != bg(new))
+            || (self.indexed.iter().enumerate())
+                .any(|(n, &used)| used && entry(old, n) != entry(new, n))
+    }
+}
+
 /// `attributes` as a snapshot of `screen` draws them: in the colours its program set, if any. What
 /// a terminal reading the client's paint shows for a cell of `screen`.
 pub fn drawn(attributes: Attributes, screen: &fux_vt::Screen) -> Attributes {
@@ -240,8 +294,6 @@ pub(super) struct RowCache {
     /// The palette the rows were drawn in. A new palette changes no row's version, so it starts
     /// the cache over.
     palette: Option<Palette>,
-    /// How many times a new palette drew a row of the history otherwise.
-    history_redrawn: u64,
     /// By live index, the id and version of the row the snapshot took there.
     ids: Vec<(RowId, u64)>,
     /// The snapshot's rows, which the next one shares whole when no row changed.
@@ -251,10 +303,9 @@ pub(super) struct RowCache {
 }
 
 impl RowCache {
-    /// How many times a new palette drew a row of the history otherwise: a change means the
-    /// history's too, looks different.
-    pub(super) const fn history_redrawn(&self) -> u64 {
-        self.history_redrawn
+    /// The palette the last snapshot was drawn in.
+    pub(super) const fn palette(&self) -> Option<&Palette> {
+        self.palette.as_ref()
     }
 
     /// The cached row for the live row `live` at `index`, if it is what it holds: its own row
@@ -306,20 +357,6 @@ impl RowCache {
 
 /// A copy of `row`, cells and text, exactly `cols` wide, drawn in `palette`. A live row is exactly
 /// that wide; anything longer is cut, anything shorter padded with blank cells.
-/// Whether a row of `screen`'s history draws otherwise in palette `new` than in `old`: a program
-/// that sets a colour no row of its history uses leaves the history as it was drawn.
-fn history_redrawn(screen: &fux_vt::Screen, old: Option<&Palette>, new: Option<&Palette>) -> bool {
-    let drawn = |palette: Option<&Palette>, attributes| {
-        palette.map_or(attributes, |palette| palette.draw(attributes))
-    };
-    screen.rows().take(screen.history_len()).any(|row| {
-        row.cells().any(|cell| {
-            let attributes = cell.attributes();
-            drawn(old, attributes) != drawn(new, attributes)
-        })
-    })
-}
-
 pub(super) fn exactly(
     row: Option<&fux_vt::Row<'_>>,
     cols: u16,
@@ -361,21 +398,22 @@ impl Grid {
         }
     }
 
-    /// The live rows, cursor and modes of a fux-vt screen, sharing the rows `cache` holds unchanged;
-    /// `cache` is left holding this snapshot's rows.
-    pub(super) fn of(screen: &fux_vt::Screen, cache: &mut RowCache) -> Self {
+    /// The live rows, cursor and modes of a fux-vt screen, drawn in `palette`, sharing the rows
+    /// `cache` holds unchanged; `cache` is left holding this snapshot's rows.
+    pub(super) fn of(
+        screen: &fux_vt::Screen,
+        palette: Option<Palette>,
+        cache: &mut RowCache,
+    ) -> Self {
         let (rows, cols) = screen.size().into();
-        let palette = Palette::of(screen);
         if let Some(grid) = Self::of_dirty(screen, cache, palette.as_ref()) {
             return grid;
         }
         let window = screen.window();
         let live: Vec<fux_vt::Row<'_>> = (0..rows).filter_map(|row| window.row(row)).collect();
         if palette != cache.palette {
-            let redrawn = history_redrawn(screen, cache.palette.as_ref(), palette.as_ref());
             *cache = RowCache {
                 palette,
-                history_redrawn: cache.history_redrawn.saturating_add(u64::from(redrawn)),
                 ..RowCache::default()
             };
         }

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use fux_vt::{CellRef, Cells, RowId};
 use serde::{Deserialize, Serialize};
 
-use super::grid::{exactly, Palette, RowLinks};
+use super::grid::{exactly, Palette, RowLinks, Uses};
 use super::{
     cells_of, link_bytes, runs_of, Run, WireLink, DIM, MAX_DIM, MAX_LINK_BYTES, MAX_ROW_LINKS,
 };
@@ -129,6 +129,8 @@ pub(super) struct HistoryNames {
     /// The last name given; the first is 1.
     last: u64,
     by_row: HashMap<RowId, u64>,
+    /// The colours the rows named use, whose copies a client holds under those names.
+    uses: Uses,
 }
 
 impl HistoryNames {
@@ -136,6 +138,12 @@ impl HistoryNames {
     /// again.
     pub(super) fn renew(&mut self) {
         self.by_row.clear();
+        self.uses = Uses::default();
+    }
+
+    /// Whether palette `new` draws a row named otherwise than `old`, which the rows were named in.
+    pub(super) fn redrawn(&self, old: Option<&Palette>, new: Option<&Palette>) -> bool {
+        old != new && self.uses.drawn_otherwise(old, new)
     }
 
     /// Name the rows that entered `screen`'s history since the last call, in order, and say where
@@ -156,6 +164,7 @@ impl HistoryNames {
             .take_while(|row| !self.by_row.contains_key(&row.id()))
             .count();
         for row in screen.rows().take(len).skip(len.saturating_sub(unnamed)) {
+            self.uses.add(row.cells().map(|cell| cell.attributes()));
             self.last = self.last.saturating_add(1);
             self.by_row.insert(row.id(), self.last);
         }

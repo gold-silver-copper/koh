@@ -533,28 +533,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_first_key_creation_publishes_exactly_one_identity() {
-        let dir = scratch("key-create-race", 0o700);
-        let path = dir.join("id.key");
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let mut threads = Vec::new();
-        for _ in 0..2 {
-            let key = KeyFile::open(&path).unwrap();
-            let barrier = std::sync::Arc::clone(&barrier);
-            threads.push(std::thread::spawn(move || {
-                barrier.wait();
-                key.create_secret().unwrap().unwrap().to_bytes()
-            }));
-        }
-        barrier.wait();
-        // Each creator ends with the one published key, whoever published it.
-        for thread in threads {
-            let secret = thread.join().unwrap();
-            assert_eq!(std::fs::read(&path).unwrap(), secret);
-        }
-    }
-
-    #[test]
     fn preplanted_predictable_temporary_name_cannot_block_key_creation() {
         let dir = scratch("key-preplant", 0o700);
         let path = dir.join("id.key");

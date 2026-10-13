@@ -254,17 +254,14 @@ pub fn check_name(name: &str) -> anyhow::Result<()> {
 
 /// `id` shortened for a list: its first and last four characters.
 pub fn short(id: EndpointId) -> String {
+    // Hex, so every character is a byte.
     let id = id.to_string();
-    let head: String = id.chars().take(4).collect();
-    let tail: String = id
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}…{tail}")
+    let tail = id.len().saturating_sub(4);
+    format!(
+        "{}…{}",
+        id.get(..4).unwrap_or(""),
+        id.get(tail..).unwrap_or("")
+    )
 }
 
 /// The list `list`, empty if its file does not exist.

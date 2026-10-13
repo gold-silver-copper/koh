@@ -229,103 +229,73 @@ impl Allowlist {
     }
 }
 
-/// The clients allowed, as reads of the list settle it. A read that fails (a typo) keeps the list
-/// as it was. One that drops a client is taken only once the next read, [`CONFIRM`] later, agrees:
-/// an editor saving the list leaves it missing or empty for a moment, which must lock no one out.
-struct Settled {
-    allowed: Arc<HashSet<EndpointId>>,
+/// What reads of the list have settled. A read that fails (a typo) keeps the list as it was. One
+/// that drops a client is taken only once the next read, [`CONFIRM`] later, agrees: an editor
+/// saving the list leaves it missing or empty for a moment, which must lock no one out.
+#[derive(Default)]
+struct Settling {
     /// A read that dropped a client, waiting for the next to agree.
     dropping: Option<HashSet<EndpointId>>,
     /// The last read failed, and said so.
     failing: bool,
 }
 
-impl Settled {
-    const fn new(allowed: Arc<HashSet<EndpointId>>) -> Self {
-        Self {
-            allowed,
-            dropping: None,
-            failing: false,
-        }
-    }
-
-    /// Take what a read gave: if that settles a change, the clients it drops. A failure is warned
+impl Settling {
+    /// What the list allowing `now` is to become after `read`, if it changes. A failure is warned
     /// of once until a read succeeds again.
-    fn update(&mut self, read: anyhow::Result<HashSet<EndpointId>>) -> Option<Vec<EndpointId>> {
-        let read = match read {
-            Ok(read) => read,
-            Err(error) => {
-                if !std::mem::replace(&mut self.failing, true) {
-                    warn!(error = %format!("{error:#}"), "could not read the saved clients; keeping the list last read");
-                }
-                self.dropping = None;
-                return None;
-            }
-        };
-        self.failing = false;
-        let drops = !self.allowed.is_subset(&read);
-        if drops && self.dropping.as_ref() != Some(&read) {
+    fn settle(
+        &mut self,
+        now: &HashSet<EndpointId>,
+        read: anyhow::Result<HashSet<EndpointId>>,
+    ) -> Option<HashSet<EndpointId>> {
+        if let Some(error) = read.as_ref().err().filter(|_| !self.failing) {
+            warn!(error = %format!("{error:#}"), "could not read the saved clients; keeping the list last read");
+        }
+        self.failing = read.is_err();
+        let (read, dropping) = (read.ok()?, self.dropping.take());
+        if !now.is_subset(&read) && dropping.as_ref() != Some(&read) {
             self.dropping = Some(read);
             return None;
         }
-        self.dropping = None;
-        let gone = self.allowed.difference(&read).copied().collect();
-        (*self.allowed != read).then(|| {
-            self.allowed = Arc::new(read);
-            gone
-        })
-    }
-
-    /// How long until the next read: [`CONFIRM`] while a drop waits for it, so a removal is seen
-    /// within [`REVOKE_CHECK`] in all.
-    fn next_read(&self) -> Duration {
-        if self.dropping.is_some() {
-            CONFIRM
-        } else {
-            REVOKE_CHECK.saturating_sub(CONFIRM)
-        }
+        (*now != read).then_some(read)
     }
 }
 
-/// Read `list` again and again ([`Settled::next_read`]), publishing each change on `allowed`, until
-/// no one watches; and end in `registry` the session of each peer a change drops, connected or not.
-/// The one reader of the list.
+/// Read `list` again and again, publishing each change on `allowed`, until no one watches; and end
+/// in `registry` the session of each peer a change drops, connected or not. The one reader of the
+/// list: every [`REVOKE_CHECK`], [`CONFIRM`] included, so a removal is seen within it.
 async fn watch_allowlist(
     list: Allowlist,
     allowed: watch::Sender<Arc<HashSet<EndpointId>>>,
     registry: Registry,
 ) {
     let list = Arc::new(list);
-    let mut settled = Settled::new(allowed.borrow().clone());
+    let mut settling = Settling::default();
     loop {
+        let wait = if settling.dropping.is_some() {
+            CONFIRM
+        } else {
+            REVOKE_CHECK.saturating_sub(CONFIRM)
+        };
         tokio::select! {
             () = allowed.closed() => return,
-            () = tokio::time::sleep(settled.next_read()) => {}
+            () = tokio::time::sleep(wait) => {}
         }
         let reading = Arc::clone(&list);
         let read = tokio::task::spawn_blocking(move || reading.read())
             .await
             .map_err(anyhow::Error::from)
             .and_then(|read| read);
-        if let Some(gone) = settled.update(read) {
+        let now = allowed.borrow().clone();
+        if let Some(next) = settling.settle(&now, read) {
+            let gone: Vec<_> = now.difference(&next).copied().collect();
             // Published first: the registry refuses an attach the list no longer allows, so none
             // can start a session after the end below.
-            allowed.send_replace(Arc::clone(&settled.allowed));
+            allowed.send_replace(Arc::new(next));
             for peer in gone {
                 registry.end(peer).await;
             }
         }
-    }
-}
-
-/// A connection whose peer the allowlist admitted: the only kind a session is served to, and made
-/// only by the accept loop, after the allowlist.
-pub struct Authorized(iroh::endpoint::Connection);
-
-impl Authorized {
-    /// The connection.
-    pub const fn conn(&self) -> &iroh::endpoint::Connection {
-        &self.0
     }
 }
 
@@ -514,9 +484,10 @@ async fn serve_connection(
             "reattaching to this peer's existing session"
         ),
     }
-    // Its first frame tells the client it was admitted.
+    // Its first frame tells the client it was admitted. The session is the proof the peer is allowed:
+    // the registry attaches no other.
     tokio::select! {
-        () = run_attached(Authorized(conn.clone()), client) => {}
+        () = run_attached(&conn, client) => {}
         () = revoked(allowed, peer) => {
             auth_event(Outcome::Rejected, &peer, "removed from the allowlist");
             close(&conn, Close::NotAuthorized);
@@ -541,10 +512,10 @@ pub async fn serve_endpoint(
         allowed,
         registry: registry.clone(),
         connections: Arc::new(tokio::sync::Semaphore::new(hosting.max_connections)),
-        turned_away: Arc::new(Throttle::new()),
+        turned_away: Arc::default(),
     };
     let mut pending: Pending<_> = Pending(Bounded::new());
-    let flood = Throttle::new();
+    let flood = Throttle::default();
 
     loop {
         let incoming = tokio::select! {
@@ -623,13 +594,17 @@ mod tests {
             ..ServeConfig::default()
         })
         .unwrap();
-        let mut settled = Settled::new(Arc::new(hosting.allowed));
+        let (mut allowed, mut settling) = (hosting.allowed, Settling::default());
+        // The list as `text`, or gone: the clients it drops once that is settled, if it changes.
         let mut read = |text: Option<&str>| {
             match text {
                 Some(text) => std::fs::write(&clients, text).unwrap(),
                 None => std::fs::remove_file(&clients).unwrap(),
             }
-            settled.update(hosting.allow.read())
+            let next = settling.settle(&allowed, hosting.allow.read())?;
+            let gone: Vec<_> = allowed.difference(&next).copied().collect();
+            allowed = next;
+            Some(gone)
         };
         // An editor saving it: a typo, then emptied or gone a moment, then whole. No one is cut off.
         let typo = format!("laptop {laptop} oops\n");
@@ -648,7 +623,6 @@ mod tests {
         assert_eq!(read(Some(&one)), Some(vec![phone]));
         // One added is let in at once.
         assert_eq!(read(Some(&both)), Some(vec![]));
-        assert!(settled.allowed.contains(&phone));
     }
 
     #[test]

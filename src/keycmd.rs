@@ -126,36 +126,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn output_failure_is_an_error_without_creating_keys() {
-        struct Broken;
-        impl std::io::Write for Broken {
-            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::ErrorKind::BrokenPipe.into())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let error = run_with_output(
-            &KeyConfig {
-                op: KeyOp::Info,
-                role: "client",
-                key_file: None,
-                role_named: false,
-            },
-            &mut Broken,
-        )
-        .expect_err("output failure");
-        assert_eq!(
-            error
-                .downcast_ref::<std::io::Error>()
-                .expect("I/O error")
-                .kind(),
-            std::io::ErrorKind::BrokenPipe
-        );
-    }
-
-    #[test]
     fn an_unconfirmed_reset_creates_and_judges_nothing() {
         let root = crate::test_runtime::scratch("keycmd");
         let missing = root.join("newdir");

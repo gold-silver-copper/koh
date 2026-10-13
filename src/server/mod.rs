@@ -573,8 +573,7 @@ impl ServerConn {
 /// It forwards the client's input as the session takes it, sends each frame on its own stream and
 /// resets the streams of superseded ones, and answers history requests. Returning (or panicking)
 /// detaches.
-pub async fn run_attached(authorized: cli::Authorized, mut session: session::SessionClient) {
-    let conn = authorized.conn();
+pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: session::SessionClient) {
     let mut core = ServerConn::default();
     core.install_snapshot(session.screen());
     let input = session.input.clone();

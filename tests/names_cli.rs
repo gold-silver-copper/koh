@@ -183,17 +183,13 @@ fn serve_without_allow_allows_the_saved_clients() {
     assert!(!out.status.success(), "no clients: {}", text(&out));
     assert!(text(&out).contains("koh clients add"), "{}", text(&out));
     home.koh(&["clients", "add", "phone", &some_id(3)]).unwrap();
-    // A hang-up drains the server, unless it was started ignoring them (`nohup`): then a logout
-    // leaves it running, and SIGTERM still drains it.
-    // Only Linux says a signal is ignored.
+    // A hang-up drains the server, unless it was started ignoring them (`nohup`, which only Linux
+    // reports): then a logout leaves it running, and SIGTERM still drains it.
     for nohup in [false, cfg!(target_os = "linux")] {
         let koh = env!("CARGO_BIN_EXE_koh");
-        let mut server =
-            command(if nohup { "nohup" } else { koh }, &koh_testkit::home!()).expect("spawn koh");
-        if nohup {
-            server.arg(koh);
-        }
-        let mut server = server
+        let mut server = command([koh, "nohup"][usize::from(nohup)], &koh_testkit::home!())
+            .expect("spawn koh")
+            .args(nohup.then_some(koh))
             .args(["serve", "--local", "--shell", "sh"])
             .env("HOME", home.0.path())
             .env("XDG_CONFIG_HOME", home.0.join(".config"))
@@ -210,11 +206,7 @@ fn serve_without_allow_allows_the_saved_clients() {
         let banner = next("auth");
         let pid = fuxix::process::Pid::of(&server).unwrap();
         fuxix::process::kill(pid, fuxix::process::Signal::Hup).unwrap();
-        let hung_up = next(if nohup {
-            "SIGHUP ignored"
-        } else {
-            "shutting down"
-        });
+        let hung_up = next(["shutting down", "SIGHUP ignored"][usize::from(nohup)]);
         if nohup {
             fuxix::process::kill(pid, fuxix::process::Signal::Term).unwrap();
         }

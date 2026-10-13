@@ -38,9 +38,14 @@ pub(crate) fn cancel_on_signals(
     token: &tokio_util::sync::CancellationToken,
 ) -> std::io::Result<tokio_util::sync::CancellationToken> {
     use tokio::signal::unix::{signal, SignalKind};
-    // Read before the handler replaces it. The handler is installed even so: a program started
-    // later gets SIGHUP's default at its `exec`, as a hosted shell must to hang up with its session.
-    let hangup = Hangup::inherited();
+    // Read before the handler replaces it: the lowest bit of the `SigIgn` mask Linux and Android show
+    // (elsewhere, never). The handler is installed even so: a program started later gets SIGHUP's
+    // default at its `exec`, as a hosted shell must to hang up with its session.
+    let nohup = std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+        let mask = status.lines().find_map(|line| line.strip_prefix("SigIgn:"));
+        mask.and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .is_some_and(|mask| mask & 1 == 1)
+    });
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
@@ -53,12 +58,11 @@ pub(crate) fn cancel_on_signals(
             let name = tokio::select! {
                 Some(()) = term.recv() => "SIGTERM",
                 Some(()) = int.recv() => "SIGINT",
-                Some(()) = hup.recv() => match hangup {
-                    Hangup::Ends => "SIGHUP",
-                    Hangup::Ignored => {
-                        tracing::info!("SIGHUP ignored, as it was when koh started (nohup)");
-                        continue;
-                    }
+                Some(()) = hup.recv() => if nohup {
+                    tracing::info!("SIGHUP ignored, as it was when koh started (nohup)");
+                    continue;
+                } else {
+                    "SIGHUP"
                 },
                 else => return,
             };
@@ -71,33 +75,6 @@ pub(crate) fn cancel_on_signals(
         }
     });
     Ok(forced)
-}
-
-/// What SIGHUP did to this process as it started.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Hangup {
-    /// The default: it ends the process, which drains instead.
-    Ends,
-    /// Ignored, as `nohup` starts a program, so a logout leaves the process running.
-    Ignored,
-}
-
-impl Hangup {
-    /// As the `SigIgn` mask in `/proc/self/status` says (Linux, Android), whose lowest bit is
-    /// SIGHUP; [`Hangup::Ends`] where there is none (macOS).
-    fn inherited() -> Self {
-        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        let ignored = status
-            .lines()
-            .find_map(|line| line.strip_prefix("SigIgn:"))
-            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-            .is_some_and(|mask| mask & 1 == 1);
-        if ignored {
-            Self::Ignored
-        } else {
-            Self::Ends
-        }
-    }
 }
 
 /// Where a process is in shutting down, by the signals it got. Counted apart from what they

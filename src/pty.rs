@@ -114,16 +114,15 @@ pub(crate) fn is_koh_env_key(key: &std::ffi::OsStr) -> bool {
 /// The session shell when the caller didn't pass `--shell`: `shell_env` (`$SHELL`) if set, else
 /// `/bin/sh`, which does **not** exist on Android, where it is `/system/bin/sh`.
 fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
-    if let Some(sh) = shell_env {
-        if !sh.is_empty() {
-            return sh.to_string_lossy().into_owned();
-        }
-    }
-    if cfg!(target_os = "android") {
-        "/system/bin/sh".to_string()
+    let platform = if cfg!(target_os = "android") {
+        "/system/bin/sh"
     } else {
-        "/bin/sh".to_string()
-    }
+        "/bin/sh"
+    };
+    shell_env.filter(|sh| !sh.is_empty()).map_or_else(
+        || platform.to_owned(),
+        |sh| sh.to_string_lossy().into_owned(),
+    )
 }
 
 /// What failed in a PTY: allocation, the spawn, the pump threads, or a resize.

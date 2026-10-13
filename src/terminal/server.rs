@@ -487,11 +487,18 @@ pub const FRAME_HOLD: Duration = Duration::from_millis(150);
 /// longer than [`FRAME_HOLD`] is let go, and the screen goes out as if the program had ended it.
 /// Without I/O: the session gives it the time.
 #[derive(Debug, Default)]
-pub struct FrameHold {
-    /// When the frame held was first seen.
-    since: Option<Instant>,
-    /// Whether the frame held was let go after [`FRAME_HOLD`].
-    released: bool,
+pub struct FrameHold(Held);
+
+/// Where the program's frame stands.
+#[derive(Clone, Copy, Debug, Default)]
+enum Held {
+    /// No frame is drawn.
+    #[default]
+    Not,
+    /// The frame drawn was first seen then.
+    Since(Instant),
+    /// The frame drawn was let go after [`FRAME_HOLD`].
+    Released,
 }
 
 impl FrameHold {
@@ -503,50 +510,45 @@ impl FrameHold {
     ) -> Option<TerminalScreen> {
         let (began, started) = emu.take_frame_start();
         if !emu.synchronized() {
-            self.since = None;
-            self.released = false;
+            self.0 = Held::Not;
             return Some(emu.snapshot());
         }
-        if began {
+        match self.0 {
             // A frame began in this output, so any before it ended: hold this one from now, even
             // if the one before was let go and ended within the same output.
-            self.since = Some(now);
-            self.released = false;
-            return started;
-        }
-        let since = *self.since.get_or_insert(now);
-        if self.released || now.saturating_duration_since(since) >= FRAME_HOLD {
-            self.released = true;
-            return Some(emu.snapshot());
+            _ if began => self.0 = Held::Since(now),
+            Held::Not => self.0 = Held::Since(now),
+            Held::Since(since) if now.saturating_duration_since(since) < FRAME_HOLD => {}
+            Held::Since(_) | Held::Released => {
+                self.0 = Held::Released;
+                return Some(emu.snapshot());
+            }
         }
         started
     }
 
     /// When the frame held is let go, if one is held.
     pub fn deadline(&self) -> Option<Instant> {
-        if self.released {
-            return None;
+        match self.0 {
+            Held::Since(since) => since.checked_add(FRAME_HOLD),
+            Held::Not | Held::Released => None,
         }
-        self.since.and_then(|since| since.checked_add(FRAME_HOLD))
     }
 
     /// At `now`, past [`FrameHold::deadline`]: the screen to send, if a frame is still held.
     pub fn expire(&mut self, emu: &mut ServerTerminal, now: Instant) -> Option<TerminalScreen> {
         if !emu.synchronized() {
-            self.since = None;
-            self.released = false;
+            self.0 = Held::Not;
             return None;
         }
-        if self.deadline().is_some_and(|deadline| now >= deadline) {
-            self.released = true;
-            return Some(emu.snapshot());
-        }
-        None
+        self.deadline().filter(|&deadline| now >= deadline)?;
+        self.0 = Held::Released;
+        Some(emu.snapshot())
     }
 
     /// Whether a frame is held: the screen sent is the one from before it began.
-    pub fn holding(&self) -> bool {
-        self.since.is_some() && !self.released
+    pub const fn holding(&self) -> bool {
+        matches!(self.0, Held::Since(_))
     }
 }
 

@@ -23,8 +23,9 @@ use crate::server::session::{AttachKind, Registry, SessionSpec};
 use crate::transport_iroh::{bind_on, close, Network, PROTOCOL};
 use tracing::{debug, info, warn};
 
-/// Deadline on the QUIC handshake, so a stalled dial cannot hold its permits for the 5-minute idle
-/// timeout; a real handshake takes far less, even on a slow mobile link.
+/// Deadline on the QUIC handshake, so a stalled dial gives up its place among those pending rather
+/// than keep it for the 5-minute idle timeout; a real handshake takes far less, even on a slow
+/// mobile link.
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The clap-free form of `koh serve`'s arguments. [`Default`] gives the CLI's defaults, with an

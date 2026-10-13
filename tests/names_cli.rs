@@ -6,30 +6,27 @@
 //! directory and the user's own `~/.config/koh` is never read or written.
 #![forbid(clippy::disallowed_methods)]
 
-use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
+mod common;
+
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-use koh::pty::{Launcher, Pty};
-use koh_testkit::{command, Capture, Scratch};
+use common::{connected, loopback_server, on_pty, serve};
+use koh_testkit::{command, Scratch};
 
 #[cfg(target_os = "linux")]
 #[test]
 fn unwritable_stdout_and_stderr_do_not_panic() {
     let home = Home::new("failed-output").expect("scratch home");
     for discard_diagnostics in [false, true] {
-        let mut command =
-            command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!()).expect("spawn koh");
-        command
-            .args(["key", "info"])
-            .env("HOME", home.0.path())
-            .env("XDG_CONFIG_HOME", home.0.join(".config"))
-            .stdout(
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open("/dev/full")
-                    .expect("full"),
-            );
+        let mut command = home.command(&["key", "info"]).expect("spawn koh");
+        command.stdout(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .expect("full"),
+        );
         if discard_diagnostics {
             command.stderr(
                 std::fs::OpenOptions::new()
@@ -59,14 +56,18 @@ impl Home {
         self.0.join(".config").join("koh")
     }
 
+    /// `koh args…` in this home.
+    fn command(&self, args: &[&str]) -> anyhow::Result<Command> {
+        let mut koh = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())?;
+        koh.args(args)
+            .env("HOME", self.0.path())
+            .env("XDG_CONFIG_HOME", self.0.join(".config"));
+        Ok(koh)
+    }
+
     /// `koh args…` in this home, its stdin closed.
     fn koh(&self, args: &[&str]) -> anyhow::Result<Output> {
-        Ok(command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())?
-            .args(args)
-            .env("HOME", self.0.path())
-            .env("XDG_CONFIG_HOME", self.0.join(".config"))
-            .stdin(Stdio::null())
-            .output()?)
+        Ok(self.command(args)?.stdin(Stdio::null()).output()?)
     }
 
     /// The argv that runs `koh args…` in this home, for a PTY (which takes no environment).
@@ -95,10 +96,6 @@ fn some_id(seed: u8) -> String {
     iroh::SecretKey::from_bytes(&[seed; 32])
         .public()
         .to_string()
-}
-
-fn launcher() -> Launcher {
-    Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!())
 }
 
 #[test]
@@ -182,22 +179,12 @@ fn serve_without_allow_allows_the_saved_clients() {
     assert!(!out.status.success(), "no clients: {}", text(&out));
     assert!(text(&out).contains("koh clients add"), "{}", text(&out));
     home.koh(&["clients", "add", "phone", &some_id(3)]).unwrap();
-    let mut server = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
-        .expect("spawn koh")
-        .args(["serve", "--local", "--shell", "sh"])
-        .env("HOME", home.0.path())
-        .env("XDG_CONFIG_HOME", home.0.join(".config"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let logs = koh_testkit::stderr_lines(&mut server);
-    let line = std::iter::from_fn(|| logs.recv_timeout(Duration::from_secs(20)).ok())
-        .find(|line| line.contains("auth"));
-    let _ = server.kill();
-    let _ = server.wait();
-    let line = line.expect("the server's banner");
+    let (_server, banner) = serve(
+        home.command(&["serve", "--local", "--shell", "sh"])
+            .unwrap(),
+    )
+    .unwrap();
+    let line = banner.iter().find(|line| line.contains("auth")).unwrap();
     assert!(line.contains("allowlist (1 client(s))"), "{line}");
 }
 
@@ -249,16 +236,7 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
     koh_testkit::multi_thread(2)
         .expect("tokio runtime")
         .block_on(async {
-            let (mut menu, output) = Pty::spawn(
-                24,
-                80,
-                &home.argv(&[]),
-                "xterm-256color",
-                &launcher(),
-                &koh::pty::Reaper::start().expect("reaper"),
-            )
-            .expect("spawn koh on a PTY");
-            let buf = Capture::new(output);
+            let (mut menu, buf) = on_pty(&home.argv(&[])).expect("spawn koh on a PTY");
             buf.wait_for(0, "koh — this machine", 10).await.unwrap();
             buf.wait_for(0, "1  laptop", 5).await.unwrap();
             menu.write(b"q\n".to_vec()).unwrap();
@@ -275,71 +253,28 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
         });
 }
 
-/// The path the given home's `connected` file is at, for a test that connects.
-fn connected(home: &Home) -> PathBuf {
-    home.koh_dir().join("connected")
-}
-
 #[test]
 fn connect_by_name_dials_the_saved_server_and_notes_it() {
     let home = Home::new("connect").unwrap();
     koh_testkit::multi_thread(2)
         .expect("tokio runtime")
         .block_on(async {
-            let server = koh::transport_iroh::bind_endpoint_local(
-                koh::transport_iroh::generate_secret_key().unwrap(),
-                true,
-            )
-            .await
-            .unwrap();
-            let id = server.id().to_string();
-            let port = server
-                .bound_sockets()
-                .iter()
-                .find(|s| s.is_ipv4())
-                .map(std::net::SocketAddr::port)
-                .unwrap();
             // The server allows this home's client, as `koh serve` would.
             let me = home.koh(&["id"]).unwrap();
-            let config = koh::server::ServeConfig {
-                allow: vec![koh::transport_iroh::parse_endpoint_id(
-                    String::from_utf8_lossy(&me.stdout).trim(),
-                )
-                .unwrap()],
-                command: vec!["sh".to_owned()],
-                launcher: launcher(),
-                ..koh::server::ServeConfig::default()
-            };
-            let task = koh_testkit::spawn(koh::server::cli::serve_endpoint(
-                server,
-                koh::server::cli::Hosting::from_config(&config).unwrap(),
-                tokio_util::sync::CancellationToken::new(),
-            ));
+            let (id, port, task) = loopback_server(String::from_utf8_lossy(&me.stdout).trim())
+                .await
+                .unwrap();
             home.koh(&["servers", "add", "box", &id]).unwrap();
             let direct = format!("127.0.0.1:{port}");
             let argv = home.argv(&["connect", "box", "--direct", &direct]);
-            let (client, output) = Pty::spawn(
-                24,
-                80,
-                &argv,
-                "xterm-256color",
-                &launcher(),
-                &koh::pty::Reaper::start().expect("reaper"),
-            )
-            .expect("spawn the client");
-            let buf = Capture::new(output);
-            let seen = buf
-                .type_until(0, "by_name", 15, || {
-                    let _ = client.write(b"echo by''_name\r".to_vec());
-                })
-                .await;
+            let (client, ..) = connected(&argv, b"echo by''_name\r", "by_name")
+                .await
+                .unwrap();
             let _ = client.write(vec![0x1e, b'.']);
             drop(client);
             task.abort();
-            seen.unwrap();
-            let noted = std::fs::read_to_string(connected(&home)).unwrap();
+            let noted = std::fs::read_to_string(home.koh_dir().join("connected")).unwrap();
             assert!(noted.starts_with(&id), "the connect is noted: {noted:?}");
-            assert!(Path::new(&connected(&home)).exists());
         });
 }
 
@@ -353,33 +288,15 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
     let me = home.koh(&["id"]).unwrap();
     let me = String::from_utf8_lossy(&me.stdout).trim().to_owned();
     home.koh(&["clients", "add", "other", &some_id(4)]).unwrap();
-    let mut server = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
-        .expect("spawn koh")
-        .args(["serve", "--local", "--shell", "sh"])
-        .env("HOME", home.0.path())
-        .env("XDG_CONFIG_HOME", home.0.join(".config"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let banner = koh_testkit::stderr_lines(&mut server);
-    let (mut id, mut port) = (None, None);
-    while id.is_none() || port.is_none() {
-        let line = banner
-            .recv_timeout(Duration::from_secs(20))
-            .expect("banner");
-        if let Some(rest) = line.split_once("endpoint id : ").map(|(_, r)| r) {
-            id = Some(parse_endpoint_id(rest).unwrap());
-        }
-        if let Some(rest) = line.split_once("udp port    : ").map(|(_, r)| r) {
-            port = rest
-                .split_whitespace()
-                .next()
-                .and_then(|p| p.parse::<u16>().ok());
-        }
-    }
-    let at = direct_addr(id.unwrap(), ([127, 0, 0, 1], port.unwrap()).into());
+    let (server, _) = serve(
+        home.command(&["serve", "--local", "--shell", "sh"])
+            .unwrap(),
+    )
+    .unwrap();
+    let at = direct_addr(
+        parse_endpoint_id(&server.id).unwrap(),
+        ([127, 0, 0, 1], server.port).into(),
+    );
     let key = std::fs::read(home.koh_dir().join("client.key")).unwrap();
     let secret = iroh::SecretKey::from_bytes(&key.try_into().unwrap());
     let admitted = || {
@@ -409,8 +326,7 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
             let removed = admitted().await.is_ok();
             (before, added, cut_off, removed)
         });
-    let _ = server.kill();
-    let _ = server.wait();
+    drop(server);
     assert_eq!(
         outcomes,
         (false, true, true, false),

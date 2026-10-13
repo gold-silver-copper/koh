@@ -67,7 +67,7 @@ async fn converges(profile: Profile, seed: u64, outage: bool) -> anyhow::Result<
         }
     }
     let _ = client.finish().await;
-    server.stop().await;
+    server.stop().await?;
     Ok(())
 }
 
@@ -151,7 +151,7 @@ fn input_arrives_exactly_once_and_in_order_under_loss() -> anyhow::Result<()> {
             "input did not arrive exactly once in order"
         );
         let _ = client.finish().await;
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     })
 }

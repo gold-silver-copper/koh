@@ -527,36 +527,37 @@ fn corpus() -> Result<Vec<Recording>, String> {
     Recording::load_all(&Path::new(env!("CARGO_MANIFEST_DIR")).join("testing/corpus"))
 }
 
-/// Replay every recording with `loss`, seeds from `first`: the failures, those of [`recording::DIFFERS`] that
-/// no longer differ among them, and what was sent.
+/// Replay every recording with `loss`, seeds from `first`: the failures, and what was sent.
 fn replay_all(corpus: &[Recording], first: u64, loss: f64) -> (Vec<String>, Replayed) {
     let mut failures = Vec::new();
     let mut total = Replayed::default();
     for (seed, recording) in (first..).zip(corpus) {
-        let differs = recording::DIFFERS
-            .iter()
-            .any(|(name, _)| *name == recording.name);
-        match (replay(recording, seed, loss), differs) {
-            (Ok(replayed), false) => {
+        match replay(recording, seed, loss) {
+            Ok(replayed) => {
                 total.frames = total.frames.saturating_add(replayed.frames);
                 total.applied = total.applied.saturating_add(replayed.applied);
                 total.wire_bytes = total.wire_bytes.saturating_add(replayed.wire_bytes);
             }
-            (Err(_), true) => {}
-            (Err(e), false) => failures.push(e),
-            (Ok(_), true) => failures.push(format!(
-                "{} no longer differs: take it off recording::DIFFERS",
-                recording.name
-            )),
+            Err(e) => failures.push(e),
         }
     }
     (failures, total)
 }
 
+/// Every recording, read whole (its steps to its last byte, its resizes too), reads back as the
+/// server shows it.
 #[test]
 fn every_recording_reads_back_as_the_server_shows_it() {
     let corpus = corpus().expect("the corpus");
     assert!(corpus.len() >= 100, "{} recordings", corpus.len());
+    for recording in &corpus {
+        let end = recording.steps.last().map(|step| step.end);
+        assert_eq!(end, Some(recording.bytes.len()), "{}", recording.name);
+    }
+    assert!(corpus
+        .iter()
+        .flat_map(|r| &r.steps)
+        .any(|s| s.resize.is_some()));
     let (failures, total) = replay_all(&corpus, 1, 0.0);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert_eq!(total.applied, total.frames, "every frame applied");
@@ -676,28 +677,6 @@ fn random_small_sessions_read_back_as_the_server_shows_them() {
         let (failures, _) = replay_all(&sessions, 0, loss);
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
-}
-
-#[test]
-fn the_corpus_is_read_whole() {
-    let corpus = corpus().expect("the corpus");
-    let resizes = corpus
-        .iter()
-        .flat_map(|r| &r.steps)
-        .filter(|s| s.resize.is_some())
-        .count();
-    assert_eq!(resizes, 23, "the recordings' resizes");
-    for recording in &corpus {
-        let last = recording.steps.last().expect("a step");
-        assert_eq!(last.end, recording.bytes.len(), "{}", recording.name);
-    }
-    let nvim = corpus
-        .iter()
-        .find(|r| r.name == "nvim-split")
-        .expect("nvim-split");
-    assert_eq!((nvim.rows, nvim.cols), (40, 120));
-    assert_eq!(nvim.steps[1].keys, b":split\r");
-    assert_eq!(nvim.steps[3].keys, b"\x17w");
 }
 
 /// What the predictor did over the corpus: guesses shown, those the next screen did not bear out

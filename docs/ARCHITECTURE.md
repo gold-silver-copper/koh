@@ -530,8 +530,7 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   reattach, a forced mid-session drop, exit status, resize, XON/XOFF, input backpressure, the bell
   hook, prediction and the no-echo property, and hostile clients and servers. The corpus runs
   here too, through a real server and client under loss (eleven recordings by default, every one
-  with `KOH_NET_CORPUS=all`). An `#[ignore]`d baseline measures echo latency, output bursts, bytes
-  and outage recovery per network profile.
+  with `KOH_NET_CORPUS=all`).
 - **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs, started through
   the `koh` binary's `__launch`: output streaming and teardown, exit statuses, the
   reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its

@@ -65,7 +65,7 @@ fn echoed_keystrokes_are_predicted_then_confirmed() -> anyhow::Result<()> {
             "keystrokes were predicted before their echo arrived"
         );
         let _ = client.finish().await;
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     })
 }
@@ -111,7 +111,7 @@ fn keystrokes_at_a_no_echo_prompt_are_never_shown() -> anyhow::Result<()> {
             }
         }
         let _ = client.finish().await;
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     })
 }
@@ -188,7 +188,7 @@ fn a_trusted_session_shows_nothing_typed_at_real_password_prompts() -> anyhow::R
             }
         }
         let _ = client.finish().await;
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     })
 }

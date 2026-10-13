@@ -8,10 +8,6 @@
 
 use std::path::Path;
 
-/// Recordings the user's terminal shows otherwise than the server, and why. Each must still
-/// differ, so that a fix takes its recording off this list.
-pub const DIFFERS: &[(&str, &str)] = &[];
-
 /// One step of a recording: the terminal resized first, if `resize` says so, then `keys` were
 /// typed, and the program's output to the step's end followed.
 #[derive(Clone, Debug, PartialEq, Eq)]

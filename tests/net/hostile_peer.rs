@@ -11,8 +11,8 @@ use anyhow::Context as _;
 use iroh::endpoint::Connection;
 use iroh::{EndpointId, SecretKey};
 use koh::proto::{
-    decode_server, encode_client, ClientMsg, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg,
-    MAX_FRAME, MAX_PENDING_HISTORY,
+    decode_server, encode_client, ClientMsg, Close, Frame, FrameEncoder, FrameNum, InputSeq,
+    ServerMsg, MAX_FRAME, MAX_PENDING_HISTORY,
 };
 use koh::terminal::{ServerTerminal, TerminalScreen};
 use koh::transport_iroh::{admission, generate_secret_key, ALPN};
@@ -78,6 +78,20 @@ async fn server_under_attack(net: &FaultNet, evil: EndpointId) -> anyhow::Result
     Ok((server, client))
 }
 
+/// Wait for `conn` to close, and check the server closed it for breaking the protocol: not for a
+/// crash, a timeout or any other reason.
+async fn closed_for_breaking_the_protocol(conn: &Connection, what: &str) -> anyhow::Result<()> {
+    let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+        .await
+        .with_context(|| format!("the server must close a connection that sent {what}"))?;
+    anyhow::ensure!(
+        matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(c)
+            if c.error_code == Close::ProtocolError.code().into()),
+        "{what}: closed with {closed:?}"
+    );
+    Ok(())
+}
+
 async fn assert_good_client_still_works(client: &mut Client) -> anyhow::Result<()> {
     client.send(b"echo STILL_A''LIVE\r").await?;
     anyhow::ensure!(
@@ -103,15 +117,10 @@ fn an_oversized_client_message_closes_the_connection_only() -> anyhow::Result<()
             .context("MAX_FRAME fits u32")?
             .to_be_bytes();
         raw_client_stream(&conn, &huge).await?;
-        anyhow::ensure!(
-            tokio::time::timeout(Duration::from_secs(5), conn.closed())
-                .await
-                .is_ok(),
-            "the server must close a connection that announced an oversized message"
-        );
+        closed_for_breaking_the_protocol(&conn, "an oversized message's length").await?;
         assert_good_client_still_works(&mut good).await?;
         let _ = good.finish().await;
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     })
 }
@@ -152,16 +161,11 @@ fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> 
             stream.extend_from_slice(&body);
             let conn = admitted(&net, evil.clone(), server.id).await?;
             raw_client_stream(&conn, &stream).await?;
-            anyhow::ensure!(
-                tokio::time::timeout(Duration::from_secs(5), conn.closed())
-                    .await
-                    .is_ok(),
-                "the server must close a connection that sent {msg:?}"
-            );
+            closed_for_breaking_the_protocol(&conn, &format!("{msg:?}")).await?;
         }
         assert_good_client_still_works(&mut good).await?;
         let _ = good.finish().await;
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     })
 }
@@ -171,15 +175,16 @@ fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> 
 /// prints still go out.
 #[test]
 fn a_full_session_queue_does_not_stop_the_frames() -> anyhow::Result<()> {
-    use koh::events::{InputEvent, WireColours, MAX_PASTE};
+    use koh::events::{InputEvent, MAX_PASTE};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let evil = identity()?;
         let printing = "stty raw -echo; while :; do echo tick; sleep 0.05; done";
         let server = Server::start(&net, &[evil.public()], &["sh", "-c", printing]).await?;
         let conn = admitted(&net, evil, server.id).await?;
-        let frames = std::sync::Arc::new(AtomicUsize::new(0));
+        let frames = Arc::new(AtomicUsize::new(0));
         let reader = {
             let (conn, frames) = (conn.clone(), frames.clone());
             koh_testkit::spawn(async move {
@@ -193,36 +198,68 @@ fn a_full_session_queue_does_not_stop_the_frames() -> anyhow::Result<()> {
                 }
             })
         };
+        // Two pastes fill the PTY and what waits for it; then keys fill the session's queue, and
+        // those after it wait in QUIC's windows until those are full too.
         let mut send = conn.open_uni().await?;
-        let mut messages = Vec::new();
-        // Two pastes fill the PTY and what waits for it; then the session's queue fills.
-        for seq in 1..=2 {
-            messages.push(encode_client(&ClientMsg::Keys {
-                seq: InputSeq(seq),
-                events: vec![InputEvent::Paste("x".repeat(MAX_PASTE))],
-            })?);
-        }
-        for _ in 0..2000 {
-            messages.push(encode_client(&ClientMsg::Colours(WireColours::default()))?);
-        }
-        let writer = koh_testkit::spawn(async move {
-            for message in messages {
-                if send.write_all(&message).await.is_err() {
-                    return;
+        let written = Arc::new(AtomicUsize::new(0));
+        let writer = {
+            let written = written.clone();
+            koh_testkit::spawn(async move {
+                for seq in 1.. {
+                    let events = if seq <= 2 {
+                        vec![InputEvent::Paste("x".repeat(MAX_PASTE))]
+                    } else {
+                        let ClientMsg::Keys { events, .. } = typed("x") else {
+                            return;
+                        };
+                        events
+                    };
+                    let message = ClientMsg::Keys {
+                        seq: InputSeq(seq),
+                        events,
+                    };
+                    let Ok(bytes) = encode_client(&message) else {
+                        return;
+                    };
+                    if send.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                    written.fetch_add(1, Ordering::Relaxed);
                 }
+            })
+        };
+        // The writer stalls: the server stopped reading the client. Telling a stall from a slow
+        // write takes time passing with nothing written; that wait is what is measured.
+        let mut stalled = None;
+        for _ in 0..40 {
+            let before = written.load(Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if written.load(Ordering::Relaxed) == before && before > 2 {
+                stalled = Some(before);
+                break;
             }
-            Box::leak(Box::new(send));
-        });
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let stalled = stalled.context("the server never stopped reading the client")?;
+        // And frames still come, while it stays stalled.
         let before = frames.load(Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while frames.load(Ordering::Relaxed) < before + 10 && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let after = frames.load(Ordering::Relaxed);
+        let still = written.load(Ordering::Relaxed);
         writer.abort();
         reader.abort();
-        server.stop().await;
+        server.stop().await?;
         anyhow::ensure!(
             after >= before + 10,
             "frames stopped while the session's queue was full: {before} then {after}"
+        );
+        anyhow::ensure!(
+            still == stalled,
+            "the server read the client again ({stalled} then {still} messages), so the queue \
+             was not full while the frames came"
         );
         Ok(())
     })
@@ -245,7 +282,7 @@ fn a_client_cannot_open_a_second_stream() -> anyhow::Result<()> {
         );
         assert_good_client_still_works(&mut good).await?;
         let _ = good.finish().await;
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     })
 }
@@ -264,7 +301,7 @@ fn a_flood_of_connections_and_garbage_does_not_take_the_server_down() -> anyhow:
         }
         assert_good_client_still_works(&mut good).await?;
         let _ = good.finish().await;
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     })
 }
@@ -318,15 +355,10 @@ fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_co
         }
         send.write_all(&flood).await?;
         Box::leak(Box::new(send));
-        let closed = tokio::time::timeout(WAIT, conn.closed()).await?;
-        anyhow::ensure!(
-            matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(c)
-                if c.error_code == 2u32.into()),
-            "closed with {closed:?}"
-        );
+        closed_for_breaking_the_protocol(&conn, "a flood of history requests").await?;
         assert_good_client_still_works(&mut good).await?;
         let _ = good.finish().await;
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     })
 }
@@ -365,70 +397,155 @@ async fn send_frame_bytes(conn: &Connection, bytes: Vec<u8>) {
     }
 }
 
-/// A client running against a hand-rolled server survives its frames without crashing or hanging.
-async fn client_survives(net: &FaultNet, good: SecretKey, evil: EndpointId) -> anyhow::Result<()> {
-    let endpoint = net.endpoint(good, false).await?;
-    let client = Client::connect_on(endpoint, evil, Options::default()).await?;
-    // A crash would end the client loop, a hang keep it from quitting. Neither may happen.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let quit = client.quit(Duration::from_secs(5)).await;
-    anyhow::ensure!(
-        matches!(quit, Some(Ok(None))),
-        "the client did not keep running under the hostile server's frames: {quit:?}"
-    );
-    Ok(())
+/// What a hostile server sends a client.
+#[derive(Clone, Copy, Debug)]
+enum Hostile {
+    /// An inflate bomb, then plain garbage.
+    Bomb,
+    /// Frames on bases the client never held.
+    UnknownBases,
+    /// History rows the client never asked for.
+    HistoryRows,
 }
 
-#[test]
-fn an_oversized_or_bomb_frame_leaves_the_client_running() -> anyhow::Result<()> {
-    koh_testkit::multi_thread(4)?.block_on(async {
-        let net = net();
-        let good = identity()?;
-        let evil_id = evil_server(&net, good.public(), |conn| {
-            koh_testkit::spawn(async move {
-                // An inflate bomb: 64 MiB of zeros deflates tiny; the client's 16 MiB limit rejects it.
-                let bomb = miniz_oxide::deflate::compress_to_vec(&vec![0u8; 4 * MAX_FRAME], 9);
-                send_frame_bytes(&conn, bomb).await;
-                send_frame_bytes(&conn, vec![0xff; 4096]).await; // plain garbage
-                conn.closed().await;
-            })
-        })
-        .await?;
-        client_survives(&net, good, evil_id).await
-    })
-}
-
-#[test]
-fn frames_on_unknown_bases_leave_the_client_running() -> anyhow::Result<()> {
-    koh_testkit::multi_thread(4)?.block_on(async {
-        let net = net();
-        let good = identity()?;
-        let evil_id = evil_server(&net, good.public(), |conn| {
-            koh_testkit::spawn(async move {
-                // 1000 frames, numbered far apart, each diffing from a base the client never holds.
-                let base = TerminalScreen::default();
-                for n in 1..=1000u64 {
-                    let Ok(mut emu) = ServerTerminal::new(24, 80, 0) else {
-                        return;
-                    };
-                    emu.process(format!("frame {n}").as_bytes());
-                    let diff = emu.snapshot().diff_from(&base);
-                    let frame = Frame {
-                        num: FrameNum(n.wrapping_mul(1000)),
-                        base: FrameNum(n.wrapping_mul(1000).wrapping_sub(1)),
-                        echo_ack: InputSeq(0),
-                        diff,
-                    };
-                    if let Ok(bytes) = FrameEncoder::default().encode(&frame, &base) {
-                        send_frame_bytes(&conn, bytes).await;
-                    }
+/// Send `hostile` on `conn`.
+async fn send_hostile(hostile: Hostile, conn: &Connection) {
+    use koh::terminal::{HistoryReply, HistoryRow};
+    match hostile {
+        Hostile::Bomb => {
+            // 64 MiB of zeros deflates tiny; the client's 16 MiB limit rejects it.
+            let bomb = miniz_oxide::deflate::compress_to_vec(&vec![0u8; 4 * MAX_FRAME], 9);
+            send_frame_bytes(conn, bomb).await;
+            send_frame_bytes(conn, vec![0xff; 4096]).await;
+        }
+        Hostile::UnknownBases => {
+            // 1000 frames, numbered far apart, each diffing from a base the client never holds.
+            let base = TerminalScreen::default();
+            for n in 1..=1000u64 {
+                let Ok(mut emu) = ServerTerminal::new(24, 80, 0) else {
+                    return;
+                };
+                emu.process(format!("frame {n}").as_bytes());
+                let frame = Frame {
+                    num: FrameNum(n.wrapping_mul(1000)),
+                    base: FrameNum(n.wrapping_mul(1000).wrapping_sub(1)),
+                    echo_ack: InputSeq(0),
+                    diff: emu.snapshot().diff_from(&base),
+                };
+                if let Ok(bytes) = FrameEncoder::default().encode(&frame, &base) {
+                    send_frame_bytes(conn, bytes).await;
                 }
-                conn.closed().await;
-            })
-        })
-        .await?;
-        client_survives(&net, good, evil_id).await
+            }
+        }
+        Hostile::HistoryRows => {
+            // A screen whose history claims a million rows, then rows the client never asked
+            // for: too many, too wide, named outside the history, over and over.
+            let Ok(mut emu) = ServerTerminal::new(24, 80, 1000) else {
+                return;
+            };
+            for n in 0..200 {
+                emu.process(format!("line {n}\r\n").as_bytes());
+            }
+            let mut diff = emu.snapshot().diff_from(&TerminalScreen::default());
+            diff.history = Some(koh::terminal::HistoryMark {
+                newest: 1_000_000,
+                len: 1_000_000,
+            });
+            if let Ok(bytes) = FrameEncoder::default().encode(
+                &Frame {
+                    num: FrameNum(1),
+                    base: FrameNum::BLANK,
+                    echo_ack: InputSeq(0),
+                    diff,
+                },
+                &TerminalScreen::default(),
+            ) {
+                send_frame_bytes(conn, bytes).await;
+            }
+            let newest = emu.snapshot().history().newest;
+            let real = emu
+                .history(koh::terminal::HistoryRequest {
+                    id: 0,
+                    newest,
+                    count: 1,
+                })
+                .rows;
+            let Some(template) = real.into_iter().next() else {
+                return;
+            };
+            let wide = |name: u64| HistoryRow {
+                name,
+                runs: std::iter::repeat_n(template.runs.clone(), 100)
+                    .flatten()
+                    .collect(),
+                ..template.clone()
+            };
+            for round in 0..50_u64 {
+                let rows: Vec<HistoryRow> = (0..300)
+                    .map(|n| {
+                        wide(1_000_000_u64.wrapping_sub(round.wrapping_mul(300).wrapping_add(n)))
+                    })
+                    .collect();
+                if let Ok(bytes) =
+                    FrameEncoder::default().encode_history(&HistoryReply { id: 0, rows })
+                {
+                    send_frame_bytes(conn, bytes).await;
+                }
+            }
+        }
+    }
+}
+
+/// A client running against a server that sends it `hostile`, then one frame it takes, neither
+/// crashes nor hangs: it shows that frame, and quits when told.
+#[test]
+fn hostile_frames_and_history_leave_the_client_running() -> anyhow::Result<()> {
+    koh_testkit::multi_thread(4)?.block_on(async {
+        let runs = [Hostile::Bomb, Hostile::UnknownBases, Hostile::HistoryRows]
+            .map(|hostile| koh_testkit::spawn(survives(hostile)));
+        for run in runs {
+            run.await??;
+        }
+        Ok(())
     })
+}
+
+/// Whether a client survives `hostile`, as [`hostile_frames_and_history_leave_the_client_running`]
+/// says.
+async fn survives(hostile: Hostile) -> anyhow::Result<()> {
+    let net = net();
+    let good = identity()?;
+    let evil_id = evil_server(&net, good.public(), move |conn| {
+        koh_testkit::spawn(async move {
+            send_hostile(hostile, &conn).await;
+            // Numbered past every frame before it, from the blank screen.
+            let base = TerminalScreen::default();
+            let frame = Frame {
+                num: FrameNum(2_000_000_000),
+                base: FrameNum::BLANK,
+                echo_ack: InputSeq(0),
+                diff: TerminalScreen::from_bytes(24, 80, b"SURVIVED").diff_from(&base),
+            };
+            if let Ok(bytes) = FrameEncoder::default().encode(&frame, &base) {
+                send_frame_bytes(&conn, bytes).await;
+            }
+            conn.closed().await;
+        })
+    })
+    .await?;
+    let endpoint = net.endpoint(good, false).await?;
+    let mut client = Client::connect_on(endpoint, evil_id, Options::default()).await?;
+    anyhow::ensure!(
+        client
+            .wait_until(WAIT, |t| t.contains("SURVIVED"))
+            .await
+            .is_some(),
+        "{hostile:?}: the frame after never showed; screen:\n{}",
+        client.screen()
+    );
+    let quit = client.quit(Duration::from_secs(5)).await;
+    anyhow::ensure!(matches!(quit, Some(Ok(None))), "{hostile:?}: {quit:?}");
+    Ok(())
 }
 
 #[test]
@@ -456,8 +573,13 @@ fn a_bad_admission_byte_is_rejected_not_treated_as_admitted() -> anyhow::Result<
         });
         // The client must fail to connect, not proceed as if admitted.
         let endpoint = net.endpoint(good, false).await?;
-        let result = Client::connect_on(endpoint, evil_id, Options::default()).await;
-        anyhow::ensure!(result.is_err(), "a non-ADMIT byte must be rejected");
+        let Err(error) = Client::connect_on(endpoint, evil_id, Options::default()).await else {
+            anyhow::bail!("a non-ADMIT byte must be rejected");
+        };
+        anyhow::ensure!(
+            format!("{error:#}").contains("server did not admit the connection"),
+            "refused for another reason: {error:#}"
+        );
         Ok(())
     })
 }
@@ -550,73 +672,5 @@ fn a_servers_hostile_links_are_shown_as_text_or_dropped() -> anyhow::Result<()> 
         );
         client.abort();
         Ok(())
-    })
-}
-
-#[test]
-fn hostile_history_rows_leave_the_client_running() -> anyhow::Result<()> {
-    use koh::terminal::{HistoryReply, HistoryRow};
-    koh_testkit::multi_thread(4)?.block_on(async {
-        let net = net();
-        let good = identity()?;
-        let evil_id = evil_server(&net, good.public(), |conn| {
-            koh_testkit::spawn(async move {
-                // A screen whose history claims a million rows, then rows the client never asked
-                // for: too many, too wide, named outside the history, over and over.
-                let Ok(mut emu) = ServerTerminal::new(24, 80, 1000) else {
-                    return;
-                };
-                for n in 0..200 {
-                    emu.process(format!("line {n}\r\n").as_bytes());
-                }
-                let mut diff = emu.snapshot().diff_from(&TerminalScreen::default());
-                diff.history = Some(koh::terminal::HistoryMark {
-                    newest: 1_000_000,
-                    len: 1_000_000,
-                });
-                if let Ok(bytes) = FrameEncoder::default().encode(
-                    &Frame {
-                        num: FrameNum(1),
-                        base: FrameNum::BLANK,
-                        echo_ack: InputSeq(0),
-                        diff,
-                    },
-                    &TerminalScreen::default(),
-                ) {
-                    send_frame_bytes(&conn, bytes).await;
-                }
-                let newest = emu.snapshot().history().newest;
-                let real = emu
-                    .history(koh::terminal::HistoryRequest {
-                        id: 0,
-                        newest,
-                        count: 1,
-                    })
-                    .rows;
-                let Some(template) = real.into_iter().next() else {
-                    return;
-                };
-                let wide = |name: u64| HistoryRow {
-                    name,
-                    runs: std::iter::repeat_n(template.runs.clone(), 100)
-                        .flatten()
-                        .collect(),
-                    ..template.clone()
-                };
-                for round in 0..50_u64 {
-                    let rows: Vec<HistoryRow> = (0..300)
-                        .map(|n| wide(1_000_000 - round * 300 - n))
-                        .collect();
-                    if let Ok(bytes) =
-                        FrameEncoder::default().encode_history(&HistoryReply { id: 0, rows })
-                    {
-                        send_frame_bytes(&conn, bytes).await;
-                    }
-                }
-                conn.closed().await;
-            })
-        })
-        .await?;
-        client_survives(&net, good, evil_id).await
     })
 }

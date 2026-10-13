@@ -4,7 +4,6 @@
 //! One test binary, so every test shares the harness.
 #![forbid(clippy::disallowed_methods)]
 
-mod baseline;
 mod bell;
 mod convergence;
 mod corpus;

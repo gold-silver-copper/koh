@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/5 client.
+//! loopback iroh with a minimal koh/6 client.
 //!
 //! Every session's program starts through the `koh` binary's `__launch`, as `koh serve`'s do; unit
 //! tests cannot reach a binary, so these live here.
@@ -18,7 +18,6 @@ use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
 use koh::terminal::{clamp_dims, RowEncodings, Size, TerminalScreen};
-use koh::transport_iroh::admission::await_admission;
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 use tokio_util::sync::CancellationToken;
 
@@ -51,21 +50,28 @@ async fn loopback_serve(
 
 /// The launcher every session in these tests starts through.
 fn launcher() -> Launcher {
-    Launcher::new(env!("CARGO_BIN_EXE_koh"))
+    Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!())
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     koh_testkit::multi_thread(2)
 }
 
-fn registry(command: &[&str], max_sessions: usize, ttl: Duration) -> std::io::Result<Registry> {
-    Registry::spawn(SessionSpec {
+/// A registry attaching the peers `allows` allows.
+fn registry(
+    command: &[&str],
+    max_sessions: usize,
+    ttl: Duration,
+    allows: impl Fn(&iroh::EndpointId) -> bool + Send + 'static,
+) -> std::io::Result<Registry> {
+    let spec = SessionSpec {
         command: command.iter().map(|arg| (*arg).to_owned()).collect(),
         scrollback: 0,
         max_sessions,
         ttl,
         launcher: launcher(),
-    })
+    };
+    Registry::spawn(spec, allows)
 }
 
 /// Attach `peer` and say how.
@@ -80,7 +86,7 @@ fn peer() -> std::io::Result<iroh::EndpointId> {
 #[test]
 fn attach_creates_then_reattaches_the_same_peer() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30))?;
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30), |_| true)?;
         let peer = peer()?;
         let (client, kind) = reg.attach(peer).await.context("first attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
@@ -98,7 +104,7 @@ fn attach_creates_then_reattaches_the_same_peer() -> anyhow::Result<()> {
 #[test]
 fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 1, Duration::from_secs(30))?;
+        let reg = registry(&["sleep", "30"], 1, Duration::from_secs(30), |_| true)?;
         let (a, b) = (peer()?, peer()?);
         let (a_client, _) = reg
             .attach(a)
@@ -121,43 +127,53 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
     })
 }
 
+/// The last client to leave a session starts its TTL, and only the last: a session one client
+/// still holds outlives it, and one every client left is reaped after it (the next attach creates
+/// a new one), however many left at once (more than the session's control queue holds), and
+/// whether or not its program had exited before any client saw it end.
 #[test]
 fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<()> {
-    runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_millis(150))?;
-        let peer = peer()?;
-        let (a, _) = reg.attach(peer).await.context("A")?;
-        let (b, _) = reg
-            .attach(peer)
-            .await
-            .context("B (concurrent, same session)")?;
-        // Dropping ONE of two attached clients must not start the TTL.
-        drop(a);
-        // Time must pass here: the session must outlive its TTL. (Polling would attach, and a
-        // detach restarts the TTL.)
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        anyhow::ensure!(
-            matches!(
-                attach_kind(&reg, peer).await,
-                Some(AttachKind::Reattached { .. })
-            ),
-            "with one client still attached the session must survive past the TTL"
-        );
-        // Now drop every client; after the TTL the session is reaped and a fresh attach creates one.
-        drop(b);
-        drop(reg.attach(peer).await.context("reattach C")?.0);
-        // Past the TTL, by time: polling would attach, and a detach restarts it.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        anyhow::ensure!(
-            attach_kind(&reg, peer).await == Some(AttachKind::Created),
-            "after the last detach and the TTL the session is gone"
-        );
-        reg.shutdown().await;
+    const TTL: Duration = Duration::from_millis(200);
+    koh_testkit::current_thread()?.block_on(async {
+        // (case, its program, clients attached, of them still attached, whether it is reaped)
+        let cases = [
+            ("one of two left", &["sleep", "30"][..], 2, 1, false),
+            ("both of two left", &["sleep", "30"], 2, 0, true),
+            ("a burst of 20 left", &["sleep", "30"], 20, 0, true),
+            ("its program exited unseen", &["true"], 1, 0, true),
+        ];
+        let mut sessions = Vec::new();
+        let mut held = Vec::new();
+        for (case, command, attached, kept, reaped) in cases {
+            let reg = registry(command, 4, TTL, |_| true)?;
+            let peer = peer()?;
+            let mut clients = Vec::new();
+            for _ in 0..attached {
+                clients.push(reg.attach(peer).await.context(case)?.0);
+            }
+            if let Some(client) = clients.first_mut().filter(|_| command == ["true"]) {
+                await_exit(client).await?;
+            }
+            held.extend(clients.drain(..kept));
+            drop(clients);
+            sessions.push((case, reg, peer, reaped));
+        }
+        // The TTL is what passes here: polling would attach, which restarts it.
+        tokio::time::sleep(TTL * 5).await;
+        for (case, reg, peer, reaped) in sessions {
+            let kind = attach_kind(&reg, peer).await;
+            reg.shutdown().await;
+            anyhow::ensure!(
+                (kind == Some(AttachKind::Created)) == reaped,
+                "{case}: {kind:?}"
+            );
+        }
+        drop(held);
         Ok(())
     })
 }
 
-/// A bare koh/5 client: writes messages, applies frames whose base it holds, and acks them.
+/// A bare koh/6 client: writes messages, applies frames whose base it holds, and acks them.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -171,18 +187,13 @@ struct RawClient {
 }
 
 impl RawClient {
-    /// Connect to `addr` as `secret`, waiting for the admission ack if the server sends one.
-    async fn connect(
-        addr: iroh::EndpointAddr,
-        secret: iroh::SecretKey,
-        admitted: bool,
-    ) -> anyhow::Result<Self> {
+    /// Connect to `addr` as `secret`, and wait for the first frame, which admits it.
+    async fn connect(addr: iroh::EndpointAddr, secret: iroh::SecretKey) -> anyhow::Result<Self> {
         let endpoint = bind_endpoint_local(secret, false).await?;
         let conn = endpoint.connect(addr, ALPN).await?;
-        if admitted {
-            await_admission(&conn).await?;
-        }
+        // Its control stream: its bytes go before the input stream's, as the client's do.
         let send = conn.open_uni().await?;
+        send.set_priority(1)?;
         let (tx, frames) = tokio::sync::mpsc::channel(64);
         let reader = conn.clone();
         koh_testkit::spawn(async move {
@@ -197,7 +208,7 @@ impl RawClient {
                 });
             }
         });
-        Ok(Self {
+        let mut client = Self {
             conn,
             send,
             frames,
@@ -206,7 +217,15 @@ impl RawClient {
             echo_ack: InputSeq(0),
             last_seq: InputSeq(0),
             _endpoint: endpoint,
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while client.newest == FrameNum::BLANK {
+                client.pump(20).await?;
+            }
+            anyhow::Ok(client)
         })
+        .await
+        .context("no frame came")?
     }
 
     async fn write(&mut self, msg: &ClientMsg) -> anyhow::Result<()> {
@@ -249,7 +268,11 @@ impl RawClient {
         while let Ok(Some((base, rows, body))) =
             tokio::time::timeout_at(deadline, self.frames.recv()).await
         {
+            // As the client does: a frame on a base not held asks for a resync, and one that came
+            // late is kept as a base, as the server may diff against it. Frames come on streams
+            // of their own, so they can come out of order.
             let Some(base_screen) = self.screens.get(&base) else {
+                self.write(&ClientMsg::Resync).await?;
                 continue;
             };
             let Ok(frame) = decode_frame_body(
@@ -259,14 +282,10 @@ impl RawClient {
             ) else {
                 continue;
             };
-            if frame.num <= self.newest {
-                continue;
-            }
-            let base = base_screen;
-            let mut next = base.clone();
+            let mut next = base_screen.clone();
             next.apply(&frame.diff)?;
             self.screens.insert(frame.num, next);
-            self.newest = frame.num;
+            self.newest = self.newest.max(frame.num);
             self.echo_ack = self.echo_ack.max(frame.echo_ack);
             self.write(&ClientMsg::Ack { frame: frame.num }).await?;
         }
@@ -285,9 +304,12 @@ fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyho
         // The program sees the clamped size too, on its terminal.
         let program = ["sh", "-c", "read l; stty size; cat"];
         let (addr, shutdown, serve) = loopback_serve(secret.public(), &program).await?;
-        let mut client = RawClient::connect(addr, secret, true).await?;
+        let mut client = RawClient::connect(addr, secret).await?;
         client
-            .write(&ClientMsg::Resize(Size::new(65000, 1)))
+            .write(&ClientMsg::Resize {
+                n: 1,
+                size: Size::new(65000, 1),
+            })
             .await?;
         client.type_bytes(b"xy\r").await?;
         let clamped = clamp_dims(Size::new(65000, 1));
@@ -350,8 +372,8 @@ fn echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the
             shutdown.clone(),
         ));
         // Both connections share one client identity, so they land on ONE session.
-        let mut a = RawClient::connect(addr.clone(), secret.clone(), true).await?;
-        let mut b = RawClient::connect(addr, secret, true).await?;
+        let mut a = RawClient::connect(addr.clone(), secret.clone()).await?;
+        let mut b = RawClient::connect(addr, secret).await?;
         for _ in 0..30 {
             a.type_bytes(b"a").await?;
             a.pump(20).await?;
@@ -412,6 +434,7 @@ fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Resul
             &["sh", "-c", script, "sh", path],
             1,
             Duration::from_secs(30),
+            |_| true,
         )?;
         let a = peer()?;
         let (mut c1, kind) = reg.attach(a).await.context("first attach")?;
@@ -453,7 +476,7 @@ fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Resul
 #[test]
 fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Result<()> {
     koh_testkit::multi_thread(4)?.block_on(async {
-        let reg = registry(&["true"], 4, Duration::from_secs(30))?;
+        let reg = registry(&["true"], 4, Duration::from_secs(30), |_| true)?;
         let a = peer()?;
         let mut client = reg.attach(a).await.context("first attach")?.0;
         // An acknowledgement the reconnect overtook ends the session it reattached to, once the
@@ -495,33 +518,108 @@ fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Resu
     })
 }
 
-/// A session whose program exited, left before any client had its final screen, is kept for the
-/// TTL and then reaped: the next attach starts a new one.
+/// A program that never reads its input holds up no resize: the client's input stream stalls
+/// behind typing it has not taken, its control stream does not.
 #[test]
-fn an_exited_session_no_client_saw_end_is_reaped_after_the_ttl() -> anyhow::Result<()> {
-    koh_testkit::current_thread()?.block_on(async {
-        let reg = registry(&["true"], 4, Duration::from_millis(200))?;
-        let a = peer()?;
-        let (mut client, _) = reg.attach(a).await.context("attach")?;
-        await_exit(&mut client).await?;
-        drop(client);
-        // Past the TTL, by time: polling would attach, and an attach restarts it.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let kind = attach_kind(&reg, a).await;
-        reg.shutdown().await;
-        anyhow::ensure!(kind == Some(AttachKind::Created), "{kind:?}");
+fn a_resize_waits_for_no_typing_the_program_has_not_read() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let secret = generate_secret_key()?;
+        let (addr, shutdown, serve) = loopback_serve(
+            secret.public(),
+            &["sh", "-c", "stty raw -echo; exec sleep 30"],
+        )
+        .await?;
+        let mut client = RawClient::connect(addr, secret).await?;
+        // Far more than the PTY's writer, the session and the connection take, on the input
+        // stream, by a task of its own: its writes stall once the server stops reading it. That is
+        // the client's first stream, which the server already reads; the control stream, with
+        // the resize, is its second.
+        let control = client.conn.open_uni().await?;
+        control.set_priority(1)?;
+        let mut input = std::mem::replace(&mut client.send, control);
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let typing = koh_testkit::spawn({
+            let written = std::sync::Arc::clone(&written);
+            async move {
+                // Pastes fill the PTY's writer, so the session takes no more input; keys, each with
+                // colours so that none merges with the one before, fill its queue and what the
+                // connection holds for it; then more pastes than QUIC lets wait unread.
+                for seq in 1..=1010 {
+                    let event = if (3..=1000).contains(&seq) {
+                        koh::events::InputEvent::Paste("k".to_owned())
+                    } else {
+                        koh::events::InputEvent::Paste("x".repeat(1000 * 1024))
+                    };
+                    let mut bytes = encode_client(&ClientMsg::Keys {
+                        seq: InputSeq(seq),
+                        events: vec![event],
+                    })?;
+                    bytes.extend(encode_client(&ClientMsg::Colours(
+                        koh::events::WireColours::default(),
+                    ))?);
+                    for chunk in bytes.chunks(16 * 1024) {
+                        if input.write_all(chunk).await.is_err() {
+                            return anyhow::Ok(());
+                        }
+                        written.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                anyhow::Ok(())
+            }
+        });
+        // The resize goes once the input stream has stalled, its writes held up with more to go:
+        // the server no longer reads it.
+        let mut seen = usize::MAX;
+        loop {
+            client.pump(200).await?;
+            let now = written.load(std::sync::atomic::Ordering::Relaxed);
+            anyhow::ensure!(!typing.is_finished(), "the input stream never stalled");
+            if now == seen {
+                break;
+            }
+            seen = now;
+        }
+        let size = Size::new(30, 100);
+        client.write(&ClientMsg::Resize { n: 1, size }).await?;
+        let resized = |c: &RawClient| c.screen().is_some_and(|s| s.size() == size);
+        for _ in 0..50 {
+            client.pump(100).await?;
+            if resized(&client) {
+                break;
+            }
+        }
+        let shown = resized(&client);
+        typing.abort();
+        client.conn.close(0u32.into(), b"done");
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
+        anyhow::ensure!(
+            shown,
+            "the resize waited behind typing the program never read"
+        );
         Ok(())
     })
 }
 
-/// A peer removed from the allowlist has its session ended, its program hung up.
+/// A peer removed from the allowlist has its session ended, its program hung up, and starts no
+/// other: an attach the registry takes once the list no longer allows it is refused, even one on its
+/// way as the peer was removed. Allowed again, it gets a new session.
 #[test]
 fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30))?;
+        let allowed = std::sync::Arc::new(AtomicBool::new(true));
+        let allows = std::sync::Arc::clone(&allowed);
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30), move |_| {
+            allows.load(Relaxed)
+        })?;
         let a = peer()?;
         let (mut client, _) = reg.attach(a).await.context("attach")?;
+        allowed.store(false, Relaxed);
+        let refused = reg.attach(a).await.err();
+        anyhow::ensure!(refused == Some(Close::NotAuthorized), "{refused:?}");
         reg.end(a).await;
+        allowed.store(true, Relaxed);
         tokio::time::timeout(Duration::from_secs(5), async {
             while client.next_screen().await.is_some() {}
         })
@@ -534,26 +632,56 @@ fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
     })
 }
 
-/// More detaches than the session's control queue holds, at once, must all count: after the TTL
-/// the session is reaped and the next attach creates a new one.
+/// A program that prints its prompt and then turns echo off, as PAM does, in the same moment, is
+/// never told with its prompt and echo on: the client would trust that echo and show what is typed
+/// at the prompt.
 #[test]
-fn a_burst_of_detaches_larger_than_the_control_queue_still_starts_the_ttl() -> anyhow::Result<()> {
-    koh_testkit::current_thread()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_millis(200))?;
-        let p = peer()?;
-        let mut clients = Vec::new();
-        for _ in 0..20 {
-            clients.push(reg.attach(p).await.context("attach")?.0);
+fn a_prompt_printed_before_echo_goes_off_is_never_told_with_echo_on() -> anyhow::Result<()> {
+    // How long the server waits after output that is no echo before it sends it, with the PTY's
+    // modes read again (`TTY_SETTLE`): a program that takes longer to turn echo off after its
+    // prompt (a loaded machine can stall it) is past the promise.
+    const SETTLE: Duration = Duration::from_millis(10);
+    runtime()?.block_on(async {
+        let program = [
+            "perl",
+            "-e",
+            // A fifth of a millisecond between the prompt and echo going off, then how long that
+            // took in all, which the test reads.
+            "use POSIX; use Time::HiRes qw(time); $| = 1; my $t0 = time; print 'pw: '; \
+             select(undef, undef, undef, 0.0002); my $t = POSIX::Termios->new; $t->getattr(0); \
+             $t->setlflag($t->getlflag & ~POSIX::ECHO()); $t->setattr(0, POSIX::TCSANOW()); \
+             printf(\"took %d us\\r\\n\", (time - $t0) * 1e6); sleep 30",
+        ];
+        for round in 0..20 {
+            let reg = registry(&program, 1, Duration::from_secs(30), |_| true)?;
+            let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
+            let told = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut prompted = None;
+                while let Some(screen) = client.next_screen().await {
+                    let shown = screen.screen().contents();
+                    if shown.contains("pw:") {
+                        prompted = prompted.or_else(|| screen.tty());
+                    }
+                    let took = shown.split("took ").nth(1).and_then(|rest| {
+                        rest.split(" us")
+                            .next()
+                            .and_then(|us| us.parse::<u64>().ok())
+                    });
+                    if let (Some(tty), Some(took)) = (prompted, took) {
+                        return Some((tty, Duration::from_micros(took)));
+                    }
+                }
+                None
+            })
+            .await;
+            drop(client);
+            reg.shutdown().await;
+            let (tty, took) = told.ok().flatten().context("the prompt never came")?;
+            anyhow::ensure!(
+                !tty.echo || took >= SETTLE,
+                "round {round}: the prompt was told with echo on, {took:?} before it went off"
+            );
         }
-        drop(clients);
-        // Past the TTL, by time: polling would attach, and a detach restarts it.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let kind = attach_kind(&reg, p).await;
-        reg.shutdown().await;
-        anyhow::ensure!(
-            kind == Some(AttachKind::Created),
-            "every client left 1.3 s past a 200 ms TTL, so the session is reaped; got {kind:?}"
-        );
         Ok(())
     })
 }
@@ -562,7 +690,7 @@ fn a_burst_of_detaches_larger_than_the_control_queue_still_starts_the_ttl() -> a
 #[test]
 fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30))?;
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30), |_| true)?;
         let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
         tokio::time::timeout(Duration::from_secs(5), reg.shutdown())
             .await
@@ -590,7 +718,7 @@ fn a_session_ends_when_its_program_does_whatever_holds_its_terminal() -> anyhow:
         let closed = cfg!(any(target_os = "linux", target_os = "android"))
             .then_some(("exec </dev/null >/dev/null 2>&1; sleep 3600", 129));
         for (script, code) in std::iter::once(("sleep 3600 & exit 7", 7)).chain(closed) {
-            let reg = registry(&["sh", "-c", script], 4, Duration::from_secs(30))?;
+            let reg = registry(&["sh", "-c", script], 4, Duration::from_secs(30), |_| true)?;
             let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
             await_exit(&mut client).await.context(script)?;
             anyhow::ensure!(
@@ -627,7 +755,7 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
         // `true` has exited by the time the connection's loop first looks.
         let secret = generate_secret_key()?;
         let (addr, shutdown, serve) = loopback_serve(secret.public(), &["true"]).await?;
-        let mut raw = RawClient::connect(addr, secret, true).await?;
+        let mut raw = RawClient::connect(addr, secret).await?;
         let mut close = None;
         for _ in 0..30 {
             // An ack written as the server closes fails: the close is what is looked for.
@@ -649,7 +777,7 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
 }
 
 /// A program that cannot start is not reported as the server being full, nor as a refusal for
-/// good: no admission comes, and the connection is closed saying the session could not start.
+/// good: no frame comes, and the connection is closed saying the session could not start.
 #[test]
 fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
     runtime()?.block_on(async {
@@ -683,6 +811,107 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
             error.downcast_ref::<Close>() == Some(&Close::CouldNotStart),
             "{error:#}"
         );
+        Ok(())
+    })
+}
+
+/// A UDP relay on loopback to `server`, from a socket of its own: each datagram waits `delay` (the
+/// link's latency, which is what is tested), and the server's are dropped unless `answers`, so a
+/// handshake through it stalls. Its address.
+async fn relay(
+    server: std::net::SocketAddr,
+    delay: Duration,
+    answers: bool,
+) -> std::io::Result<std::net::SocketAddr> {
+    use std::sync::{Arc, OnceLock};
+    let bind = || tokio::net::UdpSocket::bind("127.0.0.1:0");
+    let (near, far) = (Arc::new(bind().await?), Arc::new(bind().await?));
+    let (at, client) = (near.local_addr()?, Arc::new(OnceLock::new()));
+    for (from, out, outward) in [
+        (Arc::clone(&near), Arc::clone(&far), true),
+        (far, near, false),
+    ] {
+        let client = Arc::clone(&client);
+        koh_testkit::spawn(async move {
+            let mut buf = vec![0; 65_536];
+            while let Ok((n, sender)) = from.recv_from(&mut buf).await {
+                let to = if outward {
+                    let _ = client.set(sender);
+                    Some(server)
+                } else {
+                    client.get().copied().filter(|_| answers)
+                };
+                let (out, bytes) = (Arc::clone(&out), buf.get(..n).unwrap_or_default().to_vec());
+                koh_testkit::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Some(to) = to {
+                        let _ = out.send_to(&bytes, to).await;
+                    }
+                });
+            }
+        });
+    }
+    Ok(at)
+}
+
+/// A flood of handshakes that never finish, from the allowed client's own address, takes neither
+/// the one connection a server allows (`--max-connections 1`) nor the room for the client's own
+/// handshake, which takes several round trips of 100 ms: the flood is asked to show it gets the
+/// server's answers (a QUIC retry), and it never does, as a spoofed address could not.
+#[test]
+fn an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes() -> anyhow::Result<()>
+{
+    koh_testkit::multi_thread(3)?.block_on(async {
+        let good = generate_secret_key()?;
+        let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
+        let addr = loopback_addr(&server_ep);
+        let config = ServeConfig {
+            allow: vec![good.public()],
+            command: vec!["sleep".to_owned(), "30".to_owned()],
+            launcher: launcher(),
+            max_connections: std::num::NonZeroU32::MIN,
+            ..ServeConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let serving = koh_testkit::spawn(serve_endpoint(
+            server_ep,
+            Hosting::from_config(&config)?,
+            shutdown.clone(),
+        ));
+        let server = *addr.ip_addrs().next().context("a loopback address")?;
+        let at = move |relayed| koh::transport_iroh::direct_addr(addr.id, relayed);
+        let stalled = bind_endpoint_local(generate_secret_key()?, false).await?;
+        let black_hole = at(relay(server, Duration::ZERO, false).await?);
+        // Some 200 dials a second, each stalled: the flood's rate, which is what is tested.
+        let flood = || {
+            let (stalled, black_hole) = (stalled.clone(), black_hole.clone());
+            async move {
+                for _ in 0..10_000 {
+                    let (endpoint, to) = (stalled.clone(), black_hole.clone());
+                    koh_testkit::spawn(async move { endpoint.connect(to, ALPN).await });
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        // Under way before the client dials, and while it does.
+        let _ = tokio::time::timeout(Duration::from_millis(500), flood()).await;
+        let flood = koh_testkit::spawn(flood());
+        let near = bind_endpoint_local(good, false).await?;
+        let far = at(relay(server, Duration::from_millis(50), true).await?);
+        let admitted = tokio::time::timeout(Duration::from_secs(20), async {
+            for _ in 0..3 {
+                // Its first frame admits it.
+                if let Ok(conn) = near.connect(far.clone(), ALPN).await {
+                    return conn.accept_uni().await.is_ok();
+                }
+            }
+            false
+        });
+        let admitted = admitted.await;
+        flood.abort();
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+        anyhow::ensure!(admitted == Ok(true), "the allowed client never got in");
         Ok(())
     })
 }

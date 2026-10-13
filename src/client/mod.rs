@@ -23,10 +23,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::log::Peer;
 use crate::predict::Overlay;
-use crate::proto::{decode_server, encode_client, Close, ServerMsg, MAX_FRAME};
+use crate::proto::{decode_server, encode_client, ClientMsg, Close, ServerMsg, Stream, MAX_FRAME};
 use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::{closed_because, ALPN, PROTOCOL};
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, RecvStream};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -60,12 +60,7 @@ const MIN_CONNECTION_DWELL: Duration = Duration::from_secs(5);
 /// costs only a brief banner, so the threshold is low.
 const STALE_AFTER_FREEZE: Duration = Duration::from_secs(20);
 
-/// Whether a wall-clock gap between loop iterations means the process was frozen.
-fn looks_like_resume_from_freeze(wall_gap: Duration) -> bool {
-    wall_gap >= STALE_AFTER_FREEZE
-}
-
-/// Dials the server and awaits its admission ack: the first connection and every reconnect, which
+/// Dials the server and awaits its first frame, which admits the client: the first connection and every reconnect, which
 /// reattaches to the same server session.
 pub struct IrohConnector {
     endpoint: Endpoint,
@@ -78,26 +73,30 @@ impl IrohConnector {
         Self { endpoint, target }
     }
 
-    /// Connect and await the admission ack, which the server sends once the client has a session.
+    /// Connect and await the stream of the first frame, which the server sends once the client has a
+    /// session.
     /// A server that will not have us for good closes the connection instead, a [`Refused`]
     /// error, so the client fails fast rather than redialing forever; one that cannot have us now
     /// (at capacity, say) closes it saying so, an error that is its [`Close`].
-    pub async fn connect(&self) -> anyhow::Result<Connection> {
+    pub async fn connect(&self) -> anyhow::Result<Admitted> {
         let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
             Ok(conn) => conn,
             Err(e) if refused_our_alpn(&e) => return Err(Refused::OtherProtocol.into()),
             Err(e) => anyhow::bail!("connecting to server: {}", Peer(e)),
         };
-        if let Err(e) = crate::transport_iroh::admission::await_admission(&conn).await {
-            return Err(match closed_because(&conn) {
+        match conn.accept_uni().await {
+            Ok(first) => Ok(Admitted(conn, first)),
+            Err(e) => Err(match closed_because(&conn) {
                 Some(Close::NotAuthorized) => Refused::NotAuthorized.into(),
                 Some(why) => why.into(),
                 None => anyhow::anyhow!("server did not admit the connection: {}", Peer(e)),
-            });
+            }),
         }
-        Ok(conn)
     }
 }
+
+/// A connection the server admitted, and the stream of its first frame, which said so.
+pub struct Admitted(pub Connection, RecvStream);
 
 /// The server refused us for good: redialing cannot help, so the client exits saying why.
 #[derive(Debug, thiserror::Error)]
@@ -295,15 +294,6 @@ impl<B: KohBackend> BackendTerminal<B> {
         self.painter.set_hyperlinks(on);
     }
 
-    /// Ask the user's terminal `queries` (written and flushed now).
-    pub(crate) fn ask(&mut self, queries: &[u8]) -> std::io::Result<()> {
-        if queries.is_empty() {
-            return Ok(());
-        }
-        self.backend.write_bytes(queries)?;
-        self.backend.flush()
-    }
-
     /// Turn off what [`turn_on`](Self::turn_on) turned on.
     fn turn_off(&mut self) -> std::io::Result<()> {
         let off = std::mem::take(&mut self.extras).off();
@@ -336,7 +326,11 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
     }
 
     fn ask(&mut self, questions: &[u8]) -> std::io::Result<()> {
-        Self::ask(self, questions)
+        if questions.is_empty() {
+            return Ok(());
+        }
+        self.backend.write_bytes(questions)?;
+        self.backend.flush()
     }
 
     fn found(&mut self, found: Found) -> std::io::Result<()> {
@@ -412,7 +406,7 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
               not shorten it"
 )]
 pub async fn run_client<T: ClientTerminal>(
-    initial: Connection,
+    initial: Admitted,
     dialed_at: SystemTime,
     connector: IrohConnector,
     initial_size: Size,
@@ -426,7 +420,7 @@ pub async fn run_client<T: ClientTerminal>(
     let mut session = ClientSession::new(term.size().unwrap_or(initial_size));
     session.ask_terminal(Instant::now(), colours);
     // `None` once the resize ticks end, so a closed channel is not polled again.
-    let mut resize_rx = Some(resize_rx);
+    let mut resizes = Resizes(Some(resize_rx));
     // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
     let mut attempt: u32 = 0;
     let mut net = Net::Up(Wire::open(initial));
@@ -443,7 +437,7 @@ pub async fn run_client<T: ClientTerminal>(
         let wall_gap = wall_now.duration_since(last_wall).unwrap_or(Duration::ZERO);
         last_wall = wall_now;
         let rtt = if let Net::Up(wire) = &net {
-            if looks_like_resume_from_freeze(wall_gap) {
+            if wall_gap >= STALE_AFTER_FREEZE {
                 tracing::info!(
                     frozen_secs = wall_gap.as_secs(),
                     "detected resume from a process freeze (suspend/screen-off); forcing a reconnect"
@@ -479,7 +473,9 @@ pub async fn run_client<T: ClientTerminal>(
                 term.prime(win);
                 if let Some(hook) = bell.as_mut() {
                     hook.prime(win.bell_count);
-                    hook.observe_and_fire(win.bell_count, win.title, now);
+                    if hook.observe(win.bell_count, now) {
+                        hook.fire(win.bell_count, win.title);
+                    }
                 }
             }
         }
@@ -498,8 +494,12 @@ pub async fn run_client<T: ClientTerminal>(
             tracing::debug!(error = %e, "could not ask the terminal");
         }
 
-        let (writer, frames, dialing) = match &mut net {
-            Net::Up(wire) => (Some(&wire.writer_tx), Some(&mut wire.frame_rx), None),
+        let (writers, frames, dialing) = match &mut net {
+            Net::Up(wire) => (
+                Some((&wire.input_tx, &wire.control_tx)),
+                Some(&mut wire.frame_rx),
+                None,
+            ),
             Net::Down(dial) => (None, None, Some(dial)),
         };
         let change = tokio::select! {
@@ -513,28 +513,16 @@ pub async fn run_client<T: ClientTerminal>(
                 session.on_timeout(Instant::now()).into()
             }
             () = shutdown.cancelled() => Some(Change::Quit),
-            permit = when(writer.map(mpsc::Sender::reserve)), if session.has_outgoing() => match permit.ok() {
-                // The writer ended: the stream, and so the connection, is gone.
-                None => Some(Change::Closed),
-                Some(permit) => {
-                    if let Some(msg) = session.pop_outgoing() {
-                        match encode_client(&msg) {
-                            Ok(bytes) => permit.send(bytes),
-                            Err(e) => tracing::warn!(error = %e, "dropping an unencodable message"),
-                        }
-                    }
-                    None
-                }
-            },
-            maybe = when(resize_rx.as_mut().map(mpsc::Receiver::recv)) => {
-                match maybe {
-                    Some(()) => {
-                        term.window_resized();
-                        if let Ok(size) = term.size() {
-                            session.on_resize(size);
-                        }
-                    }
-                    None => resize_rx = None,
+            permit = when(writers.map(|(input, _)| input.reserve())), if session.has_outgoing_on(Stream::Input) => {
+                send(permit.ok(), session.pop_outgoing_on(Stream::Input))
+            }
+            permit = when(writers.map(|(_, control)| control.reserve())), if session.has_outgoing_on(Stream::Control) => {
+                send(permit.ok(), session.pop_outgoing_on(Stream::Control))
+            }
+            () = resizes.next() => {
+                term.window_resized();
+                if let Ok(size) = term.size() {
+                    session.on_resize(size);
                 }
                 None
             }
@@ -574,7 +562,8 @@ pub async fn run_client<T: ClientTerminal>(
                 let Net::Up(wire) = &mut net else {
                     continue;
                 };
-                if session_ended(&wire.conn) {
+                // The server ended the session (its shell exited); else the link was lost.
+                if closed_because(&wire.conn) == Some(Close::SessionEnded) {
                     // What the reader still has was sent before the close: the last frame says
                     // how the program exited, whichever end noticed the close first.
                     let drained = async {
@@ -651,7 +640,7 @@ enum Net<'c> {
 type Dial<'c> = std::pin::Pin<Box<dyn std::future::Future<Output = Dialed> + Send + 'c>>;
 
 /// A redial's result: connected, refused, or timed out.
-type Dialed = Result<anyhow::Result<Connection>, tokio::time::error::Elapsed>;
+type Dialed = Result<anyhow::Result<Admitted>, tokio::time::error::Elapsed>;
 
 /// What one turn of [`run_client`]'s loop left for it to act on.
 enum Change {
@@ -678,34 +667,41 @@ impl From<InputOutcome> for Option<Change> {
 /// A live connection: its stream writer and frame reader, which end with it, and it with them.
 struct Wire {
     conn: Connection,
-    writer_tx: mpsc::Sender<Vec<u8>>,
+    /// The writers of the client's input and control streams.
+    input_tx: mpsc::Sender<Vec<u8>>,
+    control_tx: mpsc::Sender<Vec<u8>>,
     frame_rx: mpsc::Receiver<Received>,
-    _writer: AbortOnDropHandle<()>,
+    _writers: [AbortOnDropHandle<()>; 2],
     _reader: AbortOnDropHandle<()>,
     /// When the loop took the connection, for its dwell.
     started: Instant,
 }
 
 impl Wire {
-    /// Start the tasks opening and writing the client's stream and reading frames on `conn`. The
-    /// stream is opened by the writer, so a server that grants none holds up nothing else; one
-    /// that fails to open ends the writer, which loses the link.
-    fn open(conn: Connection) -> Self {
-        let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
+    /// Start the tasks opening and writing the client's input and control streams and reading
+    /// frames on `conn`. Each stream is opened by its writer, so a server that grants none holds
+    /// up nothing else; one that fails to open ends its writer, which loses the link.
+    fn open(Admitted(conn, first): Admitted) -> Self {
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
+        let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
         let (frame_tx, frame_rx) = mpsc::channel::<Received>(FRAME_QUEUE);
         #[expect(
             clippy::disallowed_methods,
-            reason = "a writer and a reader a connection"
+            reason = "two writers and a reader a connection"
         )]
-        let (writer, reader) = (
-            AbortOnDropHandle::new(tokio::spawn(write_client_stream(conn.clone(), writer_rx))),
-            AbortOnDropHandle::new(tokio::spawn(read_frames(conn.clone(), frame_tx))),
+        let (writers, reader) = (
+            [(input_rx, 0), (control_rx, 1)].map(|(rx, priority)| {
+                let writer = write_client_stream(conn.clone(), rx, priority);
+                AbortOnDropHandle::new(tokio::spawn(writer))
+            }),
+            AbortOnDropHandle::new(tokio::spawn(read_frames(conn.clone(), first, frame_tx))),
         );
         Self {
             conn,
-            writer_tx,
+            input_tx,
+            control_tx,
             frame_rx,
-            _writer: writer,
+            _writers: writers,
             _reader: reader,
             started: Instant::now(),
         }
@@ -759,12 +755,44 @@ const WRITER_QUEUE: usize = 64;
 /// How many decoded frames may wait for the connection loop.
 const FRAME_QUEUE: usize = 16;
 
-/// Open the client's stream on `conn` and write queued messages to it, until the queue or the
-/// stream closes.
-async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>>) {
+/// The window's resize ticks. [`next`](Self::next) waits for one, and for ever once the channel
+/// closed: a closed channel cannot spin the loop.
+struct Resizes(Option<mpsc::Receiver<()>>);
+
+impl Resizes {
+    async fn next(&mut self) {
+        while let Some(rx) = self.0.as_mut() {
+            if rx.recv().await.is_some() {
+                return;
+            }
+            self.0 = None;
+        }
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Send `msg` with `permit`, a writer's room; a writer that ended (`None`) lost the connection.
+fn send(permit: Option<mpsc::Permit<'_, Vec<u8>>>, msg: Option<ClientMsg>) -> Option<Change> {
+    let Some(permit) = permit else {
+        return Some(Change::Closed);
+    };
+    match msg.map(|msg| encode_client(&msg)) {
+        Some(Ok(bytes)) => permit.send(bytes),
+        Some(Err(e)) => tracing::warn!(error = %e, "dropping an unencodable message"),
+        None => {}
+    }
+    None
+}
+
+/// Open one of the client's streams on `conn`, at `priority`, and write queued messages to it,
+/// until the queue or the stream closes.
+async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>>, priority: i32) {
     let Ok(mut send) = conn.open_uni().await else {
         return;
     };
+    // The control stream's bytes go before input's: a resize or an acknowledgement does not wait
+    // behind a paste QUIC is still sending.
+    let _ = send.set_priority(priority);
     while let Some(bytes) = queue.recv().await {
         if send.write_all(&bytes).await.is_err() {
             return;
@@ -779,8 +807,9 @@ const SMALL_STREAM: usize = 256 * 1024;
 /// Most large server streams read, or waiting for the loop, at once.
 ///
 /// With the small ones, the client holds at most about `LARGE_STREAMS` of [`MAX_FRAME`] and
-/// [`FRAME_QUEUE`] of twice [`SMALL_STREAM`] of the server's streams: some 40 MiB, not 16 of the
-/// largest. A large stream waits for its turn holding at most two chunks, and one that has its
+/// [`FRAME_QUEUE`] of twice [`SMALL_STREAM`] of the server's streams, as they came: some 40 MiB,
+/// not 16 of the largest. The loop inflates them one at a time (a frame to at most [`MAX_FRAME`],
+/// history rows to at most [`MAX_HISTORY_REPLY`](crate::terminal::MAX_HISTORY_REPLY)). A large stream waits for its turn holding at most two chunks, and one that has its
 /// turn waits on nothing but its own bytes, so the turns cannot deadlock.
 const LARGE_STREAMS: usize = 2;
 
@@ -791,20 +820,25 @@ struct Received {
     _large: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-/// Accept the server's streams (frames, and history rows), each read on its own task so a stalled or
+/// Accept the server's streams (frames, and history rows), after `first`, each read on its own task so a stalled or
 /// reset stream never holds up a newer frame. Ends when the connection closes.
 ///
 /// At most [`FRAME_QUEUE`] streams are read or wait to be applied at once, together: a reader
 /// takes its slot in `frames` before it reads. Past them, no stream is accepted, so QUIC's stream
 /// limit stops the server opening more; and of them, at most [`LARGE_STREAMS`] are large.
-async fn read_frames(conn: Connection, frames: mpsc::Sender<Received>) {
+async fn read_frames(conn: Connection, first: RecvStream, frames: mpsc::Sender<Received>) {
     let large = std::sync::Arc::new(tokio::sync::Semaphore::new(LARGE_STREAMS));
+    let mut first = Some(first);
     loop {
         let Ok(slot) = frames.clone().reserve_owned().await else {
             return;
         };
-        let Ok(mut recv) = conn.accept_uni().await else {
-            return;
+        let mut recv = match first.take() {
+            Some(recv) => recv,
+            None => match conn.accept_uni().await {
+                Ok(recv) => recv,
+                Err(_) => return,
+            },
         };
         let large = std::sync::Arc::clone(&large);
         #[expect(
@@ -832,12 +866,6 @@ async fn read_frames(conn: Connection, frames: mpsc::Sender<Received>) {
     }
 }
 
-/// Whether the closed `conn` was the server ending the session (its shell exited), not the link
-/// being lost.
-fn session_ended(conn: &Connection) -> bool {
-    closed_because(conn) == Some(Close::SessionEnded)
-}
-
 /// Paint the "session ended" banner and linger briefly so it is seen.
 async fn end_session<T: ClientTerminal>(
     term: &mut T,
@@ -856,9 +884,14 @@ async fn end_session<T: ClientTerminal>(
 }
 
 #[cfg(test)]
-#[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {
     use super::*;
+
+    /// What a server sends to admit the client: a first stream, here an empty one.
+    async fn admit(conn: &Connection) -> anyhow::Result<()> {
+        conn.open_uni().await?.finish()?;
+        Ok(())
+    }
 
     /// A server that will not have the client for good (another protocol, or not authorized) is
     /// a [`Refused`]; one that cannot have it now closes saying why, and is redialed.
@@ -877,7 +910,7 @@ mod tests {
                 .await
                 .unwrap();
             let addr = loopback_addr(&old);
-            let accept = tokio::spawn(async move {
+            let accept = koh_testkit::spawn(async move {
                 if let Some(incoming) = old.accept().await {
                     let _ = incoming.await;
                 }
@@ -925,17 +958,10 @@ mod tests {
 
     #[test]
     fn reconnect_backoff_grows_then_caps() {
-        // 1-based attempts: 1s, 2s, 4s, 8s, then capped at 8s — never below base, never above max.
-        assert_eq!(backoff(1), Duration::from_secs(1));
-        assert_eq!(backoff(2), Duration::from_secs(2));
-        assert_eq!(backoff(3), Duration::from_secs(4));
-        assert_eq!(backoff(4), RECONNECT_BACKOFF_MAX);
-        assert_eq!(backoff(5), RECONNECT_BACKOFF_MAX);
-        assert_eq!(
-            backoff(99),
-            RECONNECT_BACKOFF_MAX,
-            "shift is clamped, no overflow"
-        );
+        // 1-based attempts: 1s, 2s, 4s, 8s, then capped at 8s; the shift is clamped, no overflow.
+        for (attempt, secs) in [(1, 1), (2, 2), (3, 4), (4, 8), (5, 8), (99, 8)] {
+            assert_eq!(backoff(attempt), Duration::from_secs(secs), "{attempt}");
+        }
     }
 
     #[test]
@@ -962,21 +988,6 @@ mod tests {
         );
         // Saturates rather than overflowing under a sustained flapping server.
         assert_eq!(next_attempt_after_drop(u32::MAX, Duration::ZERO), u32::MAX);
-    }
-
-    #[test]
-    fn freeze_detection_fires_only_on_a_real_suspend_gap() {
-        // A normal loop cadence (the steady loop polls at least every ~50ms) must never look like a
-        // freeze, so an active session is never needlessly torn down...
-        assert!(!looks_like_resume_from_freeze(Duration::from_millis(0)));
-        assert!(!looks_like_resume_from_freeze(Duration::from_millis(50)));
-        assert!(!looks_like_resume_from_freeze(Duration::from_secs(5)));
-        // ...a sub-threshold glance still rides out on the existing connection...
-        assert_eq!(STALE_AFTER_FREEZE, Duration::from_secs(20));
-        assert!(!looks_like_resume_from_freeze(Duration::from_secs(19)));
-        // ...but a multi-second-to-minutes suspend (phone screen-off) forces a proactive reconnect.
-        assert!(looks_like_resume_from_freeze(STALE_AFTER_FREEZE));
-        assert!(looks_like_resume_from_freeze(Duration::from_secs(300)));
     }
 
     /// What the client turns on in the user's terminal it turns off again, popping its push: on
@@ -1034,9 +1045,7 @@ mod tests {
     /// the client's, and the quit escape ends it at once.
     #[test]
     fn a_server_granting_no_streams_cannot_block_quit() {
-        use crate::transport_iroh::{
-            admission, bind_endpoint_local, generate_secret_key, loopback_addr,
-        };
+        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
         use iroh::endpoint::{QuicTransportConfig, VarInt};
         let key = || generate_secret_key().expect("OS randomness");
         crate::test_runtime::current_thread().block_on(async {
@@ -1052,10 +1061,10 @@ mod tests {
                 .await
                 .expect("bind the server");
             let addr = loopback_addr(&server);
-            let accept = tokio::spawn(async move {
+            let accept = koh_testkit::spawn(async move {
                 if let Some(incoming) = server.accept().await {
                     if let Ok(conn) = incoming.await {
-                        if admission::admit(&conn).await.is_ok() {
+                        if admit(&conn).await.is_ok() {
                             conn.closed().await;
                         }
                     }
@@ -1069,7 +1078,7 @@ mod tests {
             let conn = connector.connect().await.expect("admitted");
             let (input, input_rx) = mpsc::channel(8);
             let (_resize, resize_rx) = mpsc::channel(1);
-            let run = tokio::spawn(run_client(
+            let run = koh_testkit::spawn(run_client(
                 conn,
                 SystemTime::now(),
                 connector,
@@ -1095,21 +1104,21 @@ mod tests {
     }
 
     /// A real server, admitting the one client, that runs `serve` on the connection.
-    async fn loopback<F, Fut>(serve: F) -> (Connection, IrohConnector)
+    async fn loopback<F, Fut>(serve: F) -> (Admitted, IrohConnector)
     where
         F: FnOnce(Connection) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        use crate::transport_iroh::{admission, bind_endpoint_local, generate_secret_key};
+        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key};
         let key = || generate_secret_key().expect("OS randomness");
         let server = bind_endpoint_local(key(), true)
             .await
             .expect("bind the server");
         let addr = crate::transport_iroh::loopback_addr(&server);
-        tokio::spawn(async move {
+        koh_testkit::spawn(async move {
             if let Some(incoming) = server.accept().await {
                 if let Ok(conn) = incoming.await {
-                    if admission::admit(&conn).await.is_ok() {
+                    if admit(&conn).await.is_ok() {
                         serve(conn.clone()).await;
                         conn.closed().await;
                     }
@@ -1130,7 +1139,7 @@ mod tests {
         // a dropped stream would leave readers holding every slot, and the reply after them would
         // never come.
         crate::test_runtime::current_thread().block_on(async {
-            let (conn, _connector) = loopback(|conn| async move {
+            let (Admitted(conn, first), _connector) = loopback(|conn| async move {
                 for _ in 0..20 {
                     let mut send = conn.open_uni().await.expect("a stream");
                     send.write_all(&vec![0xff; 1 << 20]).await.expect("written");
@@ -1149,49 +1158,28 @@ mod tests {
             })
             .await;
             let (tx, mut rx) = mpsc::channel(FRAME_QUEUE);
-            tokio::spawn(read_frames(conn, tx));
+            koh_testkit::spawn(read_frames(conn, first, tx));
             let got = tokio::time::timeout(Duration::from_secs(20), rx.recv())
                 .await
                 .expect("the reply after the large streams never came")
                 .expect("the reader ended");
-            assert!(matches!(got.msg, ServerMsg::History(ref reply) if reply.id == 7));
+            assert!(matches!(got.msg, ServerMsg::History(ref body) if crate::proto::decode_history(body).is_ok_and(|reply| reply.id == 7)));
         });
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn a_closed_resize_channel_does_not_spin_the_loop() {
-        /// This thread's CPU time so far, in clock ticks: the loop runs on it (one-thread runtime).
-        fn cpu_ticks() -> u64 {
-            let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("stat");
-            let fields: Vec<&str> = stat.rsplit(") ").next().unwrap().split(' ').collect();
-            fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
-        }
+    fn a_closed_resize_channel_is_waited_on_for_ever_not_taken() {
         crate::test_runtime::current_thread().block_on(async {
-            let (conn, connector) = loopback(|_| async {}).await;
-            let (input, input_rx) = mpsc::channel(8);
             let (resize, resize_rx) = mpsc::channel(1);
+            let mut resizes = Resizes(Some(resize_rx));
+            resize.send(()).await.expect("sent");
+            let wait = Duration::from_millis(50);
+            let taken = tokio::time::timeout(wait, resizes.next()).await;
+            assert!(taken.is_ok(), "a tick is taken");
             drop(resize);
-            let run = tokio::spawn(run_client(
-                conn,
-                SystemTime::now(),
-                connector,
-                Size::new(24, 80),
-                false,
-                input_rx,
-                resize_rx,
-                Blind,
-                CancellationToken::new(),
-                None,
-            ));
-            let before = cpu_ticks();
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let used = cpu_ticks() - before;
-            input.send(vec![ESCAPE_PREFIX, b'.']).await.expect("typed");
-            let quit = tokio::time::timeout(Duration::from_secs(5), run).await;
-            assert!(matches!(quit, Ok(Ok(Ok(None)))), "{quit:?}");
-            // A spinning loop takes the whole second (100 ticks); an idle one a few.
-            assert!(used < 30, "the loop spun: {used} ticks of CPU in a second");
+            let taken = tokio::time::timeout(wait, resizes.next()).await;
+            assert!(taken.is_err(), "closed, it is waited on for ever");
+            assert!(resizes.0.is_none(), "and never polled again");
         });
     }
 }

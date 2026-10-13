@@ -77,8 +77,6 @@ struct State {
     /// Everything sent before this instant is dropped.
     outage_until: Option<Instant>,
     inboxes: HashMap<EndpointId, mpsc::Sender<Packet>>,
-    /// Everything sent towards each endpoint, before faults.
-    sent: HashMap<EndpointId, Count>,
     /// Everything the link let through to each endpoint (duplicates counted twice).
     delivered: HashMap<EndpointId, Count>,
     /// When the link towards each endpoint is next free, when `rate` limits it.
@@ -99,7 +97,6 @@ impl FaultNet {
                 rng: koh_testkit::Rng(seed),
                 outage_until: None,
                 inboxes: HashMap::new(),
-                sent: HashMap::new(),
                 delivered: HashMap::new(),
                 busy_until: HashMap::new(),
             })),
@@ -114,11 +111,6 @@ impl FaultNet {
     /// Drop every packet sent during the next `duration`.
     pub fn black_hole(&self, duration: Duration) {
         self.lock().outage_until = Instant::now().checked_add(duration);
-    }
-
-    /// What has been sent towards `id` so far, before faults.
-    pub fn sent(&self, id: EndpointId) -> Count {
-        self.lock().sent.get(&id).copied().unwrap_or_default()
     }
 
     /// What the link has let through to `id` so far.
@@ -160,7 +152,6 @@ impl FaultNet {
             .get(&to)
             .cloned()
             .ok_or_else(|| io::Error::other("no such endpoint on the fault link"))?;
-        state.sent.entry(to).or_default().add(data.len());
         let now = Instant::now();
         if state.outage_until.is_some_and(|until| now < until) {
             return Ok(());

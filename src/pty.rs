@@ -114,16 +114,15 @@ pub(crate) fn is_koh_env_key(key: &std::ffi::OsStr) -> bool {
 /// The session shell when the caller didn't pass `--shell`: `shell_env` (`$SHELL`) if set, else
 /// `/bin/sh`, which does **not** exist on Android, where it is `/system/bin/sh`.
 fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
-    if let Some(sh) = shell_env {
-        if !sh.is_empty() {
-            return sh.to_string_lossy().into_owned();
-        }
-    }
-    if cfg!(target_os = "android") {
-        "/system/bin/sh".to_string()
+    let platform = if cfg!(target_os = "android") {
+        "/system/bin/sh"
     } else {
-        "/bin/sh".to_string()
-    }
+        "/bin/sh"
+    };
+    shell_env.filter(|sh| !sh.is_empty()).map_or_else(
+        || platform.to_owned(),
+        |sh| sh.to_string_lossy().into_owned(),
+    )
 }
 
 /// What failed in a PTY: allocation, the spawn, the pump threads, or a resize.
@@ -152,9 +151,18 @@ pub const LAUNCH: &str = fuxix::pty::LAUNCH;
 /// The binary [`Pty::spawn`] runs as the launcher.
 ///
 /// The default is the running binary, which must hand a [`LAUNCH`] invocation to [`launched`], as
-/// the `koh` binary does. Tests run a test harness, so they name the `koh` binary explicitly.
+/// the `koh` binary does. Tests run a test harness, so they name the `koh` binary, and with it a
+/// home of their own ([`isolated`](Self::isolated)): a shell a test hosts never reads or writes the
+/// user's files.
 #[derive(Clone, Debug, Default)]
-pub struct Launcher(Option<PathBuf>);
+pub struct Launcher(Option<Isolated>);
+
+/// A launcher binary other than the running one, and the home the programs it launches get.
+#[derive(Clone, Debug)]
+struct Isolated {
+    binary: PathBuf,
+    home: PathBuf,
+}
 
 impl Launcher {
     /// The running binary.
@@ -162,20 +170,34 @@ impl Launcher {
         Self(None)
     }
 
-    /// The binary at `path`.
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self(Some(path.into()))
+    /// The binary at `binary`, launching programs with `home` as their home, no history file, no
+    /// `ENV` script and a plain prompt.
+    pub fn isolated(binary: impl Into<PathBuf>, home: impl Into<PathBuf>) -> Self {
+        Self(Some(Isolated {
+            binary: binary.into(),
+            home: home.into(),
+        }))
     }
 
     /// The file to run. On Linux and Android the running binary is its image, even once its file
     /// is replaced (an upgrade) or removed.
     fn program(&self) -> io::Result<PathBuf> {
         match &self.0 {
-            Some(path) => Ok(path.clone()),
+            Some(isolated) => Ok(isolated.binary.clone()),
             None if cfg!(any(target_os = "linux", target_os = "android")) => {
                 Ok(PathBuf::from("/proc/self/exe"))
             }
             None => std::env::current_exe(),
+        }
+    }
+
+    /// Give `cmd` the isolated home, if this launcher has one.
+    fn isolate(&self, cmd: &mut Command) {
+        if let Some(Isolated { home, .. }) = &self.0 {
+            cmd.env("HOME", home)
+                .env("HISTFILE", "/dev/null")
+                .env("ENV", "")
+                .env("PS1", "$ ");
         }
     }
 }
@@ -337,24 +359,22 @@ impl Reaper {
         std::thread::Builder::new()
             .name("koh-child-reaper".into())
             .spawn(move || {
+                use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
+                const POLL: Duration = Duration::from_millis(20);
                 let mut children: Vec<Stopping> = Vec::new();
                 let mut drains: Vec<Sender<()>> = Vec::new();
-                let mut open = true;
-                while open || !children.is_empty() {
-                    let received = if !open {
-                        std::thread::sleep(Duration::from_millis(20));
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    } else if children.is_empty() {
-                        rx.recv()
-                            .map_err(|_closed| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                loop {
+                    let received = if children.is_empty() {
+                        rx.recv().map_err(|_closed| Disconnected)
                     } else {
-                        rx.recv_timeout(Duration::from_millis(20))
+                        rx.recv_timeout(POLL)
                     };
                     match received {
                         Ok(Reap::Child(child)) => children.push(child),
                         Ok(Reap::Drain(done)) => drains.push(done),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => open = false,
+                        Err(Timeout) => {}
+                        Err(Disconnected) if children.is_empty() => return,
+                        Err(Disconnected) => std::thread::sleep(POLL),
                     }
                     children.retain_mut(|child| !child.reaped());
                     if children.is_empty() {
@@ -406,7 +426,7 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Allocate a `rows`×`cols` PTY and start `command` (argv, verbatim; empty for the login shell)
+    /// Allocate a `rows`×`cols` PTY and start `command` (argv, verbatim; empty for `$SHELL`)
     /// on it through `launcher`, with `TERM` set. Returns it and a receiver of its output, which
     /// ends when the program closes the PTY.
     pub fn spawn(
@@ -500,6 +520,7 @@ impl Pty {
                 |cmd| {
                     cmd.env("TERM", term);
                     scrub_koh_env(cmd, std::env::vars_os().map(|(key, _)| key));
+                    launcher.isolate(cmd);
                 },
             )
             .map_err(|error| {
@@ -605,47 +626,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_command_passes_argv_verbatim_and_falls_back_when_empty() {
-        // `command[0]` is the program, the tail its arguments — no splitting, no quoting.
-        let argv: Vec<String> = ["zellij", "attach", "-c", "my session"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        // The fallback must not be consulted for a non-empty argv; a sentinel proves it wasn't.
-        let got = build_command(&argv, || "FALLBACK-MUST-NOT-BE-USED".to_owned());
+    fn the_command_is_argv_verbatim_or_else_the_shell() {
+        let argv = ["zellij", "attach", "-c", "my session"].map(String::from);
         assert_eq!(
-            got,
-            ["zellij", "attach", "-c", "my session"],
-            "argv must reach the child exactly as given"
+            build_command(&argv, || "unused".to_owned()),
+            argv.map(OsString::from)
         );
-
-        // Empty argv means "the session shell", resolved by the injected fallback.
-        let got = build_command(&[], || "/custom/shell".to_owned());
-        assert_eq!(got, ["/custom/shell"]);
-    }
-
-    #[test]
-    fn resolve_shell_prefers_env_then_platform_default() {
-        use std::ffi::OsString;
-        // An explicit non-empty `$SHELL` wins.
         assert_eq!(
-            resolve_shell(Some(OsString::from("/usr/bin/fish"))),
-            "/usr/bin/fish"
+            build_command(&[], || "/custom/shell".to_owned()),
+            ["/custom/shell"]
         );
-        // Empty `$SHELL` behaves like unset → a concrete absolute platform default.
-        let empty = resolve_shell(Some(OsString::new()));
-        let unset = resolve_shell(None);
-        assert_eq!(empty, unset, "empty SHELL falls through like unset");
-        assert!(
-            unset.starts_with('/') && !unset.is_empty(),
-            "an absolute fallback path"
-        );
-        // On Android the default must be the shell that actually exists (NOT /bin/sh).
-        if cfg!(target_os = "android") {
-            assert_eq!(unset, "/system/bin/sh");
+        // An empty `$SHELL` is as if unset: the platform's shell, which on Android is not /bin/sh.
+        let fish = resolve_shell(Some(OsString::from("/usr/bin/fish")));
+        let platform = if cfg!(target_os = "android") {
+            "/system/bin/sh"
         } else {
-            assert_eq!(unset, "/bin/sh");
-        }
+            "/bin/sh"
+        };
+        assert_eq!(fish, "/usr/bin/fish");
+        assert_eq!(resolve_shell(Some(OsString::new())), platform);
+        assert_eq!(resolve_shell(None), platform);
     }
 
     #[test]
@@ -667,8 +667,4 @@ mod tests {
             .collect();
         assert_eq!(removed, ["KOH_DNS", "KOH_SCRUB_TEST"]);
     }
-
-    // The real-PTY / real-shell tests (spawn + stream + teardown) live in `tests/pty.rs` — a
-    // dedicated integration-test binary — so they don't contend with the ~100 inline tests in
-    // this crate's parallel test binary (which starved the PTY reader thread under load).
 }

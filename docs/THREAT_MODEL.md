@@ -12,18 +12,20 @@ A peer finds a server by its Ed25519 **node-id** (through relays + NAT hole-punc
 on its **allowlist** are admitted. The node-id is not enumerable, but the server's UDP port is open
 like any listener's: anyone who can reach it can start QUIC handshakes, as iroh answers a
 ClientHello whatever its server name. So handshakes under way are capped: 2 from one IP address (an
-IPv6 /64 counts as one; a relay's are capped only in all), that address's oldest given up for a
-new one, and a quarter of `--max-connections` in all (at least 4, and below the total), the oldest
-given up. A new handshake is never refused, and an allowed client's finishes in a round trip, so a
-flood of stalled handshakes cannot keep it out, even from its own address (the same host, a shared
-NAT). Each has 10 s, and the flood is warned of at most once every 10 s. It is a
+IPv6 /48 counts as one; a relay's are capped only in all), that address's oldest given up for a
+new one, and 256 in all, the oldest given up; they hold no connection permit. A new handshake is
+never refused, but when its room would cost one under way, an address not yet validated must first
+answer a QUIC retry, which a spoofed address cannot. So stalled handshakes from spoofed addresses
+take no room; a flood from enough real addresses (or from a NAT the client shares) can still give
+up an allowed client's handshakes while it lasts. Each has 10 s, and the flood is warned of at most
+once every 10 s. It is a
 **single-operator** tool for connecting a small set of machines you control — not a multi-user network
 service.
 
 ## Attacker models
 
 1. **Malicious / compromised client** — a peer that dials the server. If it is on the allowlist it
-   reaches the koh/5 data plane: it sends arbitrary input, resize, ack and resync messages and opens
+   reaches the koh/6 data plane: it sends arbitrary input, resize, ack and resync messages and opens
    streams. Input comes as decoded events (`Keys`: keys, mouse events, focus changes, whole
    pastes); decoding refuses what no terminal sends (a modifier bit no key has, a function key past
    F12, a kitty code that is no Unicode scalar, a paste over 1 MiB, more than 512 events, more than

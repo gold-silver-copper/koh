@@ -50,7 +50,7 @@ impl Server {
         let config = ServeConfig {
             allow: allow.to_vec(),
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
-            launcher: koh::pty::Launcher::new(env!("CARGO_BIN_EXE_koh")),
+            launcher: koh::pty::Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!()),
             ..ServeConfig::default()
         };
         let hosting = Hosting::from_config(&config)?;
@@ -59,20 +59,21 @@ impl Server {
         Ok(Self { id, shutdown, task })
     }
 
-    pub async fn stop(self) {
+    /// Shut the server down, as `koh serve` on a signal: what the accept loop returned, an error
+    /// if it panicked or did not stop within 5 s.
+    pub async fn stop(self) -> anyhow::Result<()> {
         self.shutdown.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.task).await;
+        tokio::time::timeout(Duration::from_secs(5), self.task).await??
     }
 }
 
-/// What the client has painted: the screen text, the predicted glyphs drawn over it, its status
-/// line, and when any of them last changed.
-#[derive(Clone, Debug)]
+/// What the client has painted: the screen text, the predicted glyphs drawn over it, and its
+/// status line.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Painted {
     pub text: String,
     pub predicted: String,
     pub status: Option<String>,
-    pub at: Instant,
 }
 
 /// How a test client runs.
@@ -115,16 +116,13 @@ impl ClientTerminal for Recorder {
             text: state.screen().contents(),
             predicted: predicted_glyphs(overlay, state.size()),
             status: status.map(str::to_owned),
-            at: Instant::now(),
         };
         let changed = self.painted.send_if_modified(|last| {
-            if (&last.text, &last.predicted, &last.status)
-                == (&painted.text, &painted.predicted, &painted.status)
-            {
-                return false;
+            let changed = *last != painted;
+            if changed {
+                last.clone_from(&painted);
             }
-            *last = painted.clone();
-            true
+            changed
         });
         if changed {
             self.history
@@ -174,13 +172,12 @@ impl Client {
         let id = endpoint.id();
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server));
         let channel = connector.connect().await?;
-        let first = channel.clone();
+        let first = channel.0.clone();
         let size = Arc::new(Mutex::new(Size::new(24, 80)));
         let (painted_tx, painted) = watch::channel(Painted {
             text: String::new(),
             predicted: String::new(),
             status: None,
-            at: Instant::now(),
         });
         let history = Arc::new(Mutex::new(Vec::new()));
         let term = Recorder {
@@ -262,6 +259,31 @@ impl Client {
         self.wait_for(timeout, |painted| done(&painted.text)).await
     }
 
+    /// Type `typed` and wait until the screen shows `shown`, for up to 20 s: whether it did.
+    pub async fn ran(&mut self, typed: &[u8], shown: &str) -> bool {
+        self.send(typed).await.is_ok()
+            && self
+                .wait_until(Duration::from_secs(20), |t| t.contains(shown))
+                .await
+                .is_some()
+    }
+
+    /// Type `typed` until the screen satisfies `done`, for up to 30 s: what typing during a
+    /// reconnect needs, since the client drops it.
+    pub async fn retype_until(
+        &mut self,
+        typed: &[u8],
+        done: impl Fn(&str) -> bool + Sync,
+    ) -> Option<Painted> {
+        for _ in 0..150 {
+            let _ = self.send(typed).await;
+            if let Some(painted) = self.wait_until(Duration::from_millis(200), &done).await {
+                return Some(painted);
+            }
+        }
+        None
+    }
+
     /// Wait until what was painted, status line included, satisfies `done`, up to `timeout`.
     pub async fn wait_for(
         &mut self,
@@ -324,10 +346,17 @@ pub fn identity() -> std::io::Result<SecretKey> {
     generate_secret_key()
 }
 
-/// A session: one server hosting `command` for one connected client.
-pub async fn session(net: &FaultNet, command: &[&str]) -> anyhow::Result<(Server, Client)> {
+/// A server hosting `command` for one client, and that client's endpoint, to connect (and
+/// reconnect) with [`Client::connect_on`].
+pub async fn hosting(net: &FaultNet, command: &[&str]) -> anyhow::Result<(Server, Endpoint)> {
     let secret = identity()?;
     let server = Server::start(net, &[secret.public()], command).await?;
-    let client = Client::connect(net, secret, server.id).await?;
+    Ok((server, net.endpoint(secret, false).await?))
+}
+
+/// A session: one server hosting `command` for one connected client.
+pub async fn session(net: &FaultNet, command: &[&str]) -> anyhow::Result<(Server, Client)> {
+    let (server, endpoint) = hosting(net, command).await?;
+    let client = Client::connect_on(endpoint, server.id, Options::default()).await?;
     Ok((server, client))
 }

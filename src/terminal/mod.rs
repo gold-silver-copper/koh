@@ -29,7 +29,7 @@ pub mod test_support {
 }
 pub use history::{
     HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, KeptRow,
-    HISTORY_CACHE_BYTES, MAX_HISTORY_CELLS, MAX_HISTORY_ROWS,
+    HISTORY_CACHE_BYTES, MAX_HISTORY_CELLS, MAX_HISTORY_REPLY, MAX_HISTORY_ROWS,
 };
 pub use server::{FrameHold, ServerTerminal, FRAME_HOLD, IDENTITY, OPTIONS};
 
@@ -109,11 +109,7 @@ impl RowEncodings {
             .or_else(|| self.kept.remove(&key))
             .filter(|kept| {
                 kept.wrapped == wrapped
-                    && match (&kept.links, &links) {
-                        (None, None) => true,
-                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                        (None, Some(_)) | (Some(_), None) => false,
-                    }
+                    && kept.links.as_ref().map(Arc::as_ptr) == links.as_ref().map(Arc::as_ptr)
             });
         let encoding = if let Some(kept) = hit {
             kept
@@ -167,7 +163,7 @@ pub(crate) fn host_size(size: Size) -> fux_vt::Size {
 }
 
 /// Truncate `s` to at most `max` characters (not bytes), preserving whole scalars.
-fn capped_chars(s: &str, max: usize) -> String {
+pub(super) fn capped_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
@@ -179,7 +175,7 @@ fn capped_bytes(s: &str, max: usize) -> String {
 }
 
 /// The screen: the cell grid plus the out-of-band channels.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerminalScreen {
     grid: Grid,
     /// Window title (OSC 2).
@@ -196,21 +192,6 @@ pub struct TerminalScreen {
     history: HistoryMark,
     /// How the PTY takes typed keys, if known.
     tty: Option<TtyModes>,
-}
-
-impl Default for TerminalScreen {
-    fn default() -> Self {
-        Self {
-            grid: Grid::blank(DEFAULT_SIZE),
-            title: String::new(),
-            icon: String::new(),
-            clipboard: String::new(),
-            bell_count: 0,
-            exit_code: None,
-            history: HistoryMark { newest: 0, len: 0 },
-            tty: None,
-        }
-    }
 }
 
 impl TerminalScreen {
@@ -369,7 +350,7 @@ impl TerminalScreen {
         let size = self.size();
         (size == other.size()).then(|| {
             (0..size.rows)
-                .filter(|&r| !self.grid.row_eq(&other.grid, r))
+                .filter(|&r| !self.grid.same_row(r, &other.grid, r))
                 .count()
         })
     }
@@ -458,18 +439,14 @@ impl WireStyle {
 
     /// The style with exactly `bits`, or `None` if any is not a defined bit, both blinks are, the
     /// underline's style is none defined, or a style is given with no underline.
-    pub const fn new(bits: u16) -> Option<Self> {
+    pub fn new(bits: u16) -> Option<Self> {
         let blinks = Self::BLINK_SLOW | Self::BLINK_RAPID;
         let style = bits & Self::UNDERLINE_STYLE;
-        if bits & !Self::ALL == 0
+        (bits & !Self::ALL == 0
             && bits & blinks != blinks
             && style <= Self::UNDERLINE_DASHED
-            && (style == 0 || bits & Self::UNDERLINE != 0)
-        {
-            Some(Self(bits))
-        } else {
-            None
-        }
+            && (style == 0 || bits & Self::UNDERLINE != 0))
+            .then_some(Self(bits))
     }
 
     pub const fn bits(self) -> u16 {
@@ -728,25 +705,18 @@ impl WireCell {
                 );
                 Some(())
             }
-            CellKind::Chars => {
+            CellKind::Chars | CellKind::WideChars => {
+                let wide = self.kind == CellKind::WideChars;
                 let mut buf = [0; 4];
-                for (col, ch) in (at..).zip(self.text.as_str().chars()) {
+                for (i, ch) in self.text.as_str().chars().enumerate() {
+                    let col = i.checked_mul(if wide { 2 } else { 1 })?.checked_add(at)?;
                     cells.set(
                         col,
-                        CellRef::new(ch.encode_utf8(&mut buf), false, self.attributes()),
+                        CellRef::new(ch.encode_utf8(&mut buf), wide, self.attributes()),
                     );
-                }
-                Some(())
-            }
-            CellKind::WideChars => {
-                let mut buf = [0; 4];
-                for (pair, ch) in self.text.as_str().chars().enumerate() {
-                    let col = pair.checked_mul(2).and_then(|c| c.checked_add(at))?;
-                    cells.set(
-                        col,
-                        CellRef::new(ch.encode_utf8(&mut buf), true, self.attributes()),
-                    );
-                    cells.set(col.checked_add(1)?, CellRef::wide_continuation());
+                    if wide {
+                        cells.set(col.checked_add(1)?, CellRef::wide_continuation());
+                    }
                 }
                 Some(())
             }
@@ -792,24 +762,18 @@ struct RawRun {
 impl TryFrom<RawRun> for Run {
     type Error = &'static str;
 
-    fn try_from(raw: RawRun) -> Result<Self, Self::Error> {
-        let text = raw.cell.text.as_str();
-        let fits = match raw.cell.kind {
+    fn try_from(RawRun { count, cell }: RawRun) -> Result<Self, Self::Error> {
+        let text = cell.text.as_str();
+        let fits = match cell.kind {
             CellKind::Narrow | CellKind::Wide | CellKind::Continuation => {
                 text.len() <= fux_vt::CLUSTER_CAPACITY
             }
             CellKind::Chars | CellKind::WideChars => {
-                text.chars().count() == usize::from(raw.count.get())
+                text.chars().count() == usize::from(count.get())
             }
         };
-        if fits {
-            Ok(Self {
-                count: raw.count,
-                cell: raw.cell,
-            })
-        } else {
-            Err("a run whose text does not fit its kind")
-        }
+        fits.then_some(Self { count, cell })
+            .ok_or("a run whose text does not fit its kind")
     }
 }
 
@@ -826,13 +790,7 @@ impl Run {
     /// Add one more cell. `false` if the run already holds `u16::MAX` cells, the most `count`
     /// can say; the caller then starts a new run.
     fn extend(&mut self) -> bool {
-        match self.count.checked_add(1) {
-            Some(count) => {
-                self.count = count;
-                true
-            }
-            None => false,
-        }
+        self.count.checked_add(1).map(|c| self.count = c).is_some()
     }
 }
 
@@ -857,15 +815,10 @@ struct RawLink {
 impl TryFrom<RawLink> for WireLink {
     type Error = &'static str;
 
-    fn try_from(raw: RawLink) -> Result<Self, Self::Error> {
-        if raw.uri.len() <= fux_vt::URI_LIMIT && raw.id.len() <= fux_vt::ID_LIMIT {
-            Ok(Self {
-                uri: raw.uri,
-                id: raw.id,
-            })
-        } else {
-            Err("a hyperlink past fux-vt's limits")
-        }
+    fn try_from(RawLink { uri, id }: RawLink) -> Result<Self, Self::Error> {
+        (uri.len() <= fux_vt::URI_LIMIT && id.len() <= fux_vt::ID_LIMIT)
+            .then_some(Self { uri, id })
+            .ok_or("a hyperlink past fux-vt's limits")
     }
 }
 
@@ -910,16 +863,6 @@ impl RowDiff {
             runs,
             links,
         }
-    }
-
-    /// The row these runs decode to, exactly `cols` cells, with its links (see [`cells_of`]).
-    fn decode(&self, cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
-        cells_of(&self.runs, &self.links, cols)
-    }
-
-    /// The bytes of hyperlinks this row carries.
-    fn link_bytes(&self) -> usize {
-        link_bytes(&self.links)
     }
 }
 
@@ -1071,9 +1014,6 @@ fn seal(runs: &mut [Run], open: &mut Option<String>) {
 /// hostile server could otherwise make the client hold links nothing shows). Work is bounded
 /// by `cols`: every run is non-empty, and each cell's text by [`fux_vt::CLUSTER_CAPACITY`].
 fn cells_of(runs: &[Run], links: &[WireLink], cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
-    if links.len() > MAX_ROW_LINKS {
-        return None;
-    }
     let mut cells = Cells::new(usize::from(cols));
     let mut linked = Vec::new();
     let mut named = vec![false; links.len()];
@@ -1418,7 +1358,7 @@ impl TerminalScreen {
             let same = if resized {
                 !wrapped && cells.iter().all(is_blank)
             } else {
-                self.grid.row_eq(base_grid, r)
+                self.grid.same_row(r, base_grid, r)
             };
             (!same).then(|| {
                 RowDiff::of(
@@ -1457,33 +1397,24 @@ impl TerminalScreen {
             return Err(Malformed);
         }
         // A hostile server's links are bounded: more than a diff may carry drops the frame.
-        let link_bytes = diff
-            .rows
-            .iter()
-            .map(RowDiff::link_bytes)
-            .fold(0_usize, usize::saturating_add);
-        if link_bytes > MAX_LINK_BYTES {
+        let links = (diff.rows.iter()).fold(0_usize, |sum, row| {
+            sum.saturating_add(link_bytes(&row.links))
+        });
+        if links > MAX_LINK_BYTES {
             return Err(Malformed);
         }
         // Every row decodes before any is committed, in the diff's order. At most `rows × cols`
         // cells, which the clamp bounds.
-        let mut staged = Vec::with_capacity(diff.rows.len());
-        for row in &diff.rows {
-            let Some(cells) = (row.row < rows).then(|| row.decode(cols)).flatten() else {
-                return Err(Malformed);
-            };
-            staged.push(cells);
-        }
-        let grid = if diff.resize.is_some() {
+        let staged = (diff.rows.iter())
+            .map(|row| (row.row < rows).then(|| cells_of(&row.runs, &row.links, cols))?)
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Malformed)?;
+        self.grid = if diff.resize.is_some() {
             Grid::blank(Size { rows, cols })
         } else {
             // Rows move as shared cells, never copied.
-            let Some(moved) = self.grid.shifted(&diff.shifts) else {
-                return Err(Malformed);
-            };
-            moved
+            self.grid.shifted(&diff.shifts).ok_or(Malformed)?
         };
-        self.grid = grid;
         // Only the rows the diff carries are replaced; the rest stay shared with the base.
         for (row, (cells, links)) in diff.rows.iter().zip(staged) {
             self.grid
@@ -1506,15 +1437,9 @@ impl TerminalScreen {
         if let Some(clipboard) = &diff.clipboard {
             self.clipboard = capped_bytes(clipboard, MAXIMUM_CLIPBOARD_SIZE);
         }
-        if diff.exit_code.is_some() {
-            self.exit_code = diff.exit_code;
-        }
-        if let Some(history) = diff.history {
-            self.history = history;
-        }
-        if diff.tty.is_some() {
-            self.tty = diff.tty;
-        }
+        self.exit_code = diff.exit_code.or(self.exit_code);
+        self.history = diff.history.unwrap_or(self.history);
+        self.tty = diff.tty.or(self.tty);
         Ok(())
     }
 }
@@ -1522,10 +1447,6 @@ impl TerminalScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn screen_from(rows: u16, cols: u16, bytes: &[u8]) -> TerminalScreen {
-        TerminalScreen::from_bytes(rows, cols, bytes)
-    }
 
     fn wire_cell() -> impl proptest::strategy::Strategy<Value = WireCell> {
         use proptest::prelude::*;
@@ -1862,10 +1783,7 @@ mod tests {
         let spread: Vec<(u16, u16, i16)> = (0..=MAX_SHIFTS)
             .map(|i| (u16::try_from(i * 3).unwrap(), 1, 1))
             .collect();
-        assert!(
-            with(&spread[..MAX_SHIFTS]).is_ok(),
-            "the most shifts allowed"
-        );
+        assert!(with(&spread[..MAX_SHIFTS]).is_ok(), "the most shifts");
         let bad: [&[(u16, u16, i16)]; 8] = [
             &[(0, 1, 0)],              // a zero offset
             &[(0, 0, 1)],              // an empty shift
@@ -1899,37 +1817,11 @@ mod tests {
     }
 
     #[test]
-    fn client_apply_caps_oversized_title_and_clipboard() {
-        // A malicious server ships an oversized title + clipboard. The client re-applies the caps
-        // (it must not trust the wire even though the honest server emulator already caps them).
-        let mut c = TerminalScreen::default();
-        let mut diff = TerminalScreen::default().diff_from(&TerminalScreen::default());
-        diff.title = Some("T".repeat(MAX_TITLE_LEN + 1000));
-        diff.icon = Some("I".repeat(MAX_TITLE_LEN + 5));
-        diff.clipboard = Some("C".repeat(MAXIMUM_CLIPBOARD_SIZE + 1000));
-        c.apply(&diff).unwrap();
-        assert_eq!(
-            c.title().chars().count(),
-            MAX_TITLE_LEN,
-            "title capped client-side"
-        );
-        assert_eq!(
-            c.icon().chars().count(),
-            MAX_TITLE_LEN,
-            "icon capped client-side"
-        );
-        assert!(
-            c.clipboard().len() <= MAXIMUM_CLIPBOARD_SIZE,
-            "clipboard capped client-side"
-        );
-    }
-
-    #[test]
     fn a_malformed_last_row_drops_the_rows_before_it_too() {
         // Every row is validated before any is committed: a malformed row leaves the prior screen
         // untouched, never half-applied, though the rows before it decoded fine.
-        let base = screen_from(24, 80, b"keep\r\nkeep\r\nkeep");
-        let target = screen_from(24, 80, b"one\r\ntwo\r\nthree");
+        let base = TerminalScreen::from_bytes(24, 80, b"keep\r\nkeep\r\nkeep");
+        let target = TerminalScreen::from_bytes(24, 80, b"one\r\ntwo\r\nthree");
         let good = target.diff_from(&base);
         assert_eq!(good.rows.len(), 3);
         let mutations: [fn(&mut ScreenDiff); 4] = [
@@ -2093,10 +1985,7 @@ mod tests {
         for (i, mutate) in mutations.iter().enumerate() {
             let mut raw = raw_two_by_two();
             mutate(&mut raw);
-            assert!(
-                decode_raw(&raw).is_err(),
-                "mutation {i} must fail to decode"
-            );
+            assert!(decode_raw(&raw).is_err(), "mutation {i}");
         }
     }
 
@@ -2144,11 +2033,7 @@ mod tests {
             };
             let mut screen = TerminalScreen::default();
             screen.apply(&diff).unwrap_err();
-            assert_eq!(
-                screen,
-                TerminalScreen::default(),
-                "mutation {i} changed the screen"
-            );
+            assert_eq!(screen, TerminalScreen::default(), "mutation {i}");
         }
     }
 
@@ -2159,9 +2044,12 @@ mod tests {
         let before = emu.snapshot();
         emu.process(b"three");
         let after = emu.snapshot();
-        assert!(after.grid.row_shared(&before.grid, 0));
-        assert!(after.grid.row_shared(&before.grid, 1));
-        assert!(!after.grid.row_shared(&before.grid, 2), "the changed row");
+        assert!(after.grid.lines_share(0, &before.grid, 0));
+        assert!(after.grid.lines_share(1, &before.grid, 1));
+        assert!(
+            !after.grid.lines_share(2, &before.grid, 2),
+            "the changed row"
+        );
         assert_eq!(after.grid.row(2).map(Cells::len), Some(80));
         // Scrolled rows are shared too, wherever they moved: one screen and one row in all.
         for n in 0..30 {
@@ -2170,10 +2058,7 @@ mod tests {
         let before = emu.snapshot();
         emu.process(b"\r\nscrolled");
         let after = emu.snapshot();
-        assert_eq!(
-            TerminalScreen::distinct_cells([&before, &after]),
-            (24 + 1) * 80
-        );
+        assert_eq!(TerminalScreen::distinct_cells([&before, &after]), 25 * 80);
         assert_eq!(after.screen().row(0), before.screen().row(1));
     }
 
@@ -2250,39 +2135,39 @@ mod tests {
 
     #[test]
     fn apply_replaces_only_the_rows_the_diff_carries() {
-        let base = screen_from(24, 80, b"one\r\ntwo\r\nthree");
-        let target = screen_from(24, 80, b"one\r\nTWO\r\nthree");
+        let base = TerminalScreen::from_bytes(24, 80, b"one\r\ntwo\r\nthree");
+        let target = TerminalScreen::from_bytes(24, 80, b"one\r\nTWO\r\nthree");
         let diff = target.diff_from(&base);
         assert_eq!(diff.rows.len(), 1);
         let mut client = base.clone();
         client.apply(&diff).unwrap();
         assert_eq!(client, target);
         for row in (0..24).filter(|&row| row != 1) {
-            assert!(client.grid.row_shared(&base.grid, row), "row {row}");
+            assert!(client.grid.lines_share(row, &base.grid, row), "row {row}");
         }
-        assert!(!client.grid.row_shared(&base.grid, 1));
+        assert!(!client.grid.lines_share(1, &base.grid, 1));
         assert_eq!(TerminalScreen::distinct_cells([&base, &client]), 25 * 80);
     }
 
     #[test]
     fn cell_text_holds_what_a_cell_holds() {
         // Inline, just past inline, and a whole cluster.
-        for len in [
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        let lens = [
             CellText::INLINE,
             CellText::INLINE + 1,
             fux_vt::CLUSTER_CAPACITY,
-        ] {
-            let text = "x".repeat(len);
+        ];
+        for text in lens
+            .map(|len| "x".repeat(len))
+            .into_iter()
+            .chain([family.to_owned()])
+        {
             assert_eq!(
                 CellText::new(&text).map(|t| t.as_str().to_owned()),
                 Some(text)
             );
         }
-        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
-        assert_eq!(
-            CellText::new(family).map(|t| t.as_str().to_owned()),
-            Some(family.to_owned())
-        );
         assert!(CellText::new(&"x".repeat(fux_vt::CLUSTER_CAPACITY + 1)).is_none());
         for control in ["\x1b[2J", "\x07", "\x7f", "\u{9d}", "a\nb"] {
             assert!(CellText::new(control).is_none(), "{control:?}");
@@ -2325,33 +2210,30 @@ mod tests {
     #[test]
     fn a_run_s_text_must_fit_its_kind() {
         let run = |count, kind, text| postcard::from_bytes::<Run>(&wire_run(count, kind, text));
-        assert!(run(3, CellKind::Chars, "abc").is_ok());
-        assert!(
-            run(2, CellKind::Chars, "abc").is_err(),
-            "more characters than cells"
-        );
-        assert!(
-            run(4, CellKind::Chars, "abc").is_err(),
-            "fewer characters than cells"
-        );
-        assert!(run(2, CellKind::WideChars, "日本").is_ok());
-        assert!(run(3, CellKind::WideChars, "日本").is_err());
+        // A run's characters match its cells; a cell's text is a cluster, a run's may be longer.
         let cluster = "x".repeat(fux_vt::CLUSTER_CAPACITY + 1);
-        assert!(
-            run(1, CellKind::Narrow, &cluster).is_err(),
-            "a cell's text is a cluster"
-        );
-        assert!(
-            run(129, CellKind::Chars, &"x".repeat(129)).is_ok(),
-            "a run's may be longer"
-        );
+        for (count, kind, text, ok) in [
+            (3, CellKind::Chars, "abc", true),
+            (2, CellKind::Chars, "abc", false),
+            (4, CellKind::Chars, "abc", false),
+            (2, CellKind::WideChars, "日本", true),
+            (3, CellKind::WideChars, "日本", false),
+            (1, CellKind::Narrow, &cluster, false),
+            (129, CellKind::Chars, &"x".repeat(129), true),
+        ] {
+            assert_eq!(
+                run(count, kind, text).is_ok(),
+                ok,
+                "{count} {kind:?} {text}"
+            );
+        }
     }
 
     #[test]
     fn runs_of_characters_decode_to_the_cells_they_name() {
-        let target = screen_from(
+        let target = TerminalScreen::from_bytes(
             4,
-            12,
+            20,
             "ab\x1b[31mcd日本\x1b[m\u{1f468}\u{200d}\u{1f469}x".as_bytes(),
         );
         let diff = target.diff_from(&TerminalScreen::default());
@@ -2369,17 +2251,17 @@ mod tests {
                 (CellKind::Wide, 1),
                 (CellKind::Continuation, 1),
                 (CellKind::Narrow, 1),
-                (CellKind::Narrow, 1),
+                (CellKind::Narrow, 9),
             ],
-            "a cluster of several characters goes as a cell of its own"
+            "a cluster of several characters goes as a cell of its own, identical cells as one run"
         );
         let mut client = TerminalScreen::default();
         client.apply(&diff).unwrap();
         assert_eq!(client, target);
         // A run of characters that overruns the row drops the frame.
         let mut long = diff.clone();
-        long.rows[0].runs[0].count = NonZeroU16::new(13).unwrap();
-        long.rows[0].runs[0].cell.text = CellText::run(&"a".repeat(13)).unwrap();
+        long.rows[0].runs[0].count = NonZeroU16::new(21).unwrap();
+        long.rows[0].runs[0].cell.text = CellText::run(&"a".repeat(21)).unwrap();
         let mut client = TerminalScreen::default();
         client.apply(&long).unwrap_err();
         assert_eq!(client, TerminalScreen::default());
@@ -2402,46 +2284,30 @@ mod tests {
                 "step {n}"
             );
         }
-        assert!(
-            kept.kept.len() <= 10,
-            "only the newest dictionary's rows are kept"
-        );
-    }
-
-    #[test]
-    fn identical_cells_are_run_length_encoded() {
-        let target = screen_from(24, 80, b"ab");
-        let diff = target.diff_from(&TerminalScreen::default());
-        assert_eq!(diff.rows.len(), 1, "only the changed row is sent");
-        assert_eq!(
-            diff.rows[0].runs.len(),
-            2,
-            "'ab' as a run of characters, then one run of 78 blanks"
-        );
-        assert_eq!(diff.rows[0].runs[0].cell.kind, CellKind::Chars);
-        assert_eq!(diff.rows[0].runs[1].count.get(), 78);
+        assert!(kept.kept.len() <= 10, "only the newest dictionary's rows");
     }
 
     #[test]
     fn capped_bytes_never_splits_utf8() {
         // A multi-byte scalar straddling the byte budget must be dropped whole, leaving valid UTF-8.
         let s = "a".repeat(MAXIMUM_CLIPBOARD_SIZE - 1) + "é"; // 'é' is 2 bytes, crosses the cap
-        let out = capped_bytes(&s, MAXIMUM_CLIPBOARD_SIZE);
-        assert!(out.len() <= MAXIMUM_CLIPBOARD_SIZE);
         assert_eq!(
-            out.len(),
-            MAXIMUM_CLIPBOARD_SIZE - 1,
-            "the straddling scalar is dropped whole"
+            capped_bytes(&s, MAXIMUM_CLIPBOARD_SIZE).len(),
+            MAXIMUM_CLIPBOARD_SIZE - 1
         );
     }
 
     #[test]
-    fn icon_clipboard_and_exit_code_roundtrip_and_resist_collapse() {
+    fn side_channels_roundtrip_and_resist_collapse() {
         // When the shell exits, the server stamps the code. Each survives diff -> apply, and a
         // state carrying one must NOT compare equal to one without (so it isn't collapsed).
         let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
-        emu.process(b"\x1b]1;myicon\x07\x1b]2;mytitle\x07\x1b]52;c;aGk=\x07");
+        let huge = "x".repeat(MAX_TITLE_LEN + 500);
+        emu.process(format!("\x1b]2;{huge}\x07").as_bytes());
+        assert_eq!(emu.snapshot().title().chars().count(), MAX_TITLE_LEN);
+        emu.process(b"\x1b]1;myicon\x07\x1b]2;mytitle\x07\x07\x1b]52;c;aGk=\x07");
         let with_icon = emu.snapshot();
+        assert_eq!((with_icon.title(), with_icon.bell_count()), ("mytitle", 1));
         emu.set_exit_code(42);
         let exited = emu.snapshot();
         assert_eq!(exited.exit_code(), Some(42));
@@ -2452,23 +2318,23 @@ mod tests {
         assert_eq!(diff.exit_code, Some(42));
         let mut c = base.clone();
         c.apply(&diff).unwrap();
-        assert_eq!(
-            c, exited,
-            "icon, clipboard and exit code reconstruct via diff/apply"
-        );
+        assert_eq!(c, exited);
         assert_eq!((c.icon(), c.clipboard()), ("myicon", "aGk="));
+        // A hostile server's oversized title is cut by the client too.
+        let hostile = ScreenDiff {
+            title: Some(huge),
+            ..diff
+        };
+        c.apply(&hostile).unwrap();
+        assert_eq!(c.title().chars().count(), MAX_TITLE_LEN);
         assert_ne!(base, with_icon);
         assert_ne!(with_icon, exited, "the exit code alone tells them apart");
     }
 
-    // --- Ported mosh terminal-emulation / unicode regression tests, recast as diff/apply
-    // round-trip tests: feed the byte sequence from the corresponding mosh test to the server emulator, ship
-    // the snapshot through diff/apply onto a fresh client, and assert the client reconstructs the
-    // screen EXACTLY (koh's verification guarantee) plus the semantic outcome mosh checked.
-    // mosh source: src/tests/emulation-*.test, unicode-*.test. ---
+    // Ported from mosh's src/tests/emulation-*.test and unicode-*.test, as diff/apply round trips.
 
-    /// Process `bytes`, ship server→client via diff/apply, assert exact reconstruction, and
-    /// return the reconstructed client screen for semantic assertions.
+    /// Process `bytes`, ship them to a fresh client, assert it reconstructs the screen exactly, and
+    /// return the client's screen.
     fn roundtrip(rows: u16, cols: u16, bytes: &[u8]) -> TerminalScreen {
         let mut emu = ServerTerminal::new(rows, cols, 0).expect("emulator");
         emu.process(bytes);
@@ -2477,10 +2343,7 @@ mod tests {
         let diff = target.diff_from(&base);
         let mut client = base;
         client.apply(&diff).unwrap();
-        assert_eq!(
-            client, target,
-            "client must reconstruct the server screen exactly"
-        );
+        assert_eq!(client, target, "reconstructed exactly");
         client
     }
 
@@ -2494,28 +2357,16 @@ mod tests {
         emu.process(&[b'a'; 80]); // frame N: fill to col 80 -> deferred-wrap state
         let frame_n = emu.snapshot();
         let mut client = TerminalScreen::default();
-        client
-            .apply(&frame_n.diff_from(&TerminalScreen::default()))
-            .unwrap();
+        client.apply(&frame_n.diff_from(&client.clone())).unwrap();
         assert_eq!(client, frame_n);
 
         emu.process(b"b"); // frame N+1: one more char forces the wrap to row 1
         let frame_n1 = emu.snapshot();
         let diff = frame_n1.diff_from(&frame_n);
-        assert!(
-            diff.resize.is_none(),
-            "incremental path, not a full repaint"
-        );
+        assert!(diff.resize.is_none(), "incremental, not a full repaint");
         client.apply(&diff).unwrap();
-        assert_eq!(
-            client, frame_n1,
-            "wrap across frames must reconstruct incrementally"
-        );
-        assert_eq!(
-            client.screen().cell(1, 0).unwrap().contents(),
-            "b",
-            "wrapped char on row 1"
-        );
+        assert_eq!(client, frame_n1);
+        assert_eq!(client.screen().cell(1, 0).unwrap().contents(), "b");
     }
 
     #[test]
@@ -2537,11 +2388,8 @@ mod tests {
         let cluster = |col| s.cell(0, col).map(|c| c.contents().to_owned());
         assert_eq!(cluster(0).as_deref(), Some(family));
         assert_eq!(cluster(2).as_deref(), Some(flag));
-        assert_eq!(
-            cluster(4).as_deref(),
-            Some(heart),
-            "a variation selector makes it wide"
-        );
+        // A variation selector makes it wide.
+        assert_eq!(cluster(4).as_deref(), Some(heart));
         assert!(s.cell(4, 0).is_none_or(|c| !c.is_wide()));
         assert!(s.cell(0, 4).is_some_and(|c| c.is_wide()));
         assert_eq!(cluster(6).map(|t| t.len()), Some(marked.len()));
@@ -2551,19 +2399,12 @@ mod tests {
         assert!(cell(2).hidden());
         assert!(cell(3).strikeout());
         assert!(cell(4).underline() && cell(4).underline_color() == Color::Idx(9));
-        assert_eq!(
-            cell(5).underline_color(),
-            Color::Rgb(fux_vt::Rgb { r: 1, g: 2, b: 3 })
-        );
+        let rgb = |r, g, b| Color::Rgb(fux_vt::Rgb { r, g, b });
+        assert_eq!(cell(5).underline_color(), rgb(1, 2, 3));
         let cell = |col| s.cell(2, col).expect("a cell");
         assert!(cell(0).bold() && cell(1).underline() && cell(2).inverse() && cell(3).italic());
         let colours = [4, 5, 6].map(|col| cell(col).fgcolor());
-        let rgb = Color::Rgb(fux_vt::Rgb {
-            r: 10,
-            g: 20,
-            b: 30,
-        });
-        assert_eq!(colours, [Color::Idx(1), Color::Idx(208), rgb]);
+        assert_eq!(colours, [Color::Idx(1), Color::Idx(208), rgb(10, 20, 30)]);
     }
 
     #[test]

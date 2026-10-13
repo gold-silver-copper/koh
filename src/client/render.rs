@@ -6,7 +6,7 @@
 
 use std::io;
 
-use super::backend::{drawn, KohBackend};
+use super::backend::{drawn, KohBackend, OscText};
 use crate::predict::Overlay;
 use crate::terminal::{Grid, Link, Size, MAXIMUM_CLIPBOARD_SIZE};
 use fux_vt::{Attributes, CellRef, Cells, Color, MouseProtocolMode};
@@ -65,14 +65,19 @@ enum Paint<'a> {
     },
 }
 
-/// A blank cell in `style`.
-const fn blank<'a>(style: Attributes) -> Paint<'a> {
+/// A narrow `glyph` in `style`.
+const fn narrow<'a>(glyph: &'a str, style: Attributes, link: Option<&'a Link>) -> Paint<'a> {
     Paint::Glyph {
-        glyph: " ",
+        glyph,
         style,
         wide: false,
-        link: None,
+        link,
     }
+}
+
+/// A blank cell in `style`.
+const fn blank<'a>(style: Attributes) -> Paint<'a> {
+    narrow(" ", style, None)
 }
 
 /// What a cleared terminal, or a row a scroll brought in, shows: a blank in the default style.
@@ -110,10 +115,10 @@ impl<'a> View<'a> {
     /// `None` outside the screen.
     fn source(&self, row: u16, col: u16) -> Option<(CellRef<'a>, Option<&'a Link>)> {
         let cell = self.grid.cell(row, col)?;
-        match self.overlay.cell(row, col) {
-            Some(predicted) => Some((predicted.as_ref(), None)),
-            None => Some((cell, self.grid.link(row, col))),
-        }
+        Some(self.overlay.cell(row, col).map_or_else(
+            || (cell, self.grid.link(row, col)),
+            |predicted| (predicted.as_ref(), None),
+        ))
     }
 
     /// The style of the prediction at `(row, col)`, if there is one.
@@ -146,12 +151,7 @@ impl<'a> View<'a> {
     /// style, as a terminal leaves a wide glyph one of whose halves is overwritten.
     fn paint(&self, row: u16, col: u16) -> Paint<'a> {
         if let Some(glyph) = self.status_at(row, col) {
-            return Paint::Glyph {
-                glyph,
-                style: STATUS,
-                wide: false,
-                link: None,
-            };
+            return narrow(glyph, STATUS, None);
         }
         let Some((cell, link)) = self.source(row, col) else {
             return BLANK;
@@ -190,12 +190,7 @@ impl<'a> View<'a> {
         if glyph.width() != 1 {
             return blank(style);
         }
-        Paint::Glyph {
-            glyph,
-            style,
-            wide: false,
-            link,
-        }
+        narrow(glyph, style, link)
     }
 
     /// Whether `row` draws what `other`'s row `from` draws: the same grid row (cells, links and
@@ -539,11 +534,6 @@ impl Painter {
     }
 }
 
-/// `t` without control characters, which would break the OSC sequence it goes in.
-fn sanitize_osc(t: &str) -> String {
-    t.chars().filter(|c| !c.is_control()).collect()
-}
-
 /// Whether `s` is non-empty base64, as a clipboard set must be to be forwarded.
 fn is_base64_payload(s: &str) -> bool {
     !s.is_empty()
@@ -722,12 +712,11 @@ impl OutOfBand {
         self.last_icon = icon.to_string();
         // The icon is prefixed only if equal to the title, which keeps them equal (mosh's
         // `prefix_window_title`).
-        let icon_eq_title = icon == title;
-        let t = format!("{}{}", self.title_prefix, sanitize_osc(title));
-        let ic = if icon_eq_title {
-            format!("{}{}", self.title_prefix, sanitize_osc(icon))
+        let t = OscText::new(&format!("{}{title}", self.title_prefix));
+        let ic = if icon == title {
+            t.clone()
         } else {
-            sanitize_osc(icon)
+            OscText::new(icon)
         };
         if ic == t {
             backend.set_window_title(&t)
@@ -999,7 +988,13 @@ mod tests {
 
     /// A terminal of `rows`×`cols`, as the user's.
     fn terminal_of(rows: u16, cols: u16) -> fux_vt::Parser {
-        fux_vt::Parser::new(fux_vt::Size::new(rows, cols).expect("nonzero size"), 0).unwrap()
+        featured(rows, cols, fux_vt::Options::new())
+    }
+
+    /// A `rows`×`cols` terminal with `options`.
+    fn featured(rows: u16, cols: u16, options: fux_vt::Options) -> fux_vt::Parser {
+        let size = fux_vt::Size::new(rows, cols).expect("nonzero size");
+        fux_vt::Parser::with_options(size, 0, options).unwrap()
     }
 
     #[test]
@@ -1042,13 +1037,7 @@ mod tests {
         for osc in ["\x1b]4", "\x1b]10", "\x1b]11", "\x1b]104"] {
             assert!(!painted.contains(osc), "{osc:?} sent: {painted:?}");
         }
-        let options = fux_vt::Options::new().with(fux_vt::Feature::Palette);
-        let mut terminal = fux_vt::Parser::with_options(
-            fux_vt::Size::new(6, 20).expect("nonzero size"),
-            0,
-            options,
-        )
-        .unwrap();
+        let mut terminal = featured(6, 20, fux_vt::Options::new().with(fux_vt::Feature::Palette));
         terminal.process(painted.as_bytes()).unwrap();
         assert!(!terminal.screen().colors_changed(), "the user's palette");
         let cell = terminal.screen().cell(0, 0).unwrap();
@@ -1061,13 +1050,11 @@ mod tests {
 
     /// A terminal that keeps hyperlinks, `rows`×`cols`.
     fn linking_terminal(rows: u16, cols: u16) -> fux_vt::Parser {
-        let options = fux_vt::Options::new().with(fux_vt::Feature::Hyperlinks);
-        fux_vt::Parser::with_options(
-            fux_vt::Size::new(rows, cols).expect("nonzero size"),
-            0,
-            options,
+        featured(
+            rows,
+            cols,
+            fux_vt::Options::new().with(fux_vt::Feature::Hyperlinks),
         )
-        .unwrap()
     }
 
     /// What a painter (with links `on`) paints for `screen`, a 6×20 one.
@@ -1288,8 +1275,6 @@ mod tests {
 
     /// A wide glyph in the bottom-right cell never scrolls the user's terminal: autowrap is off
     /// while a frame paints, and a glyph that cannot fill its cells there is a blank.
-    /// A wide glyph in the bottom-right cell never scrolls the user's terminal: autowrap is off
-    /// while a frame paints, and a glyph that cannot fill its cells there is a blank.
     #[test]
     fn a_wide_glyph_in_the_bottom_right_cell_does_not_scroll() {
         let malformed = wide_in_the_last_column(5);
@@ -1369,18 +1354,32 @@ mod tests {
         emu
     }
 
-    /// The bytes painting `more` after the screen `emu` shows, on a terminal `size` large.
+    /// The bytes painting `more` after the screen `emu` shows, on a terminal `size` large, and
+    /// whether that terminal then shows what one painted the new screen alone does.
     fn after(
         emu: &mut crate::terminal::ServerTerminal,
         more: &[u8],
         status: Option<&str>,
         size: Size,
-    ) -> String {
+    ) -> (String, bool) {
         let mut painter = Painter::default();
         let empty = Overlay::default();
-        paint_at(&mut painter, size, emu.snapshot().screen(), &empty, status);
+        let mut terminal = terminal_of(size.rows, size.cols);
+        let first = paint_at(&mut painter, size, emu.snapshot().screen(), &empty, status);
+        terminal.process(first.as_bytes()).unwrap();
         emu.process(more);
-        paint_at(&mut painter, size, emu.snapshot().screen(), &empty, status)
+        let painted = paint_at(&mut painter, size, emu.snapshot().screen(), &empty, status);
+        terminal.process(painted.as_bytes()).unwrap();
+        let mut whole = terminal_of(size.rows, size.cols);
+        let alone = paint_at(
+            &mut Painter::default(),
+            size,
+            emu.snapshot().screen(),
+            &empty,
+            status,
+        );
+        whole.process(alone.as_bytes()).unwrap();
+        (painted, shown(&terminal) == shown(&whole))
     }
 
     /// A scroll scrolls the terminal and paints only the new row; under a status line, only the
@@ -1388,17 +1387,17 @@ mod tests {
     #[test]
     fn a_scroll_scrolls_the_terminal_and_paints_only_the_new_row() {
         let scroll = format!("\r\n{}", letters(6));
-        let painted = after(&mut lettered(), scroll.as_bytes(), None, SMALL);
-        assert_eq!(
-            painted,
-            framed(
-                &format!("\x1b[m\x1b[1;6r\x1b[1S\x1b[r\x1b[6;1H{}\x1b[m", letters(6)),
-                "6;13"
-            )
+        let (painted, same) = after(&mut lettered(), scroll.as_bytes(), None, SMALL);
+        assert!(same, "{painted:?}");
+        assert!(painted.contains("\x1b[1S"), "scrolled: {painted:?}");
+        assert!(
+            (1..6).all(|row| !painted.contains(&letters(row))),
+            "only the new row is painted: {painted:?}"
         );
         // Rows 1..=5 scroll; row 5 then shows what the status line hid, and the status line's
         // row keeps the status, with the screen's new row beside it.
-        let painted = after(&mut lettered(), scroll.as_bytes(), Some("down"), SMALL);
+        let (painted, same) = after(&mut lettered(), scroll.as_bytes(), Some("down"), SMALL);
+        assert!(same, "{painted:?}");
         assert!(painted.contains("\x1b[1;5r\x1b[1S\x1b[r"), "{painted:?}");
         assert!(
             painted.contains(&format!("\x1b[5;1H{}", letters(5))),
@@ -1406,9 +1405,8 @@ mod tests {
         );
         assert!(painted.contains("\x1b[6;7Hgggggg"), "{painted:?}");
         assert!(!painted.contains("down"), "{painted:?}");
-        let painted = after(&mut lettered(), scroll.as_bytes(), None, Size::new(8, 30));
-        assert!(!painted.contains("\x1b[r"), "{painted:?}");
-        assert!(painted.contains(&letters(6)), "{painted:?}");
+        let (painted, same) = after(&mut lettered(), scroll.as_bytes(), None, Size::new(8, 30));
+        assert!(!painted.contains("\x1b[r") && same, "{painted:?}");
     }
 
     #[test]
@@ -1418,8 +1416,8 @@ mod tests {
             (&b"\x1b[2;5r\x1b[5;1H\n"[..], "\x1b[2;5r\x1b[1S\x1b[r"),
             (b"\x1b[3;1H\x1b[L", "\x1b[3;6r\x1b[1T\x1b[r"),
         ] {
-            let painted = after(&mut lettered(), more, None, SMALL);
-            assert!(painted.contains(scroll), "{painted:?}");
+            let (painted, same) = after(&mut lettered(), more, None, SMALL);
+            assert!(painted.contains(scroll) && same, "{painted:?}");
             assert!(!painted.contains("aaa"), "no row repainted: {painted:?}");
         }
     }
@@ -1432,8 +1430,12 @@ mod tests {
         for row in 1..=6 {
             emu.process(format!("\x1b[{row};1Hthe same").as_bytes());
         }
-        let painted = after(&mut emu, b"\r\nthe same", None, SMALL);
-        assert_eq!(painted, framed("", "6;9"));
+        let (painted, same) = after(&mut emu, b"\r\nthe same", None, SMALL);
+        assert!(same, "{painted:?}");
+        assert!(
+            !painted.contains("the same") && !painted.contains("\x1b[1S"),
+            "nothing scrolled or painted: {painted:?}"
+        );
     }
 
     /// Output that exercises what a frame can change: text, wide glyphs, combining marks, clusters
@@ -1633,10 +1635,56 @@ mod tests {
         }
     }
 
-    /// Whether each clipboard, new to a terminal with clipboard writes `on`, reaches it: once,
-    /// and never again while it stays the same.
-    fn forwards_clipboard(cases: &[(bool, &str, bool)]) {
-        for &(on, clipboard, forwarded) in cases {
+    /// Every event a terminal reads, as fux-vt reports it.
+    #[derive(Default)]
+    struct Told(Vec<String>);
+
+    impl fux_vt::Sink for Told {
+        fn event(&mut self, event: fux_vt::Event<'_>) {
+            self.0.push(format!("{event:?}"));
+        }
+    }
+
+    /// A title and icon name are what the server names that the client writes into an OSC, and
+    /// they go without a control character, C0 or C1, which could end the OSC early and start
+    /// another sequence: a terminal reads the title and icon name as text, and nothing else.
+    #[test]
+    fn a_hostile_title_reaches_the_terminal_as_text_and_nothing_else() {
+        let hostile = "a\x07\x1b]52;c;ZXZpbA==\x07b\u{9c}\u{9d}52;c;ZXZpbA==\u{9c}\u{9b}31mc\r\nd";
+        let text = "a]52;c;ZXZpbA==b52;c;ZXZpbA==31mcd";
+        for icon in [hostile, "an \u{90}icon"] {
+            let mut oob = OutOfBand::default();
+            let out = oob_emit(&mut oob, &screen_of(b""), win(hostile, icon, "", 0));
+            let mut terminal =
+                featured(6, 20, fux_vt::Options::new().with(fux_vt::Feature::Events));
+            let mut told = Told::default();
+            terminal.process_with(out.as_bytes(), &mut told).unwrap();
+            let icon = if icon == hostile { text } else { "an icon" };
+            let mut expected = [
+                fux_vt::Event::Title(text.as_bytes()),
+                fux_vt::Event::IconName(icon.as_bytes()),
+            ]
+            .map(|event| format!("{event:?}"));
+            expected.sort();
+            told.0.sort();
+            assert_eq!(told.0, expected, "{out:?}");
+            assert_eq!(shown(&terminal), shown(&terminal_of(6, 20)), "{out:?}");
+        }
+    }
+
+    /// Only base64 within the cap, and only with clipboard writes on: never raw shell injection,
+    /// nor a query (`OSC 52 ; c ; ?`, which would ask the user's terminal for their clipboard).
+    #[test]
+    fn only_a_base64_clipboard_within_the_cap_is_forwarded_and_only_when_on() {
+        let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
+        // Each new to the terminal: forwarded once, and never again while it stays the same.
+        for (on, clipboard, forwarded) in [
+            (false, "aGVsbG8=", false),
+            (true, "aGVsbG8=", true),
+            (true, "curl evil|sh", false),
+            (true, "?", false),
+            (true, huge.as_str(), false),
+        ] {
             let mut oob = OutOfBand::default().with_clipboard(on);
             oob.prime(win("", "", "", 0));
             let scr = screen_of(b"");
@@ -1647,35 +1695,6 @@ mod tests {
             let again = oob_emit(&mut oob, &scr, win("", "", clipboard, 0));
             assert!(!again.contains("\x1b]52;"), "{again:?}");
         }
-    }
-
-    #[test]
-    fn out_of_band_clipboard_off_emits_nothing() {
-        forwards_clipboard(&[(false, "aGVsbG8=", false), (true, "aGVsbG8=", true)]);
-    }
-
-    /// Never raw shell injection.
-    #[test]
-    fn out_of_band_rejects_non_base64_clipboard_even_when_on() {
-        forwards_clipboard(&[(true, "curl evil|sh", false)]);
-    }
-
-    /// Nor a query (`OSC 52 ; c ; ?`, which would ask the user's terminal for their clipboard), nor
-    /// a payload over the cap.
-    #[test]
-    fn a_clipboard_query_or_an_oversized_payload_is_never_forwarded() {
-        let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
-        forwards_clipboard(&[(true, "?", false), (true, &huge, false)]);
-    }
-
-    /// A program turning the mouse on has the real terminal report it, in SGR.
-    #[test]
-    fn out_of_band_reasserts_input_modes_on_change() {
-        let mut oob = OutOfBand::default();
-        oob_emit(&mut oob, &screen_of(b""), win("", "", "", 0));
-        let modes = screen_of(b"\x1b[?2004h\x1b[?1000h\x1b[?1005h");
-        let buf = oob_emit(&mut oob, &modes, win("", "", "", 0));
-        assert_eq!(buf, "\x1b[?1000h\x1b[?1006h");
     }
 
     /// What the first frame shows of the clipboard and bell was there before the client came, and

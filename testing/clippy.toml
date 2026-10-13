@@ -12,3 +12,7 @@ allow-indexing-slicing-in-tests = true
 allow-dbg-in-tests = true
 
 allow-print-in-tests = true
+
+disallowed-methods = [
+    { path = "std::env::temp_dir", reason = "write under the harness's own target/, in a koh_testkit::Scratch" },
+]

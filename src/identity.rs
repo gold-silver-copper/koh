@@ -36,14 +36,15 @@ pub fn load(key: &KeyFile) -> anyhow::Result<Identity> {
     load_or_create(key, true)
 }
 
-/// Load the identity at `path`, which must exist. A missing key is reported without creating
-/// anything: not its directory, nor its lock file.
-pub fn load_existing(path: &std::path::Path) -> anyhow::Result<Identity> {
-    let key = KeyFile::open_existing(path)?.with_context(|| no_key(path.display()))?;
-    load_or_create(&key, false)
+/// Load the identity at `path`, `None` if there is no key there. Creates nothing: not its
+/// directory, nor its lock file.
+pub fn load_existing(path: &std::path::Path) -> anyhow::Result<Option<Identity>> {
+    KeyFile::open_existing(path)?
+        .map(|key| load_or_create(&key, false))
+        .transpose()
 }
 
-fn no_key(key: impl std::fmt::Display) -> String {
+pub(crate) fn no_key(key: impl std::fmt::Display) -> String {
     format!(
         "no identity key at {key} — run `koh id` (or `koh connect`/`koh serve`) to create one \
          first, or pass --key-file"

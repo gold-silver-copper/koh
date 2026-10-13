@@ -12,7 +12,7 @@ fn concurrent_first_uses_publish_one_key_and_one_endpoint_id() {
     let mut children = Vec::new();
     for _ in 0..4 {
         children.push(
-            command(env!("CARGO_BIN_EXE_koh"))
+            command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
                 .expect("spawn koh")
                 .args(["id", "--key-file"])
                 .arg(&key)
@@ -53,7 +53,8 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
     .expect("disposable identity");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("key mode");
     let run = |confirmed: bool| {
-        let mut command = command(env!("CARGO_BIN_EXE_koh")).expect("spawn koh");
+        let mut command =
+            command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!()).expect("spawn koh");
         command
             .current_dir(&directory)
             .env_clear()
@@ -67,7 +68,7 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
     assert!(!run(false).status.success());
     assert!(path.exists(), "unconfirmed reset removed key");
     // `koh id` refuses the file and points at the reset.
-    let id = command(env!("CARGO_BIN_EXE_koh"))
+    let id = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
         .expect("spawn koh")
         .current_dir(&directory)
         .env_clear()
@@ -89,8 +90,11 @@ fn reset_removes_an_unreadable_key_by_relative_path_only_after_explicit_confirma
 
 #[test]
 fn tests_may_start_koh_but_never_a_program_that_authenticates() {
-    assert!(command(env!("CARGO_BIN_EXE_koh")).is_ok());
+    assert!(command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!()).is_ok());
     for program in ["sudo", "/usr/bin/passwd", "su", "ssh"] {
-        assert!(command(program).is_err(), "{program}");
+        assert!(
+            command(program, &koh_testkit::home!()).is_err(),
+            "{program}"
+        );
     }
 }

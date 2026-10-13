@@ -100,11 +100,11 @@ run_client_attack "over-cap input message" oversized
   && ok "[oversized] server refused the over-cap message and closed the connection" \
   || bad "[oversized] no size-cap rejection logged"
 
-# second-stream: the server grants one client stream; a second must never open.
-run_client_attack "second input stream" second-stream
-contains "second stream blocked by the limit" "$EVIL_OUT" \
-  && ok "[second-stream] the server's one-stream limit blocked a second stream" \
-  || bad "[second-stream] a second client stream opened: $(printf '%s\n' "$EVIL_OUT" | grep evil-client | tail -1)"
+# second-stream: the server grants two client streams, input and control; a third must never open.
+run_client_attack "third client stream" second-stream
+contains "third stream blocked by the limit" "$EVIL_OUT" \
+  && ok "[second-stream] the server's two-stream limit blocked a third stream" \
+  || bad "[second-stream] a third client stream opened: $(printf '%s\n' "$EVIL_OUT" | grep evil-client | tail -1)"
 
 run_client_attack "state accumulation"     accumulate "$ACC" 4096
 
@@ -184,9 +184,8 @@ rm -f "$WIT"
 stop_all_koh
 
 # ---- Part B: admission-stall attack — a stalling client must hold nobody up -----------------------
-# The admission ack is one byte on a stream the server opens, and QUIC does not need the client to
-# accept it, so the server's 3s admission deadline need not fire for the server to be unharmed. What
-# must hold is that a client which never accepts the ack holds nobody up: every connection is served
+# The server's first frame admits a client, and QUIC does not need the client to read it. What must
+# hold is that a client which never reads its frames holds nobody up: every connection is served
 # in its own task, behind the connection and pending-handshake caps. So we keep one stalling and
 # require a legit client to be admitted while it does.
 STALL_KEY=/data/local/tmp/koh-evil-stall-fresh.key
@@ -206,15 +205,15 @@ else
 fi
 wait "$STALL_BG" 2>/dev/null || true
 SRV="$(cat_dev "$SRV_LOG")"
-printf '%s\n' "$SRV" | grep -qE 'admission ack timed out|too many handshakes' \
-  && echo "    note: the server also logged its admission timeout / handshake cap"
+printf '%s\n' "$SRV" | grep -q 'too many handshakes' \
+  && echo "    note: the server also logged its handshake cap"
 [ -n "$(server_pid)" ] && ok "server survived the admission-stall attack" || bad "server died under the admission-stall attack"
 assert_no_crash "$SRV" >/dev/null && ok "no panic in the server log" || bad "server log shows a crash"
 stop_all_koh
 
 # ---- Part C: malicious SERVER (admission direction) — a koh CLIENT must refuse it ----------------
 if [ -x "$EVIL_SERVER_HOST" ]; then
-  for atk in bad-admit stall-admit; do
+  for atk in stall-admit; do
     echo "  -- malicious server: $atk (koh client must refuse)"
     ESLOG="$HOST_TMP/koh-evilsrv-$atk-$$.log"
     ( adb $ADB_SERIAL shell "$EVIL_SERVER_DEV $atk" > "$ESLOG" 2>&1 || true ) &
@@ -226,12 +225,9 @@ if [ -x "$EVIL_SERVER_HOST" ]; then
       w=$((w + 1)); sleep 1
     done
     if [ -z "$EID" ] || [ -z "$EPORT" ]; then bad "[$atk] evil-server did not announce its id/port"; rm -f "$ESLOG"; continue; fi
-    # A koh client dials the malicious server; it must FAIL admission and exit with the refusal: a
-    # non-ADMIT byte is rejected, and a never-opened admission stream hits the 15s connect timeout.
-    case "$atk" in
-      bad-admit) refusal="server did not admit the connection" ;;
-      *) refusal="timed out connecting" ;;
-    esac
+    # A koh client dials the malicious server; it must FAIL admission and exit with the refusal: no
+    # first frame hits the 15s connect timeout.
+    refusal="timed out connecting"
     run_remote "$DEVICE_BIN connect $EID --direct 127.0.0.1:$EPORT --key-file /data/local/tmp/koh-evilcli-$atk.key"
     if contains "$PAST_ADMISSION" "$OUT"; then
       bad "[$atk] the koh client was TRICKED into connecting to the malicious server!"

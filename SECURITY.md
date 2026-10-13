@@ -26,8 +26,8 @@ credit reporters who want it.
   `src/identity/key_file.rs`): the key file is the raw 32-byte secret, protected by its
   permissions (0600) like an SSH host key.
 - The connection accept gauntlet / node-id allowlist authorization
-  (`src/server/cli.rs`) and the admission barrier
-  (`src/transport_iroh/admission.rs`).
+  (`src/server/cli.rs`), and the session registry that attaches only allowed peers
+  (`src/server/session/sessions.rs`).
 - The untrusted wire decoders (`src/proto.rs`) and the connection cores
   (`src/server/mod.rs`, `src/client/session.rs`).
 - The terminal apply path (`src/terminal/`): decoding and validating the structured screen diff.
@@ -57,8 +57,8 @@ and the git log.
 | H-1 | A peer's resize allocates an unbounded grid (OOM) | `tests/sessions.rs::a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server`, `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`; `testing/android/scripts/sec-resize-oom-server.sh` |
 | M-1 | The identity key is written world-readable | `src/identity/key_file.rs::a_created_key_is_its_raw_bytes_and_loads_back_to_the_same_identity`; `testing/android/scripts/sec-key-perms.sh` |
 | M-2 | A (0, 0) resize panics the emulator | `tests/sessions.rs::a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server`, `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`; `testing/android/scripts/sec-resize-zero-panic.sh` |
-| L-1 | A server silently sets the client's clipboard (OSC 52) | Accepted since 0.13: clipboard writes are on by default, the owner's choice, and off with `--no-clipboard` (`src/args.rs::no_clipboard_turns_clipboard_writes_off`). What bounds them stays: `src/client/render.rs::out_of_band_clipboard_off_emits_nothing`, `out_of_band_rejects_non_base64_clipboard_even_when_on`, `a_clipboard_query_or_an_oversized_payload_is_never_forwarded`; `src/terminal/server.rs::only_base64_sets_the_clipboard_and_a_query_sets_nothing` |
-| L-2 | The client trusts the server's title/icon/clipboard sizes | `src/terminal/mod.rs::client_apply_caps_oversized_title_and_clipboard` |
+| L-1 | A server silently sets the client's clipboard (OSC 52) | Accepted since 0.13: clipboard writes are on by default, the owner's choice, and off with `--no-clipboard` (`src/args.rs::connect_takes_a_server_a_bell_command_and_turns_features_off`). What bounds them stays: `src/client/render.rs::only_a_base64_clipboard_within_the_cap_is_forwarded_and_only_when_on`; `src/terminal/server.rs::only_base64_sets_the_clipboard_and_a_query_sets_nothing` |
+| L-2 | The client trusts the server's title/icon/clipboard sizes | `src/terminal/mod.rs::side_channels_roundtrip_and_resist_collapse`, `apply_is_panic_free_and_holds_invariants` |
 | L-3 | No cap on connections, handshakes or sessions | `tests/sessions.rs::max_sessions_refuses_a_new_peer_but_allows_a_reattach`, `tests/net/hostile_peer.rs::a_flood_of_connections_and_garbage_does_not_take_the_server_down` |
 | L-4 | `KOH_*` variables leak into the spawned shell | `src/pty.rs::scrub_removes_inherited_koh_vars`; `testing/android/scripts/sec-env-leak.sh` |
 
@@ -66,15 +66,15 @@ and the git log.
 
 | ID | Finding | Guarded by |
 |----|---------|------------|
-| KOH-01 | Received states bounded by count, not bytes | Replaced by koh/4's fixed window of 16 frames per end: `src/client/session.rs::only_the_last_frames_are_kept_as_bases`, `src/server/mod.rs::only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored`, `tests/net/hostile_peer.rs::frames_on_unknown_bases_leave_the_client_running` |
-| KOH-02 | Decompression amplification on apply | `src/proto.rs::an_inflate_bomb_is_rejected`, `oversized_client_messages_are_rejected_before_buffering`, `tests/net/hostile_peer.rs::an_oversized_or_bomb_frame_leaves_the_client_running`, `an_oversized_client_message_closes_the_connection_only` |
+| KOH-01 | Received states bounded by count, not bytes | Replaced by koh/4's fixed window of 16 frames per end: `src/client/session.rs::only_the_last_frames_are_kept_as_bases_and_the_one_the_server_diffs_against`, `src/server/mod.rs::only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored`, `tests/net/hostile_peer.rs::hostile_frames_and_history_leave_the_client_running` |
+| KOH-02 | Decompression amplification on apply | `src/proto.rs::an_inflate_bomb_is_rejected`, `oversized_client_messages_are_rejected_before_buffering`, `tests/net/hostile_peer.rs::hostile_frames_and_history_leave_the_client_running`, `an_oversized_client_message_closes_the_connection_only` |
 | KOH-03 | Fixed public KDF salt in the passphrase handshake | Removed: there is no over-the-wire passphrase; the node-id allowlist is the only factor |
 | KOH-04 | `String::truncate` on the status line panics the client | `src/client/render.rs::status_line_truncation_is_panic_free_across_all_widths` |
-| KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_queues_the_session_input_in_order_merging_neighbours`, `input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
+| KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_queues_input_and_resizes_in_order_and_keeps_the_newest_window_beside_them`, `a_stream_decodes_whole_messages_as_the_session_takes_them_even_after_it_ends`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
 | KOH-06 | State dir in a world-writable shared location | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_directory_of_another_user_but_root_is_refused`, `src/transport_iroh/mod.rs::config_dir_is_xdg_then_home_and_never_elsewhere` |
 | KOH-07 | Fragment reassembly buffers ~39 MiB | Removed: koh/4 has no fragments; a frame is one stream read under `MAX_FRAME` (see KOH-02) |
-| KOH-08 | Stalled handshakes hold connection permits | The handshake and admission deadlines, and the pending-handshake cap, which gives up the oldest for a new one, never refusing it, and caps each address, giving up that address's oldest: `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room`; the admission-stall attack in `testing/android/scripts/stress-evil-peer.sh` exercises it on a device |
-| KOH-10 | A SIGHUP-immune child leaks the PTY threads | `Pty`'s `Drop` hangs the program up and the reaper kills it after a second's grace: `tests/pty.rs::a_child_that_ignores_sighup_dies_when_its_pty_is_dropped`, `a_hung_up_program_has_time_to_exit_before_it_is_killed`, `dropping_pty_eofs_child_and_stops_writer`, `shutdown_joins_both_io_threads_without_deadlock` |
+| KOH-08 | Stalled handshakes hold connection permits | Handshakes hold none, and have a deadline; the pending-handshake cap gives up the oldest for a new one, never refusing it, and caps each address, giving up that address's oldest: `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room`, `tests/sessions.rs::an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes`; the admission-stall attack in `testing/android/scripts/stress-evil-peer.sh` exercises it on a device |
+| KOH-10 | A SIGHUP-immune child leaks the PTY threads | `Pty`'s `Drop` hangs the program up and the reaper kills it after a second's grace: `tests/pty.rs::dropping_a_pty_ends_its_program`, `a_hung_up_program_has_time_to_exit_before_it_is_killed`, `shutdown_joins_both_io_threads_without_deadlock` |
 | KOH-11, KOH-13 | Passphrase handshake downgrades | Removed with the passphrase handshake |
 | KOH-12 | A pre-existing state dir is not made private | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_missing_directory_is_created_private` |
 | KOH-14 | CLI args holding a passphrase derive `Debug` | Removed: no passphrase or other secret is a CLI argument |
@@ -92,7 +92,7 @@ and the git log.
 | A-2 | Frames a client never takes grew the server's in-flight list | `src/bounded.rs`, and `clippy.toml`'s ban on unbounded queues: `src/server/mod.rs::frames_a_client_never_takes_are_forgotten` |
 | A-3 | Links left off a frame made the two ends' dictionaries differ | The server holds the screen as sent: `src/server/mod.rs::links_left_off_a_frame_go_in_a_later_one` |
 | A-4 | The allowlist check had no test; `koh clients rm` needed a restart | `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server` |
-| A-5 | Hostile-server tests that could not fail | `tests/net/hostile_peer.rs::client_survives` quits the client through the escape |
+| A-5 | Hostile-server tests that could not fail | `tests/net/hostile_peer.rs::hostile_frames_and_history_leave_the_client_running` waits for a good frame after the hostile ones, then quits the client through the escape; the hostile clients' tests check the close is `Close::ProtocolError` |
 | A-6 | A hostile frame could allocate before its counts were checked | `src/bounded.rs::a_sequence_past_its_bound_is_refused_before_it_is_read`, the wire's `at_most` bounds |
 | A-7 | A flood of input starved the client's frames | The client's loop is unbiased: `tests/net/session.rs::a_flood_of_typing_does_not_starve_the_frames` |
 
@@ -100,7 +100,7 @@ and the git log.
 
 | ID | Finding | Guarded by |
 |----|---------|------------|
-| B-1 | A `clients` file that could not be read disconnected every saved client | One reader keeps the list last read well: `src/server/cli.rs::a_saved_list_that_cannot_be_read_keeps_the_last_one` |
+| B-1 | A `clients` file that could not be read disconnected every saved client | One reader keeps the list last read well, and drops a client only when two reads agree (an editor's save leaves it missing or empty a moment): `src/server/cli.rs::only_a_removal_two_reads_agree_on_drops_a_saved_client` |
 | B-2 | Removing a client left its session running | `tests/sessions.rs::ending_a_peers_session_ends_it_at_once` |
 | B-3 | Log lines could interleave; a peer's text could start a line or reorder one | `src/log.rs::a_log_line_is_written_whole_in_one_write`, `a_peers_text_is_one_line_of_printable_ascii`; close reasons are codes, never text: `src/proto.rs::close_codes_round_trip_and_0_is_none_of_them` |
 | B-4 | A refusal after admission was retried for ever; a capacity close could look permanent | `src/client/mod.rs::a_refusal_is_for_good_only_when_not_authorized`, `tests/sessions.rs::a_program_that_cannot_start_is_refused_as_such` |
@@ -109,10 +109,10 @@ and the git log.
 | B-7 | A lost or reordered history reply stalled scrollback | `src/client/scrollback.rs::replies_pair_with_their_requests_by_id_in_any_order` |
 | B-8 | A search could loop on history rows it fetched and lost | `src/client/scrollback.rs::a_search_through_more_history_than_the_cache_holds_finishes` |
 | B-9 | A double SIGHUP skipped the drain | `src/lib.rs::a_double_sighup_still_drains_and_a_later_signal_forces` |
-| B-10 | Anyone who reaches the UDP port could block allowed clients' dials | `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room` |
+| B-10 | Anyone who reaches the UDP port could block allowed clients' dials | Slowed, not stopped: spoofed addresses must answer a QUIC retry first, real ones are capped each. `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room`, `tests/sessions.rs::an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes` |
 | B-11 | The server kept a clipboard of up to 3 times its cap | `src/terminal/server.rs::only_base64_sets_the_clipboard_and_a_query_sets_nothing` |
 | B-12 | A hard-linked key could be truncated through `$KOH_LOG` | `src/identity/key_file.rs::a_hard_linked_key_or_log_is_refused_and_left_whole` |
-| B-13 | Queued client messages waited for more bytes; a clean end with some left was an error | `src/server/mod.rs::input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends` |
+| B-13 | Queued client messages waited for more bytes; a clean end with some left was an error | `src/server/mod.rs::a_stream_decodes_whole_messages_as_the_session_takes_them_even_after_it_ends` |
 | B-14 | An old connection's input could interleave with a reconnect's | Input is numbered by attachment, and only the newest's reaches the program: `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` |
 
 **Review follow-ups (KR-, K-, KB-, KC-, KS-, S-, AR-).**
@@ -126,19 +126,19 @@ and the git log.
 | K-01 | Key load races a path swap (TOCTOU) | `src/identity/key_file.rs::a_symlinked_key_is_refused_and_its_target_left_alone`, `loose_key_and_lock_files_are_tightened_through_the_descriptor` |
 | K-03 | An accept-then-close server spins the client's reconnect | `src/client/mod.rs::dwell_gate_resets_on_proven_connection_and_climbs_on_flap`, `reconnect_backoff_grows_then_caps` |
 | K-13 | `clamp_dims` is the only bound on one resize's allocation | `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`, `apply_is_panic_free_and_holds_invariants` |
-| K-16 | A panicking connection leaks its session | Detach on drop of `SessionClient`: `tests/sessions.rs::the_last_detach_starts_the_ttl_a_concurrent_one_does_not`, `tests/net/session.rs::connections_dropped_with_input_in_flight_do_not_hurt_the_session` |
+| K-16 | A panicking connection leaks its session | Detach on drop of `SessionClient`: `tests/sessions.rs::the_last_detach_starts_the_ttl_a_concurrent_one_does_not`, `tests/net/session.rs::many_connects_in_a_row_reattach_the_same_session` |
 | KB-01 | The bell hook | `src/client/cli.rs::bell_hook_fires_on_a_rise_and_rate_limits_a_burst`, `tests/net/bell.rs::a_remote_bell_runs_the_hook_at_most_once_a_second` |
 | KB-02 | The bell hook's environment and first frame | `src/client/cli.rs::bell_hook_command_scrubs_parent_koh_vars_and_exports_its_own`, `bell_hook_prime_swallows_the_count_it_is_seeded_with_but_not_later_rises`, `tests/net/bell.rs::stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do` |
-| KC-01 | Predictor over a `ScreenView`; input modes byte-identical | `src/predict.rs::predictor_runs_over_a_plain_screen_view`, `src/client/render.rs::the_real_terminal_reports_input_whatever_the_program_set`, `out_of_band_reasserts_input_modes_on_change` |
-| KC-IO-01 | Client teardown owns and joins every producer | `src/client/io.rs::idle_input_poll_cancels_and_joins_without_waiting_for_a_byte`, `dropping_public_tasks_cancels_both_producers` |
-| KC-IO-02 | The input producer does not transform bytes | `src/client/io.rs::input_producer_forwards_bytes_exactly` |
+| KC-01 | Predictor over a `ScreenView`; input modes byte-identical | `src/predict.rs::prop_predicting_any_keys_is_panic_free`, `src/client/render.rs::the_real_terminal_reports_input_whatever_the_program_set` |
+| KC-IO-01 | Client teardown owns and joins every producer | `src/client/io.rs::input_producer_forwards_bytes_exactly_and_an_idle_one_cancels_without_a_byte`, `dropping_public_tasks_cancels_both_producers` |
+| KC-IO-02 | The input producer does not transform bytes | `src/client/io.rs::input_producer_forwards_bytes_exactly_and_an_idle_one_cancels_without_a_byte` |
 | KS-01, KS-04 | Shared sessions across peers; their unwind guard | Removed with the generic session host: one PTY per peer, and K-16's detach on drop |
 | KS-02 | Echo-ack per connection, not per session | `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` |
 | KS-03 | A screen change wakes every attached connection | The session's `watch` channel: `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` keeps two connections on one session receiving frames |
 | S-04 | Per-cell `String` allocation on repaint | Performance only; nothing to guard |
-| S-07 | One place states the prediction-cell invariants | `PredictionEngine::place_cell`; the prediction tests in `src/predict.rs` |
+| S-07 | One place states the prediction-cell invariants | `PredictionEngine::place`; the prediction tests in `src/predict.rs` |
 | AR-02 | `predict` and `proto` import direction | CI's layering-guard step (`.github/workflows/ci.yml`) |
-| AR-06 | The admission pipeline's order | `src/server/cli.rs::serve_endpoint`; `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server`, `tests/net/hostile_peer.rs::a_bad_admission_byte_is_rejected_not_treated_as_admitted` |
+| AR-06 | The admission pipeline's order | `src/server/cli.rs::serve_endpoint`; `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server`, `tests/sessions.rs::ending_a_peers_session_ends_it_at_once` |
 
 ## Please do not
 

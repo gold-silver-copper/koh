@@ -22,9 +22,10 @@
 //!                            (a paste piece over the cap), `events` (too many in one message),
 //!                            `palette` (17 colours)                       (event validation)
 //!   events-flood <mib>       a mib-MiB paste as valid paste events        (PTY backpressure)
-//!   second-stream            open a second client stream                 (one-stream limit)
+//!   second-stream            open a third client stream                  (two-stream limit)
 //!   bad-alpn                 connect with the wrong ALPN                  (handshake rejects)
-//!   stall-admission          connect but never accept the admission ack  (3s admission timeout)
+//!   stall-admission          connect but never read a frame              (no one else held up)
+//!   handshake-flood [n] [s] [alpn]  n stalled handshakes a second for s s, through a black hole
 //!
 //! `empty-frags`, `partial-frags` and `bad-version` are accepted as aliases of `garbage` /
 //! `bad-alpn`, the nearest koh/4 attacks: koh/4 has no fragments and the ALPN is the version. The
@@ -41,8 +42,7 @@ use koh::events::{
 use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE};
 use koh::terminal::Size;
 use koh::transport_iroh::{
-    admission, bind_endpoint_local, direct_addr, generate_secret_key, parse_endpoint_id, ALPN,
-    KEY_LEN,
+    bind_endpoint_local, direct_addr, generate_secret_key, parse_endpoint_id, ALPN, KEY_LEN,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -82,6 +82,10 @@ async fn main() -> Result<()> {
     if attack == "stall-admission" {
         return admission_stall(server_id, saddr).await;
     }
+    if attack == "handshake-flood" {
+        let alpn = args.get(6).map_or(ALPN, |alpn| alpn.as_bytes());
+        return handshake_flood(server_id, saddr, num(4, 150), num(5, 30), alpn).await;
+    }
     if attack == "bad-alpn" || attack == "bad-version" {
         let ep = bind_endpoint_local(evil_secret!(), false).await?;
         eprintln!("evil-client: connecting with a bad ALPN (the handshake must reject us)");
@@ -99,7 +103,8 @@ async fn main() -> Result<()> {
     // messages on it.
     let ep = bind_endpoint_local(evil_secret!(), false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
-    admission::await_admission(&conn).await?;
+    // The first frame admits us.
+    conn.accept_uni().await?;
     eprintln!("evil-client: admitted; running attack '{attack}'");
 
     match attack {
@@ -146,8 +151,9 @@ async fn write_msg(send: &mut SendStream, msg: &ClientMsg) -> Result<()> {
 /// clamp_dims: an oversized or zero terminal geometry, sent many times.
 async fn resize(send: &mut SendStream, rows: u16, cols: u16) -> Result<()> {
     eprintln!("evil-client: injecting resize({rows}, {cols})");
-    for _ in 0..30 {
-        write_msg(send, &ClientMsg::Resize(Size::new(rows, cols))).await?;
+    for n in 1..=30 {
+        let size = Size::new(rows, cols);
+        write_msg(send, &ClientMsg::Resize { n, size }).await?;
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
     Ok(())
@@ -210,7 +216,15 @@ async fn resize_flood(send: &mut SendStream, n: usize) -> Result<()> {
     eprintln!("evil-client: {n} resize messages (the server must coalesce)");
     for k in 0..n {
         let (rows, cols) = if k % 2 == 0 { (1000, 1000) } else { (2, 2) };
-        write_msg(send, &ClientMsg::Resize(Size::new(rows, cols))).await?;
+        let n = u32::try_from(k).unwrap_or(u32::MAX).saturating_add(1);
+        write_msg(
+            send,
+            &ClientMsg::Resize {
+                n,
+                size: Size::new(rows, cols),
+            },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -320,20 +334,45 @@ async fn second_stream(conn: &Connection) -> Result<()> {
         },
     )
     .await?;
-    eprintln!("evil-client: trying a second client stream (the one-stream limit must block it)");
+    let _control = conn.open_uni().await?;
+    eprintln!("evil-client: trying a third client stream (the two-stream limit must block it)");
     match tokio::time::timeout(Duration::from_secs(3), conn.open_uni()).await {
-        Err(_) => eprintln!("evil-client: second stream blocked by the limit, as expected"),
-        Ok(_) => eprintln!("evil-client: WARNING second stream opened — limit not enforced"),
+        Err(_) => eprintln!("evil-client: third stream blocked by the limit, as expected"),
+        Ok(_) => eprintln!("evil-client: WARNING third stream opened — limit not enforced"),
     }
     let _ = first.finish();
     Ok(())
 }
 
-/// Connect but never accept the admission ack: the server's 3s admission timeout must fire.
+/// Start `per_sec` handshakes a second for `secs` seconds, each abandoned after 10 s: through a
+/// relay that drops the server's replies, every one stalls, holding a pending handshake.
+async fn handshake_flood(
+    server_id: iroh::EndpointId,
+    saddr: SocketAddr,
+    per_sec: u64,
+    secs: u64,
+    alpn: &[u8],
+) -> Result<()> {
+    let ep = bind_endpoint_local(evil_secret!(), false).await?;
+    let mut tick = tokio::time::interval(Duration::from_micros(1_000_000 / per_sec.max(1)));
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    eprintln!("evil-client: {per_sec} handshakes a second for {secs} s");
+    while tokio::time::Instant::now() < end {
+        tick.tick().await;
+        let (ep, alpn) = (ep.clone(), alpn.to_vec());
+        tokio::spawn(async move {
+            let dial = ep.connect(direct_addr(server_id, saddr), &alpn);
+            let _ = tokio::time::timeout(Duration::from_secs(10), dial).await;
+        });
+    }
+    Ok(())
+}
+
+/// Connect but never read a frame: the server must hold no one else up for it.
 async fn admission_stall(server_id: iroh::EndpointId, saddr: SocketAddr) -> Result<()> {
     let ep = bind_endpoint_local(evil_secret!(), false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
-    eprintln!("evil-client: connected; NOT accepting the admission ack (server timeout must fire)");
+    eprintln!("evil-client: connected; NOT reading any frame (no one else may be held up)");
     tokio::time::sleep(Duration::from_secs(8)).await;
     drop(conn);
     drop(ep);

@@ -405,9 +405,11 @@ struct Results {
     scrollback: Vec<(String, usize, scrollback::History)>,
 }
 
+/// Where the bench writes, never the system temp dir: under its own `target/`, removed at the end.
+const SCRATCH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/scratch");
+
 async fn run(args: &Args) -> anyhow::Result<String> {
-    let scratch = std::env::temp_dir().join(format!("koh-bench-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch)?;
+    let scratch = koh_testkit::Scratch::new(SCRATCH, "bench")?;
     let mut systems = Vec::new();
     let mut missing = Vec::new();
     for &system in &args.systems {
@@ -434,6 +436,7 @@ async fn run(args: &Args) -> anyhow::Result<String> {
     };
     let setup = Setup {
         koh: std::fs::canonicalize(&args.koh)?,
+        home: koh_testkit::home(&*scratch),
         sshd,
         direct: false,
     };
@@ -631,7 +634,6 @@ async fn run(args: &Args) -> anyhow::Result<String> {
         load()
     );
     drop(setup);
-    let _ = std::fs::remove_dir_all(&scratch);
     Ok(out)
 }
 
@@ -1154,7 +1156,7 @@ fn netns_child(args: &[String]) -> anyhow::Result<()> {
         .worker_threads(4)
         .enable_all()
         .build()?;
-    let scratch = std::env::temp_dir().join(format!("koh-bench-ns-{}", std::process::id()));
+    let scratch = koh_testkit::Scratch::new(SCRATCH, "bench-ns")?;
     let measure = arg(0)?;
     let system = system(&arg(1)?)?;
     // Where the arguments after the measure's own begin.
@@ -1170,6 +1172,7 @@ fn netns_child(args: &[String]) -> anyhow::Result<()> {
     };
     let setup = Setup {
         koh: PathBuf::from(arg(rest)?),
+        home: koh_testkit::home(&*scratch),
         sshd,
         direct: true,
     };
@@ -1217,7 +1220,6 @@ fn netns_child(args: &[String]) -> anyhow::Result<()> {
         }
         other => Err(anyhow!("no namespaced measure {other}")),
     };
-    let _ = std::fs::remove_dir_all(&scratch);
     result
 }
 

@@ -15,23 +15,22 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 
 use crate::proto::Close;
 
-pub mod admission;
-
 /// The connection idle timeout is 5 minutes, not iroh's ~30 s, so a short suspend (Android
 /// freezing the process, so keepalives stop) is ridden out on the same connection; the client
 /// redials after a longer one.
 ///
-/// The server accepts only the client's one message stream; the client, the admission bi-stream
-/// and a few frame streams (superseded ones are reset, so few are ever open).
+/// The server accepts only the client's two message streams, input and control; the client, a few
+/// frame streams (superseded ones are reset, so few are ever open), and no bi-stream on either
+/// side.
 fn koh_transport_config(accept: bool) -> QuicTransportConfig {
     // From a `u32` of milliseconds, unlike from a `Duration`, it cannot fail.
     const IDLE_TIMEOUT_MS: u32 = 300_000;
-    let (uni, bidi) = if accept { (1, 0) } else { (8, 1) };
+    let uni = if accept { 2 } else { 8 };
     let config = QuicTransportConfig::builder()
         .keep_alive_interval(Duration::from_secs(5))
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))))
         .max_concurrent_uni_streams(VarInt::from_u32(uni))
-        .max_concurrent_bidi_streams(VarInt::from_u32(bidi));
+        .max_concurrent_bidi_streams(VarInt::from_u32(0));
     // The server takes a frame's delivery as its acknowledgement, so it asks the client to
     // acknowledge within a couple of milliseconds rather than QUIC's 25: the next frame is then
     // diffed against the newest screen, and a frame is not resent while its acknowledgement waits.
@@ -49,7 +48,7 @@ fn koh_transport_config(accept: bool) -> QuicTransportConfig {
 const CLIENT_ACK_DELAY: Duration = Duration::from_millis(2);
 
 /// The protocol's name and version ([`crate::proto`]), its ALPN.
-pub const PROTOCOL: &str = "koh/5";
+pub const PROTOCOL: &str = "koh/6";
 
 /// The ALPN, [`PROTOCOL`]: a peer on another fails the TLS handshake instead of misparsing
 /// mid-session.
@@ -378,15 +377,22 @@ mod tests {
     #[test]
     fn a_fixed_port_is_bound_and_a_taken_one_is_reported() {
         crate::test_runtime::current_thread().block_on(async {
-            // A port the OS just handed out, so almost surely free.
-            let port = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-                .and_then(|socket| socket.local_addr())
-                .expect("a free port")
-                .port();
+            // A port the OS just handed out, so almost surely free; another taken meanwhile is
+            // tried again with the next.
             let secret = generate_secret_key().expect("OS randomness");
-            let first = bind_on(secret.clone(), true, &Network::Local, Some(port))
-                .await
-                .expect("bind the port");
+            let mut found = None;
+            for _ in 0..5 {
+                let port = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                    .and_then(|socket| socket.local_addr())
+                    .expect("a free port")
+                    .port();
+                if let Ok(first) = bind_on(secret.clone(), true, &Network::Local, Some(port)).await
+                {
+                    found = Some((port, first));
+                    break;
+                }
+            }
+            let (port, first) = found.expect("bind a free port");
             let bound = first.bound_sockets();
             assert!(
                 bound.iter().any(|s| s.is_ipv4() && s.port() == port),

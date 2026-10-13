@@ -68,15 +68,18 @@ jobs:
       - name: clippy (production build)
         run: cargo clippy --lib --bins --locked -- -D warnings
       - name: layering guard
-        # Enforce the load-bearing dependency edges the architecture relies on. Greps
-        # the `use crate::` import form only, so doc-comment rustdoc links can't false-positive.
+        # Enforce the load-bearing dependency edges the architecture relies on: any `crate::` path
+        # in the code, a `use` (grouped or split over lines) or inline, but not in a comment, so a
+        # rustdoc link can't false-positive.
         run: |
-          if grep -rnE '^[[:space:]]*use crate::' src/predict.rs; then
+          # The code of a file, its comments removed, on one line, so a `use` split over lines is one.
+          code() { sed -e 's://.*$::' "$1" | tr '\n' ' '; }
+          if code src/predict.rs | grep -E '(^|[^[:alnum:]_])crate::' >/dev/null; then
             echo "::error::predict.rs must import nothing from crate:: — keep it a standalone library"
             exit 1
           fi
           # The wire protocol sits below both ends: it may use the screen types, never a client or server.
-          if grep -rnE '^[[:space:]]*use crate::(server|client)' src/proto.rs; then
+          if code src/proto.rs | grep -E 'crate::(\{[^}]*)?(server|client)' >/dev/null; then
             echo "::error::proto.rs must not import from server/client — both ends build on it"
             exit 1
           fi
@@ -146,9 +149,18 @@ jobs:
         run: |
           cargo +nightly check --locked --manifest-path fuzz/Cargo.toml --bins
           cargo +nightly fuzz build
+      # What earlier runs found, a directory per target: each run goes on from there.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: seed the corpus with the hand-built wire messages
+        run: KOH_FUZZ_SEEDS="$PWD/fuzz/corpus" cargo +nightly test --locked --test wire_golden the_wire_messages_seed_the_fuzzers
       - name: smoke (must stay crash-free)
-        # Each starts from nothing (fuzz/corpus is not committed), except `server_process`, whose
-        # input is a program's output: it is seeded with the recorded output of real programs.
+        # Each target from its corpus (fuzz/corpus is not committed): what earlier runs found and
+        # the wire messages above, and for `server_process`, whose input is a program's output,
+        # the recorded output of real programs.
         run: |
           for target in screen_apply proto_decode history_apply server_input client_input; do
             cargo +nightly fuzz run "$target" -- -max_total_time=45 -rss_limit_mb=4096

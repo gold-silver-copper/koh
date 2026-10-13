@@ -63,6 +63,13 @@ fn the_overview_shows_both_keys_and_both_lists() {
     );
     assert!(shown.contains("3  phone"), "{shown}");
     assert!(shown.contains("[1-3] pick"), "{shown}");
+    // A key that is there but cannot be loaded says why, not "none yet".
+    std::fs::write(&places.server_key, [7; 31]).unwrap();
+    let (_, shown) = menu(&places, "q\n");
+    assert!(
+        shown.contains("cannot be loaded") && !shown.contains("none yet"),
+        "{shown}"
+    );
 }
 
 #[test]

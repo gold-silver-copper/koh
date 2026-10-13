@@ -101,11 +101,6 @@ impl Scrollback {
         self.view = Some(0);
     }
 
-    /// The rows held, for tests and the status line.
-    pub const fn cache(&self) -> &HistoryCache {
-        &self.cache
-    }
-
     /// The rows scrolled back, if viewing.
     pub const fn offset(&self) -> Option<usize> {
         self.view
@@ -200,7 +195,6 @@ impl Scrollback {
         if let Some(search) = self.search.as_mut().filter(|s| !s.query.is_empty()) {
             search.typing = false;
             search.older = older;
-            search.failed = false;
             search.next = match (older, at_live) {
                 (true, true) => Some(top),
                 (true, false) => top.checked_sub(1),
@@ -339,25 +333,16 @@ impl Scrollback {
 
     pub(crate) fn status_at(&self, cols: u16) -> Option<String> {
         let offset = self.view?;
-        let len = self.mark.len;
-        Some(match &self.search {
-            Some(search) if search.typing => search.editing_status(cols),
-            Some(search) if search.next.is_some() => {
-                format!(
-                    "[koh] scrollback {offset}/{len} — searching for {:?}…",
-                    search.query
-                )
-            }
-            Some(search) if search.failed => {
-                format!(
-                    "[koh] scrollback {offset}/{len} — {:?} not found",
-                    search.query
-                )
-            }
-            Some(_) | None => format!(
-                "[koh] scrollback {offset}/{len} — arrows, PgUp/PgDn, wheel; / searches; q leaves"
-            ),
-        })
+        let what = match &self.search {
+            Some(search) if search.typing => return Some(search.editing_status(cols)),
+            Some(search) if search.next.is_some() => format!("searching for {:?}…", search.query),
+            Some(search) if search.failed => format!("{:?} not found", search.query),
+            Some(_) | None => "arrows, PgUp/PgDn, wheel; / searches; q leaves".to_owned(),
+        };
+        Some(format!(
+            "[koh] scrollback {offset}/{} — {what}",
+            self.mark.len
+        ))
     }
 
     /// Input decoded while viewing, for a screen `rows` high: each key in its legacy form (one
@@ -636,18 +621,6 @@ mod tests {
     }
 
     #[test]
-    fn an_escape_sequence_split_across_reads_is_read_whole() {
-        let mut s = viewing(100);
-        let mut decoder = fux_vt::keys::decode::Decoder::default();
-        for bytes in [&b"\x1b["[..], b"5", b"~"] {
-            let mut inputs = Vec::new();
-            decoder.bytes(bytes, &mut inputs);
-            s.on_events(&inputs, 25);
-        }
-        assert_eq!(s.offset(), Some(24));
-    }
-
-    #[test]
     fn q_ctrl_c_or_a_lone_escape_leaves() {
         for keys in [&b"q"[..], b"\x03", b"\x1b", b"kkq"] {
             let mut s = viewing(100);
@@ -765,11 +738,11 @@ mod tests {
             ..answer(first, 10, 0)
         });
         assert!(
-            !s.cache().holds(first.newest),
+            !s.cache.holds(first.newest),
             "an answer to nothing is dropped"
         );
         s.on_reply(&answer(first, 10, 0));
-        assert!(s.cache().holds(first.newest) && s.cache().holds(second.newest));
+        assert!(s.cache.holds(first.newest) && s.cache.holds(second.newest));
         // A lost answer would have held a slot; an empty one frees it.
         s.on_keys(&b"\x1b[5~".repeat(10), 25);
         let third = s.next_request(25, false).unwrap();

@@ -2,12 +2,12 @@
 
 A Rust, peer-to-peer remote shell inspired by [mosh](https://mosh.org), built on [iroh](https://iroh.computer) / QUIC.
 
-koh gives you a responsive remote shell that survives network changes, suspend/resume, and reconnects — without SSH, open ports, or server-side accounts.
+koh gives you a responsive remote shell that survives network changes, suspend/resume, and reconnects — without SSH, port forwarding, or server-side accounts.
 
 ## Install and usage
 
 ```sh
-cargo install koh
+cargo install --locked koh
 ```
 
 koh authorizes by endpoint id. There are no passwords or accounts.
@@ -50,7 +50,7 @@ Useful flags:
 --no-colours              # don't tell the server your terminal's colours (told by default, so
                           # vim, bat and delta pick a matching theme)
 --on-bell <cmd>           # run a shell command whenever the remote bell rings
---shell <program>         # host a program instead of the login shell (repeat to pass args)
+--shell <program>         # host a program instead of $SHELL (repeat to pass args)
 --key-file <path>         # use a custom identity-key path
 --session-ttl-secs <n>    # keep detached sessions around longer/shorter
 --max-connections <n>     # limit concurrent connections
@@ -82,7 +82,7 @@ for the program, kitty's encoding to nvim or helix, legacy bytes to the rest.
 3. Install koh:
 
    ```sh
-   cargo install koh
+   cargo install --locked koh
    ```
 
 If DNS resolution is broken on your Android device, try setting an explicit resolver:
@@ -113,7 +113,7 @@ binary, not the library.
 - Built in Rust on iroh peer-to-peer QUIC; connects by endpoint id instead of hostname/port.
 - Mosh-style predictive local echo and screen-state sync for responsive shells on bad networks.
 - Detachable sessions survive suspend/resume, IP changes, and reconnects without tmux.
-- No SSH bootstrap, no listening port, and no port forwarding needed.
+- No SSH bootstrap and no port forwarding: the server listens on one UDP port (random unless `--port`), reached through iroh's relays and hole-punching, and admits only allowlisted keys.
 - Not wire-compatible with mosh or SSH; koh is its own protocol/tool.
 - Intended for personal machines you control; not a full SSH replacement.
 - Scrollback: `Ctrl-^ [` opens the server's history above the live screen, in full colour, with

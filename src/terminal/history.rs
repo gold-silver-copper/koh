@@ -14,8 +14,10 @@ use std::sync::Arc;
 use fux_vt::{CellRef, Cells, RowId};
 use serde::{Deserialize, Serialize};
 
-use super::grid::{exactly, Palette, RowLinks};
-use super::{cells_of, link_bytes, runs_of, Run, WireLink, MAX_DIM, MAX_LINK_BYTES};
+use super::grid::{exactly, Palette, RowLinks, Uses};
+use super::{
+    cells_of, link_bytes, runs_of, Run, WireLink, DIM, MAX_DIM, MAX_LINK_BYTES, MAX_ROW_LINKS,
+};
 
 /// Most rows one [`HistoryRequest`] asks for, and one reply carries.
 pub const MAX_HISTORY_ROWS: u16 = 256;
@@ -26,6 +28,15 @@ const HISTORY_ROWS: usize = MAX_HISTORY_ROWS as usize;
 /// Most cells one reply carries: [`MAX_HISTORY_ROWS`] rows of a wide screen. Past it the server
 /// stops adding rows, and the client asks again for the rest.
 pub const MAX_HISTORY_CELLS: usize = 256 * 256;
+
+/// Most bytes a reply the server may send inflates to.
+///
+/// Its cells, past [`MAX_HISTORY_CELLS`] by a row at most, each a run of its own of the longest
+/// cluster (its count, kind, colours, style and link are under 32 bytes); each row's name, flag,
+/// lengths and links' lengths; and the links.
+pub const MAX_HISTORY_REPLY: usize = (MAX_HISTORY_CELLS + DIM) * (fux_vt::CLUSTER_CAPACITY + 32)
+    + HISTORY_ROWS * (32 + MAX_ROW_LINKS * 8)
+    + MAX_LINK_BYTES;
 
 /// Most bytes of history a client keeps, by [`KeptRow::bytes`]: what a server chooses to send is
 /// bounded by memory, not by a count its rows' links or overhead could multiply.
@@ -118,6 +129,8 @@ pub(super) struct HistoryNames {
     /// The last name given; the first is 1.
     last: u64,
     by_row: HashMap<RowId, u64>,
+    /// The colours the rows named use, whose copies a client holds under those names.
+    uses: Uses,
 }
 
 impl HistoryNames {
@@ -125,6 +138,12 @@ impl HistoryNames {
     /// again.
     pub(super) fn renew(&mut self) {
         self.by_row.clear();
+        self.uses = Uses::default();
+    }
+
+    /// Whether palette `new` draws a row named otherwise than `old`, which the rows were named in.
+    pub(super) fn redrawn(&self, old: Option<&Palette>, new: Option<&Palette>) -> bool {
+        old != new && self.uses.drawn_otherwise(old, new)
     }
 
     /// Name the rows that entered `screen`'s history since the last call, in order, and say where
@@ -145,6 +164,7 @@ impl HistoryNames {
             .take_while(|row| !self.by_row.contains_key(&row.id()))
             .count();
         for row in screen.rows().take(len).skip(len.saturating_sub(unnamed)) {
+            self.uses.add(row.cells().map(|cell| cell.attributes()));
             self.last = self.last.saturating_add(1);
             self.by_row.insert(row.id(), self.last);
         }
@@ -392,9 +412,6 @@ impl HistoryCache {
         mark: HistoryMark,
         view: std::ops::RangeInclusive<u64>,
     ) -> Option<usize> {
-        if reply.rows.len() > usize::from(MAX_HISTORY_ROWS) {
-            return None;
-        }
         let mut cells = 0_usize;
         let mut links = 0_usize;
         let mut staged = Vec::with_capacity(reply.rows.len());
@@ -566,6 +583,38 @@ mod tests {
     }
 
     #[test]
+    fn the_largest_reply_the_server_may_send_inflates_within_its_bound() {
+        // Every cell a run of its own, of the longest cluster in true colours, naming the last of
+        // the most links a row has; the cells past the bound by a row, the links' bytes at theirs.
+        let rgb = WireColor::Rgb(255, 255, 255);
+        let run = Run {
+            count: NonZeroU16::MIN,
+            cell: WireCell {
+                text: CellText::run(&"\u{301}".repeat(fux_vt::CLUSTER_CAPACITY.div_euclid(2)))
+                    .unwrap(),
+                kind: CellKind::Narrow,
+                fg: rgb,
+                bg: rgb,
+                underline_color: rgb,
+                style: WireStyle::default(),
+                link: u16::try_from(MAX_ROW_LINKS).unwrap(),
+            },
+        };
+        let link = WireLink {
+            uri: "u".repeat(MAX_LINK_BYTES.div_euclid(HISTORY_ROWS * MAX_ROW_LINKS)),
+            id: String::new(),
+        };
+        let row = HistoryRow {
+            name: u64::MAX,
+            wrapped: true,
+            runs: vec![run; (MAX_HISTORY_CELLS + DIM).div_euclid(HISTORY_ROWS)],
+            links: vec![link; MAX_ROW_LINKS],
+        };
+        let largest = reply(vec![row; HISTORY_ROWS]);
+        assert!(postcard::to_allocvec(&largest).unwrap().len() <= MAX_HISTORY_REPLY);
+    }
+
+    #[test]
     fn a_resize_names_every_row_afresh() {
         let mut emu = ServerTerminal::new(4, 20, 100).unwrap();
         lines(&mut emu, 0, 20);
@@ -648,16 +697,20 @@ mod tests {
             }],
             ..row(3, 4)
         };
-        let too_many = reply(
-            (1..=u64::from(MAX_HISTORY_ROWS) + 1)
-                .map(|n| row(n, 1))
-                .collect(),
-        );
         let too_many_cells = reply((1..=100).map(|n| row(n, 1000)).collect());
+        // A link no cell names: a hostile server could otherwise make the client keep links
+        // nothing shows.
+        let unnamed_link = HistoryRow {
+            links: vec![WireLink {
+                uri: "https://example.org".to_owned(),
+                id: String::new(),
+            }],
+            ..row(3, 4)
+        };
         for reply in [
             reply(vec![row(1, 3), too_wide]),
             reply(vec![row(1, 3), bad_link]),
-            too_many,
+            reply(vec![unnamed_link]),
             too_many_cells,
         ] {
             let mut cache = HistoryCache::default();
@@ -718,22 +771,6 @@ mod tests {
                 "the farthest went"
             );
         }
-    }
-
-    #[test]
-    fn a_row_with_a_link_no_cell_names_is_refused() {
-        // A hostile server could otherwise make the client keep links nothing shows.
-        let mut unnamed = row(3, 4);
-        unnamed.links = vec![WireLink {
-            uri: "https://example.org".to_owned(),
-            id: String::new(),
-        }];
-        let mut cache = HistoryCache::default();
-        assert_eq!(
-            cache.insert(&reply(vec![unnamed]), ask(3, 1), MARK, 3..=3),
-            None
-        );
-        assert!(cache.is_empty());
     }
 
     #[test]

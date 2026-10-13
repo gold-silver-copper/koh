@@ -1,4 +1,4 @@
-//! The koh/5 encoding.
+//! The koh/6 encoding.
 //!
 //! Messages built here by hand from the wire types, both ways, are pinned: the expected bytes were
 //! captured by running the encoder, and a change to the wire must change them in the same commit,
@@ -12,15 +12,25 @@ use koh::events::{
     WireMouseAction, WireScheme,
 };
 use koh::proto::{
-    decode_frame, decode_server, encode_client, ClientDecoder, ClientMsg, Frame, FrameEncoder,
-    FrameNum, InputSeq, ServerMsg,
+    decode_frame_body, decode_history, decode_server, dictionary_for, encode_client, ClientDecoder,
+    ClientMsg, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg,
 };
 use koh::terminal::{
-    CellKind, CellText, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, RowDiff, Run,
-    ScreenDiff, ServerTerminal, Shift, Shifts, Size, TerminalScreen, TtyModes, WireCell, WireColor,
-    WireLink, WireModes, WireMouseEncoding, WireMouseMode, WireStyle,
+    CellKind, CellText, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, RowDiff,
+    RowEncodings, Run, ScreenDiff, ServerTerminal, Shift, Shifts, Size, TerminalScreen, TtyModes,
+    WireCell, WireColor, WireLink, WireModes, WireMouseEncoding, WireMouseMode, WireStyle,
 };
 use std::num::{NonZeroI16, NonZeroU16};
+
+/// A stream that must hold a frame on `screen`, the screen of its base, read as the client reads
+/// it.
+fn decode_frame(stream: &[u8], screen: &TerminalScreen) -> Option<Frame> {
+    let ServerMsg::Frame { base, rows, body } = decode_server(stream).ok()? else {
+        return None;
+    };
+    let dictionary = dictionary_for(base, screen, &rows, &mut RowEncodings::default());
+    decode_frame_body(base, &body, &dictionary).ok()
+}
 
 /// Terminal output exercising every part of a cell and of the side channels: runs, wide glyphs
 /// and their continuations, a combining mark, a cluster too long to keep inline, every colour kind
@@ -131,8 +141,14 @@ fn modes() -> Vec<WireModes> {
 /// One message of each kind, with varints of one and several bytes.
 fn client_msgs() -> Vec<ClientMsg> {
     vec![
-        ClientMsg::Resize(Size::new(50, 132)),
-        ClientMsg::Resize(Size::new(1000, 1000)),
+        ClientMsg::Resize {
+            n: 1,
+            size: Size::new(50, 132),
+        },
+        ClientMsg::Resize {
+            n: 70_000,
+            size: Size::new(1000, 1000),
+        },
         ClientMsg::Ack {
             frame: FrameNum(70_000),
         },
@@ -364,8 +380,8 @@ const MODES: [&str; 9] = [
 
 /// Each of [`client_msgs`] as the client's stream carries it, length prefix included.
 const CLIENT_MSGS: [&str; 8] = [
-    "0000000400328401",
-    "0000000500e807e807",
+    "000000050001328401",
+    "0000000800f0a204e807e807",
     "0000000401f0a204",
     "0000000102",
     "0000000803ac02f0a2048002",
@@ -422,19 +438,17 @@ fn frames_and_history_round_trip_through_their_streams() {
     let encoded = FrameEncoder::default()
         .encode_history(&reply)
         .expect("encodes");
-    assert_eq!(
-        decode_server(&encoded).expect("decodes"),
-        ServerMsg::History(reply)
-    );
+    assert!(matches!(decode_server(&encoded), Ok(ServerMsg::History(_))));
+    assert_eq!(decode_history(&encoded[1..]).ok(), Some(reply));
     assert!(
-        decode_frame(&encoded, &TerminalScreen::default()).is_err(),
+        decode_frame(&encoded, &TerminalScreen::default()).is_none(),
         "history rows are not a frame"
     );
 }
 
 /// The protocol these bytes are pinned for. A change to them is a new protocol: bump the ALPN
 /// (`koh::transport_iroh::ALPN`) and this with it.
-const PINNED_FOR: &[u8] = b"koh/5";
+const PINNED_FOR: &[u8] = b"koh/6";
 
 #[test]
 fn client_messages_encode_as_pinned() {
@@ -493,10 +507,7 @@ fn server_messages_encode_as_pinned() {
         .encode_history(&reply)
         .expect("encodes");
     assert_eq!(stream.first(), Some(&1), "the history stream's tag");
-    assert_eq!(
-        decode_server(&stream).expect("decodes"),
-        ServerMsg::History(reply)
-    );
+    assert_eq!(decode_history(&stream[1..]).ok(), Some(reply));
 }
 
 #[test]
@@ -515,5 +526,66 @@ fn modes_encode_as_pinned() {
             &postcard::from_bytes::<WireModes>(&pinned).expect("decodes"),
             modes
         );
+    }
+}
+
+/// The hand-built messages, as the fuzz targets read their input: CI's fuzz job starts each target
+/// from them (in `$KOH_FUZZ_SEEDS/<target>/`, when that is set) instead of from nothing. Each seed
+/// must reach the code it seeds: the client stream decodes whole, every diff applies.
+#[test]
+fn the_wire_messages_seed_the_fuzzers() {
+    let client: Vec<u8> = client_msgs()
+        .iter()
+        .flat_map(|msg| encode_client(msg).expect("encodes"))
+        .collect();
+    let mut decoder = ClientDecoder::default();
+    decoder.push(&client);
+    while decoder.next_msg().expect("decodes").is_some() {}
+    decoder.finish().expect("whole");
+
+    let frames = wire_frames().expect("frames");
+    let reply = wire_history().expect("history");
+    let mut screen = TerminalScreen::default();
+    let mut streams = Vec::new();
+    for frame in &frames {
+        streams.push(
+            FrameEncoder::default()
+                .encode(frame, &screen)
+                .expect("encodes"),
+        );
+        screen.apply(&frame.diff).expect("applies");
+    }
+    streams.push(
+        FrameEncoder::default()
+            .encode_history(&reply)
+            .expect("encodes"),
+    );
+    // What history_apply reads first: the mark, the request and the view's offset.
+    let header =
+        postcard::to_allocvec(&(70_000_u64, 2_u32, 70_000_u64, 2_u16, 1_u16)).expect("encodes");
+    let seeds = [
+        // The first byte splits the rest into reads of that many bytes.
+        ("proto_decode", [&[255][..], &client].concat()),
+        ("server_input", [&[0][..], &client].concat()),
+        (
+            "history_apply",
+            [header, postcard::to_allocvec(&reply).expect("encodes")].concat(),
+        ),
+    ]
+    .into_iter()
+    .chain(streams.into_iter().map(|stream| ("proto_decode", stream)))
+    .chain(frames.iter().map(|frame| {
+        (
+            "screen_apply",
+            postcard::to_allocvec(&frame.diff).expect("encodes"),
+        )
+    }));
+    let Some(root) = std::env::var_os("KOH_FUZZ_SEEDS") else {
+        return;
+    };
+    for (n, (target, seed)) in seeds.enumerate() {
+        let dir = std::path::Path::new(&root).join(target);
+        std::fs::create_dir_all(&dir).expect("the target's corpus");
+        std::fs::write(dir.join(format!("wire-{n}")), seed).expect("a seed");
     }
 }

@@ -7,7 +7,6 @@ use std::os::fd::AsFd;
 use std::thread::JoinHandle;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -153,7 +152,8 @@ fn read_input<R: Read + AsFd>(
                     let Some(chunk) = buffer.get(..count) else {
                         break;
                     };
-                    if !send_chunk(sender, cancel, chunk.to_vec()) {
+                    // Blocks while the loop is behind; ends when it is gone (the run is over).
+                    if sender.blocking_send(chunk.to_vec()).is_err() {
                         break;
                     }
                 }
@@ -163,28 +163,7 @@ fn read_input<R: Read + AsFd>(
     }
 }
 
-fn send_chunk(
-    sender: &mpsc::Sender<Vec<u8>>,
-    cancel: &CancellationToken,
-    mut chunk: Vec<u8>,
-) -> bool {
-    loop {
-        if cancel.is_cancelled() {
-            return false;
-        }
-        match sender.try_send(chunk) {
-            Ok(()) => return true,
-            Err(TrySendError::Closed(_)) => return false,
-            Err(TrySendError::Full(returned)) => {
-                chunk = returned;
-                std::thread::park_timeout(std::time::Duration::from_millis(10));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
-#[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -253,26 +232,10 @@ mod tests {
     }
 
     #[test]
-    fn idle_input_poll_cancels_and_joins_without_waiting_for_a_byte() {
+    fn input_producer_forwards_bytes_exactly_and_an_idle_one_cancels_without_a_byte() {
         crate::test_runtime::current_thread().block_on(async {
-            // Client teardown owns and joins every producer.
-            let (reader, _writer) = UnixStream::pair().expect("socket pair");
-            let (sender, mut receiver) = mpsc::channel(1);
-            let cancel = CancellationToken::new();
-            let thread_cancel = cancel.clone();
-            let input = std::thread::spawn(move || read_input(reader, &sender, &thread_cancel));
-            cancel.cancel();
-            let start = Instant::now();
-            input.join().expect("join producer");
-            assert!(start.elapsed() < Duration::from_secs(1));
-            assert!(receiver.recv().await.is_none());
-        });
-    }
-
-    #[test]
-    fn input_producer_forwards_bytes_exactly() {
-        crate::test_runtime::current_thread().block_on(async {
-            // Producer framing does not transform terminal input.
+            // Producer framing does not transform terminal input; client teardown owns and joins
+            // every producer, idle in its poll.
             let (reader, mut writer) = UnixStream::pair().expect("socket pair");
             let (sender, mut receiver) = mpsc::channel(1);
             let cancel = CancellationToken::new();
@@ -284,21 +247,25 @@ mod tests {
                 Some(b"a\0\x1bZ".as_slice())
             );
             cancel.cancel();
+            let start = Instant::now();
             input.join().expect("join producer");
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(receiver.recv().await.is_none());
         });
     }
 
     #[test]
-    fn shutdown_cancels_input_blocked_by_a_full_channel() {
+    fn shutdown_ends_input_blocked_by_a_full_channel_once_the_loop_is_gone() {
+        // Shutdown follows the loop's return, which drops the receiving end.
         crate::test_runtime::current_thread().block_on(async {
             let (reader, mut writer) = UnixStream::pair().expect("socket pair");
-            let (sender, mut receiver) = mpsc::channel(1);
+            let (sender, receiver) = mpsc::channel(1);
             sender.try_send(vec![0]).expect("fill input channel");
             let cancel = CancellationToken::new();
             let thread_cancel = cancel.clone();
             let input = std::thread::spawn(move || read_input(reader, &sender, &thread_cancel));
             let resize_cancel = cancel.clone();
-            let resize = tokio::spawn(async move { resize_cancel.cancelled().await });
+            let resize = koh_testkit::spawn(async move { resize_cancel.cancelled().await });
             let tasks = ClientIoTasks {
                 cancel,
                 input: Some(input),
@@ -306,13 +273,11 @@ mod tests {
             };
 
             writer.write_all(b"blocked").expect("write blocked input");
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(receiver);
             timeout(Duration::from_secs(1), tasks.shutdown())
                 .await
                 .expect("shutdown stalled on the full channel")
                 .expect("shutdown failed");
-            assert_eq!(receiver.recv().await, Some(vec![0]));
-            assert!(receiver.recv().await.is_none());
         });
     }
 
@@ -323,7 +288,7 @@ mod tests {
             sender.try_send(()).expect("fill resize channel");
             let cancel = CancellationToken::new();
             let resize_cancel = cancel.clone();
-            let resize = tokio::spawn(async move {
+            let resize = koh_testkit::spawn(async move {
                 assert!(!send_resize(&sender, &resize_cancel).await);
             });
             let tasks = ClientIoTasks {

@@ -31,3 +31,26 @@ pub fn auth_event(outcome: Outcome, peer: &EndpointId, reason: &str) {
         tracing::warn!(target: "koh::auth", event = "authz", outcome = outcome.token(), peer = %peer, reason);
     }
 }
+
+/// A warning said at most once every ten seconds, however often its cause comes: a flood would
+/// say it at the flood's rate.
+#[derive(Default)]
+pub struct Throttle(std::sync::Mutex<Option<std::time::Instant>>);
+
+impl Throttle {
+    /// Whether to say it now: the first time, then once ten seconds have passed since it was.
+    pub fn ready(&self) -> bool {
+        let (Ok(mut said), now) = (self.0.lock(), std::time::Instant::now()) else {
+            return false;
+        };
+        let ready = said.is_none_or(|at| now.saturating_duration_since(at).as_secs() >= 10);
+        ready.then(|| *said = Some(now)).is_some()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_flood_of_turned_away_peers_is_said_once() {
+    let throttle = Throttle::default();
+    assert_eq!((0..1000).filter(|_| throttle.ready()).count(), 1);
+}

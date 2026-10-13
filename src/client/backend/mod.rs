@@ -45,6 +45,19 @@ pub fn drawn(style: Attributes, styles: bool) -> Attributes {
     style.with_underline_style(underline)
 }
 
+/// Text for an OSC sequence, without the control characters that would end it early.
+///
+/// C0 and C1 both go. Only [`OscText::new`] makes one, so a title a server chose reaches the
+/// terminal only stripped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OscText(String);
+
+impl OscText {
+    pub fn new(text: &str) -> Self {
+        Self(text.chars().filter(|c| !c.is_control()).collect())
+    }
+}
+
 /// The terminal `koh connect` paints on. Output is buffered until [`flush`](Self::flush), once per
 /// frame.
 pub trait KohBackend {
@@ -148,38 +161,34 @@ pub trait KohBackend {
     /// Set a whole style: reset, then each attribute, then the colours.
     fn set_style(&mut self, style: Attributes) -> io::Result<()> {
         self.reset_sgr()?; // clears everything (incl. colors), then re-apply
-        if style.bold() {
-            self.write_bytes(b"\x1b[1m")?;
-        }
-        if style.dim() {
-            self.write_bytes(b"\x1b[2m")?;
-        }
-        if style.italic() {
-            self.write_bytes(b"\x1b[3m")?;
-        }
-        match style.underline_style() {
-            UnderlineStyle::None => {}
+        let underline: &[u8] = match style.underline_style() {
+            UnderlineStyle::None => b"",
             // Kitty's `4:n`, only where the terminal draws it (see `drawn`).
-            UnderlineStyle::Double => self.write_bytes(b"\x1b[4:2m")?,
-            UnderlineStyle::Curly => self.write_bytes(b"\x1b[4:3m")?,
-            UnderlineStyle::Dotted => self.write_bytes(b"\x1b[4:4m")?,
-            UnderlineStyle::Dashed => self.write_bytes(b"\x1b[4:5m")?,
+            UnderlineStyle::Double => b"\x1b[4:2m",
+            UnderlineStyle::Curly => b"\x1b[4:3m",
+            UnderlineStyle::Dotted => b"\x1b[4:4m",
+            UnderlineStyle::Dashed => b"\x1b[4:5m",
             // A style fux-vt adds later is drawn plain.
-            UnderlineStyle::Single | _ => self.write_bytes(b"\x1b[4m")?,
-        }
-        if style.inverse() {
-            self.write_bytes(b"\x1b[7m")?;
-        }
-        if style.hidden() {
-            self.write_bytes(b"\x1b[8m")?;
-        }
-        if style.strikeout() {
-            self.write_bytes(b"\x1b[9m")?;
-        }
-        match style.blink() {
-            Blink::Slow => self.write_bytes(b"\x1b[5m")?,
-            Blink::Rapid => self.write_bytes(b"\x1b[6m")?,
-            Blink::None | _ => {}
+            UnderlineStyle::Single | _ => b"\x1b[4m",
+        };
+        let blink: &[u8] = match style.blink() {
+            Blink::Slow => b"\x1b[5m",
+            Blink::Rapid => b"\x1b[6m",
+            Blink::None | _ => b"",
+        };
+        for (on, sgr) in [
+            (style.bold(), &b"\x1b[1m"[..]),
+            (style.dim(), b"\x1b[2m"),
+            (style.italic(), b"\x1b[3m"),
+            (true, underline),
+            (style.inverse(), b"\x1b[7m"),
+            (style.hidden(), b"\x1b[8m"),
+            (style.strikeout(), b"\x1b[9m"),
+            (true, blink),
+        ] {
+            if on && !sgr.is_empty() {
+                self.write_bytes(sgr)?;
+            }
         }
         write_sgr_color(self, style.foreground(), true)?;
         write_sgr_color(self, style.background(), false)?;
@@ -203,13 +212,13 @@ pub trait KohBackend {
     }
 
     /// Set the window title and icon name together (`OSC 0`).
-    fn set_window_title(&mut self, title: &str) -> io::Result<()> {
-        write!(self, "\x1b]0;{title}\x07")
+    fn set_window_title(&mut self, title: &OscText) -> io::Result<()> {
+        write!(self, "\x1b]0;{}\x07", title.0)
     }
 
     /// Set the icon name (`OSC 1`) and the window title (`OSC 2`).
-    fn set_window_icon_and_title(&mut self, icon: &str, title: &str) -> io::Result<()> {
-        write!(self, "\x1b]1;{icon}\x07\x1b]2;{title}\x07")
+    fn set_window_icon_and_title(&mut self, icon: &OscText, title: &OscText) -> io::Result<()> {
+        write!(self, "\x1b]1;{}\x07\x1b]2;{}\x07", icon.0, title.0)
     }
 
     /// Set the clipboard (`OSC 52`) to `base64`, which the caller validated.
@@ -424,9 +433,12 @@ mod tests {
 
     #[test]
     fn out_of_band_escapes() {
-        assert_eq!(emit(|b| b.set_window_title("x")), b"\x1b]0;x\x07");
         assert_eq!(
-            emit(|b| b.set_window_icon_and_title("i", "t")),
+            emit(|b| b.set_window_title(&OscText::new("x\x07\u{9c}"))),
+            b"\x1b]0;x\x07"
+        );
+        assert_eq!(
+            emit(|b| b.set_window_icon_and_title(&OscText::new("i"), &OscText::new("t"))),
             b"\x1b]1;i\x07\x1b]2;t\x07"
         );
         assert_eq!(emit(|b| b.set_clipboard("aGk=")), b"\x1b]52;c;aGk=\x07");

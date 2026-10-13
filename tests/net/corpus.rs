@@ -361,32 +361,32 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     drop(input);
     drop(resize);
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    server.stop().await;
+    server.stop().await?;
     result
 }
 
 #[test]
 fn the_corpus_converges_over_a_lossy_link() {
-    let wanted = std::env::var("KOH_NET_CORPUS").unwrap_or_default();
-    let named: Vec<&str> = if wanted.is_empty() {
-        DEFAULT.to_vec()
-    } else {
-        wanted.split(',').collect()
-    };
-    let corpus = Recording::load_all(&Path::new(env!("CARGO_MANIFEST_DIR")).join("testing/corpus"))
-        .expect("the corpus");
-    let chosen: Vec<&Recording> = corpus
-        .iter()
-        .filter(|r| wanted == "all" || named.contains(&r.name.as_str()))
-        .filter(|r| !recording::DIFFERS.iter().any(|(name, _)| *name == r.name))
-        .collect();
-    assert!(!chosen.is_empty(), "no recording named {wanted:?}");
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("testing/corpus");
+    // Each recording named, or every one: a name with no recording is an error, not skipped.
+    let chosen = match std::env::var("KOH_NET_CORPUS").as_deref() {
+        Ok("all") => Recording::load_all(&corpus),
+        Ok(named) if !named.is_empty() => named
+            .split(',')
+            .map(|name| Recording::load(&corpus, name))
+            .collect(),
+        _ => DEFAULT
+            .iter()
+            .map(|name| Recording::load(&corpus, name))
+            .collect(),
+    }
+    .expect("the recordings");
     let dir = koh_testkit::scratch!("net-corpus").expect("a scratch directory");
     koh_testkit::multi_thread(4)
         .expect("runtime")
         .block_on(async {
             let mut failures = Vec::new();
-            for (seed, recording) in (1u64..).zip(chosen) {
+            for (seed, recording) in (1u64..).zip(&chosen) {
                 let net = FaultNet::new(
                     Profile {
                         loss: 0.05,

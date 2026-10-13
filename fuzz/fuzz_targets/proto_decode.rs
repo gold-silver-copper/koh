@@ -4,7 +4,7 @@
 //! dictionary for a frame, plus postcard). Both must only return errors on bad input, never
 //! panic, and never allocate past their caps.
 
-use koh::proto::{decode_frame_body, decode_server, ClientDecoder, FrameNum};
+use koh::proto::{decode_frame_body, decode_history, decode_server, ClientDecoder, FrameNum};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -25,6 +25,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let _ = decoder.finish();
     let _ = decode_server(data);
+    let _ = decode_history(data);
     // A frame's body against a dictionary: the first half of the bytes as the dictionary, the
     // rest as the body, as a server could send against any base.
     let (dictionary, body) = rest.split_at(rest.len() / 2);

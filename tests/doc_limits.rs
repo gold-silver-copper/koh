@@ -41,45 +41,81 @@ fn the_docs_state_the_limits_the_code_enforces() {
     }
 }
 
-/// Every test (or function) SECURITY.md's audit trail cites is still there: `path.rs::name` names
-/// a function in that file, as does a bare `name` after it in the same cell, and every other cited
-/// path exists.
+/// Every Rust file under `dir`, read.
+fn sources(dir: &std::path::Path, into: &mut String) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() && !path.ends_with("target") {
+            sources(&path, into);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            into.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        }
+    }
+}
+
+/// Whether `text` defines `name` as one of `kinds` (`fn`, `struct`, ...).
+fn defines(text: &str, kinds: &[&str], name: &str) -> bool {
+    kinds.iter().any(|kind| {
+        [" ", "(", "<", ":", ";", "{"]
+            .iter()
+            .any(|after| text.contains(&format!("{kind} {name}{after}")))
+    })
+}
+
+/// Every test, function, type and constant SECURITY.md's audit trail cites is still there:
+/// `path.rs::name` names a function in that file, as does a bare `name` after it in the same
+/// cell; `Type::name` names a function, variant or constant of a type koh defines (a type koh does
+/// not define, as `String`, is std's); a bare `snake_case_name` names a function and a `SCREAMING_NAME` a
+/// constant somewhere in koh's sources; and every other cited path exists.
 #[test]
-fn every_test_security_md_cites_exists() {
+fn everything_security_md_cites_exists() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut koh = String::new();
+    for dir in ["src", "tests", "testing", "testkit"] {
+        sources(&root.join(dir), &mut koh);
+    }
     let mut missing = Vec::new();
     let rows = include_str!("../SECURITY.md")
         .lines()
         .filter(|l| l.starts_with('|'));
     for cell in rows.flat_map(|row| row.split('|')) {
-        let mut file: Option<(&str, String)> = None;
+        let mut file: Option<String> = None;
         for cite in cell.split('`').skip(1).step_by(2) {
-            let name = if let Some((path, name)) = cite.split_once("::") {
-                let path = path.trim_end_matches(".rs");
-                file = std::fs::read_to_string(root.join(format!("{path}.rs")))
-                    .ok()
-                    .map(|text| (path, text));
-                if file.is_none() && path.contains('/') {
-                    missing.push(cite.to_owned());
+            let found = if let Some((path, name)) = cite.split_once("::") {
+                let source = std::fs::read_to_string(root.join(path));
+                if path.contains('/') {
+                    file = source.ok();
+                    file.as_ref()
+                        .is_some_and(|text| defines(text, &["fn"], name))
+                } else {
+                    // A variant or associated constant is a capitalized name on a line of its own.
+                    let kinds: &[&str] = if name.starts_with(char::is_uppercase) {
+                        &["", "const"]
+                    } else {
+                        &["fn"]
+                    };
+                    !defines(&koh, &["struct", "enum", "trait", "type"], path)
+                        || defines(&koh, kinds, name)
                 }
-                name
             } else if cite.contains('/') {
-                if !root.join(cite).exists() {
-                    missing.push(cite.to_owned());
-                }
-                continue;
-            } else {
-                cite
-            };
-            let is_fn = name.contains('_')
-                && name
+                root.join(cite).exists()
+            } else if cite.contains('_')
+                && cite
                     .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-            if let Some((path, text)) = file.as_ref().filter(|_| is_fn) {
-                if !text.contains(&format!("fn {name}(")) && !text.contains(&format!("fn {name}<"))
-                {
-                    missing.push(format!("{path}.rs::{name}"));
-                }
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            {
+                defines(file.as_deref().unwrap_or(&koh), &["fn"], cite)
+            } else if cite.contains('_')
+                && cite
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            {
+                defines(&koh, &["const", "static"], cite)
+            } else {
+                true
+            };
+            if !found {
+                missing.push(cite.to_owned());
             }
         }
     }

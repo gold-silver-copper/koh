@@ -9,7 +9,9 @@ use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
+use crate::client::{
+    Admitted, BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector,
+};
 use crate::transport_iroh::{bind_on, close_endpoint, Network};
 
 /// The clap-free form of `koh connect`'s arguments.
@@ -59,10 +61,9 @@ impl ConnectConfig {
 #[derive(Debug, Clone)]
 pub struct BellHook {
     command: String,
-    last_count: u64,
+    /// The last count seen (by `prime` or `observe`), after which `prime` is a no-op.
+    last_count: Option<u64>,
     last_spawn: Option<Instant>,
-    /// Whether a count has been seen (by `prime` or `observe`); `prime` is a no-op afterwards.
-    primed: bool,
 }
 
 /// Minimum spacing between two hook spawns; a burst of bells inside it coalesces into one.
@@ -72,26 +73,20 @@ impl BellHook {
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into(),
-            last_count: 0,
+            last_count: None,
             last_spawn: None,
-            primed: false,
         }
     }
 
     /// Take `count` as seen, without firing, unless a count was seen already.
     pub fn prime(&mut self, count: u64) {
-        if !self.primed {
-            self.last_count = count;
-            self.primed = true;
-        }
+        self.last_count.get_or_insert(count);
     }
 
     /// Note the bell count at `now`; whether to fire: it rose, and the last spawn was at least
     /// [`BELL_HOOK_MIN_INTERVAL`] ago. A rise within that is absorbed, not deferred.
     pub fn observe(&mut self, count: u64, now: Instant) -> bool {
-        let rose = count > self.last_count;
-        self.last_count = count;
-        self.primed = true;
+        let rose = count > self.last_count.replace(count).unwrap_or(0);
         let spaced = rose
             && self
                 .last_spawn
@@ -100,13 +95,6 @@ impl BellHook {
             self.last_spawn = Some(now);
         }
         spaced
-    }
-
-    /// [`observe`](Self::observe) at `now` and, if due, [`fire`](Self::fire).
-    pub fn observe_and_fire(&mut self, count: u64, title: &str, now: Instant) {
-        if self.observe(count, now) {
-            self.fire(count, title);
-        }
     }
 
     /// The command to spawn, with `parent_env` scrubbed of `KOH_*` (given, so tests can pass their
@@ -159,7 +147,7 @@ impl BellHook {
 async fn dial(
     config: &ConnectConfig,
     identity: &crate::identity::Identity,
-) -> anyhow::Result<(iroh::Endpoint, IrohConnector, iroh::endpoint::Connection)> {
+) -> anyhow::Result<(iroh::Endpoint, IrohConnector, Admitted)> {
     let secret = identity.secret.clone();
     let server = config.server;
     let (network, target) = match (config.direct, config.relay_url.clone()) {
@@ -211,10 +199,10 @@ fn warn_if_locale_not_utf8() {
 /// a private file of this user's (see [`crate::identity::open_private_log`]), as debug logs can be
 /// sensitive; failing that, nothing is logged. An empty `$KOH_LOG` is off, silently.
 fn log_to_koh_log() {
-    let Some(path) = koh_log_path(std::env::var_os("KOH_LOG")) else {
+    let Some(path) = std::env::var_os("KOH_LOG").filter(|path| !path.is_empty()) else {
         return;
     };
-    match crate::identity::open_private_log(&path) {
+    match crate::identity::open_private_log(path.as_ref()) {
         Ok(file) => crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG),
         Err(e) => {
             crate::log::stderr(format_args!(
@@ -222,11 +210,6 @@ fn log_to_koh_log() {
             ));
         }
     }
-}
-
-/// The log file `$KOH_LOG` (given as `value`) names, if any: unset and empty both mean none.
-fn koh_log_path(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
-    value.filter(|path| !path.is_empty()).map(Into::into)
 }
 
 /// `koh connect`: the remote shell's exit code if it exited. Takes the process's terminal, stdin
@@ -285,19 +268,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_empty_koh_log_is_off_like_an_unset_one() {
-        assert_eq!(koh_log_path(None), None);
-        assert_eq!(koh_log_path(Some("".into())), None, "KOH_LOG= logs nothing");
-        assert_eq!(
-            koh_log_path(Some("/x/koh.log".into())),
-            Some("/x/koh.log".into())
-        );
-    }
-
-    #[test]
     fn redial_reuses_the_loaded_identity_without_touching_the_key_file() -> anyhow::Result<()> {
         crate::test_runtime::current_thread().block_on(async {
-            use crate::transport_iroh::{admission, bind_endpoint_local, generate_secret_key};
+            use crate::transport_iroh::{bind_endpoint_local, generate_secret_key};
             let server = bind_endpoint_local(generate_secret_key()?, true).await?;
             let identity = crate::identity::Identity::generate()?;
             let expected = identity.secret.public();
@@ -307,15 +280,10 @@ mod tests {
                 .find(std::net::SocketAddr::is_ipv4)
                 .context("server IPv4 socket")?;
             let config = ConnectConfig {
-                server: server.id(),
                 // Any attempt to reload instead of reusing `identity` would fail here.
                 key_file: Some("/nonexistent/koh-redial-test.key".into()),
                 direct: Some(([127, 0, 0, 1], socket.port()).into()),
-                relay_url: None,
-                clipboard: false,
-                hyperlinks: false,
-                colours: false,
-                bell_command: None,
+                ..ConnectConfig::new(server.id())
             };
             let peer = server.clone();
             let accept = async move {
@@ -325,17 +293,17 @@ mod tests {
                         connection.remote_id() == expected,
                         "client identity changed"
                     );
-                    admission::admit(&connection).await?;
+                    connection.open_uni().await?.finish()?;
                     connection.closed().await;
                 }
                 Ok::<_, anyhow::Error>(())
             };
             let client = async {
                 let (endpoint, connector, channel) = dial(&config, &identity).await?;
-                channel.close(0u32.into(), b"test reconnect");
+                channel.0.close(0u32.into(), b"test reconnect");
                 // The same connector `run_client` redials with after a link loss.
                 let channel = connector.connect().await?;
-                channel.close(0u32.into(), b"test done");
+                channel.0.close(0u32.into(), b"test done");
                 endpoint.close().await;
                 Ok::<_, anyhow::Error>(())
             };

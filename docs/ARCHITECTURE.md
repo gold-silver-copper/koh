@@ -26,13 +26,13 @@ src/
 ├── main.rs          the binary: serve / connect / id / key dispatch, and the hidden `__launch`
 ├── args.rs          the command line (clap's builder API) and the config structs it produces
 ├── lib.rs           crate root: module declarations + the architecture overview
-├── proto.rs         the koh/5 wire protocol: client messages, screen frames, caps, pacing
+├── proto.rs         the koh/6 wire protocol: client messages, screen frames, caps, pacing
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
 │   └── history.rs   scrollback rows, named for the wire
 ├── predict.rs       local-echo prediction engine (overlays, epochs)
-├── transport_iroh/  iroh endpoint setup, the default key path, path RTT, admission
+├── transport_iroh/  iroh endpoint setup, the default key path, path RTT
 ├── pty.rs           PTYs over fuxix, the `__launch` launcher sessions start through, reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
 │   ├── held.rs      the frames the server takes the client to hold
@@ -61,16 +61,19 @@ binary) build on both. The protocol cores (`proto`, `terminal`, `predict`, `serv
 `client::ClientSession`) do no I/O and are tested with no network at all. `predict` imports nothing
 from `crate::` (CI checks it), so it is a standalone terminal-prediction library.
 
-## The protocol (koh/5)
+## The protocol (koh/6)
 
-The ALPN `koh/5` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/6` is the version check: a peer on another version fails the TLS handshake with a
 clear error. After the handshake the server checks the allowlist, attaches the peer's session, and
-only then opens a bi-stream carrying one ADMIT byte, so "admitted, then refused" cannot happen. A
+only then sends the session's first frame, which admits the client, so "admitted, then refused"
+cannot happen. A
 refusal is a close code, never prose to match (`proto::Close`: `NotAuthorized` 1, `ProtocolError` 2,
 `SessionEnded` 3, `AtCapacity` 4, `CouldNotStart` 5). Only `NotAuthorized` makes a client give up;
 on the others it redials and its banner says why. Then (`src/proto.rs`):
 
-- **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Keys { seq,
+- **Client to server: two uni streams** of length-prefixed postcard `ClientMsg`s, one for input
+  (`Keys` and `Colours`) and one for control (the rest, `ClientMsg::stream`), so a control message
+  never waits behind input a program has not read: `Keys { seq,
   events }`, the input the client decoded (`src/events.rs`: keys, mouse events, focus changes and
   whole pastes of at most 1 MiB, at most 512 events a message), `Resize`, `Resync` when a frame's
   base is unknown, `History { id, newest, count }` for scrollback rows, `Ack { frame }`, now only a nudge
@@ -156,12 +159,13 @@ on the others it redials and its banner says why. Then (`src/proto.rs`):
   the client ask for a resync). Screens are shared, not copied — a resent frame holds the session's
   own snapshot, a client screen shares every row a frame did not carry with its base — and the
   session takes one snapshot per burst of program output rather than per read. That, plus QUIC flow
-  control and the stream limits (the server accepts one client stream; the client a handful of
+  control and the stream limits (the server accepts two client streams; the client a handful of
   frame streams), bounds memory; a peer cannot make either end accumulate.
 - **Backpressure:** PTY input goes through a writer queue of at most 1 MiB, and the session's
   input queue holds a bounded number of messages. While they are full the connection stops reading
-  the client's stream, and only that: it goes on sending frames and heartbeats and seeing the
-  connection close. QUIC flow control stops the client's writes, and the client keeps at most
+  the client's input stream, and only that: it goes on reading the control stream (resizes,
+  acknowledgements, history requests), sending frames and heartbeats and seeing the connection
+  close. QUIC flow control stops the client's writes, and the client keeps at most
   1 MiB of typing before dropping it with an "input paused" status line. The keyboard loop never
   waits on the network, so `Ctrl-^ .` always works.
 - **Every queue is bounded** (`src/bounded.rs`): `clippy.toml` bans `VecDeque` and unbounded
@@ -176,8 +180,11 @@ on the others it redials and its banner says why. Then (`src/proto.rs`):
   view is anchored to its rows: output that scrolls into history moves it up with them, so what
   is being read stays still while the live screen goes on below. Out of the view, a client idle for
   2 s fetches the newest screenful ahead, so opening the view shows rows at once.
-- **Shutdown:** when the shell exits, the server sends the final frame (carrying the exit code),
-  waits up to 1 s for its ack, then closes the connection with code 0 and reason `session ended`.
+- **Shutdown:** when the shell exits, the server sends the final frame (carrying the exit code)
+  and resends it as any frame until it is acknowledged, at least 1 s (two retries on a slow link).
+  Acknowledged, the session ends and the connection closes with `Close::SessionEnded` (3) once the
+  client has read it; unacknowledged, it closes as a lost link and the session keeps the end for
+  the client's redial.
 
 `TerminalScreen` is a plain `Grid` of rows stored as `fux_vt::Cells` (with a cursor, per-row soft-wrap flags and
 the input modes the client mirrors) plus the side channels: title, icon, OSC 52 clipboard, bell count
@@ -254,10 +261,10 @@ Both ends split into a synchronous, I/O-free core and a thin async shell. The cl
 escape/render state, and exposes pure steps: `on_input` (the `Ctrl-^`-prefix machine, prediction
 seeding, input queueing), `on_frame`, `on_resize` and `on_tick` (the link-down and input-paused
 banners), with the outgoing messages taken from a queue. The server's **`ServerConn`**
-(`server/mod.rs`) decodes the client's stream, tracks the echo-ack, and decides which frame to
+(`server/mod.rs`) decodes the client's streams, tracks the echo-ack, and decides which frame to
 send against which base. None of it touches tokio, iroh or a terminal, and time is an argument, so
 both are deterministically unit-testable. The shells own the `tokio::select!` (unbiased, so a flood of
-keystrokes or of frames starves neither), a writer task for the client's stream, a task per frame stream, and
+keystrokes or of frames starves neither), a writer task for each of the client's streams, a task per frame stream, and
 the rendering.
 
 On the server side, **PTY writes are non-blocking**: a dedicated `koh-pty-writer` thread drains a
@@ -394,7 +401,7 @@ measures from when the connection was dialed, so a freeze while the client start
 user's terminal, entering raw mode) counts too. A sub-20 s glance still rides out silently on the
 existing connection.
 
-The client loop's `select!` is the only place it waits: the writer task opens the client's stream,
+The client loop's `select!` is the only place it waits: each writer task opens its stream,
 a redial is a polled future, and a closed resize channel is disabled, so a server that grants no
 stream cannot block quitting or signals. The session's first phase asks the user's terminal its
 start-up questions on stdin's one decoder, with answers expected, so a late answer is still an
@@ -475,20 +482,26 @@ construction rather than by care at each call:
   sink, its stderr and its log, a whole line per write, so lines never interleave. A peer's text
   goes in only as `log::Peer`, one line of printable ASCII; `std::io::stderr`, `eprint!` and
   `eprintln!` are banned elsewhere (`clippy.toml`). Close reasons are codes, not text.
-- **Unknown is never "no".** The saved allowlist is read by one task every 2 s (and at once for a
-  peer not yet on it); a read that fails keeps the last good list and warns once, so a typo in the
-  file disconnects no one. Removing a client closes its connection and ends its session.
+- **Unknown is never "no".** The saved allowlist is read by one task; a read that fails keeps the
+  last good list and warns once, and one that drops a client is taken only once the next, 0.5 s
+  later, agrees, so neither a typo nor an editor saving the file (missing or empty a moment)
+  disconnects anyone. A client added or removed is seen within 2 s. Removing one closes its
+  connection and ends its session, and the registry attaches no peer the list no longer allows.
 - **What a server makes the client keep is bounded by bytes, and asked for.** The history cache
   counts fux-vt's storage against `HISTORY_CACHE_BYTES` and keeps only rows a request it has
   outstanding (by id) asked for. A frame's rows are strictly ascending, and its dictionary is built
   from the end, stopping at its window. Server streams over 256 KiB need one of two turns, so the
-  client holds about 40 MiB of them at most.
-- **Shutdown and handshakes.** One task counts SIGTERM, SIGINT and SIGHUP: the first drains, a
+  client holds about 40 MiB of them, compressed, at most; history replies are inflated one at a
+  time in its loop, no further than `MAX_HISTORY_REPLY`, the most a legal reply holds.
+- **Shutdown and handshakes.** One task counts SIGTERM, SIGINT and SIGHUP (unless SIGHUP was ignored at start,
+  as `nohup` does): the first drains, a
   repeat within 1 s (a double SIGHUP on a terminal's close) is the same, and a later one forces an
-  exit with a nonzero status. At most 2 handshakes are pending per address (an IPv6 /64 counts as
-  one), that address's oldest given up for a new one, and the oldest of all when all the room is
-  taken: no handshake is refused, so a flood cannot keep an allowed client out, even from its own
-  address.
+  exit with a nonzero status. At most 2 handshakes are pending per address (an IPv6 /48 counts as
+  one), that address's oldest given up for a new one, and 256 in all, the oldest given up; they
+  hold no connection permit. When room would cost one under way, an address not yet validated is
+  first sent a QUIC retry, which a spoofed one never answers. So a flood from spoofed addresses
+  takes no room; one from enough real addresses can still give up an allowed client's handshake,
+  and delay it, while it lasts.
 
 ## Testing tiers
 
@@ -530,8 +543,7 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   reattach, a forced mid-session drop, exit status, resize, XON/XOFF, input backpressure, the bell
   hook, prediction and the no-echo property, and hostile clients and servers. The corpus runs
   here too, through a real server and client under loss (eleven recordings by default, every one
-  with `KOH_NET_CORPUS=all`). An `#[ignore]`d baseline measures echo latency, output bursts, bytes
-  and outage recovery per network profile.
+  with `KOH_NET_CORPUS=all`).
 - **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs, started through
   the `koh` binary's `__launch`: output streaming and teardown, exit statuses, the
   reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its

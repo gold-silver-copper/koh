@@ -1800,6 +1800,23 @@ mod tests {
     }
 
     #[test]
+    fn client_apply_clamps_a_hostile_resize() {
+        // A malicious server ships a giant or zero resize: the client clamps each axis, never
+        // building a giant grid or panicking.
+        for (asked, clamped) in [
+            (Size::new(65000, 65000), Size::new(MAX_DIM, MAX_DIM)),
+            (Size::new(0, 0), Size::new(MIN_DIM, MIN_DIM)),
+            (Size::new(0, 5000), Size::new(MIN_DIM, MAX_DIM)),
+        ] {
+            let mut c = TerminalScreen::default();
+            let mut diff = c.diff_from(&c);
+            diff.resize = Some(asked);
+            c.apply(&diff).unwrap();
+            assert_eq!(c.size(), clamped, "{asked:?}");
+        }
+    }
+
+    #[test]
     fn a_malformed_last_row_drops_the_rows_before_it_too() {
         // Every row is validated before any is committed: a malformed row leaves the prior screen
         // untouched, never half-applied, though the rows before it decoded fine.

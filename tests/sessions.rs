@@ -191,7 +191,9 @@ impl RawClient {
     async fn connect(addr: iroh::EndpointAddr, secret: iroh::SecretKey) -> anyhow::Result<Self> {
         let endpoint = bind_endpoint_local(secret, false).await?;
         let conn = endpoint.connect(addr, ALPN).await?;
+        // Its control stream: its bytes go before the input stream's, as the client's do.
         let send = conn.open_uni().await?;
+        send.set_priority(1)?;
         let (tx, frames) = tokio::sync::mpsc::channel(64);
         let reader = conn.clone();
         koh_testkit::spawn(async move {
@@ -602,9 +604,9 @@ fn a_prompt_printed_before_echo_goes_off_is_never_told_with_echo_on() -> anyhow:
         let program = [
             "perl",
             "-e",
-            // A millisecond between the prompt and echo going off, well within the read that
-            // follows output.
-            "use POSIX; $| = 1; print 'pw: '; select(undef, undef, undef, 0.001); \
+            // A fifth of a millisecond between the prompt and echo going off, well within the
+            // read that follows output.
+            "use POSIX; $| = 1; print 'pw: '; select(undef, undef, undef, 0.0002); \
              my $t = POSIX::Termios->new; $t->getattr(0); \
              $t->setlflag($t->getlflag & ~POSIX::ECHO()); $t->setattr(0, POSIX::TCSANOW()); sleep 30",
         ];

@@ -695,8 +695,9 @@ impl Wire {
             reason = "two writers and a reader a connection"
         )]
         let (writers, reader) = (
-            [input_rx, control_rx].map(|rx| {
-                AbortOnDropHandle::new(tokio::spawn(write_client_stream(conn.clone(), rx)))
+            [(input_rx, 0), (control_rx, 1)].map(|(rx, priority)| {
+                let writer = write_client_stream(conn.clone(), rx, priority);
+                AbortOnDropHandle::new(tokio::spawn(writer))
             }),
             AbortOnDropHandle::new(tokio::spawn(read_frames(conn.clone(), first, frame_tx))),
         );
@@ -772,12 +773,15 @@ fn send(permit: Option<mpsc::Permit<'_, Vec<u8>>>, msg: Option<ClientMsg>) -> Op
     None
 }
 
-/// Open the client's stream on `conn` and write queued messages to it, until the queue or the
-/// stream closes.
-async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>>) {
+/// Open one of the client's streams on `conn`, at `priority`, and write queued messages to it,
+/// until the queue or the stream closes.
+async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>>, priority: i32) {
     let Ok(mut send) = conn.open_uni().await else {
         return;
     };
+    // The control stream's bytes go before input's: a resize or an acknowledgement does not wait
+    // behind a paste QUIC is still sending.
+    let _ = send.set_priority(priority);
     while let Some(bytes) = queue.recv().await {
         if send.write_all(&bytes).await.is_err() {
             return;

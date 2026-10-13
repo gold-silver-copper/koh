@@ -121,38 +121,48 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
     })
 }
 
+/// The last client to leave a session starts its TTL, and only the last: a session one client
+/// still holds outlives it, and one every client left is reaped after it (the next attach creates
+/// a new one), however many left at once (more than the session's control queue holds), and
+/// whether or not its program had exited before any client saw it end.
 #[test]
 fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<()> {
-    runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_millis(150))?;
-        let peer = peer()?;
-        let (a, _) = reg.attach(peer).await.context("A")?;
-        let (b, _) = reg
-            .attach(peer)
-            .await
-            .context("B (concurrent, same session)")?;
-        // Dropping ONE of two attached clients must not start the TTL.
-        drop(a);
-        // Time must pass here: the session must outlive its TTL. (Polling would attach, and a
-        // detach restarts the TTL.)
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        anyhow::ensure!(
-            matches!(
-                attach_kind(&reg, peer).await,
-                Some(AttachKind::Reattached { .. })
-            ),
-            "with one client still attached the session must survive past the TTL"
-        );
-        // Now drop every client; after the TTL the session is reaped and a fresh attach creates one.
-        drop(b);
-        drop(reg.attach(peer).await.context("reattach C")?.0);
-        // Past the TTL, by time: polling would attach, and a detach restarts it.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        anyhow::ensure!(
-            attach_kind(&reg, peer).await == Some(AttachKind::Created),
-            "after the last detach and the TTL the session is gone"
-        );
-        reg.shutdown().await;
+    const TTL: Duration = Duration::from_millis(200);
+    koh_testkit::current_thread()?.block_on(async {
+        // (case, its program, clients attached, of them still attached, whether it is reaped)
+        let cases = [
+            ("one of two left", &["sleep", "30"][..], 2, 1, false),
+            ("both of two left", &["sleep", "30"], 2, 0, true),
+            ("a burst of 20 left", &["sleep", "30"], 20, 0, true),
+            ("its program exited unseen", &["true"], 1, 0, true),
+        ];
+        let mut sessions = Vec::new();
+        let mut held = Vec::new();
+        for (case, command, attached, kept, reaped) in cases {
+            let reg = registry(command, 4, TTL)?;
+            let peer = peer()?;
+            let mut clients = Vec::new();
+            for _ in 0..attached {
+                clients.push(reg.attach(peer).await.context(case)?.0);
+            }
+            if let Some(client) = clients.first_mut().filter(|_| command == ["true"]) {
+                await_exit(client).await?;
+            }
+            held.extend(clients.drain(..kept));
+            drop(clients);
+            sessions.push((case, reg, peer, reaped));
+        }
+        // The TTL is what passes here: polling would attach, which restarts it.
+        tokio::time::sleep(TTL * 5).await;
+        for (case, reg, peer, reaped) in sessions {
+            let kind = attach_kind(&reg, peer).await;
+            reg.shutdown().await;
+            anyhow::ensure!(
+                (kind == Some(AttachKind::Created)) == reaped,
+                "{case}: {kind:?}"
+            );
+        }
+        drop(held);
         Ok(())
     })
 }
@@ -495,25 +505,6 @@ fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Resu
     })
 }
 
-/// A session whose program exited, left before any client had its final screen, is kept for the
-/// TTL and then reaped: the next attach starts a new one.
-#[test]
-fn an_exited_session_no_client_saw_end_is_reaped_after_the_ttl() -> anyhow::Result<()> {
-    koh_testkit::current_thread()?.block_on(async {
-        let reg = registry(&["true"], 4, Duration::from_millis(200))?;
-        let a = peer()?;
-        let (mut client, _) = reg.attach(a).await.context("attach")?;
-        await_exit(&mut client).await?;
-        drop(client);
-        // Past the TTL, by time: polling would attach, and an attach restarts it.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let kind = attach_kind(&reg, a).await;
-        reg.shutdown().await;
-        anyhow::ensure!(kind == Some(AttachKind::Created), "{kind:?}");
-        Ok(())
-    })
-}
-
 /// A peer removed from the allowlist has its session ended, its program hung up.
 #[test]
 fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
@@ -530,30 +521,6 @@ fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
         let kind = attach_kind(&reg, a).await;
         reg.shutdown().await;
         anyhow::ensure!(kind == Some(AttachKind::Created), "{kind:?}");
-        Ok(())
-    })
-}
-
-/// More detaches than the session's control queue holds, at once, must all count: after the TTL
-/// the session is reaped and the next attach creates a new one.
-#[test]
-fn a_burst_of_detaches_larger_than_the_control_queue_still_starts_the_ttl() -> anyhow::Result<()> {
-    koh_testkit::current_thread()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_millis(200))?;
-        let p = peer()?;
-        let mut clients = Vec::new();
-        for _ in 0..20 {
-            clients.push(reg.attach(p).await.context("attach")?.0);
-        }
-        drop(clients);
-        // Past the TTL, by time: polling would attach, and a detach restarts it.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let kind = attach_kind(&reg, p).await;
-        reg.shutdown().await;
-        anyhow::ensure!(
-            kind == Some(AttachKind::Created),
-            "every client left 1.3 s past a 200 ms TTL, so the session is reaped; got {kind:?}"
-        );
         Ok(())
     })
 }

@@ -774,8 +774,9 @@ const SMALL_STREAM: usize = 256 * 1024;
 /// Most large server streams read, or waiting for the loop, at once.
 ///
 /// With the small ones, the client holds at most about `LARGE_STREAMS` of [`MAX_FRAME`] and
-/// [`FRAME_QUEUE`] of twice [`SMALL_STREAM`] of the server's streams: some 40 MiB, not 16 of the
-/// largest. A large stream waits for its turn holding at most two chunks, and one that has its
+/// [`FRAME_QUEUE`] of twice [`SMALL_STREAM`] of the server's streams, as they came: some 40 MiB,
+/// not 16 of the largest. The loop inflates them one at a time (a frame to at most [`MAX_FRAME`],
+/// history rows to at most [`MAX_HISTORY_REPLY`](crate::terminal::MAX_HISTORY_REPLY)). A large stream waits for its turn holding at most two chunks, and one that has its
 /// turn waits on nothing but its own bytes, so the turns cannot deadlock.
 const LARGE_STREAMS: usize = 2;
 
@@ -1148,7 +1149,7 @@ mod tests {
                 .await
                 .expect("the reply after the large streams never came")
                 .expect("the reader ended");
-            assert!(matches!(got.msg, ServerMsg::History(ref reply) if reply.id == 7));
+            assert!(matches!(got.msg, ServerMsg::History(ref body) if crate::proto::decode_history(body).is_ok_and(|reply| reply.id == 7)));
         });
     }
 

@@ -29,7 +29,7 @@ pub mod test_support {
 }
 pub use history::{
     HistoryCache, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, KeptRow,
-    HISTORY_CACHE_BYTES, MAX_HISTORY_CELLS, MAX_HISTORY_ROWS,
+    HISTORY_CACHE_BYTES, MAX_HISTORY_CELLS, MAX_HISTORY_REPLY, MAX_HISTORY_ROWS,
 };
 pub use server::{FrameHold, ServerTerminal, FRAME_HOLD, IDENTITY, OPTIONS};
 
@@ -1071,9 +1071,6 @@ fn seal(runs: &mut [Run], open: &mut Option<String>) {
 /// hostile server could otherwise make the client hold links nothing shows). Work is bounded
 /// by `cols`: every run is non-empty, and each cell's text by [`fux_vt::CLUSTER_CAPACITY`].
 fn cells_of(runs: &[Run], links: &[WireLink], cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
-    if links.len() > MAX_ROW_LINKS {
-        return None;
-    }
     let mut cells = Cells::new(usize::from(cols));
     let mut linked = Vec::new();
     let mut named = vec![false; links.len()];

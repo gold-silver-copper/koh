@@ -13,8 +13,8 @@ use crate::bounded::Bounded;
 use crate::events::{InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE, PALETTE};
 use crate::predict::{Overlay, PredictionEngine};
 use crate::proto::{
-    decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
-    ServerMsg, HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
+    decode_frame_body, decode_history, dictionary_for, retry_after, ClientMsg, Frame, FrameNum,
+    InputSeq, ServerMsg, HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
 };
 use crate::terminal::{HistoryReply, Size, TerminalScreen};
 
@@ -829,11 +829,15 @@ impl ClientSession {
         self.dirty = true;
     }
 
-    /// A message from the server arrived: a frame's stream, or history rows.
+    /// A message from the server arrived: a frame's stream, or history rows, inflated here, one
+    /// at a time. One that does not inflate or decode is dropped.
     pub fn on_server(&mut self, now: Instant, msg: ServerMsg) {
         match msg {
             ServerMsg::Frame { base, rows, body } => self.on_frame_stream(now, base, &rows, &body),
-            ServerMsg::History(reply) => self.on_history(&reply),
+            ServerMsg::History(body) => match decode_history(&body) {
+                Ok(reply) => self.on_history(&reply),
+                Err(e) => tracing::debug!(error = %e, "dropping undecodable history rows"),
+            },
         }
     }
 

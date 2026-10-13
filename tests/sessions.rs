@@ -268,7 +268,11 @@ impl RawClient {
         while let Ok(Some((base, rows, body))) =
             tokio::time::timeout_at(deadline, self.frames.recv()).await
         {
+            // As the client does: a frame on a base not held asks for a resync, and one that came
+            // late is kept as a base, as the server may diff against it. Frames come on streams
+            // of their own, so they can come out of order.
             let Some(base_screen) = self.screens.get(&base) else {
+                self.write(&ClientMsg::Resync).await?;
                 continue;
             };
             let Ok(frame) = decode_frame_body(
@@ -278,14 +282,10 @@ impl RawClient {
             ) else {
                 continue;
             };
-            if frame.num <= self.newest {
-                continue;
-            }
-            let base = base_screen;
-            let mut next = base.clone();
+            let mut next = base_screen.clone();
             next.apply(&frame.diff)?;
             self.screens.insert(frame.num, next);
-            self.newest = frame.num;
+            self.newest = self.newest.max(frame.num);
             self.echo_ack = self.echo_ack.max(frame.echo_ack);
             self.write(&ClientMsg::Ack { frame: frame.num }).await?;
         }
@@ -600,23 +600,38 @@ fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
 /// at the prompt.
 #[test]
 fn a_prompt_printed_before_echo_goes_off_is_never_told_with_echo_on() -> anyhow::Result<()> {
+    // How long the server waits after output that is no echo before it sends it, with the PTY's
+    // modes read again (`TTY_SETTLE`): a program that takes longer to turn echo off after its
+    // prompt (a loaded machine can stall it) is past the promise.
+    const SETTLE: Duration = Duration::from_millis(10);
     runtime()?.block_on(async {
         let program = [
             "perl",
             "-e",
-            // A fifth of a millisecond between the prompt and echo going off, well within the
-            // read that follows output.
-            "use POSIX; $| = 1; print 'pw: '; select(undef, undef, undef, 0.0002); \
-             my $t = POSIX::Termios->new; $t->getattr(0); \
-             $t->setlflag($t->getlflag & ~POSIX::ECHO()); $t->setattr(0, POSIX::TCSANOW()); sleep 30",
+            // A fifth of a millisecond between the prompt and echo going off, then how long that
+            // took in all, which the test reads.
+            "use POSIX; use Time::HiRes qw(time); $| = 1; my $t0 = time; print 'pw: '; \
+             select(undef, undef, undef, 0.0002); my $t = POSIX::Termios->new; $t->getattr(0); \
+             $t->setlflag($t->getlflag & ~POSIX::ECHO()); $t->setattr(0, POSIX::TCSANOW()); \
+             printf(\"took %d us\\r\\n\", (time - $t0) * 1e6); sleep 30",
         ];
         for round in 0..20 {
             let reg = registry(&program, 1, Duration::from_secs(30), |_| true)?;
             let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
             let told = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut prompted = None;
                 while let Some(screen) = client.next_screen().await {
-                    if screen.screen().contents().contains("pw:") {
-                        return screen.tty();
+                    let shown = screen.screen().contents();
+                    if shown.contains("pw:") {
+                        prompted = prompted.or_else(|| screen.tty());
+                    }
+                    let took = shown.split("took ").nth(1).and_then(|rest| {
+                        rest.split(" us")
+                            .next()
+                            .and_then(|us| us.parse::<u64>().ok())
+                    });
+                    if let (Some(tty), Some(took)) = (prompted, took) {
+                        return Some((tty, Duration::from_micros(took)));
                     }
                 }
                 None
@@ -624,8 +639,11 @@ fn a_prompt_printed_before_echo_goes_off_is_never_told_with_echo_on() -> anyhow:
             .await;
             drop(client);
             reg.shutdown().await;
-            let tty = told.ok().flatten().context("the prompt never came")?;
-            anyhow::ensure!(!tty.echo, "round {round}: the prompt was told with echo on");
+            let (tty, took) = told.ok().flatten().context("the prompt never came")?;
+            anyhow::ensure!(
+                !tty.echo || took >= SETTLE,
+                "round {round}: the prompt was told with echo on, {took:?} before it went off"
+            );
         }
         Ok(())
     })

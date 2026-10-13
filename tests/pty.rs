@@ -341,9 +341,10 @@ fn short_lived_children_never_lose_their_output() {
         // load; spawning many at once is the load, and every one must deliver its marker.
         // 16 at a time stays well under macOS's PTY cap (`kern.tty.ptmx_max`, 511) even when several
         // PTY tests run at once, and within the room `launcher` makes in the kernel's PTY table;
-        // 128 rounds reproduce a late reader on every run.
+        // 128 rounds reproduce a late reader on every run there. Linux keeps a closed slave's
+        // output, so a few rounds check the property there, quickly.
         const CHILDREN: usize = 16;
-        const ROUNDS: usize = 128;
+        const ROUNDS: usize = if cfg!(target_os = "macos") { 128 } else { 8 };
         for round in 0..ROUNDS {
             // Spawn every child before awaiting any, so they all run concurrently.
             let mut runs = Vec::with_capacity(CHILDREN);

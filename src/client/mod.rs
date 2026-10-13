@@ -420,7 +420,7 @@ pub async fn run_client<T: ClientTerminal>(
     let mut session = ClientSession::new(term.size().unwrap_or(initial_size));
     session.ask_terminal(Instant::now(), colours);
     // `None` once the resize ticks end, so a closed channel is not polled again.
-    let mut resize_rx = Some(resize_rx);
+    let mut resizes = Resizes(Some(resize_rx));
     // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
     let mut attempt: u32 = 0;
     let mut net = Net::Up(Wire::open(initial));
@@ -519,15 +519,10 @@ pub async fn run_client<T: ClientTerminal>(
             permit = when(writers.map(|(_, control)| control.reserve())), if session.has_outgoing_on(Stream::Control) => {
                 send(permit.ok(), session.pop_outgoing_on(Stream::Control))
             }
-            maybe = when(resize_rx.as_mut().map(mpsc::Receiver::recv)) => {
-                match maybe {
-                    Some(()) => {
-                        term.window_resized();
-                        if let Ok(size) = term.size() {
-                            session.on_resize(size);
-                        }
-                    }
-                    None => resize_rx = None,
+            () = resizes.next() => {
+                term.window_resized();
+                if let Ok(size) = term.size() {
+                    session.on_resize(size);
                 }
                 None
             }
@@ -759,6 +754,22 @@ async fn when<F: std::future::Future>(future: Option<F>) -> F::Output {
 const WRITER_QUEUE: usize = 64;
 /// How many decoded frames may wait for the connection loop.
 const FRAME_QUEUE: usize = 16;
+
+/// The window's resize ticks. [`next`](Self::next) waits for one, and for ever once the channel
+/// closed: a closed channel cannot spin the loop.
+struct Resizes(Option<mpsc::Receiver<()>>);
+
+impl Resizes {
+    async fn next(&mut self) {
+        while let Some(rx) = self.0.as_mut() {
+            if rx.recv().await.is_some() {
+                return;
+            }
+            self.0 = None;
+        }
+        std::future::pending::<()>().await;
+    }
+}
 
 /// Send `msg` with `permit`, a writer's room; a writer that ended (`None`) lost the connection.
 fn send(permit: Option<mpsc::Permit<'_, Vec<u8>>>, msg: Option<ClientMsg>) -> Option<Change> {
@@ -1156,40 +1167,19 @@ mod tests {
         });
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn a_closed_resize_channel_does_not_spin_the_loop() {
-        /// This thread's CPU time so far, in clock ticks: the loop runs on it (one-thread runtime).
-        fn cpu_ticks() -> u64 {
-            let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("stat");
-            let fields: Vec<&str> = stat.rsplit(") ").next().unwrap().split(' ').collect();
-            fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
-        }
+    fn a_closed_resize_channel_is_waited_on_for_ever_not_taken() {
         crate::test_runtime::current_thread().block_on(async {
-            let (conn, connector) = loopback(|_| async {}).await;
-            let (input, input_rx) = mpsc::channel(8);
             let (resize, resize_rx) = mpsc::channel(1);
+            let mut resizes = Resizes(Some(resize_rx));
+            resize.send(()).await.expect("sent");
+            let wait = Duration::from_millis(50);
+            let taken = tokio::time::timeout(wait, resizes.next()).await;
+            assert!(taken.is_ok(), "a tick is taken");
             drop(resize);
-            let run = koh_testkit::spawn(run_client(
-                conn,
-                SystemTime::now(),
-                connector,
-                Size::new(24, 80),
-                false,
-                input_rx,
-                resize_rx,
-                Blind,
-                CancellationToken::new(),
-                None,
-            ));
-            let before = cpu_ticks();
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let used = cpu_ticks() - before;
-            input.send(vec![ESCAPE_PREFIX, b'.']).await.expect("typed");
-            let quit = tokio::time::timeout(Duration::from_secs(5), run).await;
-            assert!(matches!(quit, Ok(Ok(Ok(None)))), "{quit:?}");
-            // A spinning loop takes the whole second (100 ticks); an idle one a few.
-            assert!(used < 30, "the loop spun: {used} ticks of CPU in a second");
+            let taken = tokio::time::timeout(wait, resizes.next()).await;
+            assert!(taken.is_err(), "closed, it is waited on for ever");
+            assert!(resizes.0.is_none(), "and never polled again");
         });
     }
 }

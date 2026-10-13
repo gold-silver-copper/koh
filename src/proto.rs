@@ -252,12 +252,10 @@ pub enum ProtoError {
 }
 
 /// Refuse `len` past `max` as [`ProtoError::TooLarge`].
-const fn at_most(len: usize, max: usize) -> Result<(), ProtoError> {
-    if len > max {
-        Err(ProtoError::TooLarge { len, max })
-    } else {
-        Ok(())
-    }
+fn at_most(len: usize, max: usize) -> Result<(), ProtoError> {
+    (len <= max)
+        .then_some(())
+        .ok_or(ProtoError::TooLarge { len, max })
 }
 
 impl ClientMsg {
@@ -276,18 +274,11 @@ impl ClientMsg {
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
     msg.check()?;
     // The body goes straight after a placeholder for its length.
-    let out = postcard::to_extend(msg, vec![0; 4])?;
+    let mut out = postcard::to_extend(msg, vec![0; 4])?;
     let body = out.len().saturating_sub(4);
-    let len = u32::try_from(body)
-        .ok()
-        .filter(|_| body <= MAX_CLIENT_MESSAGE)
-        .ok_or(ProtoError::TooLarge {
-            len: body,
-            max: MAX_CLIENT_MESSAGE,
-        })?;
-    let mut out = out;
+    at_most(body, MAX_CLIENT_MESSAGE)?;
     if let Some(prefix) = out.first_chunk_mut::<4>() {
-        *prefix = len.to_be_bytes();
+        *prefix = u32::try_from(body).unwrap_or(u32::MAX).to_be_bytes();
     }
     Ok(out)
 }
@@ -344,11 +335,10 @@ impl ClientDecoder {
 
     /// The stream ended: fine between messages, a protocol error inside one.
     pub fn finish(&self) -> Result<(), ProtoError> {
-        if self.pending().is_empty() {
-            Ok(())
-        } else {
-            Err(ProtoError::Truncated)
-        }
+        self.pending()
+            .is_empty()
+            .then_some(())
+            .ok_or(ProtoError::Truncated)
     }
 }
 
@@ -544,11 +534,9 @@ pub fn decode_frame_body(
 ) -> Result<Frame, ProtoError> {
     let raw = inflate_with(dictionary, body, MAX_FRAME).ok_or(ProtoError::Inflate)?;
     let frame: Frame = postcard::from_bytes(&raw)?;
-    if frame.base == base {
-        Ok(frame)
-    } else {
-        Err(ProtoError::NotAFrame)
-    }
+    (frame.base == base)
+        .then_some(frame)
+        .ok_or(ProtoError::NotAFrame)
 }
 
 /// Inflate history rows, no further than a legal reply goes ([`MAX_HISTORY_REPLY`]), and decode
@@ -698,12 +686,12 @@ mod tests {
             WireKey, WireKeyCode, WireKitty, WireMouse, WireMouseAction, MAX_EVENTS, MAX_PASTE,
             PALETTE,
         };
-        let raw = |msg: &ClientMsg| {
-            let body = postcard::to_allocvec(msg).unwrap();
+        let framed = |body: Vec<u8>| {
             let mut stream = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
             stream.extend_from_slice(&body);
             stream
         };
+        let raw = |msg: &ClientMsg| framed(postcard::to_allocvec(msg).unwrap());
         let keys = |events: Vec<InputEvent>| ClientMsg::Keys {
             seq: InputSeq(1),
             events,
@@ -756,9 +744,7 @@ mod tests {
             postcard::to_allocvec(&keys(vec![key(WireKeyCode::Char('a'), 0, None)])).unwrap();
         let at = body.iter().rposition(|&b| b == b'a').unwrap();
         body[at] = 0xff;
-        let mut stream = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
-        stream.extend_from_slice(&body);
-        assert!(decode_all(&stream).is_err());
+        assert!(decode_all(&framed(body)).is_err());
         // What a terminal sends goes through, both ways.
         let good = [
             keys(vec![

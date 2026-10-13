@@ -1435,22 +1435,16 @@ mod tests {
         (later, s, echoed)
     }
 
+    /// Typing after a confirmed echo is shown; a focus change (an alt-tab) is no edit: the
+    /// predictions and the trust stay.
     #[test]
-    fn a_frame_confirms_echoed_predictions() {
+    fn a_frame_confirms_echoed_predictions_and_focus_events_leave_them_alone() {
         let (later, mut s, _) = trusted();
         s.on_input(later, b"y");
         assert_eq!(
             s.overlay().cell(0, 1).map(crate::predict::Cell::text),
-            Some("y"),
-            "typing after a confirmed echo is shown"
+            Some("y")
         );
-    }
-
-    /// A focus change (an alt-tab) is no edit: the predictions and the trust stay.
-    #[test]
-    fn focus_events_leave_the_predictions_alone() {
-        let (later, mut s, _) = trusted();
-        s.on_input(later, b"y");
         let before = s.overlay();
         let epoch = s.predictor.confirmed_epoch();
         s.on_input(later, b"\x1b[I\x1b[O");

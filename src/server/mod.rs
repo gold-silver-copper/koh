@@ -130,6 +130,7 @@ impl ToSession {
 
 /// The server side of one connection, without I/O: it decodes the client's stream, tracks the
 /// echo-ack, and decides when to send which frame against which base.
+#[derive(Default)]
 pub(crate) struct ServerConn {
     decoder: ClientDecoder,
     /// The client finished its stream: what it left must decode whole.
@@ -142,8 +143,8 @@ pub(crate) struct ServerConn {
     held_input: usize,
     /// The session's newest screen, shared with every frame that shows it.
     screen: Arc<TerminalScreen>,
-    /// `screen` differs from what was last sent, or the base must be rebuilt.
-    unsent_change: bool,
+    /// `screen` is what was last sent, and the base needs no rebuilding.
+    screen_sent: bool,
     /// The frames the client is taken to hold, by their delivery.
     held: ClientHolds,
     last_num: FrameNum,
@@ -214,36 +215,11 @@ impl Rate {
     }
 }
 
-impl Default for ServerConn {
-    fn default() -> Self {
-        Self {
-            decoder: ClientDecoder::default(),
-            client_ended: false,
-            echo: EchoAck::default(),
-            to_session: Bounded::default(),
-            held_input: 0,
-            screen: Arc::default(),
-            unsent_change: true,
-            held: ClientHolds::default(),
-            last_num: FrameNum::BLANK,
-            last_sent_at: None,
-            last_sent_echo: InputSeq(0),
-            final_frame: None,
-            history: Bounded::default(),
-            history_busy: false,
-            encoder: FrameEncoder::default(),
-            in_flight: Bounded::default(),
-            rates: Bounded::default(),
-            heard: None,
-        }
-    }
-}
-
 impl ServerConn {
     /// Install the session's latest screen. One that carries the program's exit code is final.
     fn install_snapshot(&mut self, screen: Arc<TerminalScreen>) {
         if screen != self.held.newest().screen {
-            self.unsent_change = true;
+            self.screen_sent = false;
         }
         self.screen = screen;
     }
@@ -362,19 +338,15 @@ impl ServerConn {
     /// The client has frame `num`, so older frames are no bases any more. An ack for a frame no
     /// longer held is ignored.
     fn ack(&mut self, num: FrameNum, now: Instant) {
-        self.delivered(num, now);
-        self.held.delivered(num);
-    }
-
-    /// Frame `num` was delivered at `now`: it is no longer in flight, nor are the frames before it,
-    /// which it superseded, and how long it took proves a rate of the link.
-    fn delivered(&mut self, num: FrameNum, now: Instant) {
+        // No longer in flight, nor are the frames before it, which it superseded, and how long it
+        // took proves a rate of the link.
         if let Some(&(_, bytes, sent)) = self.in_flight.iter().find(|(n, _, _)| *n == num) {
             if let Some(rate) = Rate::proven(bytes, now.saturating_duration_since(sent)) {
                 self.rates.push_evicting(rate);
             }
         }
         self.in_flight.retain(|(n, _, _)| *n > num);
+        self.held.delivered(num);
     }
 
     /// Frame `num`, of `bytes` on its stream, went at `now`. Frames given up on, which a client
@@ -415,6 +387,12 @@ impl ServerConn {
             .map_or(INITIAL_BUDGET, |(rtt, rate)| rate.carried(rtt))
     }
 
+    /// Whether an unsent change likely carries the echo of the user's input, with few enough
+    /// frames in flight that it goes at once.
+    fn echo_due(&self, now: Instant, rtt: Option<Duration>) -> bool {
+        !self.screen_sent && self.carries_echo() && self.in_flight(now, rtt).0 < MAX_IN_FLIGHT_ECHO
+    }
+
     /// Whether the screen's change is small and the user typed in the last echo debounce: a frame
     /// that likely carries the program's echo, which goes at once.
     fn carries_echo(&self) -> bool {
@@ -429,7 +407,7 @@ impl ServerConn {
     /// blank screen.
     fn resync(&mut self) {
         self.held.forget();
-        self.unsent_change = true;
+        self.screen_sent = false;
     }
 
     /// The frame due at `now`, if any.
@@ -448,12 +426,9 @@ impl ServerConn {
         let passed = |floor: Duration| since.is_none_or(|since| since >= floor);
         let room = self.room(now, rtt, MAX_IN_FLIGHT);
         let retry_due = self.retry_at(rtt).is_some_and(|at| now >= at);
-        let heartbeat_due = since.is_none_or(|since| since >= HEARTBEAT);
-        let echo = self.unsent_change
-            && passed(ECHO_FLOOR)
-            && self.carries_echo()
-            && self.in_flight(now, rtt).0 < MAX_IN_FLIGHT_ECHO;
-        let due = (changed && passed(FRAME_FLOOR) && room) || echo || retry_due || heartbeat_due;
+        let echo = passed(ECHO_FLOOR) && self.echo_due(now, rtt);
+        let due =
+            (changed && passed(FRAME_FLOOR) && room) || echo || retry_due || passed(HEARTBEAT);
         if !due {
             return None;
         }
@@ -469,7 +444,7 @@ impl ServerConn {
         // What the client will hold, which later frames diff against: the screen, unless the
         // frame left some of its links for a later one.
         let sent = sent.map_or_else(|| Arc::clone(&self.screen), Arc::new);
-        self.unsent_change = sent != self.screen;
+        self.screen_sent = sent == self.screen;
         self.held.sent(FrameScreen { num, screen: sent });
         self.last_num = num;
         self.last_sent_at = Some(now);
@@ -499,7 +474,7 @@ impl ServerConn {
     /// Whether the screen or the echo-ack changed since the last frame, or the base must be
     /// rebuilt.
     fn changed(&self) -> bool {
-        self.unsent_change || self.echo.echo_ack() != self.last_sent_echo
+        !self.screen_sent || self.echo.echo_ack() != self.last_sent_echo
     }
 
     /// When the newest frame, unacknowledged, is resent as a new one: once it is given up on.
@@ -529,52 +504,31 @@ impl ServerConn {
     /// When the loop must wake at the latest, with nothing else happening (a delivery wakes it
     /// too).
     fn next_wake(&self, now: Instant, rtt: Option<Duration>) -> Instant {
-        let mut wake = self
-            .last_sent_at
-            .map_or(now, |at| at.checked_add(HEARTBEAT).unwrap_or(now));
-        let changed = self.changed();
-        if changed {
-            // As `poll_frame` decides: an echo goes after its floor, anything else once the floor
-            // passed with room in flight, else when a delivery makes room or a frame is given up.
-            let floor = if self.unsent_change
-                && self.carries_echo()
-                && self.in_flight(now, rtt).0 < MAX_IN_FLIGHT_ECHO
-            {
-                Some(ECHO_FLOOR)
-            } else if self.room(now, rtt, MAX_IN_FLIGHT) {
-                Some(FRAME_FLOOR)
-            } else {
-                None
-            };
-            match floor {
-                Some(floor) => {
-                    let after = self
-                        .last_sent_at
-                        .map_or(now, |at| at.checked_add(floor).unwrap_or(now));
-                    wake = wake.min(after);
-                }
-                None => {
-                    if let Some(given_up) = self
-                        .in_flight
-                        .iter()
-                        .map(|&(_, _, sent)| given_up(sent, self.heard, rtt))
-                        .find(|&at| at > now)
-                    {
-                        wake = wake.min(given_up);
-                    }
-                }
-            }
-        }
-        if let Some(retry) = self.retry_at(rtt) {
-            wake = wake.min(retry);
-        }
-        if let Some(promotion) = self.echo.next_promotion() {
-            wake = wake.min(promotion);
-        }
-        if let Some((_, at)) = self.final_frame {
-            wake = wake.min(at.checked_add(final_wait(rtt)).unwrap_or(now));
-        }
-        wake.max(now)
+        let after = |gap| {
+            self.last_sent_at
+                .map_or(now, |at| at.checked_add(gap).unwrap_or(now))
+        };
+        // As `poll_frame` decides: an echo goes after its floor, anything else once the floor
+        // passed with room in flight, else when a delivery makes room or a frame is given up.
+        let frame = if !self.changed() {
+            None
+        } else if self.echo_due(now, rtt) {
+            Some(after(ECHO_FLOOR))
+        } else if self.room(now, rtt, MAX_IN_FLIGHT) {
+            Some(after(FRAME_FLOOR))
+        } else {
+            (self.in_flight.iter())
+                .map(|&(_, _, sent)| given_up(sent, self.heard, rtt))
+                .find(|&at| at > now)
+        };
+        let ends = self
+            .final_frame
+            .map(|(_, at)| at.checked_add(final_wait(rtt)).unwrap_or(now));
+        [frame, self.retry_at(rtt), self.echo.next_promotion(), ends]
+            .into_iter()
+            .flatten()
+            .fold(after(HEARTBEAT), Instant::min)
+            .max(now)
     }
 }
 
@@ -815,6 +769,10 @@ async fn send_frame(
     // the last the server still learns which the client has; then it is reset, so QUIC stops
     // retransmitting it. Superseded while still being written, it is reset at once.
     if !cancelled {
+        let superseded = async {
+            cancel.cancelled().await;
+            tokio::time::sleep(grace).await;
+        };
         tokio::select! {
             stopped = send.stopped() => {
                 if matches!(stopped, Ok(None)) {
@@ -822,16 +780,7 @@ async fn send_frame(
                 }
                 return;
             }
-            () = cancel.cancelled() => {}
-        }
-        tokio::select! {
-            stopped = send.stopped() => {
-                if matches!(stopped, Ok(None)) {
-                    let _ = delivered.send(num).await;
-                }
-                return;
-            }
-            () = tokio::time::sleep(grace) => {}
+            () = superseded => {}
         }
     }
     let _ = send.reset(0u32.into());

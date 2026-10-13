@@ -71,7 +71,9 @@ refusal is a close code, never prose to match (`proto::Close`: `NotAuthorized` 1
 `SessionEnded` 3, `AtCapacity` 4, `CouldNotStart` 5). Only `NotAuthorized` makes a client give up;
 on the others it redials and its banner says why. Then (`src/proto.rs`):
 
-- **Client to server: one uni stream** of length-prefixed postcard `ClientMsg`s: `Keys { seq,
+- **Client to server: two uni streams** of length-prefixed postcard `ClientMsg`s, one for input
+  (`Keys` and `Colours`) and one for control (the rest, `ClientMsg::stream`), so a control message
+  never waits behind input a program has not read: `Keys { seq,
   events }`, the input the client decoded (`src/events.rs`: keys, mouse events, focus changes and
   whole pastes of at most 1 MiB, at most 512 events a message), `Resize`, `Resync` when a frame's
   base is unknown, `History { id, newest, count }` for scrollback rows, `Ack { frame }`, now only a nudge
@@ -157,12 +159,13 @@ on the others it redials and its banner says why. Then (`src/proto.rs`):
   the client ask for a resync). Screens are shared, not copied — a resent frame holds the session's
   own snapshot, a client screen shares every row a frame did not carry with its base — and the
   session takes one snapshot per burst of program output rather than per read. That, plus QUIC flow
-  control and the stream limits (the server accepts one client stream; the client a handful of
+  control and the stream limits (the server accepts two client streams; the client a handful of
   frame streams), bounds memory; a peer cannot make either end accumulate.
 - **Backpressure:** PTY input goes through a writer queue of at most 1 MiB, and the session's
   input queue holds a bounded number of messages. While they are full the connection stops reading
-  the client's stream, and only that: it goes on sending frames and heartbeats and seeing the
-  connection close. QUIC flow control stops the client's writes, and the client keeps at most
+  the client's input stream, and only that: it goes on reading the control stream (resizes,
+  acknowledgements, history requests), sending frames and heartbeats and seeing the connection
+  close. QUIC flow control stops the client's writes, and the client keeps at most
   1 MiB of typing before dropping it with an "input paused" status line. The keyboard loop never
   waits on the network, so `Ctrl-^ .` always works.
 - **Every queue is bounded** (`src/bounded.rs`): `clippy.toml` bans `VecDeque` and unbounded
@@ -258,10 +261,10 @@ Both ends split into a synchronous, I/O-free core and a thin async shell. The cl
 escape/render state, and exposes pure steps: `on_input` (the `Ctrl-^`-prefix machine, prediction
 seeding, input queueing), `on_frame`, `on_resize` and `on_tick` (the link-down and input-paused
 banners), with the outgoing messages taken from a queue. The server's **`ServerConn`**
-(`server/mod.rs`) decodes the client's stream, tracks the echo-ack, and decides which frame to
+(`server/mod.rs`) decodes the client's streams, tracks the echo-ack, and decides which frame to
 send against which base. None of it touches tokio, iroh or a terminal, and time is an argument, so
 both are deterministically unit-testable. The shells own the `tokio::select!` (unbiased, so a flood of
-keystrokes or of frames starves neither), a writer task for the client's stream, a task per frame stream, and
+keystrokes or of frames starves neither), a writer task for each of the client's streams, a task per frame stream, and
 the rendering.
 
 On the server side, **PTY writes are non-blocking**: a dedicated `koh-pty-writer` thread drains a
@@ -398,7 +401,7 @@ measures from when the connection was dialed, so a freeze while the client start
 user's terminal, entering raw mode) counts too. A sub-20 s glance still rides out silently on the
 existing connection.
 
-The client loop's `select!` is the only place it waits: the writer task opens the client's stream,
+The client loop's `select!` is the only place it waits: each writer task opens its stream,
 a redial is a polled future, and a closed resize channel is disabled, so a server that grants no
 stream cannot block quitting or signals. The session's first phase asks the user's terminal its
 start-up questions on stdin's one decoder, with answers expected, so a late answer is still an

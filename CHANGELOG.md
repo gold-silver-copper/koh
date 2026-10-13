@@ -20,7 +20,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
   raw-bytes `Input` message is gone; history requests carry ids and every one is answered; a
   refusal is a close code; screen modes say whether the alternate screen is shown; the admission
   stream is gone: the server attaches the client's session before it sends anything, and the
-  first frame admits it.
+  first frame admits it; the client sends input and control messages on two streams, so a resize,
+  acknowledgement or history request never waits behind input a program has not read.
 - Painting is a diff of the whole terminal with autowrap off: a terminal larger or smaller than the
   screen shows the screen clipped and nothing else, the status line repaints only when it changes,
   switching mouse modes turns the old one off, and the window title is restored on exit and
@@ -43,9 +44,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
   programs still get SIGHUP's default. Turned-away peers are logged at most once every 10 s.
 - Frames land on slow links: a frame is given up only once the client has acknowledged nothing for
   a retry interval, the link's rate is what deliveries prove, and the client keeps the base the
-  server diffs against however many frames pass. A resize no longer waits behind typing the
-  program has not read. Echo turned off just after a prompt (PAM's order) is told 5 ms after the
-  prompt, not a tick later.
+  server diffs against however many frames pass. Output that is no echo of typing waits 5 ms for
+  the PTY's modes to be read again, so a prompt printed just before echo goes off (PAM's order) is
+  never told with echo on.
 - A title or icon reaches the terminal only through `OscText`, stripped of every C0 and C1
   control.
 - The tests start every program with a home of their own, no history file and no `ENV` script:

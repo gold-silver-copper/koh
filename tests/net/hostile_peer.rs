@@ -266,19 +266,20 @@ fn a_full_session_queue_does_not_stop_the_frames() -> anyhow::Result<()> {
 }
 
 #[test]
-fn a_client_cannot_open_a_second_stream() -> anyhow::Result<()> {
+fn a_client_cannot_open_a_third_stream() -> anyhow::Result<()> {
     koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let evil = identity()?;
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
         let conn = admitted(&net, evil, server.id).await?;
         raw_client_stream(&conn, &encode_client(&typed("echo hi\r"))?).await?;
-        // The server permits one uni stream from the client, so a second never opens: QUIC's
-        // stream-count flow control is the bound, before any koh code runs.
-        let second = tokio::time::timeout(Duration::from_secs(2), conn.open_uni()).await;
+        // The server permits two uni streams from the client, input and control, so a third
+        // never opens: QUIC's stream-count flow control is the bound, before any koh code runs.
+        let _second = conn.open_uni().await?;
+        let third = tokio::time::timeout(Duration::from_secs(2), conn.open_uni()).await;
         anyhow::ensure!(
-            second.is_err(),
-            "a second client stream must not be grantable"
+            third.is_err(),
+            "a third client stream must not be grantable"
         );
         assert_good_client_still_works(&mut good).await?;
         let _ = good.finish().await;

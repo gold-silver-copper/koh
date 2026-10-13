@@ -2320,6 +2320,13 @@ mod tests {
         c.apply(&diff).unwrap();
         assert_eq!(c, exited);
         assert_eq!((c.icon(), c.clipboard()), ("myicon", "aGk="));
+        // A hostile server's oversized title is cut by the client too.
+        let hostile = ScreenDiff {
+            title: Some(huge),
+            ..diff
+        };
+        c.apply(&hostile).unwrap();
+        assert_eq!(c.title().chars().count(), MAX_TITLE_LEN);
         assert_ne!(base, with_icon);
         assert_ne!(with_icon, exited, "the exit code alone tells them apart");
     }

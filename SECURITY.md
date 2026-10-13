@@ -58,7 +58,7 @@ and the git log.
 | M-1 | The identity key is written world-readable | `src/identity/key_file.rs::a_created_key_is_its_raw_bytes_and_loads_back_to_the_same_identity`; `testing/android/scripts/sec-key-perms.sh` |
 | M-2 | A (0, 0) resize panics the emulator | `tests/sessions.rs::a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server`, `src/terminal/mod.rs::client_apply_clamps_a_hostile_resize`; `testing/android/scripts/sec-resize-zero-panic.sh` |
 | L-1 | A server silently sets the client's clipboard (OSC 52) | Accepted since 0.13: clipboard writes are on by default, the owner's choice, and off with `--no-clipboard` (`src/args.rs::connect_takes_a_server_a_bell_command_and_turns_features_off`). What bounds them stays: `src/client/render.rs::only_a_base64_clipboard_within_the_cap_is_forwarded_and_only_when_on`; `src/terminal/server.rs::only_base64_sets_the_clipboard_and_a_query_sets_nothing` |
-| L-2 | The client trusts the server's title/icon/clipboard sizes | `src/terminal/mod.rs::apply_is_panic_free_and_holds_invariants` |
+| L-2 | The client trusts the server's title/icon/clipboard sizes | `src/terminal/mod.rs::side_channels_roundtrip_and_resist_collapse`, `apply_is_panic_free_and_holds_invariants` |
 | L-3 | No cap on connections, handshakes or sessions | `tests/sessions.rs::max_sessions_refuses_a_new_peer_but_allows_a_reattach`, `tests/net/hostile_peer.rs::a_flood_of_connections_and_garbage_does_not_take_the_server_down` |
 | L-4 | `KOH_*` variables leak into the spawned shell | `src/pty.rs::scrub_removes_inherited_koh_vars`; `testing/android/scripts/sec-env-leak.sh` |
 

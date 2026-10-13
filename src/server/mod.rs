@@ -35,8 +35,13 @@ const ECHO_TIMEOUT: Duration = Duration::from_millis(50);
 /// Most inputs awaiting their echo: one message each, within [`ECHO_TIMEOUT`].
 const ECHO_PENDING: usize = 256;
 
-/// Most messages for the session waiting for room in its queue, from one read of the client.
+/// Most messages for the session waiting for room in its queue.
 const TO_SESSION: usize = 64;
+
+/// Most bytes of input waiting for room in the session's queue before the client's stream is left
+/// unread: a message's worth, so a paste the program is slow to take holds up neither the control
+/// messages behind it (acknowledgements, history requests) nor more than itself.
+const HELD_INPUT: usize = crate::proto::MAX_CLIENT_MESSAGE;
 
 /// How long the server waits for the client to acknowledge the final frame, at least.
 const FINAL_ACK_WAIT: Duration = Duration::from_secs(1);
@@ -113,6 +118,16 @@ pub(crate) enum ToSession {
     Resize(Size),
 }
 
+impl ToSession {
+    /// The bytes of input it holds.
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Events(events) => events.iter().map(InputEvent::encoded_len).sum(),
+            Self::Colours(_) | Self::Resize(_) => 0,
+        }
+    }
+}
+
 /// The server side of one connection, without I/O: it decodes the client's stream, tracks the
 /// echo-ack, and decides when to send which frame against which base.
 pub(crate) struct ServerConn {
@@ -121,8 +136,10 @@ pub(crate) struct ServerConn {
     client_ended: bool,
     echo: EchoAck,
     /// What the client sent for the session, oldest first, until the session has room. Nothing
-    /// more is decoded once it is full, nor read while any waits.
+    /// more is decoded once it is full, nor read while it holds [`HELD_INPUT`].
     to_session: Bounded<ToSession, TO_SESSION>,
+    /// The bytes of input in `to_session`.
+    held_input: usize,
     /// The session's newest screen, shared with every frame that shows it.
     screen: Arc<TerminalScreen>,
     /// `screen` differs from what was last sent, or the base must be rebuilt.
@@ -204,6 +221,7 @@ impl Default for ServerConn {
             client_ended: false,
             echo: EchoAck::default(),
             to_session: Bounded::default(),
+            held_input: 0,
             screen: Arc::default(),
             unsent_change: true,
             held: ClientHolds::default(),
@@ -252,8 +270,17 @@ impl ServerConn {
     /// The oldest input for the session, which has room for it, decoding on behind it.
     fn poll_input(&mut self, now: Instant) -> Result<Option<ToSession>, ProtoError> {
         let input = self.to_session.pop_front();
+        self.held_input = self
+            .held_input
+            .saturating_sub(input.as_ref().map_or(0, ToSession::bytes));
         self.decode(now)?;
         Ok(input)
+    }
+
+    /// Whether to read more of the client's stream: while the input waiting for the session is
+    /// under [`HELD_INPUT`] and its queue has room.
+    fn wants_bytes(&self) -> bool {
+        self.held_input < HELD_INPUT && !self.to_session.is_full()
     }
 
     /// Decode the complete messages read, at `now`, while the session's queue has room: control
@@ -299,6 +326,7 @@ impl ServerConn {
     /// Queue `input` for the session, merged into the last if both are events, or resizes, of
     /// which only the last matters. The caller made room.
     fn for_session(&mut self, input: ToSession) {
+        self.held_input = self.held_input.saturating_add(input.bytes());
         match (self.to_session.back_mut(), input) {
             (Some(ToSession::Events(queued)), ToSession::Events(events)) => queued.extend(events),
             (Some(ToSession::Resize(queued)), ToSession::Resize(size)) => *queued = size,
@@ -648,7 +676,7 @@ pub async fn run_attached(authorized: cli::Authorized, mut session: session::Ses
             break "shell exited";
         }
         let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
-        let reading = client.is_some() && core.to_session.is_empty();
+        let reading = client.is_some() && core.wants_bytes();
         let broke = tokio::select! {
             // Not biased: a pending screen change would starve client input.
             screen = session.next_screen(), if session_open => match screen {
@@ -836,7 +864,6 @@ async fn send_history(
 const HISTORY_PRIORITY: i32 = -1;
 
 #[cfg(test)]
-#[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -900,6 +927,33 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_the_session_has_not_taken_holds_up_no_control_message_behind_it() {
+        // The program is slow to take a paste: the client's stream is still read, and the history
+        // request behind the paste answered, until a message's worth of input waits.
+        let now = Instant::now();
+        let mut conn = ServerConn::default();
+        let paste = ClientMsg::Keys {
+            seq: InputSeq(1),
+            events: vec![InputEvent::Paste("p".repeat(crate::events::MAX_PASTE))],
+        };
+        conn.push_client_bytes(&stream(std::slice::from_ref(&paste)), now)
+            .unwrap();
+        assert!(conn.wants_bytes());
+        let ask = crate::terminal::HistoryRequest {
+            id: 1,
+            newest: 1,
+            count: 1,
+        };
+        conn.push_client_bytes(&stream(&[ClientMsg::History(ask)]), now)
+            .unwrap();
+        assert_eq!(conn.next_history(), Some(ask));
+        conn.push_client_bytes(&stream(&[paste]), now).unwrap();
+        assert!(!conn.wants_bytes(), "two pastes wait: read no more");
+        conn.poll_input(now).unwrap();
+        assert!(conn.wants_bytes(), "taken: read on");
+    }
+
+    #[test]
     fn input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends() {
         // More than the session's queue holds: the rest waits undecoded, so a client cannot grow
         // it, and goes on as the session takes input, with no bytes more from the client. A clean
@@ -945,7 +999,7 @@ mod tests {
         use tokio_util::sync::CancellationToken;
         crate::test_runtime::current_thread().block_on(async {
             let (server, client, _s, _c) = loopback().await;
-            let reader = tokio::spawn(async move {
+            let reader = koh_testkit::spawn(async move {
                 let mut recv = client.accept_uni().await.unwrap();
                 recv.read_to_end(MAX_FRAME_TEST).await.unwrap();
                 client
@@ -953,7 +1007,7 @@ mod tests {
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             let grace = Duration::from_secs(5);
             let current = CancellationToken::new();
-            tokio::spawn(send_frame(
+            koh_testkit::spawn(send_frame(
                 server.clone(),
                 FrameNum(1),
                 vec![1; 100],

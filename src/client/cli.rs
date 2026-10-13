@@ -59,10 +59,9 @@ impl ConnectConfig {
 #[derive(Debug, Clone)]
 pub struct BellHook {
     command: String,
-    last_count: u64,
+    /// The last count seen (by `prime` or `observe`), after which `prime` is a no-op.
+    last_count: Option<u64>,
     last_spawn: Option<Instant>,
-    /// Whether a count has been seen (by `prime` or `observe`); `prime` is a no-op afterwards.
-    primed: bool,
 }
 
 /// Minimum spacing between two hook spawns; a burst of bells inside it coalesces into one.
@@ -72,26 +71,20 @@ impl BellHook {
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into(),
-            last_count: 0,
+            last_count: None,
             last_spawn: None,
-            primed: false,
         }
     }
 
     /// Take `count` as seen, without firing, unless a count was seen already.
     pub fn prime(&mut self, count: u64) {
-        if !self.primed {
-            self.last_count = count;
-            self.primed = true;
-        }
+        self.last_count.get_or_insert(count);
     }
 
     /// Note the bell count at `now`; whether to fire: it rose, and the last spawn was at least
     /// [`BELL_HOOK_MIN_INTERVAL`] ago. A rise within that is absorbed, not deferred.
     pub fn observe(&mut self, count: u64, now: Instant) -> bool {
-        let rose = count > self.last_count;
-        self.last_count = count;
-        self.primed = true;
+        let rose = count > self.last_count.replace(count).unwrap_or(0);
         let spaced = rose
             && self
                 .last_spawn

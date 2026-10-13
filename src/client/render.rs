@@ -1369,18 +1369,32 @@ mod tests {
         emu
     }
 
-    /// The bytes painting `more` after the screen `emu` shows, on a terminal `size` large.
+    /// The bytes painting `more` after the screen `emu` shows, on a terminal `size` large, and
+    /// whether that terminal then shows what one painted the new screen alone does.
     fn after(
         emu: &mut crate::terminal::ServerTerminal,
         more: &[u8],
         status: Option<&str>,
         size: Size,
-    ) -> String {
+    ) -> (String, bool) {
         let mut painter = Painter::default();
         let empty = Overlay::default();
-        paint_at(&mut painter, size, emu.snapshot().screen(), &empty, status);
+        let mut terminal = terminal_of(size.rows, size.cols);
+        let first = paint_at(&mut painter, size, emu.snapshot().screen(), &empty, status);
+        terminal.process(first.as_bytes()).unwrap();
         emu.process(more);
-        paint_at(&mut painter, size, emu.snapshot().screen(), &empty, status)
+        let painted = paint_at(&mut painter, size, emu.snapshot().screen(), &empty, status);
+        terminal.process(painted.as_bytes()).unwrap();
+        let mut whole = terminal_of(size.rows, size.cols);
+        let alone = paint_at(
+            &mut Painter::default(),
+            size,
+            emu.snapshot().screen(),
+            &empty,
+            status,
+        );
+        whole.process(alone.as_bytes()).unwrap();
+        (painted, shown(&terminal) == shown(&whole))
     }
 
     /// A scroll scrolls the terminal and paints only the new row; under a status line, only the
@@ -1388,17 +1402,17 @@ mod tests {
     #[test]
     fn a_scroll_scrolls_the_terminal_and_paints_only_the_new_row() {
         let scroll = format!("\r\n{}", letters(6));
-        let painted = after(&mut lettered(), scroll.as_bytes(), None, SMALL);
-        assert_eq!(
-            painted,
-            framed(
-                &format!("\x1b[m\x1b[1;6r\x1b[1S\x1b[r\x1b[6;1H{}\x1b[m", letters(6)),
-                "6;13"
-            )
+        let (painted, same) = after(&mut lettered(), scroll.as_bytes(), None, SMALL);
+        assert!(same, "{painted:?}");
+        assert!(painted.contains("\x1b[1S"), "scrolled: {painted:?}");
+        assert!(
+            (1..6).all(|row| !painted.contains(&letters(row))),
+            "only the new row is painted: {painted:?}"
         );
         // Rows 1..=5 scroll; row 5 then shows what the status line hid, and the status line's
         // row keeps the status, with the screen's new row beside it.
-        let painted = after(&mut lettered(), scroll.as_bytes(), Some("down"), SMALL);
+        let (painted, same) = after(&mut lettered(), scroll.as_bytes(), Some("down"), SMALL);
+        assert!(same, "{painted:?}");
         assert!(painted.contains("\x1b[1;5r\x1b[1S\x1b[r"), "{painted:?}");
         assert!(
             painted.contains(&format!("\x1b[5;1H{}", letters(5))),
@@ -1406,9 +1420,8 @@ mod tests {
         );
         assert!(painted.contains("\x1b[6;7Hgggggg"), "{painted:?}");
         assert!(!painted.contains("down"), "{painted:?}");
-        let painted = after(&mut lettered(), scroll.as_bytes(), None, Size::new(8, 30));
-        assert!(!painted.contains("\x1b[r"), "{painted:?}");
-        assert!(painted.contains(&letters(6)), "{painted:?}");
+        let (painted, same) = after(&mut lettered(), scroll.as_bytes(), None, Size::new(8, 30));
+        assert!(!painted.contains("\x1b[r") && same, "{painted:?}");
     }
 
     #[test]
@@ -1418,8 +1431,8 @@ mod tests {
             (&b"\x1b[2;5r\x1b[5;1H\n"[..], "\x1b[2;5r\x1b[1S\x1b[r"),
             (b"\x1b[3;1H\x1b[L", "\x1b[3;6r\x1b[1T\x1b[r"),
         ] {
-            let painted = after(&mut lettered(), more, None, SMALL);
-            assert!(painted.contains(scroll), "{painted:?}");
+            let (painted, same) = after(&mut lettered(), more, None, SMALL);
+            assert!(painted.contains(scroll) && same, "{painted:?}");
             assert!(!painted.contains("aaa"), "no row repainted: {painted:?}");
         }
     }
@@ -1432,8 +1445,12 @@ mod tests {
         for row in 1..=6 {
             emu.process(format!("\x1b[{row};1Hthe same").as_bytes());
         }
-        let painted = after(&mut emu, b"\r\nthe same", None, SMALL);
-        assert_eq!(painted, framed("", "6;9"));
+        let (painted, same) = after(&mut emu, b"\r\nthe same", None, SMALL);
+        assert!(same, "{painted:?}");
+        assert!(
+            !painted.contains("the same") && !painted.contains("\x1b[1S"),
+            "nothing scrolled or painted: {painted:?}"
+        );
     }
 
     /// Output that exercises what a frame can change: text, wide glyphs, combining marks, clusters
@@ -1630,6 +1647,48 @@ mod tests {
             for osc in sent {
                 assert!(out.contains(osc), "{prefix:?} {title:?} {icon:?}: {out:?}");
             }
+        }
+    }
+
+    /// Every event a terminal reads, as fux-vt reports it.
+    #[derive(Default)]
+    struct Told(Vec<String>);
+
+    impl fux_vt::Sink for Told {
+        fn event(&mut self, event: fux_vt::Event<'_>) {
+            self.0.push(format!("{event:?}"));
+        }
+    }
+
+    /// A title and icon name are what the server names that the client writes into an OSC, and
+    /// they go without a control character, C0 or C1, which could end the OSC early and start
+    /// another sequence: a terminal reads the title and icon name as text, and nothing else.
+    #[test]
+    fn a_hostile_title_reaches_the_terminal_as_text_and_nothing_else() {
+        let hostile = "a\x07\x1b]52;c;ZXZpbA==\x07b\u{9c}\u{9d}52;c;ZXZpbA==\u{9c}\u{9b}31mc\r\nd";
+        let text = "a]52;c;ZXZpbA==b52;c;ZXZpbA==31mcd";
+        for icon in [hostile, "an \u{90}icon"] {
+            let mut oob = OutOfBand::default();
+            let out = oob_emit(&mut oob, &screen_of(b""), win(hostile, icon, "", 0));
+            let options = fux_vt::Options::new().with(fux_vt::Feature::Events);
+            let mut terminal = fux_vt::Parser::with_options(
+                fux_vt::Size::new(6, 20).expect("nonzero size"),
+                0,
+                options,
+            )
+            .unwrap();
+            let mut told = Told::default();
+            terminal.process_with(out.as_bytes(), &mut told).unwrap();
+            let icon = if icon == hostile { text } else { "an icon" };
+            let mut expected = [
+                fux_vt::Event::Title(text.as_bytes()),
+                fux_vt::Event::IconName(icon.as_bytes()),
+            ]
+            .map(|event| format!("{event:?}"));
+            expected.sort();
+            told.0.sort();
+            assert_eq!(told.0, expected, "{out:?}");
+            assert_eq!(shown(&terminal), shown(&terminal_of(6, 20)), "{out:?}");
         }
     }
 

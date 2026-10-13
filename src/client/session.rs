@@ -577,7 +577,7 @@ impl ClientSession {
                 } else {
                     fwd.push(InputEvent::Key(prefix.into()));
                     if !literal {
-                        events_of(input, &mut fwd);
+                        fwd.extend(InputEvent::from_input(input));
                     }
                 }
             } else if key == Some(&[ESCAPE_PREFIX]) {
@@ -589,7 +589,7 @@ impl ClientSession {
                 self.send_to_view(&[input]);
             } else if !self.input_paused {
                 // While paused, what is typed is dropped: only the escape is looked for.
-                events_of(input, &mut fwd);
+                fwd.extend(InputEvent::from_input(input));
             }
         }
         if !fwd.is_empty() {
@@ -969,18 +969,6 @@ impl ClientSession {
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
     pub fn window_state(&self) -> WindowState<'_> {
         window_state(&self.link.current().screen)
-    }
-}
-
-/// What the server gets for one decoded input.
-fn events_of(input: Input, out: &mut Vec<InputEvent>) {
-    match input {
-        Input::Key(stroke) => out.push(InputEvent::Key(stroke.into())),
-        Input::Mouse(event) => out.push(InputEvent::Mouse(event.into())),
-        Input::FocusIn => out.push(InputEvent::Focus(true)),
-        Input::FocusOut => out.push(InputEvent::Focus(false)),
-        Input::Paste(text) => out.push(InputEvent::Paste(text)),
-        Input::PasteTooLong | Input::Reply(_) => {}
     }
 }
 

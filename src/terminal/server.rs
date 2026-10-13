@@ -989,15 +989,7 @@ mod tests {
         decoder.timeout(&mut inputs);
         let events: Vec<InputEvent> = inputs
             .into_iter()
-            .filter_map(|input| match input {
-                fux_vt::keys::decode::Input::Key(stroke) => Some(InputEvent::Key(stroke.into())),
-                fux_vt::keys::decode::Input::Mouse(event) => Some(InputEvent::Mouse(event.into())),
-                fux_vt::keys::decode::Input::FocusIn => Some(InputEvent::Focus(true)),
-                fux_vt::keys::decode::Input::FocusOut => Some(InputEvent::Focus(false)),
-                fux_vt::keys::decode::Input::Paste(text) => Some(InputEvent::Paste(text)),
-                fux_vt::keys::decode::Input::PasteTooLong
-                | fux_vt::keys::decode::Input::Reply(_) => None,
-            })
+            .filter_map(InputEvent::from_input)
             .collect();
         let mut out = Vec::new();
         t.encode_input(&events, &mut out);
@@ -1005,29 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_reach_a_program_as_it_asked_from_any_terminal() {
-        // Legacy bytes back to a legacy program, cursor keys in its cursor mode.
-        assert_eq!(program_gets(b"", b"ls\r\x1b[A\x01"), b"ls\r\x1b[A\x01");
-        assert_eq!(program_gets(b"\x1b[?1h", b"\x1b[A\x1bOB"), b"\x1bOA\x1bOB");
-        // A program that pushed kitty's disambiguate gets kitty's keys, from a legacy terminal:
-        // Ctrl-A and Escape are escapes, text stays text.
-        assert_eq!(program_gets(b"\x1b[>1u", b"a\x01"), b"a\x1b[97;5u");
-        assert_eq!(program_gets(b"\x1b[>1u", b"\x1b"), b"\x1b[27u");
-        // And from a kitty terminal, which tells Ctrl-I from Tab.
-        assert_eq!(
-            program_gets(b"\x1b[>1u", b"\x1b[105;5u\t"),
-            b"\x1b[105;5u\t"
-        );
-        // A legacy program gets a kitty terminal's keys as legacy bytes.
-        assert_eq!(program_gets(b"", b"\x1b[105;5u\x1b[1;5C"), b"\t\x1b[1;5C");
-        // xterm's modifyOtherKeys 2.
-        assert_eq!(program_gets(b"\x1b[>4;2m", b"\x01"), b"\x1b[27;5;97~");
-        // A pop restores the legacy keys.
-        assert_eq!(program_gets(b"\x1b[>1u\x1b[<u", b"\x01"), b"\x01");
-    }
-
-    #[test]
-    fn mouse_events_reach_a_program_in_its_mode_and_encoding() {
+    fn keys_mouse_and_focus_reach_a_program_as_it_asked_from_any_terminal() {
         // The user's terminal reports in SGR: a press at row 5, column 10, and its release.
         let click = &b"\x1b[<0;10;5M\x1b[<0;10;5m"[..];
         // A drag: motion with a button held, in 1002 and 1003 but not 1000; a hover, motion with
@@ -1038,7 +1008,27 @@ mod tests {
             &b"\x1b[?1002h\x1b[?1006h"[..],
         );
         for (mode, sent, gets) in [
-            (&b""[..], click, &b""[..]),
+            // Legacy bytes back to a legacy program, cursor keys in its cursor mode.
+            (&b""[..], &b"ls\r\x1b[A\x01"[..], &b"ls\r\x1b[A\x01"[..]),
+            (b"\x1b[?1h", b"\x1b[A\x1bOB", b"\x1bOA\x1bOB"),
+            // A program that pushed kitty's disambiguate gets kitty's keys, from a legacy
+            // terminal: Ctrl-A and Escape are escapes, text stays text.
+            (b"\x1b[>1u", b"a\x01", b"a\x1b[97;5u"),
+            (b"\x1b[>1u", b"\x1b", b"\x1b[27u"),
+            // And from a kitty terminal, which tells Ctrl-I from Tab.
+            (b"\x1b[>1u", b"\x1b[105;5u\t", b"\x1b[105;5u\t"),
+            // A legacy program gets a kitty terminal's keys as legacy bytes.
+            (b"", b"\x1b[105;5u\x1b[1;5C", b"\t\x1b[1;5C"),
+            // xterm's modifyOtherKeys 2.
+            (b"\x1b[>4;2m", b"\x01", b"\x1b[27;5;97~"),
+            // A pop restores the legacy keys.
+            (b"\x1b[>1u\x1b[<u", b"\x01", b"\x01"),
+            // Focus, only to a program that asked.
+            (b"", b"\x1b[I\x1b[O", b""),
+            (b"\x1b[?1004h", b"\x1b[I\x1b[O", b"\x1b[I\x1b[O"),
+            (b"\x1b[?1004h\x1b[?1004l", b"\x1b[I", b""),
+            // The mouse.
+            (b"", click, b""),
             (b"\x1b[?9h", click, b"\x1b[M *%"),
             (b"\x1b[?1000h", click, b"\x1b[M *%\x1b[M#*%"),
             (sgr_1000, click, click),
@@ -1059,16 +1049,6 @@ mod tests {
         ] {
             assert_eq!(program_gets(mode, sent), gets, "{mode:?} {sent:?}");
         }
-    }
-
-    #[test]
-    fn focus_reaches_only_a_program_that_asked() {
-        assert_eq!(program_gets(b"", b"\x1b[I\x1b[O"), b"");
-        assert_eq!(
-            program_gets(b"\x1b[?1004h", b"\x1b[I\x1b[O"),
-            b"\x1b[I\x1b[O"
-        );
-        assert_eq!(program_gets(b"\x1b[?1004h\x1b[?1004l", b"\x1b[I"), b"");
     }
 
     #[test]

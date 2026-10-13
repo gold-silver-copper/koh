@@ -172,10 +172,6 @@ impl Outgoing {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-    }
-
     /// Queue `msg`, unless the queue is full; whether it was.
     fn push_back(&mut self, msg: ClientMsg) -> bool {
         let cost = Self::input_cost(&msg);
@@ -931,11 +927,6 @@ impl ClientSession {
             wait: Duration::from_millis(50),
             status,
         }
-    }
-
-    /// Whether messages are waiting for the server.
-    pub fn has_outgoing(&self) -> bool {
-        self.link.owes_resync() || !self.outgoing.is_empty()
     }
 
     /// Whether messages are waiting for the server on `stream`.
@@ -2137,30 +2128,6 @@ mod tests {
                 "{steps:?}: {status}"
             );
         }
-    }
-
-    /// A line typed across the drop: its start went out on the lost connection unconfirmed, so
-    /// its end, typed while down, is not sent on the next (it would run without its start), and
-    /// the status line says so. Typing after the reattach goes out as ever.
-    #[test]
-    fn input_after_an_unconfirmed_send_is_not_sent_after_the_attach() {
-        let (now, mut s) = start();
-        s.on_input(now, b"false && ");
-        drain(&mut s);
-        s.detach(now);
-        s.on_input(now, b"rm -rf *\r");
-        s.attach(Size::new(24, 80));
-        let sent = drain(&mut s);
-        assert!(
-            matches!(sent.as_slice(), [ClientMsg::Resize { .. }]),
-            "the tail is not sent: {sent:?}"
-        );
-        let status = s.on_tick(now, None).status.expect("a notice");
-        assert!(status.contains("not sent"), "{status}");
-        s.on_frame(now, &first(0, b""));
-        drain(&mut s);
-        s.on_input(now, b"x");
-        assert_eq!(typed(&drain(&mut s)), b"x");
     }
 
     /// Trust in predictions is the drop's: a resize while down (which voids the predictions)

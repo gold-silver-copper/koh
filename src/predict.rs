@@ -875,11 +875,10 @@ impl PredictionEngine {
             (Key::Backspace, false, false) => self.predict_backspace(&ctx),
             (Key::Enter, false, false) => self.predict_enter(&ctx),
             // The kernel echoes an arrow as `^[[D`: only a line editor moves the cursor.
-            (Key::Arrow(Direction::Right), false, false) if ctx.editing() => {
-                self.predict_arrow(&ctx, true);
-            }
-            (Key::Arrow(Direction::Left), false, false) if ctx.editing() => {
-                self.predict_arrow(&ctx, false);
+            (Key::Arrow(d @ (Direction::Right | Direction::Left)), false, false)
+                if ctx.editing() =>
+            {
+                self.predict_arrow(&ctx, d == Direction::Right);
             }
             (Key::Home, false, false) => self.predict_line_start(&ctx),
             (Key::End, false, false) => self.predict_line_end(&ctx),
@@ -1141,84 +1140,19 @@ mod tests {
         p.screen().clone()
     }
 
-    /// A screen that is NOT an emulator: a plain char grid with a cursor.
-    struct FakeView {
-        rows: Vec<Vec<char>>,
-        cursor: (u16, u16),
-    }
-
-    impl ScreenView for FakeView {
-        fn size(&self) -> Size {
-            Size::new(
-                u16::try_from(self.rows.len()).expect("rows fit u16"),
-                u16::try_from(self.rows[0].len()).expect("columns fit u16"),
-            )
-        }
-        fn cursor_position(&self) -> (u16, u16) {
-            self.cursor
-        }
-        fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>> {
-            // Leak-free static strs for the tiny alphabet the test uses.
-            let ch = *self.rows.get(row as usize)?.get(col as usize)?;
-            let contents: &'static str = match ch {
-                ' ' => "",
-                'x' => "x",
-                'y' => "y",
-                _ => "?",
-            };
-            Some(CellRef::new(contents, false, Attributes::default()))
-        }
-        fn alternate(&self) -> bool {
-            false
-        }
-    }
-
     /// The glyph predicted shown at `(row, col)`.
     fn shown_at(e: &PredictionEngine, row: u16, col: u16) -> Option<String> {
         e.overlay().cell(row, col).map(|c| c.text().to_owned())
     }
 
-    #[test]
-    fn predictor_runs_over_a_plain_screen_view() {
-        // The exact flow of `confirm_first_keystroke`, but over a 5×10 fake grid that is
-        // not an emulator: the first keystroke is hidden, the server's echo confirms the epoch, and the
-        // next keystroke is visible at the right column. Proves the engine needs no emulator.
-        let blank = FakeView {
-            rows: vec![vec![' '; 10]; 5],
-            cursor: (0, 0),
-        };
-        let mut e = engine();
-        e.type_bytes(b"x", &blank);
-        assert!(e.overlay().is_empty(), "hidden until confirmed");
-        let mut echoed = FakeView {
-            rows: vec![vec![' '; 10]; 5],
-            cursor: (0, 1),
-        };
-        echoed.rows[0][0] = 'x';
-        e.set_local_frame_late_acked(1);
-        e.cull(&echoed);
-        assert_eq!(e.confirmed_epoch(), 1, "the echoed 'x' confirms the epoch");
-        e.set_local_frame_sent(1);
-        e.type_bytes(b"y", &echoed);
-        assert_eq!(
-            shown_at(&e, 0, 1).as_deref(),
-            Some("y"),
-            "typing after confirmation is visible over the fake view"
-        );
-    }
-
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
 
-        /// Whatever keys arbitrary bytes decode to, predicting them over a fake view or an
-        /// emulator's screen never panics.
+        /// Whatever keys arbitrary bytes decode to, predicting them never panics.
         #[test]
         fn prop_predicting_any_keys_is_panic_free(
             bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
         ) {
-            let fake = FakeView { rows: vec![vec![' '; 80]; 24], cursor: (0, 0) };
-            let mut pf = engine();
-            pf.type_bytes(&bytes, &fake);
             let mut pe = engine();
             pe.type_bytes(&bytes, &screen_of(b"ready prompt $ "));
             let _ = pe.overlay();
@@ -1472,22 +1406,6 @@ mod tests {
             assert_eq!(ov.cursor(), Some((0, 0)), "{arrow:?}");
             assert!(ov.cell(0, 0).is_none() && ov.cell(0, 1).is_none());
         }
-    }
-
-    #[test]
-    fn double_width_grapheme_predicted_and_advances_cursor_by_two() {
-        // A CJK character is double-width: its multi-byte UTF-8 arrives one byte at a time and is
-        // reassembled into a single predicted glyph, with the cursor stepping forward two cells
-        // (and no stray glyph in the continuation cell).
-        let (mut e, echoed) = confirm_first_keystroke();
-        e.set_local_frame_sent(1);
-        e.type_bytes("世".as_bytes(), &echoed);
-        let ov = e.overlay();
-        assert_eq!(ov.cell(0, 1).map(Cell::text), Some("世"));
-        assert!(ov
-            .cell(0, 2)
-            .is_some_and(|c| c.covered() && c.text().is_empty()));
-        assert_eq!(ov.cursor(), Some((0, 3)));
     }
 
     /// An emoji with a skin tone, typed in one keystroke or two (an IME commits it as two

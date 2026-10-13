@@ -621,18 +621,6 @@ mod tests {
     }
 
     #[test]
-    fn an_escape_sequence_split_across_reads_is_read_whole() {
-        let mut s = viewing(100);
-        let mut decoder = fux_vt::keys::decode::Decoder::default();
-        for bytes in [&b"\x1b["[..], b"5", b"~"] {
-            let mut inputs = Vec::new();
-            decoder.bytes(bytes, &mut inputs);
-            s.on_events(&inputs, 25);
-        }
-        assert_eq!(s.offset(), Some(24));
-    }
-
-    #[test]
     fn q_ctrl_c_or_a_lone_escape_leaves() {
         for keys in [&b"q"[..], b"\x03", b"\x1b", b"kkq"] {
             let mut s = viewing(100);

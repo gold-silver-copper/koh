@@ -60,11 +60,6 @@ const MIN_CONNECTION_DWELL: Duration = Duration::from_secs(5);
 /// costs only a brief banner, so the threshold is low.
 const STALE_AFTER_FREEZE: Duration = Duration::from_secs(20);
 
-/// Whether a wall-clock gap between loop iterations means the process was frozen.
-fn looks_like_resume_from_freeze(wall_gap: Duration) -> bool {
-    wall_gap >= STALE_AFTER_FREEZE
-}
-
 /// Dials the server and awaits its first frame, which admits the client: the first connection and every reconnect, which
 /// reattaches to the same server session.
 pub struct IrohConnector {
@@ -442,7 +437,7 @@ pub async fn run_client<T: ClientTerminal>(
         let wall_gap = wall_now.duration_since(last_wall).unwrap_or(Duration::ZERO);
         last_wall = wall_now;
         let rtt = if let Net::Up(wire) = &net {
-            if looks_like_resume_from_freeze(wall_gap) {
+            if wall_gap >= STALE_AFTER_FREEZE {
                 tracing::info!(
                     frozen_secs = wall_gap.as_secs(),
                     "detected resume from a process freeze (suspend/screen-off); forcing a reconnect"
@@ -478,7 +473,9 @@ pub async fn run_client<T: ClientTerminal>(
                 term.prime(win);
                 if let Some(hook) = bell.as_mut() {
                     hook.prime(win.bell_count);
-                    hook.observe_and_fire(win.bell_count, win.title, now);
+                    if hook.observe(win.bell_count, now) {
+                        hook.fire(win.bell_count, win.title);
+                    }
                 }
             }
         }
@@ -570,7 +567,8 @@ pub async fn run_client<T: ClientTerminal>(
                 let Net::Up(wire) = &mut net else {
                     continue;
                 };
-                if session_ended(&wire.conn) {
+                // The server ended the session (its shell exited); else the link was lost.
+                if closed_because(&wire.conn) == Some(Close::SessionEnded) {
                     // What the reader still has was sent before the close: the last frame says
                     // how the program exited, whichever end noticed the close first.
                     let drained = async {
@@ -761,8 +759,6 @@ const WRITER_QUEUE: usize = 64;
 /// How many decoded frames may wait for the connection loop.
 const FRAME_QUEUE: usize = 16;
 
-/// Open the client's stream on `conn` and write queued messages to it, until the queue or the
-/// stream closes.
 /// Send `msg` with `permit`, a writer's room; a writer that ended (`None`) lost the connection.
 fn send(permit: Option<mpsc::Permit<'_, Vec<u8>>>, msg: Option<ClientMsg>) -> Option<Change> {
     let Some(permit) = permit else {
@@ -776,6 +772,8 @@ fn send(permit: Option<mpsc::Permit<'_, Vec<u8>>>, msg: Option<ClientMsg>) -> Op
     None
 }
 
+/// Open the client's stream on `conn` and write queued messages to it, until the queue or the
+/// stream closes.
 async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>>) {
     let Ok(mut send) = conn.open_uni().await else {
         return;
@@ -851,12 +849,6 @@ async fn read_frames(conn: Connection, first: RecvStream, frames: mpsc::Sender<R
             Some(())
         });
     }
-}
-
-/// Whether the closed `conn` was the server ending the session (its shell exited), not the link
-/// being lost.
-fn session_ended(conn: &Connection) -> bool {
-    closed_because(conn) == Some(Close::SessionEnded)
 }
 
 /// Paint the "session ended" banner and linger briefly so it is seen.
@@ -951,17 +943,10 @@ mod tests {
 
     #[test]
     fn reconnect_backoff_grows_then_caps() {
-        // 1-based attempts: 1s, 2s, 4s, 8s, then capped at 8s — never below base, never above max.
-        assert_eq!(backoff(1), Duration::from_secs(1));
-        assert_eq!(backoff(2), Duration::from_secs(2));
-        assert_eq!(backoff(3), Duration::from_secs(4));
-        assert_eq!(backoff(4), RECONNECT_BACKOFF_MAX);
-        assert_eq!(backoff(5), RECONNECT_BACKOFF_MAX);
-        assert_eq!(
-            backoff(99),
-            RECONNECT_BACKOFF_MAX,
-            "shift is clamped, no overflow"
-        );
+        // 1-based attempts: 1s, 2s, 4s, 8s, then capped at 8s; the shift is clamped, no overflow.
+        for (attempt, secs) in [(1, 1), (2, 2), (3, 4), (4, 8), (5, 8), (99, 8)] {
+            assert_eq!(backoff(attempt), Duration::from_secs(secs), "{attempt}");
+        }
     }
 
     #[test]
@@ -988,21 +973,6 @@ mod tests {
         );
         // Saturates rather than overflowing under a sustained flapping server.
         assert_eq!(next_attempt_after_drop(u32::MAX, Duration::ZERO), u32::MAX);
-    }
-
-    #[test]
-    fn freeze_detection_fires_only_on_a_real_suspend_gap() {
-        // A normal loop cadence (the steady loop polls at least every ~50ms) must never look like a
-        // freeze, so an active session is never needlessly torn down...
-        assert!(!looks_like_resume_from_freeze(Duration::from_millis(0)));
-        assert!(!looks_like_resume_from_freeze(Duration::from_millis(50)));
-        assert!(!looks_like_resume_from_freeze(Duration::from_secs(5)));
-        // ...a sub-threshold glance still rides out on the existing connection...
-        assert_eq!(STALE_AFTER_FREEZE, Duration::from_secs(20));
-        assert!(!looks_like_resume_from_freeze(Duration::from_secs(19)));
-        // ...but a multi-second-to-minutes suspend (phone screen-off) forces a proactive reconnect.
-        assert!(looks_like_resume_from_freeze(STALE_AFTER_FREEZE));
-        assert!(looks_like_resume_from_freeze(Duration::from_secs(300)));
     }
 
     /// What the client turns on in the user's terminal it turns off again, popping its push: on

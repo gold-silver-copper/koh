@@ -97,13 +97,6 @@ impl BellHook {
         spaced
     }
 
-    /// [`observe`](Self::observe) at `now` and, if due, [`fire`](Self::fire).
-    pub fn observe_and_fire(&mut self, count: u64, title: &str, now: Instant) {
-        if self.observe(count, now) {
-            self.fire(count, title);
-        }
-    }
-
     /// The command to spawn, with `parent_env` scrubbed of `KOH_*` (given, so tests can pass their
     /// own).
     pub(crate) fn command(
@@ -206,10 +199,10 @@ fn warn_if_locale_not_utf8() {
 /// a private file of this user's (see [`crate::identity::open_private_log`]), as debug logs can be
 /// sensitive; failing that, nothing is logged. An empty `$KOH_LOG` is off, silently.
 fn log_to_koh_log() {
-    let Some(path) = koh_log_path(std::env::var_os("KOH_LOG")) else {
+    let Some(path) = std::env::var_os("KOH_LOG").filter(|path| !path.is_empty()) else {
         return;
     };
-    match crate::identity::open_private_log(&path) {
+    match crate::identity::open_private_log(path.as_ref()) {
         Ok(file) => crate::log::init(std::sync::Mutex::new(file), tracing::Level::DEBUG),
         Err(e) => {
             crate::log::stderr(format_args!(
@@ -217,11 +210,6 @@ fn log_to_koh_log() {
             ));
         }
     }
-}
-
-/// The log file `$KOH_LOG` (given as `value`) names, if any: unset and empty both mean none.
-fn koh_log_path(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
-    value.filter(|path| !path.is_empty()).map(Into::into)
 }
 
 /// `koh connect`: the remote shell's exit code if it exited. Takes the process's terminal, stdin
@@ -278,16 +266,6 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_empty_koh_log_is_off_like_an_unset_one() {
-        assert_eq!(koh_log_path(None), None);
-        assert_eq!(koh_log_path(Some("".into())), None, "KOH_LOG= logs nothing");
-        assert_eq!(
-            koh_log_path(Some("/x/koh.log".into())),
-            Some("/x/koh.log".into())
-        );
-    }
 
     #[test]
     fn redial_reuses_the_loaded_identity_without_touching_the_key_file() -> anyhow::Result<()> {

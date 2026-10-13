@@ -263,8 +263,8 @@ impl Outgoing {
     }
 }
 
-/// How long after a frame shows the program's output at the cursor (a fresh prompt) a key typed is
-/// shown only once echoed: the server reads the PTY's modes at least every [`TTY_TICK`], so a program
+/// How long after a frame moves the cursor to another row (a fresh prompt) a key typed is shown
+/// only once echoed: the server reads the PTY's modes at least every [`TTY_TICK`], so a program
 /// that turned echo off just after printing its prompt is heard of within about one; two leave
 /// room for the link's jitter.
 const PROMPT_HOLD: Duration = TTY_TICK.saturating_mul(2);
@@ -716,7 +716,7 @@ impl ClientSession {
                     // turned echo off: the key shows only once echoed.
                     if self
                         .link
-                        .output_at
+                        .new_row_at
                         .is_some_and(|at| now.saturating_duration_since(at) < PROMPT_HOLD)
                     {
                         self.predictor.hold();
@@ -794,24 +794,19 @@ impl ClientSession {
             self.link.refuse(frame.base);
             return;
         };
-        // The program's output at the cursor, maybe a prompt that turns echo off a moment after
-        // the modes the frame carries: the cursor on another row (its index changed, or the
-        // screen scrolled: at the bottom a new line scrolls, leaving the index as it was, and
-        // names a new history row, or moves the rows), or its row written when every key typed
-        // was already shown echoed (PAM prints its prompt, then turns echo off).
+        // The cursor's row is another when its index changed, or when the screen scrolled: at the
+        // bottom of the screen a new line scrolls, leaving the index as it was, and names a new
+        // history row, or moves the rows (a scroll region, no scrollback kept).
         let (now_grid, was) = (next.screen().screen(), &self.link.current().screen);
         let row = |screen: &TerminalScreen| {
             (screen.screen().cursor_position().0, screen.history().newest)
         };
-        let (cursor_row, _) = row(next.screen());
         if row(next.screen()) != row(was)
             || !now_grid
                 .moves_from(was.screen(), now_grid.size().rows)
                 .is_empty()
-            || (self.link.echo_ack >= self.last_seq
-                && !now_grid.same_row(cursor_row, was.screen(), cursor_row))
         {
-            self.link.output_at = Some(now);
+            self.link.new_row_at = Some(now);
         }
         self.link.advance(next);
         // The outage ends with the new connection's first frame, which shows the shell it reached;
@@ -1445,23 +1440,15 @@ mod tests {
         );
     }
 
-    /// A program that prints its prompt and turns echo off a moment after (bash's `read -s`, or
-    /// PAM's prompt on the row it was run from) can be shown with the modes from before: a key
-    /// typed at once must not be shown, however trusted the session; once the server could have
-    /// told the new modes, keys are predicted as before. At the bottom of the screen Enter
-    /// scrolls, so the cursor's row index stays: the hold sees the scroll, by the history row it
-    /// names or, with no scrollback, by the rows it moves.
+    /// A program that prints its prompt and turns echo off a moment after (bash's `read -s`) can
+    /// be shown with the modes from before: a key typed at once must not be shown, however
+    /// trusted the session; once the server could have told the new modes, keys are predicted as
+    /// before. At the bottom of the screen Enter scrolls, so the cursor's row index stays: the
+    /// hold sees the scroll, by the history row it names or, with no scrollback, by the rows it
+    /// moves.
     #[test]
     fn a_key_at_a_fresh_prompt_waits_for_its_echo_even_at_the_bottom_of_the_screen() {
-        // Each: the rows above the prompt, the scrollback, and the prompt the program prints
-        // once the key typed is echoed and acknowledged.
-        for (above, scrollback, prompt) in [
-            (0, 0, &b"\r\nSecret: "[..]),
-            (30, 100, b"\r\nSecret: "),
-            (30, 0, b"\r\nSecret: "),
-            // `sudo` run: its prompt on the row it was run from.
-            (0, 0, b" Secret: "),
-        ] {
+        for (above, scrollback) in [(0, 0), (30, 100), (30, 0)] {
             let echoing = crate::predict::TtyModes {
                 echo: true,
                 line: true,
@@ -1479,16 +1466,12 @@ mod tests {
             s.on_input(t1, b"x");
             assert!(!s.overlay().is_empty(), "kernel echo shows at once");
             drain(&mut s);
-            emu.process(b"x");
-            let echoed = emu.snapshot();
-            s.on_frame(t1, &frame(2, 1, 1, &first, &echoed));
-            // The program prints a prompt, on a new row (at the bottom, the same row index) or on
-            // the cursor's; the modes the frame carries still echo.
-            emu.process(prompt);
-            let same_row = above > 0 || !prompt.contains(&b'\n');
+            // Enter: the shell prints a prompt on a new row (at the bottom, the same row index); the
+            // modes the frame carries still echo.
+            emu.process(b"x\r\nSecret: ");
             let prompt = emu.snapshot();
-            assert_eq!(prompt.screen().cursor_position().0 == row, same_row);
-            s.on_frame(t1, &frame(3, 2, 1, &echoed, &prompt));
+            assert_eq!(prompt.screen().cursor_position().0 == row, above > 0);
+            s.on_frame(t1, &frame(2, 1, 1, &first, &prompt));
             s.on_input(t1 + Duration::from_millis(10), b"Q");
             drain(&mut s);
             let shown =
@@ -1502,7 +1485,7 @@ mod tests {
             emu.process(b"Q");
             let echoed = emu.snapshot();
             let t2 = t1 + PROMPT_HOLD + Duration::from_millis(1);
-            s.on_frame(t2, &frame(4, 3, 2, &prompt, &echoed));
+            s.on_frame(t2, &frame(3, 2, 2, &prompt, &echoed));
             s.on_input(t2, b"Z");
             assert!(shown(&s, "Z") && !shown(&s, "Q"), "{above} {scrollback}");
         }

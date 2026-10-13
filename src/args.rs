@@ -344,12 +344,7 @@ fn names(list: List) -> Command {
         .subcommand(
             Command::new("add")
                 .about(format!("Save a {} under a name", list.noun()))
-                .arg(
-                    Arg::new("name")
-                        .value_name("NAME")
-                        .value_parser(name)
-                        .required(true),
-                )
+                .arg(name_arg("name", "NAME"))
                 .arg(
                     Arg::new("id")
                         .value_name("ENDPOINT_ID")
@@ -360,29 +355,22 @@ fn names(list: List) -> Command {
         .subcommand(
             Command::new("rm")
                 .about(format!("Forget a {}", list.noun()))
-                .arg(
-                    Arg::new("name")
-                        .value_name("NAME")
-                        .value_parser(name)
-                        .required(true),
-                ),
+                .arg(name_arg("name", "NAME")),
         )
         .subcommand(
             Command::new("rename")
                 .about(format!("Rename a {}", list.noun()))
-                .arg(
-                    Arg::new("old")
-                        .value_name("OLD")
-                        .value_parser(name)
-                        .required(true),
-                )
-                .arg(
-                    Arg::new("new")
-                        .value_name("NEW")
-                        .value_parser(name)
-                        .required(true),
-                ),
+                .arg(name_arg("old", "OLD"))
+                .arg(name_arg("new", "NEW")),
         )
+}
+
+/// A required name, `<VALUE_NAME>`.
+fn name_arg(id: &'static str, value_name: &'static str) -> Arg {
+    Arg::new(id)
+        .value_name(value_name)
+        .value_parser(name)
+        .required(true)
 }
 
 /// The config `matches` asks for. clap has already enforced the required subcommands and
@@ -435,11 +423,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                 ),
                 _ => return Err(missing("key subcommand")),
             };
-            // `--key-file` is global to `key`: clap stores it with the subcommand given.
-            let key_file = sub
-                .get_one::<PathBuf>("key_file")
-                .or_else(|| m.get_one::<PathBuf>("key_file"))
-                .cloned();
+            let key_file = global_key_file(m, sub);
             let named = sub.get_one::<String>("role");
             let role = if named.is_some_and(|r| r == "server") {
                 "server"
@@ -491,15 +475,19 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                 ),
                 Some(_) => return Err(missing("servers or clients subcommand")),
             };
-            let key_file = sub
-                .get_one::<PathBuf>("key_file")
-                .or_else(|| m.get_one::<PathBuf>("key_file"))
-                .cloned();
+            let key_file = global_key_file(m, sub);
             Ok(Cmd::Names { list, op, key_file })
         }
         None => Ok(Cmd::Menu),
         Some(_) => Err(missing("subcommand")),
     }
+}
+
+/// A `--key-file` global to `m`: clap stores it with the subcommand given, `sub`.
+fn global_key_file(m: &ArgMatches, sub: &ArgMatches) -> Option<PathBuf> {
+    (sub.get_one::<PathBuf>("key_file"))
+        .or_else(|| m.get_one::<PathBuf>("key_file"))
+        .cloned()
 }
 
 /// Every value of a repeatable argument, in order.
@@ -606,18 +594,14 @@ mod tests {
         assert!(d.clipboard && d.hyperlinks && d.colours && d.bell_command.is_none());
         let c = connect(&["laptop"]);
         assert_eq!(c.server, super::ServerRef::Name("laptop".to_owned()));
-        let c = connect(&[ID, "--no-hyperlinks"]);
-        assert!(c.clipboard && !c.hyperlinks && c.colours);
-        let c = connect(&[ID, "--no-colours"]);
-        assert!(c.clipboard && c.hyperlinks && !c.colours);
-    }
-
-    #[test]
-    fn no_clipboard_turns_clipboard_writes_off() {
-        let Cmd::Connect(c) = parsed(&["koh", "connect", ID, "--no-clipboard"]) else {
-            panic!("connect");
-        };
-        assert!(!c.clipboard && c.hyperlinks && c.colours);
+        for (flag, on) in [
+            ("--no-clipboard", [false, true, true]),
+            ("--no-hyperlinks", [true, false, true]),
+            ("--no-colours", [true, true, false]),
+        ] {
+            let c = connect(&[ID, flag]);
+            assert_eq!([c.clipboard, c.hyperlinks, c.colours], on, "{flag}");
+        }
         // The old opt-in is gone, so a script that passed it hears of it.
         assert!(command()
             .try_get_matches_from(["koh", "connect", ID, "--clipboard"])

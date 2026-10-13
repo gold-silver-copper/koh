@@ -367,8 +367,8 @@ impl ServerConn {
         }
     }
 
-    /// The next history request to answer, if no answer is on its way; the caller calls
-    /// clears `history_busy` once its answer is delivered.
+    /// The next history request to answer, if no answer is on its way; the caller clears
+    /// `history_busy` once its answer is delivered.
     fn next_history(&mut self) -> Option<HistoryRequest> {
         if self.history_busy {
             return None;
@@ -608,11 +608,11 @@ pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: sessio
     core.install_snapshot(session.screen());
     let input = session.input.clone();
     // The client's input and control streams: two for the connection, even once they finish.
-    let (mut first, mut second): (Option<RecvStream>, Option<RecvStream>) = (None, None);
-    let mut client_streams = 0u8;
+    let mut streams: [Option<RecvStream>; 2] = [None, None];
+    let mut client_streams = 0;
+    let mut bufs = [vec![0u8; 16 * 1024], vec![0u8; 16 * 1024]];
     // Whether the session still publishes screens: `next_screen` ends with it.
     let mut session_open = true;
-    let (mut first_buf, mut second_buf) = (vec![0u8; 16 * 1024], vec![0u8; 16 * 1024]);
     // Cancels the newest frame, which the next supersedes.
     let mut newest = CancellationToken::new();
     // The client's acknowledgements counted so far: a new one is the link making progress.
@@ -688,10 +688,8 @@ pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: sessio
             break "shell exited";
         }
         let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
-        let (reading_first, reading_second) = (
-            first.is_some() && core.wants_bytes(0),
-            second.is_some() && core.wants_bytes(1),
-        );
+        let wants =
+            [0, 1].map(|at| streams.get(at).is_some_and(Option::is_some) && core.wants_bytes(at));
         let broke = tokio::select! {
             // Not biased: a pending screen change would starve client input.
             screen = session.next_screen(), if session_open => match screen {
@@ -719,37 +717,27 @@ pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: sessio
                 Err(_) => break "the session was ended (revoked, or the server is stopping)",
             },
             stream = conn.accept_uni() => match stream {
-                Ok(stream) if client_streams < 2 => {
-                    if client_streams == 0 {
-                        first = Some(stream);
-                    } else {
-                        second = Some(stream);
+                Ok(stream) => match streams.get_mut(client_streams) {
+                    Some(slot) => {
+                        *slot = Some(stream);
+                        client_streams = client_streams.saturating_add(1);
+                        Ok(())
                     }
-                    client_streams = client_streams.saturating_add(1);
-                    Ok(())
-                }
-                Ok(_) => Err(ProtoError::UnknownStream),
+                    None => Err(ProtoError::UnknownStream),
+                },
                 Err(e) => {
                     info!(reason = %Peer(e), "connection closed by peer (detaching)");
                     break "client detached (session retained)";
                 }
             },
-            read = read_client(first.as_mut(), &mut first_buf), if reading_first => match read {
-                Ok(Some(n)) => core.push_client_bytes(0, first_buf.get(..n).unwrap_or_default(), Instant::now()),
-                Ok(None) => {
-                    first = None;
-                    core.client_ended(0, Instant::now())
+            (at, read) = read_client(&mut streams, &mut bufs, wants), if wants.contains(&true) => match read {
+                Ok(Some(n)) => {
+                    let read = bufs.get(at).and_then(|buf| buf.get(..n)).unwrap_or_default();
+                    core.push_client_bytes(at, read, Instant::now())
                 }
-                Err(e) => {
-                    info!(reason = %Peer(e), "client stream failed (detaching)");
-                    break "client detached (session retained)";
-                }
-            },
-            read = read_client(second.as_mut(), &mut second_buf), if reading_second => match read {
-                Ok(Some(n)) => core.push_client_bytes(1, second_buf.get(..n).unwrap_or_default(), Instant::now()),
                 Ok(None) => {
-                    second = None;
-                    core.client_ended(1, Instant::now())
+                    streams.get_mut(at).map(Option::take);
+                    core.client_ended(at, Instant::now())
                 }
                 Err(e) => {
                     info!(reason = %Peer(e), "client stream failed (detaching)");
@@ -795,14 +783,25 @@ pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: sessio
     info!(peer = %conn.remote_id(), "{how}");
 }
 
-/// Read from the client's stream, if there is one.
+/// Read from whichever of the client's streams `wants` reads first: which, and what it read.
 async fn read_client(
-    stream: Option<&mut RecvStream>,
-    buf: &mut [u8],
-) -> Result<Option<usize>, iroh::endpoint::ReadError> {
-    match stream {
-        Some(stream) => stream.read(buf).await,
-        None => std::future::pending().await,
+    [first, second]: &mut [Option<RecvStream>; 2],
+    [first_buf, second_buf]: &mut [Vec<u8>; 2],
+    wants: [bool; 2],
+) -> (usize, Result<Option<usize>, iroh::endpoint::ReadError>) {
+    async fn read(
+        stream: Option<&mut RecvStream>,
+        buf: &mut [u8],
+    ) -> Result<Option<usize>, iroh::endpoint::ReadError> {
+        match stream {
+            Some(stream) => stream.read(buf).await,
+            None => std::future::pending().await,
+        }
+    }
+    tokio::select! {
+        read = read(first.as_mut(), first_buf), if wants[0] => (0, read),
+        read = read(second.as_mut(), second_buf), if wants[1] => (1, read),
+        else => std::future::pending().await,
     }
 }
 
@@ -838,12 +837,9 @@ async fn send_frame(
         }
         () = cancel.cancelled() => true,
     };
-    // Written: wait until the client has it all. All of it delivered (`stopped` with no code) is
-    // the client's acknowledgement: it applies every frame it gets on a base it holds, and keeps a
-    // late one as a base. Superseded once written, it still has `grace` (a round trip and the
-    // acknowledgement's delay) to be delivered, so that through a flood of frames each superseding
-    // the last the server still learns which the client has; then it is reset, so QUIC stops
-    // retransmitting it. Superseded while still being written, it is reset at once.
+    // All of it delivered (`stopped` with no code) is the client's acknowledgement: it applies
+    // every frame it gets on a base it holds, and keeps a late one as a base. `grace` lets a flood
+    // of frames, each superseding the last, still tell the server which the client has.
     if !cancelled {
         let superseded = async {
             cancel.cancelled().await;

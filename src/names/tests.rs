@@ -44,10 +44,6 @@ fn a_bad_line_is_an_error_that_names_the_file_and_the_line() {
     ] {
         let error = Names::parse(&text, "/k/servers").unwrap_err();
         let error = format!("{error:#}");
-        assert!(
-            error.contains("/k/servers") || error.contains(says),
-            "{error}"
-        );
         assert!(error.contains(says), "{text:?}: {error}");
     }
 }
@@ -108,13 +104,7 @@ fn a_missing_list_is_empty_and_a_saved_one_is_read_back() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600, "written private");
-}
-
-#[test]
-fn a_failed_change_leaves_the_list_as_it_was() {
-    let dir = Scratch::new("failed");
-    let places = dir.places();
-    update(&places, List::Servers, |names| names.add("laptop", id(1))).unwrap();
+    // A failed change leaves the list as it was.
     assert!(update(&places, List::Servers, |names| names.add("laptop", id(2))).is_err());
     assert_eq!(
         load(&places, List::Servers).unwrap().get("laptop"),
@@ -180,9 +170,5 @@ fn ago_says_how_long_ago_briefly() {
 
 #[test]
 fn short_keeps_the_ends_of_an_id() {
-    let s = short(A.parse().unwrap());
-    let full = A.parse::<EndpointId>().unwrap().to_string();
-    let head: String = full.chars().take(4).collect();
-    let tail: String = full.chars().skip(full.chars().count() - 4).collect();
-    assert_eq!(s, format!("{head}…{tail}"));
+    assert_eq!(short(A.parse().unwrap()), "d128…febf");
 }

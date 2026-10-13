@@ -66,11 +66,11 @@ and the git log.
 
 | ID | Finding | Guarded by |
 |----|---------|------------|
-| KOH-01 | Received states bounded by count, not bytes | Replaced by koh/4's fixed window of 16 frames per end: `src/client/session.rs::only_the_last_frames_are_kept_as_bases`, `src/server/mod.rs::only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored`, `tests/net/hostile_peer.rs::hostile_frames_and_history_leave_the_client_running` |
+| KOH-01 | Received states bounded by count, not bytes | Replaced by koh/4's fixed window of 16 frames per end: `src/client/session.rs::only_the_last_frames_are_kept_as_bases_and_the_one_the_server_diffs_against`, `src/server/mod.rs::only_the_last_frames_are_kept_so_an_ack_for_an_older_one_is_ignored`, `tests/net/hostile_peer.rs::hostile_frames_and_history_leave_the_client_running` |
 | KOH-02 | Decompression amplification on apply | `src/proto.rs::an_inflate_bomb_is_rejected`, `oversized_client_messages_are_rejected_before_buffering`, `tests/net/hostile_peer.rs::hostile_frames_and_history_leave_the_client_running`, `an_oversized_client_message_closes_the_connection_only` |
 | KOH-03 | Fixed public KDF salt in the passphrase handshake | Removed: there is no over-the-wire passphrase; the node-id allowlist is the only factor |
 | KOH-04 | `String::truncate` on the status line panics the client | `src/client/render.rs::status_line_truncation_is_panic_free_across_all_widths` |
-| KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_queues_the_session_input_in_order_merging_neighbours`, `input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
+| KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_queues_the_session_input_in_order_merging_neighbours`, `a_stream_decodes_whole_messages_as_the_session_takes_them_even_after_it_ends`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
 | KOH-06 | State dir in a world-writable shared location | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_directory_of_another_user_but_root_is_refused`, `src/transport_iroh/mod.rs::config_dir_is_xdg_then_home_and_never_elsewhere` |
 | KOH-07 | Fragment reassembly buffers ~39 MiB | Removed: koh/4 has no fragments; a frame is one stream read under `MAX_FRAME` (see KOH-02) |
 | KOH-08 | Stalled handshakes hold connection permits | Handshakes hold none, and have a deadline; the pending-handshake cap gives up the oldest for a new one, never refusing it, and caps each address, giving up that address's oldest: `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room`, `tests/sessions.rs::an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes`; the admission-stall attack in `testing/android/scripts/stress-evil-peer.sh` exercises it on a device |
@@ -112,7 +112,7 @@ and the git log.
 | B-10 | Anyone who reaches the UDP port could block allowed clients' dials | Slowed, not stopped: spoofed addresses must answer a QUIC retry first, real ones are capped each. `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room`, `tests/sessions.rs::an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes` |
 | B-11 | The server kept a clipboard of up to 3 times its cap | `src/terminal/server.rs::only_base64_sets_the_clipboard_and_a_query_sets_nothing` |
 | B-12 | A hard-linked key could be truncated through `$KOH_LOG` | `src/identity/key_file.rs::a_hard_linked_key_or_log_is_refused_and_left_whole` |
-| B-13 | Queued client messages waited for more bytes; a clean end with some left was an error | `src/server/mod.rs::input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends` |
+| B-13 | Queued client messages waited for more bytes; a clean end with some left was an error | `src/server/mod.rs::a_stream_decodes_whole_messages_as_the_session_takes_them_even_after_it_ends` |
 | B-14 | An old connection's input could interleave with a reconnect's | Input is numbered by attachment, and only the newest's reaches the program: `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` |
 
 **Review follow-ups (KR-, K-, KB-, KC-, KS-, S-, AR-).**
@@ -130,8 +130,8 @@ and the git log.
 | KB-01 | The bell hook | `src/client/cli.rs::bell_hook_fires_on_a_rise_and_rate_limits_a_burst`, `tests/net/bell.rs::a_remote_bell_runs_the_hook_at_most_once_a_second` |
 | KB-02 | The bell hook's environment and first frame | `src/client/cli.rs::bell_hook_command_scrubs_parent_koh_vars_and_exports_its_own`, `bell_hook_prime_swallows_the_count_it_is_seeded_with_but_not_later_rises`, `tests/net/bell.rs::stale_bells_before_attach_do_not_fire_but_bells_after_a_reconnect_do` |
 | KC-01 | Predictor over a `ScreenView`; input modes byte-identical | `src/predict.rs::predictor_runs_over_a_plain_screen_view`, `src/client/render.rs::the_real_terminal_reports_input_whatever_the_program_set`, `out_of_band_reasserts_input_modes_on_change` |
-| KC-IO-01 | Client teardown owns and joins every producer | `src/client/io.rs::idle_input_poll_cancels_and_joins_without_waiting_for_a_byte`, `dropping_public_tasks_cancels_both_producers` |
-| KC-IO-02 | The input producer does not transform bytes | `src/client/io.rs::input_producer_forwards_bytes_exactly` |
+| KC-IO-01 | Client teardown owns and joins every producer | `src/client/io.rs::input_producer_forwards_bytes_exactly_and_an_idle_one_cancels_without_a_byte`, `dropping_public_tasks_cancels_both_producers` |
+| KC-IO-02 | The input producer does not transform bytes | `src/client/io.rs::input_producer_forwards_bytes_exactly_and_an_idle_one_cancels_without_a_byte` |
 | KS-01, KS-04 | Shared sessions across peers; their unwind guard | Removed with the generic session host: one PTY per peer, and K-16's detach on drop |
 | KS-02 | Echo-ack per connection, not per session | `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` |
 | KS-03 | A screen change wakes every attached connection | The session's `watch` channel: `tests/sessions.rs::echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the_program` keeps two connections on one session receiving frames |

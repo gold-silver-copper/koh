@@ -39,7 +39,7 @@ fuzz_target!(|data: &[u8]| {
             assert!(cache.bytes() <= HISTORY_CACHE_BYTES || cache.len() <= kept + 1);
         }
     }
-    let _ = koh::proto::decode_server(data);
+    let _ = koh::proto::decode_history(data);
     let screen = TerminalScreen::from_bytes(24, 80, b"live\r\nscreen");
     let view = screen.scrolled_back(&cache, usize::from(offset));
     let Size { rows, cols } = view.size();

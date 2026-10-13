@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{check_events, InputEvent, WireColours};
 use crate::terminal::{
-    HistoryReply, HistoryRequest, RowEncodings, ScreenDiff, Size, TerminalScreen,
+    HistoryReply, HistoryRequest, RowEncodings, ScreenDiff, Size, TerminalScreen, MAX_HISTORY_REPLY,
 };
 
 /// A frame number. Frame 0 is the blank default screen both ends start from; it is never sent.
@@ -253,37 +253,33 @@ pub enum ProtoError {
 }
 
 /// Refuse `len` past `max` as [`ProtoError::TooLarge`].
-const fn at_most(len: usize, max: usize) -> Result<(), ProtoError> {
-    if len > max {
-        Err(ProtoError::TooLarge { len, max })
-    } else {
-        Ok(())
+fn at_most(len: usize, max: usize) -> Result<(), ProtoError> {
+    (len <= max)
+        .then_some(())
+        .ok_or(ProtoError::TooLarge { len, max })
+}
+
+impl ClientMsg {
+    /// Refuse input no terminal sends, which neither end sends nor takes.
+    fn check(&self) -> Result<(), ProtoError> {
+        match self {
+            Self::Keys { events, .. } => check_events(events),
+            Self::Colours(colours) => colours.check(),
+            Self::Resize(_) | Self::Ack { .. } | Self::Resync | Self::History(_) => Ok(()),
+        }
+        .map_err(ProtoError::BadInput)
     }
 }
 
 /// Encode one client message with its length prefix.
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
-    match msg {
-        ClientMsg::Keys { events, .. } => check_events(events).map_err(ProtoError::BadInput)?,
-        ClientMsg::Colours(colours) => colours.check().map_err(ProtoError::BadInput)?,
-        ClientMsg::Resize(_)
-        | ClientMsg::Ack { .. }
-        | ClientMsg::Resync
-        | ClientMsg::History(_) => {}
-    }
+    msg.check()?;
     // The body goes straight after a placeholder for its length.
-    let out = postcard::to_extend(msg, vec![0; 4])?;
+    let mut out = postcard::to_extend(msg, vec![0; 4])?;
     let body = out.len().saturating_sub(4);
-    let len = u32::try_from(body)
-        .ok()
-        .filter(|_| body <= MAX_CLIENT_MESSAGE)
-        .ok_or(ProtoError::TooLarge {
-            len: body,
-            max: MAX_CLIENT_MESSAGE,
-        })?;
-    let mut out = out;
+    at_most(body, MAX_CLIENT_MESSAGE)?;
     if let Some(prefix) = out.first_chunk_mut::<4>() {
-        *prefix = len.to_be_bytes();
+        *prefix = u32::try_from(body).unwrap_or(u32::MAX).to_be_bytes();
     }
     Ok(out)
 }
@@ -322,14 +318,7 @@ impl ClientDecoder {
             return Ok(None);
         };
         let msg: ClientMsg = postcard::from_bytes(body)?;
-        match &msg {
-            ClientMsg::Keys { events, .. } => check_events(events).map_err(ProtoError::BadInput)?,
-            ClientMsg::Colours(colours) => colours.check().map_err(ProtoError::BadInput)?,
-            ClientMsg::Resize(_)
-            | ClientMsg::Ack { .. }
-            | ClientMsg::Resync
-            | ClientMsg::History(_) => {}
-        }
+        msg.check()?;
         // The header and body were just read, so `start + 4 + len` is within the buffer.
         self.start = self
             .start
@@ -347,16 +336,15 @@ impl ClientDecoder {
 
     /// The stream ended: fine between messages, a protocol error inside one.
     pub fn finish(&self) -> Result<(), ProtoError> {
-        if self.pending().is_empty() {
-            Ok(())
-        } else {
-            Err(ProtoError::Truncated)
-        }
+        self.pending()
+            .is_empty()
+            .then_some(())
+            .ok_or(ProtoError::Truncated)
     }
 }
 
-/// A message on one of the server's streams, as the stream's reader takes it: a frame still to
-/// inflate against its base, or history rows.
+/// A message on one of the server's streams, as the stream's reader takes it, still compressed: a
+/// frame to inflate against its base, or history rows ([`decode_history`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerMsg {
     /// A frame diffed against frame `base`, changing `rows`, whose compressed `body` inflates only
@@ -366,7 +354,7 @@ pub enum ServerMsg {
         rows: Vec<u16>,
         body: Vec<u8>,
     },
-    History(HistoryReply),
+    History(Vec<u8>),
 }
 
 /// The first byte of a server stream: what it carries.
@@ -501,7 +489,7 @@ fn inflate_with(dictionary: &[u8], body: &[u8], limit: usize) -> Option<Vec<u8>>
 }
 
 /// Read a server stream: a frame's base and compressed body, which [`decode_frame_body`] inflates
-/// once the base is found, or history rows, inflated with a [`MAX_FRAME`] limit.
+/// once the base is found, or history rows, which [`decode_history`] inflates.
 pub fn decode_server(bytes: &[u8]) -> Result<ServerMsg, ProtoError> {
     at_most(bytes.len(), MAX_FRAME)?;
     match bytes.split_first() {
@@ -514,10 +502,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMsg, ProtoError> {
                 body: body.to_vec(),
             })
         }
-        Some((&TAG_HISTORY, rest)) => {
-            let raw = inflate_with(&[], rest, MAX_FRAME).ok_or(ProtoError::Inflate)?;
-            Ok(ServerMsg::History(postcard::from_bytes(&raw)?))
-        }
+        Some((&TAG_HISTORY, rest)) => Ok(ServerMsg::History(rest.to_vec())),
         _ => Err(ProtoError::UnknownStream),
     }
 }
@@ -550,22 +535,16 @@ pub fn decode_frame_body(
 ) -> Result<Frame, ProtoError> {
     let raw = inflate_with(dictionary, body, MAX_FRAME).ok_or(ProtoError::Inflate)?;
     let frame: Frame = postcard::from_bytes(&raw)?;
-    if frame.base == base {
-        Ok(frame)
-    } else {
-        Err(ProtoError::NotAFrame)
-    }
+    (frame.base == base)
+        .then_some(frame)
+        .ok_or(ProtoError::NotAFrame)
 }
 
-/// Decode a stream that must hold a frame on `screen`, the screen of the frame's base.
-pub fn decode_frame(bytes: &[u8], screen: &TerminalScreen) -> Result<Frame, ProtoError> {
-    match decode_server(bytes)? {
-        ServerMsg::Frame { base, rows, body } => {
-            let dictionary = dictionary_for(base, screen, &rows, &mut RowEncodings::default());
-            decode_frame_body(base, &body, &dictionary)
-        }
-        ServerMsg::History(_) => Err(ProtoError::NotAFrame),
-    }
+/// Inflate history rows, no further than a legal reply goes ([`MAX_HISTORY_REPLY`]), and decode
+/// them.
+pub fn decode_history(body: &[u8]) -> Result<HistoryReply, ProtoError> {
+    let raw = inflate_with(&[], body, MAX_HISTORY_REPLY).ok_or(ProtoError::Inflate)?;
+    Ok(postcard::from_bytes(&raw)?)
 }
 
 #[cfg(test)]
@@ -574,6 +553,17 @@ mod tests {
 
     fn encode_frame(frame: &Frame, base: &TerminalScreen) -> Result<Vec<u8>, ProtoError> {
         FrameEncoder::default().encode(frame, base)
+    }
+
+    /// Decode a stream that must hold a frame on `screen`, the screen of the frame's base.
+    fn decode_frame(bytes: &[u8], screen: &TerminalScreen) -> Result<Frame, ProtoError> {
+        match decode_server(bytes)? {
+            ServerMsg::Frame { base, rows, body } => {
+                let dictionary = dictionary_for(base, screen, &rows, &mut RowEncodings::default());
+                decode_frame_body(base, &body, &dictionary)
+            }
+            ServerMsg::History(_) => Err(ProtoError::NotAFrame),
+        }
     }
 
     #[test]
@@ -697,12 +687,12 @@ mod tests {
             WireKey, WireKeyCode, WireKitty, WireMouse, WireMouseAction, MAX_EVENTS, MAX_PASTE,
             PALETTE,
         };
-        let raw = |msg: &ClientMsg| {
-            let body = postcard::to_allocvec(msg).unwrap();
+        let framed = |body: Vec<u8>| {
             let mut stream = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
             stream.extend_from_slice(&body);
             stream
         };
+        let raw = |msg: &ClientMsg| framed(postcard::to_allocvec(msg).unwrap());
         let keys = |events: Vec<InputEvent>| ClientMsg::Keys {
             seq: InputSeq(1),
             events,
@@ -755,9 +745,7 @@ mod tests {
             postcard::to_allocvec(&keys(vec![key(WireKeyCode::Char('a'), 0, None)])).unwrap();
         let at = body.iter().rposition(|&b| b == b'a').unwrap();
         body[at] = 0xff;
-        let mut stream = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
-        stream.extend_from_slice(&body);
-        assert!(decode_all(&stream).is_err());
+        assert!(decode_all(&framed(body)).is_err());
         // What a terminal sends goes through, both ways.
         let good = [
             keys(vec![
@@ -888,9 +876,9 @@ mod tests {
             decode_frame(&stream, &TerminalScreen::default()),
             Err(ProtoError::Inflate)
         ));
-        let mut stream = vec![TAG_HISTORY];
-        stream.extend_from_slice(&bomb);
-        assert!(matches!(decode_server(&stream), Err(ProtoError::Inflate)));
+        // History inflates no further than the largest legal reply.
+        let past = miniz_oxide::deflate::compress_to_vec(&vec![0u8; MAX_HISTORY_REPLY + 1], 9);
+        assert!(matches!(decode_history(&past), Err(ProtoError::Inflate)));
     }
 
     #[test]

@@ -65,14 +65,19 @@ enum Paint<'a> {
     },
 }
 
-/// A blank cell in `style`.
-const fn blank<'a>(style: Attributes) -> Paint<'a> {
+/// A narrow `glyph` in `style`.
+const fn narrow<'a>(glyph: &'a str, style: Attributes, link: Option<&'a Link>) -> Paint<'a> {
     Paint::Glyph {
-        glyph: " ",
+        glyph,
         style,
         wide: false,
-        link: None,
+        link,
     }
+}
+
+/// A blank cell in `style`.
+const fn blank<'a>(style: Attributes) -> Paint<'a> {
+    narrow(" ", style, None)
 }
 
 /// What a cleared terminal, or a row a scroll brought in, shows: a blank in the default style.
@@ -110,10 +115,10 @@ impl<'a> View<'a> {
     /// `None` outside the screen.
     fn source(&self, row: u16, col: u16) -> Option<(CellRef<'a>, Option<&'a Link>)> {
         let cell = self.grid.cell(row, col)?;
-        match self.overlay.cell(row, col) {
-            Some(predicted) => Some((predicted.as_ref(), None)),
-            None => Some((cell, self.grid.link(row, col))),
-        }
+        Some(self.overlay.cell(row, col).map_or_else(
+            || (cell, self.grid.link(row, col)),
+            |predicted| (predicted.as_ref(), None),
+        ))
     }
 
     /// The style of the prediction at `(row, col)`, if there is one.
@@ -146,12 +151,7 @@ impl<'a> View<'a> {
     /// style, as a terminal leaves a wide glyph one of whose halves is overwritten.
     fn paint(&self, row: u16, col: u16) -> Paint<'a> {
         if let Some(glyph) = self.status_at(row, col) {
-            return Paint::Glyph {
-                glyph,
-                style: STATUS,
-                wide: false,
-                link: None,
-            };
+            return narrow(glyph, STATUS, None);
         }
         let Some((cell, link)) = self.source(row, col) else {
             return BLANK;
@@ -190,12 +190,7 @@ impl<'a> View<'a> {
         if glyph.width() != 1 {
             return blank(style);
         }
-        Paint::Glyph {
-            glyph,
-            style,
-            wide: false,
-            link,
-        }
+        narrow(glyph, style, link)
     }
 
     /// Whether `row` draws what `other`'s row `from` draws: the same grid row (cells, links and

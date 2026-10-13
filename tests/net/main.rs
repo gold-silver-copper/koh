@@ -13,3 +13,4 @@ mod keys;
 mod link;
 mod predict;
 mod session;
+mod slow_link;

@@ -147,6 +147,19 @@ pub fn check_events(events: &[InputEvent]) -> Result<(), &'static str> {
 }
 
 impl InputEvent {
+    /// What the server gets for one input decoded from the user's terminal, if anything.
+    pub fn from_input(input: fux_vt::keys::decode::Input) -> Option<Self> {
+        use fux_vt::keys::decode::Input;
+        match input {
+            Input::Key(stroke) => Some(Self::Key(stroke.into())),
+            Input::Mouse(event) => Some(Self::Mouse(event.into())),
+            Input::FocusIn => Some(Self::Focus(true)),
+            Input::FocusOut => Some(Self::Focus(false)),
+            Input::Paste(text) => Some(Self::Paste(text)),
+            Input::PasteTooLong | Input::Reply(_) => None,
+        }
+    }
+
     fn check(&self) -> Result<(), &'static str> {
         match self {
             Self::Key(key) => key.check(),
@@ -320,10 +333,9 @@ impl From<MouseEvent> for WireMouse {
 impl WireColours {
     /// Whether the message is within the wire's bounds.
     pub fn check(&self) -> Result<(), &'static str> {
-        if self.palette.len() > PALETTE {
-            return Err("too many palette entries");
-        }
-        Ok(())
+        (self.palette.len() <= PALETTE)
+            .then_some(())
+            .ok_or("too many palette entries")
     }
 
     /// The foreground, background and scheme, as fux-vt answers programs from them.

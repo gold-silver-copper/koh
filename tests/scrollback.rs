@@ -16,7 +16,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use koh::client::ClientSession;
-use koh::proto::{decode_server, ClientMsg, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg};
+use koh::proto::{
+    decode_history, decode_server, ClientMsg, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg,
+};
 use koh::terminal::{ServerTerminal, Size, TerminalScreen};
 use recording::Recording;
 
@@ -93,7 +95,9 @@ impl Pair {
                     .history_bytes
                     .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
                 match decode_server(&bytes).map_err(|e| e.to_string())? {
-                    ServerMsg::History(reply) => self.client.on_history(&reply),
+                    ServerMsg::History(body) => self
+                        .client
+                        .on_history(&decode_history(&body).map_err(|e| e.to_string())?),
                     ServerMsg::Frame { .. } => return Err("a frame for history".to_owned()),
                 }
             }

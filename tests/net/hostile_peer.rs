@@ -338,7 +338,8 @@ fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_co
             let Ok(bytes) = recv.read_to_end(MAX_FRAME).await else {
                 continue;
             };
-            if let ServerMsg::History(reply) = decode_server(&bytes)? {
+            if let ServerMsg::History(body) = decode_server(&bytes)? {
+                let reply = koh::proto::decode_history(&body)?;
                 answers += 1;
                 anyhow::ensure!(reply.rows.len() <= usize::from(MAX_HISTORY_ROWS));
                 anyhow::ensure!(reply.rows.len() <= 300, "more than the history holds");

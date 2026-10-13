@@ -257,11 +257,6 @@ struct Context<'a> {
 }
 
 impl Context<'_> {
-    /// Whether the kernel echoes what is typed, so a printable key shows where the cursor is.
-    const fn kernel_echo(&self) -> bool {
-        self.tty.echo
-    }
-
     /// Whether line editing keys may be predicted: a line editor reads keys (no kernel echo,
     /// which edits a line its own way).
     const fn editing(&self) -> bool {
@@ -365,10 +360,10 @@ impl PredictionEngine {
     /// What a cell shows, predicted if there is a prediction: what a row shift copies, a wide
     /// glyph's halves included. `None` if it is not known.
     fn guess_at(&self, ctx: &Context<'_>, row: u16, col: u16) -> Option<Cell> {
-        match self.cells.get(&(row, col)) {
-            Some(p) => p.guess.clone(),
-            None => ctx.screen.cell(row, col).map(Cell::of),
-        }
+        self.cells.get(&(row, col)).map_or_else(
+            || ctx.screen.cell(row, col).map(Cell::of),
+            |p| p.guess.clone(),
+        )
     }
 
     /// Predict `guess` at `(row, col)`, stamped with the next frame, the current epoch (which hides
@@ -559,7 +554,7 @@ impl PredictionEngine {
     /// one glyph however many keys typed it, or nothing if joining would change its width. A
     /// glyph reaching the last column, where the terminal may wrap, opens a new epoch.
     fn predict_glyph(&mut self, ctx: &Context<'_>, c: char) {
-        if ctx.kernel_echo() {
+        if ctx.tty.echo {
             // The kernel echoes it: no need to wait for the program to prove it does.
             self.confirmed_epoch = self.confirmed_epoch.max(self.prediction_epoch);
         }
@@ -670,24 +665,38 @@ impl PredictionEngine {
         self.move_cursor((row, to));
     }
 
-    /// Backspace: the cell before the cursor deleted, never past where the line began.
+    /// Whether Backspace or Left may step back from `(row, col)`: never past where the line began
+    /// if that is known, else only over a glyph this line's own guesses typed, so the prompt
+    /// before a line whose start is not known (just connected, or after Up or Tab) is never
+    /// taken for it.
+    fn may_step_back(&self, row: u16, col: u16) -> bool {
+        match self.line_start(row) {
+            Some(start) => col > start,
+            None => col
+                .checked_sub(1)
+                .and_then(|left| self.cells.get(&(row, left)))
+                .is_some_and(|cell| cell.typed),
+        }
+    }
+
+    /// Backspace: the cell before the cursor deleted, as [`may_step_back`](Self::may_step_back)
+    /// allows.
     fn predict_backspace(&mut self, ctx: &Context<'_>) {
         let (row, col) = self.cursor_at(ctx.screen);
-        if self.line_start(row).is_some_and(|start| col <= start) {
+        if !self.may_step_back(row, col) {
             return self.unmodelled();
         }
         self.delete_before(ctx, 1);
     }
 
     /// Left or Right (`right`): the cursor one column over, within the row (Right stops before
-    /// the last column), and Left never past where the line began.
+    /// the last column), and Left as [`may_step_back`](Self::may_step_back) allows.
     fn predict_arrow(&mut self, ctx: &Context<'_>, right: bool) {
         let (row, col) = self.cursor_at(ctx.screen);
         let to = if right {
             col.checked_add(1).filter(|&next| next < ctx.size.cols)
         } else {
-            col.checked_sub(1)
-                .filter(|&prev| self.line_start(row).is_none_or(|start| prev >= start))
+            col.checked_sub(1).filter(|_| self.may_step_back(row, col))
         };
         match to {
             Some(to) => self.move_cursor((row, to)),
@@ -1179,7 +1188,6 @@ mod tests {
             cursor: (0, 0),
         };
         let mut e = engine();
-        e.set_local_frame_sent(0);
         e.type_bytes(b"x", &blank);
         assert!(e.overlay().is_empty(), "hidden until confirmed");
         let mut echoed = FakeView {
@@ -1210,10 +1218,8 @@ mod tests {
         ) {
             let fake = FakeView { rows: vec![vec![' '; 80]; 24], cursor: (0, 0) };
             let mut pf = engine();
-            pf.set_local_frame_sent(0);
             pf.type_bytes(&bytes, &fake);
             let mut pe = engine();
-            pe.set_local_frame_sent(0);
             pe.type_bytes(&bytes, &screen_of(b"ready prompt $ "));
             let _ = pe.overlay();
         }
@@ -1237,7 +1243,6 @@ mod tests {
                 confirmed_epoch: u64::MAX,
                 ..engine()
             };
-            e.set_local_frame_sent(0);
             for key in bytes {
                 e.type_bytes(key, &screen);
                 let ov = e.overlay();
@@ -1265,7 +1270,6 @@ mod tests {
     /// subsequent typing to be *visible*.
     fn confirm_first_keystroke() -> (PredictionEngine, Screen) {
         let mut e = engine();
-        e.set_local_frame_sent(0);
         let blank = screen_of(b"");
         e.type_bytes(b"x", &blank);
         assert!(
@@ -1283,7 +1287,6 @@ mod tests {
         // P0 (security): a secret typed before any server confirmation is never drawn, and one
         // the server never echoes (a password prompt) is culled away.
         let mut e = engine();
-        e.set_local_frame_sent(0);
         e.type_bytes(b"hunter2", &screen_of(b""));
         assert!(e.overlay().is_empty(), "non-echoed input is never shown");
         e.set_local_frame_late_acked(1);
@@ -1314,14 +1317,18 @@ mod tests {
     }
 
     #[test]
-    fn insert_mode_shifts_row_right() {
-        // Screen "ab" with the cursor on 'b' (col 1). Typing 'X' should INSERT before 'b',
-        // shifting the tail right — not overwrite 'b'. (Inspect predicted cells directly; the
-        // epoch gate hides them from overlay() until confirmed, but the shift populates cells.)
-        let mut e = engine();
-        e.set_local_frame_sent(0);
-        e.type_bytes(b"X", &screen_of(b"ab\x1b[1;2H"));
-        predicted_row(&e, 1, &["X", "b"]);
+    fn insert_mode_shifts_the_row_right_wide_glyphs_whole() {
+        // Typing 'X' INSERTS before the cursor, shifting the tail right, not overwriting it.
+        // (Inspect predicted cells directly; the epoch gate hides them from overlay() until
+        // confirmed, but the shift populates cells.)
+        for (screen, from, glyphs) in [
+            ("ab\x1b[1;2H", 1, &["X", "b"][..]),
+            ("a本b\x1b[1;1H", 0, &["X", "a", "本", ">", "b"]),
+        ] {
+            let mut e = engine();
+            e.type_bytes(b"X", &screen_of(screen.as_bytes()));
+            predicted_row(&e, from, glyphs);
+        }
     }
 
     #[test]
@@ -1330,7 +1337,7 @@ mod tests {
         // and the last TWO columns become unknown (content scrolled in from off-screen; mosh marks
         // the cell unknown when `i + 2 >= width`, so both edge columns, not just the last one).
         let mut e = engine();
-        e.set_local_frame_sent(0);
+        e.line = Line::Started(Confirmed { row: 0, col: 0 });
         e.type_bytes(&[0x7f], &screen_of(b"abc\x1b[1;3H"));
         predicted_row(&e, 1, &["c"]);
         // A blank moved in, then the two unknown edge columns.
@@ -1345,8 +1352,8 @@ mod tests {
         let p = fux_vt::Parser::new(fux_vt::Size::new(1, u16::MAX).expect("nonzero size"), 0)
             .expect("1-row parser");
         let mut e = engine();
-        e.set_local_frame_sent(0);
         e.move_cursor((0, u16::MAX - 1));
+        e.line = Line::Started(Confirmed { row: 0, col: 0 });
         e.type_bytes(&[0x7f], p.screen());
         predicted_row(&e, u16::MAX - 2, &["U", "U"]);
     }
@@ -1459,6 +1466,7 @@ mod tests {
         for arrow in [&b"\x1b[D"[..], b"\x1bOD"] {
             let (mut e, echoed) = confirm_first_keystroke();
             e.set_local_frame_sent(1);
+            e.line = Line::Started(Confirmed { row: 0, col: 0 });
             e.type_bytes(arrow, &echoed);
             let ov = e.overlay();
             assert_eq!(ov.cursor(), Some((0, 0)), "{arrow:?}");
@@ -1507,28 +1515,18 @@ mod tests {
     }
 
     #[test]
-    fn inserting_before_a_wide_glyph_moves_it_whole() {
-        let mut e = engine();
-        e.set_local_frame_sent(0);
-        e.type_bytes(b"X", &screen_of("a本b\x1b[1;1H".as_bytes()));
-        predicted_row(&e, 0, &["X", "a", "本", ">", "b"]);
-    }
-
-    #[test]
     fn a_wide_glyph_split_by_a_shift_is_unknown() {
         // Pushed to the edge, its right half would leave the screen.
         let mut e = engine();
-        e.set_local_frame_sent(0);
         e.type_bytes(b"X", &sized_screen_of(2, 6, "abc本\x1b[1;1H".as_bytes()));
         predicted_row(&e, 4, &["U", "U"]);
         // Typed inside one, its halves part: the moved right half is unknown.
         let mut e = engine();
-        e.set_local_frame_sent(0);
         e.type_bytes(b"a", &screen_of("本x\x1b[1;2H".as_bytes()));
         predicted_row(&e, 1, &["a", "U"]);
         // Deleting before one moves it left, whole.
         let mut e = engine();
-        e.set_local_frame_sent(0);
+        e.line = Line::Started(Confirmed { row: 0, col: 0 });
         e.type_bytes(&[0x7f], &screen_of("ab本c\x1b[1;3H".as_bytes()));
         predicted_row(&e, 1, &["本", ">", "c"]);
     }
@@ -1712,6 +1710,16 @@ mod tests {
             assert!(e.overlay().is_empty(), "{key:?}");
             assert!(e.prediction_epoch > epoch, "{key:?} opened a new epoch");
             e.line = Line::Started(Confirmed { row: 0, col: 2 });
+            // Where the line began is not known: only over what its own guesses typed.
+            let (mut e, screen) = editor_on(b"$ ");
+            type_keys(&mut e, &screen, key);
+            assert!(e.overlay().is_empty(), "{key:?} into the prompt");
+            let (mut e, screen) = editor_on(b"$ ");
+            type_keys(&mut e, &screen, b"ab");
+            for col in [3, 2, 2] {
+                type_keys(&mut e, &screen, key);
+                assert_eq!(shown_row(&e, &screen).1, Some(col), "{key:?}");
+            }
         }
     }
 

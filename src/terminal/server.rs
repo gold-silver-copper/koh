@@ -16,10 +16,7 @@ use fux_vt::{Event, Options, Parser, Sink, Unhandled};
 
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
 fn title_from(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .chars()
-        .take(MAX_TITLE_LEN)
-        .collect()
+    super::capped_chars(&String::from_utf8_lossy(bytes), MAX_TITLE_LEN)
 }
 
 /// Whether `data` is base64: its alphabet, then at most two `=` of padding.
@@ -151,8 +148,6 @@ pub struct ServerTerminal {
     exit_code: Option<u32>,
     /// The last snapshot's rows, which the next one shares where they are unchanged.
     rows: RowCache,
-    /// [`RowCache::history_redrawn`] at the last snapshot.
-    history_redrawn: u64,
     /// The screen as it was when the program last began a frame (synchronized output), a whole
     /// one, until taken.
     frame_start: Option<TerminalScreen>,
@@ -176,7 +171,6 @@ impl ServerTerminal {
             observed: Observed::default(),
             exit_code: None,
             rows: RowCache::default(),
-            history_redrawn: 0,
             frame_start: None,
             frame_began: false,
             frame_ends: FrameEnds::default(),
@@ -332,23 +326,30 @@ impl ServerTerminal {
     /// The screen scrolled `offset` rows back into history, as this emulator shows it: what a
     /// client's scrollback view at `offset` must show. For tests.
     pub fn window(&self, offset: usize) -> TerminalScreen {
+        let grid = Grid::window_of(self.parser.screen(), offset);
+        self.screen(grid, HistoryMark::default())
+    }
+
+    /// `grid` and `history` with the side channels and modes as they are now.
+    fn screen(&self, grid: Grid, history: HistoryMark) -> TerminalScreen {
         TerminalScreen {
-            grid: Grid::window_of(self.parser.screen(), offset),
+            grid,
             title: self.observed.title.clone(),
             icon: self.observed.icon.clone(),
             clipboard: self.observed.clipboard.clone(),
             bell_count: self.observed.bell_count,
             exit_code: self.exit_code,
-            history: HistoryMark::default(),
+            history,
             tty: self.tty,
         }
     }
 
-    /// The history rows `request` asks for that the history still holds.
+    /// The history rows `request` asks for that the history still holds, drawn in the last
+    /// snapshot's palette, the one their names are for (a program drawing a frame may change it a
+    /// moment, and change it back before the next snapshot).
     pub fn history(&mut self, request: HistoryRequest) -> HistoryReply {
-        let screen = self.parser.screen();
-        let palette = Palette::of(screen);
-        self.names.reply(screen, palette.as_ref(), request)
+        self.names
+            .reply(self.parser.screen(), self.rows.palette(), request)
     }
 
     /// The report a program that set in-band resize (mode 2048) is sent after a resize, for its
@@ -381,23 +382,14 @@ impl ServerTerminal {
     /// copies, in the old one, are then rows the history no longer holds. One that changes no row
     /// of it (a colour the history never used) leaves the names, and the client's copies, alone.
     pub fn snapshot(&mut self) -> TerminalScreen {
-        let grid = Grid::of(self.parser.screen(), &mut self.rows);
-        if std::mem::replace(&mut self.history_redrawn, self.rows.history_redrawn())
-            != self.history_redrawn
-        {
+        let palette = Palette::of(self.parser.screen());
+        if self.names.redrawn(self.rows.palette(), palette.as_ref()) {
             tracing::debug!("a new palette redraws the history: it is named afresh");
             self.names.renew();
         }
-        TerminalScreen {
-            grid,
-            title: self.observed.title.clone(),
-            icon: self.observed.icon.clone(),
-            clipboard: self.observed.clipboard.clone(),
-            bell_count: self.observed.bell_count,
-            exit_code: self.exit_code,
-            history: self.names.mark(self.parser.screen()),
-            tty: self.tty,
-        }
+        let grid = Grid::of(self.parser.screen(), palette, &mut self.rows);
+        let history = self.names.mark(self.parser.screen());
+        self.screen(grid, history)
     }
 }
 
@@ -490,11 +482,18 @@ pub const FRAME_HOLD: Duration = Duration::from_millis(150);
 /// longer than [`FRAME_HOLD`] is let go, and the screen goes out as if the program had ended it.
 /// Without I/O: the session gives it the time.
 #[derive(Debug, Default)]
-pub struct FrameHold {
-    /// When the frame held was first seen.
-    since: Option<Instant>,
-    /// Whether the frame held was let go after [`FRAME_HOLD`].
-    released: bool,
+pub struct FrameHold(Held);
+
+/// Where the program's frame stands.
+#[derive(Clone, Copy, Debug, Default)]
+enum Held {
+    /// No frame is drawn.
+    #[default]
+    Not,
+    /// The frame drawn was first seen then.
+    Since(Instant),
+    /// The frame drawn was let go after [`FRAME_HOLD`].
+    Released,
 }
 
 impl FrameHold {
@@ -506,50 +505,45 @@ impl FrameHold {
     ) -> Option<TerminalScreen> {
         let (began, started) = emu.take_frame_start();
         if !emu.synchronized() {
-            self.since = None;
-            self.released = false;
+            self.0 = Held::Not;
             return Some(emu.snapshot());
         }
-        if began {
+        match self.0 {
             // A frame began in this output, so any before it ended: hold this one from now, even
             // if the one before was let go and ended within the same output.
-            self.since = Some(now);
-            self.released = false;
-            return started;
-        }
-        let since = *self.since.get_or_insert(now);
-        if self.released || now.saturating_duration_since(since) >= FRAME_HOLD {
-            self.released = true;
-            return Some(emu.snapshot());
+            _ if began => self.0 = Held::Since(now),
+            Held::Not => self.0 = Held::Since(now),
+            Held::Since(since) if now.saturating_duration_since(since) < FRAME_HOLD => {}
+            Held::Since(_) | Held::Released => {
+                self.0 = Held::Released;
+                return Some(emu.snapshot());
+            }
         }
         started
     }
 
     /// When the frame held is let go, if one is held.
     pub fn deadline(&self) -> Option<Instant> {
-        if self.released {
-            return None;
+        match self.0 {
+            Held::Since(since) => since.checked_add(FRAME_HOLD),
+            Held::Not | Held::Released => None,
         }
-        self.since.and_then(|since| since.checked_add(FRAME_HOLD))
     }
 
     /// At `now`, past [`FrameHold::deadline`]: the screen to send, if a frame is still held.
     pub fn expire(&mut self, emu: &mut ServerTerminal, now: Instant) -> Option<TerminalScreen> {
         if !emu.synchronized() {
-            self.since = None;
-            self.released = false;
+            self.0 = Held::Not;
             return None;
         }
-        if self.deadline().is_some_and(|deadline| now >= deadline) {
-            self.released = true;
-            return Some(emu.snapshot());
-        }
-        None
+        self.deadline().filter(|&deadline| now >= deadline)?;
+        self.0 = Held::Released;
+        Some(emu.snapshot())
     }
 
     /// Whether a frame is held: the screen sent is the one from before it began.
-    pub fn holding(&self) -> bool {
-        self.since.is_some() && !self.released
+    pub const fn holding(&self) -> bool {
+        matches!(self.0, Held::Since(_))
     }
 }
 
@@ -558,6 +552,29 @@ mod tests {
     use super::*;
     use crate::terminal::Grid;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn history_served_while_a_frame_is_drawn_is_drawn_in_the_palette_its_names_are_for() {
+        // The program sets colour 1 for a moment inside a frame, and back before it ends: the
+        // names stand, so the rows served meanwhile must be drawn as they were named.
+        let mut emu = ServerTerminal::new(4, 20, 100).unwrap();
+        for n in 0..10 {
+            emu.process(format!("\x1b[31mline {n}\x1b[m\r\n").as_bytes());
+        }
+        let mark = emu.snapshot().history();
+        emu.process(b"\x1b[?2026h\x1b]4;1;rgb:00/00/00\x07");
+        let reply = emu.history(HistoryRequest {
+            id: 0,
+            newest: mark.newest,
+            count: 1,
+        });
+        emu.process(b"\x1b]104;1\x07\x1b[?2026l");
+        assert_eq!(emu.snapshot().history(), mark);
+        assert_eq!(
+            reply.rows[0].runs[0].cell.fg,
+            crate::terminal::WireColor::Idx(1)
+        );
+    }
 
     #[test]
     fn a_palette_change_names_the_history_afresh_only_if_it_redraws_it() {
@@ -623,7 +640,8 @@ mod tests {
                     t.resize(Size::new(rows, cols));
                 }
                 let reused = t.snapshot();
-                let fresh = Grid::of(t.parser.screen(), &mut RowCache::default());
+                let palette = Palette::of(t.parser.screen());
+                let fresh = Grid::of(t.parser.screen(), palette, &mut RowCache::default());
                 proptest::prop_assert_eq!(reused.screen(), &fresh);
             }
         }
@@ -966,15 +984,7 @@ mod tests {
         decoder.timeout(&mut inputs);
         let events: Vec<InputEvent> = inputs
             .into_iter()
-            .filter_map(|input| match input {
-                fux_vt::keys::decode::Input::Key(stroke) => Some(InputEvent::Key(stroke.into())),
-                fux_vt::keys::decode::Input::Mouse(event) => Some(InputEvent::Mouse(event.into())),
-                fux_vt::keys::decode::Input::FocusIn => Some(InputEvent::Focus(true)),
-                fux_vt::keys::decode::Input::FocusOut => Some(InputEvent::Focus(false)),
-                fux_vt::keys::decode::Input::Paste(text) => Some(InputEvent::Paste(text)),
-                fux_vt::keys::decode::Input::PasteTooLong
-                | fux_vt::keys::decode::Input::Reply(_) => None,
-            })
+            .filter_map(InputEvent::from_input)
             .collect();
         let mut out = Vec::new();
         t.encode_input(&events, &mut out);
@@ -982,29 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_reach_a_program_as_it_asked_from_any_terminal() {
-        // Legacy bytes back to a legacy program, cursor keys in its cursor mode.
-        assert_eq!(program_gets(b"", b"ls\r\x1b[A\x01"), b"ls\r\x1b[A\x01");
-        assert_eq!(program_gets(b"\x1b[?1h", b"\x1b[A\x1bOB"), b"\x1bOA\x1bOB");
-        // A program that pushed kitty's disambiguate gets kitty's keys, from a legacy terminal:
-        // Ctrl-A and Escape are escapes, text stays text.
-        assert_eq!(program_gets(b"\x1b[>1u", b"a\x01"), b"a\x1b[97;5u");
-        assert_eq!(program_gets(b"\x1b[>1u", b"\x1b"), b"\x1b[27u");
-        // And from a kitty terminal, which tells Ctrl-I from Tab.
-        assert_eq!(
-            program_gets(b"\x1b[>1u", b"\x1b[105;5u\t"),
-            b"\x1b[105;5u\t"
-        );
-        // A legacy program gets a kitty terminal's keys as legacy bytes.
-        assert_eq!(program_gets(b"", b"\x1b[105;5u\x1b[1;5C"), b"\t\x1b[1;5C");
-        // xterm's modifyOtherKeys 2.
-        assert_eq!(program_gets(b"\x1b[>4;2m", b"\x01"), b"\x1b[27;5;97~");
-        // A pop restores the legacy keys.
-        assert_eq!(program_gets(b"\x1b[>1u\x1b[<u", b"\x01"), b"\x01");
-    }
-
-    #[test]
-    fn mouse_events_reach_a_program_in_its_mode_and_encoding() {
+    fn keys_mouse_and_focus_reach_a_program_as_it_asked_from_any_terminal() {
         // The user's terminal reports in SGR: a press at row 5, column 10, and its release.
         let click = &b"\x1b[<0;10;5M\x1b[<0;10;5m"[..];
         // A drag: motion with a button held, in 1002 and 1003 but not 1000; a hover, motion with
@@ -1015,7 +1003,27 @@ mod tests {
             &b"\x1b[?1002h\x1b[?1006h"[..],
         );
         for (mode, sent, gets) in [
-            (&b""[..], click, &b""[..]),
+            // Legacy bytes back to a legacy program, cursor keys in its cursor mode.
+            (&b""[..], &b"ls\r\x1b[A\x01"[..], &b"ls\r\x1b[A\x01"[..]),
+            (b"\x1b[?1h", b"\x1b[A\x1bOB", b"\x1bOA\x1bOB"),
+            // A program that pushed kitty's disambiguate gets kitty's keys, from a legacy
+            // terminal: Ctrl-A and Escape are escapes, text stays text.
+            (b"\x1b[>1u", b"a\x01", b"a\x1b[97;5u"),
+            (b"\x1b[>1u", b"\x1b", b"\x1b[27u"),
+            // And from a kitty terminal, which tells Ctrl-I from Tab.
+            (b"\x1b[>1u", b"\x1b[105;5u\t", b"\x1b[105;5u\t"),
+            // A legacy program gets a kitty terminal's keys as legacy bytes.
+            (b"", b"\x1b[105;5u\x1b[1;5C", b"\t\x1b[1;5C"),
+            // xterm's modifyOtherKeys 2.
+            (b"\x1b[>4;2m", b"\x01", b"\x1b[27;5;97~"),
+            // A pop restores the legacy keys.
+            (b"\x1b[>1u\x1b[<u", b"\x01", b"\x01"),
+            // Focus, only to a program that asked.
+            (b"", b"\x1b[I\x1b[O", b""),
+            (b"\x1b[?1004h", b"\x1b[I\x1b[O", b"\x1b[I\x1b[O"),
+            (b"\x1b[?1004h\x1b[?1004l", b"\x1b[I", b""),
+            // The mouse.
+            (b"", click, b""),
             (b"\x1b[?9h", click, b"\x1b[M *%"),
             (b"\x1b[?1000h", click, b"\x1b[M *%\x1b[M#*%"),
             (sgr_1000, click, click),
@@ -1036,16 +1044,6 @@ mod tests {
         ] {
             assert_eq!(program_gets(mode, sent), gets, "{mode:?} {sent:?}");
         }
-    }
-
-    #[test]
-    fn focus_reaches_only_a_program_that_asked() {
-        assert_eq!(program_gets(b"", b"\x1b[I\x1b[O"), b"");
-        assert_eq!(
-            program_gets(b"\x1b[?1004h", b"\x1b[I\x1b[O"),
-            b"\x1b[I\x1b[O"
-        );
-        assert_eq!(program_gets(b"\x1b[?1004h\x1b[?1004l", b"\x1b[I"), b"");
     }
 
     #[test]

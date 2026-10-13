@@ -12,15 +12,25 @@ use koh::events::{
     WireMouseAction, WireScheme,
 };
 use koh::proto::{
-    decode_frame, decode_server, encode_client, ClientDecoder, ClientMsg, Frame, FrameEncoder,
-    FrameNum, InputSeq, ServerMsg,
+    decode_frame_body, decode_history, decode_server, dictionary_for, encode_client, ClientDecoder,
+    ClientMsg, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg,
 };
 use koh::terminal::{
-    CellKind, CellText, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, RowDiff, Run,
-    ScreenDiff, ServerTerminal, Shift, Shifts, Size, TerminalScreen, TtyModes, WireCell, WireColor,
-    WireLink, WireModes, WireMouseEncoding, WireMouseMode, WireStyle,
+    CellKind, CellText, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, RowDiff,
+    RowEncodings, Run, ScreenDiff, ServerTerminal, Shift, Shifts, Size, TerminalScreen, TtyModes,
+    WireCell, WireColor, WireLink, WireModes, WireMouseEncoding, WireMouseMode, WireStyle,
 };
 use std::num::{NonZeroI16, NonZeroU16};
+
+/// A stream that must hold a frame on `screen`, the screen of its base, read as the client reads
+/// it.
+fn decode_frame(stream: &[u8], screen: &TerminalScreen) -> Option<Frame> {
+    let ServerMsg::Frame { base, rows, body } = decode_server(stream).ok()? else {
+        return None;
+    };
+    let dictionary = dictionary_for(base, screen, &rows, &mut RowEncodings::default());
+    decode_frame_body(base, &body, &dictionary).ok()
+}
 
 /// Terminal output exercising every part of a cell and of the side channels: runs, wide glyphs
 /// and their continuations, a combining mark, a cluster too long to keep inline, every colour kind
@@ -422,12 +432,10 @@ fn frames_and_history_round_trip_through_their_streams() {
     let encoded = FrameEncoder::default()
         .encode_history(&reply)
         .expect("encodes");
-    assert_eq!(
-        decode_server(&encoded).expect("decodes"),
-        ServerMsg::History(reply)
-    );
+    assert!(matches!(decode_server(&encoded), Ok(ServerMsg::History(_))));
+    assert_eq!(decode_history(&encoded[1..]).ok(), Some(reply));
     assert!(
-        decode_frame(&encoded, &TerminalScreen::default()).is_err(),
+        decode_frame(&encoded, &TerminalScreen::default()).is_none(),
         "history rows are not a frame"
     );
 }
@@ -493,10 +501,7 @@ fn server_messages_encode_as_pinned() {
         .encode_history(&reply)
         .expect("encodes");
     assert_eq!(stream.first(), Some(&1), "the history stream's tag");
-    assert_eq!(
-        decode_server(&stream).expect("decodes"),
-        ServerMsg::History(reply)
-    );
+    assert_eq!(decode_history(&stream[1..]).ok(), Some(reply));
 }
 
 #[test]

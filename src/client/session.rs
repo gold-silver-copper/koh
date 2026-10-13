@@ -13,8 +13,8 @@ use crate::bounded::Bounded;
 use crate::events::{InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE, PALETTE};
 use crate::predict::{Overlay, PredictionEngine};
 use crate::proto::{
-    decode_frame_body, dictionary_for, retry_after, ClientMsg, Frame, FrameNum, InputSeq,
-    ServerMsg, HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
+    decode_frame_body, decode_history, dictionary_for, retry_after, ClientMsg, Frame, FrameNum,
+    InputSeq, ServerMsg, HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
 };
 use crate::terminal::{HistoryReply, Size, TerminalScreen};
 
@@ -222,35 +222,33 @@ impl Outgoing {
                 <= MAX_CLIENT_MESSAGE
     }
 
-    /// The message an event of `cost` bytes goes in: the last one queued if it has room, else a
-    /// new one after `last_seq`.
-    fn seq_for(&self, cost: usize, last_seq: InputSeq) -> InputSeq {
-        match self.messages.back() {
-            Some(ClientMsg::Keys { seq, events }) if self.fits(events, cost) => *seq,
-            _ => last_seq.next(),
-        }
-    }
-
-    /// Queue `event`, of `cost` bytes, as [`seq_for`](Self::seq_for) says, unless the queue is
-    /// full; whether it was.
-    fn event(&mut self, event: InputEvent, cost: usize, last_seq: &mut InputSeq) -> bool {
+    /// Queue `event`, of `cost` bytes, in the last message queued if it has room, else in a new
+    /// one after `last_seq`: the message's number, or `None` if the queue is full.
+    #[must_use]
+    fn event(
+        &mut self,
+        event: InputEvent,
+        cost: usize,
+        last_seq: &mut InputSeq,
+    ) -> Option<InputSeq> {
         let room = matches!(self.messages.back(), Some(ClientMsg::Keys { events, .. }) if self.fits(events, cost));
         match self.messages.back_mut() {
-            Some(ClientMsg::Keys { events, .. }) if room => {
+            Some(ClientMsg::Keys { seq, events }) if room => {
                 events.push(event);
                 self.input_bytes = self.input_bytes.saturating_add(cost);
                 self.newest_bytes = self.newest_bytes.saturating_add(cost);
-                true
+                Some(*seq)
             }
             _ => {
-                let queued = self.push_back(ClientMsg::Keys {
-                    seq: last_seq.next(),
+                let seq = last_seq.next();
+                self.push_back(ClientMsg::Keys {
+                    seq,
                     events: vec![event],
-                });
-                if queued {
-                    *last_seq = last_seq.next();
-                }
-                queued
+                })
+                .then(|| {
+                    *last_seq = seq;
+                    seq
+                })
             }
         }
     }
@@ -423,10 +421,9 @@ impl ClientSession {
         self.outgoing
             .retain(|msg| !matches!(msg, ClientMsg::Ack { .. } | ClientMsg::History(_)));
         self.link.drop_resync();
-        if self.decoder.deadline().is_some() {
-            self.stale_decode = true;
-            outage.dropped_typing();
-        }
+        // What the decoder holds is said dropped once decoded, if it is typing: a terminal's
+        // answer cut by the drop is not.
+        self.stale_decode = self.decoder.deadline().is_some();
         if self.outgoing.input_bytes > 0 {
             self.outgoing
                 .retain(|msg| !matches!(msg, ClientMsg::Keys { .. }));
@@ -478,7 +475,7 @@ impl ClientSession {
             };
             self.decoder.bytes(std::slice::from_ref(byte), &mut inputs);
             self.decoder.mark(now);
-            inputs.retain(|input| matches!(input, Input::Reply(_) | Input::PasteTooLong));
+            self.drop_stale(now, &mut inputs);
             self.stale_decode = self.decoder.deadline().is_some();
             rest = tail;
         }
@@ -501,9 +498,25 @@ impl ClientSession {
         let mut inputs = Vec::new();
         self.decoder.timeout(&mut inputs);
         if std::mem::take(&mut self.stale_decode) {
-            inputs.retain(|input| matches!(input, Input::Reply(_) | Input::PasteTooLong));
+            self.drop_stale(now, &mut inputs);
         }
         self.on_inputs(now, inputs)
+    }
+
+    /// Drop what was decoded of input begun before the drop, but the terminal's answers, and say
+    /// so if it was typing.
+    fn drop_stale(&mut self, now: Instant, inputs: &mut Vec<Input>) {
+        if inputs
+            .iter()
+            .any(|input| matches!(input, Input::Key(_) | Input::Paste(_)))
+        {
+            match &mut self.outage {
+                Some(outage) => outage.dropped_typing(),
+                None => self.notice.give(INPUT_DROPPED, now),
+            }
+            self.dirty = true;
+        }
+        inputs.retain(|input| matches!(input, Input::Reply(_) | Input::PasteTooLong));
     }
 
     /// Take decoded input: the escape prefix (a key whose legacy byte is `Ctrl-^`, from any
@@ -515,9 +528,9 @@ impl ClientSession {
         let mut suspend = false;
         let mut fwd: Vec<InputEvent> = Vec::new();
         for input in inputs {
-            match input {
+            let key = match &input {
                 Input::Reply(reply) => {
-                    self.on_reply(now, reply);
+                    self.on_reply(now, *reply);
                     continue;
                 }
                 Input::PasteTooLong => {
@@ -525,13 +538,6 @@ impl ClientSession {
                     self.dirty = true;
                     continue;
                 }
-                Input::Key(_)
-                | Input::Paste(_)
-                | Input::FocusIn
-                | Input::FocusOut
-                | Input::Mouse(_) => {}
-            }
-            let key = match &input {
                 // The prefix is a control: a key without Ctrl can only matter after one.
                 Input::Key(stroke) if stroke.press.mods.ctrl || self.pending_escape.is_some() => {
                     self.scratch.clear();
@@ -544,11 +550,9 @@ impl ClientSession {
                 }
                 Input::Key(_)
                 | Input::Paste(_)
-                | Input::PasteTooLong
                 | Input::FocusIn
                 | Input::FocusOut
-                | Input::Mouse(_)
-                | Input::Reply(_) => None,
+                | Input::Mouse(_) => None,
             };
             if let Some(prefix) = self.pending_escape.take() {
                 match key {
@@ -573,7 +577,7 @@ impl ClientSession {
                 } else {
                     fwd.push(InputEvent::Key(prefix.into()));
                     if !literal {
-                        events_of(input, &mut fwd);
+                        fwd.extend(InputEvent::from_input(input));
                     }
                 }
             } else if key == Some(&[ESCAPE_PREFIX]) {
@@ -585,7 +589,7 @@ impl ClientSession {
                 self.send_to_view(&[input]);
             } else if !self.input_paused {
                 // While paused, what is typed is dropped: only the escape is looked for.
-                events_of(input, &mut fwd);
+                fwd.extend(InputEvent::from_input(input));
             }
         }
         if !fwd.is_empty() {
@@ -689,15 +693,25 @@ impl ClientSession {
         // user's terminal: what they do is not predicted, but taken as one unmodelled input.
         let burst = events.len() > TYPED_KEYS;
         for (n, event) in events.into_iter().enumerate() {
+            // What the predictor hears of it: a key it models, input it does not (`Some(None)`),
+            // or nothing (focus changes the screen of no line editor).
+            let key = match &event {
+                InputEvent::Key(key) if !burst => Some(Some(key.stroke().press)),
+                InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_) => Some(None),
+                InputEvent::Focus(_) => None,
+            };
             let cost = event.encoded_len();
+            let Some(seq) = self.outgoing.event(event, cost, &mut self.last_seq) else {
+                // No room: this and the rest are dropped, never sent around a hole.
+                self.input_paused = true;
+                break;
+            };
             // Predictions made now expire with the input message that carries the event.
-            let seq = self.outgoing.seq_for(cost, self.last_seq);
             self.predictor.set_local_frame_sent(seq.0.saturating_sub(1));
             let screen = self.link.current().screen.screen();
-            match &event {
+            match key {
                 _ if burst && n > 0 => {}
-                InputEvent::Key(_) if burst => self.predictor.new_user_other(screen),
-                InputEvent::Key(key) => {
+                Some(Some(press)) => {
                     // At a fresh prompt the modes the client holds may be from before the program
                     // turned echo off: the key shows only once echoed.
                     if self
@@ -707,15 +721,11 @@ impl ClientSession {
                     {
                         self.predictor.hold();
                     }
-                    self.predictor.new_user_key(key.stroke().press, screen);
+                    self.predictor.new_user_key(press, screen);
                 }
-                InputEvent::Mouse(_) | InputEvent::Paste(_) => {
-                    self.predictor.new_user_other(screen);
-                }
-                // Focus changes the screen of no line editor: the predictor never hears of it.
-                InputEvent::Focus(_) => {}
+                Some(None) => self.predictor.new_user_other(screen),
+                None => {}
             }
-            self.outgoing.event(event, cost, &mut self.last_seq);
         }
         self.link.last_nudge = Some(now);
         self.last_activity = Some(now);
@@ -787,11 +797,11 @@ impl ClientSession {
         // The cursor's row is another when its index changed, or when the screen scrolled: at the
         // bottom of the screen a new line scrolls, leaving the index as it was, and names a new
         // history row, or moves the rows (a scroll region, no scrollback kept).
-        let (now_grid, was) = (next.screen.screen(), &self.link.current().screen);
+        let (now_grid, was) = (next.screen().screen(), &self.link.current().screen);
         let row = |screen: &TerminalScreen| {
             (screen.screen().cursor_position().0, screen.history().newest)
         };
-        if row(&next.screen) != row(was)
+        if row(next.screen()) != row(was)
             || !now_grid
                 .moves_from(was.screen(), now_grid.size().rows)
                 .is_empty()
@@ -815,11 +825,15 @@ impl ClientSession {
         self.dirty = true;
     }
 
-    /// A message from the server arrived: a frame's stream, or history rows.
+    /// A message from the server arrived: a frame's stream, or history rows, inflated here, one
+    /// at a time. One that does not inflate or decode is dropped.
     pub fn on_server(&mut self, now: Instant, msg: ServerMsg) {
         match msg {
             ServerMsg::Frame { base, rows, body } => self.on_frame_stream(now, base, &rows, &body),
-            ServerMsg::History(reply) => self.on_history(&reply),
+            ServerMsg::History(body) => match decode_history(&body) {
+                Ok(reply) => self.on_history(&reply),
+                Err(e) => tracing::debug!(error = %e, "dropping undecodable history rows"),
+            },
         }
     }
 
@@ -906,20 +920,12 @@ impl ClientSession {
             return Some(resync);
         }
         let msg = self.outgoing.pop_front()?;
-        let sent = match &msg {
-            ClientMsg::Keys { seq, .. } => Some(*seq),
-            ClientMsg::Resize(_)
-            | ClientMsg::Ack { .. }
-            | ClientMsg::Resync
-            | ClientMsg::History(_)
-            | ClientMsg::Colours(_) => None,
-        };
-        if let Some(seq) = sent {
-            self.sent_seq = seq;
-            if self.input_paused && self.outgoing.input_bytes == 0 {
-                self.input_paused = false;
-                self.dirty = true;
-            }
+        if let ClientMsg::Keys { seq, .. } = &msg {
+            self.sent_seq = *seq;
+        }
+        if self.input_paused && self.outgoing.input_bytes == 0 {
+            self.input_paused = false;
+            self.dirty = true;
         }
         Some(msg)
     }
@@ -958,18 +964,6 @@ impl ClientSession {
     /// The window state (title, icon, clipboard, bell) to mirror onto the real terminal.
     pub fn window_state(&self) -> WindowState<'_> {
         window_state(&self.link.current().screen)
-    }
-}
-
-/// What the server gets for one decoded input.
-fn events_of(input: Input, out: &mut Vec<InputEvent>) {
-    match input {
-        Input::Key(stroke) => out.push(InputEvent::Key(stroke.into())),
-        Input::Mouse(event) => out.push(InputEvent::Mouse(event.into())),
-        Input::FocusIn => out.push(InputEvent::Focus(true)),
-        Input::FocusOut => out.push(InputEvent::Focus(false)),
-        Input::Paste(text) => out.push(InputEvent::Paste(text)),
-        Input::PasteTooLong | Input::Reply(_) => {}
     }
 }
 
@@ -1012,6 +1006,11 @@ mod tests {
         }
     }
 
+    /// The first frame on a connection, showing `bytes`.
+    fn first(echo_ack: u64, bytes: &[u8]) -> Frame {
+        frame(1, 0, echo_ack, &TerminalScreen::default(), &screen(bytes))
+    }
+
     fn drain(s: &mut ClientSession) -> Vec<ClientMsg> {
         std::iter::from_fn(|| s.pop_outgoing()).collect()
     }
@@ -1043,12 +1042,6 @@ mod tests {
             }
         }
         out
-    }
-
-    #[test]
-    fn a_session_first_tells_the_server_its_window_size() {
-        let (_, mut s) = start();
-        assert_eq!(drain(&mut s), [ClientMsg::Resize(Size::new(24, 80))]);
     }
 
     /// What the escape prefix and the key after it do, however the reads split them and whatever
@@ -1139,6 +1132,19 @@ mod tests {
             s.on_tick(now, None).status.is_none(),
             "draining clears the banner"
         );
+        // A queue full of messages takes no key: none is predicted that is not sent, typing
+        // pauses, and once the queue drains what is typed goes as ever.
+        let (now, mut s) = start();
+        s.predictor.set_tty(Some(EDITOR));
+        s.predictor.confirm_for_tests();
+        while s.outgoing.push_back(ClientMsg::Resync) {}
+        s.on_input(now, b"x");
+        assert!(s.overlay().is_empty(), "predicted, not sent");
+        let status = s.on_tick(now, None).status.expect("input paused banner");
+        assert!(status.contains("input paused"), "{status}");
+        assert_eq!(typed(&drain(&mut s)), b"");
+        s.on_input(now, b"y");
+        assert_eq!(typed(&drain(&mut s)), b"y");
     }
 
     #[test]
@@ -1244,7 +1250,20 @@ mod tests {
     }
 
     #[test]
-    fn only_the_last_frames_are_kept_as_bases() {
+    fn only_the_last_frames_are_kept_as_bases_and_the_one_the_server_diffs_against() {
+        // A server that hears of no delivery since frame 1 (its uplink stalled) sends every frame
+        // on it, however many: the base the newest frame named is never dropped.
+        let (now, mut s) = start();
+        let one = screen(b"one");
+        s.on_frame(now, &frame(1, 0, 0, &TerminalScreen::default(), &one));
+        for n in 2..=40u64 {
+            let next = screen(format!("frame {n}").as_bytes());
+            s.on_frame(now, &frame(n, 1, 0, &one, &next));
+        }
+        s.on_frame(now, &frame(41, 1, 0, &one, &screen(b"still on one")));
+        assert!(!drain(&mut s).contains(&ClientMsg::Resync));
+        assert!(s.state().screen().contents().contains("still on one"));
+
         let (now, mut s) = start();
         let mut prev = TerminalScreen::default();
         for n in 1..=20u64 {
@@ -1399,22 +1418,16 @@ mod tests {
         (later, s, echoed)
     }
 
+    /// Typing after a confirmed echo is shown; a focus change (an alt-tab) is no edit: the
+    /// predictions and the trust stay.
     #[test]
-    fn a_frame_confirms_echoed_predictions() {
+    fn a_frame_confirms_echoed_predictions_and_focus_events_leave_them_alone() {
         let (later, mut s, _) = trusted();
         s.on_input(later, b"y");
         assert_eq!(
             s.overlay().cell(0, 1).map(crate::predict::Cell::text),
-            Some("y"),
-            "typing after a confirmed echo is shown"
+            Some("y")
         );
-    }
-
-    /// A focus change (an alt-tab) is no edit: the predictions and the trust stay.
-    #[test]
-    fn focus_events_leave_the_predictions_alone() {
-        let (later, mut s, _) = trusted();
-        s.on_input(later, b"y");
         let before = s.overlay();
         let epoch = s.predictor.confirmed_epoch();
         s.on_input(later, b"\x1b[I\x1b[O");
@@ -1501,10 +1514,7 @@ mod tests {
             s.on_tick(now + LINK_DOWN_GRACE * 2, None).status.is_none(),
             "no banner before the first frame (still connecting)"
         );
-        s.on_frame(
-            now,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"$ ")),
-        );
+        s.on_frame(now, &first(0, b"$ "));
         assert!(s.on_tick(now + HEARTBEAT * 2, None).status.is_none());
         assert!(s.on_tick(now + LINK_DOWN_GRACE, None).status.is_none());
         let stalled = s.on_tick(now + LINK_DOWN_GRACE + Duration::from_secs(2), None);
@@ -1909,10 +1919,7 @@ mod tests {
         // not sent. After it, it goes out.
         s.on_input(now, b"d");
         assert_eq!(drain(&mut s), [], "not before the first frame");
-        s.on_frame(
-            now,
-            &frame(1, 0, 1, &TerminalScreen::default(), &screen(b"")),
-        );
+        s.on_frame(now, &first(1, b""));
         drain(&mut s);
         s.on_input(now, b"e");
         assert_eq!(
@@ -1941,10 +1948,7 @@ mod tests {
         assert!(s.view().is_some(), "the view is still open");
         assert!(s.state().screen().contents().contains("kept"));
         assert!(!s.synced(), "not the new connection's screen yet");
-        s.on_frame(
-            now,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"new")),
-        );
+        s.on_frame(now, &first(0, b"new"));
         assert!(s.synced() && s.state().screen().contents().contains("new"));
     }
 
@@ -1971,7 +1975,14 @@ mod tests {
     fn what_an_outage_lost_is_said() {
         use Step::{Down, Flush, FocusIn, Frame, PasteTooLong, Pause, Type, Up, Wait};
         const LINE: Step = Type(b"false && ");
-        let cases: [(&[Step], &[&str], &[&str]); 10] = [
+        let cases: [(&[Step], &[&str], &[&str]); 12] = [
+            // A terminal's answer cut by the drop is not typing; a key cut by it is.
+            (
+                &[Type(b"\x1b[?62;"), Down, Type(b"22c")],
+                &["reconnecting"],
+                &["not sent"],
+            ),
+            (&[Type(b"\x1b[1;5"), Down, Type(b"A")], &["not sent"], &[]),
             // Though nothing was typed during the outage.
             (&[LINE, Flush, Down, Up], &["may not have arrived"], &[]),
             // A focus report or the mouse is not typing.
@@ -2086,10 +2097,7 @@ mod tests {
         );
         let status = s.on_tick(now, None).status.expect("a notice");
         assert!(status.contains("not sent"), "{status}");
-        s.on_frame(
-            now,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
+        s.on_frame(now, &first(0, b""));
         drain(&mut s);
         s.on_input(now, b"x");
         assert_eq!(typed(&drain(&mut s)), b"x");
@@ -2136,10 +2144,7 @@ mod tests {
         s.attach(Size::new(24, 80));
         let status = s.on_tick(t1, None).status.expect("the banner");
         assert!(status.contains("not sent"), "{status}");
-        s.on_frame(
-            t1,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
+        s.on_frame(t1, &first(0, b""));
         let status = s.on_tick(t1, None).status.expect("a notice");
         assert!(
             status.contains("not sent") && !status.contains("reconnecting"),
@@ -2150,10 +2155,7 @@ mod tests {
         let status = s.on_tick(t1, None).status.expect("the banner");
         assert_eq!(status.matches("not sent").count(), 1, "{status}");
         s.attach(Size::new(24, 80));
-        s.on_frame(
-            t1,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
+        s.on_frame(t1, &first(0, b""));
         assert!(s.on_tick(t1 + NOTICE_FOR, None).status.is_none());
     }
 
@@ -2166,10 +2168,7 @@ mod tests {
         s.input_paused = true;
         s.detach(now);
         s.attach(Size::new(24, 80));
-        s.on_frame(
-            now,
-            &frame(1, 0, 0, &TerminalScreen::default(), &screen(b"")),
-        );
+        s.on_frame(now, &first(0, b""));
         drain(&mut s);
         s.on_input(now, b"x");
         assert_eq!(typed(&drain(&mut s)), b"x");

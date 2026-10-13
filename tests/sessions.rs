@@ -524,7 +524,11 @@ fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Resu
 fn a_resize_waits_for_no_typing_the_program_has_not_read() -> anyhow::Result<()> {
     runtime()?.block_on(async {
         let secret = generate_secret_key()?;
-        let (addr, shutdown, serve) = loopback_serve(secret.public(), &["sleep", "30"]).await?;
+        let (addr, shutdown, serve) = loopback_serve(
+            secret.public(),
+            &["sh", "-c", "stty raw -echo; exec sleep 30"],
+        )
+        .await?;
         let mut client = RawClient::connect(addr, secret).await?;
         // Far more than the PTY's writer, the session and the connection take, on the input
         // stream, by a task of its own: its writes stall once the server stops reading it. That is
@@ -533,19 +537,48 @@ fn a_resize_waits_for_no_typing_the_program_has_not_read() -> anyhow::Result<()>
         let control = client.conn.open_uni().await?;
         control.set_priority(1)?;
         let mut input = std::mem::replace(&mut client.send, control);
-        let typing = koh_testkit::spawn(async move {
-            for seq in 1..=12 {
-                let paste = koh::events::InputEvent::Paste("x".repeat(1000 * 1024));
-                let msg = ClientMsg::Keys {
-                    seq: InputSeq(seq),
-                    events: vec![paste],
-                };
-                if input.write_all(&encode_client(&msg)?).await.is_err() {
-                    break;
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let typing = koh_testkit::spawn({
+            let written = std::sync::Arc::clone(&written);
+            async move {
+                // Pastes fill the PTY's writer, so the session takes no more input; keys, each with
+                // colours so that none merges with the one before, fill its queue and what the
+                // connection holds for it; then more pastes than QUIC lets wait unread.
+                for seq in 1..=1010 {
+                    let event = if (3..=1000).contains(&seq) {
+                        koh::events::InputEvent::Paste("k".to_owned())
+                    } else {
+                        koh::events::InputEvent::Paste("x".repeat(1000 * 1024))
+                    };
+                    let mut bytes = encode_client(&ClientMsg::Keys {
+                        seq: InputSeq(seq),
+                        events: vec![event],
+                    })?;
+                    bytes.extend(encode_client(&ClientMsg::Colours(
+                        koh::events::WireColours::default(),
+                    ))?);
+                    for chunk in bytes.chunks(16 * 1024) {
+                        if input.write_all(chunk).await.is_err() {
+                            return anyhow::Ok(());
+                        }
+                        written.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
+                anyhow::Ok(())
             }
-            anyhow::Ok(())
         });
+        // The resize goes once the input stream has stalled, its writes held up with more to go:
+        // the server no longer reads it.
+        let mut seen = usize::MAX;
+        loop {
+            client.pump(200).await?;
+            let now = written.load(std::sync::atomic::Ordering::Relaxed);
+            anyhow::ensure!(!typing.is_finished(), "the input stream never stalled");
+            if now == seen {
+                break;
+            }
+            seen = now;
+        }
         let size = Size::new(30, 100);
         client.write(&ClientMsg::Resize { n: 1, size }).await?;
         let resized = |c: &RawClient| c.screen().is_some_and(|s| s.size() == size);

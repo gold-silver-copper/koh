@@ -109,11 +109,7 @@ impl RowEncodings {
             .or_else(|| self.kept.remove(&key))
             .filter(|kept| {
                 kept.wrapped == wrapped
-                    && match (&kept.links, &links) {
-                        (None, None) => true,
-                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                        (None, Some(_)) | (Some(_), None) => false,
-                    }
+                    && kept.links.as_ref().map(Arc::as_ptr) == links.as_ref().map(Arc::as_ptr)
             });
         let encoding = if let Some(kept) = hit {
             kept
@@ -179,7 +175,7 @@ fn capped_bytes(s: &str, max: usize) -> String {
 }
 
 /// The screen: the cell grid plus the out-of-band channels.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerminalScreen {
     grid: Grid,
     /// Window title (OSC 2).
@@ -196,21 +192,6 @@ pub struct TerminalScreen {
     history: HistoryMark,
     /// How the PTY takes typed keys, if known.
     tty: Option<TtyModes>,
-}
-
-impl Default for TerminalScreen {
-    fn default() -> Self {
-        Self {
-            grid: Grid::blank(DEFAULT_SIZE),
-            title: String::new(),
-            icon: String::new(),
-            clipboard: String::new(),
-            bell_count: 0,
-            exit_code: None,
-            history: HistoryMark { newest: 0, len: 0 },
-            tty: None,
-        }
-    }
 }
 
 impl TerminalScreen {
@@ -369,7 +350,7 @@ impl TerminalScreen {
         let size = self.size();
         (size == other.size()).then(|| {
             (0..size.rows)
-                .filter(|&r| !self.grid.row_eq(&other.grid, r))
+                .filter(|&r| !self.grid.same_row(r, &other.grid, r))
                 .count()
         })
     }
@@ -458,18 +439,14 @@ impl WireStyle {
 
     /// The style with exactly `bits`, or `None` if any is not a defined bit, both blinks are, the
     /// underline's style is none defined, or a style is given with no underline.
-    pub const fn new(bits: u16) -> Option<Self> {
+    pub fn new(bits: u16) -> Option<Self> {
         let blinks = Self::BLINK_SLOW | Self::BLINK_RAPID;
         let style = bits & Self::UNDERLINE_STYLE;
-        if bits & !Self::ALL == 0
+        (bits & !Self::ALL == 0
             && bits & blinks != blinks
             && style <= Self::UNDERLINE_DASHED
-            && (style == 0 || bits & Self::UNDERLINE != 0)
-        {
-            Some(Self(bits))
-        } else {
-            None
-        }
+            && (style == 0 || bits & Self::UNDERLINE != 0))
+            .then_some(Self(bits))
     }
 
     pub const fn bits(self) -> u16 {
@@ -792,24 +769,18 @@ struct RawRun {
 impl TryFrom<RawRun> for Run {
     type Error = &'static str;
 
-    fn try_from(raw: RawRun) -> Result<Self, Self::Error> {
-        let text = raw.cell.text.as_str();
-        let fits = match raw.cell.kind {
+    fn try_from(RawRun { count, cell }: RawRun) -> Result<Self, Self::Error> {
+        let text = cell.text.as_str();
+        let fits = match cell.kind {
             CellKind::Narrow | CellKind::Wide | CellKind::Continuation => {
                 text.len() <= fux_vt::CLUSTER_CAPACITY
             }
             CellKind::Chars | CellKind::WideChars => {
-                text.chars().count() == usize::from(raw.count.get())
+                text.chars().count() == usize::from(count.get())
             }
         };
-        if fits {
-            Ok(Self {
-                count: raw.count,
-                cell: raw.cell,
-            })
-        } else {
-            Err("a run whose text does not fit its kind")
-        }
+        fits.then_some(Self { count, cell })
+            .ok_or("a run whose text does not fit its kind")
     }
 }
 
@@ -826,13 +797,7 @@ impl Run {
     /// Add one more cell. `false` if the run already holds `u16::MAX` cells, the most `count`
     /// can say; the caller then starts a new run.
     fn extend(&mut self) -> bool {
-        match self.count.checked_add(1) {
-            Some(count) => {
-                self.count = count;
-                true
-            }
-            None => false,
-        }
+        self.count.checked_add(1).map(|c| self.count = c).is_some()
     }
 }
 
@@ -857,15 +822,10 @@ struct RawLink {
 impl TryFrom<RawLink> for WireLink {
     type Error = &'static str;
 
-    fn try_from(raw: RawLink) -> Result<Self, Self::Error> {
-        if raw.uri.len() <= fux_vt::URI_LIMIT && raw.id.len() <= fux_vt::ID_LIMIT {
-            Ok(Self {
-                uri: raw.uri,
-                id: raw.id,
-            })
-        } else {
-            Err("a hyperlink past fux-vt's limits")
-        }
+    fn try_from(RawLink { uri, id }: RawLink) -> Result<Self, Self::Error> {
+        (uri.len() <= fux_vt::URI_LIMIT && id.len() <= fux_vt::ID_LIMIT)
+            .then_some(Self { uri, id })
+            .ok_or("a hyperlink past fux-vt's limits")
     }
 }
 
@@ -910,16 +870,6 @@ impl RowDiff {
             runs,
             links,
         }
-    }
-
-    /// The row these runs decode to, exactly `cols` cells, with its links (see [`cells_of`]).
-    fn decode(&self, cols: u16) -> Option<(Cells, Option<Arc<RowLinks>>)> {
-        cells_of(&self.runs, &self.links, cols)
-    }
-
-    /// The bytes of hyperlinks this row carries.
-    fn link_bytes(&self) -> usize {
-        link_bytes(&self.links)
     }
 }
 
@@ -1415,7 +1365,7 @@ impl TerminalScreen {
             let same = if resized {
                 !wrapped && cells.iter().all(is_blank)
             } else {
-                self.grid.row_eq(base_grid, r)
+                self.grid.same_row(r, base_grid, r)
             };
             (!same).then(|| {
                 RowDiff::of(
@@ -1454,33 +1404,24 @@ impl TerminalScreen {
             return Err(Malformed);
         }
         // A hostile server's links are bounded: more than a diff may carry drops the frame.
-        let link_bytes = diff
-            .rows
-            .iter()
-            .map(RowDiff::link_bytes)
-            .fold(0_usize, usize::saturating_add);
-        if link_bytes > MAX_LINK_BYTES {
+        let links = (diff.rows.iter()).fold(0_usize, |sum, row| {
+            sum.saturating_add(link_bytes(&row.links))
+        });
+        if links > MAX_LINK_BYTES {
             return Err(Malformed);
         }
         // Every row decodes before any is committed, in the diff's order. At most `rows × cols`
         // cells, which the clamp bounds.
-        let mut staged = Vec::with_capacity(diff.rows.len());
-        for row in &diff.rows {
-            let Some(cells) = (row.row < rows).then(|| row.decode(cols)).flatten() else {
-                return Err(Malformed);
-            };
-            staged.push(cells);
-        }
-        let grid = if diff.resize.is_some() {
+        let staged = (diff.rows.iter())
+            .map(|row| (row.row < rows).then(|| cells_of(&row.runs, &row.links, cols))?)
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Malformed)?;
+        self.grid = if diff.resize.is_some() {
             Grid::blank(Size { rows, cols })
         } else {
             // Rows move as shared cells, never copied.
-            let Some(moved) = self.grid.shifted(&diff.shifts) else {
-                return Err(Malformed);
-            };
-            moved
+            self.grid.shifted(&diff.shifts).ok_or(Malformed)?
         };
-        self.grid = grid;
         // Only the rows the diff carries are replaced; the rest stay shared with the base.
         for (row, (cells, links)) in diff.rows.iter().zip(staged) {
             self.grid
@@ -1503,15 +1444,9 @@ impl TerminalScreen {
         if let Some(clipboard) = &diff.clipboard {
             self.clipboard = capped_bytes(clipboard, MAXIMUM_CLIPBOARD_SIZE);
         }
-        if diff.exit_code.is_some() {
-            self.exit_code = diff.exit_code;
-        }
-        if let Some(history) = diff.history {
-            self.history = history;
-        }
-        if diff.tty.is_some() {
-            self.tty = diff.tty;
-        }
+        self.exit_code = diff.exit_code.or(self.exit_code);
+        self.history = diff.history.unwrap_or(self.history);
+        self.tty = diff.tty.or(self.tty);
         Ok(())
     }
 }
@@ -1519,10 +1454,6 @@ impl TerminalScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn screen_from(rows: u16, cols: u16, bytes: &[u8]) -> TerminalScreen {
-        TerminalScreen::from_bytes(rows, cols, bytes)
-    }
 
     fn wire_cell() -> impl proptest::strategy::Strategy<Value = WireCell> {
         use proptest::prelude::*;
@@ -1925,8 +1856,8 @@ mod tests {
     fn a_malformed_last_row_drops_the_rows_before_it_too() {
         // Every row is validated before any is committed: a malformed row leaves the prior screen
         // untouched, never half-applied, though the rows before it decoded fine.
-        let base = screen_from(24, 80, b"keep\r\nkeep\r\nkeep");
-        let target = screen_from(24, 80, b"one\r\ntwo\r\nthree");
+        let base = TerminalScreen::from_bytes(24, 80, b"keep\r\nkeep\r\nkeep");
+        let target = TerminalScreen::from_bytes(24, 80, b"one\r\ntwo\r\nthree");
         let good = target.diff_from(&base);
         assert_eq!(good.rows.len(), 3);
         let mutations: [fn(&mut ScreenDiff); 4] = [
@@ -2156,9 +2087,12 @@ mod tests {
         let before = emu.snapshot();
         emu.process(b"three");
         let after = emu.snapshot();
-        assert!(after.grid.row_shared(&before.grid, 0));
-        assert!(after.grid.row_shared(&before.grid, 1));
-        assert!(!after.grid.row_shared(&before.grid, 2), "the changed row");
+        assert!(after.grid.lines_share(0, &before.grid, 0));
+        assert!(after.grid.lines_share(1, &before.grid, 1));
+        assert!(
+            !after.grid.lines_share(2, &before.grid, 2),
+            "the changed row"
+        );
         assert_eq!(after.grid.row(2).map(Cells::len), Some(80));
         // Scrolled rows are shared too, wherever they moved: one screen and one row in all.
         for n in 0..30 {
@@ -2247,17 +2181,17 @@ mod tests {
 
     #[test]
     fn apply_replaces_only_the_rows_the_diff_carries() {
-        let base = screen_from(24, 80, b"one\r\ntwo\r\nthree");
-        let target = screen_from(24, 80, b"one\r\nTWO\r\nthree");
+        let base = TerminalScreen::from_bytes(24, 80, b"one\r\ntwo\r\nthree");
+        let target = TerminalScreen::from_bytes(24, 80, b"one\r\nTWO\r\nthree");
         let diff = target.diff_from(&base);
         assert_eq!(diff.rows.len(), 1);
         let mut client = base.clone();
         client.apply(&diff).unwrap();
         assert_eq!(client, target);
         for row in (0..24).filter(|&row| row != 1) {
-            assert!(client.grid.row_shared(&base.grid, row), "row {row}");
+            assert!(client.grid.lines_share(row, &base.grid, row), "row {row}");
         }
-        assert!(!client.grid.row_shared(&base.grid, 1));
+        assert!(!client.grid.lines_share(1, &base.grid, 1));
         assert_eq!(TerminalScreen::distinct_cells([&base, &client]), 25 * 80);
     }
 
@@ -2346,7 +2280,7 @@ mod tests {
 
     #[test]
     fn runs_of_characters_decode_to_the_cells_they_name() {
-        let target = screen_from(
+        let target = TerminalScreen::from_bytes(
             4,
             12,
             "ab\x1b[31mcd日本\x1b[m\u{1f468}\u{200d}\u{1f469}x".as_bytes(),
@@ -2407,7 +2341,7 @@ mod tests {
 
     #[test]
     fn identical_cells_are_run_length_encoded() {
-        let target = screen_from(24, 80, b"ab");
+        let target = TerminalScreen::from_bytes(24, 80, b"ab");
         let diff = target.diff_from(&TerminalScreen::default());
         assert_eq!(diff.rows.len(), 1, "only the changed row is sent");
         assert_eq!(

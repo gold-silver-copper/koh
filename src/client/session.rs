@@ -808,7 +808,8 @@ impl ClientSession {
             || !now_grid
                 .moves_from(was.screen(), now_grid.size().rows)
                 .is_empty()
-            || (self.link.echo_ack >= self.last_seq && !now_grid.row_eq(was.screen(), cursor_row))
+            || (self.link.echo_ack >= self.last_seq
+                && !now_grid.same_row(cursor_row, was.screen(), cursor_row))
         {
             self.link.output_at = Some(now);
         }

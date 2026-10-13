@@ -137,6 +137,15 @@ struct Row {
 }
 
 impl Row {
+    /// A copy of the live `row` (a blank one if `None`), `cols` wide, drawn in `palette`.
+    fn of(row: Option<&fux_vt::Row<'_>>, cols: u16, palette: Option<&Palette>) -> Self {
+        Self {
+            cells: exactly(row, cols, palette),
+            wrapped: row.is_some_and(fux_vt::Row::wrapped),
+            links: row.and_then(|row| RowLinks::of(row, cols)),
+        }
+    }
+
     /// A row of `cols` blank cells.
     fn blank(cols: u16) -> Self {
         Self {
@@ -386,6 +395,12 @@ pub struct Grid {
     modes: Modes,
 }
 
+impl Default for Grid {
+    fn default() -> Self {
+        Self::blank(super::DEFAULT_SIZE)
+    }
+}
+
 impl Grid {
     /// A blank grid (default cells, cursor home, default modes). Every row shares one allocation.
     pub fn blank(size: Size) -> Self {
@@ -422,23 +437,14 @@ impl Grid {
             let mut by_id = None;
             let lines: Vec<Row> = (0..usize::from(rows))
                 .map(|index| {
-                    let Some(row) = live.get(index) else {
-                        return Row {
-                            cells: exactly(None, cols, cache.palette.as_ref()),
-                            wrapped: false,
-                            links: None,
-                        };
-                    };
-                    let (cells, links) = cache.cells(index, row, &mut by_id).unwrap_or_else(|| {
-                        (
-                            exactly(Some(row), cols, cache.palette.as_ref()),
-                            RowLinks::of(row, cols),
-                        )
-                    });
-                    Row {
-                        cells,
-                        wrapped: row.wrapped(),
-                        links,
+                    let row = live.get(index);
+                    match row.and_then(|row| cache.cells(index, row, &mut by_id)) {
+                        Some((cells, links)) => Row {
+                            cells,
+                            wrapped: row.is_some_and(fux_vt::Row::wrapped),
+                            links,
+                        },
+                        None => Row::of(row, cols, cache.palette.as_ref()),
                     }
                 })
                 .collect();
@@ -446,9 +452,15 @@ impl Grid {
             cache.lines = lines.into();
         }
         cache.mark = Some(screen.mark());
+        Self::live(screen, Arc::clone(&cache.lines))
+    }
+
+    /// `lines` with `screen`'s size, cursor and modes.
+    fn live(screen: &fux_vt::Screen, lines: Arc<[Row]>) -> Self {
+        let (rows, cols) = screen.size().into();
         Self {
             size: Size { rows, cols },
-            lines: Arc::clone(&cache.lines),
+            lines,
             cursor: screen.cursor_position(),
             modes: Modes::of(screen),
         }
@@ -458,28 +470,16 @@ impl Grid {
     /// the server's emulator shows them, with its cursor and modes: what a client's scrollback
     /// view at `offset` must show, built without the row cache.
     pub(super) fn window_of(screen: &fux_vt::Screen, offset: usize) -> Self {
-        let (rows, cols) = screen.size().into();
+        let (rows, cols): (u16, u16) = screen.size().into();
         let window = screen
             .window()
             .row(0)
             .map_or_else(|| screen.window(), |row| row.up(offset).window());
         let palette = Palette::of(screen);
-        let lines: Vec<Row> = (0..rows)
-            .map(|r| {
-                let row = window.row(r);
-                Row {
-                    cells: exactly(row.as_ref(), cols, palette.as_ref()),
-                    wrapped: row.is_some_and(|row| row.wrapped()),
-                    links: row.as_ref().and_then(|row| RowLinks::of(row, cols)),
-                }
-            })
+        let lines = (0..rows)
+            .map(|r| Row::of(window.row(r).as_ref(), cols, palette.as_ref()))
             .collect();
-        Self {
-            size: Size { rows, cols },
-            lines: lines.into(),
-            cursor: screen.cursor_position(),
-            modes: Modes::of(screen),
-        }
+        Self::live(screen, lines)
     }
 
     /// The snapshot from the rows that changed since the last one alone, when nothing but rows'
@@ -506,11 +506,7 @@ impl Grid {
         let mut lines: Option<Vec<Row>> = None;
         for (index, row) in screen.dirty_live_rows_since(mark) {
             let at = usize::from(index);
-            let line = Row {
-                cells: exactly(Some(&row), cols, cache.palette.as_ref()),
-                wrapped: row.wrapped(),
-                links: RowLinks::of(&row, cols),
-            };
+            let line = Row::of(Some(&row), cols, cache.palette.as_ref());
             let lines = lines.get_or_insert_with(|| cache.lines.to_vec());
             *lines.get_mut(at)? = line;
             *cache.ids.get_mut(at)? = (row.id(), row.version());
@@ -519,12 +515,7 @@ impl Grid {
             cache.lines = lines.into();
         }
         cache.mark = Some(screen.mark());
-        Some(Self {
-            size: Size { rows, cols },
-            lines: Arc::clone(&cache.lines),
-            cursor: screen.cursor_position(),
-            modes: Modes::of(screen),
-        })
+        Some(Self::live(screen, Arc::clone(&cache.lines)))
     }
 
     pub const fn size(&self) -> Size {
@@ -556,13 +547,6 @@ impl Grid {
         self.lines
             .get(usize::from(row))
             .is_some_and(|line| line.wrapped)
-    }
-
-    /// Whether `row` is the same in `self` and `other`: the same cells and wrap flag. Rows that
-    /// share their cells compare without reading them.
-    pub fn row_eq(&self, other: &Self, row: u16) -> bool {
-        let row = usize::from(row);
-        self.lines.get(row) == other.lines.get(row)
     }
 
     /// Whether `row` is `other`'s `other_row` whole: the same cells, links and wrap flag. Rows
@@ -681,22 +665,12 @@ impl Grid {
         })
     }
 
-    /// Whether `row` shares its cells with `other`'s, rather than holding a copy.
-    #[cfg(test)]
-    pub(super) fn row_shared(&self, other: &Self, row: u16) -> bool {
-        self.lines_share(row, other, row)
-    }
-
     /// Whether `row` shares its cells with `other`'s `other_row`.
     #[cfg(test)]
     pub(super) fn lines_share(&self, row: u16, other: &Self, other_row: u16) -> bool {
-        match (
-            self.lines.get(usize::from(row)),
-            other.lines.get(usize::from(other_row)),
-        ) {
-            (Some(line), Some(other)) => line.shares(other),
-            _ => false,
-        }
+        (self.lines.get(usize::from(row)))
+            .zip(other.lines.get(usize::from(other_row)))
+            .is_some_and(|(line, other)| line.shares(other))
     }
 
     /// Whether `self` shares its whole row list with `other`, rather than holding its own.

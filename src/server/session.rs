@@ -47,8 +47,9 @@ const OUTPUT_CHUNKS_PER_SNAPSHOT: usize = 64;
 const DRAINED: Duration = TTY_TICK;
 
 /// How soon after output the PTY's modes are read again, then twice as long each time until a
-/// tick: a password prompt printed before echo goes off (PAM's order) is told without echo within
-/// moments of the prompt, not a tick later, while the client may still trust the echo it shows.
+/// tick. Output that is no echo of typing waits for that read before it is sent: a password prompt
+/// printed just before echo goes off (PAM's order) is never told with echo on, which the client
+/// would trust to show what is typed at it.
 const TTY_SETTLE: Duration = Duration::from_millis(5);
 
 /// The longest the output may go on after the exit was seen: a job left in the background writing
@@ -406,6 +407,9 @@ impl Session {
         tty_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // The next read of the PTY's modes after output, and the wait before the one after it.
         let mut settle: Option<(Instant, Duration)> = None;
+        // When typed input last reached the program, and whether output waits for the next read.
+        let mut typed_at: Option<Instant> = None;
+        let mut owed = false;
 
         loop {
             if let Some(exit) = ending.ended(Instant::now()).filter(|_| !exited) {
@@ -418,8 +422,11 @@ impl Session {
                 // Its output is read no more: a job left writing stops the reader, not wakes it.
                 pty_rx.close();
             }
-            if !exited {
+            if !exited && !pending.is_empty() {
                 pending.flush(|bytes| self.host.pty.write(bytes));
+                if pending.is_empty() {
+                    typed_at = Some(Instant::now());
+                }
             }
             let reading = !exited && ending.output_ended.is_none();
 
@@ -438,12 +445,19 @@ impl Session {
                         }
                         // Query answers go to the program, not the screen.
                         pending.reply(&self.host.emu.take_host_replies());
-                        if let Some(screen) =
-                            hold.after_output(&mut self.host.emu, std::time::Instant::now())
-                        {
-                            self.screens.send_replace(Arc::new(screen));
+                        let echo = typed_at.is_some_and(|at| now.saturating_duration_since(at) < TTY_SETTLE);
+                        if echo {
+                            owed = false;
+                            if let Some(screen) =
+                                hold.after_output(&mut self.host.emu, std::time::Instant::now())
+                            {
+                                self.screens.send_replace(Arc::new(screen));
+                            }
                         }
-                        settle = now.checked_add(TTY_SETTLE).map(|at| (at, TTY_SETTLE));
+                        // Output still waiting keeps its read: more of it does not put that off.
+                        if echo || !std::mem::replace(&mut owed, true) {
+                            settle = now.checked_add(TTY_SETTLE).map(|at| (at, TTY_SETTLE));
+                        }
                     } else {
                         ending.output_ended = Some(now);
                         ending.exit = ending.exit.or_else(|| self.host.exit().map(|e| (e, now)));
@@ -461,7 +475,14 @@ impl Session {
                         .checked_add(wait)
                         .filter(|_| wait < TTY_TICK)
                         .map(|at| (at, wait));
-                    if detached.is_none() && self.host.refresh_tty() && !hold.holding() {
+                    let changed = self.host.refresh_tty();
+                    if std::mem::take(&mut owed) {
+                        if let Some(screen) =
+                            hold.after_output(&mut self.host.emu, std::time::Instant::now())
+                        {
+                            self.screens.send_replace(Arc::new(screen));
+                        }
+                    } else if detached.is_none() && changed && !hold.holding() {
                         self.publish();
                     }
                 }

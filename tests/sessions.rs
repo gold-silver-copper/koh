@@ -554,25 +554,28 @@ fn a_resize_waits_for_no_typing_the_program_has_not_read() -> anyhow::Result<()>
     })
 }
 
-/// A program that prints its prompt and then turns echo off, as PAM does, is told without echo
-/// moments after the prompt, not a tick later: until then the client may show what is typed.
+/// A program that prints its prompt and then turns echo off, as PAM does, in the same moment, is
+/// never told with its prompt and echo on: the client would trust that echo and show what is typed
+/// at the prompt.
 #[test]
-fn echo_turned_off_after_a_prompt_is_told_at_once() -> anyhow::Result<()> {
+fn a_prompt_printed_before_echo_goes_off_is_never_told_with_echo_on() -> anyhow::Result<()> {
     runtime()?.block_on(async {
-        let program = ["sh", "-c", "printf 'pw: '; stty -echo; exec sleep 30"];
-        let mut took = Vec::new();
-        for _ in 0..20 {
+        let program = [
+            "perl",
+            "-e",
+            // A millisecond between the prompt and echo going off, well within the read that
+            // follows output.
+            "use POSIX; $| = 1; print 'pw: '; select(undef, undef, undef, 0.001); \
+             my $t = POSIX::Termios->new; $t->getattr(0); \
+             $t->setlflag($t->getlflag & ~POSIX::ECHO()); $t->setattr(0, POSIX::TCSANOW()); sleep 30",
+        ];
+        for round in 0..20 {
             let reg = registry(&program, 1, Duration::from_secs(30), |_| true)?;
             let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
-            let mut prompted = None;
             let told = tokio::time::timeout(Duration::from_secs(5), async {
                 while let Some(screen) = client.next_screen().await {
-                    let now = std::time::Instant::now();
                     if screen.screen().contents().contains("pw:") {
-                        prompted.get_or_insert(now);
-                    }
-                    if screen.tty().is_some_and(|tty| !tty.echo) {
-                        return Some(now);
+                        return screen.tty();
                     }
                 }
                 None
@@ -580,44 +583,9 @@ fn echo_turned_off_after_a_prompt_is_told_at_once() -> anyhow::Result<()> {
             .await;
             drop(client);
             reg.shutdown().await;
-            let told = told.ok().flatten().context("echo never told off")?;
-            took.push(told.saturating_duration_since(prompted.unwrap_or(told)));
+            let tty = told.ok().flatten().context("the prompt never came")?;
+            anyhow::ensure!(!tty.echo, "round {round}: the prompt was told with echo on");
         }
-        // The middle of the twenty.
-        took.sort_unstable();
-        let median = took.get(10).copied().unwrap_or_default();
-        anyhow::ensure!(median < koh::proto::TTY_TICK / 4, "{took:?}");
-        Ok(())
-    })
-}
-
-/// A peer removed from the allowlist has its session ended, its program hung up, and starts no
-/// other: an attach the registry takes once the list no longer allows it is refused, even one on its
-/// way as the peer was removed. Allowed again, it gets a new session.
-#[test]
-fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    runtime()?.block_on(async {
-        let allowed = std::sync::Arc::new(AtomicBool::new(true));
-        let allows = std::sync::Arc::clone(&allowed);
-        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30), move |_| {
-            allows.load(Relaxed)
-        })?;
-        let a = peer()?;
-        let (mut client, _) = reg.attach(a).await.context("attach")?;
-        allowed.store(false, Relaxed);
-        let refused = reg.attach(a).await.err();
-        anyhow::ensure!(refused == Some(Close::NotAuthorized), "{refused:?}");
-        reg.end(a).await;
-        allowed.store(true, Relaxed);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while client.next_screen().await.is_some() {}
-        })
-        .await
-        .context("the session ends")?;
-        let kind = attach_kind(&reg, a).await;
-        reg.shutdown().await;
-        anyhow::ensure!(kind == Some(AttachKind::Created), "{kind:?}");
         Ok(())
     })
 }

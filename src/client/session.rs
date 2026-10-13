@@ -787,11 +787,11 @@ impl ClientSession {
         // The cursor's row is another when its index changed, or when the screen scrolled: at the
         // bottom of the screen a new line scrolls, leaving the index as it was, and names a new
         // history row, or moves the rows (a scroll region, no scrollback kept).
-        let (now_grid, was) = (next.screen.screen(), &self.link.current().screen);
+        let (now_grid, was) = (next.screen().screen(), &self.link.current().screen);
         let row = |screen: &TerminalScreen| {
             (screen.screen().cursor_position().0, screen.history().newest)
         };
-        if row(&next.screen) != row(was)
+        if row(next.screen()) != row(was)
             || !now_grid
                 .moves_from(was.screen(), now_grid.size().rows)
                 .is_empty()
@@ -1244,7 +1244,20 @@ mod tests {
     }
 
     #[test]
-    fn only_the_last_frames_are_kept_as_bases() {
+    fn only_the_last_frames_are_kept_as_bases_and_the_one_the_server_diffs_against() {
+        // A server that hears of no delivery since frame 1 (its uplink stalled) sends every frame
+        // on it, however many: the base the newest frame named is never dropped.
+        let (now, mut s) = start();
+        let one = screen(b"one");
+        s.on_frame(now, &frame(1, 0, 0, &TerminalScreen::default(), &one));
+        for n in 2..=40u64 {
+            let next = screen(format!("frame {n}").as_bytes());
+            s.on_frame(now, &frame(n, 1, 0, &one, &next));
+        }
+        s.on_frame(now, &frame(41, 1, 0, &one, &screen(b"still on one")));
+        assert!(!drain(&mut s).contains(&ClientMsg::Resync));
+        assert!(s.state().screen().contents().contains("still on one"));
+
         let (now, mut s) = start();
         let mut prev = TerminalScreen::default();
         for n in 1..=20u64 {

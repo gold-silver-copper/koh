@@ -11,11 +11,29 @@ use crate::proto::{ClientMsg, Frame, FrameNum, FrameScreen, InputSeq, FRAME_WIND
 const OLDER: usize = FRAME_WINDOW - 1;
 use crate::terminal::{RowEncodings, TerminalScreen};
 
+/// A frame applied to its base, with that base: only [`Link::applied`] makes one, so the base
+/// [`Link::advance`] pins is the one the frame came on.
+pub(super) struct Applied {
+    frame: FrameScreen,
+    base: FrameScreen,
+}
+
+impl Applied {
+    /// The screen the frame shows.
+    pub(super) const fn screen(&self) -> &Arc<TerminalScreen> {
+        &self.frame.screen
+    }
+}
+
 /// One connection's frames and echo. Only [`ClientSession::new`](super::session::ClientSession::new)
 /// and [`ClientSession::attach`](super::session::ClientSession::attach) make one.
 pub(super) struct Link {
     /// The newest applied frame and its screen.
     current: FrameScreen,
+    /// The base `current` came on: the newest frame the server knew delivered, which it diffs
+    /// against until it hears of a newer one, however many frames it sends meanwhile (a stalled
+    /// uplink keeps it from hearing). Apart from `older`, so evicting never drops it.
+    pinned: FrameScreen,
     /// The frames applied before it, oldest first: at most `FRAME_WINDOW - 1`, holding at most
     /// [`WINDOW_CELLS`] cells beyond `current`'s.
     older: Bounded<FrameScreen, OLDER>,
@@ -50,6 +68,7 @@ impl Link {
                 num: FrameNum::BLANK,
                 screen,
             },
+            pinned: FrameScreen::default(),
             older: Bounded::default(),
             refused: FrameNum::BLANK,
             resync_owed: false,
@@ -66,33 +85,44 @@ impl Link {
         &self.current
     }
 
-    /// The screen of frame `num`, if it is held as a base: the blank one, the current one or an
+    /// Frame `num`, if it is held as a base: the blank one, the current one, the pinned one or an
     /// older one.
-    pub(super) fn base(&self, num: FrameNum) -> Option<Arc<TerminalScreen>> {
+    fn held(&self, num: FrameNum) -> Option<FrameScreen> {
         if num == FrameNum::BLANK {
-            return Some(Arc::default());
+            return Some(FrameScreen::default());
         }
-        self.older
-            .iter()
-            .chain(std::iter::once(&self.current))
+        [&self.current, &self.pinned]
+            .into_iter()
+            .chain(&*self.older)
             .find(|held| held.num == num)
-            .map(|held| Arc::clone(&held.screen))
+            .cloned()
+    }
+
+    /// The screen of frame `num`, if it is held as a base.
+    pub(super) fn base(&self, num: FrameNum) -> Option<Arc<TerminalScreen>> {
+        self.held(num).map(|held| held.screen)
     }
 
     /// `frame` applied to its base, if that is held and the frame is well formed for it.
-    pub(super) fn applied(&self, frame: &Frame) -> Option<FrameScreen> {
+    pub(super) fn applied(&self, frame: &Frame) -> Option<Applied> {
+        let base = self.held(frame.base)?;
         // The copy shares every row with the base; the frame replaces only its own.
-        let mut screen = Arc::unwrap_or_clone(self.base(frame.base)?);
+        let mut screen = Arc::unwrap_or_clone(Arc::clone(&base.screen));
         screen.apply(&frame.diff).ok()?;
-        Some(FrameScreen {
-            num: frame.num,
-            screen: Arc::new(screen),
+        Some(Applied {
+            frame: FrameScreen {
+                num: frame.num,
+                screen: Arc::new(screen),
+            },
+            base,
         })
     }
 
-    /// `frame`, newer than the current one, applied: it is current, and the current one older.
-    pub(super) fn advance(&mut self, frame: FrameScreen) {
-        let previous = std::mem::replace(&mut self.current, frame);
+    /// `applied`, newer than the current frame: it is current, its base pinned, and the current
+    /// one older.
+    pub(super) fn advance(&mut self, applied: Applied) {
+        self.pinned = applied.base;
+        let previous = std::mem::replace(&mut self.current, applied.frame);
         self.keep(previous);
     }
 
@@ -103,7 +133,7 @@ impl Link {
             return;
         }
         if let Some(late) = self.applied(frame) {
-            self.keep(late);
+            self.keep(late.frame);
         }
     }
 

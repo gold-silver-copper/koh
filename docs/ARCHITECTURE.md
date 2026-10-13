@@ -26,13 +26,13 @@ src/
 ├── main.rs          the binary: serve / connect / id / key dispatch, and the hidden `__launch`
 ├── args.rs          the command line (clap's builder API) and the config structs it produces
 ├── lib.rs           crate root: module declarations + the architecture overview
-├── proto.rs         the koh/5 wire protocol: client messages, screen frames, caps, pacing
+├── proto.rs         the koh/6 wire protocol: client messages, screen frames, caps, pacing
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
 │   └── history.rs   scrollback rows, named for the wire
 ├── predict.rs       local-echo prediction engine (overlays, epochs)
-├── transport_iroh/  iroh endpoint setup, the default key path, path RTT, admission
+├── transport_iroh/  iroh endpoint setup, the default key path, path RTT
 ├── pty.rs           PTYs over fuxix, the `__launch` launcher sessions start through, reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
 │   ├── held.rs      the frames the server takes the client to hold
@@ -61,11 +61,12 @@ binary) build on both. The protocol cores (`proto`, `terminal`, `predict`, `serv
 `client::ClientSession`) do no I/O and are tested with no network at all. `predict` imports nothing
 from `crate::` (CI checks it), so it is a standalone terminal-prediction library.
 
-## The protocol (koh/5)
+## The protocol (koh/6)
 
-The ALPN `koh/5` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/6` is the version check: a peer on another version fails the TLS handshake with a
 clear error. After the handshake the server checks the allowlist, attaches the peer's session, and
-only then opens a bi-stream carrying one ADMIT byte, so "admitted, then refused" cannot happen. A
+only then sends the session's first frame, which admits the client, so "admitted, then refused"
+cannot happen. A
 refusal is a close code, never prose to match (`proto::Close`: `NotAuthorized` 1, `ProtocolError` 2,
 `SessionEnded` 3, `AtCapacity` 4, `CouldNotStart` 5). Only `NotAuthorized` makes a client give up;
 on the others it redials and its banner says why. Then (`src/proto.rs`):
@@ -475,20 +476,25 @@ construction rather than by care at each call:
   sink, its stderr and its log, a whole line per write, so lines never interleave. A peer's text
   goes in only as `log::Peer`, one line of printable ASCII; `std::io::stderr`, `eprint!` and
   `eprintln!` are banned elsewhere (`clippy.toml`). Close reasons are codes, not text.
-- **Unknown is never "no".** The saved allowlist is read by one task every 2 s (and at once for a
-  peer not yet on it); a read that fails keeps the last good list and warns once, so a typo in the
-  file disconnects no one. Removing a client closes its connection and ends its session.
+- **Unknown is never "no".** The saved allowlist is read by one task; a read that fails keeps the
+  last good list and warns once, and one that drops a client is taken only once the next, 0.5 s
+  later, agrees, so neither a typo nor an editor saving the file (missing or empty a moment)
+  disconnects anyone. A client added or removed is seen within 2 s. Removing one closes its
+  connection and ends its session, and the registry attaches no peer the list no longer allows.
 - **What a server makes the client keep is bounded by bytes, and asked for.** The history cache
   counts fux-vt's storage against `HISTORY_CACHE_BYTES` and keeps only rows a request it has
   outstanding (by id) asked for. A frame's rows are strictly ascending, and its dictionary is built
   from the end, stopping at its window. Server streams over 256 KiB need one of two turns, so the
   client holds about 40 MiB of them at most.
-- **Shutdown and handshakes.** One task counts SIGTERM, SIGINT and SIGHUP: the first drains, a
+- **Shutdown and handshakes.** One task counts SIGTERM, SIGINT and SIGHUP (unless SIGHUP was ignored at start,
+  as `nohup` does): the first drains, a
   repeat within 1 s (a double SIGHUP on a terminal's close) is the same, and a later one forces an
-  exit with a nonzero status. At most 2 handshakes are pending per address (an IPv6 /64 counts as
-  one), that address's oldest given up for a new one, and the oldest of all when all the room is
-  taken: no handshake is refused, so a flood cannot keep an allowed client out, even from its own
-  address.
+  exit with a nonzero status. At most 2 handshakes are pending per address (an IPv6 /48 counts as
+  one), that address's oldest given up for a new one, and 256 in all, the oldest given up; they
+  hold no connection permit. When room would cost one under way, an address not yet validated is
+  first sent a QUIC retry, which a spoofed one never answers. So a flood from spoofed addresses
+  takes no room; one from enough real addresses can still give up an allowed client's handshake,
+  and delay it, while it lasts.
 
 ## Testing tiers
 

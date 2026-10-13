@@ -1,4 +1,4 @@
-//! Hostile peers on koh/5, both directions.
+//! Hostile peers on koh/6, both directions.
 //!
 //! A malicious client (admitted, so on the allowlist) throws malformed and oversized traffic at a
 //! real server; a malicious server throws it at a real client. Neither may crash or hang the
@@ -15,7 +15,7 @@ use koh::proto::{
     MAX_FRAME, MAX_PENDING_HISTORY,
 };
 use koh::terminal::{ServerTerminal, TerminalScreen};
-use koh::transport_iroh::{admission, generate_secret_key, ALPN};
+use koh::transport_iroh::{generate_secret_key, ALPN};
 
 use crate::harness::{identity, Client, Options, Server};
 use crate::link::{FaultNet, Profile};
@@ -26,8 +26,8 @@ fn net() -> FaultNet {
     FaultNet::new(Profile::default(), 1)
 }
 
-/// Connect to `server` as `secret`, complete admission, and keep the endpoint alive; the caller
-/// then speaks koh/5 by hand.
+/// Connect to `server` as `secret`, wait for its first frame, which admits it, and keep the
+/// endpoint alive; the caller then speaks koh/6 by hand.
 async fn admitted(
     net: &FaultNet,
     secret: SecretKey,
@@ -35,7 +35,7 @@ async fn admitted(
 ) -> anyhow::Result<Connection> {
     let endpoint = net.endpoint(secret, false).await?;
     let conn = endpoint.connect(FaultNet::addr(server), ALPN).await?;
-    admission::await_admission(&conn).await?;
+    conn.accept_uni().await?;
     Box::leak(Box::new(endpoint));
     Ok(conn)
 }
@@ -333,6 +333,12 @@ fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_co
 
 // --- a malicious server against a real client ---
 
+/// What admits a client: a first stream, here an empty one.
+async fn admit(conn: &Connection) -> anyhow::Result<()> {
+    conn.open_uni().await?.finish()?;
+    Ok(())
+}
+
 /// Bind a hand-rolled server for `allow`, admit it, and run `frames` on its connection. Returns the
 /// server's id.
 async fn evil_server<F>(net: &FaultNet, allow: EndpointId, frames: F) -> anyhow::Result<EndpointId>
@@ -347,7 +353,7 @@ where
             return;
         };
         let Ok(conn) = incoming.await else { return };
-        if conn.remote_id() != allow || admission::admit(&conn).await.is_err() {
+        if conn.remote_id() != allow || admit(&conn).await.is_err() {
             return;
         }
         let handle = frames(conn);
@@ -428,37 +434,6 @@ fn frames_on_unknown_bases_leave_the_client_running() -> anyhow::Result<()> {
         })
         .await?;
         client_survives(&net, good, evil_id).await
-    })
-}
-
-#[test]
-fn a_bad_admission_byte_is_rejected_not_treated_as_admitted() -> anyhow::Result<()> {
-    koh_testkit::multi_thread(4)?.block_on(async {
-        let net = net();
-        let good = identity()?;
-        // A server that opens the admission stream but writes the wrong byte.
-        let secret = generate_secret_key()?;
-        let evil_id = secret.public();
-        let endpoint = net.endpoint(secret, true).await?;
-        koh_testkit::spawn(async move {
-            if let Some(incoming) = endpoint.accept().await {
-                if let Ok(conn) = incoming.await {
-                    if let Ok((mut send, _recv)) = conn.open_bi().await {
-                        let _ = send.write_all(&[0u8]).await; // 0 != ADMIT
-                        let _ = send.finish();
-                    }
-                    // The hostile server's pacing: it keeps the connection up, so the client must
-                    // refuse the byte itself rather than see a close.
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
-            Box::leak(Box::new(endpoint));
-        });
-        // The client must fail to connect, not proceed as if admitted.
-        let endpoint = net.endpoint(good, false).await?;
-        let result = Client::connect_on(endpoint, evil_id, Options::default()).await;
-        anyhow::ensure!(result.is_err(), "a non-ADMIT byte must be rejected");
-        Ok(())
     })
 }
 

@@ -26,7 +26,7 @@ use crate::predict::Overlay;
 use crate::proto::{decode_server, encode_client, Close, ServerMsg, MAX_FRAME};
 use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::{closed_because, ALPN, PROTOCOL};
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, RecvStream};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -65,7 +65,7 @@ fn looks_like_resume_from_freeze(wall_gap: Duration) -> bool {
     wall_gap >= STALE_AFTER_FREEZE
 }
 
-/// Dials the server and awaits its admission ack: the first connection and every reconnect, which
+/// Dials the server and awaits its first frame, which admits the client: the first connection and every reconnect, which
 /// reattaches to the same server session.
 pub struct IrohConnector {
     endpoint: Endpoint,
@@ -78,26 +78,30 @@ impl IrohConnector {
         Self { endpoint, target }
     }
 
-    /// Connect and await the admission ack, which the server sends once the client has a session.
+    /// Connect and await the stream of the first frame, which the server sends once the client has a
+    /// session.
     /// A server that will not have us for good closes the connection instead, a [`Refused`]
     /// error, so the client fails fast rather than redialing forever; one that cannot have us now
     /// (at capacity, say) closes it saying so, an error that is its [`Close`].
-    pub async fn connect(&self) -> anyhow::Result<Connection> {
+    pub async fn connect(&self) -> anyhow::Result<Admitted> {
         let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
             Ok(conn) => conn,
             Err(e) if refused_our_alpn(&e) => return Err(Refused::OtherProtocol.into()),
             Err(e) => anyhow::bail!("connecting to server: {}", Peer(e)),
         };
-        if let Err(e) = crate::transport_iroh::admission::await_admission(&conn).await {
-            return Err(match closed_because(&conn) {
+        match conn.accept_uni().await {
+            Ok(first) => Ok(Admitted(conn, first)),
+            Err(e) => Err(match closed_because(&conn) {
                 Some(Close::NotAuthorized) => Refused::NotAuthorized.into(),
                 Some(why) => why.into(),
                 None => anyhow::anyhow!("server did not admit the connection: {}", Peer(e)),
-            });
+            }),
         }
-        Ok(conn)
     }
 }
+
+/// A connection the server admitted, and the stream of its first frame, which said so.
+pub struct Admitted(pub Connection, RecvStream);
 
 /// The server refused us for good: redialing cannot help, so the client exits saying why.
 #[derive(Debug, thiserror::Error)]
@@ -412,7 +416,7 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
               not shorten it"
 )]
 pub async fn run_client<T: ClientTerminal>(
-    initial: Connection,
+    initial: Admitted,
     dialed_at: SystemTime,
     connector: IrohConnector,
     initial_size: Size,
@@ -651,7 +655,7 @@ enum Net<'c> {
 type Dial<'c> = std::pin::Pin<Box<dyn std::future::Future<Output = Dialed> + Send + 'c>>;
 
 /// A redial's result: connected, refused, or timed out.
-type Dialed = Result<anyhow::Result<Connection>, tokio::time::error::Elapsed>;
+type Dialed = Result<anyhow::Result<Admitted>, tokio::time::error::Elapsed>;
 
 /// What one turn of [`run_client`]'s loop left for it to act on.
 enum Change {
@@ -690,7 +694,7 @@ impl Wire {
     /// Start the tasks opening and writing the client's stream and reading frames on `conn`. The
     /// stream is opened by the writer, so a server that grants none holds up nothing else; one
     /// that fails to open ends the writer, which loses the link.
-    fn open(conn: Connection) -> Self {
+    fn open(Admitted(conn, first): Admitted) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
         let (frame_tx, frame_rx) = mpsc::channel::<Received>(FRAME_QUEUE);
         #[expect(
@@ -699,7 +703,7 @@ impl Wire {
         )]
         let (writer, reader) = (
             AbortOnDropHandle::new(tokio::spawn(write_client_stream(conn.clone(), writer_rx))),
-            AbortOnDropHandle::new(tokio::spawn(read_frames(conn.clone(), frame_tx))),
+            AbortOnDropHandle::new(tokio::spawn(read_frames(conn.clone(), first, frame_tx))),
         );
         Self {
             conn,
@@ -791,20 +795,25 @@ struct Received {
     _large: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-/// Accept the server's streams (frames, and history rows), each read on its own task so a stalled or
+/// Accept the server's streams (frames, and history rows), after `first`, each read on its own task so a stalled or
 /// reset stream never holds up a newer frame. Ends when the connection closes.
 ///
 /// At most [`FRAME_QUEUE`] streams are read or wait to be applied at once, together: a reader
 /// takes its slot in `frames` before it reads. Past them, no stream is accepted, so QUIC's stream
 /// limit stops the server opening more; and of them, at most [`LARGE_STREAMS`] are large.
-async fn read_frames(conn: Connection, frames: mpsc::Sender<Received>) {
+async fn read_frames(conn: Connection, first: RecvStream, frames: mpsc::Sender<Received>) {
     let large = std::sync::Arc::new(tokio::sync::Semaphore::new(LARGE_STREAMS));
+    let mut first = Some(first);
     loop {
         let Ok(slot) = frames.clone().reserve_owned().await else {
             return;
         };
-        let Ok(mut recv) = conn.accept_uni().await else {
-            return;
+        let mut recv = match first.take() {
+            Some(recv) => recv,
+            None => match conn.accept_uni().await {
+                Ok(recv) => recv,
+                Err(_) => return,
+            },
         };
         let large = std::sync::Arc::clone(&large);
         #[expect(
@@ -859,6 +868,12 @@ async fn end_session<T: ClientTerminal>(
 #[expect(clippy::disallowed_methods, reason = "tests spawn freely")]
 mod tests {
     use super::*;
+
+    /// What a server sends to admit the client: a first stream, here an empty one.
+    async fn admit(conn: &Connection) -> anyhow::Result<()> {
+        conn.open_uni().await?.finish()?;
+        Ok(())
+    }
 
     /// A server that will not have the client for good (another protocol, or not authorized) is
     /// a [`Refused`]; one that cannot have it now closes saying why, and is redialed.
@@ -1034,9 +1049,7 @@ mod tests {
     /// the client's, and the quit escape ends it at once.
     #[test]
     fn a_server_granting_no_streams_cannot_block_quit() {
-        use crate::transport_iroh::{
-            admission, bind_endpoint_local, generate_secret_key, loopback_addr,
-        };
+        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
         use iroh::endpoint::{QuicTransportConfig, VarInt};
         let key = || generate_secret_key().expect("OS randomness");
         crate::test_runtime::current_thread().block_on(async {
@@ -1055,7 +1068,7 @@ mod tests {
             let accept = tokio::spawn(async move {
                 if let Some(incoming) = server.accept().await {
                     if let Ok(conn) = incoming.await {
-                        if admission::admit(&conn).await.is_ok() {
+                        if admit(&conn).await.is_ok() {
                             conn.closed().await;
                         }
                     }
@@ -1095,12 +1108,12 @@ mod tests {
     }
 
     /// A real server, admitting the one client, that runs `serve` on the connection.
-    async fn loopback<F, Fut>(serve: F) -> (Connection, IrohConnector)
+    async fn loopback<F, Fut>(serve: F) -> (Admitted, IrohConnector)
     where
         F: FnOnce(Connection) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        use crate::transport_iroh::{admission, bind_endpoint_local, generate_secret_key};
+        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key};
         let key = || generate_secret_key().expect("OS randomness");
         let server = bind_endpoint_local(key(), true)
             .await
@@ -1109,7 +1122,7 @@ mod tests {
         tokio::spawn(async move {
             if let Some(incoming) = server.accept().await {
                 if let Ok(conn) = incoming.await {
-                    if admission::admit(&conn).await.is_ok() {
+                    if admit(&conn).await.is_ok() {
                         serve(conn.clone()).await;
                         conn.closed().await;
                     }
@@ -1130,7 +1143,7 @@ mod tests {
         // a dropped stream would leave readers holding every slot, and the reply after them would
         // never come.
         crate::test_runtime::current_thread().block_on(async {
-            let (conn, _connector) = loopback(|conn| async move {
+            let (Admitted(conn, first), _connector) = loopback(|conn| async move {
                 for _ in 0..20 {
                     let mut send = conn.open_uni().await.expect("a stream");
                     send.write_all(&vec![0xff; 1 << 20]).await.expect("written");
@@ -1149,7 +1162,7 @@ mod tests {
             })
             .await;
             let (tx, mut rx) = mpsc::channel(FRAME_QUEUE);
-            tokio::spawn(read_frames(conn, tx));
+            tokio::spawn(read_frames(conn, first, tx));
             let got = tokio::time::timeout(Duration::from_secs(20), rx.recv())
                 .await
                 .expect("the reply after the large streams never came")

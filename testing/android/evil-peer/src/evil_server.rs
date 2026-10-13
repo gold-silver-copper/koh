@@ -1,15 +1,13 @@
 //! A deliberately-MALICIOUS koh SERVER. It impersonates a `koh serve` to attack a real
 //! `koh connect` on the **admission** direction (there is no over-the-wire second factor: the
-//! node-id is authenticated by the QUIC/TLS handshake and admission is a single ADMIT byte the
-//! server writes). It prints its
+//! node-id is authenticated by the QUIC/TLS handshake, and the server's first frame admits the
+//! client). It prints its
 //! endpoint id + port (machine-readable) so the harness can point a koh client at it, accepts one
 //! connection, and then misbehaves on the admission step.
 //!
 //! Usage: evil-server <attack>
-//!   bad-admit   open the admission stream and write a NON-ADMIT byte → the client must reject the
-//!               connection (`AdmissionError::Rejected`) instead of proceeding as if admitted.
-//!   stall-admit accept the connection but never open the admission stream → the client's admission
-//!               await must not hang forever; its bounded connect/admission timeout must fire.
+//!   stall-admit accept the connection but never send a frame → the client's wait to be admitted
+//!               must not hang forever; its bounded connect timeout must fire.
 
 use std::time::Duration;
 
@@ -20,7 +18,7 @@ use koh::transport_iroh::{bind_endpoint_local, generate_secret_key};
 async fn main() -> Result<()> {
     let attack = std::env::args()
         .nth(1)
-        .ok_or_else(|| anyhow!("usage: evil-server <bad-admit|stall-admit>"))?;
+        .ok_or_else(|| anyhow!("usage: evil-server stall-admit"))?;
 
     let secret = generate_secret_key()?;
     let id = secret.public();
@@ -41,22 +39,16 @@ async fn main() -> Result<()> {
         .accept()
         .await
         .ok_or_else(|| anyhow!("endpoint closed"))?;
-    let conn = incoming.await?;
+    // Held, never written to.
+    let _conn = incoming.await?;
 
     match attack.as_str() {
-        // The real server opens the admission bi-stream and writes ADMIT (= 1). We open it and write
-        // a different byte; the koh client's `await_admission` must surface this as a rejection, not
-        // silently proceed.
-        "bad-admit" => {
-            eprintln!("evil-server: writing a NON-ADMIT admission byte (client must reject)");
-            let (mut send, _recv) = conn.open_bi().await?;
-            send.write_all(&[0u8]).await?; // 0 != ADMIT(1)
-            let _ = send.finish();
-        }
-        // Never open the admission stream at all: the client's admission await must be bounded by its
-        // own connect/admission timeout rather than hanging on us forever.
+        // Never send a frame: the client's wait to be admitted must be bounded by its own connect
+        // timeout rather than hanging on us forever.
         "stall-admit" => {
-            eprintln!("evil-server: accepting but never opening the admission stream (client timeout must fire)");
+            eprintln!(
+                "evil-server: accepting but never sending a frame (client timeout must fire)"
+            );
         }
         other => return Err(anyhow!("unknown attack '{other}'")),
     }

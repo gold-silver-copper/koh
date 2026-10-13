@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/5 client.
+//! loopback iroh with a minimal koh/6 client.
 //!
 //! Every session's program starts through the `koh` binary's `__launch`, as `koh serve`'s do; unit
 //! tests cannot reach a binary, so these live here.
@@ -18,7 +18,6 @@ use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
 use koh::terminal::{clamp_dims, RowEncodings, Size, TerminalScreen};
-use koh::transport_iroh::admission::await_admission;
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 use tokio_util::sync::CancellationToken;
 
@@ -58,14 +57,25 @@ fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     koh_testkit::multi_thread(2)
 }
 
+/// A registry allowing every peer.
 fn registry(command: &[&str], max_sessions: usize, ttl: Duration) -> std::io::Result<Registry> {
-    Registry::spawn(SessionSpec {
+    registry_allowing(command, max_sessions, ttl, |_| true)
+}
+
+fn registry_allowing(
+    command: &[&str],
+    max_sessions: usize,
+    ttl: Duration,
+    allows: impl Fn(&iroh::EndpointId) -> bool + Send + 'static,
+) -> std::io::Result<Registry> {
+    let spec = SessionSpec {
         command: command.iter().map(|arg| (*arg).to_owned()).collect(),
         scrollback: 0,
         max_sessions,
         ttl,
         launcher: launcher(),
-    })
+    };
+    Registry::spawn(spec, allows)
 }
 
 /// Attach `peer` and say how.
@@ -157,7 +167,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-/// A bare koh/5 client: writes messages, applies frames whose base it holds, and acks them.
+/// A bare koh/6 client: writes messages, applies frames whose base it holds, and acks them.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -171,17 +181,10 @@ struct RawClient {
 }
 
 impl RawClient {
-    /// Connect to `addr` as `secret`, waiting for the admission ack if the server sends one.
-    async fn connect(
-        addr: iroh::EndpointAddr,
-        secret: iroh::SecretKey,
-        admitted: bool,
-    ) -> anyhow::Result<Self> {
+    /// Connect to `addr` as `secret`, and wait for the first frame, which admits it.
+    async fn connect(addr: iroh::EndpointAddr, secret: iroh::SecretKey) -> anyhow::Result<Self> {
         let endpoint = bind_endpoint_local(secret, false).await?;
         let conn = endpoint.connect(addr, ALPN).await?;
-        if admitted {
-            await_admission(&conn).await?;
-        }
         let send = conn.open_uni().await?;
         let (tx, frames) = tokio::sync::mpsc::channel(64);
         let reader = conn.clone();
@@ -197,7 +200,7 @@ impl RawClient {
                 });
             }
         });
-        Ok(Self {
+        let mut client = Self {
             conn,
             send,
             frames,
@@ -206,7 +209,15 @@ impl RawClient {
             echo_ack: InputSeq(0),
             last_seq: InputSeq(0),
             _endpoint: endpoint,
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while client.newest == FrameNum::BLANK {
+                client.pump(20).await?;
+            }
+            anyhow::Ok(client)
         })
+        .await
+        .context("no frame came")?
     }
 
     async fn write(&mut self, msg: &ClientMsg) -> anyhow::Result<()> {
@@ -285,7 +296,7 @@ fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyho
         // The program sees the clamped size too, on its terminal.
         let program = ["sh", "-c", "read l; stty size; cat"];
         let (addr, shutdown, serve) = loopback_serve(secret.public(), &program).await?;
-        let mut client = RawClient::connect(addr, secret, true).await?;
+        let mut client = RawClient::connect(addr, secret).await?;
         client
             .write(&ClientMsg::Resize(Size::new(65000, 1)))
             .await?;
@@ -350,8 +361,8 @@ fn echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the
             shutdown.clone(),
         ));
         // Both connections share one client identity, so they land on ONE session.
-        let mut a = RawClient::connect(addr.clone(), secret.clone(), true).await?;
-        let mut b = RawClient::connect(addr, secret, true).await?;
+        let mut a = RawClient::connect(addr.clone(), secret.clone()).await?;
+        let mut b = RawClient::connect(addr, secret).await?;
         for _ in 0..30 {
             a.type_bytes(b"a").await?;
             a.pump(20).await?;
@@ -514,14 +525,25 @@ fn an_exited_session_no_client_saw_end_is_reaped_after_the_ttl() -> anyhow::Resu
     })
 }
 
-/// A peer removed from the allowlist has its session ended, its program hung up.
+/// A peer removed from the allowlist has its session ended, its program hung up, and starts no
+/// other: an attach the registry takes once the list no longer allows it is refused, even one on its
+/// way as the peer was removed. Allowed again, it gets a new session.
 #[test]
 fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     runtime()?.block_on(async {
-        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30))?;
+        let allowed = std::sync::Arc::new(AtomicBool::new(true));
+        let allows = std::sync::Arc::clone(&allowed);
+        let reg = registry_allowing(&["sleep", "30"], 4, Duration::from_secs(30), move |_| {
+            allows.load(Relaxed)
+        })?;
         let a = peer()?;
         let (mut client, _) = reg.attach(a).await.context("attach")?;
+        allowed.store(false, Relaxed);
+        let refused = reg.attach(a).await.err();
+        anyhow::ensure!(refused == Some(Close::NotAuthorized), "{refused:?}");
         reg.end(a).await;
+        allowed.store(true, Relaxed);
         tokio::time::timeout(Duration::from_secs(5), async {
             while client.next_screen().await.is_some() {}
         })
@@ -627,7 +649,7 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
         // `true` has exited by the time the connection's loop first looks.
         let secret = generate_secret_key()?;
         let (addr, shutdown, serve) = loopback_serve(secret.public(), &["true"]).await?;
-        let mut raw = RawClient::connect(addr, secret, true).await?;
+        let mut raw = RawClient::connect(addr, secret).await?;
         let mut close = None;
         for _ in 0..30 {
             // An ack written as the server closes fails: the close is what is looked for.
@@ -649,7 +671,7 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
 }
 
 /// A program that cannot start is not reported as the server being full, nor as a refusal for
-/// good: no admission comes, and the connection is closed saying the session could not start.
+/// good: no frame comes, and the connection is closed saying the session could not start.
 #[test]
 fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
     runtime()?.block_on(async {
@@ -686,3 +708,129 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// A UDP relay on loopback to `server`, from its own socket: each datagram waits `delay` (the
+/// link's latency, which is what is tested), and the server's are dropped unless `answers`, so a
+/// handshake through it stalls. Its address.
+async fn relay(
+    server: std::net::SocketAddr,
+    delay: Duration,
+    answers: bool,
+) -> std::io::Result<std::net::SocketAddr> {
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+    let (near, far) = (
+        Arc::new(UdpSocket::bind("127.0.0.1:0").await?),
+        Arc::new(UdpSocket::bind("127.0.0.1:0").await?),
+    );
+    let at = near.local_addr()?;
+    let (client, client_at) = tokio::sync::watch::channel(None);
+    let later = move |socket: &Arc<UdpSocket>, bytes: Vec<u8>, to| {
+        let socket = Arc::clone(socket);
+        koh_testkit::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = socket.send_to(&bytes, to).await;
+        });
+    };
+    let (inward, outward) = (Arc::clone(&near), Arc::clone(&far));
+    koh_testkit::spawn(async move {
+        let mut buf = Vec::with_capacity(65_536);
+        while let Ok((_, from)) = inward.recv_buf_from(&mut buf).await {
+            client.send_replace(Some(from));
+            later(&outward, std::mem::take(&mut buf), server);
+            buf.reserve(65_536);
+        }
+    });
+    koh_testkit::spawn(async move {
+        let mut buf = Vec::with_capacity(65_536);
+        while far.recv_buf(&mut buf).await.is_ok() {
+            let bytes = std::mem::take(&mut buf);
+            buf.reserve(65_536);
+            let to = *client_at.borrow();
+            if let Some(to) = to.filter(|_| answers) {
+                later(&near, bytes, to);
+            }
+        }
+    });
+    Ok(at)
+}
+
+/// A flood of handshakes that never finish, from the allowed client's own address, takes neither
+/// the one connection a server allows (`--max-connections 1`) nor the room for the client's own
+/// handshake, which takes several round trips of 100 ms: the flood is asked to show it gets the
+/// server's answers (a QUIC retry), and it never does, as a spoofed address could not.
+#[test]
+fn an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes() -> anyhow::Result<()>
+{
+    koh_testkit::multi_thread(3)?.block_on(async {
+        let good = generate_secret_key()?;
+        let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
+        let server = server_ep.id();
+        let port = server_ep
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .context("an IPv4 socket")?
+            .port();
+        let config = ServeConfig {
+            allow: vec![good.public()],
+            command: vec!["sleep".to_owned(), "30".to_owned()],
+            launcher: launcher(),
+            max_connections: std::num::NonZeroU32::MIN,
+            ..ServeConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let serving = koh_testkit::spawn(serve_endpoint(
+            server_ep,
+            Hosting::from_config(&config)?,
+            shutdown.clone(),
+        ));
+        let at = move |relayed| koh::transport_iroh::direct_addr(server, relayed);
+        let server_udp = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        // Some 200 dials a second, each stalled.
+        let (stalled, black_hole) = (
+            bind_endpoint_local(generate_secret_key()?, false).await?,
+            at(relay(server_udp, Duration::ZERO, false).await?),
+        );
+        let (flooding, flood_on) = tokio::sync::oneshot::channel();
+        let flood = koh_testkit::spawn(async move {
+            let mut flooding = Some(flooding);
+            for n in 0..10_000 {
+                let (endpoint, to) = (stalled.clone(), black_hole.clone());
+                koh_testkit::spawn(async move {
+                    let _ = tokio::time::timeout(WAIT, endpoint.connect(to, ALPN)).await;
+                });
+                if n == 100 {
+                    flooding.take().map(|on| on.send(()));
+                }
+                // The flood's rate.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let _ = flood_on.await;
+        let near = bind_endpoint_local(good, false).await?;
+        let far = at(relay(server_udp, Duration::from_millis(50), true).await?);
+        let mut admitted = false;
+        for _ in 0..3 {
+            if let Ok(Ok(conn)) = tokio::time::timeout(WAIT, near.connect(far.clone(), ALPN)).await
+            {
+                // Its first frame admits it.
+                admitted = matches!(
+                    tokio::time::timeout(WAIT, conn.accept_uni()).await,
+                    Ok(Ok(_))
+                );
+            }
+            if admitted {
+                break;
+            }
+        }
+        flood.abort();
+        shutdown.cancel();
+        let _ = tokio::time::timeout(WAIT, serving).await;
+        anyhow::ensure!(admitted, "the allowed client never got in");
+        Ok(())
+    })
+}
+
+/// How long the flood test waits on anything.
+const WAIT: Duration = Duration::from_secs(5);

@@ -386,7 +386,6 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
 /// with no restart: a lost machine's key is refused at once.
 #[test]
 fn clients_added_and_removed_take_effect_on_a_running_server() {
-    use koh::transport_iroh::admission::await_admission;
     use koh::transport_iroh::{bind_endpoint_local, direct_addr, parse_endpoint_id, ALPN};
     let home = Home::new("live-allowlist").unwrap();
     let me = home.koh(&["id"]).unwrap();
@@ -426,7 +425,7 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
         async move {
             let endpoint = bind_endpoint_local(secret, false).await?;
             let conn = endpoint.connect(at, ALPN).await?;
-            await_admission(&conn).await?;
+            conn.accept_uni().await?;
             anyhow::Ok((endpoint, conn))
         }
     };
@@ -435,7 +434,12 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
         .block_on(async {
             let before = admitted().await.is_ok();
             home.koh(&["clients", "add", "me", &me]).unwrap();
-            let live = admitted().await;
+            // Seen at the next read of the list, within two seconds.
+            let mut live = admitted().await;
+            let seen = tokio::time::Instant::now() + Duration::from_secs(10);
+            while live.is_err() && tokio::time::Instant::now() < seen {
+                live = admitted().await;
+            }
             let added = live.is_ok();
             home.koh(&["clients", "rm", "me"]).unwrap();
             // The connection it already had is cut off too.

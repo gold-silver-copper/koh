@@ -26,8 +26,8 @@ credit reporters who want it.
   `src/identity/key_file.rs`): the key file is the raw 32-byte secret, protected by its
   permissions (0600) like an SSH host key.
 - The connection accept gauntlet / node-id allowlist authorization
-  (`src/server/cli.rs`) and the admission barrier
-  (`src/transport_iroh/admission.rs`).
+  (`src/server/cli.rs`), and the session registry that attaches only allowed peers
+  (`src/server/session/sessions.rs`).
 - The untrusted wire decoders (`src/proto.rs`) and the connection cores
   (`src/server/mod.rs`, `src/client/session.rs`).
 - The terminal apply path (`src/terminal/`): decoding and validating the structured screen diff.
@@ -73,7 +73,7 @@ and the git log.
 | KOH-05, KOH-09 | Unbounded per-frame resize and key events | `src/server/mod.rs::a_read_queues_the_session_input_in_order_merging_neighbours`, `input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends`; the resize flood in `testing/android/scripts/stress-evil-peer.sh` |
 | KOH-06 | State dir in a world-writable shared location | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_directory_of_another_user_but_root_is_refused`, `src/transport_iroh/mod.rs::config_dir_is_xdg_then_home_and_never_elsewhere` |
 | KOH-07 | Fragment reassembly buffers ~39 MiB | Removed: koh/4 has no fragments; a frame is one stream read under `MAX_FRAME` (see KOH-02) |
-| KOH-08 | Stalled handshakes hold connection permits | The handshake and admission deadlines, and the pending-handshake cap, which gives up the oldest for a new one, never refusing it, and caps each address, giving up that address's oldest: `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room`; the admission-stall attack in `testing/android/scripts/stress-evil-peer.sh` exercises it on a device |
+| KOH-08 | Stalled handshakes hold connection permits | Handshakes hold none, and have a deadline; the pending-handshake cap gives up the oldest for a new one, never refusing it, and caps each address, giving up that address's oldest: `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room`, `tests/sessions.rs::an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes`; the admission-stall attack in `testing/android/scripts/stress-evil-peer.sh` exercises it on a device |
 | KOH-10 | A SIGHUP-immune child leaks the PTY threads | `Pty`'s `Drop` hangs the program up and the reaper kills it after a second's grace: `tests/pty.rs::a_child_that_ignores_sighup_dies_when_its_pty_is_dropped`, `a_hung_up_program_has_time_to_exit_before_it_is_killed`, `dropping_pty_eofs_child_and_stops_writer`, `shutdown_joins_both_io_threads_without_deadlock` |
 | KOH-11, KOH-13 | Passphrase handshake downgrades | Removed with the passphrase handshake |
 | KOH-12 | A pre-existing state dir is not made private | `src/identity/key_file.rs::only_a_nonsticky_world_writable_directory_is_refused`, `a_missing_directory_is_created_private` |
@@ -100,7 +100,7 @@ and the git log.
 
 | ID | Finding | Guarded by |
 |----|---------|------------|
-| B-1 | A `clients` file that could not be read disconnected every saved client | One reader keeps the list last read well: `src/server/cli.rs::a_saved_list_that_cannot_be_read_keeps_the_last_one` |
+| B-1 | A `clients` file that could not be read disconnected every saved client | One reader keeps the list last read well, and drops a client only when two reads agree (an editor's save leaves it missing or empty a moment): `src/server/cli.rs::only_a_removal_two_reads_agree_on_drops_a_saved_client` |
 | B-2 | Removing a client left its session running | `tests/sessions.rs::ending_a_peers_session_ends_it_at_once` |
 | B-3 | Log lines could interleave; a peer's text could start a line or reorder one | `src/log.rs::a_log_line_is_written_whole_in_one_write`, `a_peers_text_is_one_line_of_printable_ascii`; close reasons are codes, never text: `src/proto.rs::close_codes_round_trip_and_0_is_none_of_them` |
 | B-4 | A refusal after admission was retried for ever; a capacity close could look permanent | `src/client/mod.rs::a_refusal_is_for_good_only_when_not_authorized`, `tests/sessions.rs::a_program_that_cannot_start_is_refused_as_such` |
@@ -109,7 +109,7 @@ and the git log.
 | B-7 | A lost or reordered history reply stalled scrollback | `src/client/scrollback.rs::replies_pair_with_their_requests_by_id_in_any_order` |
 | B-8 | A search could loop on history rows it fetched and lost | `src/client/scrollback.rs::a_search_through_more_history_than_the_cache_holds_finishes` |
 | B-9 | A double SIGHUP skipped the drain | `src/lib.rs::a_double_sighup_still_drains_and_a_later_signal_forces` |
-| B-10 | Anyone who reaches the UDP port could block allowed clients' dials | `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room` |
+| B-10 | Anyone who reaches the UDP port could block allowed clients' dials | Slowed, not stopped: spoofed addresses must answer a QUIC retry first, real ones are capped each. `src/server/cli.rs::a_handshake_flood_cannot_take_an_allowed_clients_room`, `tests/sessions.rs::an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes` |
 | B-11 | The server kept a clipboard of up to 3 times its cap | `src/terminal/server.rs::only_base64_sets_the_clipboard_and_a_query_sets_nothing` |
 | B-12 | A hard-linked key could be truncated through `$KOH_LOG` | `src/identity/key_file.rs::a_hard_linked_key_or_log_is_refused_and_left_whole` |
 | B-13 | Queued client messages waited for more bytes; a clean end with some left was an error | `src/server/mod.rs::input_left_undecoded_is_decoded_as_the_session_takes_it_even_after_the_stream_ends` |
@@ -138,7 +138,7 @@ and the git log.
 | S-04 | Per-cell `String` allocation on repaint | Performance only; nothing to guard |
 | S-07 | One place states the prediction-cell invariants | `PredictionEngine::place_cell`; the prediction tests in `src/predict.rs` |
 | AR-02 | `predict` and `proto` import direction | CI's layering-guard step (`.github/workflows/ci.yml`) |
-| AR-06 | The admission pipeline's order | `src/server/cli.rs::serve_endpoint`; `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server`, `tests/net/hostile_peer.rs::a_bad_admission_byte_is_rejected_not_treated_as_admitted` |
+| AR-06 | The admission pipeline's order | `src/server/cli.rs::serve_endpoint`; `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server`, `tests/sessions.rs::ending_a_peers_session_ends_it_at_once` |
 
 ## Please do not
 

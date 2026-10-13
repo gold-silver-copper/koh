@@ -1,7 +1,7 @@
 //! The library behind the `koh` remote shell: `koh serve` hosts a PTY for allowlisted peers and
 //! `koh connect` renders it with predictive local echo, reconnecting transparently.
 //!
-//! [`transport_iroh`] sets up endpoints and admission; [`identity`] loads identities
+//! [`transport_iroh`] sets up endpoints; [`identity`] loads identities
 //! and their reset leases; [`keycmd`] is `koh id` and `koh key`; [`names`] names the servers and clients
 //! a machine knows. [`proto`] is the wire protocol, [`events`] the input it carries;
 //! [`terminal`], [`predict`] and [`pty`] the screen, the prediction and the PTY; [`server`] hosts

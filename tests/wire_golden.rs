@@ -1,4 +1,4 @@
-//! The koh/5 encoding.
+//! The koh/6 encoding.
 //!
 //! Messages built here by hand from the wire types, both ways, are pinned: the expected bytes were
 //! captured by running the encoder, and a change to the wire must change them in the same commit,
@@ -434,7 +434,7 @@ fn frames_and_history_round_trip_through_their_streams() {
 
 /// The protocol these bytes are pinned for. A change to them is a new protocol: bump the ALPN
 /// (`koh::transport_iroh::ALPN`) and this with it.
-const PINNED_FOR: &[u8] = b"koh/5";
+const PINNED_FOR: &[u8] = b"koh/6";
 
 #[test]
 fn client_messages_encode_as_pinned() {

@@ -24,7 +24,7 @@
 //!   events-flood <mib>       a mib-MiB paste as valid paste events        (PTY backpressure)
 //!   second-stream            open a second client stream                 (one-stream limit)
 //!   bad-alpn                 connect with the wrong ALPN                  (handshake rejects)
-//!   stall-admission          connect but never accept the admission ack  (3s admission timeout)
+//!   stall-admission          connect but never read a frame              (no one else held up)
 //!
 //! `empty-frags`, `partial-frags` and `bad-version` are accepted as aliases of `garbage` /
 //! `bad-alpn`, the nearest koh/4 attacks: koh/4 has no fragments and the ALPN is the version. The
@@ -41,8 +41,7 @@ use koh::events::{
 use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE};
 use koh::terminal::Size;
 use koh::transport_iroh::{
-    admission, bind_endpoint_local, direct_addr, generate_secret_key, parse_endpoint_id, ALPN,
-    KEY_LEN,
+    bind_endpoint_local, direct_addr, generate_secret_key, parse_endpoint_id, ALPN, KEY_LEN,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -99,7 +98,8 @@ async fn main() -> Result<()> {
     // messages on it.
     let ep = bind_endpoint_local(evil_secret!(), false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
-    admission::await_admission(&conn).await?;
+    // The first frame admits us.
+    conn.accept_uni().await?;
     eprintln!("evil-client: admitted; running attack '{attack}'");
 
     match attack {
@@ -329,11 +329,11 @@ async fn second_stream(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Connect but never accept the admission ack: the server's 3s admission timeout must fire.
+/// Connect but never read a frame: the server must hold no one else up for it.
 async fn admission_stall(server_id: iroh::EndpointId, saddr: SocketAddr) -> Result<()> {
     let ep = bind_endpoint_local(evil_secret!(), false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
-    eprintln!("evil-client: connected; NOT accepting the admission ack (server timeout must fire)");
+    eprintln!("evil-client: connected; NOT reading any frame (no one else may be held up)");
     tokio::time::sleep(Duration::from_secs(8)).await;
     drop(conn);
     drop(ep);

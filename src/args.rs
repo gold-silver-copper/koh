@@ -8,6 +8,7 @@
 
 use std::error::Error as _;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use clap::error::ErrorKind;
@@ -171,7 +172,7 @@ fn serve() -> Command {
                 .long("shell")
                 .value_name("PROGRAM_OR_ARG")
                 .action(ArgAction::Append)
-                .help("Program to run in the session (defaults to the user's login shell). Repeat to pass arguments: `--shell zellij --shell attach --shell -c --shell main` runs `zellij attach -c main`. The value is never split on whitespace"),
+                .help("Program to run in the session (defaults to $SHELL, else /bin/sh, started as a plain shell, not a login one). Repeat to pass arguments: `--shell zellij --shell attach --shell -c --shell main` runs `zellij attach -c main`. The value is never split on whitespace"),
         )
         .arg(
             Arg::new("scrollback")
@@ -213,15 +214,15 @@ fn serve() -> Command {
                 .long("max-connections")
                 .value_name("MAX_CONNECTIONS")
                 .default_value(DEFAULT_MAX_CONNECTIONS.to_string())
-                .value_parser(value_parser!(u32).range(1..))
-                .help("Maximum number of connections being handled concurrently (each holds a permit for its whole lifetime; excess incoming connections are refused cheaply, before the crypto handshake). This bounds the work a flood of dials can pin on the server before the allowlist check rejects them"),
+                .value_parser(value_parser!(NonZeroU32))
+                .help("Maximum number of connections handled at once (each holds a permit for its whole life; past them a new one is closed as at capacity once its handshake is done). Handshakes under way are capped apart, so stalled ones never take these"),
         )
         .arg(
             Arg::new("max_sessions")
                 .long("max-sessions")
                 .value_name("MAX_SESSIONS")
                 .default_value(DEFAULT_MAX_SESSIONS.to_string())
-                .value_parser(value_parser!(u32).range(1..))
+                .value_parser(value_parser!(NonZeroU32))
                 .help("Maximum number of distinct live sessions (one per authorized peer). A new peer is refused once this many sessions exist; reconnecting to an existing session is always allowed. Bounds the number of real shells a flood of authorized keys can spawn"),
         )
 }
@@ -564,7 +565,7 @@ mod tests {
             panic!("serve");
         };
         assert_eq!(c.command, ["/bin/zsh"]);
-        // No `--shell` = login shell.
+        // No `--shell` = `$SHELL`.
         let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", ID]) else {
             panic!("serve");
         };

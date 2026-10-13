@@ -1,12 +1,13 @@
-//! The koh/5 wire protocol.
+//! The koh/6 wire protocol.
 //!
-//! After admission the client opens one uni stream and writes [`ClientMsg`]s on it, each a 4-byte
+//! The client opens one uni stream and writes [`ClientMsg`]s on it, each a 4-byte
 //! big-endian length followed by its postcard encoding. The server sends every screen update as a
 //! [`Frame`] on its own uni stream: a tag, the base's number, then the postcard encoding
 //! DEFLATE-compressed against the base screen ([`FrameEncoder`]); history rows go the same way,
 //! without a base, each reply naming the request it answers. Frames diff against a frame the
 //! client has (its delivery is its acknowledgement), so a lost or reset frame only delays the
-//! screen until the next one. Why a connection closed is its close code ([`Close`]).
+//! screen until the next one. The first frame admits the client; a refusal, as any close, says why
+//! by its code ([`Close`]).
 //!
 //! Everything here is pure: the connection loops move bytes, this module turns them into messages
 //! and rejects anything oversized or malformed.

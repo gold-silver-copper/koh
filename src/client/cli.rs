@@ -9,7 +9,9 @@ use anyhow::Context;
 use iroh::{EndpointId, RelayUrl};
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector};
+use crate::client::{
+    Admitted, BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector,
+};
 use crate::transport_iroh::{bind_on, close_endpoint, Network};
 
 /// The clap-free form of `koh connect`'s arguments.
@@ -159,7 +161,7 @@ impl BellHook {
 async fn dial(
     config: &ConnectConfig,
     identity: &crate::identity::Identity,
-) -> anyhow::Result<(iroh::Endpoint, IrohConnector, iroh::endpoint::Connection)> {
+) -> anyhow::Result<(iroh::Endpoint, IrohConnector, Admitted)> {
     let secret = identity.secret.clone();
     let server = config.server;
     let (network, target) = match (config.direct, config.relay_url.clone()) {
@@ -297,7 +299,7 @@ mod tests {
     #[test]
     fn redial_reuses_the_loaded_identity_without_touching_the_key_file() -> anyhow::Result<()> {
         crate::test_runtime::current_thread().block_on(async {
-            use crate::transport_iroh::{admission, bind_endpoint_local, generate_secret_key};
+            use crate::transport_iroh::{bind_endpoint_local, generate_secret_key};
             let server = bind_endpoint_local(generate_secret_key()?, true).await?;
             let identity = crate::identity::Identity::generate()?;
             let expected = identity.secret.public();
@@ -325,17 +327,17 @@ mod tests {
                         connection.remote_id() == expected,
                         "client identity changed"
                     );
-                    admission::admit(&connection).await?;
+                    connection.open_uni().await?.finish()?;
                     connection.closed().await;
                 }
                 Ok::<_, anyhow::Error>(())
             };
             let client = async {
                 let (endpoint, connector, channel) = dial(&config, &identity).await?;
-                channel.close(0u32.into(), b"test reconnect");
+                channel.0.close(0u32.into(), b"test reconnect");
                 // The same connector `run_client` redials with after a link loss.
                 let channel = connector.connect().await?;
-                channel.close(0u32.into(), b"test done");
+                channel.0.close(0u32.into(), b"test done");
                 endpoint.close().await;
                 Ok::<_, anyhow::Error>(())
             };

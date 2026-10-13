@@ -109,6 +109,9 @@ pub fn connect_qr(data: &str) -> Option<String> {
 /// Logs to stderr.
 pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     crate::log::init_stderr(tracing::Level::INFO);
+    // Before the banner, so a signal once it shows is handled.
+    let shutdown = CancellationToken::new();
+    let forced = crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
     let hosting = Hosting::from_config(&args)?;
 
     let key_file = crate::identity::KeyFile::locate(args.key_file.clone(), "server")?;
@@ -179,8 +182,6 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
         "transport crypto posture"
     );
 
-    let shutdown = CancellationToken::new();
-    let forced = crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
     tokio::select! {
         served = serve_endpoint(endpoint, hosting, shutdown) => served,
         () = forced.cancelled() => {

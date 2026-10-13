@@ -602,8 +602,8 @@ mod tests {
         let link = dir.join("server.key");
         std::os::unix::fs::symlink(dir.join("missing"), &link).unwrap();
         let key = KeyFile::open(&link).unwrap();
-        for result in [load(&key), load_existing(&link)] {
-            let error = result.err().expect("refused");
+        for error in [load(&key).err(), load_existing(&link).err()] {
+            let error = error.expect("refused");
             assert!(
                 matches!(error.downcast_ref(), Some(SetupError::Refused { .. })),
                 "{error:#}"
@@ -613,11 +613,10 @@ mod tests {
     }
 
     #[test]
-    fn load_existing_reports_a_missing_key_and_creates_nothing() {
+    fn load_existing_finds_no_key_and_creates_nothing() {
         let dir = scratch("no-key", 0o700);
         for path in [dir.join("id.key"), dir.join("a").join("b").join("id.key")] {
-            let error = load_existing(&path).err().unwrap();
-            assert!(format!("{error:#}").contains("run `koh id`"), "{error:#}");
+            assert!(load_existing(&path).unwrap().is_none());
             let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
             assert!(left.is_empty(), "{}: created {left:?}", path.display());
         }

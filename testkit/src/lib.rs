@@ -22,8 +22,8 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
-/// The programs besides koh a test may start.
-const HARMLESS: &[&str] = &["nvim"];
+/// The programs besides koh a test may start (`nohup` only to start koh).
+const HARMLESS: &[&str] = &["nvim", "nohup"];
 
 /// A command for `program`: the `koh` binary (by path, the file named `koh`) or a program of
 /// [`HARMLESS`]. Anything else is refused: never a program that authenticates, as `sudo` or

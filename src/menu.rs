@@ -401,6 +401,7 @@ fn tilde(path: &std::path::Path) -> String {
 fn key_id(places: &Places, role: &str) -> Option<EndpointId> {
     crate::identity::load_existing(places.key(role))
         .ok()
+        .flatten()
         .map(|identity| identity.endpoint_id())
 }
 

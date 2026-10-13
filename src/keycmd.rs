@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context as _;
+
 /// What [`run`] should do to the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOp {
@@ -66,7 +68,8 @@ pub fn run_with_output(config: &KeyConfig, output: &mut impl std::io::Write) -> 
         }
         // Creates nothing, so asking about a key that is not there leaves no trace.
         KeyOp::Info if config.key_file.is_some() || config.role_named => {
-            let identity = crate::identity::load_existing(&path)?;
+            let identity = crate::identity::load_existing(&path)?
+                .with_context(|| crate::identity::no_key(path.display()))?;
             writeln!(output, "key file    : {}", path.display())?;
             writeln!(output, "endpoint id : {}", identity.endpoint_id())?;
         }
@@ -75,12 +78,13 @@ pub fn run_with_output(config: &KeyConfig, output: &mut impl std::io::Write) -> 
             for role in ["client", "server"] {
                 let path = crate::identity::KeyFile::path_for(None, role)?;
                 writeln!(output, "{role} key  : {}", path.display())?;
-                match crate::identity::load_existing(&path) {
-                    Ok(identity) => {
+                // A key that is there but cannot be loaded is said so, not taken for none.
+                match crate::identity::load_existing(&path)? {
+                    Some(identity) => {
                         found = true;
                         writeln!(output, "endpoint id : {}", identity.endpoint_id())?;
                     }
-                    Err(_none_yet) => {
+                    None => {
                         writeln!(output, "endpoint id : none yet ({})", creates(role))?;
                     }
                 }

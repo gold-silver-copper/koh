@@ -6,6 +6,7 @@
 //! directory and the user's own `~/.config/koh` is never read or written.
 #![forbid(clippy::disallowed_methods)]
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::Duration;
@@ -182,23 +183,50 @@ fn serve_without_allow_allows_the_saved_clients() {
     assert!(!out.status.success(), "no clients: {}", text(&out));
     assert!(text(&out).contains("koh clients add"), "{}", text(&out));
     home.koh(&["clients", "add", "phone", &some_id(3)]).unwrap();
-    let mut server = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
-        .expect("spawn koh")
-        .args(["serve", "--local", "--shell", "sh"])
-        .env("HOME", home.0.path())
-        .env("XDG_CONFIG_HOME", home.0.join(".config"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let logs = koh_testkit::stderr_lines(&mut server);
-    let line = std::iter::from_fn(|| logs.recv_timeout(Duration::from_secs(20)).ok())
-        .find(|line| line.contains("auth"));
-    let _ = server.kill();
-    let _ = server.wait();
-    let line = line.expect("the server's banner");
-    assert!(line.contains("allowlist (1 client(s))"), "{line}");
+    // A hang-up drains the server, unless it was started ignoring them (`nohup`): then a logout
+    // leaves it running, and SIGTERM still drains it.
+    // Only Linux says a signal is ignored.
+    for nohup in [false, cfg!(target_os = "linux")] {
+        let koh = env!("CARGO_BIN_EXE_koh");
+        let mut server =
+            command(if nohup { "nohup" } else { koh }, &koh_testkit::home!()).expect("spawn koh");
+        if nohup {
+            server.arg(koh);
+        }
+        let mut server = server
+            .args(["serve", "--local", "--shell", "sh"])
+            .env("HOME", home.0.path())
+            .env("XDG_CONFIG_HOME", home.0.join(".config"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let logs = koh_testkit::stderr_lines(&mut server);
+        let next = |what: &str| {
+            std::iter::from_fn(|| logs.recv_timeout(Duration::from_secs(20)).ok())
+                .find(|line| line.contains(what))
+        };
+        let banner = next("auth");
+        let pid = fuxix::process::Pid::of(&server).unwrap();
+        fuxix::process::kill(pid, fuxix::process::Signal::Hup).unwrap();
+        let hung_up = next(if nohup {
+            "SIGHUP ignored"
+        } else {
+            "shutting down"
+        });
+        if nohup {
+            fuxix::process::kill(pid, fuxix::process::Signal::Term).unwrap();
+        }
+        let drained = next("draining");
+        let _ = server.kill();
+        let _ = server.wait();
+        let banner = banner.expect("the server's banner");
+        assert!(banner.contains("allowlist (1 client(s))"), "{banner}");
+        let hung_up = hung_up.expect("the hang-up seen");
+        assert!(nohup || hung_up.contains("SIGHUP"), "{hung_up}");
+        assert!(drained.is_some(), "nohup {nohup}: never drained");
+    }
 }
 
 #[test]
@@ -216,6 +244,17 @@ fn key_info_shows_both_keys_and_reset_names_the_one() {
         "{said}"
     );
     assert!(said.contains("none yet (`koh serve` creates it)"), "{said}");
+    // A server key that is there but no key is said so, not taken for none.
+    let server_key = home.koh_dir().join("server.key");
+    std::fs::write(&server_key, [7; 31]).unwrap();
+    std::fs::set_permissions(&server_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = home.koh(&["key", "info"]).unwrap();
+    let said = text(&out);
+    assert!(
+        !out.status.success() && said.contains("koh key reset"),
+        "{said}"
+    );
+    std::fs::remove_file(&server_key).unwrap();
     let out = home.koh(&["key", "reset", "client"]).unwrap();
     assert!(
         !out.status.success() && text(&out).contains("--yes"),

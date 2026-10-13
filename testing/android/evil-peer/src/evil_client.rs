@@ -22,9 +22,10 @@
 //!                            (a paste piece over the cap), `events` (too many in one message),
 //!                            `palette` (17 colours)                       (event validation)
 //!   events-flood <mib>       a mib-MiB paste as valid paste events        (PTY backpressure)
-//!   second-stream            open a second client stream                 (one-stream limit)
+//!   second-stream            open a third client stream                  (two-stream limit)
 //!   bad-alpn                 connect with the wrong ALPN                  (handshake rejects)
 //!   stall-admission          connect but never read a frame              (no one else held up)
+//!   handshake-flood [n] [s] [alpn]  n stalled handshakes a second for s s, through a black hole
 //!
 //! `empty-frags`, `partial-frags` and `bad-version` are accepted as aliases of `garbage` /
 //! `bad-alpn`, the nearest koh/4 attacks: koh/4 has no fragments and the ALPN is the version. The
@@ -80,6 +81,10 @@ async fn main() -> Result<()> {
     // Attacks that do NOT complete admission: they exercise the handshake/admission bounds.
     if attack == "stall-admission" {
         return admission_stall(server_id, saddr).await;
+    }
+    if attack == "handshake-flood" {
+        let alpn = args.get(6).map_or(ALPN, |alpn| alpn.as_bytes());
+        return handshake_flood(server_id, saddr, num(4, 150), num(5, 30), alpn).await;
     }
     if attack == "bad-alpn" || attack == "bad-version" {
         let ep = bind_endpoint_local(evil_secret!(), false).await?;
@@ -329,12 +334,37 @@ async fn second_stream(conn: &Connection) -> Result<()> {
         },
     )
     .await?;
-    eprintln!("evil-client: trying a second client stream (the one-stream limit must block it)");
+    let _control = conn.open_uni().await?;
+    eprintln!("evil-client: trying a third client stream (the two-stream limit must block it)");
     match tokio::time::timeout(Duration::from_secs(3), conn.open_uni()).await {
-        Err(_) => eprintln!("evil-client: second stream blocked by the limit, as expected"),
-        Ok(_) => eprintln!("evil-client: WARNING second stream opened — limit not enforced"),
+        Err(_) => eprintln!("evil-client: third stream blocked by the limit, as expected"),
+        Ok(_) => eprintln!("evil-client: WARNING third stream opened — limit not enforced"),
     }
     let _ = first.finish();
+    Ok(())
+}
+
+/// Start `per_sec` handshakes a second for `secs` seconds, each abandoned after 10 s: through a
+/// relay that drops the server's replies, every one stalls, holding a pending handshake.
+async fn handshake_flood(
+    server_id: iroh::EndpointId,
+    saddr: SocketAddr,
+    per_sec: u64,
+    secs: u64,
+    alpn: &[u8],
+) -> Result<()> {
+    let ep = bind_endpoint_local(evil_secret!(), false).await?;
+    let mut tick = tokio::time::interval(Duration::from_micros(1_000_000 / per_sec.max(1)));
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    eprintln!("evil-client: {per_sec} handshakes a second for {secs} s");
+    while tokio::time::Instant::now() < end {
+        tick.tick().await;
+        let (ep, alpn) = (ep.clone(), alpn.to_vec());
+        tokio::spawn(async move {
+            let dial = ep.connect(direct_addr(server_id, saddr), &alpn);
+            let _ = tokio::time::timeout(Duration::from_secs(10), dial).await;
+        });
+    }
     Ok(())
 }
 

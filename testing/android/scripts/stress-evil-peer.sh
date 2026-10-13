@@ -100,11 +100,11 @@ run_client_attack "over-cap input message" oversized
   && ok "[oversized] server refused the over-cap message and closed the connection" \
   || bad "[oversized] no size-cap rejection logged"
 
-# second-stream: the server grants one client stream; a second must never open.
-run_client_attack "second input stream" second-stream
-contains "second stream blocked by the limit" "$EVIL_OUT" \
-  && ok "[second-stream] the server's one-stream limit blocked a second stream" \
-  || bad "[second-stream] a second client stream opened: $(printf '%s\n' "$EVIL_OUT" | grep evil-client | tail -1)"
+# second-stream: the server grants two client streams, input and control; a third must never open.
+run_client_attack "third client stream" second-stream
+contains "third stream blocked by the limit" "$EVIL_OUT" \
+  && ok "[second-stream] the server's two-stream limit blocked a third stream" \
+  || bad "[second-stream] a third client stream opened: $(printf '%s\n' "$EVIL_OUT" | grep evil-client | tail -1)"
 
 run_client_attack "state accumulation"     accumulate "$ACC" 4096
 

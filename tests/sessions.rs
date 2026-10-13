@@ -513,26 +513,30 @@ fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Resu
     })
 }
 
-/// A program that never reads its input holds up no resize: the typing waits for it to read, the
-/// window does not.
+/// A program that never reads its input holds up no resize: the client's input stream stalls
+/// behind typing it has not taken, its control stream does not.
 #[test]
 fn a_resize_waits_for_no_typing_the_program_has_not_read() -> anyhow::Result<()> {
     runtime()?.block_on(async {
         let secret = generate_secret_key()?;
         let (addr, shutdown, serve) = loopback_serve(secret.public(), &["sleep", "30"]).await?;
         let mut client = RawClient::connect(addr, secret).await?;
-        // More than the PTY's writer takes, so the session keeps the rest waiting, then a key.
-        for _ in 0..2 {
-            client.last_seq = client.last_seq.next();
-            let paste = koh::events::InputEvent::Paste("x".repeat(1000 * 1024));
-            client
-                .write(&ClientMsg::Keys {
-                    seq: client.last_seq,
+        // Far more than the PTY's writer, the session and the connection take, on the input
+        // stream, by a task of its own: its writes stall once the server stops reading it.
+        let mut input = client.conn.open_uni().await?;
+        let typing = koh_testkit::spawn(async move {
+            for seq in 1..=12 {
+                let paste = koh::events::InputEvent::Paste("x".repeat(1000 * 1024));
+                let msg = ClientMsg::Keys {
+                    seq: InputSeq(seq),
                     events: vec![paste],
-                })
-                .await?;
-        }
-        client.type_bytes(b"y").await?;
+                };
+                if input.write_all(&encode_client(&msg)?).await.is_err() {
+                    break;
+                }
+            }
+            anyhow::Ok(())
+        });
         let size = Size::new(30, 100);
         client.write(&ClientMsg::Resize(size)).await?;
         let resized = |c: &RawClient| c.screen().is_some_and(|s| s.size() == size);
@@ -543,6 +547,7 @@ fn a_resize_waits_for_no_typing_the_program_has_not_read() -> anyhow::Result<()>
             }
         }
         let shown = resized(&client);
+        typing.abort();
         client.conn.close(0u32.into(), b"done");
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
@@ -550,6 +555,37 @@ fn a_resize_waits_for_no_typing_the_program_has_not_read() -> anyhow::Result<()>
             shown,
             "the resize waited behind typing the program never read"
         );
+        Ok(())
+    })
+}
+
+/// A peer removed from the allowlist has its session ended, its program hung up, and starts no
+/// other: an attach the registry takes once the list no longer allows it is refused, even one on its
+/// way as the peer was removed. Allowed again, it gets a new session.
+#[test]
+fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    runtime()?.block_on(async {
+        let allowed = std::sync::Arc::new(AtomicBool::new(true));
+        let allows = std::sync::Arc::clone(&allowed);
+        let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30), move |_| {
+            allows.load(Relaxed)
+        })?;
+        let a = peer()?;
+        let (mut client, _) = reg.attach(a).await.context("attach")?;
+        allowed.store(false, Relaxed);
+        let refused = reg.attach(a).await.err();
+        anyhow::ensure!(refused == Some(Close::NotAuthorized), "{refused:?}");
+        reg.end(a).await;
+        allowed.store(true, Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.next_screen().await.is_some() {}
+        })
+        .await
+        .context("the session ends")?;
+        let kind = attach_kind(&reg, a).await;
+        reg.shutdown().await;
+        anyhow::ensure!(kind == Some(AttachKind::Created), "{kind:?}");
         Ok(())
     })
 }

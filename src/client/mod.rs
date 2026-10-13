@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::log::Peer;
 use crate::predict::Overlay;
-use crate::proto::{decode_server, encode_client, Close, ServerMsg, MAX_FRAME};
+use crate::proto::{decode_server, encode_client, ClientMsg, Close, ServerMsg, Stream, MAX_FRAME};
 use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::{closed_because, ALPN, PROTOCOL};
 use iroh::endpoint::{Connection, RecvStream};
@@ -497,8 +497,12 @@ pub async fn run_client<T: ClientTerminal>(
             tracing::debug!(error = %e, "could not ask the terminal");
         }
 
-        let (writer, frames, dialing) = match &mut net {
-            Net::Up(wire) => (Some(&wire.writer_tx), Some(&mut wire.frame_rx), None),
+        let (writers, frames, dialing) = match &mut net {
+            Net::Up(wire) => (
+                Some((&wire.input_tx, &wire.control_tx)),
+                Some(&mut wire.frame_rx),
+                None,
+            ),
             Net::Down(dial) => (None, None, Some(dial)),
         };
         let change = tokio::select! {
@@ -512,19 +516,12 @@ pub async fn run_client<T: ClientTerminal>(
                 session.on_timeout(Instant::now()).into()
             }
             () = shutdown.cancelled() => Some(Change::Quit),
-            permit = when(writer.map(mpsc::Sender::reserve)), if session.has_outgoing() => match permit.ok() {
-                // The writer ended: the stream, and so the connection, is gone.
-                None => Some(Change::Closed),
-                Some(permit) => {
-                    if let Some(msg) = session.pop_outgoing() {
-                        match encode_client(&msg) {
-                            Ok(bytes) => permit.send(bytes),
-                            Err(e) => tracing::warn!(error = %e, "dropping an unencodable message"),
-                        }
-                    }
-                    None
-                }
-            },
+            permit = when(writers.map(|(input, _)| input.reserve())), if session.has_outgoing_on(Stream::Input) => {
+                send(permit.ok(), session.pop_outgoing_on(Stream::Input))
+            }
+            permit = when(writers.map(|(_, control)| control.reserve())), if session.has_outgoing_on(Stream::Control) => {
+                send(permit.ok(), session.pop_outgoing_on(Stream::Control))
+            }
             maybe = when(resize_rx.as_mut().map(mpsc::Receiver::recv)) => {
                 match maybe {
                     Some(()) => {
@@ -677,34 +674,40 @@ impl From<InputOutcome> for Option<Change> {
 /// A live connection: its stream writer and frame reader, which end with it, and it with them.
 struct Wire {
     conn: Connection,
-    writer_tx: mpsc::Sender<Vec<u8>>,
+    /// The writers of the client's input and control streams.
+    input_tx: mpsc::Sender<Vec<u8>>,
+    control_tx: mpsc::Sender<Vec<u8>>,
     frame_rx: mpsc::Receiver<Received>,
-    _writer: AbortOnDropHandle<()>,
+    _writers: [AbortOnDropHandle<()>; 2],
     _reader: AbortOnDropHandle<()>,
     /// When the loop took the connection, for its dwell.
     started: Instant,
 }
 
 impl Wire {
-    /// Start the tasks opening and writing the client's stream and reading frames on `conn`. The
-    /// stream is opened by the writer, so a server that grants none holds up nothing else; one
-    /// that fails to open ends the writer, which loses the link.
+    /// Start the tasks opening and writing the client's input and control streams and reading
+    /// frames on `conn`. Each stream is opened by its writer, so a server that grants none holds
+    /// up nothing else; one that fails to open ends its writer, which loses the link.
     fn open(Admitted(conn, first): Admitted) -> Self {
-        let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
+        let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
         let (frame_tx, frame_rx) = mpsc::channel::<Received>(FRAME_QUEUE);
         #[expect(
             clippy::disallowed_methods,
-            reason = "a writer and a reader a connection"
+            reason = "two writers and a reader a connection"
         )]
-        let (writer, reader) = (
-            AbortOnDropHandle::new(tokio::spawn(write_client_stream(conn.clone(), writer_rx))),
+        let (writers, reader) = (
+            [input_rx, control_rx].map(|rx| {
+                AbortOnDropHandle::new(tokio::spawn(write_client_stream(conn.clone(), rx)))
+            }),
             AbortOnDropHandle::new(tokio::spawn(read_frames(conn.clone(), first, frame_tx))),
         );
         Self {
             conn,
-            writer_tx,
+            input_tx,
+            control_tx,
             frame_rx,
-            _writer: writer,
+            _writers: writers,
             _reader: reader,
             started: Instant::now(),
         }
@@ -760,6 +763,19 @@ const FRAME_QUEUE: usize = 16;
 
 /// Open the client's stream on `conn` and write queued messages to it, until the queue or the
 /// stream closes.
+/// Send `msg` with `permit`, a writer's room; a writer that ended (`None`) lost the connection.
+fn send(permit: Option<mpsc::Permit<'_, Vec<u8>>>, msg: Option<ClientMsg>) -> Option<Change> {
+    let Some(permit) = permit else {
+        return Some(Change::Closed);
+    };
+    match msg.map(|msg| encode_client(&msg)) {
+        Some(Ok(bytes)) => permit.send(bytes),
+        Some(Err(e)) => tracing::warn!(error = %e, "dropping an unencodable message"),
+        None => {}
+    }
+    None
+}
+
 async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>>) {
     let Ok(mut send) = conn.open_uni().await else {
         return;

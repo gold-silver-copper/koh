@@ -19,12 +19,13 @@ use crate::proto::Close;
 /// freezing the process, so keepalives stop) is ridden out on the same connection; the client
 /// redials after a longer one.
 ///
-/// The server accepts only the client's one message stream; the client, a few frame streams
-/// (superseded ones are reset, so few are ever open), and no bi-stream on either side.
+/// The server accepts only the client's two message streams, input and control; the client, a few
+/// frame streams (superseded ones are reset, so few are ever open), and no bi-stream on either
+/// side.
 fn koh_transport_config(accept: bool) -> QuicTransportConfig {
     // From a `u32` of milliseconds, unlike from a `Duration`, it cannot fail.
     const IDLE_TIMEOUT_MS: u32 = 300_000;
-    let uni = if accept { 1 } else { 8 };
+    let uni = if accept { 2 } else { 8 };
     let config = QuicTransportConfig::builder()
         .keep_alive_interval(Duration::from_secs(5))
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))))

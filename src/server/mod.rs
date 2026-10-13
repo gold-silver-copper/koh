@@ -20,7 +20,7 @@ use crate::events::{InputEvent, WireColours};
 use crate::log::Peer;
 use crate::proto::{
     retry_after, ClientDecoder, ClientMsg, Close, Frame, FrameEncoder, FrameNum, FrameScreen,
-    InputSeq, ProtoError, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
+    InputSeq, ProtoError, Stream, FRAME_FLOOR, FRAME_WINDOW, HEARTBEAT, MAX_PENDING_HISTORY,
 };
 use crate::terminal::{HistoryReply, HistoryRequest, Size, TerminalScreen};
 use crate::transport_iroh::close;
@@ -116,13 +116,23 @@ impl ToSession {
     }
 }
 
+/// One of the client's streams as the server reads it.
+#[derive(Default)]
+struct FromClient {
+    decoder: ClientDecoder,
+    /// The client finished it: what it left must decode whole.
+    ended: bool,
+    /// Input decoded when the session had no room for it: the stream is read no further until it
+    /// has, while the other goes on.
+    waiting: Option<ClientMsg>,
+}
+
 /// The server side of one connection, without I/O: it decodes the client's stream, tracks the
 /// echo-ack, and decides when to send which frame against which base.
 #[derive(Default)]
 pub(crate) struct ServerConn {
-    decoder: ClientDecoder,
-    /// The client finished its stream: what it left must decode whole.
-    client_ended: bool,
+    /// The client's input and control streams, in the order they came.
+    streams: [FromClient; 2],
     echo: EchoAck,
     /// What the client sent for the session, oldest first, until the session has room. Nothing
     /// more is decoded once it is full, nor read while it holds [`HELD_INPUT`].
@@ -221,16 +231,25 @@ impl ServerConn {
         self.screen.exit_code().is_some()
     }
 
-    /// Bytes read from the client's stream, at `now`: what they complete is decoded.
-    fn push_client_bytes(&mut self, bytes: &[u8], now: Instant) -> Result<(), ProtoError> {
-        self.decoder.push(bytes);
+    /// Bytes read from the client's stream `at`, at `now`: what they complete is decoded.
+    fn push_client_bytes(
+        &mut self,
+        at: usize,
+        bytes: &[u8],
+        now: Instant,
+    ) -> Result<(), ProtoError> {
+        if let Some(stream) = self.streams.get_mut(at) {
+            stream.decoder.push(bytes);
+        }
         self.decode(now)
     }
 
-    /// The client finished its stream: fine between messages, a protocol error inside one, once
-    /// the messages before it are decoded.
-    fn client_ended(&mut self, now: Instant) -> Result<(), ProtoError> {
-        self.client_ended = true;
+    /// The client finished its stream `at`: fine between messages, a protocol error inside one,
+    /// once the messages before it are decoded.
+    fn client_ended(&mut self, at: usize, now: Instant) -> Result<(), ProtoError> {
+        if let Some(stream) = self.streams.get_mut(at) {
+            stream.ended = true;
+        }
         self.decode(now)
     }
 
@@ -244,53 +263,72 @@ impl ServerConn {
         Ok(input)
     }
 
-    /// Whether to read more of the client's stream: while the input waiting for the session is
-    /// under [`HELD_INPUT`] and its queue has room.
-    fn wants_bytes(&self) -> bool {
-        self.held_input < HELD_INPUT && !self.to_session.is_full()
+    /// Whether to read more of the client's stream `at`: unless input it decoded waits for room.
+    fn wants_bytes(&self, at: usize) -> bool {
+        self.streams
+            .get(at)
+            .is_some_and(|stream| stream.waiting.is_none())
     }
 
-    /// Decode the complete messages read, at `now`, while the session's queue has room: control
-    /// messages handled at once, input queued for the session (none once the program exited).
+    /// Decode the complete messages read on each stream, at `now`: control messages handled at
+    /// once, input queued for the session (none once the program exited) while it has room, under
+    /// [`HELD_INPUT`] and its queue not full; input past that waits, holding up its stream.
     fn decode(&mut self, now: Instant) -> Result<(), ProtoError> {
-        while !self.to_session.is_full() {
-            let Some(msg) = self.decoder.next_msg()? else {
-                return if self.client_ended {
-                    self.decoder.finish()
-                } else {
-                    Ok(())
+        for at in 0..self.streams.len() {
+            loop {
+                let room = self.held_input < HELD_INPUT && !self.to_session.is_full();
+                let Some(stream) = self.streams.get_mut(at) else {
+                    break;
                 };
-            };
-            let input = match msg {
-                ClientMsg::Keys { seq, events } => {
-                    self.echo.register(seq, now);
-                    ToSession::Events(events)
+                let msg = match stream.waiting.take() {
+                    Some(msg) => msg,
+                    None => match stream.decoder.next_msg()? {
+                        Some(msg) => msg,
+                        None if stream.ended => break stream.decoder.finish()?,
+                        None => break,
+                    },
+                };
+                if msg.stream() == Stream::Input && !room {
+                    stream.waiting = Some(msg);
+                    break;
                 }
-                ClientMsg::Colours(colours) => ToSession::Colours(colours),
-                ClientMsg::Resize(size) => {
-                    if !self.exited() {
-                        self.window = Some(crate::terminal::clamp_dims(size));
-                    }
-                    continue;
-                }
-                ClientMsg::Ack { frame } => {
-                    self.ack(frame, now);
-                    continue;
-                }
-                ClientMsg::Resync => {
-                    self.resync();
-                    continue;
-                }
-                ClientMsg::History(request) => {
-                    self.history
-                        .push_back(request)
-                        .map_err(|_full| ProtoError::TooManyRequests)?;
-                    continue;
-                }
-            };
-            if !self.exited() {
-                self.for_session(input);
+                self.take(msg, now)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Act on `msg` from the client, at `now`.
+    fn take(&mut self, msg: ClientMsg, now: Instant) -> Result<(), ProtoError> {
+        let input = match msg {
+            ClientMsg::Keys { seq, events } => {
+                self.echo.register(seq, now);
+                ToSession::Events(events)
+            }
+            ClientMsg::Colours(colours) => ToSession::Colours(colours),
+            ClientMsg::Resize(size) => {
+                if !self.exited() {
+                    self.window = Some(crate::terminal::clamp_dims(size));
+                }
+                return Ok(());
+            }
+            ClientMsg::Ack { frame } => {
+                self.ack(frame, now);
+                return Ok(());
+            }
+            ClientMsg::Resync => {
+                self.resync();
+                return Ok(());
+            }
+            ClientMsg::History(request) => {
+                return self
+                    .history
+                    .push_back(request)
+                    .map_err(|_full| ProtoError::TooManyRequests);
+            }
+        };
+        if !self.exited() {
+            self.for_session(input);
         }
         Ok(())
     }
@@ -547,12 +585,12 @@ pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: sessio
     let mut core = ServerConn::default();
     core.install_snapshot(session.screen());
     let input = session.input.clone();
-    let mut client: Option<RecvStream> = None;
-    // The client gets exactly one stream for the connection, even after it finishes that one.
-    let mut had_client_stream = false;
+    // The client's input and control streams: two for the connection, even once they finish.
+    let (mut first, mut second): (Option<RecvStream>, Option<RecvStream>) = (None, None);
+    let mut client_streams = 0u8;
     // Whether the session still publishes screens: `next_screen` ends with it.
     let mut session_open = true;
-    let mut read_buf = vec![0u8; 16 * 1024];
+    let (mut first_buf, mut second_buf) = (vec![0u8; 16 * 1024], vec![0u8; 16 * 1024]);
     // Cancels the newest frame, which the next supersedes.
     let mut newest = CancellationToken::new();
     // The client's acknowledgements counted so far: a new one is the link making progress.
@@ -628,7 +666,10 @@ pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: sessio
             break "shell exited";
         }
         let wake = tokio::time::Instant::from_std(core.next_wake(now, rtt));
-        let reading = client.is_some() && core.wants_bytes();
+        let (reading_first, reading_second) = (
+            first.is_some() && core.wants_bytes(0),
+            second.is_some() && core.wants_bytes(1),
+        );
         let broke = tokio::select! {
             // Not biased: a pending screen change would starve client input.
             screen = session.next_screen(), if session_open => match screen {
@@ -656,9 +697,13 @@ pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: sessio
                 Err(_) => break "the session was ended (revoked, or the server is stopping)",
             },
             stream = conn.accept_uni() => match stream {
-                Ok(stream) if !had_client_stream => {
-                    had_client_stream = true;
-                    client = Some(stream);
+                Ok(stream) if client_streams < 2 => {
+                    if client_streams == 0 {
+                        first = Some(stream);
+                    } else {
+                        second = Some(stream);
+                    }
+                    client_streams = client_streams.saturating_add(1);
                     Ok(())
                 }
                 Ok(_) => Err(ProtoError::UnknownStream),
@@ -667,11 +712,22 @@ pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: sessio
                     break "client detached (session retained)";
                 }
             },
-            read = read_client(client.as_mut(), &mut read_buf), if reading => match read {
-                Ok(Some(n)) => core.push_client_bytes(read_buf.get(..n).unwrap_or_default(), Instant::now()),
+            read = read_client(first.as_mut(), &mut first_buf), if reading_first => match read {
+                Ok(Some(n)) => core.push_client_bytes(0, first_buf.get(..n).unwrap_or_default(), Instant::now()),
                 Ok(None) => {
-                    client = None;
-                    core.client_ended(Instant::now())
+                    first = None;
+                    core.client_ended(0, Instant::now())
+                }
+                Err(e) => {
+                    info!(reason = %Peer(e), "client stream failed (detaching)");
+                    break "client detached (session retained)";
+                }
+            },
+            read = read_client(second.as_mut(), &mut second_buf), if reading_second => match read {
+                Ok(Some(n)) => core.push_client_bytes(1, second_buf.get(..n).unwrap_or_default(), Instant::now()),
+                Ok(None) => {
+                    second = None;
+                    core.client_ended(1, Instant::now())
                 }
                 Err(e) => {
                     info!(reason = %Peer(e), "client stream failed (detaching)");
@@ -859,7 +915,7 @@ mod tests {
             ClientMsg::Resize(Size::new(30, 40)),
             ClientMsg::Resize(Size::new(65000, 1)),
         ]);
-        conn.push_client_bytes(&read, now).unwrap();
+        conn.push_client_bytes(0, &read, now).unwrap();
         assert_eq!(
             conn.window.take(),
             Some(crate::terminal::clamp_dims(Size::new(65000, 1)))
@@ -872,30 +928,38 @@ mod tests {
     }
 
     #[test]
-    fn a_paste_the_session_has_not_taken_holds_up_no_control_message_behind_it() {
-        // The program is slow to take a paste: the client's stream is still read, and the history
-        // request behind the paste answered, until a message's worth of input waits.
+    fn input_the_session_has_not_taken_holds_up_its_stream_and_never_the_control_one() {
+        // The program is slow to take pastes: the input stream is read until a paste waits for
+        // room, and the control stream all along, its history request and resize taken at once.
         let now = Instant::now();
         let mut conn = ServerConn::default();
         let paste = ClientMsg::Keys {
             seq: InputSeq(1),
             events: vec![InputEvent::Paste("p".repeat(crate::events::MAX_PASTE))],
         };
-        conn.push_client_bytes(&stream(std::slice::from_ref(&paste)), now)
-            .unwrap();
-        assert!(conn.wants_bytes());
+        for _ in 0..3 {
+            conn.push_client_bytes(0, &stream(std::slice::from_ref(&paste)), now)
+                .unwrap();
+        }
+        assert!(
+            !conn.wants_bytes(0),
+            "a paste waits: read no more of its stream"
+        );
         let ask = crate::terminal::HistoryRequest {
             id: 1,
             newest: 1,
             count: 1,
         };
-        conn.push_client_bytes(&stream(&[ClientMsg::History(ask)]), now)
-            .unwrap();
+        let control = [
+            ClientMsg::History(ask),
+            ClientMsg::Resize(Size::new(30, 100)),
+        ];
+        conn.push_client_bytes(1, &stream(&control), now).unwrap();
+        assert!(conn.wants_bytes(1));
         assert_eq!(conn.next_history(), Some(ask));
-        conn.push_client_bytes(&stream(&[paste]), now).unwrap();
-        assert!(!conn.wants_bytes(), "two pastes wait: read no more");
+        assert_eq!(conn.window, Some(Size::new(30, 100)));
         conn.poll_input(now).unwrap();
-        assert!(conn.wants_bytes(), "taken: read on");
+        assert!(conn.wants_bytes(0), "taken: read on");
     }
 
     #[test]
@@ -905,12 +969,12 @@ mod tests {
         let bytes = stream(&[typed(1, "hello")]);
         let (first, rest) = bytes.split_at(3);
         let mut conn = ServerConn::default();
-        conn.push_client_bytes(first, now).unwrap();
+        conn.push_client_bytes(0, first, now).unwrap();
         assert!(conn.to_session.is_empty());
-        assert!(conn.client_ended(now).is_err(), "ended inside a message");
+        assert!(conn.client_ended(0, now).is_err(), "ended inside a message");
         let mut conn = ServerConn::default();
-        conn.push_client_bytes(first, now).unwrap();
-        conn.push_client_bytes(rest, now).unwrap();
+        conn.push_client_bytes(0, first, now).unwrap();
+        conn.push_client_bytes(0, rest, now).unwrap();
         assert_eq!(
             conn.poll_input(now).unwrap(),
             Some(ToSession::Events("hello".chars().map(key).collect()))
@@ -919,10 +983,10 @@ mod tests {
         // it, and goes on as the session takes input, with no bytes more from the client. A clean
         // end with messages left is no error.
         let colours = ClientMsg::Colours(crate::events::WireColours::default());
-        conn.push_client_bytes(&stream(&vec![colours; super::TO_SESSION + 1]), now)
+        conn.push_client_bytes(0, &stream(&vec![colours; super::TO_SESSION + 1]), now)
             .unwrap();
         assert!(!conn.to_session.is_empty());
-        conn.client_ended(now).unwrap();
+        conn.client_ended(0, now).unwrap();
         let taken = std::iter::from_fn(|| conn.poll_input(now).unwrap()).count();
         assert_eq!(taken, super::TO_SESSION + 1);
     }
@@ -1009,7 +1073,7 @@ mod tests {
             })
         };
         let mut conn = ServerConn::default();
-        conn.push_client_bytes(&stream(&[ask(1), ask(2)]), Instant::now())
+        conn.push_client_bytes(0, &stream(&[ask(1), ask(2)]), Instant::now())
             .unwrap();
         assert_eq!(conn.next_history().map(|r| r.newest), Some(1));
         assert_eq!(conn.next_history(), None, "waits for the last's delivery");
@@ -1021,7 +1085,7 @@ mod tests {
             .map(ask)
             .collect();
         assert!(matches!(
-            conn.push_client_bytes(&stream(&flood), Instant::now()),
+            conn.push_client_bytes(0, &stream(&flood), Instant::now()),
             Err(ProtoError::TooManyRequests)
         ));
     }
@@ -1153,10 +1217,11 @@ mod tests {
         // full: nothing can go until a delivery, so the loop must not spin.
         let ms = Duration::from_millis;
         let (mut c, rtt, t, _) = on_a_full_link(b"$ ");
-        c.push_client_bytes(&stream(&[typed(1, "x")]), t).unwrap();
+        c.push_client_bytes(0, &stream(&[typed(1, "x")]), t)
+            .unwrap();
         // A second key, still awaiting its echo once the first is promoted.
         let typed_y = t + ms(30);
-        c.push_client_bytes(&stream(&[typed(2, "y")]), typed_y)
+        c.push_client_bytes(0, &stream(&[typed(2, "y")]), typed_y)
             .unwrap();
         let later = t + ms(60);
         c.echo.promote(later);
@@ -1200,7 +1265,8 @@ mod tests {
     fn the_echo_of_typing_goes_at_once_even_with_the_link_full() {
         let (mut c, rtt, t, _) = on_a_full_link(b"$ ");
         // The user types; the program's echo changes one row.
-        c.push_client_bytes(&stream(&[typed(1, "l")]), t).unwrap();
+        c.push_client_bytes(0, &stream(&[typed(1, "l")]), t)
+            .unwrap();
         c.install_snapshot(Arc::new(screen(b"$ l")));
         let typed = t + Duration::from_millis(1);
         let echo = c.poll_frame(typed, rtt).expect("the echo goes at once");
@@ -1308,7 +1374,7 @@ mod tests {
         let two = c.poll_frame(later(2), None).unwrap();
         assert_eq!(two.base, FrameNum(1));
         let resync = stream(&[ClientMsg::Resync]);
-        c.push_client_bytes(&resync, later(3)).unwrap();
+        c.push_client_bytes(0, &resync, later(3)).unwrap();
         c.ack(FrameNum(2), later(3));
         c.install_snapshot(Arc::new(screen(b"a b c")));
         let next = c.poll_frame(later(4), None).expect("a resync forces one");

@@ -217,6 +217,24 @@ pub enum ClientMsg {
     Colours(WireColours),
 }
 
+/// Which of the client's two streams a message goes on. Control messages have one of their own,
+/// so none waits behind input a slow program has not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream {
+    Input,
+    Control,
+}
+
+impl ClientMsg {
+    /// The stream it goes on.
+    pub const fn stream(&self) -> Stream {
+        match self {
+            Self::Keys { .. } | Self::Colours(_) => Stream::Input,
+            Self::Resize(_) | Self::Ack { .. } | Self::Resync | Self::History(_) => Stream::Control,
+        }
+    }
+}
+
 /// A screen update: the change from frame `base` to frame `num`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Frame {

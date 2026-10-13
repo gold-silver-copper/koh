@@ -14,7 +14,7 @@ use crate::events::{InputEvent, WireColours, WireScheme, MAX_EVENTS, MAX_PASTE, 
 use crate::predict::{Overlay, PredictionEngine};
 use crate::proto::{
     decode_frame_body, decode_history, dictionary_for, retry_after, ClientMsg, Frame, FrameNum,
-    InputSeq, ServerMsg, HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
+    InputSeq, ServerMsg, Stream, HEARTBEAT, MAX_CLIENT_MESSAGE, TTY_TICK,
 };
 use crate::terminal::{HistoryReply, Size, TerminalScreen};
 
@@ -196,11 +196,14 @@ impl Outgoing {
     }
 
     fn pop_front(&mut self) -> Option<ClientMsg> {
-        let msg = self.messages.pop_front()?;
+        self.take_first(|_| true)
+    }
+
+    /// The oldest message `matches`, taken from the queue.
+    fn take_first(&mut self, matches: impl FnMut(&ClientMsg) -> bool) -> Option<ClientMsg> {
+        let msg = self.messages.take_first(matches)?;
         self.input_bytes = self.input_bytes.saturating_sub(Self::input_cost(&msg));
-        if self.messages.is_empty() {
-            self.newest_bytes = 0;
-        }
+        self.newest_bytes = self.messages.back().map_or(0, Self::input_cost);
         Some(msg)
     }
 
@@ -914,12 +917,28 @@ impl ClientSession {
         self.link.owes_resync() || !self.outgoing.is_empty()
     }
 
+    /// Whether messages are waiting for the server on `stream`.
+    pub fn has_outgoing_on(&self, stream: Stream) -> bool {
+        (stream == Stream::Control && self.link.owes_resync())
+            || self.outgoing.iter().any(|msg| msg.stream() == stream)
+    }
+
     /// Take the next message for the server.
     pub fn pop_outgoing(&mut self) -> Option<ClientMsg> {
-        if let Some(resync) = self.link.take_resync() {
-            return Some(resync);
+        self.pop(|_| true)
+    }
+
+    /// Take the next message for the server on `stream`: a control message never waits behind
+    /// input the server has not taken.
+    pub fn pop_outgoing_on(&mut self, stream: Stream) -> Option<ClientMsg> {
+        self.pop(|msg| msg.stream() == stream)
+    }
+
+    fn pop(&mut self, mut on: impl FnMut(&ClientMsg) -> bool) -> Option<ClientMsg> {
+        if self.link.owes_resync() && on(&ClientMsg::Resync) {
+            return self.link.take_resync();
         }
-        let msg = self.outgoing.pop_front()?;
+        let msg = self.outgoing.take_first(on)?;
         if let ClientMsg::Keys { seq, .. } = &msg {
             self.sent_seq = *seq;
         }

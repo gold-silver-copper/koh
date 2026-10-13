@@ -1377,6 +1377,19 @@ mod tests {
     }
 
     #[test]
+    fn a_delivery_exactly_as_fast_as_the_link_proves_the_link() {
+        // No baseline is taken off: what took exactly what the link needs proves it, no more.
+        for (bytes, nanos, per_sec) in [
+            (1500, 1_500_000, 1_000_000),
+            (10_000, 1_250_000_000, 8_000),
+            (3_000_000, 24_000_000, 125_000_000),
+        ] {
+            let took = Duration::from_nanos(nanos);
+            assert_eq!(super::Rate::proven(bytes, took), Some(super::Rate(per_sec)));
+        }
+    }
+
+    #[test]
     fn frames_diff_against_the_newest_acknowledged_frame() {
         let t0 = Instant::now();
         let later = |n| t0 + Duration::from_secs(n);

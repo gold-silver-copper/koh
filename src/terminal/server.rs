@@ -358,25 +358,6 @@ impl ServerTerminal {
         self.parser.resize_report()
     }
 
-    /// The size. Test-only.
-    #[cfg(test)]
-    pub fn size(&self) -> Size {
-        let (rows, cols) = self.parser.screen().size().into();
-        Size { rows, cols }
-    }
-
-    /// The window title. Test-only.
-    #[cfg(test)]
-    pub fn title(&self) -> &str {
-        &self.observed.title
-    }
-
-    /// How many bells rang. Test-only.
-    #[cfg(test)]
-    pub fn bell_count(&self) -> u64 {
-        self.observed.bell_count
-    }
-
     /// A snapshot of the current screen. Rows unchanged since the last snapshot share its cells.
     /// A new palette that draws a row of the history otherwise names the history afresh: a client's
     /// copies, in the old one, are then rows the history no longer holds. One that changes no row
@@ -884,53 +865,18 @@ mod tests {
         );
     }
 
+    /// The emulator clamps a resize itself, behind the clamp at the protocol: a hostile size
+    /// never reaches fux-vt. `MAX_SCROLLBACK` leaves room for the largest screen in fux-vt's cell
+    /// limit, or `koh serve --scrollback <max>` would refuse it; the smallest takes wide glyphs.
     #[test]
-    fn title_icon_bell_clipboard_captured() {
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.process(b"\x1b]2;my-title\x07\x07\x1b]1;my-icon\x07\x1b]52;c;aGVsbG8=\x07");
-        assert_eq!(t.title(), "my-title");
-        assert_eq!(t.bell_count(), 1);
-        let snap = t.snapshot();
-        assert_eq!(snap.title(), "my-title");
-        assert_eq!(snap.icon(), "my-icon", "snapshot carries the icon name");
-        assert_eq!(
-            snap.clipboard(),
-            "aGVsbG8=",
-            "snapshot carries the OSC-52 clipboard"
-        );
-        assert_eq!(snap.bell_count(), 1, "snapshot carries the bell count");
-        // A runaway title is clamped to MAX_TITLE_LEN chars (mosh's parse-time cap).
-        let huge = "x".repeat(MAX_TITLE_LEN + 500);
-        t.process(format!("\x1b]2;{huge}\x07").as_bytes());
-        assert_eq!(t.title().chars().count(), MAX_TITLE_LEN);
-    }
-
-    #[test]
-    fn max_scrollback_fits_the_largest_screen() {
-        // `MAX_SCROLLBACK` must leave room for a MAX_DIM×MAX_DIM screen in fux-vt's per-buffer
-        // cell limit, or `koh serve --scrollback <max>` would fail to start or refuse a resize.
-        use crate::terminal::MAX_DIM;
+    fn a_resize_is_clamped_and_the_largest_fits_the_most_scrollback() {
+        use crate::terminal::{MAX_DIM, MIN_DIM};
         let history = usize::try_from(crate::server::cli::MAX_SCROLLBACK).expect("fits usize");
         let mut t = ServerTerminal::new(24, 80, history).expect("default size at max scrollback");
-        t.resize(Size::new(MAX_DIM, MAX_DIM));
-        assert_eq!(
-            t.size(),
-            Size::new(MAX_DIM, MAX_DIM),
-            "largest resize accepted"
-        );
+        assert!(t.resize(Size::new(65000, 65000)));
+        assert_eq!(t.snapshot().size(), Size::new(MAX_DIM, MAX_DIM));
         assert!(ServerTerminal::new(MAX_DIM, MAX_DIM, history).is_ok());
-    }
-
-    /// The emulator clamps a resize itself, behind the clamp at the protocol: a hostile size
-    /// never reaches fux-vt, and the smallest grid still takes wide glyphs.
-    #[test]
-    fn a_resize_is_clamped_by_the_emulator_too() {
-        use crate::terminal::{MAX_DIM, MIN_DIM};
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        assert!(t.resize(Size::new(65000, 0)));
-        assert_eq!(t.size(), Size::new(MAX_DIM, MIN_DIM));
         t.resize(Size::new(0, 0));
-        assert_eq!(t.size(), Size::new(MIN_DIM, MIN_DIM));
         t.process("日本語\u{1f468}\u{200d}\u{1f469}x\r\n日".as_bytes());
         assert_eq!(t.snapshot().size(), Size::new(MIN_DIM, MIN_DIM));
     }
@@ -951,7 +897,7 @@ mod tests {
         let contents = terminal.snapshot().screen().contents();
         assert_eq!(contents.matches("beforeafter").count(), 5, "{contents:?}");
         assert_eq!(
-            terminal.title(),
+            terminal.snapshot().title(),
             "",
             "an over-limit title is dropped, not truncated"
         );
@@ -969,7 +915,7 @@ mod tests {
         ] {
             terminal.process(chunk);
         }
-        assert_eq!(terminal.title(), "split title");
+        assert_eq!(terminal.snapshot().title(), "split title");
         assert!(terminal.snapshot().screen().contents().contains("ok"));
     }
 

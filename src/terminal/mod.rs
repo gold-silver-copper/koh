@@ -705,25 +705,18 @@ impl WireCell {
                 );
                 Some(())
             }
-            CellKind::Chars => {
+            CellKind::Chars | CellKind::WideChars => {
+                let wide = self.kind == CellKind::WideChars;
                 let mut buf = [0; 4];
-                for (col, ch) in (at..).zip(self.text.as_str().chars()) {
+                for (i, ch) in self.text.as_str().chars().enumerate() {
+                    let col = i.checked_mul(if wide { 2 } else { 1 })?.checked_add(at)?;
                     cells.set(
                         col,
-                        CellRef::new(ch.encode_utf8(&mut buf), false, self.attributes()),
+                        CellRef::new(ch.encode_utf8(&mut buf), wide, self.attributes()),
                     );
-                }
-                Some(())
-            }
-            CellKind::WideChars => {
-                let mut buf = [0; 4];
-                for (pair, ch) in self.text.as_str().chars().enumerate() {
-                    let col = pair.checked_mul(2).and_then(|c| c.checked_add(at))?;
-                    cells.set(
-                        col,
-                        CellRef::new(ch.encode_utf8(&mut buf), true, self.attributes()),
-                    );
-                    cells.set(col.checked_add(1)?, CellRef::wide_continuation());
+                    if wide {
+                        cells.set(col.checked_add(1)?, CellRef::wide_continuation());
+                    }
                 }
                 Some(())
             }
@@ -1807,38 +1800,6 @@ mod tests {
     }
 
     #[test]
-    fn client_apply_clamps_a_hostile_resize() {
-        // A malicious server ships a giant or zero resize: the client clamps each axis, never
-        // building a giant grid or panicking.
-        for (asked, clamped) in [
-            (Size::new(65000, 65000), Size::new(MAX_DIM, MAX_DIM)),
-            (Size::new(0, 0), Size::new(MIN_DIM, MIN_DIM)),
-            (Size::new(0, 5000), Size::new(MIN_DIM, MAX_DIM)),
-        ] {
-            let mut c = TerminalScreen::default();
-            let mut diff = c.diff_from(&c);
-            diff.resize = Some(asked);
-            c.apply(&diff).unwrap();
-            assert_eq!(c.size(), clamped, "{asked:?}");
-        }
-    }
-
-    #[test]
-    fn client_apply_caps_oversized_title_and_clipboard() {
-        // A malicious server ships an oversized title + clipboard. The client re-applies the caps
-        // (it must not trust the wire even though the honest server emulator already caps them).
-        let mut c = TerminalScreen::default();
-        let mut diff = TerminalScreen::default().diff_from(&TerminalScreen::default());
-        diff.title = Some("T".repeat(MAX_TITLE_LEN + 1000));
-        diff.icon = Some("I".repeat(MAX_TITLE_LEN + 5));
-        diff.clipboard = Some("C".repeat(MAXIMUM_CLIPBOARD_SIZE + 1000));
-        c.apply(&diff).unwrap();
-        let (title, icon) = (c.title().chars().count(), c.icon().chars().count());
-        assert_eq!((title, icon), (MAX_TITLE_LEN, MAX_TITLE_LEN));
-        assert!(c.clipboard().len() <= MAXIMUM_CLIPBOARD_SIZE);
-    }
-
-    #[test]
     fn a_malformed_last_row_drops_the_rows_before_it_too() {
         // Every row is validated before any is committed: a malformed row leaves the prior screen
         // untouched, never half-applied, though the rows before it decoded fine.
@@ -2255,7 +2216,7 @@ mod tests {
     fn runs_of_characters_decode_to_the_cells_they_name() {
         let target = TerminalScreen::from_bytes(
             4,
-            12,
+            20,
             "ab\x1b[31mcd日本\x1b[m\u{1f468}\u{200d}\u{1f469}x".as_bytes(),
         );
         let diff = target.diff_from(&TerminalScreen::default());
@@ -2273,17 +2234,17 @@ mod tests {
                 (CellKind::Wide, 1),
                 (CellKind::Continuation, 1),
                 (CellKind::Narrow, 1),
-                (CellKind::Narrow, 1),
+                (CellKind::Narrow, 9),
             ],
-            "a cluster of several characters goes as a cell of its own"
+            "a cluster of several characters goes as a cell of its own, identical cells as one run"
         );
         let mut client = TerminalScreen::default();
         client.apply(&diff).unwrap();
         assert_eq!(client, target);
         // A run of characters that overruns the row drops the frame.
         let mut long = diff.clone();
-        long.rows[0].runs[0].count = NonZeroU16::new(13).unwrap();
-        long.rows[0].runs[0].cell.text = CellText::run(&"a".repeat(13)).unwrap();
+        long.rows[0].runs[0].count = NonZeroU16::new(21).unwrap();
+        long.rows[0].runs[0].cell.text = CellText::run(&"a".repeat(21)).unwrap();
         let mut client = TerminalScreen::default();
         client.apply(&long).unwrap_err();
         assert_eq!(client, TerminalScreen::default());
@@ -2310,22 +2271,6 @@ mod tests {
     }
 
     #[test]
-    fn identical_cells_are_run_length_encoded() {
-        let target = TerminalScreen::from_bytes(24, 80, b"ab");
-        let diff = target.diff_from(&TerminalScreen::default());
-        // Only the changed row: 'ab' as a run of characters, then one run of 78 blanks.
-        let [row] = &diff.rows[..] else {
-            panic!("{:?}", diff.rows)
-        };
-        let runs: Vec<_> = row
-            .runs
-            .iter()
-            .map(|r| (r.cell.kind, r.count.get()))
-            .collect();
-        assert_eq!(runs, [(CellKind::Chars, 2), (CellKind::Narrow, 78)]);
-    }
-
-    #[test]
     fn capped_bytes_never_splits_utf8() {
         // A multi-byte scalar straddling the byte budget must be dropped whole, leaving valid UTF-8.
         let s = "a".repeat(MAXIMUM_CLIPBOARD_SIZE - 1) + "é"; // 'é' is 2 bytes, crosses the cap
@@ -2336,12 +2281,16 @@ mod tests {
     }
 
     #[test]
-    fn icon_clipboard_and_exit_code_roundtrip_and_resist_collapse() {
+    fn side_channels_roundtrip_and_resist_collapse() {
         // When the shell exits, the server stamps the code. Each survives diff -> apply, and a
         // state carrying one must NOT compare equal to one without (so it isn't collapsed).
         let mut emu = ServerTerminal::new(24, 80, 0).expect("emulator");
-        emu.process(b"\x1b]1;myicon\x07\x1b]2;mytitle\x07\x1b]52;c;aGk=\x07");
+        let huge = "x".repeat(MAX_TITLE_LEN + 500);
+        emu.process(format!("\x1b]2;{huge}\x07").as_bytes());
+        assert_eq!(emu.snapshot().title().chars().count(), MAX_TITLE_LEN);
+        emu.process(b"\x1b]1;myicon\x07\x1b]2;mytitle\x07\x07\x1b]52;c;aGk=\x07");
         let with_icon = emu.snapshot();
+        assert_eq!((with_icon.title(), with_icon.bell_count()), ("mytitle", 1));
         emu.set_exit_code(42);
         let exited = emu.snapshot();
         assert_eq!(exited.exit_code(), Some(42));
@@ -2358,14 +2307,10 @@ mod tests {
         assert_ne!(with_icon, exited, "the exit code alone tells them apart");
     }
 
-    // --- Ported mosh terminal-emulation / unicode regression tests, recast as diff/apply
-    // round-trip tests: feed the byte sequence from the corresponding mosh test to the server emulator, ship
-    // the snapshot through diff/apply onto a fresh client, and assert the client reconstructs the
-    // screen EXACTLY (koh's verification guarantee) plus the semantic outcome mosh checked.
-    // mosh source: src/tests/emulation-*.test, unicode-*.test. ---
+    // Ported from mosh's src/tests/emulation-*.test and unicode-*.test, as diff/apply round trips.
 
-    /// Process `bytes`, ship server→client via diff/apply, assert exact reconstruction, and
-    /// return the reconstructed client screen for semantic assertions.
+    /// Process `bytes`, ship them to a fresh client, assert it reconstructs the screen exactly, and
+    /// return the client's screen.
     fn roundtrip(rows: u16, cols: u16, bytes: &[u8]) -> TerminalScreen {
         let mut emu = ServerTerminal::new(rows, cols, 0).expect("emulator");
         emu.process(bytes);

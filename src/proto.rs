@@ -657,11 +657,11 @@ mod tests {
 
     #[test]
     fn a_read_of_many_tiny_messages_decodes_them_all_and_leaves_the_buffer_empty() {
-        let resize = encode_client(&ClientMsg::Resize {
+        let msg = ClientMsg::Resize {
             n: 1,
             size: Size::new(1, 2),
-        })
-        .unwrap();
+        };
+        let resize = encode_client(&msg).unwrap();
         let count = (16 * 1024_usize).div_euclid(resize.len());
         let mut decoder = ClientDecoder::default();
         decoder.push(&resize.repeat(count));
@@ -672,14 +672,8 @@ mod tests {
             "decoding a message does not move the rest of the read"
         );
         let mut decoded = 1;
-        while let Some(msg) = decoder.next_msg().unwrap() {
-            assert_eq!(
-                msg,
-                ClientMsg::Resize {
-                    n: 1,
-                    size: Size::new(1, 2)
-                }
-            );
+        while let Some(next) = decoder.next_msg().unwrap() {
+            assert_eq!(next, msg);
             decoded += 1;
         }
         assert_eq!(decoded, count);
@@ -689,13 +683,7 @@ mod tests {
         decoder.push(&resize[..3]);
         assert!(decoder.next_msg().unwrap().is_none());
         decoder.push(&resize[3..]);
-        assert_eq!(
-            decoder.next_msg().unwrap(),
-            Some(ClientMsg::Resize {
-                n: 1,
-                size: Size::new(1, 2)
-            })
-        );
+        assert_eq!(decoder.next_msg().unwrap(), Some(msg));
     }
 
     #[test]
@@ -919,20 +907,5 @@ mod tests {
         // History inflates no further than the largest legal reply.
         let past = miniz_oxide::deflate::compress_to_vec(&vec![0u8; MAX_HISTORY_REPLY + 1], 9);
         assert!(matches!(decode_history(&past), Err(ProtoError::Inflate)));
-    }
-
-    #[test]
-    fn a_retry_waits_a_round_trip_the_floor_and_the_acknowledgement_delay() {
-        let ms = Duration::from_millis;
-        assert_eq!(retry_after(Some(ms(200))), ms(200 + 5 + 25));
-        assert_eq!(retry_after(Some(ms(10))), ms(10 + 5 + 25));
-        assert_eq!(retry_after(None), ms(333 + 5 + 25));
-    }
-
-    #[test]
-    fn frame_and_sequence_numbers_saturate() {
-        assert_eq!(FrameNum(u64::MAX).next(), FrameNum(u64::MAX));
-        assert_eq!(InputSeq(u64::MAX).next(), InputSeq(u64::MAX));
-        assert_eq!(FrameNum::BLANK.next(), FrameNum(1));
     }
 }

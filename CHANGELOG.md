@@ -16,10 +16,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
 ## [Unreleased]
 
 ### Changed
-- **The wire protocol is now `koh/5`**: a paste goes whole in one message (up to 1 MiB), and the
+- **The wire protocol is now `koh/6`**: a paste goes whole in one message (up to 1 MiB), and the
   raw-bytes `Input` message is gone; history requests carry ids and every one is answered; a
-  refusal is a close code; screen modes say whether the alternate screen is shown; the server
-  admits a client only once it holds its session.
+  refusal is a close code; screen modes say whether the alternate screen is shown; the admission
+  stream is gone: the server attaches the client's session before it sends anything, and the
+  first frame admits it.
 - Painting is a diff of the whole terminal with autowrap off: a terminal larger or smaller than the
   screen shows the screen clipped and nothing else, the status line repaints only when it changes,
   switching mouse modes turns the old one off, and the window title is restored on exit and
@@ -30,13 +31,29 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - The terminal's answers to the start-up questions are read by the session's own input decoder.
 - `Ctrl-^ Ctrl-^` or `Ctrl-^ ^` sends one Ctrl-^.
 - Removing a client with `koh clients rm` ends its session as well as its connection.
-- At most 2 handshakes are pending per address, its oldest given up for a new one, which is never
-  refused; the client holds
-  at most about 40 MiB of server streams; the server keeps a clipboard only as base64 within its
-  cap; a key, list or `$KOH_LOG` file with another hard link is refused.
+- At most 2 handshakes are pending per address (an IPv6 /48 is one), its oldest given up for a new
+  one, which is never refused, and they hold no connection permit; when giving one up would cost
+  a handshake under way, an address not yet validated answers a QUIC retry first, so spoofed
+  addresses take no room. The client holds at most about 40 MiB of compressed server streams and
+  inflates history replies one at a time, no further than a legal reply; the server keeps a
+  clipboard only as base64 within its cap; a key, list or `$KOH_LOG` file with another hard link
+  is refused.
+- `--max-connections` and `--max-sessions` are at least 1.
+- A server started under `nohup` (SIGHUP ignored) survives the terminal's close; its sessions'
+  programs still get SIGHUP's default. Turned-away peers are logged at most once every 10 s.
+- Frames land on slow links: a frame is given up only once the client has acknowledged nothing for
+  a retry interval, the link's rate is what deliveries prove, and the client keeps the base the
+  server diffs against however many frames pass. A resize no longer waits behind typing the
+  program has not read. Echo turned off just after a prompt (PAM's order) is told 5 ms after the
+  prompt, not a tick later.
+- A title or icon reaches the terminal only through `OscText`, stripped of every C0 and C1
+  control.
+- The tests start every program with a home of their own, no history file and no `ENV` script:
+  a test run never writes to the developer's shell history.
 - Every queue in koh has a bound, and `clippy.toml` bans unbounded ones; the wire's sequences are
   refused as they are decoded once past their bound.
-- `koh serve` reads the saved clients at every connection: `koh clients rm` takes effect at once.
+- `koh serve` reads the saved clients every 1.5 s: `koh clients rm` takes effect within 2 s. A read
+  that drops a client counts only once the next, 0.5 s later, agrees.
 - A session's program is hung up and given a second to exit (a shell saves its history) before it
   is killed.
 - More keys in one read than anyone types (a paste into a terminal without bracketed paste, a
@@ -54,6 +71,16 @@ binary, its tests and the fuzz targets share code, and any release may change it
   only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
+- A reconnect that landed as its exited session ended could wait for ever: the attach the
+  session had queued was kept alive until the next one. Sessions are reaped as they end.
+- An editor saving the `clients` file (missing or empty for a moment) could disconnect every saved
+  client and end their sessions.
+- Backspace or Left typed fast at a fresh line could appear to erase the prompt; a key could be
+  shown and then never sent when the outgoing queue was full; a terminal's answer cut by a drop
+  was reported as typing not sent.
+- A palette change scanned the whole history at every snapshot; a history reply served while a
+  frame was held could keep a colour the program had already restored.
+- `koh key info` and the menu said "none yet" for a key that exists but cannot be loaded.
 - A kitty-protocol key whose code is no Unicode scalar (a terminal's garbage) no longer makes a
   message the client cannot send, losing the keys typed with it: the code is dropped.
 - A typo in the saved `clients` file disconnected every saved client and refused their redials;
@@ -87,8 +114,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - `koh clients rm` left the removed client's live connection open; a refused redial retried
   forever.
 - Another local user could hang koh by locking its key directory; the menu's replace could lose
-  the saved name; `koh serve --key-file` needed `$HOME`; with `--max-connections` up to 4, stalled
-  handshakes could hold every slot.
+  the saved name; `koh serve --key-file` needed `$HOME`; stalled handshakes could hold every
+  connection slot.
 - A test typed a wrong password into the real `sudo` and `passwd`.
 - A program that stopped reading its input, under a large paste, froze its connection's frames,
   and a client that left meanwhile kept its session attached and its connection slot held.

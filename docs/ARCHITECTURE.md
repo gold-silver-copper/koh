@@ -177,8 +177,11 @@ on the others it redials and its banner says why. Then (`src/proto.rs`):
   view is anchored to its rows: output that scrolls into history moves it up with them, so what
   is being read stays still while the live screen goes on below. Out of the view, a client idle for
   2 s fetches the newest screenful ahead, so opening the view shows rows at once.
-- **Shutdown:** when the shell exits, the server sends the final frame (carrying the exit code),
-  waits up to 1 s for its ack, then closes the connection with code 0 and reason `session ended`.
+- **Shutdown:** when the shell exits, the server sends the final frame (carrying the exit code)
+  and resends it as any frame until it is acknowledged, at least 1 s (two retries on a slow link).
+  Acknowledged, the session ends and the connection closes with `Close::SessionEnded` (3) once the
+  client has read it; unacknowledged, it closes as a lost link and the session keeps the end for
+  the client's redial.
 
 `TerminalScreen` is a plain `Grid` of rows stored as `fux_vt::Cells` (with a cursor, per-row soft-wrap flags and
 the input modes the client mirrors) plus the side channels: title, icon, OSC 52 clipboard, bell count
@@ -485,7 +488,8 @@ construction rather than by care at each call:
   counts fux-vt's storage against `HISTORY_CACHE_BYTES` and keeps only rows a request it has
   outstanding (by id) asked for. A frame's rows are strictly ascending, and its dictionary is built
   from the end, stopping at its window. Server streams over 256 KiB need one of two turns, so the
-  client holds about 40 MiB of them at most.
+  client holds about 40 MiB of them, compressed, at most; history replies are inflated one at a
+  time in its loop, no further than `MAX_HISTORY_REPLY`, the most a legal reply holds.
 - **Shutdown and handshakes.** One task counts SIGTERM, SIGINT and SIGHUP (unless SIGHUP was ignored at start,
   as `nohup` does): the first drains, a
   repeat within 1 s (a double SIGHUP on a terminal's close) is the same, and a later one forces an

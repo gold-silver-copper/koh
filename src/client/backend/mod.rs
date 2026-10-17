@@ -7,7 +7,7 @@
 use std::fmt;
 use std::io;
 
-use fux_vt::{Attributes, Blink, Color, UnderlineStyle};
+use fux_vt::{Attributes, SgrForm};
 
 use crate::terminal::{Link, Size};
 
@@ -23,31 +23,6 @@ pub type DefaultBackend = Tty;
 pub(crate) const RESET_FORWARDED_MODES: &[u8] =
     b"\x1b[?9l\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\
 \x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>";
-
-/// `style` as a terminal draws it: underline styles only where it `styles` them.
-///
-/// Elsewhere a styled underline is a plain one: a terminal that does not know `4:n` draws no
-/// underline at all, or reads the colon as a semicolon (underline and italic).
-#[must_use]
-pub fn drawn(style: Attributes, styles: bool) -> Attributes {
-    let underline = match style.underline_style() {
-        UnderlineStyle::None => UnderlineStyle::None,
-        kind @ (UnderlineStyle::Double
-        | UnderlineStyle::Curly
-        | UnderlineStyle::Dotted
-        | UnderlineStyle::Dashed)
-            if styles =>
-        {
-            kind
-        }
-        UnderlineStyle::Single
-        | UnderlineStyle::Double
-        | UnderlineStyle::Curly
-        | UnderlineStyle::Dotted
-        | UnderlineStyle::Dashed => UnderlineStyle::Single,
-    };
-    style.with_underline_style(underline)
-}
 
 /// Text for an OSC sequence, without the control characters that would end it early.
 ///
@@ -162,41 +137,15 @@ pub trait KohBackend {
         self.write_bytes(b"\x1b[r")
     }
 
-    /// Set a whole style: reset, then each attribute, then the colours.
-    fn set_style(&mut self, style: Attributes) -> io::Result<()> {
-        self.reset_sgr()?; // clears everything (incl. colors), then re-apply
-        let underline: &[u8] = match style.underline_style() {
-            UnderlineStyle::None => b"",
-            // Kitty's `4:n`, only where the terminal draws it (see `drawn`).
-            UnderlineStyle::Double => b"\x1b[4:2m",
-            UnderlineStyle::Curly => b"\x1b[4:3m",
-            UnderlineStyle::Dotted => b"\x1b[4:4m",
-            UnderlineStyle::Dashed => b"\x1b[4:5m",
-            UnderlineStyle::Single => b"\x1b[4m",
-        };
-        let blink: &[u8] = match style.blink() {
-            Blink::Slow => b"\x1b[5m",
-            Blink::Rapid => b"\x1b[6m",
-            Blink::None => b"",
-        };
-        for (on, sgr) in [
-            (style.bold(), &b"\x1b[1m"[..]),
-            (style.dim(), b"\x1b[2m"),
-            (style.italic(), b"\x1b[3m"),
-            (true, underline),
-            (style.inverse(), b"\x1b[7m"),
-            (style.hidden(), b"\x1b[8m"),
-            (style.strikeout(), b"\x1b[9m"),
-            (true, blink),
-        ] {
-            if on && !sgr.is_empty() {
-                self.write_bytes(sgr)?;
-            }
-        }
-        write_sgr_color(self, style.foreground(), true)?;
-        write_sgr_color(self, style.background(), false)?;
-        // Only when set: a terminal that does not know SGR 58 may read its parameters as others.
-        write_underline_color(self, style.underline_color())
+    /// Set a whole style, from a reset, in one SGR, as fux-vt paints it: underline styles
+    /// (kitty's `4:n`) only where the terminal `styles` them, else a plain underline, as a
+    /// terminal that does not know `4:n` draws no underline at all, or reads the colon as a
+    /// semicolon (underline and italic).
+    fn set_style(&mut self, style: Attributes, styles: bool) -> io::Result<()> {
+        let mut sgr = b"\x1b[0".to_vec();
+        style.write_sgr(&mut sgr, SgrForm::Paint { styles });
+        sgr.push(b'm');
+        self.write_bytes(&sgr)
     }
 
     /// Reset all SGR attributes (`ESC [ m`, the zero-parameter form).
@@ -255,40 +204,6 @@ pub trait KohBackend {
     }
 }
 
-/// Emit `color` as the underline colour (SGR 58), unless it is the default (the text's colour),
-/// which the reset before every style already restored.
-fn write_underline_color(out: &mut (impl KohBackend + ?Sized), color: Color) -> io::Result<()> {
-    match color {
-        Color::Idx(i) => write!(out, "\x1b[58;5;{i}m"),
-        Color::Rgb(fux_vt::Rgb { r, g, b }) => write!(out, "\x1b[58;2;{r};{g};{b}m"),
-        Color::Default => Ok(()),
-    }
-}
-
-/// Emit `color` as the foreground (`fg`) or background. Indices 0–15 use the classic 30–37/90–97
-/// (40–47/100–107) codes, which follow the user's theme, rather than `38;5;n`.
-fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool) -> io::Result<()> {
-    match color {
-        Color::Idx(i) if i < 8 => {
-            let lead = if fg { 3 } else { 4 };
-            write!(out, "\x1b[{lead}{i}m")
-        }
-        Color::Idx(i) if i < 16 => {
-            let lead = if fg { 9 } else { 10 };
-            write!(out, "\x1b[{lead}{}m", i & 7)
-        }
-        Color::Idx(i) => {
-            let lead = if fg { 38 } else { 48 };
-            write!(out, "\x1b[{lead};5;{i}m")
-        }
-        Color::Rgb(fux_vt::Rgb { r, g, b }) => {
-            let lead = if fg { 38 } else { 48 };
-            write!(out, "\x1b[{lead};2;{r};{g};{b}m")
-        }
-        Color::Default => out.write_bytes(if fg { b"\x1b[39m" } else { b"\x1b[49m" }),
-    }
-}
-
 /// A backend that captures the bytes a terminal would receive, for tests. It reports `size`, 24×80
 /// by default.
 #[cfg(test)]
@@ -330,6 +245,7 @@ impl KohBackend for CaptureBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fux_vt::{Blink, Color, UnderlineStyle};
 
     /// Capture the bytes a single provided method emits.
     fn emit(f: impl FnOnce(&mut CaptureBackend) -> io::Result<()>) -> Vec<u8> {
@@ -342,25 +258,14 @@ mod tests {
     /// fixed 256-palette `38;5;n` form, so a user's terminal theme still recolors them.
     #[test]
     fn sgr_colors_are_the_classic_theme_aware_codes_where_they_can_be() {
-        for i in 0..16u8 {
-            for (fg, low, high) in [(true, 30, 90), (false, 40, 100)] {
-                let code = if i < 8 { low + i } else { high + i - 8 };
-                assert_eq!(
-                    emit(|b| write_sgr_color(b, Color::Idx(i), fg)),
-                    format!("\x1b[{code}m").into_bytes(),
-                    "index {i}, fg {fg}"
-                );
-            }
-        }
         let blue = Color::Rgb(fux_vt::Rgb { r: 0, g: 0, b: 255 });
-        for (color, fg, sgr) in [
-            (Color::Idx(196), true, &b"\x1b[38;5;196m"[..]),
-            (blue, true, b"\x1b[38;2;0;0;255m"),
-            (Color::Default, true, b"\x1b[39m"),
-            (Color::Idx(196), false, b"\x1b[48;5;196m"),
-            (Color::Default, false, b"\x1b[49m"),
+        for (fg, bg, sgr) in [
+            (Color::Idx(1), Color::Idx(9), &b"\x1b[0;31;101m"[..]),
+            (Color::Idx(15), Color::Idx(4), b"\x1b[0;97;44m"),
+            (Color::Idx(196), blue, b"\x1b[0;38;5;196;48;2;0;0;255m"),
         ] {
-            assert_eq!(emit(|b| write_sgr_color(b, color, fg)), sgr, "{color:?}");
+            let style = Attributes::new(fg, bg);
+            assert_eq!(emit(|b| b.set_style(style, true)), sgr, "{style:?}");
         }
     }
 
@@ -400,31 +305,21 @@ mod tests {
             .with_strikeout(true)
             .with_blink(Blink::Rapid);
         assert_eq!(
-            emit(|b| b.set_style(style)),
-            b"\x1b[m\x1b[4m\x1b[8m\x1b[9m\x1b[6m\x1b[31m\x1b[49m\x1b[58;2;1;2;3m"
+            emit(|b| b.set_style(style, true)),
+            b"\x1b[0;8;9;4;6;58:2::1:2:3;31m"
         );
-        assert_eq!(emit(|b| b.set_style(plain)), b"\x1b[m\x1b[31m\x1b[49m");
+        assert_eq!(emit(|b| b.set_style(plain, true)), b"\x1b[0;31m");
         // Each underline style, where the terminal draws them; plain where it does not.
         for (underline, sgr) in [
-            (UnderlineStyle::Double, &b"\x1b[4:2m"[..]),
-            (UnderlineStyle::Curly, b"\x1b[4:3m"),
-            (UnderlineStyle::Dotted, b"\x1b[4:4m"),
-            (UnderlineStyle::Dashed, b"\x1b[4:5m"),
+            (UnderlineStyle::Double, &b"\x1b[0;4:2;31m"[..]),
+            (UnderlineStyle::Curly, b"\x1b[0;4:3;31m"),
+            (UnderlineStyle::Dotted, b"\x1b[0;4:4;31m"),
+            (UnderlineStyle::Dashed, b"\x1b[0;4:5;31m"),
         ] {
             let styled = plain.with_underline_style(underline);
-            assert_eq!(
-                emit(|b| b.set_style(drawn(styled, true))),
-                [b"\x1b[m", sgr, b"\x1b[31m\x1b[49m"].concat()
-            );
-            assert_eq!(
-                emit(|b| b.set_style(drawn(styled, false))),
-                b"\x1b[m\x1b[4m\x1b[31m\x1b[49m"
-            );
+            assert_eq!(emit(|b| b.set_style(styled, true)), sgr);
+            assert_eq!(emit(|b| b.set_style(styled, false)), b"\x1b[0;4;31m");
         }
-        assert_eq!(
-            emit(|b| write_underline_color(b, Color::Idx(200))),
-            b"\x1b[58;5;200m"
-        );
     }
 
     #[test]

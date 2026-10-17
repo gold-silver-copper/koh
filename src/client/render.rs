@@ -6,7 +6,7 @@
 
 use std::io;
 
-use super::backend::{drawn, KohBackend, OscText};
+use super::backend::{KohBackend, OscText};
 use crate::predict::Overlay;
 use crate::terminal::{Grid, Link, Size, MAXIMUM_CLIPBOARD_SIZE};
 use fux_vt::{Attributes, CellRef, Cells, Color, MouseProtocolMode};
@@ -488,9 +488,8 @@ impl Painter {
                     if cursor != Some((row, col)) || joins(printed, glyph) {
                         backend.move_to(row, col)?;
                     }
-                    let want = drawn(want, self.underline_styles);
                     if style != Some(want) {
-                        backend.set_style(want)?;
+                        backend.set_style(want, self.underline_styles)?;
                         style = Some(want);
                     }
                     let link = link.filter(|link| self.hyperlinks && link.safe());
@@ -837,7 +836,7 @@ mod tests {
     }
 
     /// What `set_style` emits for the default style.
-    const PLAIN: &str = "\x1b[m\x1b[39m\x1b[49m";
+    const PLAIN: &str = "\x1b[0m";
 
     #[test]
     fn a_first_frame_clears_the_terminal_and_paints_only_what_is_not_blank() {
@@ -932,10 +931,7 @@ mod tests {
             "an unchanged status line is not painted"
         );
         let next = paint_frame(&mut painter, &screen, &empty, Some("down 2s"));
-        assert_eq!(
-            next,
-            framed("\x1b[24;7H\x1b[m\x1b[7m\x1b[39m\x1b[49m2\x1b[m", "24;11")
-        );
+        assert_eq!(next, framed("\x1b[24;7H\x1b[0;7m2\x1b[m", "24;11"));
         let gone = paint_frame(&mut painter, &screen, &empty, None);
         assert!(
             gone.contains("bottom ") && !gone.contains("down"),

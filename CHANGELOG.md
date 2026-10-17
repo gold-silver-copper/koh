@@ -70,6 +70,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
     others, primary device attributes now name selective erase, horizontal scrolling and
     rectangular editing, which it carries out, and `CSI 3 J` clears the scrollback.
   - Kitty's F13 to F35 reach the program; a mouse press on the wire always names its button.
+  - The client paints each style in one SGR, as fux-vt writes it, the underline colour in its
+    colon form, which a terminal that does not know it skips whole.
 - PTY input is bounded by bytes, including in-flight writes; backpressure retains pending
   buffers and terminal replies stay behind earlier input. Reply overflow is bounded and logged.
 - Hyperlink snapshots allocate strings only for distinct links in a row. Terminal dimensions

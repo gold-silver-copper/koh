@@ -1,6 +1,8 @@
-//! PTYs: start the session's program on one through the launcher ([`LAUNCH`]), pump its output
-//! and input on two threads of their own (so a slow program never blocks a tokio worker), resize
-//! it, reap it.
+//! PTYs: start the session's program on one, pump its output and input, resize it, reap it.
+//!
+//! The program leads a session of its own with the PTY as its controlling terminal (fuxix sets
+//! that up between `fork` and `exec`). Its output and input go on two threads of their own, so a
+//! slow program never blocks a tokio worker.
 
 use std::ffi::OsString;
 use std::io;
@@ -131,7 +133,7 @@ pub enum PtyError {
     /// Allocating the pseudo-terminal pair failed.
     #[error("opening pty: {0}")]
     OpenPty(#[source] io::Error),
-    /// Starting the program on the slave side failed: the launcher, or the program itself.
+    /// Starting the program on the slave side failed.
     #[error("spawning shell: {0}")]
     Spawn(#[source] io::Error),
     /// Cloning the master or starting a pump thread failed.
@@ -142,86 +144,31 @@ pub enum PtyError {
     Resize(#[source] io::Error),
 }
 
-/// The hidden subcommand that starts a session's program.
-///
-/// `<binary> __launch PROGRAM [ARGS...]`. Only koh runs it, so it is in no usage text. Its interface
-/// is fixed: a running `koh serve` may launch through a newer binary installed over it.
-pub const LAUNCH: &str = fuxix::pty::LAUNCH;
-
-/// The binary [`Pty::spawn`] runs as the launcher.
-///
-/// The default is the running binary, which must hand a [`LAUNCH`] invocation to [`launched`], as
-/// the `koh` binary does. Tests run a test harness, so they name the `koh` binary, and with it a
-/// home of their own ([`isolated`](Self::isolated)): a shell a test hosts never reads or writes the
-/// user's files.
+/// The home a session's program gets: the user's, or for tests one of their own
+/// ([`isolated`](Self::isolated)), so a shell a test hosts never reads or writes the user's files.
 #[derive(Clone, Debug, Default)]
-pub struct Launcher(Option<Isolated>);
+pub struct Home(Option<PathBuf>);
 
-/// A launcher binary other than the running one, and the home the programs it launches get.
-#[derive(Clone, Debug)]
-struct Isolated {
-    binary: PathBuf,
-    home: PathBuf,
-}
-
-impl Launcher {
-    /// The running binary.
-    pub const fn this_binary() -> Self {
+impl Home {
+    /// The user's: the program inherits the server's environment.
+    pub const fn user() -> Self {
         Self(None)
     }
 
-    /// The binary at `binary`, launching programs with `home` as their home, no history file, no
-    /// `ENV` script and a plain prompt.
-    pub fn isolated(binary: impl Into<PathBuf>, home: impl Into<PathBuf>) -> Self {
-        Self(Some(Isolated {
-            binary: binary.into(),
-            home: home.into(),
-        }))
+    /// `home`, with no history file, no `ENV` script and a plain prompt.
+    pub fn isolated(home: impl Into<PathBuf>) -> Self {
+        Self(Some(home.into()))
     }
 
-    /// The file to run. On Linux and Android the running binary is its image, even once its file
-    /// is replaced (an upgrade) or removed.
-    fn program(&self) -> io::Result<PathBuf> {
-        match &self.0 {
-            Some(isolated) => Ok(isolated.binary.clone()),
-            None if cfg!(any(target_os = "linux", target_os = "android")) => {
-                Ok(PathBuf::from("/proc/self/exe"))
-            }
-            None => std::env::current_exe(),
-        }
-    }
-
-    /// Give `cmd` the isolated home, if this launcher has one.
-    fn isolate(&self, cmd: &mut Command) {
-        if let Some(Isolated { home, .. }) = &self.0 {
+    /// Give `cmd` this home, unless it is the user's.
+    fn apply(&self, cmd: &mut Command) {
+        if let Some(home) = &self.0 {
             cmd.env("HOME", home)
                 .env("HISTFILE", "/dev/null")
                 .env("ENV", "")
                 .env("PS1", "$ ");
         }
     }
-}
-
-/// The launcher's arguments, `PROGRAM [ARGS...]`, if this process was started as the launcher.
-///
-/// That is `<binary> __launch PROGRAM [ARGS...]`. A binary that launches sessions checks this first,
-/// before it parses its command line or starts anything, and then calls [`launched`].
-pub fn launch_argv() -> Option<Vec<OsString>> {
-    let mut args = std::env::args_os().skip(1);
-    if args.next()? == LAUNCH {
-        Some(args.collect())
-    } else {
-        None
-    }
-}
-
-/// The launcher: makes `PROGRAM [ARGS...]` a session leader on the PTY and becomes it.
-///
-/// [`Pty::spawn`] runs it as `<binary> __launch PROGRAM [ARGS...]`, with its stdin and stderr on a
-/// PTY slave and its stdout on the pipe that reports a failure. It returns only if the program
-/// could not start, with the exit status to use.
-pub fn launched(argv: &[OsString]) -> u8 {
-    fuxix::pty::launched(argv)
 }
 
 /// How long the writer waits for the terminal to take more input before it looks at `stopping`
@@ -427,14 +374,14 @@ pub struct Pty {
 
 impl Pty {
     /// Allocate a `rows`×`cols` PTY and start `command` (argv, verbatim; empty for `$SHELL`)
-    /// on it through `launcher`, with `TERM` set. Returns it and a receiver of its output, which
+    /// on it in `home`, with `TERM` set. Returns it and a receiver of its output, which
     /// ends when the program closes the PTY.
     pub fn spawn(
         rows: u16,
         cols: u16,
         command: &[String],
         term: &str,
-        launcher: &Launcher,
+        home: &Home,
         reaper: &Reaper,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
         let size = pty_size(rows, cols).map_err(PtyError::OpenPty)?;
@@ -514,15 +461,11 @@ impl Pty {
 
         let argv = build_command(command, || resolve_shell(std::env::var_os("SHELL")));
         let (child, pid) = slave
-            .spawn(
-                &launcher.program().map_err(PtyError::Spawn)?,
-                &argv,
-                |cmd| {
-                    cmd.env("TERM", term);
-                    scrub_koh_env(cmd, std::env::vars_os().map(|(key, _)| key));
-                    launcher.isolate(cmd);
-                },
-            )
+            .spawn(&argv, |cmd| {
+                cmd.env("TERM", term);
+                scrub_koh_env(cmd, std::env::vars_os().map(|(key, _)| key));
+                home.apply(cmd);
+            })
             .map_err(|error| {
                 let program = argv
                     .first()
@@ -580,10 +523,10 @@ impl Pty {
     /// How the PTY takes typed keys now, as the program set it: echo and line mode. `None` if the
     /// modes cannot be read.
     pub fn tty_modes(&self) -> Option<crate::terminal::TtyModes> {
-        let modes = fuxix::terminal::attributes(&self.master).ok()?;
+        let modes = fuxix::terminal::attributes(&self.master).ok()?.modes();
         Some(crate::terminal::TtyModes {
-            echo: modes.echoes(),
-            line: modes.line_mode(),
+            echo: modes.echo,
+            line: modes.canonical,
         })
     }
 

@@ -116,19 +116,19 @@ struct PtyHost {
 }
 
 impl PtyHost {
-    /// Start `command` (empty for `$SHELL`) through `launcher` at the default size, left to
+    /// Start `command` (empty for `$SHELL`) in `home` at the default size, left to
     /// `reaper` once closed; the host and a receiver of its output. Blocks until the program starts.
     fn spawn(
         command: &[String],
         scrollback: usize,
-        launcher: &crate::pty::Launcher,
+        home: &crate::pty::Home,
         reaper: &crate::pty::Reaper,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let Size { rows, cols } = DEFAULT_SIZE;
         let emu = ServerTerminal::new(rows, cols, scrollback)
             .context("creating the terminal emulator")?;
         let (pty, pty_rx) =
-            crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", launcher, reaper)
+            crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", home, reaper)
                 .context("spawning shell")?;
         Ok((
             Self {
@@ -327,12 +327,12 @@ fn start(
 ) {
     let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
     let command = Arc::clone(&spec.command);
-    let (scrollback, ttl, launcher) = (spec.scrollback, spec.ttl, spec.launcher.clone());
+    let (scrollback, ttl, home) = (spec.scrollback, spec.ttl, spec.home.clone());
     let reaper = reaper.clone();
     let task = async move {
         // Forking and the program's exec block, and must hold up no other session.
         let spawned = tokio::task::spawn_blocking(move || {
-            PtyHost::spawn(&command, scrollback, &launcher, &reaper)
+            PtyHost::spawn(&command, scrollback, &home, &reaper)
         })
         .await;
         let (mut host, pty_rx) = match spawned.map_err(anyhow::Error::from).and_then(|s| s) {
@@ -598,8 +598,8 @@ pub struct SessionSpec {
     pub scrollback: usize,
     pub max_sessions: usize,
     pub ttl: Duration,
-    /// The binary each session's program is started through.
-    pub launcher: crate::pty::Launcher,
+    /// The home each session's program gets.
+    pub home: crate::pty::Home,
 }
 
 /// How often an attach is tried: one that reached a session as it ended is tried again.

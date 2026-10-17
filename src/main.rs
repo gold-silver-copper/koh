@@ -10,10 +10,6 @@ use koh::names::{List, Places};
 
 // An explicit runtime instead of `#[tokio::main]`, whose expansion `allow`s `clippy::expect_used`.
 fn main() -> std::process::ExitCode {
-    // Sessions start through this binary (`koh __launch …`), before anything else runs.
-    if let Some(argv) = koh::pty::launch_argv() {
-        return std::process::ExitCode::from(koh::pty::launched(&argv));
-    }
     let cmd = match args::command()
         .try_get_matches()
         .and_then(|matches| args::parse(&matches))

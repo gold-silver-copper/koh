@@ -57,9 +57,8 @@ pub struct ServeConfig {
     pub max_connections: NonZeroU32,
     /// Most live sessions, one per peer.
     pub max_sessions: NonZeroU32,
-    /// The binary each session's program starts through: by default the running one, which hands
-    /// `__launch` to [`crate::pty::launched`].
-    pub launcher: crate::pty::Launcher,
+    /// The home each session's program gets: the user's, but in tests.
+    pub home: crate::pty::Home,
 }
 
 /// The CLI's default for `--scrollback`.
@@ -88,7 +87,7 @@ impl Default for ServeConfig {
             port: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_sessions: DEFAULT_MAX_SESSIONS,
-            launcher: crate::pty::Launcher::this_binary(),
+            home: crate::pty::Home::user(),
         }
     }
 }
@@ -345,7 +344,7 @@ impl Hosting {
                 max_sessions: usize::try_from(args.max_sessions.get())
                     .context("max_sessions does not fit in usize")?,
                 ttl: Duration::from_secs(args.session_ttl_secs),
-                launcher: args.launcher.clone(),
+                home: args.home.clone(),
             },
             max_connections: usize::try_from(args.max_connections.get())
                 .context("max_connections does not fit in usize")?,

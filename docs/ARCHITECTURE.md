@@ -23,7 +23,7 @@ clap's builder API rather than its derive, and tests build their tokio runtimes 
 
 ```
 src/
-├── main.rs          the binary: serve / connect / id / key dispatch, and the hidden `__launch`
+├── main.rs          the binary: serve / connect / id / key dispatch
 ├── args.rs          the command line (clap's builder API) and the config structs it produces
 ├── lib.rs           crate root: module declarations + the architecture overview
 ├── proto.rs         the koh/6 wire protocol: client messages, screen frames, caps, pacing
@@ -33,7 +33,7 @@ src/
 │   └── history.rs   scrollback rows, named for the wire
 ├── predict.rs       local-echo prediction engine (overlays, epochs)
 ├── transport_iroh/  iroh endpoint setup, the default key path, path RTT
-├── pty.rs           PTYs over fuxix, the `__launch` launcher sessions start through, reaping
+├── pty.rs           PTYs over fuxix: the session leader on each, its pumps, reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
 │   ├── held.rs      the frames the server takes the client to hold
 │   └── audit.rs     admission decisions as structured `koh::auth` events
@@ -49,7 +49,7 @@ src/
 ├── menu.rs          the menu `koh` alone opens on a terminal, over a reader and a writer
 └── test_runtime.rs  unit tests' runtime and scratch directories, through koh-testkit
 tests/net/           koh over a fault-injecting link between real iroh endpoints
-tests/               PTYs, sessions, scrollback, the binary on a PTY, names, upgrade in place,
+tests/               PTYs, sessions, scrollback, the binary on a PTY, names,
                      key creation races, wire goldens and the corpus
 testkit/             koh-testkit: what the tests share (starting programs, tasks, scratch dirs)
 testing/corpus/      113 real programs' output (from fux), replayed by tests and bench
@@ -422,14 +422,11 @@ the reason; any other close is redialed, the banner saying why.
 
 ## Sessions, connections and the bell hook
 
-A session is one PTY + emulator per authorized peer (`server::session`). Its program starts
-through the launcher, `koh __launch PROGRAM ARGS…`: making a program a session leader with the
-PTY as its controlling terminal needs code between `fork` and `exec`, which std allows only
-through `unsafe`, so the launcher does it as a program of its own. It marks every inherited
-descriptor close-on-exec, calls `setsid`, takes the PTY as its controlling terminal and `exec`s
-the program, reporting a failure (including a failed `exec`) on a pipe the `exec` closes. On
-Linux the launcher is `/proc/self/exe`, so a server whose binary was upgraded in place still
-launches sessions; `__launch`'s interface is fixed for the same reason. Two connections from the
+A session is one PTY + emulator per authorized peer (`server::session`). Its program leads a
+session of its own with the PTY as its controlling terminal: `fuxix::pty::Slave::spawn` marks
+every inherited descriptor close-on-exec, calls `setsid` and takes the PTY between `fork` and
+`exec` (the `unsafe` that needs stays in fuxix), and std reports a failed `exec` to the spawn.
+Two connections from the
 same peer can briefly share it, when a reconnect races the old connection's teardown, so the
 per-connection state never lives in the session:
 
@@ -544,8 +541,8 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   hook, prediction and the no-echo property, and hostile clients and servers. The corpus runs
   here too, through a real server and client under loss (eleven recordings by default, every one
   with `KOH_NET_CORPUS=all`).
-- **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs, started through
-  the `koh` binary's `__launch`: output streaming and teardown, exit statuses, the
+- **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs: output
+  streaming and teardown, exit statuses, the
   reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its
   terminal; the session registry's attach/reattach/cap/TTL/teardown; the real accept loop
   (`serve_endpoint`, its allowlist and admission) and the per-connection echo-ack over loopback
@@ -558,8 +555,6 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   frames read back from the master, connected with `--direct` to an in-process server; the
   `Ctrl-^ Ctrl-Z` suspend under a job-control bash; and a `koh serve --local --port` process
   restarted under a connected client, which finds it again.
-- **`tests/upgrade_in_place.rs`** (Linux) — a running `koh serve` whose binary file is removed
-  still starts sessions, because it launches them from `/proc/self/exe`.
 
 The rules the tests keep are in their structure, not in lint lists a file can lift. Every test
 crate starts with `#![forbid(clippy::disallowed_methods)]`, so none can start a program, spawn a

@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _};
 use koh::client::{run_client, BackendTerminal, ClientTerminal, IrohConnector, KohBackend};
 use koh::predict::Overlay;
-use koh::pty::{Launcher, Pty};
+use koh::pty::{Home, Pty};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::terminal::{Size, TerminalScreen};
 use koh::transport_iroh::generate_secret_key;
@@ -43,7 +43,7 @@ impl System {
     }
 }
 
-/// What the measuring needs from outside: koh's binary (the launcher of its PTYs), and for ssh a
+/// What the measuring needs from outside: koh's binary, and for ssh a
 /// running `sshd` and the key it accepts.
 pub struct Setup {
     pub koh: PathBuf,
@@ -335,7 +335,7 @@ impl Remote {
             allow: vec![client_id],
             command: program.to_vec(),
             scrollback: 1000,
-            launcher: Launcher::isolated(&setup.koh, &setup.home),
+            home: Home::isolated(&setup.home),
             ..ServeConfig::default()
         };
         let hosting = Hosting::from_config(&config)?;
@@ -411,7 +411,7 @@ impl Remote {
             cols,
             argv,
             "xterm-256color",
-            &Launcher::isolated(&setup.koh, &setup.home),
+            &Home::isolated(&setup.home),
             &koh::pty::Reaper::start()?,
         )
         .map_err(|e| anyhow!("{e}"))?;

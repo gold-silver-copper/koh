@@ -100,15 +100,10 @@ fn endpoint_id(key: &Path) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// `koh serve --local`, the binary at `koh`, hosting `sh` for `client`, as the key at `key`, on
+/// `koh serve --local` hosting `sh` for `client`, as the key at `key`, on
 /// `port` if given.
-fn serve_local(
-    koh: impl AsRef<std::ffi::OsStr>,
-    key: &Path,
-    port: Option<u16>,
-    client: &str,
-) -> anyhow::Result<Served> {
-    let mut server = command(koh, &koh_testkit::home!())?;
+fn serve_local(key: &Path, port: Option<u16>, client: &str) -> anyhow::Result<Served> {
+    let mut server = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())?;
     server
         .args([
             "serve",
@@ -151,8 +146,7 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
             let (server_key, client_key) = (dir.join("server.key"), dir.join("client.key"));
             let client_id = endpoint_id(&client_key).expect("the client's id");
             // The port the first server picked is the one the restarted server asks for.
-            let server = serve_local(env!("CARGO_BIN_EXE_koh"), &server_key, None, &client_id)
-                .expect("the server");
+            let server = serve_local(&server_key, None, &client_id).expect("the server");
             let port = server.port;
             // A variable only this session holds, and an answer only a remote shell computes.
             let (client, buf, at) = connected(
@@ -168,13 +162,8 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
                 .wait_for(at, "reconnecting", 20)
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
-            let server = serve_local(
-                env!("CARGO_BIN_EXE_koh"),
-                &server_key,
-                Some(port),
-                &client_id,
-            )
-            .expect("the restarted server");
+            let server =
+                serve_local(&server_key, Some(port), &client_id).expect("the restarted server");
 
             // Typing while the client redials is dropped, so type until the new session answers.
             let seen = buf
@@ -187,39 +176,6 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
             drop(client);
             stop(server).expect("stop the restarted server");
             seen.unwrap_or_else(|e| panic!("the client found the restarted server: {e}"));
-        });
-}
-
-/// A `koh serve` whose binary is removed while it runs (an upgrade) still starts sessions: on
-/// Linux it launches them from its own image, `/proc/self/exe`, not from the path it was started
-/// from.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_server_whose_binary_was_removed_still_starts_sessions() {
-    koh_testkit::multi_thread(2)
-        .expect("tokio runtime")
-        .block_on(async {
-            let dir = koh_testkit::scratch!("upgrade").expect("a scratch directory");
-            // A second name for the binary, which is all the server's path is.
-            let installed = dir.join("koh");
-            std::fs::hard_link(env!("CARGO_BIN_EXE_koh"), &installed).expect("install koh");
-            let client_key = dir.join("client.key");
-            let client_id = endpoint_id(&client_key).expect("the client's id");
-            let server = serve_local(&installed, &dir.join("server.key"), None, &client_id)
-                .expect("koh serve");
-
-            // The upgrade: the file the server was started from is gone.
-            std::fs::remove_file(&installed).expect("remove the installed binary");
-
-            // Only the remote shell turns `$((6*7))` into 42.
-            let (client, ..) = connected(
-                &connect_argv(&server, &client_key),
-                b"echo up_$((6*7))\r",
-                "up_42",
-            )
-            .await
-            .expect("a session after the server's binary was removed");
-            let _ = client.write(vec![0x1e, b'.']);
         });
 }
 

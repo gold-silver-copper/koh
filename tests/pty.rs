@@ -13,14 +13,14 @@ use koh::terminal::TtyModes;
 use koh_testkit::{current_thread, multi_thread, read_until};
 use tokio::sync::mpsc::Receiver;
 
-/// `argv` on a 24×80 PTY, through [`launcher`]: the PTY, and what the program prints.
+/// `argv` on a 24×80 PTY, in [`home`]: the PTY, and what the program prints.
 fn spawn(argv: &[String]) -> Result<(Pty, Receiver<Vec<u8>>), PtyError> {
     Pty::spawn(
         24,
         80,
         argv,
         "xterm-256color",
-        &launcher(),
+        &home(),
         &koh::pty::Reaper::start()?,
     )
 }
@@ -340,7 +340,7 @@ fn short_lived_children_never_lose_their_output() {
         // running before the spawn. A reader started late loses about 3 outputs in 1000 under
         // load; spawning many at once is the load, and every one must deliver its marker.
         // 16 at a time stays well under macOS's PTY cap (`kern.tty.ptmx_max`, 511) even when several
-        // PTY tests run at once, and within the room `launcher` makes in the kernel's PTY table;
+        // PTY tests run at once, and within the room `home` makes in the kernel's PTY table;
         // 128 rounds reproduce a late reader on every run there. Linux keeps a closed slave's
         // output, so a few rounds check the property there, quickly.
         const CHILDREN: usize = 16;
@@ -439,12 +439,12 @@ fn the_shell_leads_its_own_session_and_owns_its_terminal() {
     });
 }
 
-/// The launcher every PTY in these tests starts through. First, once, room in the kernel's PTY
+/// The home every PTY in these tests gets. First, once, room in the kernel's PTY
 /// table (see [`grow_the_pty_table`]), so every test's PTYs are allocated after it.
-fn launcher() -> koh::pty::Launcher {
+fn home() -> koh::pty::Home {
     static GROWN: std::sync::Once = std::sync::Once::new();
     GROWN.call_once(grow_the_pty_table);
-    koh::pty::Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!())
+    koh::pty::Home::isolated(koh_testkit::home!())
 }
 
 /// How many PTYs [`grow_the_pty_table`] opens: well past what these tests hold at once (about 30).

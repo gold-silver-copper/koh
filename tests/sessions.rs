@@ -1,8 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
 //! loopback iroh with a minimal koh/6 client.
-//!
-//! Every session's program starts through the `koh` binary's `__launch`, as `koh serve`'s do; unit
-//! tests cannot reach a binary, so these live here.
 #![forbid(clippy::disallowed_methods)]
 
 use std::collections::HashMap;
@@ -13,7 +10,7 @@ use koh::proto::{
     decode_frame_body, decode_server, dictionary_for, encode_client, ClientMsg, Close, FrameNum,
     InputSeq, ServerMsg, MAX_FRAME,
 };
-use koh::pty::Launcher;
+use koh::pty::Home;
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
@@ -36,7 +33,7 @@ async fn loopback_serve(
     let config = ServeConfig {
         allow: vec![client],
         command: command.iter().map(|arg| (*arg).to_owned()).collect(),
-        launcher: launcher(),
+        home: home(),
         ..ServeConfig::default()
     };
     let shutdown = CancellationToken::new();
@@ -48,9 +45,9 @@ async fn loopback_serve(
     Ok((addr, shutdown, task))
 }
 
-/// The launcher every session in these tests starts through.
-fn launcher() -> Launcher {
-    Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!())
+/// The home every session in these tests gets.
+fn home() -> Home {
+    Home::isolated(koh_testkit::home!())
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -69,7 +66,7 @@ fn registry(
         scrollback: 0,
         max_sessions,
         ttl,
-        launcher: launcher(),
+        home: home(),
     };
     Registry::spawn(spec, allows)
 }
@@ -362,7 +359,7 @@ fn echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the
             allow: vec![secret.public()],
             command: vec!["cat".to_owned()],
             scrollback: 0,
-            launcher: launcher(),
+            home: home(),
             ..ServeConfig::default()
         };
         let shutdown = CancellationToken::new();
@@ -787,7 +784,7 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
         let config = ServeConfig {
             allow: vec![secret.public()],
             command: vec!["/nonexistent/koh-test-program".to_owned()],
-            launcher: launcher(),
+            home: home(),
             ..ServeConfig::default()
         };
         let shutdown = CancellationToken::new();
@@ -868,7 +865,7 @@ fn an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes() ->
         let config = ServeConfig {
             allow: vec![good.public()],
             command: vec!["sleep".to_owned(), "30".to_owned()],
-            launcher: launcher(),
+            home: home(),
             max_connections: std::num::NonZeroU32::MIN,
             ..ServeConfig::default()
         };

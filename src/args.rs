@@ -391,7 +391,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             port: m.get_one::<u16>("port").copied(),
             max_connections: value(m, "max_connections")?,
             max_sessions: value(m, "max_sessions")?,
-            launcher: koh::pty::Launcher::this_binary(),
+            home: koh::pty::Home::user(),
         })),
         Some(("connect", m)) => Ok(Cmd::Connect(ConnectArgs {
             server: m

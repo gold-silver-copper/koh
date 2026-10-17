@@ -1,25 +1,25 @@
-//! What the tests that run the `koh` binary share: its launcher, a PTY to run it on, a loopback
+//! What the tests that run the `koh` binary share: a home, a PTY to run it on, a loopback
 //! server to connect it to, and a `koh serve` found by its banner.
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use koh::pty::{Launcher, Pty};
+use koh::pty::{Home, Pty};
 use koh::server::cli::serve_endpoint;
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key};
 use koh_testkit::Capture;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// The `koh` binary, as the launcher every program here starts through.
-pub fn launcher() -> Launcher {
-    Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!())
+/// The home every program here gets.
+pub fn home() -> Home {
+    Home::isolated(koh_testkit::home!())
 }
 
 /// `argv` on a 24×80 PTY, and what it prints.
 pub fn on_pty(argv: &[String]) -> anyhow::Result<(Pty, Capture)> {
     let reaper = koh::pty::Reaper::start()?;
-    let (pty, output) = Pty::spawn(24, 80, argv, "xterm-256color", &launcher(), &reaper)?;
+    let (pty, output) = Pty::spawn(24, 80, argv, "xterm-256color", &home(), &reaper)?;
     Ok((pty, Capture::new(output)))
 }
 
@@ -47,7 +47,7 @@ pub async fn loopback_server(allow: &str) -> anyhow::Result<(String, u16, JoinHa
     let config = koh::server::ServeConfig {
         allow: vec![koh::transport_iroh::parse_endpoint_id(allow)?],
         command: vec!["sh".to_owned()],
-        launcher: launcher(),
+        home: home(),
         ..koh::server::ServeConfig::default()
     };
     let hosting = koh::server::cli::Hosting::from_config(&config)?;

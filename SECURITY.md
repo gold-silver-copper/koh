@@ -37,7 +37,7 @@ credit reporters who want it.
 - Transport crypto / QUIC / TLS: **iroh** and its QUIC backend, **rustls**, **ring**.
 - The server's terminal emulator **`fux-vt`** (a parse/logic bug belongs to the
   [fux](https://github.com/gold-silver-copper/fux) project; the client never runs it on server
-  bytes) and the system-call layer **`fuxix`** (PTYs, the session launcher's `setsid` and
+  bytes) and the system-call layer **`fuxix`** (PTYs, each session's `setsid` and
   controlling terminal, signals; also fux's).
 - Known advisories in the dependency tree are tracked via `cargo deny check advisories` (CI) +
   [`deny.toml`](deny.toml).

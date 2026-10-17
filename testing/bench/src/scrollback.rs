@@ -8,8 +8,8 @@ use koh::terminal::{HistoryRequest, ServerTerminal, Size, MAX_HISTORY_ROWS};
 
 use crate::workloads::Workload;
 
-/// The scrollback a server keeps by default (`koh serve --scrollback`).
-const SCROLLBACK: usize = 1000;
+/// The scrollback a server keeps by default (`koh serve --scrollback-bytes`), in bytes.
+const SCROLLBACK: usize = 8 << 20;
 
 /// A workload's history: the rows the server keeps at its end, and the bytes to fetch them all.
 #[derive(Clone, Copy, Debug, Default)]

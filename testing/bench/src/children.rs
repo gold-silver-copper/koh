@@ -3,7 +3,7 @@
 //! the client retire.
 //!
 //! - `--footprint-child SCROLLBACK FILL SESSIONS`: makes `SESSIONS` server emulators at 40x120
-//!   keeping `SCROLLBACK` lines, fills each (if `FILL` is 1) with enough lines of text to fill its
+//!   keeping `SCROLLBACK` bytes of history, fills each (if `FILL` is 1) with enough lines of text to fill its
 //!   scrollback and screen, takes a snapshot of each as a session holds, and prints how much the
 //!   process's resident memory grew, per session, in bytes.
 //! - `--instructions-child SIDE WORKLOAD [baseline]`: `emulator` feeds the workload to a server
@@ -56,17 +56,20 @@ pub fn footprint_child(args: &[String]) -> anyhow::Result<()> {
             .into_iter()
             .find(|w| w.name == "ascii-flood")
             .ok_or_else(|| anyhow!("no flood"))?;
-        let lines = scrollback.saturating_add(40);
         let all: Vec<u8> = workload
             .steps
             .iter()
             .flat_map(|s| s.output.clone())
             .collect();
-        let mut seen = 0usize;
+        // A character costs the history more than its byte, so as many bytes of text as the
+        // budget, and a screenful more, fill it.
+        let mut screen = 0usize;
         for line in all.split_inclusive(|&b| b == b'\n').cycle() {
             text.extend_from_slice(line);
-            seen = seen.saturating_add(1);
-            if seen >= lines {
+            if text.len() >= scrollback {
+                screen = screen.saturating_add(1);
+            }
+            if screen > 40 {
                 break;
             }
         }

@@ -380,7 +380,7 @@ impl From<Color> for WireColor {
         match c {
             Color::Idx(i) => Self::Idx(i),
             Color::Rgb(fux_vt::Rgb { r, g, b }) => Self::Rgb(r, g, b),
-            Color::Default | _ => Self::Default,
+            Color::Default => Self::Default,
         }
     }
 }
@@ -463,15 +463,14 @@ impl WireStyle {
         let blink = match attributes.blink() {
             Blink::Slow => Self::BLINK_SLOW,
             Blink::Rapid => Self::BLINK_RAPID,
-            Blink::None | _ => 0,
+            Blink::None => 0,
         };
-        // A style fux-vt adds later is carried as a single underline.
         let style = match attributes.underline_style() {
             UnderlineStyle::Double => Self::UNDERLINE_DOUBLE,
             UnderlineStyle::Curly => Self::UNDERLINE_CURLY,
             UnderlineStyle::Dotted => Self::UNDERLINE_DOTTED,
             UnderlineStyle::Dashed => Self::UNDERLINE_DASHED,
-            UnderlineStyle::None | UnderlineStyle::Single | _ => 0,
+            UnderlineStyle::None | UnderlineStyle::Single => 0,
         };
         // Only defined bits, at most one blink, and a style only with an underline.
         Self(
@@ -1090,7 +1089,7 @@ impl From<MouseProtocolMode> for WireMouseMode {
             MouseProtocolMode::PressRelease => Self::PressRelease,
             MouseProtocolMode::ButtonMotion => Self::ButtonMotion,
             MouseProtocolMode::AnyMotion => Self::AnyMotion,
-            MouseProtocolMode::None | _ => Self::None,
+            MouseProtocolMode::None => Self::None,
         }
     }
 }
@@ -1120,7 +1119,7 @@ impl From<MouseProtocolEncoding> for WireMouseEncoding {
         match encoding {
             MouseProtocolEncoding::Utf8 => Self::Utf8,
             MouseProtocolEncoding::Sgr => Self::Sgr,
-            MouseProtocolEncoding::Default | _ => Self::Default,
+            MouseProtocolEncoding::Default => Self::Default,
         }
     }
 }

@@ -64,7 +64,7 @@ service.
    (a fresh prompt) is not predicted until the server has reflected it, and a secret typed at
    once is not drawn either. A hostile server can of course claim any modes: it already sees
    every key.
-   **History:** the server already holds the session's history (`--scrollback`, 1,000 lines by
+   **History:** the server already holds the session's history (`--scrollback-bytes`, 8 MiB by
    default); with the scrollback view the client now holds a part of it too, in memory, for the
    connection: at most `HISTORY_CACHE_BYTES` (64 MiB of fux-vt's storage), only replies to requests
    it has outstanding (matched by id), dropped when the connection ends. A server's history

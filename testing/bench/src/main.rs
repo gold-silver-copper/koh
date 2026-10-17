@@ -609,7 +609,7 @@ async fn run(args: &Args) -> anyhow::Result<String> {
              holds a PTY, two threads and its connection, which this does not count.\n\n\
              | Scrollback | Sessions | Idle | Full |\n| ---: | ---: | ---: | ---: |\n",
         );
-        for (scrollback, sessions) in [(1000usize, 16usize), (65_000, 2)] {
+        for (scrollback, sessions) in [(8usize << 20, 16usize), (64 << 20, 2)] {
             let idle = children::footprint(scrollback, false, sessions);
             let full = children::footprint(scrollback, true, sessions);
             let show = |r: &anyhow::Result<u64>| {
@@ -618,7 +618,8 @@ async fn run(args: &Args) -> anyhow::Result<String> {
             };
             let _ = writeln!(
                 out,
-                "| {scrollback} | {sessions} | {} | {} |",
+                "| {} MiB | {sessions} | {} | {} |",
+                scrollback >> 20,
                 show(&idle),
                 show(&full)
             );
@@ -790,7 +791,7 @@ fn scrollback_section(out: &mut String, systems: &[System], results: &Results) {
     }
     out.push_str("\n## Scrollback\n\n");
     out.push_str(
-        "Each workload played into a server emulator keeping the default 1,000 lines, then \
+        "Each workload played into a server emulator keeping the default 8 MiB, then \
          every row of its history fetched as koh's scrollback view (`Ctrl-^ [`) fetches them: \
          the bytes of the compressed history streams, in KiB. koh fetches a row only when the \
          user scrolls to it (and the newest screenful when idle), and never twice. mosh keeps \

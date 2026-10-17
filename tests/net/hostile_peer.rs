@@ -126,7 +126,7 @@ fn an_oversized_client_message_closes_the_connection_only() -> anyhow::Result<()
 }
 
 /// A client that sends input no terminal sends (a modifier bit no key has, a paste piece over
-/// the cap, a palette past 16 entries, a function key past F12) loses its connection, each, and
+/// the cap, a palette past 16 entries) loses its connection, each, and
 /// the server goes on serving the good client.
 #[test]
 fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> {
@@ -148,7 +148,6 @@ fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> 
         };
         for msg in [
             keys(vec![key(WireKeyCode::Char('x'), 0x80)]),
-            keys(vec![key(WireKeyCode::F(99), 0)]),
             keys(vec![InputEvent::Paste("x".repeat(MAX_PASTE + 1))]),
             ClientMsg::Colours(WireColours {
                 palette: vec![None; PALETTE + 1],
@@ -448,7 +447,7 @@ async fn send_hostile(hostile: Hostile, conn: &Connection) {
         Hostile::HistoryRows => {
             // A screen whose history claims a million rows, then rows the client never asked
             // for: too many, too wide, named outside the history, over and over.
-            let Ok(mut emu) = ServerTerminal::new(24, 80, 1000) else {
+            let Ok(mut emu) = ServerTerminal::new(24, 80, 1 << 20) else {
                 return;
             };
             for n in 0..200 {

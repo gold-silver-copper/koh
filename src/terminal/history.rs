@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn rows_entering_history_take_consecutive_names() {
-        let mut emu = ServerTerminal::new(4, 20, 100).unwrap();
+        let mut emu = ServerTerminal::new(4, 20, 1 << 20).unwrap();
         assert_eq!(emu.snapshot().history(), HistoryMark::default());
         lines(&mut emu, 0, 10);
         // Ten lines and the cursor's row on four rows: seven scrolled off.
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn a_reply_holds_only_what_the_history_holds_and_at_most_the_bound() {
-        let mut emu = ServerTerminal::new(4, 20, 1000).unwrap();
+        let mut emu = ServerTerminal::new(4, 20, 1 << 20).unwrap();
         lines(&mut emu, 0, 600);
         let mark = emu.snapshot().history();
         let rows =
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_reply_stops_at_the_cell_bound() {
-        let mut emu = ServerTerminal::new(4, 1000, 1000).unwrap();
+        let mut emu = ServerTerminal::new(4, 1000, 16 << 20).unwrap();
         for _ in 0..300 {
             emu.process(&[b'x'; 1000]);
             emu.process(b"\r\n");
@@ -614,9 +614,25 @@ mod tests {
         assert!(postcard::to_allocvec(&largest).unwrap().len() <= MAX_HISTORY_REPLY);
     }
 
+    /// `CSI 3 J` drops the history: its rows are not there to fetch, and the rows that enter it
+    /// next take new names.
+    #[test]
+    fn a_cleared_history_holds_nothing_and_names_what_enters_it_afresh() {
+        let mut emu = ServerTerminal::new(4, 20, 1 << 20).unwrap();
+        lines(&mut emu, 0, 10);
+        let before = emu.snapshot().history();
+        emu.process(b"\x1b[3J");
+        assert_eq!(emu.snapshot().history(), HistoryMark::default());
+        assert!(emu.history(ask(before.newest, 5)).rows.is_empty(), "gone");
+        lines(&mut emu, 10, 12);
+        let after = emu.snapshot().history();
+        assert_eq!(after.len, 2);
+        assert!(after.oldest() > Some(before.newest), "{before:?} {after:?}");
+    }
+
     #[test]
     fn a_resize_names_every_row_afresh() {
-        let mut emu = ServerTerminal::new(4, 20, 100).unwrap();
+        let mut emu = ServerTerminal::new(4, 20, 1 << 20).unwrap();
         lines(&mut emu, 0, 20);
         let before = emu.snapshot().history();
         emu.resize(Size::new(6, 10));

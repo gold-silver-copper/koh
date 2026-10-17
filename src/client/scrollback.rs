@@ -356,8 +356,7 @@ impl Scrollback {
             match input {
                 Input::Key(stroke) => self.on_key(stroke.press, rows),
                 Input::Mouse(MouseEvent {
-                    action: MouseAction::Press,
-                    button: Some(button),
+                    action: MouseAction::Press(button),
                     ..
                 }) => match button {
                     MouseButton::WheelUp => self.step(Step::Up(WHEEL_ROWS)),

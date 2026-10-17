@@ -120,12 +120,12 @@ impl PtyHost {
     /// `reaper` once closed; the host and a receiver of its output. Blocks until the program starts.
     fn spawn(
         command: &[String],
-        scrollback: usize,
+        scrollback_bytes: usize,
         home: &crate::pty::Home,
         reaper: &crate::pty::Reaper,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let Size { rows, cols } = DEFAULT_SIZE;
-        let emu = ServerTerminal::new(rows, cols, scrollback)
+        let emu = ServerTerminal::new(rows, cols, scrollback_bytes)
             .context("creating the terminal emulator")?;
         let (pty, pty_rx) =
             crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", home, reaper)
@@ -327,12 +327,12 @@ fn start(
 ) {
     let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
     let command = Arc::clone(&spec.command);
-    let (scrollback, ttl, home) = (spec.scrollback, spec.ttl, spec.home.clone());
+    let (scrollback_bytes, ttl, home) = (spec.scrollback_bytes, spec.ttl, spec.home.clone());
     let reaper = reaper.clone();
     let task = async move {
         // Forking and the program's exec block, and must hold up no other session.
         let spawned = tokio::task::spawn_blocking(move || {
-            PtyHost::spawn(&command, scrollback, &home, &reaper)
+            PtyHost::spawn(&command, scrollback_bytes, &home, &reaper)
         })
         .await;
         let (mut host, pty_rx) = match spawned.map_err(anyhow::Error::from).and_then(|s| s) {
@@ -595,7 +595,7 @@ pub struct Registry {
 /// What the registry hosts, and the session TTL.
 pub struct SessionSpec {
     pub command: Arc<[String]>,
-    pub scrollback: usize,
+    pub scrollback_bytes: usize,
     pub max_sessions: usize,
     pub ttl: Duration,
     /// The home each session's program gets.

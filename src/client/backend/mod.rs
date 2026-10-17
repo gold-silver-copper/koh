@@ -40,7 +40,11 @@ pub fn drawn(style: Attributes, styles: bool) -> Attributes {
         {
             kind
         }
-        UnderlineStyle::Single | _ => UnderlineStyle::Single,
+        UnderlineStyle::Single
+        | UnderlineStyle::Double
+        | UnderlineStyle::Curly
+        | UnderlineStyle::Dotted
+        | UnderlineStyle::Dashed => UnderlineStyle::Single,
     };
     style.with_underline_style(underline)
 }
@@ -168,13 +172,12 @@ pub trait KohBackend {
             UnderlineStyle::Curly => b"\x1b[4:3m",
             UnderlineStyle::Dotted => b"\x1b[4:4m",
             UnderlineStyle::Dashed => b"\x1b[4:5m",
-            // A style fux-vt adds later is drawn plain.
-            UnderlineStyle::Single | _ => b"\x1b[4m",
+            UnderlineStyle::Single => b"\x1b[4m",
         };
         let blink: &[u8] = match style.blink() {
             Blink::Slow => b"\x1b[5m",
             Blink::Rapid => b"\x1b[6m",
-            Blink::None | _ => b"",
+            Blink::None => b"",
         };
         for (on, sgr) in [
             (style.bold(), &b"\x1b[1m"[..]),
@@ -258,7 +261,7 @@ fn write_underline_color(out: &mut (impl KohBackend + ?Sized), color: Color) -> 
     match color {
         Color::Idx(i) => write!(out, "\x1b[58;5;{i}m"),
         Color::Rgb(fux_vt::Rgb { r, g, b }) => write!(out, "\x1b[58;2;{r};{g};{b}m"),
-        Color::Default | _ => Ok(()),
+        Color::Default => Ok(()),
     }
 }
 
@@ -282,7 +285,7 @@ fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool)
             let lead = if fg { 38 } else { 48 };
             write!(out, "\x1b[{lead};2;{r};{g};{b}m")
         }
-        Color::Default | _ => out.write_bytes(if fg { b"\x1b[39m" } else { b"\x1b[49m" }),
+        Color::Default => out.write_bytes(if fg { b"\x1b[39m" } else { b"\x1b[49m" }),
     }
 }
 

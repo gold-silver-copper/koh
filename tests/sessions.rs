@@ -63,7 +63,7 @@ fn registry(
 ) -> std::io::Result<Registry> {
     let spec = SessionSpec {
         command: command.iter().map(|arg| (*arg).to_owned()).collect(),
-        scrollback: 0,
+        scrollback_bytes: 0,
         max_sessions,
         ttl,
         home: home(),
@@ -358,7 +358,7 @@ fn echo_ack_is_tracked_per_connection_and_only_the_newest_ones_input_reaches_the
         let config = ServeConfig {
             allow: vec![secret.public()],
             command: vec!["cat".to_owned()],
-            scrollback: 0,
+            scrollback_bytes: 0,
             home: home(),
             ..ServeConfig::default()
         };

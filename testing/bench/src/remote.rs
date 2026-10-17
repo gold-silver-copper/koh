@@ -334,7 +334,6 @@ impl Remote {
         let config = ServeConfig {
             allow: vec![client_id],
             command: program.to_vec(),
-            scrollback: 1000,
             home: Home::isolated(&setup.home),
             ..ServeConfig::default()
         };

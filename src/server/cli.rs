@@ -42,8 +42,8 @@ pub struct ServeConfig {
     pub saved_clients: Option<crate::names::Places>,
     /// The program each session runs, as argv, verbatim; empty for `$SHELL`.
     pub command: Vec<String>,
-    /// Scrollback lines each session's emulator keeps, at most [`MAX_SCROLLBACK`].
-    pub scrollback: u64,
+    /// Bytes of scrollback each session's emulator keeps, at most [`MAX_SCROLLBACK_BYTES`].
+    pub scrollback_bytes: u64,
     /// How long a detached session lives, in seconds.
     pub session_ttl_secs: u64,
     /// A self-hosted relay instead of n0's; wins over `local`.
@@ -61,17 +61,17 @@ pub struct ServeConfig {
     pub home: crate::pty::Home,
 }
 
-/// The CLI's default for `--scrollback`.
-pub const DEFAULT_SCROLLBACK: u64 = 1000;
+/// The CLI's default for `--scrollback-bytes`: 8 MiB, as fux keeps.
+pub const DEFAULT_SCROLLBACK_BYTES: u64 = 8 << 20;
 /// The CLI's default for `--session-ttl-secs`: a day, to close the laptop and reopen it later.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
 /// The CLI's default for `--max-connections`.
 pub const DEFAULT_MAX_CONNECTIONS: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
 /// The CLI's default for `--max-sessions`.
 pub const DEFAULT_MAX_SESSIONS: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
-/// Upper bound on `scrollback`. fux-vt caps a buffer at 64 Mi cells, which must hold the history
-/// and a `MAX_DIM × MAX_DIM` screen: `(65_000 + 1000) × 1000 < 64 Mi`.
-pub const MAX_SCROLLBACK: u64 = 65_000;
+/// Upper bound on `scrollback_bytes`, 1 GiB: past what fux-vt's history holds whatever its budget
+/// (64 Mi cells at 8 bytes, and their text).
+pub const MAX_SCROLLBACK_BYTES: u64 = 1 << 30;
 
 impl Default for ServeConfig {
     fn default() -> Self {
@@ -80,7 +80,7 @@ impl Default for ServeConfig {
             allow: Vec::new(),
             saved_clients: None,
             command: Vec::new(),
-            scrollback: DEFAULT_SCROLLBACK,
+            scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             relay_url: None,
             local: false,
@@ -312,9 +312,9 @@ impl Hosting {
     /// Validate `args`: clap checks these ranges, but a `ServeConfig` built in code does not.
     pub fn from_config(args: &ServeConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            args.scrollback <= MAX_SCROLLBACK,
-            "scrollback {} exceeds the maximum of {MAX_SCROLLBACK}",
-            args.scrollback
+            args.scrollback_bytes <= MAX_SCROLLBACK_BYTES,
+            "scrollback of {} bytes exceeds the maximum of {MAX_SCROLLBACK_BYTES}",
+            args.scrollback_bytes
         );
         let saved = args
             .saved_clients
@@ -339,7 +339,7 @@ impl Hosting {
             allowed,
             spec: SessionSpec {
                 command: args.command.clone().into(),
-                scrollback: usize::try_from(args.scrollback)
+                scrollback_bytes: usize::try_from(args.scrollback_bytes)
                     .context("scrollback does not fit in usize")?,
                 max_sessions: usize::try_from(args.max_sessions.get())
                     .context("max_sessions does not fit in usize")?,

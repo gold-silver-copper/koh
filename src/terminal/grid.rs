@@ -210,7 +210,7 @@ impl Palette {
                 .flatten()
                 .map_or(c, rgb),
             Color::Default => default.map_or(c, rgb),
-            Color::Rgb(..) | _ => c,
+            Color::Rgb(..) => c,
         };
         attributes
             .with_foreground(colour(attributes.foreground(), self.foreground))
@@ -257,7 +257,7 @@ impl Uses {
                 match (colour, default) {
                     (Color::Idx(n), _) => drop(self.indexed.insert(n)),
                     (Color::Default, Some(used)) => *used = true,
-                    (Color::Default | Color::Rgb(..) | _, _) => {}
+                    (Color::Default | Color::Rgb(..), _) => {}
                 }
             }
         }

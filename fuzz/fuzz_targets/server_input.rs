@@ -15,7 +15,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let (output, stream) = rest.split_at(usize::from(cut).min(rest.len()));
-    let Ok(mut t) = ServerTerminal::new(24, 80, 100) else {
+    let Ok(mut t) = ServerTerminal::new(24, 80, 64 << 10) else {
         return;
     };
     t.process(output);

@@ -708,8 +708,8 @@ mod tests {
     #[test]
     fn keys_and_colours_no_terminal_sends_are_refused() {
         use crate::events::{
-            WireKey, WireKeyCode, WireKitty, WireMouse, WireMouseAction, MAX_EVENTS, MAX_PASTE,
-            PALETTE,
+            WireButton, WireKey, WireKeyCode, WireKitty, WireMouse, WireMouseAction, MAX_EVENTS,
+            MAX_PASTE, PALETTE,
         };
         let framed = |body: Vec<u8>| {
             let mut stream = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
@@ -724,8 +724,6 @@ mod tests {
         let key = |key, mods, kitty| InputEvent::Key(WireKey { key, mods, kitty });
         let bad = [
             keys(vec![key(WireKeyCode::Char('a'), 0x08, None)]),
-            keys(vec![key(WireKeyCode::F(0), 0, None)]),
-            keys(vec![key(WireKeyCode::F(13), 0, None)]),
             keys(vec![key(
                 WireKeyCode::Char('a'),
                 0,
@@ -747,8 +745,7 @@ mod tests {
                 }),
             )]),
             keys(vec![InputEvent::Mouse(WireMouse {
-                action: WireMouseAction::Press,
-                button: None,
+                action: WireMouseAction::Press(WireButton::Left),
                 mods: 0x10,
                 row: 0,
                 col: 0,
@@ -764,17 +761,23 @@ mod tests {
             assert!(encode_client(msg).is_err(), "{msg:?}");
             assert!(decode_all(&raw(msg)).is_err(), "{msg:?}");
         }
-        // A code that is no character at all does not even decode.
-        let mut body =
-            postcard::to_allocvec(&keys(vec![key(WireKeyCode::Char('a'), 0, None)])).unwrap();
-        let at = body.iter().rposition(|&b| b == b'a').unwrap();
-        body[at] = 0xff;
-        assert!(decode_all(&framed(body)).is_err());
+        // A code that is no character at all, or no function key's, does not even decode.
+        let f35 = WireKeyCode::F(35.try_into().unwrap());
+        for (code, at, byte) in [
+            (WireKeyCode::Char('a'), b'a', 0xff),
+            (f35, 35, 0),
+            (f35, 35, 36),
+        ] {
+            let mut body = postcard::to_allocvec(&keys(vec![key(code, 0, None)])).unwrap();
+            let at = body.iter().rposition(|&b| b == at).unwrap();
+            body[at] = byte;
+            assert!(decode_all(&framed(body)).is_err(), "{code:?} as {byte}");
+        }
         // What a terminal sends goes through, both ways.
         let good = [
             keys(vec![
                 key(WireKeyCode::Char('é'), 7, None),
-                key(WireKeyCode::F(12), 0, None),
+                key(f35, 0, None),
                 InputEvent::Paste("x".repeat(MAX_PASTE)),
             ]),
             keys(vec![InputEvent::Focus(false); MAX_EVENTS]),

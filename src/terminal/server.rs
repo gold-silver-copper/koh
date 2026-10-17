@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::events::{InputEvent, WireColours};
 use fux_vt::keys::colour::Colours;
-use fux_vt::keys::encode::paste;
+use fux_vt::keys::encode::{key_bytes, paste};
 use fux_vt::{Event, Options, Parser, Sink, Unhandled};
 
 /// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
@@ -68,8 +68,9 @@ impl Sink for Observed {
                     self.host_replies.extend_from_slice(&answer);
                 }
             }
-            // An oversized clipboard is dropped; `_` is for events a later fux-vt adds.
-            Event::Clipboard { .. } | _ => {}
+            // An oversized clipboard is dropped; desktop notifications (OSC 9, 777, 99) koh does
+            // not carry.
+            Event::Clipboard { .. } | Event::Notification(_) => {}
         }
     }
     fn unhandled(&mut self, sequence: Unhandled<'_>) {
@@ -162,12 +163,12 @@ pub struct ServerTerminal {
 }
 
 impl ServerTerminal {
-    /// An emulator of this (clamped) size keeping `scrollback` lines. Fails only if fux-vt refuses
-    /// the allocation (see [`MAX_SCROLLBACK`](crate::server::cli::MAX_SCROLLBACK)).
-    pub fn new(rows: u16, cols: u16, scrollback: usize) -> Result<Self, fux_vt::Error> {
+    /// An emulator of this (clamped) size keeping `history_bytes` of history. Fails only if fux-vt
+    /// refuses the allocation.
+    pub fn new(rows: u16, cols: u16, history_bytes: usize) -> Result<Self, fux_vt::Error> {
         let size = super::host_size(Size { rows, cols });
         Ok(Self {
-            parser: Parser::with_options(size, scrollback, OPTIONS)?,
+            parser: Parser::with_options(size, history_bytes, OPTIONS)?,
             observed: Observed::default(),
             exit_code: None,
             rows: RowCache::default(),
@@ -188,12 +189,12 @@ impl ServerTerminal {
         for event in events {
             let screen = self.parser.screen();
             match event {
-                InputEvent::Key(key) => screen.encode_key(key.stroke(), out),
+                InputEvent::Key(key) => key_bytes(key.stroke(), screen.key_mode(), out),
                 InputEvent::Mouse(mouse) => {
                     screen.encode_mouse(mouse.event(), out);
                 }
                 InputEvent::Focus(focused) => {
-                    screen.encode_focus(*focused, out);
+                    out.extend_from_slice(screen.focus_report(*focused).unwrap_or_default());
                 }
                 InputEvent::Paste(text) => {
                     paste(text, screen.mode(fux_vt::Mode::BracketedPaste), out);
@@ -538,7 +539,7 @@ mod tests {
     fn history_served_while_a_frame_is_drawn_is_drawn_in_the_palette_its_names_are_for() {
         // The program sets colour 1 for a moment inside a frame, and back before it ends: the
         // names stand, so the rows served meanwhile must be drawn as they were named.
-        let mut emu = ServerTerminal::new(4, 20, 100).unwrap();
+        let mut emu = ServerTerminal::new(4, 20, 1 << 20).unwrap();
         for n in 0..10 {
             emu.process(format!("\x1b[31mline {n}\x1b[m\r\n").as_bytes());
         }
@@ -562,7 +563,7 @@ mod tests {
         // A client's copies of history rows were drawn in the old palette: new names make them
         // rows the history no longer holds, so the client asks again. A colour the history never
         // used changes none of them, so they keep their names, and the client its copies.
-        let mut emu = ServerTerminal::new(4, 20, 100).unwrap();
+        let mut emu = ServerTerminal::new(4, 20, 1 << 20).unwrap();
         for n in 0..10 {
             emu.process(format!("\x1b[31mline {n}\x1b[m\r\n").as_bytes());
         }
@@ -612,7 +613,7 @@ mod tests {
                 1..16,
             ),
         ) {
-            let mut t = ServerTerminal::new(5, 10, 3).expect("emulator");
+            let mut t = ServerTerminal::new(5, 10, 256).expect("emulator");
             for (pieces, resize) in steps {
                 for piece in pieces {
                     t.process(PIECES[piece].as_bytes());
@@ -640,8 +641,9 @@ mod tests {
                 b"\x1b[?2004$p\x1b[?2004h\x1b[?2004$p\x1b[?4242$p",
                 b"\x1b[?2004;2$y\x1b[?2004;1$y\x1b[?4242;0$y",
             ),
-            // Primary DA: a VT220-class terminal with ANSI colour.
-            (b"\x1b[c", b"\x1b[?62;22c"),
+            // Primary DA: level 2, with selective erase, horizontal scrolling, ANSI colour and
+            // rectangular editing.
+            (b"\x1b[c", b"\x1b[?62;6;21;22;28c"),
         ] {
             t.process(asked);
             assert_eq!(t.take_host_replies(), answer, "{asked:?}");
@@ -851,7 +853,7 @@ mod tests {
 
     #[test]
     fn a_resize_rewraps_the_primary_screen() {
-        let mut t = ServerTerminal::new(4, 20, 100).expect("emulator");
+        let mut t = ServerTerminal::new(4, 20, 1 << 20).expect("emulator");
         t.process(b"0123456789abcdefghijKLMNO");
         t.resize(Size::new(4, 30));
         let snapshot = t.snapshot();
@@ -866,12 +868,13 @@ mod tests {
     }
 
     /// The emulator clamps a resize itself, behind the clamp at the protocol: a hostile size
-    /// never reaches fux-vt. `MAX_SCROLLBACK` leaves room for the largest screen in fux-vt's cell
-    /// limit, or `koh serve --scrollback <max>` would refuse it; the smallest takes wide glyphs.
+    /// never reaches fux-vt. The largest screen takes the most scrollback; the smallest takes wide
+    /// glyphs.
     #[test]
     fn a_resize_is_clamped_and_the_largest_fits_the_most_scrollback() {
         use crate::terminal::{MAX_DIM, MIN_DIM};
-        let history = usize::try_from(crate::server::cli::MAX_SCROLLBACK).expect("fits usize");
+        let history =
+            usize::try_from(crate::server::cli::MAX_SCROLLBACK_BYTES).expect("fits usize");
         let mut t = ServerTerminal::new(24, 80, history).expect("default size at max scrollback");
         assert!(t.resize(Size::new(65000, 65000)));
         assert_eq!(t.snapshot().size(), Size::new(MAX_DIM, MAX_DIM));
@@ -1105,7 +1108,7 @@ mod tests {
     fn history_keeps_its_names_through_the_alternate_screen_and_a_resize_to_the_same_size() {
         // The client caches history rows by name: a visit to the alternate screen (which has no
         // history), or a resize that changes nothing, must not rename them all.
-        let mut t = ServerTerminal::new(24, 80, 1000).expect("emulator");
+        let mut t = ServerTerminal::new(24, 80, 1 << 20).expect("emulator");
         for n in 0..300 {
             t.process(format!("line {n}\r\n").as_bytes());
         }

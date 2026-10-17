@@ -22,8 +22,8 @@ use koh::proto::{
 use koh::terminal::{ServerTerminal, Size, TerminalScreen};
 use recording::Recording;
 
-/// The scrollback a server keeps by default (`koh serve --scrollback`).
-const SCROLLBACK: usize = 1000;
+/// The scrollback a server keeps by default (`koh serve --scrollback-bytes`), in bytes.
+const SCROLLBACK: usize = 8 << 20;
 
 /// The escape prefix (`Ctrl-^`).
 const ESCAPE: u8 = 0x1e;
@@ -42,8 +42,13 @@ struct Pair {
 
 impl Pair {
     fn new(rows: u16, cols: u16) -> Result<Self, String> {
+        Self::keeping(rows, cols, SCROLLBACK)
+    }
+
+    /// A pair whose server keeps `history_bytes` of history.
+    fn keeping(rows: u16, cols: u16, history_bytes: usize) -> Result<Self, String> {
         Ok(Self {
-            server: ServerTerminal::new(rows, cols, SCROLLBACK).map_err(|e| e.to_string())?,
+            server: ServerTerminal::new(rows, cols, history_bytes).map_err(|e| e.to_string())?,
             client: ClientSession::new(Size::new(rows, cols)),
             sent: TerminalScreen::default(),
             num: 0,
@@ -249,17 +254,19 @@ fn rows_held_are_never_fetched_again() {
 
 #[test]
 fn history_past_the_servers_scrollback_is_not_there_to_fetch() {
-    let mut pair = Pair::new(6, 20).expect("pair");
+    let mut pair = Pair::keeping(6, 20, 64 << 10).expect("pair");
     for n in 0..1500 {
         pair.server.process(format!("line {n}\r\n").as_bytes());
     }
+    let held = pair.server.live().history_len();
+    assert!((100..1495).contains(&held), "{held}");
     pair.frame().expect("frame");
     pair.page_through().expect("pages");
-    assert_eq!(pair.history_rows, SCROLLBACK);
+    assert_eq!(pair.history_rows, held);
     pair.keys(b"g").expect("top");
-    assert_eq!(pair.client.scrollback().offset(), Some(SCROLLBACK));
+    assert_eq!(pair.client.scrollback().offset(), Some(held));
     let top = pair.client.view().expect("view").screen().contents();
-    assert!(top.starts_with("line 495"), "{top:?}");
+    assert!(top.starts_with(&format!("line {}", 1495 - held)), "{top:?}");
 }
 
 #[test]

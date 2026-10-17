@@ -88,7 +88,7 @@ fn incremental_frame() -> Result<(Frame, TerminalScreen), fux_vt::Error> {
 /// A frame that scrolls: the screen scrolled up a line and a line written at the bottom, the rest
 /// moved rather than sent, and the line scrolled off kept in history.
 fn scrolled_frame() -> Result<(Frame, TerminalScreen), fux_vt::Error> {
-    let mut emu = ServerTerminal::new(6, 20, 10)?;
+    let mut emu = ServerTerminal::new(6, 20, 1 << 20)?;
     emu.process(OUTPUT);
     let base = emu.snapshot();
     emu.process(b"\x1b[6;1H\r\nscrolled in");
@@ -103,7 +103,7 @@ fn scrolled_frame() -> Result<(Frame, TerminalScreen), fux_vt::Error> {
 
 /// The history the scrolled frame's server holds: the two rows its output scrolled off.
 fn history_reply() -> Result<HistoryReply, fux_vt::Error> {
-    let mut emu = ServerTerminal::new(6, 20, 10)?;
+    let mut emu = ServerTerminal::new(6, 20, 1 << 20)?;
     emu.process(OUTPUT);
     emu.process(b"\x1b[6;1H\r\nscrolled in\r\n");
     let mark = emu.snapshot().history();
@@ -139,8 +139,8 @@ fn modes() -> Vec<WireModes> {
 }
 
 /// One message of each kind, with varints of one and several bytes.
-fn client_msgs() -> Vec<ClientMsg> {
-    vec![
+fn client_msgs() -> Option<Vec<ClientMsg>> {
+    Some(vec![
         ClientMsg::Resize {
             n: 1,
             size: Size::new(50, 132),
@@ -167,7 +167,7 @@ fn client_msgs() -> Vec<ClientMsg> {
                     kitty: None,
                 }),
                 InputEvent::Key(WireKey {
-                    key: WireKeyCode::F(12),
+                    key: WireKeyCode::F(12.try_into().ok()?),
                     mods: 0,
                     kitty: Some(WireKitty {
                         code: Some(57_399),
@@ -177,11 +177,16 @@ fn client_msgs() -> Vec<ClientMsg> {
                     }),
                 }),
                 InputEvent::Mouse(WireMouse {
-                    action: WireMouseAction::Release,
-                    button: Some(WireButton::WheelDown),
+                    action: WireMouseAction::Release(Some(WireButton::WheelDown)),
                     mods: 2,
                     row: 300,
                     col: 7,
+                }),
+                InputEvent::Mouse(WireMouse {
+                    action: WireMouseAction::Press(WireButton::Left),
+                    mods: 0,
+                    row: 1,
+                    col: 2,
                 }),
                 InputEvent::Focus(true),
                 InputEvent::Paste("hi".to_owned()),
@@ -197,7 +202,7 @@ fn client_msgs() -> Vec<ClientMsg> {
             palette: vec![None, Some([0xcd, 0, 0])],
             scheme: Some(WireScheme::Light),
         }),
-    ]
+    ])
 }
 
 /// One cell with `text`, of `kind`, `fg` and `style`, the rest default.
@@ -385,7 +390,7 @@ const CLIENT_MSGS: [&str; 8] = [
     "0000000401f0a204",
     "0000000102",
     "0000000803ac02f0a2048002",
-    "00000025040205000002c3a90500000f0c000101b7c003014100840101010402ac0207020103026869",
+    "0000002b040206000002c3a90500000f0c000101b7c003014100840101010402ac0207010000000102020103026869",
     "000000cf04ac020103c8017878787878787878787878787878787878787878787878787878787878787878787878\
         78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878\
         78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878\
@@ -453,7 +458,7 @@ const PINNED_FOR: &[u8] = b"koh/6";
 #[test]
 fn client_messages_encode_as_pinned() {
     assert_eq!(koh::transport_iroh::ALPN, PINNED_FOR);
-    let msgs = client_msgs();
+    let msgs = client_msgs().expect("messages");
     assert_eq!(msgs.len(), CLIENT_MSGS.len());
     for (msg, pinned) in msgs.iter().zip(CLIENT_MSGS) {
         let pinned = unhex(pinned).expect("hex");
@@ -535,6 +540,7 @@ fn modes_encode_as_pinned() {
 #[test]
 fn the_wire_messages_seed_the_fuzzers() {
     let client: Vec<u8> = client_msgs()
+        .expect("messages")
         .iter()
         .flat_map(|msg| encode_client(msg).expect("encodes"))
         .collect();

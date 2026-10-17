@@ -8,7 +8,7 @@ use koh::terminal::ServerTerminal;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(mut t) = ServerTerminal::new(24, 80, 100) else {
+    let Ok(mut t) = ServerTerminal::new(24, 80, 64 << 10) else {
         return;
     };
     // Split the input into a few chunks so sequences straddle `process` calls.

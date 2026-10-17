@@ -19,8 +19,8 @@ use koh::client::ConnectConfig;
 use koh::keycmd::{KeyConfig, KeyOp};
 use koh::names::{List, Op};
 use koh::server::cli::{
-    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SESSIONS, DEFAULT_SCROLLBACK, DEFAULT_SESSION_TTL_SECS,
-    MAX_SCROLLBACK,
+    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SESSIONS, DEFAULT_SCROLLBACK_BYTES,
+    DEFAULT_SESSION_TTL_SECS, MAX_SCROLLBACK_BYTES,
 };
 use koh::server::ServeConfig;
 use koh::transport_iroh::{parse_endpoint_id, parse_relay_url};
@@ -175,12 +175,12 @@ fn serve() -> Command {
                 .help("Program to run in the session (defaults to $SHELL, else /bin/sh, started as a plain shell, not a login one). Repeat to pass arguments: `--shell zellij --shell attach --shell -c --shell main` runs `zellij attach -c main`. The value is never split on whitespace"),
         )
         .arg(
-            Arg::new("scrollback")
-                .long("scrollback")
-                .value_name("SCROLLBACK")
-                .default_value(DEFAULT_SCROLLBACK.to_string())
-                .value_parser(value_parser!(u64).range(0..=MAX_SCROLLBACK))
-                .help("Scrollback lines retained by the server-side emulator (per session). Bounded like the other resource knobs (`--max-connections`/`--max-sessions`) and by the emulator's per-buffer cell limit at the largest screen. 0 = no scrollback"),
+            Arg::new("scrollback_bytes")
+                .long("scrollback-bytes")
+                .value_name("BYTES")
+                .default_value(DEFAULT_SCROLLBACK_BYTES.to_string())
+                .value_parser(value_parser!(u64).range(0..=MAX_SCROLLBACK_BYTES))
+                .help("Bytes of scrollback each session's server-side emulator keeps (8 MiB holds about 20,000 lines of 50 characters); past it, the oldest lines go. At most 1 GiB; 0 = no scrollback"),
         )
         .arg(
             Arg::new("session_ttl_secs")
@@ -384,7 +384,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                 .map_or_else(Vec::new, |ids| ids.copied().collect()),
             saved_clients: None,
             command: strings(m, "shell"),
-            scrollback: value(m, "scrollback")?,
+            scrollback_bytes: value(m, "scrollback_bytes")?,
             session_ttl_secs: value(m, "session_ttl_secs")?,
             relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
             local: m.get_flag("local"),
@@ -541,7 +541,7 @@ mod tests {
         assert_eq!(c.allow, [ID.parse().unwrap()]);
         // Everything not given on the command line must equal `ServeConfig::default()`.
         let d = ServeConfig::default();
-        assert_eq!(c.scrollback, d.scrollback);
+        assert_eq!(c.scrollback_bytes, d.scrollback_bytes);
         assert_eq!(c.session_ttl_secs, d.session_ttl_secs);
         assert_eq!(c.max_connections, d.max_connections);
         assert_eq!(c.max_sessions, d.max_sessions);

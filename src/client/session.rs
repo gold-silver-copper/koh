@@ -33,6 +33,13 @@ pub const LINK_DOWN_GRACE: Duration = HEARTBEAT.saturating_mul(3);
 /// status line says so. An empty queue takes any input, a whole paste included.
 const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 
+/// The keys the client reads its own commands in: xterm's legacy bytes, in normal cursor mode.
+const LEGACY: KeyMode = KeyMode::Legacy {
+    application: false,
+    other_keys: None,
+    backarrow: false,
+};
+
 /// What the status line says of a paste past [`MAX_PASTE`], which is dropped whole.
 const PASTE_TOO_LONG: &str = "paste over 1 MiB — not sent";
 
@@ -561,11 +568,7 @@ impl ClientSession {
                 // The prefix is a control: a key without Ctrl can only matter after one.
                 Input::Key(stroke) if stroke.press.mods.ctrl || self.pending_escape.is_some() => {
                     self.scratch.clear();
-                    key_bytes(
-                        stroke.press.into(),
-                        KeyMode::legacy(false),
-                        &mut self.scratch,
-                    );
+                    key_bytes(stroke.press.into(), LEGACY, &mut self.scratch);
                     Some(self.scratch.as_slice())
                 }
                 Input::Key(_)
@@ -667,7 +670,7 @@ impl ClientSession {
                     *slot = Some(rgb.into());
                 }
             }
-            Reply::Attributes => {
+            Reply::Attributes { .. } => {
                 if let Some(colours) = colours.filter(|_| self.colours_asked) {
                     self.colours_asked = false;
                     if colours.known() {
@@ -675,7 +678,7 @@ impl ClientSession {
                     }
                 }
             }
-            Reply::Mode { .. } => {}
+            Reply::Mode { .. } | Reply::CellSize { .. } => {}
         }
         self.found.1 |= self.found.0 != before;
     }
@@ -1019,7 +1022,7 @@ mod tests {
     /// A key's legacy bytes, in normal cursor mode.
     fn legacy_bytes(press: KeyPress) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(8);
-        key_bytes(press.into(), KeyMode::legacy(false), &mut bytes);
+        key_bytes(press.into(), LEGACY, &mut bytes);
         bytes
     }
 
@@ -1484,7 +1487,7 @@ mod tests {
     /// moves.
     #[test]
     fn a_key_at_a_fresh_prompt_waits_for_its_echo_even_at_the_bottom_of_the_screen() {
-        for (above, scrollback) in [(0, 0), (30, 100), (30, 0)] {
+        for (above, scrollback) in [(0, 0), (30, 1 << 20), (30, 0)] {
             let echoing = crate::predict::TtyModes {
                 echo: true,
                 line: true,
@@ -1851,16 +1854,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_backspace_crosses_the_wire_and_unsupported_function_keys_emit_nothing() {
+    fn ctrl_backspace_and_kitty_function_keys_cross_the_wire_and_legacy_f13_sends_nothing() {
         let (now, mut session) = start();
         drain(&mut session);
-        session.on_input(now, b"\x1b[127;5u");
-        let mut sent = events(&drain(&mut session));
-        assert!(matches!(sent.as_slice(), [InputEvent::Key(key)]
-            if key.stroke().press == fux_vt::keys::KeyPress::new(fux_vt::keys::Key::Backspace, fux_vt::keys::Modifiers::CTRL)));
-        sent.push(InputEvent::Key(
-            Keystroke::from(fux_vt::keys::KeyPress::plain(fux_vt::keys::Key::F(13))).into(),
-        ));
+        session.on_input(now, b"\x1b[127;5u\x1b[57376u");
+        let sent = events(&drain(&mut session));
+        let f13 = fux_vt::keys::Key::F(fux_vt::keys::Function::new(13).unwrap());
+        assert!(
+            matches!(sent.as_slice(), [InputEvent::Key(backspace), InputEvent::Key(f)]
+            if backspace.stroke().press == fux_vt::keys::KeyPress::new(fux_vt::keys::Key::Backspace, fux_vt::keys::Modifiers::CTRL)
+                && f.stroke().press.key == f13),
+            "{sent:?}"
+        );
         let server = ServerTerminal::new(24, 80, 0).expect("emulator");
         let mut bytes = Vec::new();
         server.encode_input(&sent, &mut bytes);

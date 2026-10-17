@@ -90,7 +90,7 @@ The median repeat is the run's figure.
 
 ## Scrollback
 
-Each workload played into a server emulator keeping the default 1,000 lines, then every row of its
+Each workload played into a server emulator keeping the default 8 MiB, then every row of its
 history fetched as koh's scrollback view fetches them (`Ctrl-^ [`, requests of up to 256 rows):
 the compressed history streams' bytes. In process, with no link. mosh keeps no history; ssh's is
 the user's terminal's, which the output's bytes already paid for, and a reconnect loses.

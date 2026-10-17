@@ -570,7 +570,7 @@ fn mouse_modes(prev: MouseProtocolMode, mouse: MouseProtocolMode) -> Vec<u8> {
         Mode::PressRelease => Some(1000),
         Mode::ButtonMotion => Some(1002),
         Mode::AnyMotion => Some(1003),
-        Mode::None | _ => None,
+        Mode::None => None,
     };
     if prev == mouse {
         return Vec::new();

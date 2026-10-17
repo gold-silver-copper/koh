@@ -32,8 +32,8 @@ use koh::proto::{
 use koh::terminal::{FrameHold, Modes, ServerTerminal, Size, TerminalScreen, FRAME_HOLD};
 use recording::Recording;
 
-/// The scrollback a server keeps by default (`koh serve --scrollback`).
-const SCROLLBACK: usize = 1000;
+/// The scrollback a server keeps by default (`koh serve --scrollback-bytes`), in bytes.
+const SCROLLBACK: usize = 8 << 20;
 
 /// The most bytes one read of a PTY returns here.
 const PIECE: u64 = 2048;
@@ -98,7 +98,7 @@ impl fux_vt::Sink for Said {
             fux_vt::Event::IconName(icon) => self.icon = text(icon),
             fux_vt::Event::Clipboard { data, .. } => self.clipboard = text(data),
             fux_vt::Event::Bell => self.bells = self.bells.saturating_add(1),
-            fux_vt::Event::ColorQuery { .. } | _ => {}
+            fux_vt::Event::ColorQuery { .. } | fux_vt::Event::Notification(_) => {}
         }
     }
 }
@@ -796,6 +796,7 @@ fn confirmed_guesses_never_disagree_with_the_server() {
 /// program asked at that moment, as fux's recorder made the recordings (`record.rs`, `typed`).
 fn read_by_the_program(keys: &[u8], screen: &fux_vt::Screen) -> Vec<u8> {
     use fux_vt::keys::decode::{Decoder, Input};
+    use fux_vt::keys::encode::{key_bytes, paste};
     let mut decoder = Decoder::default();
     let mut inputs = Vec::new();
     decoder.bytes(keys, &mut inputs);
@@ -803,8 +804,8 @@ fn read_by_the_program(keys: &[u8], screen: &fux_vt::Screen) -> Vec<u8> {
     let mut out = Vec::new();
     for input in inputs {
         match input {
-            Input::Key(stroke) => screen.encode_key(stroke, &mut out),
-            Input::Paste(text) => screen.encode_paste(&text, &mut out),
+            Input::Key(stroke) => key_bytes(stroke, screen.key_mode(), &mut out),
+            Input::Paste(text) => paste(&text, screen.mode(fux_vt::Mode::BracketedPaste), &mut out),
             Input::PasteTooLong
             | Input::FocusIn
             | Input::FocusOut

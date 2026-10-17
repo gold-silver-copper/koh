@@ -192,3 +192,34 @@ fn connect_argv(server: &Served, key: &Path) -> [String; 7] {
     ]
     .map(str::to_owned)
 }
+
+/// A long line the terminal writes in one go, as an agent's terminal types it, runs at once: none
+/// of it waits for a key typed after.
+#[test]
+fn a_long_line_written_in_one_go_runs_with_nothing_typed_after() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let dir = koh_testkit::scratch!("long-line-test").expect("a scratch directory");
+            let (server_key, client_key) = (dir.join("server.key"), dir.join("client.key"));
+            let client_id = endpoint_id(&client_key).expect("the client's id");
+            let server = serve_local(&server_key, None, &client_id).expect("the server");
+            let (client, buf, at) = connected(
+                &connect_argv(&server, &client_key),
+                b"echo up_$((6*7))\r",
+                "up_42",
+            )
+            .await
+            .expect("the session");
+
+            // Only the remote shell turns this into `len_2000`; its echo shows `${#A}`.
+            let line = format!("A={}; echo len_${{#A}}\r", "y".repeat(2000));
+            client.write(line.into_bytes()).expect("type the line");
+            let seen = buf.wait_for(at, "len_2000", 10).await;
+
+            let _ = client.write(vec![0x1e, b'.']);
+            drop(client);
+            stop(server).expect("stop the server");
+            seen.unwrap_or_else(|e| panic!("the whole line ran: {e}"));
+        });
+}

@@ -14,9 +14,9 @@ copies.
 A peer finds a server by its Ed25519 **node-id** (through relays + NAT hole-punching), and only peers
 on its **allowlist** are admitted. The node-id is not enumerable, but the server's UDP port is open
 like any listener's: anyone who can reach it can start QUIC handshakes, as iroh answers a
-ClientHello whatever its server name. So handshakes under way are capped: 2 from one IP address (an
-IPv6 /48 counts as one; a relay's are capped only in all), that address's oldest given up for a
-new one, and 256 in all, the oldest given up; they hold no connection permit. A new handshake is
+ClientHello whatever its server name. So handshakes under way are capped: 256 in all, and when all
+the room is taken a new one gives up the oldest of the address holding the most (an IPv6 /48
+counts as one, and a relay's as one); they hold no connection permit. A new handshake is
 never refused, but when its room would cost one under way, an address not yet validated must first
 answer a QUIC retry, which a spoofed address cannot. So stalled handshakes from spoofed addresses
 take no room; a flood from enough real addresses (or from a NAT the client shares) can still give
@@ -35,7 +35,7 @@ service.
    request of at most 1 MiB, a command of at most 256 KiB and 4096 words with no NUL, paths of at
    most 4096 bytes with no NUL, at most 1024 sources, a job's name a short word, a wait's text at
    most 4 KiB, each refused as it is decoded, before anything is allocated for it. A shell reaches
-   the koh/9 data plane: it sends input, resizes, colours, its reads of the output (`Read`, which
+   the koh/10 data plane: it sends input, resizes, colours, its reads of the output (`Read`, which
    pace what the server sends) and redraw requests. Input comes as decoded events (`Keys`: keys,
    mouse events, focus changes, whole pastes); decoding refuses what no terminal sends (a modifier
    bit no key has, a function key past F12, a kitty code that is no Unicode scalar, a paste over
@@ -53,7 +53,7 @@ service.
    by `--max-connections`. A command (`koh exec`) is one process group, with no terminal, run as
    the server's user, its words passed to the program as they are (a shell only for `--sh`): its
    stdin is read from the stream a chunk at a time and its output written a chunk at a time, so
-   the pipes and QUIC's flow control hold back whichever end is slow; a lost connection (20 s
+   the pipes and QUIC's flow control hold back whichever end is slow; a lost connection (10 s
    after its client went silent), revocation or shutdown hangs it up (SIGHUP to the group, SIGKILL
    after a second). A job (`koh run`) is a command that outlives its connection: at most 64 are
    kept, all peers' together, each a peer's own (another peer's are never named), with stdin

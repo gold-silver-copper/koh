@@ -317,7 +317,9 @@ impl Remote {
         let endpoint = net.endpoint(client_secret, false).await?;
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server_id));
         let start = Size::new(rows, cols);
-        let channel = connector.connect(koh::request::Pick::Latest, start).await?;
+        let channel = connector
+            .connect(koh::request::Pick::Latest, start, None)
+            .await?;
         let size = Arc::new(Mutex::new(start));
         let shown = Arc::new(Mutex::new(parser(rows, cols)?));
         let predicted = Arc::new(Mutex::new(String::new()));

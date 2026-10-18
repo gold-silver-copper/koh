@@ -18,9 +18,9 @@ use crate::proto::Close;
 ///
 /// For a shell, 5 minutes, not iroh's ~30 s, so a
 /// short suspend (Android freezing the process, so keepalives stop) is ridden out on the same
-/// connection, and the client redials after a longer one; for a command, a copy or a wait, 20
-/// seconds, so a client killed where it stood (SIGKILL) has its command hung up within that. A
-/// connection lives as long as the shorter of its two ends' says.
+/// connection, and the client redials after a longer one; for a command, a copy or a wait, 10
+/// seconds, five of its keepalives, so a client killed where it stood (SIGKILL) has its command
+/// hung up within that. A connection lives as long as the shorter of its two ends' says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Idle {
     Shell,
@@ -31,7 +31,15 @@ impl Idle {
     const fn millis(self) -> u32 {
         match self {
             Self::Shell => 300_000,
-            Self::Command => 20_000,
+            Self::Command => 10_000,
+        }
+    }
+
+    /// How often a connection with nothing to send says it is there.
+    const fn keepalive(self) -> Duration {
+        match self {
+            Self::Shell => Duration::from_secs(5),
+            Self::Command => Duration::from_secs(2),
         }
     }
 }
@@ -42,7 +50,7 @@ impl Idle {
 fn koh_transport_config(accept: bool, idle: Idle) -> QuicTransportConfig {
     let uni = if accept { 2 } else { 8 };
     QuicTransportConfig::builder()
-        .keep_alive_interval(Duration::from_secs(5))
+        .keep_alive_interval(idle.keepalive())
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(idle.millis()))))
         .max_concurrent_uni_streams(VarInt::from_u32(uni))
         .max_concurrent_bidi_streams(VarInt::from_u32(0))
@@ -50,7 +58,7 @@ fn koh_transport_config(accept: bool, idle: Idle) -> QuicTransportConfig {
 }
 
 /// The protocol's name and version ([`crate::proto`]), its ALPN.
-pub const PROTOCOL: &str = "koh/9";
+pub const PROTOCOL: &str = "koh/10";
 
 /// The ALPN, [`PROTOCOL`]: a peer on another fails the TLS handshake instead of misparsing
 /// mid-session.

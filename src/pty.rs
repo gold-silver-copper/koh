@@ -625,7 +625,38 @@ impl Pty {
         let Some(leader) = self.running.as_ref().map(|running| running.pid) else {
             return crate::terminal::Activity::Unknown;
         };
+        // Keys it has yet to read (on a busy machine, a program blocked reading is not woken at
+        // once), or output no one has read yet: what it does with its input is still to come, as
+        // fux's own check has it.
+        if self.keys_unread() || self.output_unread() {
+            return crate::terminal::Activity::Busy;
+        }
         fuxix::process::terminal_activity(&self.master, leader, since_key, answered, prompt).into()
+    }
+
+    /// Whether output the program wrote waits to be read from the master, as a poll that does
+    /// not wait says (`FIONREAD` misses a write the kernel has yet to move on, on Linux).
+    fn output_unread(&self) -> bool {
+        let mut fds = [PollFd::new(&self.master, Events::IN)];
+        let polled = fuxix::poll::poll(&mut fds, Some(Duration::ZERO));
+        polled.is_ok_and(|n| n > 0) && fds.iter().any(|fd| fd.revents().intersects(Events::IN))
+    }
+
+    /// Whether keys wait in the terminal for the program to read. On Linux the slave is opened to
+    /// ask (with no wait, and never as a controlling terminal); on macOS the master's `FIONREAD`
+    /// counts them.
+    fn keys_unread(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        let unread = fuxix::io::unread(&self.master).ok();
+        #[cfg(not(target_os = "macos"))]
+        let unread = {
+            use rustix::fs::{Mode, OFlags};
+            let flags = OFlags::RDONLY | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            rustix::fs::open(self.master.slave_path(), flags, Mode::empty())
+                .ok()
+                .and_then(|slave| fuxix::io::unread(slave).ok())
+        };
+        unread.is_some_and(|n| n > 0)
     }
 
     /// Propagate a window-size change to `rows`×`cols`; the kernel raises `SIGWINCH` in the child.

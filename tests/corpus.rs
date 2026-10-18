@@ -164,7 +164,7 @@ fn show(display: &mut Display, term: &mut Term, pieces: &[Shown]) -> Result<(), 
         match piece {
             Shown::Out(bytes) => display.output(term, bytes),
             Shown::Mark(mark) => display.mark(term, mark.as_bytes()),
-            Shown::Report(activity) => display.report(term, *activity),
+            Shown::Report { activity, .. } => display.report(term, *activity),
             Shown::Tty(_)
             | Shown::Echo(_)
             | Shown::Bell(_)

@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
     let shell = koh::request::Request::Shell {
         pick: koh::request::Pick::Latest,
         size: koh::terminal::Size::new(24, 80),
+        program: None,
     };
     control
         .write_all(&koh::request::encode(&shell, koh::request::MAX_REQUEST)?)

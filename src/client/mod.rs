@@ -26,12 +26,12 @@ use crate::log::Peer;
 use crate::proto::{
     encode_client, ClientMsg, Close, InputSeq, Shown, ShownDecoder, HEARTBEAT, SHOWN_TAG,
 };
-use crate::request::{Attached, Pick, Request, Resume, MAX_REPLY, MAX_REQUEST};
+use crate::request::{Argv, Attached, Pick, Request, Resume, MAX_REPLY, MAX_REQUEST};
 use crate::terminal::Size;
 use crate::transport_iroh::{closed_because, ALPN, PROTOCOL};
 use display::Display;
 use input::Keys;
-use iroh::endpoint::{Connection, SendStream};
+use iroh::endpoint::{Connection, SendStream, TransportErrorCode};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -88,7 +88,15 @@ impl IrohConnector {
     pub async fn open(&self, request: &Request) -> anyhow::Result<(Connection, SendStream)> {
         let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
             Ok(conn) => conn,
-            Err(e) if refused_our_alpn(&e) => return Err(Refused::OtherProtocol.into()),
+            // The TLS handshake ended with alert 120 (`no_application_protocol`), QUIC's crypto
+            // error `0x178`: the server does not serve [`ALPN`].
+            Err(e) if failed_with(&e, TransportErrorCode::crypto(120)) => {
+                return Err(Refused::OtherProtocol.into())
+            }
+            // The server had no room for the handshake.
+            Err(e) if failed_with(&e, TransportErrorCode::CONNECTION_REFUSED) => {
+                return Err(Close::Busy.into())
+            }
             Err(e) => anyhow::bail!("connecting to server: {}", Peer(e)),
         };
         let opened = async {
@@ -106,12 +114,22 @@ impl IrohConnector {
         }
     }
 
-    /// Connect to the session `pick` names, for a terminal of `size`, and await the server's
-    /// first stream, which admits the client and says which session it reached. A server that
+    /// Connect to the session `pick` names (a new one running `program`, if given), for a
+    /// terminal of `size`, and await the server's first stream, which admits the client and says which session it reached. A server that
     /// will not have us for good closes the connection instead, a [`Refused`] error; one that
     /// cannot have us now (at capacity, say) closes it saying so, an error that is its [`Close`].
-    pub async fn connect(&self, pick: Pick, size: Size) -> anyhow::Result<Admitted> {
-        let (conn, control) = self.open(&Request::Shell { pick, size }).await?;
+    pub async fn connect(
+        &self,
+        pick: Pick,
+        size: Size,
+        program: Option<Argv>,
+    ) -> anyhow::Result<Admitted> {
+        let request = Request::Shell {
+            pick,
+            size,
+            program,
+        };
+        let (conn, control) = self.open(&request).await?;
         let attached = async {
             let mut first = conn.accept_uni().await?;
             let bytes = first.read_to_end(MAX_REPLY.saturating_add(4)).await?;
@@ -161,18 +179,19 @@ pub enum Refused {
     OtherProtocol,
 }
 
-/// Whether a dial failed because the server does not serve [`ALPN`]: the TLS handshake ended with
-/// alert 120 (`no_application_protocol`), which QUIC reports as crypto error `0x178`.
-fn refused_our_alpn(error: &(dyn std::error::Error + 'static)) -> bool {
-    use iroh::endpoint::{ConnectionError, TransportErrorCode};
-    let no_alpn = TransportErrorCode::crypto(120);
+/// Whether a dial failed with the transport error `code`.
+fn failed_with(
+    error: &(dyn std::error::Error + 'static),
+    code: iroh::endpoint::TransportErrorCode,
+) -> bool {
+    use iroh::endpoint::ConnectionError;
     let mut next = Some(error);
     while let Some(e) = next {
         match e.downcast_ref::<ConnectionError>() {
-            Some(ConnectionError::ConnectionClosed(close)) if close.error_code == no_alpn => {
+            Some(ConnectionError::ConnectionClosed(close)) if close.error_code == code => {
                 return true;
             }
-            Some(ConnectionError::TransportError(t)) if t.code == no_alpn => return true,
+            Some(ConnectionError::TransportError(t)) if t.code == code => return true,
             _ => {}
         }
         next = e.source();
@@ -243,6 +262,8 @@ struct Wire {
     queued_bytes: usize,
     /// Typing was dropped since the queue was last empty: the status line says so.
     paused: bool,
+    /// The newest input sent on it: a report made before the server wrote it is held.
+    sent: InputSeq,
 }
 
 /// The most typed bytes held while the server takes no input; past it, typing is dropped and the
@@ -291,6 +312,7 @@ impl Wire {
             queued: crate::bounded::Bounded::new(),
             queued_bytes: 0,
             paused: false,
+            sent: InputSeq::default(),
         }
     }
 
@@ -436,7 +458,11 @@ fn dial(connector: &IrohConnector, attempt: u32, pick: Pick, size: Size) -> Dial
     };
     Box::pin(async move {
         tokio::time::sleep(wait).await;
-        tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect(pick, size)).await
+        tokio::time::timeout(
+            RECONNECT_CONNECT_TIMEOUT,
+            connector.connect(pick, size, None),
+        )
+        .await
     })
 }
 
@@ -629,7 +655,13 @@ pub async fn run_client<B: KohBackend>(
                         match msg {
                             Shown::Out(bytes) => display.output(&mut backend, &bytes)?,
                             Shown::Mark(mark) => display.mark(&mut backend, mark.as_bytes())?,
-                            Shown::Report(activity) => display.report(&mut backend, activity)?,
+                            // Made before the server wrote all this connection sent, it may say
+                            // `reading` of a program that has yet to take those keys: held.
+                            Shown::Report { activity, input } => {
+                                if input >= wire.sent {
+                                    display.report(&mut backend, activity)?;
+                                }
+                            }
                             Shown::Tty(tty) => display.predictor.set_tty(Some(tty)),
                             Shown::Echo(acked) => {
                                 display.predictor.set_local_frame_late_acked(acked.0);
@@ -754,7 +786,9 @@ pub async fn run_client<B: KohBackend>(
                         seq,
                         events: events.to_vec(),
                     };
-                    let _ = wire.send(&msg);
+                    if wire.send(&msg) {
+                        wire.sent = seq;
+                    }
                 }
             }
             // Not sent, nor predicted: the end of a line whose start was lost must not run alone.

@@ -470,6 +470,8 @@ impl SessionClient {
 struct Attach {
     size: Size,
     history: usize,
+    /// What a new session runs in place of the spec's command.
+    program: Option<Arc<[String]>>,
     reply: oneshot::Sender<Attached>,
 }
 
@@ -498,7 +500,10 @@ fn start(
     let (asks, asks_rx) = mpsc::channel(ASK_QUEUE);
     let (status_tx, status) = watch::channel(Status::default());
     let asked = asks.clone();
-    let command = Arc::clone(&spec.command);
+    let command = first
+        .program
+        .clone()
+        .unwrap_or_else(|| Arc::clone(&spec.command));
     let (scrollback_bytes, ttl, home) = (spec.scrollback_bytes, spec.ttl, spec.home.clone());
     let marks = spec.marks.clone();
     let reaper = reaper.clone();
@@ -539,6 +544,7 @@ fn start(
             title: String::new(),
             bells: 0,
             echo: EchoAck::default(),
+            written: InputSeq::default(),
             screen_changes: 0,
             exited: None,
         };
@@ -590,6 +596,8 @@ struct Session {
     bells: u64,
     /// The newest attachment's inputs awaiting their echo.
     echo: EchoAck,
+    /// The newest attachment's newest input written to the program: what a report follows.
+    written: InputSeq,
     /// How often the screen changed: a wait for text looks again at each.
     screen_changes: u64,
     /// The program's status, once it exited: a client attaching then is told it.
@@ -601,6 +609,7 @@ impl Session {
     fn client(&mut self, size: Size, history: usize) -> (SessionClient, Start) {
         self.attaches = self.attaches.saturating_add(1);
         self.echo = EchoAck::default();
+        self.written = InputSeq::default();
         let mut pending = PendingInput::default();
         let window = Window { n: 0, size };
         if self
@@ -634,7 +643,10 @@ impl Session {
         shown.push(Shown::Title(emu.title().to_owned()));
         shown.push(Shown::Bell(emu.bell_count()));
         if let Some(report) = self.reports.last() {
-            shown.push(Shown::Report(report.activity));
+            shown.push(Shown::Report {
+                activity: report.activity,
+                input: self.written,
+            });
         }
         if let Some(code) = self.exited {
             shown.push(Shown::Exit(code));
@@ -684,8 +696,21 @@ impl Session {
         let prompt = self.host.emu.live().commands().prompt;
         let activity = self.host.pty.activity(since_key, answered, prompt);
         if let Some(report) = self.reports.probed(now, why, activity) {
-            self.show(Shown::Report(report.activity));
+            self.show(Shown::Report {
+                activity: report.activity,
+                input: self.written,
+            });
         }
+    }
+
+    /// Probe for a report as polled, after what is `held` is told (with the modes read first, as
+    /// its settling would): a report never goes before output the program wrote before it.
+    fn report(&mut self, held: &mut Vec<Shown>, typed: (Option<Instant>, bool)) {
+        if !held.is_empty() {
+            self.refresh_tty();
+            self.release(held);
+        }
+        self.probe(Instant::now(), Probe::Poll, typed);
     }
 
     /// Feed `chunk` to the emulator and the filter; what passes goes into `held`.
@@ -772,6 +797,7 @@ impl Session {
                         answered = false;
                         self.reports.owe();
                         self.echo.written(seq, now);
+                        self.written = seq;
                     }
                 }
             }
@@ -884,7 +910,7 @@ impl Session {
                     }
                 },
                 msg = control.recv() => match msg {
-                    Some(Attach { size, history, reply }) => {
+                    Some(Attach { size, history, reply, .. }) => {
                         // The one place the detach is squared with the clients: the last may have
                         // left unseen by the arm below, and it is dated before this attach.
                         if detached.is_none() && self.presence.receiver_count() == 0 {
@@ -917,13 +943,17 @@ impl Session {
                     }
                 }
                 // What the program is doing: the report owed, and a change while a client sees it.
-                () = until(self.reports.due(Instant::now())), if exited.is_none() => {
-                    self.probe(Instant::now(), Probe::Poll, (typed_at, answered));
+                // Output it wrote before goes first: none read and waiting (the report stays owed
+                // until that is taken), then what is held for the modes.
+                () = until(self.reports.due(Instant::now())), if exited.is_none() && (pty_rx.is_empty() || !reading) => {
+                    self.report(&mut held, (typed_at, answered));
                     self.publish_status(exited);
                 }
                 _ = poll.tick(), if exited.is_none() && self.presence.receiver_count() > 0 => {
-                    self.probe(Instant::now(), Probe::Poll, (typed_at, answered));
-                    self.publish_status(exited);
+                    if pty_rx.is_empty() || !reading {
+                        self.report(&mut held, (typed_at, answered));
+                        self.publish_status(exited);
+                    }
                 }
                 // Detached for the whole TTL.
                 () = until(detached.and_then(|since| since.checked_add(ttl))) => break,
@@ -1090,9 +1120,16 @@ impl Registry {
     }
 
     /// Attach `peer` to the session `pick` names, at window `size`: its latest (or a new one if it
-    /// has none), a new one, or one by number, which must be the peer's. A client that attaches
-    /// afresh (not redialing) is sent [`ATTACH_HISTORY`] rows of history above the screen.
-    pub async fn attach(&self, peer: EndpointId, pick: Pick, size: Size) -> Attached {
+    /// has none), a new one, or one by number, which must be the peer's; with a `program`, a new
+    /// one running it. A client that attaches afresh (not redialing) is sent [`ATTACH_HISTORY`]
+    /// rows of history above the screen.
+    pub async fn attach(
+        &self,
+        peer: EndpointId,
+        pick: Pick,
+        size: Size,
+        program: Option<Arc<[String]>>,
+    ) -> Attached {
         let history = if matches!(pick, Pick::Resume(_)) {
             0
         } else {
@@ -1103,6 +1140,7 @@ impl Registry {
             let attach = Attach {
                 size,
                 history,
+                program: program.clone(),
                 reply,
             };
             self.tx

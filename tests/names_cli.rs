@@ -368,7 +368,11 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
         async move {
             let endpoint = bind_endpoint_local(secret, false).await?;
             let admitted = koh::client::IrohConnector::new(endpoint.clone(), at)
-                .connect(koh::request::Pick::Latest, koh::terminal::Size::new(24, 80))
+                .connect(
+                    koh::request::Pick::Latest,
+                    koh::terminal::Size::new(24, 80),
+                    None,
+                )
                 .await?;
             anyhow::Ok((endpoint, admitted))
         }

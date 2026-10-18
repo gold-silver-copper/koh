@@ -1,4 +1,4 @@
-//! The koh/9 shell protocol: what a session's connection carries after its opening request
+//! The koh/10 shell protocol: what a session's connection carries after its opening request
 //! ([`crate::request`]).
 //!
 //! The client writes [`ClientMsg`]s on two uni streams, its first (the request's) for control
@@ -72,7 +72,8 @@ pub enum Close {
     ProtocolError = 2,
     /// The hosted program exited, and the client was sent its end.
     SessionEnded = 3,
-    /// The server holds its most sessions, and the client asked for a new one.
+    /// The server holds its most sessions, and the client asked for a new one; or the session
+    /// has as many attaches waiting as it takes.
     AtCapacity = 4,
     /// The session's program, or the command asked for, could not start, or the server is
     /// shutting down.
@@ -81,6 +82,9 @@ pub enum Close {
     NoSuchSession = 6,
     /// The client's key is scoped to commands or copies, and asked for something else.
     OutOfScope = 7,
+    /// The server has `--max-connections` connections, and as many waiting for one: nothing was
+    /// done, and a retry may get in.
+    Busy = 8,
 }
 
 impl Close {
@@ -98,6 +102,7 @@ impl Close {
             5 => Self::CouldNotStart,
             6 => Self::NoSuchSession,
             7 => Self::OutOfScope,
+            8 => Self::Busy,
             _ => return None,
         })
     }
@@ -108,13 +113,14 @@ impl Close {
             Self::NotAuthorized => "not authorized (is this client on the server's allowlist?)",
             Self::ProtocolError => "protocol error",
             Self::SessionEnded => "session ended",
-            Self::AtCapacity => "server at capacity",
+            Self::AtCapacity => "the server holds its most sessions (`koh serve --max-sessions`)",
             Self::CouldNotStart => "the server could not start the program",
             Self::NoSuchSession => "no such session (it ended, or the server restarted)",
             Self::OutOfScope => {
                 "this client's key is scoped on the server (`koh clients` there), and may not do \
                  that"
             }
+            Self::Busy => "server busy: too many connections at once; retry",
         }
     }
 }
@@ -190,8 +196,10 @@ pub enum Shown {
     Out(#[serde(deserialize_with = "at_most::<{ crate::stream::MAX_OUT }, _, _>")] Vec<u8>),
     /// A shell mark, for the client to write with its terminal's nonce ([`MarkText`]).
     Mark(MarkText),
-    /// What the program in the foreground is doing, newly probed.
-    Report(Activity),
+    /// What the program in the foreground is doing, newly probed, after the input up to `input`
+    /// (this connection's) was written to it: a client that has sent more since holds it, as the
+    /// program may not have had those keys yet.
+    Report { activity: Activity, input: InputSeq },
     /// How the program's PTY takes typed keys: before the output they apply to.
     Tty(TtyModes),
     /// The input up to this one (this connection's) had its time to show: what the program
@@ -379,13 +387,14 @@ mod tests {
             Close::CouldNotStart,
             Close::NoSuchSession,
             Close::OutOfScope,
+            Close::Busy,
         ];
         for close in all {
             assert_eq!(Close::from_code(u64::from(close.code())), Some(close));
             assert!(close.text().is_ascii() && !close.text().contains('\n'));
         }
         assert_eq!(Close::from_code(0), None);
-        assert_eq!(Close::from_code(8), None);
+        assert_eq!(Close::from_code(9), None);
     }
 
     #[test]
@@ -393,7 +402,10 @@ mod tests {
         let msgs = [
             Shown::Out(b"hello\x1b[1m".to_vec()),
             Shown::Mark(MarkText::new(b"D;1".to_vec()).unwrap()),
-            Shown::Report(Activity::Reading),
+            Shown::Report {
+                activity: Activity::Reading,
+                input: InputSeq(4),
+            },
             Shown::Echo(InputSeq(9)),
             Shown::Exit(3),
         ];

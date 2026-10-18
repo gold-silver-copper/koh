@@ -6,7 +6,7 @@
 //! stdout and stderr, a chunk at a time, or, with `--json`, kept (at most [`MAX_KEPT`] each) and
 //! said with the status as one JSON value. Stopped by a signal, or losing the link, the
 //! connection closes, which hangs the command up; a client killed where it stands is noticed by
-//! the server within 20 seconds. On a terminal it reports `busy` (`OSC 133 ; S`) while the
+//! the server within 10 seconds. On a terminal it reports `busy` (`OSC 133 ; S`) while the
 //! command runs, so a terminal that reads reports does not take it for one waiting for input.
 
 use std::pin::pin;
@@ -35,7 +35,10 @@ const BROKEN_PIPE: u32 = 128 + 13;
 pub async fn exec(remote: &Remote, run: Run, format: Format) -> anyhow::Result<u32> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
-    let mut opened = Opened::dial(remote, &Request::Exec(run)).await?;
+    // Apart, its stdout and stderr could come back in another order than it wrote them: when they
+    // go to one file here (`2>&1`, a terminal), they are one pipe there.
+    let together = !format.json && one_file();
+    let mut opened = Opened::dial(remote, &Request::Exec { run, together }).await?;
     super::cli::report_busy();
     let (stdin, reading) = super::io::spawn_stdin()?;
     let ran = drive(
@@ -49,6 +52,22 @@ pub async fn exec(remote: &Remote, run: Run, format: Format) -> anyhow::Result<u
     reading.cancel();
     opened.close().await;
     ran
+}
+
+/// Whether this process's stdout and stderr are one file.
+fn one_file() -> bool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "its file looked at, nothing written to it"
+    )]
+    let stderr = std::io::stderr();
+    match (
+        rustix::fs::fstat(std::io::stdout()),
+        rustix::fs::fstat(stderr),
+    ) {
+        (Ok(out), Ok(err)) => (out.st_dev, out.st_ino) == (err.st_dev, err.st_ino),
+        _ => false,
+    }
 }
 
 /// What stopped the command's output from reaching the user.

@@ -169,6 +169,8 @@ pub enum Cmd {
         remote: RemoteArgs,
         job: JobName,
         follow: bool,
+        /// Its last lines kept to show; `None` for all.
+        tail: Option<u32>,
     },
     /// `koh kill`.
     Kill {
@@ -181,6 +183,8 @@ pub enum Cmd {
     Wait {
         remote: RemoteArgs,
         wait: Wait,
+        /// A job's last lines to show once it ends.
+        tail: u32,
         timeout: Option<std::time::Duration>,
         json: bool,
     },
@@ -237,6 +241,7 @@ impl RemoteArgs {
 pub struct ConnectArgs {
     pub remote: RemoteArgs,
     pub pick: Pick,
+    pub program: Option<Argv>,
     pub clipboard: bool,
     pub hyperlinks: bool,
     pub colours: bool,
@@ -249,6 +254,7 @@ impl ConnectArgs {
         ConnectConfig {
             remote: self.remote.into_remote(server, saved),
             pick: self.pick,
+            program: self.program,
             clipboard: self.clipboard,
             hyperlinks: self.hyperlinks,
             colours: self.colours,
@@ -267,16 +273,22 @@ Run something:
   koh exec SERVER --sh 'cd src && make'  a shell line, on purpose: one word, quoted whole
   koh exec SERVER -- sh -s < script.sh  a longer script, or one with quotes in it, on stdin
   koh exec SERVER -C DIR -- PROG ...   start in DIR (relative: in the home)
-  stdin goes to the command; stdout and stderr come back apart; exits with its status
-  (127 no such program, 126 could not start: no -C DIR there, 255 koh's own error).
-  A killed koh hangs it up within 20 s.
+  stdin goes to the command; stdout and stderr come back apart (sent to one file here, as
+  2>&1 or a terminal does, in the order it wrote them); exits with its status (127 no such
+  program, 126 could not start: no -C DIR there, 255 koh's own error). A killed koh hangs it up
+  at once (SIGTERM, SIGHUP, SIGINT), within 10 s if SIGKILLed.
+  koh connect SERVER -- gdb ./prog     one program on a terminal of its own (an editor, a
+                                       debugger, a TUI), in a terminal; ends with its status
 
 Jobs (survive koh exiting and the link dropping; output and status kept):
   koh run SERVER [--name build] -- make -j4   prints the job's name
-  koh wait SERVER build                 until it ends; exits with its status
+  koh wait SERVER build                 until it ends: prints its last 200 lines (--tail N, 0 for
+                                        none), exits with its status
   koh wait SERVER build --text listening  until its output has the text (1 if it ended first)
   koh wait SERVER --file out/done.txt   until the file exists
-  koh logs SERVER build [--follow]      its output (with --follow until it ends, then its status)
+  koh logs SERVER build [--follow]      its last 200 lines (--tail N, --all), then on stderr
+                                        `· running 34s` or `· exited 101 after 34s`; with
+                                        --follow on until it ends, then exits with its status
   koh jobs SERVER [build]               one line a job; with a name, its command whole
   koh kill SERVER build [--signal KILL]
 
@@ -287,7 +299,7 @@ Copy (a sync: merges, makes parents, sends only files that changed, by hash):
   koh cp SERVER:proj/out.txt .          the other way
   --delete removes what the source lacks; --exclude PAT (repeat); -p keeps mtimes (default:
   arrival time, so builds see changes); --atomic lands nothing until all came. Prints one line,
-  where it landed: `3 files, 41 KB → SERVER:proj/src (2 replaced, 120 unchanged)`. A cut copy
+  where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`. A cut copy
   resumes when rerun.
 
 Shell sessions (`koh connect SERVER` in a terminal, or fux):
@@ -299,7 +311,8 @@ Shell sessions (`koh connect SERVER` in a terminal, or fux):
 --json on sessions, output, exec, run, jobs, kill, wait and cp: one JSON value on stdout, and on
 failure {\"error\":{\"kind\":...,\"message\":...}}. --timeout SECS on wait (exit 124).
 Exit codes: 0 ok, 1 failed, 2 usage, 3 server not reached, 4 refused (not allowed, or out of
-the key's scope), 124 wait timed out; exec, wait and logs --follow exit with the remote status.
+the key's scope), 75 server busy (too many connections at once: nothing ran, so retry), 124 wait
+timed out; exec, wait and logs --follow exit with the remote status (75 too when busy).
 ";
 
 /// `koh`'s command line.
@@ -404,7 +417,7 @@ fn serve() -> Command {
                 .value_name("N")
                 .default_value(DEFAULT_MAX_CONNECTIONS.to_string())
                 .value_parser(value_parser!(NonZeroU32))
-                .help("Most connections at once"),
+                .help("Most connections at once; as many more from allowed clients wait up to 10 s for room, then are told the server is busy"),
         )
         .arg(
             Arg::new("max_sessions")
@@ -460,9 +473,18 @@ fn session(required: bool) -> Arg {
 }
 
 fn connect() -> Command {
-    remote(Command::new("connect").about("Open a shell on a server, in this terminal: your session there attached last, else a new one. Ctrl-^ . detaches, Ctrl-^ Ctrl-Z suspends"))
+    remote(Command::new("connect").about("Open a shell on a server, in this terminal: your session there attached last, else a new one; with `-- PROG ARG...`, a new session running that program on a terminal of its own (an editor, a debugger, a TUI) in place of the shell, ending when it does with its status. Ctrl-^ . detaches, Ctrl-^ Ctrl-Z suspends"))
         .arg(flag("new", "new").conflicts_with("session").help("A new session, beside your others"))
         .arg(session(false))
+        .arg(
+            Arg::new("program")
+                .value_name("PROG")
+                .value_parser(value_parser!(OsString))
+                .num_args(1..)
+                .last(true)
+                .conflicts_with("session")
+                .help("After `--`: a program and its arguments, passed as they are, run in a new session in place of the shell"),
+        )
         .arg(flag("no_clipboard", "no-clipboard").help("Do not let the server set your clipboard (OSC 52)"))
         .arg(flag("no_hyperlinks", "no-hyperlinks").help("Do not pass the server's links (OSC 8) to your terminal"))
         .arg(flag("no_colours", "no-colours").help("Do not tell the server your terminal's colours (programs asking get no answer)"))
@@ -513,7 +535,7 @@ fn command_args(cmd: Command) -> Command {
 }
 
 fn exec() -> Command {
-    command_args(remote(Command::new("exec").about("Run a command on a server with no terminal and exit with its status: your stdin goes to it, its stdout and stderr come back apart. A killed or dropped koh hangs it up (within 20 s if killed). 127: no such program; 126: it could not start (no -C DIR there, say); 255: koh's own error")))
+    command_args(remote(Command::new("exec").about("Run a command on a server with no terminal and exit with its status: your stdin goes to it, its stdout and stderr come back apart. A killed or dropped koh hangs it up (at once on SIGTERM, SIGHUP or SIGINT; within 10 s on SIGKILL). 127: no such program; 126: it could not start (no -C DIR there, say); 75: the server was busy (nothing ran: retry); 255: koh's own error")))
 }
 
 fn run() -> Command {
@@ -539,9 +561,26 @@ fn job_arg(required: bool) -> Arg {
 }
 
 fn logs() -> Command {
-    remote(Command::new("logs").about("Print a job's output (the newest `--job-log-bytes` kept); with --follow, until it ends, then exit with its status"))
+    remote(Command::new("logs").about("Print a job's output, its last 200 lines unless asked for more (of the newest `--job-log-bytes` kept), then on stderr whether it runs on or how it ended; with --follow, until it ends, then exit with its status"))
         .arg(job_arg(true))
         .arg(flag("follow", "follow").short('f').help("Go on until the job ends"))
+        .arg(tail(DEFAULT_TAIL).conflicts_with("all"))
+        .arg(flag("all", "all").help("All of the output kept"))
+}
+
+/// The lines of a job's output `koh logs` and `koh wait` show unless told otherwise: the end of a
+/// test run's or a build's, where its failures are.
+const DEFAULT_TAIL: &str = "200";
+
+/// `--tail N`, defaulting to `default`.
+fn tail(default: &'static str) -> Arg {
+    Arg::new("tail")
+        .long("tail")
+        .short('n')
+        .value_name("N")
+        .default_value(default)
+        .value_parser(value_parser!(u32))
+        .help("Its last N lines")
 }
 
 fn kill() -> Command {
@@ -560,13 +599,14 @@ fn kill() -> Command {
 }
 
 fn wait() -> Command {
-    remote(Command::new("wait").about("Wait on the server: for a job to end (exit with its status), or a text in its output, or a file; for a session's running command to end (at once if none runs), its program to read its terminal, or a text on its screen"))
+    remote(Command::new("wait").about("Wait on the server: for a job to end (print its last lines, as `koh logs` does, and exit with its status), or a text in its output, or a file; for a session's running command to end (at once if none runs), its program to read its terminal, or a text on its screen"))
         .arg(job_arg(false).conflicts_with("session"))
         .arg(session(false))
         .arg(Arg::new("text").long("text").value_name("TEXT").conflicts_with_all(["file", "reading"]).help("Until the text appears (exit 1 if the job ends first)"))
         .arg(Arg::new("file").long("file").value_name("PATH").value_parser(value_parser!(OsString)).conflicts_with("reading").help("Until the path exists (relative: in the home)"))
         .arg(flag("reading", "reading").requires("session").help("Until the session's program waits for input"))
         .arg(Arg::new("timeout").long("timeout").value_name("SECS").value_parser(value_parser!(f64)).help("Give up after SECS: exit 124"))
+        .arg(tail(DEFAULT_TAIL).help("When a job ends, print its last N lines first (0: none)"))
         .arg(json())
 }
 
@@ -776,9 +816,14 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             remote: remote_args(m)?,
             pick: match m.get_one::<u64>("session") {
                 Some(&n) => Pick::Id(SessionNum(n)),
-                None if m.get_flag("new") => Pick::New,
+                None if m.get_flag("new") || m.contains_id("program") => Pick::New,
                 None => Pick::Latest,
             },
+            program: m
+                .get_many::<OsString>("program")
+                .map(|words| Argv::new(words.map(|word| word.as_bytes().to_vec()).collect()))
+                .transpose()
+                .map_err(|why| invalid(&format!("the program: {why}")))?,
             clipboard: !m.get_flag("no_clipboard"),
             hyperlinks: !m.get_flag("no_hyperlinks"),
             colours: !m.get_flag("no_colours"),
@@ -811,6 +856,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             remote: remote_args(m)?,
             job: value(m, "job")?,
             follow: m.get_flag("follow"),
+            tail: (!m.get_flag("all")).then(|| value(m, "tail")).transpose()?,
         }),
         Some(("kill", m)) => Ok(Cmd::Kill {
             remote: remote_args(m)?,
@@ -852,6 +898,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             Ok(Cmd::Wait {
                 remote: remote_args(m)?,
                 wait,
+                tail: value(m, "tail")?,
                 timeout,
                 json: json(m),
             })

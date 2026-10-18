@@ -20,8 +20,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
   passed as they are (no shell; `--sh 'LINE'` runs a shell line, `-C DIR` starts it elsewhere),
   local stdin streamed to it, its stdout and stderr back apart, and koh exiting with its status
   (128+N when signal N killed it; 127 for no such program, 126 when it could not start; 255 on
-  koh's own errors). A killed or dropped koh hangs the command up within 20 s (SIGHUP to its
-  process group, SIGKILL after a second).
+  koh's own errors). A koh stopped by a signal hangs the command up at once, and one killed
+  outright or cut off within 10 s (SIGHUP to its process group, SIGKILL after a second).
 - **Jobs**: `koh run SERVER [--name NAME] -- PROG ARG...` starts a command that outlives koh and
   the link, its output kept (the newest `--job-log-bytes`, 4 MiB by default) and its status;
   `koh jobs`, `koh logs [--follow]`, `koh kill [--signal]` and `koh wait SERVER JOB [--text
@@ -41,7 +41,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
   are copied as symlinks and never followed, setuid and setgid never land.
 - **`--json`** on `sessions`, `output`, `exec`, `run`, `jobs`, `kill`, `wait` and `cp`, failures
   as `{"error":{"kind","message"}}`, and one table of exit codes for every command (0, 1, 2 usage,
-  3 not reached, 4 refused, 124 timed out). `koh help-agents`, and the end of `koh --help`, is the
+  3 not reached, 4 refused, 75 server busy, 124 timed out). `koh help-agents`, and the end of `koh --help`, is the
   page scripts and agents need.
 - **Scoped client keys**: `koh clients add NAME ID --cp DIR` allows only copies beneath `DIR`;
   `--exec DIR` only commands and jobs, started in `DIR`. Saved as `cp=DIR` and `exec=DIR` in
@@ -67,6 +67,34 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (`terminal_activity`, fux's own); on macOS it says only `busy`, `idle` or `unknown`.
 
 ### Changed
+- **Protocol `koh/10`**: `koh connect SERVER -- PROG ARG...`, `koh logs --tail`, the end of a
+  log saying how the job stands, a command's stdout and stderr on one pipe, and the close code
+  `Busy`.
+- **A burst of commands from one client is all served** (an agent's parallel reads): a full
+  table of pending handshakes gives up the oldest of the address holding the most, no longer any
+  address's third, and a connection past `--max-connections` waits up to 10 s for room, among at
+  most as many waiting. Past them both ends say `server busy: too many connections at once;
+  retry`, and koh exits 75 (`exec` too): nothing ran, so a retry is safe.
+- **`koh connect SERVER -- PROG ARG...`** runs one program on a terminal of its own (gdb, an
+  editor, a TUI) in a new session in place of the shell, and exits with its status when it ends.
+- **`koh logs` shows a job's last 200 lines** (`--tail N`, `--all` for all that is kept), saying
+  how many it left out, and ends on stderr with how the job stands: `· running 34s: koh wait
+  SERVER build waits for its end`, or `· exited 101 after 34s`.
+- **`koh wait SERVER JOB` prints the job's last 200 lines when it ends** (`--tail N`, `--tail 0`
+  for none), as every wait on a job was followed by `koh logs`.
+- **A command's stdout and stderr keep their order** when they go to one file here (`2>&1`, a
+  terminal): the server gives the command one pipe for both. A job's are always one pipe, so its
+  log is in the order it wrote them.
+- **A killed `koh exec` is found sooner**: a command connection's idle timeout is 10 s (5 missed
+  keepalives of 2 s), not 20 s. A SIGTERM, SIGHUP or SIGINT still hangs the command up at once.
+- **The state report is never early**: the server sends it after the output it read before it
+  (none left queued, and output held for the modes' read let go first); it says `busy` while keys
+  wait unread in the terminal or output waits unread, as fux's own check does; and it carries the
+  newest input written before it, so the client drops one made before the server had the keys it
+  sent last (fux saw `reading` before the program had taken them).
+- **`koh cp` says new and replaced files apart**, adding up to what was sent: `2 files sent, 18 B
+  → SERVER:proj (1 new, 1 replaced; 2 unchanged)`. A symlink already the same is no longer
+  counted among the unchanged files.
 - **Protocol `koh/9`**: `koh jobs` asks for one job by name, `koh cp`'s summary says where the
   copy landed, and a missing `-C` directory and a nesting tree are told apart on the wire.
 - **`koh cp` says where things landed** (`→ SERVER:proj/src`, not `→ SERVER:proj`; `landed` in

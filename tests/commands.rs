@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-use common::{connected, endpoint_id, loopback_server, on_pty};
+use common::{connected, endpoint_id, on_pty};
 use koh_testkit::Scratch;
 
 /// A loopback server hosting `sh` for one client, and that client's key.
@@ -32,9 +32,23 @@ struct Remote {
 
 impl Remote {
     async fn start(name: &str) -> anyhow::Result<Self> {
+        Self::serving(name, std::convert::identity).await
+    }
+
+    /// As [`Self::start`], its server's config as `config` makes it.
+    async fn serving(
+        name: &str,
+        config: impl FnOnce(koh::server::ServeConfig) -> koh::server::ServeConfig,
+    ) -> anyhow::Result<Self> {
         let dir = koh_testkit::scratch!(name)?;
         let key = dir.join("client.key");
-        let (id, port, server) = loopback_server(&endpoint_id(&key)?).await?;
+        let (id, port, server) = common::serve_in_process(&config(koh::server::ServeConfig {
+            allow: vec![koh::transport_iroh::parse_endpoint_id(&endpoint_id(&key)?)?],
+            command: vec!["bash".to_owned()],
+            home: common::home(),
+            ..koh::server::ServeConfig::default()
+        }))
+        .await?;
         Ok(Self {
             id,
             port,
@@ -164,22 +178,171 @@ fn exec_passes_its_words_as_they_are_and_exits_with_the_commands_status() {
         });
 }
 
+/// Lines written to stdout and stderr by turns, as fast as a shell writes them.
+const BY_TURNS: &str = "i=1; while [ $i -le 400 ]; do if [ $((i % 2)) = 0 ]; then echo out$i; \
+                        else echo err$i >&2; fi; i=$((i + 1)); done";
+
+/// What [`BY_TURNS`] writes, in its order.
+fn by_turns() -> String {
+    let lines: Vec<String> = (1..=400)
+        .map(|i| format!("{}{i}\n", if i % 2 == 0 { "out" } else { "err" }))
+        .collect();
+    lines.concat()
+}
+
+/// A command's stdout and stderr, sent to one file here (`2>&1`), come in the order it wrote
+/// them, as from a local command; and so do a job's in its log.
+#[test]
+fn stdout_and_stderr_to_one_file_keep_their_order() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let remote = Remote::start("exec-order").await.expect("the server");
+            let (mut read, write) = std::io::pipe().expect("a pipe");
+            let mut koh = remote.koh("exec").expect("koh");
+            koh.args([&remote.id, "--sh", BY_TURNS])
+                .stdin(Stdio::null())
+                .stdout(write.try_clone().expect("the pipe"))
+                .stderr(write);
+            let mut child = koh.spawn().expect("exec");
+            drop(koh);
+            let mut got = String::new();
+            std::io::Read::read_to_string(&mut read, &mut got).expect("its output");
+            assert!(child.wait().expect("exec").success());
+            assert_eq!(got, by_turns());
+            remote
+                .run("run", &["--name", "turns", "--sh", BY_TURNS])
+                .expect("run");
+            let out = remote.run("wait", &["turns", "--tail", "0"]).expect("wait");
+            assert!(out.status.success(), "{out:?}");
+            let logs = remote.run("logs", &["turns", "--all"]).expect("logs");
+            assert_eq!(String::from_utf8_lossy(&logs.stdout), by_turns());
+        });
+}
+
+/// A burst of commands from one client, as an agent's parallel reads send them: each is served,
+/// none given up for the others' handshakes.
+#[test]
+fn a_burst_of_commands_from_one_client_is_all_served() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let remote = Remote::start("exec-burst").await.expect("the server");
+            #[expect(
+                clippy::needless_collect,
+                reason = "all start before any is waited for"
+            )]
+            let children: Vec<_> = (0..32)
+                .map(|n| {
+                    remote
+                        .koh("exec")
+                        .expect("koh")
+                        .args([&remote.id, "--", "echo", &n.to_string()])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("exec")
+                })
+                .collect();
+            for (n, child) in children.into_iter().enumerate() {
+                let out = child.wait_with_output().expect("exec");
+                assert_eq!(
+                    (out.status.code(), String::from_utf8_lossy(&out.stdout)),
+                    (Some(0), format!("{n}\n").into()),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        });
+}
+
+/// A connection past `--max-connections` waits for room; one past as many waiting is turned away
+/// as busy, saying so, with its own status: nothing ran, so it may be retried.
+#[test]
+fn past_its_room_a_command_waits_and_past_the_waiting_it_is_told_the_server_is_busy() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let remote = Remote::serving("exec-busy", |config| koh::server::ServeConfig {
+                max_connections: std::num::NonZeroU32::MIN,
+                ..config
+            })
+            .await
+            .expect("the server");
+            // One runs, holding the one connection; one waits for it.
+            let mut running = remote
+                .koh("exec")
+                .expect("koh")
+                .args([&remote.id, "--sh", "echo running; sleep 2"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("exec");
+            let mut said = String::new();
+            let mut first = std::io::BufReader::new(running.stdout.take().expect("stdout"));
+            first.read_line(&mut said).expect("its first line");
+            assert_eq!(said, "running\n");
+            let waiting = remote
+                .koh("exec")
+                .expect("koh")
+                .args([&remote.id, "--", "echo", "waited"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("exec");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let busy = remote.run("exec", &["--", "true"]).expect("exec");
+            assert_eq!(busy.status.code(), Some(75), "{busy:?}");
+            let said = String::from_utf8_lossy(&busy.stderr);
+            assert!(
+                said.contains("server busy: too many connections at once; retry"),
+                "{said}"
+            );
+            let busy = remote.run("sessions", &["--json"]).expect("sessions");
+            assert_eq!(busy.status.code(), Some(75), "{busy:?}");
+            let said: serde_json::Value = serde_json::from_slice(&busy.stdout).expect("json");
+            assert_eq!(said["error"]["kind"], "busy");
+            // The first ends; the one waiting is served.
+            let _ = running.wait();
+            drop(first);
+            let out = waiting.wait_with_output().expect("exec");
+            assert_eq!(
+                (out.status.code(), &out.stdout[..]),
+                (Some(0), &b"waited\n"[..])
+            );
+        });
+}
+
 /// The command `koh exec` runs, hung up once its client goes, as `koh help exec` says: at once if
-/// the client is stopped by a signal, within the 20 s idle timeout if it is killed where it stands.
+/// the client is stopped by a signal, within the 10 s idle timeout if it is killed where it
+/// stands.
 #[test]
 fn a_command_whose_client_is_stopped_or_killed_is_hung_up() {
     koh_testkit::multi_thread(2)
         .expect("tokio runtime")
         .block_on(async {
             let remote = Remote::start("exec-hangup").await.expect("the server");
+            // Neither gone nor a zombie (a hung-up command's group leader is reaped only once its
+            // group's grace is over), as `ps` says.
+            let runs = |pid: u32| {
+                let ps = remote
+                    .exec(&format!("ps -o stat= -p {pid}"), b"")
+                    .expect("ps");
+                let stat = String::from_utf8_lossy(&ps.stdout);
+                !stat.trim().is_empty() && !stat.trim_start().starts_with('Z')
+            };
             for (signal, within) in [
-                (fuxix::process::Signal::Term, 5),
-                (fuxix::process::Signal::Kill, 30),
+                (fuxix::process::Signal::Term, Duration::from_secs(1)),
+                (fuxix::process::Signal::Hup, Duration::from_secs(1)),
+                (fuxix::process::Signal::Int, Duration::from_secs(1)),
+                (fuxix::process::Signal::Kill, Duration::from_secs(15)),
             ] {
                 let mut child = remote
                     .koh("exec")
                     .expect("koh")
-                    .args([&remote.id, "--sh", "echo $$; exec sleep 300"])
+                    .args([&remote.id, "--sh", "echo $$; exec sleep 100"])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .spawn()
@@ -188,20 +351,18 @@ fn a_command_whose_client_is_stopped_or_killed_is_hung_up() {
                 std::io::BufReader::new(child.stdout.take().expect("stdout"))
                     .read_line(&mut line)
                     .expect("the command's pid");
-                let pid = fuxix::process::Pid::from_raw(line.trim().parse().expect("a pid"))
-                    .expect("a pid");
+                let pid: u32 = line.trim().parse().expect("a pid");
                 let client = fuxix::process::Pid::of(&child).expect("the client's pid");
                 fuxix::process::kill(client, signal).expect("stop the client");
-                let _ = child.wait();
-                let mut gone = false;
-                for _ in 0..within * 10 {
-                    gone = !fuxix::process::exists(pid);
-                    if gone {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                let stopped = std::time::Instant::now();
+                while runs(pid) && stopped.elapsed() < within {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                assert!(gone, "the command outlived its client ({signal:?})");
+                assert!(
+                    !runs(pid),
+                    "the command outlived its client by {within:?} ({signal:?})"
+                );
+                let _ = child.wait();
             }
         });
 }
@@ -238,11 +399,28 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
                 .run("wait", &["build", "--text", "listening", "--json"])
                 .expect("wait");
             assert_eq!(waited.status.code(), Some(0), "{waited:?}");
-            // The end, with its status.
+            // The end, with its status, and the end of its output.
             let ended = remote.run("wait", &["build"]).expect("wait");
             assert_eq!(ended.status.code(), Some(4), "{ended:?}");
+            assert_eq!(ended.stdout, b"start\nlistening\nerr\n");
+            let said = String::from_utf8_lossy(&ended.stderr);
+            assert!(said.starts_with("· exited 4 after "), "{said}");
+            let quiet = remote.run("wait", &["build", "--tail", "0"]).expect("wait");
+            assert_eq!(
+                (quiet.status.code(), &quiet.stdout[..], &quiet.stderr[..]),
+                (Some(4), &b""[..], &b""[..])
+            );
             let logs = remote.run("logs", &["build"]).expect("logs");
             assert_eq!(ok(&logs), "start\nlistening\nerr\n");
+            assert!(String::from_utf8_lossy(&logs.stderr).starts_with("· exited 4 after "));
+            // Its last lines, and how many went before them.
+            let last = remote.run("logs", &["build", "--tail", "1"]).expect("logs");
+            assert_eq!(ok(&last), "err\n");
+            let said = String::from_utf8_lossy(&last.stderr);
+            assert!(
+                said.contains("2 earlier lines not shown (--tail N shows more, --all all)"),
+                "{said}"
+            );
             let listed = remote.run("jobs", &["--json"]).expect("jobs");
             let jobs: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("json");
             assert_eq!(jobs[0]["name"], "build");
@@ -265,6 +443,15 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
             // Unnamed, it takes the next number; killed, it ends by the signal.
             let sleeper = remote.run("run", &["--", "sleep", "300"]).expect("run");
             assert_eq!(ok(&sleeper), "1\n");
+            // Running, it is said to run on, and what waits for it.
+            let running = remote.run("logs", &["1"]).expect("logs");
+            ok(&running);
+            let said = String::from_utf8_lossy(&running.stderr);
+            assert!(said.starts_with("· running "), "{said}");
+            assert!(
+                said.contains("`koh wait SERVER 1` waits for its end"),
+                "{said}"
+            );
             ok(&remote.run("kill", &["1"]).expect("kill"));
             let killed = remote.run("wait", &["1", "--timeout", "10"]).expect("wait");
             assert_eq!(killed.status.code(), Some(128 + 15), "{killed:?}");
@@ -373,7 +560,7 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             let said = String::from_utf8_lossy(&out.stdout);
             let landed = format!("{}a tree", into.to_string_lossy());
             assert!(
-                said.starts_with(&format!("3 files, 200 KB → {landed} (")),
+                said.starts_with(&format!("3 files sent, 200 KB → {landed} (3 new; ")),
                 "{said}"
             );
             let want = tree(&from).expect("the tree");
@@ -389,13 +576,16 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             let out = cp(&[from.join(".").into(), same.clone()]);
             let said = String::from_utf8_lossy(&out.stdout);
             assert!(
-                said.starts_with(&format!("0 files, 0 B → {}", same.to_string_lossy())),
+                said.starts_with(&format!(
+                    "0 files sent, 0 B → {} (3 unchanged",
+                    same.to_string_lossy()
+                )),
                 "{said}"
             );
             // Again: nothing changed, nothing sent.
             let out = cp(&[from.clone().into(), into.clone()]);
             assert!(
-                String::from_utf8_lossy(&out.stdout).starts_with("0 files, 0 B"),
+                String::from_utf8_lossy(&out.stdout).starts_with("0 files sent, 0 B"),
                 "{out:?}"
             );
             // One file edited, dated before the copy landed (an editor's save, or `touch -d`):
@@ -414,11 +604,22 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             let summary: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
             assert_eq!(
                 (summary["replaced"].as_u64(), summary["unchanged"].as_u64()),
-                (Some(1), Some(3)),
+                (Some(1), Some(2)),
                 "{summary}"
             );
             assert_eq!(summary["landed"].as_str(), Some(&*landed), "{summary}");
             assert!(mtime(&inner) > before, "the edit landed with an old time");
+            // A file new and one edited: the two sent, said apart, and the rest beside them.
+            std::fs::write(from.join("fresh"), b"new").expect("a new file");
+            std::fs::write(from.join("run me"), b"#!/bin/sh\nexit\n").expect("edit");
+            let out = cp(&[from.clone().into(), into.clone()]);
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                said.starts_with(&format!(
+                    "2 files sent, 18 B → {landed} (1 new, 1 replaced; 2 unchanged"
+                )),
+                "{said}"
+            );
             // -p keeps the source's time.
             let out = cp(&["-p".into(), from.clone().into(), into.clone()]);
             assert!(out.status.success(), "{out:?}");
@@ -555,6 +756,59 @@ fn a_scoped_key_copies_only_in_its_directory_and_runs_no_shell() {
             assert_eq!(out.status.code(), Some(255), "{out:?}");
             let out = koh(&["sessions".into(), server_id.clone().into()]);
             assert_eq!(out.status.code(), Some(4), "{out:?}");
+        });
+}
+
+/// `koh connect SERVER -- PROG ARG...`: a new session running the program on a terminal of its
+/// own, in place of the shell; the client ends when it does, with its status.
+#[test]
+fn connect_runs_one_program_on_a_terminal_and_exits_with_its_status() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let remote = Remote::start("connect-program").await.expect("the server");
+            let mut argv = vec![env!("CARGO_BIN_EXE_koh").to_owned(), "connect".to_owned()];
+            argv.extend(
+                remote
+                    .dialing()
+                    .into_iter()
+                    .map(|a| a.to_string_lossy().into_owned()),
+            );
+            let program = "[ -t 0 ] && [ -t 1 ] && echo \"tty_$(stty size | tr ' ' x)\"; \
+                           read line; echo \"got_${line}_$((6*7))\"; exit 3";
+            argv.extend([
+                remote.id.clone(),
+                "--".into(),
+                "sh".into(),
+                "-c".into(),
+                program.into(),
+            ]);
+            let (mut client, seen, at) = connected(&argv, b"hi\r", "got_hi_42")
+                .await
+                .expect("the program's answer");
+            assert!(
+                seen.text_from(0).contains("tty_24x80"),
+                "{}",
+                seen.text_from(0)
+            );
+            let mut status = None;
+            for _ in 0..100 {
+                status = client.try_wait().expect("the client");
+                if status.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert_eq!(
+                status.map(koh::pty::Exit::code),
+                Some(3),
+                "{}",
+                seen.text_from(at)
+            );
+            // It was a session of its own, now ended: none is left.
+            let out = remote.run("sessions", &["--json"]).expect("sessions");
+            let listed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+            assert_eq!(listed.as_array().map(Vec::len), Some(0), "{listed}");
         });
 }
 

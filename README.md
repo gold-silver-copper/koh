@@ -25,6 +25,16 @@ koh servers add laptop <server-id>
 koh connect laptop
 ```
 
+The same server runs one command, or copies files, with no shell session at all:
+
+```sh
+koh exec laptop -- make test          # its stdout and stderr apart, and koh exits with its status
+git diff | koh exec laptop -- 'cd src/app && git apply'
+koh cp -r ./site laptop:              # a whole tree, into the server user's home (-r and -p, as
+                                      # scp takes them, change nothing: trees, modes, times are kept)
+koh cp laptop:notes.md laptop:todo .  # back here, into the current directory
+```
+
 Or run `koh` alone on a terminal for a menu of this machine's keys, the servers it connects to
 and the clients allowed here: pick one by number to connect, rename or delete it; `a` adds one,
 `k` shows both keys in full with QR codes and resets one, saying first who will lose access.
@@ -37,7 +47,15 @@ koh id                    # print this machine's endpoint id (its client key's)
 koh servers               # the servers you connect to: add <name> <id>, rm <name>, rename <old> <new>
 koh clients               # the clients allowed here, likewise
 koh serve                 # host a shell for the saved clients (--allow <id> adds one for this run)
-koh connect <name|id>     # connect to a saved server, or to a server id
+koh connect <name|id>     # connect to a saved server, or to a server id: your session there
+                          # attached last, else a new one
+koh connect <name> --new  # a new session beside your others; --session N picks one by number
+koh sessions <name>       # your sessions there, one a line: number, attached or detached, age,
+                          # size, running or exited, title
+koh exec <name> -- CMD... # run CMD with no terminal ($SHELL -c, in the server user's home) and exit
+                          # with its status: stdin goes to it, stdout and stderr come back apart
+koh cp SRC... <name>:DST  # copy files and directory trees there, or `koh cp <name>:SRC... DST`
+                          # back; ~ and relative paths are the server user's home
 koh key info              # show both identity key files and their endpoint ids
 koh key reset [client|server] --yes  # delete a key (client by default); the next use makes a new id
 ```
@@ -52,10 +70,19 @@ Useful flags:
 --on-bell <cmd>           # run a shell command whenever the remote bell rings
 --shell <program>         # host a program instead of $SHELL (repeat to pass args)
 --key-file <path>         # use a custom identity-key path
+--direct <ip:port>        # dial a server directly (LAN, loopback), as connect, exec, cp, sessions do
 --session-ttl-secs <n>    # keep detached sessions around longer/shorter
 --max-connections <n>     # limit concurrent connections
---max-sessions <n>        # limit sessions
+--max-sessions <n>        # limit sessions, all clients' together
 ```
+
+**Copies land whole.** `koh cp` writes each file or tree it copies beside its target under a
+hidden `.koh-….part` name and renames it into place once all of it is written, so a copy cut short
+leaves nothing that looks complete; it replaces a file, but never merges a directory into one
+already there. A source given on the command line is followed if it is a symlink, as `cp` does;
+symlinks inside a tree are copied as symlinks, and fifos, sockets and devices are skipped and
+said so. Remote paths are taken as the server user's shell would take them, but not globbed: no
+remote shell runs. `koh exec` exits 255 on its own errors (not reached, refused), as ssh does.
 
 Keys live under `$XDG_CONFIG_HOME/koh/` (else `~/.config/koh/`) by default (`client.key`,
 `server.key`), and the names beside them: `servers` beside the client key and `clients` beside the
@@ -112,7 +139,8 @@ binary, not the library.
 
 - Built in Rust on iroh peer-to-peer QUIC; connects by endpoint id instead of hostname/port.
 - Mosh-style predictive local echo and screen-state sync for responsive shells on bad networks.
-- Detachable sessions survive suspend/resume, IP changes, and reconnects without tmux.
+- Detachable sessions survive suspend/resume, IP changes, and reconnects without tmux; a client
+  may have several, by number.
 - No SSH bootstrap and no port forwarding: the server listens on one UDP port (random unless `--port`), reached through iroh's relays and hole-punching, and admits only allowlisted keys.
 - Not wire-compatible with mosh or SSH; koh is its own protocol/tool.
 - Intended for personal machines you control; not a full SSH replacement.
@@ -124,7 +152,9 @@ binary, not the library.
   `last-output`) sees remote commands as local ones. Commands that end between two screen updates
   end as one, with the last one's status; output that scrolled off before an update starts at the
   screen's top. The remote shell must send the marks (koh adds no shell integration).
-- Does not provide multi-user accounts, file transfer, or Windows support.
+- Runs one command (`koh exec`) or copies files and trees (`koh cp`) over the same connection and
+  allowlist as a shell, with no SSH or remote shell needed.
+- Does not provide multi-user accounts, port forwarding, or Windows support.
 
 ## Status
 

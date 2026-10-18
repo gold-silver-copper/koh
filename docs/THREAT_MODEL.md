@@ -25,14 +25,34 @@ service.
 ## Attacker models
 
 1. **Malicious / compromised client** — a peer that dials the server. If it is on the allowlist it
-   reaches the koh/7 data plane: it sends arbitrary input, resize, ack and resync messages and opens
-   streams. Input comes as decoded events (`Keys`: keys, mouse events, focus changes, whole
+   makes one opening request (`src/request.rs`: a shell, its sessions' listing, a command or a
+   copy) and reaches what it asks. Nothing is attached or started before the request, which must
+   come within 10 s, holding the connection's permit meanwhile, and decode whole: an opening
+   request of at most 1 MiB, a command line of at most 256 KiB with no NUL, paths of at most 4096
+   bytes with no NUL, at most 1024 sources, each refused as it is decoded, before anything is
+   allocated for it. A shell reaches the koh/7 data plane: it sends arbitrary input, resize, ack
+   and resync messages and opens streams. Input comes as decoded events (`Keys`: keys, mouse events, focus changes, whole
    pastes); decoding refuses what no terminal sends (a modifier bit no key has, a function key past
    F12, a kitty code that is no Unicode scalar, a paste over 1 MiB, more than 512 events, more than
    16 palette entries in `Colours`) and closes the connection, refusing a sequence past its bound
    before allocating for it. The server encodes events with fux-vt for the program's modes; a paste
    is framed whole with its end markers removed, so even a hostile client cannot end a program's
    bracketed paste early, nor leave one open (it can type anything else, as any client can).
+   **Commands, copies and listings** are as powerful as a shell (a shell can run any command and
+   write any file), so they are for exactly the clients allowed a shell, through the same gate,
+   permits and request; what they make the server hold is bounded per connection, and connections
+   by `--max-connections`. A command (`koh exec`) is one process group, with no terminal, run as
+   the server's user: its stdin is read from the stream a chunk at a time and its output written a
+   chunk at a time, so the pipes and QUIC's flow control hold back whichever end is slow; a lost
+   connection, revocation or shutdown hangs it up (SIGHUP to the group, SIGKILL after a second).
+   A copy holds one file open, a chunk of 64 KiB, an item of at most 8 KiB and, sending a tree, a
+   descriptor for each directory it is in, at most 128 directories deep. Landing one, every name is
+   one entry (no `/`, NUL, `.` or `..`), every entry is created anew (`O_EXCL`, `mkdir`) inside a
+   directory the same copy created, so no name the client sends reaches outside its target or
+   through a symlink, whatever symlinks the copy itself brings; each top-level item is staged
+   under a hidden name and renamed into place whole, and a copy cut short, malformed or failed
+   removes what it staged. A listing holds the peer's sessions only (another peer's are never
+   named, nor attachable by number: `NoSuchSession`), each title cut to 256 characters.
    **Goal it must be denied:** crash / OOM / hang the server, bypass a cap, or escape the admission
    gauntlet. The server is the high-value target (it runs a shell).
 2. **Malicious / compromised server** — a server a client dials (a wrong/typo'd node-id, or a popped
@@ -95,6 +115,16 @@ service.
    the terminal speaks the protocol, and scheme reports (mode 2031) if it reports a scheme. A
    server's modes are no longer mirrored for their own sake: nothing it sends sets the user's
    keyboard flags or leaves a mode set.
+   **`koh exec`'s output** is the command's, written to the user's stdout and stderr as it came,
+   as ssh writes it: a hostile server can write escape sequences to a terminal the user left them
+   on, as any program the user runs can. Nothing else of the server's reaches them raw: a listing's
+   titles are escaped, and a server's error is a close code or a copy's failure kind, its path
+   shown escaped.
+   **`koh cp` from a server** lands what the server sends under the rules a server lands a
+   client's copy by (above): only inside the destination the user named, never merging into a
+   directory there, staged until whole. The server chooses the names, modes (setuid included, as
+   `cp -p` keeps them) and symlink targets in the tree it sends, and how much of it: a user who does
+   not trust the server copies from it into a directory of its own.
 3. **Network / MITM** — QUIC + TLS 1.3 (via iroh) give transport encryption and node-id
    authentication by construction (no TOFU window). Considered: replay, and connection-level tamper.
 4. **Local attacker** — another uid on the same host. Targets: the identity key file, the state dir,
@@ -107,8 +137,8 @@ service.
   required, so there is no "accept any peer" mode. This is the **single** authentication factor —
   there is no passphrase/PAKE second factor. A leaked key file is a leaked identity: protect it
   like an SSH private key, and remove a lost machine's id from every allowlist (`koh clients rm`,
-  which a running server heeds within 2 s, closing that peer's connection and ending its session,
-  and any `--allow`, which needs a restart). A saved list that cannot be read keeps the last one
+  which a running server heeds within 2 s, closing that peer's connections, which hangs up any
+  command it runs, and ending all of its sessions, and any `--allow`, which needs a restart). A saved list that cannot be read keeps the last one
   read well, so a typo in it disconnects no one. The saved allowlist, `clients` beside the server key, is held to the key's own
   rules (`src/identity/key_file.rs`): a symlink, a hard-linked file or another user's file is
   refused and a loose mode tightened, since whoever can write it can let a peer in. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary

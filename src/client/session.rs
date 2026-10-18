@@ -43,9 +43,7 @@ const LEGACY: KeyMode = KeyMode::Legacy {
 /// What the status line says of a paste past [`MAX_PASTE`], which is dropped whole.
 const PASTE_TOO_LONG: &str = "paste over 1 MiB — not sent";
 
-/// Said when typing was not sent. The reattach may have landed on a new shell (the session
-/// expired, or the server restarted), which the client cannot tell from its own, and keys typed at
-/// the old screen must not run there; nor may the end of a line whose start was lost with the link
+/// Said when typing was not sent: the end of a line whose start was lost with the link must not
 /// run alone (`false && rm …` must not run `rm …`).
 const INPUT_DROPPED: &str = "typing during the outage not sent";
 
@@ -432,8 +430,8 @@ impl ClientSession {
 
     /// The connection was lost: what was meant for it alone (acknowledgements, history requests
     /// and the resync its link owes) goes with it; resizes and colours wait for the next. Input
-    /// not yet sent is dropped, and the status line says so: the client cannot tell a reattach
-    /// from a new shell, where keys typed at the old screen must not run. A first drop begins the
+    /// not yet sent is dropped, and the status line says so: what reached the lost connection,
+    /// and so the program, is not known, and what follows must not run without it. A first drop begins the
     /// outage: the predictions go, and whether typing was trusted, or handed on unconfirmed, is
     /// kept as it was then.
     pub fn detach(&mut self, now: Instant) {

@@ -23,10 +23,12 @@ clap's builder API rather than its derive, and tests build their tokio runtimes 
 
 ```
 src/
-├── main.rs          the binary: serve / connect / id / key dispatch
+├── main.rs          the binary: serve / connect / sessions / exec / cp / id / key dispatch
 ├── args.rs          the command line (clap's builder API) and the config structs it produces
 ├── lib.rs           crate root: module declarations + the architecture overview
-├── proto.rs         the koh/7 wire protocol: client messages, screen frames, caps, pacing
+├── request.rs       the opening request (what a connection is for) and the replies sent whole
+├── proto.rs         the koh/7 shell protocol: client messages, screen frames, caps, pacing
+├── copy.rs          `koh cp`'s item stream: a tree walked and sent, landed staged, either end
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
@@ -36,8 +38,12 @@ src/
 ├── pty.rs           PTYs over fuxix: the session leader on each, its pumps, reaping
 ├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
 │   ├── held.rs      the frames the server takes the client to hold
+│   ├── exec.rs      `koh exec`'s command: a process group with no terminal, its pipes
+│   ├── copy.rs      `koh cp` on the server: remote paths resolved, items sent or landed
 │   └── audit.rs     admission decisions as structured `koh::auth` events
 ├── client/          the connection loop + ClientSession core + predictor + render + `connect`
+│   ├── exec.rs      `koh exec`: stdin to the command, its output back apart, its status
+│   ├── copy.rs      `koh cp` at this end
 │   ├── scrollback.rs the scrollback view (`Ctrl-^ [`)
 │   ├── probe.rs     the start-up questions to the user's terminal
 │   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through fuxix::terminal)
@@ -49,8 +55,8 @@ src/
 ├── menu.rs          the menu `koh` alone opens on a terminal, over a reader and a writer
 └── test_runtime.rs  unit tests' runtime and scratch directories, through koh-testkit
 tests/net/           koh over a fault-injecting link between real iroh endpoints
-tests/               PTYs, sessions, scrollback, the binary on a PTY, names,
-                     key creation races, wire goldens and the corpus
+tests/               PTYs, sessions, scrollback, the binary on a PTY, exec, cp and
+                     sessions, names, key creation races, wire goldens and the corpus
 testkit/             koh-testkit: what the tests share (starting programs, tasks, scratch dirs)
 testing/corpus/      113 real programs' output (from fux), replayed by tests and bench
 testing/bench/       the scoreboard: koh beside mosh and ssh (`testing/scoreboard.sh`)
@@ -64,16 +70,35 @@ from `crate::` (CI checks it), so it is a standalone terminal-prediction library
 ## The protocol (koh/7)
 
 The ALPN `koh/7` is the version check: a peer on another version fails the TLS handshake with a
-clear error. After the handshake the server checks the allowlist, attaches the peer's session, and
-only then sends the session's first frame, which admits the client, so "admitted, then refused"
-cannot happen. A
-refusal is a close code, never prose to match (`proto::Close`: `NotAuthorized` 1, `ProtocolError` 2,
-`SessionEnded` 3, `AtCapacity` 4, `CouldNotStart` 5). Only `NotAuthorized` makes a client give up;
-on the others it redials and its banner says why. Then (`src/proto.rs`):
+clear error. After the handshake the server checks the allowlist and takes a connection permit;
+then the client says what the connection is for, as the first message on its first uni stream
+(`src/request.rs`), a 4-byte length and its postcard encoding, at most 1 MiB, and the server
+attaches or starts nothing before it. A client that makes no request within 10 s (the handshake's
+deadline) is closed as breaking the protocol, and so is one whose request does not decode: a
+path holding a NUL, a command over 256 KiB, no sources or more than 1024 are refused as they are
+decoded. The request is one of:
 
-- **Client to server: two uni streams** of length-prefixed postcard `ClientMsg`s, one for input
-  (`Keys` and `Colours`) and one for control (the rest, `ClientMsg::stream`), so a control message
-  never waits behind input a program has not read: `Keys { seq,
+- `Shell(Pick)`: a session. `Pick::Latest` is the peer's session attached last, else a new one;
+  `New` always a new one; `Id(n)` that one, if it is the peer's; `Resume { run, session }` that
+  one of that server run, which is how a client redials. The rest of the stream is the session's
+  control stream. The server's first stream carries `Attached { at: Resume }`, which admits the
+  client and says which session it reached, and frames follow, so "admitted, then refused" cannot
+  happen.
+- `Sessions`: the peer's sessions, answered as one `SessionList` on a stream; then the client
+  closes the connection.
+- `Exec(CommandLine)`: a command, with no terminal ([below](#commands-and-copies)); the rest of
+  the stream is its stdin.
+- `Copy(Get(sources) | Put { dest, arity })`: a copy from or to the server; a `Put`'s items
+  follow on the stream.
+
+A refusal is a close code, never prose to match (`proto::Close`: `NotAuthorized` 1, `ProtocolError`
+2, `SessionEnded` 3, `AtCapacity` 4, `CouldNotStart` 5, `NoSuchSession` 6). Only `NotAuthorized`
+and `NoSuchSession` make a shell's client give up; on the others it redials and its banner says
+why. Then, for a shell (`src/proto.rs`):
+
+- **Client to server: two uni streams** of length-prefixed postcard `ClientMsg`s, one for control
+  (the first, its request's: `ClientMsg::stream` says which messages) and one for input (`Keys` and
+  `Colours`), so a control message never waits behind input a program has not read: `Keys { seq,
   events }`, the input the client decoded (`src/events.rs`: keys, mouse events, focus changes and
   whole pastes of at most 1 MiB, at most 512 events a message), `Resize`, `Resync` when a frame's
   base is unknown, `History { id, newest, count }` for scrollback rows, `Ack { frame }`, now only a nudge
@@ -415,10 +440,14 @@ is always reconciled away — it never corrupts the display.
 ## Reconnect & detachable sessions
 
 Sessions are **detachable**: the server keeps your shell (and its live screen) running after a
-disconnect, keyed by your client endpoint id, so reconnecting from the same client drops you back
-exactly where you left off. A detached session is reaped after `--session-ttl-secs` (default 24 h).
+disconnect, keyed by your client endpoint id and a number, so reconnecting from the same client
+drops you back exactly where you left off. A client may have several: `koh connect --new` starts
+another, `--session N` picks one, and `koh connect` alone the one attached last (a new one if it
+has none); `koh sessions` lists them. Numbers are server-wide and only rise during a server's run,
+and `--max-sessions` bounds all peers' together; a reattach is always allowed. A detached session
+is reaped after `--session-ttl-secs` (default 24 h).
 One whose shell exited is kept until a client acknowledges its final frame (or the TTL ends), so a
-reconnect after the exit sees the exit and its status, not a fresh shell. There is one session per peer, one shell — no multiplexing.
+reconnect after the exit sees the exit and its status, not a fresh shell.
 
 The reconnect is **automatic and in-process**: the client doesn't exit when the link drops. A brief
 outage (e.g. a phone screen-off — Android freezes the process, so QUIC keepalives stop) is ridden
@@ -434,13 +463,14 @@ sent when the link dropped is dropped, and the banner says so; it also says when
 lost connection was never confirmed, as what follows may run without it. The outage (`Outage`, from the
 first drop to that first frame; a drop meanwhile is the same outage) holds these as facts, and only the
 status line puts them in words, for the whole outage and a few seconds after. A notice on the status line
-can be given, retired and shown but not read (`notice::Notices`), so what it says decides nothing; a new outage retires what the last one lost. A reattach may land on a new shell (the session expired, the shell
-exited, or the server restarted), which the client cannot tell from its own (the server's
-`AttachKind` is not on the wire), and keys typed at the old screen must not run there; nor may the
-end of a line whose start was lost with the link run alone (`false && rm …` typed across the drop
-must not run `rm …`). Sending them would take the session's identity on the wire. The history rows
-held are the server session's too, so `attach` drops them and the new connection's frames say the
-history again. A **wall-clock freeze
+can be given, retired and shown but not read (`notice::Notices`), so what it says decides nothing; a new outage retires what the last one lost. A redial asks
+for the session the first connection reached, by its number in that server's run
+(`Pick::Resume`), never for another: if it is gone (it expired, its shell's end was seen, or the
+server restarted) the server says `NoSuchSession` and the client ends saying so, rather than
+landing in a new shell where keys typed at the old screen would run. Typing is still not carried
+across the drop: the end of a line whose start was lost with the link must not run alone
+(`false && rm …` typed across the drop must not run `rm …`). The history rows held are dropped
+by `attach` all the same, and the new connection's frames say the history again. A **wall-clock freeze
 detector** turns a multi-minute wake-up hang into a ~1–2 s reattach: if real time jumps more than
 20 s between two (≤50 ms-cadence) loop iterations, the client concludes the process was suspended,
 drops the (almost certainly dead) connection, and re-dials immediately. The first iteration
@@ -454,14 +484,15 @@ stream cannot block quitting or signals. The session's first phase asks the user
 start-up questions on stdin's one decoder, with answers expected, so a late answer is still an
 answer and never reaches the program as keys. On a `SessionEnded` close, frames in flight are
 applied first, so the exit status is not lost. A suspend waits for SIGCONT (or a key, or a fatal
-signal) before taking the terminal back. A refused redial (`NotAuthorized`) ends the client with
-the reason; any other close is redialed, the banner saying why.
+signal) before taking the terminal back. A refused redial (`NotAuthorized`, `NoSuchSession`) ends
+the client with the reason; any other close is redialed, the banner saying why.
 
 > **`--direct` and server restarts:** transparent re-dial targets the *same* address it first
 > dialed. By default `koh serve` binds an ephemeral UDP port, so a restarted server is elsewhere and
 > a `--direct <ip:port>` client redials the old port forever. `koh serve --port <PORT>` binds a fixed
 > port (IPv4, and IPv6 where the host has it), so the restarted server is where the client looks,
-> and it reattaches, to a fresh session: the old session's program died with the old server. A
+> and finds that its session died with the old server: it ends saying so, and `koh connect` again
+> starts a new one. A
 > server stopped with SIGTERM closes its connections, so clients redial at once; one that died
 > without closing them (SIGKILL, a crash, a power cut) leaves them to notice through the 5-minute
 > idle timeout. The relay/discovery path (a bare endpoint id) re-dials by node id and follows the
@@ -469,7 +500,7 @@ the reason; any other close is redialed, the banner saying why.
 
 ## Sessions, connections and the bell hook
 
-A session is one PTY + emulator per authorized peer (`server::session`). Its program leads a
+A session is one PTY + emulator, a peer's, by number (`server::session`). Its program leads a
 session of its own with the PTY as its controlling terminal: `fuxix::pty::Slave::spawn` marks
 every inherited descriptor close-on-exec, calls `setsid` and takes the PTY between `fork` and
 `exec` (the `unsafe` that needs stays in fuxix), and std reports a failed `exec` to the spawn.
@@ -491,7 +522,10 @@ per-connection state never lives in the session:
   (on return **or** panic) detaches with no message to lose. The session starts the TTL when the
   last receiver drops and tears itself down at the TTL. Input comes only from the newest
   attachment, and only while the program runs; history has its own path (`Ask`) the session always
-  answers. `Registry::end(peer)` ends a peer's session, as revoking it does.
+  answers. `Registry::end(peer)` ends all of a peer's sessions, as revoking it does.
+- **A listing asks each session.** `Registry::sessions(peer)` takes the peer's sessions from the
+  registry, which never waits on one, then asks each how it stands (an `Ask::Describe` beside
+  history requests: attached or since when not, its size, title and exit), waiting 2 s at most.
 - **How a session ends.** Its program's exit is looked for at every tick. It ends once the exit is
   known and its output drained; after a 1 s grace if the program closed its terminal and ran on
   (as hung up, 129, which teardown makes true); or 5 s after the exit if a job left in the
@@ -510,6 +544,46 @@ per-connection state never lives in the session:
   synthetic environment rather than assumed. The bell count is cumulative per server session, so
   the first synced frame `prime`s the hook: bells from before this attach do not fire it. The hook
   outlives a reconnect and is not re-primed, so bells during an outage do.
+
+## Commands and copies
+
+`koh exec` and `koh cp` are a connection each, with no session and no terminal, through the same
+gate, permits and request as a shell.
+
+- **`koh exec`** (`server::exec`, `client::exec`) runs the words joined with spaces as
+  `$SHELL -c LINE` (else the platform's `sh`) in the server user's home, with a session's
+  environment but `TERM`, as the leader of a session of its own (`fuxix::process::lead_session`,
+  which also closes every inherited descriptor), so it has no controlling terminal. It starts at
+  once: the rest of the client's stream is its stdin, read by the client from its own stdin on a
+  thread (`client::io::spawn_stdin`), whose end is the command's. Its stdout and stderr go back on a
+  stream each, tagged (`request::ExecStream`), a chunk at a time, flushed as they come; then its
+  `ExitStatus` (its code, or 128 plus the signal) on a third, once both have ended, or, once it
+  exited, gone quiet for 100 ms (a job it left in the background holds the pipes). The client
+  writes its stdin and reads its output apart, so a command that never reads stdin never holds up
+  its output; a slow reader on either end holds the other back through the pipes and QUIC's flow
+  control. A lost connection, revocation, the server's shutdown or the client's signal hangs the
+  command up: SIGHUP to its process group, and the reaper sends SIGKILL to the group after a
+  second's grace, reaping the leader only then, so the group's id cannot have been reused. The
+  client exits with the status (141 if its own stdout closed, as SIGPIPE would), or 255 on its own
+  errors, as ssh does. No PTY mode: a command that wants a terminal wants a session.
+- **`koh cp`** (`copy`, `server::copy`, `client::copy`) moves a stream of items, each a framed
+  postcard `copy::Item` of at most 8 KiB, a file's bytes in `Data` chunks of at most 64 KiB, `End`
+  closing a file or directory and `Done` the stream: `Dir`, `File` and `Symlink` carry a `Name`
+  (no `/`, NUL, `.` or `..`), a mode (`0o7777` at most) and a modification time. The sender walks
+  each source (followed if it is a symlink, as `cp` follows its arguments), its tree as it is
+  (symlinks as symlinks, fifos, sockets and devices said `Skipped`), at most 128 directories deep,
+  each holding a descriptor. The receiver lands each top-level item beside its target as
+  `.koh-<random>.part`, creating every entry anew (`O_EXCL`, `mkdir`) and only inside directories
+  it created, so no name reaches outside the target or through a symlink; a directory's mode and
+  time are set at its `End`, after what is in it; at the item's end it is renamed into place,
+  which replaces a file but never a directory (`AlreadyExists`: a copy never merges). A stream that
+  ends before `Done`, a malformed item or an `Item::Failed` from the sender removes what was staged,
+  read-only directories made writable first. Each end runs on a blocking thread over `Read` or
+  `Write`, joined to the stream's task by a channel of at most 8 chunks. The destination is
+  resolved as `cp` would: inside it if it is a directory, else as it for one source. Remote paths
+  are the server user's shell's (`~`, `~/x`, relative in their home), unglobbed; a `Put`'s outcome
+  comes back as `Result<(), Failure>`, a failure as a kind (`copy::FailKind`) and a path, so it
+  reads the same whatever systems the ends run.
 
 The client renders through `client::ClientTerminal`, so tests can capture frames instead of
 driving a real terminal, and the predictor reads screens through `predict::ScreenView`
@@ -565,7 +639,8 @@ deterministically:
 - **Terminal / predictor** — diff+resize, predict→confirm→clear, predict→no-echo→suppress.
 - **Property tests and fuzzing** on the attacker-reachable parsers — assert never-panic and bounded.
   Coverage-guided fuzz targets (`fuzz/fuzz_targets/`): `screen_apply` (the structured diff),
-  `history_apply` (scrollback), `proto_decode` (both directions of the wire), `server_process`
+  `history_apply` (scrollback), `proto_decode` (both directions of the wire), `request_decode`
+  (the opening request, the replies sent whole and a copy's items), `server_process`
   (the hosted program's output), `server_input` and `client_input` (the user's input on each side)
   and `client_input` (the terminal's start-up answers, read by the session's decoder).
 - **The corpus** (`tests/corpus.rs`) — 113 recordings of real programs (`testing/corpus/`, from
@@ -601,7 +676,11 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   `isatty()` is true and raw mode runs for real), driven by scripted keystrokes with rendered
   frames read back from the master, connected with `--direct` to an in-process server; the
   `Ctrl-^ Ctrl-Z` suspend under a job-control bash; and a `koh serve --local --port` process
-  restarted under a connected client, which finds it again.
+  restarted under a connected client, which finds it again and hears its session is gone.
+- **`tests/commands.rs`** — the real binary's `koh exec` (output apart, statuses, stdin, the
+  hang-up), `koh cp` both ways (a tree with a mode, an odd name and a symlink, and a copy failing
+  partway landing nothing either way) and `koh sessions` beside `koh connect --new` and
+  `--session`, against an in-process server.
 
 The rules the tests keep are in their structure, not in lint lists a file can lift. Every test
 crate starts with `#![forbid(clippy::disallowed_methods)]`, so none can start a program, spawn a

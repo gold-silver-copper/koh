@@ -1,11 +1,13 @@
-//! The library behind the `koh` remote shell: `koh serve` hosts a PTY for allowlisted peers and
-//! `koh connect` renders it with predictive local echo, reconnecting transparently.
+//! The library behind the `koh` remote shell: `koh serve` hosts PTYs for allowlisted peers and
+//! `koh connect` renders one with predictive local echo, reconnecting transparently; `koh exec`
+//! runs a command there and `koh cp` copies files.
 //!
 //! [`transport_iroh`] sets up endpoints; [`identity`] loads identities
 //! and their reset leases; [`keycmd`] is `koh id` and `koh key`; [`names`] names the servers and clients
-//! a machine knows. [`proto`] is the wire protocol, [`events`] the input it carries;
-//! [`terminal`], [`predict`] and [`pty`] the screen, the prediction and the PTY; [`server`] hosts
-//! sessions and [`client`] renders them. [`bounded`] holds every queue.
+//! a machine knows. [`request`] is what a connection opens with, [`proto`] a shell's wire
+//! protocol, [`events`] the input it carries, [`copy`] a copy's; [`terminal`], [`predict`] and
+//! [`pty`] the screen, the prediction and the PTY; [`server`] hosts sessions and commands and
+//! [`client`] renders them. [`bounded`] holds every queue.
 //!
 //! Production code is panic-free by construction: `Cargo.toml` forbids the panic lints, lossy casts
 //! and unchecked arithmetic, and a `forbid` cannot be lifted locally. Tests may panic.

@@ -1,13 +1,14 @@
-//! The koh/7 wire protocol.
+//! The koh/7 shell protocol: what a session's connection carries after its opening request
+//! ([`crate::request`]).
 //!
-//! The client opens one uni stream and writes [`ClientMsg`]s on it, each a 4-byte
-//! big-endian length followed by its postcard encoding. The server sends every screen update as a
+//! The client writes [`ClientMsg`]s on two uni streams, its first (the request's) for control and
+//! one for input, each a 4-byte big-endian length followed by its postcard encoding. After the
+//! [`Attached`](crate::request::Attached) that admits the client, the server sends every screen update as a
 //! [`Frame`] on its own uni stream: a tag, the base's number, then the postcard encoding
 //! DEFLATE-compressed against the base screen ([`FrameEncoder`]); history rows go the same way,
 //! without a base, each reply naming the request it answers. Frames diff against a frame the
 //! client has (its delivery is its acknowledgement), so a lost or reset frame only delays the
-//! screen until the next one. The first frame admits the client; a refusal, as any close, says why
-//! by its code ([`Close`]).
+//! screen until the next one. A refusal, as any close, says why by its code ([`Close`]).
 //!
 //! Everything here is pure: the connection loops move bytes, this module turns them into messages
 //! and rejects anything oversized or malformed.

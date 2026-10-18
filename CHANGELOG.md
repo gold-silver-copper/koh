@@ -15,8 +15,32 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+### Added
+- **`koh exec SERVER -- COMMAND...`** runs a command on the server with no terminal, as ssh does:
+  the words joined with spaces and run by the server user's shell (`$SHELL -c`) in their home,
+  local stdin streamed to it, its stdout and stderr back apart, and koh exiting with its status
+  (128+N when signal N killed it; 255 on koh's own errors). It works with no terminal at all, and
+  a lost connection or a signal hangs the command up (SIGHUP to its process group, SIGKILL after
+  a second).
+- **`koh cp SRC... SERVER:PATH`** and **`koh cp SERVER:PATH... DST`** copy files and whole
+  directories both ways, done in process by the server: modes, modification times, odd names and
+  symlinks kept, streamed in bounded memory, and nothing landing until all of it has (each item
+  staged beside its target under a hidden name, then renamed into place); a directory is never
+  merged into one already there. `~`, `~/x` and relative remote paths are in the server user's
+  home. scp's `-r` and `-p` are taken, as what it always does.
+- **Several sessions per client.** `koh connect SERVER --new` starts another; `koh connect SERVER
+  --session N` attaches to one by number; `koh connect SERVER` attaches to the one attached last.
+  `koh sessions SERVER` lists them, one a line: number, attached or detached (and for how long),
+  age, size, whether the program runs or exited, and title. `--max-sessions` bounds them all
+  together, and the TTL applies to each.
+
 ### Changed
-- **The wire protocol is now `koh/7`**: a paste goes whole in one message (up to 1 MiB), and the
+- **The wire protocol is now `koh/7`**. A connection opens with a request on the client's first
+  stream saying what it is for (a shell by pick, a listing, a command or a copy), and the server
+  attaches or starts nothing before it; a client that makes none in 10 s is closed. A shell's
+  admission says the session it reached, and a reconnect goes back to that session by number,
+  never to another: one gone meanwhile (expired, or the server restarted) ends the client with
+  "no such session", where it used to land in a new shell. A paste goes whole in one message (up to 1 MiB), and the
   raw-bytes `Input` message is gone; history requests carry ids and every one is answered; a
   refusal is a close code; screen modes say whether the alternate screen is shown; the admission
   stream is gone: the server attaches the client's session before it sends anything, and the

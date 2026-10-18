@@ -103,7 +103,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - More keys in one read than anyone types (a paste into a terminal without bracketed paste, a
   program writing to the client's terminal) are sent but not predicted one by one, which cost a
   screenful of work each.
-- Updated `fux-vt` 0.3.4 → 0.7.0 and `fuxix` 0.1.7 → 0.5.0, including the test harnesses. The
+- Updated `fux-vt` 0.3.4 → 0.9.1 and `fuxix` 0.1.7 → 0.5.0, including the test harnesses. The
   minimum Rust version is unchanged.
   - **`--scrollback` is now `--scrollback-bytes`**, the history each session keeps in bytes, 8 MiB
     by default (about 20,000 lines of 50 characters), at most 1 GiB, as fux-vt bounds it.

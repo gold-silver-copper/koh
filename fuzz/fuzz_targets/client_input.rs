@@ -40,8 +40,9 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(back, msg);
                 typed += events
                     .iter()
+                    // A pasted byte that is no UTF-8 is one U+FFFD: three bytes, one character.
                     .map(|event| match event {
-                        InputEvent::Paste(text) => text.len(),
+                        InputEvent::Paste(text) => text.chars().count(),
                         _ => 1,
                     })
                     .sum::<usize>();

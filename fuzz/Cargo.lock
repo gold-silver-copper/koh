@@ -847,9 +847,9 @@ dependencies = [
 
 [[package]]
 name = "fux-vt"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "148a633583c7fc0352a87d335e50348bb037424fb4937d990b0f4afae122805c"
+checksum = "70a32e7cc0884ab0b97daae2e0d18fe50e406375e4d59863ce37137eb6ec22b3"
 dependencies = [
  "unicode-width",
 ]

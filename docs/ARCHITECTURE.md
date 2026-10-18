@@ -33,7 +33,7 @@ src/
 ├── args.rs          the command line (clap's builder API), `koh help-agents`
 ├── lib.rs           crate root: module declarations
 ├── request.rs       the opening request (what a connection is for) and the replies sent whole
-├── proto.rs         the koh/9 shell protocol: client messages, what the program shows, caps
+├── proto.rs         the koh/10 shell protocol: client messages, what the program shows, caps
 ├── stream.rs        the output filter both ends run: questions out, marks apart, bounds
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
@@ -81,9 +81,9 @@ testing/agentbench/  coding agents driving koh on task sets, scored
 `predict` imports nothing from `crate::` (CI checks it), so it is a standalone
 terminal-prediction library; `stream`, `proto`, `request` and `sync`'s item types are pure.
 
-## The protocol (koh/9)
+## The protocol (koh/10)
 
-The ALPN `koh/9` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/10` is the version check: a peer on another version fails the TLS handshake with a
 clear error. After the handshake the server checks the allowlist and takes a connection permit;
 then the client says what the connection is for, as the first message on its first uni stream
 (`src/request.rs`), a 4-byte length and its postcard encoding, at most 1 MiB, and the server
@@ -92,24 +92,26 @@ deadline) is closed as breaking the protocol, and so is one whose request does n
 path holding a NUL, a command over 256 KiB or 4096 words, no sources or more than 1024 are refused
 as they are decoded. The request is one of:
 
-- `Shell { pick, size }`: a session, at the client's window size. `Pick::Latest` is the peer's
+- `Shell { pick, size, program }`: a session, at the client's window size; with a `program`
+  (`koh connect SERVER -- PROG ARG...`), a new one running it in place of the shell. `Pick::Latest` is the peer's
   session attached last, else a new one; `New` always a new one; `Id(n)` that one, if it is the
   peer's; `Resume { run, session }` that one of that server run, which is how a client redials.
   The rest of the stream is the session's control stream. The server's first stream carries
   `Attached { at: Resume }`, which admits the client and says which session it reached.
 - `Sessions`, `Output { session, last }`: the peer's sessions with how each stands, or one's text;
   answered whole on a stream.
-- `Exec(Run)`, `Start { name, run }`: a command, with no terminal, for the connection's life or as
-  a job ([below](#commands-jobs-and-copies)); `Run` is its `Command` (`Argv`, words passed as they
+- `Exec { run, together }`, `Start { name, run }`: a command, with no terminal, for the
+  connection's life or as a job ([below](#commands-jobs-and-copies)); `Run` is its `Command` (`Argv`, words passed as they
   are, or `Shell`, a line for `$SHELL -c`) and the directory it starts in.
-- `Jobs`, `Logs { job, follow }`, `Kill { job, signal }`, `Wait(Wait)`: on the peer's jobs, and a
+- `Jobs`, `Logs { job, follow, tail }`, `Kill { job, signal }`, `Wait(Wait)`: on the peer's jobs, and a
   wait on the server (a job, a session, a file).
 - `Copy(Get { sources, opts } | Put { dest, sources, opts })`: a sync from or to the server.
 
 Each answer is an `Answer<T>`: the reply, or a `Problem` (a kind, `ProblemKind`, and a message),
 which the client says as text or as `{"error":{"kind","message"}}`, and maps to its exit code.
 A refusal is a close code, never prose to match (`proto::Close`: `NotAuthorized` 1, `ProtocolError`
-2, `SessionEnded` 3, `AtCapacity` 4, `CouldNotStart` 5, `NoSuchSession` 6, `OutOfScope` 7). Only
+2, `SessionEnded` 3, `AtCapacity` 4, `CouldNotStart` 5, `NoSuchSession` 6, `OutOfScope` 7,
+`Busy` 8). Only
 `NotAuthorized`, `NoSuchSession` and `OutOfScope` make a shell's client give up; on the others it
 redials and its status line says why. Then, for a shell (`src/proto.rs`):
 
@@ -224,14 +226,19 @@ screen shows that start a prompt, and where a running command's output began, if
 **The state report** (`OSC 133 ; S ; activity=STATE`, the contract fux wrote with koh) tells a
 terminal what the remote program is doing, which it cannot see itself: locally it sees only `koh
 connect` waiting on the network. The session probes its PTY's foreground program (`Pty::activity`,
-fuxix's `terminal_activity`, the probe fux runs on its own panes): `reading` its terminal with no
+fuxix's `terminal_activity`, the probe fux runs on its own panes, `busy` as fux's own check has it
+while keys wait unread in the terminal or output waits unread on the master): `reading` its terminal with no
 time limit, `polling` it with one, `waiting` on something else, `busy`, `idle` (macOS) or
 `unknown`. The session makes a report (`server/session/reports.rs`, time passed in) once input is
 written to the program, though the state is unchanged; on a change, probed every 20 ms while a
 client is attached; after the shell's `C` or `D`, right behind the mark on the stream; and after a
 resize. An unchanged state is reported again no sooner than 10 ms after the last, but after a
-mark. The report goes as `Shown::Report` in its place among the output; the client writes it, and
-writes the last one again after any mark (fux forgets a report at a mark). A program that polls
+mark. The report goes as `Shown::Report { activity, input }` in its place among the output, after
+the output read before it (none left unread in the reader's queue, and what is held for the
+modes' read let go first), with the newest of this attachment's inputs written to the program
+before it was probed; the client writes it only if that covers all the input it sent on the
+connection (one made before the server had its last keys is dropped: the one owed after them
+follows), and writes the last one again after any mark (fux forgets a report at a mark). A program that polls
 its terminal while it prints is told `polling`: it may draw on its own.
 
 What a terminal can rely on: a report written after its own last input to `koh connect` was probed
@@ -436,25 +443,31 @@ relative in the home, unglobbed), or, for a scoped key, beneath its directory.
   inherited descriptor), so it has no controlling terminal. It starts at once: the rest of the
   client's stream is its stdin, read by the client from its own stdin on a thread
   (`client::io::spawn_stdin`), whose end is the command's. Its stdout and stderr go back on a
-  stream each, tagged (`request::ExecStream`), a chunk at a time, flushed as they come; then its
+  stream each, tagged (`request::ExecStream`), a chunk at a time, flushed as they come. Two pipes
+  and two streams do not keep the order between them that a program wrote them in, so when the
+  client's stdout and stderr are one file (`2>&1`, a terminal) it asks for them `together`: the
+  command's stderr is its stdout's pipe, all of it sent as its stdout, in its order. Then its
   `ExitStatus` on a third (its code, or 128 plus the signal; or that it did not start, which the
   client says as 127 for no such program and 126 for the rest), once both have ended, or, once it
   exited, gone quiet for 100 ms (a job it left in the background holds the pipes). A slow reader
   on either end holds the other back through the pipes and QUIC's flow control. A lost connection
-  (the command connection's idle timeout is 20 s, so a killed client is found within it),
+  (the command connection's idle timeout is 10 s, so a killed client is found within it),
   revocation, the server's shutdown or the client's signal hangs the command up: SIGHUP to its
   process group, and the reaper sends SIGKILL to the group after a second's grace, reaping the
   leader only then, so the group's id cannot have been reused. The client exits with the status
   (141 if its own stdout closed, as SIGPIPE would), or 255 on its own errors, as ssh does.
 - **Jobs** (`server::jobs`): `koh run` starts a command as `koh exec` does, with stdin
-  `/dev/null`, its stdout and stderr together into a log of the newest `--job-log-bytes` (4 MiB
+  `/dev/null`, its stdout and stderr one pipe, into a log of the newest `--job-log-bytes` (4 MiB
   by default; the oldest dropped and counted), and answers with its name at once; the job runs
   until it exits, is signalled (`koh kill`, to its process group), or the server stops, which
   hangs it up (129). A job is its peer's, by name (given, or the next number; one that ended is
   replaced by a new one of its name); at most 64 are kept, an ended one given up first for a new
-  one, and an ended one is forgotten after the session TTL. `koh logs` sends the log, and with
-  `--follow` what comes until the job ends, then its status (`LogMsg::Dropped`, `Data`, `End`);
-  `koh jobs` lists them.
+  one, and an ended one is forgotten after the session TTL. `koh logs` sends the log, its last
+  `tail` lines if asked (the client asks for 200 unless `--all`, saying how many it left out:
+  `LogMsg::Cut`), and with `--follow` what comes until the job ends; then its status if it ended
+  and how long it ran or has run (`LogMsg::Dropped`, `Cut`, `Data`, `End { exit, secs }`), which
+  the client says on stderr (`· running 34s`, `· exited 101 after 34s`). `koh wait` on a job's
+  end then asks for its last lines (200 unless `--tail N`). `koh jobs` lists them.
 - **`koh wait`** (`server::wait`) waits on the server, for as long as its connection lasts: for a
   job to end (its status), its log to hold a text, or a file to exist; for a session's running
   command to end (the one running as the wait began: at once if none), its program to read its
@@ -518,12 +531,16 @@ construction rather than by care at each call:
 - **Shutdown and handshakes.** One task counts SIGTERM, SIGINT and SIGHUP (unless SIGHUP was ignored at start,
   as `nohup` does): the first drains, a
   repeat within 1 s (a double SIGHUP on a terminal's close) is the same, and a later one forces an
-  exit with a nonzero status. At most 2 handshakes are pending per address (an IPv6 /48 counts as
-  one), that address's oldest given up for a new one, and 256 in all, the oldest given up; they
-  hold no connection permit. When room would cost one under way, an address not yet validated is
-  first sent a QUIC retry, which a spoofed one never answers. So a flood from spoofed addresses
-  takes no room; one from enough real addresses can still give up an allowed client's handshake,
-  and delay it, while it lasts.
+  exit with a nonzero status. At most 256 handshakes are pending; when all the room is taken, a
+  new one gives up the oldest of the address holding the most (an IPv6 /48 counts as one, and
+  those through a relay as one), so a burst from one client (an agent's parallel commands) is all
+  let through while a flood gives up only its own. They hold no connection permit. When room would
+  cost one under way, an address not yet validated is first sent a QUIC retry, which a spoofed one
+  never answers. So a flood from spoofed addresses takes no room; one from enough real addresses
+  can still give up an allowed client's handshake, and delay it, while it lasts. An allowed
+  client's connection past `--max-connections` waits up to 10 s for room, among at most as many
+  waiting; past them it is closed as `Busy` ("server busy: too many connections at once; retry"),
+  which the client says, exiting 75.
 
 ## Testing tiers
 

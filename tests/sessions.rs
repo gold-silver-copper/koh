@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/9 client.
+//! loopback iroh with a minimal koh/10 client.
 #![forbid(clippy::disallowed_methods)]
 
 use std::time::Duration;
@@ -28,6 +28,8 @@ struct Shownness {
     reports: Vec<Activity>,
     /// The marks, and how many reports had come when each did.
     marks: Vec<(Vec<u8>, usize)>,
+    /// Each report's input, and the screen when it came.
+    reported: Vec<(InputSeq, String)>,
     echo: InputSeq,
 }
 
@@ -40,6 +42,7 @@ impl Shownness {
             tty: None,
             reports: Vec::new(),
             marks: Vec::new(),
+            reported: Vec::new(),
             echo: InputSeq(0),
         })
     }
@@ -50,7 +53,10 @@ impl Shownness {
             Shown::Mark(mark) => self
                 .marks
                 .push((mark.as_bytes().to_vec(), self.reports.len())),
-            Shown::Report(activity) => self.reports.push(*activity),
+            Shown::Report { activity, input } => {
+                self.reports.push(*activity);
+                self.reported.push((*input, self.text()));
+            }
             Shown::Tty(tty) => self.tty = Some(*tty),
             Shown::Echo(seq) => self.echo = self.echo.max(*seq),
             Shown::Exit(code) => self.exit = Some(*code),
@@ -188,7 +194,7 @@ fn registry(
 
 /// Attach `peer` and say how.
 async fn attach_kind(reg: &Registry, peer: iroh::EndpointId) -> Option<AttachKind> {
-    reg.attach(peer, Pick::Latest, WINDOW)
+    reg.attach(peer, Pick::Latest, WINDOW, None)
         .await
         .ok()
         .map(|(_, _, kind)| kind)
@@ -197,7 +203,7 @@ async fn attach_kind(reg: &Registry, peer: iroh::EndpointId) -> Option<AttachKin
 /// Attach `peer`, and watch what it is shown.
 async fn watch(reg: &Registry, peer: iroh::EndpointId) -> anyhow::Result<(Watched, AttachKind)> {
     let (client, start, kind) = reg
-        .attach(peer, Pick::Latest, WINDOW)
+        .attach(peer, Pick::Latest, WINDOW, None)
         .await
         .map_err(|close| anyhow::anyhow!("refused: {close}"))?;
     Ok((Watched::new((client, start))?, kind))
@@ -235,7 +241,7 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
             .context("A creates the one allowed session")?;
         anyhow::ensure!(
             matches!(
-                reg.attach(b, Pick::Latest, WINDOW).await,
+                reg.attach(b, Pick::Latest, WINDOW, None).await,
                 Err(Close::AtCapacity)
             ),
             "a second distinct peer is refused at the cap, for now"
@@ -299,7 +305,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-/// A bare koh/9 client: writes messages, and reads what the server shows on its newest epoch.
+/// A bare koh/10 client: writes messages, and reads what the server shows on its newest epoch.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -321,6 +327,7 @@ impl RawClient {
         let request = Request::Shell {
             pick: Pick::Latest,
             size: WINDOW,
+            program: None,
         };
         send.write_all(&koh::request::encode(&request, MAX_REQUEST)?)
             .await?;
@@ -447,6 +454,47 @@ fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyho
             "the input is acknowledged as echoed: {:?}",
             client.shown.echo
         );
+        client.conn.close(0u32.into(), b"done");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .context("the server ends its session and returns")???;
+        Ok(())
+    })
+}
+
+/// A report says which input it came after, and never goes before the output the program wrote
+/// before it: one saying `reading` after a key has what the program wrote for it on the screen,
+/// though that came too late after the key to go out with its echo.
+#[test]
+fn a_report_follows_the_input_and_output_before_it() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let secret = generate_secret_key()?;
+        let program = [
+            "sh",
+            "-c",
+            "stty -echo; i=1; while read x; do sleep 0.03; printf \"got$i \"; i=$((i+1)); done",
+        ];
+        let (addr, shutdown, serve) = loopback_serve(secret.public(), &program).await?;
+        let mut client = RawClient::connect(addr, secret).await?;
+        client
+            .until(|s| s.reports.last() == Some(&Activity::Reading))
+            .await?;
+        for n in 1..=10 {
+            let before = client.shown.reports.len();
+            client.type_bytes(b"k\r").await?;
+            let seq = client.last_seq;
+            let reading = |s: &Shownness| {
+                (before..s.reports.len())
+                    .find(|&i| s.reports[i] == Activity::Reading && s.reported[i].0 >= seq)
+            };
+            client.until(|s| reading(s).is_some()).await?;
+            let at = reading(&client.shown).context("a report")?;
+            let (input, screen) = &client.shown.reported[at];
+            anyhow::ensure!(*input == seq, "{input:?} for {seq:?}");
+            let last = screen.split_whitespace().last();
+            anyhow::ensure!(last == Some(&*format!("got{n}")), "{n}: {screen:?}");
+        }
         client.conn.close(0u32.into(), b"done");
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), serve)
@@ -735,7 +783,7 @@ fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
         let a = peer()?;
         let (mut client, _) = watch(&reg, a).await.context("attach")?;
         allowed.store(false, Relaxed);
-        let refused = reg.attach(a, Pick::Latest, WINDOW).await.err();
+        let refused = reg.attach(a, Pick::Latest, WINDOW, None).await.err();
         anyhow::ensure!(refused == Some(Close::NotAuthorized), "{refused:?}");
         reg.end(a).await;
         allowed.store(true, Relaxed);
@@ -953,7 +1001,7 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
         let endpoint = bind_endpoint_local(secret, false).await?;
         let dialed = tokio::time::timeout(
             Duration::from_secs(10),
-            koh::client::IrohConnector::new(endpoint, addr).connect(Pick::Latest, WINDOW),
+            koh::client::IrohConnector::new(endpoint, addr).connect(Pick::Latest, WINDOW, None),
         )
         .await;
         shutdown.cancel();
@@ -1060,6 +1108,7 @@ fn an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes() ->
                         &Request::Shell {
                             pick: Pick::Latest,
                             size: WINDOW,
+                            program: None,
                         },
                         MAX_REQUEST,
                     );

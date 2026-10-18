@@ -19,9 +19,9 @@ use tokio_util::sync::CancellationToken;
 use crate::client::{refusal, Admitted, DefaultBackend, IrohConnector, KohBackend as _, Refused};
 use crate::proto::Close;
 use crate::request::{
-    Answer, JobInfo, JobList, JobName, JobState, LogMsg, Pick, Presence, Problem, Request, Run,
-    SessionInfo, SessionList, SessionNum, Signal, Started, Until, Wait, Waited, MAX_LOG_CHUNK,
-    MAX_OUTPUT, MAX_REPLY,
+    Answer, Argv, JobInfo, JobList, JobName, JobState, LogMsg, On, Pick, Presence, Problem,
+    Request, Run, SessionInfo, SessionList, SessionNum, Signal, Started, Until, Wait, Waited,
+    MAX_LOG_CHUNK, MAX_OUTPUT, MAX_REPLY,
 };
 use crate::transport_iroh::{bind_on, close_endpoint, Idle, Network};
 
@@ -59,6 +59,8 @@ pub struct ConnectConfig {
     pub remote: Remote,
     /// Which of this client's sessions to attach to.
     pub pick: Pick,
+    /// A program a new session runs in place of the shell.
+    pub program: Option<Argv>,
     /// Let the server set the clipboard (OSC 52); on unless `--no-clipboard`.
     pub clipboard: bool,
     /// Show the server's hyperlinks (OSC 8); on unless `--no-hyperlinks`.
@@ -76,6 +78,7 @@ impl ConnectConfig {
         Self {
             remote: Remote::new(server),
             pick: Pick::Latest,
+            program: None,
             clipboard: true,
             hyperlinks: true,
             colours: true,
@@ -229,7 +232,7 @@ pub(crate) struct Opened {
 
 impl Opened {
     /// Dial `remote` as its client key and make `request`. Its connection is a command's: a
-    /// client killed where it stands is noticed within 20 seconds, and what it ran hung up.
+    /// client killed where it stands is noticed within 10 seconds, and what it ran hung up.
     pub(crate) async fn dial(remote: &Remote, request: &Request) -> anyhow::Result<Self> {
         log_to_koh_log();
         let identity = crate::identity::load(&crate::identity::KeyFile::locate(
@@ -280,16 +283,27 @@ async fn ask<T: DeserializeOwned>(
     answer
 }
 
-/// The exit status for a koh error: 3 the server was not reached, 4 it refused this client for
-/// good (or its key's scope), 1 anything else.
+/// The exit status for a koh error: [`BUSY`] the server had no room for it now, 3 the server was
+/// not reached, 4 it refused this client for good (or its key's scope), 1 anything else.
 pub fn exit_code(error: &anyhow::Error) -> u8 {
-    if error.is::<Unreached>() || error.downcast_ref::<Close>() == Some(&Close::AtCapacity) {
+    if busy(error) {
+        BUSY
+    } else if error.is::<Unreached>() || error.downcast_ref::<Close>() == Some(&Close::AtCapacity) {
         3
     } else if error.is::<Refused>() {
         4
     } else {
         1
     }
+}
+
+/// The exit status when the server was too busy to take the connection: nothing was done, so a
+/// retry is safe. `EX_TEMPFAIL`, as sysexits names it.
+pub const BUSY: u8 = 75;
+
+/// Whether `error` is the server turning the connection away as busy.
+pub fn busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Close>() == Some(&Close::Busy)
 }
 
 /// What a koh error says in `--json` output: its kind, and its words.
@@ -303,7 +317,9 @@ pub fn json_error(error: &anyhow::Error) -> String {
     struct View<'a> {
         error: Inner<'a>,
     }
-    let kind = if error.is::<Unreached>() {
+    let kind = if busy(error) {
+        "busy"
+    } else if error.is::<Unreached>() {
         "unreached"
     } else if let Some(refused) = error.downcast_ref::<Refused>() {
         match refused {
@@ -625,12 +641,18 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
-/// `koh logs`: job `job`'s output to `out`, and with `follow` what it writes until it ends; its
-/// status if it ended (then koh exits with it), `None` if it runs on.
-pub async fn logs(remote: &Remote, job: JobName, follow: bool) -> anyhow::Result<Option<u32>> {
+/// `koh logs`: print job `job`'s output on `remote`, its last `tail` lines if given, and if
+/// `follow` what it writes until it ends; then, on stderr, whether it runs on or how it ended. Its
+/// status if it ended.
+pub async fn logs(
+    remote: &Remote,
+    job: JobName,
+    (follow, tail): (bool, Option<u32>),
+) -> anyhow::Result<Option<u32>> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
-    let mut opened = Opened::dial(remote, &Request::Logs { job, follow }).await?;
+    let shown = job.clone();
+    let mut opened = Opened::dial(remote, &Request::Logs { job, follow, tail }).await?;
     opened.control.finish()?;
     let read = async {
         let mut recv = opened.conn.accept_uni().await?;
@@ -648,12 +670,24 @@ pub async fn logs(remote: &Remote, job: JobName, follow: bool) -> anyhow::Result
                     "koh: {} of the job's output were dropped before this (the log keeps its newest)",
                     bytes(n)
                 )),
+                LogMsg::Cut(lines) => crate::log::stderr(format_args!(
+                    "koh: {lines} earlier line{} not shown (--tail N shows more, --all all)",
+                    if lines == 1 { "" } else { "s" }
+                )),
                 LogMsg::Data(data) => {
                     use tokio::io::AsyncWriteExt as _;
                     stdout.write_all(&data).await?;
                     stdout.flush().await?;
                 }
-                LogMsg::End(status) => return anyhow::Ok(status),
+                LogMsg::End { exit, secs } => {
+                    crate::log::stderr(match exit {
+                        Some(status) => format!("· exited {status} after {secs}s"),
+                        None => format!(
+                            "· running {secs}s: `koh wait SERVER {shown}` waits for its end"
+                        ),
+                    });
+                    return anyhow::Ok(exit);
+                }
             }
         }
     };
@@ -711,13 +745,18 @@ pub const TIMED_OUT: u32 = 124;
 /// waits.
 pub async fn wait(
     remote: &Remote,
-    (wait, timeout): (Wait, Option<Duration>),
+    (wait, timeout, tail): (Wait, Option<Duration>, u32),
     format: Format,
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<u32> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
     let until = wait.until.clone();
+    // A job waited on to its end: its last lines are shown when it ends.
+    let shown = match (&wait.on, &until) {
+        (Some(On::Job(job)), Until::End) if tail > 0 && !format.json => Some(job.clone()),
+        _ => None,
+    };
     report_busy();
     let waited = async { ask::<Waited>(remote, &Request::Wait(wait), MAX_REPLY).await };
     let waited = tokio::select! {
@@ -762,6 +801,8 @@ pub async fn wait(
         )?;
     } else if status == TIMED_OUT || (status == 1 && !matches!(until, Until::End)) {
         crate::log::stderr(format_args!("koh: {said}"));
+    } else if let Some(job) = shown {
+        logs(remote, job, (false, Some(tail))).await?;
     }
     Ok(status)
 }
@@ -847,7 +888,8 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     )?)?;
     let size = backend.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
     let (endpoint, connector) = connector(&args.remote, &identity, Idle::Shell).await?;
-    let admitted: Admitted = first_dial(&endpoint, connector.connect(args.pick, size)).await?;
+    let admitted: Admitted =
+        first_dial(&endpoint, connector.connect(args.pick, size, args.program)).await?;
     // For the menu's "last connected"; failing to note it never stops the session.
     let noted = crate::identity::KeyFile::path_for(args.remote.key_file.clone(), "client")
         .map_err(anyhow::Error::from)

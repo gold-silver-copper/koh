@@ -10,7 +10,7 @@
 //!
 //! The command ends when it has exited and its output has ended, or gone quiet for [`DRAINED`]
 //! (a job it left in the background holds its pipes, which ssh would wait on for ever). A lost
-//! connection (the client's own idle timeout is 20 s, so a killed client is found within it),
+//! connection (the client's own idle timeout is 10 s, so a killed client is found within it),
 //! revocation or the server's shutdown hangs it up: SIGHUP to its process group, and SIGKILL once
 //! the reaper's grace is over.
 
@@ -80,21 +80,26 @@ impl Drop for Process {
     }
 }
 
-/// A command started, and the pipes asked for.
+/// The read end of a command's stdout or stderr.
+pub(super) type Output = tokio::net::unix::pipe::Receiver;
+
+/// A command started, and the pipes asked for: its stdin, its stdout, and its stderr unless it
+/// writes that to its stdout's pipe.
 pub(super) type Spawned = (
     Process,
     Option<tokio::process::ChildStdin>,
-    tokio::process::ChildStdout,
-    tokio::process::ChildStderr,
+    Output,
+    Option<Output>,
 );
 
 /// Start `run` at `place`, left to `reaper` if it is hung up, stdin piped if `stdin` (else
-/// `/dev/null`); why not, said as the client shows it.
+/// `/dev/null`), its stderr into its stdout's pipe if `together`, which keeps the order it wrote
+/// them in; why not, said as the client shows it.
 pub(super) fn spawn(
     run: &Run,
     host: &Host,
     place: &Place,
-    stdin: bool,
+    (stdin, together): (bool, bool),
 ) -> Result<Spawned, Problem> {
     let home = &host.home;
     let cwd = place.cwd(run.cwd.as_ref())?;
@@ -121,9 +126,18 @@ pub(super) fn spawn(
             cmd
         }
     };
+    let io = |e: std::io::Error| Problem::new(ProblemKind::CouldNotStart, e);
+    let (out, out_end) = std::io::pipe().map_err(io)?;
+    let err = if together {
+        cmd.stderr(out_end.try_clone().map_err(io)?);
+        None
+    } else {
+        let (err, err_end) = std::io::pipe().map_err(io)?;
+        cmd.stderr(err_end);
+        Some(err)
+    };
     cmd.stdin(if stdin { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(out_end)
         .env_remove("TERM");
     crate::pty::scrub_koh_env(&mut cmd, std::env::vars_os().map(|(key, _)| key));
     home.apply(&mut cmd);
@@ -131,24 +145,16 @@ pub(super) fn spawn(
         cmd.current_dir(dir);
     }
     fuxix::process::lead_session(&mut cmd, false);
-    let mut child = cmd
-        .spawn()
-        .map_err(|error| not_started(run, cwd.as_deref(), &error))?;
-    let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let spawned = cmd.spawn();
+    // The pipes' write ends are the command's alone now: its end is their end.
+    drop(cmd);
+    let mut child = spawned.map_err(|error| not_started(run, cwd.as_deref(), &error))?;
+    let child_in = child.stdin.take();
     let process = Process {
         running: Running::group(child),
         reaper: host.reaper.clone(),
     };
-    let missing = || {
-        Problem::new(
-            ProblemKind::CouldNotStart,
-            "the command's pipes are missing",
-        )
-    };
-    let (child_in, Some(stdout), Some(stderr)) = pipes else {
-        return Err(missing());
-    };
-    let io = |e: std::io::Error| Problem::new(ProblemKind::CouldNotStart, e);
+    let output = |end: std::io::PipeReader| Output::from_owned_fd(end.into());
     let child_in = child_in
         .map(tokio::process::ChildStdin::from_std)
         .transpose()
@@ -156,8 +162,8 @@ pub(super) fn spawn(
     Ok((
         process,
         child_in,
-        tokio::process::ChildStdout::from_std(stdout).map_err(io)?,
-        tokio::process::ChildStderr::from_std(stderr).map_err(io)?,
+        output(out).map_err(io)?,
+        err.map(output).transpose().map_err(io)?,
     ))
 }
 
@@ -182,12 +188,13 @@ fn not_started(run: &Run, cwd: Option<&Path>, error: &std::io::Error) -> Problem
     )
 }
 
-/// Run `run` for the client on `conn` at `place`, `stdin` its stdin, until it ends and the client
-/// has its status, or the connection is lost, which hangs it up.
+/// Run `run` for the client on `conn` at `place`, `stdin` its stdin, its stderr into its stdout if
+/// `together`, until it ends and the client has its status, or the connection is lost, which
+/// hangs it up.
 pub(super) async fn serve(
     conn: &Connection,
     stdin: RecvStream,
-    run: &Run,
+    (run, together): (&Run, bool),
     host: &Host,
     place: &Place,
 ) {
@@ -197,7 +204,7 @@ pub(super) async fn serve(
     ) else {
         return;
     };
-    let status = match spawn(run, host, place, true) {
+    let status = match spawn(run, host, place, (true, together)) {
         Ok((mut process, child_in, child_out, child_err)) => {
             let Some(child_in) = child_in else { return };
             match pump_all(
@@ -241,13 +248,13 @@ async fn pump_all(
     (process, child_in, child_out, child_err): (
         &mut Process,
         tokio::process::ChildStdin,
-        tokio::process::ChildStdout,
-        tokio::process::ChildStderr,
+        Output,
+        Option<Output>,
     ),
     host: &Host,
 ) -> Option<u32> {
     let (exited_tx, exited) = watch::channel(false);
-    let mut stdout = pin!(pump(child_out, out, exited.clone()));
+    let mut stdout = pin!(pump(Some(child_out), out, exited.clone()));
     let mut stderr = pin!(pump(child_err, err, exited));
     let mut feeding = pin!(feed(stdin, child_in));
     let (mut out_done, mut err_done, mut fed) = (false, false, false);
@@ -286,12 +293,16 @@ async fn open(conn: &Connection, what: ExecStream) -> anyhow::Result<SendStream>
 }
 
 /// Send what the command writes on `from` to `to` until it ends, or, once `exited`, goes quiet for
-/// [`DRAINED`]; then finish `to`.
+/// [`DRAINED`]; then finish `to`. None, it finishes `to` at once.
 async fn pump(
-    mut from: impl AsyncRead + Unpin,
+    from: Option<impl AsyncRead + Unpin>,
     mut to: SendStream,
     mut exited: watch::Receiver<bool>,
 ) {
+    let Some(mut from) = from else {
+        let _ = to.finish();
+        return;
+    };
     let mut buf = vec![0u8; CHUNK];
     loop {
         let read = if *exited.borrow_and_update() {

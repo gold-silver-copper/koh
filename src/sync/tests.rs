@@ -141,7 +141,7 @@ fn a_tree_lands_then_only_what_changed_is_sent_and_gets_its_arrival_time() {
     let again = copy(&[&top], &into.join("x/"), &Opts::default()).unwrap();
     assert_eq!(
         (again.written(), again.unchanged, again.bytes),
-        (0, 4, 0),
+        (0, 3, 0),
         "{again:?}"
     );
     assert_eq!(mtime(&landed.join("sub/big")), before);
@@ -151,7 +151,7 @@ fn a_tree_lands_then_only_what_changed_is_sent_and_gets_its_arrival_time() {
     fs::write(top.join("sub/big"), vec![8u8; CHUNK * 2 + 5]).unwrap();
     filetime(&top.join("sub/big"), 1_000_000);
     let edited = copy(&[&top], &into.join("x/"), &Opts::default()).unwrap();
-    assert_eq!((edited.replaced, edited.unchanged), (1, 3), "{edited:?}");
+    assert_eq!((edited.replaced, edited.unchanged), (1, 2), "{edited:?}");
     assert!(mtime(&landed.join("sub/big")) > before);
     // With -p, the source's times, the unchanged files' too.
     let kept = Opts {

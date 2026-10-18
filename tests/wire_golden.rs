@@ -1,4 +1,4 @@
-//! The koh/9 encoding.
+//! The koh/10 encoding.
 //!
 //! Messages built here by hand from the wire types, both ways, are pinned: the expected bytes were
 //! captured by running the encoder, and a change to the wire must change them in the same commit,
@@ -40,17 +40,31 @@ fn requests() -> Option<Vec<Request>> {
                 session: SessionNum(2),
             }),
             size: Size::new(24, 80),
+            program: None,
         },
-        Request::Exec(Run {
-            command: argv(&["make", "-j4"])?,
-            cwd: Some(path("src")?),
-        }),
+        Request::Shell {
+            pick: Pick::New,
+            size: Size::new(24, 80),
+            program: Argv::new(vec![b"gdb".to_vec()]).ok(),
+        },
+        Request::Exec {
+            run: Run {
+                command: argv(&["make", "-j4"])?,
+                cwd: Some(path("src")?),
+            },
+            together: false,
+        },
         Request::Start {
             name: Some(JobName::new("build").ok()?),
             run: Run {
                 command: Command::Shell(CommandLine::new(b"cd x && make".to_vec()).ok()?),
                 cwd: None,
             },
+        },
+        Request::Logs {
+            job: JobName::new("build").ok()?,
+            follow: true,
+            tail: Some(200),
         },
         Request::Wait(
             Wait::new(
@@ -104,7 +118,10 @@ fn shown() -> Option<Vec<Shown>> {
     Some(vec![
         Shown::Out(b"\x1b[1mhi\x1b[m\r\n".to_vec()),
         Shown::Mark(MarkText::new(b"D;1".to_vec())?),
-        Shown::Report(Activity::Reading),
+        Shown::Report {
+            activity: Activity::Reading,
+            input: InputSeq(4),
+        },
         Shown::Tty(TtyModes {
             echo: false,
             line: true,
@@ -184,6 +201,15 @@ fn framed() -> Option<Vec<(String, Vec<u8>)>> {
         )
         .ok()?,
         koh::request::encode(&LogMsg::Data(b"out\n".to_vec()), usize::MAX).ok()?,
+        koh::request::encode(&LogMsg::Cut(3), usize::MAX).ok()?,
+        koh::request::encode(
+            &LogMsg::End {
+                exit: Some(101),
+                secs: 34,
+            },
+            usize::MAX,
+        )
+        .ok()?,
     ];
     for (n, a) in answers.into_iter().enumerate() {
         all.push((format!("answer {n}"), a));
@@ -193,7 +219,7 @@ fn framed() -> Option<Vec<(String, Vec<u8>)>> {
 
 #[test]
 fn the_wire_is_pinned() {
-    assert_eq!(koh::transport_iroh::PROTOCOL, "koh/9");
+    assert_eq!(koh::transport_iroh::PROTOCOL, "koh/10");
     let got: Vec<String> = framed()
         .unwrap()
         .iter()
@@ -262,9 +288,11 @@ fn the_wire_messages_seed_the_fuzzers() {
 
 /// Captured by running the encoder; see the module's doc.
 const PINNED: &[&str] = &[
-    "00000006000309021850",
-    "00000011030002046d616b65032d6a340103737263",
+    "0000000700030902185000",
+    "0000000a00011850010103676462",
+    "00000012030002046d616b65032d6a34010373726300",
     "000000170401056275696c64010c63642078202626206d616b6500",
+    "0000000b06056275696c640101c801",
     "00000014080100056275696c6401096c697374656e696e67",
     "0000000d09010570726f6a2f0200010000",
     "000000110103020000016104000306706173746564",
@@ -274,7 +302,7 @@ const PINNED: &[&str] = &[
     "0000000104",
     "0000000d000b1b5b316d68691b5b6d0d0a",
     "000000050103443b31",
-    "000000020200",
+    "00000003020004",
     "00000003030001",
     "000000020407",
     "000000020502",
@@ -291,5 +319,7 @@ const PINNED: &[&str] = &[
     "000000020902",
     "00000003008901",
     "000000080100056275696c64",
-    "0000000601046f75740a",
+    "0000000602046f75740a",
+    "000000020103",
+    "0000000403016522",
 ];

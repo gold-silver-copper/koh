@@ -111,22 +111,32 @@ pub enum Pick {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     /// A detachable shell session, for a terminal of `size`: the stream goes on as the shell's
-    /// input.
-    Shell { pick: Pick, size: Size },
+    /// input. With a `program`, a new session running it in place of the shell.
+    Shell {
+        pick: Pick,
+        size: Size,
+        program: Option<Argv>,
+    },
     /// The peer's sessions, answered as an [`Answer<SessionList>`].
     Sessions,
     /// A session's text: its screen, or the output of the last command its shell finished.
     Output { session: SessionNum, last: bool },
     /// Run a command with no terminal for as long as the connection lasts: the stream goes on as
-    /// its stdin.
-    Exec(Run),
+    /// its stdin. Its stdout and stderr are one pipe if `together` (the client's are one file),
+    /// so their order is the order it wrote them, all sent as its stdout.
+    Exec { run: Run, together: bool },
     /// Start a job: a command with no terminal that outlives the connection, its output kept.
     Start { name: Option<JobName>, run: Run },
     /// The peer's jobs, answered as an [`Answer<JobList>`], their commands cut to
     /// [`MAX_TITLE`] characters; or the one `job` names, its command whole.
     Jobs { job: Option<JobName> },
-    /// A job's output: what is kept, then, if `follow`, what it writes until it ends.
-    Logs { job: JobName, follow: bool },
+    /// A job's output: what is kept (only its last `tail` lines, if given), then, if `follow`,
+    /// what it writes until it ends.
+    Logs {
+        job: JobName,
+        follow: bool,
+        tail: Option<u32>,
+    },
     /// Send a job's processes a signal.
     Kill { job: JobName, signal: Signal },
     /// Wait for something on the server.
@@ -142,7 +152,7 @@ impl Request {
             Self::Shell { .. } => "a shell",
             Self::Sessions => "the session list",
             Self::Output { .. } => "a session's text",
-            Self::Exec(_) => "a command",
+            Self::Exec { .. } => "a command",
             Self::Start { .. } => "a job",
             Self::Jobs { .. } => "the job list",
             Self::Logs { .. } => "a job's output",
@@ -669,10 +679,13 @@ pub enum Waited {
 pub enum LogMsg {
     /// The output that went before was dropped, this many bytes, as the log was full.
     Dropped(u64),
+    /// This many lines of what is kept went before what is sent, left out as `tail` asked.
+    Cut(u64),
     /// Output, as the job wrote it.
     Data(#[serde(deserialize_with = "at_most::<MAX_LOG_CHUNK, _, _>")] Vec<u8>),
-    /// The end of what is sent: the job's status if it ended, `None` if it runs on (no follow).
-    End(Option<u32>),
+    /// The end of what is sent: the job's status if it ended, `None` if it runs on (no follow),
+    /// and the seconds it ran, or has run so far.
+    End { exit: Option<u32>, secs: u64 },
 }
 
 /// What a stream the server opens for `koh exec` carries, its first byte.
@@ -768,7 +781,7 @@ mod tests {
             Sessions,
             #[expect(dead_code, reason = "a variant's place, as Request numbers them")]
             Output,
-            Exec(RawRun),
+            Exec(RawRun, bool),
             Start(Option<String>, RawRun),
             #[expect(dead_code, reason = "a variant's place, as Request numbers them")]
             Jobs,
@@ -808,11 +821,20 @@ mod tests {
                     session: SessionNum(3),
                 }),
                 size: Size::new(24, 80),
+                program: None,
             },
-            Request::Exec(Run {
-                command: argv(&["echo", "a b"]),
-                cwd: Some(path(b"src")),
-            }),
+            Request::Shell {
+                pick: Pick::New,
+                size: Size::new(24, 80),
+                program: Some(Argv::new(vec![b"gdb".to_vec(), b"./a.out".to_vec()]).unwrap()),
+            },
+            Request::Exec {
+                run: Run {
+                    command: argv(&["echo", "a b"]),
+                    cwd: Some(path(b"src")),
+                },
+                together: true,
+            },
             Request::Start {
                 name: Some(JobName::new("build").unwrap()),
                 run: Run {
@@ -833,16 +855,19 @@ mod tests {
         }
         let run = |command| RawRun(command, None);
         for raw in [
-            Raw::Exec(run(RawCommand::Argv(Vec::new()))),
-            Raw::Exec(run(RawCommand::Argv(vec![Vec::new()]))),
-            Raw::Exec(run(RawCommand::Argv(vec![b"a\0b".to_vec()]))),
-            Raw::Exec(run(RawCommand::Argv(vec![b"x".to_vec(); MAX_ARGS + 1]))),
-            Raw::Exec(run(RawCommand::Shell(Vec::new()))),
-            Raw::Exec(run(RawCommand::Shell(vec![b'x'; MAX_COMMAND + 1]))),
-            Raw::Exec(RawRun(
-                RawCommand::Shell(b"x".to_vec()),
-                Some(b"a\0".to_vec()),
-            )),
+            Raw::Exec(run(RawCommand::Argv(Vec::new())), false),
+            Raw::Exec(run(RawCommand::Argv(vec![Vec::new()])), false),
+            Raw::Exec(run(RawCommand::Argv(vec![b"a\0b".to_vec()])), false),
+            Raw::Exec(
+                run(RawCommand::Argv(vec![b"x".to_vec(); MAX_ARGS + 1])),
+                false,
+            ),
+            Raw::Exec(run(RawCommand::Shell(Vec::new())), false),
+            Raw::Exec(run(RawCommand::Shell(vec![b'x'; MAX_COMMAND + 1])), false),
+            Raw::Exec(
+                RawRun(RawCommand::Shell(b"x".to_vec()), Some(b"a\0".to_vec())),
+                false,
+            ),
             Raw::Start(Some("-rf".into()), run(RawCommand::Shell(b"x".to_vec()))),
             Raw::Start(Some("a b".into()), run(RawCommand::Shell(b"x".to_vec()))),
             Raw::Wait(None, RawUntil::End),

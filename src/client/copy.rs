@@ -91,10 +91,15 @@ fn say(summary: &Summary, landed: &str, format: Format) -> anyhow::Result<()> {
         writeln!(out)?;
         return Ok(());
     }
-    let mut parts = Vec::new();
-    if summary.replaced > 0 {
-        parts.push(format!("{} replaced", summary.replaced));
+    // What was sent, split into new and replaced, which add up to it; then the rest.
+    let mut sent = Vec::new();
+    if summary.new > 0 {
+        sent.push(format!("{} new", summary.new));
     }
+    if summary.replaced > 0 {
+        sent.push(format!("{} replaced", summary.replaced));
+    }
+    let mut parts = Vec::new();
     if summary.unchanged > 0 {
         parts.push(format!("{} unchanged", summary.unchanged));
     }
@@ -110,15 +115,16 @@ fn say(summary: &Summary, landed: &str, format: Format) -> anyhow::Result<()> {
     if summary.links > 0 {
         parts.push(format!("{} links", summary.links));
     }
-    let more = if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", parts.join(", "))
+    let more = match (sent.is_empty(), parts.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!(" ({})", sent.join(", ")),
+        (true, false) => format!(" ({})", parts.join(", ")),
+        (false, false) => format!(" ({}; {})", sent.join(", "), parts.join(", ")),
     };
     let written = summary.written();
     writeln!(
         out,
-        "{written} file{}, {} → {landed}{more}",
+        "{written} file{} sent, {} → {landed}{more}",
         if written == 1 { "" } else { "s" },
         bytes(summary.bytes),
     )?;

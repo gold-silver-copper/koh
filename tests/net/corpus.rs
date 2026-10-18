@@ -177,7 +177,9 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     let endpoint = net.endpoint(secret, false).await?;
     let connector = IrohConnector::new(endpoint, FaultNet::addr(server.id));
     let start = Size::new(recording.rows, recording.cols);
-    let channel = connector.connect(koh::request::Pick::Latest, start).await?;
+    let channel = connector
+        .connect(koh::request::Pick::Latest, start, None)
+        .await?;
     let size = Arc::new(Mutex::new(start));
     // A terminal that does what the server's does: the same output shows the same.
     let shown = Arc::new(Mutex::new(

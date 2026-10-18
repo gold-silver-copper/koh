@@ -35,6 +35,10 @@ use tracing::{debug, info, warn};
 /// mobile link.
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long an allowed client's connection may wait for room among `--max-connections` before it
+/// is turned away as busy: a burst of its commands is served as others end.
+const QUEUED_FOR: Duration = ACCEPT_HANDSHAKE_TIMEOUT;
+
 /// Deadline on the opening request, as on the handshake: a peer that says nothing is closed, and
 /// holds its permit no longer.
 const REQUEST_TIMEOUT: Duration = ACCEPT_HANDSHAKE_TIMEOUT;
@@ -408,10 +412,10 @@ impl Hosting {
     }
 }
 
-/// Where a handshake comes from, for the cap on each: an IPv4 address, or an IPv6 /48 (one site's
-/// share: a /64 a host, a site has 65k of them). None through a relay, where an address says
-/// nothing; built from nothing else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where a handshake comes from, for sharing out the room: an IPv4 address, or an IPv6 /48 (one
+/// site's share: a /64 a host, a site has 65k of them). None through a relay, where an address
+/// says nothing; built from nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SourceKey(std::net::IpAddr);
 
 impl SourceKey {
@@ -428,43 +432,41 @@ impl SourceKey {
     }
 }
 
-/// Most handshakes one address has under way at once; past them its oldest is given up.
-const PER_SOURCE: usize = 2;
-
 /// Most handshakes under way at once.
 const MOST_PENDING: usize = 256;
 
-/// The handshakes under way, oldest first, each with its address and its handle `H`: at most
-/// [`PER_SOURCE`] from one address, that address's oldest given up for a new one, and at most `N`
-/// in all, the oldest given up (one through a relay has no address, so only `N` holds it). Anyone
-/// who can reach the port can start handshakes and stall them; this way a new handshake is never
-/// refused, so an allowed client's dial, which finishes in a round trip, gets through a flood, even
-/// one from its own address (the same host, a shared NAT). They hold no connection permit, so
-/// stalled ones never keep a connection out.
+/// The handshakes under way, oldest first, each with its address and its handle `H`: at most `N`,
+/// and when all the room is taken, a new one takes the oldest of the address holding the most
+/// (those through a relay, which have no address, count as one). Anyone who can reach the port can
+/// start handshakes and stall them; this way a new handshake is never refused, and a burst from
+/// one client (an agent's parallel commands) is all let through, while a flood gives up only its
+/// own: an allowed client's dial, which finishes in a round trip, gets through it, even one from
+/// the flood's own address (the same host, a shared NAT) while the flood's are older. They hold no
+/// connection permit, so stalled ones never keep a connection out.
 struct Pending<H, const N: usize = MOST_PENDING>(Bounded<(Option<SourceKey>, H), N>);
 
 impl<H, const N: usize> Pending<H, N> {
-    /// Forget those `done`; then whether a handshake from `source` would give one up for its room.
-    fn crowded(&mut self, source: Option<SourceKey>, done: impl Fn(&H) -> bool) -> bool {
+    /// Forget those `done`; then whether a new handshake would give one up for its room.
+    fn crowded(&mut self, done: impl Fn(&H) -> bool) -> bool {
         self.0.retain(|(_, handle)| !done(handle));
-        self.0.is_full() || self.has_share(source)
+        self.0.is_full()
     }
 
-    fn has_share(&self, source: Option<SourceKey>) -> bool {
-        source.is_some() && self.0.iter().filter(|(s, _)| *s == source).count() >= PER_SOURCE
-    }
-
-    /// Room for a handshake from `source`: the one given up for it, if any, its address's oldest
-    /// when it has its share under way, else the oldest of all when all the room is taken.
-    fn room(&mut self, source: Option<SourceKey>) -> Option<H> {
-        let given_up = if self.has_share(source) {
-            self.0.take_first(|(s, _)| *s == source)
-        } else if self.0.is_full() {
-            self.0.pop_front()
-        } else {
-            None
-        };
-        given_up.map(|(_, oldest)| oldest)
+    /// Room for a handshake: the one given up for it, if any, the oldest of the address holding
+    /// the most when all the room is taken.
+    fn room(&mut self) -> Option<H> {
+        if !self.0.is_full() {
+            return None;
+        }
+        let mut held = HashMap::new();
+        for (source, _) in self.0.iter() {
+            let n = held.entry(*source).or_insert(0_usize);
+            *n = n.saturating_add(1);
+        }
+        let most = held.into_iter().max_by_key(|&(_, n)| n)?.0;
+        self.0
+            .take_first(|(source, _)| *source == most)
+            .map(|(_, oldest)| oldest)
     }
 }
 
@@ -485,6 +487,8 @@ struct Gate {
     host: Arc<Host>,
     /// One permit a connection, held for its life.
     connections: Arc<tokio::sync::Semaphore>,
+    /// One permit a connection waiting for one of `connections`, as many.
+    waiting: Arc<tokio::sync::Semaphore>,
     /// Peers turned away (not allowed, or no room), said at most every few seconds: anyone can
     /// make a new id and dial.
     turned_away: Arc<Throttle>,
@@ -492,36 +496,62 @@ struct Gate {
 
 impl Gate {
     /// Serve `conn` on a task of its own if its peer is allowed (the handshake authenticated its
-    /// id) and there is room for it; else close it saying why.
+    /// id), once there is room for it: at once, or after a wait of at most [`QUEUED_FOR`] among
+    /// at most `--max-connections` others, as a burst of a client's commands needs. Else close it
+    /// saying why.
     fn admit(self, conn: iroh::endpoint::Connection) {
         let peer = conn.remote_id();
-        let scope = self.allowed.borrow().get(&peer).cloned();
-        let why = if let Some(scope) = scope {
-            if let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "a task a connection, each holding a permit"
-                )]
-                drop(tokio::spawn(serve_connection(
-                    conn,
-                    (self.allowed, scope),
-                    self.registry,
-                    self.host,
-                    permit,
-                )));
-                return;
-            }
-            if self.turned_away.ready() {
-                warn!(peer = %peer, "refusing connection: at max-connections capacity");
-            }
-            Close::AtCapacity
-        } else {
+        let Some(scope) = self.allowed.borrow().get(&peer).cloned() else {
             if self.turned_away.ready() {
                 auth_event(Outcome::Rejected, &peer, "not on allowlist");
             }
-            Close::NotAuthorized
+            close(&conn, Close::NotAuthorized);
+            return;
         };
-        close(&conn, why);
+        // Room now, or else a place among those waiting for it.
+        let room = Arc::clone(&self.connections).try_acquire_owned().ok();
+        let place = if room.is_some() {
+            None
+        } else if let Ok(place) = Arc::clone(&self.waiting).try_acquire_owned() {
+            Some(place)
+        } else {
+            self.busy(&conn);
+            return;
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a task a connection, each holding a permit, or a place among those waiting"
+        )]
+        drop(tokio::spawn(async move {
+            let permit = if let Some(permit) = room {
+                permit
+            } else {
+                let room = Arc::clone(&self.connections).acquire_owned();
+                let waited = tokio::time::timeout(QUEUED_FOR, room).await;
+                drop(place);
+                let Ok(Ok(permit)) = waited else {
+                    self.busy(&conn);
+                    return;
+                };
+                permit
+            };
+            serve_connection(
+                conn,
+                (self.allowed, scope),
+                self.registry,
+                self.host,
+                permit,
+            )
+            .await;
+        }));
+    }
+
+    /// Turn `conn` away for want of room, saying so.
+    fn busy(&self, conn: &iroh::endpoint::Connection) {
+        if self.turned_away.ready() {
+            warn!(peer = %conn.remote_id(), "refusing connection: busy (at --max-connections, and as many waiting)");
+        }
+        close(conn, Close::Busy);
     }
 }
 
@@ -568,7 +598,7 @@ fn permitted(request: &Request, scope: &Scope, host: &Host) -> Option<Place> {
         return Some(Place::new(home, None));
     }
     let root = match request {
-        Request::Exec(_)
+        Request::Exec { .. }
         | Request::Start { .. }
         | Request::Jobs { .. }
         | Request::Logs { .. }
@@ -593,7 +623,11 @@ async fn dispatch(
 ) {
     let peer = conn.remote_id();
     match request {
-        Request::Shell { pick, size } => shell(conn, registry, (pick, size), control).await,
+        Request::Shell {
+            pick,
+            size,
+            program,
+        } => shell(conn, registry, (pick, size, program), control).await,
         Request::Sessions => {
             let mut sessions = registry.sessions(peer).await;
             sessions.truncate(MAX_LISTED);
@@ -613,7 +647,9 @@ async fn dispatch(
                 super::linger(conn).await;
             }
         }
-        Request::Exec(run) => super::exec::serve(conn, control, &run, host, place).await,
+        Request::Exec { run, together } => {
+            super::exec::serve(conn, control, (&run, together), host, place).await;
+        }
         Request::Start { name, run } => {
             let started = host.jobs.start(peer, name, &run, host, place);
             if let Ok(started) = &started {
@@ -628,9 +664,9 @@ async fn dispatch(
             });
             super::answer(conn, &jobs).await;
         }
-        Request::Logs { job, follow } => {
+        Request::Logs { job, follow, tail } => {
             if let Some(found) = host.jobs.get(peer, &job) {
-                super::jobs::logs(conn, &found, follow).await;
+                super::jobs::logs(conn, &found, (follow, tail)).await;
             } else {
                 let none: Answer<()> = Err(Problem::new(ProblemKind::NoSuchJob, &job));
                 super::answer(conn, &none).await;
@@ -672,16 +708,32 @@ async fn opening(
     }
 }
 
-/// Attach `conn`'s peer to the session `pick` names and serve it until it detaches; the rest of
-/// the client's first stream, `control`, is the session's control stream.
+/// Attach `conn`'s peer to the session `pick` names (a new one running `program`, if given) and
+/// serve it until it detaches; the rest of the client's first stream, `control`, is the
+/// session's control stream.
 async fn shell(
     conn: &iroh::endpoint::Connection,
     registry: &Registry,
-    (pick, size): (Pick, crate::terminal::Size),
+    (pick, size, program): (Pick, crate::terminal::Size, Option<crate::request::Argv>),
     control: iroh::endpoint::RecvStream,
 ) {
     let peer = conn.remote_id();
-    let (client, start, attach_kind) = match registry.attach(peer, pick, size).await {
+    // A PTY's program takes its words as text.
+    let program = match program.map(|argv| {
+        argv.words()
+            .iter()
+            .map(|word| String::from_utf8(word.clone()))
+            .collect::<Result<Arc<[String]>, _>>()
+    }) {
+        Some(Err(_)) => {
+            info!(peer = %peer, "refusing a session: its program's words are not UTF-8");
+            close(conn, Close::CouldNotStart);
+            return;
+        }
+        Some(Ok(words)) => Some(words),
+        None => None,
+    };
+    let (client, start, attach_kind) = match registry.attach(peer, pick, size, program).await {
         Ok(attached) => attached,
         Err(refused) => {
             warn!(peer = %peer, reason = %refused, "refusing session");
@@ -741,6 +793,7 @@ pub async fn serve_endpoint(
         registry: registry.clone(),
         host: Arc::clone(&host),
         connections: Arc::new(tokio::sync::Semaphore::new(hosting.max_connections)),
+        waiting: Arc::new(tokio::sync::Semaphore::new(hosting.max_connections)),
         turned_away: Arc::default(),
     };
     let mut pending: Pending<_> = Pending(Bounded::new());
@@ -761,7 +814,7 @@ pub async fn serve_endpoint(
         // When room would cost a handshake under way, an address must first show it can be
         // answered (a QUIC retry, one round trip), which a spoofed one never does: only real
         // addresses crowd out others.
-        let crowded = pending.crowded(source, tokio::task::AbortHandle::is_finished);
+        let crowded = pending.crowded(tokio::task::AbortHandle::is_finished);
         let incoming = if crowded && source.is_some() && !incoming.remote_addr_validated() {
             match incoming.retry() {
                 Ok(()) => continue,
@@ -770,9 +823,11 @@ pub async fn serve_endpoint(
         } else {
             incoming
         };
-        let given_up = pending.room(source);
+        let given_up = pending.room();
         if given_up.is_some() && flood.ready() {
-            warn!("too many handshakes in flight: giving up the oldest for new ones");
+            warn!(
+                "too many handshakes in flight: giving up the oldest of the address with the most"
+            );
         }
         given_up.iter().for_each(tokio::task::AbortHandle::abort);
         let gate = gate.clone();
@@ -862,39 +917,38 @@ mod tests {
     }
 
     #[test]
-    fn a_handshake_flood_cannot_take_an_allowed_clients_room() {
-        type Handshakes = Pending<u8, 4>;
+    fn a_burst_is_let_through_and_a_flood_gives_up_only_its_own() {
+        type Handshakes = Pending<u8, 8>;
         /// A handshake from `from`'s address, numbered `n`: the one given up for it, if any.
         /// Handshake 99, the allowed client's, finishes as soon as it is under way.
         fn begin(pending: &mut Handshakes, from: u8, n: u8) -> Option<u8> {
             let source = Some(SourceKey(std::net::IpAddr::from([203, 0, 113, from])));
-            let crowded = pending.crowded(source, |&h| h == 99);
-            let given_up = pending.room(source);
+            let crowded = pending.crowded(|&h| h == 99);
+            let given_up = pending.room();
             assert_eq!(crowded, given_up.is_some(), "{n}");
             pending.0.push_evicting((source, n));
             given_up
         }
         let mut pending = Pending(Bounded::new());
-        // One address holds only its share: a third gives up its own oldest, no one else's.
-        assert_eq!(begin(&mut pending, 1, 1), None);
-        assert_eq!(begin(&mut pending, 1, 2), None);
-        assert_eq!(begin(&mut pending, 1, 3), Some(1));
-        // Many fill the rest; then each new handshake gives up the oldest. None is refused.
-        assert_eq!(begin(&mut pending, 4, 4), None);
-        assert_eq!(begin(&mut pending, 5, 5), None);
-        for n in 6..20 {
-            assert!(begin(&mut pending, n, n).is_some());
+        // A burst from one address takes what room there is: none is given up.
+        for n in 1..=6 {
+            assert_eq!(begin(&mut pending, 1, n), None);
         }
-        // The allowed client's dial gets room, even from the flood's own address: it gives up that
-        // address's oldest stalled handshake.
-        assert!(
-            begin(&mut pending, 1, 30).is_some(),
-            "all the room was taken"
-        );
-        assert!(begin(&mut pending, 1, 31).is_some());
-        assert_eq!(begin(&mut pending, 1, 99), Some(30));
+        assert_eq!(begin(&mut pending, 2, 7), None);
+        assert_eq!(begin(&mut pending, 3, 8), None);
+        // Full, a handshake from anywhere gives up the oldest of the address holding the most.
+        assert_eq!(begin(&mut pending, 3, 9), Some(1));
+        for n in 10..40 {
+            assert!(begin(&mut pending, 1, n).is_some());
+        }
+        // The flood gave up only its own: the others' are still under way.
+        assert!(pending.0.iter().any(|&(_, n)| n == 7));
+        assert!(pending.0.iter().any(|&(_, n)| n == 8));
+        // The allowed client's dial gets room, even from the flood's own address.
+        assert!(begin(&mut pending, 1, 99).is_some());
+        assert!(pending.0.iter().any(|&(_, n)| n == 99));
         // Done, it is forgotten, and the room it took is free.
-        assert_eq!(begin(&mut pending, 1, 32), None);
+        assert_eq!(begin(&mut pending, 1, 40), None);
         assert!(pending.0.iter().all(|&(_, n)| n != 99));
     }
 }

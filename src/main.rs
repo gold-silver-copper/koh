@@ -89,7 +89,7 @@ async fn run(cmd: Cmd) -> u8 {
             } else {
                 koh::log::stderr(format_args!("koh: {e:#}"));
             }
-            if passes {
+            if passes && !koh::client::cli::busy(&e) {
                 255
             } else {
                 koh::client::cli::exit_code(&e)
@@ -134,8 +134,9 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
             remote,
             job,
             follow,
+            tail,
         } => {
-            let status = cli::logs(&resolve(remote)?, job, follow).await?;
+            let status = cli::logs(&resolve(remote)?, job, (follow, tail)).await?;
             Ok(status.filter(|_| follow))
         }
         Cmd::Kill {
@@ -149,11 +150,17 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
         Cmd::Wait {
             remote,
             wait,
+            tail,
             timeout,
             json,
-        } => cli::wait(&resolve(remote)?, (wait, timeout), format(json), &mut out)
-            .await
-            .map(Some),
+        } => cli::wait(
+            &resolve(remote)?,
+            (wait, timeout, tail),
+            format(json),
+            &mut out,
+        )
+        .await
+        .map(Some),
         Cmd::Copy {
             remote,
             job,

@@ -666,8 +666,8 @@ impl<R: Read> Receiver<'_, R> {
         match fsat::stat(dir, name.os()).map_err(io)?.map(|e| e.kind) {
             None => fsat::symlink(&link.0, dir, name.os()).map_err(io)?,
             Some(Kind::Dir) => return Err(Failure::new(FailKind::IsADirectory, &rel)),
+            // The same already: not a file, so not counted among those unchanged.
             Some(Kind::Link) if fsat::read_link(dir, name.os()).map_err(io)? == link.0 => {
-                self.summary.unchanged = self.summary.unchanged.saturating_add(1);
                 return Ok(());
             }
             Some(Kind::Link | Kind::File | Kind::Other) => {

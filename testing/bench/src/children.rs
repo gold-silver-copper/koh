@@ -229,7 +229,7 @@ fn paint(workload: &Workload, messages: &[Vec<u8>]) -> anyhow::Result<usize> {
             match shown {
                 Shown::Out(bytes) => display.output(&mut sink, &bytes)?,
                 Shown::Mark(mark) => display.mark(&mut sink, mark.as_bytes())?,
-                Shown::Report(_)
+                Shown::Report { .. }
                 | Shown::Tty(_)
                 | Shown::Echo(_)
                 | Shown::Bell(_)

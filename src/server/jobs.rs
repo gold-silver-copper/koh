@@ -1,8 +1,8 @@
 //! Jobs (`koh run`): commands with no terminal that outlive the connection that started them,
 //! their output and status kept.
 //!
-//! A job is a peer's, by name: given, or the next number. Its stdout and stderr go together into
-//! a log of at most `job_log_bytes`, the oldest dropped past it (and counted); its stdin is
+//! A job is a peer's, by name: given, or the next number. Its stdout and stderr are one pipe, so
+//! they go into its log in the order it wrote them: a log of at most `job_log_bytes`, the oldest dropped past it (and counted); its stdin is
 //! `/dev/null`. It runs until it exits, is signalled (`koh kill`), or the server stops, which
 //! hangs it up. A job that ended is kept, with its log and status, until its name is used again,
 //! room is needed for a new one, or the session TTL has passed since it ended.
@@ -73,6 +73,30 @@ impl Log {
         (skipped, rest.get(..max.min(rest.len())).unwrap_or_default())
     }
 
+    /// Where its last `lines` lines begin (counted from the job's first byte), and how many lines
+    /// of what is kept go before them. A last line with no newline yet is one.
+    fn tail(&self, lines: u32) -> (u64, u64) {
+        let body = self.kept.strip_suffix(b"\n").unwrap_or(&self.kept);
+        // Just past the newline that ends the line before them.
+        let from = match lines.checked_sub(1) {
+            None => self.kept.len(),
+            Some(newer) => body
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|&(_, &b)| b == b'\n')
+                .nth(usize::try_from(newer).unwrap_or(usize::MAX))
+                .map_or(0, |(at, _)| at.saturating_add(1)),
+        };
+        let before = self.kept.get(..from).unwrap_or_default();
+        let before = before.split(|&b| b == b'\n').skip(1).count();
+        (
+            self.dropped()
+                .saturating_add(u64::try_from(from).unwrap_or(u64::MAX)),
+            u64::try_from(before).unwrap_or(u64::MAX),
+        )
+    }
+
     /// Whether `text` is in what is kept from byte `from` on.
     fn find(&self, text: &[u8], from: u64) -> bool {
         let (_, rest) = self.read(from, usize::MAX);
@@ -132,6 +156,15 @@ impl Job {
             output_bytes: status.written,
             dropped_bytes: dropped,
         }
+    }
+
+    /// The seconds it ran, or has run so far.
+    fn secs(&self) -> u64 {
+        let ended = self.ended.lock().ok().and_then(|e| *e);
+        ended
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(self.started)
+            .as_secs()
     }
 
     fn running(&self) -> bool {
@@ -243,7 +276,8 @@ impl Jobs {
                 None => return Err(Problem::new(ProblemKind::TooManyJobs, "")),
             }
         }
-        let (process, _, stdout, stderr) = super::exec::spawn(run, host, place, false)?;
+        // One pipe for both: the log holds them in the order the job wrote them.
+        let (process, _, output, _) = super::exec::spawn(run, host, place, (false, true))?;
         let (signals, signals_rx) = mpsc::channel(4);
         let job = Arc::new(Job {
             name: name.clone(),
@@ -265,7 +299,7 @@ impl Jobs {
         tokio::spawn(runner(
             job,
             process,
-            (stdout, stderr),
+            output,
             signals_rx,
             host.shutdown.clone(),
         ));
@@ -290,12 +324,12 @@ impl Jobs {
 async fn runner(
     job: Arc<Job>,
     mut process: super::exec::Process,
-    (mut stdout, mut stderr): (tokio::process::ChildStdout, tokio::process::ChildStderr),
+    mut output: super::exec::Output,
     mut signals: mpsc::Receiver<Signal>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    let (mut out_buf, mut err_buf) = (vec![0u8; 16 * 1024], vec![0u8; 16 * 1024]);
-    let (mut out_done, mut err_done) = (false, false);
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut done = false;
     let mut exit: Option<(u32, Instant)> = None;
     let append = |bytes: &[u8]| {
         if let Ok(mut log) = job.log.lock() {
@@ -306,18 +340,14 @@ async fn runner(
     };
     let code = loop {
         if let Some((code, at)) = exit {
-            if (out_done && err_done) || at.elapsed() >= DRAINED {
+            if done || at.elapsed() >= DRAINED {
                 break code;
             }
         }
         tokio::select! {
-            read = stdout.read(&mut out_buf), if !out_done => match read {
-                Ok(n) if n > 0 => append(out_buf.get(..n).unwrap_or_default()),
-                Ok(_) | Err(_) => out_done = true,
-            },
-            read = stderr.read(&mut err_buf), if !err_done => match read {
-                Ok(n) if n > 0 => append(err_buf.get(..n).unwrap_or_default()),
-                Ok(_) | Err(_) => err_done = true,
+            read = output.read(&mut buf), if !done => match read {
+                Ok(n) if n > 0 => append(buf.get(..n).unwrap_or_default()),
+                Ok(_) | Err(_) => done = true,
             },
             Some(signal) = signals.recv() => process.signal(match signal {
                 Signal::Term => fuxix::process::Signal::Term,
@@ -341,13 +371,23 @@ async fn runner(
     job.status.send_modify(|s| s.exit = Some(code));
 }
 
-/// Send `job`'s log on a stream of `conn`'s: what is kept, then, if `follow`, what it writes
-/// until it ends; then the end. The connection's end stops it.
-pub async fn logs(conn: &iroh::endpoint::Connection, job: &Job, follow: bool) {
+/// Send `job`'s log on a stream of `conn`'s: what is kept (its last `tail` lines, if given), then,
+/// if `follow`, what it writes until it ends; then the end. The connection's end stops it.
+pub async fn logs(
+    conn: &iroh::endpoint::Connection,
+    job: &Job,
+    (follow, tail): (bool, Option<u32>),
+) {
     let sent = async {
         let mut send = conn.open_uni().await?;
         let mut status = job.watch();
-        let mut at: u64 = 0;
+        let (mut at, cut) = match (tail, job.log.lock()) {
+            (Some(lines), Ok(log)) => log.tail(lines),
+            (None, _) | (_, Err(_)) => (0, 0),
+        };
+        if cut > 0 {
+            send_msg(&mut send, &LogMsg::Cut(cut)).await?;
+        }
         loop {
             let now = *status.borrow_and_update();
             // What is there to send now, a chunk at a time.
@@ -369,12 +409,16 @@ pub async fn logs(conn: &iroh::endpoint::Connection, job: &Job, follow: bool) {
                 at = at.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
                 send_msg(&mut send, &LogMsg::Data(chunk)).await?;
             }
-            if now.exit.is_some() && at >= now.written {
-                send_msg(&mut send, &LogMsg::End(now.exit)).await?;
-                break;
-            }
-            if !follow {
-                send_msg(&mut send, &LogMsg::End(None)).await?;
+            if (now.exit.is_some() && at >= now.written) || !follow {
+                let exit = now.exit.filter(|_| at >= now.written);
+                send_msg(
+                    &mut send,
+                    &LogMsg::End {
+                        exit,
+                        secs: job.secs(),
+                    },
+                )
+                .await?;
                 break;
             }
             tokio::select! {
@@ -417,5 +461,23 @@ mod tests {
         assert!(!log.find(b"012", 0), "dropped");
         assert!(!log.find(b"cde", 15), "before where the search starts");
         assert_eq!(log.read(21, 10), (0, &b""[..]));
+    }
+
+    #[test]
+    fn a_tail_starts_where_its_lines_do_and_counts_those_before() {
+        let mut log = Log {
+            budget: 100,
+            ..Log::default()
+        };
+        log.append(b"one\ntwo\nthree\n");
+        assert_eq!(log.tail(1), (8, 2));
+        assert_eq!(log.tail(2), (4, 1));
+        assert_eq!(log.tail(3), (0, 0));
+        assert_eq!(log.tail(9), (0, 0));
+        assert_eq!(log.tail(0), (14, 3));
+        // A line still being written is the last.
+        log.append(b"fo");
+        assert_eq!(log.tail(1), (14, 3));
+        assert_eq!(log.read(14, 10), (0, &b"fo"[..]));
     }
 }

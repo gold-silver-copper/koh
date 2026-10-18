@@ -31,7 +31,7 @@ The same server runs commands and jobs, and copies files, with no shell session 
 koh exec laptop -- make test          # its stdout and stderr apart; koh exits with its status
 git diff | koh exec laptop -C src/app -- git apply
 koh run laptop --name build -- cargo build   # a job: it outlives koh and the link
-koh wait laptop build                 # until it ends; exits with its status
+koh wait laptop build                 # until it ends: its last lines, then its status
 koh cp -r ./site laptop:              # a tree into the server user's home, as a sync
 koh cp laptop:notes.md laptop:todo .  # back here, into the current directory
 ```
@@ -53,13 +53,17 @@ koh serve                 # host shells, commands, jobs and copies for the saved
                           # (--allow <id> adds one for this run)
 koh connect <name|id>     # a shell there: your session attached last, else a new one
 koh connect <name> --new  # a new session beside your others; --session N picks one by number
+koh connect <name> -- PROG ARG...  # a new session running PROG on a terminal in place of the
+                          # shell (an editor, a debugger, a TUI); ends with its status
 koh sessions <name>       # your sessions: number, attached or not, age, size, what its program
                           # is doing (reading, busy, ...), the last command's status, title
 koh output <name> --session N [--last]  # a session's screen, or its last command's output
 koh exec <name> -- PROG ARG...  # run PROG with no terminal, each word as it is (no shell), and
                           # exit with its status; --sh 'LINE' runs a shell line; -C DIR
 koh run <name> [--name N] -- PROG ARG...  # start a job; koh jobs, logs, wait and kill find it
-koh wait <name> JOB       # until the job ends (--text T, --file PATH; --session N [--reading])
+koh wait <name> JOB       # until the job ends, then its last 200 lines (--tail N); or --text T,
+                          # --file PATH; --session N [--reading]
+koh logs <name> JOB       # its last 200 lines (--tail N, --all; --follow), then whether it runs
 koh cp SRC... <name>:DST  # copy files and trees there, or `koh cp <name>:SRC... DST` back
 koh key info              # show both identity key files and their endpoint ids
 koh key reset [client|server] --yes  # delete a key (client by default); the next use makes a new id
@@ -94,7 +98,7 @@ half-written that looks complete, and the next copy resumes the part. A file wri
 time it arrived (so `make` and `cargo` see it changed) unless `-p` keeps the source's. `dir/.`
 copies what is in `dir`. `--delete` removes what the source does not have, `--exclude PAT`
 leaves entries alone, and `--atomic` lands nothing until the whole copy came. It ends with one
-line saying where it landed: `3 files, 41 KB → laptop:proj/src (2 replaced, 120 unchanged)`, or
+line saying where it landed: `3 files sent, 41 KB → laptop:proj/src (1 new, 2 replaced; 120 unchanged)`, or
 `--json`. A tree is not nested in a directory of its own name that is there already (`koh cp -r
 src laptop:src` run twice, which `cp` would land as `src/src`): `src/.` brings it into line. A
 source given on the command line is followed if it is a symlink, as `cp` does; symlinks inside a tree are copied
@@ -103,8 +107,10 @@ so. Remote paths are taken as the server user's shell would take them, but not g
 remote shell runs.
 
 **Exit codes** are the same for every command: 0 ok, 1 failed, 2 usage, 3 the server was not
-reached, 4 refused (not allowed, or out of the key's scope), 124 a wait timed out. `exec`,
-`wait` and `logs --follow` exit with the remote command's status, and 255 on koh's own errors,
+reached, 4 refused (not allowed, or out of the key's scope), 75 the server was busy (more
+connections at once than `--max-connections`, and as many waiting: nothing ran, so a retry is
+safe), 124 a wait timed out. `exec`, `wait` and `logs --follow` exit with the remote command's
+status (75 too when busy), and 255 on koh's other errors,
 as ssh does; `exec` exits 127 when there is no such program and 126 when it could not start
 (no `-C` directory there, say).
 
@@ -141,8 +147,10 @@ Save a server with how to reach it, once, and every command dialing its name use
 koh servers add box <server-id> --direct 192.168.1.20:4433   # or --relay-url URL
 ```
 
-Run a command: its stdout, stderr and exit status come back as a local command's would. A koh
-killed or cut off hangs the command up (within 20 s when killed outright).
+Run a command: its stdout, stderr and exit status come back as a local command's would, and sent
+to one file (`2>&1`, or a terminal) its stdout and stderr keep the order it wrote them in. A koh
+stopped by a signal hangs the command up at once; one killed outright (SIGKILL) or cut off,
+within 10 s.
 
 ```sh
 koh exec box -- cargo test -j 4
@@ -154,7 +162,8 @@ Start something that should outlive the call, and wait for it on the server:
 ```sh
 koh run box --name srv -- python3 -m http.server 8000
 koh wait box srv --text 'Serving HTTP' --timeout 30
-koh logs box srv                      # its output so far; --follow until it ends
+koh logs box srv                      # its last 200 lines so far, then `· running 12s`;
+                                      # --follow until it ends
 koh kill box srv
 ```
 

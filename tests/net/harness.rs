@@ -207,7 +207,7 @@ impl Client {
         let id = endpoint.id();
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server));
         let channel = connector
-            .connect(koh::request::Pick::Latest, Size::new(24, 80))
+            .connect(koh::request::Pick::Latest, Size::new(24, 80), None)
             .await?;
         let first = channel.conn.clone();
         let size = Arc::new(Mutex::new(Size::new(24, 80)));

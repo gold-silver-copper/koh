@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/6 client.
+//! loopback iroh with a minimal koh/7 client.
 #![forbid(clippy::disallowed_methods)]
 
 use std::collections::HashMap;
@@ -170,7 +170,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-/// A bare koh/6 client: writes messages, applies frames whose base it holds, and acks them.
+/// A bare koh/7 client: writes messages, applies frames whose base it holds, and acks them.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,

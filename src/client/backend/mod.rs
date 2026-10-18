@@ -193,6 +193,32 @@ pub trait KohBackend {
         self.write_bytes(b"\x1b]8;;\x1b\\")
     }
 
+    /// Mark the cursor's row, the cursor in its first column, as where a prompt starts
+    /// (`OSC 133 ; A`).
+    fn prompt_starts(&mut self) -> io::Result<()> {
+        self.write_bytes(b"\x1b]133;A\x07")
+    }
+
+    /// Unmark the cursor's row as a prompt's, blanking it: deleted and a blank one inserted in its
+    /// place (DL, IL), the rows below put back as they were. A terminal's mark goes only with its
+    /// row.
+    fn blank_row(&mut self) -> io::Result<()> {
+        self.write_bytes(b"\x1b[M\x1b[L")
+    }
+
+    /// Say a command's output starts at the cursor (`OSC 133 ; C`).
+    fn command_starts(&mut self) -> io::Result<()> {
+        self.write_bytes(b"\x1b]133;C\x07")
+    }
+
+    /// Say the command ends at the cursor (`OSC 133 ; D`), with its status if known.
+    fn command_ends(&mut self, status: Option<i32>) -> io::Result<()> {
+        match status {
+            Some(status) => write!(self, "\x1b]133;D;{status}\x07"),
+            None => self.write_bytes(b"\x1b]133;D\x07"),
+        }
+    }
+
     /// Ring the terminal bell (BEL).
     fn bell(&mut self) -> io::Result<()> {
         self.write_bytes(b"\x07")

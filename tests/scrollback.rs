@@ -127,7 +127,7 @@ impl Pair {
         let (shown, want) = (view.screen(), truth.screen());
         for row in 0..want.size().rows {
             if shown.row(row) != want.row(row)
-                || shown.row_wrapped(row) != want.row_wrapped(row)
+                || shown.row_flags(row) != want.row_flags(row)
                 || shown.row_links(row) != want.row_links(row)
             {
                 return Err(format!(

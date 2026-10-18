@@ -696,7 +696,7 @@ mod tests {
         use crate::terminal::{CellKind, CellText, HistoryRow, Run, WireCell, WireColor};
         let row = |name: u64| HistoryRow {
             name,
-            wrapped: false,
+            flags: crate::terminal::RowFlags::default(),
             runs: vec![Run {
                 count: std::num::NonZeroU16::new(width).unwrap(),
                 cell: WireCell {

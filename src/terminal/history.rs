@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use super::grid::{exactly, Palette, RowLinks, Uses};
 use super::{
-    cells_of, link_bytes, runs_of, Run, WireLink, DIM, MAX_DIM, MAX_LINK_BYTES, MAX_ROW_LINKS,
+    cells_of, link_bytes, runs_of, RowFlags, Run, WireLink, DIM, MAX_DIM, MAX_LINK_BYTES,
+    MAX_ROW_LINKS,
 };
 
 /// Most rows one [`HistoryRequest`] asks for, and one reply carries.
@@ -88,12 +89,12 @@ impl HistoryRequest {
     }
 }
 
-/// One history row on the wire: its name, its cells as runs (its width is theirs: a history row
-/// keeps the width it had), and its links.
+/// One history row on the wire: its name, its flags, its cells as runs (its width is theirs: a
+/// history row keeps the width it had), and its links.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryRow {
     pub name: u64,
-    pub wrapped: bool,
+    pub flags: RowFlags,
     #[serde(deserialize_with = "crate::bounded::at_most::<{ super::DIM }, _, _>")]
     pub runs: Vec<Run>,
     #[serde(deserialize_with = "crate::bounded::at_most::<{ super::MAX_ROW_LINKS }, _, _>")]
@@ -235,7 +236,7 @@ impl HistoryNames {
             let (runs, wire_links) = runs_of(&row_cells, row_links.as_deref());
             out.push(HistoryRow {
                 name,
-                wrapped: row.wrapped(),
+                flags: RowFlags::of(Some(&row)),
                 runs,
                 links: wire_links,
             });
@@ -252,7 +253,7 @@ impl HistoryNames {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeptRow {
     pub cells: Arc<Cells>,
-    pub wrapped: bool,
+    pub flags: RowFlags,
     pub links: Option<Arc<RowLinks>>,
 }
 
@@ -429,7 +430,7 @@ impl HistoryCache {
                 row.name,
                 KeptRow {
                     cells: Arc::new(decoded),
-                    wrapped: row.wrapped,
+                    flags: row.flags,
                     links: row_links,
                 },
             ));
@@ -465,14 +466,14 @@ impl HistoryCache {
         Some(kept.len())
     }
 
-    /// The row named `name` as a screen row of `cols` cells, with its wrap flag and links.
+    /// The row named `name` as a screen row of `cols` cells, with its flags and links.
     pub fn screen_row(
         &self,
         name: u64,
         cols: u16,
-    ) -> Option<(Arc<Cells>, bool, Option<Arc<RowLinks>>)> {
+    ) -> Option<(Arc<Cells>, RowFlags, Option<Arc<RowLinks>>)> {
         let row = self.rows.get(&name)?;
-        Some((row.fitted(cols), row.wrapped, row.links_fitted(cols)))
+        Some((row.fitted(cols), row.flags, row.links_fitted(cols)))
     }
 }
 
@@ -606,7 +607,10 @@ mod tests {
         };
         let row = HistoryRow {
             name: u64::MAX,
-            wrapped: true,
+            flags: RowFlags {
+                wrapped: true,
+                prompt: true,
+            },
             runs: vec![run; (MAX_HISTORY_CELLS + DIM).div_euclid(HISTORY_ROWS)],
             links: vec![link; MAX_ROW_LINKS],
         };
@@ -648,7 +652,7 @@ mod tests {
     fn row(name: u64, width: u16) -> HistoryRow {
         HistoryRow {
             name,
-            wrapped: false,
+            flags: RowFlags::default(),
             runs: vec![Run {
                 count: NonZeroU16::new(width).unwrap(),
                 cell: WireCell {
@@ -796,7 +800,7 @@ mod tests {
         cells.set(3, CellRef::wide_continuation());
         let kept = KeptRow {
             cells: Arc::new(cells),
-            wrapped: false,
+            flags: RowFlags::default(),
             links: None,
         };
         let cut = kept.fitted(3);

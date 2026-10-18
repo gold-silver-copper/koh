@@ -1,4 +1,4 @@
-//! Hostile peers on koh/6, both directions.
+//! Hostile peers on koh/7, both directions.
 //!
 //! A malicious client (admitted, so on the allowlist) throws malformed and oversized traffic at a
 //! real server; a malicious server throws it at a real client. Neither may crash or hang the
@@ -27,7 +27,7 @@ fn net() -> FaultNet {
 }
 
 /// Connect to `server` as `secret`, wait for its first frame, which admits it, and keep the
-/// endpoint alive; the caller then speaks koh/6 by hand.
+/// endpoint alive; the caller then speaks koh/7 by hand.
 async fn admitted(
     net: &FaultNet,
     secret: SecretKey,

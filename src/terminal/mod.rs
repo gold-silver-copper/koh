@@ -1,5 +1,7 @@
-//! The screen the server sends: a [`Grid`] of rows stored as [`Cells`], which the server's emulator
-//! ([`ServerTerminal`]) produces, plus the title, icon, clipboard, bell count and exit code.
+//! The screen the server sends: a [`Grid`] of rows stored as [`Cells`], and its side channels.
+//!
+//! The server's emulator ([`ServerTerminal`]) produces the grid, the title, icon, clipboard, bell
+//! count, exit code and the shell's commands ([`Commands`]).
 //!
 //! A [`ScreenDiff`] carries the changed rows as run-length-encoded cells, the cursor and the modes.
 //! The client validates and copies cells; it never runs a terminal parser on server bytes.
@@ -17,10 +19,12 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 mod grid;
 mod history;
+mod marks;
 mod server;
 
 pub use crate::predict::{Size, TtyModes};
 pub use grid::{Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
+pub use marks::{Commands, Place, RowFlags};
 
 /// What the integration tests check the client's screen against: not koh's API.
 #[doc(hidden)]
@@ -69,8 +73,8 @@ pub const MAX_RUN_TEXT: usize = 4 * MAX_DIM as usize;
 /// their place while it is kept; an entry not used by the newest dictionary goes.
 #[derive(Debug, Default)]
 pub struct RowEncodings {
-    /// By the address of the row's cells (held, so not reused): the row's cells, wrap flag and
-    /// links, and its encoding without its index.
+    /// By the address of the row's cells (held, so not reused): the row's cells, flags and links,
+    /// and its encoding without its index.
     kept: HashMap<usize, RowEncoding>,
     /// The entries the dictionary being built used, moved from `kept` or made: the next `kept`.
     next: HashMap<usize, RowEncoding>,
@@ -84,9 +88,9 @@ struct RowEncoding {
                   entry is keyed by"
     )]
     cells: Arc<Cells>,
-    wrapped: bool,
+    flags: RowFlags,
     links: Option<Arc<RowLinks>>,
-    /// The row's wrap flag, runs and links as [`RowDiff`] encodes them after its index.
+    /// The row's flags, runs and links as [`RowDiff`] encodes them after its index.
     bytes: Vec<u8>,
 }
 
@@ -95,7 +99,7 @@ impl RowEncodings {
     fn append(
         &mut self,
         row: u16,
-        (cells, wrapped, links): (Arc<Cells>, bool, Option<Arc<RowLinks>>),
+        (cells, flags, links): (Arc<Cells>, RowFlags, Option<Arc<RowLinks>>),
         out: &mut Vec<u8>,
     ) {
         let Ok(index) = postcard::to_extend(&row, std::mem::take(out)) else {
@@ -108,19 +112,19 @@ impl RowEncodings {
             .remove(&key)
             .or_else(|| self.kept.remove(&key))
             .filter(|kept| {
-                kept.wrapped == wrapped
+                kept.flags == flags
                     && kept.links.as_ref().map(Arc::as_ptr) == links.as_ref().map(Arc::as_ptr)
             });
         let encoding = if let Some(kept) = hit {
             kept
         } else {
             let (runs, wire_links) = runs_of(&cells, links.as_deref());
-            let Ok(bytes) = postcard::to_allocvec(&(wrapped, runs, wire_links)) else {
+            let Ok(bytes) = postcard::to_allocvec(&(flags, runs, wire_links)) else {
                 return;
             };
             RowEncoding {
                 cells,
-                wrapped,
+                flags,
                 links,
                 bytes,
             }
@@ -192,6 +196,8 @@ pub struct TerminalScreen {
     history: HistoryMark,
     /// How the PTY takes typed keys, if known.
     tty: Option<TtyModes>,
+    /// What the shell's marks say of its commands.
+    commands: Commands,
 }
 
 impl TerminalScreen {
@@ -250,6 +256,11 @@ impl TerminalScreen {
         self.tty
     }
 
+    /// What the shell's marks say of its commands, placed on this screen.
+    pub const fn commands(&self) -> Commands {
+        self.commands
+    }
+
     /// This screen scrolled `offset` rows back into the history `cache` holds part of: the
     /// history rows above its top, then its own rows, the top `rows` of them shown. A row not held
     /// is blank. The cursor is hidden, and mouse reporting on, so the wheel can scroll.
@@ -275,9 +286,9 @@ impl TerminalScreen {
                     .ok()
                     .and_then(|from| self.grid.row_parts(from))
             };
-            let (cells, wrapped, links) =
-                shown.unwrap_or_else(|| (Arc::clone(&blank), false, None));
-            grid.set_row(row, cells, wrapped, links);
+            let (cells, flags, links) =
+                shown.unwrap_or_else(|| (Arc::clone(&blank), RowFlags::default(), None));
+            grid.set_row(row, cells, flags, links);
         }
         grid.set_modes(Modes {
             hide_cursor: true,
@@ -287,6 +298,7 @@ impl TerminalScreen {
         });
         Self {
             grid,
+            commands: self.commands.scrolled(offset, size),
             ..self.clone()
         }
     }
@@ -337,6 +349,7 @@ impl TerminalScreen {
             exit_code: self.exit_code,
             history: None,
             tty: None,
+            commands: Some(self.commands),
             cursor: self.grid.cursor_position(),
             modes: self.grid.modes().into(),
             shifts: Shifts::default(),
@@ -826,7 +839,7 @@ impl TryFrom<RawLink> for WireLink {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowDiff {
     pub row: u16,
-    pub wrapped: bool,
+    pub flags: RowFlags,
     #[serde(deserialize_with = "crate::bounded::at_most::<DIM, _, _>")]
     pub runs: Vec<Run>,
     /// The row's distinct hyperlinks, at most [`MAX_ROW_LINKS`].
@@ -841,7 +854,7 @@ impl RowDiff {
     fn of(
         row: u16,
         cells: &Cells,
-        wrapped: bool,
+        flags: RowFlags,
         links: Option<&RowLinks>,
         budget: &mut usize,
         dropped: &mut bool,
@@ -858,7 +871,7 @@ impl RowDiff {
         let (runs, links) = runs_of(cells, links);
         Self {
             row,
-            wrapped,
+            flags,
             runs,
             links,
         }
@@ -1294,6 +1307,8 @@ pub struct ScreenDiff {
     pub history: Option<HistoryMark>,
     /// How the PTY takes typed keys, if that changed.
     pub tty: Option<TtyModes>,
+    /// What the shell's marks say of its commands, if that changed.
+    pub commands: Option<Commands>,
     /// The cursor at the target state.
     pub cursor: (u16, u16),
     /// The modes at the target state.
@@ -1352,10 +1367,10 @@ impl TerminalScreen {
         let mut budget = MAX_LINK_BYTES;
         let changed = (0..rows).filter_map(|r| {
             let cells = self.grid.row(r)?;
-            let wrapped = self.grid.row_wrapped(r);
+            let flags = self.grid.row_flags(r);
             // A row shared with the base is the same without comparing its cells.
             let same = if resized {
-                !wrapped && cells.iter().all(is_blank)
+                flags == RowFlags::default() && cells.iter().all(is_blank)
             } else {
                 self.grid.same_row(r, base_grid, r)
             };
@@ -1363,7 +1378,7 @@ impl TerminalScreen {
                 RowDiff::of(
                     r,
                     cells,
-                    wrapped,
+                    flags,
                     self.grid.row_links(r),
                     &mut budget,
                     dropped,
@@ -1379,6 +1394,7 @@ impl TerminalScreen {
             exit_code: self.exit_code,
             history: (self.history != base.history).then_some(self.history),
             tty: self.tty.filter(|_| self.tty != base.tty),
+            commands: (self.commands != base.commands).then_some(self.commands),
             cursor: self.grid.cursor_position(),
             modes: self.grid.modes().into(),
             shifts,
@@ -1417,7 +1433,7 @@ impl TerminalScreen {
         // Only the rows the diff carries are replaced; the rest stay shared with the base.
         for (row, (cells, links)) in diff.rows.iter().zip(staged) {
             self.grid
-                .set_row(row.row, Arc::new(cells), row.wrapped, links);
+                .set_row(row.row, Arc::new(cells), row.flags, links);
         }
         let (crow, ccol) = diff.cursor;
         self.grid
@@ -1439,6 +1455,11 @@ impl TerminalScreen {
         self.exit_code = diff.exit_code.or(self.exit_code);
         self.history = diff.history.unwrap_or(self.history);
         self.tty = diff.tty.or(self.tty);
+        if let Some(commands) = diff.commands {
+            self.commands = commands;
+        }
+        // Within the screen, as the cursor: the server's places are anything.
+        self.commands = self.commands.within(Size { rows, cols });
         Ok(())
     }
 }
@@ -1491,7 +1512,7 @@ mod tests {
         use proptest::prelude::*;
         (
             0u16..40,
-            any::<bool>(),
+            any::<(bool, bool)>(),
             proptest::collection::vec(
                 (1u16..120, wire_cell()).prop_map(|(count, cell)| Run {
                     count: NonZeroU16::new(count).unwrap(),
@@ -1504,9 +1525,9 @@ mod tests {
                 0..4,
             ),
         )
-            .prop_map(|(row, wrapped, runs, links)| RowDiff {
+            .prop_map(|(row, (wrapped, prompt), runs, links)| RowDiff {
                 row,
-                wrapped,
+                flags: RowFlags { wrapped, prompt },
                 runs,
                 links,
             })
@@ -1571,8 +1592,14 @@ mod tests {
             };
             let resize = resize.map(|(rows, cols)| Size::new(rows, cols));
             let diff = ScreenDiff {
-                resize, title, icon, clipboard, bell_count, exit_code, history: None, tty: None, cursor, modes,
-                shifts, rows,
+                resize, title, icon, clipboard, bell_count, exit_code, history: None, tty: None,
+                commands: Some(Commands {
+                    finished: 1,
+                    status: Some(-1),
+                    output: Some(((u16::MAX, u16::MAX), cursor)),
+                    running: Some(cursor),
+                }),
+                cursor, modes, shifts, rows,
             };
             let mut screen = TerminalScreen::default();
             let _ = screen.apply(&diff); // must not panic on adversarial input
@@ -1584,6 +1611,12 @@ mod tests {
             }
             let (crow, ccol) = screen.screen().cursor_position();
             proptest::prop_assert!(crow < rows && ccol <= cols);
+            // The shell's places too, a hostile server's past the screen's edge.
+            let commands = screen.commands();
+            let places = commands.output.into_iter().flat_map(<[_; 2]>::from).chain(commands.running);
+            for (row, col) in places {
+                proptest::prop_assert!(row < rows && col <= cols);
+            }
             proptest::prop_assert!(screen.title.chars().count() <= MAX_TITLE_LEN);
             proptest::prop_assert!(screen.icon.chars().count() <= MAX_TITLE_LEN);
             proptest::prop_assert!(screen.clipboard.len() <= MAXIMUM_CLIPBOARD_SIZE);
@@ -1861,6 +1894,7 @@ mod tests {
         exit_code: Option<u32>,
         history: Option<(u64, u32)>,
         tty: Option<(bool, bool)>,
+        commands: Option<Commands>,
         cursor: (u16, u16),
         modes: RawModes,
         shifts: Vec<RawShift>,
@@ -1888,7 +1922,7 @@ mod tests {
     #[derive(Clone, Serialize)]
     struct RawRow {
         row: u16,
-        wrapped: bool,
+        flags: u8,
         runs: Vec<RawRun>,
         links: Vec<(String, String)>,
     }
@@ -1921,6 +1955,12 @@ mod tests {
             exit_code: None,
             history: None,
             tty: None,
+            commands: Some(Commands {
+                finished: 1,
+                status: Some(-2),
+                output: None,
+                running: Some((1, 1)),
+            }),
             cursor: (0, 0),
             modes: RawModes {
                 hide_cursor: false,
@@ -1934,7 +1974,7 @@ mod tests {
             shifts: Vec::new(),
             rows: vec![RawRow {
                 row: 0,
-                wrapped: false,
+                flags: 3,
                 runs: vec![RawRun {
                     count: 2,
                     cell: RawCell {
@@ -1965,7 +2005,8 @@ mod tests {
         screen.apply(&good).unwrap();
         assert_eq!(screen.size(), Size::new(2, 2));
         assert_eq!(screen.screen().cell(0, 1).map(|c| c.contents()), Some("x"));
-        let mutations: [fn(&mut RawDiff); 14] = [
+        let mutations: [fn(&mut RawDiff); 15] = [
+            |d| d.rows[0].flags = 4,         // an unknown row flag
             |d| d.rows[0].runs[0].count = 0, // empty run
             |d| d.rows[0].runs[0].cell.text = "x".repeat(fux_vt::CLUSTER_CAPACITY + 1),
             |d| d.rows[0].runs[0].cell.text = "\x1b".to_owned(), // an escape for the terminal

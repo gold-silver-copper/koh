@@ -151,6 +151,7 @@ fn window_state(screen: &TerminalScreen) -> WindowState<'_> {
         icon: screen.icon(),
         clipboard: screen.clipboard(),
         bell_count: screen.bell_count(),
+        commands: screen.commands(),
     }
 }
 
@@ -196,8 +197,9 @@ pub trait ClientTerminal {
         Ok(())
     }
 
-    /// The run's first frame arrived, showing `win`: the clipboard and bells in it are from before
-    /// the client came. Default: a no-op, for a terminal that mirrors neither.
+    /// The run's first frame arrived, showing `win`, and is painted next: the clipboard, bells and
+    /// ended commands in it are from before the client came. Default: a no-op, for a terminal that
+    /// mirrors none of them.
     fn prime(&mut self, _win: WindowState<'_>) {}
 }
 
@@ -313,8 +315,13 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
             state.screen().modes().mouse_mode,
             window_state(state),
         )?;
-        self.painter
-            .render(&mut self.backend, state.screen(), overlay, status)
+        self.painter.render(
+            &mut self.backend,
+            state.screen(),
+            state.commands(),
+            overlay,
+            status,
+        )
     }
 
     fn size(&self) -> std::io::Result<Size> {
@@ -343,6 +350,7 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
 
     fn prime(&mut self, win: WindowState<'_>) {
         self.oob.prime(win);
+        self.painter.prime(win.commands);
     }
 
     fn suspend(&mut self) -> std::io::Result<bool> {
@@ -460,17 +468,21 @@ pub async fn run_client<T: ClientTerminal>(
 
         // Repaint on new content, or when the status line says something else.
         if session.dirty || tick.status != shown_status {
+            // Only once synced: the first synced frame primes the mirroring before it is painted,
+            // so bells, a clipboard and commands ended from before this attach reach none of it.
+            if session.synced() {
+                term.prime(session.window_state());
+            }
             match session.view() {
                 Some(view) => term.render(&view, &Overlay::default(), tick.status.as_deref())?,
                 None => term.render(session.state(), &session.overlay(), tick.status.as_deref())?,
             }
             shown_status = tick.status;
             session.dirty = false;
-            // Only once synced: the first synced frame primes the hook and the mirroring, so bells
-            // and a clipboard from before this attach reach neither.
+            // Only once synced: the first synced frame primes the hook, so bells from before this
+            // attach do not fire it.
             if session.synced() {
                 let win = session.window_state();
-                term.prime(win);
                 if let Some(hook) = bell.as_mut() {
                     hook.prime(win.bell_count);
                     if hook.observe(win.bell_count, now) {

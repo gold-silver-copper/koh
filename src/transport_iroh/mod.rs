@@ -48,7 +48,7 @@ fn koh_transport_config(accept: bool) -> QuicTransportConfig {
 const CLIENT_ACK_DELAY: Duration = Duration::from_millis(2);
 
 /// The protocol's name and version ([`crate::proto`]), its ALPN.
-pub const PROTOCOL: &str = "koh/6";
+pub const PROTOCOL: &str = "koh/7";
 
 /// The ALPN, [`PROTOCOL`]: a peer on another fails the TLS handshake instead of misparsing
 /// mid-session.

@@ -1,4 +1,4 @@
-//! The koh/6 wire protocol.
+//! The koh/7 wire protocol.
 //!
 //! The client opens one uni stream and writes [`ClientMsg`]s on it, each a 4-byte
 //! big-endian length followed by its postcard encoding. The server sends every screen update as a

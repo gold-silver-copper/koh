@@ -25,7 +25,7 @@ service.
 ## Attacker models
 
 1. **Malicious / compromised client** — a peer that dials the server. If it is on the allowlist it
-   reaches the koh/6 data plane: it sends arbitrary input, resize, ack and resync messages and opens
+   reaches the koh/7 data plane: it sends arbitrary input, resize, ack and resync messages and opens
    streams. Input comes as decoded events (`Keys`: keys, mouse events, focus changes, whole
    pastes); decoding refuses what no terminal sends (a modifier bit no key has, a function key past
    F12, a kitty code that is no Unicode scalar, a paste over 1 MiB, more than 512 events, more than

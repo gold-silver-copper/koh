@@ -3,12 +3,16 @@
 //! scrolls the terminal where rows only moved, paints only the cells that changed, emits SGR only
 //! when the style changes, and is wrapped in synchronized output (DEC 2026), with autowrap off, so
 //! it shows at once and nothing it paints can wrap or scroll.
+//!
+//! The shell's marks (OSC 133) are the screen's too, and painted with it: a row that starts a
+//! prompt is marked where it is painted, and a command's start and end are told once each, at
+//! their places on what was painted ([`Commands`]).
 
 use std::io;
 
 use super::backend::{KohBackend, OscText};
 use crate::predict::Overlay;
-use crate::terminal::{Grid, Link, Size, MAXIMUM_CLIPBOARD_SIZE};
+use crate::terminal::{Commands, Grid, Link, Place, Size, MAXIMUM_CLIPBOARD_SIZE};
 use fux_vt::{Attributes, CellRef, Color, MouseProtocolMode};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
@@ -23,13 +27,42 @@ use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 /// A frame is painted whole, on a cleared terminal, when the terminal may not show what was
 /// painted: the first frame, after [`invalidate`](Self::invalidate) (a resume, a window resize),
 /// and when the screen's or the terminal's size changed.
+///
+/// A row that starts a prompt is marked (`OSC 133 ; A`) as it comes to show one, and a row that no
+/// longer does is blanked before it is painted, which takes its mark away. Once the run's first
+/// frame came ([`prime`](Self::prime)), the shell's commands are told too, after the rows: a start
+/// (`C`) where the running command's output starts, again wherever that moves on what was painted,
+/// and an end (`D;status`) once for each frame whose screen counts commands ended since the last,
+/// with the start and the end of the last one's output.
 #[derive(Default)]
 pub(super) struct Painter {
     last: Option<Painted>,
+    /// What the terminal was told of the shell's commands: `None` before the run's first frame,
+    /// whose commands are not news.
+    told: Option<Told>,
     /// Whether the terminal draws underline styles (`4:n`); if not, they are painted plain.
     underline_styles: bool,
     /// Whether hyperlinks are painted (OSC 8); if not, their text is painted plain.
     hyperlinks: bool,
+}
+
+/// What the terminal was told of the shell's commands.
+#[derive(Clone, Copy, Debug)]
+struct Told {
+    /// The count of commands ended, as the screen last told it.
+    finished: u64,
+    running: Running,
+}
+
+/// Whether the terminal was told a command runs, and where its output starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Running {
+    No,
+    /// A command runs, its output told to start here.
+    At(Place),
+    /// A command runs, its start told at a place the terminal may no longer have where it was told
+    /// (it was painted whole, scrolled or had a row blanked since): told again.
+    Lost,
 }
 
 /// A frame as it was painted.
@@ -99,6 +132,12 @@ fn status_cells(line: &str, cols: u16) -> Vec<&str> {
 }
 
 impl<'a> View<'a> {
+    /// Whether row `row` shows the start of a prompt: the grid's row does, and no status line
+    /// covers it.
+    fn prompt(&self, row: u16) -> bool {
+        self.grid.row_prompt(row) && !self.status_on(row)
+    }
+
     /// The status line's glyph at `(row, col)`, if it covers that cell.
     fn status_at(&self, row: u16, col: u16) -> Option<&'a str> {
         (row.checked_add(1) == Some(self.terminal.rows))
@@ -223,8 +262,8 @@ impl Scroll {
 /// The terminal scrolls that move the rows of the first `height` rows of `painted` where `screen`
 /// has them: the moves [`Grid::moves_from`] finds, the longest first, each kept only if its region
 /// overlaps none kept before, so the scrolls can run one after another. A row that moved is moved
-/// even where painting it in place would write less, so that what the terminal keeps of a row
-/// moves with it.
+/// even where painting it in place would write less, so that what the terminal keeps of a row (the
+/// shell's marks on it) moves with it.
 fn scrolls(screen: &Grid, painted: &Grid, height: u16) -> Vec<Scroll> {
     let mut moves = screen.moves_from(painted, height);
     moves.sort_by_key(|shift| std::cmp::Reverse(shift.len));
@@ -318,17 +357,42 @@ impl Painter {
         }
     }
 
-    /// Forget what was painted: the next frame is painted whole.
+    /// Forget what was painted: the next frame is painted whole, and tells again where the
+    /// running command's output starts.
     pub(super) fn invalidate(&mut self) {
         self.last = None;
+        self.moved();
+    }
+
+    /// The terminal's rows moved or went: where the running command's output starts is told
+    /// again.
+    fn moved(&mut self) {
+        if let Some(Told {
+            running: running @ Running::At(_),
+            ..
+        }) = &mut self.told
+        {
+            *running = Running::Lost;
+        }
+    }
+
+    /// The run's first frame arrived, with `commands`: the commands it counts ended before the
+    /// client came, and are not told. One it shows running is.
+    pub(super) fn prime(&mut self, commands: Commands) {
+        self.told.get_or_insert(Told {
+            finished: commands.finished,
+            running: Running::No,
+        });
     }
 
     /// Paint `screen` with the predictions `overlay` and an optional `status` line (reverse video,
-    /// on the terminal's last row), on the terminal as large as `backend` says now.
+    /// on the terminal's last row), on the terminal as large as `backend` says now, and tell what
+    /// `commands`, the shell's on that screen, say that is news.
     pub(super) fn render(
         &mut self,
         backend: &mut impl KohBackend,
         screen: &Grid,
+        commands: Commands,
         overlay: &Overlay,
         status: Option<&str>,
     ) -> io::Result<()> {
@@ -374,9 +438,11 @@ impl Painter {
         backend.begin_frame()?;
         if before.is_none() {
             backend.clear()?;
+            self.moved();
         }
         let mut style: Option<Attributes> = None;
         if !scrolls.is_empty() {
+            self.moved();
             // Rows scrolled in take the current background: the default one.
             backend.reset_sgr()?;
             style = Some(Attributes::default());
@@ -391,10 +457,26 @@ impl Painter {
         let mut cursor: Option<(u16, u16)> = None;
         // The glyph printed last, which the next one printed with no cursor move follows.
         let mut printed: Option<&str> = None;
+        // The rows that came to start a prompt, marked once painted.
+        let mut prompts = Vec::new();
         for row in 0..terminal.rows {
-            let shows = shown_at(row);
+            let mut shows = shown_at(row);
             if shows.is_some_and(|(before, from)| now.same_row(row, before, from)) {
                 continue;
+            }
+            let marked = shows.is_some_and(|(before, from)| before.prompt(from));
+            if marked && !now.prompt(row) {
+                // Only a row's going takes its mark: it goes blank, and is painted as from blank.
+                if style != Some(Attributes::default()) {
+                    backend.reset_sgr()?;
+                    style = Some(Attributes::default());
+                }
+                backend.move_to(row, 0)?;
+                backend.blank_row()?;
+                (shows, cursor, printed) = (None, None, None);
+                self.moved();
+            } else if now.prompt(row) && !marked {
+                prompts.push(row);
             }
             let was = |col| shows.map_or(BLANK, |(before, from)| before.paint(from, col));
             let mut col = 0;
@@ -447,6 +529,7 @@ impl Painter {
         if style.is_some() {
             backend.reset_sgr()?;
         }
+        self.tell(backend, screen, commands, (terminal, &prompts))?;
 
         // The predicted cursor wins; one off the terminal is not shown.
         let (row, col) = overlay.cursor().unwrap_or_else(|| screen.cursor_position());
@@ -464,6 +547,56 @@ impl Painter {
         });
         backend.flush()
     }
+
+    /// Mark the rows `prompts`, which came to start a prompt, and tell what `commands` say that
+    /// the terminal was not told, on a terminal `terminal` large showing `screen`: the ends of the
+    /// commands counted since, as one, at the start and end of the last one's output, before the
+    /// prompts (which follow them), and where the running one's output starts, after them.
+    fn tell(
+        &mut self,
+        backend: &mut impl KohBackend,
+        screen: &Grid,
+        commands: Commands,
+        (terminal, prompts): (Size, &[u16]),
+    ) -> io::Result<()> {
+        let edge = |n: u16| n.saturating_sub(1);
+        let move_to = |backend: &mut _, (row, col): Place| {
+            KohBackend::move_to(
+                backend,
+                row.min(edge(terminal.rows)),
+                col.min(edge(terminal.cols)),
+            )
+        };
+        if let Some(told) = &mut self.told {
+            if commands.finished > told.finished {
+                let (start, end) = commands.output.unwrap_or_default();
+                move_to(backend, start)?;
+                backend.command_starts()?;
+                move_to(backend, end)?;
+                backend.command_ends(commands.status)?;
+                told.running = Running::No;
+            } else if commands.running.is_none() && told.running != Running::No {
+                // It ended uncounted: another shell's count, or a reset terminal.
+                move_to(backend, screen.cursor_position())?;
+                backend.command_ends(None)?;
+                told.running = Running::No;
+            }
+            // A count that fell is a new shell's.
+            told.finished = commands.finished;
+        }
+        for &row in prompts {
+            backend.move_to(row, 0)?;
+            backend.prompt_starts()?;
+        }
+        if let (Some(told), Some(start)) = (&mut self.told, commands.running) {
+            if told.running != Running::At(start) {
+                move_to(backend, start)?;
+                backend.command_starts()?;
+                told.running = Running::At(start);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether `s` is non-empty base64, as a clipboard set must be to be forwarded.
@@ -473,13 +606,15 @@ fn is_base64_payload(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
 }
 
-/// The window state the client mirrors beside the grid: title, icon, clipboard and bell count.
+/// The window state the client mirrors beside the grid: title, icon, clipboard, bell count and
+/// the shell's commands.
 #[derive(Clone, Copy)]
 pub struct WindowState<'a> {
     pub title: &'a str,
     pub icon: &'a str,
     pub clipboard: &'a str,
     pub bell_count: u64,
+    pub commands: Commands,
 }
 
 /// The input modes the real terminal is kept in, so the client receives the input it decodes, set
@@ -692,7 +827,32 @@ mod tests {
             ..CaptureBackend::default()
         };
         painter
-            .render(&mut backend, screen, overlay, status)
+            .render(&mut backend, screen, Commands::default(), overlay, status)
+            .unwrap();
+        String::from_utf8(backend.bytes).unwrap()
+    }
+
+    /// Paint one frame of `screen`, its grid and the shell's commands, with `painter` on a
+    /// terminal of `size`, and return the bytes.
+    fn paint_told(
+        painter: &mut Painter,
+        size: Size,
+        screen: &TerminalScreen,
+        overlay: &Overlay,
+        status: Option<&str>,
+    ) -> String {
+        let mut backend = CaptureBackend {
+            size,
+            ..CaptureBackend::default()
+        };
+        painter
+            .render(
+                &mut backend,
+                screen.screen(),
+                screen.commands(),
+                overlay,
+                status,
+            )
             .unwrap();
         String::from_utf8(backend.bytes).unwrap()
     }
@@ -982,7 +1142,9 @@ mod tests {
         featured(
             rows,
             cols,
-            fux_vt::Options::new().with(fux_vt::Feature::Hyperlinks),
+            fux_vt::Options::new()
+                .with(fux_vt::Feature::Hyperlinks)
+                .with(fux_vt::Feature::PromptMarks),
         )
     }
 
@@ -1180,7 +1342,7 @@ mod tests {
         let mut diff = base.diff_from(&base);
         diff.rows = vec![RowDiff {
             row,
-            wrapped: false,
+            flags: crate::terminal::RowFlags::default(),
             runs: vec![
                 Run {
                     count: std::num::NonZeroU16::new(19).unwrap(),
@@ -1351,11 +1513,72 @@ mod tests {
         }
     }
 
+    /// A command's end is told once: not for one that ended before the run's first frame, as one
+    /// for two that ended between frames (with the last one's status and output), not again on a
+    /// repaint or a reattach to the same shell, nor for a new shell's lower count; a command told
+    /// running that a new shell does not run is ended, with no status.
+    #[test]
+    fn a_commands_end_is_told_once() {
+        let mut terminal = linking_terminal(SMALL.rows, SMALL.cols);
+        let mut painter = Painter::default();
+        let mut paint = |painter: &mut Painter, screen: &TerminalScreen| {
+            let painted = paint_told(painter, SMALL, screen, &Overlay::default(), None);
+            terminal.process(painted.as_bytes()).unwrap();
+            let told = terminal.screen().commands();
+            let place = |mark| place_of(&terminal, mark);
+            (told, told.last_output.map(|(a, b)| (place(a), place(b))))
+        };
+        let shell = |bytes: &[u8]| {
+            let mut emu = crate::terminal::ServerTerminal::new(SMALL.rows, SMALL.cols, 0).unwrap();
+            emu.process(bytes);
+            emu
+        };
+        let mut emu = shell(b"\x1b]133;A\x07$ old\x1b]133;C\x07\r\nold\r\n\x1b]133;D;3\x07");
+        let first = emu.snapshot();
+        painter.prime(first.commands());
+        assert_eq!(paint(&mut painter, &first).0.finished, 0, "ended before");
+
+        emu.process(b"\x1b]133;A\x07$ a\x1b]133;C\x07\r\na\r\n\x1b]133;D;1\x07");
+        emu.process(b"\x1b]133;A\x07$ b\x1b]133;C\x07\r\nb\r\n\x1b]133;D;2\x07\x1b]133;A\x07$ ");
+        let two = emu.snapshot();
+        let (told, output) = paint(&mut painter, &two);
+        assert_eq!((told.finished, told.last_status), (1, Some(2)));
+        let (start, end) = two.commands().output.unwrap();
+        assert_eq!(
+            output,
+            Some((Some(start), Some(end))),
+            "the last one's output"
+        );
+        painter.invalidate();
+        assert_eq!(paint(&mut painter, &two).0.finished, 1, "a repaint");
+        assert_eq!(
+            paint(&mut painter, &two).0.finished,
+            1,
+            "the same shell again"
+        );
+
+        // A new shell, its count lower, runs a command; then another, which runs none.
+        let (told, _) = paint(
+            &mut painter,
+            &shell(b"\x1b]133;A\x07$ \x1b]133;C\x07").snapshot(),
+        );
+        assert_eq!((told.finished, told.running()), (1, true));
+        let (told, _) = paint(&mut painter, &shell(b"\x1b]133;A\x07$ ").snapshot());
+        assert_eq!(
+            (told.finished, told.last_status, told.running()),
+            (2, None, false)
+        );
+    }
+
     /// Output that exercises what a frame can change: text, wide glyphs, combining marks, clusters
     /// (a ZWJ family, a flag, a heart a variation selector widens), colours and every attribute,
     /// cursor motion, erasing, scrolling (the whole screen and in a region, up and down),
-    /// inserting and deleting lines, wrapping, hyperlinks.
-    const PIECES: [&str; 38] = [
+    /// inserting and deleting lines, wrapping, hyperlinks, a shell's marks.
+    const PIECES: [&str; 42] = [
+        "\x1b]133;A\x07",
+        "\x1b]133;C\x07",
+        "\x1b]133;D;1\x07",
+        "\x1b]133;D;0\x07",
         "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
         "\u{1f1fa}\u{1f1f8}",
         "\u{2764}\u{fe0f}",
@@ -1410,12 +1633,15 @@ mod tests {
     /// its link.
     type Look = (String, bool, bool, fux_vt::Attributes, Option<String>);
 
-    /// The cells and cursor a terminal shows. A printed space shows what an erased cell of its
-    /// attributes does, the blank a whole repaint prints and a scroll brings in, so it counts as
-    /// one.
-    fn shown(terminal: &fux_vt::Parser) -> (Vec<Option<Look>>, (u16, u16)) {
+    /// The cells and cursor a terminal shows, and the rows it has marked as a prompt's start. A
+    /// printed space shows what an erased cell of its attributes does, the blank a whole repaint
+    /// prints and a scroll brings in, so it counts as one.
+    fn shown(terminal: &fux_vt::Parser) -> (Vec<Option<Look>>, (u16, u16), Vec<u16>) {
         let screen = terminal.screen();
         let (rows, cols) = screen.size().into();
+        let prompts = (0..rows)
+            .filter(|&row| screen.window().row(row).is_some_and(|r| r.starts_prompt()))
+            .collect();
         let cells = (0..rows)
             .flat_map(|row| (0..cols).map(move |col| (row, col)))
             .map(|(row, col)| {
@@ -1435,7 +1661,16 @@ mod tests {
                 })
             })
             .collect();
-        (cells, screen.cursor_position())
+        (cells, screen.cursor_position(), prompts)
+    }
+
+    /// Where `terminal` has `mark`, on its screen.
+    fn place_of(terminal: &fux_vt::Parser, mark: fux_vt::CommandMark) -> Option<(u16, u16)> {
+        let screen = terminal.screen();
+        let row = screen
+            .row_index(mark.row)?
+            .checked_sub(screen.history_len())?;
+        Some((u16::try_from(row).ok()?, mark.col))
     }
 
     proptest::proptest! {
@@ -1443,7 +1678,9 @@ mod tests {
 
         /// A terminal fed only what changed shows, after every frame, exactly what a terminal fed
         /// every frame whole shows: on a terminal the screen's size, a larger one and a smaller
-        /// one.
+        /// one. Its prompt marks are the screen's rows', and what it was told of the shell's
+        /// commands is what the screen says: one end for each frame that counts commands ended,
+        /// with the last one's status, and the running one's start where the screen has it.
         #[test]
         fn painting_what_changed_shows_what_painting_everything_shows(
             steps in proptest::collection::vec(
@@ -1460,8 +1697,12 @@ mod tests {
             let mut emu = crate::terminal::ServerTerminal::new(SMALL.rows, SMALL.cols, 0).unwrap();
             let mut painter = Painter::default();
             painter.set_hyperlinks(true);
+            painter.prime(Commands::default());
             let mut incremental = linking_terminal(size.rows, size.cols);
             let mut whole = linking_terminal(size.rows, size.cols);
+            // The frames that counted commands ended, and the status the last one said.
+            let (mut ends, mut status_told) = (0_u64, None);
+            let mut finished = 0;
             for (pieces, status, predictions, covering) in steps {
                 for piece in pieces {
                     emu.process(PIECES[piece].as_bytes());
@@ -1476,13 +1717,37 @@ mod tests {
                     None,
                 );
                 let status = status.map(|status| STATUSES[status]);
-                let changed = paint_at(&mut painter, size, screen.screen(), &overlay, status);
+                let changed = paint_told(&mut painter, size, &screen, &overlay, status);
                 let mut fresh = Painter::default();
                 fresh.set_hyperlinks(true);
                 let everything = paint_at(&mut fresh, size, screen.screen(), &overlay, status);
                 incremental.process(changed.as_bytes()).unwrap();
                 whole.process(everything.as_bytes()).unwrap();
-                proptest::prop_assert_eq!(shown(&incremental), shown(&whole));
+                let shows = shown(&incremental);
+                proptest::prop_assert_eq!(&shows, &shown(&whole));
+                // The screen's prompts, as far as the terminal shows them, and no other, whatever
+                // was predicted.
+                let grid = screen.screen();
+                let prompts: Vec<u16> = (0..size.rows.min(grid.size().rows))
+                    .filter(|&row| grid.row_prompt(row))
+                    .filter(|&row| status.is_none() || row.checked_add(1) != Some(size.rows))
+                    .collect();
+                proptest::prop_assert_eq!(&shows.2, &prompts);
+                let commands = screen.commands();
+                if commands.finished > finished {
+                    (ends, status_told) = (ends.saturating_add(1), commands.status);
+                }
+                finished = commands.finished;
+                let told = incremental.screen().commands();
+                proptest::prop_assert_eq!(told.finished, ends);
+                proptest::prop_assert_eq!(told.last_status, status_told);
+                let edge = |(row, col): (u16, u16)| {
+                    (row.min(size.rows.saturating_sub(1)), col.min(size.cols.saturating_sub(1)))
+                };
+                proptest::prop_assert_eq!(
+                    told.output_start.and_then(|start| place_of(&incremental, start)),
+                    commands.running.map(edge)
+                );
             }
         }
     }
@@ -1494,6 +1759,7 @@ mod tests {
             icon,
             clipboard,
             bell_count: bell,
+            commands: Commands::default(),
         }
     }
 

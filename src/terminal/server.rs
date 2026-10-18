@@ -4,7 +4,7 @@
 use crate::terminal::grid::{Palette, RowCache};
 use crate::terminal::history::HistoryNames;
 use crate::terminal::{
-    Grid, HistoryMark, HistoryReply, HistoryRequest, Size, TerminalScreen, TtyModes,
+    Commands, Grid, HistoryMark, HistoryReply, HistoryRequest, Size, TerminalScreen, TtyModes,
     MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
 };
 use std::time::{Duration, Instant};
@@ -121,10 +121,13 @@ pub const IDENTITY: fux_vt::Identity = fux_vt::Identity {
 ///   kitty's keys from any terminal;
 /// - colour scheme updates (mode 2031): a program that subscribes hears when the user's terminal
 ///   reports a new scheme;
+/// - the shell's marks (OSC 133): each row, history's too, says whether a prompt starts on it,
+///   and the screen what the marks say of the shell's commands, so the client marks what it
+///   paints for the user's terminal;
 /// - koh's [`IDENTITY`].
 ///
-/// Left off: prompt marks (koh does not carry them in its history); rectangle checksums (a
-/// program reading back its screen, which xterm refuses by default).
+/// Left off: rectangle checksums (a program reading back its screen, which xterm refuses by
+/// default).
 pub const OPTIONS: Options = Options::new()
     .with(fux_vt::Feature::KittyKeyboard)
     .with(fux_vt::Feature::ColorSchemeUpdates)
@@ -136,6 +139,7 @@ pub const OPTIONS: Options = Options::new()
     .with(fux_vt::Feature::Reflow)
     .with(fux_vt::Feature::SettingReports)
     .with(fux_vt::Feature::Hyperlinks)
+    .with(fux_vt::Feature::PromptMarks)
     .with_identity(Some(IDENTITY));
 
 /// The server's terminal: the live parser, and the [`TerminalScreen`] snapshots it sends.
@@ -319,11 +323,11 @@ impl ServerTerminal {
     /// client's scrollback view at `offset` must show. For tests.
     pub fn window(&self, offset: usize) -> TerminalScreen {
         let grid = Grid::window_of(self.parser.screen(), offset);
-        self.screen(grid, HistoryMark::default())
+        self.screen(grid, HistoryMark::default(), Commands::default())
     }
 
-    /// `grid` and `history` with the side channels and modes as they are now.
-    fn screen(&self, grid: Grid, history: HistoryMark) -> TerminalScreen {
+    /// `grid`, `history` and `commands` with the side channels and modes as they are now.
+    fn screen(&self, grid: Grid, history: HistoryMark, commands: Commands) -> TerminalScreen {
         TerminalScreen {
             grid,
             title: self.observed.title.clone(),
@@ -333,6 +337,7 @@ impl ServerTerminal {
             exit_code: self.exit_code,
             history,
             tty: self.tty,
+            commands,
         }
     }
 
@@ -362,7 +367,8 @@ impl ServerTerminal {
         }
         let grid = Grid::of(self.parser.screen(), palette, &mut self.rows);
         let history = self.names.mark(self.parser.screen());
-        self.screen(grid, history)
+        let commands = Commands::of(self.parser.screen(), |id| self.rows.index_of(id));
+        self.screen(grid, history, commands)
     }
 }
 
@@ -763,6 +769,46 @@ mod tests {
         let snapshot = t.snapshot();
         let cell = snapshot.screen().cell(0, 0).expect("a cell");
         assert_eq!(cell.underline_style(), fux_vt::UnderlineStyle::Curly);
+    }
+
+    /// A prompt's mark changes no row's version, yet reaches the next snapshot, the client's
+    /// screen and the history; the shell's commands are placed on the screen, at its top left
+    /// once their row went into history.
+    #[test]
+    fn the_shells_marks_reach_the_snapshot_the_client_and_the_history() {
+        let mut t = ServerTerminal::new(4, 20, 1 << 20).expect("emulator");
+        t.process(b"$ ");
+        let before = t.snapshot();
+        // `P` marks the row the cursor is on, written already, with no fresh line.
+        t.process(b"\x1b]133;P\x07");
+        let marked = t.snapshot();
+        assert!(!before.screen().row_prompt(0) && marked.screen().row_prompt(0));
+        let mut client = before.clone();
+        client.apply(&marked.diff_from(&before)).expect("applies");
+        assert_eq!(client, marked);
+
+        t.process(b"ls\x1b]133;C\x07\r\nout\r\n\x1b]133;D;2\x07\x1b]133;A\x07$ \x1b]133;C\x07");
+        let commands = t.snapshot().commands();
+        assert_eq!(
+            (commands.finished, commands.status),
+            (1, Some(2)),
+            "{commands:?}"
+        );
+        assert_eq!(commands.output, Some(((0, 4), (2, 0))));
+        assert_eq!(commands.running, Some((2, 2)));
+        // Scrolled off: the first prompt's row is history, the running output's start too.
+        t.process(b"\r\n1\r\n2\r\n3\r\n4");
+        let scrolled = t.snapshot();
+        assert_eq!(scrolled.commands().running, Some((0, 0)));
+        assert_eq!(scrolled.commands().output, Some(((0, 0), (0, 0))));
+        let mark = scrolled.history();
+        let reply = t.history(HistoryRequest {
+            id: 0,
+            newest: mark.newest,
+            count: 4,
+        });
+        let prompts: Vec<bool> = reply.rows.iter().map(|row| row.flags.prompt).collect();
+        assert_eq!(prompts, [true, false, true]);
     }
 
     #[test]

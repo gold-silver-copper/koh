@@ -1,4 +1,4 @@
-//! The koh/6 encoding.
+//! The koh/7 encoding.
 //!
 //! Messages built here by hand from the wire types, both ways, are pinned: the expected bytes were
 //! captured by running the encoder, and a change to the wire must change them in the same commit,
@@ -16,9 +16,10 @@ use koh::proto::{
     ClientMsg, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg,
 };
 use koh::terminal::{
-    CellKind, CellText, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, RowDiff,
-    RowEncodings, Run, ScreenDiff, ServerTerminal, Shift, Shifts, Size, TerminalScreen, TtyModes,
-    WireCell, WireColor, WireLink, WireModes, WireMouseEncoding, WireMouseMode, WireStyle,
+    CellKind, CellText, Commands, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, RowDiff,
+    RowEncodings, RowFlags, Run, ScreenDiff, ServerTerminal, Shift, Shifts, Size, TerminalScreen,
+    TtyModes, WireCell, WireColor, WireLink, WireModes, WireMouseEncoding, WireMouseMode,
+    WireStyle,
 };
 use std::num::{NonZeroI16, NonZeroU16};
 
@@ -35,10 +36,10 @@ fn decode_frame(stream: &[u8], screen: &TerminalScreen) -> Option<Frame> {
 /// Terminal output exercising every part of a cell and of the side channels: runs, wide glyphs
 /// and their continuations, a combining mark, a cluster too long to keep inline, every colour kind
 /// on both layers and as an underline's colour, every style bit and both blinks, curly, double and
-/// dashed underlines, a hyperlink, a soft wrap, the
+/// dashed underlines, a hyperlink, a soft wrap, a prompt's mark and a command's, the
 /// title, icon, clipboard, bell and the input modes.
 const OUTPUT: &[u8] = "\x1b]2;the title\x07\x1b]1;the icon\x07\x1b]52;c;aGVsbG8=\x07\x07\x07\
-    aaaa日本e\u{301}  \r\n\
+    \x1b]133;A\x07\x1b]133;C\x07aaaa日本e\u{301}  \r\n\x1b]133;D;2\x07\
     \x1b[31mr\x1b[92mg\x1b[38;5;200mp\x1b[38;2;1;2;3mt\x1b[39m\
     \x1b[44mR\x1b[103mG\x1b[48;5;100mP\x1b[48;2;4;5;6mT\x1b[m\r\n\
     \x1b[1mB\x1b[m\x1b[2mD\x1b[m\x1b[3mI\x1b[m\x1b[4mU\x1b[m\x1b[7mV\x1b[m\
@@ -243,7 +244,10 @@ fn wire_row(row: u16) -> Option<RowDiff> {
     let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
     Some(RowDiff {
         row,
-        wrapped: true,
+        flags: RowFlags {
+            wrapped: true,
+            prompt: true,
+        },
         runs: vec![
             run(
                 3,
@@ -283,6 +287,12 @@ fn wire_frames() -> Option<Vec<Frame>> {
                 echo: true,
                 line: false,
             }),
+            commands: Some(Commands {
+                finished: 300,
+                status: Some(-1),
+                output: Some(((0, 0), (2, 7))),
+                running: Some((2, 3)),
+            }),
             cursor: (1, 2),
             modes: WireModes {
                 hide_cursor: true,
@@ -309,6 +319,7 @@ fn wire_frames() -> Option<Vec<Frame>> {
             exit_code: None,
             history: None,
             tty: None,
+            commands: None,
             shifts: Shifts::new(vec![Shift {
                 top: 1,
                 len: NonZeroU16::new(2)?,
@@ -316,7 +327,7 @@ fn wire_frames() -> Option<Vec<Frame>> {
             }])?,
             rows: vec![RowDiff {
                 row: 2,
-                wrapped: false,
+                flags: RowFlags::default(),
                 runs: vec![run(8, cell(" ", CellKind::Narrow, WireColor::Default, 0))?],
                 links: Vec::new(),
             }],
@@ -334,13 +345,16 @@ fn wire_history() -> Option<HistoryReply> {
         rows: vec![
             HistoryRow {
                 name: 69_999,
-                wrapped: true,
+                flags: RowFlags {
+                    wrapped: true,
+                    prompt: true,
+                },
                 runs,
                 links,
             },
             HistoryRow {
                 name: 70_000,
-                wrapped: false,
+                flags: RowFlags::default(),
                 runs: vec![run(2, cell("z", CellKind::Narrow, WireColor::Idx(9), 0))?],
                 links: Vec::new(),
             },
@@ -403,23 +417,23 @@ const CLIENT_MSGS: [&str; 8] = [
 const FRAMES: [(&str, &str); 2] = [
     (
         "ac020081010103080109746865207469746c6501087468652069636f6e010461476b3d02010301f0a2040201\
-        010001020100010103020000020001050303616263030101000001000103e697a5040000000000010365cc81\
-        000201020301c8020708098808010119f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6010000\
-        0000000100020000000000011468747470733a2f2f6b6f682e6578616d706c652f016b020105030361626303\
-        0101000001000103e697a5040000000000010365cc81000201020301c8020708098808010119f09f91a8e280\
-        8df09f91a9e2808df09f91a7e2808df09f91a60100000000000100020000000000011468747470733a2f2f6b\
-        6f682e6578616d706c652f016b",
+        010001ac020101010000020701020301020100010103020000020003050303616263030101000001000103e6\
+        97a5040000000000010365cc81000201020301c8020708098808010119f09f91a8e2808df09f91a9e2808df0\
+        9f91a7e2808df09f91a60100000000000100020000000000011468747470733a2f2f6b6f682e6578616d706c\
+        652f016b0203050303616263030101000001000103e697a5040000000000010365cc81000201020301c80207\
+        08098808010119f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6010000000000010002000000\
+        0000011468747470733a2f2f6b6f682e6578616d706c652f016b",
         "0000020002",
     ),
     (
-        "ad02ac0282010000000002000000010201000101030200010102010102000108012000000000000000",
+        "ad02ac028201000000000200000000010201000101030200010102010102000108012000000000000000",
         "00ac020102",
     ),
 ];
 
 /// [`wire_history`].
 const HISTORY: &str =
-    "ac0202efa20401050303616263030101000001000103e697a5040000000000010365cc81000201020301c802\
+    "ac0202efa20403050303616263030101000001000103e697a5040000000000010365cc81000201020301c802\
         0708098808010119f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a60100000000000100020000\
         000000011468747470733a2f2f6b6f682e6578616d706c652f016bf0a204000102017a0001090000000000";
 
@@ -453,7 +467,7 @@ fn frames_and_history_round_trip_through_their_streams() {
 
 /// The protocol these bytes are pinned for. A change to them is a new protocol: bump the ALPN
 /// (`koh::transport_iroh::ALPN`) and this with it.
-const PINNED_FOR: &[u8] = b"koh/6";
+const PINNED_FOR: &[u8] = b"koh/7";
 
 #[test]
 fn client_messages_encode_as_pinned() {

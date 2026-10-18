@@ -29,7 +29,7 @@ use koh::proto::{
     decode_server, encode_client, ClientDecoder, ClientMsg, Frame, FrameEncoder, FrameNum,
     InputSeq, ServerMsg,
 };
-use koh::terminal::{FrameHold, Modes, ServerTerminal, Size, TerminalScreen, FRAME_HOLD};
+use koh::terminal::{Commands, FrameHold, Modes, ServerTerminal, Size, TerminalScreen, FRAME_HOLD};
 use recording::Recording;
 
 /// The scrollback a server keeps by default (`koh serve --scrollback-bytes`), in bytes.
@@ -103,12 +103,15 @@ impl fux_vt::Sink for Said {
     }
 }
 
-/// What a screen shows: its size, every cell, whether the cursor is hidden and where it is, its
-/// modes, and what it was told beside the grid.
+/// What a screen shows: its size, every cell, the rows that start a prompt, whether the cursor is
+/// hidden and where it is, its modes, whether a shell's command runs, and what it was told beside
+/// the grid.
 #[derive(Clone, Debug, PartialEq)]
 struct View {
     size: (u16, u16),
     cells: Vec<Option<Look>>,
+    prompts: Vec<u16>,
+    running: bool,
     hidden: bool,
     cursor: (u16, u16),
     modes: Modes,
@@ -146,9 +149,14 @@ impl View {
                 })
             })
             .collect();
+        let window = screen.window();
         Self {
             size: screen.size().into(),
             cells,
+            prompts: (0..rows)
+                .filter(|&row| window.row(row).is_some_and(|r| r.starts_prompt()))
+                .collect(),
+            running: screen.commands().running(),
             hidden: !screen.mode(fux_vt::Mode::ShowCursor),
             cursor: screen.cursor_position(),
             modes: Modes {
@@ -177,6 +185,18 @@ impl View {
                     "cell ({row:?}, {col:?}): shown {a:?}, expected {b:?}"
                 ));
             }
+        }
+        if shown.prompts != self.prompts {
+            return Some(format!(
+                "prompts on rows {:?}, expected {:?}",
+                shown.prompts, self.prompts
+            ));
+        }
+        if shown.running != self.running {
+            return Some(format!(
+                "a command running {}, expected {}",
+                shown.running, self.running
+            ));
         }
         if shown.hidden != self.hidden {
             return Some(format!(
@@ -299,6 +319,7 @@ impl Session {
                     icon: "",
                     clipboard: "",
                     bell_count: 0,
+                    commands: Commands::default(),
                 });
                 terminal
             },
@@ -309,7 +330,8 @@ impl Session {
                 0,
                 fux_vt::Options::new()
                     .with(fux_vt::Feature::Hyperlinks)
-                    .with(fux_vt::Feature::Events),
+                    .with(fux_vt::Feature::Events)
+                    .with(fux_vt::Feature::PromptMarks),
             )
             .map_err(|e| e.to_string())?,
             shown_said: Said::default(),

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use fux_vt::{Attributes, CellRef, Cells, Color, MouseProtocolEncoding, MouseProtocolMode, RowId};
 
-use super::{Shift, Shifts, MAX_SHIFTS};
+use super::{RowFlags, Shift, Shifts, MAX_SHIFTS};
 use crate::predict::{ScreenView, Size};
 
 /// The terminal modes the client mirrors onto the real terminal (or draws with).
@@ -128,11 +128,12 @@ impl RowLinks {
 }
 
 /// One row of a [`Grid`]: its cells with their text, shared by every screen that holds the row
-/// unchanged, whether it soft-wraps into the next, and its cells' links.
+/// unchanged, its flags (whether it soft-wraps into the next, whether a prompt starts on it), and
+/// its cells' links.
 #[derive(Clone, Debug)]
 struct Row {
     cells: Arc<Cells>,
-    wrapped: bool,
+    flags: RowFlags,
     links: Option<Arc<RowLinks>>,
 }
 
@@ -141,7 +142,7 @@ impl Row {
     fn of(row: Option<&fux_vt::Row<'_>>, cols: u16, palette: Option<&Palette>) -> Self {
         Self {
             cells: exactly(row, cols, palette),
-            wrapped: row.is_some_and(fux_vt::Row::wrapped),
+            flags: RowFlags::of(row),
             links: row.and_then(|row| RowLinks::of(row, cols)),
         }
     }
@@ -150,7 +151,7 @@ impl Row {
     fn blank(cols: u16) -> Self {
         Self {
             cells: Arc::new(Cells::new(usize::from(cols))),
-            wrapped: false,
+            flags: RowFlags::default(),
             links: None,
         }
     }
@@ -168,7 +169,7 @@ impl Row {
 
 impl PartialEq for Row {
     fn eq(&self, other: &Self) -> bool {
-        self.wrapped == other.wrapped
+        self.flags == other.flags
             && self.links == other.links
             && (self.shares(other) || self.cells == other.cells)
     }
@@ -303,6 +304,12 @@ impl RowCache {
         self.palette.as_ref()
     }
 
+    /// Where the last snapshot took the row `id`, if it took it.
+    pub(super) fn index_of(&self, id: RowId) -> Option<u16> {
+        let at = self.ids.iter().position(|(row, _)| *row == id)?;
+        u16::try_from(at).ok()
+    }
+
     /// The cached row for the live row `live` at `index`, if it is what it holds: its own row
     /// found by id (at the same index, else by `by_id`, built on first need), at the cached version
     /// or, at another version, with the same cells and no links.
@@ -336,14 +343,15 @@ impl RowCache {
     }
 
     /// Whether the live rows `rows` are exactly the cached ones: the same ids, at the same
-    /// versions and places, with the same wrap flags and widths.
+    /// versions and places, with the same flags and widths. A prompt's mark changes no version,
+    /// so the flags are compared apart.
     fn holds(&self, rows: &[fux_vt::Row<'_>]) -> bool {
         rows.len() == self.ids.len()
             && rows.iter().zip(&self.ids).zip(self.lines.iter()).all(
                 |((live, (id, version)), line)| {
                     live.id() == *id
                         && live.version() == *version
-                        && live.wrapped() == line.wrapped
+                        && RowFlags::of(Some(live)) == line.flags
                         && live.len() == line.cells.len()
                 },
             )
@@ -427,7 +435,7 @@ impl Grid {
                     match row.and_then(|row| cache.cells(index, row, &mut by_id)) {
                         Some((cells, links)) => Row {
                             cells,
-                            wrapped: row.is_some_and(fux_vt::Row::wrapped),
+                            flags: RowFlags::of(row),
                             links,
                         },
                         None => Row::of(row, cols, cache.palette.as_ref()),
@@ -497,6 +505,18 @@ impl Grid {
             *lines.get_mut(at)? = line;
             *cache.ids.get_mut(at)? = (row.id(), row.version());
         }
+        // A prompt's mark changes no row's version: each live row's is compared apart.
+        let window = screen.window();
+        for (at, line) in cache.lines.iter().enumerate() {
+            let live = u16::try_from(at).ok().and_then(|row| window.row(row));
+            let flags = RowFlags::of(live.as_ref());
+            if flags != line.flags {
+                let lines = lines.get_or_insert_with(|| cache.lines.to_vec());
+                if let Some(line) = lines.get_mut(at) {
+                    line.flags = flags;
+                }
+            }
+        }
         if let Some(lines) = lines {
             cache.lines = lines.into();
         }
@@ -530,12 +550,22 @@ impl Grid {
 
     /// Whether `row` soft-wraps into the next one.
     pub fn row_wrapped(&self, row: u16) -> bool {
-        self.lines
-            .get(usize::from(row))
-            .is_some_and(|line| line.wrapped)
+        self.row_flags(row).wrapped
     }
 
-    /// Whether `row` is `other`'s `other_row` whole: the same cells, links and wrap flag. Rows
+    /// Whether a shell's prompt starts on `row`.
+    pub fn row_prompt(&self, row: u16) -> bool {
+        self.row_flags(row).prompt
+    }
+
+    /// `row`'s flags: none out of bounds.
+    pub fn row_flags(&self, row: u16) -> RowFlags {
+        self.lines
+            .get(usize::from(row))
+            .map_or_else(RowFlags::default, |line| line.flags)
+    }
+
+    /// Whether `row` is `other`'s `other_row` whole: the same cells, links and flags. Rows
     /// that share their cells compare without reading them.
     pub fn same_row(&self, row: u16, other: &Self, other_row: u16) -> bool {
         let line = self.lines.get(usize::from(row));
@@ -684,10 +714,13 @@ impl Grid {
             .sum()
     }
 
-    /// Row `row`'s shared cells, wrap flag and links, to set into another grid of this width.
-    pub(super) fn row_parts(&self, row: u16) -> Option<(Arc<Cells>, bool, Option<Arc<RowLinks>>)> {
+    /// Row `row`'s shared cells, flags and links, to set into another grid of this width.
+    pub(super) fn row_parts(
+        &self,
+        row: u16,
+    ) -> Option<(Arc<Cells>, RowFlags, Option<Arc<RowLinks>>)> {
         let line = self.lines.get(usize::from(row))?;
-        Some((Arc::clone(&line.cells), line.wrapped, line.links.clone()))
+        Some((Arc::clone(&line.cells), line.flags, line.links.clone()))
     }
 
     /// Replace `row` with `cells`, which must be exactly `cols` long, and their `links`. Out of
@@ -696,7 +729,7 @@ impl Grid {
         &mut self,
         row: u16,
         cells: Arc<Cells>,
-        wrapped: bool,
+        flags: RowFlags,
         links: Option<Arc<RowLinks>>,
     ) {
         if cells.len() != usize::from(self.size.cols) {
@@ -706,7 +739,7 @@ impl Grid {
             if let Some(line) = Arc::make_mut(&mut self.lines).get_mut(usize::from(row)) {
                 *line = Row {
                     cells,
-                    wrapped,
+                    flags,
                     links,
                 };
             }

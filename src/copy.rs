@@ -845,7 +845,12 @@ mod tests {
     fn sample(root: &Path) -> PathBuf {
         let top = root.join("top dir");
         fs::create_dir_all(top.join("sub")).unwrap();
-        let odd = OsStr::from_bytes(b"line\nbreak \xff name");
+        // A byte that is no UTF-8 where the file system takes one; macOS's refuses it.
+        let odd = OsStr::from_bytes(if cfg!(target_os = "macos") {
+            b"line\nbreak \xc3\xa9 name"
+        } else {
+            b"line\nbreak \xff name"
+        });
         fs::write(top.join(odd), b"odd").unwrap();
         fs::write(top.join("sub/big"), vec![7u8; CHUNK * 2 + 5]).unwrap();
         fs::write(top.join("empty"), b"").unwrap();

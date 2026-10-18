@@ -197,7 +197,12 @@ fn tree(dir: &Path) -> std::io::Result<Vec<Entry>> {
 /// a symlink.
 fn sample(at: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(at.join("sub dir"))?;
-    let odd = std::ffi::OsStr::from_bytes(b"line\nbreak \xff");
+    // A byte that is no UTF-8 where the file system takes one; macOS's refuses it.
+    let odd = std::ffi::OsStr::from_bytes(if cfg!(target_os = "macos") {
+        b"line\nbreak \xc3\xa9"
+    } else {
+        b"line\nbreak \xff"
+    });
     std::fs::write(at.join(odd), b"odd")?;
     std::fs::write(at.join("run me"), b"#!/bin/sh\n")?;
     std::fs::set_permissions(at.join("run me"), std::fs::Permissions::from_mode(0o751))?;

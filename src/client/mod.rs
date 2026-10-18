@@ -147,7 +147,10 @@ pub enum Refused {
     NotAuthorized,
     #[error("{}", Close::NoSuchSession)]
     NoSuchSession,
-    #[error("the server does not speak this koh protocol ({PROTOCOL}); upgrade koh on both ends")]
+    #[error(
+        "this koh speaks protocol {PROTOCOL} and the server speaks another; upgrade koh on \
+         whichever end is older"
+    )]
     OtherProtocol,
 }
 
@@ -1004,7 +1007,13 @@ mod tests {
                 matches!(error.downcast_ref(), Some(Refused::OtherProtocol)),
                 "{error:#}"
             );
-            assert!(format!("{error:#}").contains(PROTOCOL), "{error:#}");
+            let said = format!("{error:#}");
+            assert!(
+                said.contains(&format!(
+                    "this koh speaks protocol {PROTOCOL} and the server speaks another"
+                )),
+                "{said}"
+            );
             let _ = accept.await;
             // A server that closes the connection instead of admitting it, saying why.
             let server = bind_endpoint_local(key(), true).await.unwrap();

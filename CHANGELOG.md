@@ -42,6 +42,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - **`koh connect` with no terminal says what to use instead**: that it needs one, and that `koh
   exec SERVER -- COMMAND` runs a command without one and `koh cp` copies files, rather than
   `acquiring the terminal: No such device or address`. It says so before dialing.
+- **A version mismatch says both sides**: `this koh speaks protocol koh/7 and the server speaks
+  another; upgrade koh on whichever end is older`, rather than naming one protocol it could be read
+  as the server's.
 - **The wire protocol is now `koh/7`**. A connection opens with a request on the client's first
   stream saying what it is for (a shell by pick, a listing, a command or a copy), and the server
   attaches or starts nothing before it; a client that makes none in 10 s is closed. A shell's

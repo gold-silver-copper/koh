@@ -49,7 +49,7 @@ impl Entry {
         Self {
             kind,
             size: u64::try_from(stat.st_size).unwrap_or(0),
-            mode: stat.st_mode & 0o7777,
+            mode: wide(stat.st_mode) & 0o7777,
             mtime: secs.zip(nanos).and_then(|(s, n)| Time::new(s, n)),
         }
     }
@@ -135,7 +135,18 @@ pub(super) fn read_link(dir: impl AsFd, name: &OsStr) -> io::Result<Vec<u8>> {
 
 /// Set the mode of `name` in `dir`, a directory reached by its descriptor.
 pub(super) fn chmod(dir: impl AsFd, mode: u32) -> io::Result<()> {
-    Ok(rustix::fs::fchmod(dir, RawMode::from_raw_mode(mode))?)
+    let raw = narrow(mode & 0o7777).ok_or_else(|| io::Error::other("a mode past 0o7777"))?;
+    Ok(rustix::fs::fchmod(dir, RawMode::from_raw_mode(raw))?)
+}
+
+/// A system's mode bits (`u32` on Linux, `u16` on macOS) as a `u32`.
+fn wide(raw: impl Into<u32>) -> u32 {
+    raw.into()
+}
+
+/// Mode bits as the system takes them, if they fit.
+fn narrow<T: TryFrom<u32>>(bits: u32) -> Option<T> {
+    T::try_from(bits).ok()
 }
 
 /// Set the modification time of `file` (a file or a directory), leaving its access time.

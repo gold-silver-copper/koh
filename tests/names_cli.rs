@@ -113,12 +113,14 @@ fn servers_are_added_listed_renamed_and_removed_by_name() {
         "{}",
         text(&out)
     );
-    let out = home.koh(&["servers", "add", "laptop", &id]).unwrap();
+    let out = home
+        .koh(&["servers", "add", "laptop", &id, "--direct", "10.0.0.2:4433"])
+        .unwrap();
     assert!(out.status.success(), "{}", text(&out));
     let out = home.koh(&["servers"]).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!("laptop {id}\n")
+        format!("laptop {id} direct=10.0.0.2:4433\n")
     );
     let out = home.koh(&["servers", "add", "other", &id]).unwrap();
     assert!(
@@ -132,7 +134,7 @@ fn servers_are_added_listed_renamed_and_removed_by_name() {
         .status
         .success());
     let saved = std::fs::read_to_string(home.koh_dir().join("servers")).unwrap();
-    assert_eq!(saved, format!("desk {id}\n"));
+    assert_eq!(saved, format!("desk {id} direct=10.0.0.2:4433\n"));
     assert!(home
         .koh(&["servers", "rm", "desk"])
         .unwrap()
@@ -299,7 +301,7 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
 }
 
 #[test]
-fn connect_by_name_dials_the_saved_server_and_notes_it() {
+fn connect_by_name_dials_the_saved_server_where_it_was_saved_and_notes_it() {
     let home = Home::new("connect").unwrap();
     koh_testkit::multi_thread(2)
         .expect("tokio runtime")
@@ -309,9 +311,10 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
             let (id, port, task) = loopback_server(String::from_utf8_lossy(&me.stdout).trim())
                 .await
                 .unwrap();
-            home.koh(&["servers", "add", "box", &id]).unwrap();
             let direct = format!("127.0.0.1:{port}");
-            let argv = home.argv(&["connect", "box", "--direct", &direct]);
+            home.koh(&["servers", "add", "box", &id, "--direct", &direct])
+                .unwrap();
+            let argv = home.argv(&["connect", "box"]);
             let (client, ..) = connected(&argv, b"echo by''_name\r", "by_name")
                 .await
                 .unwrap();

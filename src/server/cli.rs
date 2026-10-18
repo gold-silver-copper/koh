@@ -231,7 +231,7 @@ impl Allowlist {
         let mut allowed = self.given.clone();
         if let Some((key, shown)) = &self.saved {
             let saved = crate::names::read(key, List::Clients, shown)?;
-            allowed.extend(saved.entries().map(|(_, id)| id));
+            allowed.extend(saved.entries().map(|entry| entry.id));
         }
         Ok(allowed)
     }

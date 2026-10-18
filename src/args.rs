@@ -19,7 +19,7 @@ use iroh::{EndpointId, RelayUrl};
 
 use koh::client::{ConnectConfig, CopyJob, Remote};
 use koh::keycmd::{KeyConfig, KeyOp};
-use koh::names::{List, Op};
+use koh::names::{List, Op, Route};
 use koh::request::{CommandLine, Pick, RemotePath, SessionNum, Sources};
 use koh::server::cli::{
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SESSIONS, DEFAULT_SCROLLBACK_BYTES,
@@ -122,13 +122,18 @@ pub struct RemoteArgs {
 }
 
 impl RemoteArgs {
-    /// `server`, as these say to dial it.
-    pub fn into_remote(self, server: EndpointId) -> Remote {
+    /// `server`, as these say to dial it, else by its `saved` route.
+    pub fn into_remote(self, server: EndpointId, saved: Option<Route>) -> Remote {
+        let (direct, relay_url) = match (self.direct, self.relay_url, saved) {
+            (None, None, Some(Route::Direct(addr))) => (Some(addr), None),
+            (None, None, Some(Route::Relay(url))) => (None, Some(url)),
+            (direct, relay_url, _) => (direct, relay_url),
+        };
         Remote {
             server,
             key_file: self.key_file,
-            direct: self.direct,
-            relay_url: self.relay_url,
+            direct,
+            relay_url,
         }
     }
 }
@@ -145,10 +150,10 @@ pub struct ConnectArgs {
 }
 
 impl ConnectArgs {
-    /// The config for dialing `server`.
-    pub fn into_config(self, server: EndpointId) -> ConnectConfig {
+    /// The config for dialing `server`, by its `saved` route unless told another.
+    pub fn into_config(self, server: EndpointId, saved: Option<Route>) -> ConnectConfig {
         ConnectConfig {
-            remote: self.remote.into_remote(server),
+            remote: self.remote.into_remote(server, saved),
             pick: self.pick,
             clipboard: self.clipboard,
             hyperlinks: self.hyperlinks,
@@ -425,6 +430,33 @@ fn names(list: List) -> Command {
             "server",
         ),
     };
+    let mut add = Command::new("add")
+        .about(format!("Save a {} under a name", list.noun()))
+        .arg(name_arg("name", "NAME"))
+        .arg(
+            Arg::new("id")
+                .value_name("ENDPOINT_ID")
+                .value_parser(saved_id)
+                .required(true),
+        );
+    if list == List::Servers {
+        add = add
+            .arg(
+                Arg::new("direct")
+                    .long("direct")
+                    .value_name("IP:PORT")
+                    .value_parser(value_parser!(SocketAddr))
+                    .conflicts_with("relay_url")
+                    .help("Dial it at this direct socket address (LAN / loopback) unless a command says --direct or --relay-url itself"),
+            )
+            .arg(
+                Arg::new("relay_url")
+                    .long("relay-url")
+                    .value_name("URL")
+                    .value_parser(relay_url)
+                    .help("Dial it via this self-hosted relay unless a command says --direct or --relay-url itself"),
+            );
+    }
     Command::new(list.file())
         .about(about)
         .arg(
@@ -435,17 +467,7 @@ fn names(list: List) -> Command {
                     "The {key} key whose directory holds the list (defaults to the {key} key path)"
                 )),
         )
-        .subcommand(
-            Command::new("add")
-                .about(format!("Save a {} under a name", list.noun()))
-                .arg(name_arg("name", "NAME"))
-                .arg(
-                    Arg::new("id")
-                        .value_name("ENDPOINT_ID")
-                        .value_parser(saved_id)
-                        .required(true),
-                ),
-        )
+        .subcommand(add)
         .subcommand(
             Command::new("rm")
                 .about(format!("Forget a {}", list.noun()))
@@ -582,6 +604,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                             .get_one::<EndpointId>("id")
                             .copied()
                             .ok_or_else(|| missing("id"))?,
+                        route: saved_route(sub),
                     },
                     sub,
                 ),
@@ -606,6 +629,16 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
         None => Ok(Cmd::Menu),
         Some(_) => Err(missing("subcommand")),
     }
+}
+
+/// The route `koh servers add` was given, if any: `koh clients add` takes none.
+fn saved_route(m: &ArgMatches) -> Option<Route> {
+    let direct = m.try_get_one::<SocketAddr>("direct").ok().flatten();
+    let relay = || m.try_get_one::<RelayUrl>("relay_url").ok().flatten();
+    direct
+        .copied()
+        .map(Route::Direct)
+        .or_else(|| relay().cloned().map(Route::Relay))
 }
 
 /// The server and how to dial it, as `m` says.
@@ -899,10 +932,51 @@ mod tests {
             op,
             Op::Add {
                 name: "phone".to_owned(),
-                id: ID.parse().unwrap()
+                id: ID.parse().unwrap(),
+                route: None,
             }
         );
         assert_eq!(key_file.as_deref(), Some(std::path::Path::new("/k")));
+        // A server is saved with how to dial it; a client, never dialed, has no such flag.
+        let Cmd::Names { op, .. } = parsed(&[
+            "koh",
+            "servers",
+            "add",
+            "box",
+            ID,
+            "--direct",
+            "10.0.0.2:4433",
+        ]) else {
+            panic!("servers add --direct");
+        };
+        assert!(
+            matches!(op, Op::Add { route: Some(koh::names::Route::Direct(addr)), .. } if addr.port() == 4433),
+            "{op:?}"
+        );
+        for argv in [
+            &[
+                "koh",
+                "clients",
+                "add",
+                "phone",
+                ID,
+                "--direct",
+                "10.0.0.2:4433",
+            ][..],
+            &[
+                "koh",
+                "servers",
+                "add",
+                "box",
+                ID,
+                "--direct",
+                "10.0.0.2:4433",
+                "--relay-url",
+                "https://relay.example",
+            ],
+        ] {
+            assert!(command().try_get_matches_from(argv).is_err(), "{argv:?}");
+        }
         let Cmd::Names { op, .. } = parsed(&["koh", "servers", "rename", "a", "b"]) else {
             panic!("servers rename");
         };

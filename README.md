@@ -44,7 +44,8 @@ Useful commands:
 ```sh
 koh                       # on a terminal: the menu of keys, servers and clients
 koh id                    # print this machine's endpoint id (its client key's)
-koh servers               # the servers you connect to: add <name> <id>, rm <name>, rename <old> <new>
+koh servers               # the servers you connect to: add <name> <id> [--direct IP:PORT],
+                          # rm <name>, rename <old> <new>
 koh clients               # the clients allowed here, likewise
 koh serve                 # host a shell for the saved clients (--allow <id> adds one for this run)
 koh connect <name|id>     # connect to a saved server, or to a server id: your session there
@@ -70,7 +71,8 @@ Useful flags:
 --on-bell <cmd>           # run a shell command whenever the remote bell rings
 --shell <program>         # host a program instead of $SHELL (repeat to pass args)
 --key-file <path>         # use a custom identity-key path
---direct <ip:port>        # dial a server directly (LAN, loopback), as connect, exec, cp, sessions do
+--direct <ip:port>        # dial a server directly (LAN, loopback), as connect, exec, cp, sessions do;
+                          # saved with `koh servers add`, every command dialing that name does
 --session-ttl-secs <n>    # keep detached sessions around longer/shorter
 --max-connections <n>     # limit concurrent connections
 --max-sessions <n>        # limit sessions, all clients' together
@@ -86,7 +88,8 @@ remote shell runs. `koh exec` exits 255 on its own errors (not reached, refused)
 
 Keys live under `$XDG_CONFIG_HOME/koh/` (else `~/.config/koh/`) by default (`client.key`,
 `server.key`), and the names beside them: `servers` beside the client key and `clients` beside the
-server key, one `name id` a line (`#` comments allowed). They are checked as the keys are, since `clients` decides who may open a
+server key, one `name id` a line (`#` comments allowed); a server's may end `direct=IP:PORT` or
+`relay=URL`, how to dial it. They are checked as the keys are, since `clients` decides who may open a
 shell: a file that is a symlink or someone else's is refused, and a loose mode is tightened.
 
 **Keys, mouse and pastes** reach the remote program as it asked, whatever terminal you type on: the

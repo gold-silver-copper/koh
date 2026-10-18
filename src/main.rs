@@ -84,7 +84,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
             )?;
             match choice {
                 koh::menu::Choice::Quit => Ok(None),
-                koh::menu::Choice::Connect(id) => connect(defaults_for_connect(id)?).await,
+                koh::menu::Choice::Connect(name) => connect(defaults_for_connect(&name)?).await,
                 koh::menu::Choice::Serve => serve(defaults_for_serve()?).await,
             }
         }
@@ -97,34 +97,37 @@ async fn serve(mut config: koh::server::ServeConfig) -> anyhow::Result<Option<u3
     koh::server::serve(config).await.map(|()| None)
 }
 
-/// `koh connect`, with a saved name turned into its id.
+/// `koh connect`, with a saved name turned into its id and route.
 async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
-    let server = server_id(&args.remote)?;
-    koh::client::connect(args.into_config(server)).await
+    let (server, route) = saved_server(&args.remote)?;
+    koh::client::connect(args.into_config(server, route)).await
 }
 
-/// `koh exec`, with a saved name turned into its id: the command's status.
+/// `koh exec`, with a saved name turned into its id and route: the command's status.
 async fn exec(remote: RemoteArgs, line: koh::request::CommandLine) -> anyhow::Result<u32> {
     koh::client::exec(&resolve(remote)?, line).await
 }
 
-/// `remote`, with a saved name turned into its id.
+/// `remote`, with a saved name turned into its id and route.
 fn resolve(remote: RemoteArgs) -> anyhow::Result<koh::client::Remote> {
-    let server = server_id(&remote)?;
-    Ok(remote.into_remote(server))
+    let (server, route) = saved_server(&remote)?;
+    Ok(remote.into_remote(server, route))
 }
 
-/// The id of `remote`'s server: as given, or saved under its name beside the client key.
-fn server_id(remote: &RemoteArgs) -> anyhow::Result<iroh::EndpointId> {
+/// The id of `remote`'s server and the route it was saved with: as given (with no route), or
+/// saved under its name beside the client key.
+fn saved_server(
+    remote: &RemoteArgs,
+) -> anyhow::Result<(iroh::EndpointId, Option<koh::names::Route>)> {
     match &remote.server {
-        ServerRef::Id(id) => Ok(*id),
+        ServerRef::Id(id) => Ok((*id, None)),
         ServerRef::Name(name) => {
             let places = Places::new(remote.key_file.clone(), None)?;
             let saved = koh::names::load(&places, List::Servers)?;
-            if let Some(id) = saved.get(name) {
-                Ok(id)
+            if let Some(entry) = saved.get(name) {
+                Ok((entry.id, entry.route.clone()))
             } else {
-                let known: Vec<&str> = saved.entries().map(|(n, _)| n).collect();
+                let known: Vec<&str> = saved.entries().map(|entry| entry.name.as_str()).collect();
                 anyhow::bail!(
                     "{name:?} is neither an endpoint id nor a saved server name ({}); save it with \
                      `koh servers add {name} <id>`",
@@ -139,10 +142,9 @@ fn server_id(remote: &RemoteArgs) -> anyhow::Result<iroh::EndpointId> {
     }
 }
 
-/// `koh connect <id>` with every option at its default.
-fn defaults_for_connect(id: iroh::EndpointId) -> anyhow::Result<ConnectArgs> {
-    let id = id.to_string();
-    match args::parse(&args::command().try_get_matches_from(["koh", "connect", id.as_str()])?)? {
+/// `koh connect <name>` with every option at its default.
+fn defaults_for_connect(name: &str) -> anyhow::Result<ConnectArgs> {
+    match args::parse(&args::command().try_get_matches_from(["koh", "connect", name])?)? {
         Cmd::Connect(args) => Ok(args),
         Cmd::Serve(_)
         | Cmd::Sessions(_)

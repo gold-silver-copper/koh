@@ -33,6 +33,10 @@ binary, its tests and the fuzz targets share code, and any release may change it
   `koh sessions SERVER` lists them, one a line: number, attached or detached (and for how long),
   age, size, whether the program runs or exited, and title. `--max-sessions` bounds them all
   together, and the TTL applies to each.
+- **A saved server remembers how to dial it.** `koh servers add NAME ID --direct IP:PORT` (or
+  `--relay-url URL`) saves it in `servers` as `name id direct=IP:PORT` (or `relay=URL`), and
+  `connect`, `exec`, `cp`, `sessions` and the menu dial that name so unless given `--direct` or
+  `--relay-url` themselves. `koh servers` and the menu show it.
 
 ### Changed
 - **The wire protocol is now `koh/7`**. A connection opens with a request on the client's first

@@ -26,7 +26,7 @@ src/
 ├── main.rs          the binary: serve / connect / id / key dispatch
 ├── args.rs          the command line (clap's builder API) and the config structs it produces
 ├── lib.rs           crate root: module declarations + the architecture overview
-├── proto.rs         the koh/6 wire protocol: client messages, screen frames, caps, pacing
+├── proto.rs         the koh/7 wire protocol: client messages, screen frames, caps, pacing
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
 ├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
@@ -61,9 +61,9 @@ binary) build on both. The protocol cores (`proto`, `terminal`, `predict`, `serv
 `client::ClientSession`) do no I/O and are tested with no network at all. `predict` imports nothing
 from `crate::` (CI checks it), so it is a standalone terminal-prediction library.
 
-## The protocol (koh/6)
+## The protocol (koh/7)
 
-The ALPN `koh/6` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/7` is the version check: a peer on another version fails the TLS handshake with a
 clear error. After the handshake the server checks the allowlist, attaches the peer's session, and
 only then sends the session's first frame, which admits the client, so "admitted, then refused"
 cannot happen. A
@@ -186,9 +186,10 @@ on the others it redials and its banner says why. Then (`src/proto.rs`):
   client has read it; unacknowledged, it closes as a lost link and the session keeps the end for
   the client's redial.
 
-`TerminalScreen` is a plain `Grid` of rows stored as `fux_vt::Cells` (with a cursor, per-row soft-wrap flags and
-the input modes the client mirrors) plus the side channels: title, icon, OSC 52 clipboard, bell count
-and exit code. The grid stores each row as its own reference-counted slice of cells, shared by every
+`TerminalScreen` is a plain `Grid` of rows stored as `fux_vt::Cells` (with a cursor, per-row flags
+(soft wrap, and whether a shell's prompt starts on it) and the input modes the client mirrors) plus
+the side channels: title, icon, OSC 52 clipboard, bell count, exit code and the shell's commands
+(below). The grid stores each row as its own reference-counted slice of cells, shared by every
 screen that holds the row unchanged: a snapshot shares the rows the program left alone (found by
 fux-vt's row ids, so rows that scrolled are shared too) with the snapshot before it, and a client
 screen shares every row a diff did not carry with the base it was applied to. So a screen costs the
@@ -202,8 +203,8 @@ last one's list whole. Counting a window's memory looks only at the rows that di
 newest screen's at the same place. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with the options in
 `terminal::OPTIONS`, each for what koh carries: events (title, icon, bell, clipboard), extended
 replies (DECRQM, DECXCPR, secondary DA), in-band resize and the size query, the palette (a
-program's colours, drawn as RGB in snapshots, so the user's palette never changes), reflow, and
-koh's identity for device attributes and XTVERSION. A frame a program draws with synchronized
+program's colours, drawn as RGB in snapshots, so the user's palette never changes), reflow, the
+shell's marks (OSC 133), and koh's identity for device attributes and XTVERSION. A frame a program draws with synchronized
 output is not sent half drawn (`FrameHold`): while it is drawn the screen from before it goes out,
 and it is let go after 150 ms. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
 cursor and the modes; after a resize the client starts from a blank grid and receives every
@@ -254,6 +255,50 @@ over it, and refuses one malformed for its base as it refuses one on a base it l
 link with OSC 8 (with the program's id, if it gave one) unless `--no-hyperlinks`, after checking
 it again, and closes it before any cell without it and at the frame's end.
 
+### The shell's marks (OSC 133)
+
+A shell with shell integration marks where each prompt starts (`OSC 133 ; A`), where a command's
+output starts (`C`) and where it ends, with its status (`D ; status`), so a terminal (or fux, which
+answers `· done STATUS` and `last-output` by them) knows when a command typed into it ended, how, and
+which output was its. The server's emulator keeps them (fux-vt's `Feature::PromptMarks`), and
+since control sequences never reach the user's terminal, the client writes them again, from the
+synced screen:
+
+- **A prompt's start is a row's.** Each row carries a flag, beside its wrap flag, in one byte
+  (`RowFlags`, any other bit refused), in frames and in history rows alike: the mark moves with its
+  row through scrolls, history and reflow, as fux-vt keeps it. A mark changes no row's fux-vt
+  version, so a snapshot compares each live row's flag apart from its cells. The client marks a row
+  (`133;A` with the cursor in its first column) when it paints one that came to start a prompt, and
+  blanks a painted row that no longer does (DL then IL, the rows below put back), as a terminal's
+  mark goes only with its row.
+- **Commands are the screen's side channel.** A screen carries `Commands`: fux-vt's count of the
+  commands ended (`finished`), the last one's status, where its output began and ended, and where
+  the running one's output began, each placed on the screen (a place the screen does not show,
+  scrolled into history or on the main screen under the alternate one, is the top left). A frame
+  carries them when they changed. Once the run's first frame came, whose ended commands are from
+  before the client and not told, the painter tells, after a frame's rows: for a frame whose count
+  is above the count it last saw, one `C` at the start of the last command's output and one
+  `D;status` at its end; a `C` where the running command's output starts, again whenever that place
+  moves on what it painted (a repaint, a scroll, a blanked row); and a `D` with no status if the
+  command it told running is not running and the count did not grow (the redial reached another
+  shell). A count lower than the last is a new shell's: taken, not told.
+
+What a terminal can rely on through koh: every row it shows that starts a prompt is marked, and no
+other (prediction paints cells, never marks); when a frame shows that commands ended, it is told
+one end, with the status and output of the last of them, so commands that end between two frames
+end as one (a count of ends counts the frames that brought them, not the commands); an end is told
+once, never again on a repaint, a resize, a redial or a reattach to the same shell; while a command
+runs, it is told where its output starts on the screen. What it cannot rely on: output that
+scrolled above the screen before a frame showed it (the output then starts at the screen's top, and
+the client paints on the alternate screen, which keeps no history); the status of each of several
+commands that ended between two frames; telling a new shell's count from the old one's, as the
+session's identity is not on the wire (a count above the last after a redial to a new shell tells
+that shell's last command). As through ssh, the remote shell's marks are the local terminal's: a
+local shell's own mark for the `koh` command it ran is overridden (fux, which gives the shells it
+starts a nonce their marks must carry, ignores koh's marks in such a pane; run `koh connect` as the
+pane's program for fux to read them). The server needs a shell that sends the marks: koh adds no
+shell integration, so a program the remote shell runs can send marks of its own too.
+
 ## Headless drivers (the protocol is I/O-free; the shells are thin)
 
 Both ends split into a synchronous, I/O-free core and a thin async shell. The client's
@@ -291,7 +336,7 @@ The client paints the synced grid, the predictions over it and an optional statu
 painter builds what the terminal is to show (the screen clipped to the terminal's size, read once a
 frame; blank where the screen does not reach; the predictions over it; the status line on the
 terminal's last row) and compares it with what it painted last, row by row (rows compare whole,
-links and wrap included; a row shared with the last paint is skipped unread), then cell by cell,
+links and flags included; a row shared with the last paint is skipped unread), then cell by cell,
 moving the cursor only to reach a changed cell. So a keystroke's echo writes a few bytes, and the
 status line is painted only where it changed.
 
@@ -309,12 +354,14 @@ Rows that only moved since the last paint (the painted grid's rows, shared with 
 other indices) are moved on the terminal, not repainted: in a scroll region (`CSI t;b r`), `CSI n S`
 scrolls up and `CSI n T` down, and `CSI r` resets the region. The painter finds these moves itself,
 by the cells the rows share with the grid it painted, because that grid may be several frames
-behind; each scroll's region must overlap no other, and a scroll is only made when it writes less
-than repainting its rows in place. SGR is reset first, so the rows a scroll brings in have the
-default background. It scrolls only on a terminal exactly the screen's size, and never the status
-line's row. A property test feeds incremental and whole paints, on terminals of the screen's size
-and smaller and with hyperlinks, into a fux-vt terminal and checks it shows the same after every
-frame.
+behind; each scroll's region must overlap no other. A row that moved is moved even where painting
+it in place would write less, so what the terminal keeps of a row (the shell's marks on it) moves
+with it. SGR is reset first, so the rows a scroll brings in have the default background. It
+scrolls only on a terminal exactly the screen's size, and never the status line's row. A property
+test feeds incremental and whole paints, on terminals of the screen's size and smaller and with
+hyperlinks and the shell's marks, into a fux-vt terminal and checks it shows the same after every
+frame, marks the screen's prompt rows and no other, and was told of the shell's commands what the
+screen says.
 
 ## The predictor
 

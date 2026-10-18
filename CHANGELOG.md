@@ -16,12 +16,16 @@ binary, its tests and the fuzz targets share code, and any release may change it
 ## [Unreleased]
 
 ### Changed
-- **The wire protocol is now `koh/6`**: a paste goes whole in one message (up to 1 MiB), and the
+- **The wire protocol is now `koh/7`**: a paste goes whole in one message (up to 1 MiB), and the
   raw-bytes `Input` message is gone; history requests carry ids and every one is answered; a
   refusal is a close code; screen modes say whether the alternate screen is shown; the admission
   stream is gone: the server attaches the client's session before it sends anything, and the
   first frame admits it; the client sends input and control messages on two streams, so a resize,
-  acknowledgement or history request never waits behind input a program has not read.
+  acknowledgement or history request never waits behind input a program has not read; rows carry
+  a prompt flag beside the wrap flag, and screens the shell's commands (OSC 133).
+- The remote shell's marks (OSC 133) reach the user's terminal: prompts' rows, and each command's
+  start and its end with its status, told once (`fux`'s `· done` and `last-output` work through
+  koh). The painter moves every row that moved, so what a terminal keeps of a row moves with it.
 - Painting is a diff of the whole terminal with autowrap off: a terminal larger or smaller than the
   screen shows the screen clipped and nothing else, the status line repaints only when it changes,
   switching mouse modes turns the old one off, and the window title is restored on exit and

@@ -119,6 +119,11 @@ binary, not the library.
 - Scrollback: `Ctrl-^ [` opens the server's history above the live screen, in full colour, with
   the arrows, Page Up/Down, the mouse wheel, `/` to search and `q` to leave; new output keeps
   arriving below.
+- Shell integration marks (OSC 133) reach your terminal: the rows where the remote shell's prompts
+  start, and each command's start and end with its status, so a terminal (or fux's `· done` and
+  `last-output`) sees remote commands as local ones. Commands that end between two screen updates
+  end as one, with the last one's status; output that scrolled off before an update starts at the
+  screen's top. The remote shell must send the marks (koh adds no shell integration).
 - Does not provide multi-user accounts, file transfer, or Windows support.
 
 ## Status

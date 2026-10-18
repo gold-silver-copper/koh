@@ -68,6 +68,7 @@ fn registry(
         max_sessions,
         ttl,
         home: home(),
+        marks: None,
     };
     Registry::spawn(spec, allows)
 }
@@ -791,6 +792,71 @@ fn a_connection_attached_to_an_already_exited_session_is_told_it_ended() -> anyh
 
 /// A program that cannot start is not reported as the server being full, nor as a refusal for
 /// good: no frame comes, and the connection is closed saying the session could not start.
+/// A session's bash, started plainly, reads the user's `~/.bashrc` (their prompt and their
+/// `PROMPT_COMMAND` run as always) and then marks its commands: a command's end and its status
+/// reach the screen, and a mark a program prints is not the shell's. With `--no-shell-marks` it
+/// sends no marks, and a program's mark counts.
+#[test]
+fn a_sessions_bash_marks_its_commands_after_the_users_bashrc() -> anyhow::Result<()> {
+    let home = koh_testkit::scratch!("marks-home")?;
+    std::fs::write(
+        home.join(".bashrc"),
+        "PROMPT_COMMAND='__mine=$((__mine + 1))'\nPS1='rc$__mine> '\n",
+    )?;
+    runtime()?.block_on(async {
+        for marks in [true, false] {
+            let secret = generate_secret_key()?;
+            let server_ep = bind_endpoint_local(generate_secret_key()?, true).await?;
+            let addr = loopback_addr(&server_ep);
+            let config = ServeConfig {
+                allow: vec![secret.public()],
+                command: vec!["bash".to_owned()],
+                home: Home::isolated(home.path()),
+                shell_marks: marks,
+                ..ServeConfig::default()
+            };
+            let shutdown = CancellationToken::new();
+            let server = koh_testkit::spawn(serve_endpoint(
+                server_ep,
+                Hosting::from_config(&config)?,
+                shutdown.clone(),
+            ));
+            let mut client = RawClient::connect(addr, secret).await?;
+            client
+                .type_bytes(b"printf '\\033]133;D;7\\007'; echo hi; false\r")
+                .await?;
+            // The second prompt: the command has ended, and the user's hook ran twice.
+            let mut shown = String::new();
+            for _ in 0..100 {
+                client.pump(100).await?;
+                shown = client.screen().context("a screen")?.screen().contents();
+                if shown.contains("\nhi\nrc2>") {
+                    break;
+                }
+            }
+            let commands = client.screen().context("a screen")?.commands();
+            shutdown.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+            anyhow::ensure!(
+                shown.contains("rc1> printf") && shown.contains("\nhi\nrc2>"),
+                "marks {marks}: the user's prompt and hook: {shown:?}"
+            );
+            if marks {
+                anyhow::ensure!(
+                    commands.finished == 1 && commands.status == Some(1),
+                    "the shell's mark ends the command, not the program's: {commands:?}"
+                );
+            } else {
+                anyhow::ensure!(
+                    commands.status != Some(1),
+                    "no marks from the shell: {commands:?}"
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
 #[test]
 fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
     runtime()?.block_on(async {

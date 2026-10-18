@@ -92,12 +92,17 @@ impl Exit {
 
 /// The argv for `command`, taken verbatim (no splitting, so a path with a space works); empty means
 /// the shell `fallback` names.
-fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> Vec<OsString> {
+fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> Vec<String> {
     if command.is_empty() {
-        vec![fallback().into()]
+        vec![fallback()]
     } else {
-        command.iter().map(OsString::from).collect()
+        command.to_vec()
     }
+}
+
+/// The argv a session runs for `command`: it, or `$SHELL` (else the platform's shell) if empty.
+pub fn session_argv(command: &[String]) -> Vec<String> {
+    build_command(command, || resolve_shell(std::env::var_os("SHELL")))
 }
 
 /// Remove each `KOH_*` variable of the `inherited` from `cmd`: they configure koh, not the hosted
@@ -179,6 +184,22 @@ impl Home {
             Some(_) => PLATFORM_SHELL.to_owned(),
             None => resolve_shell(std::env::var_os("SHELL")),
         }
+    }
+
+    /// Where a server run keeps the startup files that mark its shells' commands: an isolated
+    /// home's own directory; else `$XDG_RUNTIME_DIR`, else the system's temporary directory.
+    pub(crate) fn runtime_dir(&self) -> PathBuf {
+        if let Some(home) = &self.0 {
+            return home.clone();
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a server's runtime files, in a private directory of its own, if there is no XDG_RUNTIME_DIR"
+        )]
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .unwrap_or_else(std::env::temp_dir)
     }
 
     /// Give `cmd` this home, unless it is the user's.
@@ -426,12 +447,13 @@ pub struct Pty {
 
 impl Pty {
     /// Allocate a `rows`×`cols` PTY and start `command` (argv, verbatim; empty for `$SHELL`)
-    /// on it in `home`, with `TERM` set. Returns it and a receiver of its output, which
+    /// on it in `home`, with `TERM` and `env` set. Returns it and a receiver of its output, which
     /// ends when the program closes the PTY.
     pub fn spawn(
         rows: u16,
         cols: u16,
         command: &[String],
+        env: &[(String, String)],
         term: &str,
         home: &Home,
         reaper: &Reaper,
@@ -511,18 +533,16 @@ impl Pty {
                 })?
         });
 
-        let argv = build_command(command, || resolve_shell(std::env::var_os("SHELL")));
+        let argv = session_argv(command);
         let (child, pid) = slave
             .spawn(&argv, |cmd| {
                 cmd.env("TERM", term);
                 scrub_koh_env(cmd, std::env::vars_os().map(|(key, _)| key));
                 home.apply(cmd);
+                cmd.envs(env.iter().map(|(key, value)| (key, value)));
             })
             .map_err(|error| {
-                let program = argv
-                    .first()
-                    .map(|arg| arg.to_string_lossy())
-                    .unwrap_or_default();
+                let program = argv.first().map_or("", String::as_str);
                 PtyError::Spawn(io::Error::new(
                     error.kind(),
                     format!("starting {program}: {error}"),
@@ -627,10 +647,7 @@ mod tests {
     #[test]
     fn the_command_is_argv_verbatim_or_else_the_shell() {
         let argv = ["zellij", "attach", "-c", "my session"].map(String::from);
-        assert_eq!(
-            build_command(&argv, || "unused".to_owned()),
-            argv.map(OsString::from)
-        );
+        assert_eq!(build_command(&argv, || "unused".to_owned()), argv);
         assert_eq!(
             build_command(&[], || "/custom/shell".to_owned()),
             ["/custom/shell"]

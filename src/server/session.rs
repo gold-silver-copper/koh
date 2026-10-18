@@ -119,19 +119,26 @@ struct PtyHost {
 
 impl PtyHost {
     /// Start `command` (empty for `$SHELL`) in `home` at the default size, left to
-    /// `reaper` once closed; the host and a receiver of its output. Blocks until the program starts.
+    /// `reaper` once closed, a shell `marks` knows started so that it marks its commands, and only
+    /// its marks counted; the host and a receiver of its output. Blocks until the program starts.
     fn spawn(
         command: &[String],
         scrollback_bytes: usize,
-        home: &crate::pty::Home,
+        (home, marks): (&crate::pty::Home, Option<&super::marks::MarksDir>),
         reaper: &crate::pty::Reaper,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let Size { rows, cols } = DEFAULT_SIZE;
-        let emu = ServerTerminal::new(rows, cols, scrollback_bytes)
+        let mut emu = ServerTerminal::new(rows, cols, scrollback_bytes)
             .context("creating the terminal emulator")?;
+        let argv = crate::pty::session_argv(command);
+        let marked = marks.and_then(|marks| marks.mark(&argv));
+        let (argv, env) = marked
+            .as_ref()
+            .map_or((&argv[..], &[][..]), |m| (&m.argv[..], &m.env[..]));
         let (pty, pty_rx) =
-            crate::pty::Pty::spawn(rows, cols, command, "xterm-256color", home, reaper)
+            crate::pty::Pty::spawn(rows, cols, argv, env, "xterm-256color", home, reaper)
                 .context("spawning shell")?;
+        emu.require_mark_nonce(marked.as_ref().map(|m| m.nonce.as_bytes()));
         Ok((
             Self {
                 emu,
@@ -353,11 +360,17 @@ fn start(
     let asked = asks.clone();
     let command = Arc::clone(&spec.command);
     let (scrollback_bytes, ttl, home) = (spec.scrollback_bytes, spec.ttl, spec.home.clone());
+    let marks = spec.marks.clone();
     let reaper = reaper.clone();
     let task = async move {
         // Forking and the program's exec block, and must hold up no other session.
         let spawned = tokio::task::spawn_blocking(move || {
-            PtyHost::spawn(&command, scrollback_bytes, &home, &reaper)
+            PtyHost::spawn(
+                &command,
+                scrollback_bytes,
+                (&home, marks.as_deref()),
+                &reaper,
+            )
         })
         .await;
         let (mut host, pty_rx) = match spawned.map_err(anyhow::Error::from).and_then(|s| s) {
@@ -649,6 +662,8 @@ pub struct SessionSpec {
     pub ttl: Duration,
     /// The home each session's program gets.
     pub home: crate::pty::Home,
+    /// Where the startup files that mark a shell's commands go, if shells are marked.
+    pub marks: Option<Arc<super::marks::MarksDir>>,
 }
 
 /// How often an attach is tried: one that reached a session as it ended is tried again.

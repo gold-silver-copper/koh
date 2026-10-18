@@ -19,6 +19,7 @@ fn spawn(argv: &[String]) -> Result<(Pty, Receiver<Vec<u8>>), PtyError> {
         24,
         80,
         argv,
+        &[],
         "xterm-256color",
         &home(),
         &koh::pty::Reaper::start()?,

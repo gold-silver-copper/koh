@@ -215,6 +215,10 @@ fn serve() -> Command {
                 .help("Program to run in the session (defaults to $SHELL, else /bin/sh, started as a plain shell, not a login one). Repeat to pass arguments: `--shell zellij --shell attach --shell -c --shell main` runs `zellij attach -c main`. The value is never split on whitespace"),
         )
         .arg(
+            flag("no_shell_marks", "no-shell-marks")
+                .help("Start bash, zsh or fish as it is, without the shell integration koh adds: by default a session's shell (given no arguments) reads your own startup files, then marks each command (OSC 133), so your terminal knows where each remote command starts and ends, and how"),
+        )
+        .arg(
             Arg::new("scrollback_bytes")
                 .long("scrollback-bytes")
                 .value_name("BYTES")
@@ -508,6 +512,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             max_connections: value(m, "max_connections")?,
             max_sessions: value(m, "max_sessions")?,
             home: koh::pty::Home::user(),
+            shell_marks: !m.get_flag("no_shell_marks"),
         })),
         Some(("connect", m)) => Ok(Cmd::Connect(ConnectArgs {
             remote: remote_args(m)?,
@@ -794,6 +799,11 @@ mod tests {
         assert_eq!(c.max_sessions, d.max_sessions);
         assert!(!c.local && c.relay_url.is_none() && c.key_file.is_none());
         assert_eq!(c.port, d.port);
+        assert!(c.shell_marks && d.shell_marks);
+        let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", ID, "--no-shell-marks"]) else {
+            panic!("serve");
+        };
+        assert!(!c.shell_marks);
 
         // A single `--shell` is just the program.
         let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", ID, "--shell", "/bin/zsh"]) else {

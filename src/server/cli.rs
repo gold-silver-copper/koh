@@ -67,6 +67,8 @@ pub struct ServeConfig {
     pub max_sessions: NonZeroU32,
     /// The home each session's program gets: the user's, but in tests.
     pub home: crate::pty::Home,
+    /// Start a session's bash, zsh or fish so that it marks its commands (OSC 133).
+    pub shell_marks: bool,
 }
 
 /// The CLI's default for `--scrollback-bytes`: 8 MiB, as fux keeps.
@@ -96,6 +98,7 @@ impl Default for ServeConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_sessions: DEFAULT_MAX_SESSIONS,
             home: crate::pty::Home::user(),
+            shell_marks: true,
         }
     }
 }
@@ -353,6 +356,11 @@ impl Hosting {
                     .context("max_sessions does not fit in usize")?,
                 ttl: Duration::from_secs(args.session_ttl_secs),
                 home: args.home.clone(),
+                marks: args
+                    .shell_marks
+                    .then(|| super::marks::MarksDir::new(&args.home.runtime_dir()).map(Arc::new))
+                    .transpose()
+                    .context("naming the directory for the shells' startup files")?,
             },
             max_connections: usize::try_from(args.max_connections.get())
                 .context("max_connections does not fit in usize")?,

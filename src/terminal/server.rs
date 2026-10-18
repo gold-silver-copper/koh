@@ -238,6 +238,12 @@ impl ServerTerminal {
         self.parser.screen()
     }
 
+    /// Count only the shell marks (OSC 133) that carry `nonce=NONCE`, the marks of a shell given
+    /// it; `None`, every one.
+    pub fn require_mark_nonce(&mut self, nonce: Option<&[u8]>) {
+        self.parser.require_mark_nonce(nonce);
+    }
+
     /// Record the shell's exit code; the next snapshot carries it to the client.
     pub fn set_exit_code(&mut self, code: u32) {
         self.exit_code = Some(code);

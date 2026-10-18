@@ -166,7 +166,18 @@ service.
   user (but root), or world-writable without the sticky bit, is refused, and a group-accessible one
   is warned about (members of its group could rename or delete the files in it); the directory's
   lock is a private file in it, which no other user can hold; `KOH_*` env scrubbed before exec'ing
-  the shell; PTY kill gated against pid reuse.
+  the shell; PTY kill gated against pid reuse. The startup files that mark a session's shell's
+  commands (OSC 133) are code the shell runs, so they are kept as a key is: in a 0700 directory of
+  the server run's own (under `$XDG_RUNTIME_DIR`, else the system's temporary directory), made by
+  `mkdir`, which follows no symlink, checked to be the user's own and private before each write,
+  in a parent no other user can write to (or a sticky one, as `/tmp`), each file born 0600 and
+  renamed into place.
+- **The shell's marks:** a shell koh marks is given a random nonce for its session, and only marks
+  carrying it count, so output the user did not mean as the shell's (a file `cat`'d, a program, a
+  remote shell inside the session) cannot tell the user's terminal, or an agent reading it through
+  fux, that a command ended, or with what status. The nonce is in the shell's environment (not
+  exported to what it runs): a process of the same user can read it, as it can anything else of the
+  user's. A program koh does not mark, or `--no-shell-marks`, counts every mark.
 
 The detailed finding history lives in [SECURITY.md's audit trail](../SECURITY.md#audit-trail).
 

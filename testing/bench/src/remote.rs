@@ -409,6 +409,7 @@ impl Remote {
             rows,
             cols,
             argv,
+            &[],
             "xterm-256color",
             &Home::isolated(&setup.home),
             &koh::pty::Reaper::start()?,

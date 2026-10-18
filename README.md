@@ -191,7 +191,9 @@ binary, not the library.
   start, and each command's start and end with its status, so a terminal (or fux's `· done` and
   `last-output`) sees remote commands as local ones. Commands that end between two screen updates
   end as one, with the last one's status; output that scrolled off before an update starts at the
-  screen's top. The remote shell must send the marks (koh adds no shell integration).
+  screen's top. `koh serve` starts bash, zsh and fish so that they send the marks, after your
+  own startup files (your prompt and hooks unchanged), and counts only the shell's own marks, not
+  ones a program prints; `koh serve --no-shell-marks` starts the shell as it is.
 - Runs one command (`koh exec`) or copies files and trees (`koh cp`) over the same connection and
   allowlist as a shell, with no SSH or remote shell needed.
 - Does not provide multi-user accounts, port forwarding, or Windows support.

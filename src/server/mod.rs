@@ -11,6 +11,7 @@ pub mod cli;
 mod copy;
 mod exec;
 mod held;
+pub mod marks;
 pub mod session;
 
 pub use cli::{serve, ServeConfig};

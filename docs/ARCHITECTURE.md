@@ -321,8 +321,35 @@ session's identity is not on the wire (a count above the last after a redial to 
 that shell's last command). As through ssh, the remote shell's marks are the local terminal's: a
 local shell's own mark for the `koh` command it ran is overridden (fux, which gives the shells it
 starts a nonce their marks must carry, ignores koh's marks in such a pane; run `koh connect` as the
-pane's program for fux to read them). The server needs a shell that sends the marks: koh adds no
-shell integration, so a program the remote shell runs can send marks of its own too.
+pane's program for fux to read them).
+
+**koh marks the shells it starts** (`server/marks.rs`), as fux marks its own, so that this works on
+a server nobody set up: a session's bash, zsh or fish, started plainly (`$SHELL`, or a lone
+`--shell`, with no argument; one given any is left as it is, as is any other program), reads the
+user's own startup files, then marks each command. bash is given `--rcfile` with a file that
+sources `~/.bashrc` and then puts the marks first in `PROMPT_COMMAND` (an array's first element,
+after which the user's own hooks run with `$?` and `PIPESTATUS` as without koh), at the start of
+`PS1` and at the end of `PS0` (before bash 4.4, macOS's 3.2, a DEBUG trap armed before each prompt
+in its place); a variable the user made readonly is left unmarked. zsh is given a shim `ZDOTDIR`
+whose `.zshenv` puts the user's `ZDOTDIR` back, sources their `.zshenv` and adds a `preexec` and a
+`precmd` hook; fish an `--init-command` adding two event handlers. The files are written once a
+shell needs them, in a directory of this server run (`koh-shell-marks-PID-RANDOM`, 0700) under
+`$XDG_RUNTIME_DIR`, else the system's temporary directory; it is made with `mkdir`, which never
+follows a symlink, and checked to be the user's own and private before each write, its parent
+checked to be writable by no other user (or sticky), and each file written beside its name and
+renamed into place; the directory is removed as the server stops. `koh serve --no-shell-marks`
+starts the shells as they are, for a user with an integration of their own or a shell koh
+misreads.
+
+Each marked shell is given a nonce (`__koh_k`, 64 random bits, a new one for every session, not
+exported to what the shell runs), its marks carry it (`133;D;1;nonce=…`), and its session's
+emulator counts only marks that do (fux-vt's `require_mark_nonce`). So a program the shell runs
+cannot end or start a command: not `cat` of a file holding marks, not a shell of its own (ssh, a
+nested koh, a terminal multiplexer's shells), and not a shell's own integration, which is how
+fish 4 (which marks natively) or a user's own bash integration is not counted twice. For a
+program koh does not mark, and with `--no-shell-marks`, every mark counts, as before: then the
+marks are whatever the program and what it runs send. The marks a client writes to the user's
+terminal carry no nonce; they are koh's, from the screen.
 
 ## Headless drivers (the protocol is I/O-free; the shells are thin)
 

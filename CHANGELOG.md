@@ -60,6 +60,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - The remote shell's marks (OSC 133) reach the user's terminal: prompts' rows, and each command's
   start and its end with its status, told once (`fux`'s `· done` and `last-output` work through
   koh). The painter moves every row that moved, so what a terminal keeps of a row moves with it.
+- **`koh serve` marks its shells' commands**, as fux does: a session's bash, zsh or fish, started
+  plainly (`$SHELL` or a lone `--shell`), reads the user's own startup files, then sends OSC 133
+  marks, so a terminal sees remote commands end, with their status, on a server nobody set up.
+  Only the shell's own marks count (each carries a nonce of its session), not marks a program
+  prints or fish 4's own; `--no-shell-marks` starts the shell as it is.
 - Painting is a diff of the whole terminal with autowrap off: a terminal larger or smaller than the
   screen shows the screen clipped and nothing else, the status line repaints only when it changes,
   switching mouse modes turns the old one off, and the window title is restored on exit and

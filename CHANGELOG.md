@@ -39,6 +39,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
   `--relay-url` themselves. `koh servers` and the menu show it.
 
 ### Changed
+- **`koh connect` with no terminal says what to use instead**: that it needs one, and that `koh
+  exec SERVER -- COMMAND` runs a command without one and `koh cp` copies files, rather than
+  `acquiring the terminal: No such device or address`. It says so before dialing.
 - **The wire protocol is now `koh/7`**. A connection opens with a request on the client's first
   stream saying what it is for (a shell by pick, a listing, a command or a copy), and the server
   attaches or starts nothing before it; a client that makes none in 10 s is closed. A shell's

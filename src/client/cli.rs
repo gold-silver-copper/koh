@@ -362,6 +362,13 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
 
     warn_if_locale_not_utf8();
 
+    // Before dialing, so a run with no terminal (a script's, an agent's) starts nothing there.
+    let backend = DefaultBackend::new().map_err(|error| {
+        anyhow::anyhow!(
+            "`koh connect` needs a terminal, and there is none here ({error}); \
+             `koh exec SERVER -- COMMAND` runs a command without one, and `koh cp` copies files"
+        )
+    })?;
     // Held for the session: its lease stops `koh key reset` while it may redial.
     let identity = crate::identity::load(&crate::identity::KeyFile::locate(
         args.remote.key_file.clone(),
@@ -381,7 +388,6 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
     let (channels, tasks) = super::spawn_client_io()?;
     let result = async {
-        let backend = DefaultBackend::new().context("acquiring the terminal")?;
         let mut terminal = BackendTerminal::enter(backend, args.clipboard)
             .context("entering raw mode / alt screen")?;
         terminal.set_hyperlinks(args.hyperlinks);

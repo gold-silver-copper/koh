@@ -179,6 +179,23 @@ fn connect_to_an_unsaved_name_lists_the_saved_ones() {
     );
 }
 
+/// `koh connect` with no terminal at all, as a script or an agent runs it, says what to use
+/// instead, and dials nothing.
+#[test]
+fn connect_with_no_terminal_points_at_exec_and_cp() {
+    let home = Home::new("no-terminal").unwrap();
+    let mut koh = home.command(&["connect", &some_id(5)]).unwrap();
+    // A session of its own, so no controlling terminal is inherited for `/dev/tty`.
+    fuxix::process::lead_session(&mut koh, false);
+    let out = koh.stdin(Stdio::null()).output().unwrap();
+    let said = text(&out);
+    assert!(!out.status.success(), "{said}");
+    assert!(
+        said.contains("needs a terminal") && said.contains("koh exec SERVER -- COMMAND"),
+        "{said}"
+    );
+}
+
 #[test]
 fn serve_without_allow_allows_the_saved_clients() {
     let home = Home::new("serve").unwrap();

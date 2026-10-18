@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/8 client.
+//! loopback iroh with a minimal koh/9 client.
 #![forbid(clippy::disallowed_methods)]
 
 use std::time::Duration;
@@ -299,7 +299,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-/// A bare koh/8 client: writes messages, and reads what the server shows on its newest epoch.
+/// A bare koh/9 client: writes messages, and reads what the server shows on its newest epoch.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,

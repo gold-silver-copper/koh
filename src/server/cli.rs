@@ -570,7 +570,7 @@ fn permitted(request: &Request, scope: &Scope, host: &Host) -> Option<Place> {
     let root = match request {
         Request::Exec(_)
         | Request::Start { .. }
-        | Request::Jobs
+        | Request::Jobs { .. }
         | Request::Logs { .. }
         | Request::Kill { .. } => scope.exec.clone(),
         Request::Wait(wait) => match (&wait.on, &wait.until) {
@@ -621,10 +621,12 @@ async fn dispatch(
             }
             super::answer(conn, &started).await;
         }
-        Request::Jobs => {
-            let mut jobs = host.jobs.list(peer);
-            jobs.0.truncate(MAX_LISTED);
-            super::answer(conn, &Answer::Ok(jobs)).await;
+        Request::Jobs { job } => {
+            let jobs = host.jobs.list(peer, job.as_ref()).map(|mut jobs| {
+                jobs.0.truncate(MAX_LISTED);
+                jobs
+            });
+            super::answer(conn, &jobs).await;
         }
         Request::Logs { job, follow } => {
             if let Some(found) = host.jobs.get(peer, &job) {

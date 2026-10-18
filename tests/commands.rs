@@ -123,9 +123,16 @@ fn exec_passes_its_words_as_they_are_and_exits_with_the_commands_status() {
                 .expect("exec");
             assert_eq!(out.status.code(), Some(127), "{out:?}");
             assert!(String::from_utf8_lossy(&out.stderr).contains("no-such-program"));
-            // A directory to start in.
+            // A directory to start in; one not there is said as that, 126: the command could
+            // not start, not that there is no such program.
             let out = remote.run("exec", &["-C", "/", "--", "pwd"]).expect("exec");
             assert_eq!(out.stdout, b"/\n", "{out:?}");
+            let out = remote
+                .run("exec", &["-C", "/no/such/dir", "--", "pwd"])
+                .expect("exec");
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(126), "{out:?}");
+            assert!(said.contains("/no/such/dir: no such directory"), "{said}");
             // Killed by a signal: 128 plus it, as a shell says, and nothing else on stderr.
             let out = remote.exec("kill -9 $$", b"").expect("exec");
             assert_eq!((out.status.code(), &out.stderr[..]), (Some(137), &b""[..]));
@@ -240,6 +247,21 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
             let jobs: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("json");
             assert_eq!(jobs[0]["name"], "build");
             assert_eq!(jobs[0]["status"], 4);
+            // A job is one line in the list, its command's first line marked as cut; by name, its
+            // command whole.
+            let script = "echo one\necho two";
+            ok(&remote
+                .run("run", &["--name", "lines", "--sh", script])
+                .expect("run"));
+            let listed = ok(&remote.run("jobs", &[]).expect("jobs"));
+            let line = listed
+                .lines()
+                .find(|l| l.starts_with("lines "))
+                .expect("listed");
+            assert!(line.ends_with(" echo one …"), "{listed}");
+            assert_eq!(listed.lines().count(), 2, "{listed}");
+            let one = ok(&remote.run("jobs", &["lines"]).expect("jobs"));
+            assert!(one.ends_with("\n  echo one\n  echo two\n"), "{one}");
             // Unnamed, it takes the next number; killed, it ends by the signal.
             let sleeper = remote.run("run", &["--", "sleep", "300"]).expect("run");
             assert_eq!(ok(&sleeper), "1\n");
@@ -347,10 +369,29 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             into.push("/");
             let out = cp(&["-r".into(), from.clone().into(), into.clone()]);
             assert!(out.status.success(), "{out:?}");
+            // It says where the tree landed: in the directory, as its own name.
             let said = String::from_utf8_lossy(&out.stdout);
-            assert!(said.starts_with("3 files, 200 KB → "), "{said}");
+            let landed = format!("{}a tree", into.to_string_lossy());
+            assert!(
+                said.starts_with(&format!("3 files, 200 KB → {landed} (")),
+                "{said}"
+            );
             let want = tree(&from).expect("the tree");
             assert_eq!(tree(&there.join("a tree")).expect("there"), want);
+            // Named as the tree, which is there now, it would nest inside it (cp's rule): refused,
+            // saying how to bring it into line, which `a tree/.` does.
+            let same = remote.at(&there.join("a tree"));
+            let out = cp(&["-r".into(), from.clone().into(), same.clone()]);
+            assert_eq!(out.status.code(), Some(1), "{out:?}");
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert!(said.contains("nested") && said.contains("DIR/."), "{said}");
+            assert!(!there.join("a tree/a tree").exists());
+            let out = cp(&[from.join(".").into(), same.clone()]);
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                said.starts_with(&format!("0 files, 0 B → {}", same.to_string_lossy())),
+                "{said}"
+            );
             // Again: nothing changed, nothing sent.
             let out = cp(&[from.clone().into(), into.clone()]);
             assert!(
@@ -376,6 +417,7 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
                 (Some(1), Some(3)),
                 "{summary}"
             );
+            assert_eq!(summary["landed"].as_str(), Some(&*landed), "{summary}");
             assert!(mtime(&inner) > before, "the edit landed with an old time");
             // -p keeps the source's time.
             let out = cp(&["-p".into(), from.clone().into(), into.clone()]);

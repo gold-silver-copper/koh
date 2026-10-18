@@ -96,16 +96,19 @@ impl Place {
     }
 
     /// The directory `cwd` names for a command to start in (or the default), which, for a scoped
-    /// key, is in its directory as the system finds it, symlinks followed.
+    /// key, is in its directory as the system finds it, symlinks followed. One that is not a
+    /// directory is said as such, not as the program missing.
     pub(super) fn cwd(&self, cwd: Option<&RemotePath>) -> Result<Option<PathBuf>, Problem> {
         let Some(cwd) = cwd else {
             return Ok(self.start().map(Path::to_path_buf));
         };
         let dir = self.resolve(cwd)?.path();
+        if !dir.is_dir() {
+            return Err(Problem::new(ProblemKind::NoSuchDir, dir.display()));
+        }
         if let Some(root) = &self.root {
-            let real = std::fs::canonicalize(&dir).map_err(|e| {
-                Problem::new(ProblemKind::NotFound, format!("{}: {e}", dir.display()))
-            })?;
+            let real = std::fs::canonicalize(&dir)
+                .map_err(|_gone| Problem::new(ProblemKind::NoSuchDir, dir.display()))?;
             let real_root = std::fs::canonicalize(root).map_err(|e| {
                 Problem::new(ProblemKind::NotFound, format!("{}: {e}", root.display()))
             })?;

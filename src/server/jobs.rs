@@ -20,7 +20,7 @@ use super::cli::Host;
 use super::place::Place;
 use crate::request::{
     JobInfo, JobList, JobName, JobState, LogMsg, Problem, ProblemKind, Run, Signal, Started,
-    MAX_LOG_CHUNK,
+    MAX_COMMAND, MAX_LOG_CHUNK, MAX_TITLE,
 };
 
 /// Most jobs kept, all peers', running and ended together.
@@ -113,13 +113,19 @@ impl Job {
             .is_ok_and(|log| log.find(text.as_bytes(), from))
     }
 
-    fn info(&self, now: Instant) -> JobInfo {
+    /// How it stands at `now`, its command whole if `whole`, else cut for a listing.
+    fn info(&self, now: Instant, whole: bool) -> JobInfo {
         let status = *self.status.borrow();
         let ended = self.ended.lock().ok().and_then(|e| *e);
         let dropped = self.log.lock().map_or(0, |log| log.dropped());
         JobInfo {
             name: self.name.clone(),
-            command: self.command.clone(),
+            command: if whole {
+                let end = self.command.floor_char_boundary(MAX_COMMAND);
+                self.command.get(..end).unwrap_or_default().to_owned()
+            } else {
+                self.command.chars().take(MAX_TITLE).collect()
+            },
             age_secs: now.saturating_duration_since(self.started).as_secs(),
             ran_secs: ended.map(|at| at.saturating_duration_since(self.started).as_secs()),
             state: status.exit.map_or(JobState::Running, JobState::Exited),
@@ -169,9 +175,15 @@ impl Jobs {
         table.get(&(peer, name.clone())).cloned()
     }
 
-    /// `peer`'s jobs, oldest first.
-    pub fn list(&self, peer: EndpointId) -> JobList {
+    /// `peer`'s jobs, oldest first; or the one `only` names, its command whole.
+    pub fn list(&self, peer: EndpointId, only: Option<&JobName>) -> Result<JobList, Problem> {
         let now = Instant::now();
+        if let Some(name) = only {
+            let job = self
+                .get(peer, name)
+                .ok_or_else(|| Problem::new(ProblemKind::NoSuchJob, name))?;
+            return Ok(JobList(vec![job.info(now, true)]));
+        }
         let mut jobs: Vec<Arc<Job>> = self.table.lock().map_or_else(
             |_| Vec::new(),
             |table| {
@@ -183,7 +195,9 @@ impl Jobs {
             },
         );
         jobs.sort_by_key(|job| job.started);
-        JobList(jobs.iter().map(|job| job.info(now)).collect())
+        Ok(JobList(
+            jobs.iter().map(|job| job.info(now, false)).collect(),
+        ))
     }
 
     /// Start `run` at `place` as `peer`'s job `name` (else the next number free).

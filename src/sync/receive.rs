@@ -25,8 +25,14 @@ const MAX_DEFERRED: usize = 1_000_000;
 /// Where what is copied lands.
 #[derive(Debug)]
 pub enum Target {
-    /// Each item inside this directory, under its own name.
-    Into { dir: OwnedFd, shown: PathBuf },
+    /// Each item inside this directory, under its own name. `nest` is its name when it was there
+    /// and nothing else said to copy into it (a `/` at its end, several sources): `cp`'s rule
+    /// puts a tree of that name inside it, which is refused, as one copied there again would be.
+    Into {
+        dir: OwnedFd,
+        shown: PathBuf,
+        nest: Option<Name>,
+    },
     /// The one item, as `name` in this directory.
     As {
         dir: OwnedFd,
@@ -62,6 +68,10 @@ impl Target {
                     Ok(meta) if meta.is_dir() => Self::Into {
                         dir: fsat::open_dir_path(path).map_err(io)?,
                         shown: path.clone(),
+                        nest: path
+                            .file_name()
+                            .and_then(|name| Name::new(name.as_bytes().to_vec()).ok())
+                            .filter(|_| !names_dir),
                     },
                     Ok(_) if count > 1 => return Err(Failure::new(FailKind::SeveralIntoOne, path)),
                     Ok(_) if names_dir => return Err(Failure::new(FailKind::NotADirectory, path)),
@@ -72,6 +82,7 @@ impl Target {
                         Self::Into {
                             dir: fsat::open_dir_path(path).map_err(io)?,
                             shown: path.clone(),
+                            nest: None,
                         }
                     }
                     _ => {
@@ -102,6 +113,7 @@ impl Target {
                     None => Self::Into {
                         dir: root_fd,
                         shown,
+                        nest: None,
                     },
                     Some((last, parents)) => {
                         let parent = fsat::walk(root_fd, parents, true, &mut made).map_err(io)?;
@@ -109,6 +121,7 @@ impl Target {
                             Some(Kind::Dir) => Self::Into {
                                 dir: fsat::open_dir(&parent, last.os()).map_err(io)?,
                                 shown,
+                                nest: (!names_dir).then(|| last.clone()),
                             },
                             Some(Kind::Link) => {
                                 return Err(Failure::new(FailKind::IsASymlink, &shown))
@@ -123,7 +136,11 @@ impl Target {
                                 let dir =
                                     fsat::walk(parent, std::slice::from_ref(last), true, &mut made)
                                         .map_err(io)?;
-                                Self::Into { dir, shown }
+                                Self::Into {
+                                    dir,
+                                    shown,
+                                    nest: None,
+                                }
                             }
                             Some(_) | None => Self::As {
                                 dir: parent,
@@ -276,7 +293,7 @@ impl<R: Read> Receiver<'_, R> {
 
     fn run(&mut self, target: &Target) -> Result<Summary, Failure> {
         let top_dir = match target {
-            Target::Into { dir, shown } | Target::As { dir, shown, .. } => {
+            Target::Into { dir, shown, .. } | Target::As { dir, shown, .. } => {
                 dir.try_clone().map_err(|e| Failure::io(shown, &e))?
             }
         };
@@ -306,7 +323,7 @@ impl<R: Read> Receiver<'_, R> {
                 Item::Contents { mode, mtime } if at_top => {
                     placed = placed.saturating_add(1);
                     match target {
-                        Target::Into { dir, shown } => {
+                        Target::Into { dir, shown, .. } => {
                             let fd = dir.try_clone().map_err(|e| Failure::io(shown, &e))?;
                             self.open.push(Open {
                                 fd,
@@ -324,6 +341,19 @@ impl<R: Read> Receiver<'_, R> {
                     }
                 }
                 Item::Dir { name, mode, mtime } => {
+                    if let (
+                        true,
+                        Target::Into {
+                            nest: Some(nest),
+                            shown,
+                            ..
+                        },
+                    ) = (at_top, target)
+                    {
+                        if *nest == name {
+                            return Err(Failure::new(FailKind::Nests, shown));
+                        }
+                    }
                     let (dir, name) = self.place(target, name, &mut placed)?;
                     self.enter(&dir, &name, mode, mtime)?;
                 }
@@ -353,7 +383,7 @@ impl<R: Read> Receiver<'_, R> {
     /// The directory an entry named `name` goes in, and the name it lands as: the open
     /// directory's, or at the top as `target` says.
     fn place(
-        &self,
+        &mut self,
         target: &Target,
         name: Name,
         placed: &mut usize,
@@ -368,7 +398,8 @@ impl<R: Read> Receiver<'_, R> {
         let nth = *placed;
         *placed = placed.saturating_add(1);
         match target {
-            Target::Into { dir, shown } => {
+            Target::Into { dir, shown, .. } => {
+                self.summary.inside = Some(String::from_utf8_lossy(name.as_bytes()).into_owned());
                 Ok((dir.try_clone().map_err(|e| Failure::io(shown, &e))?, name))
             }
             Target::As { dir, name, shown } if nth == 0 => Ok((

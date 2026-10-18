@@ -356,6 +356,17 @@ pub struct Summary {
     pub skipped: u64,
     #[serde(deserialize_with = "skipped_shown")]
     pub skipped_shown: Vec<String>,
+    /// The name the one source landed as inside the destination, a directory: `None` when it
+    /// landed as the destination itself, or its contents did (`dir/.`).
+    #[serde(deserialize_with = "inside")]
+    pub inside: Option<String>,
+}
+
+fn inside<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    struct Inside(#[serde(deserialize_with = "at_most::<MAX_NAME, _, _>")] Vec<u8>);
+    let inside = Option::<Inside>::deserialize(deserializer)?;
+    Ok(inside.map(|Inside(name)| String::from_utf8_lossy(&name).into_owned()))
 }
 
 fn skipped_shown<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
@@ -460,6 +471,8 @@ pub enum FailKind {
     Malformed,
     /// Any other error.
     Other,
+    /// A tree whose name the destination, a directory already, has: it would land nested.
+    Nests,
 }
 
 impl FailKind {
@@ -502,6 +515,7 @@ impl FailKind {
             Self::Truncated => "truncated",
             Self::Malformed => "malformed",
             Self::Other => "failed",
+            Self::Nests => "nests",
         }
     }
 
@@ -530,6 +544,11 @@ impl FailKind {
             }
             Self::Malformed => "the other end sent a malformed copy stream",
             Self::Other => "failed",
+            Self::Nests => {
+                "is a directory of the tree's name already, so the tree would land nested inside \
+                 it: to bring it into line, copy what is in the tree (`DIR/.`) to it; to nest it, \
+                 name the destination DIR/NAME"
+            }
         }
     }
 }

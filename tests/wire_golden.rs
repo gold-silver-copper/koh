@@ -7,6 +7,7 @@
 //! to round-trip through their streams.
 #![forbid(clippy::disallowed_methods)]
 
+use koh::copy::{FailKind, Failure, Item, LinkTarget, Mode, Name, Time};
 use koh::events::{
     InputEvent, WireButton, WireColours, WireKey, WireKeyCode, WireKitty, WireMouse,
     WireMouseAction, WireScheme,
@@ -14,6 +15,10 @@ use koh::events::{
 use koh::proto::{
     decode_frame_body, decode_history, decode_server, dictionary_for, encode_client, ClientDecoder,
     ClientMsg, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg,
+};
+use koh::request::{
+    Arity, Attached, CommandLine, Copy, ExecStream, ExitStatus, Pick, Presence, RemotePath,
+    Request, Resume, RunId, SessionInfo, SessionList, SessionNum, Sources,
 };
 use koh::terminal::{
     CellKind, CellText, Commands, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, RowDiff,
@@ -469,6 +474,174 @@ fn frames_and_history_round_trip_through_their_streams() {
 /// (`koh::transport_iroh::ALPN`) and this with it.
 const PINNED_FOR: &[u8] = b"koh/7";
 
+/// One opening request of each kind, with varints of one and several bytes.
+fn requests() -> Option<Vec<Request>> {
+    let path = |p: &[u8]| RemotePath::new(p.to_vec()).ok();
+    Some(vec![
+        Request::Shell(Pick::Latest),
+        Request::Shell(Pick::New),
+        Request::Shell(Pick::Id(SessionNum(300))),
+        Request::Shell(Pick::Resume(Resume {
+            run: RunId(0x0102_0304_0506_0708),
+            session: SessionNum(3),
+        })),
+        Request::Sessions,
+        Request::Exec(CommandLine::join(&["echo", "a b"]).ok()?),
+        Request::Copy(Copy::Get(
+            Sources::new(vec![path(b"~/x")?, path(b"")?]).ok()?,
+        )),
+        Request::Copy(Copy::Put {
+            dest: path(b"/srv")?,
+            arity: Arity::Several,
+        }),
+    ])
+}
+
+/// [`requests`], as the client's first stream carries them, length prefix included.
+const REQUESTS: [&str; 8] = [
+    "000000020000",
+    "000000020001",
+    "000000040002ac02",
+    "0000000c0003888e98a8c0e080810103",
+    "0000000101",
+    "0000000a02086563686f20612062",
+    "00000008030002037e2f7800",
+    "000000080301042f73727601",
+];
+
+/// The server's replies sent whole: a shell's admission, a listing and a command's status.
+fn replies() -> Vec<Vec<u8>> {
+    let attached = Attached {
+        at: Resume {
+            run: RunId(9),
+            session: SessionNum(300),
+        },
+    };
+    let list = SessionList(vec![
+        SessionInfo {
+            session: SessionNum(1),
+            age_secs: 70_000,
+            presence: Presence::Attached,
+            size: Size::new(24, 80),
+            title: "vim".to_owned(),
+            exited: None,
+        },
+        SessionInfo {
+            session: SessionNum(2),
+            age_secs: 5,
+            presence: Presence::Detached { secs: 4 },
+            size: Size::new(50, 132),
+            title: String::new(),
+            exited: Some(137),
+        },
+    ]);
+    let max = koh::request::MAX_REPLY;
+    [
+        koh::request::encode(&attached, max),
+        koh::request::encode(&list, max),
+        koh::request::encode(&ExitStatus(137), max),
+    ]
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect()
+}
+
+/// [`replies`].
+const REPLIES: [&str; 3] = [
+    "0000000309ac02",
+    "000000180201f0a2040018500376696d000205010432840100018901",
+    "000000028901",
+];
+
+/// One copy item of each kind.
+fn copy_items() -> Option<Vec<Item>> {
+    let name = |n: &[u8]| Name::new(n.to_vec()).ok();
+    Some(vec![
+        Item::Dir {
+            name: name(b"a dir")?,
+            mode: Mode::new(0o755)?,
+            mtime: Time::new(1_700_000_000, 5),
+        },
+        Item::File {
+            name: name(b"odd\n\xff")?,
+            mode: Mode::new(0o4751)?,
+            mtime: None,
+        },
+        Item::Data(koh::copy::DataLen::new(65_536)?),
+        Item::Symlink {
+            name: name(b"link")?,
+            target: LinkTarget::new(b"../x".to_vec()).ok()?,
+        },
+        Item::End,
+        Item::Skipped(name(b"fifo")?),
+        Item::Failed(Failure::new(
+            FailKind::PermissionDenied,
+            std::path::Path::new("/root"),
+        )),
+        Item::Done,
+    ])
+}
+
+/// [`copy_items`], as a copy stream carries them, length prefix included.
+const COPY_ITEMS: [&str; 8] = [
+    "0000001000056120646972ed030180e2cfaa0605",
+    "0000000a01056f64640affe91300",
+    "0000000402808004",
+    "0000000b03046c696e6b042e2e2f78",
+    "0000000104",
+    "0000000605046669666f",
+    "000000080601052f726f6f74",
+    "0000000107",
+];
+
+#[test]
+fn opening_requests_replies_and_copy_items_encode_as_pinned() {
+    assert_eq!(koh::transport_iroh::ALPN, PINNED_FOR);
+    let requests = requests().expect("requests");
+    let items = copy_items().expect("items");
+    let encoded = |msg: &dyn erased::Encode| hex(&msg.encode());
+    let actual: Vec<String> = (requests.iter().map(|r| encoded(r)))
+        .chain(replies().iter().map(|reply| hex(reply)))
+        .chain(items.iter().map(|item| encoded(item)))
+        .collect();
+    let pinned: Vec<&str> = REQUESTS
+        .iter()
+        .chain(&REPLIES)
+        .chain(&COPY_ITEMS)
+        .copied()
+        .collect();
+    assert_eq!(actual, pinned, "a change here is a new protocol");
+    for (request, pinned) in requests.iter().zip(REQUESTS) {
+        let pinned = unhex(pinned).expect("hex");
+        let decoded: Request =
+            koh::request::decode_framed(&pinned, koh::request::MAX_REQUEST).expect("decodes");
+        assert_eq!(&decoded, request);
+    }
+    for (item, pinned) in items.iter().zip(COPY_ITEMS) {
+        let pinned = unhex(pinned).expect("hex");
+        let decoded: Item =
+            koh::request::decode_framed(&pinned, koh::copy::MAX_ITEM).expect("decodes");
+        assert_eq!(&decoded, item);
+    }
+    assert_eq!(
+        [ExecStream::Stdout, ExecStream::Stderr, ExecStream::Status].map(ExecStream::tag),
+        [0, 1, 2]
+    );
+}
+
+/// Framed encodings of the opening's types, as one list.
+mod erased {
+    pub trait Encode {
+        fn encode(&self) -> Vec<u8>;
+    }
+
+    impl<T: serde::Serialize> Encode for T {
+        fn encode(&self) -> Vec<u8> {
+            koh::request::encode(self, usize::MAX).unwrap_or_default()
+        }
+    }
+}
+
 #[test]
 fn client_messages_encode_as_pinned() {
     assert_eq!(koh::transport_iroh::ALPN, PINNED_FOR);
@@ -580,6 +753,13 @@ fn the_wire_messages_seed_the_fuzzers() {
             .encode_history(&reply)
             .expect("encodes"),
     );
+    // What request_decode reads: a message's body, as `decode` takes it.
+    let (requests, items) = (requests().expect("requests"), copy_items().expect("items"));
+    let bodies = (requests.iter())
+        .map(|request| koh::request::encode(request, usize::MAX).expect("encodes"))
+        .chain(replies())
+        .chain((items.iter()).map(|item| koh::request::encode(item, usize::MAX).expect("encodes")))
+        .map(|framed| framed[4..].to_vec());
     // What history_apply reads first: the mark, the request and the view's offset.
     let header =
         postcard::to_allocvec(&(70_000_u64, 2_u32, 70_000_u64, 2_u16, 1_u16)).expect("encodes");
@@ -594,6 +774,7 @@ fn the_wire_messages_seed_the_fuzzers() {
     ]
     .into_iter()
     .chain(streams.into_iter().map(|stream| ("proto_decode", stream)))
+    .chain(bodies.map(|body| ("request_decode", body)))
     .chain(frames.iter().map(|frame| {
         (
             "screen_apply",

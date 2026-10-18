@@ -21,6 +21,7 @@ disallowed-methods = [
     { path = "tokio::spawn", reason = "say what bounds the tasks spawned here, in the expectation's reason" },
     { path = "tokio::task::spawn", reason = "say what bounds the tasks spawned here, in the expectation's reason" },
     { path = "std::io::stderr", reason = "write through koh::log::stderr, which escapes what a peer chose" },
+    { path = "tokio::io::stderr", reason = "write through koh::log::stderr, which escapes what a peer chose" },
     { path = "std::process::Command::new", reason = "tests start programs through koh_testkit::command, whose list never holds one that authenticates; elsewhere say what is run" },
     { path = "std::env::temp_dir", reason = "write under target/, in a koh_testkit::Scratch" },
 ]

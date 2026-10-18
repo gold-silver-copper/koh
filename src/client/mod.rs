@@ -6,6 +6,8 @@
 
 pub mod backend;
 pub mod cli;
+mod copy;
+mod exec;
 mod io;
 mod link;
 mod probe;
@@ -14,7 +16,7 @@ mod scrollback;
 mod session;
 
 pub use backend::{DefaultBackend, KohBackend};
-pub use cli::{connect, BellHook, ConnectConfig};
+pub use cli::{connect, copy, exec, sessions, BellHook, ConnectConfig, CopyJob, Remote};
 pub(crate) use io::spawn_client_io;
 pub use render::WindowState;
 pub use session::{ClientSession, Found, InputOutcome, TickResult};
@@ -24,9 +26,10 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::log::Peer;
 use crate::predict::Overlay;
 use crate::proto::{decode_server, encode_client, ClientMsg, Close, ServerMsg, Stream, MAX_FRAME};
+use crate::request::{Attached, Pick, Request, Resume, MAX_REPLY, MAX_REQUEST};
 use crate::terminal::{Size, TerminalScreen};
 use crate::transport_iroh::{closed_because, ALPN, PROTOCOL};
-use iroh::endpoint::{Connection, RecvStream};
+use iroh::endpoint::{Connection, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -60,8 +63,10 @@ const MIN_CONNECTION_DWELL: Duration = Duration::from_secs(5);
 /// costs only a brief banner, so the threshold is low.
 const STALE_AFTER_FREEZE: Duration = Duration::from_secs(20);
 
-/// Dials the server and awaits its first frame, which admits the client: the first connection and every reconnect, which
-/// reattaches to the same server session.
+/// Dials the server and makes the opening request ([`crate::request`]).
+///
+/// It makes a shell's first connection and every reconnect, which reattaches to the session the
+/// first reached, and the one connection of a command, a copy or a listing.
 pub struct IrohConnector {
     endpoint: Endpoint,
     target: EndpointAddr,
@@ -73,36 +78,75 @@ impl IrohConnector {
         Self { endpoint, target }
     }
 
-    /// Connect and await the stream of the first frame, which the server sends once the client has a
-    /// session.
-    /// A server that will not have us for good closes the connection instead, a [`Refused`]
-    /// error, so the client fails fast rather than redialing forever; one that cannot have us now
-    /// (at capacity, say) closes it saying so, an error that is its [`Close`].
-    pub async fn connect(&self) -> anyhow::Result<Admitted> {
+    /// Connect and make `request`, on the client's first stream, left open for what follows it.
+    pub async fn open(&self, request: &Request) -> anyhow::Result<(Connection, SendStream)> {
         let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
             Ok(conn) => conn,
             Err(e) if refused_our_alpn(&e) => return Err(Refused::OtherProtocol.into()),
             Err(e) => anyhow::bail!("connecting to server: {}", Peer(e)),
         };
-        match conn.accept_uni().await {
-            Ok(first) => Ok(Admitted(conn, first)),
-            Err(e) => Err(match closed_because(&conn) {
-                Some(Close::NotAuthorized) => Refused::NotAuthorized.into(),
-                Some(why) => why.into(),
-                None => anyhow::anyhow!("server did not admit the connection: {}", Peer(e)),
-            }),
+        let opened = async {
+            let mut control = conn.open_uni().await?;
+            // The control stream's bytes go before input's: a resize or an acknowledgement does
+            // not wait behind a paste QUIC is still sending.
+            let _ = control.set_priority(1);
+            control
+                .write_all(&crate::request::encode(request, MAX_REQUEST)?)
+                .await?;
+            anyhow::Ok(control)
+        };
+        match opened.await {
+            Ok(control) => Ok((conn, control)),
+            Err(e) => Err(refusal(&conn, &e)),
+        }
+    }
+
+    /// Connect to the session `pick` names and await the server's first stream, which admits the
+    /// client and says which session it reached.
+    /// A server that will not have us for good closes the connection instead, a [`Refused`]
+    /// error, so the client fails fast rather than redialing forever; one that cannot have us now
+    /// (at capacity, say) closes it saying so, an error that is its [`Close`].
+    pub async fn connect(&self, pick: Pick) -> anyhow::Result<Admitted> {
+        let (conn, control) = self.open(&Request::Shell(pick)).await?;
+        let attached = async {
+            let mut first = conn.accept_uni().await?;
+            let bytes = first.read_to_end(MAX_REPLY.saturating_add(4)).await?;
+            anyhow::Ok(crate::request::decode_framed::<Attached>(
+                &bytes, MAX_REPLY,
+            )?)
+        };
+        match attached.await {
+            Ok(Attached { at }) => Ok(Admitted { conn, control, at }),
+            Err(e) => Err(refusal(&conn, &e)),
         }
     }
 }
 
-/// A connection the server admitted, and the stream of its first frame, which said so.
-pub struct Admitted(pub Connection, RecvStream);
+/// Why the server did not answer on `conn`, which failed with `error`: its close code, a
+/// [`Refused`] if it is for good.
+pub(crate) fn refusal(conn: &Connection, error: &anyhow::Error) -> anyhow::Error {
+    match closed_because(conn) {
+        Some(Close::NotAuthorized) => Refused::NotAuthorized.into(),
+        Some(Close::NoSuchSession) => Refused::NoSuchSession.into(),
+        Some(why) => why.into(),
+        None => anyhow::anyhow!("the server did not answer: {}", Peer(format!("{error:#}"))),
+    }
+}
+
+/// A shell connection the server admitted: its control stream, open, and the session it reached.
+pub struct Admitted {
+    pub conn: Connection,
+    control: SendStream,
+    pub at: Resume,
+}
 
 /// The server refused us for good: redialing cannot help, so the client exits saying why.
 #[derive(Debug, thiserror::Error)]
 pub enum Refused {
     #[error("server rejected the connection: {}", Close::NotAuthorized)]
     NotAuthorized,
+    #[error("{}", Close::NoSuchSession)]
+    NoSuchSession,
     #[error("the server does not speak this koh protocol ({PROTOCOL}); upgrade koh on both ends")]
     OtherProtocol,
 }
@@ -389,8 +433,10 @@ impl<B: KohBackend> Drop for BackendTerminal<B> {
     }
 }
 
-/// Run a client session on `initial`, redialing through `connector` and reattaching to the same
-/// server session whenever the link drops; meanwhile the last screen stays up under a banner.
+/// Run a client session on `initial`, redialing through `connector` whenever the link drops.
+///
+/// Each redial reattaches to the same server session, by its number in that server's run; a
+/// session gone meanwhile ends the run. Meanwhile the last screen stays up under a banner.
 ///
 /// The I/O shell around [`ClientSession`], which makes every protocol decision. One session lives
 /// for the whole run, its first phase asking the user's terminal what it does (its colours too if
@@ -427,6 +473,8 @@ pub async fn run_client<T: ClientTerminal>(
 ) -> anyhow::Result<Option<u32>> {
     let mut session = ClientSession::new(term.size().unwrap_or(initial_size));
     session.ask_terminal(Instant::now(), colours);
+    // Every redial goes back to the session the first connection reached, never to another.
+    let back = Pick::Resume(initial.at);
     // `None` once the resize ticks end, so a closed channel is not polled again.
     let mut resizes = Resizes(Some(resize_rx));
     // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
@@ -450,7 +498,7 @@ pub async fn run_client<T: ClientTerminal>(
                     frozen_secs = wall_gap.as_secs(),
                     "detected resume from a process freeze (suspend/screen-off); forcing a reconnect"
                 );
-                net = redial(wire, &mut attempt, &mut session, &connector);
+                net = redial(wire, &mut attempt, &mut session, &connector, back);
                 continue;
             }
             crate::transport_iroh::rtt(&wire.conn)
@@ -588,7 +636,7 @@ pub async fn run_client<T: ClientTerminal>(
                     return Ok(session.state().exit_code());
                 }
                 tracing::info!(reason = ?wire.conn.close_reason(), "link lost; will reconnect");
-                net = redial(wire, &mut attempt, &mut session, &connector);
+                net = redial(wire, &mut attempt, &mut session, &connector, back);
             }
             Some(Change::Dialed(Ok(Ok(conn)))) => {
                 session.attach(term.size().unwrap_or(initial_size));
@@ -608,7 +656,7 @@ pub async fn run_client<T: ClientTerminal>(
                     tracing::info!(attempt, "reconnect dial timed out");
                 }
                 attempt = attempt.saturating_add(1);
-                net = Net::Down(dial(&connector, attempt));
+                net = Net::Down(dial(&connector, attempt, back));
             }
         }
     }
@@ -690,23 +738,32 @@ struct Wire {
 }
 
 impl Wire {
-    /// Start the tasks opening and writing the client's input and control streams and reading
-    /// frames on `conn`. Each stream is opened by its writer, so a server that grants none holds
-    /// up nothing else; one that fails to open ends its writer, which loses the link.
-    fn open(Admitted(conn, first): Admitted) -> Self {
+    /// Start the tasks writing the client's control stream, opened with the request, and opening
+    /// and writing its input stream, and reading frames on `conn`. The input stream is opened by
+    /// its writer, so a server that grants none holds up nothing else; one that fails to open ends
+    /// its writer, which loses the link.
+    fn open(Admitted { conn, control, .. }: Admitted) -> Self {
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
         let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
         let (frame_tx, frame_rx) = mpsc::channel::<Received>(FRAME_QUEUE);
+        let input = {
+            let conn = conn.clone();
+            async move {
+                if let Ok(stream) = conn.open_uni().await {
+                    write_client_stream(stream, input_rx).await;
+                }
+            }
+        };
         #[expect(
             clippy::disallowed_methods,
             reason = "two writers and a reader a connection"
         )]
         let (writers, reader) = (
-            [(input_rx, 0), (control_rx, 1)].map(|(rx, priority)| {
-                let writer = write_client_stream(conn.clone(), rx, priority);
-                AbortOnDropHandle::new(tokio::spawn(writer))
-            }),
-            AbortOnDropHandle::new(tokio::spawn(read_frames(conn.clone(), first, frame_tx))),
+            [
+                AbortOnDropHandle::new(tokio::spawn(input)),
+                AbortOnDropHandle::new(tokio::spawn(write_client_stream(control, control_rx))),
+            ],
+            AbortOnDropHandle::new(tokio::spawn(read_frames(conn.clone(), frame_tx))),
         );
         Self {
             conn,
@@ -727,22 +784,24 @@ impl Drop for Wire {
     }
 }
 
-/// The link on `wire` was lost: close it, detach the session, and redial.
+/// The link on `wire` was lost: close it, detach the session, and redial to `back`.
 fn redial<'c>(
     wire: &Wire,
     attempt: &mut u32,
     session: &mut ClientSession,
     connector: &'c IrohConnector,
+    back: Pick,
 ) -> Net<'c> {
     wire.conn.close(0u32.into(), b"reconnecting");
     *attempt = next_attempt_after_drop(*attempt, wire.started.elapsed());
     session.detach(Instant::now());
-    Net::Down(dial(connector, *attempt))
+    Net::Down(dial(connector, *attempt, back))
 }
 
-/// Dial again: at once after a proven connection's drop (`attempt` 0), else after a backoff, so a
-/// server that completes the handshake and at once closes is not redialed in a tight loop.
-fn dial(connector: &IrohConnector, attempt: u32) -> Dial<'_> {
+/// Dial `pick` again: at once after a proven connection's drop (`attempt` 0), else after a
+/// backoff, so a server that completes the handshake and at once closes is not redialed in a tight
+/// loop.
+fn dial(connector: &IrohConnector, attempt: u32, pick: Pick) -> Dial<'_> {
     let wait = if attempt > 0 {
         backoff(attempt)
     } else {
@@ -750,7 +809,7 @@ fn dial(connector: &IrohConnector, attempt: u32) -> Dial<'_> {
     };
     Box::pin(async move {
         tokio::time::sleep(wait).await;
-        tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect()).await
+        tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect(pick)).await
     })
 }
 
@@ -796,15 +855,9 @@ fn send(permit: Option<mpsc::Permit<'_, Vec<u8>>>, msg: Option<ClientMsg>) -> Op
     None
 }
 
-/// Open one of the client's streams on `conn`, at `priority`, and write queued messages to it,
-/// until the queue or the stream closes.
-async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>>, priority: i32) {
-    let Ok(mut send) = conn.open_uni().await else {
-        return;
-    };
-    // The control stream's bytes go before input's: a resize or an acknowledgement does not wait
-    // behind a paste QUIC is still sending.
-    let _ = send.set_priority(priority);
+/// Write queued messages to one of the client's streams, `send`, until the queue or the stream
+/// closes.
+async fn write_client_stream(mut send: SendStream, mut queue: mpsc::Receiver<Vec<u8>>) {
     while let Some(bytes) = queue.recv().await {
         if send.write_all(&bytes).await.is_err() {
             return;
@@ -832,25 +885,21 @@ struct Received {
     _large: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-/// Accept the server's streams (frames, and history rows), after `first`, each read on its own task so a stalled or
-/// reset stream never holds up a newer frame. Ends when the connection closes.
+/// Accept the server's streams after its first (frames, and history rows), each read on its own
+/// task so a stalled or reset stream never holds up a newer frame. Ends when the connection
+/// closes.
 ///
 /// At most [`FRAME_QUEUE`] streams are read or wait to be applied at once, together: a reader
 /// takes its slot in `frames` before it reads. Past them, no stream is accepted, so QUIC's stream
 /// limit stops the server opening more; and of them, at most [`LARGE_STREAMS`] are large.
-async fn read_frames(conn: Connection, first: RecvStream, frames: mpsc::Sender<Received>) {
+async fn read_frames(conn: Connection, frames: mpsc::Sender<Received>) {
     let large = std::sync::Arc::new(tokio::sync::Semaphore::new(LARGE_STREAMS));
-    let mut first = Some(first);
     loop {
         let Ok(slot) = frames.clone().reserve_owned().await else {
             return;
         };
-        let mut recv = match first.take() {
-            Some(recv) => recv,
-            None => match conn.accept_uni().await {
-                Ok(recv) => recv,
-                Err(_) => return,
-            },
+        let Ok(mut recv) = conn.accept_uni().await else {
+            return;
         };
         let large = std::sync::Arc::clone(&large);
         #[expect(
@@ -895,15 +944,32 @@ async fn end_session<T: ClientTerminal>(
     }
 }
 
+/// What a server does to admit a shell's client: read its request and say it attached session 1.
+/// The request's stream, which the client goes on writing, for the caller to keep open.
+#[cfg(test)]
+pub(crate) async fn admit(conn: &Connection) -> anyhow::Result<iroh::endpoint::RecvStream> {
+    let mut control = conn.accept_uni().await?;
+    let request = crate::transport_iroh::read_framed(&mut control, MAX_REQUEST).await?;
+    anyhow::ensure!(matches!(
+        crate::request::decode(&request)?,
+        Request::Shell(_)
+    ));
+    let attached = Attached {
+        at: Resume {
+            run: crate::request::RunId(0),
+            session: crate::request::SessionNum(1),
+        },
+    };
+    let mut send = conn.open_uni().await?;
+    send.write_all(&crate::request::encode(&attached, MAX_REPLY)?)
+        .await?;
+    send.finish()?;
+    Ok(control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// What a server sends to admit the client: a first stream, here an empty one.
-    async fn admit(conn: &Connection) -> anyhow::Result<()> {
-        conn.open_uni().await?.finish()?;
-        Ok(())
-    }
 
     /// A server that will not have the client for good (another protocol, or not authorized) is
     /// a [`Refused`]; one that cannot have it now closes saying why, and is redialed.
@@ -928,7 +994,10 @@ mod tests {
                 }
                 old
             });
-            let Err(error) = IrohConnector::new(client.clone(), addr).connect().await else {
+            let Err(error) = IrohConnector::new(client.clone(), addr)
+                .connect(Pick::Latest)
+                .await
+            else {
                 panic!("an old-protocol server must refuse the handshake");
             };
             assert!(
@@ -944,6 +1013,7 @@ mod tests {
                 Close::AtCapacity,
                 Close::CouldNotStart,
                 Close::NotAuthorized,
+                Close::NoSuchSession,
             ] {
                 let (refusing, dialed) = tokio::join!(
                     async {
@@ -951,13 +1021,13 @@ mod tests {
                         crate::transport_iroh::close(&conn, why);
                         conn.closed().await
                     },
-                    connector.connect()
+                    connector.connect(Pick::Id(crate::request::SessionNum(3)))
                 );
                 drop(refusing);
                 let Err(error) = dialed else {
                     panic!("{why:?}: admitted");
                 };
-                if why == Close::NotAuthorized {
+                if matches!(why, Close::NotAuthorized | Close::NoSuchSession) {
                     assert!(error.is::<Refused>(), "{why:?}: {error:#}");
                 } else {
                     // Transient: redialed, and the banner says why.
@@ -1053,8 +1123,8 @@ mod tests {
         }
     }
 
-    /// A server that admits the client and grants it no stream to write on: the keyboard stays
-    /// the client's, and the quit escape ends it at once.
+    /// A server that admits the client and grants it no stream to write on but the one its request
+    /// went on: the keyboard stays the client's, and the quit escape ends it at once.
     #[test]
     fn a_server_granting_no_streams_cannot_block_quit() {
         use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
@@ -1066,7 +1136,7 @@ mod tests {
                 .alpns(vec![ALPN.to_vec()])
                 .transport_config(
                     QuicTransportConfig::builder()
-                        .max_concurrent_uni_streams(VarInt::from_u32(0))
+                        .max_concurrent_uni_streams(VarInt::from_u32(1))
                         .build(),
                 )
                 .bind()
@@ -1076,7 +1146,7 @@ mod tests {
             let accept = koh_testkit::spawn(async move {
                 if let Some(incoming) = server.accept().await {
                     if let Ok(conn) = incoming.await {
-                        if admit(&conn).await.is_ok() {
+                        if let Ok(_control) = admit(&conn).await {
                             conn.closed().await;
                         }
                     }
@@ -1087,7 +1157,7 @@ mod tests {
                 .await
                 .expect("bind the client");
             let connector = IrohConnector::new(client, addr);
-            let conn = connector.connect().await.expect("admitted");
+            let conn = connector.connect(Pick::Latest).await.expect("admitted");
             let (input, input_rx) = mpsc::channel(8);
             let (_resize, resize_rx) = mpsc::channel(1);
             let run = koh_testkit::spawn(run_client(
@@ -1130,7 +1200,7 @@ mod tests {
         koh_testkit::spawn(async move {
             if let Some(incoming) = server.accept().await {
                 if let Ok(conn) = incoming.await {
-                    if admit(&conn).await.is_ok() {
+                    if let Ok(_control) = admit(&conn).await {
                         serve(conn.clone()).await;
                         conn.closed().await;
                     }
@@ -1142,7 +1212,10 @@ mod tests {
             .await
             .expect("bind the client");
         let connector = IrohConnector::new(client, addr);
-        (connector.connect().await.expect("admitted"), connector)
+        (
+            connector.connect(Pick::Latest).await.expect("admitted"),
+            connector,
+        )
     }
 
     #[test]
@@ -1151,7 +1224,7 @@ mod tests {
         // a dropped stream would leave readers holding every slot, and the reply after them would
         // never come.
         crate::test_runtime::current_thread().block_on(async {
-            let (Admitted(conn, first), _connector) = loopback(|conn| async move {
+            let (Admitted { conn, .. }, _connector) = loopback(|conn| async move {
                 for _ in 0..20 {
                     let mut send = conn.open_uni().await.expect("a stream");
                     send.write_all(&vec![0xff; 1 << 20]).await.expect("written");
@@ -1170,7 +1243,7 @@ mod tests {
             })
             .await;
             let (tx, mut rx) = mpsc::channel(FRAME_QUEUE);
-            koh_testkit::spawn(read_frames(conn, first, tx));
+            koh_testkit::spawn(read_frames(conn, tx));
             let got = tokio::time::timeout(Duration::from_secs(20), rx.recv())
                 .await
                 .expect("the reply after the large streams never came")

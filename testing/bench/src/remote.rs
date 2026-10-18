@@ -342,7 +342,7 @@ impl Remote {
         let server = tokio::spawn(serve_endpoint(server_endpoint, hosting, shutdown.clone()));
         let endpoint = net.endpoint(client_secret, false).await?;
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server_id));
-        let channel = connector.connect().await?;
+        let channel = connector.connect(koh::request::Pick::Latest).await?;
         let start = Size::new(rows, cols);
         let buffer = Buffer {
             painted: Arc::default(),

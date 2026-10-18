@@ -1,6 +1,7 @@
 //! Detachable sessions, as tasks.
 //!
-//! A [`Registry`] task creates, reattaches, caps and ends them, one per peer. Each session task
+//! A [`Registry`] task creates, reattaches, caps, lists and ends them, by peer and number: a peer
+//! may have several, each numbered server-wide as it starts. Each session task
 //! owns its program's PTY and emulator and publishes every screen on a `watch` channel, attached
 //! or not, so a client that reconnects finds the live screen: or, once the program exited, its
 //! final screen and status, kept until a client acknowledges it or the TTL runs out.
@@ -15,6 +16,7 @@ use std::time::Duration;
 
 use crate::proto::Close;
 use crate::pty::Exit;
+use crate::request::{Pick, Presence, RunId, SessionInfo, SessionNum, MAX_TITLE};
 use crate::terminal::{
     FrameHold, HistoryReply, HistoryRequest, ServerTerminal, Size, TerminalScreen, DEFAULT_SIZE,
 };
@@ -249,6 +251,17 @@ enum Ask {
     /// The window of attachment `attach` is now `size` (clamped): asked beside input, so a
     /// resize never waits behind typing the program has not taken.
     Resize { attach: u64, window: super::Window },
+    /// How the session stands, for a listing: asked by the registry's caller.
+    Describe(oneshot::Sender<Description>),
+}
+
+/// How a session stands, as it says for a listing.
+struct Description {
+    /// Since when no client is attached, if none is.
+    detached: Option<Instant>,
+    size: Size,
+    title: String,
+    exited: Option<u32>,
 }
 
 /// Whether [`Registry::attach`] created a fresh session or reattached to a running one.
@@ -266,6 +279,8 @@ type Attached = Result<(SessionClient, AttachKind), Close>;
 /// A connection's handle to its session: watch the screen, send input, ask for history, and
 /// detach on drop.
 pub struct SessionClient {
+    /// Which session it is.
+    session: SessionNum,
     /// The attachment itself: the session counts its clients by its screen receivers, so this is
     /// never cloned, and none is made but for a client.
     screens: watch::Receiver<Arc<TerminalScreen>>,
@@ -276,6 +291,11 @@ pub struct SessionClient {
 }
 
 impl SessionClient {
+    /// Which session it is attached to.
+    pub const fn session(&self) -> SessionNum {
+        self.session
+    }
+
     /// Wait for the next screen the session publishes, or `None` once the session ends.
     pub async fn next_screen(&mut self) -> Option<Arc<TerminalScreen>> {
         self.screens.changed().await.ok()?;
@@ -315,17 +335,22 @@ struct Attach(oneshot::Sender<Attached>);
 /// How many attaches may wait for one session; past them, one is refused as at capacity.
 const CONTROL_QUEUE: usize = 8;
 
-/// Start a session for `spec`, its program left to `reaper` once closed, answering `first` once it
-/// started: the sender that attaches to it, and the task that runs it.
+/// Start session `session` for `spec`, its program left to `reaper` once closed, answering `first`
+/// once it started: the sender that attaches to it, the one that asks it, and the task that runs
+/// it.
 fn start(
+    session: SessionNum,
     spec: &SessionSpec,
     reaper: &crate::pty::Reaper,
     first: Attach,
 ) -> (
     mpsc::Sender<Attach>,
+    mpsc::Sender<Ask>,
     impl std::future::Future<Output = ()> + Send + 'static,
 ) {
     let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
+    let (asks, asks_rx) = mpsc::channel(ASK_QUEUE);
+    let asked = asks.clone();
     let command = Arc::clone(&spec.command);
     let (scrollback_bytes, ttl, home) = (spec.scrollback_bytes, spec.ttl, spec.home.clone());
     let reaper = reaper.clone();
@@ -345,8 +370,8 @@ fn start(
         };
         let (screens, _) = watch::channel(Arc::new(host.emu.snapshot()));
         let (input, input_rx) = mpsc::channel(INPUT_QUEUE);
-        let (asks, asks_rx) = mpsc::channel(ASK_QUEUE);
         let mut session = Session {
+            num: session,
             host,
             screens,
             input,
@@ -359,7 +384,7 @@ fn start(
             .run(pty_rx, control_rx, input_rx, asks_rx, ttl)
             .await;
     };
-    (control, task)
+    (control, asked, task)
 }
 
 /// Wait until `deadline`, or forever if there is none.
@@ -372,6 +397,7 @@ async fn until(deadline: Option<Instant>) {
 
 /// A running session: its program, and what its clients hold of it.
 struct Session {
+    num: SessionNum,
     host: PtyHost,
     /// Its clients are this sender's receivers: no other receiver may exist.
     screens: watch::Sender<Arc<TerminalScreen>>,
@@ -386,6 +412,7 @@ impl Session {
     fn client(&mut self) -> SessionClient {
         self.attaches = self.attaches.saturating_add(1);
         SessionClient {
+            session: self.num,
             screens: self.screens.subscribe(),
             input: self.input.clone(),
             attach: self.attaches,
@@ -521,6 +548,19 @@ impl Session {
                             self.publish();
                         }
                     }
+                    Ask::Describe(reply) => {
+                        // Squared with the clients as an attach squares it.
+                        if detached.is_none() && self.screens.receiver_count() == 0 {
+                            detached = Some(Instant::now());
+                        }
+                        let screen = self.screens.borrow().clone();
+                        let _ = reply.send(Description {
+                            detached,
+                            size: screen.size(),
+                            title: screen.title().chars().take(MAX_TITLE).collect(),
+                            exited: screen.exit_code(),
+                        });
+                    }
                 },
                 msg = control.recv() => match msg {
                     Some(Attach(reply)) => {
@@ -574,12 +614,18 @@ impl Session {
 
 /// What the registry is asked.
 enum Request {
-    /// Attach `peer`, answered on `reply`.
+    /// Attach `peer` to the session `pick` names, answered on `reply`.
     Attach {
         peer: EndpointId,
+        pick: Pick,
         reply: oneshot::Sender<Attached>,
     },
-    /// End `peer`'s session, if it has one.
+    /// `peer`'s sessions, to ask how each stands.
+    List {
+        peer: EndpointId,
+        reply: oneshot::Sender<Vec<sessions::Listed>>,
+    },
+    /// End `peer`'s sessions, if it has any.
     End(EndpointId),
 }
 
@@ -590,12 +636,15 @@ pub struct Registry {
     shutdown: CancellationToken,
     /// What every session's program is left to once closed.
     reaper: crate::pty::Reaper,
+    /// This run of the server.
+    run: RunId,
 }
 
 /// What the registry hosts, and the session TTL.
 pub struct SessionSpec {
     pub command: Arc<[String]>,
     pub scrollback_bytes: usize,
+    /// Most live sessions, all peers' together.
     pub max_sessions: usize,
     pub ttl: Duration,
     /// The home each session's program gets.
@@ -604,6 +653,9 @@ pub struct SessionSpec {
 
 /// How often an attach is tried: one that reached a session as it ended is tried again.
 const ATTACH_TRIES: usize = 3;
+
+/// How long a listing waits for the sessions to say how they stand.
+const DESCRIBE_WAIT: Duration = Duration::from_secs(2);
 
 impl Registry {
     /// Spawn the registry task, attaching only the peers `allows` allows when it takes their
@@ -614,11 +666,12 @@ impl Registry {
         allows: impl Fn(&EndpointId) -> bool + Send + 'static,
     ) -> std::io::Result<Self> {
         let reaper = crate::pty::Reaper::start()?;
+        let run = RunId::random()?;
         let (tx, rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
         #[expect(clippy::disallowed_methods, reason = "one registry a server")]
         tokio::spawn(registry_task(
-            sessions::Sessions::new(spec, reaper.clone(), Box::new(allows)),
+            sessions::Sessions::new(spec, run, reaper.clone(), Box::new(allows)),
             rx,
             shutdown.clone(),
         ));
@@ -626,15 +679,27 @@ impl Registry {
             tx,
             shutdown,
             reaper,
+            run,
         })
     }
 
-    /// Attach `peer` to its session, creating one if it has none.
-    pub async fn attach(&self, peer: EndpointId) -> Attached {
+    /// This run of the server, which a client's redial names with the session it was on.
+    pub const fn run(&self) -> RunId {
+        self.run
+    }
+
+    /// What every session's program, and every command `koh exec` runs, is left to once closed.
+    pub fn reaper(&self) -> crate::pty::Reaper {
+        self.reaper.clone()
+    }
+
+    /// Attach `peer` to the session `pick` names: its latest (or a new one if it has none), a new
+    /// one, or one by number, which must be the peer's.
+    pub async fn attach(&self, peer: EndpointId, pick: Pick) -> Attached {
         for _ in 0..ATTACH_TRIES {
             let (reply, rx) = oneshot::channel();
             self.tx
-                .send(Request::Attach { peer, reply })
+                .send(Request::Attach { peer, pick, reply })
                 .await
                 .map_err(|_closed| Close::CouldNotStart)?;
             // Unanswered: the session ended as it got the attach, and the registry now knows.
@@ -645,7 +710,46 @@ impl Registry {
         Err(Close::CouldNotStart)
     }
 
-    /// End `peer`'s session, its program hung up: the peer may no longer connect.
+    /// `peer`'s sessions, oldest first, each as it says it stands; one that does not say within
+    /// [`DESCRIBE_WAIT`] (it is starting, or ending) is left out.
+    pub async fn sessions(&self, peer: EndpointId) -> Vec<SessionInfo> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Request::List { peer, reply }).await.is_err() {
+            return Vec::new();
+        }
+        let listed = rx.await.unwrap_or_default();
+        let deadline = Instant::now().checked_add(DESCRIBE_WAIT);
+        let mut infos = Vec::with_capacity(listed.len());
+        for sessions::Listed {
+            session,
+            started,
+            asks,
+        } in listed
+        {
+            let (tx, rx) = oneshot::channel();
+            let (Some(deadline), Ok(())) = (deadline, asks.try_send(Ask::Describe(tx))) else {
+                continue;
+            };
+            let Ok(Ok(described)) = tokio::time::timeout_at(deadline, rx).await else {
+                continue;
+            };
+            let now = Instant::now();
+            let secs = |since: Instant| now.saturating_duration_since(since).as_secs();
+            infos.push(SessionInfo {
+                session,
+                age_secs: secs(started),
+                presence: described.detached.map_or(Presence::Attached, |since| {
+                    Presence::Detached { secs: secs(since) }
+                }),
+                size: described.size,
+                title: described.title,
+                exited: described.exited,
+            });
+        }
+        infos
+    }
+
+    /// End `peer`'s sessions, their programs hung up: the peer may no longer connect.
     pub async fn end(&self, peer: EndpointId) {
         let _ = self.tx.send(Request::End(peer)).await;
     }
@@ -679,7 +783,8 @@ async fn registry_task(
             },
         };
         match request {
-            Request::Attach { peer, reply } => sessions.attach(peer, Attach(reply)),
+            Request::Attach { peer, pick, reply } => sessions.attach(peer, pick, Attach(reply)),
+            Request::List { peer, reply } => drop(reply.send(sessions.list(peer))),
             Request::End(peer) => sessions.end(peer),
         }
     }

@@ -94,7 +94,7 @@ pub fn spawn_client_io() -> anyhow::Result<(ClientIoChannels, ClientIoTasks)> {
         .context("duplicating stdin")?;
     let input = std::thread::Builder::new()
         .name("koh-stdin".into())
-        .spawn(move || read_input(&stdin, &input_tx, &input_cancel))
+        .spawn(move || read_input::<TYPED>(&stdin, &input_tx, &input_cancel))
         .context("spawning stdin producer")?;
     let (resize_tx, resize_rx) = mpsc::channel(8);
     let resize_cancel = cancel.clone();
@@ -133,8 +133,38 @@ async fn send_resize(sender: &mpsc::Sender<()>, cancel: &CancellationToken) -> b
     }
 }
 
-fn read_input(fd: &OwnedFd, sender: &mpsc::Sender<Vec<u8>>, cancel: &CancellationToken) {
-    let mut buffer = [0_u8; 1024];
+/// Most bytes of one read of what is typed: a terminal writes a keystroke, or a paste, at a time.
+const TYPED: usize = 1024;
+
+/// Most bytes of one read of `koh exec`'s stdin, which may be a large file piped in.
+const PIPED: usize = 64 * 1024;
+
+/// Stdin, read on a thread of its own until it ends, for `koh exec`: what it reads, which ends
+/// with it (at once if there is no stdin), and the token that stops the thread. Never in the way
+/// of the process exiting: the thread looks at the token every 100 ms, and blocks on nothing else
+/// once the receiver is gone.
+pub fn spawn_stdin() -> anyhow::Result<(mpsc::Receiver<Vec<u8>>, CancellationToken)> {
+    let (tx, rx) = mpsc::channel(8);
+    let cancel = CancellationToken::new();
+    // No stdin at all reads as an empty one.
+    let Ok(stdin) = std::io::stdin().as_fd().try_clone_to_owned() else {
+        return Ok((rx, cancel));
+    };
+    let stopping = cancel.clone();
+    std::thread::Builder::new()
+        .name("koh-stdin".into())
+        .spawn(move || read_input::<PIPED>(&stdin, &tx, &stopping))
+        .context("spawning the stdin reader")?;
+    Ok((rx, cancel))
+}
+
+/// Read `fd` until it ends, `N` bytes at most at a time, sending what it reads, until `cancel`.
+fn read_input<const N: usize>(
+    fd: &OwnedFd,
+    sender: &mpsc::Sender<Vec<u8>>,
+    cancel: &CancellationToken,
+) {
+    let mut buffer = vec![0_u8; N];
     while !cancel.is_cancelled() {
         let ready = {
             let mut descriptors = [PollFd::new(fd, Events::IN)];
@@ -241,7 +271,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let thread_cancel = cancel.clone();
             let input = std::thread::spawn(move || {
-                read_input(&OwnedFd::from(reader), &sender, &thread_cancel);
+                read_input::<TYPED>(&OwnedFd::from(reader), &sender, &thread_cancel);
             });
             writer.write_all(b"a\0\x1bZ").expect("write input");
             assert_eq!(
@@ -266,7 +296,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let thread_cancel = cancel.clone();
             let input = std::thread::spawn(move || {
-                read_input(&OwnedFd::from(reader), &sender, &thread_cancel);
+                read_input::<TYPED>(&OwnedFd::from(reader), &sender, &thread_cancel);
             });
             let line = [vec![b'y'; 2000].as_slice(), b"\r"].concat();
             writer.write_all(&line).expect("write input");
@@ -294,7 +324,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let thread_cancel = cancel.clone();
             let input = std::thread::spawn(move || {
-                read_input(&OwnedFd::from(reader), &sender, &thread_cancel);
+                read_input::<TYPED>(&OwnedFd::from(reader), &sender, &thread_cancel);
             });
             let resize_cancel = cancel.clone();
             let resize = koh_testkit::spawn(async move { resize_cancel.cancelled().await });

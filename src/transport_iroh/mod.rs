@@ -67,6 +67,19 @@ pub fn closed_because(conn: &Connection) -> Option<Close> {
     Close::from_code(close.error_code.into_inner())
 }
 
+/// Read one length-prefixed message from `recv` ([`crate::request::encode`]'s framing), its
+/// body refused past `max` bytes before it is read, and leave the rest of the stream unread.
+pub async fn read_framed(
+    recv: &mut iroh::endpoint::RecvStream,
+    max: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut prefix = [0u8; 4];
+    recv.read_exact(&mut prefix).await?;
+    let mut body = vec![0u8; crate::request::body_len(prefix, max)?];
+    recv.read_exact(&mut body).await?;
+    Ok(body)
+}
+
 /// Errors from endpoint/identity setup.
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {

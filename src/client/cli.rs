@@ -1,22 +1,30 @@
-//! The `koh connect` command: dial the server and run [`crate::client::run_client`] on the real
-//! terminal.
+//! The client's commands that dial a server: `koh connect`, which runs
+//! [`crate::client::run_client`] on the real terminal, `koh sessions`, and the dialing `koh exec`
+//! and `koh cp` share.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use iroh::endpoint::{Connection, SendStream};
 use iroh::{EndpointId, RelayUrl};
 use tokio_util::sync::CancellationToken;
 
+pub use crate::client::copy::{copy, CopyJob};
+pub use crate::client::exec::exec;
 use crate::client::{
-    Admitted, BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector,
+    refusal, Admitted, BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector,
 };
+use crate::request::{Pick, Presence, Request, SessionInfo, SessionList, MAX_REPLY};
 use crate::transport_iroh::{bind_on, close_endpoint, Network};
 
-/// The clap-free form of `koh connect`'s arguments.
+/// How long the first dial may take.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The server a command dials, and how.
 #[derive(Debug, Clone)]
-pub struct ConnectConfig {
+pub struct Remote {
     /// Server endpoint id to connect to.
     pub server: EndpointId,
     /// The secret-key file; `None` for the default client key path.
@@ -25,6 +33,26 @@ pub struct ConnectConfig {
     pub direct: Option<SocketAddr>,
     /// Dial through a self-hosted relay instead of n0's.
     pub relay_url: Option<RelayUrl>,
+}
+
+impl Remote {
+    /// `server`, dialed through n0's relays and discovery, as the default client key.
+    pub const fn new(server: EndpointId) -> Self {
+        Self {
+            server,
+            key_file: None,
+            direct: None,
+            relay_url: None,
+        }
+    }
+}
+
+/// The clap-free form of `koh connect`'s arguments.
+#[derive(Debug, Clone)]
+pub struct ConnectConfig {
+    pub remote: Remote,
+    /// Which of this client's sessions to attach to.
+    pub pick: Pick,
     /// Let the server set the clipboard (OSC 52); on unless `--no-clipboard`.
     pub clipboard: bool,
     /// Paint the server's hyperlinks (OSC 8); on unless `--no-hyperlinks`.
@@ -38,12 +66,10 @@ pub struct ConnectConfig {
 
 impl ConnectConfig {
     /// A config for dialing `server` with every other option at the CLI default.
-    pub fn new(server: EndpointId) -> Self {
+    pub const fn new(server: EndpointId) -> Self {
         Self {
-            server,
-            key_file: None,
-            direct: None,
-            relay_url: None,
+            remote: Remote::new(server),
+            pick: Pick::Latest,
             clipboard: true,
             hyperlinks: true,
             colours: true,
@@ -142,15 +168,14 @@ impl BellHook {
     }
 }
 
-/// Bind an endpoint for `config` and make the first connection; the connector redials the same
-/// target.
-async fn dial(
-    config: &ConnectConfig,
+/// Bind an endpoint to dial `remote` from, as `identity`, and the connector that dials it.
+async fn connector(
+    remote: &Remote,
     identity: &crate::identity::Identity,
-) -> anyhow::Result<(iroh::Endpoint, IrohConnector, Admitted)> {
+) -> anyhow::Result<(iroh::Endpoint, IrohConnector)> {
     let secret = identity.secret.clone();
-    let server = config.server;
-    let (network, target) = match (config.direct, config.relay_url.clone()) {
+    let server = remote.server;
+    let (network, target) = match (remote.direct, remote.relay_url.clone()) {
         (Some(addr), _) => (
             Network::Local,
             iroh::EndpointAddr::new(server).with_ip_addr(addr),
@@ -163,16 +188,134 @@ async fn dial(
     };
     let endpoint = bind_on(secret, false, &network, None).await?;
     let connector = IrohConnector::new(endpoint.clone(), target);
-    let first = tokio::time::timeout(Duration::from_secs(15), connector.connect())
+    Ok((endpoint, connector))
+}
+
+/// `future`, the first dial, within [`DIAL_TIMEOUT`]; failing, `endpoint` is closed.
+async fn first_dial<T>(
+    endpoint: &iroh::Endpoint,
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let first = tokio::time::timeout(DIAL_TIMEOUT, future)
         .await
         .context("timed out connecting (server unreachable or not responding)")
         .and_then(std::convert::identity);
-    match first {
-        Ok(channel) => Ok((endpoint, connector, channel)),
-        Err(error) => {
-            let _ = close_endpoint(&endpoint).await;
-            Err(error)
+    if first.is_err() {
+        let _ = close_endpoint(endpoint).await;
+    }
+    first
+}
+
+/// Bind an endpoint for `config` and make the first connection; the connector redials the same
+/// target.
+async fn dial(
+    config: &ConnectConfig,
+    identity: &crate::identity::Identity,
+) -> anyhow::Result<(iroh::Endpoint, IrohConnector, Admitted)> {
+    let (endpoint, connector) = connector(&config.remote, identity).await?;
+    let admitted = first_dial(&endpoint, connector.connect(config.pick)).await?;
+    Ok((endpoint, connector, admitted))
+}
+
+/// One connection to a server for one request: `koh exec`'s, `koh cp`'s or `koh sessions`'.
+pub(crate) struct Opened {
+    pub(crate) conn: Connection,
+    /// The client's first stream, the request on it, open for what follows.
+    pub(crate) control: SendStream,
+    endpoint: iroh::Endpoint,
+    /// Held while connected: its lease stops `koh key reset`.
+    _identity: crate::identity::Identity,
+}
+
+impl Opened {
+    /// Dial `remote` as its client key and make `request`.
+    pub(crate) async fn dial(remote: &Remote, request: &Request) -> anyhow::Result<Self> {
+        log_to_koh_log();
+        let identity = crate::identity::load(&crate::identity::KeyFile::locate(
+            remote.key_file.clone(),
+            "client",
+        )?)?;
+        let (endpoint, connector) = connector(remote, &identity).await?;
+        let (conn, control) = first_dial(&endpoint, connector.open(request)).await?;
+        Ok(Self {
+            conn,
+            control,
+            endpoint,
+            _identity: identity,
+        })
+    }
+
+    /// Done: close the connection, telling the server at once.
+    pub(crate) async fn close(self) {
+        self.conn.close(0u32.into(), b"done");
+        let _ = close_endpoint(&self.endpoint).await;
+    }
+}
+
+/// `koh sessions`: this client's sessions on `remote`, one a line, to `out`.
+pub async fn sessions(remote: &Remote, out: &mut impl std::io::Write) -> anyhow::Result<()> {
+    let mut opened = Opened::dial(remote, &Request::Sessions).await?;
+    opened.control.finish()?;
+    let listed = async {
+        let mut recv = opened.conn.accept_uni().await?;
+        let bytes = recv.read_to_end(MAX_REPLY.saturating_add(4)).await?;
+        anyhow::Ok(crate::request::decode_framed::<SessionList>(
+            &bytes, MAX_REPLY,
+        )?)
+    };
+    let listed = listed.await.map_err(|e| refusal(&opened.conn, &e));
+    opened.close().await;
+    for info in listed?.0 {
+        writeln!(out, "{}", listing(&info))?;
+    }
+    Ok(())
+}
+
+/// One session as `koh sessions` lists it: space-separated fields, none holding a space, then the
+/// title, escaped, to the line's end: `3 detached=5m age=2h01m 80x24 running vim notes`.
+fn listing(info: &SessionInfo) -> String {
+    let presence = match info.presence {
+        Presence::Attached => "attached".to_owned(),
+        Presence::Detached { secs } => format!("detached={}", span(secs)),
+    };
+    let program = info
+        .exited
+        .map_or_else(|| "running".to_owned(), |code| format!("exited={code}"));
+    // A program chose it: nothing in it may move the cursor or reorder the line.
+    let mut title = String::with_capacity(info.title.len());
+    for c in info.title.chars() {
+        if c == ' ' || !(c.is_control() || c.is_whitespace() || crate::log::is_bidi(c)) {
+            title.push(c);
+        } else {
+            title.extend(c.escape_default());
         }
+    }
+    format!(
+        "{} {presence} age={} {}x{} {program} {title}",
+        info.session,
+        span(info.age_secs),
+        info.size.cols,
+        info.size.rows,
+    )
+    .trim_end()
+    .to_owned()
+}
+
+/// `secs` in its two largest units: `45s`, `3m12s`, `2h05m`, `4d03h`.
+fn span(secs: u64) -> String {
+    let (m, h, d) = (
+        secs.div_euclid(60),
+        secs.div_euclid(3600),
+        secs.div_euclid(86_400),
+    );
+    if d > 0 {
+        format!("{d}d{:02}h", h.rem_euclid(24))
+    } else if h > 0 {
+        format!("{h}h{:02}m", m.rem_euclid(60))
+    } else if m > 0 {
+        format!("{m}m{:02}s", secs.rem_euclid(60))
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -221,14 +364,14 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
 
     // Held for the session: its lease stops `koh key reset` while it may redial.
     let identity = crate::identity::load(&crate::identity::KeyFile::locate(
-        args.key_file.clone(),
+        args.remote.key_file.clone(),
         "client",
     )?)?;
     let (endpoint, connector, channel) = dial(&args, &identity).await?;
     // For the menu's "last connected"; failing to note it never stops the session.
-    let noted = crate::identity::KeyFile::path_for(args.key_file.clone(), "client")
+    let noted = crate::identity::KeyFile::path_for(args.remote.key_file.clone(), "client")
         .map_err(anyhow::Error::from)
-        .and_then(|key| crate::names::record_connected(&key, args.server));
+        .and_then(|key| crate::names::record_connected(&key, args.remote.server));
     if let Err(error) = noted {
         tracing::debug!(error = %format!("{error:#}"), "noting when the server was reached");
     }
@@ -280,9 +423,12 @@ mod tests {
                 .find(std::net::SocketAddr::is_ipv4)
                 .context("server IPv4 socket")?;
             let config = ConnectConfig {
-                // Any attempt to reload instead of reusing `identity` would fail here.
-                key_file: Some("/nonexistent/koh-redial-test.key".into()),
-                direct: Some(([127, 0, 0, 1], socket.port()).into()),
+                remote: Remote {
+                    // Any attempt to reload instead of reusing `identity` would fail here.
+                    key_file: Some("/nonexistent/koh-redial-test.key".into()),
+                    direct: Some(([127, 0, 0, 1], socket.port()).into()),
+                    ..Remote::new(server.id())
+                },
                 ..ConnectConfig::new(server.id())
             };
             let peer = server.clone();
@@ -293,17 +439,17 @@ mod tests {
                         connection.remote_id() == expected,
                         "client identity changed"
                     );
-                    connection.open_uni().await?.finish()?;
+                    let _control = crate::client::admit(&connection).await?;
                     connection.closed().await;
                 }
                 Ok::<_, anyhow::Error>(())
             };
             let client = async {
                 let (endpoint, connector, channel) = dial(&config, &identity).await?;
-                channel.0.close(0u32.into(), b"test reconnect");
+                channel.conn.close(0u32.into(), b"test reconnect");
                 // The same connector `run_client` redials with after a link loss.
-                let channel = connector.connect().await?;
-                channel.0.close(0u32.into(), b"test done");
+                let channel = connector.connect(Pick::Resume(channel.at)).await?;
+                channel.conn.close(0u32.into(), b"test done");
                 endpoint.close().await;
                 Ok::<_, anyhow::Error>(())
             };

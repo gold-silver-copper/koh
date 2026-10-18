@@ -34,13 +34,17 @@ impl<T: fmt::Display> fmt::Display for Peer<T> {
     }
 }
 
+/// Whether `c` is a bidi control, which reorders what is shown around it.
+pub(crate) const fn is_bidi(c: char) -> bool {
+    matches!(c, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// `text` as one line, or as lines if `lines`, ending in a newline: every control character but
 /// those newlines, and every bidi control, escaped.
 fn line(text: &str, lines: bool) -> String {
-    let bidi = |c: char| matches!(c, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
     let mut out = String::with_capacity(text.len().saturating_add(1));
     for c in text.chars() {
-        if (c.is_control() && !(lines && c == '\n')) || bidi(c) {
+        if (c.is_control() && !(lines && c == '\n')) || is_bidi(c) {
             out.extend(c.escape_default());
         } else {
             out.push(c);

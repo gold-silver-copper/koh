@@ -223,7 +223,7 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     let server = Server::start(net, &[secret.public()], &["bash", &script]).await?;
     let endpoint = net.endpoint(secret, false).await?;
     let connector = IrohConnector::new(endpoint, FaultNet::addr(server.id));
-    let channel = connector.connect().await?;
+    let channel = connector.connect(koh::request::Pick::Latest).await?;
     let start = Size::new(recording.rows, recording.cols);
     let shared = Shared {
         painted: Arc::default(),

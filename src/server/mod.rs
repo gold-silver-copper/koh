@@ -1,11 +1,15 @@
 //! The koh server.
 //!
-//! A session's PTY and emulator live in a [`session`] task that outlives its
-//! connections; each connection runs [`run_attached`] with a fresh protocol core, so a client that
-//! reconnects gets the current screen.
+//! A connection says what it is for in its opening request ([`crate::request`]). A session's PTY
+//! and emulator live in a [`session`] task that outlives its connections; each connection to one
+//! runs [`run_attached`] with a fresh protocol core, so a client that reconnects gets the current
+//! screen. A command (`koh exec`) runs in [`exec`], a copy (`koh cp`) in [`copy`], each for its
+//! connection alone.
 
 mod audit;
 pub mod cli;
+mod copy;
+mod exec;
 mod held;
 pub mod session;
 
@@ -597,19 +601,46 @@ fn given_up(sent: Instant, heard: Option<Instant>, rtt: Option<Duration>) -> Ins
     since.checked_add(retry_after(rtt)).unwrap_or(since)
 }
 
+/// How long the server waits, once a request is answered, for the client to close the connection
+/// having read the answer: a close of the server's own could throw away what it had not read.
+const LINGER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Send `msg` whole to the client on `conn`, on a stream of its own.
+async fn reply<T: serde::Serialize + Sync>(
+    conn: &iroh::endpoint::Connection,
+    msg: &T,
+) -> anyhow::Result<()> {
+    let bytes = crate::request::encode(msg, crate::request::MAX_REPLY)?;
+    let mut send = conn.open_uni().await?;
+    send.write_all(&bytes).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// Wait, at most [`LINGER`], for the client to close `conn` once it has what it asked for; then
+/// close it.
+async fn linger(conn: &iroh::endpoint::Connection) {
+    let _ = tokio::time::timeout(LINGER, conn.closed()).await;
+    conn.close(0u32.into(), b"");
+}
+
 /// Drive one connection against its session: the I/O around a `ServerConn`, which nothing here
-/// waits on but in its `select!`.
+/// waits on but in its `select!`. `control` is the client's first stream, after its request.
 ///
 /// It forwards the client's input as the session takes it, sends each frame on its own stream and
 /// resets the streams of superseded ones, and answers history requests. Returning (or panicking)
 /// detaches.
-pub async fn run_attached(conn: &iroh::endpoint::Connection, mut session: session::SessionClient) {
+pub async fn run_attached(
+    conn: &iroh::endpoint::Connection,
+    mut session: session::SessionClient,
+    control: RecvStream,
+) {
     let mut core = ServerConn::default();
     core.install_snapshot(session.screen());
     let input = session.input.clone();
-    // The client's input and control streams: two for the connection, even once they finish.
-    let mut streams: [Option<RecvStream>; 2] = [None, None];
-    let mut client_streams = 0;
+    // The client's control and input streams: two for the connection, even once they finish.
+    let mut streams: [Option<RecvStream>; 2] = [Some(control), None];
+    let mut client_streams = 1;
     let mut bufs = [vec![0u8; 16 * 1024], vec![0u8; 16 * 1024]];
     // Whether the session still publishes screens: `next_screen` ends with it.
     let mut session_open = true;

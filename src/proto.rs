@@ -102,18 +102,23 @@ pub const HEARTBEAT: Duration = Duration::from_secs(3);
 ///
 /// The code is the only part read; the reason bytes a peer chooses are never shown, only
 /// [`Close::text`]. Code 0 is none of these: an endpoint closing (a server restarting) uses it.
-/// Only `NotAuthorized` is for good: a client redials after the others but `SessionEnded`.
+/// Only `NotAuthorized` and `NoSuchSession` are for good: a shell's client redials after the
+/// others but `SessionEnded`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Close {
     NotAuthorized = 1,
+    /// The peer broke the protocol, or made no request in time.
     ProtocolError = 2,
     /// The hosted program exited, and the client was sent its final screen.
     SessionEnded = 3,
-    /// The server holds its most sessions, none of them the client's.
+    /// The server holds its most sessions, and the client asked for a new one.
     AtCapacity = 4,
-    /// The session's program could not start, or the server is shutting down.
+    /// The session's program, or the command asked for, could not start, or the server is
+    /// shutting down.
     CouldNotStart = 5,
+    /// The session asked for by number is not the client's, or is gone.
+    NoSuchSession = 6,
 }
 
 impl Close {
@@ -129,6 +134,7 @@ impl Close {
             3 => Self::SessionEnded,
             4 => Self::AtCapacity,
             5 => Self::CouldNotStart,
+            6 => Self::NoSuchSession,
             _ => return None,
         })
     }
@@ -141,6 +147,7 @@ impl Close {
             Self::SessionEnded => "session ended",
             Self::AtCapacity => "server at session capacity",
             Self::CouldNotStart => "server could not start a session",
+            Self::NoSuchSession => "no such session (it ended, or the server restarted)",
         }
     }
 }
@@ -588,14 +595,14 @@ mod tests {
 
     #[test]
     fn close_codes_round_trip_and_0_is_none_of_them() {
-        for code in 1..=5 {
+        for code in 1..=6 {
             assert_eq!(
                 Close::from_code(code).map(|c| u64::from(c.code())),
                 Some(code)
             );
         }
         assert_eq!(Close::from_code(0), None);
-        assert_eq!(Close::from_code(6), None);
+        assert_eq!(Close::from_code(7), None);
     }
 
     fn frame() -> Frame {

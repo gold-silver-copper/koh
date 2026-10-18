@@ -16,6 +16,16 @@ pub fn home() -> Home {
     Home::isolated(koh_testkit::home!())
 }
 
+/// `koh id` for the key at `key`, creating it: the endpoint id, as the binary prints it.
+pub fn endpoint_id(key: &std::path::Path) -> anyhow::Result<String> {
+    let out = koh_testkit::command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())?
+        .args(["id", "--key-file"])
+        .arg(key)
+        .output()?;
+    anyhow::ensure!(out.status.success(), "koh id: {out:?}");
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
 /// `argv` on a 24×80 PTY, and what it prints.
 pub fn on_pty(argv: &[String]) -> anyhow::Result<(Pty, Capture)> {
     let reaper = koh::pty::Reaper::start()?;

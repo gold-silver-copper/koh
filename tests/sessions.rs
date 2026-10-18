@@ -11,6 +11,7 @@ use koh::proto::{
     InputSeq, ServerMsg, MAX_FRAME,
 };
 use koh::pty::Home;
+use koh::request::{Pick, Request, MAX_REQUEST};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
@@ -73,7 +74,10 @@ fn registry(
 
 /// Attach `peer` and say how.
 async fn attach_kind(reg: &Registry, peer: iroh::EndpointId) -> Option<AttachKind> {
-    reg.attach(peer).await.ok().map(|(_, kind)| kind)
+    reg.attach(peer, Pick::Latest)
+        .await
+        .ok()
+        .map(|(_, kind)| kind)
 }
 
 fn peer() -> std::io::Result<iroh::EndpointId> {
@@ -85,9 +89,15 @@ fn attach_creates_then_reattaches_the_same_peer() -> anyhow::Result<()> {
     runtime()?.block_on(async {
         let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30), |_| true)?;
         let peer = peer()?;
-        let (client, kind) = reg.attach(peer).await.context("first attach")?;
+        let (client, kind) = reg
+            .attach(peer, Pick::Latest)
+            .await
+            .context("first attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
-        let (_c2, kind) = reg.attach(peer).await.context("second attach")?;
+        let (_c2, kind) = reg
+            .attach(peer, Pick::Latest)
+            .await
+            .context("second attach")?;
         anyhow::ensure!(
             matches!(kind, AttachKind::Reattached { .. }),
             "same peer reattaches: {kind:?}"
@@ -104,11 +114,11 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
         let reg = registry(&["sleep", "30"], 1, Duration::from_secs(30), |_| true)?;
         let (a, b) = (peer()?, peer()?);
         let (a_client, _) = reg
-            .attach(a)
+            .attach(a, Pick::Latest)
             .await
             .context("A creates the one allowed session")?;
         anyhow::ensure!(
-            matches!(reg.attach(b).await, Err(Close::AtCapacity)),
+            matches!(reg.attach(b, Pick::Latest).await, Err(Close::AtCapacity)),
             "a second distinct peer is refused at the cap, for now"
         );
         anyhow::ensure!(
@@ -146,7 +156,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
             let peer = peer()?;
             let mut clients = Vec::new();
             for _ in 0..attached {
-                clients.push(reg.attach(peer).await.context(case)?.0);
+                clients.push(reg.attach(peer, Pick::Latest).await.context(case)?.0);
             }
             if let Some(client) = clients.first_mut().filter(|_| command == ["true"]) {
                 await_exit(client).await?;
@@ -188,9 +198,15 @@ impl RawClient {
     async fn connect(addr: iroh::EndpointAddr, secret: iroh::SecretKey) -> anyhow::Result<Self> {
         let endpoint = bind_endpoint_local(secret, false).await?;
         let conn = endpoint.connect(addr, ALPN).await?;
-        // Its control stream: its bytes go before the input stream's, as the client's do.
-        let send = conn.open_uni().await?;
+        // Its control stream, opened with its request: its bytes go before the input stream's, as
+        // the client's do.
+        let mut send = conn.open_uni().await?;
         send.set_priority(1)?;
+        send.write_all(&koh::request::encode(
+            &Request::Shell(Pick::Latest),
+            MAX_REQUEST,
+        )?)
+        .await?;
         let (tx, frames) = tokio::sync::mpsc::channel(64);
         let reader = conn.clone();
         koh_testkit::spawn(async move {
@@ -434,11 +450,11 @@ fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Resul
             |_| true,
         )?;
         let a = peer()?;
-        let (mut c1, kind) = reg.attach(a).await.context("first attach")?;
+        let (mut c1, kind) = reg.attach(a, Pick::Latest).await.context("first attach")?;
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
         await_exit(&mut c1).await?;
         drop(c1);
-        let (mut c2, kind) = reg.attach(a).await.context("reconnect")?;
+        let (mut c2, kind) = reg.attach(a, Pick::Latest).await.context("reconnect")?;
         anyhow::ensure!(
             matches!(kind, AttachKind::Reattached { .. }),
             "reconnect: {kind:?}"
@@ -451,7 +467,7 @@ fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Resul
         // The client has the final screen: the session ends.
         c2.ended().await;
         while c2.next_screen().await.is_some() {}
-        let (c3, kind) = reg.attach(a).await.context("after the end")?;
+        let (c3, kind) = reg.attach(a, Pick::Latest).await.context("after the end")?;
         anyhow::ensure!(kind == AttachKind::Created, "after the end: {kind:?}");
         // c3 is still attached to its live session, so this must reattach to it.
         let again = attach_kind(&reg, a).await;
@@ -475,7 +491,7 @@ fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Resu
     koh_testkit::multi_thread(4)?.block_on(async {
         let reg = registry(&["true"], 4, Duration::from_secs(30), |_| true)?;
         let a = peer()?;
-        let mut client = reg.attach(a).await.context("first attach")?.0;
+        let mut client = reg.attach(a, Pick::Latest).await.context("first attach")?.0;
         // An acknowledgement the reconnect overtook ends the session it reattached to, once the
         // reconnect was shown the exit: the next reconnect finds a new session.
         let mut ending = false;
@@ -491,7 +507,7 @@ fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Resu
                 }
             };
             let (attached, ()) = tokio::join!(
-                tokio::time::timeout(Duration::from_secs(5), reg.attach(a)),
+                tokio::time::timeout(Duration::from_secs(5), reg.attach(a, Pick::Latest)),
                 ended
             );
             drop(client);
@@ -611,9 +627,9 @@ fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
             allows.load(Relaxed)
         })?;
         let a = peer()?;
-        let (mut client, _) = reg.attach(a).await.context("attach")?;
+        let (mut client, _) = reg.attach(a, Pick::Latest).await.context("attach")?;
         allowed.store(false, Relaxed);
-        let refused = reg.attach(a).await.err();
+        let refused = reg.attach(a, Pick::Latest).await.err();
         anyhow::ensure!(refused == Some(Close::NotAuthorized), "{refused:?}");
         reg.end(a).await;
         allowed.store(true, Relaxed);
@@ -651,7 +667,7 @@ fn a_prompt_printed_before_echo_goes_off_is_never_told_with_echo_on() -> anyhow:
         ];
         for round in 0..20 {
             let reg = registry(&program, 1, Duration::from_secs(30), |_| true)?;
-            let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
+            let (mut client, _) = reg.attach(peer()?, Pick::Latest).await.context("attach")?;
             let told = tokio::time::timeout(Duration::from_secs(5), async {
                 let mut prompted = None;
                 while let Some(screen) = client.next_screen().await {
@@ -688,7 +704,7 @@ fn a_prompt_printed_before_echo_goes_off_is_never_told_with_echo_on() -> anyhow:
 fn shutdown_ends_a_session_that_still_has_a_client() -> anyhow::Result<()> {
     runtime()?.block_on(async {
         let reg = registry(&["sleep", "30"], 4, Duration::from_secs(30), |_| true)?;
-        let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
+        let (mut client, _) = reg.attach(peer()?, Pick::Latest).await.context("attach")?;
         tokio::time::timeout(Duration::from_secs(5), reg.shutdown())
             .await
             .context("shutdown returns")?;
@@ -716,7 +732,7 @@ fn a_session_ends_when_its_program_does_whatever_holds_its_terminal() -> anyhow:
             .then_some(("exec </dev/null >/dev/null 2>&1; sleep 3600", 129));
         for (script, code) in std::iter::once(("sleep 3600 & exit 7", 7)).chain(closed) {
             let reg = registry(&["sh", "-c", script], 4, Duration::from_secs(30), |_| true)?;
-            let (mut client, _) = reg.attach(peer()?).await.context("attach")?;
+            let (mut client, _) = reg.attach(peer()?, Pick::Latest).await.context("attach")?;
             await_exit(&mut client).await.context(script)?;
             anyhow::ensure!(
                 client.screen().exit_code() == Some(code),
@@ -796,7 +812,7 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
         let endpoint = bind_endpoint_local(secret, false).await?;
         let dialed = tokio::time::timeout(
             Duration::from_secs(10),
-            koh::client::IrohConnector::new(endpoint, addr).connect(),
+            koh::client::IrohConnector::new(endpoint, addr).connect(Pick::Latest),
         )
         .await;
         shutdown.cancel();
@@ -897,9 +913,19 @@ fn an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes() ->
         let far = at(relay(server, Duration::from_millis(50), true).await?);
         let admitted = tokio::time::timeout(Duration::from_secs(20), async {
             for _ in 0..3 {
-                // Its first frame admits it.
+                // Its first stream, after its request, admits it.
                 if let Ok(conn) = near.connect(far.clone(), ALPN).await {
-                    return conn.accept_uni().await.is_ok();
+                    let request = koh::request::encode(&Request::Shell(Pick::Latest), MAX_REQUEST);
+                    let Ok(request) = request else { return false };
+                    let Ok(mut send) = conn.open_uni().await else {
+                        return false;
+                    };
+                    if send.write_all(&request).await.is_err() {
+                        return false;
+                    }
+                    let admitted = conn.accept_uni().await.is_ok();
+                    drop(send);
+                    return admitted;
                 }
             }
             false

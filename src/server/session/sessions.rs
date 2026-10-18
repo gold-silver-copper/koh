@@ -1,21 +1,46 @@
-//! The registry's live sessions, one per peer. A session is forgotten only when its task has
-//! ended, which closes its control channel: nothing outside this module can add or remove one.
+//! The registry's live sessions, by number, each a peer's. A session is forgotten only when its
+//! task has ended, which closes its control channel, or when its peer's sessions are ended:
+//! nothing outside this module can add or remove one.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use iroh::EndpointId;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
-use super::{start, Attach, SessionSpec};
+use super::{start, Ask, Attach, SessionSpec};
 use crate::proto::Close;
+use crate::request::{Pick, RunId, SessionNum};
 
-/// Every session task the registry started, and the ones still live, by peer.
+/// A live session.
+struct Live {
+    peer: EndpointId,
+    /// Its control sender; closed once its task ends.
+    control: mpsc::Sender<Attach>,
+    asks: mpsc::Sender<Ask>,
+    started: Instant,
+    /// When an attach last went to it, as the registry counts them: the latest is the highest.
+    attached: u64,
+}
+
+/// One of a peer's sessions, for a listing to ask how it stands.
+pub(in crate::server) struct Listed {
+    pub(in crate::server) session: SessionNum,
+    pub(in crate::server) started: Instant,
+    pub(in crate::server) asks: mpsc::Sender<Ask>,
+}
+
+/// Every session task the registry started, and the ones still live, by number.
 pub(super) struct Sessions {
-    /// Each session's control sender, by peer; closed once its task ends.
-    live: HashMap<EndpointId, mpsc::Sender<Attach>>,
+    live: BTreeMap<SessionNum, Live>,
+    /// The number the last session took.
+    last: SessionNum,
+    /// How many attaches went to a session.
+    attaches: u64,
     tasks: JoinSet<()>,
     spec: SessionSpec,
+    run: RunId,
     reaper: crate::pty::Reaper,
     /// Whether a peer may attach, asked as its attach is taken.
     allows: Box<dyn Fn(&EndpointId) -> bool + Send>,
@@ -24,46 +49,106 @@ pub(super) struct Sessions {
 impl Sessions {
     pub(super) fn new(
         spec: SessionSpec,
+        run: RunId,
         reaper: crate::pty::Reaper,
         allows: Box<dyn Fn(&EndpointId) -> bool + Send>,
     ) -> Self {
         Self {
-            live: HashMap::new(),
+            live: BTreeMap::new(),
+            last: SessionNum::default(),
+            attaches: 0,
             tasks: JoinSet::new(),
             spec,
+            run,
             reaper,
             allows,
         }
     }
 
-    /// Hand `attach` to `peer`'s session, which answers it, starting one if it has none. Refused
-    /// a peer no longer allowed (the end of its session is then on its way, or done), at the
-    /// session cap, or when its session has too many attaches waiting.
-    pub(super) fn attach(&mut self, peer: EndpointId, attach: Attach) {
+    /// Hand `attach` to the session of `peer`'s that `pick` names, which answers it, or start one.
+    /// Refused a peer no longer allowed (the end of its sessions is then on its way, or done), a
+    /// number not the peer's, a new session at the cap, or a session with too many attaches
+    /// waiting.
+    pub(super) fn attach(&mut self, peer: EndpointId, pick: Pick, attach: Attach) {
         if !(self.allows)(&peer) {
             let _ = attach.0.send(Err(Close::NotAuthorized));
             return;
         }
-        self.live.retain(|_, control| !control.is_closed());
-        let attach = match self.live.get(&peer) {
-            Some(control) => match control.try_send(attach) {
-                Ok(()) => return,
+        self.live.retain(|_, live| !live.control.is_closed());
+        let named = match pick {
+            Pick::Latest => self
+                .live
+                .iter()
+                .filter(|(_, live)| live.peer == peer)
+                .max_by_key(|(_, live)| live.attached)
+                .map(|(&session, _)| session),
+            Pick::New => None,
+            Pick::Resume(at) if at.run != self.run => {
+                let _ = attach.0.send(Err(Close::NoSuchSession));
+                return;
+            }
+            Pick::Id(session) | Pick::Resume(crate::request::Resume { session, .. }) => {
+                if self.live.get(&session).is_none_or(|live| live.peer != peer) {
+                    let _ = attach.0.send(Err(Close::NoSuchSession));
+                    return;
+                }
+                Some(session)
+            }
+        };
+        let attach = match named.and_then(|session| self.live.get_mut(&session)) {
+            Some(live) => match live.control.try_send(attach) {
+                Ok(()) => {
+                    self.attaches = self.attaches.saturating_add(1);
+                    live.attached = self.attaches;
+                    return;
+                }
                 Err(TrySendError::Full(Attach(reply))) => {
                     let _ = reply.send(Err(Close::AtCapacity));
                     return;
                 }
-                // It ended a moment ago: a new one takes its place.
-                Err(TrySendError::Closed(attach)) => attach,
+                // It ended a moment ago: the latest gets a new one in its place; one asked for
+                // by number is gone.
+                Err(TrySendError::Closed(attach)) if pick == Pick::Latest => attach,
+                Err(TrySendError::Closed(Attach(reply))) => {
+                    let _ = reply.send(Err(Close::NoSuchSession));
+                    return;
+                }
             },
-            None if self.live.len() >= self.spec.max_sessions => {
-                let _ = attach.0.send(Err(Close::AtCapacity));
-                return;
-            }
             None => attach,
         };
-        let (control, task) = start(&self.spec, &self.reaper, attach);
+        if self.live.len() >= self.spec.max_sessions {
+            let _ = attach.0.send(Err(Close::AtCapacity));
+            return;
+        }
+        let session = SessionNum(self.last.0.saturating_add(1));
+        self.last = session;
+        self.attaches = self.attaches.saturating_add(1);
+        let (control, asks, task) = start(session, &self.spec, &self.reaper, attach);
         self.tasks.spawn(task);
-        self.live.insert(peer, control);
+        self.live.insert(
+            session,
+            Live {
+                peer,
+                control,
+                asks,
+                started: Instant::now(),
+                attached: self.attaches,
+            },
+        );
+    }
+
+    /// `peer`'s live sessions, oldest first.
+    pub(super) fn list(&mut self, peer: EndpointId) -> Vec<Listed> {
+        self.live.retain(|_, live| !live.control.is_closed());
+        self.live
+            .iter()
+            .filter(|(_, live)| live.peer == peer)
+            .map(|(&session, live)| Listed {
+                session,
+                started: live.started,
+                asks: live.asks.clone(),
+            })
+            .collect()
     }
 
     /// Wait for a session task to end, and forget its control channel: an attach that reached it
@@ -74,12 +159,12 @@ impl Sessions {
             return std::future::pending().await;
         };
         log_panic(ended);
-        self.live.retain(|_, control| !control.is_closed());
+        self.live.retain(|_, live| !live.control.is_closed());
     }
 
-    /// End `peer`'s session, if it has one: its control channel closes, and it ends.
+    /// End `peer`'s sessions: their control channels close, and they end.
     pub(super) fn end(&mut self, peer: EndpointId) {
-        self.live.remove(&peer);
+        self.live.retain(|_, live| live.peer != peer);
     }
 
     /// End every session, attached or not, and wait for their tasks.

@@ -454,10 +454,11 @@ fn the_escape_quits_at_the_reconnecting_banner() {
         });
 }
 
-/// The reattach lands on a new shell (the server restarted during the outage): the scrollback
-/// view shows the new shell's history, not the rows the client held of the old one.
+/// A redial goes back to the session the client was on, never to another: after a server restart
+/// during the outage that session is gone, though the new server would start one, and the client
+/// ends saying so instead of typing into a new shell.
 #[test]
-fn after_a_server_restart_the_scrollback_is_the_new_shells() {
+fn after_a_server_restart_the_client_ends_as_its_session_is_gone() {
     koh_testkit::multi_thread(4)
         .expect("tokio runtime")
         .block_on(async {
@@ -471,12 +472,7 @@ fn after_a_server_restart_the_scrollback_is_the_new_shells() {
             let mut client = Client::connect(&net, client_secret, server.id)
                 .await
                 .expect("connect");
-            assert!(client.ran(OLD_LINES, "old line 199").await);
-            // The old shell's history is held: the view showed it.
-            client.send(b"\x1e[g").await.expect("send");
-            assert!(client.wait_until(WAIT, oldest).await.is_some(), "the view");
-            // The view is closed: the live screen shows again.
-            assert!(client.ran(b"q", "old line 199").await);
+            assert!(client.ran(b"echo RE''ADY\r", "READY").await);
             // The server restarts during an outage.
             net.black_hole(Duration::from_secs(3));
             client.drop_first_connection();
@@ -484,35 +480,17 @@ fn after_a_server_restart_the_scrollback_is_the_new_shells() {
             let server = Server::start_as(&net, server_secret, &allow, &["sh"])
                 .await
                 .expect("restart the server");
-            assert!(
-                client.wait_for(WAIT, reconnecting).await.is_some(),
-                "the client must show the reconnecting banner"
-            );
-            // Once the client is on the new shell, the loop is typed there.
-            assert!(
-                client
-                    .wait_for(Duration::from_secs(20), |p| !reconnecting(p))
-                    .await
-                    .is_some(),
-                "the client must reattach to the restarted server"
-            );
-            let new_lines = String::from_utf8_lossy(OLD_LINES).replace("old", "new");
-            assert!(
-                client.ran(new_lines.as_bytes(), "new line 199").await,
-                "the new shell never ran:\n{}",
-                client.screen()
-            );
-            client.send(b"\x1e[g").await.expect("send");
-            let top = client
-                .wait_until(WAIT, |t| t.contains("new line 0") || t.contains("old line"))
-                .await;
-            let screen = client.screen();
-            let _ = client.send(b"q").await;
-            let _ = client.finish().await;
+            let ended = client.exit(Duration::from_secs(30)).await;
             server.stop().await.expect("the server stops cleanly");
+            let Some(Err(error)) = ended else {
+                panic!("the client went on: {ended:?}");
+            };
             assert!(
-                top.is_some_and(|p| !p.text.contains("old line")),
-                "the scrollback view shows the dead shell's rows:\n{screen}"
+                matches!(
+                    error.downcast_ref(),
+                    Some(koh::client::Refused::NoSuchSession)
+                ),
+                "{error:#}"
             );
         });
 }

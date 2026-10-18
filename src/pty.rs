@@ -102,7 +102,7 @@ fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> Vec<O
 
 /// Remove each `KOH_*` variable of the `inherited` from `cmd`: they configure koh, not the hosted
 /// program, and matching the prefix cannot miss one added later.
-fn scrub_koh_env(cmd: &mut Command, inherited: impl Iterator<Item = OsString>) {
+pub(crate) fn scrub_koh_env(cmd: &mut Command, inherited: impl Iterator<Item = OsString>) {
     for key in inherited.filter(|key| is_koh_env_key(key)) {
         cmd.env_remove(key);
     }
@@ -113,16 +113,19 @@ pub(crate) fn is_koh_env_key(key: &std::ffi::OsStr) -> bool {
     key.to_string_lossy().starts_with("KOH_")
 }
 
+/// The platform's shell: `/bin/sh`, which does **not** exist on Android, where it is
+/// `/system/bin/sh`.
+const PLATFORM_SHELL: &str = if cfg!(target_os = "android") {
+    "/system/bin/sh"
+} else {
+    "/bin/sh"
+};
+
 /// The session shell when the caller didn't pass `--shell`: `shell_env` (`$SHELL`) if set, else
-/// `/bin/sh`, which does **not** exist on Android, where it is `/system/bin/sh`.
+/// [`PLATFORM_SHELL`].
 fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
-    let platform = if cfg!(target_os = "android") {
-        "/system/bin/sh"
-    } else {
-        "/bin/sh"
-    };
     shell_env.filter(|sh| !sh.is_empty()).map_or_else(
-        || platform.to_owned(),
+        || PLATFORM_SHELL.to_owned(),
         |sh| sh.to_string_lossy().into_owned(),
     )
 }
@@ -155,13 +158,31 @@ impl Home {
         Self(None)
     }
 
-    /// `home`, with no history file, no `ENV` script and a plain prompt.
+    /// `home`, with no history file, no `ENV` script, a plain prompt and the platform's shell.
     pub fn isolated(home: impl Into<PathBuf>) -> Self {
         Self(Some(home.into()))
     }
 
+    /// The directory: an isolated one, else `$HOME`, if set.
+    pub(crate) fn dir(&self) -> Option<PathBuf> {
+        self.0.clone().or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from)
+        })
+    }
+
+    /// The shell a command `koh exec` asks for runs in: `$SHELL`, else the platform's; an isolated
+    /// home's is the platform's, whatever the user's is.
+    pub(crate) fn shell(&self) -> String {
+        match self.0 {
+            Some(_) => PLATFORM_SHELL.to_owned(),
+            None => resolve_shell(std::env::var_os("SHELL")),
+        }
+    }
+
     /// Give `cmd` this home, unless it is the user's.
-    fn apply(&self, cmd: &mut Command) {
+    pub(crate) fn apply(&self, cmd: &mut Command) {
         if let Some(home) = &self.0 {
             cmd.env("HOME", home)
                 .env("HISTFILE", "/dev/null")
@@ -219,20 +240,46 @@ fn write_while_running(fd: &OwnedFd, bytes: &[u8], stopping: &AtomicBool) -> boo
     true
 }
 
-/// The program, until it is reaped: owning it is the right to signal its pid, which is no longer
-/// its own once reaped.
-struct Running {
+/// A program koh started, until it is reaped: owning it is the right to signal its pid, which is
+/// no longer its own once reaped.
+pub(crate) struct Running {
     child: std::process::Child,
     pid: Pid,
+    whom: Whom,
+}
+
+/// Who a hang-up reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Whom {
+    /// The program alone: a PTY's session leader, whose terminal closing hangs up the rest.
+    Leader,
+    /// Its whole process group: a program with no terminal (`koh exec`'s), which leads a session
+    /// of its own, so its group is its pid.
+    Group,
 }
 
 impl Running {
+    /// `child`, which leads a session of its own (`fuxix::process::lead_session`) and has no
+    /// terminal: a hang-up reaches its whole group. `None` if it has no pid to signal.
+    pub(crate) fn group(child: std::process::Child) -> Option<Self> {
+        let pid = Pid::of(&child)?;
+        Some(Self {
+            child,
+            pid,
+            whom: Whom::Group,
+        })
+    }
+
     fn signal(&self, signal: Signal) -> io::Result<()> {
-        fuxix::process::kill(self.pid, signal).map_err(io::Error::from)
+        match self.whom {
+            Whom::Leader => fuxix::process::kill(self.pid, signal),
+            Whom::Group => fuxix::process::kill_group(self.pid, signal),
+        }
+        .map_err(io::Error::from)
     }
 
     /// How it ended, if it has; reaped then.
-    fn try_wait(&mut self) -> io::Result<Option<Exit>> {
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<Exit>> {
         let Some(status) = self.child.try_wait()? else {
             return Ok(None);
         };
@@ -244,8 +291,8 @@ impl Running {
     }
 
     /// Hang up, as a terminal closing does, and leave it to `reaper`, which kills it if it
-    /// outlives [`HANGUP_GRACE`].
-    fn hang_up(self, reaper: &Reaper) {
+    /// outlives [`HANGUP_GRACE`] (a group, whatever of it is left then).
+    pub(crate) fn hang_up(self, reaper: &Reaper) {
         let _ = self.signal(Signal::Hup);
         let kill_at = std::time::Instant::now().checked_add(HANGUP_GRACE);
         if let Err(error) = reaper.0.send(Reap::Child(Stopping {
@@ -279,6 +326,11 @@ impl Stopping {
         {
             let _ = self.running.signal(Signal::Kill);
             self.kill_at = None;
+        }
+        // A group's leader is reaped only once the group is killed: until then its pid, even a
+        // zombie's, holds the group's id, so the kill cannot reach another group.
+        if self.running.whom == Whom::Group && self.kill_at.is_some() {
+            return false;
         }
         match self.running.try_wait() {
             Ok(exit) => exit.is_some(),
@@ -481,7 +533,11 @@ impl Pty {
                 master,
                 writer_tx,
                 write_budget,
-                running: Some(Running { child, pid }),
+                running: Some(Running {
+                    child,
+                    pid,
+                    whom: Whom::Leader,
+                }),
                 reaper: reaper.clone(),
                 pumps,
             },
@@ -581,14 +637,9 @@ mod tests {
         );
         // An empty `$SHELL` is as if unset: the platform's shell, which on Android is not /bin/sh.
         let fish = resolve_shell(Some(OsString::from("/usr/bin/fish")));
-        let platform = if cfg!(target_os = "android") {
-            "/system/bin/sh"
-        } else {
-            "/bin/sh"
-        };
         assert_eq!(fish, "/usr/bin/fish");
-        assert_eq!(resolve_shell(Some(OsString::new())), platform);
-        assert_eq!(resolve_shell(None), platform);
+        assert_eq!(resolve_shell(Some(OsString::new())), PLATFORM_SHELL);
+        assert_eq!(resolve_shell(None), PLATFORM_SHELL);
     }
 
     #[test]

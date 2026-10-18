@@ -14,6 +14,7 @@ use koh::proto::{
     decode_server, encode_client, ClientMsg, Close, Frame, FrameEncoder, FrameNum, InputSeq,
     ServerMsg, MAX_FRAME, MAX_PENDING_HISTORY,
 };
+use koh::request::{Attached, Pick, Request, Resume, RunId, SessionNum, MAX_REPLY, MAX_REQUEST};
 use koh::terminal::{ServerTerminal, TerminalScreen};
 use koh::transport_iroh::{generate_secret_key, ALPN};
 
@@ -26,8 +27,9 @@ fn net() -> FaultNet {
     FaultNet::new(Profile::default(), 1)
 }
 
-/// Connect to `server` as `secret`, wait for its first frame, which admits it, and keep the
-/// endpoint alive; the caller then speaks koh/7 by hand.
+/// Connect to `server` as `secret`, ask for a shell on the first stream, wait for the server's
+/// first stream, which admits it, and keep the endpoint and that stream alive; the caller then
+/// speaks koh/7 by hand.
 async fn admitted(
     net: &FaultNet,
     secret: SecretKey,
@@ -35,6 +37,8 @@ async fn admitted(
 ) -> anyhow::Result<Connection> {
     let endpoint = net.endpoint(secret, false).await?;
     let conn = endpoint.connect(FaultNet::addr(server), ALPN).await?;
+    let request = koh::request::encode(&Request::Shell(Pick::Latest), MAX_REQUEST)?;
+    raw_client_stream(&conn, &request).await?;
     conn.accept_uni().await?;
     Box::leak(Box::new(endpoint));
     Ok(conn)
@@ -62,7 +66,7 @@ fn typed(text: &str) -> ClientMsg {
     }
 }
 
-/// Open the one client stream, write `bytes`, and keep it open (a real client keeps its stream).
+/// Open a client stream, write `bytes`, and keep it open (a real client keeps its streams).
 async fn raw_client_stream(conn: &Connection, bytes: &[u8]) -> anyhow::Result<()> {
     let mut send = conn.open_uni().await?;
     send.write_all(bytes).await?;
@@ -265,6 +269,28 @@ fn a_full_session_queue_does_not_stop_the_frames() -> anyhow::Result<()> {
 }
 
 #[test]
+fn an_opening_request_that_is_no_request_closes_the_connection_only() -> anyhow::Result<()> {
+    koh_testkit::multi_thread(4)?.block_on(async {
+        let net = net();
+        let evil = identity()?;
+        let (server, mut good) = server_under_attack(&net, evil.public()).await?;
+        // Garbage where the request goes, then a command holding a NUL (`Request::Exec`, the
+        // third kind, of 3 bytes), which no command line can.
+        let nul = vec![0, 0, 0, 5, 2, 3, b'a', 0, b'b'];
+        for request in [vec![0, 0, 0, 3, 0xff, 0xff, 0xff], nul] {
+            let endpoint = net.endpoint(evil.clone(), false).await?;
+            let conn = endpoint.connect(FaultNet::addr(server.id), ALPN).await?;
+            raw_client_stream(&conn, &request).await?;
+            closed_for_breaking_the_protocol(&conn, "a malformed request").await?;
+        }
+        assert_good_client_still_works(&mut good).await?;
+        let _ = good.finish().await;
+        server.stop().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn a_client_cannot_open_a_third_stream() -> anyhow::Result<()> {
     koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
@@ -272,9 +298,9 @@ fn a_client_cannot_open_a_third_stream() -> anyhow::Result<()> {
         let (server, mut good) = server_under_attack(&net, evil.public()).await?;
         let conn = admitted(&net, evil, server.id).await?;
         raw_client_stream(&conn, &encode_client(&typed("echo hi\r"))?).await?;
-        // The server permits two uni streams from the client, input and control, so a third
-        // never opens: QUIC's stream-count flow control is the bound, before any koh code runs.
-        let _second = conn.open_uni().await?;
+        // The server permits two uni streams from the client, control (its request's) and input,
+        // so a third never opens: QUIC's stream-count flow control is the bound, before any koh
+        // code runs.
         let third = tokio::time::timeout(Duration::from_secs(2), conn.open_uni()).await;
         anyhow::ensure!(
             third.is_err(),
@@ -366,10 +392,22 @@ fn history_requests_are_answered_within_bounds_and_a_flood_of_them_closes_the_co
 
 // --- a malicious server against a real client ---
 
-/// What admits a client: a first stream, here an empty one.
-async fn admit(conn: &Connection) -> anyhow::Result<()> {
-    conn.open_uni().await?.finish()?;
-    Ok(())
+/// What admits a client: its request read, the first stream says it attached session 1. The
+/// request's stream, kept open as the client's control stream.
+async fn admit(conn: &Connection) -> anyhow::Result<iroh::endpoint::RecvStream> {
+    let mut control = conn.accept_uni().await?;
+    koh::transport_iroh::read_framed(&mut control, MAX_REQUEST).await?;
+    let attached = Attached {
+        at: Resume {
+            run: RunId(0),
+            session: SessionNum(1),
+        },
+    };
+    let mut send = conn.open_uni().await?;
+    send.write_all(&koh::request::encode(&attached, MAX_REPLY)?)
+        .await?;
+    send.finish()?;
+    Ok(control)
 }
 
 /// Bind a hand-rolled server for `allow`, admit it, and run `frames` on its connection. Returns the
@@ -386,9 +424,13 @@ where
             return;
         };
         let Ok(conn) = incoming.await else { return };
-        if conn.remote_id() != allow || admit(&conn).await.is_err() {
+        if conn.remote_id() != allow {
             return;
         }
+        let Ok(control) = admit(&conn).await else {
+            return;
+        };
+        Box::leak(Box::new(control));
         let handle = frames(conn);
         Box::leak(Box::new(endpoint));
         let _ = handle.await;

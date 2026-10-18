@@ -14,6 +14,7 @@
 
 pub mod bounded;
 pub mod client;
+pub mod copy;
 pub mod events;
 pub mod identity;
 pub mod keycmd;
@@ -23,6 +24,7 @@ pub mod names;
 pub mod predict;
 pub mod proto;
 pub mod pty;
+pub mod request;
 pub mod server;
 pub mod terminal;
 pub mod transport_iroh;

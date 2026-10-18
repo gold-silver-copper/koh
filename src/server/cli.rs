@@ -1,5 +1,8 @@
-//! The `koh serve` command: bind an endpoint with a persistent identity, admit only the clients on
-//! the `--allow` list, and host each one's session. There is no "accept any peer" mode.
+//! The `koh serve` command: admit only the clients on the allowlist, and serve each what it asks.
+//!
+//! It binds an endpoint with a persistent identity, and serves each connection what its opening
+//! request asks: a session, the peer's sessions, a command or a copy. There is no "accept any
+//! peer" mode.
 
 use std::collections::HashSet;
 use std::num::NonZeroU32;
@@ -17,6 +20,7 @@ use crate::identity::KeyFile;
 use crate::log::Peer;
 use crate::names::List;
 use crate::proto::Close;
+use crate::request::{Attached, Pick, Request, Resume, SessionList, MAX_LISTED, MAX_REQUEST};
 use crate::server::audit::{auth_event, Outcome, Throttle};
 use crate::server::run_attached;
 use crate::server::session::{AttachKind, Registry, SessionSpec};
@@ -27,6 +31,10 @@ use tracing::{debug, info, warn};
 /// than keep it for the 5-minute idle timeout; a real handshake takes far less, even on a slow
 /// mobile link.
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline on the opening request, as on the handshake: a peer that says nothing is closed, and
+/// holds its permit no longer.
+const REQUEST_TIMEOUT: Duration = ACCEPT_HANDSHAKE_TIMEOUT;
 
 /// The clap-free form of `koh serve`'s arguments. [`Default`] gives the CLI's defaults, with an
 /// empty `allow`, which [`serve`] rejects.
@@ -55,7 +63,7 @@ pub struct ServeConfig {
     pub port: Option<u16>,
     /// Most connections handled at once.
     pub max_connections: NonZeroU32,
-    /// Most live sessions, one per peer.
+    /// Most live sessions, all peers' together.
     pub max_sessions: NonZeroU32,
     /// The home each session's program gets: the user's, but in tests.
     pub home: crate::pty::Home,
@@ -412,11 +420,20 @@ impl<H, const N: usize> Pending<H, N> {
     }
 }
 
+/// What a connection's request may use beside the sessions: where commands run and copies
+/// land, what reaps commands hung up, and the server's shutdown, which hangs them up.
+pub(super) struct Host {
+    pub(super) home: crate::pty::Home,
+    pub(super) reaper: crate::pty::Reaper,
+    pub(super) shutdown: CancellationToken,
+}
+
 /// What a finished handshake needs to be admitted, cloned for each.
 #[derive(Clone)]
 struct Gate {
     allowed: Allowed,
     registry: Registry,
+    host: Arc<Host>,
     /// One permit a connection, held for its life.
     connections: Arc<tokio::sync::Semaphore>,
     /// Peers turned away (not allowed, or no room), said at most every few seconds: anyone can
@@ -443,6 +460,7 @@ impl Gate {
                 conn,
                 self.allowed,
                 self.registry,
+                self.host,
                 permit,
             )));
             return;
@@ -456,42 +474,116 @@ impl Gate {
     }
 }
 
-/// Serve the session of `conn`'s peer to it until it detaches, or the peer is removed from the
-/// list, which ends its session too. The registry attaches no peer the list no longer allows: one
-/// removed as this connection was admitted starts no session. Holds `permit` throughout.
+/// Serve what `conn`'s opening request asks until it is done, or the peer is removed from the
+/// list, which ends its sessions too. The registry attaches no peer the list no longer allows: one
+/// removed as this connection was admitted starts no session. Holds `permit` throughout, the wait
+/// for the request included.
 async fn serve_connection(
     conn: iroh::endpoint::Connection,
     allowed: Allowed,
     registry: Registry,
+    host: Arc<Host>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _permit = permit;
     let peer = conn.remote_id();
-    let (client, attach_kind) = match registry.attach(peer).await {
-        Ok(attached) => attached,
-        Err(refused) => {
-            warn!(peer = %peer, reason = %refused, "refusing session");
-            close(&conn, refused);
+    let served = async {
+        let Some((request, control)) = opening(&conn).await else {
             return;
+        };
+        match request {
+            Request::Shell(pick) => shell(&conn, &registry, pick, control).await,
+            Request::Sessions => {
+                auth_event(Outcome::Accepted, &peer, "authorized; listing sessions");
+                let mut sessions = registry.sessions(peer).await;
+                sessions.truncate(MAX_LISTED);
+                if super::reply(&conn, &SessionList(sessions)).await.is_ok() {
+                    super::linger(&conn).await;
+                }
+            }
+            Request::Exec(line) => {
+                auth_event(Outcome::Accepted, &peer, "authorized; running a command");
+                super::exec::serve(&conn, control, line, &host).await;
+            }
+            Request::Copy(copy) => {
+                auth_event(Outcome::Accepted, &peer, "authorized; copying");
+                super::copy::serve(&conn, control, copy, &host).await;
+            }
         }
     };
-    auth_event(Outcome::Accepted, &peer, "authorized; session attached");
-    match attach_kind {
-        AttachKind::Created => info!(peer = %peer, "started a new session"),
-        AttachKind::Reattached { detached_for } => info!(
-            peer = %peer,
-            detached_secs = detached_for.map(|d| d.as_secs()),
-            "reattaching to this peer's existing session"
-        ),
-    }
-    // Its first frame tells the client it was admitted. The session is the proof the peer is allowed:
-    // the registry attaches no other.
     tokio::select! {
-        () = run_attached(&conn, client) => {}
+        () = served => {}
         () = revoked(allowed, peer) => {
             auth_event(Outcome::Rejected, &peer, "removed from the allowlist");
             close(&conn, Close::NotAuthorized);
         }
+    }
+}
+
+/// The request `conn`'s client opens with, and the rest of its stream, read within
+/// [`REQUEST_TIMEOUT`]: else the connection is closed, as one that broke the protocol.
+async fn opening(
+    conn: &iroh::endpoint::Connection,
+) -> Option<(Request, iroh::endpoint::RecvStream)> {
+    let read = async {
+        let mut control = conn.accept_uni().await?;
+        let body = crate::transport_iroh::read_framed(&mut control, MAX_REQUEST).await?;
+        let request: Request = crate::request::decode(&body)?;
+        anyhow::Ok((request, control))
+    };
+    match tokio::time::timeout(REQUEST_TIMEOUT, read).await {
+        Ok(Ok(opened)) => Some(opened),
+        Ok(Err(error)) => {
+            debug!(error = %Peer(format!("{error:#}")), "no opening request");
+            close(conn, Close::ProtocolError);
+            None
+        }
+        Err(_) => {
+            debug!("no opening request in time");
+            close(conn, Close::ProtocolError);
+            None
+        }
+    }
+}
+
+/// Attach `conn`'s peer to the session `pick` names and serve it until it detaches; the rest of
+/// the client's first stream, `control`, is the session's control stream.
+async fn shell(
+    conn: &iroh::endpoint::Connection,
+    registry: &Registry,
+    pick: Pick,
+    control: iroh::endpoint::RecvStream,
+) {
+    let peer = conn.remote_id();
+    let (client, attach_kind) = match registry.attach(peer, pick).await {
+        Ok(attached) => attached,
+        Err(refused) => {
+            warn!(peer = %peer, reason = %refused, "refusing session");
+            close(conn, refused);
+            return;
+        }
+    };
+    let session = client.session();
+    auth_event(Outcome::Accepted, &peer, "authorized; session attached");
+    match attach_kind {
+        AttachKind::Created => info!(peer = %peer, %session, "started a new session"),
+        AttachKind::Reattached { detached_for } => info!(
+            peer = %peer,
+            %session,
+            detached_secs = detached_for.map(|d| d.as_secs()),
+            "reattaching to this peer's session"
+        ),
+    }
+    // Its first stream tells the client it was admitted, and to which session. The session is
+    // the proof the peer is allowed: the registry attaches no other.
+    let attached = Attached {
+        at: Resume {
+            run: registry.run(),
+            session,
+        },
+    };
+    if super::reply(conn, &attached).await.is_ok() {
+        run_attached(conn, client, control).await;
     }
 }
 
@@ -504,13 +596,20 @@ pub async fn serve_endpoint(
 ) -> anyhow::Result<()> {
     let (allowed_tx, allowed) = watch::channel(Arc::new(hosting.allowed));
     let allows = allowed.clone();
+    let home = hosting.spec.home.clone();
     let registry = Registry::spawn(hosting.spec, move |peer| allows.borrow().contains(peer))
         .context("starting the child reaper")?;
+    let host = Arc::new(Host {
+        home,
+        reaper: registry.reaper(),
+        shutdown: shutdown.clone(),
+    });
     #[expect(clippy::disallowed_methods, reason = "one allowlist reader a server")]
     tokio::spawn(watch_allowlist(hosting.allow, allowed_tx, registry.clone()));
     let gate = Gate {
         allowed,
         registry: registry.clone(),
+        host: Arc::clone(&host),
         connections: Arc::new(tokio::sync::Semaphore::new(hosting.max_connections)),
         turned_away: Arc::default(),
     };
@@ -562,13 +661,16 @@ pub async fn serve_endpoint(
         pending.0.push_evicting((source, handshake.abort_handle()));
     }
 
-    // Sessions first, with their programs reaped (or killed after their grace), then the endpoint.
+    // Sessions first, with their programs reaped (or killed after their grace), then the endpoint;
+    // the commands hung up as the shutdown reached them are reaped last.
     info!("draining: stopping the registry and closing endpoint");
     shutdown.cancel();
     registry.shutdown().await;
     if !crate::transport_iroh::close_endpoint(&endpoint).await {
         warn!("peers did not see the endpoint close in time; exiting anyway");
     }
+    let reaper = host.reaper.clone();
+    let _ = tokio::task::spawn_blocking(move || reaper.drain()).await;
     Ok(())
 }
 

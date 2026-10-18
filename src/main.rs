@@ -1,11 +1,11 @@
-//! The `koh` binary: `serve` / `connect` / `id` / `key` / `servers` / `clients` dispatch, and the
-//! menu `koh` alone opens on a terminal.
+//! The `koh` binary: `serve` / `connect` / `sessions` / `exec` / `cp` / `id` / `key` / `servers` /
+//! `clients` dispatch, and the menu `koh` alone opens on a terminal.
 
 mod args;
 
 use std::io::IsTerminal as _;
 
-use crate::args::{Cmd, ConnectArgs, ServerRef};
+use crate::args::{Cmd, ConnectArgs, RemoteArgs, ServerRef};
 use koh::names::{List, Places};
 
 // An explicit runtime instead of `#[tokio::main]`, whose expansion `allow`s `clippy::expect_used`.
@@ -49,6 +49,24 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
     match cmd {
         Cmd::Serve(config) => serve(config).await,
         Cmd::Connect(args) => connect(args).await,
+        Cmd::Sessions(remote) => {
+            let remote = resolve(remote)?;
+            koh::client::sessions(&remote, &mut std::io::stdout())
+                .await
+                .map(|()| None)
+        }
+        // koh's own errors exit 255, as ssh's do, apart from any status a command exits with.
+        Cmd::Exec { remote, line } => match exec(remote, line).await {
+            Ok(code) => Ok(Some(code)),
+            Err(e) => {
+                koh::log::stderr(format_args!("koh: {e:#}"));
+                Ok(Some(255))
+            }
+        },
+        Cmd::Copy { remote, job } => {
+            let remote = resolve(remote)?;
+            koh::client::copy(&remote, job).await.map(|()| None)
+        }
         Cmd::Key(config) => koh::keycmd::run(&config).map(|()| None),
         Cmd::Names { list, op, key_file } => {
             let places = match list {
@@ -81,13 +99,30 @@ async fn serve(mut config: koh::server::ServeConfig) -> anyhow::Result<Option<u3
 
 /// `koh connect`, with a saved name turned into its id.
 async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
-    let server = match &args.server {
-        ServerRef::Id(id) => *id,
+    let server = server_id(&args.remote)?;
+    koh::client::connect(args.into_config(server)).await
+}
+
+/// `koh exec`, with a saved name turned into its id: the command's status.
+async fn exec(remote: RemoteArgs, line: koh::request::CommandLine) -> anyhow::Result<u32> {
+    koh::client::exec(&resolve(remote)?, line).await
+}
+
+/// `remote`, with a saved name turned into its id.
+fn resolve(remote: RemoteArgs) -> anyhow::Result<koh::client::Remote> {
+    let server = server_id(&remote)?;
+    Ok(remote.into_remote(server))
+}
+
+/// The id of `remote`'s server: as given, or saved under its name beside the client key.
+fn server_id(remote: &RemoteArgs) -> anyhow::Result<iroh::EndpointId> {
+    match &remote.server {
+        ServerRef::Id(id) => Ok(*id),
         ServerRef::Name(name) => {
-            let places = Places::new(args.key_file.clone(), None)?;
+            let places = Places::new(remote.key_file.clone(), None)?;
             let saved = koh::names::load(&places, List::Servers)?;
             if let Some(id) = saved.get(name) {
-                id
+                Ok(id)
             } else {
                 let known: Vec<&str> = saved.entries().map(|(n, _)| n).collect();
                 anyhow::bail!(
@@ -101,8 +136,7 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
                 );
             }
         }
-    };
-    koh::client::connect(args.into_config(server)).await
+    }
 }
 
 /// `koh connect <id>` with every option at its default.
@@ -110,7 +144,13 @@ fn defaults_for_connect(id: iroh::EndpointId) -> anyhow::Result<ConnectArgs> {
     let id = id.to_string();
     match args::parse(&args::command().try_get_matches_from(["koh", "connect", id.as_str()])?)? {
         Cmd::Connect(args) => Ok(args),
-        Cmd::Serve(_) | Cmd::Key(_) | Cmd::Names { .. } | Cmd::Menu => {
+        Cmd::Serve(_)
+        | Cmd::Sessions(_)
+        | Cmd::Exec { .. }
+        | Cmd::Copy { .. }
+        | Cmd::Key(_)
+        | Cmd::Names { .. }
+        | Cmd::Menu => {
             anyhow::bail!("internal error: `koh connect` parsed as another command")
         }
     }
@@ -120,7 +160,13 @@ fn defaults_for_connect(id: iroh::EndpointId) -> anyhow::Result<ConnectArgs> {
 fn defaults_for_serve() -> anyhow::Result<koh::server::ServeConfig> {
     match args::parse(&args::command().try_get_matches_from(["koh", "serve"])?)? {
         Cmd::Serve(config) => Ok(config),
-        Cmd::Connect(_) | Cmd::Key(_) | Cmd::Names { .. } | Cmd::Menu => {
+        Cmd::Connect(_)
+        | Cmd::Sessions(_)
+        | Cmd::Exec { .. }
+        | Cmd::Copy { .. }
+        | Cmd::Key(_)
+        | Cmd::Names { .. }
+        | Cmd::Menu => {
             anyhow::bail!("internal error: `koh serve` parsed as another command")
         }
     }

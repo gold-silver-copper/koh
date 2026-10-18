@@ -8,7 +8,7 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{connected, loopback_server, on_pty, serve, Served};
+use common::{connected, endpoint_id, loopback_server, on_pty, serve, Served};
 use koh_testkit::command;
 
 /// `Ctrl-^ Ctrl-Z` stops the client with SIGTSTP, as a terminal's suspend key would: the job
@@ -90,16 +90,6 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
         });
 }
 
-/// `koh id` for the key at `key`, creating it: the endpoint id, as the binary prints it.
-fn endpoint_id(key: &Path) -> anyhow::Result<String> {
-    let out = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())?
-        .args(["id", "--key-file"])
-        .arg(key)
-        .output()?;
-    anyhow::ensure!(out.status.success(), "koh id: {out:?}");
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-}
-
 /// `koh serve --local` hosting `sh` for `client`, as the key at `key`, on
 /// `port` if given.
 fn serve_local(key: &Path, port: Option<u16>, client: &str) -> anyhow::Result<Served> {
@@ -136,7 +126,7 @@ fn stop(mut server: Served) -> anyhow::Result<()> {
 
 /// A `koh serve --local --port` restarted under a connected client (a new process, the same key
 /// and port) is found again: the client redials the address it dialed. The session died with the
-/// old server, so the client gets a fresh one.
+/// old server, and a redial goes back to its own session only, so the client ends saying so.
 #[test]
 fn a_client_redials_a_local_server_restarted_on_its_port() {
     koh_testkit::multi_thread(2)
@@ -165,12 +155,7 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
             let server =
                 serve_local(&server_key, Some(port), &client_id).expect("the restarted server");
 
-            // Typing while the client redials is dropped, so type until the new session answers.
-            let seen = buf
-                .type_until(at, "after_fresh_42", 30, || {
-                    let _ = client.write(b"echo after_${X:-fresh}_$((6*7))\r".to_vec());
-                })
-                .await;
+            let seen = buf.wait_for(at, "no such session", 30).await;
 
             let _ = client.write(vec![0x1e, b'.']);
             drop(client);

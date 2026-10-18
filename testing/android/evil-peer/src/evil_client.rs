@@ -99,11 +99,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Everything else gets admitted first, then opens the one client stream and writes crafted
+    // Everything else gets admitted first, then opens its input stream and writes crafted
     // messages on it.
     let ep = bind_endpoint_local(evil_secret!(), false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
-    // The first frame admits us.
+    // A shell, asked for on the first stream, kept open as the control stream; the server's first
+    // stream admits us.
+    let mut control = conn.open_uni().await?;
+    let shell = koh::request::Request::Shell(koh::request::Pick::Latest);
+    control
+        .write_all(&koh::request::encode(&shell, koh::request::MAX_REQUEST)?)
+        .await?;
     conn.accept_uni().await?;
     eprintln!("evil-client: admitted; running attack '{attack}'");
 
@@ -323,7 +329,8 @@ async fn garbage(send: &mut SendStream, n: usize) -> Result<()> {
     Ok(())
 }
 
-/// Open a second client stream: the server permits one, so this must not be grantable.
+/// Open a third client stream beside the control and input streams: the server permits two, so
+/// this must not be grantable.
 async fn second_stream(conn: &Connection) -> Result<()> {
     let mut first = conn.open_uni().await?;
     write_msg(
@@ -334,7 +341,6 @@ async fn second_stream(conn: &Connection) -> Result<()> {
         },
     )
     .await?;
-    let _control = conn.open_uni().await?;
     eprintln!("evil-client: trying a third client stream (the two-stream limit must block it)");
     match tokio::time::timeout(Duration::from_secs(3), conn.open_uni()).await {
         Err(_) => eprintln!("evil-client: third stream blocked by the limit, as expected"),

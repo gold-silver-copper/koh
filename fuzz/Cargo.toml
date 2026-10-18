@@ -60,3 +60,10 @@ path = "fuzz_targets/server_input.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "request_decode"
+path = "fuzz_targets/request_decode.rs"
+test = false
+doc = false
+bench = false

@@ -6,6 +6,10 @@
 //! directory and the user's own `~/.config/koh` is never read or written.
 #![forbid(clippy::disallowed_methods)]
 
+#[expect(
+    dead_code,
+    reason = "the keys here are made by the binary itself, in its home"
+)]
 mod common;
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -323,7 +327,7 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
 /// with no restart: a lost machine's key is refused at once.
 #[test]
 fn clients_added_and_removed_take_effect_on_a_running_server() {
-    use koh::transport_iroh::{bind_endpoint_local, direct_addr, parse_endpoint_id, ALPN};
+    use koh::transport_iroh::{bind_endpoint_local, direct_addr, parse_endpoint_id};
     let home = Home::new("live-allowlist").unwrap();
     let me = home.koh(&["id"]).unwrap();
     let me = String::from_utf8_lossy(&me.stdout).trim().to_owned();
@@ -343,9 +347,10 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
         let (at, secret) = (at.clone(), secret.clone());
         async move {
             let endpoint = bind_endpoint_local(secret, false).await?;
-            let conn = endpoint.connect(at, ALPN).await?;
-            conn.accept_uni().await?;
-            anyhow::Ok((endpoint, conn))
+            let admitted = koh::client::IrohConnector::new(endpoint.clone(), at)
+                .connect(koh::request::Pick::Latest)
+                .await?;
+            anyhow::Ok((endpoint, admitted))
         }
     };
     let outcomes = koh_testkit::multi_thread(2)
@@ -363,9 +368,11 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
             home.koh(&["clients", "rm", "me"]).unwrap();
             // The connection it already had is cut off too.
             let cut_off = match &live {
-                Ok((_, conn)) => tokio::time::timeout(Duration::from_secs(10), conn.closed())
-                    .await
-                    .is_ok(),
+                Ok((_, admitted)) => {
+                    tokio::time::timeout(Duration::from_secs(10), admitted.conn.closed())
+                        .await
+                        .is_ok()
+                }
                 Err(_) => false,
             };
             let removed = admitted().await.is_ok();

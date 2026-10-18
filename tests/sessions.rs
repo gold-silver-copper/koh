@@ -465,7 +465,9 @@ fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyho
 
 /// A report says which input it came after, and never goes before the output the program wrote
 /// before it: one saying `reading` after a key has what the program wrote for it on the screen,
-/// though that came too late after the key to go out with its echo.
+/// though that came too late after the key to go out with its echo. Only where the system says a
+/// program reads (macOS says only busy or idle).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn a_report_follows_the_input_and_output_before_it() -> anyhow::Result<()> {
     runtime()?.block_on(async {

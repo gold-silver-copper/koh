@@ -9,7 +9,7 @@ use std::io;
 use super::backend::{KohBackend, OscText};
 use crate::predict::Overlay;
 use crate::terminal::{Grid, Link, Size, MAXIMUM_CLIPBOARD_SIZE};
-use fux_vt::{Attributes, CellRef, Cells, Color, MouseProtocolMode};
+use fux_vt::{Attributes, CellRef, Color, MouseProtocolMode};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 /// What the terminal shows, so the next frame paints only what changed.
@@ -220,69 +220,11 @@ impl Scroll {
     }
 }
 
-/// About what a scroll costs in bytes: the reset, the region, the scroll and the region's reset.
-const SCROLL_COST: usize = 16;
-
-/// About what moving the cursor to a cell costs in bytes.
-const MOVE_COST: usize = 8;
-
-/// About the bytes painting a row writes, given which of its cells differ from what the terminal
-/// shows: a byte for each, and a cursor move to reach each run of them. Counting stops past
-/// `limit`.
-fn repaint_cost(differs: impl Iterator<Item = bool>, limit: usize) -> usize {
-    let mut cost = 0_usize;
-    let mut in_run = false;
-    for differs in differs {
-        if differs {
-            let step = if in_run {
-                1
-            } else {
-                MOVE_COST.saturating_add(1)
-            };
-            cost = cost.saturating_add(step);
-            if cost > limit {
-                break;
-            }
-        }
-        in_run = differs;
-    }
-    cost
-}
-
-/// Whether `scroll` writes less than painting its rows in place: the rows it moves need no paint,
-/// the rows it leaves blank need their glyphs, and every row in place needs what differs.
-fn worth(scroll: Scroll, screen: &Grid, painted: &Grid) -> bool {
-    let mut with = SCROLL_COST;
-    for row in (scroll.top..scroll.bottom).filter(|&row| scroll.source(row).is_none()) {
-        let differs = screen
-            .row(row)
-            .into_iter()
-            .flat_map(Cells::iter)
-            .map(|cell| !shows_blank(cell));
-        with = with.saturating_add(repaint_cost(differs, usize::MAX));
-    }
-    let mut without = 0_usize;
-    for row in scroll.top..scroll.bottom {
-        let (Some(now), Some(before)) = (screen.row(row), painted.row(row)) else {
-            continue;
-        };
-        let left = with.saturating_sub(without);
-        let differs = now
-            .iter()
-            .zip(before.iter())
-            .map(|(now, before)| now != before);
-        without = without.saturating_add(repaint_cost(differs, left));
-        if without > with {
-            return true;
-        }
-    }
-    false
-}
-
 /// The terminal scrolls that move the rows of the first `height` rows of `painted` where `screen`
 /// has them: the moves [`Grid::moves_from`] finds, the longest first, each kept only if its region
-/// overlaps none kept before, so the scrolls can run one after another, and if it paints less than
-/// painting its rows in place.
+/// overlaps none kept before, so the scrolls can run one after another. A row that moved is moved
+/// even where painting it in place would write less, so that what the terminal keeps of a row
+/// moves with it.
 fn scrolls(screen: &Grid, painted: &Grid, height: u16) -> Vec<Scroll> {
     let mut moves = screen.moves_from(painted, height);
     moves.sort_by_key(|shift| std::cmp::Reverse(shift.len));
@@ -299,7 +241,6 @@ fn scrolls(screen: &Grid, painted: &Grid, height: u16) -> Vec<Scroll> {
         if kept
             .iter()
             .all(|other| scroll.bottom <= other.top || other.bottom <= scroll.top)
-            && worth(scroll, screen, painted)
         {
             kept.push(scroll);
         }
@@ -318,14 +259,6 @@ fn shown_after(rows: u16, scrolls: &[Scroll]) -> Vec<Option<u16>> {
                 .map_or(Some(row), |scroll| scroll.source(row))
         })
         .collect()
-}
-
-/// Whether `cell` draws what a row a scroll brought in shows: a blank in the default style.
-fn shows_blank(cell: CellRef<'_>) -> bool {
-    !cell.is_wide()
-        && !cell.is_wide_continuation()
-        && matches!(cell.contents(), "" | " ")
-        && cell.attributes() == Attributes::default()
 }
 
 /// Make `want` the hyperlink the glyphs printed next have, in place of `open`: close the one open,
@@ -1416,22 +1349,6 @@ mod tests {
             assert!(painted.contains(scroll) && same, "{painted:?}");
             assert!(!painted.contains("aaa"), "no row repainted: {painted:?}");
         }
-    }
-
-    #[test]
-    fn a_scroll_that_would_write_more_than_it_saves_is_not_made() {
-        // Rows that all read the same: in place, the scrolled rows already show what they would
-        // bring, so only the new row is painted, and nothing scrolls.
-        let mut emu = crate::terminal::ServerTerminal::new(6, 20, 0).unwrap();
-        for row in 1..=6 {
-            emu.process(format!("\x1b[{row};1Hthe same").as_bytes());
-        }
-        let (painted, same) = after(&mut emu, b"\r\nthe same", None, SMALL);
-        assert!(same, "{painted:?}");
-        assert!(
-            !painted.contains("the same") && !painted.contains("\x1b[1S"),
-            "nothing scrolled or painted: {painted:?}"
-        );
     }
 
     /// Output that exercises what a frame can change: text, wide glyphs, combining marks, clusters

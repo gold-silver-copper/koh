@@ -124,6 +124,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
   only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
+- The shell's marks koh writes count in a fux shell pane too: with `FUX_MARK_NONCE` in its
+  environment (fux 0.27 gives it to the programs a shell pane runs), every mark carries it, so
+  `koh connect` typed into a shell pane answers fux's `line` with `· done STATUS`.
 - A line typed in one go past 1 KiB (as an agent's terminal types it) no longer waits for the next
   key: the client read stdin through a buffer `poll` cannot see, so the line's end, its Enter
   among it, sat there until something more was typed.

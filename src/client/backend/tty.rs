@@ -6,7 +6,7 @@ use std::os::fd::AsFd;
 
 use fuxix::terminal::{self, Termios};
 
-use super::KohBackend;
+use super::{KohBackend, MarkNonce};
 use crate::terminal::Size;
 
 /// Output is buffered and flushed once per frame.
@@ -17,6 +17,8 @@ pub struct Tty {
     out: BufWriter<File>,
     /// The terminal's mode when koh started, restored on leaving raw mode and on drop.
     original: Termios,
+    /// The nonce the terminal asks marks to carry, read once at start-up.
+    nonce: Option<MarkNonce>,
 }
 
 impl Tty {
@@ -35,6 +37,7 @@ impl Tty {
         Ok(Self {
             out: BufWriter::with_capacity(BUF_SIZE, file),
             original,
+            nonce: MarkNonce::from_env(),
         })
     }
 }
@@ -42,6 +45,10 @@ impl Tty {
 impl KohBackend for Tty {
     fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.out.write_all(bytes)
+    }
+
+    fn mark_nonce(&self) -> Option<&MarkNonce> {
+        self.nonce.as_ref()
     }
 
     fn flush(&mut self) -> io::Result<()> {

@@ -37,6 +37,27 @@ impl OscText {
     }
 }
 
+/// A nonce the user's terminal asks marks to carry (`FUX_MARK_NONCE`).
+///
+/// fux gives it to the programs a shell pane runs: with it, the shell's marks koh writes count in
+/// a terminal that ignores marks a program prints without one. A word of at most 64 letters and
+/// digits, else none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkNonce(String);
+
+impl MarkNonce {
+    /// The nonce `value` names, if it is one.
+    pub fn new(value: &str) -> Option<Self> {
+        (!value.is_empty() && value.len() <= 64 && value.bytes().all(|b| b.is_ascii_alphanumeric()))
+            .then(|| Self(value.to_owned()))
+    }
+
+    /// The nonce in koh's environment, if one is there.
+    pub fn from_env() -> Option<Self> {
+        Self::new(&std::env::var("FUX_MARK_NONCE").ok()?)
+    }
+}
+
 /// The terminal `koh connect` paints on. Output is buffered until [`flush`](Self::flush), once per
 /// frame.
 pub trait KohBackend {
@@ -54,6 +75,19 @@ pub trait KohBackend {
 
     /// The current terminal size.
     fn size(&self) -> io::Result<Size>;
+
+    /// The nonce the terminal asks marks to carry, if any.
+    fn mark_nonce(&self) -> Option<&MarkNonce> {
+        None
+    }
+
+    /// Write `OSC 133 ; body`, with the terminal's nonce if it asks for one.
+    fn mark(&mut self, body: fmt::Arguments<'_>) -> io::Result<()> {
+        match self.mark_nonce().map(|n| n.0.clone()) {
+            Some(nonce) => write!(self, "\x1b]133;{body};nonce={nonce}\x07"),
+            None => write!(self, "\x1b]133;{body}\x07"),
+        }
+    }
 
     /// Format `args` into the output buffer with no intermediate `String`; what `write!` calls.
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
@@ -196,7 +230,7 @@ pub trait KohBackend {
     /// Mark the cursor's row, the cursor in its first column, as where a prompt starts
     /// (`OSC 133 ; A`).
     fn prompt_starts(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b]133;A\x07")
+        self.mark(format_args!("A"))
     }
 
     /// Unmark the cursor's row as a prompt's, blanking it: deleted and a blank one inserted in its
@@ -208,14 +242,14 @@ pub trait KohBackend {
 
     /// Say a command's output starts at the cursor (`OSC 133 ; C`).
     fn command_starts(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b]133;C\x07")
+        self.mark(format_args!("C"))
     }
 
     /// Say the command ends at the cursor (`OSC 133 ; D`), with its status if known.
     fn command_ends(&mut self, status: Option<i32>) -> io::Result<()> {
         match status {
-            Some(status) => write!(self, "\x1b]133;D;{status}\x07"),
-            None => self.write_bytes(b"\x1b]133;D\x07"),
+            Some(status) => self.mark(format_args!("D;{status}")),
+            None => self.mark(format_args!("D")),
         }
     }
 
@@ -272,6 +306,53 @@ impl KohBackend for CaptureBackend {
 mod tests {
     use super::*;
     use fux_vt::{Blink, Color, UnderlineStyle};
+
+    /// A capture whose terminal asks marks to carry a nonce.
+    struct Nonced(CaptureBackend, Option<MarkNonce>);
+
+    impl KohBackend for Nonced {
+        fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.0.write_bytes(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn enter_raw_mode(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn leave_raw_mode(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.0.size)
+        }
+        fn mark_nonce(&self) -> Option<&MarkNonce> {
+            self.1.as_ref()
+        }
+    }
+
+    #[test]
+    fn marks_carry_the_nonce_the_terminal_asks_for_and_only_a_word_is_one() {
+        let marks = |nonce| {
+            let mut b = Nonced(CaptureBackend::default(), nonce);
+            b.prompt_starts().unwrap();
+            b.command_starts().unwrap();
+            b.command_ends(Some(1)).unwrap();
+            b.command_ends(None).unwrap();
+            String::from_utf8(b.0.bytes).unwrap()
+        };
+        assert_eq!(
+            marks(None),
+            "\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;1\x07\x1b]133;D\x07"
+        );
+        assert_eq!(
+            marks(MarkNonce::new("ab12")),
+            "\x1b]133;A;nonce=ab12\x07\x1b]133;C;nonce=ab12\x07\x1b]133;D;1;nonce=ab12\x07\x1b]133;D;nonce=ab12\x07"
+        );
+        for bad in ["", "a;b", "a\x07", &"x".repeat(65)] {
+            assert_eq!(MarkNonce::new(bad), None, "{bad:?}");
+        }
+    }
 
     /// Capture the bytes a single provided method emits.
     fn emit(f: impl FnOnce(&mut CaptureBackend) -> io::Result<()>) -> Vec<u8> {

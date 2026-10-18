@@ -1,0 +1,9 @@
+id = "TA-037"
+title = "Stop a job from a job monitor"
+cat = "tui"
+difficulty = "moderate"
+goal = '''
+On the remote machine, `~/bin/jobmon` is an interactive job monitor; when first started it also
+launches the background jobs it watches. Start it, and stop the job `reindex-7`, leaving every
+other job running. It is done when `reindex-7` is no longer running and the others still are.
+'''

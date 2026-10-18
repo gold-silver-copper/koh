@@ -1,0 +1,10 @@
+id = "TA-043"
+title = "Answer a slow project wizard"
+cat = "prompt"
+difficulty = "hard"
+goal = '''
+On the remote machine, `~/bin/init-project` creates a project by asking a series of questions,
+some only after a pause (it discards anything typed before it asks). Use it to create a project
+named `ledger-sync` with the Apache-2.0 license and CI on GitLab, keeping the default for any
+other question. It is done when the project has been created.
+'''

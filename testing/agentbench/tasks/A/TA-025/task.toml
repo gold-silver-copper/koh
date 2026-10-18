@@ -1,0 +1,9 @@
+id = "TA-025"
+title = "Store notes with tricky lines"
+cat = "stdin"
+difficulty = "moderate"
+goal = '''
+Your local directory has `notes.txt`. On the remote machine, `~/bin/store-note NAME` stores
+what it reads on its standard input as the note NAME. Store your local `notes.txt` as the note
+`meeting-2026-10`. It is done when the stored note is byte-for-byte identical to `notes.txt`.
+'''

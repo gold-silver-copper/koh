@@ -1,0 +1,8 @@
+id = "SM-001"
+title = "Read a status line"
+cat = "run"
+difficulty = "easy"
+goal = """
+On the remote machine, the file `status.txt` in the home directory says how a build went. Write the
+number of warnings it reports to `answer.txt` in your local directory.
+"""

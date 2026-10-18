@@ -1,0 +1,9 @@
+id = "TA-005"
+title = "Save a report exactly"
+cat = "run"
+difficulty = "moderate"
+goal = '''
+On the remote machine, `~/bin/render` prints a CSV report for one day; it takes the day from
+its environment (see `~/bin/render --help`). Render the report for 2026-09-30 and save exactly
+what it prints, byte for byte, as `report.csv` in your local directory.
+'''

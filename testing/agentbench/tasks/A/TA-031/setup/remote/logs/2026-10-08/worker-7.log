@@ -1,0 +1,10 @@
+2026-10-08T00:44 worker-7 processed batch
+2026-10-08T01:00 worker-7 processed batch
+2026-10-08T02:09 worker-7 flushed cache
+2026-10-08T03:30 worker-7 flushed cache
+2026-10-08T04:40 worker-7 flushed cache
+2026-10-08T05:55 worker-7 processed batch
+2026-10-08T06:51 worker-7 flushed cache
+2026-10-08T07:58 worker-7 processed batch
+2026-10-08T08:41 worker-7 heartbeat
+2026-10-08T23:59 worker-7 heap usage 91% (OutOfMemory guard ok)

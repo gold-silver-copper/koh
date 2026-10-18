@@ -1,0 +1,10 @@
+id = "TA-040"
+title = "Run a simulation and save it"
+cat = "repl"
+difficulty = "hard"
+goal = '''
+On the remote machine, `~/bin/sim` is an interactive simulator (type `help` in it). In it, load
+the scenario `surge`, set the parameter `workers` to 12, run the simulation for 1000 steps (this
+takes a while), and save the results under the name `surge-12`. It is done when the saved
+results exist for exactly that run.
+'''

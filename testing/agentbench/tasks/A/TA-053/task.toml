@@ -1,0 +1,9 @@
+id = "TA-053"
+title = "Stop the runaway worker"
+cat = "process"
+difficulty = "moderate"
+goal = '''
+On the remote machine, run `~/bin/start-workers`; it starts five worker processes in the
+background. One of them gets stuck using a full CPU core. Stop that one, and only that one: the
+other workers must keep running.
+'''

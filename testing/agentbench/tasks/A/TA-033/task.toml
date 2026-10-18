@@ -1,0 +1,8 @@
+id = "TA-033"
+title = "Pick from a menu"
+cat = "tui"
+difficulty = "easy"
+goal = '''
+On the remote machine, `~/bin/pick-region` is an interactive menu that sets the default cloud
+region. Use it to choose `eu-central-2`. It is done when the menu has saved that choice.
+'''

@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+import os, random, time
+d = os.path.expanduser("~/crawl")
+os.makedirs(d, exist_ok=True)
+log = os.path.join(d, "processed.log")
+lock = os.path.join(d, "crawl.pid")
+if os.path.exists(lock):
+    pid = open(lock).read().strip()
+    if pid and os.path.exists(f"/proc/{pid}") and "crawl" in open(f"/proc/{pid}/cmdline").read():
+        raise SystemExit(f"crawl: already running (pid {pid})")
+open(lock, "w").write(f"{os.getpid()}\n")
+done = open(log).read().split() if os.path.exists(log) else []
+if len(done) >= 200:
+    print("crawl: all 200 items already processed")
+    raise SystemExit(0)
+if done:
+    print(f"crawl: resuming after {done[-1]} ({len(done)} done)", flush=True)
+rng = random.Random(47 + len(done))
+with open(log, "a") as f:
+    for i in range(len(done) + 1, 201):
+        time.sleep(rng.uniform(0.05, 0.25))
+        print(f"crawl: item-{i:03d} fetched, {rng.randint(1, 80)} links", flush=True)
+        f.write(f"item-{i:03d}\n")
+        f.flush()
+print("crawl: finished 200 items", flush=True)

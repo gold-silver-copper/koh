@@ -1,0 +1,15 @@
+id = "TA-006"
+title = "An argument full of quotes"
+cat = "run"
+difficulty = "hard"
+goal = '''
+On the remote machine, `~/bin/lookup NAME` prints the account code of the customer named NAME
+(the whole name as a single argument, exactly as written). Look up the customer whose name is
+exactly the text on the line between the two markers below (every character is part of the
+name, including the quotes, the dollar sign, the backslash and the backticks), and write the
+code it prints (only the code) to `answer.txt` in your local directory.
+
+----- name -----
+O'Brien & Sons "Ltd" $HOME\n #1;`date`
+----- end -----
+'''

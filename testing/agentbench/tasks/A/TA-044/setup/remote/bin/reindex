@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+import os, random, time
+home = os.path.expanduser("~")
+open(os.path.join(home, "reindex.started"), "w").write(f"{os.getpid()}\n")
+rng = random.Random(44)
+total = 0
+log = open(os.path.join(home, "reindex.log"), "w")
+for shard in range(1, 26):
+    n = rng.randint(1500, 2500)
+    total += n
+    msg = f"reindex: shard {shard:02d}/25: {n} documents"
+    print(msg, flush=True)
+    log.write(msg + "\n")
+    log.flush()
+    time.sleep(rng.uniform(0.8, 1.6))
+open(os.path.join(home, "reindex.done"), "w").write(f"indexed {total} documents\n")
+print(f"reindex: indexed {total} documents", flush=True)

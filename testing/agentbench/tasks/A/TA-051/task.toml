@@ -1,0 +1,10 @@
+id = "TA-051"
+title = "Find a background worker's report"
+cat = "sessions"
+difficulty = "moderate"
+goal = '''
+On the remote machine, run `~/bin/nightly`. It starts a worker in the background and returns
+at once, without saying which batch the worker took. Find that worker, wait until it has
+finished, and then copy the report it wrote for its batch (somewhere under `~/reports`) to
+`report.txt` in your local directory.
+'''

@@ -1,0 +1,9 @@
+id = "TA-013"
+title = "Wait for a slow build"
+cat = "wait"
+difficulty = "easy"
+goal = '''
+On the remote machine, run `~/bin/slowbuild`. It takes a while. When it has finished, its last
+line names the artifact it produced (`artifact: build-...`). Write the artifact name (like
+`build-0123abcd`, only that) to `answer.txt` in your local directory.
+'''

@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+import json, os, random, sys, termios, time
+rng = random.Random(43)
+try:
+    tty = open("/dev/tty")
+    out = open("/dev/tty", "w")
+except OSError:
+    sys.exit("init-project: interactive only (needs a terminal)")
+def ask(q, work):
+    print(work, flush=True)
+    time.sleep(rng.uniform(1.5, 3.5))
+    termios.tcflush(tty.fileno(), termios.TCIFLUSH)
+    out.write(q)
+    out.flush()
+    return tty.readline().strip()
+name = ask("Project name: ", "init-project: checking the registry ...")
+if not name:
+    sys.exit("init-project: a name is required")
+lic = ask("License: (1) MIT (2) Apache-2.0 (3) GPL-3.0 (4) proprietary; choose 1-4: ", "fetching license list ...")
+lic = {"1": "MIT", "2": "Apache-2.0", "3": "GPL-3.0", "4": "proprietary"}.get(lic)
+if not lic:
+    sys.exit("init-project: no such license")
+ci = ask("Add CI configuration? [y/n]: ", "probing CI templates ...").lower()
+provider = None
+if ci.startswith("y"):
+    provider = ask("CI provider [github/gitlab]: ", "loading providers ...").lower()
+    if provider not in ("github", "gitlab"):
+        sys.exit("init-project: unknown CI provider")
+msrv = ask("Minimum Rust version [1.75]: ", "querying toolchains ...") or "1.75"
+if ask("Type the project name to confirm: ", f"about to create {name}") != name:
+    sys.exit("init-project: confirmation did not match, nothing created")
+d = os.path.expanduser(f"~/projects/{name}")
+os.makedirs(d, exist_ok=True)
+with open(os.path.join(d, "project.json"), "w") as f:
+    json.dump({"name": name, "license": lic, "ci": provider, "msrv": msrv}, f)
+print(f"init-project: created ~/projects/{name}")

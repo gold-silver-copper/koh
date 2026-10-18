@@ -1,0 +1,9 @@
+id = "TA-009"
+title = "A value in a very wide line"
+cat = "output"
+difficulty = "easy"
+goal = '''
+On the remote machine, `~/bin/dump-config` prints the service's whole configuration as one very
+long line of `key=value` pairs separated by `;`. Write the value of the key `upstream_token`
+(only the value) to `answer.txt` in your local directory.
+'''

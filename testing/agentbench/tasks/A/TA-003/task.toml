@@ -1,0 +1,10 @@
+id = "TA-003"
+title = "Stderr apart from stdout"
+cat = "run"
+difficulty = "moderate"
+goal = '''
+On the remote machine, run `~/bin/migrate`. It prints progress on standard output and problems
+on standard error. In your local directory, write exactly what it prints on standard error
+(nothing from standard output) to `errors.txt`, and its exit status (only the number) to
+`status.txt`.
+'''

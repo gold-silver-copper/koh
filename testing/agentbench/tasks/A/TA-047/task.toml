@@ -1,0 +1,13 @@
+id = "TA-047"
+title = "Pick a crawl back up"
+cat = "drop"
+difficulty = "moderate"
+goal = '''
+On the remote machine, `~/bin/crawl` processes 200 items, keeping a checkpoint so that a run
+which is stopped can be resumed by running it again. The connection to the remote machine will
+drop while it crawls. It is done when all 200 items have been processed, each exactly once.
+'''
+solve_timeout = 240
+[drop]
+when = "crawl/processed.log"
+after = 4

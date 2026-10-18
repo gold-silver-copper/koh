@@ -1,0 +1,10 @@
+id = "TA-034"
+title = "Page to the end and accept"
+cat = "tui"
+difficulty = "easy"
+goal = '''
+On the remote machine, `~/bin/changelog` shows the release notes in its own pager and lets you
+accept them once you have paged to the end. Accept the release notes with it, and write the
+oldest release it lists (the last one, like `v1.2.3`, only that) to `answer.txt` in your local
+directory.
+'''

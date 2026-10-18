@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+import json, os, random, sys, termios, time
+SCEN = {"baseline": (40, 0.05), "surge": (95, 0.30), "outage": (60, 0.60)}
+def simulate(name, params, steps):
+    rate, noise = SCEN[name]
+    rng = random.Random(f"{name}:{params['workers']}:{params['queue']}:{steps}")
+    q = dropped = served = 0
+    lat = []
+    for _ in range(steps):
+        arrivals = max(0, int(rng.gauss(rate, rate * noise)))
+        q += arrivals
+        done = min(q, params["workers"] * 8)
+        q -= done
+        served += done
+        if q > params["queue"] * 10:
+            dropped += q - params["queue"] * 10
+            q = params["queue"] * 10
+        lat.append(5 + q * 0.7 + rng.random())
+    lat.sort()
+    return {"scenario": name, "workers": params["workers"], "queue": params["queue"], "steps": steps,
+            "served": served, "dropped": dropped, "p99_ms": round(lat[int(len(lat) * 0.99) - 1], 2)}
+if __name__ == "__main__":
+    if not os.isatty(0):
+        sys.exit("sim: interactive only (run it in a terminal)")
+    scen, params, result, saved = None, {"workers": 4, "queue": 64}, None, True
+    print("sim 0.9 -- type 'help'")
+    while True:
+        try:
+            line = input("sim> ").split()
+        except EOFError:
+            break
+        if not line:
+            continue
+        cmd, args = line[0], line[1:]
+        if cmd == "help":
+            print("load SCENARIO | scenarios | set PARAM VALUE | params | run STEPS | stats | save NAME | quit")
+        elif cmd == "scenarios":
+            print("  ".join(SCEN))
+        elif cmd == "load" and args and args[0] in SCEN:
+            scen, result = args[0], None
+            print(f"scenario {scen} loaded")
+        elif cmd == "load":
+            print("no such scenario (try 'scenarios')")
+        elif cmd == "set" and len(args) == 2 and args[0] in params and args[1].isdigit():
+            params[args[0]] = int(args[1])
+            print(f"{args[0]} = {args[1]}")
+        elif cmd == "set":
+            print("usage: set PARAM VALUE (params: workers, queue)")
+        elif cmd == "params":
+            print(" ".join(f"{k}={v}" for k, v in params.items()))
+        elif cmd == "run" and args and args[0].isdigit():
+            if not scen:
+                print("load a scenario first")
+                continue
+            n = int(args[0])
+            print(f"running {scen} for {n} steps (workers={params['workers']})", flush=True)
+            for i in range(1, 11):
+                time.sleep(n / 1000 * 1.4)
+                print(f"  {i * 10:3d}%", flush=True)
+            result, saved = simulate(scen, dict(params), n), False
+            termios.tcflush(0, termios.TCIFLUSH)
+            print("run complete; 'stats' shows the results", flush=True)
+        elif cmd == "stats":
+            print(json.dumps(result) if result else "nothing run yet")
+        elif cmd == "save" and len(args) == 1:
+            if not result:
+                print("nothing to save: run first")
+                continue
+            d = os.path.expanduser("~/results")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, args[0] + ".json"), "w") as f:
+                json.dump(result, f)
+            saved = True
+            print(f"saved ~/results/{args[0]}.json")
+        elif cmd in ("quit", "exit"):
+            if not saved and input("discard unsaved results? [y/N] ").strip().lower() != "y":
+                continue
+            break
+        else:
+            print(f"unknown command {cmd!r} (try 'help')")

@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+import os, random, time
+rng = random.Random(19)
+def rows():
+    for i in range(1, 260):
+        r = {"customer_id": f"C{i:05d}", "name": f"customer {i}", "region": rng.choice("NSEW")}
+        if i == 241:
+            del r["customer_id"]
+            r["customerid"] = f"C{i:05d}"
+        yield r
+def store(r, db):
+    db[r["customer_id"]] = r
+db = {}
+with open(os.path.expanduser("~/.import-state"), "w") as f:
+    f.write("started\n")
+for n, r in enumerate(rows(), 1):
+    print(f"imported row {n}", flush=True)
+    time.sleep(0.04)
+    store(r, db)

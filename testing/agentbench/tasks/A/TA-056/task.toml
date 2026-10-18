@@ -1,0 +1,10 @@
+id = "TA-056"
+title = "Take down a self-healing farm"
+cat = "process"
+difficulty = "hard"
+goal = '''
+On the remote machine, run `~/bin/start-farm`. It starts a worker farm in the background: a
+supervisor that keeps restarting its workers when they die, and, beside it, an unrelated
+`metrics-agent`. Stop the whole farm, so that no supervisor or worker of it is left running,
+but leave `metrics-agent` running.
+'''

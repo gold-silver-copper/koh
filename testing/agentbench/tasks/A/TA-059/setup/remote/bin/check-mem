@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+import os, random, sys, time
+rng = random.Random(60)
+print("check-mem: probing ...", flush=True)
+time.sleep(rng.uniform(2, 6))
+os.makedirs(os.path.expanduser("~/.checks"), exist_ok=True)
+open(os.path.expanduser("~/.checks/mem"), "w").write("ran\n")
+print('mem: CRITICAL 97% used, swap 88%')
+sys.exit(2)

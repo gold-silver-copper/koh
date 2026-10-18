@@ -1,0 +1,10 @@
+id = "TA-018"
+title = "Retry a flaky test"
+cat = "wait"
+difficulty = "easy"
+goal = '''
+On the remote machine, `~/bin/flaky-test` is a flaky integration test: each run takes a few
+seconds and sometimes fails for no good reason. Run it again and again until it passes, and stop
+as soon as it passes (do not run it again after a pass). Write how many runs it took, counting
+the passing one (only the number), to `answer.txt` in your local directory.
+'''

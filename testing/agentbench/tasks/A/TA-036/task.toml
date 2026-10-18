@@ -1,0 +1,10 @@
+id = "TA-036"
+title = "Fill in a full-screen form"
+cat = "tui"
+difficulty = "hard"
+goal = '''
+On the remote machine, `~/bin/netconfig` is a full-screen form for the machine's network
+settings. Use it to set the hostname to `build-07`, the address to `10.20.30.47/24` and the
+gateway to `10.20.30.1`, leaving the DNS servers as they are, and save. It is done when the
+form has saved those settings.
+'''

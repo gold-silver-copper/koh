@@ -1,0 +1,9 @@
+id = "TA-057"
+title = "Fix the failing Rust test"
+cat = "multi"
+difficulty = "moderate"
+goal = '''
+On the remote machine, `~/crates/textstats` is a small Rust library. Its tests fail. Find the
+bug in the library and fix it, without changing the tests, so that `cargo test` passes there.
+'''
+solve_timeout = 400

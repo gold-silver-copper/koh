@@ -1,0 +1,10 @@
+id = "TA-031"
+title = "Fetch only the logs with OOMs"
+cat = "files"
+difficulty = "moderate"
+goal = '''
+On the remote machine, `~/logs/` holds a worker log per day and worker
+(`~/logs/DATE/worker-N.log`). Copy every log that contains `java.lang.OutOfMemoryError`, and no
+other, into `oom/` in your local directory, keeping their paths below `~/logs` (for example
+`oom/2026-10-03/worker-7.log`).
+'''

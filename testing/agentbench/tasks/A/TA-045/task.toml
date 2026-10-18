@@ -1,0 +1,13 @@
+id = "TA-045"
+title = "A migration that must not be cut"
+cat = "drop"
+difficulty = "moderate"
+goal = '''
+On the remote machine, run `~/bin/migrate-db` to migrate the database in `~/db` to schema
+version 42; it takes a while. The connection to the remote machine will drop while it runs.
+It is done when the database is at version 42 and not left in a dirty state.
+'''
+solve_timeout = 240
+[drop]
+when = "db/migration.lock"
+after = 4

@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+import hashlib, random, sys
+BAD_LINE = 6187
+if __name__ == "__main__":
+    rng = random.Random(12)
+    print("verify-archive 2.3: archive backup-2026-10-15.tar")
+    print("status\tpath\tsize\tsha256")
+    n = 3
+    for i in range(9200):
+        path = f"data/{rng.choice(['a', 'b', 'c'])}/part_{i:05d}.dat"
+        sha = hashlib.sha256(path.encode()).hexdigest()[:16]
+        if n == BAD_LINE:
+            print(f"BAD\t{path}\t{rng.randint(1, 10**6)}\t{sha}\tchecksum mismatch (stored {sha[::-1]})")
+        else:
+            print(f"ok\t{path}\t{rng.randint(1, 10**6)}\t{sha}")
+        n += 1
+        if i % 1500 == 0:
+            print(f"progress: {i} entries", file=sys.stderr)
+    print("1 problem found")

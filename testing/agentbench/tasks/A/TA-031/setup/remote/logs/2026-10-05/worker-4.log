@@ -1,0 +1,20 @@
+2026-10-05T00:08 worker-4 heartbeat
+2026-10-05T01:22 worker-4 processed batch
+2026-10-05T02:01 worker-4 processed batch
+2026-10-05T03:30 worker-4 flushed cache
+2026-10-05T04:43 worker-4 GC pause 12ms
+2026-10-05T05:00 worker-4 flushed cache
+2026-10-05T06:36 worker-4 heartbeat
+2026-10-05T07:41 worker-4 heartbeat
+2026-10-05T08:04 worker-4 processed batch
+2026-10-05T09:36 worker-4 processed batch
+2026-10-05T10:48 worker-4 flushed cache
+2026-10-05T11:40 worker-4 GC pause 12ms
+2026-10-05T12:40 worker-4 processed batch
+2026-10-05T13:10 worker-4 heartbeat
+2026-10-05T14:47 worker-4 GC pause 12ms
+2026-10-05T15:39 worker-4 GC pause 12ms
+2026-10-05T16:45 worker-4 heartbeat
+2026-10-05T17:27 worker-4 flushed cache
+2026-10-05T18:20 worker-4 flushed cache
+2026-10-05T19:37 worker-4 GC pause 12ms

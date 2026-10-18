@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+import os, random, socket, sys, time
+run = os.path.expanduser("~/run")
+os.makedirs(run, exist_ok=True)
+with open(os.path.join(run, "appserver.pid"), "w") as f:
+    f.write(f"{os.getpid()}\n")
+path = os.path.join(run, "app.sock")
+if os.path.exists(path):
+    os.unlink(path)
+rng = random.Random(14)
+warm = rng.uniform(9, 15)
+end = time.time() + warm
+n = 0
+while time.time() < end:
+    n += 1
+    print(f"warming cache: segment {n}", flush=True)
+    time.sleep(min(1.0, max(0.0, end - time.time())))
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)
+s.listen(8)
+print(f"ready: listening on {path}", flush=True)
+while True:
+    c, _ = s.accept()
+    with c:
+        data = c.recv(100)
+        if data.strip() == b"ping":
+            c.sendall(b"pong\n")
+            with open(os.path.join(run, "pings.log"), "a") as f:
+                f.write(f"{time.time():.3f}\n")
+            print("answered a ping", flush=True)

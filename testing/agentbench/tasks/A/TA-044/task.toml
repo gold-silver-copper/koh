@@ -1,0 +1,14 @@
+id = "TA-044"
+title = "Reindex through a dropped connection"
+cat = "drop"
+difficulty = "easy"
+goal = '''
+On the remote machine, run `~/bin/reindex`; it takes about half a minute. The connection to the
+remote machine will drop while it runs: make sure it still runs to completion, then write the
+number of documents it reports having indexed (only the number) to `answer.txt` in your local
+directory.
+'''
+solve_timeout = 240
+[drop]
+when = "reindex.started"
+after = 3

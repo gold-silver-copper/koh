@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+import hashlib, os, sys
+if sys.stdin.isatty():
+    sys.exit("flash: pipe the image in on standard input (it is binary)")
+data = sys.stdin.buffer.read()
+if not data.startswith(b"FWIMG"):
+    sys.exit(f"flash: not a firmware image (starts {data[:8]!r})")
+d = os.path.expanduser("~/device")
+os.makedirs(d, exist_ok=True)
+with open(os.path.join(d, "flash.img"), "wb") as f:
+    f.write(data)
+print(f"flash: wrote {len(data)} bytes, sha256 {hashlib.sha256(data).hexdigest()}")

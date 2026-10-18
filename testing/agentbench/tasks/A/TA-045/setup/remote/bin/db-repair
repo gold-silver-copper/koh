@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+import os, sys, time
+db = os.path.expanduser("~/db")
+lock = os.path.join(db, "migration.lock")
+if not os.path.exists(lock):
+    sys.exit("db-repair: the database is clean, nothing to do")
+pid, _, ver = open(lock).read().split()
+if os.path.exists(f"/proc/{pid}"):
+    sys.exit(f"db-repair: migration {pid} is still running")
+print("db-repair: rolling back the interrupted migration (this takes a while)", flush=True)
+for i in range(30):
+    time.sleep(1)
+    print(f"db-repair: {i + 1}/30", flush=True)
+open(os.path.join(db, "schema_version"), "w").write(f"{ver}\n")
+os.unlink(lock)
+print(f"db-repair: done, back at version {ver}")

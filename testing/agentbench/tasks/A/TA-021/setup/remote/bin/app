@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+import hashlib, os, sys, time
+home = os.path.expanduser("~")
+path = os.path.join(home, "app", "app.conf")
+print("app: loading ~/app/app.conf", flush=True)
+time.sleep(1.5)
+text = open(path).read()
+settings = {}
+for n, line in enumerate(text.splitlines(), 1):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    if "=" not in line:
+        sys.exit(f"app: config error: app.conf:{n}: expected key = value")
+    k, v = (x.strip() for x in line.split("=", 1))
+    settings[k] = (v, n)
+v, n = settings.get("max_connections", ("64", 0))
+if not v.isdigit() or not 1 <= int(v) <= 1024:
+    sys.exit(f"app: config error: app.conf:{n}: max_connections must be between 1 and 1024 (got {v})")
+print("app: opening connection pool", flush=True)
+time.sleep(1.5)
+v, n = settings.get("log_dir", ("~/app/logs", 0))
+d = os.path.expanduser(v)
+if not os.path.isdir(d):
+    sys.exit(f"app: fatal: cannot open log directory {v}: No such file or directory")
+with open(os.path.join(home, "app", "started.txt"), "w") as f:
+    f.write("ok " + hashlib.sha256(text.encode()).hexdigest()[:16] + "\n")
+print("app: started (check mode), exiting", flush=True)

@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+import os, random, re, sys
+if "--help" in sys.argv or "-h" in sys.argv:
+    print("usage: REPORT_DATE=YYYY-MM-DD render\n\nPrints the day's sales report as CSV on stdout.")
+    sys.exit(0)
+day = os.environ.get("REPORT_DATE", "")
+if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+    print("render: REPORT_DATE is not set (want YYYY-MM-DD)", file=sys.stderr)
+    sys.exit(2)
+rng = random.Random("render:" + day)
+regions = ["north", "south", "east", "west", "central"]
+items = ["widget", "gadget, large", "bolt  M6", "nut ", "\"premium\" cable", "gear\tbox"]
+out = sys.stdout
+out.write("date,region,item,qty,unit_price,total\n")
+for _ in range(240):
+    r, it = rng.choice(regions), rng.choice(items)
+    q, p = rng.randint(1, 90), rng.randint(50, 9999) / 100
+    field = '"' + it.replace('"', '""') + '"' if any(c in it for c in ',"') else it
+    out.write(f"{day},{r},{field},{q},{p:.2f},{q * p:.2f}\n")
+out.write(f"# rows=240 generated for {day} \n")

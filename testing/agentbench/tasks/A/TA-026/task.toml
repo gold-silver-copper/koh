@@ -1,0 +1,8 @@
+id = "TA-026"
+title = "Fetch a file with an awkward name"
+cat = "files"
+difficulty = "easy"
+goal = '''
+On the remote machine, the directory `~/reports` holds the quarter's reports. Copy the file
+named `q3 summary (final) [v2].txt` from it to `q3.txt` in your local directory.
+'''

@@ -1,0 +1,9 @@
+id = "TA-022"
+title = "The fatal line among warnings"
+cat = "crash"
+difficulty = "moderate"
+goal = '''
+On the remote machine, run `~/bin/ingest`. After a while it fails. In `answer.txt` in your local
+directory, write two lines: first its exit status (only the number), then the one line it
+printed that starts with `FATAL`, exactly.
+'''

@@ -33,8 +33,10 @@ iroh = "=1.3.0"
 # both emulator rows and client-owned cells; 0.7 bounds history in bytes, closes its enums,
 # carries a mouse press's button in its action and F1 to F35 as `Function`, writes the SGR a
 # client paints with (`Attributes::write_sgr`), and follows the standards more closely (fux's
-# "refined" audit).
-fux-vt = "0.7.0"
+# "refined" audit); 0.8 decodes no pictures unless asked (`Feature::Pictures`, which koh leaves
+# off: a sixel header can no longer make the server allocate), and stops where a frame begins or
+# ends as it judges it, so koh needs no scanner of its own.
+fux-vt = "0.8.0"
 unicode-width = "0.2.2"
 # The system calls koh makes beyond std, each safe to call: the server's PTYs, the client's
 # terminal (raw mode, the window size), `poll` on stdin, signals and `O_NOFOLLOW`, and the PTY's

@@ -154,8 +154,6 @@ pub struct ServerTerminal {
     frame_start: Option<TerminalScreen>,
     /// Whether the program began a frame since this was last asked.
     frame_began: bool,
-    /// Where the program's output ends a frame.
-    frame_ends: FrameEnds,
     /// The names of the history's rows on the wire.
     names: HistoryNames,
     /// How the PTY takes typed keys, as last read.
@@ -174,7 +172,6 @@ impl ServerTerminal {
             rows: RowCache::default(),
             frame_start: None,
             frame_began: false,
-            frame_ends: FrameEnds::default(),
             names: HistoryNames::default(),
             tty: None,
         })
@@ -248,36 +245,28 @@ impl ServerTerminal {
     /// Where the program begins a frame (synchronized output, `CSI ? 2026 h`), the screen as it was
     /// is kept, for [`FrameHold`] to send while the frame is drawn.
     pub fn process(&mut self, bytes: &[u8]) {
-        // Fed in pieces that each end at an ESU, so that whether a frame was being drawn just
-        // before a BSU is known: at the start of its piece, or after a BSU earlier in it.
-        let mut start = 0;
-        let ends = self.frame_ends.after_each(bytes);
-        let pieces = ends.len();
-        for (piece, end) in ends
-            .into_iter()
-            .chain(std::iter::once(bytes.len()))
-            .enumerate()
-        {
-            let mut rest = bytes.get(start..end).unwrap_or_default();
-            start = end;
-            // A frame begun in any piece but the last is ended by the ESU that ends its piece,
-            // so only one begun in the last can still be drawn when these bytes are done.
-            let last = piece == pieces;
-            loop {
-                let drawing = self.synchronized();
-                match self.parser.process_until_frame(rest, &mut self.observed) {
-                    Ok(Some(taken)) if taken > 0 => {
-                        if !drawing {
-                            self.frame_start = last.then(|| self.snapshot());
+        // The parser stops where a frame begins or ends, as it judges it (ESU, XTRESTORE, DECSTR
+        // or RIS end one), so the screen from before a frame is caught as the frame begins.
+        let mut rest = bytes;
+        loop {
+            let drawing = self.synchronized();
+            match self.parser.process_until_frame(rest, &mut self.observed) {
+                Ok(Some((taken, frame))) => {
+                    match frame {
+                        // A BSU while a frame is drawn begins none.
+                        fux_vt::Frame::Begun if drawing => {}
+                        fux_vt::Frame::Begun => {
                             self.frame_began = true;
+                            self.frame_start = Some(self.snapshot());
                         }
-                        rest = rest.get(taken..).unwrap_or_default();
+                        fux_vt::Frame::Ended => self.frame_start = None,
                     }
-                    Ok(Some(_) | None) => break,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "terminal emulator refused shell output");
-                        break;
-                    }
+                    rest = rest.get(taken..).unwrap_or_default();
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "terminal emulator refused shell output");
+                    break;
                 }
             }
         }
@@ -313,6 +302,8 @@ impl ServerTerminal {
             tracing::warn!(error = %e, rows = size.rows(), cols = size.cols(), "terminal emulator refused a resize");
             return false;
         }
+        // A resize ends a frame being drawn, as fux-vt turns synchronized output off.
+        self.frame_start = None;
         // A reflow lays the history out afresh, its rows with new cells.
         self.names.renew();
         true
@@ -372,83 +363,6 @@ impl ServerTerminal {
         let grid = Grid::of(self.parser.screen(), palette, &mut self.rows);
         let history = self.names.mark(self.parser.screen());
         self.screen(grid, history)
-    }
-}
-
-/// Finds where a program ends synchronized output (ESU, `CSI ? … 2026 … l`) in its output, its state
-/// carried from one read to the next so that a sequence split between them is found too.
-#[derive(Debug, Default)]
-struct FrameEnds {
-    state: Scan,
-    /// The parameters of the private CSI being read, up to [`FrameEnds::PARAMS`] bytes.
-    params: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Scan {
-    #[default]
-    Ground,
-    Escape,
-    /// After `ESC [`.
-    Csi,
-    /// In a CSI that starts with `?`, whose parameters may name 2026.
-    Private,
-    /// In a CSI that cannot be an ESU, to its final byte.
-    Other,
-}
-
-impl FrameEnds {
-    /// The longest parameter list read; a longer one is not an ESU koh looks for.
-    const PARAMS: usize = 64;
-
-    /// The offsets in `bytes` just past each ESU.
-    fn after_each(&mut self, bytes: &[u8]) -> Vec<usize> {
-        let mut ends = Vec::new();
-        let mut at = 0usize;
-        while let Some(&byte) = bytes.get(at) {
-            // Outside a sequence only an ESC matters, and in one that cannot be an ESU only its
-            // end: the bytes between are skipped.
-            let skip = match self.state {
-                Scan::Ground => byte != 0x1b,
-                Scan::Other => byte != 0x1b && !(0x40..=0x7e).contains(&byte),
-                Scan::Escape | Scan::Csi | Scan::Private => false,
-            };
-            if skip {
-                let rest = bytes.get(at..).unwrap_or_default();
-                let ends =
-                    |b: &u8| *b == 0x1b || (self.state == Scan::Other && (0x40..=0x7e).contains(b));
-                at = rest
-                    .iter()
-                    .position(ends)
-                    .map_or(bytes.len(), |next| at.saturating_add(next));
-                continue;
-            }
-            self.state = match (self.state, byte) {
-                (_, 0x1b) => Scan::Escape,
-                (Scan::Escape, b'[') => Scan::Csi,
-                (Scan::Csi, b'?') => {
-                    self.params.clear();
-                    Scan::Private
-                }
-                (Scan::Private, b'0'..=b'9' | b';') if self.params.len() < Self::PARAMS => {
-                    self.params.push(byte);
-                    Scan::Private
-                }
-                (Scan::Private, b'l')
-                    if self.params.split(|&b| b == b';').any(|p| p == b"2026") =>
-                {
-                    ends.push(at.saturating_add(1));
-                    Scan::Ground
-                }
-                (Scan::Csi | Scan::Private | Scan::Other, 0x40..=0x7e) | (Scan::Escape, _) => {
-                    Scan::Ground
-                }
-                (Scan::Csi | Scan::Private | Scan::Other, _) => Scan::Other,
-                (Scan::Ground, _) => Scan::Ground,
-            };
-            at = at.saturating_add(1);
-        }
-        ends
     }
 }
 

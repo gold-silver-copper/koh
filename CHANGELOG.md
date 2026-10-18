@@ -81,6 +81,13 @@ binary, its tests and the fuzz targets share code, and any release may change it
   only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
+- A line typed in one go past 1 KiB (as an agent's terminal types it) no longer waits for the next
+  key: the client read stdin through a buffer `poll` cannot see, so the line's end, its Enter
+  among it, sat there until something more was typed.
+- A sixel picture can no longer make the server allocate: fux-vt 0.8 decodes pictures only for a
+  host that asks, and koh does not, so a crafted header of a few bytes no longer costs ~34 MiB.
+- A frame drawn in synchronized output ends where fux-vt says it does (an ESU, XTRESTORE, DECSTR
+  or RIS), not only at an ESU koh's own scanner found; the scanner is gone.
 - A reconnect that landed as its exited session ended could wait for ever: the attach the
   session had queued was kept alive until the next one. Sessions are reaped as they end.
 - An editor saving the `clients` file (missing or empty for a moment) could disconnect every saved

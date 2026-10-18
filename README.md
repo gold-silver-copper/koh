@@ -99,6 +99,43 @@ for the program, kitty's encoding to nvim or helix, legacy bytes to the rest.
 
 **Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
 
+## Scripts and agents
+
+`koh connect` needs a terminal; run with none (from a script, or an agent's tool call), it says so
+and points at `exec` and `cp`. Everything else works without one.
+
+Save a server with how to reach it, once, and every command dialing its name uses that:
+
+```sh
+koh servers add box <server-id> --direct 192.168.1.20:4433   # or --relay-url URL
+```
+
+Run a command: its stdout, stderr and exit status come back as a local command's would.
+
+```sh
+koh exec box -- cargo test -j 4
+koh exec box -- 'cd ~/app && git status --short' > status.txt
+```
+
+Copy files and trees either way:
+
+```sh
+koh cp -r ./src box:app/              # here to there
+koh cp box:app/target/report.json .   # there to here
+```
+
+Get a second shell beside the first, and find it again later:
+
+```sh
+koh connect box --new                 # a new session; your others keep running
+koh sessions box                      # their numbers, attached or not, and titles
+koh connect box --session 2           # back to session 2
+```
+
+Prompt marks (OSC 133) from the remote shell pass through to your terminal, so one that reads
+them, as [fux](https://github.com/gold-silver-copper/fux) does, sees where each remote command
+starts and ends, and its status, as it would a local one's.
+
 ## Android / Termux install
 
 1. Install Termux from the [Termux GitHub releases](https://github.com/termux/termux-app/releases). Do not use the old Play Store build.

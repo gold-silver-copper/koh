@@ -309,6 +309,20 @@ impl RawClient {
     fn screen(&self) -> Option<&TerminalScreen> {
         self.screens.get(&self.newest)
     }
+
+    /// Pump until the newest screen is one that `done` holds of, for at most 5 s: that screen.
+    async fn until(
+        &mut self,
+        done: impl Fn(&TerminalScreen) -> bool,
+    ) -> anyhow::Result<TerminalScreen> {
+        for _ in 0..100 {
+            if let Some(screen) = self.screen().filter(|s| done(s)) {
+                return Ok(screen.clone());
+            }
+            self.pump(50).await?;
+        }
+        anyhow::bail!("no such screen came")
+    }
 }
 
 #[test]
@@ -353,6 +367,46 @@ fn a_session_takes_keys_and_clamped_resizes_then_ends_with_the_server() -> anyho
             "the input is acknowledged as echoed: {:?}",
             client.echo_ack
         );
+        client.conn.close(0u32.into(), b"done");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .context("the server ends its session and returns")???;
+        Ok(())
+    })
+}
+
+/// The session reports what its program is doing on the screens it sends: with the screen that
+/// carries a command's end, and after each input, though nothing changed.
+#[test]
+fn a_report_comes_with_a_commands_end_and_after_every_input() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let secret = generate_secret_key()?;
+        let program = [
+            "sh",
+            "-c",
+            r"sleep 1; printf '\033]133;C\007ran\033]133;D;0\007'; exec cat",
+        ];
+        let (addr, shutdown, serve) = loopback_serve(secret.public(), &program).await?;
+        let mut client = RawClient::connect(addr, secret).await?;
+        let report = |c: &RawClient| c.screen().and_then(TerminalScreen::report).map(|r| r.n);
+        let first = client.until(|s| s.report().is_some()).await?;
+        // The mark's screen carries a report made after it, whatever came before.
+        let ended = client.until(|s| s.commands().finished == 1).await?;
+        anyhow::ensure!(
+            ended.report().map(|r| r.n) > first.report().map(|r| r.n),
+            "a report with the command's end: {:?} after {:?}",
+            ended.report(),
+            first.report()
+        );
+        for key in [&b"a"[..], b"b"] {
+            let before = report(&client);
+            client.type_bytes(key).await?;
+            let after = client.until(|s| s.report().map(|r| r.n) > before).await?;
+            anyhow::ensure!(
+                after.report().map(|r| r.activity) == first.report().map(|r| r.activity)
+            );
+        }
         client.conn.close(0u32.into(), b"done");
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), serve)

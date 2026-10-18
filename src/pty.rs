@@ -606,6 +606,25 @@ impl Pty {
         })
     }
 
+    /// What the program in the PTY's foreground is doing, as fux decides it: `since_key` since
+    /// input was last written to it (`Duration::MAX` if never), `answered` if the screen changed
+    /// after that input, and `prompt` if the shell's marks say it is back at its prompt.
+    pub fn activity(
+        &self,
+        since_key: Duration,
+        answered: bool,
+        prompt: bool,
+    ) -> crate::terminal::Activity {
+        let Some(leader) = self.running.as_ref().map(|running| running.pid) else {
+            return crate::terminal::Activity::Unknown;
+        };
+        // TODO(fuxix 0.6): replace the two lines below with the probe,
+        // `fuxix::process::terminal_activity(&self.master, leader, since_key, answered, prompt).into()`,
+        // and map `fuxix::process::Activity` to koh's in a `From` beside `Activity`.
+        let _ = (&self.master, leader, since_key, answered, prompt);
+        crate::terminal::Activity::Unknown
+    }
+
     /// Propagate a window-size change to `rows`×`cols`; the kernel raises `SIGWINCH` in the child.
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
         let size = pty_size(rows, cols).map_err(PtyError::Resize)?;

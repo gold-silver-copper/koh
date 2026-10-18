@@ -9,7 +9,7 @@ use std::io;
 
 use fux_vt::{Attributes, SgrForm};
 
-use crate::terminal::{Link, Size};
+use crate::terminal::{Activity, Link, Size};
 
 mod tty;
 pub use self::tty::Tty;
@@ -253,6 +253,11 @@ pub trait KohBackend {
         }
     }
 
+    /// Report what the remote program is doing (`OSC 133 ; S ; activity=STATE`), as fux reads it.
+    fn activity(&mut self, activity: Activity) -> io::Result<()> {
+        self.mark(format_args!("S;activity={}", activity.name()))
+    }
+
     /// Ring the terminal bell (BEL).
     fn bell(&mut self) -> io::Result<()> {
         self.write_bytes(b"\x07")
@@ -339,15 +344,17 @@ mod tests {
             b.command_starts().unwrap();
             b.command_ends(Some(1)).unwrap();
             b.command_ends(None).unwrap();
+            b.activity(Activity::Reading).unwrap();
             String::from_utf8(b.0.bytes).unwrap()
         };
         assert_eq!(
             marks(None),
-            "\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;1\x07\x1b]133;D\x07"
+            "\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;1\x07\x1b]133;D\x07\x1b]133;S;activity=reading\x07"
         );
         assert_eq!(
             marks(MarkNonce::new("ab12")),
-            "\x1b]133;A;nonce=ab12\x07\x1b]133;C;nonce=ab12\x07\x1b]133;D;1;nonce=ab12\x07\x1b]133;D;nonce=ab12\x07"
+            "\x1b]133;A;nonce=ab12\x07\x1b]133;C;nonce=ab12\x07\x1b]133;D;1;nonce=ab12\x07\x1b]133;D;nonce=ab12\x07\
+             \x1b]133;S;activity=reading;nonce=ab12\x07"
         );
         for bad in ["", "a;b", "a\x07", &"x".repeat(65)] {
             assert_eq!(MarkNonce::new(bad), None, "{bad:?}");

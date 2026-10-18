@@ -38,6 +38,16 @@ binary, its tests and the fuzz targets share code, and any release may change it
   `connect`, `exec`, `cp`, `sessions` and the menu dial that name so unless given `--direct` or
   `--relay-url` themselves. `koh servers` and the menu show it.
 
+- **The remote program's state reaches your terminal** (`OSC 133 ; S ; activity=STATE`, with
+  `FUX_MARK_NONCE`'s nonce as the marks have it): the server reports what the session's program
+  is doing (`reading` its terminal, `polling` it, `waiting` on something else, `busy`, `idle` or
+  `unknown`) after each input written to it, on each change (probed every 20 ms while a client is
+  attached), after each command's start and end and after a resize, an unchanged state at most
+  every 10 ms; the client writes each report after the marks of the frame that brought it, and
+  again after any mark. fux driving `koh connect` then sees a remote `less`, REPL or prompt wait
+  for input. Frames carry the report beside the shell's commands. The probe is fuxix 0.6's; until
+  it is released the state is always `unknown`.
+
 ### Changed
 - **`koh connect` with no terminal says what to use instead**: that it needs one, and that `koh
   exec SERVER -- COMMAND` runs a command without one and `koh cp` copies files, rather than
@@ -56,7 +66,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
   stream is gone: the server attaches the client's session before it sends anything, and the
   first frame admits it; the client sends input and control messages on two streams, so a resize,
   acknowledgement or history request never waits behind input a program has not read; rows carry
-  a prompt flag beside the wrap flag, and screens the shell's commands (OSC 133).
+  a prompt flag beside the wrap flag, and screens the shell's commands (OSC 133) and the server's
+  report of what the program is doing.
 - The remote shell's marks (OSC 133) reach the user's terminal: prompts' rows, and each command's
   start and its end with its status, told once (`fux`'s `· done` and `last-output` work through
   koh). The painter moves every row that moved, so what a terminal keeps of a row moves with it.

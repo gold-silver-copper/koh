@@ -24,7 +24,7 @@ mod server;
 
 pub use crate::predict::{Size, TtyModes};
 pub use grid::{Grid, Link, Modes, RowLinks, MAX_ROW_LINKS};
-pub use marks::{Commands, Place, RowFlags};
+pub use marks::{Activity, Commands, Place, Report, RowFlags};
 
 /// What the integration tests check the client's screen against: not koh's API.
 #[doc(hidden)]
@@ -198,6 +198,8 @@ pub struct TerminalScreen {
     tty: Option<TtyModes>,
     /// What the shell's marks say of its commands.
     commands: Commands,
+    /// The server's last report of what the program is doing, if it made one.
+    report: Option<Report>,
 }
 
 impl TerminalScreen {
@@ -259,6 +261,16 @@ impl TerminalScreen {
     /// What the shell's marks say of its commands, placed on this screen.
     pub const fn commands(&self) -> Commands {
         self.commands
+    }
+
+    /// The server's last report of what the program is doing, if it made one.
+    pub const fn report(&self) -> Option<Report> {
+        self.report
+    }
+
+    /// Carry `report` as the server's last.
+    pub fn set_report(&mut self, report: Option<Report>) {
+        self.report = report;
     }
 
     /// This screen scrolled `offset` rows back into the history `cache` holds part of: the
@@ -350,6 +362,7 @@ impl TerminalScreen {
             history: None,
             tty: None,
             commands: Some(self.commands),
+            report: self.report,
             cursor: self.grid.cursor_position(),
             modes: self.grid.modes().into(),
             shifts: Shifts::default(),
@@ -1309,6 +1322,8 @@ pub struct ScreenDiff {
     pub tty: Option<TtyModes>,
     /// What the shell's marks say of its commands, if that changed.
     pub commands: Option<Commands>,
+    /// The server's report of what the program is doing, if it made one since the base.
+    pub report: Option<Report>,
     /// The cursor at the target state.
     pub cursor: (u16, u16),
     /// The modes at the target state.
@@ -1395,6 +1410,7 @@ impl TerminalScreen {
             history: (self.history != base.history).then_some(self.history),
             tty: self.tty.filter(|_| self.tty != base.tty),
             commands: (self.commands != base.commands).then_some(self.commands),
+            report: self.report.filter(|_| self.report != base.report),
             cursor: self.grid.cursor_position(),
             modes: self.grid.modes().into(),
             shifts,
@@ -1458,6 +1474,7 @@ impl TerminalScreen {
         if let Some(commands) = diff.commands {
             self.commands = commands;
         }
+        self.report = diff.report.or(self.report);
         // Within the screen, as the cursor: the server's places are anything.
         self.commands = self.commands.within(Size { rows, cols });
         Ok(())
@@ -1599,6 +1616,7 @@ mod tests {
                     output: Some(((u16::MAX, u16::MAX), cursor)),
                     running: Some(cursor),
                 }),
+                report: None,
                 cursor, modes, shifts, rows,
             };
             let mut screen = TerminalScreen::default();
@@ -1895,6 +1913,7 @@ mod tests {
         history: Option<(u64, u32)>,
         tty: Option<(bool, bool)>,
         commands: Option<Commands>,
+        report: Option<(u64, u8)>,
         cursor: (u16, u16),
         modes: RawModes,
         shifts: Vec<RawShift>,
@@ -1961,6 +1980,7 @@ mod tests {
                 output: None,
                 running: Some((1, 1)),
             }),
+            report: Some((7, 0)),
             cursor: (0, 0),
             modes: RawModes {
                 hide_cursor: false,
@@ -2005,7 +2025,15 @@ mod tests {
         screen.apply(&good).unwrap();
         assert_eq!(screen.size(), Size::new(2, 2));
         assert_eq!(screen.screen().cell(0, 1).map(|c| c.contents()), Some("x"));
-        let mutations: [fn(&mut RawDiff); 15] = [
+        assert_eq!(
+            screen.report(),
+            Some(Report {
+                n: 7,
+                activity: Activity::Reading
+            })
+        );
+        let mutations: [fn(&mut RawDiff); 16] = [
+            |d| d.report = Some((7, 6)),     // an unknown activity
             |d| d.rows[0].flags = 4,         // an unknown row flag
             |d| d.rows[0].runs[0].count = 0, // empty run
             |d| d.rows[0].runs[0].cell.text = "x".repeat(fux_vt::CLUSTER_CAPACITY + 1),

@@ -323,6 +323,29 @@ local shell's own mark for the `koh` command it ran is overridden (fux, which gi
 starts a nonce their marks must carry, ignores koh's marks in such a pane; run `koh connect` as the
 pane's program for fux to read them).
 
+**The state report** (`OSC 133 ; S ; activity=STATE`, the contract fux wrote with koh) tells a
+terminal what the remote program is doing, which it cannot see itself: locally it sees only `koh
+connect` waiting on the network. The session probes its PTY's foreground program (`Pty::activity`,
+fuxix's `terminal_activity`, the probe fux runs on its own panes): `reading` its terminal with no
+time limit, `polling` it with one, `waiting` on something else, `busy`, `idle` (macOS) or
+`unknown`. A screen carries the session's last `Report`, its state and its number, and a frame
+carries it when it is new; the session makes one (`server/session/reports.rs`, time passed in)
+once input is written to the program, though the state is unchanged; on a change, probed every
+20 ms while a client is attached; after the shell's `C` or `D` (fux-vt's commands changed), on the
+very screen that carries the mark; and after a resize. An unchanged state is reported again no
+sooner than 10 ms after the last, but after a mark; a report owed sooner waits. The client writes
+the report at the end of the paint of the frame that brought it, after every mark of that paint,
+and writes the last one again after any mark it writes (fux forgets a report at a mark).
+
+What a terminal can rely on: a report written after its own last input to `koh connect` was probed
+after that input was written to the remote program's terminal (the server makes one then, and
+numbers every report, so the client writes each); a report follows every mark koh writes, so no
+mark leaves it without one; and every report carries the terminal's nonce as the marks do. What it
+cannot: a state from between two frames, as the client paints only the newest (a program that was
+`busy` for a moment and is `reading` again may be told only `reading`); a report as soon as the
+state changes, for it is probed every 20 ms and goes with the next frame the link has room for.
+Until fuxix 0.6 is out, the probe says `unknown`.
+
 **koh marks the shells it starts** (`server/marks.rs`), as fux marks its own, so that this works on
 a server nobody set up: a session's bash, zsh or fish, started plainly (`$SHELL`, or a lone
 `--shell`, with no argument; one given any is left as it is, as is any other program), reads the
@@ -349,7 +372,8 @@ nested koh, a terminal multiplexer's shells), and not a shell's own integration,
 fish 4 (which marks natively) or a user's own bash integration is not counted twice. For a
 program koh does not mark, and with `--no-shell-marks`, every mark counts, as before: then the
 marks are whatever the program and what it runs send. The marks a client writes to the user's
-terminal carry no nonce; they are koh's, from the screen.
+terminal never carry the session's nonce; they are koh's, from the screen, and carry the user's
+terminal's own nonce if it asks for one (`FUX_MARK_NONCE`).
 
 ## Headless drivers (the protocol is I/O-free; the shells are thin)
 

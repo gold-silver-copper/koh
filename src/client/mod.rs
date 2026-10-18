@@ -365,7 +365,7 @@ impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
         self.painter.render(
             &mut self.backend,
             state.screen(),
-            state.commands(),
+            (state.commands(), state.report()),
             overlay,
             status,
         )

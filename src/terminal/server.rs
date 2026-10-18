@@ -344,6 +344,8 @@ impl ServerTerminal {
             history,
             tty: self.tty,
             commands,
+            // The session's, which it puts on each screen it publishes.
+            report: None,
         }
     }
 

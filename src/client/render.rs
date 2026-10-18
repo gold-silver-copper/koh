@@ -12,7 +12,7 @@ use std::io;
 
 use super::backend::{KohBackend, OscText};
 use crate::predict::Overlay;
-use crate::terminal::{Commands, Grid, Link, Place, Size, MAXIMUM_CLIPBOARD_SIZE};
+use crate::terminal::{Commands, Grid, Link, Place, Report, Size, MAXIMUM_CLIPBOARD_SIZE};
 use fux_vt::{Attributes, CellRef, Color, MouseProtocolMode};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
@@ -33,13 +33,17 @@ use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 /// frame came ([`prime`](Self::prime)), the shell's commands are told too, after the rows: a start
 /// (`C`) where the running command's output starts, again wherever that moves on what was painted,
 /// and an end (`D;status`) once for each frame whose screen counts commands ended since the last,
-/// with the start and the end of the last one's output.
+/// with the start and the end of the last one's output. Last, after every mark of the frame, the
+/// server's report of what the program is doing (`S;activity=STATE`): each new one once, and the
+/// last again after any mark, which makes a terminal (fux) forget the report it had.
 #[derive(Default)]
 pub(super) struct Painter {
     last: Option<Painted>,
     /// What the terminal was told of the shell's commands: `None` before the run's first frame,
     /// whose commands are not news.
     told: Option<Told>,
+    /// The number of the server's report the terminal was told last (`OSC 133 ; S`).
+    reported: Option<u64>,
     /// Whether the terminal draws underline styles (`4:n`); if not, they are painted plain.
     underline_styles: bool,
     /// Whether hyperlinks are painted (OSC 8); if not, their text is painted plain.
@@ -387,12 +391,12 @@ impl Painter {
 
     /// Paint `screen` with the predictions `overlay` and an optional `status` line (reverse video,
     /// on the terminal's last row), on the terminal as large as `backend` says now, and tell what
-    /// `commands`, the shell's on that screen, say that is news.
+    /// `commands`, the shell's on that screen, and `report`, the server's, say that is news.
     pub(super) fn render(
         &mut self,
         backend: &mut impl KohBackend,
         screen: &Grid,
-        commands: Commands,
+        (commands, report): (Commands, Option<Report>),
         overlay: &Overlay,
         status: Option<&str>,
     ) -> io::Result<()> {
@@ -529,7 +533,7 @@ impl Painter {
         if style.is_some() {
             backend.reset_sgr()?;
         }
-        self.tell(backend, screen, commands, (terminal, &prompts))?;
+        self.tell(backend, screen, (commands, report), (terminal, &prompts))?;
 
         // The predicted cursor wins; one off the terminal is not shown.
         let (row, col) = overlay.cursor().unwrap_or_else(|| screen.cursor_position());
@@ -551,12 +555,13 @@ impl Painter {
     /// Mark the rows `prompts`, which came to start a prompt, and tell what `commands` say that
     /// the terminal was not told, on a terminal `terminal` large showing `screen`: the ends of the
     /// commands counted since, as one, at the start and end of the last one's output, before the
-    /// prompts (which follow them), and where the running one's output starts, after them.
+    /// prompts (which follow them), and where the running one's output starts, after them; then
+    /// `report`, if it is new or a mark was written (a mark makes a terminal forget the report).
     fn tell(
         &mut self,
         backend: &mut impl KohBackend,
         screen: &Grid,
-        commands: Commands,
+        (commands, report): (Commands, Option<Report>),
         (terminal, prompts): (Size, &[u16]),
     ) -> io::Result<()> {
         let edge = |n: u16| n.saturating_sub(1);
@@ -567,6 +572,7 @@ impl Painter {
                 col.min(edge(terminal.cols)),
             )
         };
+        let mut marked = !prompts.is_empty();
         if let Some(told) = &mut self.told {
             if commands.finished > told.finished {
                 let (start, end) = commands.output.unwrap_or_default();
@@ -575,11 +581,13 @@ impl Painter {
                 move_to(backend, end)?;
                 backend.command_ends(commands.status)?;
                 told.running = Running::No;
+                marked = true;
             } else if commands.running.is_none() && told.running != Running::No {
                 // It ended uncounted: another shell's count, or a reset terminal.
                 move_to(backend, screen.cursor_position())?;
                 backend.command_ends(None)?;
                 told.running = Running::No;
+                marked = true;
             }
             // A count that fell is a new shell's.
             told.finished = commands.finished;
@@ -593,7 +601,12 @@ impl Painter {
                 move_to(backend, start)?;
                 backend.command_starts()?;
                 told.running = Running::At(start);
+                marked = true;
             }
+        }
+        if let Some(report) = report.filter(|report| marked || self.reported != Some(report.n)) {
+            backend.activity(report.activity)?;
+            self.reported = Some(report.n);
         }
         Ok(())
     }
@@ -827,7 +840,13 @@ mod tests {
             ..CaptureBackend::default()
         };
         painter
-            .render(&mut backend, screen, Commands::default(), overlay, status)
+            .render(
+                &mut backend,
+                screen,
+                (Commands::default(), None),
+                overlay,
+                status,
+            )
             .unwrap();
         String::from_utf8(backend.bytes).unwrap()
     }
@@ -849,7 +868,7 @@ mod tests {
             .render(
                 &mut backend,
                 screen.screen(),
-                screen.commands(),
+                (screen.commands(), screen.report()),
                 overlay,
                 status,
             )
@@ -1568,6 +1587,54 @@ mod tests {
             (told.finished, told.last_status, told.running()),
             (2, None, false)
         );
+    }
+
+    /// The server's report is told after every mark of the paint of the frame that carries it:
+    /// each new one once, unchanged or not, none on a paint that marks nothing, and the last again
+    /// after a mark, which makes the terminal forget it.
+    #[test]
+    fn a_report_is_told_after_the_marks_of_its_frame() {
+        use crate::terminal::{Activity, Report};
+        let mut emu = crate::terminal::ServerTerminal::new(SMALL.rows, SMALL.cols, 0).unwrap();
+        let mut painter = Painter::default();
+        let mut paint = |painter: &mut Painter, more: &[u8], report: Option<(u64, Activity)>| {
+            emu.process(more);
+            let mut screen = emu.snapshot();
+            screen.set_report(report.map(|(n, activity)| Report { n, activity }));
+            painter.prime(Commands::default());
+            let painted = paint_told(painter, SMALL, &screen, &Overlay::default(), None);
+            // The reports told, and whether every one comes after every mark.
+            let reports = painted
+                .split("\x1b]133;S;activity=")
+                .skip(1)
+                .filter_map(|rest| rest.split('\x07').next())
+                .collect::<Vec<_>>()
+                .join(",");
+            let last = painted.rfind("\x1b]133;S") >= painted.rfind("\x1b]133;");
+            (reports, last)
+        };
+        let reading = Some((1, Activity::Reading));
+        assert_eq!(
+            paint(&mut painter, b"\x1b]133;A\x07$ ", reading),
+            ("reading".to_owned(), true)
+        );
+        assert_eq!(paint(&mut painter, b"", reading).0, "");
+        let again = Some((2, Activity::Reading));
+        assert_eq!(paint(&mut painter, b"", again).0, "reading");
+        // A repaint marks the prompt again, so the report is told again.
+        painter.invalidate();
+        assert_eq!(
+            paint(&mut painter, b"", again),
+            ("reading".to_owned(), true)
+        );
+        // A command starts and ends in one frame, which brings a report: once, after its marks.
+        let busy = Some((3, Activity::Busy));
+        let ran = b"ls\x1b]133;C\x07\r\nout\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ";
+        assert_eq!(paint(&mut painter, ran, busy), ("busy".to_owned(), true));
+        // A start told again with no new report retells the last.
+        let runs = b"sleep\x1b]133;C\x07\r\n";
+        assert_eq!(paint(&mut painter, runs, busy), ("busy".to_owned(), true));
+        assert_eq!(paint(&mut painter, b"", busy).0, "");
     }
 
     /// Output that exercises what a frame can change: text, wide glyphs, combining marks, clusters

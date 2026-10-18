@@ -26,7 +26,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+mod reports;
 mod sessions;
+
+use reports::{Probe, Reports};
 
 // How often a session reads its PTY's modes when nothing else made it: a password prompt that
 // turned echo off after printing is known to the client within this (the wire's contract).
@@ -390,6 +393,7 @@ fn start(
             input,
             asks,
             attaches: 0,
+            reports: Reports::default(),
         };
         // A requester already gone drops its client, which the session sees as a detach.
         let _ = first.0.send(Ok((session.client(), AttachKind::Created)));
@@ -418,6 +422,8 @@ struct Session {
     asks: mpsc::Sender<Ask>,
     /// How many attaches there were: the newest's number, whose input alone is taken.
     attaches: u64,
+    /// What it reported of what the program is doing, which every screen it publishes carries.
+    reports: Reports,
 }
 
 impl Session {
@@ -434,8 +440,28 @@ impl Session {
     }
 
     fn publish(&mut self) {
-        self.screens
-            .send_replace(Arc::new(self.host.emu.snapshot()));
+        let screen = self.host.emu.snapshot();
+        self.send(screen);
+    }
+
+    /// Publish `screen`, with the last report.
+    fn send(&self, mut screen: TerminalScreen) {
+        screen.set_report(self.reports.last());
+        self.screens.send_replace(Arc::new(screen));
+    }
+
+    /// Probe what the program is doing at `now`, for `why`, input last written to it at `typed`
+    /// and the screen changed since if `answered`. A report made after a mark goes with the screen
+    /// that carries the mark, published next; any other on the screen published now.
+    fn probe(&mut self, now: Instant, why: Probe, (typed, answered): (Option<Instant>, bool)) {
+        let since_key = typed.map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+        let prompt = self.host.emu.live().commands().prompt;
+        let activity = self.host.pty.activity(since_key, answered, prompt);
+        if self.reports.probed(now, why, activity).is_some() && why == Probe::Poll {
+            let report = self.reports.last();
+            self.screens
+                .send_modify(|screen| Arc::make_mut(screen).set_report(report));
+        }
     }
 
     /// Run until the program exited and a client acknowledged its final screen, the session is
@@ -466,6 +492,11 @@ impl Session {
         // When typed input last reached the program, and whether output waits for the next read.
         let mut typed_at: Option<Instant> = None;
         let mut owed = false;
+        // Whether the program wrote after the input that reached it last, which the probe asks.
+        let mut answered = false;
+        // While a client is attached, what the program is doing is probed for a change.
+        let mut poll = tokio::time::interval(reports::POLL);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             if let Some(exit) = ending.ended(Instant::now()).filter(|_| !exited) {
@@ -482,6 +513,8 @@ impl Session {
                 pending.flush(|bytes| self.host.pty.write(bytes));
                 if pending.is_empty() {
                     typed_at = Some(Instant::now());
+                    answered = false;
+                    self.reports.owe();
                 }
             }
             let reading = !exited && ending.output_ended.is_none();
@@ -492,12 +525,19 @@ impl Session {
                     if let Some(chunk) = chunk {
                         ending.last_output = Some(now);
                         self.host.refresh_tty();
+                        let marks = self.host.emu.live().commands();
                         self.host.emu.process(&chunk);
                         // What is already read, without waiting; the channel's end is left for
                         // `recv`.
                         for _ in 0..OUTPUT_CHUNKS_PER_SNAPSHOT {
                             let Ok(more) = pty_rx.try_recv() else { break };
                             self.host.emu.process(&more);
+                        }
+                        answered = true;
+                        // The shell marked a command's start or end: the screen with the mark
+                        // carries a report made after it.
+                        if self.host.emu.live().commands() != marks {
+                            self.probe(now, Probe::Marked, (typed_at, answered));
                         }
                         // Query answers go to the program, not the screen.
                         pending.reply(&self.host.emu.take_host_replies());
@@ -507,7 +547,7 @@ impl Session {
                             if let Some(screen) =
                                 hold.after_output(&mut self.host.emu, std::time::Instant::now())
                             {
-                                self.screens.send_replace(Arc::new(screen));
+                                self.send(screen);
                             }
                         }
                         // Output still waiting keeps its read: more of it does not put that off.
@@ -521,7 +561,7 @@ impl Session {
                 },
                 _ = until(hold.deadline().map(Instant::from_std)) => {
                     if let Some(screen) = hold.expire(&mut self.host.emu, std::time::Instant::now()) {
-                        self.screens.send_replace(Arc::new(screen));
+                        self.send(screen);
                     }
                 },
                 () = until(ending.deadline().map(|(at, _)| at)), if !exited => {}
@@ -536,7 +576,7 @@ impl Session {
                         if let Some(screen) =
                             hold.after_output(&mut self.host.emu, std::time::Instant::now())
                         {
-                            self.screens.send_replace(Arc::new(screen));
+                            self.send(screen);
                         }
                     } else if detached.is_none() && changed && !hold.holding() {
                         self.publish();
@@ -547,6 +587,8 @@ impl Session {
                 Some(Input { attach, input }) = input_rx.recv(), if pending.is_empty() || exited => {
                     if attach == self.attaches && !exited && self.host.apply(attach, input, &mut pending) {
                         self.publish();
+                        // Resized: a report follows.
+                        self.reports.owe();
                     }
                 },
                 Some(ask) = asks_rx.recv() => match ask {
@@ -559,6 +601,8 @@ impl Session {
                         let input = super::ToSession::Resize(window);
                         if attach == self.attaches && !exited && self.host.apply(attach, input, &mut pending) {
                             self.publish();
+                            // Resized: a report follows.
+                            self.reports.owe();
                         }
                     }
                     Ask::Describe(reply) => {
@@ -609,6 +653,13 @@ impl Session {
                     if detached.is_none() && self.host.refresh_tty() && !hold.holding() {
                         self.publish();
                     }
+                }
+                // What the program is doing: the report owed, and a change while a client sees it.
+                () = until(self.reports.due(Instant::now())), if !exited => {
+                    self.probe(Instant::now(), Probe::Poll, (typed_at, answered));
+                }
+                _ = poll.tick(), if !exited && self.screens.receiver_count() > 0 => {
+                    self.probe(Instant::now(), Probe::Poll, (typed_at, answered));
                 }
                 // Detached for the whole TTL.
                 () = until(detached.and_then(|since| since.checked_add(ttl))) => break,

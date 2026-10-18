@@ -21,10 +21,10 @@ use koh::request::{
     Request, Resume, RunId, SessionInfo, SessionList, SessionNum, Sources,
 };
 use koh::terminal::{
-    CellKind, CellText, Commands, HistoryMark, HistoryReply, HistoryRequest, HistoryRow, RowDiff,
-    RowEncodings, RowFlags, Run, ScreenDiff, ServerTerminal, Shift, Shifts, Size, TerminalScreen,
-    TtyModes, WireCell, WireColor, WireLink, WireModes, WireMouseEncoding, WireMouseMode,
-    WireStyle,
+    Activity, CellKind, CellText, Commands, HistoryMark, HistoryReply, HistoryRequest, HistoryRow,
+    Report, RowDiff, RowEncodings, RowFlags, Run, ScreenDiff, ServerTerminal, Shift, Shifts, Size,
+    TerminalScreen, TtyModes, WireCell, WireColor, WireLink, WireModes, WireMouseEncoding,
+    WireMouseMode, WireStyle,
 };
 use std::num::{NonZeroI16, NonZeroU16};
 
@@ -298,6 +298,10 @@ fn wire_frames() -> Option<Vec<Frame>> {
                 output: Some(((0, 0), (2, 7))),
                 running: Some((2, 3)),
             }),
+            report: Some(Report {
+                n: 300,
+                activity: Activity::Reading,
+            }),
             cursor: (1, 2),
             modes: WireModes {
                 hide_cursor: true,
@@ -325,6 +329,10 @@ fn wire_frames() -> Option<Vec<Frame>> {
             history: None,
             tty: None,
             commands: None,
+            report: Some(Report {
+                n: 301,
+                activity: Activity::Unknown,
+            }),
             shifts: Shifts::new(vec![Shift {
                 top: 1,
                 len: NonZeroU16::new(2)?,
@@ -422,16 +430,17 @@ const CLIENT_MSGS: [&str; 8] = [
 const FRAMES: [(&str, &str); 2] = [
     (
         "ac020081010103080109746865207469746c6501087468652069636f6e010461476b3d02010301f0a2040201\
-        010001ac020101010000020701020301020100010103020000020003050303616263030101000001000103e6\
-        97a5040000000000010365cc81000201020301c8020708098808010119f09f91a8e2808df09f91a9e2808df0\
-        9f91a7e2808df09f91a60100000000000100020000000000011468747470733a2f2f6b6f682e6578616d706c\
-        652f016b0203050303616263030101000001000103e697a5040000000000010365cc81000201020301c80207\
-        08098808010119f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6010000000000010002000000\
-        0000011468747470733a2f2f6b6f682e6578616d706c652f016b",
+        010001ac020101010000020701020301ac020001020100010103020000020003050303616263030101000001\
+        000103e697a5040000000000010365cc81000201020301c8020708098808010119f09f91a8e2808df09f91a9\
+        e2808df09f91a7e2808df09f91a60100000000000100020000000000011468747470733a2f2f6b6f682e6578\
+        616d706c652f016b0203050303616263030101000001000103e697a5040000000000010365cc810002010203\
+        01c8020708098808010119f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a60100000000000100\
+        020000000000011468747470733a2f2f6b6f682e6578616d706c652f016b",
         "0000020002",
     ),
     (
-        "ad02ac028201000000000200000000010201000101030200010102010102000108012000000000000000",
+        "ad02ac02820100000000020000000001ad020501020100010103020001010201010200010801200000000000\
+        0000",
         "00ac020102",
     ),
 ];

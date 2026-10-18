@@ -1,6 +1,8 @@
 //! The shell's marks (OSC 133) as the screen carries them: which rows start a prompt, in each
 //! row's [`RowFlags`], and what the marks say of the shell's commands, placed on the screen
-//! ([`Commands`]), so that the client can mark what it paints for the user's terminal.
+//! ([`Commands`]), so that the client can mark what it paints for the user's terminal; and the
+//! server's report of what the session's program is doing ([`Report`]), which the client writes
+//! as a mark of the same family (`OSC 133 ; S`).
 
 use fux_vt::RowId;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -118,4 +120,45 @@ impl Commands {
         }
         .within(size)
     }
+}
+
+/// What the program in the foreground of the session's terminal is doing, as the server probed
+/// it: fuxix's `Activity`, on koh's wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Activity {
+    /// Blocked reading the terminal with no time limit: it waits for input.
+    Reading,
+    /// Waiting on the terminal with a time limit, so it may draw again on its own.
+    Polling,
+    /// Blocked on something else: the network, a pipe, another program.
+    Waiting,
+    /// Running, sleeping on a timer, or starting.
+    Busy,
+    /// Every thread waits on something the system does not name (macOS).
+    Idle,
+    /// The system does not say.
+    Unknown,
+}
+
+impl Activity {
+    /// The state as `OSC 133 ; S ; activity=` names it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Reading => "reading",
+            Self::Polling => "polling",
+            Self::Waiting => "waiting",
+            Self::Busy => "busy",
+            Self::Idle => "idle",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The server's report of the program's [`Activity`], numbered by the session: each report is a
+/// new number, even of an unchanged state, so that the client tells every one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Report {
+    /// Which report it is: the session's count of them, from 1.
+    pub n: u64,
+    pub activity: Activity,
 }

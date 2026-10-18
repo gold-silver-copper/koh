@@ -67,10 +67,23 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (`terminal_activity`, fux's own); on macOS it says only `busy`, `idle` or `unknown`.
 
 ### Changed
+- **Protocol `koh/9`**: `koh jobs` asks for one job by name, `koh cp`'s summary says where the
+  copy landed, and a missing `-C` directory and a nesting tree are told apart on the wire.
+- **`koh cp` says where things landed** (`→ SERVER:proj/src`, not `→ SERVER:proj`; `landed` in
+  `--json`, which replaces `to`), and **refuses to nest a tree in a directory of its own name**
+  that is there already (`koh cp -r X SERVER:X` run twice): cp's rule would land it as `X/X`.
+  `X/.` updates `X`; naming `SERVER:X/X` nests it. A destination ending in `/` still takes it in.
+- **`-C DIR` that is not there says so**: `koh: /home/u/dsp: no such directory on the server to
+  start in (...)`, and `koh exec` exits 126 (it could not start), no longer 127 (no such program).
+- **A `--sh` script the local shell split** (its quoting broke) says so in a line, with how to
+  send it whole (`koh exec SERVER -- sh -s < script.sh`; for a job, `--sh "$(cat script.sh)"`),
+  instead of clap's echo of the stray word and the usage.
+- **`koh jobs` shows one line a job**: its command's first line, cut at 60 characters, ` …`
+  marking a cut; `koh jobs SERVER NAME` shows that job with its command whole.
 - **`koh connect` with no terminal says what to use instead**: that it needs one, and that `koh
   exec SERVER -- COMMAND` runs a command without one and `koh cp` copies files, rather than
   `acquiring the terminal: No such device or address`. It says so before dialing.
-- **A version mismatch says both sides**: `this koh speaks protocol koh/8 and the server speaks
+- **A version mismatch says both sides**: `this koh speaks protocol koh/9 and the server speaks
   another; upgrade koh on whichever end is older`.
 - **The program's output reaches the user's terminal as it wrote it** (protocol `koh/8`), as over
   ssh, less the questions the server's own terminal answers and the shell's marks, which travel

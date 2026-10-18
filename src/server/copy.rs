@@ -49,7 +49,8 @@ fn failure(path: &RemotePath, problem: &crate::request::Problem) -> Failure {
         | crate::request::ProblemKind::TooManyJobs
         | crate::request::ProblemKind::CouldNotStart
         | crate::request::ProblemKind::NotFound
-        | crate::request::ProblemKind::Failed => FailKind::Other,
+        | crate::request::ProblemKind::Failed
+        | crate::request::ProblemKind::NoSuchDir => FailKind::Other,
     };
     Failure::new(
         kind,

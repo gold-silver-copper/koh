@@ -403,7 +403,7 @@ pub async fn sessions(
 
 /// Text a program chose, safe to print on a line: nothing in it may move the cursor or reorder
 /// the line.
-fn escaped(text: &str) -> String {
+pub(crate) fn escaped(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if c == ' ' || !(c.is_control() || c.is_whitespace() || crate::log::is_bidi(c)) {
@@ -546,10 +546,12 @@ pub async fn run(
 /// `koh jobs`: this client's jobs on `remote`, one a line, to `out`.
 pub async fn jobs(
     remote: &Remote,
+    job: Option<JobName>,
     format: Format,
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
-    let JobList(jobs) = ask(remote, &Request::Jobs, MAX_REPLY).await?;
+    let by_name = job.is_some();
+    let JobList(jobs) = ask(remote, &Request::Jobs { job }, MAX_REPLY).await?;
     if format.json {
         let views: Vec<JobView<'_>> = jobs.iter().map(JobView::from).collect();
         return json_line(out, &views);
@@ -574,15 +576,35 @@ pub async fn jobs(
         } else {
             String::new()
         };
-        writeln!(
-            out,
-            "{} {state} output={}{dropped} {}",
+        let head = format!(
+            "{} {state} output={}{dropped}",
             job.name,
-            bytes(job.output_bytes),
-            escaped(&job.command)
-        )?;
+            bytes(job.output_bytes)
+        );
+        if by_name {
+            // The command whole, on the lines after, as it was given.
+            writeln!(out, "{head}")?;
+            for line in job.command.lines() {
+                writeln!(out, "  {}", escaped(line))?;
+            }
+        } else {
+            writeln!(out, "{head} {}", first_line(&job.command))?;
+        }
     }
     Ok(())
+}
+
+/// Most characters of a command a job listing shows.
+const LISTED_COMMAND: usize = 60;
+
+/// `command`'s first line, escaped, cut to [`LISTED_COMMAND`] characters: ` …` marks a cut, or
+/// lines after it (`koh jobs SERVER NAME` shows it whole).
+fn first_line(command: &str) -> String {
+    let mut lines = command.lines();
+    let first = lines.next().unwrap_or_default();
+    let shown: String = first.chars().take(LISTED_COMMAND).collect();
+    let cut = shown.len() < first.len() || lines.next().is_some();
+    format!("{}{}", escaped(&shown), if cut { " …" } else { "" })
 }
 
 /// `bytes` for a person: `41 KB`, `1.2 MB`.

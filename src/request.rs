@@ -122,8 +122,9 @@ pub enum Request {
     Exec(Run),
     /// Start a job: a command with no terminal that outlives the connection, its output kept.
     Start { name: Option<JobName>, run: Run },
-    /// The peer's jobs, answered as an [`Answer<JobList>`].
-    Jobs,
+    /// The peer's jobs, answered as an [`Answer<JobList>`], their commands cut to
+    /// [`MAX_TITLE`] characters; or the one `job` names, its command whole.
+    Jobs { job: Option<JobName> },
     /// A job's output: what is kept, then, if `follow`, what it writes until it ends.
     Logs { job: JobName, follow: bool },
     /// Send a job's processes a signal.
@@ -143,7 +144,7 @@ impl Request {
             Self::Output { .. } => "a session's text",
             Self::Exec(_) => "a command",
             Self::Start { .. } => "a job",
-            Self::Jobs => "the job list",
+            Self::Jobs { .. } => "the job list",
             Self::Logs { .. } => "a job's output",
             Self::Kill { .. } => "a signal to a job",
             Self::Wait(_) => "a wait",
@@ -172,9 +173,9 @@ pub enum Command {
 }
 
 impl Command {
-    /// The command as a person reads it, for a listing: its words joined with spaces.
+    /// The command as a person reads it: its words joined with spaces.
     pub fn display(&self) -> String {
-        let text = match self {
+        match self {
             Self::Argv(argv) => argv
                 .words()
                 .iter()
@@ -182,8 +183,7 @@ impl Command {
                 .collect::<Vec<_>>()
                 .join(" "),
             Self::Shell(line) => String::from_utf8_lossy(line.as_bytes()).into_owned(),
-        };
-        text.chars().take(MAX_TITLE).collect()
+        }
     }
 }
 
@@ -516,6 +516,8 @@ pub enum ProblemKind {
     NotFound,
     /// Anything else.
     Failed,
+    /// The directory a command was to start in is not there, or is not a directory.
+    NoSuchDir,
 }
 
 impl ProblemKind {
@@ -531,6 +533,7 @@ impl ProblemKind {
             Self::NoHome => "no_home",
             Self::NotFound => "not_found",
             Self::Failed => "failed",
+            Self::NoSuchDir => "no_such_dir",
         }
     }
 
@@ -545,6 +548,10 @@ impl ProblemKind {
             Self::NoHome => "the server user has no home directory",
             Self::NotFound => "no such file or directory",
             Self::Failed => "failed",
+            Self::NoSuchDir => {
+                "no such directory on the server to start in (-C takes the server's path; a \
+                 relative one is in its home)"
+            }
         }
     }
 }
@@ -596,6 +603,11 @@ fn title<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error>
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+fn command<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let bytes = at_most::<MAX_COMMAND, D, u8>(deserializer)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// The peer's sessions, oldest first.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionList(
@@ -620,8 +632,9 @@ pub enum JobState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobInfo {
     pub name: JobName,
-    /// Its command, as a person reads it, at most [`MAX_TITLE`] characters.
-    #[serde(deserialize_with = "title")]
+    /// Its command, as a person reads it: at most [`MAX_TITLE`] characters in a listing, at most
+    /// [`MAX_COMMAND`] bytes asked for by name.
+    #[serde(deserialize_with = "command")]
     pub command: String,
     /// Seconds since it started.
     pub age_secs: u64,

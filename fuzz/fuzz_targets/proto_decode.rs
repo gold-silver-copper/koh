@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz both directions of the koh/8 shell stream: arbitrary bytes as the client's message stream
+//! Fuzz both directions of the koh/9 shell stream: arbitrary bytes as the client's message stream
 //! (the server's parser) and as what a program shows (the client's parser). Both must only return
 //! errors on bad input, never panic, and never allocate past their caps.
 

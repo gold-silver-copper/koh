@@ -10,18 +10,23 @@ use koh::names::{List, Places};
 
 // An explicit runtime instead of `#[tokio::main]`, whose expansion `allow`s `clippy::expect_used`.
 fn main() -> std::process::ExitCode {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let cmd = match args::command()
-        .try_get_matches()
+        .try_get_matches_from(&argv)
         .and_then(|matches| args::parse(&matches))
     {
         Ok(cmd) => cmd,
-        Err(e) => match args::bad_value(&e) {
-            Some(bad) => {
+        Err(e) => {
+            if let Some(bad) = args::bad_value(&e) {
                 koh::log::stderr(format_args!("koh: {bad}"));
                 return std::process::ExitCode::FAILURE;
             }
-            None => e.exit(),
-        },
+            if let Some(broken) = args::broken_sh(&e, &argv) {
+                koh::log::stderr(format_args!("koh: {broken}"));
+                return std::process::ExitCode::from(2);
+            }
+            e.exit()
+        }
     };
     if matches!(cmd, Cmd::Menu)
         && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
@@ -46,7 +51,7 @@ fn main() -> std::process::ExitCode {
 const fn wants_json(cmd: &Cmd) -> bool {
     match cmd {
         Cmd::Sessions(_, json)
-        | Cmd::Jobs(_, json)
+        | Cmd::Jobs(_, _, json)
         | Cmd::Output { json, .. }
         | Cmd::Exec { json, .. }
         | Cmd::Start { json, .. }
@@ -122,7 +127,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
         } => cli::run(&resolve(remote)?, (name, run), format(json), &mut out)
             .await
             .map(|()| None),
-        Cmd::Jobs(remote, json) => cli::jobs(&resolve(remote)?, format(json), &mut out)
+        Cmd::Jobs(remote, job, json) => cli::jobs(&resolve(remote)?, job, format(json), &mut out)
             .await
             .map(|()| None),
         Cmd::Logs {

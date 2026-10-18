@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::cli::{bytes, Format, Opened, Remote};
+use super::cli::{bytes, escaped, Format, Opened, Remote};
 use crate::request::{RemotePath, Request, Sources};
 use crate::sync::{
     self, ChannelReader, ChannelWriter, Copy, Dest, FailKind, Failure, Opts, Reply, Source,
@@ -42,25 +42,52 @@ pub async fn copy(
 ) -> anyhow::Result<()> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
-    let summary = match job {
-        CopyJob::Get { sources, dest } => get(remote, (sources, dest), opts, &interrupted).await?,
-        CopyJob::Put { sources, dest } => put(remote, (sources, dest), opts, &interrupted).await?,
+    let (summary, several) = match job {
+        CopyJob::Get { sources, dest } => {
+            let several = sources.paths().len() > 1;
+            (
+                get(remote, (sources, dest), opts, &interrupted).await?,
+                several,
+            )
+        }
+        CopyJob::Put { sources, dest } => {
+            let several = sources.len() > 1;
+            (
+                put(remote, (sources, dest), opts, &interrupted).await?,
+                several,
+            )
+        }
     };
-    say(&summary, shown, format)
+    say(&summary, &landed(&summary, shown, several), format)
 }
 
-/// Say `summary` of a copy to `shown`: one line, or one JSON value.
-fn say(summary: &Summary, shown: &str, format: Format) -> anyhow::Result<()> {
+/// Where a copy to `shown` landed: inside it, as its one source's name, if the summary says so;
+/// in it, if there were `several`; else as it.
+fn landed(summary: &Summary, shown: &str, several: bool) -> String {
+    let into = if shown.ends_with('/') || shown.ends_with(':') {
+        shown.to_owned()
+    } else {
+        format!("{shown}/")
+    };
+    match &summary.inside {
+        _ if several => into,
+        Some(name) => format!("{into}{}", escaped(name)),
+        None => shown.to_owned(),
+    }
+}
+
+/// Say `summary` of a copy that landed at `landed`: one line, or one JSON value.
+fn say(summary: &Summary, landed: &str, format: Format) -> anyhow::Result<()> {
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
     if format.json {
         #[derive(Serialize)]
         struct View<'a> {
-            to: &'a str,
+            landed: &'a str,
             #[serde(flatten)]
             summary: &'a Summary,
         }
-        serde_json::to_writer(&mut out, &View { to: shown, summary })?;
+        serde_json::to_writer(&mut out, &View { landed, summary })?;
         writeln!(out)?;
         return Ok(());
     }
@@ -91,7 +118,7 @@ fn say(summary: &Summary, shown: &str, format: Format) -> anyhow::Result<()> {
     let written = summary.written();
     writeln!(
         out,
-        "{written} file{}, {} → {shown}{more}",
+        "{written} file{}, {} → {landed}{more}",
         if written == 1 { "" } else { "s" },
         bytes(summary.bytes),
     )?;

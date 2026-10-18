@@ -94,8 +94,10 @@ half-written that looks complete, and the next copy resumes the part. A file wri
 time it arrived (so `make` and `cargo` see it changed) unless `-p` keeps the source's. `dir/.`
 copies what is in `dir`. `--delete` removes what the source does not have, `--exclude PAT`
 leaves entries alone, and `--atomic` lands nothing until the whole copy came. It ends with one
-line: `3 files, 41 KB → laptop:proj/ (2 replaced, 120 unchanged)`, or `--json`. A source given on
-the command line is followed if it is a symlink, as `cp` does; symlinks inside a tree are copied
+line saying where it landed: `3 files, 41 KB → laptop:proj/src (2 replaced, 120 unchanged)`, or
+`--json`. A tree is not nested in a directory of its own name that is there already (`koh cp -r
+src laptop:src` run twice, which `cp` would land as `src/src`): `src/.` brings it into line. A
+source given on the command line is followed if it is a symlink, as `cp` does; symlinks inside a tree are copied
 as symlinks, never followed on either side, and fifos, sockets and devices are skipped and said
 so. Remote paths are taken as the server user's shell would take them, but not globbed: no
 remote shell runs.
@@ -103,7 +105,8 @@ remote shell runs.
 **Exit codes** are the same for every command: 0 ok, 1 failed, 2 usage, 3 the server was not
 reached, 4 refused (not allowed, or out of the key's scope), 124 a wait timed out. `exec`,
 `wait` and `logs --follow` exit with the remote command's status, and 255 on koh's own errors,
-as ssh does; `exec` exits 127 when there is no such program.
+as ssh does; `exec` exits 127 when there is no such program and 126 when it could not start
+(no `-C` directory there, say).
 
 **Scoped keys.** `koh clients add ci <id> --cp /srv/drop` lets that client copy to and from
 `/srv/drop` and below only, and nothing else: no shell, no commands. `--exec DIR` lets it run

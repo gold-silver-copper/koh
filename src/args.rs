@@ -51,6 +51,52 @@ pub fn bad_value(error: &clap::Error) -> Option<&BadValue> {
     error.source()?.downcast_ref()
 }
 
+/// koh's message for `error` if it is a `--sh` script whose quoting broke on the way: the shell
+/// that ran koh split it, so words came after it that clap takes for arguments. The script is
+/// one word, or goes on stdin; what came is shown cut, not echoed whole.
+pub fn broken_sh(error: &clap::Error, argv: &[OsString]) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue};
+    if error.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    let sub = argv.get(1)?.to_str()?;
+    let given = argv
+        .iter()
+        .skip(2)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--sh" || arg.as_bytes().starts_with(b"--sh="));
+    if !matches!(sub, "exec" | "run") || !given {
+        return None;
+    }
+    let came = match error.get(ContextKind::InvalidArg) {
+        Some(ContextValue::String(came)) => came.as_str(),
+        _ => "",
+    };
+    let mut cut: String = came
+        .chars()
+        .take(40)
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect();
+    if came.chars().nth(40).is_some() {
+        cut.push('…');
+    }
+    let fix = if sub == "exec" {
+        "pipe the script in instead: koh exec SERVER -- sh -s < script.sh (or <<'EOF' ... EOF)"
+    } else {
+        "a job has no stdin: koh run SERVER --sh \"$(cat script.sh)\""
+    };
+    Some(format!(
+        "--sh takes the script as one word, and more came after it ('{cut}'): its quoting broke; \
+         {fix}"
+    ))
+}
+
 /// A `--allow` endpoint id.
 fn allow_id(value: &str) -> Result<EndpointId, BadValue> {
     parse_endpoint_id(value).map_err(|e| BadValue(format!("bad --allow id: {value}: {e}")))
@@ -117,7 +163,7 @@ pub enum Cmd {
         json: bool,
     },
     /// `koh jobs`.
-    Jobs(RemoteArgs, bool),
+    Jobs(RemoteArgs, Option<JobName>, bool),
     /// `koh logs`.
     Logs {
         remote: RemoteArgs,
@@ -218,10 +264,12 @@ or an endpoint id. Nothing here needs a terminal but `connect`.
 
 Run something:
   koh exec SERVER -- PROG ARG...       words passed as they are, no shell; ~/x is in the home
-  koh exec SERVER --sh 'cd src && make'  a shell line, on purpose
+  koh exec SERVER --sh 'cd src && make'  a shell line, on purpose: one word, quoted whole
+  koh exec SERVER -- sh -s < script.sh  a longer script, or one with quotes in it, on stdin
   koh exec SERVER -C DIR -- PROG ...   start in DIR (relative: in the home)
   stdin goes to the command; stdout and stderr come back apart; exits with its status
-  (127 no such program, 255 koh's own error). A killed koh hangs it up within 20 s.
+  (127 no such program, 126 could not start: no -C DIR there, 255 koh's own error).
+  A killed koh hangs it up within 20 s.
 
 Jobs (survive koh exiting and the link dropping; output and status kept):
   koh run SERVER [--name build] -- make -j4   prints the job's name
@@ -229,14 +277,18 @@ Jobs (survive koh exiting and the link dropping; output and status kept):
   koh wait SERVER build --text listening  until its output has the text (1 if it ended first)
   koh wait SERVER --file out/done.txt   until the file exists
   koh logs SERVER build [--follow]      its output (with --follow until it ends, then its status)
-  koh jobs SERVER   koh kill SERVER build [--signal KILL]
+  koh jobs SERVER [build]               one line a job; with a name, its command whole
+  koh kill SERVER build [--signal KILL]
 
 Copy (a sync: merges, makes parents, sends only files that changed, by hash):
   koh cp -r ./src SERVER:proj/          src lands as proj/src; `./src/.` lands its contents
+  koh cp -r ./src/. SERVER:proj/src     updates proj/src (`./src SERVER:proj/src` would nest it
+                                        in itself, as cp does: koh refuses that)
   koh cp SERVER:proj/out.txt .          the other way
   --delete removes what the source lacks; --exclude PAT (repeat); -p keeps mtimes (default:
-  arrival time, so builds see changes); --atomic lands nothing until all came. Prints one line:
-  `3 files, 41 KB → SERVER:proj/ (2 replaced, 120 unchanged)`. A cut copy resumes when rerun.
+  arrival time, so builds see changes); --atomic lands nothing until all came. Prints one line,
+  where it landed: `3 files, 41 KB → SERVER:proj/src (2 replaced, 120 unchanged)`. A cut copy
+  resumes when rerun.
 
 Shell sessions (`koh connect SERVER` in a terminal, or fux):
   koh sessions SERVER                   number, attached, state (reading/busy/...), last status
@@ -461,7 +513,7 @@ fn command_args(cmd: Command) -> Command {
 }
 
 fn exec() -> Command {
-    command_args(remote(Command::new("exec").about("Run a command on a server with no terminal and exit with its status: your stdin goes to it, its stdout and stderr come back apart. A killed or dropped koh hangs it up (within 20 s if killed). 127: no such program; 255: koh's own error")))
+    command_args(remote(Command::new("exec").about("Run a command on a server with no terminal and exit with its status: your stdin goes to it, its stdout and stderr come back apart. A killed or dropped koh hangs it up (within 20 s if killed). 127: no such program; 126: it could not start (no -C DIR there, say); 255: koh's own error")))
 }
 
 fn run() -> Command {
@@ -471,8 +523,9 @@ fn run() -> Command {
 
 fn jobs() -> Command {
     remote(Command::new("jobs").about(
-        "List your jobs: name, running or exited (status, how long it ran), output size, command",
+        "List your jobs, one line each: name, running or exited (status, how long it ran), output size, the command's first line; with JOB, that one, its command whole",
     ))
+    .arg(job_arg(false))
     .arg(json())
 }
 
@@ -518,7 +571,7 @@ fn wait() -> Command {
 }
 
 fn cp() -> Command {
-    dialing(Command::new("cp").about("Copy files and trees between here and a server, as a sync: `koh cp SRC... SERVER:DST` or `koh cp SERVER:SRC... DST`. Into DST if it is a directory (or ends in /, or there are several SRC: it is made), else as DST, its parents made. Directories merge; only files that changed are sent (by hash); a cut copy resumes when run again. A file written gets its arrival time unless -p. `dir/.` copies what is in dir. Prints what it did"))
+    dialing(Command::new("cp").about("Copy files and trees between here and a server, as a sync: `koh cp SRC... SERVER:DST` or `koh cp SERVER:SRC... DST`. Into DST if it is a directory (or ends in /, or there are several SRC: it is made), else as DST, its parents made. Directories merge; only files that changed are sent (by hash); a cut copy resumes when run again. A file written gets its arrival time unless -p. `dir/.` copies what is in dir. A tree is not nested in a directory of its own name that is there (`koh cp -r X S:X` again): `X/.` updates it. Prints what it did and where it landed"))
         .arg(
             Arg::new("paths")
                 .value_name("PATH")
@@ -749,7 +802,11 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             run: run_of(m)?,
             json: json(m),
         }),
-        Some(("jobs", m)) => Ok(Cmd::Jobs(remote_args(m)?, json(m))),
+        Some(("jobs", m)) => Ok(Cmd::Jobs(
+            remote_args(m)?,
+            m.get_one::<JobName>("job").cloned(),
+            json(m),
+        )),
         Some(("logs", m)) => Ok(Cmd::Logs {
             remote: remote_args(m)?,
             job: value(m, "job")?,
@@ -1064,6 +1121,32 @@ mod tests {
     #[test]
     fn the_command_line_is_consistent() {
         command().debug_assert();
+    }
+
+    /// A `--sh` script the shell split says so, short, and how to send it whole.
+    #[test]
+    fn a_split_sh_script_says_how_to_send_it_whole() {
+        let script = format!("print('a b'){}", "x".repeat(1000));
+        for (sub, fix) in [("exec", "-- sh -s"), ("run", "$(cat script.sh)")] {
+            let argv: Vec<std::ffi::OsString> = ["koh", sub, ID, "--sh", "python3 -c ", &script]
+                .iter()
+                .map(Into::into)
+                .collect();
+            let error = command().try_get_matches_from(&argv).expect_err("split");
+            let said = super::broken_sh(&error, &argv).expect("said");
+            assert!(
+                said.contains(fix) && said.contains("print('a b')xx"),
+                "{said}"
+            );
+            assert!(said.len() < 300, "{said}");
+        }
+        // Another unexpected word, with no --sh, is clap's to say.
+        let argv: Vec<std::ffi::OsString> = ["koh", "exec", ID, "ls", "-l"]
+            .iter()
+            .map(Into::into)
+            .collect();
+        let error = command().try_get_matches_from(&argv).expect_err("no --");
+        assert_eq!(super::broken_sh(&error, &argv), None);
     }
 
     #[test]

@@ -140,6 +140,20 @@ pub enum Activity {
     Unknown,
 }
 
+impl From<fuxix::process::Activity> for Activity {
+    fn from(activity: fuxix::process::Activity) -> Self {
+        use fuxix::process::Activity as Probed;
+        match activity {
+            Probed::Reading => Self::Reading,
+            Probed::Polling => Self::Polling,
+            Probed::Waiting => Self::Waiting,
+            Probed::Busy => Self::Busy,
+            Probed::Idle => Self::Idle,
+            Probed::Unknown => Self::Unknown,
+        }
+    }
+}
+
 impl Activity {
     /// The state as `OSC 133 ; S ; activity=` names it.
     pub const fn name(self) -> &'static str {

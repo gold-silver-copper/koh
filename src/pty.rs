@@ -618,11 +618,7 @@ impl Pty {
         let Some(leader) = self.running.as_ref().map(|running| running.pid) else {
             return crate::terminal::Activity::Unknown;
         };
-        // TODO(fuxix 0.6): replace the two lines below with the probe,
-        // `fuxix::process::terminal_activity(&self.master, leader, since_key, answered, prompt).into()`,
-        // and map `fuxix::process::Activity` to koh's in a `From` beside `Activity`.
-        let _ = (&self.master, leader, since_key, answered, prompt);
-        crate::terminal::Activity::Unknown
+        fuxix::process::terminal_activity(&self.master, leader, since_key, answered, prompt).into()
     }
 
     /// Propagate a window-size change to `rows`×`cols`; the kernel raises `SIGWINCH` in the child.

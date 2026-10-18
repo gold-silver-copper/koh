@@ -258,6 +258,33 @@ fn a_password_prompt_without_echo_is_read_so() {
     });
 }
 
+/// The probe tells a program waiting on its terminal from one at work: `cat` reading is
+/// `reading`, a busy loop is not (fuxix reads it from `/proc`, so only where there is one).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn the_probe_tells_a_program_reading_its_terminal_from_one_at_work() {
+    use koh::terminal::Activity;
+    use std::time::{Duration, Instant};
+    current_thread().expect("tokio runtime").block_on(async {
+        let settled = |pty: &Pty, want: Activity| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let now = pty.activity(Duration::MAX, false, false);
+                if now == want || Instant::now() > deadline {
+                    return now;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let (pty, mut rx) = sh("echo RE''ADY; exec cat").expect("spawn sh");
+        read_until(&mut rx, "READY").await.expect("sh ran");
+        assert_eq!(settled(&pty, Activity::Reading), Activity::Reading);
+        let (pty, mut rx) = sh("echo RE''ADY; while :; do :; done").expect("spawn sh");
+        read_until(&mut rx, "READY").await.expect("sh ran");
+        assert_eq!(settled(&pty, Activity::Busy), Activity::Busy);
+    });
+}
+
 /// Dropping the `Pty` ends its program, and so the output channel: `cat` on the EOF the writer
 /// thread writes once its sender is dropped (if it were stuck, or kept its handle, the channel would
 /// never close), and a program that ignores SIGHUP (`sleep` inherits it) on the SIGKILL `Drop`

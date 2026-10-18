@@ -45,8 +45,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
   attached), after each command's start and end and after a resize, an unchanged state at most
   every 10 ms; the client writes each report after the marks of the frame that brought it, and
   again after any mark. fux driving `koh connect` then sees a remote `less`, REPL or prompt wait
-  for input. Frames carry the report beside the shell's commands. The probe is fuxix 0.6's; until
-  it is released the state is always `unknown`.
+  for input. Frames carry the report beside the shell's commands. The probe is fuxix 0.6's
+  (`terminal_activity`, fux's own); on macOS it says only `busy`, `idle` or `unknown`.
 
 ### Changed
 - **`koh connect` with no terminal says what to use instead**: that it needs one, and that `koh
@@ -114,7 +114,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - More keys in one read than anyone types (a paste into a terminal without bracketed paste, a
   program writing to the client's terminal) are sent but not predicted one by one, which cost a
   screenful of work each.
-- Updated `fux-vt` 0.3.4 → 0.9.1 and `fuxix` 0.1.7 → 0.5.0, including the test harnesses. The
+- Updated `fux-vt` 0.3.4 → 0.10.0 and `fuxix` 0.1.7 → 0.6.0, including the test harnesses. The
   minimum Rust version is unchanged.
   - **`--scrollback` is now `--scrollback-bytes`**, the history each session keeps in bytes, 8 MiB
     by default (about 20,000 lines of 50 characters), at most 1 GiB, as fux-vt bounds it.

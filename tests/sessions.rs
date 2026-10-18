@@ -15,7 +15,7 @@ use koh::request::{Pick, Request, MAX_REQUEST};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
 use koh::server::session::AttachKind;
 use koh::server::{Registry, SessionSpec};
-use koh::terminal::{clamp_dims, RowEncodings, Size, TerminalScreen};
+use koh::terminal::{clamp_dims, Activity, RowEncodings, Size, TerminalScreen};
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
 use tokio_util::sync::CancellationToken;
 
@@ -402,10 +402,17 @@ fn a_report_comes_with_a_commands_end_and_after_every_input() -> anyhow::Result<
         for key in [&b"a"[..], b"b"] {
             let before = report(&client);
             client.type_bytes(key).await?;
-            let after = client.until(|s| s.report().map(|r| r.n) > before).await?;
-            anyhow::ensure!(
-                after.report().map(|r| r.activity) == first.report().map(|r| r.activity)
-            );
+            // A report after the key; and, where the system tells it, one saying `cat` waits for
+            // the next (it may be caught at work on this one first).
+            client.until(|s| s.report().map(|r| r.n) > before).await?;
+            if cfg!(any(target_os = "linux", target_os = "android")) {
+                client
+                    .until(|s| {
+                        s.report()
+                            .is_some_and(|r| Some(r.n) > before && r.activity == Activity::Reading)
+                    })
+                    .await?;
+            }
         }
         client.conn.close(0u32.into(), b"done");
         shutdown.cancel();

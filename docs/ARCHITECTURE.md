@@ -344,7 +344,8 @@ mark leaves it without one; and every report carries the terminal's nonce as the
 cannot: a state from between two frames, as the client paints only the newest (a program that was
 `busy` for a moment and is `reading` again may be told only `reading`); a report as soon as the
 state changes, for it is probed every 20 ms and goes with the next frame the link has room for.
-Until fuxix 0.6 is out, the probe says `unknown`.
+The probe is fuxix's `terminal_activity`, the one fux runs on its own panes; on macOS it says only
+`busy`, `idle` or `unknown`.
 
 **koh marks the shells it starts** (`server/marks.rs`), as fux marks its own, so that this works on
 a server nobody set up: a session's bash, zsh or fish, started plainly (`$SHELL`, or a lone

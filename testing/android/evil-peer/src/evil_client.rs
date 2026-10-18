@@ -267,9 +267,25 @@ async fn bad_keys(send: &mut SendStream, kind: &str) -> Result<()> {
         seq: InputSeq(1),
         events,
     };
+    if kind == "fkey" {
+        // F35, the last function key a terminal sends, encoded, then made F99, which no wire type
+        // can hold.
+        let f35 = WireKeyCode::F(35.try_into().map_err(|_| anyhow!("F35"))?);
+        let mut body = postcard::to_allocvec(&keys(vec![key(f35, 0, None)]))?;
+        let at = body
+            .iter()
+            .rposition(|&b| b == 35)
+            .ok_or_else(|| anyhow!("no F35"))?;
+        if let Some(byte) = body.get_mut(at) {
+            *byte = 99;
+        }
+        let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+        send.write_all(&len.to_be_bytes()).await?;
+        send.write_all(&body).await?;
+        return Ok(());
+    }
     let msg = match kind {
         "mods" => keys(vec![key(WireKeyCode::Char('x'), 0x80, None)]),
-        "fkey" => keys(vec![key(WireKeyCode::F(99), 0, None)]),
         "surrogate" => keys(vec![key(
             WireKeyCode::Char('x'),
             0,

@@ -147,7 +147,7 @@ impl Close {
             Self::ProtocolError => "protocol error",
             Self::SessionEnded => "session ended",
             Self::AtCapacity => "server at session capacity",
-            Self::CouldNotStart => "server could not start a session",
+            Self::CouldNotStart => "the server could not start the program",
             Self::NoSuchSession => "no such session (it ended, or the server restarted)",
         }
     }

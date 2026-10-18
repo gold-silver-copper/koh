@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Derives a release tag from a label."""
+import hashlib, json, os, sys
+home = os.path.expanduser("~")
+os.makedirs(os.path.join(home, ".tagger"), exist_ok=True)
+with open(os.path.join(home, ".tagger", "calls.jsonl"), "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+if len(sys.argv) != 2:
+    sys.exit(f"tagger: expected exactly one argument, got {len(sys.argv) - 1}")
+print("tag: " + hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])

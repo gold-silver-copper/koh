@@ -1,21 +1,23 @@
 //! Names for endpoint ids, kept beside the keys.
 //!
 //! `servers`, the servers this machine connects to, sits beside the client key; `clients`, the
-//! clients allowed to connect to it, beside the server key. Each line is `name id`; `#` lines and
-//! blank lines are kept as they are. Both files go through [`KeyFile`]'s rules, as the key does:
+//! clients allowed to connect to it, beside the server key. Each line is `name id`, and a server's
+//! may end with how to dial it, `direct=IP:PORT` or `relay=URL`, a client's with its scope
+//! (`cp=DIR`, `exec=DIR`, [`Scope`]); `#` lines and blank lines are kept as they are. Both files go through [`KeyFile`]'s rules, as the key does:
 //! `clients` decides who may open a shell here.
 //!
 //! When each server was last reached is kept apart, in `connected` beside the client key (`id
 //! seconds` lines), so a connect never rewrites the list the user edits.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
-use iroh::EndpointId;
+use iroh::{EndpointId, RelayUrl};
 
 use crate::identity::KeyFile;
-use crate::transport_iroh::parse_endpoint_id;
+use crate::transport_iroh::{parse_endpoint_id, parse_relay_url};
 
 /// Most bytes in a name.
 pub const MAX_NAME: usize = 32;
@@ -103,20 +105,132 @@ pub struct Names {
     lines: Vec<Line>,
 }
 
+/// How a saved server is dialed, when not through iroh's discovery and n0's relays: what
+/// `--direct` or `--relay-url` would say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    Direct(SocketAddr),
+    Relay(RelayUrl),
+}
+
+impl Route {
+    /// A route as its file holds it: `direct=IP:PORT` or `relay=URL`.
+    fn parse(word: &str) -> anyhow::Result<Self> {
+        match word.split_once('=') {
+            Some(("direct", addr)) => addr
+                .parse()
+                .map(Self::Direct)
+                .with_context(|| format!("bad direct address {addr:?}")),
+            Some(("relay", url)) => Ok(Self::Relay(parse_relay_url(url)?)),
+            _ => anyhow::bail!("expected `direct=IP:PORT` or `relay=URL`, found {word:?}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct(addr) => write!(f, "direct={addr}"),
+            Self::Relay(url) => write!(f, "relay={url}"),
+        }
+    }
+}
+
+/// What a client may do on the server: everything, or only what its words name.
+///
+/// - `cp=DIR`: copies to and from DIR and what is in it, and nowhere else: a path is taken from
+///   DIR, and none reaches out of it, by `..`, `~` or a symlink.
+/// - `exec=DIR`: commands and jobs (`koh exec`, `run`, `jobs`, `logs`, `kill`, `wait` on a job or
+///   for a file in DIR), started in DIR or a directory in it. A command is no sandbox: it can do
+///   whatever the server user can.
+///
+/// A scoped client gets no shell session, no session list and no session's text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub cp: Option<PathBuf>,
+    pub exec: Option<PathBuf>,
+}
+
+impl Scope {
+    /// Whether the client may do everything.
+    pub const fn is_full(&self) -> bool {
+        self.cp.is_none() && self.exec.is_none()
+    }
+
+    /// A directory a scope names: absolute, holding no whitespace or `..`.
+    pub fn dir(text: &str) -> anyhow::Result<PathBuf> {
+        let path = PathBuf::from(text);
+        anyhow::ensure!(
+            path.is_absolute()
+                && !text.contains(char::is_whitespace)
+                && !path
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir),
+            "a scope's directory is an absolute path with no spaces or `..`, not {text:?}"
+        );
+        Ok(path)
+    }
+
+    /// Add the word `word` (`cp=DIR` or `exec=DIR`), refused if it is another or said twice.
+    fn take(&mut self, word: &str) -> anyhow::Result<()> {
+        let (slot, dir) = match word.split_once('=') {
+            Some(("cp", dir)) => (&mut self.cp, dir),
+            Some(("exec", dir)) => (&mut self.exec, dir),
+            _ => anyhow::bail!("expected `cp=DIR` or `exec=DIR`, found {word:?}"),
+        };
+        anyhow::ensure!(slot.is_none(), "{word:?} is said twice");
+        *slot = Some(Self::dir(dir)?);
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for Scope {
+    /// The scope as the file holds it, each word after a space.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(dir) = &self.cp {
+            write!(f, " cp={}", dir.display())?;
+        }
+        if let Some(dir) = &self.exec {
+            write!(f, " exec={}", dir.display())?;
+        }
+        Ok(())
+    }
+}
+
+/// A saved name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub id: EndpointId,
+    /// How to dial it, for a server saved with one.
+    pub route: Option<Route>,
+    /// What it may do, for a client.
+    pub scope: Scope,
+}
+
+impl std::fmt::Display for Entry {
+    /// The entry as its file holds it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.name, self.id)?;
+        if let Some(route) = &self.route {
+            write!(f, " {route}")?;
+        }
+        write!(f, "{}", self.scope)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Line {
-    Entry {
-        name: String,
-        id: EndpointId,
-    },
+    Entry(Entry),
     /// A comment or a blank line, kept as written.
     Other(String),
 }
 
 impl Names {
-    /// Parse `text`, the contents of `file` (for errors). A line that is neither a comment, blank,
-    /// nor `name id` with a good name and id is an error naming the file and the line.
-    pub fn parse(text: &str, file: &str) -> anyhow::Result<Self> {
+    /// Parse `text`, the contents of `file` (for errors), a `list`. A line that is neither a
+    /// comment, blank, nor `name id` with a good name and id (and for a server, perhaps a route)
+    /// is an error naming the file and the line.
+    pub fn parse(text: &str, file: &str, list: List) -> anyhow::Result<Self> {
         let mut names = Self::default();
         for (number, line) in (1_usize..).zip(text.lines()) {
             let trimmed = line.trim();
@@ -126,18 +240,36 @@ impl Names {
             }
             let at = || format!("{file}, line {number}");
             let mut words = trimmed.split_whitespace();
-            let (Some(name), Some(id), None) = (words.next(), words.next(), words.next()) else {
-                anyhow::bail!("{}: expected `name id`, found {trimmed:?}", at());
+            let expected = match list {
+                List::Servers => "`name id`, or `name id direct=IP:PORT` or `name id relay=URL`",
+                List::Clients => "`name id`, then perhaps `cp=DIR` and `exec=DIR`",
+            };
+            let (Some(name), Some(id)) = (words.next(), words.next()) else {
+                anyhow::bail!("{}: expected {expected}, found {trimmed:?}", at());
             };
             check_name(name).with_context(at)?;
             let id = parse_endpoint_id(id).with_context(at)?;
+            let (mut route, mut scope) = (None, Scope::default());
+            for word in words {
+                match list {
+                    List::Servers if route.is_none() => {
+                        route = Some(Route::parse(word).with_context(at)?);
+                    }
+                    List::Servers => {
+                        anyhow::bail!("{}: expected {expected}, found {trimmed:?}", at())
+                    }
+                    List::Clients => scope.take(word).with_context(at)?,
+                }
+            }
             if names.get(name).is_some() {
                 anyhow::bail!("{}: {name:?} is named twice", at());
             }
-            names.lines.push(Line::Entry {
+            names.lines.push(Line::Entry(Entry {
                 name: name.to_owned(),
                 id,
-            });
+                route,
+                scope,
+            }));
         }
         Ok(names)
     }
@@ -148,17 +280,17 @@ impl Names {
         let mut text = String::new();
         for line in &self.lines {
             let _ = match line {
-                Line::Entry { name, id } => writeln!(text, "{name} {id}"),
+                Line::Entry(entry) => writeln!(text, "{entry}"),
                 Line::Other(other) => writeln!(text, "{other}"),
             };
         }
         text
     }
 
-    /// Every name and its id, in the file's order.
-    pub fn entries(&self) -> impl Iterator<Item = (&str, EndpointId)> {
+    /// Every entry, in the file's order.
+    pub fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.lines.iter().filter_map(|line| match line {
-            Line::Entry { name, id } => Some((name.as_str(), *id)),
+            Line::Entry(entry) => Some(entry),
             Line::Other(_) => None,
         })
     }
@@ -167,18 +299,27 @@ impl Names {
         self.entries().next().is_none()
     }
 
-    /// The id saved under `name`.
-    pub fn get(&self, name: &str) -> Option<EndpointId> {
-        self.entries().find(|(n, _)| *n == name).map(|(_, id)| id)
+    /// The entry saved under `name`.
+    pub fn get(&self, name: &str) -> Option<&Entry> {
+        self.entries().find(|entry| entry.name == name)
     }
 
     /// The name `id` is saved under.
     pub fn name_of(&self, id: EndpointId) -> Option<&str> {
-        self.entries().find(|(_, i)| *i == id).map(|(n, _)| n)
+        self.entries()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.name.as_str())
     }
 
-    /// Save `id` as `name`: refused if the name is taken or the id is saved under another name.
-    pub fn add(&mut self, name: &str, id: EndpointId) -> anyhow::Result<()> {
+    /// Save `id` as `name`, dialed by `route` if given, scoped to `scope`: refused if the name is
+    /// taken or the id is saved under another name.
+    pub fn add(
+        &mut self,
+        name: &str,
+        id: EndpointId,
+        route: Option<Route>,
+        scope: Scope,
+    ) -> anyhow::Result<()> {
         check_name(name)?;
         if self.get(name).is_some() {
             anyhow::bail!("{name:?} is already saved; remove or rename it first");
@@ -186,18 +327,20 @@ impl Names {
         if let Some(other) = self.name_of(id) {
             anyhow::bail!("{id} is already saved as {other:?}");
         }
-        self.lines.push(Line::Entry {
+        self.lines.push(Line::Entry(Entry {
             name: name.to_owned(),
             id,
-        });
+            route,
+            scope,
+        }));
         Ok(())
     }
 
     /// Forget `name`, and return its id.
     pub fn remove(&mut self, name: &str) -> anyhow::Result<EndpointId> {
-        let id = self.get(name).with_context(|| self.unknown(name))?;
+        let id = self.get(name).with_context(|| self.unknown(name))?.id;
         self.lines
-            .retain(|line| !matches!(line, Line::Entry { name: n, .. } if n == name));
+            .retain(|line| !matches!(line, Line::Entry(entry) if entry.name == name));
         Ok(id)
     }
 
@@ -212,8 +355,8 @@ impl Names {
             .lines
             .iter_mut()
             .find_map(|line| match line {
-                Line::Entry { name, .. } if name == old => Some(name),
-                Line::Entry { .. } | Line::Other(_) => None,
+                Line::Entry(entry) if entry.name == old => Some(&mut entry.name),
+                Line::Entry(_) | Line::Other(_) => None,
             })
             .context(unknown)?;
         new.clone_into(entry);
@@ -222,7 +365,7 @@ impl Names {
 
     /// The error for a name that is not saved, listing those that are.
     fn unknown(&self, name: &str) -> String {
-        let saved: Vec<&str> = self.entries().map(|(n, _)| n).collect();
+        let saved: Vec<&str> = self.entries().map(|entry| entry.name.as_str()).collect();
         if saved.is_empty() {
             format!("{name:?} is not saved, and nothing is")
         } else {
@@ -272,7 +415,7 @@ pub fn load(places: &Places, list: List) -> anyhow::Result<Names> {
 /// The list `list` beside `key`, empty if its file does not exist; `shown` names it in errors.
 pub fn read(key: &KeyFile, list: List, shown: &str) -> anyhow::Result<Names> {
     let text = key.read_beside(list.file())?;
-    Names::parse(text.as_deref().unwrap_or(""), shown)
+    Names::parse(text.as_deref().unwrap_or(""), shown, list)
 }
 
 /// Change the list `list` with `change`, which sees it as it is on disk now; another koh's change
@@ -287,7 +430,7 @@ pub fn update<T>(
     let file = shown(places, list);
     let mut out = None;
     key.update_beside(list.file(), |text| {
-        let mut names = Names::parse(text.as_deref().unwrap_or(""), &file)?;
+        let mut names = Names::parse(text.as_deref().unwrap_or(""), &file, list)?;
         out = Some(change(&mut names)?);
         Ok(Some(names.render()))
     })?;
@@ -297,11 +440,15 @@ pub fn update<T>(
 /// What `koh servers` or `koh clients` does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    /// Print the list, one `name id` a line.
+    /// Print the list, one entry a line, as the file holds it.
     List,
     Add {
         name: String,
         id: EndpointId,
+        /// How to dial it: only a server has one.
+        route: Option<Route>,
+        /// What it may do: only a client has one.
+        scope: Scope,
     },
     Remove {
         name: String,
@@ -331,15 +478,30 @@ pub fn run(
                     list.file()
                 )?;
             }
-            for (name, id) in names.entries() {
-                writeln!(out, "{name} {id}")?;
+            for entry in names.entries() {
+                writeln!(out, "{entry}")?;
             }
         }
-        Op::Add { name, id } => {
-            update(places, list, |names| names.add(&name, id))?;
+        Op::Add {
+            name,
+            id,
+            route,
+            scope,
+        } => {
+            let dialed = route
+                .as_ref()
+                .map_or_else(String::new, |route| format!(", {route}"));
+            let scoped = scope.to_string();
+            let scoped = if scoped.is_empty() {
+                String::new()
+            } else {
+                format!(", scoped to{scoped}")
+            };
+            let dialed = format!("{dialed}{scoped}");
+            update(places, list, |names| names.add(&name, id, route, scope))?;
             writeln!(
                 out,
-                "saved {} {name} ({}) in {file}",
+                "saved {} {name} ({}{dialed}) in {file}",
                 list.noun(),
                 short(id)
             )?;

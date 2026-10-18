@@ -1,0 +1,11 @@
+id = "TA-052"
+title = "Patch inside a maintenance window"
+cat = "sessions"
+difficulty = "hard"
+goal = '''
+On the remote machine, run `~/bin/maintenance`. It opens a maintenance window, prints a code, and
+waits in its terminal. While the window is open, apply the patch from a second shell by running
+`~/bin/apply-patch CODE` with that code (it takes a while). When the patch is applied, go back to
+the first terminal and press Enter there to close the window. It is done when the window has
+been closed after a successful patch.
+'''

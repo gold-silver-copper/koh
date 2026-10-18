@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+import os, random, time
+home = os.path.expanduser("~")
+os.makedirs(f"{home}/dist", exist_ok=True)
+path = f"{home}/dist/game-1.4.2.pak"
+print("packing 1.4.2 ...", flush=True)
+with open(path + ".tmp", "wb") as f:
+    f.write(b"PAK1\x00\x01\x04\x02")
+    for i in range(48):
+        f.write(random.Random(8700 + i).randbytes(1 << 20))
+        if i % 8 == 7:
+            print(f"  {i + 1} MiB", flush=True)
+os.replace(path + ".tmp", path)
+print(f"package written: {path} ({os.path.getsize(path)} bytes)")

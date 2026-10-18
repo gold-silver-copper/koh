@@ -1,6 +1,8 @@
-//! PTYs: start the session's program on one through the launcher ([`LAUNCH`]), pump its output
-//! and input on two threads of their own (so a slow program never blocks a tokio worker), resize
-//! it, reap it.
+//! PTYs: start the session's program on one, pump its output and input, resize it, reap it.
+//!
+//! The program leads a session of its own with the PTY as its controlling terminal (fuxix sets
+//! that up between `fork` and `exec`). Its output and input go on two threads of their own, so a
+//! slow program never blocks a tokio worker.
 
 use std::ffi::OsString;
 use std::io;
@@ -90,17 +92,22 @@ impl Exit {
 
 /// The argv for `command`, taken verbatim (no splitting, so a path with a space works); empty means
 /// the shell `fallback` names.
-fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> Vec<OsString> {
+fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> Vec<String> {
     if command.is_empty() {
-        vec![fallback().into()]
+        vec![fallback()]
     } else {
-        command.iter().map(OsString::from).collect()
+        command.to_vec()
     }
+}
+
+/// The argv a session runs for `command`: it, or `$SHELL` (else the platform's shell) if empty.
+pub fn session_argv(command: &[String]) -> Vec<String> {
+    build_command(command, || resolve_shell(std::env::var_os("SHELL")))
 }
 
 /// Remove each `KOH_*` variable of the `inherited` from `cmd`: they configure koh, not the hosted
 /// program, and matching the prefix cannot miss one added later.
-fn scrub_koh_env(cmd: &mut Command, inherited: impl Iterator<Item = OsString>) {
+pub(crate) fn scrub_koh_env(cmd: &mut Command, inherited: impl Iterator<Item = OsString>) {
     for key in inherited.filter(|key| is_koh_env_key(key)) {
         cmd.env_remove(key);
     }
@@ -111,16 +118,19 @@ pub(crate) fn is_koh_env_key(key: &std::ffi::OsStr) -> bool {
     key.to_string_lossy().starts_with("KOH_")
 }
 
+/// The platform's shell: `/bin/sh`, which does **not** exist on Android, where it is
+/// `/system/bin/sh`.
+const PLATFORM_SHELL: &str = if cfg!(target_os = "android") {
+    "/system/bin/sh"
+} else {
+    "/bin/sh"
+};
+
 /// The session shell when the caller didn't pass `--shell`: `shell_env` (`$SHELL`) if set, else
-/// `/bin/sh`, which does **not** exist on Android, where it is `/system/bin/sh`.
+/// [`PLATFORM_SHELL`].
 fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
-    let platform = if cfg!(target_os = "android") {
-        "/system/bin/sh"
-    } else {
-        "/bin/sh"
-    };
     shell_env.filter(|sh| !sh.is_empty()).map_or_else(
-        || platform.to_owned(),
+        || PLATFORM_SHELL.to_owned(),
         |sh| sh.to_string_lossy().into_owned(),
     )
 }
@@ -131,7 +141,7 @@ pub enum PtyError {
     /// Allocating the pseudo-terminal pair failed.
     #[error("opening pty: {0}")]
     OpenPty(#[source] io::Error),
-    /// Starting the program on the slave side failed: the launcher, or the program itself.
+    /// Starting the program on the slave side failed.
     #[error("spawning shell: {0}")]
     Spawn(#[source] io::Error),
     /// Cloning the master or starting a pump thread failed.
@@ -142,86 +152,65 @@ pub enum PtyError {
     Resize(#[source] io::Error),
 }
 
-/// The hidden subcommand that starts a session's program.
-///
-/// `<binary> __launch PROGRAM [ARGS...]`. Only koh runs it, so it is in no usage text. Its interface
-/// is fixed: a running `koh serve` may launch through a newer binary installed over it.
-pub const LAUNCH: &str = fuxix::pty::LAUNCH;
-
-/// The binary [`Pty::spawn`] runs as the launcher.
-///
-/// The default is the running binary, which must hand a [`LAUNCH`] invocation to [`launched`], as
-/// the `koh` binary does. Tests run a test harness, so they name the `koh` binary, and with it a
-/// home of their own ([`isolated`](Self::isolated)): a shell a test hosts never reads or writes the
-/// user's files.
+/// The home a session's program gets: the user's, or for tests one of their own
+/// ([`isolated`](Self::isolated)), so a shell a test hosts never reads or writes the user's files.
 #[derive(Clone, Debug, Default)]
-pub struct Launcher(Option<Isolated>);
+pub struct Home(Option<PathBuf>);
 
-/// A launcher binary other than the running one, and the home the programs it launches get.
-#[derive(Clone, Debug)]
-struct Isolated {
-    binary: PathBuf,
-    home: PathBuf,
-}
-
-impl Launcher {
-    /// The running binary.
-    pub const fn this_binary() -> Self {
+impl Home {
+    /// The user's: the program inherits the server's environment.
+    pub const fn user() -> Self {
         Self(None)
     }
 
-    /// The binary at `binary`, launching programs with `home` as their home, no history file, no
-    /// `ENV` script and a plain prompt.
-    pub fn isolated(binary: impl Into<PathBuf>, home: impl Into<PathBuf>) -> Self {
-        Self(Some(Isolated {
-            binary: binary.into(),
-            home: home.into(),
-        }))
+    /// `home`, with no history file, no `ENV` script, a plain prompt and the platform's shell.
+    pub fn isolated(home: impl Into<PathBuf>) -> Self {
+        Self(Some(home.into()))
     }
 
-    /// The file to run. On Linux and Android the running binary is its image, even once its file
-    /// is replaced (an upgrade) or removed.
-    fn program(&self) -> io::Result<PathBuf> {
-        match &self.0 {
-            Some(isolated) => Ok(isolated.binary.clone()),
-            None if cfg!(any(target_os = "linux", target_os = "android")) => {
-                Ok(PathBuf::from("/proc/self/exe"))
-            }
-            None => std::env::current_exe(),
+    /// The directory: an isolated one, else `$HOME`, if set.
+    pub(crate) fn dir(&self) -> Option<PathBuf> {
+        self.0.clone().or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from)
+        })
+    }
+
+    /// The shell a command `koh exec` asks for runs in: `$SHELL`, else the platform's; an isolated
+    /// home's is the platform's, whatever the user's is.
+    pub(crate) fn shell(&self) -> String {
+        match self.0 {
+            Some(_) => PLATFORM_SHELL.to_owned(),
+            None => resolve_shell(std::env::var_os("SHELL")),
         }
     }
 
-    /// Give `cmd` the isolated home, if this launcher has one.
-    fn isolate(&self, cmd: &mut Command) {
-        if let Some(Isolated { home, .. }) = &self.0 {
+    /// Where a server run keeps the startup files that mark its shells' commands: an isolated
+    /// home's own directory; else `$XDG_RUNTIME_DIR`, else the system's temporary directory.
+    pub(crate) fn runtime_dir(&self) -> PathBuf {
+        if let Some(home) = &self.0 {
+            return home.clone();
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a server's runtime files, in a private directory of its own, if there is no XDG_RUNTIME_DIR"
+        )]
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
+    /// Give `cmd` this home, unless it is the user's.
+    pub(crate) fn apply(&self, cmd: &mut Command) {
+        if let Some(home) = &self.0 {
             cmd.env("HOME", home)
                 .env("HISTFILE", "/dev/null")
                 .env("ENV", "")
                 .env("PS1", "$ ");
         }
     }
-}
-
-/// The launcher's arguments, `PROGRAM [ARGS...]`, if this process was started as the launcher.
-///
-/// That is `<binary> __launch PROGRAM [ARGS...]`. A binary that launches sessions checks this first,
-/// before it parses its command line or starts anything, and then calls [`launched`].
-pub fn launch_argv() -> Option<Vec<OsString>> {
-    let mut args = std::env::args_os().skip(1);
-    if args.next()? == LAUNCH {
-        Some(args.collect())
-    } else {
-        None
-    }
-}
-
-/// The launcher: makes `PROGRAM [ARGS...]` a session leader on the PTY and becomes it.
-///
-/// [`Pty::spawn`] runs it as `<binary> __launch PROGRAM [ARGS...]`, with its stdin and stderr on a
-/// PTY slave and its stdout on the pipe that reports a failure. It returns only if the program
-/// could not start, with the exit status to use.
-pub fn launched(argv: &[OsString]) -> u8 {
-    fuxix::pty::launched(argv)
 }
 
 /// How long the writer waits for the terminal to take more input before it looks at `stopping`
@@ -272,20 +261,53 @@ fn write_while_running(fd: &OwnedFd, bytes: &[u8], stopping: &AtomicBool) -> boo
     true
 }
 
-/// The program, until it is reaped: owning it is the right to signal its pid, which is no longer
-/// its own once reaped.
-struct Running {
+/// A program koh started, until it is reaped: owning it is the right to signal its pid, which is
+/// no longer its own once reaped.
+pub(crate) struct Running {
     child: std::process::Child,
     pid: Pid,
+    whom: Whom,
+}
+
+/// Who a hang-up reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Whom {
+    /// The program alone: a PTY's session leader, whose terminal closing hangs up the rest.
+    Leader,
+    /// Its whole process group: a program with no terminal (`koh exec`'s), which leads a session
+    /// of its own, so its group is its pid.
+    Group,
 }
 
 impl Running {
+    /// `child`, which leads a session of its own (`fuxix::process::lead_session`) and has no
+    /// terminal: a hang-up reaches its whole group. `None` if it has no pid to signal.
+    pub(crate) fn group(child: std::process::Child) -> Option<Self> {
+        let pid = Pid::of(&child)?;
+        Some(Self {
+            child,
+            pid,
+            whom: Whom::Group,
+        })
+    }
+
     fn signal(&self, signal: Signal) -> io::Result<()> {
-        fuxix::process::kill(self.pid, signal).map_err(io::Error::from)
+        match self.whom {
+            Whom::Leader => fuxix::process::kill(self.pid, signal),
+            Whom::Group => fuxix::process::kill_group(self.pid, signal),
+        }
+        .map_err(io::Error::from)
+    }
+
+    /// Send `signal` to what it reaches: its group, for a command with no terminal.
+    pub(crate) fn kill(&self, signal: Signal) {
+        if let Err(error) = self.signal(signal) {
+            tracing::debug!(%error, "signalling a command failed");
+        }
     }
 
     /// How it ended, if it has; reaped then.
-    fn try_wait(&mut self) -> io::Result<Option<Exit>> {
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<Exit>> {
         let Some(status) = self.child.try_wait()? else {
             return Ok(None);
         };
@@ -297,8 +319,8 @@ impl Running {
     }
 
     /// Hang up, as a terminal closing does, and leave it to `reaper`, which kills it if it
-    /// outlives [`HANGUP_GRACE`].
-    fn hang_up(self, reaper: &Reaper) {
+    /// outlives [`HANGUP_GRACE`] (a group, whatever of it is left then).
+    pub(crate) fn hang_up(self, reaper: &Reaper) {
         let _ = self.signal(Signal::Hup);
         let kill_at = std::time::Instant::now().checked_add(HANGUP_GRACE);
         if let Err(error) = reaper.0.send(Reap::Child(Stopping {
@@ -332,6 +354,11 @@ impl Stopping {
         {
             let _ = self.running.signal(Signal::Kill);
             self.kill_at = None;
+        }
+        // A group's leader is reaped only once the group is killed: until then its pid, even a
+        // zombie's, holds the group's id, so the kill cannot reach another group.
+        if self.running.whom == Whom::Group && self.kill_at.is_some() {
+            return false;
         }
         match self.running.try_wait() {
             Ok(exit) => exit.is_some(),
@@ -427,14 +454,15 @@ pub struct Pty {
 
 impl Pty {
     /// Allocate a `rows`×`cols` PTY and start `command` (argv, verbatim; empty for `$SHELL`)
-    /// on it through `launcher`, with `TERM` set. Returns it and a receiver of its output, which
+    /// on it in `home`, with `TERM` and `env` set. Returns it and a receiver of its output, which
     /// ends when the program closes the PTY.
     pub fn spawn(
         rows: u16,
         cols: u16,
         command: &[String],
+        env: &[(String, String)],
         term: &str,
-        launcher: &Launcher,
+        home: &Home,
         reaper: &Reaper,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
         let size = pty_size(rows, cols).map_err(PtyError::OpenPty)?;
@@ -512,22 +540,16 @@ impl Pty {
                 })?
         });
 
-        let argv = build_command(command, || resolve_shell(std::env::var_os("SHELL")));
+        let argv = session_argv(command);
         let (child, pid) = slave
-            .spawn(
-                &launcher.program().map_err(PtyError::Spawn)?,
-                &argv,
-                |cmd| {
-                    cmd.env("TERM", term);
-                    scrub_koh_env(cmd, std::env::vars_os().map(|(key, _)| key));
-                    launcher.isolate(cmd);
-                },
-            )
+            .spawn(&argv, |cmd| {
+                cmd.env("TERM", term);
+                scrub_koh_env(cmd, std::env::vars_os().map(|(key, _)| key));
+                home.apply(cmd);
+                cmd.envs(env.iter().map(|(key, value)| (key, value)));
+            })
             .map_err(|error| {
-                let program = argv
-                    .first()
-                    .map(|arg| arg.to_string_lossy())
-                    .unwrap_or_default();
+                let program = argv.first().map_or("", String::as_str);
                 PtyError::Spawn(io::Error::new(
                     error.kind(),
                     format!("starting {program}: {error}"),
@@ -538,7 +560,11 @@ impl Pty {
                 master,
                 writer_tx,
                 write_budget,
-                running: Some(Running { child, pid }),
+                running: Some(Running {
+                    child,
+                    pid,
+                    whom: Whom::Leader,
+                }),
                 reaper: reaper.clone(),
                 pumps,
             },
@@ -580,11 +606,26 @@ impl Pty {
     /// How the PTY takes typed keys now, as the program set it: echo and line mode. `None` if the
     /// modes cannot be read.
     pub fn tty_modes(&self) -> Option<crate::terminal::TtyModes> {
-        let modes = fuxix::terminal::attributes(&self.master).ok()?;
+        let modes = fuxix::terminal::attributes(&self.master).ok()?.modes();
         Some(crate::terminal::TtyModes {
-            echo: modes.echoes(),
-            line: modes.line_mode(),
+            echo: modes.echo,
+            line: modes.canonical,
         })
+    }
+
+    /// What the program in the PTY's foreground is doing, as fux decides it: `since_key` since
+    /// input was last written to it (`Duration::MAX` if never), `answered` if the screen changed
+    /// after that input, and `prompt` if the shell's marks say it is back at its prompt.
+    pub fn activity(
+        &self,
+        since_key: Duration,
+        answered: bool,
+        prompt: bool,
+    ) -> crate::terminal::Activity {
+        let Some(leader) = self.running.as_ref().map(|running| running.pid) else {
+            return crate::terminal::Activity::Unknown;
+        };
+        fuxix::process::terminal_activity(&self.master, leader, since_key, answered, prompt).into()
     }
 
     /// Propagate a window-size change to `rows`×`cols`; the kernel raises `SIGWINCH` in the child.
@@ -628,24 +669,16 @@ mod tests {
     #[test]
     fn the_command_is_argv_verbatim_or_else_the_shell() {
         let argv = ["zellij", "attach", "-c", "my session"].map(String::from);
-        assert_eq!(
-            build_command(&argv, || "unused".to_owned()),
-            argv.map(OsString::from)
-        );
+        assert_eq!(build_command(&argv, || "unused".to_owned()), argv);
         assert_eq!(
             build_command(&[], || "/custom/shell".to_owned()),
             ["/custom/shell"]
         );
         // An empty `$SHELL` is as if unset: the platform's shell, which on Android is not /bin/sh.
         let fish = resolve_shell(Some(OsString::from("/usr/bin/fish")));
-        let platform = if cfg!(target_os = "android") {
-            "/system/bin/sh"
-        } else {
-            "/bin/sh"
-        };
         assert_eq!(fish, "/usr/bin/fish");
-        assert_eq!(resolve_shell(Some(OsString::new())), platform);
-        assert_eq!(resolve_shell(None), platform);
+        assert_eq!(resolve_shell(Some(OsString::new())), PLATFORM_SHELL);
+        assert_eq!(resolve_shell(None), PLATFORM_SHELL);
     }
 
     #[test]

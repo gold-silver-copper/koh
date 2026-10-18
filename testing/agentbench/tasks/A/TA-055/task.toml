@@ -1,0 +1,10 @@
+id = "TA-055"
+title = "Reload a proxy without restarting it"
+cat = "process"
+difficulty = "moderate"
+goal = '''
+On the remote machine, start the proxy with `~/bin/start-proxy`. Then change its upstream (in
+`~/proxy/proxy.conf`) to `10.0.0.9:8080` and make the running proxy pick up the change without
+restarting it: the proxy reloads its config when it gets a hangup signal. It is done when the
+same proxy process that was first started is still running and has reloaded the new upstream.
+'''

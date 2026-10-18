@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+import hashlib, json, os, sys
+KNOWN = {'O\'Brien & Sons "Ltd" $HOME\\n #1;`date`', "Acme Corp", "Initech", "O'Brien & Sons Ltd"}
+if len(sys.argv) != 2:
+    print("usage: lookup NAME   (the customer's name as one argument)", file=sys.stderr)
+    sys.exit(2)
+name = sys.argv[1]
+hit = name in KNOWN
+with open(os.path.expanduser("~/.lookup-calls"), "a") as f:
+    f.write(json.dumps({"arg": name, "matched": hit and name == 'O\'Brien & Sons "Ltd" $HOME\\n #1;`date`'}) + "\n")
+if not hit:
+    print(f"lookup: no customer named {name!r}", file=sys.stderr)
+    sys.exit(1)
+print("code: " + hashlib.sha256(("acct:" + name).encode()).hexdigest()[:12])

@@ -1,0 +1,12 @@
+id = "TB-0085"
+title = "Redact remote events through a local filter"
+cat = "stdin"
+difficulty = "moderate"
+goal = """
+On the remote machine, `~/bin/emit-events` prints the day's analytics events, one JSON object per
+line. They contain personal data that must be removed with the local program `redact.py` (in your
+local directory; it reads events on standard input and writes redacted events on standard output)
+before they are loaded. Load the redacted events with the remote `~/bin/load-events`, which reads
+them on its standard input. It must receive exactly what `redact.py` outputs for the full output
+of `emit-events`, and no unredacted event may be written to any file on the remote.
+"""

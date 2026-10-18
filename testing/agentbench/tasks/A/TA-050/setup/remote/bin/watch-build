@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+import os, time
+home = os.path.expanduser("~")
+os.makedirs(os.path.join(home, "trigger"), exist_ok=True)
+go = os.path.join(home, "trigger", "go")
+if os.path.exists(go):
+    os.unlink(go)
+open(os.path.join(home, ".watch-build.pid"), "w").write(f"{os.getpid()}\n")
+print("watch-build: waiting for a trigger (run ~/bin/trigger-build)", flush=True)
+n = 0
+while not os.path.exists(go):
+    time.sleep(0.5)
+    n += 1
+    if n % 10 == 0:
+        print(f"watch-build: still waiting ({n // 2}s)", flush=True)
+time.sleep(0.2)
+trig = open(go).read().strip()
+print(f"watch-build: trigger {trig} seen, building ... done", flush=True)
+open(os.path.join(home, ".watch-build.result"), "w").write(f"seen {trig}\n")

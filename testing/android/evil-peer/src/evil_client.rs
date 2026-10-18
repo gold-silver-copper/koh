@@ -99,11 +99,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Everything else gets admitted first, then opens the one client stream and writes crafted
+    // Everything else gets admitted first, then opens its input stream and writes crafted
     // messages on it.
     let ep = bind_endpoint_local(evil_secret!(), false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
-    // The first frame admits us.
+    // A shell, asked for on the first stream, kept open as the control stream; the server's first
+    // stream admits us.
+    let mut control = conn.open_uni().await?;
+    let shell = koh::request::Request::Shell {
+        pick: koh::request::Pick::Latest,
+        size: koh::terminal::Size::new(24, 80),
+    };
+    control
+        .write_all(&koh::request::encode(&shell, koh::request::MAX_REQUEST)?)
+        .await?;
     conn.accept_uni().await?;
     eprintln!("evil-client: admitted; running attack '{attack}'");
 
@@ -261,9 +270,25 @@ async fn bad_keys(send: &mut SendStream, kind: &str) -> Result<()> {
         seq: InputSeq(1),
         events,
     };
+    if kind == "fkey" {
+        // F35, the last function key a terminal sends, encoded, then made F99, which no wire type
+        // can hold.
+        let f35 = WireKeyCode::F(35.try_into().map_err(|_| anyhow!("F35"))?);
+        let mut body = postcard::to_allocvec(&keys(vec![key(f35, 0, None)]))?;
+        let at = body
+            .iter()
+            .rposition(|&b| b == 35)
+            .ok_or_else(|| anyhow!("no F35"))?;
+        if let Some(byte) = body.get_mut(at) {
+            *byte = 99;
+        }
+        let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+        send.write_all(&len.to_be_bytes()).await?;
+        send.write_all(&body).await?;
+        return Ok(());
+    }
     let msg = match kind {
         "mods" => keys(vec![key(WireKeyCode::Char('x'), 0x80, None)]),
-        "fkey" => keys(vec![key(WireKeyCode::F(99), 0, None)]),
         "surrogate" => keys(vec![key(
             WireKeyCode::Char('x'),
             0,
@@ -323,7 +348,8 @@ async fn garbage(send: &mut SendStream, n: usize) -> Result<()> {
     Ok(())
 }
 
-/// Open a second client stream: the server permits one, so this must not be grantable.
+/// Open a third client stream beside the control and input streams: the server permits two, so
+/// this must not be grantable.
 async fn second_stream(conn: &Connection) -> Result<()> {
     let mut first = conn.open_uni().await?;
     write_msg(
@@ -334,7 +360,6 @@ async fn second_stream(conn: &Connection) -> Result<()> {
         },
     )
     .await?;
-    let _control = conn.open_uni().await?;
     eprintln!("evil-client: trying a third client stream (the two-stream limit must block it)");
     match tokio::time::timeout(Duration::from_secs(3), conn.open_uni()).await {
         Err(_) => eprintln!("evil-client: third stream blocked by the limit, as expected"),

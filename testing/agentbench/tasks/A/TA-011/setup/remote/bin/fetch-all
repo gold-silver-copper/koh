@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+import random, sys
+def plan():
+    rng = random.Random(11)
+    words = ["lib", "core", "http", "json", "yaml", "zip", "tls", "log", "cli", "orm", "img", "fmt"]
+    names = sorted({f"{rng.choice(words)}-{rng.choice(words)}-{rng.randint(1, 999)}" for _ in range(1600)})[:1500]
+    out = []
+    for n in names:
+        r = rng.random()
+        out.append((n, "fail" if r < 0.004 else "retry" if r < 0.03 else "ok"))
+    return out
+if __name__ == "__main__":
+    w = sys.stdout.write
+    rng = random.Random(12)
+    RED, GREEN, YEL, OFF, CLR = "\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[0m", "\x1b[2K"
+    p = plan()
+    for i, (n, outcome) in enumerate(p):
+        for pct in (10, 40, 70):
+            bar = "#" * (pct // 10)
+            w(f"\r{CLR}{n} [{bar:<10}] {pct}%")
+        if outcome == "retry":
+            w(f"\r{CLR}{n} {YEL}FAILED (timeout), retrying{OFF}")
+            w(f"\r{CLR}{n} [##########] 100%")
+            w(f"\r{CLR}{n} {GREEN}ok{OFF}\n")
+        elif outcome == "fail":
+            w(f"\r{CLR}{n} {RED}FAILED ({rng.choice(['checksum mismatch', 'HTTP 503', 'connection reset'])}){OFF}\n")
+        else:
+            w(f"\r{CLR}{n} {GREEN}ok{OFF}\n")
+    bad = sum(1 for _, o in p if o == "fail")
+    w(f"{len(p) - bad} ok, {bad} failed\n")

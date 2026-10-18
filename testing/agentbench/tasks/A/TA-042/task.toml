@@ -1,0 +1,10 @@
+id = "TA-042"
+title = "Unlock a vault with a passphrase"
+cat = "prompt"
+difficulty = "moderate"
+goal = '''
+On the remote machine, `~/bin/unlock-vault` asks for a passphrase and, when it is right, prints
+an access token. The passphrase is in `passphrase.txt` in your local directory. Unlock the vault
+and write the token it prints (only the token) to `token.txt` in your local directory. Three
+wrong passphrases lock the vault for a long time.
+'''

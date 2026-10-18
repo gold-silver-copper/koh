@@ -6,18 +6,19 @@
 //! The client decodes what the user's terminal sends with fux-vt's decoder, whatever protocol the
 //! terminal speaks (legacy bytes, xterm's modifiers, the kitty keyboard protocol, SGR mouse
 //! reports), and the server encodes each event as the program on its screen asked for
-//! (`fux_vt::Screen::encode_*`). So a program gets what it asked for from any terminal, and a
+//! (`fux_vt::keys::encode`). So a program gets what it asked for from any terminal, and a
 //! reattach from another terminal changes nothing for it.
 //!
 //! The types here are the wire's own, so its encoding is pinned here and not by fux-vt's types.
 //! Decoding refuses what no terminal sends: a modifier mask with unknown bits, a function key past
-//! F12, a kitty code that is no Unicode scalar, a paste over [`MAX_PASTE`] bytes, more
+//! F35, a mouse press with no button, a kitty code that is no Unicode scalar, a paste over
+//! [`MAX_PASTE`] bytes, more
 //! than [`MAX_EVENTS`] events in a message, more than [`PALETTE`] palette entries ([`check_events`],
 //! [`WireColours::check`]).
 
 use fux_vt::keys::colour::{Colours, Scheme};
 use fux_vt::keys::mouse::{MouseAction, MouseButton, MouseEvent};
-use fux_vt::keys::{Direction, Key, KeyPress, Keystroke, Kitty, Modifiers};
+use fux_vt::keys::{Direction, Function, Key, KeyPress, Keystroke, Kitty, Modifiers};
 use fux_vt::Rgb;
 use serde::{Deserialize, Serialize};
 
@@ -72,8 +73,28 @@ pub enum WireKeyCode {
     End,
     PageUp,
     PageDown,
-    /// F1 to F12.
-    F(u8),
+    F(WireFunction),
+}
+
+/// A function key, F1 to F35 (F13 on are kitty's), on the wire as its number: another number does
+/// not decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct WireFunction(Function);
+
+impl TryFrom<u8> for WireFunction {
+    type Error = &'static str;
+    fn try_from(number: u8) -> Result<Self, Self::Error> {
+        Function::new(number)
+            .map(Self)
+            .ok_or("no such function key")
+    }
+}
+
+impl From<WireFunction> for u8 {
+    fn from(key: WireFunction) -> Self {
+        key.0.number()
+    }
 }
 
 /// What a kitty-protocol terminal reported of a key: its code, its shifted and base-layout keys,
@@ -86,21 +107,22 @@ pub struct WireKitty {
     pub mods: u8,
 }
 
-/// A mouse event: cell row and column from zero, the button and modifiers (as a key's).
+/// A mouse event: what happened, with its button, the modifiers (as a key's), and the cell's row
+/// and column from zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireMouse {
     pub action: WireMouseAction,
-    pub button: Option<WireButton>,
     pub mods: u8,
     pub row: u16,
     pub col: u16,
 }
 
+/// A press always names its button; a release or a motion may not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireMouseAction {
-    Press,
-    Release,
-    Motion,
+    Press(WireButton),
+    Release(Option<WireButton>),
+    Motion(Option<WireButton>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,11 +203,6 @@ impl WireKey {
         if self.mods & !MODS != 0 {
             return Err("unknown modifier bits");
         }
-        if let WireKeyCode::F(n) = self.key {
-            if !(1..=12).contains(&n) {
-                return Err("no such function key");
-            }
-        }
         if let Some(kitty) = self.kitty {
             let scalar = |c: Option<u32>| c.is_none_or(|c| char::from_u32(c).is_some());
             if !(scalar(kitty.code) && scalar(kitty.shifted) && scalar(kitty.base)) {
@@ -213,7 +230,7 @@ impl WireKey {
             WireKeyCode::End => Key::End,
             WireKeyCode::PageUp => Key::PageUp,
             WireKeyCode::PageDown => Key::PageDown,
-            WireKeyCode::F(n) => Key::F(n),
+            WireKeyCode::F(WireFunction(key)) => Key::F(key),
         };
         Keystroke {
             // `new` normalizes as the decoder does: a character carries its own shift.
@@ -246,7 +263,7 @@ impl From<Keystroke> for WireKey {
             Key::End => WireKeyCode::End,
             Key::PageUp => WireKeyCode::PageUp,
             Key::PageDown => WireKeyCode::PageDown,
-            Key::F(n) => WireKeyCode::F(n),
+            Key::F(key) => WireKeyCode::F(WireFunction(key)),
         };
         Self {
             key,
@@ -280,23 +297,23 @@ fn bits_of(mods: Modifiers) -> u8 {
 impl WireMouse {
     /// The event, as fux-vt's encoder takes it.
     pub fn event(&self) -> MouseEvent {
+        let button = |b: WireButton| match b {
+            WireButton::Left => MouseButton::Left,
+            WireButton::Middle => MouseButton::Middle,
+            WireButton::Right => MouseButton::Right,
+            WireButton::WheelUp => MouseButton::WheelUp,
+            WireButton::WheelDown => MouseButton::WheelDown,
+            WireButton::WheelLeft => MouseButton::WheelLeft,
+            WireButton::WheelRight => MouseButton::WheelRight,
+            WireButton::Back => MouseButton::Back,
+            WireButton::Forward => MouseButton::Forward,
+        };
         MouseEvent {
             action: match self.action {
-                WireMouseAction::Press => MouseAction::Press,
-                WireMouseAction::Release => MouseAction::Release,
-                WireMouseAction::Motion => MouseAction::Motion,
+                WireMouseAction::Press(b) => MouseAction::Press(button(b)),
+                WireMouseAction::Release(b) => MouseAction::Release(b.map(button)),
+                WireMouseAction::Motion(b) => MouseAction::Motion(b.map(button)),
             },
-            button: self.button.map(|b| match b {
-                WireButton::Left => MouseButton::Left,
-                WireButton::Middle => MouseButton::Middle,
-                WireButton::Right => MouseButton::Right,
-                WireButton::WheelUp => MouseButton::WheelUp,
-                WireButton::WheelDown => MouseButton::WheelDown,
-                WireButton::WheelLeft => MouseButton::WheelLeft,
-                WireButton::WheelRight => MouseButton::WheelRight,
-                WireButton::Back => MouseButton::Back,
-                WireButton::Forward => MouseButton::Forward,
-            }),
             mods: mods_of(self.mods),
             row: self.row,
             col: self.col,
@@ -306,23 +323,23 @@ impl WireMouse {
 
 impl From<MouseEvent> for WireMouse {
     fn from(event: MouseEvent) -> Self {
+        let button = |b: MouseButton| match b {
+            MouseButton::Left => WireButton::Left,
+            MouseButton::Middle => WireButton::Middle,
+            MouseButton::Right => WireButton::Right,
+            MouseButton::WheelUp => WireButton::WheelUp,
+            MouseButton::WheelDown => WireButton::WheelDown,
+            MouseButton::WheelLeft => WireButton::WheelLeft,
+            MouseButton::WheelRight => WireButton::WheelRight,
+            MouseButton::Back => WireButton::Back,
+            MouseButton::Forward => WireButton::Forward,
+        };
         Self {
             action: match event.action {
-                MouseAction::Press => WireMouseAction::Press,
-                MouseAction::Release => WireMouseAction::Release,
-                MouseAction::Motion => WireMouseAction::Motion,
+                MouseAction::Press(b) => WireMouseAction::Press(button(b)),
+                MouseAction::Release(b) => WireMouseAction::Release(b.map(button)),
+                MouseAction::Motion(b) => WireMouseAction::Motion(b.map(button)),
             },
-            button: event.button.map(|b| match b {
-                MouseButton::Left => WireButton::Left,
-                MouseButton::Middle => WireButton::Middle,
-                MouseButton::Right => WireButton::Right,
-                MouseButton::WheelUp => WireButton::WheelUp,
-                MouseButton::WheelDown => WireButton::WheelDown,
-                MouseButton::WheelLeft => WireButton::WheelLeft,
-                MouseButton::WheelRight => WireButton::WheelRight,
-                MouseButton::Back => WireButton::Back,
-                MouseButton::Forward => WireButton::Forward,
-            }),
             mods: bits_of(event.mods),
             row: event.row,
             col: event.col,
@@ -390,7 +407,7 @@ mod tests {
                     mods: 4 | 64,
                 }),
             },
-            Keystroke::from(KeyPress::plain(Key::F(12))),
+            Keystroke::from(KeyPress::plain(Key::F(Function::new(35).unwrap()))),
         ];
         for stroke in strokes {
             let wire = WireKey::from(stroke);
@@ -415,8 +432,7 @@ mod tests {
             Some((None, None, Some(1096)))
         );
         let mouse = MouseEvent {
-            action: MouseAction::Motion,
-            button: Some(MouseButton::Right),
+            action: MouseAction::Motion(Some(MouseButton::Right)),
             mods: Modifiers {
                 ctrl: true,
                 ..Modifiers::NONE

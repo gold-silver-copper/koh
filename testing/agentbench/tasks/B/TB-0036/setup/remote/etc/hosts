@@ -1,0 +1,12 @@
+# managed by edit-hosts; checksum=939c41d8061522f6
+127.0.0.1   localhost
+::1         localhost ip6-localhost
+# databases
+10.0.2.11   db-primary.internal db-primary
+10.0.2.12   db-replica.internal db-replica
+10.0.2.9    old-db.internal old-db
+# caches
+10.0.4.6    cache-1.internal cache-1
+# services
+10.0.8.20   api.internal api
+10.0.8.21   auth.internal auth

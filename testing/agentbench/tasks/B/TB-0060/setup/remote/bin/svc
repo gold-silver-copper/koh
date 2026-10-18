@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""The ledger-sync service.
+
+  svc start    check ~/svc/config.ini and start the service in the background
+  svc stop     stop it
+  svc status   say whether it is running and healthy
+"""
+import configparser, json, os, signal, sys, time
+home = os.path.expanduser("~")
+d = os.path.join(home, "svc")
+pidf, runf = os.path.join(d, "svc.pid"), os.path.join(d, ".running.json")
+
+
+def running():
+    try:
+        pid = int(open(pidf).read())
+        if b"svc" in open(f"/proc/{pid}/cmdline", "rb").read():
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def load():
+    cp = configparser.ConfigParser()
+    cp.read(os.path.join(d, "config.ini"))
+    try:
+        port = int(cp["server"]["listen_port"])
+    except (KeyError, ValueError):
+        return None, "config error: [server] listen_port is missing or not a number"
+    if not 1024 <= port <= 65535:
+        return None, f"config error: listen_port {port} out of range (1024-65535)"
+    lvl = cp["server"].get("log_level", "info")
+    if lvl not in ("debug", "info", "warn", "error"):
+        return None, f"config error: unknown log_level {lvl!r} (debug, info, warn, error)"
+    data = os.path.expanduser(cp["storage"].get("data_dir", ""))
+    if not os.path.isdir(data):
+        return None, f"config error: data_dir {data} does not exist"
+    if not os.path.exists(os.path.join(data, "catalog.db")):
+        return None, f"config error: no catalog.db in data_dir {data}"
+    return {"port": port, "log_level": lvl, "data_dir": os.path.realpath(data)}, None
+
+
+cmd = sys.argv[1:2]
+if cmd == ["start"]:
+    if running():
+        sys.exit(f"svc: already running (pid {running()})")
+    conf, err = load()
+    if err:
+        with open(os.path.join(d, "svc.log"), "a") as f:
+            f.write(err + "\n")
+        sys.exit(f"svc: failed to start; see ~/svc/svc.log")
+    if os.fork():
+        time.sleep(1.5)
+        print(f"svc: started on port {conf['port']}" if running() else "svc: failed to start; see ~/svc/svc.log")
+        sys.exit(0)
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    fd = os.open(os.path.join(d, "svc.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    nul = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(nul, 0); os.dup2(fd, 1); os.dup2(fd, 2)
+    open(pidf, "w").write(f"{os.getpid()}\n")
+    json.dump(dict(conf, pid=os.getpid()), open(runf, "w"))
+    print(f"svc: listening on {conf['port']}, data in {conf['data_dir']}", flush=True)
+    signal.signal(signal.SIGTERM, lambda s, f: (os.unlink(pidf), sys.exit(0)))
+    while True:
+        time.sleep(1)
+        open(os.path.join(d, ".health"), "w").write(f"{time.time():.0f}\n")
+elif cmd == ["stop"]:
+    pid = running()
+    if not pid:
+        sys.exit("svc: not running")
+    os.kill(pid, signal.SIGTERM)
+    print("svc: stopped")
+elif cmd == ["status"]:
+    pid = running()
+    if not pid:
+        print("svc: not running")
+        sys.exit(3)
+    conf = json.load(open(runf))
+    print(f"svc: running (pid {pid}), healthy, port {conf['port']}, data {conf['data_dir']}")
+else:
+    print(__doc__.strip())
+    sys.exit(2)

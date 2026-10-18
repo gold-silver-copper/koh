@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""qstat [--wait] [JOBID]: show the queue, or one job; --wait blocks until the job ends."""
+import json, os, sys, time
+home = os.path.expanduser("~")
+q = f"{home}/.queue"
+args = sys.argv[1:]
+if args and args[0] in ("-h", "--help"):
+    print(__doc__.strip())
+    sys.exit(0)
+wait = "--wait" in args
+args = [a for a in args if a != "--wait"]
+def show(jid):
+    try:
+        s = json.load(open(f"{q}/{jid}.json"))
+    except (OSError, ValueError):
+        return None
+    if s["state"] == "queued":
+        return s, f"job {jid}: queued (position {s['position']})"
+    if s["state"] == "running":
+        return s, f"job {jid}: running ({s['progress']}%)"
+    return s, f"job {jid}: {s['state']} result={s['result']}"
+if not args:
+    jobs = sorted(n[:-5] for n in os.listdir(q) if n.endswith(".json")) if os.path.isdir(q) else []
+    for j in jobs:
+        print(show(j)[1])
+    if not jobs:
+        print("queue empty")
+    sys.exit(0)
+got = show(args[0])
+if got is None:
+    print(f"qstat: no job {args[0]}", file=sys.stderr)
+    sys.exit(1)
+while wait and got[0]["state"] in ("queued", "running"):
+    time.sleep(0.5)
+    got = show(args[0])
+print(got[1])

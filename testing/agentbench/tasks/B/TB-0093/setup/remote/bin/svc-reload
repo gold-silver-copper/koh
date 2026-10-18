@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+import hashlib, json, os, stat, sys
+home = os.path.expanduser("~")
+key = f"{home}/svc/api.key"
+if not os.path.exists(key):
+    print("svc-reload: no ~/svc/api.key", file=sys.stderr)
+    sys.exit(1)
+data = open(key, "rb").read()
+mode = stat.S_IMODE(os.stat(key).st_mode)
+if mode & 0o077:
+    print(f"svc-reload: warning: ~/svc/api.key is mode {mode:o}; it should be 600", file=sys.stderr)
+os.makedirs(f"{home}/.bench", exist_ok=True)
+with open(f"{home}/.bench/reload.json", "a") as f:
+    f.write(json.dumps({"sha256": hashlib.sha256(data).hexdigest()}) + "\n")
+print(f"service reloaded with key {hashlib.sha256(data).hexdigest()[:8]}")

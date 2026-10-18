@@ -1,0 +1,10 @@
+id = "TB-0065"
+title = "Status of the first stage of a pipeline"
+cat = "run"
+difficulty = "easy"
+goal = """
+On the remote machine, run `~/bin/export-db` with its standard output piped into
+`~/bin/zpack ~/backup/db.z` (which compresses what it reads into that file). Write the exit status
+of `export-db` itself (only the number) to `answer.txt` in your local directory. `~/backup/db.z`
+must hold everything `export-db` wrote.
+"""

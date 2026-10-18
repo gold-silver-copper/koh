@@ -1,0 +1,11 @@
+id = "TB-0041"
+title = "Read a register in a VM debugger"
+cat = "repl"
+difficulty = "hard"
+goal = """
+On the remote machine, `~/prog.vm` is a program for a small register VM, and `~/bin/vmdbg` is its
+interactive debugger (`vmdbg ~/prog.vm`; `help` at its prompt lists the commands, which are much
+like gdb's). Find the value of register `r3` at the moment execution reaches the label `mix` for
+the 5th time (before the instruction at `mix` runs). Write the number to `answer.txt` in your local
+directory.
+"""

@@ -1,0 +1,10 @@
+id = "TB-0089"
+title = "Copy a tree of awkwardly named reports"
+cat = "files"
+difficulty = "moderate"
+goal = """
+On the remote machine, `~/reports` is a directory tree of reports whose file names contain spaces,
+quotes, brackets, leading dashes, non-ASCII letters and other awkward characters. Copy the whole
+tree into your local directory as `reports/`, so that `reports/` holds exactly the same files at the
+same relative paths with the same names and the same contents (nothing missing, nothing extra).
+"""

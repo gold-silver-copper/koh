@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+import os, random, signal, time
+rng = random.Random(20)
+open(os.path.expanduser("~/.cachedaemon"), "w").write("ran\n")
+print("cachedaemon: serving from ~/cache (watchdog 2s)", flush=True)
+for i in range(rng.randint(8, 12)):
+    signal.alarm(2)
+    print(f"cachedaemon: sweep {i + 1}: {rng.randint(100, 900)} entries", flush=True)
+    time.sleep(rng.uniform(0.4, 1.0))
+print("cachedaemon: compacting index", flush=True)
+signal.alarm(2)
+while True:
+    time.sleep(10)

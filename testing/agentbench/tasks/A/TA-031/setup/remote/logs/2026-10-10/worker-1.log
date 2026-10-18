@@ -1,0 +1,14 @@
+2026-10-10T00:48 worker-1 processed batch
+2026-10-10T01:35 worker-1 GC pause 12ms
+2026-10-10T02:42 worker-1 GC pause 12ms
+2026-10-10T03:30 worker-1 processed batch
+2026-10-10T04:31 worker-1 GC pause 12ms
+2026-10-10T05:01 worker-1 heartbeat
+2026-10-10T06:05 worker-1 GC pause 12ms
+2026-10-10T07:18 worker-1 heartbeat
+2026-10-10T08:43 worker-1 heartbeat
+2026-10-10T09:51 worker-1 processed batch
+2026-10-10T10:31 worker-1 processed batch
+2026-10-10T11:15 worker-1 flushed cache
+2026-10-10T12:47 worker-1 GC pause 12ms
+2026-10-10T13:22 worker-1 heartbeat

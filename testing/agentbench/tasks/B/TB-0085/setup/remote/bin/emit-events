@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+import json, random, sys
+rng = random.Random(85)
+names = ["Ada Byron", "Lin Wei", "Omar Haddad", "Sofia Marquez", "Kenji Sato", "Priya Nair"]
+for i in range(2400):
+    n = rng.choice(names)
+    ev = {"seq": i, "type": rng.choice(["match_start", "match_end", "purchase", "crash", "login"]),
+          "player": n, "email": n.lower().replace(" ", ".") + "@example.invalid",
+          "ip": f"10.{rng.randint(0, 255)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}",
+          "value": round(rng.uniform(0, 100), 2)}
+    sys.stdout.write(json.dumps(ev) + "\n")

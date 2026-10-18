@@ -1,0 +1,10 @@
+id = "TB-0044"
+title = "Answer an installer's questions"
+cat = "prompt"
+difficulty = "easy"
+goal = """
+On the remote machine, run the interactive installer `~/bin/install-ledger` and answer its questions
+so that ledger is installed into `~/apps/ledger`, with telemetry turned off, listening on port
+9091, and with the license accepted. Take the default for anything else it asks. The installer
+writes `ledger.conf` into the install directory when it finishes.
+"""

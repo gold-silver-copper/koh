@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+checks=(dns ntp disk-space inodes kernel-params ulimits tls-expiry cert-chain db-reachable
+        cache-warm queue-depth migrations feature-flags secrets-mounted)
+for c in "${checks[@]}"; do
+  case $c in
+    tls-expiry) echo "check $c ... WARN (expires in 9 days)" ;;
+    migrations) echo "check $c ... FAIL (2 pending)" >&2 ;;
+    *) echo "check $c ... ok" ;;
+  esac
+done
+echo "preflight finished"
+exit 3

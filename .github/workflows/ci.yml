@@ -162,7 +162,7 @@ jobs:
         # the wire messages above, and for `server_process`, whose input is a program's output,
         # the recorded output of real programs.
         run: |
-          for target in screen_apply proto_decode history_apply server_input client_input; do
+          for target in proto_decode server_input client_input request_decode; do
             cargo +nightly fuzz run "$target" -- -max_total_time=45 -rss_limit_mb=4096
           done
           mkdir -p fuzz/corpus/server_process

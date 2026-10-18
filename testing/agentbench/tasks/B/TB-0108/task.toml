@@ -1,0 +1,14 @@
+id = "TB-0108"
+title = "Answer a migration's question after a disconnect"
+cat = "drop"
+difficulty = "hard"
+goal = """
+On the remote machine, run the database migration `~/bin/migrate-db`. Part way through it asks a
+question on its standard input: whether to delete the orphaned rows it found. The answer must be
+`y`. The connection to the remote will drop a few seconds after the migration starts, before it
+asks. The migration must still run to completion with `y` as the answer to that question (if its
+input ends instead, it gives up).
+"""
+[drop]
+when = "migrate.started"
+after = 4

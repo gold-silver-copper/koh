@@ -1,0 +1,7 @@
+server:
+  port: 8443
+  workers: 8
+  tls: true
+log:
+  level: warn
+  format: json

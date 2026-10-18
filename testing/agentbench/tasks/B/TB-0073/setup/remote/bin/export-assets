@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+import json, os, random, sys, time
+rng = random.Random(73)
+total = 0
+batches = 23
+for b in range(1, batches + 1):
+    n = rng.randint(40, 120)
+    time.sleep(rng.uniform(0.6, 2.9))
+    total += n
+    print(f"batch {b}: {n} assets packed", flush=True)
+print(f"exported {total} assets (412 MB) to ~/export/", flush=True)
+os.makedirs(os.path.expanduser("~/.bench"), exist_ok=True)
+with open(os.path.expanduser("~/.bench/done.json"), "w") as f:
+    json.dump({"total": total}, f)

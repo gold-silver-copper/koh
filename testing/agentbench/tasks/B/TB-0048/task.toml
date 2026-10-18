@@ -1,0 +1,13 @@
+id = "TB-0048"
+title = "Finish a staged deploy across a drop"
+cat = "drop"
+difficulty = "hard"
+goal = """
+On the remote machine, deploy release 2.4.0 with `~/bin/deploy`: first `deploy stage` (slow, about
+half a minute), then `deploy commit` (`deploy --help` describes all its commands). The connection to
+the remote machine will drop while the stage is running. The task is done when 2.4.0 is staged
+completely, committed as the current release, and no stage lock is left behind.
+"""
+[drop]
+when = "deploy/stage.lock"
+after = 4.0

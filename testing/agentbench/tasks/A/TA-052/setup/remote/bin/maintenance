@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+import hashlib, json, os, sys, time
+try:
+    tin = open("/dev/tty")
+except OSError:
+    sys.exit("maintenance: needs a terminal")
+run = os.path.expanduser("~/run")
+os.makedirs(run, exist_ok=True)
+h = hashlib.sha256(f"maint{os.getpid()}".encode()).hexdigest().upper()
+code = "".join(c for c in h if c.isalpha())[:3] + "-" + str(int(h[:8], 16) % 9000 + 1000)
+json.dump({"pid": os.getpid(), "code": code}, open(os.path.join(run, "maint.json"), "w"))
+print("maintenance: draining traffic ...", flush=True)
+time.sleep(2)
+print(f"maintenance: window open, code {code}", flush=True)
+while True:
+    print("maintenance: apply the patch from another shell, then press Enter here to close the window", flush=True)
+    if not tin.readline():
+        sys.exit("maintenance: terminal closed, window aborted")
+    if (open(os.path.join(run, "patched")).read().strip() if os.path.exists(os.path.join(run, "patched")) else "") == code:
+        break
+    print("maintenance: the patch has not been applied yet; the window stays open", flush=True)
+os.unlink(os.path.join(run, "maint.json"))
+open(os.path.join(run, "maint.result"), "w").write(f"closed ok {code}\n")
+print("maintenance: window closed, traffic restored", flush=True)

@@ -8,7 +8,7 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{connected, loopback_server, on_pty, serve, Served};
+use common::{connected, endpoint_id, loopback_server, on_pty, serve, Served};
 use koh_testkit::command;
 
 /// `Ctrl-^ Ctrl-Z` stops the client with SIGTSTP, as a terminal's suspend key would: the job
@@ -90,25 +90,10 @@ fn ctrl_z_suspends_the_client_with_sigtstp_and_fg_resumes_it() {
         });
 }
 
-/// `koh id` for the key at `key`, creating it: the endpoint id, as the binary prints it.
-fn endpoint_id(key: &Path) -> anyhow::Result<String> {
-    let out = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())?
-        .args(["id", "--key-file"])
-        .arg(key)
-        .output()?;
-    anyhow::ensure!(out.status.success(), "koh id: {out:?}");
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-}
-
-/// `koh serve --local`, the binary at `koh`, hosting `sh` for `client`, as the key at `key`, on
+/// `koh serve --local` hosting `sh` for `client`, as the key at `key`, on
 /// `port` if given.
-fn serve_local(
-    koh: impl AsRef<std::ffi::OsStr>,
-    key: &Path,
-    port: Option<u16>,
-    client: &str,
-) -> anyhow::Result<Served> {
-    let mut server = command(koh, &koh_testkit::home!())?;
+fn serve_local(key: &Path, port: Option<u16>, client: &str) -> anyhow::Result<Served> {
+    let mut server = command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())?;
     server
         .args([
             "serve",
@@ -141,7 +126,7 @@ fn stop(mut server: Served) -> anyhow::Result<()> {
 
 /// A `koh serve --local --port` restarted under a connected client (a new process, the same key
 /// and port) is found again: the client redials the address it dialed. The session died with the
-/// old server, so the client gets a fresh one.
+/// old server, and a redial goes back to its own session only, so the client ends saying so.
 #[test]
 fn a_client_redials_a_local_server_restarted_on_its_port() {
     koh_testkit::multi_thread(2)
@@ -151,8 +136,7 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
             let (server_key, client_key) = (dir.join("server.key"), dir.join("client.key"));
             let client_id = endpoint_id(&client_key).expect("the client's id");
             // The port the first server picked is the one the restarted server asks for.
-            let server = serve_local(env!("CARGO_BIN_EXE_koh"), &server_key, None, &client_id)
-                .expect("the server");
+            let server = serve_local(&server_key, None, &client_id).expect("the server");
             let port = server.port;
             // A variable only this session holds, and an answer only a remote shell computes.
             let (client, buf, at) = connected(
@@ -168,58 +152,15 @@ fn a_client_redials_a_local_server_restarted_on_its_port() {
                 .wait_for(at, "reconnecting", 20)
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
-            let server = serve_local(
-                env!("CARGO_BIN_EXE_koh"),
-                &server_key,
-                Some(port),
-                &client_id,
-            )
-            .expect("the restarted server");
+            let server =
+                serve_local(&server_key, Some(port), &client_id).expect("the restarted server");
 
-            // Typing while the client redials is dropped, so type until the new session answers.
-            let seen = buf
-                .type_until(at, "after_fresh_42", 30, || {
-                    let _ = client.write(b"echo after_${X:-fresh}_$((6*7))\r".to_vec());
-                })
-                .await;
+            let seen = buf.wait_for(at, "no such session", 30).await;
 
             let _ = client.write(vec![0x1e, b'.']);
             drop(client);
             stop(server).expect("stop the restarted server");
             seen.unwrap_or_else(|e| panic!("the client found the restarted server: {e}"));
-        });
-}
-
-/// A `koh serve` whose binary is removed while it runs (an upgrade) still starts sessions: on
-/// Linux it launches them from its own image, `/proc/self/exe`, not from the path it was started
-/// from.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_server_whose_binary_was_removed_still_starts_sessions() {
-    koh_testkit::multi_thread(2)
-        .expect("tokio runtime")
-        .block_on(async {
-            let dir = koh_testkit::scratch!("upgrade").expect("a scratch directory");
-            // A second name for the binary, which is all the server's path is.
-            let installed = dir.join("koh");
-            std::fs::hard_link(env!("CARGO_BIN_EXE_koh"), &installed).expect("install koh");
-            let client_key = dir.join("client.key");
-            let client_id = endpoint_id(&client_key).expect("the client's id");
-            let server = serve_local(&installed, &dir.join("server.key"), None, &client_id)
-                .expect("koh serve");
-
-            // The upgrade: the file the server was started from is gone.
-            std::fs::remove_file(&installed).expect("remove the installed binary");
-
-            // Only the remote shell turns `$((6*7))` into 42.
-            let (client, ..) = connected(
-                &connect_argv(&server, &client_key),
-                b"echo up_$((6*7))\r",
-                "up_42",
-            )
-            .await
-            .expect("a session after the server's binary was removed");
-            let _ = client.write(vec![0x1e, b'.']);
         });
 }
 
@@ -235,4 +176,35 @@ fn connect_argv(server: &Served, key: &Path) -> [String; 7] {
         &key.display().to_string(),
     ]
     .map(str::to_owned)
+}
+
+/// A long line the terminal writes in one go, as an agent's terminal types it, runs at once: none
+/// of it waits for a key typed after.
+#[test]
+fn a_long_line_written_in_one_go_runs_with_nothing_typed_after() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let dir = koh_testkit::scratch!("long-line-test").expect("a scratch directory");
+            let (server_key, client_key) = (dir.join("server.key"), dir.join("client.key"));
+            let client_id = endpoint_id(&client_key).expect("the client's id");
+            let server = serve_local(&server_key, None, &client_id).expect("the server");
+            let (client, buf, at) = connected(
+                &connect_argv(&server, &client_key),
+                b"echo up_$((6*7))\r",
+                "up_42",
+            )
+            .await
+            .expect("the session");
+
+            // Only the remote shell turns this into `len_2000`; its echo shows `${#A}`.
+            let line = format!("A={}; echo len_${{#A}}\r", "y".repeat(2000));
+            client.write(line.into_bytes()).expect("type the line");
+            let seen = buf.wait_for(at, "len_2000", 10).await;
+
+            let _ = client.write(vec![0x1e, b'.']);
+            drop(client);
+            stop(server).expect("stop the server");
+            seen.unwrap_or_else(|e| panic!("the whole line ran: {e}"));
+        });
 }

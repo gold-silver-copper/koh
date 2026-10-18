@@ -3,27 +3,27 @@
 //! the client retire.
 //!
 //! - `--footprint-child SCROLLBACK FILL SESSIONS`: makes `SESSIONS` server emulators at 40x120
-//!   keeping `SCROLLBACK` lines, fills each (if `FILL` is 1) with enough lines of text to fill its
-//!   scrollback and screen, takes a snapshot of each as a session holds, and prints how much the
-//!   process's resident memory grew, per session, in bytes.
+//!   keeping `SCROLLBACK` bytes of history, fills each (if `FILL` is 1) with enough lines of text to
+//!   fill its scrollback and screen, and prints how much the process's resident memory grew, per
+//!   session, in bytes.
 //! - `--instructions-child SIDE WORKLOAD [baseline]`: `emulator` feeds the workload to a server
-//!   emulator in 4 KiB reads; `server` does too, and after each read takes the snapshot, diff and
-//!   encoded frame a session's burst takes; `client` decodes, applies and paints those frames, as
-//!   `koh connect` does. With `baseline` it makes the same inputs and does nothing with them, so that the
-//!   parent can take that away. It prints what it fed: bytes for the server, frames for the
+//!   emulator in 4 KiB reads; `server` does too, and filters each read and encodes the messages
+//!   it sends; `client` decodes those messages and writes them to the user's terminal, as `koh
+//!   connect` does. With `baseline` it makes the same inputs and does nothing with them, so that
+//!   the parent can take that away. It prints what it fed: bytes for the server, messages for the
 //!   client.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::path::Path;
 use std::process::Command;
 use std::rc::Rc;
-use std::time::Instant;
 
 use anyhow::{anyhow, Context as _};
-use koh::client::{BackendTerminal, ClientSession, ClientTerminal, KohBackend};
-use koh::predict::Overlay;
-use koh::proto::{decode_server, Frame, FrameEncoder, FrameNum, InputSeq, ServerMsg};
-use koh::terminal::{ServerTerminal, Size, TerminalScreen};
+use koh::client::display::Display;
+use koh::client::KohBackend;
+use koh::proto::{encode_shown, MarkText, Shown, ShownDecoder};
+use koh::stream::{Filter, Marks, Piece, Policy};
+use koh::terminal::{ServerTerminal, Size};
 
 use crate::recording::Recording;
 use crate::workloads::{synthetic, Workload};
@@ -56,17 +56,20 @@ pub fn footprint_child(args: &[String]) -> anyhow::Result<()> {
             .into_iter()
             .find(|w| w.name == "ascii-flood")
             .ok_or_else(|| anyhow!("no flood"))?;
-        let lines = scrollback.saturating_add(40);
         let all: Vec<u8> = workload
             .steps
             .iter()
             .flat_map(|s| s.output.clone())
             .collect();
-        let mut seen = 0usize;
+        // A character costs the history more than its byte, so as many bytes of text as the
+        // budget, and a screenful more, fill it.
+        let mut screen = 0usize;
         for line in all.split_inclusive(|&b| b == b'\n').cycle() {
             text.extend_from_slice(line);
-            seen = seen.saturating_add(1);
-            if seen >= lines {
+            if text.len() >= scrollback {
+                screen = screen.saturating_add(1);
+            }
+            if screen > 40 {
                 break;
             }
         }
@@ -78,8 +81,7 @@ pub fn footprint_child(args: &[String]) -> anyhow::Result<()> {
         for chunk in text.chunks(4096) {
             emu.process(chunk);
         }
-        let snapshot = emu.snapshot();
-        kept.push((emu, snapshot));
+        kept.push(emu);
     }
     let after = resident()?;
     let grown = after.saturating_sub(before);
@@ -136,20 +138,22 @@ fn workloads(name: &str) -> anyhow::Result<Vec<Workload>> {
         .ok_or_else(|| anyhow!("no workload {name}"))
 }
 
-/// The frames a server sends for `workload`, a snapshot after each 4 KiB read: encoded, and the
-/// bytes fed. With `work` false, only the bytes are made; with `frames` false, the emulator is fed
-/// and no frame is made.
+/// The messages a server sends for `workload`, its output read 4 KiB at a time: encoded, and the
+/// bytes fed. With `work` false, only the bytes are made; with `messages_too` false, the emulator
+/// is fed and nothing is sent.
 fn serve(
     workload: &Workload,
     work: bool,
-    frames_too: bool,
+    messages_too: bool,
 ) -> anyhow::Result<(Vec<Vec<u8>>, usize)> {
     let mut emu =
         ServerTerminal::new(workload.rows, workload.cols, 1000).map_err(|e| anyhow!("{e}"))?;
-    let mut base = TerminalScreen::default();
-    let mut encoder = FrameEncoder::default();
-    let mut frames = Vec::new();
-    let mut num = FrameNum::BLANK;
+    let mut filter = Filter::new(Policy {
+        marks: Marks::All,
+        clipboard: true,
+        links: true,
+    });
+    let mut messages = Vec::new();
     let mut fed = 0usize;
     for step in &workload.steps {
         if let Some((rows, cols)) = step.resize {
@@ -164,29 +168,30 @@ fn serve(
             }
             emu.process(chunk);
             drop(emu.take_host_replies());
-            if !frames_too {
+            if !messages_too {
                 continue;
             }
-            let screen = emu.snapshot();
-            let next = num.next();
-            let frame = Frame {
-                num: next,
-                base: num,
-                echo_ack: InputSeq::default(),
-                diff: screen.diff_from(&base),
-            };
-            frames.push(encoder.encode(&frame, &base).map_err(|e| anyhow!("{e}"))?);
-            base = screen;
-            num = next;
+            let mut pieces = Vec::new();
+            filter.feed(chunk, &mut |piece| pieces.push(piece));
+            for piece in pieces {
+                let shown = match piece {
+                    Piece::Out(bytes) => Shown::Out(bytes),
+                    Piece::Mark(mark) => match MarkText::new(mark) {
+                        Some(mark) => Shown::Mark(mark),
+                        None => continue,
+                    },
+                };
+                messages.push(encode_shown(&shown).map_err(|e| anyhow!("{e}"))?);
+            }
         }
     }
-    Ok((frames, fed))
+    Ok((messages, fed))
 }
 
 #[derive(Clone)]
 struct Sink {
     bytes: Rc<RefCell<usize>>,
-    size: Rc<Cell<Size>>,
+    size: Size,
 }
 
 impl KohBackend for Sink {
@@ -205,38 +210,35 @@ impl KohBackend for Sink {
         Ok(())
     }
     fn size(&self) -> std::io::Result<Size> {
-        Ok(self.size.get())
+        Ok(self.size)
     }
 }
 
-/// Decode, apply and paint `frames`, as the client does.
-fn paint(workload: &Workload, frames: &[Vec<u8>]) -> anyhow::Result<usize> {
+/// Decode `messages` and write them to the user's terminal, as the client does.
+fn paint(workload: &Workload, messages: &[Vec<u8>]) -> anyhow::Result<usize> {
     let size = Size::new(workload.rows, workload.cols);
-    let sink = Sink {
+    let mut sink = Sink {
         bytes: Rc::default(),
-        size: Rc::new(Cell::new(size)),
+        size,
     };
-    let mut terminal = BackendTerminal::enter(sink.clone(), false)?;
-    let mut client = ClientSession::new(size);
-    let now = Instant::now();
-    for bytes in frames {
-        // As the client takes a frame's stream: inflated against its base's dictionary, then
-        // applied. Each frame is on the one before, which the client holds.
-        let ServerMsg::Frame { base, rows, body } =
-            decode_server(bytes).map_err(|e| anyhow!("{e}"))?
-        else {
-            anyhow::bail!("history rows among the frames");
-        };
-        let before = client.state().size();
-        client.on_frame_stream(now, base, &rows, &body);
-        let size = client.state().size();
-        if size != before {
-            sink.size.set(size);
-            client.on_resize(size);
-            terminal.window_resized();
+    let mut display = Display::new(size, true, true)?;
+    let mut decoder = ShownDecoder::default();
+    for bytes in messages {
+        decoder.push(bytes);
+        while let Some(shown) = decoder.next_shown().map_err(|e| anyhow!("{e}"))? {
+            match shown {
+                Shown::Out(bytes) => display.output(&mut sink, &bytes)?,
+                Shown::Mark(mark) => display.mark(&mut sink, mark.as_bytes())?,
+                Shown::Report(_)
+                | Shown::Tty(_)
+                | Shown::Echo(_)
+                | Shown::Bell(_)
+                | Shown::Title(_)
+                | Shown::Exit(_)
+                | Shown::Beat => {}
+            }
         }
-        while client.pop_outgoing().is_some() {}
-        terminal.render(client.state(), &Overlay::default(), None)?;
+        display.paint(&mut sink)?;
     }
     let painted = *sink.bytes.borrow();
     Ok(painted)
@@ -252,11 +254,11 @@ pub fn instructions_child(args: &[String]) -> anyhow::Result<()> {
             "emulator" => fed = fed.saturating_add(serve(&workload, !baseline, false)?.1),
             "server" => fed = fed.saturating_add(serve(&workload, !baseline, true)?.1),
             "client" => {
-                let (frames, _) = serve(&workload, true, true)?;
+                let (messages, _) = serve(&workload, true, true)?;
                 if !baseline {
-                    paint(&workload, &frames)?;
+                    paint(&workload, &messages)?;
                 }
-                fed = fed.saturating_add(frames.len());
+                fed = fed.saturating_add(messages.len());
             }
             other => return Err(anyhow!("no side {other}")),
         }

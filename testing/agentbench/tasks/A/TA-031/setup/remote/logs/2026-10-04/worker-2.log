@@ -1,0 +1,9 @@
+2026-10-04T00:31 worker-2 GC pause 12ms
+2026-10-04T01:41 worker-2 processed batch
+2026-10-04T02:22 worker-2 flushed cache
+2026-10-04T03:47 worker-2 GC pause 12ms
+2026-10-04T04:17 worker-2 heartbeat
+2026-10-04T05:15 worker-2 flushed cache
+2026-10-04T06:26 worker-2 processed batch
+2026-10-04T12:00 worker-2 java.lang.OutOfMemoryError: Java heap space
+2026-10-04T07:43 worker-2 flushed cache

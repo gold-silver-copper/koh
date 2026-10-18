@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+import json, os, shlex, sys
+home = os.path.expanduser("~")
+path = f"{home}/server/players.json"
+state = json.load(open(path))
+dirty = False
+HELP = """commands (quote names that contain spaces, e.g. kick "Some Name"):
+  players [PAGE]        list connected players, 8 per page
+  inspect NAME          show a player's report
+  kick NAME [REASON]    disconnect a player
+  ban NAME              ban a player permanently
+  say TEXT              broadcast a message
+  save                  save the server state
+  quit                  leave the console"""
+
+
+def find(name):
+    for p in state["players"]:
+        if p["name"] == name:
+            return p
+    return None
+
+
+print("server-console: connected to ladder-eu-3 (24 players); `help` for commands")
+while True:
+    try:
+        line = input("admin> ")
+    except EOFError:
+        print()
+        break
+    try:
+        words = shlex.split(line)
+    except ValueError as e:
+        print(f"error: {e}")
+        continue
+    if not words:
+        continue
+    cmd, args = words[0], words[1:]
+    if cmd == "help":
+        print(HELP)
+    elif cmd == "players":
+        page = int(args[0]) if args and args[0].isdigit() else 1
+        on = [p for p in state["players"] if p["name"] not in state["kicked"] + state["banned"]]
+        chunk = on[(page - 1) * 8: page * 8]
+        for p in chunk:
+            print(f"  {p['name']:<20} ping {p['ping']:>3}  score {p['score']:>5}")
+        pages = (len(on) + 7) // 8
+        print(f"-- page {page} of {pages}" + (f"; `players {page + 1}` for more --" if page < pages else " --"))
+    elif cmd == "inspect" and len(args) == 1:
+        p = find(args[0])
+        if not p:
+            print(f"no player named {args[0]!r}")
+        else:
+            print(f"player: {p['name']}\nping: {p['ping']} ms\nscore: {p['score']}\nflags: {p['flags']}\nnotes: {p['notes'] or '-'}")
+    elif cmd in ("kick", "ban") and args:
+        p = find(args[0])
+        if not p:
+            print(f"no player named {args[0]!r}")
+        elif p["name"] in state["kicked"] + state["banned"]:
+            print(f"{p['name']} is not connected")
+        else:
+            state["kicked" if cmd == "kick" else "banned"].append(p["name"])
+            dirty = True
+            print(f"{p['name']} {'kicked' if cmd == 'kick' else 'banned'}")
+    elif cmd == "say":
+        print(f"[broadcast] {' '.join(args)}")
+    elif cmd == "save":
+        with open(path + ".tmp", "w") as f:
+            json.dump(state, f, indent=1, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+        dirty = False
+        print("state saved")
+    elif cmd in ("quit", "exit"):
+        if dirty:
+            try:
+                a = input("unsaved changes; quit anyway? [y/N] ").strip().lower()
+            except EOFError:
+                a = ""
+            if a != "y":
+                continue
+        os.makedirs(f"{home}/.bench", exist_ok=True)
+        open(f"{home}/.bench/console.quit", "w").write("clean")
+        print("bye")
+        break
+    else:
+        print(f"unknown or malformed command: {line!r}; try `help`")

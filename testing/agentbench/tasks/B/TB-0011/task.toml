@@ -1,0 +1,11 @@
+id = "TB-0011"
+title = "Count risky files in a wide audit"
+cat = "output"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/audit-perms`. It prints a wide table, one row per file, with the
+columns `mode owner group size modified path`. Count the rows whose owner is exactly `nobody` and
+whose mode is world-writable (the "others" write bit is set, i.e. the 9th character of the mode
+string, counting the file-type character as the 1st, is `w`). Write the count (only the number) to
+`answer.txt` in your local directory.
+"""

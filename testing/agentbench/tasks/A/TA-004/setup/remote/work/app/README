@@ -1,0 +1,1 @@
+app: a small demo project. Build with ./configure --prefix=DIR && make.

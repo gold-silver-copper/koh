@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+here=$(cd "$(dirname "$0")" && pwd -P)
+if [ "$(pwd -P)" != "$here" ]; then
+  echo "configure: error: run configure from the source directory ($here)" >&2
+  exit 1
+fi
+prefix=
+for a in "$@"; do
+  case $a in
+    --prefix=*) prefix=${a#--prefix=} ;;
+    -h|--help) echo "usage: ./configure --prefix=DIR"; exit 0 ;;
+    *) echo "configure: error: unknown option $a" >&2; exit 2 ;;
+  esac
+done
+[ -n "$prefix" ] || { echo "configure: error: --prefix=DIR is required" >&2; exit 2; }
+case $prefix in /*) ;; *) echo "configure: error: prefix must be an absolute path, got $prefix" >&2; exit 2 ;; esac
+for t in "C compiler" "make" "pkg-config" "zlib" "pthread"; do echo "checking for $t... yes"; done
+printf 'prefix=%s\nsrcdir=%s\n' "$prefix" "$here" > config.status
+echo "configure: wrote config.status"

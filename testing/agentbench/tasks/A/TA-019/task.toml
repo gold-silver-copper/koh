@@ -1,0 +1,9 @@
+id = "TA-019"
+title = "The last line of a traceback"
+cat = "crash"
+difficulty = "easy"
+goal = '''
+On the remote machine, `~/bin/import-customers` imports a customer file and crashes partway
+through. Run it and write the last line of the error it dies with (the exception line itself,
+exactly) to `answer.txt` in your local directory.
+'''

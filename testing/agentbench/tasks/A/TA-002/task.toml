@@ -1,0 +1,9 @@
+id = "TA-002"
+title = "Full commit of a build"
+cat = "run"
+difficulty = "easy"
+goal = '''
+On the remote machine, `~/bin/buildinfo` describes the installed build of ledgerd. Write the
+full 40-character commit hash it was built from (only the hash) to `answer.txt` in your local
+directory.
+'''

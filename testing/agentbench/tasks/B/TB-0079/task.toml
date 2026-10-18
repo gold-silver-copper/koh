@@ -1,0 +1,9 @@
+id = "TB-0079"
+title = "Why the scene importer crashed"
+cat = "crash"
+difficulty = "easy"
+goal = """
+On the remote machine, run `~/bin/import-scene ~/levels/level3.json`. After a while it fails. Write
+two lines to `answer.txt` in your local directory: first the last line of the error it reports
+(exactly as printed), then its exit status.
+"""

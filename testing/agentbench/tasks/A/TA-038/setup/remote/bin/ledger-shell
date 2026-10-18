@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+import os, random, sys
+ACCOUNTS = ["ops:travel", "ops:hosting", "ops:travel:refunds", "sales:emea", "sales:apac", "payroll", "cash"]
+def books():
+    out = {}
+    for year in ("2024", "2025", "2026"):
+        rng = random.Random("ledger" + year)
+        out[year] = {a: rng.randint(-500000, 900000) / 100 for a in ACCOUNTS}
+    return out
+if __name__ == "__main__":
+    if not os.isatty(0):
+        sys.exit("ledger-shell: interactive only (run it in a terminal)")
+    data, book = books(), None
+    log = open(os.path.expanduser("~/.ledger-shell.log"), "a")
+    print("ledger-shell 2.1 -- type 'help'")
+    while True:
+        try:
+            line = input(f"ledger[{book}]> " if book else "ledger> ").split()
+        except EOFError:
+            print()
+            break
+        if not line:
+            continue
+        cmd, args = line[0], line[1:]
+        if cmd == "help":
+            print("commands: books | open BOOK | accounts | balance ACCOUNT | close | quit")
+        elif cmd == "books":
+            print("  ".join(data))
+        elif cmd == "open" and len(args) == 1 and args[0] in data:
+            book = args[0]
+            print(f"book {book} open, {len(data[book])} accounts")
+        elif cmd == "open":
+            print("no such book (try 'books')")
+        elif cmd == "close":
+            book = None
+        elif cmd in ("accounts", "balance") and not book:
+            print("no book open (try 'open BOOK')")
+        elif cmd == "accounts":
+            print("\n".join(data[book]))
+        elif cmd == "balance" and len(args) == 1 and args[0] in data[book]:
+            log.write(f"{book} balance {args[0]}\n")
+            log.flush()
+            print(f"{args[0]:<20} {data[book][args[0]]:>12.2f}")
+        elif cmd == "balance":
+            print("no such account (try 'accounts')")
+        elif cmd in ("quit", "exit"):
+            break
+        else:
+            print(f"unknown command {cmd!r} (try 'help')")

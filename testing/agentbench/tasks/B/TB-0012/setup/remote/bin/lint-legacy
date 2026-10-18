@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Lints the legacy modules. Everything it says goes to stderr."""
+import random, sys
+rng = random.Random(1212)
+e = sys.stderr
+kinds = ["warning[unused]", "warning[shadowed]", "warning[deprecated]", "note", "help", "warning[style]"]
+n = 0
+for i in range(4200):
+    f = f"legacy/{rng.choice(['billing', 'core', 'ui', 'jobs'])}/mod_{rng.randint(1, 80)}.py"
+    k = rng.choice(kinds)
+    line = rng.randint(1, 900)
+    if k == "warning[deprecated]":
+        n += 1
+        e.write(f"warning[deprecated]: {f}:{line}: call to deprecated function `old_api_{rng.randint(1, 30)}`\n")
+    elif k == "note":
+        e.write(f"note: {f}:{line}: deprecated alias kept for compatibility\n")
+    elif k == "help":
+        e.write(f"  help: see warning[deprecated] docs at docs/lint.md#{rng.randint(1, 50)}\n")
+    else:
+        e.write(f"{k}: {f}:{line}: {rng.choice(['variable', 'import', 'argument'])} `x{rng.randint(1, 99)}`\n")
+e.write(f"lint finished: {4200} findings in 320 files\n")

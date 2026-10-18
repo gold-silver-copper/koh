@@ -1,0 +1,10 @@
+id = "TB-0074"
+title = "Stop at the threshold line"
+cat = "wait"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/stress-sim`. It runs until it is stopped, printing a line per
+iteration. At some point it prints `THRESHOLD crossed at iteration N (...)`. Wait for that line,
+write N (only the number) to `answer.txt` in your local directory, and then stop `stress-sim`: it
+must not be left running.
+"""

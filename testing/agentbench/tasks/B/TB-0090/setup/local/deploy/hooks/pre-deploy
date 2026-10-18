@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "pre-deploy checks ok"

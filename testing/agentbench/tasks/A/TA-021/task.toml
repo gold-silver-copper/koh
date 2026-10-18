@@ -1,0 +1,10 @@
+id = "TA-021"
+title = "Fix the config so the app starts"
+cat = "crash"
+difficulty = "moderate"
+goal = '''
+On the remote machine, `~/bin/app` (the order service) fails to start because of problems with
+its setup. Fix them, changing as little as possible: every setting in `~/app/app.conf` that is
+not part of a problem must stay as it is. It is done when `~/bin/app` starts successfully
+(it then records the start in `~/app/started.txt` and exits).
+'''

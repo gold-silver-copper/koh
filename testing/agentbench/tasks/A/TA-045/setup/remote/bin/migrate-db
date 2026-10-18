@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+import os, random, sys, time
+db = os.path.expanduser("~/db")
+lock = os.path.join(db, "migration.lock")
+ver_path = os.path.join(db, "schema_version")
+if os.path.exists(lock):
+    pid = open(lock).read().split()[0]
+    if os.path.exists(f"/proc/{pid}"):
+        sys.exit(f"migrate-db: a migration is already running (pid {pid})")
+    sys.exit("migrate-db: the database is dirty: a previous migration was interrupted; run ~/bin/db-repair first")
+ver = int(open(ver_path).read())
+if ver >= 42:
+    print("migrate-db: already at version 42")
+    sys.exit(0)
+open(lock, "w").write(f"{os.getpid()} from {ver}\n")
+rng = random.Random(45)
+for v in range(ver + 1, 43):
+    print(f"migrate-db: applying {v:04d} ...", flush=True)
+    time.sleep(rng.uniform(1.5, 3.0))
+    open(ver_path, "w").write(f"{v}\n")
+os.unlink(lock)
+print("migrate-db: done, schema version 42", flush=True)

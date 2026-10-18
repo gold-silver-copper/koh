@@ -1,48 +1,41 @@
-//! The koh client: the session loop, abstracted over a [`ClientTerminal`].
+//! The koh client: `koh connect`'s loop, and the commands that dial a server ([`cli`]).
 //!
-//! Typed bytes and resize ticks arrive on channels; output and the window size go through
-//! [`ClientTerminal`]: the real tty ([`BackendTerminal`] over [`KohBackend`]) in the binary, a
-//! capturing mock in tests.
+//! The loop relays the program's output to the user's terminal ([`display`]) and what is typed to
+//! the server ([`input`]), across reconnects: one display and one input machine live for the
+//! whole run, and only what belongs to a connection is made anew.
 
 pub mod backend;
 pub mod cli;
+mod copy;
+pub mod display;
+mod exec;
+pub mod input;
 mod io;
-mod link;
 mod probe;
-mod render;
-mod scrollback;
-mod session;
 
 pub use backend::{DefaultBackend, KohBackend};
-pub use cli::{connect, BellHook, ConnectConfig};
+pub use cli::{connect, sessions, BellHook, ConnectConfig, Remote};
+pub use copy::{copy, CopyJob};
+pub use exec::exec;
 pub(crate) use io::spawn_client_io;
-pub use render::WindowState;
-pub use session::{ClientSession, Found, InputOutcome, TickResult};
 
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::events::InputEvent;
 use crate::log::Peer;
-use crate::predict::Overlay;
-use crate::proto::{decode_server, encode_client, ClientMsg, Close, ServerMsg, Stream, MAX_FRAME};
-use crate::terminal::{Size, TerminalScreen};
+use crate::proto::{
+    encode_client, ClientMsg, Close, InputSeq, Shown, ShownDecoder, HEARTBEAT, SHOWN_TAG,
+};
+use crate::request::{Attached, Pick, Request, Resume, MAX_REPLY, MAX_REQUEST};
+use crate::terminal::Size;
 use crate::transport_iroh::{closed_because, ALPN, PROTOCOL};
-use iroh::endpoint::{Connection, RecvStream};
+use display::Display;
+use input::Keys;
+use iroh::endpoint::{Connection, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
-
-/// Prefixed to the mirrored window title, as mosh prefixes `[mosh] `.
-const KOH_TITLE_PREFIX: &str = "[koh] ";
-
-/// The escape prefix (Ctrl-^); followed by '.' it disconnects the session.
-pub(crate) const ESCAPE_PREFIX: u8 = 0x1e;
-/// After the escape prefix, suspends the client (as mosh does): in raw mode `Ctrl-Z` is a plain
-/// byte, not SIGTSTP.
-pub(crate) const SUSPEND_KEY: u8 = 0x1a;
-
-/// After [`ESCAPE_PREFIX`], opens the scrollback view.
-pub(crate) const SCROLLBACK_KEY: u8 = b'[';
 
 /// How long a single reconnect dial may run before it is abandoned and retried.
 const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -56,12 +49,30 @@ const MIN_CONNECTION_DWELL: Duration = Duration::from_secs(5);
 /// A wall-clock gap between two loop iterations (which run at least every 50 ms) this long means
 /// the process was frozen, as Android does at screen-off. The connection is then almost surely
 /// dead, but iroh's idle timer runs on the monotonic clock, which pauses too, so it would hold it
-/// for up to five minutes; reconnecting at once reattaches in a second or two. A false positive
-/// costs only a brief banner, so the threshold is low.
+/// for up to five minutes; reconnecting at once reattaches in a second or two.
 const STALE_AFTER_FREEZE: Duration = Duration::from_secs(20);
 
-/// Dials the server and awaits its first frame, which admits the client: the first connection and every reconnect, which
-/// reattaches to the same server session.
+/// How long the server may go unheard before the "link down" banner: three heartbeats.
+const LINK_DOWN_GRACE: Duration = HEARTBEAT.saturating_mul(3);
+
+/// More keys in one read than anyone types come from a paste or a program writing to the user's
+/// terminal: what they do is not predicted.
+const TYPED_KEYS: usize = 32;
+
+/// How long after the cursor went to a fresh row a key typed is held from showing until echoed:
+/// the PTY's modes may not be known yet (a password prompt).
+const PROMPT_HOLD: Duration = crate::proto::TTY_TICK.saturating_mul(2);
+
+/// How long notices stay on the status line.
+const NOTICE_FOR: Duration = Duration::from_secs(3);
+
+/// How long the client waits, once it has the program's end, for the server to close.
+const END_WAIT: Duration = Duration::from_secs(2);
+
+/// Dials the server and makes the opening request ([`crate::request`]).
+///
+/// It makes a shell's first connection and every reconnect, which reattaches to the session the
+/// first reached, and the one connection of a command, a copy or a listing.
 pub struct IrohConnector {
     endpoint: Endpoint,
     target: EndpointAddr,
@@ -73,43 +84,85 @@ impl IrohConnector {
         Self { endpoint, target }
     }
 
-    /// Connect and await the stream of the first frame, which the server sends once the client has a
-    /// session.
-    /// A server that will not have us for good closes the connection instead, a [`Refused`]
-    /// error, so the client fails fast rather than redialing forever; one that cannot have us now
-    /// (at capacity, say) closes it saying so, an error that is its [`Close`].
-    pub async fn connect(&self) -> anyhow::Result<Admitted> {
+    /// Connect and make `request`, on the client's first stream, left open for what follows it.
+    pub async fn open(&self, request: &Request) -> anyhow::Result<(Connection, SendStream)> {
         let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
             Ok(conn) => conn,
             Err(e) if refused_our_alpn(&e) => return Err(Refused::OtherProtocol.into()),
             Err(e) => anyhow::bail!("connecting to server: {}", Peer(e)),
         };
-        match conn.accept_uni().await {
-            Ok(first) => Ok(Admitted(conn, first)),
-            Err(e) => Err(match closed_because(&conn) {
-                Some(Close::NotAuthorized) => Refused::NotAuthorized.into(),
-                Some(why) => why.into(),
-                None => anyhow::anyhow!("server did not admit the connection: {}", Peer(e)),
-            }),
+        let opened = async {
+            let mut control = conn.open_uni().await?;
+            // The control stream's bytes go before input's.
+            let _ = control.set_priority(1);
+            control
+                .write_all(&crate::request::encode(request, MAX_REQUEST)?)
+                .await?;
+            anyhow::Ok(control)
+        };
+        match opened.await {
+            Ok(control) => Ok((conn, control)),
+            Err(e) => Err(refusal(&conn, &e)),
+        }
+    }
+
+    /// Connect to the session `pick` names, for a terminal of `size`, and await the server's
+    /// first stream, which admits the client and says which session it reached. A server that
+    /// will not have us for good closes the connection instead, a [`Refused`] error; one that
+    /// cannot have us now (at capacity, say) closes it saying so, an error that is its [`Close`].
+    pub async fn connect(&self, pick: Pick, size: Size) -> anyhow::Result<Admitted> {
+        let (conn, control) = self.open(&Request::Shell { pick, size }).await?;
+        let attached = async {
+            let mut first = conn.accept_uni().await?;
+            let bytes = first.read_to_end(MAX_REPLY.saturating_add(4)).await?;
+            anyhow::Ok(crate::request::decode_framed::<Attached>(
+                &bytes, MAX_REPLY,
+            )?)
+        };
+        match attached.await {
+            Ok(Attached { at }) => Ok(Admitted { conn, control, at }),
+            Err(e) => Err(refusal(&conn, &e)),
         }
     }
 }
 
-/// A connection the server admitted, and the stream of its first frame, which said so.
-pub struct Admitted(pub Connection, RecvStream);
+/// Why the server did not answer on `conn`, which failed with `error`: its close code, a
+/// [`Refused`] if it is for good.
+pub(crate) fn refusal(conn: &Connection, error: &anyhow::Error) -> anyhow::Error {
+    match closed_because(conn) {
+        Some(Close::NotAuthorized) => Refused::NotAuthorized.into(),
+        Some(Close::NoSuchSession) => Refused::NoSuchSession.into(),
+        Some(Close::OutOfScope) => Refused::OutOfScope.into(),
+        Some(why) => why.into(),
+        None => anyhow::anyhow!("the server did not answer: {}", Peer(format!("{error:#}"))),
+    }
+}
+
+/// A shell connection the server admitted: its control stream, open, and the session it reached.
+pub struct Admitted {
+    pub conn: Connection,
+    control: SendStream,
+    pub at: Resume,
+}
 
 /// The server refused us for good: redialing cannot help, so the client exits saying why.
 #[derive(Debug, thiserror::Error)]
 pub enum Refused {
     #[error("server rejected the connection: {}", Close::NotAuthorized)]
     NotAuthorized,
-    #[error("the server does not speak this koh protocol ({PROTOCOL}); upgrade koh on both ends")]
+    #[error("{}", Close::NoSuchSession)]
+    NoSuchSession,
+    #[error("{}", Close::OutOfScope)]
+    OutOfScope,
+    #[error(
+        "this koh speaks protocol {PROTOCOL} and the server speaks another; upgrade koh on \
+         whichever end is older"
+    )]
     OtherProtocol,
 }
 
 /// Whether a dial failed because the server does not serve [`ALPN`]: the TLS handshake ended with
-/// alert 120 (`no_application_protocol`), which QUIC reports as crypto error `0x178`. A server on
-/// another koh protocol version refuses us this way, and pointing at the allowlist would mislead.
+/// alert 120 (`no_application_protocol`), which QUIC reports as crypto error `0x178`.
 fn refused_our_alpn(error: &(dyn std::error::Error + 'static)) -> bool {
     use iroh::endpoint::{ConnectionError, TransportErrorCode};
     let no_alpn = TransportErrorCode::crypto(120);
@@ -144,63 +197,6 @@ const fn next_attempt_after_drop(attempt: u32, dwell: Duration) -> u32 {
     }
 }
 
-/// The out-of-band window state (title / icon / clipboard / bell) to mirror onto the real terminal.
-fn window_state(screen: &TerminalScreen) -> WindowState<'_> {
-    WindowState {
-        title: screen.title(),
-        icon: screen.icon(),
-        clipboard: screen.clipboard(),
-        bell_count: screen.bell_count(),
-    }
-}
-
-/// Where the client paints frames and reads the window size: the tty, or a test's capture.
-pub trait ClientTerminal {
-    /// Paint `state`, the synced screen, with the predictions `overlay` and an optional status
-    /// line.
-    fn render(
-        &mut self,
-        state: &TerminalScreen,
-        overlay: &Overlay,
-        status: Option<&str>,
-    ) -> std::io::Result<()>;
-
-    /// The current window size.
-    fn size(&self) -> std::io::Result<Size>;
-
-    /// The window was resized: whatever it showed may be gone, so the next [`render`](Self::render)
-    /// paints everything. Default: a no-op, for a terminal that paints everything every time.
-    fn window_resized(&mut self) {}
-
-    /// Suspend the client (`Ctrl-^ Ctrl-Z`): restore the user's terminal and stop the process with
-    /// SIGTSTP; whether it did, so the caller waits for SIGCONT before [`resume`](Self::resume).
-    /// Default: nothing, so a test terminal never stops the test process.
-    fn suspend(&mut self) -> std::io::Result<bool> {
-        Ok(false)
-    }
-
-    /// Take the terminal back after a [`suspend`](Self::suspend): it was reset meanwhile.
-    fn resume(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    /// Ask the user's terminal `questions` (the session's: what it does at start-up, its colours
-    /// again after it reported a new scheme). Default: a no-op, for a terminal that answers
-    /// nothing.
-    fn ask(&mut self, _questions: &[u8]) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    /// The user's terminal said what it does: paint and listen by it. Default: a no-op.
-    fn found(&mut self, _found: Found) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    /// The run's first frame arrived, showing `win`: the clipboard and bells in it are from before
-    /// the client came. Default: a no-op, for a terminal that mirrors neither.
-    fn prime(&mut self, _win: WindowState<'_>) {}
-}
-
 /// This process's pid, as the signal calls take it.
 fn own_pid() -> std::io::Result<fuxix::process::Pid> {
     i32::try_from(std::process::id())
@@ -209,501 +205,142 @@ fn own_pid() -> std::io::Result<fuxix::process::Pid> {
         .ok_or_else(|| std::io::Error::other("this process's pid is not a valid pid"))
 }
 
-/// The production [`ClientTerminal`] over a [`KohBackend`]: raw mode and the alternate screen from
-/// [`enter`](Self::enter) until drop, the mirrored window state, and the painted grid.
-pub struct BackendTerminal<B: KohBackend> {
-    backend: B,
-    /// The title, clipboard, bell and input modes mirrored to the terminal.
-    oob: render::OutOfBand,
-    /// What the terminal was last painted with, so a frame paints only what changed.
-    painter: render::Painter,
-    /// What the client turned on in the user's terminal beside the input modes, which it turns
-    /// off again on leaving and on suspend: kitty's disambiguate and alternate keys, pushed, and
-    /// scheme reports (mode 2031).
-    extras: Extras,
-    /// What was on when the client suspended, to turn on at the resume.
-    suspended: Extras,
-}
-
-/// What the client turns on in a terminal that speaks it, beside the input modes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Extras {
-    kitty: bool,
-    scheme_reports: bool,
-}
-
-impl Extras {
-    /// The bytes turning on what `self` has and `was` has not.
-    fn on(self, was: Self) -> Vec<u8> {
-        let mut out = Vec::new();
-        if self.kitty && !was.kitty {
-            out.extend_from_slice(b"\x1b[>5u");
-        }
-        if self.scheme_reports && !was.scheme_reports {
-            out.extend_from_slice(b"\x1b[?2031h");
-        }
-        out
-    }
-
-    /// The bytes turning them off: the push popped.
-    fn off(self) -> Vec<u8> {
-        let mut out = Vec::new();
-        if self.kitty {
-            out.extend_from_slice(b"\x1b[<u");
-        }
-        if self.scheme_reports {
-            out.extend_from_slice(b"\x1b[?2031l");
-        }
-        out
-    }
-}
-
-impl<B: KohBackend> BackendTerminal<B> {
-    /// Enter raw mode and the alternate screen on `backend`. `clipboard_enabled` lets the server
-    /// set the clipboard (OSC 52).
-    pub fn enter(mut backend: B, clipboard_enabled: bool) -> std::io::Result<Self> {
-        backend.enter_raw_mode()?;
-        let mut this = Self {
-            backend,
-            oob: render::OutOfBand::with_title_prefix(KOH_TITLE_PREFIX.to_string())
-                .with_clipboard(clipboard_enabled),
-            painter: render::Painter::default(),
-            extras: Extras::default(),
-            suspended: Extras::default(),
-        };
-        this.backend.enter_alt_screen()?;
-        Ok(this)
-    }
-
-    /// Turn on, until the client leaves, what `want` has and is not on yet.
-    fn turn_on(&mut self, want: Extras) -> std::io::Result<()> {
-        let on = want.on(self.extras);
-        self.extras = want;
-        self.ask(&on)
-    }
-
-    /// Paint underline styles (`4:n`) if the terminal draws them (`on`), else plain underlines,
-    /// the default; what the terminal shows is painted again.
-    pub fn set_underline_styles(&mut self, on: bool) {
-        self.painter.set_underline_styles(on);
-    }
-
-    /// Paint hyperlinks (OSC 8) if `on`, the default; else their text alone. What the terminal
-    /// shows is painted again.
-    pub fn set_hyperlinks(&mut self, on: bool) {
-        self.painter.set_hyperlinks(on);
-    }
-
-    /// Turn off what [`turn_on`](Self::turn_on) turned on.
-    fn turn_off(&mut self) -> std::io::Result<()> {
-        let off = std::mem::take(&mut self.extras).off();
-        self.ask(&off)
-    }
-}
-
-impl<B: KohBackend> ClientTerminal for BackendTerminal<B> {
-    fn render(
-        &mut self,
-        state: &TerminalScreen,
-        overlay: &Overlay,
-        status: Option<&str>,
-    ) -> std::io::Result<()> {
-        self.oob.emit(
-            &mut self.backend,
-            state.screen().modes().mouse_mode,
-            window_state(state),
-        )?;
-        self.painter
-            .render(&mut self.backend, state.screen(), overlay, status)
-    }
-
-    fn size(&self) -> std::io::Result<Size> {
-        self.backend.size()
-    }
-
-    fn window_resized(&mut self) {
-        self.painter.invalidate();
-    }
-
-    fn ask(&mut self, questions: &[u8]) -> std::io::Result<()> {
-        if questions.is_empty() {
-            return Ok(());
-        }
-        self.backend.write_bytes(questions)?;
-        self.backend.flush()
-    }
-
-    fn found(&mut self, found: Found) -> std::io::Result<()> {
-        self.painter.set_underline_styles(found.underline_styles);
-        self.turn_on(Extras {
-            kitty: found.kitty,
-            scheme_reports: found.scheme_reports,
-        })
-    }
-
-    fn prime(&mut self, win: WindowState<'_>) {
-        self.oob.prime(win);
-    }
-
-    fn suspend(&mut self) -> std::io::Result<bool> {
-        // Off until turned on again at the resume, so a failure meanwhile does not turn them off
-        // twice.
-        self.suspended = self.extras;
-        self.turn_off()?;
-        self.backend.leave_alt_screen()?;
-        self.backend.leave_raw_mode()?;
-        let _ = self
-            .backend
-            .write_bytes("\n[koh suspended — run `fg` to resume]\n".as_bytes());
-        let _ = self.backend.flush();
-        fuxix::process::kill(own_pid()?, fuxix::process::Signal::Tstp)?;
-        Ok(true)
-    }
-
-    fn resume(&mut self) -> std::io::Result<()> {
-        // The terminal was reset meanwhile: everything is asserted again on the next frame.
-        self.backend.enter_raw_mode()?;
-        self.backend.enter_alt_screen()?;
-        let extras = std::mem::take(&mut self.suspended);
-        self.turn_on(extras)?;
-        self.oob.invalidate();
-        self.painter.invalidate();
-        Ok(())
-    }
-}
-
-impl<B: KohBackend> Drop for BackendTerminal<B> {
-    fn drop(&mut self) {
-        // Best-effort: a mode left on (mouse reporting, say) would garble the user's shell.
-        let _ = self.turn_off();
-        let _ = self.backend.leave_alt_screen();
-        let _ = self.backend.leave_raw_mode();
-    }
-}
-
-/// Run a client session on `initial`, redialing through `connector` and reattaching to the same
-/// server session whenever the link drops; meanwhile the last screen stays up under a banner.
-///
-/// The I/O shell around [`ClientSession`], which makes every protocol decision. One session lives
-/// for the whole run, its first phase asking the user's terminal what it does (its colours too if
-/// `colours`), so stdin has one decoder from start to end and what is typed while the link is down
-/// is read by the same escape machine. `input_rx` carries typed bytes (its closing ends the
-/// session); `resize_rx` carries resize ticks, on which the size is read from `term`
-/// (`initial_size` if that fails). Cancelling `shutdown` (on a fatal signal) quits like the user,
-/// so the terminal is restored. `bell` runs on every remote bell.
-///
-/// The client's stream is opened and written by its own task behind a bounded queue, and frames
-/// are read by their own tasks, so nothing here waits on the network outside the one `select!`:
-/// the keyboard, the quit escape and signals stay live even when the server grants no stream or
-/// stops reading.
-///
-/// Returns the remote shell's exit code if it exited, `None` on a local quit.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the I/O shell wires up the connection, connector, size, whether colours are told, \
-              the two input/resize channels, the terminal, the shutdown token and the bell hook — \
-              each a distinct collaborator; bundling them into a struct would only move the list, \
-              not shorten it"
-)]
-pub async fn run_client<T: ClientTerminal>(
-    initial: Admitted,
-    dialed_at: SystemTime,
-    connector: IrohConnector,
-    initial_size: Size,
-    colours: bool,
-    mut input_rx: mpsc::Receiver<Vec<u8>>,
-    resize_rx: mpsc::Receiver<()>,
-    mut term: T,
-    shutdown: CancellationToken,
-    mut bell: Option<BellHook>,
-) -> anyhow::Result<Option<u32>> {
-    let mut session = ClientSession::new(term.size().unwrap_or(initial_size));
-    session.ask_terminal(Instant::now(), colours);
-    // `None` once the resize ticks end, so a closed channel is not polled again.
-    let mut resizes = Resizes(Some(resize_rx));
-    // Kept across connections: only one that lasts resets it (see `MIN_CONNECTION_DWELL`).
-    let mut attempt: u32 = 0;
-    let mut net = Net::Up(Wire::open(initial));
-    // Wall-clock time, which keeps running while the process is frozen (see `STALE_AFTER_FREEZE`),
-    // from when the connection was made: a freeze before the first iteration counts.
-    let mut last_wall = dialed_at;
-    // Logged on a change of 30 ms or more, to tell a slow link from a slow server in debug logs.
-    let mut last_logged_rtt: Option<Duration> = None;
-    // The status line as last painted: painted again only when it changes.
-    let mut shown_status: Option<String> = None;
-    loop {
-        // A clock stepped backwards reads as no gap.
-        let wall_now = SystemTime::now();
-        let wall_gap = wall_now.duration_since(last_wall).unwrap_or(Duration::ZERO);
-        last_wall = wall_now;
-        let rtt = if let Net::Up(wire) = &net {
-            if wall_gap >= STALE_AFTER_FREEZE {
-                tracing::info!(
-                    frozen_secs = wall_gap.as_secs(),
-                    "detected resume from a process freeze (suspend/screen-off); forcing a reconnect"
-                );
-                net = redial(wire, &mut attempt, &mut session, &connector);
-                continue;
-            }
-            crate::transport_iroh::rtt(&wire.conn)
-        } else {
-            None
-        };
-        if let Some(rtt) = rtt {
-            if last_logged_rtt.is_none_or(|prev| prev.abs_diff(rtt) >= Duration::from_millis(30)) {
-                tracing::debug!(rtt_ms = rtt.as_millis(), "link rtt");
-                last_logged_rtt = Some(rtt);
-            }
-        }
-        let now = Instant::now();
-        let tick = session.on_tick(now, rtt);
-
-        // Repaint on new content, or when the status line says something else.
-        if session.dirty || tick.status != shown_status {
-            match session.view() {
-                Some(view) => term.render(&view, &Overlay::default(), tick.status.as_deref())?,
-                None => term.render(session.state(), &session.overlay(), tick.status.as_deref())?,
-            }
-            shown_status = tick.status;
-            session.dirty = false;
-            // Only once synced: the first synced frame primes the hook and the mirroring, so bells
-            // and a clipboard from before this attach reach neither.
-            if session.synced() {
-                let win = session.window_state();
-                term.prime(win);
-                if let Some(hook) = bell.as_mut() {
-                    hook.prime(win.bell_count);
-                    if hook.observe(win.bell_count, now) {
-                        hook.fire(win.bell_count, win.title);
-                    }
-                }
-            }
-        }
-
-        if session.exited() {
-            end_session(&mut term, &session, &shutdown).await;
-            return Ok(session.state().exit_code());
-        }
-
-        // What the user's terminal said it does, and the questions the session has for it.
-        if let Some(found) = session.take_found() {
-            term.found(found)?;
-        }
-        let questions = session.take_questions();
-        if let Err(e) = term.ask(&questions) {
-            tracing::debug!(error = %e, "could not ask the terminal");
-        }
-
-        let (writers, frames, dialing) = match &mut net {
-            Net::Up(wire) => (
-                Some((&wire.input_tx, &wire.control_tx)),
-                Some(&mut wire.frame_rx),
-                None,
-            ),
-            Net::Down(dial) => (None, None, Some(dial)),
-        };
-        let change = tokio::select! {
-            // Not biased: a flood of keystrokes must not starve frames, nor frames keystrokes.
-            maybe = input_rx.recv() => match maybe {
-                Some(chunk) => session.on_input(Instant::now(), &chunk).into(),
-                None => Some(Change::Quit), // input source closed
-            },
-            // A lone Escape, or a sequence cut short, is taken as typed once nothing follows.
-            () = when(session.deadline().map(|at| tokio::time::sleep_until(at.into()))) => {
-                session.on_timeout(Instant::now()).into()
-            }
-            () = shutdown.cancelled() => Some(Change::Quit),
-            permit = when(writers.map(|(input, _)| input.reserve())), if session.has_outgoing_on(Stream::Input) => {
-                send(permit.ok(), session.pop_outgoing_on(Stream::Input))
-            }
-            permit = when(writers.map(|(_, control)| control.reserve())), if session.has_outgoing_on(Stream::Control) => {
-                send(permit.ok(), session.pop_outgoing_on(Stream::Control))
-            }
-            () = resizes.next() => {
-                term.window_resized();
-                if let Ok(size) = term.size() {
-                    session.on_resize(size);
-                }
-                None
-            }
-            frame = when(frames.map(mpsc::Receiver::recv)) => match frame.map(|received| received.msg) {
-                // The frame reader ended because the connection closed.
-                None => Some(Change::Closed),
-                Some(msg) => {
-                    session.on_server(Instant::now(), msg);
-                    None
-                }
-            },
-            dialed = when(dialing) => Some(Change::Dialed(dialed)),
-            () = tokio::time::sleep(tick.wait) => None,
-        };
-        match change {
-            None => {}
-            Some(Change::Quit) => return Ok(None),
-            Some(Change::Suspend) => {
-                let Some(typed) = suspend(&mut term, &shutdown, &mut input_rx).await? else {
-                    return Ok(None);
-                };
-                // A suspend escape typed meanwhile is not taken again.
-                if session.on_input(Instant::now(), &typed) == InputOutcome::Quit {
-                    return Ok(None);
-                }
-                // A window resized while the client was stopped sent it no SIGWINCH.
-                term.window_resized();
-                if let Ok(size) = term.size() {
-                    session.on_resize(size);
-                }
-                session.dirty = true;
-                shown_status = None;
-                // A deliberate suspend is not a freeze to reconnect after.
-                last_wall = SystemTime::now();
-            }
-            Some(Change::Closed) => {
-                let Net::Up(wire) = &mut net else {
-                    continue;
-                };
-                // The server ended the session (its shell exited); else the link was lost.
-                if closed_because(&wire.conn) == Some(Close::SessionEnded) {
-                    // What the reader still has was sent before the close: the last frame says
-                    // how the program exited, whichever end noticed the close first.
-                    let drained = async {
-                        while let Some(received) = wire.frame_rx.recv().await {
-                            session.on_server(Instant::now(), received.msg);
-                        }
-                    };
-                    let _ = tokio::time::timeout(Duration::from_secs(1), drained).await;
-                    end_session(&mut term, &session, &shutdown).await;
-                    return Ok(session.state().exit_code());
-                }
-                tracing::info!(reason = ?wire.conn.close_reason(), "link lost; will reconnect");
-                net = redial(wire, &mut attempt, &mut session, &connector);
-            }
-            Some(Change::Dialed(Ok(Ok(conn)))) => {
-                session.attach(term.size().unwrap_or(initial_size));
-                net = Net::Up(Wire::open(conn));
-            }
-            Some(Change::Dialed(failed)) => {
-                if let Ok(Err(e)) = failed {
-                    if e.is::<Refused>() {
-                        return Err(e);
-                    }
-                    // Refused for now (at capacity, say): redialing may do, and the banner says why.
-                    if let Some(why) = e.downcast_ref::<Close>() {
-                        session.refused(why.text());
-                    }
-                    tracing::info!(reason = %e, attempt, "reconnect dial failed");
-                } else {
-                    tracing::info!(attempt, "reconnect dial timed out");
-                }
-                attempt = attempt.saturating_add(1);
-                net = Net::Down(dial(&connector, attempt));
-            }
-        }
-    }
-}
-
-/// Suspend the client on `term`, and once the process is continued take the terminal back; what
-/// was typed meanwhile, to go on with, or `None` to quit. The stop may never come (the kernel
-/// drops it in a process group without job control): then a key typed, which a stopped process
-/// could not read, ends the wait too, as does a fatal signal or the input's end, which quit.
-async fn suspend<T: ClientTerminal>(
-    term: &mut T,
-    shutdown: &CancellationToken,
-    input: &mut mpsc::Receiver<Vec<u8>>,
-) -> anyhow::Result<Option<Vec<u8>>> {
-    use tokio::signal::unix::{signal, SignalKind};
-    // Listening before the stop, so the SIGCONT that ends it is not missed.
-    let mut continued = signal(SignalKind::from_raw(fuxix::process::Signal::Cont.raw()))?;
-    let mut typed = Vec::new();
-    if term.suspend()? {
-        tokio::select! {
-            _ = continued.recv() => {}
-            maybe = input.recv() => match maybe {
-                Some(bytes) => typed = bytes,
-                None => return Ok(None),
-            },
-            () = shutdown.cancelled() => return Ok(None),
-        }
-    }
-    term.resume()?;
-    Ok(Some(typed))
-}
-
-/// The client's link to the server: a live connection, or a redial under way.
-enum Net<'c> {
-    Up(Wire),
-    Down(Dial<'c>),
-}
-
-/// A redial: the backoff, then one dial, abandoned after [`RECONNECT_CONNECT_TIMEOUT`]. Pinned,
-/// so banner repaints and keystrokes do not restart a slow one.
-type Dial<'c> = std::pin::Pin<Box<dyn std::future::Future<Output = Dialed> + Send + 'c>>;
-
-/// A redial's result: connected, refused, or timed out.
-type Dialed = Result<anyhow::Result<Admitted>, tokio::time::error::Elapsed>;
-
-/// What one turn of [`run_client`]'s loop left for it to act on.
-enum Change {
-    /// The user quit, the input channel closed, or a fatal signal came.
+/// What one turn of the loop woke for.
+enum Step {
+    Typed(Option<Vec<u8>>),
+    Timeout,
     Quit,
-    /// The user typed the suspend escape.
-    Suspend,
-    /// The connection closed: the session ended, or the link was lost.
-    Closed,
-    /// A redial finished.
+    Resize,
+    Server(Option<FromServer>),
     Dialed(Dialed),
+    Tick,
+    /// The input writer has room for what is held.
+    Room,
 }
 
-impl From<InputOutcome> for Option<Change> {
-    fn from(outcome: InputOutcome) -> Self {
-        match outcome {
-            InputOutcome::Quit => Some(Change::Quit),
-            InputOutcome::Suspend => Some(Change::Suspend),
-            InputOutcome::Forwarded => None,
-        }
-    }
+/// What a connection's reader hands the loop.
+enum FromServer {
+    /// What the program shows, on epoch `epoch`.
+    Shown { epoch: u32, msg: Shown },
+    /// So many bytes of epoch `epoch` were read.
+    Read { epoch: u32, bytes: u64 },
 }
 
-/// A live connection: its stream writer and frame reader, which end with it, and it with them.
+/// A live connection: its stream writers and its reader, which end with it.
 struct Wire {
     conn: Connection,
-    /// The writers of the client's input and control streams.
     input_tx: mpsc::Sender<Vec<u8>>,
     control_tx: mpsc::Sender<Vec<u8>>,
-    frame_rx: mpsc::Receiver<Received>,
-    _writers: [AbortOnDropHandle<()>; 2],
-    _reader: AbortOnDropHandle<()>,
-    /// When the loop took the connection, for its dwell.
+    rx: mpsc::Receiver<FromServer>,
+    _tasks: [AbortOnDropHandle<()>; 3],
     started: Instant,
+    /// The epoch the display shows.
+    epoch: u32,
+    /// When the server was last heard.
+    heard: Instant,
+    /// Input waiting for its writer, which waits for the server to take it, and its bytes.
+    queued: crate::bounded::Bounded<Vec<u8>, QUEUED_MESSAGES>,
+    queued_bytes: usize,
+    /// Typing was dropped since the queue was last empty: the status line says so.
+    paused: bool,
 }
 
+/// The most typed bytes held while the server takes no input; past it, typing is dropped and the
+/// status line says so. An empty queue takes any input, a whole paste included.
+const MAX_QUEUED_INPUT: usize = 1024 * 1024;
+
+/// The most messages of input held, however small.
+const QUEUED_MESSAGES: usize = 4096;
+
+/// How many encoded messages may wait for a writer, and decoded ones for the loop.
+const WRITER_QUEUE: usize = 64;
+const READER_QUEUE: usize = 64;
+
 impl Wire {
-    /// Start the tasks opening and writing the client's input and control streams and reading
-    /// frames on `conn`. Each stream is opened by its writer, so a server that grants none holds
-    /// up nothing else; one that fails to open ends its writer, which loses the link.
-    fn open(Admitted(conn, first): Admitted) -> Self {
+    fn open(Admitted { conn, control, .. }: Admitted) -> Self {
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
         let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
-        let (frame_tx, frame_rx) = mpsc::channel::<Received>(FRAME_QUEUE);
+        let (tx, rx) = mpsc::channel(READER_QUEUE);
+        let input = {
+            let conn = conn.clone();
+            async move {
+                if let Ok(stream) = conn.open_uni().await {
+                    write_client_stream(stream, input_rx).await;
+                }
+            }
+        };
         #[expect(
             clippy::disallowed_methods,
             reason = "two writers and a reader a connection"
         )]
-        let (writers, reader) = (
-            [(input_rx, 0), (control_rx, 1)].map(|(rx, priority)| {
-                let writer = write_client_stream(conn.clone(), rx, priority);
-                AbortOnDropHandle::new(tokio::spawn(writer))
-            }),
-            AbortOnDropHandle::new(tokio::spawn(read_frames(conn.clone(), first, frame_tx))),
-        );
+        let tasks = [
+            AbortOnDropHandle::new(tokio::spawn(input)),
+            AbortOnDropHandle::new(tokio::spawn(write_client_stream(control, control_rx))),
+            AbortOnDropHandle::new(tokio::spawn(read_epochs(conn.clone(), tx))),
+        ];
+        let now = Instant::now();
         Self {
             conn,
             input_tx,
             control_tx,
-            frame_rx,
-            _writers: writers,
-            _reader: reader,
-            started: Instant::now(),
+            rx,
+            _tasks: tasks,
+            started: now,
+            epoch: 0,
+            heard: now,
+            queued: crate::bounded::Bounded::new(),
+            queued_bytes: 0,
+            paused: false,
+        }
+    }
+
+    /// Queue `msg` on its stream; whether there was room. Input waits in order behind what the
+    /// server has not taken, up to [`MAX_QUEUED_INPUT`]; past it, it is dropped (an empty queue
+    /// takes any message).
+    fn send(&mut self, msg: &ClientMsg) -> bool {
+        let bytes = match encode_client(msg) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "dropping an unencodable message");
+                return true;
+            }
+        };
+        if msg.stream() == crate::proto::Stream::Control {
+            return self.control_tx.try_send(bytes).is_ok();
+        }
+        if self.queued.is_empty() {
+            match self.input_tx.try_send(bytes) {
+                Ok(()) => return true,
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                Err(mpsc::error::TrySendError::Full(bytes)) => return self.hold(bytes),
+            }
+        }
+        self.hold(bytes)
+    }
+
+    /// Hold `bytes` of input for the writer, if there is room.
+    fn hold(&mut self, bytes: Vec<u8>) -> bool {
+        let len = bytes.len();
+        if self.queued_bytes > 0 && self.queued_bytes.saturating_add(len) > MAX_QUEUED_INPUT {
+            self.paused = true;
+            return false;
+        }
+        if self.queued.push_back(bytes).is_err() {
+            self.paused = true;
+            return false;
+        }
+        self.queued_bytes = self.queued_bytes.saturating_add(len);
+        true
+    }
+
+    /// The writer has room: the oldest input held goes.
+    fn release(&mut self, permit: mpsc::OwnedPermit<Vec<u8>>) {
+        if let Some(bytes) = self.queued.pop_front() {
+            self.queued_bytes = self.queued_bytes.saturating_sub(bytes.len());
+            let _ = permit.send(bytes);
+        }
+        if self.queued.is_empty() {
+            self.paused = false;
         }
     }
 }
@@ -715,22 +352,83 @@ impl Drop for Wire {
     }
 }
 
-/// The link on `wire` was lost: close it, detach the session, and redial.
-fn redial<'c>(
-    wire: &Wire,
-    attempt: &mut u32,
-    session: &mut ClientSession,
-    connector: &'c IrohConnector,
-) -> Net<'c> {
-    wire.conn.close(0u32.into(), b"reconnecting");
-    *attempt = next_attempt_after_drop(*attempt, wire.started.elapsed());
-    session.detach(Instant::now());
-    Net::Down(dial(connector, *attempt))
+/// Write queued messages to one of the client's streams until the queue or the stream closes.
+async fn write_client_stream(mut send: SendStream, mut queue: mpsc::Receiver<Vec<u8>>) {
+    while let Some(bytes) = queue.recv().await {
+        if send.write_all(&bytes).await.is_err() {
+            return;
+        }
+    }
+    let _ = send.finish();
 }
 
-/// Dial again: at once after a proven connection's drop (`attempt` 0), else after a backoff, so a
-/// server that completes the handshake and at once closes is not redialed in a tight loop.
-fn dial(connector: &IrohConnector, attempt: u32) -> Dial<'_> {
+/// Accept the server's epoch streams, reading the newest: a newer one ends the reading of the
+/// one before. Ends when the connection does.
+async fn read_epochs(conn: Connection, tx: mpsc::Sender<FromServer>) {
+    let mut reading: Option<(u32, AbortOnDropHandle<()>)> = None;
+    loop {
+        let Ok(mut recv) = conn.accept_uni().await else {
+            return;
+        };
+        let mut header = [0u8; 5];
+        if recv.read_exact(&mut header).await.is_err() {
+            continue;
+        }
+        let [tag, epoch @ ..] = header;
+        let epoch = u32::from_be_bytes(epoch);
+        if tag != SHOWN_TAG || reading.as_ref().is_some_and(|(n, _)| *n >= epoch) {
+            let _ = recv.stop(0u32.into());
+            continue;
+        }
+        let tx = tx.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "one epoch's reader at a time: the one before is aborted"
+        )]
+        let task = tokio::spawn(async move {
+            let mut decoder = ShownDecoder::default();
+            let mut bytes: u64 = 5;
+            while let Ok(Some(chunk)) = recv.read_chunk(64 * 1024).await {
+                bytes = bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+                decoder.push(&chunk);
+                loop {
+                    match decoder.next_shown() {
+                        Ok(Some(msg)) => {
+                            if tx.send(FromServer::Shown { epoch, msg }).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "the server's stream broke the protocol");
+                            return;
+                        }
+                    }
+                }
+                if tx.send(FromServer::Read { epoch, bytes }).await.is_err() {
+                    return;
+                }
+            }
+        });
+        reading = Some((epoch, AbortOnDropHandle::new(task)));
+    }
+}
+
+/// The client's link to the server: a live connection, or a redial under way.
+enum Net<'c> {
+    Up(Box<Wire>),
+    Down(Dial<'c>),
+}
+
+/// A redial: the backoff, then one dial, abandoned after [`RECONNECT_CONNECT_TIMEOUT`].
+type Dial<'c> = std::pin::Pin<Box<dyn std::future::Future<Output = Dialed> + Send + 'c>>;
+
+/// A redial's result: connected, refused, or timed out.
+type Dialed = Result<anyhow::Result<Admitted>, tokio::time::error::Elapsed>;
+
+/// Dial `pick` again, for a terminal of `size`: at once after a proven connection's drop
+/// (`attempt` 0), else after a backoff.
+fn dial(connector: &IrohConnector, attempt: u32, pick: Pick, size: Size) -> Dial<'_> {
     let wait = if attempt > 0 {
         backoff(attempt)
     } else {
@@ -738,7 +436,7 @@ fn dial(connector: &IrohConnector, attempt: u32) -> Dial<'_> {
     };
     Box::pin(async move {
         tokio::time::sleep(wait).await;
-        tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect()).await
+        tokio::time::timeout(RECONNECT_CONNECT_TIMEOUT, connector.connect(pick, size)).await
     })
 }
 
@@ -750,13 +448,7 @@ async fn when<F: std::future::Future>(future: Option<F>) -> F::Output {
     }
 }
 
-/// How many encoded messages may wait for the client's stream writer.
-const WRITER_QUEUE: usize = 64;
-/// How many decoded frames may wait for the connection loop.
-const FRAME_QUEUE: usize = 16;
-
-/// The window's resize ticks. [`next`](Self::next) waits for one, and for ever once the channel
-/// closed: a closed channel cannot spin the loop.
+/// The window's resize ticks: waited for, and for ever once the channel closed.
 struct Resizes(Option<mpsc::Receiver<()>>);
 
 impl Resizes {
@@ -771,415 +463,396 @@ impl Resizes {
     }
 }
 
-/// Send `msg` with `permit`, a writer's room; a writer that ended (`None`) lost the connection.
-fn send(permit: Option<mpsc::Permit<'_, Vec<u8>>>, msg: Option<ClientMsg>) -> Option<Change> {
-    let Some(permit) = permit else {
-        return Some(Change::Closed);
-    };
-    match msg.map(|msg| encode_client(&msg)) {
-        Some(Ok(bytes)) => permit.send(bytes),
-        Some(Err(e)) => tracing::warn!(error = %e, "dropping an unencodable message"),
-        None => {}
+/// What the status line says, a notice at a time, for a while.
+#[derive(Default)]
+struct Notices {
+    shown: Option<(&'static str, Instant)>,
+}
+
+impl Notices {
+    fn give(&mut self, text: &'static str, now: Instant) {
+        self.shown = Some((text, now));
     }
-    None
-}
 
-/// Open one of the client's streams on `conn`, at `priority`, and write queued messages to it,
-/// until the queue or the stream closes.
-async fn write_client_stream(conn: Connection, mut queue: mpsc::Receiver<Vec<u8>>, priority: i32) {
-    let Ok(mut send) = conn.open_uni().await else {
-        return;
-    };
-    // The control stream's bytes go before input's: a resize or an acknowledgement does not wait
-    // behind a paste QUIC is still sending.
-    let _ = send.set_priority(priority);
-    while let Some(bytes) = queue.recv().await {
-        if send.write_all(&bytes).await.is_err() {
-            return;
-        }
+    fn say(&self, now: Instant) -> Option<&'static str> {
+        self.shown
+            .filter(|(_, at)| now.saturating_duration_since(*at) < NOTICE_FOR)
+            .map(|(text, _)| text)
     }
-    let _ = send.finish();
 }
 
-/// A server stream read past this is a large one, which needs one of [`LARGE_STREAMS`] to go on.
-const SMALL_STREAM: usize = 256 * 1024;
-
-/// Most large server streams read, or waiting for the loop, at once.
-///
-/// With the small ones, the client holds at most about `LARGE_STREAMS` of [`MAX_FRAME`] and
-/// [`FRAME_QUEUE`] of twice [`SMALL_STREAM`] of the server's streams, as they came: some 40 MiB,
-/// not 16 of the largest. The loop inflates them one at a time (a frame to at most [`MAX_FRAME`],
-/// history rows to at most [`MAX_HISTORY_REPLY`](crate::terminal::MAX_HISTORY_REPLY)). A large stream waits for its turn holding at most two chunks, and one that has its
-/// turn waits on nothing but its own bytes, so the turns cannot deadlock.
-const LARGE_STREAMS: usize = 2;
-
-/// A message from the server, holding its turn as a large stream, if it was one, until the loop
-/// takes it.
-struct Received {
-    msg: ServerMsg,
-    _large: Option<tokio::sync::OwnedSemaphorePermit>,
+/// What the user's terminal and the run hold beside the connection.
+pub struct Run<B: KohBackend> {
+    pub backend: B,
+    pub size: Size,
+    pub colours: bool,
+    pub clipboard: bool,
+    pub links: bool,
+    pub bell: Option<BellHook>,
 }
 
-/// Accept the server's streams (frames, and history rows), after `first`, each read on its own task so a stalled or
-/// reset stream never holds up a newer frame. Ends when the connection closes.
+/// Run a shell client on `initial`, redialing through `connector` whenever the link drops; the
+/// remote program's exit status if it exited, `None` on a detach.
 ///
-/// At most [`FRAME_QUEUE`] streams are read or wait to be applied at once, together: a reader
-/// takes its slot in `frames` before it reads. Past them, no stream is accepted, so QUIC's stream
-/// limit stops the server opening more; and of them, at most [`LARGE_STREAMS`] are large.
-async fn read_frames(conn: Connection, first: RecvStream, frames: mpsc::Sender<Received>) {
-    let large = std::sync::Arc::new(tokio::sync::Semaphore::new(LARGE_STREAMS));
-    let mut first = Some(first);
+/// Each redial reattaches to the same server session, by its number in that server's run; a
+/// session gone meanwhile ends the run. `input_rx` carries typed bytes (its closing ends the run),
+/// `resize_rx` resize ticks. Cancelling `shutdown` (a fatal signal) detaches.
+pub async fn run_client<B: KohBackend>(
+    initial: Admitted,
+    dialed_at: SystemTime,
+    connector: IrohConnector,
+    run: Run<B>,
+    (mut input_rx, resize_rx): (mpsc::Receiver<Vec<u8>>, mpsc::Receiver<()>),
+    shutdown: CancellationToken,
+) -> anyhow::Result<Option<u32>> {
+    let Run {
+        mut backend,
+        mut size,
+        colours,
+        clipboard,
+        links,
+        mut bell,
+    } = run;
+    let mut display = Display::new(size, clipboard, links)?;
+    let mut keys = Keys::new(Instant::now(), colours);
+    backend.write_bytes(&keys.take_questions())?;
+    backend.flush()?;
+    // Every redial goes back to the session the first connection reached, never to another.
+    let back = Pick::Resume(initial.at);
+    let mut resizes = Resizes(Some(resize_rx));
+    let mut attempt: u32 = 0;
+    let mut net = Net::Up(Box::new(Wire::open(initial)));
+    let mut seq = InputSeq::default();
+    let mut resized: u32 = 0;
+    let mut notices = Notices::default();
+    // Since when the link is down, and whether typing was dropped in the outage.
+    let mut outage: Option<(Instant, bool)> = None;
+    let mut bells: Option<u64> = None;
+    let mut title = String::new();
+    let mut last_wall = dialed_at;
+    let mut status: Option<String> = None;
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let Ok(slot) = frames.clone().reserve_owned().await else {
-            return;
+        let now = Instant::now();
+        // The status line, painted again only when it changes.
+        let said = match (&net, outage) {
+            (Net::Down(_), Some((_, dropped))) => Some(if dropped {
+                "[koh] reconnecting… · typing during the outage not sent · Ctrl-^ . to quit"
+            } else {
+                "[koh] reconnecting… · Ctrl-^ . to quit"
+            }),
+            (Net::Up(wire), _) if now.saturating_duration_since(wire.heard) > LINK_DOWN_GRACE => {
+                Some("[koh] link down… · Ctrl-^ . to quit")
+            }
+            (Net::Up(wire), _) if wire.paused => {
+                Some("[koh] input paused — the server is not taking input")
+            }
+            _ => notices.say(now),
+        }
+        .map(str::to_owned);
+        if said != status {
+            status = said;
+            display.set_status(status.clone());
+        }
+        display.paint(&mut backend)?;
+        backend.flush()?;
+
+        let (from_server, dialing, room) = match &mut net {
+            Net::Up(wire) => {
+                let room = (!wire.queued.is_empty()).then(|| wire.input_tx.clone());
+                (Some(&mut wire.rx), None, room)
+            }
+            Net::Down(dial) => (None, Some(dial), None),
         };
-        let mut recv = match first.take() {
-            Some(recv) => recv,
-            None => match conn.accept_uni().await {
-                Ok(recv) => recv,
-                Err(_) => return,
+        let step = tokio::select! {
+            typed = input_rx.recv() => Step::Typed(typed),
+            () = when(keys.deadline().map(|at| tokio::time::sleep_until(at.into()))) => Step::Timeout,
+            () = shutdown.cancelled() => Step::Quit,
+            () = resizes.next() => Step::Resize,
+            msg = when(from_server.map(mpsc::Receiver::recv)) => Step::Server(msg),
+            dialed = when(dialing) => Step::Dialed(dialed),
+            _ = tick.tick() => Step::Tick,
+            permit = when(room.as_ref().map(mpsc::Sender::reserve)) => match permit {
+                Ok(permit) => {
+                    // Taken at once: the permit is the room, and it goes with the held input.
+                    drop(permit);
+                    Step::Room
+                }
+                Err(_) => Step::Server(None),
             },
         };
-        let large = std::sync::Arc::clone(&large);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "each holds one of the frames' slots"
-        )]
-        tokio::spawn(async move {
-            let (mut bytes, mut turn) = (Vec::new(), None);
-            // A reset (superseded), oversized or malformed stream is simply not delivered.
-            while let Some(chunk) = recv.read_chunk(SMALL_STREAM).await.ok()? {
-                bytes.extend_from_slice(&chunk);
-                if bytes.len() > SMALL_STREAM && turn.is_none() {
-                    turn = Some(std::sync::Arc::clone(&large).acquire_owned().await.ok()?);
+        let read = match step {
+            Step::Typed(None) | Step::Quit => {
+                display.leave(&mut backend)?;
+                backend.flush()?;
+                return Ok(None);
+            }
+            Step::Typed(Some(bytes)) => Some(keys.bytes(Instant::now(), &bytes)),
+            Step::Timeout => Some(keys.timeout(Instant::now())),
+            Step::Resize => {
+                if let Ok(now_size) = backend.size() {
+                    size = now_size;
+                    display.resize(size);
+                    resized = resized.saturating_add(1);
+                    if let Net::Up(wire) = &mut net {
+                        // On both streams: the control one waits for no input, and among the
+                        // input nothing typed after it overtakes it.
+                        let msg = ClientMsg::Resize { n: resized, size };
+                        wire.send(&msg);
+                        if let Ok(bytes) = encode_client(&msg) {
+                            let _ = wire.control_tx.try_send(bytes);
+                        }
+                    }
                 }
-                if bytes.len() > MAX_FRAME {
-                    return None;
+                None
+            }
+            Step::Server(Some(from)) => {
+                let Net::Up(wire) = &mut net else { continue };
+                wire.heard = Instant::now();
+                match from {
+                    FromServer::Read { epoch, bytes } => {
+                        if epoch == wire.epoch {
+                            wire.send(&ClientMsg::Read { epoch, bytes });
+                        }
+                    }
+                    FromServer::Shown { epoch, msg } => {
+                        if epoch < wire.epoch {
+                            continue;
+                        }
+                        if epoch > wire.epoch {
+                            // A new epoch: its redraw resets the terminal, and the mirror with it.
+                            wire.epoch = epoch;
+                            display.new_epoch(size)?;
+                            outage = None;
+                        }
+                        match msg {
+                            Shown::Out(bytes) => display.output(&mut backend, &bytes)?,
+                            Shown::Mark(mark) => display.mark(&mut backend, mark.as_bytes())?,
+                            Shown::Report(activity) => display.report(&mut backend, activity)?,
+                            Shown::Tty(tty) => display.predictor.set_tty(Some(tty)),
+                            Shown::Echo(acked) => {
+                                display.predictor.set_local_frame_late_acked(acked.0);
+                                display.reconcile();
+                            }
+                            // The first count the run hears is from before it: it rings nothing.
+                            Shown::Bell(count) => {
+                                let first = bells.replace(count).is_none();
+                                if let Some(hook) = bell.as_mut() {
+                                    if first {
+                                        hook.prime(count);
+                                    } else if hook.observe(count, std::time::Instant::now()) {
+                                        hook.fire(count, &title);
+                                    }
+                                }
+                            }
+                            Shown::Title(now_title) => title = now_title,
+                            Shown::Exit(code) => {
+                                display.leave(&mut backend)?;
+                                backend.flush()?;
+                                // The server closes once it knows the end is here.
+                                let _ = tokio::time::timeout(END_WAIT, wire.conn.closed()).await;
+                                return Ok(Some(code));
+                            }
+                            Shown::Beat => {}
+                        }
+                    }
+                }
+                None
+            }
+            Step::Server(None) => {
+                let Net::Up(wire) = &net else { continue };
+                if closed_because(&wire.conn) == Some(Close::SessionEnded) {
+                    display.leave(&mut backend)?;
+                    backend.flush()?;
+                    return Ok(None);
+                }
+                if let Some(refused) = closed_because(&wire.conn).filter(|c| {
+                    matches!(
+                        c,
+                        Close::NotAuthorized | Close::NoSuchSession | Close::OutOfScope
+                    )
+                }) {
+                    display.leave(&mut backend)?;
+                    backend.flush()?;
+                    return Err(refusal(&wire.conn, &anyhow::Error::from(refused)));
+                }
+                tracing::info!(reason = ?wire.conn.close_reason(), "link lost; will reconnect");
+                attempt = next_attempt_after_drop(attempt, wire.started.elapsed());
+                outage = Some((Instant::now(), false));
+                display.predictor = display.predictor.reattached();
+                net = Net::Down(dial(&connector, attempt, back, size));
+                None
+            }
+            Step::Dialed(Ok(Ok(admitted))) => {
+                let mut wire = Wire::open(admitted);
+                if let Some(colours) = keys.colours() {
+                    wire.send(&ClientMsg::Colours(colours.clone()));
+                }
+                net = Net::Up(Box::new(wire));
+                None
+            }
+            Step::Dialed(failed) => {
+                if let Ok(Err(e)) = failed {
+                    if e.is::<Refused>() {
+                        display.leave(&mut backend)?;
+                        backend.flush()?;
+                        return Err(e);
+                    }
+                    tracing::info!(reason = %e, attempt, "reconnect dial failed");
+                }
+                attempt = attempt.saturating_add(1);
+                net = Net::Down(dial(&connector, attempt, back, size));
+                None
+            }
+            Step::Room => {
+                if let Net::Up(wire) = &mut net {
+                    if let Ok(permit) = wire.input_tx.clone().try_reserve_owned() {
+                        wire.release(permit);
+                    }
+                }
+                None
+            }
+            Step::Tick => {
+                // A clock stepped backwards reads as no gap.
+                let wall = SystemTime::now();
+                let gap = wall.duration_since(last_wall).unwrap_or(Duration::ZERO);
+                last_wall = wall;
+                if let (Net::Up(wire), true) = (&net, gap >= STALE_AFTER_FREEZE) {
+                    tracing::info!(
+                        frozen_secs = gap.as_secs(),
+                        "resumed from a freeze; reconnecting"
+                    );
+                    wire.conn.close(0u32.into(), b"reconnecting");
+                    outage = Some((Instant::now(), false));
+                    net = Net::Down(dial(&connector, 0, back, size));
+                }
+                None
+            }
+        };
+        let Some(read) = read else { continue };
+        backend.write_bytes(&keys.take_questions())?;
+        if read.quit {
+            display.leave(&mut backend)?;
+            backend.flush()?;
+            return Ok(None);
+        }
+        if read.paste_too_long {
+            notices.give("[koh] paste over 1 MiB — not sent", Instant::now());
+        }
+        match &mut net {
+            Net::Up(wire) => {
+                if let Some(colours) = read.colours {
+                    wire.send(&ClientMsg::Colours(colours));
+                }
+                // At most a message's events at a time, each its own input; one dropped past the
+                // queue is said on the status line while it drains.
+                for events in read.events.chunks(crate::events::MAX_EVENTS) {
+                    seq = seq.next();
+                    predict(&mut display, events, seq);
+                    let msg = ClientMsg::Keys {
+                        seq,
+                        events: events.to_vec(),
+                    };
+                    let _ = wire.send(&msg);
                 }
             }
-            match decode_server(&bytes) {
-                Ok(msg) => drop(slot.send(Received { msg, _large: turn })),
-                Err(e) => tracing::debug!(error = %e, "dropping an undecodable frame"),
+            // Not sent, nor predicted: the end of a line whose start was lost must not run alone.
+            Net::Down(_) => {
+                if read
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, InputEvent::Key(_) | InputEvent::Paste(_)))
+                {
+                    if let Some((_, dropped)) = outage.as_mut() {
+                        *dropped = true;
+                    }
+                }
             }
-            Some(())
-        });
+        }
+        if read.suspend {
+            suspend(&mut backend, &mut display, &shutdown, &mut input_rx).await?;
+            if let (Net::Up(wire), Ok(now_size)) = (&mut net, backend.size()) {
+                size = now_size;
+                display.resize(size);
+                resized = resized.saturating_add(1);
+                wire.send(&ClientMsg::Resize { n: resized, size });
+                wire.send(&ClientMsg::Redraw);
+            }
+            last_wall = SystemTime::now();
+        }
     }
 }
 
-/// Paint the "session ended" banner and linger briefly so it is seen.
-async fn end_session<T: ClientTerminal>(
-    term: &mut T,
-    session: &ClientSession,
+/// Tell the predictor of `events`, sent as input `seq`.
+fn predict(display: &mut Display, events: &[InputEvent], seq: InputSeq) {
+    // Predictions made now expire with the input that carries them.
+    display
+        .predictor
+        .set_local_frame_sent(seq.0.saturating_sub(1));
+    let burst = events.len() > TYPED_KEYS;
+    let fresh = display
+        .new_row_at
+        .is_some_and(|at| at.elapsed() < PROMPT_HOLD);
+    for (n, event) in events.iter().enumerate() {
+        match event {
+            _ if burst && n > 0 => {}
+            InputEvent::Key(key) if !burst => {
+                if fresh {
+                    display.predictor.hold();
+                }
+                let press = key.stroke().press;
+                display.predict_key(press);
+            }
+            InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_) => {
+                display.predict_other();
+            }
+            InputEvent::Focus(_) => {}
+        }
+    }
+}
+
+/// Suspend the client: the terminal left as the user's shell expects it, the process stopped
+/// with SIGTSTP; once continued, the terminal taken back. The stop may never come (no job
+/// control): then a key typed, or a fatal signal, ends the wait.
+async fn suspend<B: KohBackend>(
+    backend: &mut B,
+    display: &mut Display,
     shutdown: &CancellationToken,
-) {
-    let _ = term.render(
-        session.state(),
-        &Overlay::default(),
-        Some("[koh] session ended"),
-    );
+    input: &mut mpsc::Receiver<Vec<u8>>,
+) -> anyhow::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut continued = signal(SignalKind::from_raw(fuxix::process::Signal::Cont.raw()))?;
+    display.leave(backend)?;
+    backend.leave_raw_mode()?;
+    backend.write_bytes(b"[koh suspended: run `fg` to resume]\r\n")?;
+    backend.flush()?;
+    fuxix::process::kill(own_pid()?, fuxix::process::Signal::Tstp)?;
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_millis(400)) => {}
+        _ = continued.recv() => {}
+        _ = input.recv() => {}
         () = shutdown.cancelled() => {}
     }
+    backend.enter_raw_mode()?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// What a server sends to admit the client: a first stream, here an empty one.
-    async fn admit(conn: &Connection) -> anyhow::Result<()> {
-        conn.open_uni().await?.finish()?;
-        Ok(())
-    }
-
-    /// A server that will not have the client for good (another protocol, or not authorized) is
-    /// a [`Refused`]; one that cannot have it now closes saying why, and is redialed.
-    #[test]
-    fn a_refusal_is_for_good_only_when_not_authorized() {
-        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
-        let key = || generate_secret_key().expect("OS randomness");
-        crate::test_runtime::current_thread().block_on(async {
-            let client = bind_endpoint_local(key(), false).await.unwrap();
-            // A server that only speaks the previous protocol's ALPN refuses the TLS handshake. The
-            // error must say so, not blame the allowlist.
-            let old = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-                .secret_key(key())
-                .alpns(vec![b"koh/iroh/2".to_vec()])
-                .bind()
-                .await
-                .unwrap();
-            let addr = loopback_addr(&old);
-            let accept = koh_testkit::spawn(async move {
-                if let Some(incoming) = old.accept().await {
-                    let _ = incoming.await;
-                }
-                old
-            });
-            let Err(error) = IrohConnector::new(client.clone(), addr).connect().await else {
-                panic!("an old-protocol server must refuse the handshake");
-            };
-            assert!(
-                matches!(error.downcast_ref(), Some(Refused::OtherProtocol)),
-                "{error:#}"
-            );
-            assert!(format!("{error:#}").contains(PROTOCOL), "{error:#}");
-            let _ = accept.await;
-            // A server that closes the connection instead of admitting it, saying why.
-            let server = bind_endpoint_local(key(), true).await.unwrap();
-            let connector = IrohConnector::new(client, loopback_addr(&server));
-            for why in [
-                Close::AtCapacity,
-                Close::CouldNotStart,
-                Close::NotAuthorized,
-            ] {
-                let (refusing, dialed) = tokio::join!(
-                    async {
-                        let conn = server.accept().await.unwrap().await.unwrap();
-                        crate::transport_iroh::close(&conn, why);
-                        conn.closed().await
-                    },
-                    connector.connect()
-                );
-                drop(refusing);
-                let Err(error) = dialed else {
-                    panic!("{why:?}: admitted");
-                };
-                if why == Close::NotAuthorized {
-                    assert!(error.is::<Refused>(), "{why:?}: {error:#}");
-                } else {
-                    // Transient: redialed, and the banner says why.
-                    assert!(!error.is::<Refused>(), "{why:?}: {error:#}");
-                    assert_eq!(error.downcast_ref::<Close>(), Some(&why));
-                }
-            }
-        });
-    }
-
     #[test]
     fn reconnect_backoff_grows_then_caps() {
-        // 1-based attempts: 1s, 2s, 4s, 8s, then capped at 8s; the shift is clamped, no overflow.
-        for (attempt, secs) in [(1, 1), (2, 2), (3, 4), (4, 8), (5, 8), (99, 8)] {
-            assert_eq!(backoff(attempt), Duration::from_secs(secs), "{attempt}");
-        }
+        assert_eq!(backoff(1), Duration::from_secs(1));
+        assert_eq!(backoff(2), Duration::from_secs(2));
+        assert_eq!(backoff(3), Duration::from_secs(4));
+        assert_eq!(backoff(4), Duration::from_secs(8));
+        assert_eq!(backoff(9), Duration::from_secs(8));
     }
 
     #[test]
     fn dwell_gate_resets_on_proven_connection_and_climbs_on_flap() {
-        // A connection that lasted >= the dwell threshold proved itself -> backoff resets to 0
-        // (prompt reattach), regardless of the prior attempt count.
-        assert_eq!(next_attempt_after_drop(0, MIN_CONNECTION_DWELL), 0);
-        assert_eq!(next_attempt_after_drop(5, MIN_CONNECTION_DWELL), 0);
-        assert_eq!(
-            next_attempt_after_drop(5, MIN_CONNECTION_DWELL + Duration::from_secs(10)),
-            0
-        );
-        // A connection that dropped before the threshold (accept-then-close server) is a flap:
-        // the counter climbs so the next redial backs off.
-        assert_eq!(next_attempt_after_drop(0, Duration::ZERO), 1);
-        assert_eq!(
-            next_attempt_after_drop(
-                3,
-                MIN_CONNECTION_DWELL
-                    .checked_sub(Duration::from_millis(1))
-                    .unwrap(),
-            ),
-            4
-        );
-        // Saturates rather than overflowing under a sustained flapping server.
-        assert_eq!(next_attempt_after_drop(u32::MAX, Duration::ZERO), u32::MAX);
-    }
-
-    /// What the client turns on in the user's terminal it turns off again, popping its push: on
-    /// leaving (the terminal's drop) and on suspend (both call `turn_off`).
-    #[test]
-    fn the_kitty_push_and_scheme_reports_are_undone() {
-        let mut term = BackendTerminal {
-            backend: crate::client::backend::CaptureBackend::default(),
-            oob: render::OutOfBand::with_title_prefix(String::new()),
-            painter: render::Painter::default(),
-            extras: Extras::default(),
-            suspended: Extras::default(),
-        };
-        let both = Found {
-            underline_styles: false,
-            kitty: true,
-            scheme_reports: true,
-        };
-        term.found(Found {
-            scheme_reports: false,
-            ..both
-        })
-        .unwrap();
-        // Told again, with more: only what is new is turned on, so one push is popped.
-        term.found(both).unwrap();
-        assert_eq!(term.backend.bytes, b"\x1b[>5u\x1b[?2031h");
-        term.backend.bytes.clear();
-        term.turn_off().unwrap();
-        assert_eq!(term.backend.bytes, b"\x1b[<u\x1b[?2031l");
-        // A terminal that speaks neither is sent neither.
-        term.backend.bytes.clear();
-        term.found(Found::default()).unwrap();
-        term.turn_off().unwrap();
-        assert_eq!(term.backend.bytes, b"");
-    }
-
-    /// A terminal that shows nothing, of a fixed size.
-    struct Blind;
-
-    impl ClientTerminal for Blind {
-        fn render(
-            &mut self,
-            _: &TerminalScreen,
-            _: &Overlay,
-            _: Option<&str>,
-        ) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn size(&self) -> std::io::Result<Size> {
-            Ok(Size::new(24, 80))
-        }
-    }
-
-    /// A server that admits the client and grants it no stream to write on: the keyboard stays
-    /// the client's, and the quit escape ends it at once.
-    #[test]
-    fn a_server_granting_no_streams_cannot_block_quit() {
-        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr};
-        use iroh::endpoint::{QuicTransportConfig, VarInt};
-        let key = || generate_secret_key().expect("OS randomness");
-        crate::test_runtime::current_thread().block_on(async {
-            let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-                .secret_key(key())
-                .alpns(vec![ALPN.to_vec()])
-                .transport_config(
-                    QuicTransportConfig::builder()
-                        .max_concurrent_uni_streams(VarInt::from_u32(0))
-                        .build(),
-                )
-                .bind()
-                .await
-                .expect("bind the server");
-            let addr = loopback_addr(&server);
-            let accept = koh_testkit::spawn(async move {
-                if let Some(incoming) = server.accept().await {
-                    if let Ok(conn) = incoming.await {
-                        if admit(&conn).await.is_ok() {
-                            conn.closed().await;
-                        }
-                    }
-                }
-                server
-            });
-            let client = bind_endpoint_local(key(), false)
-                .await
-                .expect("bind the client");
-            let connector = IrohConnector::new(client, addr);
-            let conn = connector.connect().await.expect("admitted");
-            let (input, input_rx) = mpsc::channel(8);
-            let (_resize, resize_rx) = mpsc::channel(1);
-            let run = koh_testkit::spawn(run_client(
-                conn,
-                SystemTime::now(),
-                connector,
-                Size::new(24, 80),
-                false,
-                input_rx,
-                resize_rx,
-                Blind,
-                CancellationToken::new(),
-                None,
-            ));
-            // Keys that need the stream, then the quit escape.
-            for keys in [&b"ls\r"[..], &[ESCAPE_PREFIX, b'.']] {
-                input.send(keys.to_vec()).await.expect("typed");
-            }
-            let quit = tokio::time::timeout(Duration::from_secs(5), run).await;
-            assert!(
-                matches!(quit, Ok(Ok(Ok(None)))),
-                "the client did not quit: {quit:?}"
-            );
-            let _ = tokio::time::timeout(Duration::from_secs(5), accept).await;
-        });
-    }
-
-    /// A real server, admitting the one client, that runs `serve` on the connection.
-    async fn loopback<F, Fut>(serve: F) -> (Admitted, IrohConnector)
-    where
-        F: FnOnce(Connection) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send,
-    {
-        use crate::transport_iroh::{bind_endpoint_local, generate_secret_key};
-        let key = || generate_secret_key().expect("OS randomness");
-        let server = bind_endpoint_local(key(), true)
-            .await
-            .expect("bind the server");
-        let addr = crate::transport_iroh::loopback_addr(&server);
-        koh_testkit::spawn(async move {
-            if let Some(incoming) = server.accept().await {
-                if let Ok(conn) = incoming.await {
-                    if admit(&conn).await.is_ok() {
-                        serve(conn.clone()).await;
-                        conn.closed().await;
-                    }
-                }
-            }
-            drop(server);
-        });
-        let client = bind_endpoint_local(key(), false)
-            .await
-            .expect("bind the client");
-        let connector = IrohConnector::new(client, addr);
-        (connector.connect().await.expect("admitted"), connector)
-    }
-
-    #[test]
-    fn large_server_streams_take_turns_and_give_them_back() {
-        // More large streams than the client has slots, each dropped as garbage: a turn kept by
-        // a dropped stream would leave readers holding every slot, and the reply after them would
-        // never come.
-        crate::test_runtime::current_thread().block_on(async {
-            let (Admitted(conn, first), _connector) = loopback(|conn| async move {
-                for _ in 0..20 {
-                    let mut send = conn.open_uni().await.expect("a stream");
-                    send.write_all(&vec![0xff; 1 << 20]).await.expect("written");
-                    send.finish().expect("finished");
-                }
-                let reply = crate::terminal::HistoryReply {
-                    id: 7,
-                    rows: Vec::new(),
-                };
-                let bytes = crate::proto::FrameEncoder::default()
-                    .encode_history(&reply)
-                    .expect("encoded");
-                let mut send = conn.open_uni().await.expect("a stream");
-                send.write_all(&bytes).await.expect("written");
-                send.finish().expect("finished");
-            })
-            .await;
-            let (tx, mut rx) = mpsc::channel(FRAME_QUEUE);
-            koh_testkit::spawn(read_frames(conn, first, tx));
-            let got = tokio::time::timeout(Duration::from_secs(20), rx.recv())
-                .await
-                .expect("the reply after the large streams never came")
-                .expect("the reader ended");
-            assert!(matches!(got.msg, ServerMsg::History(ref body) if crate::proto::decode_history(body).is_ok_and(|reply| reply.id == 7)));
-        });
-    }
-
-    #[test]
-    fn a_closed_resize_channel_is_waited_on_for_ever_not_taken() {
-        crate::test_runtime::current_thread().block_on(async {
-            let (resize, resize_rx) = mpsc::channel(1);
-            let mut resizes = Resizes(Some(resize_rx));
-            resize.send(()).await.expect("sent");
-            let wait = Duration::from_millis(50);
-            let taken = tokio::time::timeout(wait, resizes.next()).await;
-            assert!(taken.is_ok(), "a tick is taken");
-            drop(resize);
-            let taken = tokio::time::timeout(wait, resizes.next()).await;
-            assert!(taken.is_err(), "closed, it is waited on for ever");
-            assert!(resizes.0.is_none(), "and never polled again");
-        });
+        assert_eq!(next_attempt_after_drop(3, MIN_CONNECTION_DWELL), 0);
+        assert_eq!(next_attempt_after_drop(3, Duration::from_millis(100)), 4);
     }
 }

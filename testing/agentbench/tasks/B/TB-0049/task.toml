@@ -1,0 +1,13 @@
+id = "TB-0049"
+title = "Keep a result that is only printed"
+cat = "drop"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/checksum-tree`. It takes about half a minute and, at the very end,
+prints `tree digest: ...`; it saves the digest nowhere. The connection to the remote machine will
+drop shortly after it starts. Make sure it still runs to completion and that you get its digest:
+write the digest (only the hex string) to `digest.txt` in your local directory.
+"""
+[drop]
+when = ".checksum-tree.running"
+after = 2.0

@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+import json, os, re, sys, termios, tty
+home = os.path.expanduser("~")
+if not (os.isatty(0) and os.isatty(1)):
+    print("setup-wizard: needs a terminal", file=sys.stderr)
+    sys.exit(2)
+REGIONS = ["us-east", "us-west", "eu-west", "eu-central", "ap-south"]
+vals = {"name": "my-server", "region": 0, "players": "16"}
+FIELDS = ["name", "region", "players", "save", "cancel"]
+focus = 0
+err = ""
+
+
+def out(s):
+    os.write(1, s.encode())
+
+
+def draw():
+    out("\x1b[H\x1b[2J\x1b[1m Game server setup \x1b[0m\r\n\r\n")
+    def mark(i):
+        return "\x1b[7m" if focus == i else ""
+    out(f"  Server name : {mark(0)}[{vals['name']:<20}]\x1b[0m\r\n\r\n")
+    out(f"  Region      : {mark(1)}< {REGIONS[vals['region']]:^12} >\x1b[0m\r\n\r\n")
+    out(f"  Max players : {mark(2)}[{vals['players']:<4}]\x1b[0m\r\n\r\n")
+    out(f"      {mark(3)}[ Save ]\x1b[0m    {mark(4)}[ Cancel ]\x1b[0m\r\n\r\n")
+    out(f"\x1b[31m{err}\x1b[0m\r\n\x1b[2m tab/up/down: move   left/right: change region   enter: next / press button\x1b[0m")
+
+
+def save():
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,19}", vals["name"]):
+        return "name: lowercase letters, digits and dashes only"
+    if not vals["players"].isdigit() or not 1 <= int(vals["players"]) <= 128:
+        return "max players: a number from 1 to 128"
+    os.makedirs(f"{home}/.config/gamesrv", exist_ok=True)
+    with open(f"{home}/.config/gamesrv/server.toml", "w") as f:
+        f.write(f'name = "{vals["name"]}"\nregion = "{REGIONS[vals["region"]]}"\nmax_players = {int(vals["players"])}\n')
+    return None
+
+
+old = termios.tcgetattr(0)
+tty.setraw(0)
+out("\x1b[?1049h")
+pending = b""
+result = "cancelled"
+try:
+    while True:
+        draw()
+        if not pending:
+            pending = os.read(0, 64)
+            if not pending:
+                break
+        f = FIELDS[focus]
+        if pending.startswith((b"\x1b[A", b"\x1bOA", b"\x1b[Z")):
+            pending = pending[3:]; focus = (focus - 1) % len(FIELDS); continue
+        if pending.startswith((b"\x1b[B", b"\x1bOB")):
+            pending = pending[3:]; focus = (focus + 1) % len(FIELDS); continue
+        if pending.startswith((b"\x1b[C", b"\x1bOC")):
+            pending = pending[3:]
+            if f == "region": vals["region"] = (vals["region"] + 1) % len(REGIONS)
+            elif f == "save": focus = 4
+            continue
+        if pending.startswith((b"\x1b[D", b"\x1bOD")):
+            pending = pending[3:]
+            if f == "region": vals["region"] = (vals["region"] - 1) % len(REGIONS)
+            elif f == "cancel": focus = 3
+            continue
+        c, pending = pending[:1], pending[1:]
+        err = ""
+        if c == b"\t":
+            focus = (focus + 1) % len(FIELDS)
+        elif c == b"\x03":
+            break
+        elif c in (b"\r", b"\n"):
+            if f == "save":
+                err = save() or ""
+                if not err:
+                    result = "saved"
+                    break
+            elif f == "cancel":
+                break
+            else:
+                focus += 1
+        elif c in (b"\x7f", b"\x08") and f in ("name", "players"):
+            vals[f] = vals[f][:-1]
+        elif c == b"\x15" and f in ("name", "players"):
+            vals[f] = ""
+        elif f in ("name", "players") and c.isascii() and c.decode().isprintable() and len(vals[f]) < 20:
+            vals[f] += c.decode()
+finally:
+    out("\x1b[?1049l")
+    termios.tcsetattr(0, termios.TCSADRAIN, old)
+print(f"setup-wizard: {result}")

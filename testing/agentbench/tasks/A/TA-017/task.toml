@@ -1,0 +1,10 @@
+id = "TA-017"
+title = "One job from an endless worker"
+cat = "wait"
+difficulty = "hard"
+goal = '''
+On the remote machine, `~/bin/queue-worker` processes jobs forever, printing a line as each job
+finishes. Run it, wait until job `J-0417` has finished, and write that job's result (the value
+after `result=`, only that) to `answer.txt` in your local directory. Then stop the worker: it
+must not be running when you are done.
+'''

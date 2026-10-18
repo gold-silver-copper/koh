@@ -1,0 +1,10 @@
+id = "TB-0063"
+title = "Render a frame in the right scene"
+cat = "run"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/render-frame` with its working directory set to the scene
+directory `~/scenes/forest night` (the name has a space in it) and with the environment variable
+`FRAME` set to `1042`. It prints a checksum for the frame. Write that checksum (only the checksum,
+the hex string) to `answer.txt` in your local directory.
+"""

@@ -1,0 +1,13 @@
+id = "TB-0046"
+title = "Keep a backup running through a disconnect"
+cat = "drop"
+difficulty = "easy"
+goal = """
+On the remote machine, run `~/bin/backup-home`. It takes about a minute. The connection to the
+remote machine will drop a few seconds after the backup starts; make sure the backup still runs to
+completion. When it finishes it writes a one-line summary to `~/backup/summary.txt`; copy that file
+into your local directory as `summary.txt`.
+"""
+[drop]
+when = "backup/started"
+after = 3.0

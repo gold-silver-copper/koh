@@ -1,0 +1,10 @@
+id = "TA-054"
+title = "Shut a database down cleanly"
+cat = "process"
+difficulty = "easy"
+goal = '''
+On the remote machine, start the database server with `~/bin/start-db` and make sure it is up
+(`~/bin/db-status` reports it). Then shut it down cleanly: it must stop, and it must record a
+clean shutdown in `~/db/shutdown.log` (it does that when asked to terminate politely, not when
+killed outright).
+'''

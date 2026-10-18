@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+import json, os, shlex, sys, zlib
+home = os.path.expanduser("~")
+R = ["common", "uncommon", "rare", "epic", "legendary"]
+items = json.loads(zlib.decompress(open(f"{home}/inventory.db", "rb").read()))
+os.makedirs(f"{home}/.bench", exist_ok=True)
+open(f"{home}/.bench/invsh.ran", "w").write("1")
+HELP = """commands:
+  categories                      list the categories
+  show ID                         show one item
+  find FIELD=VALUE ...            items matching every condition; FIELD is category, rarity or name
+                                  (name matches a substring); prints the matches and their count
+  quit                            leave"""
+print("invsh 2.3 - item database shell; `help` for commands")
+while True:
+    try:
+        line = input("inv> ")
+    except EOFError:
+        print()
+        break
+    try:
+        words = shlex.split(line)
+    except ValueError as e:
+        print(f"error: {e}")
+        continue
+    if not words:
+        continue
+    cmd, args = words[0], words[1:]
+    if cmd in ("quit", "exit"):
+        break
+    elif cmd == "help":
+        print(HELP)
+    elif cmd == "categories":
+        for c in sorted({i["category"] for i in items}):
+            print(c)
+    elif cmd == "show" and args and args[0].isdigit():
+        hit = [i for i in items if i["id"] == int(args[0])]
+        print(json.dumps(hit[0], indent=1) if hit else "no such item")
+    elif cmd == "find":
+        conds = []
+        for a in args:
+            if "=" not in a:
+                print(f"error: expected FIELD=VALUE, got {a!r}")
+                break
+            k, v = a.split("=", 1)
+            if k not in ("category", "rarity", "name"):
+                print(f"error: unknown field {k!r} (rarity matches one rarity exactly)")
+                break
+            conds.append((k, v))
+        else:
+            hits = [i for i in items if all((v.lower() in i["name"].lower()) if k == "name" else i[k] == v for k, v in conds)]
+            for i in hits:
+                print(f"  #{i['id']:<4} {i['name']:<30} {i['category']:<8} {i['rarity']:<10} stock {i['stock']}")
+            print(f"{len(hits)} matches")
+    else:
+        print(f"unknown command {cmd!r}; try `help`")

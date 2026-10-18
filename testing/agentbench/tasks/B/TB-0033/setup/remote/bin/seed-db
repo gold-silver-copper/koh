@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Creates the database directory ~/db (deterministic)."""
+import os, random, sys
+home = os.path.expanduser("~")
+root = os.path.join(home, "db")
+if os.path.exists(root):
+    sys.exit("seed-db: ~/db already exists")
+rng = random.Random(3333)
+modes = [0o644] * 6 + [0o444, 0o600, 0o640, 0o755]
+n = 0
+for shard in range(48):
+    d = os.path.join(root, "shards", f"{shard:02x}", rng.choice(["a", "b", "c"]))
+    os.makedirs(d, exist_ok=True)
+    for i in range(rng.randint(30, 44)):
+        p = os.path.join(d, f"seg-{i:04d}.dat")
+        open(p, "wb").write(rng.randbytes(rng.randint(0, 6000)))
+        os.chmod(p, rng.choice(modes))
+        n += 1
+os.makedirs(os.path.join(root, "wal"), exist_ok=True)
+big = os.path.join(root, "wal", "000000010000000A.wal")
+with open(big, "wb") as f:
+    for _ in range(12):
+        f.write(rng.randbytes(1 << 20))
+os.chmod(big, 0o600)
+open(os.path.join(root, "PG_VERSION"), "w").write("17\n")
+os.chmod(os.path.join(root, "PG_VERSION"), 0o444)
+open(os.path.join(root, "postmaster.opts"), "w").write("/usr/bin/postgres -D db\n")
+print(f"seeded ~/db: {n + 3} files")

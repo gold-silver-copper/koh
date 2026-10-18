@@ -1,0 +1,10 @@
+id = "TB-0112"
+title = "Read the build lock while it is held"
+cat = "sessions"
+difficulty = "easy"
+goal = """
+On the remote machine, run `~/bin/long-build` (it takes a while) and let it finish. While it runs,
+it holds the build lock; `~/bin/lockinfo` shows who holds the lock and the lock's token, but only
+while the lock is held. Write the token `lockinfo` shows for the lock this build holds (only the
+token) to `answer.txt` in your local directory.
+"""

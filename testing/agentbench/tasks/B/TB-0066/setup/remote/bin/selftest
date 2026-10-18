@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+import sys, time
+G, R, Y, Z = "\033[32m", "\033[1;31m", "\033[33m", "\033[0m"
+checks = [
+    ("net.dns", "P"), ("net.mtu", "P"), ("gpu.vram", "F"), ("gpu.driver", "P"), ("disk.scratch", "W"),
+    ("disk.free", "P"), ("audio.alsa", "P"), ("cpu.governor", "F"), ("cpu.microcode", "P"),
+    ("mem.hugepages", "W"), ("mem.ecc", "P"), ("time.ntp", "F"), ("time.tz", "P"), ("fs.inotify", "P"),
+    ("fs.case", "P"), ("license.server", "F"), ("license.seat", "P"), ("vcs.lfs", "P"), ("vcs.hooks", "W"),
+    ("sdk.android", "P"), ("sdk.console", "P"), ("shader.cache", "P"), ("crash.reporter", "P"),
+]
+fails = 0
+for name, res in checks:
+    if res == "P":
+        print(f"[{G} PASS {Z}] {name}", flush=True)
+    elif res == "W":
+        print(f"[{Y} WARN {Z}] {name}: degraded, not a failure", flush=True)
+    else:
+        fails += 1
+        print(f"[{R} FAIL {Z}] {name}", flush=True)
+    time.sleep(0.03)
+print(f"\n{len(checks)} checks, {fails} failed (failing checks are not retried; FAIL count {fails})")
+sys.exit(1 if fails else 0)

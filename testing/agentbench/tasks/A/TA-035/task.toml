@@ -1,0 +1,11 @@
+id = "TA-035"
+title = "Edit a crontab in an editor"
+cat = "tui"
+difficulty = "moderate"
+goal = '''
+On the remote machine, `~/bin/crontab-edit` opens the user's job table in a text editor (vim by
+default) and installs it when the editor exits. Use it to change the table so that: the
+`~/bin/cleanup --tmp` job runs every 15 minutes instead of hourly; a new job runs
+`~/bin/backup --full` every day at 02:30; every other entry stays as it is. It is done when
+`~/bin/crontab-edit` has installed that table.
+'''

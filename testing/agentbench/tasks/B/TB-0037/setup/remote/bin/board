@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""A team kanban board in the terminal: board [FILE] (default ~/team.board).
+
+Keys: arrows (or h j k l) move the cursor; > and < move the selected card to the next or
+previous column; s saves; q quits.
+"""
+import curses, json, os, sys, time, zlib
+home = os.path.expanduser("~")
+path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(home, "team.board")
+COLS = ["Backlog", "Doing", "Done"]
+
+
+def crc(columns):
+    return zlib.crc32(json.dumps(columns, sort_keys=True).encode())
+
+
+data = json.load(open(path))
+if data.get("crc") != crc(data["columns"]):
+    sys.exit(f"board: {path} is corrupted (checksum mismatch); restore it from backup")
+columns = data["columns"]
+if not sys.stdout.isatty():
+    sys.exit("board: needs an interactive terminal")
+
+
+def main(scr):
+    curses.curs_set(0)
+    scr.keypad(True)
+    col, row, dirty, msg = 0, 0, False, "loaded " + os.path.basename(path)
+    while True:
+        h, w = scr.getmaxyx()
+        cw = max(20, w // 3)
+        scr.erase()
+        scr.addstr(0, 0, " TEAM BOARD "[: w - 1], curses.A_REVERSE)
+        for i, c in enumerate(COLS):
+            x = i * cw
+            if x >= w - 1:
+                break
+            scr.addstr(2, x, f"{c} ({len(columns[c])})"[: cw - 1], curses.A_BOLD | curses.A_UNDERLINE)
+            for j, card in enumerate(columns[c]):
+                if 4 + j >= h - 2:
+                    break
+                selected = (i == col and j == row)
+                text = ("> " if selected else "  ") + card
+                scr.addstr(4 + j, x, text[: cw - 1], curses.A_REVERSE if selected else 0)
+        state = "modified (s to save)" if dirty else msg
+        scr.addstr(h - 1, 0, f" {state} | arrows move, > < move card, s save, q quit "[: w - 1])
+        scr.refresh()
+        k = scr.getch()
+        cards = columns[COLS[col]]
+        if k in (curses.KEY_LEFT, ord("h")):
+            col = max(0, col - 1)
+        elif k in (curses.KEY_RIGHT, ord("l")):
+            col = min(2, col + 1)
+        elif k in (curses.KEY_UP, ord("k")):
+            row -= 1
+        elif k in (curses.KEY_DOWN, ord("j")):
+            row += 1
+        elif k in (ord(">"), ord("<")) and cards:
+            to = col + (1 if k == ord(">") else -1)
+            if 0 <= to <= 2:
+                card = cards.pop(row)
+                columns[COLS[to]].append(card)
+                col, row, dirty = to, len(columns[COLS[to]]) - 1, True
+        elif k == ord("s"):
+            out = {"columns": columns, "crc": crc(columns), "saved_by": "board 1.4",
+                   "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            json.dump(out, open(path + ".tmp", "w"), indent=1)
+            os.replace(path + ".tmp", path)
+            dirty, msg = False, "saved"
+        elif k == ord("q"):
+            if not dirty:
+                return
+            scr.addstr(h - 1, 0, " unsaved changes: quit anyway? (y/n) ".ljust(w - 1)[: w - 1], curses.A_REVERSE)
+            if scr.getch() in (ord("y"), ord("Y")):
+                return
+        n = len(columns[COLS[col]])
+        row = 0 if n == 0 else min(max(row, 0), n - 1)
+
+
+curses.wrapper(main)

@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+import hashlib, os, random, sys, time
+rng = random.Random(13)
+steps = ["fetch deps", "codegen", "compile core", "compile plugins", "link", "strip", "package"]
+print("slowbuild: starting", flush=True)
+print("artifact: pending", flush=True)
+h = hashlib.sha256()
+for s in steps:
+    t = rng.uniform(3.0, 7.0)
+    print(f"  {s} ... ({t:.1f}s)", flush=True)
+    time.sleep(t)
+    h.update(s.encode())
+name = "build-" + h.hexdigest()[:8]
+d = os.path.expanduser("~/.slowbuild")
+os.makedirs(d, exist_ok=True)
+with open(os.path.join(d, "done"), "w") as f:
+    f.write(name + "\n")
+print("slowbuild: finished", flush=True)
+print(f"artifact: {name}", flush=True)

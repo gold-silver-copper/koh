@@ -1,0 +1,10 @@
+id = "TB-0032"
+title = "Install a deploy key"
+cat = "files"
+difficulty = "easy"
+goal = """
+Your local directory has `deploy_key.pub`, a public key. The remote machine's deploy daemon trusts
+the keys listed in `~/.deployd/authorized_keys`. Add the key to that file as a line of its own,
+keeping the keys already there unchanged and in order. Afterwards `~/.deployd` must have mode 700
+and `~/.deployd/authorized_keys` mode 600.
+"""

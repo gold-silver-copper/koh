@@ -1,0 +1,11 @@
+id = "TB-0075"
+title = "How did the canary end"
+cat = "wait"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/deploy-canary`. It rolls a canary out in stages and ends in one
+of three ways: a line starting with `PROMOTED`, a line starting with `ROLLED BACK:`, or a line
+starting with `ABORTED:`. Wait for it to end. Write two lines to `answer.txt` in your local
+directory: first the outcome word exactly as printed at the start of that line (`PROMOTED`,
+`ROLLED BACK` or `ABORTED`), then the program's exit status.
+"""

@@ -1,0 +1,9 @@
+id = "TB-0028"
+title = "Bring back a 40 MB snapshot"
+cat = "files"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/export-snapshot`. It writes a database snapshot of about 40 MB
+into `~/exports/` and prints the file's path and its SHA-256. Copy that snapshot into your local
+directory as `snapshot.bin`, intact.
+"""

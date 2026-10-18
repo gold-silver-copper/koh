@@ -2,8 +2,7 @@
 
 use anyhow::Context;
 use fuxix::poll::{poll, Events, PollFd};
-use std::io::Read;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::thread::JoinHandle;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
@@ -87,9 +86,15 @@ pub fn spawn_client_io() -> anyhow::Result<(ClientIoChannels, ClientIoTasks)> {
     let cancel = CancellationToken::new();
     let (input_tx, input_rx) = mpsc::channel(64);
     let input_cancel = cancel.clone();
+    // The descriptor itself, not `std::io::stdin()`: that reads through a buffer of its own, and
+    // what it took past a read's end would wait unseen by `poll` until more was typed.
+    let stdin = std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .context("duplicating stdin")?;
     let input = std::thread::Builder::new()
         .name("koh-stdin".into())
-        .spawn(move || read_input(std::io::stdin(), &input_tx, &input_cancel))
+        .spawn(move || read_input::<TYPED>(&stdin, &input_tx, &input_cancel))
         .context("spawning stdin producer")?;
     let (resize_tx, resize_rx) = mpsc::channel(8);
     let resize_cancel = cancel.clone();
@@ -128,16 +133,41 @@ async fn send_resize(sender: &mpsc::Sender<()>, cancel: &CancellationToken) -> b
     }
 }
 
-fn read_input<R: Read + AsFd>(
-    mut reader: R,
+/// Most bytes of one read of what is typed: a terminal writes a keystroke, or a paste, at a time.
+const TYPED: usize = 1024;
+
+/// Most bytes of one read of `koh exec`'s stdin, which may be a large file piped in.
+const PIPED: usize = 64 * 1024;
+
+/// Stdin, read on a thread of its own until it ends, for `koh exec`: what it reads, which ends
+/// with it (at once if there is no stdin), and the token that stops the thread. Never in the way
+/// of the process exiting: the thread looks at the token every 100 ms, and blocks on nothing else
+/// once the receiver is gone.
+pub fn spawn_stdin() -> anyhow::Result<(mpsc::Receiver<Vec<u8>>, CancellationToken)> {
+    let (tx, rx) = mpsc::channel(8);
+    let cancel = CancellationToken::new();
+    // No stdin at all reads as an empty one.
+    let Ok(stdin) = std::io::stdin().as_fd().try_clone_to_owned() else {
+        return Ok((rx, cancel));
+    };
+    let stopping = cancel.clone();
+    std::thread::Builder::new()
+        .name("koh-stdin".into())
+        .spawn(move || read_input::<PIPED>(&stdin, &tx, &stopping))
+        .context("spawning the stdin reader")?;
+    Ok((rx, cancel))
+}
+
+/// Read `fd` until it ends, `N` bytes at most at a time, sending what it reads, until `cancel`.
+fn read_input<const N: usize>(
+    fd: &OwnedFd,
     sender: &mpsc::Sender<Vec<u8>>,
     cancel: &CancellationToken,
 ) {
-    let mut buffer = [0_u8; 1024];
+    let mut buffer = vec![0_u8; N];
     while !cancel.is_cancelled() {
         let ready = {
-            let fd = reader.as_fd();
-            let mut descriptors = [PollFd::new(&fd, Events::IN)];
+            let mut descriptors = [PollFd::new(fd, Events::IN)];
             poll(
                 &mut descriptors,
                 Some(std::time::Duration::from_millis(100)),
@@ -146,7 +176,7 @@ fn read_input<R: Read + AsFd>(
         match ready {
             Ok(0) => {}
             Err(errno) if errno == fuxix::Errno::INTR => {}
-            Ok(_) => match reader.read(&mut buffer) {
+            Ok(_) => match fuxix::io::read(fd, &mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
                     let Some(chunk) = buffer.get(..count) else {
@@ -240,7 +270,9 @@ mod tests {
             let (sender, mut receiver) = mpsc::channel(1);
             let cancel = CancellationToken::new();
             let thread_cancel = cancel.clone();
-            let input = std::thread::spawn(move || read_input(reader, &sender, &thread_cancel));
+            let input = std::thread::spawn(move || {
+                read_input::<TYPED>(&OwnedFd::from(reader), &sender, &thread_cancel);
+            });
             writer.write_all(b"a\0\x1bZ").expect("write input");
             assert_eq!(
                 receiver.recv().await.as_deref(),
@@ -255,6 +287,34 @@ mod tests {
     }
 
     #[test]
+    fn input_longer_than_one_read_is_forwarded_whole_with_nothing_typed_after() {
+        // A terminal writes a long typed line in one go: every byte goes on as it is, without
+        // waiting for the next key.
+        crate::test_runtime::current_thread().block_on(async {
+            let (reader, mut writer) = UnixStream::pair().expect("socket pair");
+            let (sender, mut receiver) = mpsc::channel(8);
+            let cancel = CancellationToken::new();
+            let thread_cancel = cancel.clone();
+            let input = std::thread::spawn(move || {
+                read_input::<TYPED>(&OwnedFd::from(reader), &sender, &thread_cancel);
+            });
+            let line = [vec![b'y'; 2000].as_slice(), b"\r"].concat();
+            writer.write_all(&line).expect("write input");
+            let mut got = Vec::new();
+            while got.len() < line.len() {
+                let chunk = timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .expect("the line's end waits for more input")
+                    .expect("producer gone");
+                got.extend(chunk);
+            }
+            assert_eq!(got, line);
+            cancel.cancel();
+            input.join().expect("join producer");
+        });
+    }
+
+    #[test]
     fn shutdown_ends_input_blocked_by_a_full_channel_once_the_loop_is_gone() {
         // Shutdown follows the loop's return, which drops the receiving end.
         crate::test_runtime::current_thread().block_on(async {
@@ -263,7 +323,9 @@ mod tests {
             sender.try_send(vec![0]).expect("fill input channel");
             let cancel = CancellationToken::new();
             let thread_cancel = cancel.clone();
-            let input = std::thread::spawn(move || read_input(reader, &sender, &thread_cancel));
+            let input = std::thread::spawn(move || {
+                read_input::<TYPED>(&OwnedFd::from(reader), &sender, &thread_cancel);
+            });
             let resize_cancel = cancel.clone();
             let resize = koh_testkit::spawn(async move { resize_cancel.cancelled().await });
             let tasks = ClientIoTasks {

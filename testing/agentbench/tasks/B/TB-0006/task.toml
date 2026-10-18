@@ -1,0 +1,9 @@
+id = "TB-0006"
+title = "Status and last error of a nightly run"
+cat = "run"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/nightly` (it takes a few seconds). Write to `answer.txt` in your
+local directory two lines: first its exit status (only the number), then the last line it printed
+on standard error, exactly.
+"""

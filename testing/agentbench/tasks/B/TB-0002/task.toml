@@ -1,0 +1,9 @@
+id = "TB-0002"
+title = "Render a config for prod"
+cat = "run"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/render-config` from inside the directory `~/proj`, with the
+environment variable `STAGE` set to `prod`. Save exactly what it prints on standard output (byte
+for byte, and not the warnings it prints on standard error) to `prod.conf` in your local directory.
+"""

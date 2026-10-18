@@ -1,0 +1,12 @@
+id = "TB-0045"
+title = "Answer an upgrade's late questions in time"
+cat = "prompt"
+difficulty = "hard"
+goal = """
+On the remote machine, run `~/bin/db-upgrade` (it needs a terminal). It applies schema migrations
+for a while and stops twice to ask a yes/no question; each question waits only a limited time for
+an answer and ignores anything typed before it appeared. Answer `yes` when it asks whether to go on
+with the migration that drops `users.legacy_id`, and `no` when it asks whether to rebuild the
+search indexes now. The task is done when it reports `upgrade complete: schema version 60`.
+"""
+solve_timeout = 300

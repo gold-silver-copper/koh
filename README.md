@@ -25,6 +25,17 @@ koh servers add laptop <server-id>
 koh connect laptop
 ```
 
+The same server runs commands and jobs, and copies files, with no shell session at all:
+
+```sh
+koh exec laptop -- make test          # its stdout and stderr apart; koh exits with its status
+git diff | koh exec laptop -C src/app -- git apply
+koh run laptop --name build -- cargo build   # a job: it outlives koh and the link
+koh wait laptop build                 # until it ends; exits with its status
+koh cp -r ./site laptop:              # a tree into the server user's home, as a sync
+koh cp laptop:notes.md laptop:todo .  # back here, into the current directory
+```
+
 Or run `koh` alone on a terminal for a menu of this machine's keys, the servers it connects to
 and the clients allowed here: pick one by number to connect, rename or delete it; `a` adds one,
 `k` shows both keys in full with QR codes and resets one, saying first who will lose access.
@@ -34,40 +45,137 @@ Useful commands:
 ```sh
 koh                       # on a terminal: the menu of keys, servers and clients
 koh id                    # print this machine's endpoint id (its client key's)
-koh servers               # the servers you connect to: add <name> <id>, rm <name>, rename <old> <new>
-koh clients               # the clients allowed here, likewise
-koh serve                 # host a shell for the saved clients (--allow <id> adds one for this run)
-koh connect <name|id>     # connect to a saved server, or to a server id
+koh servers               # the servers you connect to: add <name> <id> [--direct IP:PORT],
+                          # rm <name>, rename <old> <new>
+koh clients               # the clients allowed here, likewise; add --cp DIR / --exec DIR
+                          # scopes a client's key (below)
+koh serve                 # host shells, commands, jobs and copies for the saved clients
+                          # (--allow <id> adds one for this run)
+koh connect <name|id>     # a shell there: your session attached last, else a new one
+koh connect <name> --new  # a new session beside your others; --session N picks one by number
+koh sessions <name>       # your sessions: number, attached or not, age, size, what its program
+                          # is doing (reading, busy, ...), the last command's status, title
+koh output <name> --session N [--last]  # a session's screen, or its last command's output
+koh exec <name> -- PROG ARG...  # run PROG with no terminal, each word as it is (no shell), and
+                          # exit with its status; --sh 'LINE' runs a shell line; -C DIR
+koh run <name> [--name N] -- PROG ARG...  # start a job; koh jobs, logs, wait and kill find it
+koh wait <name> JOB       # until the job ends (--text T, --file PATH; --session N [--reading])
+koh cp SRC... <name>:DST  # copy files and trees there, or `koh cp <name>:SRC... DST` back
 koh key info              # show both identity key files and their endpoint ids
 koh key reset [client|server] --yes  # delete a key (client by default); the next use makes a new id
+koh help-agents           # the page for scripts and agents
 ```
 
 Useful flags:
 
 ```sh
 --no-clipboard            # ignore the server's OSC-52 clipboard writes (on by default)
---no-hyperlinks           # paint the server's hyperlinks as plain text (links on by default)
+--no-hyperlinks           # drop the server's hyperlinks (OSC 8; passed by default)
 --no-colours              # don't tell the server your terminal's colours (told by default, so
                           # vim, bat and delta pick a matching theme)
 --on-bell <cmd>           # run a shell command whenever the remote bell rings
 --shell <program>         # host a program instead of $SHELL (repeat to pass args)
 --key-file <path>         # use a custom identity-key path
---session-ttl-secs <n>    # keep detached sessions around longer/shorter
+--direct <ip:port>        # dial a server directly (LAN, loopback), on any command that dials;
+                          # saved with `koh servers add`, every command dialing that name does
+--json                    # on sessions, output, exec, run, jobs, kill, wait, cp: one JSON value
+--session-ttl-secs <n>    # keep detached sessions, and ended jobs, around longer/shorter
+--job-log-bytes <n>       # output each job keeps, its newest (4 MiB by default)
 --max-connections <n>     # limit concurrent connections
---max-sessions <n>        # limit sessions
+--max-sessions <n>        # limit sessions, all clients' together
 ```
+
+**`koh cp` is a sync.** A source lands in the destination if that is a directory (or ends in `/`,
+or there are several sources: then it is made), else as the destination, its parents made.
+Directories merge into what is there. A file the destination already has with the same size and
+content (by hash) is not sent again; one that changed is written beside its target under a
+hidden `.koh-….part` name and renamed into place once whole, so a cut copy leaves nothing
+half-written that looks complete, and the next copy resumes the part. A file written gets the
+time it arrived (so `make` and `cargo` see it changed) unless `-p` keeps the source's. `dir/.`
+copies what is in `dir`. `--delete` removes what the source does not have, `--exclude PAT`
+leaves entries alone, and `--atomic` lands nothing until the whole copy came. It ends with one
+line: `3 files, 41 KB → laptop:proj/ (2 replaced, 120 unchanged)`, or `--json`. A source given on
+the command line is followed if it is a symlink, as `cp` does; symlinks inside a tree are copied
+as symlinks, never followed on either side, and fifos, sockets and devices are skipped and said
+so. Remote paths are taken as the server user's shell would take them, but not globbed: no
+remote shell runs.
+
+**Exit codes** are the same for every command: 0 ok, 1 failed, 2 usage, 3 the server was not
+reached, 4 refused (not allowed, or out of the key's scope), 124 a wait timed out. `exec`,
+`wait` and `logs --follow` exit with the remote command's status, and 255 on koh's own errors,
+as ssh does; `exec` exits 127 when there is no such program.
+
+**Scoped keys.** `koh clients add ci <id> --cp /srv/drop` lets that client copy to and from
+`/srv/drop` and below only, and nothing else: no shell, no commands. `--exec DIR` lets it run
+commands and jobs, started in `DIR` (not a sandbox: a command reaches what the server user
+can). A scoped client's paths that leave the directory (`..`, an absolute path outside it, a
+symlink inside it) are refused.
 
 Keys live under `$XDG_CONFIG_HOME/koh/` (else `~/.config/koh/`) by default (`client.key`,
 `server.key`), and the names beside them: `servers` beside the client key and `clients` beside the
-server key, one `name id` a line (`#` comments allowed). They are checked as the keys are, since `clients` decides who may open a
-shell: a file that is a symlink or someone else's is refused, and a loose mode is tightened.
+server key, one `name id` a line (`#` comments allowed); a server's may end `direct=IP:PORT` or
+`relay=URL`, how to dial it, and a client's `cp=DIR` or `exec=DIR`, its scope. They are checked as
+the keys are, since `clients` decides who may open a shell: a file that is a symlink or someone
+else's is refused, and a loose mode is tightened.
 
-**Keys, mouse and pastes** reach the remote program as it asked, whatever terminal you type on: the
-client decodes what your terminal sends (it turns on the kitty keyboard protocol in a terminal that
-speaks it, so Ctrl-I and Tab, or Shift-Enter and Enter, stay apart) and the server encodes each key
-for the program, kitty's encoding to nvim or helix, legacy bytes to the rest.
+**Keys, mouse and pastes** reach the remote program as it asked, whatever terminal you type on:
+the program's keyboard, mouse and paste modes reach your terminal with its output (and with the
+redraw when you attach from another terminal), the client decodes what your terminal sends, and
+the server encodes each key for the program, kitty's encoding to nvim or helix, legacy bytes to
+the rest.
 
 **Platforms:** Linux, macOS, and Android via [Termux](https://termux.dev). Windows is not supported; use WSL2.
+
+## Scripts and agents
+
+`koh help-agents` is the whole of it on one page. `koh connect` needs a terminal; run with none
+(from a script, or an agent's tool call), it says so and points at the rest, none of which needs
+one.
+
+Save a server with how to reach it, once, and every command dialing its name uses that:
+
+```sh
+koh servers add box <server-id> --direct 192.168.1.20:4433   # or --relay-url URL
+```
+
+Run a command: its stdout, stderr and exit status come back as a local command's would. A koh
+killed or cut off hangs the command up (within 20 s when killed outright).
+
+```sh
+koh exec box -- cargo test -j 4
+koh exec box -C app --sh 'git status --short' > status.txt
+```
+
+Start something that should outlive the call, and wait for it on the server:
+
+```sh
+koh run box --name srv -- python3 -m http.server 8000
+koh wait box srv --text 'Serving HTTP' --timeout 30
+koh logs box srv                      # its output so far; --follow until it ends
+koh kill box srv
+```
+
+Copy files and trees either way, sending only what changed:
+
+```sh
+koh cp -r ./src box:app/              # here to there: lands as app/src
+koh cp box:app/target/report.json .   # there to here
+```
+
+Shell sessions, opened with `koh connect` (in fux, or any terminal), can be read and waited on
+from anywhere:
+
+```sh
+koh sessions box --json               # each session's state: reading, busy, running a command
+koh wait box --session 1              # until the command running there ends; its status
+koh output box --session 1 --last     # that command's output
+```
+
+Prompt marks (OSC 133) from the remote shell pass through to your terminal, with the nonce your
+terminal asks for (`FUX_MARK_NONCE`), and so do reports of what the remote program is doing
+(`OSC 133;S;activity=reading`), so a terminal that reads them, as
+[fux](https://github.com/gold-silver-copper/fux) does, sees where each remote command starts and
+ends, its status, and whether it waits for input, as it would a local one's.
 
 ## Android / Termux install
 
@@ -111,15 +219,28 @@ binary, not the library.
 ## Highlights
 
 - Built in Rust on iroh peer-to-peer QUIC; connects by endpoint id instead of hostname/port.
-- Mosh-style predictive local echo and screen-state sync for responsive shells on bad networks.
-- Detachable sessions survive suspend/resume, IP changes, and reconnects without tmux.
-- No SSH bootstrap and no port forwarding: the server listens on one UDP port (random unless `--port`), reached through iroh's relays and hole-punching, and admits only allowlisted keys.
+- Mosh-style predictive local echo, painted over the program's output and taken back before
+  more of it is written, for responsive shells on bad networks.
+- The program's output reaches your terminal as it wrote it, as over ssh, less the questions
+  the server's own terminal answers; your terminal's scrollback and search are its own. A client
+  attaching to a session is sent its screen and up to 1000 rows of history above it; one that
+  redials after a drop, or falls far behind on a slow link, the screen as it is now, never a
+  backlog.
+- Detachable sessions survive suspend/resume, IP changes, and reconnects without tmux; a client
+  may have several, by number, and read their state, screen and last command from scripts.
+- No SSH bootstrap and no port forwarding: the server listens on one UDP port (random unless
+  `--port`), reached through iroh's relays and hole-punching, and admits only allowlisted keys,
+  which may be scoped to copying or commands in one directory.
+- Shell integration marks (OSC 133) reach your terminal: the rows where the remote shell's prompts
+  start, and each command's start and end with its status. `koh serve` starts bash, zsh and fish
+  so that they send the marks, after your own startup files (your prompt and hooks unchanged),
+  and counts only the shell's own marks, not ones a program prints; `koh serve --no-shell-marks`
+  starts the shell as it is.
+- Runs commands (`koh exec`), jobs (`koh run`) and syncs files and trees (`koh cp`) over the same
+  connection and allowlist as a shell, with no SSH or remote shell needed.
 - Not wire-compatible with mosh or SSH; koh is its own protocol/tool.
-- Intended for personal machines you control; not a full SSH replacement.
-- Scrollback: `Ctrl-^ [` opens the server's history above the live screen, in full colour, with
-  the arrows, Page Up/Down, the mouse wheel, `/` to search and `q` to leave; new output keeps
-  arriving below.
-- Does not provide multi-user accounts, file transfer, or Windows support.
+- Intended for personal machines you control; not a full SSH replacement. Does not provide
+  multi-user accounts, port forwarding, or Windows support.
 
 ## Status
 

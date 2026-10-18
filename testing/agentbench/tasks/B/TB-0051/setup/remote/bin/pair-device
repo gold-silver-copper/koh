@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Pairs a new sensor: shows a pairing code (it changes every 30 seconds) and waits until someone
+confirms it with `confirm-pair CODE` from another shell."""
+import json, os, random, sys, time
+home = os.path.expanduser("~")
+d = os.path.join(home, ".pair")
+os.makedirs(d, exist_ok=True)
+for f in ("request", "result"):
+    if os.path.exists(os.path.join(d, f)):
+        os.unlink(os.path.join(d, f))
+json.dump({"pid": os.getpid()}, open(os.path.join(d, "session.json"), "w"))
+t0 = time.time()
+
+
+def code(k):
+    r = random.Random(f"5151-{k}")
+    return f"{r.randint(100, 999)}-{r.randint(100, 999)}"
+
+
+print("pairing sensor-7f3a: confirm the code below with `confirm-pair CODE` (from another shell)", flush=True)
+shown = -1
+while time.time() - t0 < 300:
+    k = int((time.time() - t0) // 30)
+    if k != shown:
+        shown = k
+        print(f"Pairing code: {code(k)}  (valid for 30s)", flush=True)
+    req = os.path.join(d, "request")
+    if os.path.exists(req):
+        got = open(req).read().strip()
+        os.unlink(req)
+        ok = got in (code(k), code(k - 1))
+        open(os.path.join(d, "result"), "w").write("ok" if ok else "wrong")
+        if ok:
+            json.dump({"pid": os.getpid(), "code": got}, open(os.path.join(d, "paired.json"), "w"))
+            print("paired with sensor-7f3a", flush=True)
+            sys.exit(0)
+        print(f"rejected code {got!r}", flush=True)
+    time.sleep(0.2)
+print("pairing timed out", flush=True)
+sys.exit(1)

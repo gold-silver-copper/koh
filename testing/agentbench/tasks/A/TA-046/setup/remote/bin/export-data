@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+import os, random, time
+def chunks():
+    rng = random.Random(46)
+    for i in range(60):
+        yield rng.randbytes(1 << 20)
+if __name__ == "__main__":
+    d = os.path.expanduser("~/exports")
+    os.makedirs(d, exist_ok=True)
+    final = os.path.join(d, "full-2026-10-17.bin")
+    open(os.path.join(d, ".started"), "w").write(f"{os.getpid()}\n")
+    rng = random.Random(460)
+    with open(final + ".partial", "wb") as f:
+        for i, c in enumerate(chunks(), 1):
+            f.write(c)
+            if i % 3 == 0:
+                print(f"export-data: {i} MB", flush=True)
+                time.sleep(rng.uniform(0.5, 1.2))
+    os.rename(final + ".partial", final)
+    print("export-data: complete", flush=True)

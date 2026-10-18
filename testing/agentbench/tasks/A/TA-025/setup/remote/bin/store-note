@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+import os, re, sys
+if len(sys.argv) != 2 or not re.fullmatch(r"[A-Za-z0-9._-]+", sys.argv[1]):
+    sys.exit("usage: store-note NAME   (the note is read from standard input)")
+data = sys.stdin.buffer.read()
+d = os.path.expanduser("~/notes")
+os.makedirs(d, exist_ok=True)
+with open(os.path.join(d, sys.argv[1] + ".txt"), "wb") as f:
+    f.write(data)
+print(f"store-note: saved {sys.argv[1]} ({len(data)} bytes)")

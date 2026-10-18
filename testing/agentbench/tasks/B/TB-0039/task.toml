@@ -1,0 +1,10 @@
+id = "TB-0039"
+title = "Get a quote from a pricing shell"
+cat = "repl"
+difficulty = "easy"
+goal = """
+On the remote machine, `~/bin/pricer` is an interactive pricing shell (`help` at its prompt lists
+its commands). Use it to price 37 seats on the `team-annual` plan with the `EDU` discount code
+applied. Write the total it quotes, exactly as printed but without the currency (for example
+`1,234.56`), to `answer.txt` in your local directory.
+"""

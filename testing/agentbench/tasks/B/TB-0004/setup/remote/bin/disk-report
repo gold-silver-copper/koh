@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""A df-like report of the fleet's mounts."""
+import os, sys
+if "--all" not in sys.argv[1:]:
+    sys.exit("disk-report: pass --all to include network and bind mounts")
+rows = [
+    ("/dev/nvme0n1p2", 488, 301, "/"),
+    ("/dev/nvme0n1p1", 1, 0.2, "/boot"),
+    ("tmpfs", 32, 1.4, "/run"),
+    ("/dev/mapper/vg-var", 200, 171, "/var"),
+    ("/dev/mapper/vg-docker", 400, 389, "/var/lib/docker"),
+    ("nas01:/export/media", 8000, 7811, "/srv/media"),
+    ("/dev/sdb1", 1800, 1797, "/mnt/backup volume 2"),
+    ("/dev/sdc1", 1800, 1210, "/mnt/backup volume 1"),
+    ("overlay", 400, 389, "/var/lib/docker/overlay2/3f9a/merged"),
+    ("/dev/mapper/vg-home", 900, 455, "/home"),
+    ("tmpfs", 16, 15.1, "/dev/shm"),
+    ("nas02:/export/logs", 2000, 1922, "/srv/logs"),
+]
+print(f"{'Filesystem':<24}{'Size':>8}{'Used':>8}{'Avail':>8}{'Use%':>6}  Mounted on")
+for fs, size, used, mnt in rows:
+    pct = round(100 * used / size)
+    print(f"{fs:<24}{size:>7}G{used:>7}G{size - used:>7.1f}G{pct:>5}%  {mnt}")

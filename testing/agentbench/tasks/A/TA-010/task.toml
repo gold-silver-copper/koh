@@ -1,0 +1,9 @@
+id = "TA-010"
+title = "The first line of a flood"
+cat = "output"
+difficulty = "easy"
+goal = '''
+On the remote machine, run `~/bin/replay`. It prints a very large number of lines; its first
+line names the session it started. Write that session id (only the id, like `0a1b-2c3d-4e5f`)
+to `answer.txt` in your local directory.
+'''

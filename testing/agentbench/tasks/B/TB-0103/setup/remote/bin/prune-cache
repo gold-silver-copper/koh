@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+import json, os, shutil, sys
+home = os.path.expanduser("~")
+build, shared = f"{home}/cache/build", f"{home}/cache/shared"
+
+
+def ask(q):
+    while True:
+        try:
+            a = input(q).strip().lower()
+        except EOFError:
+            print("\nprune-cache: no answer; nothing more done")
+            sys.exit(1)
+        if a in ("", "n", "no"):
+            return False
+        if a in ("y", "yes"):
+            return True
+        print("please answer y or n")
+
+
+files = sorted(os.listdir(build)) if os.path.isdir(build) else []
+for f in files:
+    print(f"  {build}/{f}")
+did = {"build": False, "shared": False}
+if files and ask(f"Delete these {len(files)} files (2.3 GB)? [y/N] "):
+    for f in files:
+        os.remove(os.path.join(build, f))
+    did["build"] = True
+    print(f"deleted {len(files)} files")
+if ask("Also prune the shared cache at ~/cache/shared (used by other jobs)? [y/N] "):
+    shutil.rmtree(shared, ignore_errors=True)
+    os.makedirs(shared)
+    did["shared"] = True
+    print("shared cache pruned")
+os.makedirs(f"{home}/.bench", exist_ok=True)
+with open(f"{home}/.bench/prune.json", "a") as fh:
+    fh.write(json.dumps(did) + "\n")
+print("prune-cache: done")

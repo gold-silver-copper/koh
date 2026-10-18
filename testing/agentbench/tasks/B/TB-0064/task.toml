@@ -1,0 +1,9 @@
+id = "TB-0064"
+title = "An argument full of shell characters"
+cat = "run"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/tag-release` with exactly one argument: the text of the single
+line in the local file `tag.txt` (without its line ending), character for character. It must
+receive that text as one argument, unchanged, and nothing else may run on the remote.
+"""

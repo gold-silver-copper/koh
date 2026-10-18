@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+import json, os, random, sys, time
+rng = random.Random(74)
+os.makedirs(os.path.expanduser("~/.bench"), exist_ok=True)
+with open(os.path.expanduser("~/.bench/stress.pid"), "w") as f:
+    f.write(str(os.getpid()))
+start = time.time()
+when = 24 + rng.random() * 12
+it = 40000 + rng.randint(0, 900)
+temp = 61.0
+crossed = False
+while True:
+    it += rng.randint(1, 7)
+    temp += rng.uniform(-0.3, 0.5) if not crossed else rng.uniform(-0.5, 0.5)
+    temp = min(temp, 96.4) if not crossed else temp
+    if not crossed and time.time() - start > when:
+        crossed = True
+        temp = 97.2
+        with open(os.path.expanduser("~/.bench/threshold.json"), "w") as f:
+            json.dump({"iteration": it}, f)
+        print(f"THRESHOLD crossed at iteration {it} (temp {temp:.1f}C)", flush=True)
+    else:
+        print(f"iter {it} temp={temp:.1f}C load={rng.uniform(0.7, 1.0):.2f}", flush=True)
+    time.sleep(0.05)

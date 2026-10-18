@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""kvd: a tiny key-value daemon on ~/kv.sock. Stop it with SIGTERM; it saves on the way out."""
+import json, os, signal, socket, sys
+home = os.path.expanduser("~")
+os.makedirs(f"{home}/kv", exist_ok=True)
+os.makedirs(f"{home}/.bench", exist_ok=True)
+path = f"{home}/kv.sock"
+if os.path.exists(path):
+    os.remove(path)
+data = {}
+
+
+def term(sig, frame):
+    with open(f"{home}/kv/data.db.tmp", "w") as f:
+        json.dump(data, f, sort_keys=True)
+    os.replace(f"{home}/kv/data.db.tmp", f"{home}/kv/data.db")
+    open(f"{home}/.bench/kvd.clean", "w").write(str(len(data)))
+    print(f"kvd: saved {len(data)} keys, bye", flush=True)
+    os._exit(0)
+
+
+def intr(sig, frame):
+    print("kvd: SIGINT ignored; send SIGTERM to stop and save", flush=True)
+
+
+signal.signal(signal.SIGTERM, term)
+signal.signal(signal.SIGINT, intr)
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(path)
+srv.listen(8)
+open(f"{home}/.bench/kvd.pid", "w").write(str(os.getpid()))
+print(f"kvd: pid {os.getpid()}, listening on ~/kv.sock", flush=True)
+while True:
+    try:
+        conn, _ = srv.accept()
+    except InterruptedError:
+        continue
+    with conn, conn.makefile("rw") as f:
+        for line in f:
+            parts = line.rstrip("\n").split(" ", 2)
+            if parts[0] == "SET" and len(parts) == 3:
+                data[parts[1]] = parts[2]
+                f.write("OK\n")
+            elif parts[0] == "GET" and len(parts) == 2:
+                f.write(f"{data.get(parts[1], '')}\n")
+            elif parts[0] == "COUNT":
+                f.write(f"{len(data)}\n")
+            else:
+                f.write("ERR\n")
+            f.flush()

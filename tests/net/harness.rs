@@ -1,18 +1,17 @@
 //! A real koh server and client on the fault link.
 //!
 //! The server is `koh serve`'s accept pipeline ([`serve_endpoint`]); the client is `koh connect`'s
-//! reconnecting loop ([`run_client`]) with a terminal that records every painted screen. Tests
-//! type through the client and watch what it paints.
+//! reconnecting loop ([`run_client`]) writing to a terminal that is a fux-vt parser, which records
+//! every screen it shows. Tests type through the client and watch what its terminal shows.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId, SecretKey};
-use koh::client::{run_client, BellHook, ClientTerminal, IrohConnector};
-use koh::predict::Overlay;
+use koh::client::{run_client, BellHook, IrohConnector, KohBackend, Run};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
-use koh::terminal::{Size, TerminalScreen};
+use koh::terminal::Size;
 use koh::transport_iroh::generate_secret_key;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -50,7 +49,7 @@ impl Server {
         let config = ServeConfig {
             allow: allow.to_vec(),
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
-            launcher: koh::pty::Launcher::isolated(env!("CARGO_BIN_EXE_koh"), koh_testkit::home!()),
+            home: koh::pty::Home::isolated(koh_testkit::home!()),
             ..ServeConfig::default()
         };
         let hosting = Hosting::from_config(&config)?;
@@ -85,37 +84,59 @@ pub struct Options {
     pub dialed_at: Option<std::time::SystemTime>,
 }
 
-/// The client's terminal: records each painted screen, at a size the test can change.
+/// The client's terminal: a fux-vt parser of what the client writes, which records each screen
+/// it shows once flushed, at a size the test can change.
 struct Recorder {
+    term: fux_vt::Parser,
     painted: watch::Sender<Painted>,
     history: Arc<Mutex<Vec<Painted>>>,
     size: Arc<Mutex<Size>>,
+    /// The overlay painted now: the predicted glyphs and the status line.
+    predicted: String,
+    status: Option<String>,
+    /// What scrolled off the terminal's top, kept as a terminal's scrollback is, a row a line.
+    scrollback: Arc<Mutex<Vec<String>>>,
 }
 
-/// The glyphs a prediction overlay draws, row by row.
-fn predicted_glyphs(overlay: &Overlay, Size { rows, cols }: Size) -> String {
-    let mut glyphs = String::new();
-    for row in 0..rows {
-        for col in 0..cols {
-            if let Some(cell) = overlay.cell(row, col) {
-                glyphs.push_str(cell.text());
+impl Recorder {
+    /// The text the terminal shows, a line a row, trailing blanks dropped.
+    fn text(&self) -> String {
+        let screen = self.term.screen();
+        let rows: Vec<String> = screen
+            .rows()
+            .skip(screen.history_len())
+            .map(|row| row.cells_text().trim_end().to_owned())
+            .collect();
+        rows.join("\n")
+    }
+}
+
+impl KohBackend for Recorder {
+    fn write_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        // The window resized: the terminal with it, as a real one reflows.
+        let size = *self.size.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Ok(size) = fux_vt::Size::new(size.rows, size.cols) {
+            if self.term.screen().size() != size {
+                self.term.resize(size).map_err(std::io::Error::other)?;
             }
         }
+        self.term.process(bytes).map_err(std::io::Error::other)
     }
-    glyphs
-}
 
-impl ClientTerminal for Recorder {
-    fn render(
-        &mut self,
-        state: &TerminalScreen,
-        overlay: &Overlay,
-        status: Option<&str>,
-    ) -> std::io::Result<()> {
+    fn flush(&mut self) -> std::io::Result<()> {
+        let screen = self.term.screen();
+        *self
+            .scrollback
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = screen
+            .rows()
+            .take(screen.history_len())
+            .map(|row| row.cells_text().trim_end().to_owned())
+            .collect();
         let painted = Painted {
-            text: state.screen().contents(),
-            predicted: predicted_glyphs(overlay, state.size()),
-            status: status.map(str::to_owned),
+            text: self.text(),
+            predicted: self.predicted.clone(),
+            status: self.status.clone(),
         };
         let changed = self.painted.send_if_modified(|last| {
             let changed = *last != painted;
@@ -133,8 +154,21 @@ impl ClientTerminal for Recorder {
         Ok(())
     }
 
+    fn enter_raw_mode(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn leave_raw_mode(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn size(&self) -> std::io::Result<Size> {
         Ok(*self.size.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn overlay(&mut self, predicted: &str, status: Option<&str>) {
+        predicted.clone_into(&mut self.predicted);
+        self.status = status.map(str::to_owned);
     }
 }
 
@@ -146,6 +180,7 @@ pub struct Client {
     size: Arc<Mutex<Size>>,
     painted: watch::Receiver<Painted>,
     history: Arc<Mutex<Vec<Painted>>>,
+    scrollback: Arc<Mutex<Vec<String>>>,
     /// The first connection, so a test can cut it and watch the client reconnect.
     first: Connection,
     task: JoinHandle<anyhow::Result<Option<u32>>>,
@@ -171,8 +206,10 @@ impl Client {
     ) -> anyhow::Result<Self> {
         let id = endpoint.id();
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server));
-        let channel = connector.connect().await?;
-        let first = channel.0.clone();
+        let channel = connector
+            .connect(koh::request::Pick::Latest, Size::new(24, 80))
+            .await?;
+        let first = channel.conn.clone();
         let size = Arc::new(Mutex::new(Size::new(24, 80)));
         let (painted_tx, painted) = watch::channel(Painted {
             text: String::new(),
@@ -180,26 +217,35 @@ impl Client {
             status: None,
         });
         let history = Arc::new(Mutex::new(Vec::new()));
+        let scrollback = Arc::new(Mutex::new(Vec::new()));
         let term = Recorder {
+            term: fux_vt::Parser::new(fux_vt::Size::new(24, 80)?, 1 << 20)?,
             painted: painted_tx,
             history: history.clone(),
             size: size.clone(),
+            predicted: String::new(),
+            status: None,
+            scrollback: scrollback.clone(),
         };
         // As koh's own stdin reader (`client::io`): at most 64 reads waiting, so what is typed
         // waits behind no more than the real client would let pile up.
         let (input, input_rx) = mpsc::channel(64);
         let (resize, resize_rx) = mpsc::channel(8);
+        let run = Run {
+            backend: term,
+            size: Size::new(24, 80),
+            colours: false,
+            clipboard: true,
+            links: true,
+            bell: options.bell,
+        };
         let task = koh_testkit::spawn(run_client(
             channel,
             options.dialed_at.unwrap_or_else(std::time::SystemTime::now),
             connector,
-            Size::new(24, 80),
-            false,
-            input_rx,
-            resize_rx,
-            term,
+            run,
+            (input_rx, resize_rx),
             CancellationToken::new(),
-            options.bell,
         ));
         Ok(Self {
             id,
@@ -208,6 +254,7 @@ impl Client {
             size,
             painted,
             history,
+            scrollback,
             first,
             task,
         })
@@ -239,6 +286,14 @@ impl Client {
     /// The screen the client painted last.
     pub fn screen(&self) -> String {
         self.painted.borrow().text.clone()
+    }
+
+    /// What scrolled off the top of the client's terminal, oldest first.
+    pub fn scrollback(&self) -> Vec<String> {
+        self.scrollback
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Everything the client has painted, in order.

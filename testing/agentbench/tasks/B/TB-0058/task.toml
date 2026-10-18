@@ -1,0 +1,12 @@
+id = "TB-0058"
+title = "Fix the failing test in a Rust crate"
+cat = "multi"
+difficulty = "moderate"
+goal = """
+On the remote machine, the Rust crate in `~/crates/ringbuf` has a failing test (build and test it
+there with cargo; it has no dependencies and works offline). Find the bug in the library and fix
+it so that `cargo test` passes, without changing the tests in `tests/ring.rs`. Also write the name
+of the test that was failing (only the function name) to `answer.txt` in your local directory.
+"""
+timeout = 1500
+solve_timeout = 400

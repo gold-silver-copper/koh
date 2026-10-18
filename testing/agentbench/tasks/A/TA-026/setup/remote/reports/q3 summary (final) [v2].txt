@@ -1,0 +1,5 @@
+Q3 summary, final, version 2
+
+revenue: 4.81M (+6.2%)
+churn: 2.1%
+headcount: 212

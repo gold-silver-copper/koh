@@ -1,0 +1,21 @@
+2026-10-09T00:38 worker-6 flushed cache
+2026-10-09T01:47 worker-6 flushed cache
+2026-10-09T02:54 worker-6 processed batch
+2026-10-09T03:50 worker-6 flushed cache
+2026-10-09T04:27 worker-6 flushed cache
+2026-10-09T05:57 worker-6 processed batch
+2026-10-09T06:05 worker-6 flushed cache
+2026-10-09T07:44 worker-6 processed batch
+2026-10-09T08:23 worker-6 GC pause 12ms
+2026-10-09T09:49 worker-6 processed batch
+2026-10-09T10:24 worker-6 GC pause 12ms
+2026-10-09T11:24 worker-6 GC pause 12ms
+2026-10-09T12:00 worker-6 processed batch
+2026-10-09T13:18 worker-6 GC pause 12ms
+2026-10-09T14:23 worker-6 flushed cache
+2026-10-09T15:45 worker-6 processed batch
+2026-10-09T16:02 worker-6 heartbeat
+2026-10-09T17:53 worker-6 flushed cache
+2026-10-09T18:15 worker-6 GC pause 12ms
+2026-10-09T19:37 worker-6 GC pause 12ms
+2026-10-09T23:59 worker-6 heap usage 91% (OutOfMemory guard ok)

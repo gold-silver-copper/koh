@@ -1,0 +1,11 @@
+id = "TB-0113"
+title = "Pair a device with the host console"
+cat = "sessions"
+difficulty = "hard"
+goal = """
+On the remote machine, pair a test device with the build host. `~/bin/pair-host` and
+`~/bin/pair-device` each need a terminal of their own and must run at the same time: the host
+shows a pairing code that must be typed into the device, and then the device shows a confirmation
+code that must be typed into the host. The job is done when both programs report that pairing
+succeeded.
+"""

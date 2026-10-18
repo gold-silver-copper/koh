@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Flashes a firmware image: flash --stdin < IMAGE."""
+import hashlib, os, struct, sys, zlib
+if sys.argv[1:] != ["--stdin"]:
+    sys.exit("usage: flash --stdin < IMAGE")
+if sys.stdin.isatty():
+    sys.exit("flash: refusing to read a binary image from a terminal")
+data = sys.stdin.buffer.read()
+home = os.path.expanduser("~")
+os.makedirs(os.path.join(home, ".flash"), exist_ok=True)
+with open(os.path.join(home, ".flash", "received.log"), "a") as f:
+    f.write(f"{len(data)} {hashlib.sha256(data).hexdigest()}\n")
+if len(data) < 16 or data[:5] != b"FWIMG":
+    sys.exit("flash rejected: not a firmware image")
+n, crc = struct.unpack("<II", data[8:16])
+body = data[16:]
+if len(body) != n:
+    sys.exit(f"flash rejected: length {len(body)}, header says {n}")
+if zlib.crc32(body) != crc:
+    sys.exit("flash rejected: bad checksum")
+print(f"flashed: id={crc:08x}-{hashlib.sha256(body).hexdigest()[:8]}")

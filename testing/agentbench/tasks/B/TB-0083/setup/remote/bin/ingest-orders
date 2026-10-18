@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+import csv, hashlib, io, json, os, sys
+if sys.stdin.isatty():
+    print("ingest-orders: reading CSV from the terminal; end with Ctrl-D", file=sys.stderr)
+data = sys.stdin.buffer.read()
+home = os.path.expanduser("~")
+rows = list(csv.DictReader(io.StringIO(data.decode(errors="replace"))))
+total = sum(int(r.get("qty") or 0) * int(r.get("unit_price_cents") or 0) for r in rows if r.get("qty", "").isdigit())
+os.makedirs(f"{home}/ingest", exist_ok=True)
+with open(f"{home}/ingest/summary.txt", "w") as f:
+    f.write(f"orders: {len(rows)}\nrevenue_cents: {total}\n")
+os.makedirs(f"{home}/.bench", exist_ok=True)
+with open(f"{home}/.bench/ingest.json", "a") as f:
+    f.write(json.dumps({"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}) + "\n")
+print(f"ingested {len(rows)} orders")

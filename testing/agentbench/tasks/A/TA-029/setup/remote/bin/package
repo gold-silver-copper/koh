@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+import os, shutil
+DIST = [('bin', 'dir', 493, None), ('bin/ledgerd', 'file', 493, '#!/bin/sh\necho ledgerd 4.12\n'), ('bin/ledger-cli', 'file', 488, '#!/bin/sh\necho ledger-cli\n'), ('bin/ledger', 'link', None, 'ledgerd'), ('etc', 'dir', 493, None), ('etc/ledgerd.conf', 'file', 420, 'listen = 127.0.0.1:7000\n'), ('etc/secret.key', 'file', 384, 'k3y-0f-the-ledger\n'), ('share', 'dir', 493, None), ('share/doc', 'dir', 493, None), ('share/doc/README (copy).txt', 'file', 420, 'Read me.\n'), ('share/doc/notes for v4.12 – draft.md', 'file', 420, '# Notes\n'), ('share/doc/-leading-dash.txt', 'file', 292, 'dash\n'), ('share/doc/it\'s "quoted" $X.txt', 'file', 420, 'quotes\n'), ('current-docs', 'link', None, 'share/doc'), ('var', 'dir', 448, None), ('var/state.db', 'file', 416, 'STATE\x00\x01\x02\n'), ('var/run', 'dir', 488, None), ('var/run/.pidfile-placeholder', 'file', 384, '')]
+root = os.path.expanduser("~/dist")
+if os.path.exists(root):
+    for d, dirs, files in os.walk(root):
+        os.chmod(d, 0o755)
+    shutil.rmtree(root)
+os.makedirs(root)
+for p, kind, mode, data in DIST:
+    full = os.path.join(root, p)
+    if kind == "dir":
+        os.makedirs(full, exist_ok=True)
+    elif kind == "link":
+        os.symlink(data, full)
+    else:
+        with open(full, "w") as f:
+            f.write(data)
+for p, kind, mode, data in reversed(DIST):
+    if kind != "link":
+        os.chmod(os.path.join(root, p), mode)
+print(f"package: release 4.12.0 written to {root} ({len(DIST)} entries)")

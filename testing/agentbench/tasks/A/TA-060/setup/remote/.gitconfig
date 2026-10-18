@@ -1,0 +1,5 @@
+[user]
+	name = Bench Dev
+	email = dev@example.invalid
+[init]
+	defaultBranch = main

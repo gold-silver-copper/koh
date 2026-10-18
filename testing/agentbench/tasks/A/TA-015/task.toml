@@ -1,0 +1,9 @@
+id = "TA-015"
+title = "How the deploy ended"
+cat = "wait"
+difficulty = "easy"
+goal = '''
+On the remote machine, run `~/bin/deploy`. It takes a while and ends either in success or in a
+rollback, reported on its last line. Write that last line, exactly, to `answer.txt` in your
+local directory.
+'''

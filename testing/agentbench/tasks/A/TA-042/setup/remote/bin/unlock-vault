@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+import getpass, hashlib, os, sys, time
+state = os.path.expanduser("~/.vault-failures")
+fails = int(open(state).read()) if os.path.exists(state) else 0
+if fails >= 3:
+    print("unlock-vault: locked after 3 wrong passphrases; waiting 300 s", flush=True)
+    time.sleep(300)
+    os.unlink(state)
+    fails = 0
+try:
+    os.close(os.open("/dev/tty", os.O_RDWR))
+except OSError:
+    sys.exit("unlock-vault: needs a terminal to read the passphrase")
+time.sleep(1)
+pw = getpass.getpass("Vault passphrase: ")
+if hashlib.sha256(pw.encode()).hexdigest() != '9ccb89896949fd269395bed36238a2d74344837f0cbf7c9658ef5bd8e918e78c':
+    open(state, "w").write(str(fails + 1))
+    print(f"unlock-vault: wrong passphrase ({fails + 1}/3)")
+    sys.exit(1)
+print("unlock-vault: vault open")
+print("token: " + hashlib.sha256(b"vault:" + pw.encode()).hexdigest()[:20])

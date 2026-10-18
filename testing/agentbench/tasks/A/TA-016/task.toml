@@ -1,0 +1,10 @@
+id = "TA-016"
+title = "Copy an export once complete"
+cat = "wait"
+difficulty = "moderate"
+goal = '''
+On the remote machine, `~/bin/export` starts writing `~/out/export.csv` in the background and
+returns at once; the file keeps growing until the export is complete, which takes a while.
+Run it, and once the export is complete, copy the whole file to `export.csv` in your local
+directory.
+'''

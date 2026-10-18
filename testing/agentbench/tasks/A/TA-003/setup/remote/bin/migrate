@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+import sys, time
+ERR = ['warning: table audit_log has no primary key', 'warning: column users.legacy_id is deprecated', 'error: migration 0042_split_accounts failed: duplicate key value (account_id)=(1187)']
+at = {12: 0, 57: 1, 140: 2}
+for i in range(1, 161):
+    print(f"[{i:3d}/160] applying 00{i:02d} ... done", flush=True)
+    if i in at:
+        print(ERR[at[i]], file=sys.stderr, flush=True)
+        if at[i] == 2:
+            print("rolling back 0042_split_accounts", flush=True)
+            break
+    time.sleep(0.005)
+sys.exit(2)

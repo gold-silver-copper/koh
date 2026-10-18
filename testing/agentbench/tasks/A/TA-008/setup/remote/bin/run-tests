@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+import random, sys
+def plan():
+    rng = random.Random(8)
+    suites = ["store", "net", "codec", "auth", "sched", "query"]
+    fail = set(rng.sample(range(3100), 7))
+    return [(f"{rng.choice(suites)}::{rng.choice(['compaction', 'roundtrip', 'retry', 'parse', 'limits'])}_{i:04d}",
+             i not in fail) for i in range(3100)]
+if __name__ == "__main__":
+    p = plan()
+    print(f"running {len(p)} tests")
+    for name, ok in p:
+        print(f"test {name} ... {'ok' if ok else 'FAILED'}")
+    bad = sum(1 for _, ok in p if not ok)
+    print(f"\ntest result: FAILED. {len(p) - bad} passed; {bad} failed; 0 ignored")
+    sys.exit(101)

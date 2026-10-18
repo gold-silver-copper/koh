@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+import gzip, os, random, sys, time
+home = os.path.expanduser("~")
+os.makedirs(f"{home}/dumps", exist_ok=True)
+if os.fork() > 0:
+    print("nightly dump started in the background; it will appear at ~/dumps/nightly.sql.gz", flush=True)
+    sys.exit(0)
+os.setsid()
+if os.fork() > 0:
+    os._exit(0)
+fd = os.open(os.devnull, os.O_RDWR)
+for i in (0, 1, 2):
+    os.dup2(fd, i)
+rng = random.Random(77)
+part = f"{home}/dumps/nightly.sql.gz.partial"
+with open(part, "wb") as raw:
+    z = gzip.GzipFile(fileobj=raw, mode="wb", mtime=0)
+    for table in range(18):
+        time.sleep(rng.uniform(1.0, 2.6))
+        for r in range(400):
+            z.write(f"INSERT INTO t{table} VALUES ({r}, '{rng.random():.8f}');\n".encode())
+        z.flush()
+        raw.flush()
+    z.close()
+os.rename(part, f"{home}/dumps/nightly.sql.gz")

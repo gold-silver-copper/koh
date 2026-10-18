@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""The render farm supervisor.
+
+  farm --daemon   start the farm in the background (it starts 5 workers and restarts any that die)
+  farm --status   show the farm and its workers
+  farm --stop     ask the farm to shut down (SIGTERM): it stops its workers, then exits
+"""
+import json, os, signal, subprocess, sys, time
+home = os.path.expanduser("~")
+d = os.path.join(home, "farm")
+os.makedirs(d, exist_ok=True)
+pidf = os.path.join(d, "farm.pid")
+rec = os.path.join(home, ".farm-spawned")
+
+
+def alive(pid):
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+arg = sys.argv[1:2]
+if arg == ["--status"]:
+    try:
+        pid = int(open(pidf).read())
+    except (OSError, ValueError):
+        pid = None
+    print(f"farm: {'running, pid ' + str(pid) if pid and alive(pid) else 'not running'}")
+    w = os.path.join(d, "workers.json")
+    if os.path.exists(w) and pid and alive(pid):
+        for n, p in json.load(open(w)).items():
+            print(f"  worker {n}: pid {p} {'up' if alive(p) else 'down'}")
+    sys.exit(0)
+if arg == ["--stop"]:
+    try:
+        os.kill(int(open(pidf).read()), signal.SIGTERM)
+        print("farm: asked to stop")
+    except (OSError, ValueError):
+        sys.exit("farm: not running")
+    sys.exit(0)
+if arg != ["--daemon"]:
+    print(__doc__.strip())
+    sys.exit(2)
+if os.fork():
+    time.sleep(1.0)
+    print("farm started; see `farm --status`")
+    sys.exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+log = os.open(os.path.join(d, "farm.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+nul = os.open(os.devnull, os.O_RDONLY)
+os.dup2(nul, 0); os.dup2(log, 1); os.dup2(log, 2)
+open(pidf, "w").write(f"{os.getpid()}\n")
+with open(rec, "a") as f:
+    f.write(f"farm {os.getpid()}\n")
+workers = {}
+stopping = False
+
+
+def spawn(n):
+    p = subprocess.Popen([os.path.join(home, "bin", "farm-worker"), str(n)], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+    workers[n] = p
+    with open(rec, "a") as f:
+        f.write(f"worker {p.pid}\n")
+    json.dump({n: w.pid for n, w in workers.items()}, open(os.path.join(d, "workers.json"), "w"))
+
+
+def term(sig, frame):
+    global stopping
+    stopping = True
+
+
+signal.signal(signal.SIGTERM, term)
+signal.signal(signal.SIGINT, term)
+for n in range(1, 6):
+    spawn(n)
+while not stopping:
+    time.sleep(0.5)
+    for n, p in list(workers.items()):
+        if p.poll() is not None and not stopping:
+            print(f"farm: worker {n} exited ({p.returncode}); restarting it", flush=True)
+            spawn(n)
+print("farm: stopping workers", flush=True)
+for p in workers.values():
+    try:
+        p.terminate()
+    except OSError:
+        pass
+time.sleep(2)
+for n, p in workers.items():
+    print(f"farm: worker {n} {'stopped' if p.poll() is not None else 'did not stop'}", flush=True)
+os.unlink(pidf)
+print("farm: bye", flush=True)

@@ -1,7 +1,7 @@
 //! The corpus over the fault link: a real server hosts a script that writes a recording's output
-//! a step at a time, and a real client paints it into a fux-vt terminal. After each step, the
+//! a step at a time, and a real client relays it to a fux-vt terminal. After each step, the
 //! terminal must come to show what a fux-vt parser fed the same output and resizes shows, under
-//! loss and delay: the client converges on every step, whichever frames were lost.
+//! loss and delay: the client converges on every step, whatever was lost or redrawn.
 //!
 //! The script is the program: it writes each step's bytes when the test types one byte (so a
 //! step's output never races its resize), after waiting for the step's size, with the PTY in raw
@@ -15,9 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use koh::client::{run_client, BackendTerminal, ClientTerminal, IrohConnector, KohBackend};
-use koh::predict::Overlay;
-use koh::terminal::{Size, TerminalScreen};
+use koh::client::{run_client, IrohConnector, KohBackend, Run};
+use koh::terminal::Size;
 use recording::Recording;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -44,22 +43,23 @@ const DEFAULT: &[&str] = &[
     "zsh-resize",
 ];
 
-/// The user's terminal: every byte the client paints, read by a fux-vt parser.
-#[derive(Clone)]
-struct Shared {
-    painted: Arc<Mutex<Vec<u8>>>,
+/// The user's terminal: every byte the client writes, read by a fux-vt parser; each flush counted.
+struct Readback {
+    shown: Arc<Mutex<fux_vt::Parser>>,
+    paints: watch::Sender<u64>,
     size: Arc<Mutex<Size>>,
 }
 
-impl KohBackend for Shared {
+impl KohBackend for Readback {
     fn write_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.painted
+        self.shown
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(bytes);
-        Ok(())
+            .process(bytes)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
     fn flush(&mut self) -> std::io::Result<()> {
+        self.paints.send_modify(|n| *n = n.wrapping_add(1));
         Ok(())
     }
     fn enter_raw_mode(&mut self) -> std::io::Result<()> {
@@ -70,48 +70,6 @@ impl KohBackend for Shared {
     }
     fn size(&self) -> std::io::Result<Size> {
         Ok(*self.size.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-}
-
-/// The client's terminal: koh's own, painting into [`Shared`], whose bytes go to `shown` after
-/// every frame.
-struct Readback {
-    terminal: BackendTerminal<Shared>,
-    shared: Shared,
-    shown: Arc<Mutex<fux_vt::Parser>>,
-    paints: watch::Sender<u64>,
-}
-
-impl ClientTerminal for Readback {
-    fn render(
-        &mut self,
-        state: &TerminalScreen,
-        overlay: &Overlay,
-        status: Option<&str>,
-    ) -> std::io::Result<()> {
-        self.terminal.render(state, overlay, status)?;
-        let painted = std::mem::take(
-            &mut *self
-                .shared
-                .painted
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        self.shown
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .process(&painted)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        self.paints.send_modify(|n| *n = n.wrapping_add(1));
-        Ok(())
-    }
-
-    fn size(&self) -> std::io::Result<Size> {
-        self.shared.size()
-    }
-
-    fn window_resized(&mut self) {
-        self.terminal.window_resized();
     }
 }
 
@@ -146,12 +104,7 @@ fn difference(shown: &fux_vt::Screen, expected: &fux_vt::Screen) -> Option<Strin
                     )
                 })
             };
-            let mut b = look(expected);
-            // The server draws a program's colours as RGB.
-            if let Some(cell) = b.as_mut() {
-                cell.3 = koh::terminal::test_support::drawn(cell.3, expected);
-            }
-            let (a, b) = (look(shown), b);
+            let (a, b) = (look(shown), look(expected));
             if a != b {
                 return Some(format!("cell ({row}, {col}): shown {a:?}, expected {b:?}"));
             }
@@ -223,47 +176,41 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     let server = Server::start(net, &[secret.public()], &["bash", &script]).await?;
     let endpoint = net.endpoint(secret, false).await?;
     let connector = IrohConnector::new(endpoint, FaultNet::addr(server.id));
-    let channel = connector.connect().await?;
     let start = Size::new(recording.rows, recording.cols);
-    let shared = Shared {
-        painted: Arc::default(),
-        size: Arc::new(Mutex::new(start)),
-    };
-    // A terminal that keeps hyperlinks, as the user's does.
+    let channel = connector.connect(koh::request::Pick::Latest, start).await?;
+    let size = Arc::new(Mutex::new(start));
+    // A terminal that does what the server's does: the same output shows the same.
     let shown = Arc::new(Mutex::new(
         fux_vt::Parser::with_options(
             fux_vt::Size::new(start.rows, start.cols)?,
             0,
-            fux_vt::Options::new().with(fux_vt::Feature::Hyperlinks),
+            koh::terminal::OPTIONS,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?,
     ));
     let (paints_tx, mut paints) = watch::channel(0u64);
     let terminal = Readback {
-        terminal: {
-            // The user's terminal draws underline styles, as the one reading the paint does.
-            let mut terminal = BackendTerminal::enter(shared.clone(), false)?;
-            terminal.set_underline_styles(true);
-            terminal.set_hyperlinks(true);
-            terminal
-        },
-        shared: shared.clone(),
         shown: shown.clone(),
         paints: paints_tx,
+        size: size.clone(),
     };
     let (input, input_rx) = mpsc::channel(64);
     let (resize, resize_rx) = mpsc::channel(8);
+    let run = Run {
+        backend: terminal,
+        size: start,
+        colours: false,
+        clipboard: true,
+        links: true,
+        bell: None,
+    };
     let task = koh_testkit::spawn(run_client(
         channel,
         std::time::SystemTime::now(),
         connector,
-        start,
-        false,
-        input_rx,
-        resize_rx,
-        terminal,
+        run,
+        (input_rx, resize_rx),
         CancellationToken::new(),
-        None,
     ));
     // The server's parser, with its options; the harness's server keeps no scrollback.
     let mut expected = fux_vt::Parser::with_options(
@@ -279,7 +226,7 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
                 .resize(fux_vt::Size::new(rows, cols)?)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             // The user's terminal resizes, then the client hears of it.
-            *shared.size.lock().unwrap_or_else(PoisonError::into_inner) = Size::new(rows, cols);
+            *size.lock().unwrap_or_else(PoisonError::into_inner) = Size::new(rows, cols);
             shown
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

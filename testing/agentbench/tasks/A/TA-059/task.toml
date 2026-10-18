@@ -1,0 +1,10 @@
+id = "TA-059"
+title = "Collect three health checks"
+cat = "multi"
+difficulty = "easy"
+goal = '''
+On the remote machine, run the three health checks `~/bin/check-disk`, `~/bin/check-mem` and
+`~/bin/check-net`. Each takes a few seconds and reports through its exit status (0 ok, 1
+warning, 2 critical). Write `health.txt` in your local directory with exactly three lines, in
+this order: `disk STATUS`, `mem STATUS`, `net STATUS`, where STATUS is that check's exit status.
+'''

@@ -1,0 +1,4 @@
+# m h dom mon dow command
+0 * * * * ~/bin/cleanup --tmp
+15 3 * * 0 ~/bin/rotate-logs
+*/5 * * * * ~/bin/healthcheck

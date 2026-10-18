@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+import os, random, subprocess, sys
+home = os.path.expanduser("~")
+repo = f"{home}/engine"
+if os.path.exists(repo):
+    print("clone-engine: ~/engine already exists", file=sys.stderr)
+    sys.exit(1)
+rng = random.Random(82)
+os.makedirs(f"{repo}/src")
+env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+def git(*a):
+    subprocess.run(["git", "-C", repo, *a], check=True, env=env, stdout=subprocess.DEVNULL)
+git("init", "-q", "-b", "main")
+cfg = {"substeps": 4, "contact_slop": "0.01", "simd": "off", "sleep_threshold": "0.05",
+       "max_islands": 256, "warm_start": "on", "solver_iters": 8}
+subjects = ["tweak", "refactor", "fix", "perf", "docs", "tune"]
+areas = ["broadphase", "islands", "joints", "ccd", "friction", "contacts", "sleeping", "solver"]
+for n in range(1, 65):
+    if n == 22:
+        cfg["contact_slop"] = "0.004"; msg = "contacts: tighten contact slop to 0.004"
+    elif n == 41:
+        cfg["simd"] = "on"; msg = "solver: enable the SIMD contact path by default"
+    elif n == 47:
+        cfg["simd"] = "on "; msg = "solver: whitespace"
+    else:
+        k = rng.choice(["substeps", "sleep_threshold", "max_islands", "solver_iters", None])
+        if k == "substeps": cfg[k] = rng.choice([2, 4, 6, 8])
+        elif k == "sleep_threshold": cfg[k] = rng.choice(["0.02", "0.05", "0.08"])
+        elif k == "max_islands": cfg[k] = rng.choice([128, 256, 512])
+        elif k == "solver_iters": cfg[k] = rng.choice([6, 8, 10, 12])
+        msg = f"{rng.choice(areas)}: {rng.choice(subjects)} ({n})"
+    with open(f"{repo}/src/solver.cfg", "w") as f:
+        f.write("".join(f"{k} = {v}\n" for k, v in cfg.items()))
+    with open(f"{repo}/src/CHANGES.md", "a") as f:
+        f.write(f"- {msg}\n")
+    git("add", "-A")
+    date = f"2026-0{1 + n // 10}-{10 + n % 10:02d}T12:{n:02d}:00+00:00"
+    subprocess.run(["git", "-C", repo, "-c", "user.name=Engine Dev", "-c", "user.email=dev@engine.invalid",
+                    "commit", "-q", "-m", msg], check=True, stdout=subprocess.DEVNULL,
+                   env=dict(env, GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date))
+print("cloned engine into ~/engine (64 commits on main)")

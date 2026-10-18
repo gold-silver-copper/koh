@@ -1,0 +1,10 @@
+id = "TB-0080"
+title = "What killed the texture packer"
+cat = "crash"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/pack-textures`. It reports each atlas as it starts packing it,
+and part way through it is killed by a signal. Write two lines to `answer.txt` in your local
+directory: first the name of the signal that killed it (like `SIGTERM`), then the number of the
+last atlas it reported starting.
+"""

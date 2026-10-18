@@ -1,0 +1,11 @@
+id = "TB-0055"
+title = "Shut down a stubborn sync daemon gracefully"
+cat = "process"
+difficulty = "moderate"
+goal = """
+On the remote machine, start `~/bin/syncd`. Let it sync at least 3 batches (it prints
+`batch N synced`), then stop it in the way that makes it save its state (`~/bin/syncd --help`
+explains; it ignores the usual ways of stopping a program). It must not be killed outright. The
+task is done when it has exited on its own after saving `~/sync/state.json` with at least 3
+batches.
+"""

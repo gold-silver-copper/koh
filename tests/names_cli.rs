@@ -6,6 +6,10 @@
 //! directory and the user's own `~/.config/koh` is never read or written.
 #![forbid(clippy::disallowed_methods)]
 
+#[expect(
+    dead_code,
+    reason = "the keys here are made by the binary itself, in its home"
+)]
 mod common;
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -109,12 +113,14 @@ fn servers_are_added_listed_renamed_and_removed_by_name() {
         "{}",
         text(&out)
     );
-    let out = home.koh(&["servers", "add", "laptop", &id]).unwrap();
+    let out = home
+        .koh(&["servers", "add", "laptop", &id, "--direct", "10.0.0.2:4433"])
+        .unwrap();
     assert!(out.status.success(), "{}", text(&out));
     let out = home.koh(&["servers"]).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!("laptop {id}\n")
+        format!("laptop {id} direct=10.0.0.2:4433\n")
     );
     let out = home.koh(&["servers", "add", "other", &id]).unwrap();
     assert!(
@@ -128,7 +134,7 @@ fn servers_are_added_listed_renamed_and_removed_by_name() {
         .status
         .success());
     let saved = std::fs::read_to_string(home.koh_dir().join("servers")).unwrap();
-    assert_eq!(saved, format!("desk {id}\n"));
+    assert_eq!(saved, format!("desk {id} direct=10.0.0.2:4433\n"));
     assert!(home
         .koh(&["servers", "rm", "desk"])
         .unwrap()
@@ -169,6 +175,23 @@ fn connect_to_an_unsaved_name_lists_the_saved_ones() {
     assert!(!out.status.success(), "{said}");
     assert!(
         said.contains("nor a saved server name") && said.contains("saved: laptop"),
+        "{said}"
+    );
+}
+
+/// `koh connect` with no terminal at all, as a script or an agent runs it, says what to use
+/// instead, and dials nothing.
+#[test]
+fn connect_with_no_terminal_points_at_exec_and_cp() {
+    let home = Home::new("no-terminal").unwrap();
+    let mut koh = home.command(&["connect", &some_id(5)]).unwrap();
+    // A session of its own, so no controlling terminal is inherited for `/dev/tty`.
+    fuxix::process::lead_session(&mut koh, false);
+    let out = koh.stdin(Stdio::null()).output().unwrap();
+    let said = text(&out);
+    assert!(!out.status.success(), "{said}");
+    assert!(
+        said.contains("needs a terminal") && said.contains("koh exec SERVER -- COMMAND"),
         "{said}"
     );
 }
@@ -295,7 +318,7 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
 }
 
 #[test]
-fn connect_by_name_dials_the_saved_server_and_notes_it() {
+fn connect_by_name_dials_the_saved_server_where_it_was_saved_and_notes_it() {
     let home = Home::new("connect").unwrap();
     koh_testkit::multi_thread(2)
         .expect("tokio runtime")
@@ -305,9 +328,10 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
             let (id, port, task) = loopback_server(String::from_utf8_lossy(&me.stdout).trim())
                 .await
                 .unwrap();
-            home.koh(&["servers", "add", "box", &id]).unwrap();
             let direct = format!("127.0.0.1:{port}");
-            let argv = home.argv(&["connect", "box", "--direct", &direct]);
+            home.koh(&["servers", "add", "box", &id, "--direct", &direct])
+                .unwrap();
+            let argv = home.argv(&["connect", "box"]);
             let (client, ..) = connected(&argv, b"echo by''_name\r", "by_name")
                 .await
                 .unwrap();
@@ -323,7 +347,7 @@ fn connect_by_name_dials_the_saved_server_and_notes_it() {
 /// with no restart: a lost machine's key is refused at once.
 #[test]
 fn clients_added_and_removed_take_effect_on_a_running_server() {
-    use koh::transport_iroh::{bind_endpoint_local, direct_addr, parse_endpoint_id, ALPN};
+    use koh::transport_iroh::{bind_endpoint_local, direct_addr, parse_endpoint_id};
     let home = Home::new("live-allowlist").unwrap();
     let me = home.koh(&["id"]).unwrap();
     let me = String::from_utf8_lossy(&me.stdout).trim().to_owned();
@@ -343,9 +367,10 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
         let (at, secret) = (at.clone(), secret.clone());
         async move {
             let endpoint = bind_endpoint_local(secret, false).await?;
-            let conn = endpoint.connect(at, ALPN).await?;
-            conn.accept_uni().await?;
-            anyhow::Ok((endpoint, conn))
+            let admitted = koh::client::IrohConnector::new(endpoint.clone(), at)
+                .connect(koh::request::Pick::Latest, koh::terminal::Size::new(24, 80))
+                .await?;
+            anyhow::Ok((endpoint, admitted))
         }
     };
     let outcomes = koh_testkit::multi_thread(2)
@@ -363,9 +388,11 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
             home.koh(&["clients", "rm", "me"]).unwrap();
             // The connection it already had is cut off too.
             let cut_off = match &live {
-                Ok((_, conn)) => tokio::time::timeout(Duration::from_secs(10), conn.closed())
-                    .await
-                    .is_ok(),
+                Ok((_, admitted)) => {
+                    tokio::time::timeout(Duration::from_secs(10), admitted.conn.closed())
+                        .await
+                        .is_ok()
+                }
                 Err(_) => false,
             };
             let removed = admitted().await.is_ok();

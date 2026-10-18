@@ -1,0 +1,51 @@
+; solver.prog - toy contact solver for the tdb virtual machine
+; registers: r0..r7, all integers
+;
+        set r0, 0          ; island index
+        set r1, 9          ; islands
+        set r2, 13         ; seed
+        set r3, 0          ; accumulated impulse
+        set r4, 0
+        set r5, 0
+        set r6, 0
+        set r7, 0
+island:
+        mul r2, 31
+        add r2, 7
+        mod r2, 1009
+        set r4, r2
+        mod r4, 5
+        add r4, 2          ; contacts in this island
+        set r5, 0          ; contact index
+contact:
+        set r6, r2
+        add r6, r5
+        mul r6, r6
+        mod r6, 97
+        add r3, r6
+        mod r3, 10007
+        ; warm start
+        set r7, r3
+        xor r7, r5
+        mod r7, 13
+        jz r7, skip
+        add r3, r7
+        sub r3, 3
+skip:
+        add r5, 1
+        set r7, r4
+        sub r7, r5
+        jnz r7, contact
+        ; relax the island
+        set r6, r3
+        mod r6, 4
+        jz r6, quiet
+        mul r3, 3
+        mod r3, 10007
+quiet:
+        add r0, 1
+        set r7, r1
+        sub r7, r0
+        add r3, r0         ; island bias
+        jnz r7, island
+        halt

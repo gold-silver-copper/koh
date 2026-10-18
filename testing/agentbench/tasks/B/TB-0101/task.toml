@@ -1,0 +1,11 @@
+id = "TB-0101"
+title = "Answer the vault's challenge"
+cat = "repl"
+difficulty = "moderate"
+goal = """
+On the remote machine, `~/bin/vault` is an interactive secrets shell (`help` lists its commands).
+Before it hands out a secret it must be authenticated: its `auth` command prints a challenge that
+changes every time, and the response is what `~/bin/otp CHALLENGE` prints for that challenge.
+Authenticate a vault session, read the secret `release/signing-pass` with it, and write the secret
+(only the secret) to `answer.txt` in your local directory.
+"""

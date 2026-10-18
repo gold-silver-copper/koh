@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Interactive boot menu: choose the default boot entry."""
+import os, select, sys, termios, tty
+home = os.path.expanduser("~")
+conf = os.path.join(home, "boot", "default.conf")
+ENTRIES = [
+    "Arch Linux (linux 6.11.2)",
+    "Arch Linux (linux 6.11.2, fallback initramfs)",
+    "Arch Linux (linux-lts 6.6.54)",
+    "Arch Linux (linux-lts 6.6.54, fallback initramfs)",
+    "Arch Linux (linux-zen 6.11.1)",
+    "Memtest86+",
+    "UEFI Firmware Settings",
+]
+if not (os.isatty(0) and os.isatty(1)):
+    sys.exit("bootmenu: needs an interactive terminal")
+cur = {}
+for line in open(conf):
+    k, _, v = line.strip().partition("=")
+    cur[k] = v
+sel = ENTRIES.index(cur.get("default")) if cur.get("default") in ENTRIES else 0
+out = sys.stdout
+
+
+def draw(msg=""):
+    out.write("\x1b[H\x1b[2J\x1b[1m  Boot menu: choose the default entry\x1b[0m\r\n\r\n")
+    for i, e in enumerate(ENTRIES):
+        mark = "*" if e == cur.get("default") else " "
+        if i == sel:
+            out.write(f" > \x1b[7m{mark} {e}\x1b[0m\r\n")
+        else:
+            out.write(f"   {mark} {e}\r\n")
+    out.write("\r\n  Up/Down: move   Enter: choose   q: quit without changes\r\n")
+    if msg:
+        out.write(f"\r\n  {msg}")
+    out.flush()
+
+
+pending = []
+
+
+def getkey():
+    """The next key the terminal sent (escape sequences kept whole)."""
+    if not pending:
+        data, i = os.read(0, 64), 0
+        while i < len(data):
+            if data[i:i + 1] == b"\x1b" and data[i + 1:i + 2] in (b"[", b"O"):
+                j = i + 2
+                while j < len(data) and not (0x40 <= data[j] <= 0x7e):
+                    j += 1
+                pending.append(data[i:j + 1])
+                i = j + 1
+            else:
+                pending.append(data[i:i + 1])
+                i += 1
+    return pending.pop(0) if pending else b""
+
+
+old = termios.tcgetattr(0)
+tty.setraw(0)
+result = None
+try:
+    draw()
+    while True:
+        k = getkey()
+        if k in (b"\x1b[A", b"\x1bOA"):
+            sel = max(0, sel - 1)
+        elif k in (b"\x1b[B", b"\x1bOB"):
+            sel = min(len(ENTRIES) - 1, sel + 1)
+        elif k in (b"\x1b[H", b"\x1bOH"):
+            sel = 0
+        elif k in (b"\x1b[F", b"\x1bOF"):
+            sel = len(ENTRIES) - 1
+        elif k in (b"\r", b"\n"):
+            draw(f"Make '{ENTRIES[sel]}' the default? [y/n] ")
+            a = getkey().lower()
+            if a.startswith(b"y"):
+                cur["default"] = ENTRIES[sel]
+                with open(conf, "w") as f:
+                    f.write("# written by bootmenu\n")
+                    for kk, v in cur.items():
+                        f.write(f"{kk}={v}\n")
+                result = ENTRIES[sel]
+                break
+        elif k in (b"q", b"\x03"):
+            break
+        draw()
+finally:
+    termios.tcsetattr(0, termios.TCSADRAIN, old)
+    out.write("\x1b[H\x1b[2J")
+print(f"default boot entry: {result}" if result else "no changes")

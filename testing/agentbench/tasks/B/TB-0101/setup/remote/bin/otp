@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+import hashlib, sys
+if len(sys.argv) != 2:
+    print("usage: otp CHALLENGE", file=sys.stderr)
+    sys.exit(2)
+print(hashlib.sha256(f"otp/v2:{sys.argv[1].strip()}".encode()).hexdigest()[:8])

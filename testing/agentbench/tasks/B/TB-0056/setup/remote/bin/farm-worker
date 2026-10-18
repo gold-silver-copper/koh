@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""A render farm worker: farm-worker N."""
+import signal, sys, time
+n = int(sys.argv[1])
+if n == 4:
+    signal.signal(signal.SIGTERM, lambda s, f: print("farm-worker 4: busy with a frame; ignoring SIGTERM", flush=True))
+k = 0
+while True:
+    time.sleep(1)
+    k += 1
+    if k % 10 == 0:
+        print(f"farm-worker {n}: rendered frame {k // 10}", flush=True)

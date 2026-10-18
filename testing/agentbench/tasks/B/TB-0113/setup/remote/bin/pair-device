@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+import hashlib, json, os, socket, sys
+home = os.path.expanduser("~")
+if not (os.isatty(0) and os.isatty(1)):
+    print("pair-device: needs a terminal", file=sys.stderr)
+    sys.exit(2)
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect(f"{home}/.pair/sock")
+except OSError:
+    print("pair-device: no pair-host is waiting (start pair-host first)", file=sys.stderr)
+    sys.exit(1)
+f = s.makefile("rw")
+h = hashlib.sha256(f"device:{os.getpid()}".encode()).hexdigest()
+mine = f"{int(h[:6], 16) % 10000:04d}-{int(h[6:10], 16) % 100:02d}"
+for _ in range(3):
+    typed = input("pair-device: enter the pairing code shown on the host: ").strip()
+    f.write(f"CODE {typed or '-'} {mine}\n"); f.flush()
+    if f.readline().strip() == "OK":
+        break
+    print("pair-device: the host rejected that code")
+else:
+    sys.exit(1)
+print(f"pair-device: confirmation code: {mine}  (type it into pair-host)", flush=True)
+if f.readline().strip() == "DONE":
+    os.makedirs(f"{home}/.bench", exist_ok=True)
+    with open(f"{home}/.bench/pair.json", "a") as r:
+        r.write(json.dumps({"side": "device", "ok": True}) + "\n")
+    print("pair-device: pairing succeeded")
+else:
+    print("pair-device: pairing failed")
+    sys.exit(1)

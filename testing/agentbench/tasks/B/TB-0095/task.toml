@@ -1,0 +1,9 @@
+id = "TB-0095"
+title = "Pick a build from the deploy menu"
+cat = "tui"
+difficulty = "moderate"
+goal = """
+On the remote machine, `~/bin/select-build` is a full-screen menu for deploying builds (arrow keys
+or j/k to move, Enter to choose). Use it to deploy the build `nightly-2026-10-14 (arm64)` to the
+`staging` environment, confirming the deploy when it asks.
+"""

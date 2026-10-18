@@ -1,65 +1,45 @@
-//! The terminal the client paints on.
+//! The terminal `koh connect` writes to.
 //!
 //! [`KohBackend`]'s required methods are the platform primitives (raw mode, the size, writing
-//! bytes); its provided methods write every escape sequence. [`Tty`] is the real terminal; tests
-//! capture the bytes instead.
+//! bytes); [`Tty`] is the real terminal; tests capture the bytes instead.
 
 use std::fmt;
 use std::io;
 
-use fux_vt::{Attributes, Blink, Color, UnderlineStyle};
-
-use crate::terminal::{Link, Size};
+use crate::terminal::Size;
 
 mod tty;
 pub use self::tty::Tty;
 
-/// The terminal the `koh` binary paints through.
+/// The terminal the `koh` binary writes to.
 pub type DefaultBackend = Tty;
 
-/// Every input mode koh may have set (mouse reporting and encodings, bracketed paste, focus
-/// reporting, cursor and keypad keys), reset on leaving the alternate screen, so the user's shell
-/// does not get stray mouse or focus bytes at its prompt.
-pub(crate) const RESET_FORWARDED_MODES: &[u8] =
-    b"\x1b[?9l\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\
-\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>";
-
-/// `style` as a terminal draws it: underline styles only where it `styles` them.
+/// A nonce the user's terminal asks marks to carry (`FUX_MARK_NONCE`).
 ///
-/// Elsewhere a styled underline is a plain one: a terminal that does not know `4:n` draws no
-/// underline at all, or reads the colon as a semicolon (underline and italic).
-#[must_use]
-pub fn drawn(style: Attributes, styles: bool) -> Attributes {
-    let underline = match style.underline_style() {
-        UnderlineStyle::None => UnderlineStyle::None,
-        kind @ (UnderlineStyle::Double
-        | UnderlineStyle::Curly
-        | UnderlineStyle::Dotted
-        | UnderlineStyle::Dashed)
-            if styles =>
-        {
-            kind
-        }
-        UnderlineStyle::Single | _ => UnderlineStyle::Single,
-    };
-    style.with_underline_style(underline)
-}
+/// fux gives it to the programs a shell pane runs: with it, the shell's marks koh writes count in
+/// a terminal that ignores marks a program prints without one. A word of at most 64 letters and
+/// digits, else none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkNonce(String);
 
-/// Text for an OSC sequence, without the control characters that would end it early.
-///
-/// C0 and C1 both go. Only [`OscText::new`] makes one, so a title a server chose reaches the
-/// terminal only stripped.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OscText(String);
+impl MarkNonce {
+    /// The nonce `value` names, if it is one.
+    pub fn new(value: &str) -> Option<Self> {
+        (!value.is_empty() && value.len() <= 64 && value.bytes().all(|b| b.is_ascii_alphanumeric()))
+            .then(|| Self(value.to_owned()))
+    }
 
-impl OscText {
-    pub fn new(text: &str) -> Self {
-        Self(text.chars().filter(|c| !c.is_control()).collect())
+    /// The nonce in koh's environment, if one is there.
+    pub fn from_env() -> Option<Self> {
+        Self::new(&std::env::var("FUX_MARK_NONCE").ok()?)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-/// The terminal `koh connect` paints on. Output is buffered until [`flush`](Self::flush), once per
-/// frame.
+/// The terminal `koh connect` writes to. Output is buffered until [`flush`](Self::flush).
 pub trait KohBackend {
     /// Append bytes to the output buffer.
     fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()>;
@@ -76,213 +56,22 @@ pub trait KohBackend {
     /// The current terminal size.
     fn size(&self) -> io::Result<Size>;
 
-    /// Format `args` into the output buffer with no intermediate `String`; what `write!` calls.
-    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
-        /// Forwards formatted pieces to the backend, keeping the first I/O error for the caller.
-        struct Pieces<'a, B: ?Sized> {
-            backend: &'a mut B,
-            error: io::Result<()>,
-        }
-        impl<B: KohBackend + ?Sized> fmt::Write for Pieces<'_, B> {
-            fn write_str(&mut self, s: &str) -> fmt::Result {
-                self.backend.write_bytes(s.as_bytes()).map_err(|e| {
-                    self.error = Err(e);
-                    fmt::Error
-                })
-            }
-        }
-        let mut pieces = Pieces {
-            backend: self,
-            error: Ok(()),
+    /// The nonce the terminal asks marks to carry, if any.
+    fn mark_nonce(&self) -> Option<&MarkNonce> {
+        None
+    }
+
+    /// The overlay now painted over the program's output: the predicted glyphs and the status
+    /// line, for a test terminal to tell from what the program wrote. Default: nothing.
+    fn overlay(&mut self, _predicted: &str, _status: Option<&str>) {}
+
+    /// Write `OSC 133 ; body`, with the terminal's nonce if it asks for one.
+    fn mark(&mut self, body: fmt::Arguments<'_>) -> io::Result<()> {
+        let text = match self.mark_nonce() {
+            Some(nonce) => format!("\x1b]133;{body};nonce={}\x07", nonce.0),
+            None => format!("\x1b]133;{body}\x07"),
         };
-        if fmt::write(&mut pieces, args).is_err() {
-            // A formatter fails only through `write_str`, which kept the I/O error.
-            pieces.error?;
-            return Err(io::Error::other("formatting failed"));
-        }
-        Ok(())
-    }
-
-    /// Save the window title (XTWINOPS 22), enter the alternate screen and hide the cursor.
-    fn enter_alt_screen(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[22;0t\x1b[?1049h\x1b[?25l")?;
-        self.flush()
-    }
-
-    /// Reset the forwarded modes, show the cursor, leave the alternate screen and restore the
-    /// window title saved on entering it: the user's terminal as it was.
-    fn leave_alt_screen(&mut self) -> io::Result<()> {
-        self.write_bytes(RESET_FORWARDED_MODES)?;
-        self.write_bytes(b"\x1b[?25h\x1b[?1049l\x1b[23;0t")?;
-        self.flush()
-    }
-
-    /// Open a synchronized-output frame (DEC 2026), hide the cursor and turn autowrap off, so the
-    /// frame shows at once and no glyph, the last column's included, can wrap or scroll.
-    fn begin_frame(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[?2026h\x1b[?25l\x1b[?7l")
-    }
-
-    /// Turn autowrap back on, as the user's shell expects it, and close the frame.
-    fn end_frame(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[?7h\x1b[?2026l")
-    }
-
-    /// Erase the whole terminal in the default style.
-    fn clear(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[m\x1b[2J")
-    }
-
-    /// Move the cursor to a 0-based `(row, col)` (emitted as the 1-based CUP sequence).
-    fn move_to(&mut self, row: u16, col: u16) -> io::Result<()> {
-        // In u32, so `u16::MAX + 1` cannot overflow.
-        write!(self, "\x1b[{};{}H", u32::from(row) + 1, u32::from(col) + 1)
-    }
-
-    /// Scroll the 0-based rows `top..bottom` by `by` (negative is up) inside a scroll region
-    /// (DECSTBM, then SU or SD), leaving the region set and the cursor home. `top..bottom` holds at
-    /// least two rows.
-    fn scroll_region(&mut self, top: u16, bottom: u16, by: i16) -> io::Result<()> {
-        write!(self, "\x1b[{};{}r", u32::from(top) + 1, bottom)?;
-        let lines = by.unsigned_abs();
-        if by < 0 {
-            write!(self, "\x1b[{lines}S")
-        } else {
-            write!(self, "\x1b[{lines}T")
-        }
-    }
-
-    /// Reset the scroll region to the whole terminal (DECSTBM without parameters), moving the
-    /// cursor home.
-    fn reset_scroll_region(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[r")
-    }
-
-    /// Set a whole style: reset, then each attribute, then the colours.
-    fn set_style(&mut self, style: Attributes) -> io::Result<()> {
-        self.reset_sgr()?; // clears everything (incl. colors), then re-apply
-        let underline: &[u8] = match style.underline_style() {
-            UnderlineStyle::None => b"",
-            // Kitty's `4:n`, only where the terminal draws it (see `drawn`).
-            UnderlineStyle::Double => b"\x1b[4:2m",
-            UnderlineStyle::Curly => b"\x1b[4:3m",
-            UnderlineStyle::Dotted => b"\x1b[4:4m",
-            UnderlineStyle::Dashed => b"\x1b[4:5m",
-            // A style fux-vt adds later is drawn plain.
-            UnderlineStyle::Single | _ => b"\x1b[4m",
-        };
-        let blink: &[u8] = match style.blink() {
-            Blink::Slow => b"\x1b[5m",
-            Blink::Rapid => b"\x1b[6m",
-            Blink::None | _ => b"",
-        };
-        for (on, sgr) in [
-            (style.bold(), &b"\x1b[1m"[..]),
-            (style.dim(), b"\x1b[2m"),
-            (style.italic(), b"\x1b[3m"),
-            (true, underline),
-            (style.inverse(), b"\x1b[7m"),
-            (style.hidden(), b"\x1b[8m"),
-            (style.strikeout(), b"\x1b[9m"),
-            (true, blink),
-        ] {
-            if on && !sgr.is_empty() {
-                self.write_bytes(sgr)?;
-            }
-        }
-        write_sgr_color(self, style.foreground(), true)?;
-        write_sgr_color(self, style.background(), false)?;
-        // Only when set: a terminal that does not know SGR 58 may read its parameters as others.
-        write_underline_color(self, style.underline_color())
-    }
-
-    /// Reset all SGR attributes (`ESC [ m`, the zero-parameter form).
-    fn reset_sgr(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[m")
-    }
-
-    /// Print a glyph at the cursor.
-    fn print(&mut self, glyph: &str) -> io::Result<()> {
-        self.write_bytes(glyph.as_bytes())
-    }
-
-    /// Show the cursor (`ESC [ ? 25 h`).
-    fn show_cursor(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[?25h")
-    }
-
-    /// Set the window title and icon name together (`OSC 0`).
-    fn set_window_title(&mut self, title: &OscText) -> io::Result<()> {
-        write!(self, "\x1b]0;{}\x07", title.0)
-    }
-
-    /// Set the icon name (`OSC 1`) and the window title (`OSC 2`).
-    fn set_window_icon_and_title(&mut self, icon: &OscText, title: &OscText) -> io::Result<()> {
-        write!(self, "\x1b]1;{}\x07\x1b]2;{}\x07", icon.0, title.0)
-    }
-
-    /// Set the clipboard (`OSC 52`) to `base64`, which the caller validated.
-    fn set_clipboard(&mut self, base64: &str) -> io::Result<()> {
-        write!(self, "\x1b]52;c;{base64}\x07")
-    }
-
-    /// Open `link` (OSC 8) for the glyphs printed next, with its id if it has one. The caller
-    /// checked it is safe to write ([`Link::safe`]).
-    fn open_link(&mut self, link: &Link) -> io::Result<()> {
-        if link.id.is_empty() {
-            write!(self, "\x1b]8;;{}\x1b\\", link.uri)
-        } else {
-            write!(self, "\x1b]8;id={};{}\x1b\\", link.id, link.uri)
-        }
-    }
-
-    /// Close the hyperlink open (OSC 8 with no URI).
-    fn close_link(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b]8;;\x1b\\")
-    }
-
-    /// Ring the terminal bell (BEL).
-    fn bell(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x07")
-    }
-
-    /// Write the sequences that set the program's input modes.
-    fn write_input_modes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.write_bytes(bytes)
-    }
-}
-
-/// Emit `color` as the underline colour (SGR 58), unless it is the default (the text's colour),
-/// which the reset before every style already restored.
-fn write_underline_color(out: &mut (impl KohBackend + ?Sized), color: Color) -> io::Result<()> {
-    match color {
-        Color::Idx(i) => write!(out, "\x1b[58;5;{i}m"),
-        Color::Rgb(fux_vt::Rgb { r, g, b }) => write!(out, "\x1b[58;2;{r};{g};{b}m"),
-        Color::Default | _ => Ok(()),
-    }
-}
-
-/// Emit `color` as the foreground (`fg`) or background. Indices 0–15 use the classic 30–37/90–97
-/// (40–47/100–107) codes, which follow the user's theme, rather than `38;5;n`.
-fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool) -> io::Result<()> {
-    match color {
-        Color::Idx(i) if i < 8 => {
-            let lead = if fg { 3 } else { 4 };
-            write!(out, "\x1b[{lead}{i}m")
-        }
-        Color::Idx(i) if i < 16 => {
-            let lead = if fg { 9 } else { 10 };
-            write!(out, "\x1b[{lead}{}m", i & 7)
-        }
-        Color::Idx(i) => {
-            let lead = if fg { 38 } else { 48 };
-            write!(out, "\x1b[{lead};5;{i}m")
-        }
-        Color::Rgb(fux_vt::Rgb { r, g, b }) => {
-            let lead = if fg { 38 } else { 48 };
-            write!(out, "\x1b[{lead};2;{r};{g};{b}m")
-        }
-        Color::Default | _ => out.write_bytes(if fg { b"\x1b[39m" } else { b"\x1b[49m" }),
+        self.write_bytes(text.as_bytes())
     }
 }
 
@@ -290,16 +79,18 @@ fn write_sgr_color(out: &mut (impl KohBackend + ?Sized), color: Color, fg: bool)
 /// by default.
 #[cfg(test)]
 pub(crate) struct CaptureBackend {
-    pub bytes: Vec<u8>,
+    pub written: Vec<u8>,
     pub size: Size,
+    pub nonce: Option<MarkNonce>,
 }
 
 #[cfg(test)]
 impl Default for CaptureBackend {
     fn default() -> Self {
         Self {
-            bytes: Vec::new(),
+            written: Vec::new(),
             size: Size::new(24, 80),
+            nonce: None,
         }
     }
 }
@@ -307,7 +98,7 @@ impl Default for CaptureBackend {
 #[cfg(test)]
 impl KohBackend for CaptureBackend {
     fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.bytes.extend_from_slice(bytes);
+        self.written.extend_from_slice(bytes);
         Ok(())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -322,126 +113,33 @@ impl KohBackend for CaptureBackend {
     fn size(&self) -> io::Result<Size> {
         Ok(self.size)
     }
+    fn mark_nonce(&self) -> Option<&MarkNonce> {
+        self.nonce.as_ref()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Capture the bytes a single provided method emits.
-    fn emit(f: impl FnOnce(&mut CaptureBackend) -> io::Result<()>) -> Vec<u8> {
-        let mut b = CaptureBackend::default();
-        f(&mut b).expect("capture backend never errors");
-        b.bytes
-    }
-
-    /// The 16 palette colours use the theme-aware 30–37 / 90–97 (40–47 / 100–107) codes, not the
-    /// fixed 256-palette `38;5;n` form, so a user's terminal theme still recolors them.
     #[test]
-    fn sgr_colors_are_the_classic_theme_aware_codes_where_they_can_be() {
-        for i in 0..16u8 {
-            for (fg, low, high) in [(true, 30, 90), (false, 40, 100)] {
-                let code = if i < 8 { low + i } else { high + i - 8 };
-                assert_eq!(
-                    emit(|b| write_sgr_color(b, Color::Idx(i), fg)),
-                    format!("\x1b[{code}m").into_bytes(),
-                    "index {i}, fg {fg}"
-                );
-            }
+    fn marks_carry_the_nonce_the_terminal_asks_for_and_only_a_word_is_one() {
+        let marks = |nonce| {
+            let mut b = CaptureBackend {
+                nonce,
+                ..CaptureBackend::default()
+            };
+            b.mark(format_args!("A")).unwrap();
+            b.mark(format_args!("D;1")).unwrap();
+            String::from_utf8(b.written).unwrap()
+        };
+        assert_eq!(marks(None), "\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert_eq!(
+            marks(MarkNonce::new("ab12")),
+            "\x1b]133;A;nonce=ab12\x07\x1b]133;D;1;nonce=ab12\x07"
+        );
+        for bad in ["", "a;b", "a\x07", &"x".repeat(65)] {
+            assert_eq!(MarkNonce::new(bad), None, "{bad:?}");
         }
-        let blue = Color::Rgb(fux_vt::Rgb { r: 0, g: 0, b: 255 });
-        for (color, fg, sgr) in [
-            (Color::Idx(196), true, &b"\x1b[38;5;196m"[..]),
-            (blue, true, b"\x1b[38;2;0;0;255m"),
-            (Color::Default, true, b"\x1b[39m"),
-            (Color::Idx(196), false, b"\x1b[48;5;196m"),
-            (Color::Default, false, b"\x1b[49m"),
-        ] {
-            assert_eq!(emit(|b| write_sgr_color(b, color, fg)), sgr, "{color:?}");
-        }
-    }
-
-    #[test]
-    fn move_to_is_one_based_and_overflow_safe() {
-        assert_eq!(emit(|b| b.move_to(0, 0)), b"\x1b[1;1H");
-        assert_eq!(emit(|b| b.move_to(23, 79)), b"\x1b[24;80H");
-        // A u16::MAX coordinate must format (as 65536) rather than panic on the `+ 1`.
-        assert_eq!(emit(|b| b.move_to(u16::MAX, 0)), b"\x1b[65536;1H");
-    }
-
-    #[test]
-    fn frame_and_screen_control_bytes() {
-        assert_eq!(
-            emit(KohBackend::begin_frame),
-            b"\x1b[?2026h\x1b[?25l\x1b[?7l"
-        );
-        assert_eq!(emit(KohBackend::end_frame), b"\x1b[?7h\x1b[?2026l");
-        // The user's title is saved on entering, and restored on leaving (exit and suspend).
-        assert_eq!(
-            emit(KohBackend::enter_alt_screen),
-            b"\x1b[22;0t\x1b[?1049h\x1b[?25l"
-        );
-        // leave_alt_screen resets the forwarded-mode ledger, then shows the cursor and leaves alt.
-        let bytes = emit(KohBackend::leave_alt_screen);
-        assert!(bytes.starts_with(RESET_FORWARDED_MODES));
-        assert!(bytes.ends_with(b"\x1b[?25h\x1b[?1049l\x1b[23;0t"));
-    }
-
-    #[test]
-    fn a_style_emits_every_attribute_it_has() {
-        let plain = Attributes::new(Color::Idx(1), Color::Default);
-        let style = plain
-            .with_underline_color(Color::Rgb(fux_vt::Rgb { r: 1, g: 2, b: 3 }))
-            .with_underline_style(UnderlineStyle::Single)
-            .with_hidden(true)
-            .with_strikeout(true)
-            .with_blink(Blink::Rapid);
-        assert_eq!(
-            emit(|b| b.set_style(style)),
-            b"\x1b[m\x1b[4m\x1b[8m\x1b[9m\x1b[6m\x1b[31m\x1b[49m\x1b[58;2;1;2;3m"
-        );
-        assert_eq!(emit(|b| b.set_style(plain)), b"\x1b[m\x1b[31m\x1b[49m");
-        // Each underline style, where the terminal draws them; plain where it does not.
-        for (underline, sgr) in [
-            (UnderlineStyle::Double, &b"\x1b[4:2m"[..]),
-            (UnderlineStyle::Curly, b"\x1b[4:3m"),
-            (UnderlineStyle::Dotted, b"\x1b[4:4m"),
-            (UnderlineStyle::Dashed, b"\x1b[4:5m"),
-        ] {
-            let styled = plain.with_underline_style(underline);
-            assert_eq!(
-                emit(|b| b.set_style(drawn(styled, true))),
-                [b"\x1b[m", sgr, b"\x1b[31m\x1b[49m"].concat()
-            );
-            assert_eq!(
-                emit(|b| b.set_style(drawn(styled, false))),
-                b"\x1b[m\x1b[4m\x1b[31m\x1b[49m"
-            );
-        }
-        assert_eq!(
-            emit(|b| write_underline_color(b, Color::Idx(200))),
-            b"\x1b[58;5;200m"
-        );
-    }
-
-    #[test]
-    fn scroll_region_bytes() {
-        assert_eq!(emit(|b| b.scroll_region(0, 24, -1)), b"\x1b[1;24r\x1b[1S");
-        assert_eq!(emit(|b| b.scroll_region(4, 20, 3)), b"\x1b[5;20r\x1b[3T");
-        assert_eq!(emit(KohBackend::reset_scroll_region), b"\x1b[r");
-    }
-
-    #[test]
-    fn out_of_band_escapes() {
-        assert_eq!(
-            emit(|b| b.set_window_title(&OscText::new("x\x07\u{9c}"))),
-            b"\x1b]0;x\x07"
-        );
-        assert_eq!(
-            emit(|b| b.set_window_icon_and_title(&OscText::new("i"), &OscText::new("t"))),
-            b"\x1b]1;i\x07\x1b]2;t\x07"
-        );
-        assert_eq!(emit(|b| b.set_clipboard("aGk=")), b"\x1b]52;c;aGk=\x07");
-        assert_eq!(emit(KohBackend::bell), b"\x07");
     }
 }

@@ -1,0 +1,9 @@
+id = "TA-020"
+title = "What killed the daemon"
+cat = "crash"
+difficulty = "easy"
+goal = '''
+On the remote machine, run `~/bin/cachedaemon`. After a while it dies, killed by a signal.
+Write the name of that signal (like `SIGTERM`, only the name) to `answer.txt` in your local
+directory.
+'''

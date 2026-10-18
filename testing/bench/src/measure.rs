@@ -149,21 +149,16 @@ fn typed(screen: &fux_vt::Screen) -> usize {
         .count()
 }
 
-/// The `x`s below the top row of koh's synced screen.
+/// The `x`s below the top row of the screen koh's server sent: those shown, less those koh's
+/// client predicted and painted over it.
 fn typed_synced(remote: &Remote) -> usize {
-    remote.synced.as_ref().map_or(0, |synced| {
-        synced
+    remote.predicted.as_ref().map_or(0, |predicted| {
+        let predicted = predicted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map_or(0, |state| {
-                let grid = state.screen();
-                let size = state.size();
-                (1..size.rows)
-                    .flat_map(|row| (0..size.cols).map(move |col| (row, col)))
-                    .filter(|&(row, col)| grid.cell(row, col).is_some_and(|c| c.contents() == "x"))
-                    .count()
-            })
+            .matches('x')
+            .count();
+        remote.shown.with(typed).saturating_sub(predicted)
     })
 }
 
@@ -211,10 +206,10 @@ async fn keys(remote: &Remote, samples: usize) -> anyhow::Result<Latency> {
             if shown.is_none() && remote.shown.with(typed) >= k {
                 shown = Some(sent.elapsed());
             }
-            if echoed.is_none() && remote.synced.is_some() && typed_synced(remote) >= k {
+            if echoed.is_none() && remote.predicted.is_some() && typed_synced(remote) >= k {
                 echoed = Some(sent.elapsed());
             }
-            if shown.is_some() && (echoed.is_some() || remote.synced.is_none()) {
+            if shown.is_some() && (echoed.is_some() || remote.predicted.is_none()) {
                 break;
             }
             let _ = tokio::time::timeout(Duration::from_millis(5), paints.changed()).await;
@@ -363,7 +358,7 @@ pub async fn settle(
     std::fs::create_dir_all(dir)?;
     // A source file of koh's for nvim, and a directory of 2,000 files for ls.
     let text = dir.join("text.rs");
-    let source = include_str!("../../../src/client/render.rs");
+    let source = include_str!("../../../src/server/session.rs");
     std::fs::write(&text, source.repeat(3))?;
     let files = dir.join("files");
     if action == Action::Listing && !files.exists() {

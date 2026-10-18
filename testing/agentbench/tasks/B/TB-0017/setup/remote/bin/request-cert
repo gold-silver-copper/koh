@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Requests a certificate from the internal CA: request-cert NAME."""
+import base64, hashlib, os, random, sys, time
+home = os.path.expanduser("~")
+if len(sys.argv) != 2 or not sys.argv[1].replace(".", "").replace("-", "").isalnum():
+    sys.exit("usage: request-cert NAME")
+name = sys.argv[1]
+certs = os.path.join(home, "certs")
+os.makedirs(certs, exist_ok=True)
+req = hashlib.sha256(name.encode()).hexdigest()[:8]
+if os.fork():
+    print(f"request {req} for {name} submitted to the CA; the certificate will be written to "
+          f"~/certs/{name}.crt when it is issued")
+    sys.exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+nul = os.open(os.devnull, os.O_RDWR)
+for fd in (0, 1, 2):
+    os.dup2(nul, fd)
+rng = random.Random(name + "1717")
+time.sleep(rng.uniform(28, 46))
+body = base64.encodebytes(rng.randbytes(900) + name.encode()).decode()
+pem = f"-----BEGIN CERTIFICATE-----\n{body}-----END CERTIFICATE-----\n"
+tmp = os.path.join(certs, f".{name}.crt.partial")
+with open(tmp, "w") as f:
+    f.write(pem[: len(pem) // 2])
+    f.flush()
+    time.sleep(1.0)
+    f.write(pem[len(pem) // 2:])
+os.rename(tmp, os.path.join(certs, f"{name}.crt"))

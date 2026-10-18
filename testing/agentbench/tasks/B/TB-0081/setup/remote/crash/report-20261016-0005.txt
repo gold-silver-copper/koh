@@ -1,0 +1,9 @@
+crash report 20261016-0005
+program: physics-sim 0.31.5
+signal: SIGSEGV (address 0x0000000000000018)
+
+faulting frame:
+  #0 integrate_bodies_avx2 (src/integrate.rs:88)
+backtrace:
+  #1 step_world (src/world.rs:310)
+  #2 main_loop (src/main.rs:77)

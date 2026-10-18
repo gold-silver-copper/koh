@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+import os, select, signal, socket, sys, time
+if not os.isatty(0):
+    sys.exit("serve-dev: run me in the foreground of a terminal (it reads keys from it)")
+run = os.path.expanduser("~/run")
+os.makedirs(run, exist_ok=True)
+open(os.path.join(run, "dev.pid"), "w").write(f"{os.getpid()}\n")
+path = os.path.join(run, "dev.sock")
+if os.path.exists(path):
+    os.unlink(path)
+def stop(sig, how):
+    open(os.path.join(run, "dev.shutdown"), "w").write(how + "\n")
+    print(f"\nserve-dev: got {how}, shut down cleanly", flush=True)
+    os.unlink(path)
+    sys.exit(0)
+signal.signal(signal.SIGINT, lambda *a: stop(2, "SIGINT"))
+signal.signal(signal.SIGTERM, lambda *a: (open(os.path.join(run, "dev.shutdown"), "w").write("SIGTERM\n"), sys.exit(1)))
+print("serve-dev: compiling assets ...", flush=True)
+time.sleep(3)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)
+s.listen(4)
+print(f"serve-dev: ready on {path} (Ctrl-C to stop)", flush=True)
+while True:
+    r, _, _ = select.select([s], [], [], 1.0)
+    if not r:
+        continue
+    c, _ = s.accept()
+    with c:
+        req = c.recv(200).decode(errors="replace").strip()
+        c.sendall(b"200 ok\n" if req == "GET /health" else b"404 not found\n")
+        print(f"serve-dev: {req} -> {'200' if req == 'GET /health' else '404'}", flush=True)

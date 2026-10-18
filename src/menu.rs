@@ -11,15 +11,15 @@ use std::time::SystemTime;
 
 use iroh::EndpointId;
 
-use crate::names::{self, List, Places};
+use crate::names::{self, List, Places, Route};
 
 /// What the user chose to do once the menu ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
     /// Nothing more: quit.
     Quit,
-    /// `koh connect` to this server.
-    Connect(EndpointId),
+    /// `koh connect` to the server saved under this name, as it is saved.
+    Connect(String),
     /// `koh serve` for the saved clients.
     Serve,
 }
@@ -49,6 +49,18 @@ struct Picked {
     list: List,
     name: String,
     id: EndpointId,
+    route: Option<Route>,
+}
+
+impl Picked {
+    /// Its id, shortened, and its route if it has one.
+    fn shown(&self) -> String {
+        let id = names::short(self.id);
+        match &self.route {
+            Some(route) => format!("{id} {route}"),
+            None => id,
+        }
+    }
 }
 
 impl<R: BufRead, W: Write> Menu<'_, R, W> {
@@ -106,21 +118,29 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
             if saved.is_empty() {
                 writeln!(self.output, "  none yet — add one with a")?;
             }
-            for (name, id) in saved.entries() {
-                entries.push(Picked {
+            for entry in saved.entries() {
+                let picked = Picked {
                     list,
-                    name: name.to_owned(),
-                    id,
-                });
-                let mut line = format!("  {}  {name:<10} {}", entries.len(), names::short(id));
+                    name: entry.name.clone(),
+                    id: entry.id,
+                    route: entry.route.clone(),
+                };
+                let mut line = format!(
+                    "  {}  {:<10} {}",
+                    entries.len().saturating_add(1),
+                    picked.name,
+                    picked.shown()
+                );
                 if list == List::Servers {
-                    let seen = names::last_connected(&self.places.client_key, id).map_or_else(
-                        || "never connected".to_owned(),
-                        |then| format!("last connected {}", names::ago(then, now)),
-                    );
+                    let seen = names::last_connected(&self.places.client_key, entry.id)
+                        .map_or_else(
+                            || "never connected".to_owned(),
+                            |then| format!("last connected {}", names::ago(then, now)),
+                        );
                     line = format!("{line}   {seen}");
                 }
                 writeln!(self.output, "{line}")?;
+                entries.push(picked);
             }
         }
         let pick = match entries.len() {
@@ -158,7 +178,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
                 }
             }
         };
-        Ok(Some(Outcome::Choose(Choice::Connect(only.id))))
+        Ok(Some(Outcome::Choose(Choice::Connect(only.name.clone()))))
     }
 
     /// `s`: serve the saved clients, if there are any.
@@ -173,12 +193,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
     /// A picked entry: what can be done with it.
     fn entry(&mut self, picked: &Picked) -> anyhow::Result<Option<Outcome>> {
         let noun = picked.list.noun();
-        writeln!(
-            self.output,
-            "\n{noun} {}  {}",
-            picked.name,
-            names::short(picked.id)
-        )?;
+        writeln!(self.output, "\n{noun} {}  {}", picked.name, picked.shown())?;
         let connect = if picked.list == List::Servers {
             "c connect   "
         } else {
@@ -193,7 +208,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
         };
         match answer.as_str() {
             "c" if picked.list == List::Servers => {
-                Ok(Some(Outcome::Choose(Choice::Connect(picked.id))))
+                Ok(Some(Outcome::Choose(Choice::Connect(picked.name.clone()))))
             }
             "r" => {
                 let Some(new) = self.ask(&format!("new name for {}: ", picked.name))? else {
@@ -258,7 +273,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
         if let Some(old) = saved.get(&name) {
             let question = format!(
                 "{name} is saved already, as {}; replace it? [y/N] ",
-                names::short(old)
+                names::short(old.id)
             );
             match self.confirm(&question)? {
                 None => return Ok(Some(Outcome::Quit)),
@@ -267,7 +282,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
                 Some(true) => {
                     let replaced = names::update(self.places, list, |names| {
                         names.remove(&name)?;
-                        names.add(&name, id)
+                        names.add(&name, id, None, crate::names::Scope::default())
                     });
                     return match replaced {
                         Ok(()) => self.say(&format!("replaced {name} ({})", names::short(id))),
@@ -276,7 +291,15 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
                 }
             }
         }
-        self.act(list, names::Op::Add { name, id })
+        self.act(
+            list,
+            names::Op::Add {
+                name,
+                id,
+                route: None,
+                scope: names::Scope::default(),
+            },
+        )
     }
 
     /// `k`: both keys, in full and as QR codes, and resetting one.
@@ -310,7 +333,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
             _ => return self.say("kept: neither client nor server"),
         };
         let affected: Vec<String> = names::load(self.places, list)
-            .map(|saved| saved.entries().map(|(n, _)| n.to_owned()).collect())
+            .map(|saved| saved.entries().map(|entry| entry.name.clone()).collect())
             .unwrap_or_default();
         writeln!(
             self.output,

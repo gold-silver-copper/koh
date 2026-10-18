@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-use common::{connected, endpoint_id, loopback_server};
+use common::{connected, endpoint_id, loopback_server, on_pty};
 use koh_testkit::Scratch;
 
 /// A loopback server hosting `sh` for one client, and that client's key.
@@ -337,14 +337,10 @@ fn connect_picks_a_session_by_number_or_a_new_one_and_sessions_lists_them() {
             session(&[], b"echo got_${X}_$((6*7))\r", "got_one_42")
                 .await
                 .expect("the latest");
-            let out = remote
-                .koh("connect")
-                .expect("koh")
-                .args([&remote.id, "--session", "9"])
-                .output()
-                .expect("connect");
-            assert!(!out.status.success());
-            let said = String::from_utf8_lossy(&out.stderr);
-            assert!(said.contains("no such session"), "{said}");
+            // On a terminal, as connect needs one: the refusal is the server's.
+            let (_client, seen) = on_pty(&connect(&["--session", "9"])).expect("connect");
+            seen.wait_for(0, "no such session", 20)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
         });
 }

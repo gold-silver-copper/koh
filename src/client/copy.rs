@@ -1,18 +1,20 @@
-//! `koh cp`: copy files and trees between this machine and a server, done by [`crate::copy`] on a
-//! blocking thread at this end and in process on the server, no remote shell, `tar` or `scp`
-//! needed.
+//! `koh cp`: bring files and trees into line between this machine and a server, done by
+//! [`crate::sync`] on a blocking thread at this end and in process on the server, no remote
+//! shell, `tar` or `scp` needed. On success it says what it did in one line, or as JSON.
 
 use std::path::PathBuf;
 use std::pin::pin;
 
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::cli::{Opened, Remote};
-use crate::copy::{
-    self, ChannelReader, ChannelWriter, FailKind, Failure, Skipped, Target, PIPE_DEPTH,
+use super::cli::{bytes, Format, Opened, Remote};
+use crate::request::{RemotePath, Request, Sources};
+use crate::sync::{
+    self, ChannelReader, ChannelWriter, Copy, Dest, FailKind, Failure, Opts, Reply, Source,
+    SourceCount, Summary, Target, PIPE_DEPTH, REPLY_DEPTH,
 };
-use crate::request::{Arity, Copy, RemotePath, Request, Sources, MAX_REPLY};
 
 /// A copy, one side the server's.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,27 +28,79 @@ pub enum CopyJob {
     },
 }
 
-/// `koh cp`: do `job` with `remote`. The entries skipped (fifos, sockets, devices) are said on
-/// stderr. Stopped by a signal, it closes the connection and removes what it staged, as the
-/// server then does.
-pub async fn copy(remote: &Remote, job: CopyJob) -> anyhow::Result<()> {
+/// Said when a signal stopped the copy.
+const INTERRUPTED: &str =
+    "interrupted: the files that came are whole, the one under way kept for the next copy";
+
+/// `koh cp`: do `job` with `remote` under `opts`, `shown` the destination as the user named it;
+/// what it did is said on stdout.
+pub async fn copy(
+    remote: &Remote,
+    (job, opts): (CopyJob, Opts),
+    shown: &str,
+    format: Format,
+) -> anyhow::Result<()> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
-    let skipped = match job {
-        CopyJob::Get { sources, dest } => get(remote, sources, dest, &interrupted).await?,
-        CopyJob::Put { sources, dest } => put(remote, sources, dest, &interrupted).await?,
+    let summary = match job {
+        CopyJob::Get { sources, dest } => get(remote, (sources, dest), opts, &interrupted).await?,
+        CopyJob::Put { sources, dest } => put(remote, (sources, dest), opts, &interrupted).await?,
     };
-    if skipped.count > 0 {
-        let shown: Vec<String> = skipped
-            .shown
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect();
+    say(&summary, shown, format)
+}
+
+/// Say `summary` of a copy to `shown`: one line, or one JSON value.
+fn say(summary: &Summary, shown: &str, format: Format) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    if format.json {
+        #[derive(Serialize)]
+        struct View<'a> {
+            to: &'a str,
+            #[serde(flatten)]
+            summary: &'a Summary,
+        }
+        serde_json::to_writer(&mut out, &View { to: shown, summary })?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    let mut parts = Vec::new();
+    if summary.replaced > 0 {
+        parts.push(format!("{} replaced", summary.replaced));
+    }
+    if summary.unchanged > 0 {
+        parts.push(format!("{} unchanged", summary.unchanged));
+    }
+    if summary.resumed > 0 {
+        parts.push(format!("{} resumed", summary.resumed));
+    }
+    if summary.deleted > 0 {
+        parts.push(format!("{} deleted", summary.deleted));
+    }
+    if summary.dirs > 0 {
+        parts.push(format!("{} dirs made", summary.dirs));
+    }
+    if summary.links > 0 {
+        parts.push(format!("{} links", summary.links));
+    }
+    let more = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    };
+    let written = summary.written();
+    writeln!(
+        out,
+        "{written} file{}, {} → {shown}{more}",
+        if written == 1 { "" } else { "s" },
+        bytes(summary.bytes),
+    )?;
+    if summary.skipped > 0 {
         crate::log::stderr(format_args!(
             "koh: skipped {} fifo(s), socket(s) or device(s), which cannot be copied: {}{}",
-            skipped.count,
-            shown.join(", "),
-            if skipped.count > u64::try_from(shown.len()).unwrap_or(u64::MAX) {
+            summary.skipped,
+            summary.skipped_shown.join(", "),
+            if summary.skipped > u64::try_from(summary.skipped_shown.len()).unwrap_or(u64::MAX) {
                 ", …"
             } else {
                 ""
@@ -56,101 +110,126 @@ pub async fn copy(remote: &Remote, job: CopyJob) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Said when a signal stopped the copy.
-const INTERRUPTED: &str = "interrupted: nothing of the copy that was under way was kept";
-
 /// The server's `sources` to `dest`.
 async fn get(
     remote: &Remote,
-    sources: Sources,
-    dest: PathBuf,
+    (sources, dest): (Sources, PathBuf),
+    opts: Opts,
     interrupted: &CancellationToken,
-) -> anyhow::Result<Skipped> {
+) -> anyhow::Result<Summary> {
     // Where they land is known before the server is asked anything.
-    let arity = Arity::of(sources.paths().len());
-    let target = Target::resolve(dest, arity)?;
-    let mut opened = Opened::dial(remote, &Request::Copy(Copy::Get(sources))).await?;
-    opened.control.finish()?;
+    let (target, made) = Target::resolve(&Dest::Path(dest), sources.paths().len())?;
+    let request = Request::Copy(Copy::Get {
+        sources,
+        opts: opts.clone(),
+    });
+    let mut opened = Opened::dial(remote, &request).await?;
     let (tx, rx) = mpsc::channel(PIPE_DEPTH);
+    let (reply_tx, reply_rx) = mpsc::channel(REPLY_DEPTH);
+    let end_tx = reply_tx.clone();
     let mut landing = pin!(tokio::task::spawn_blocking(move || {
-        copy::receive(ChannelReader::new(rx), &target)
+        let mut answer = |reply: Reply| reply_tx.try_send(reply).is_ok();
+        sync::receive(ChannelReader::new(rx), &target, &opts, &mut answer)
     }));
     let conn = opened.conn.clone();
     let pumped = async move {
         let recv = conn.accept_uni().await?;
-        copy::from_stream(recv, tx).await;
+        sync::from_stream(recv, tx).await;
         anyhow::Ok(())
     };
-    // Each way out drops the stream's end of the channel, and the receiver then finishes,
-    // removing what it staged unless all of it came.
-    let pumped = tokio::select! {
-        landed = &mut landing => Some(Ok(landed)),
-        pumped = pumped => pumped.err().map(Err),
-        () = interrupted.cancelled() => None,
-    };
-    let landed = match pumped {
-        Some(Ok(landed)) => landed,
-        Some(Err(error)) => {
-            let _ = landing.await;
-            let refused = super::refusal(&opened.conn, &error);
-            opened.close().await;
-            return Err(refused);
+    let replying = sync::replies_to(reply_rx, &mut opened.control);
+    let landed = async {
+        tokio::select! {
+            landed = &mut landing => Some(Ok(landed)),
+            pumped = pumped => match pumped {
+                Ok(()) => Some(Ok(landing.await)),
+                Err(error) => Some(Err(error)),
+            },
+            () = interrupted.cancelled() => None,
         }
-        None if interrupted.is_cancelled() => {
-            let _ = landing.await;
-            opened.close().await;
-            anyhow::bail!(INTERRUPTED);
-        }
-        None => landing.await,
     };
-    let landed = landed?.map_err(|failure| cut_short(&opened.conn, failure));
+    let (landed, ()) = tokio::join!(
+        async {
+            let landed = landed.await;
+            let _ = end_tx.send(Reply::End(Ok(Summary::default()))).await;
+            drop(end_tx);
+            landed
+        },
+        replying
+    );
+    let outcome = match landed {
+        Some(Ok(landed)) => landed?.map_err(|failure| cut_short(&opened.conn, failure)),
+        Some(Err(error)) => Err(super::refusal(&opened.conn, &error)),
+        None => Err(anyhow::anyhow!(INTERRUPTED)),
+    };
     opened.close().await;
-    landed
+    outcome.map(|mut summary| {
+        summary.dirs = summary.dirs.saturating_add(made);
+        summary
+    })
 }
 
 /// `sources` to `dest` on the server.
 async fn put(
     remote: &Remote,
-    sources: Vec<PathBuf>,
-    dest: RemotePath,
+    (sources, dest): (Vec<PathBuf>, RemotePath),
+    opts: Opts,
     interrupted: &CancellationToken,
-) -> anyhow::Result<Skipped> {
-    let arity = Arity::of(sources.len());
-    let mut opened = Opened::dial(remote, &Request::Copy(Copy::Put { dest, arity })).await?;
+) -> anyhow::Result<Summary> {
+    let count = SourceCount::new(sources.len())
+        .ok_or_else(|| anyhow::anyhow!("no sources, or more than 1024"))?;
+    let request = Request::Copy(Copy::Put {
+        dest,
+        sources: count,
+        opts: opts.clone(),
+    });
+    let mut opened = Opened::dial(remote, &request).await?;
     let (tx, rx) = mpsc::channel(PIPE_DEPTH);
-    let sending = tokio::task::spawn_blocking(move || copy::send(&sources, ChannelWriter(tx)));
+    let (reply_tx, mut reply_rx) = mpsc::channel(REPLY_DEPTH);
+    let sources: Vec<Source> = sources.into_iter().map(Source::Path).collect();
+    let sending = tokio::task::spawn_blocking(move || {
+        let mut answers = |wait: bool| {
+            if wait {
+                reply_rx.blocking_recv()
+            } else {
+                reply_rx.try_recv().ok()
+            }
+        };
+        sync::send(&sources, &opts, ChannelWriter(tx), &mut answers)
+    });
     let conn = opened.conn.clone();
-    let answer = async move {
-        let mut recv = conn.accept_uni().await?;
-        let bytes = recv.read_to_end(MAX_REPLY.saturating_add(4)).await?;
-        anyhow::Ok(crate::request::decode_framed::<Result<(), Failure>>(
-            &bytes, MAX_REPLY,
-        )?)
+    let replies = async move {
+        let recv = conn.accept_uni().await?;
+        sync::replies_from(recv, reply_tx).await;
+        anyhow::Ok(())
     };
-    // The server may answer before all is sent (it failed): then the rest is not sent.
-    let sent_all = async {
-        let _ = copy::to_stream(rx, &mut opened.control).await;
-        std::future::pending::<()>().await;
+    let sent = async {
+        let _ = sync::to_stream(rx, &mut opened.control).await;
     };
-    let outcome = tokio::select! {
-        outcome = answer => Some(outcome),
-        () = sent_all => None,
+    let both = async {
+        let (_, replied) = tokio::join!(sent, replies);
+        replied
+    };
+    let finished = tokio::select! {
+        replied = both => Some(replied),
         () = interrupted.cancelled() => None,
     };
-    let Some(outcome) = outcome else {
-        // Closed, the server removes what it staged.
+    let Some(replied) = finished else {
         opened.close().await;
         let _ = sending.await;
         anyhow::bail!(INTERRUPTED);
     };
-    let sent = sending.await?;
-    let outcome = outcome.map_err(|e| super::refusal(&opened.conn, &e));
+    let outcome = sending.await?;
+    let outcome = match (outcome, replied) {
+        (Ok(Ok(summary)), _) => Ok(summary),
+        (Ok(Err(failure)), _) => Err(cut_short(&opened.conn, failure)),
+        (Err(error), replied) => Err(super::refusal(
+            &opened.conn,
+            &replied.err().unwrap_or_else(|| error.into()),
+        )),
+    };
     opened.close().await;
-    // The server's word for how it went: a failure here was sent it, and it says so.
-    match outcome? {
-        Ok(()) => Ok(sent.ok().and_then(Result::ok).unwrap_or_default()),
-        Err(failure) => Err(failure.into()),
-    }
+    outcome
 }
 
 /// `failure`, unless it is the stream cut short by the server closing `conn` with a reason, which

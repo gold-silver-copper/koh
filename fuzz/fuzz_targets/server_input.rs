@@ -2,8 +2,7 @@
 //! Fuzz the server's handling of what a client sends: the first part of the input as the
 //! program's output (setting any keyboard, mouse, focus and paste modes), the rest as the client's
 //! message stream: every `Keys` message's events encoded for the program by
-//! `ServerTerminal::encode_input`, resizes (any size, as a hostile client sends) and history
-//! requests. A hostile client controls all of it; the server must never panic, and a framed paste
+//! `ServerTerminal::encode_input`, resizes (any size, as a hostile client sends) and colours. A hostile client controls all of it; the server must never panic, and a framed paste
 //! must hold no end marker but its own.
 
 use koh::proto::{ClientDecoder, ClientMsg};
@@ -32,11 +31,9 @@ fuzz_target!(|data: &[u8]| {
                     out.extend(t.resize_report().unwrap_or_default());
                 }
             }
-            ClientMsg::History(request) => {
-                let _ = t.history(request);
-                let _ = t.snapshot();
+            ClientMsg::Read { .. } | ClientMsg::Redraw => {
+                let _ = koh::terminal::redraw(t.live(), t.title(), 1000);
             }
-            ClientMsg::Ack { .. } | ClientMsg::Resync => {}
         }
     }
     // No key, mouse or focus encoding is `ESC [ 201 ~`, and pieces lose their markers: so every

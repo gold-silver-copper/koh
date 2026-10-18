@@ -134,13 +134,16 @@ impl FaultNet {
             id,
             inbox: Mutex::new(Some(rx)),
         });
-        Ok(
-            koh::transport_iroh::configure(Endpoint::builder(presets::Minimal), secret, accept)
-                .clear_ip_transports()
-                .add_custom_transport(transport)
-                .bind()
-                .await?,
+        Ok(koh::transport_iroh::configure(
+            Endpoint::builder(presets::Minimal),
+            secret,
+            accept,
+            koh::transport_iroh::Idle::Shell,
         )
+        .clear_ip_transports()
+        .add_custom_transport(transport)
+        .bind()
+        .await?)
     }
 
     /// Route one packet from `from` to `to` through the profile.

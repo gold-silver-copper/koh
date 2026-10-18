@@ -1,7 +1,10 @@
-//! The client's commands that dial a server: `koh connect`, which runs
-//! [`crate::client::run_client`] on the real terminal, `koh sessions`, and the dialing `koh exec`
-//! and `koh cp` share.
+//! The client's commands that dial a server.
+//!
+//! `koh connect` runs [`run_client`](super::run_client) on the real terminal; the others ask one
+//! thing and print what they hear: `sessions`, `output`, `run`, `jobs`, `logs`, `kill` and `wait`.
+//! Each says it as text for a person, or as one JSON value with `--json`.
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -9,15 +12,18 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use iroh::endpoint::{Connection, SendStream};
 use iroh::{EndpointId, RelayUrl};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-pub use crate::client::copy::{copy, CopyJob};
-pub use crate::client::exec::exec;
-use crate::client::{
-    refusal, Admitted, BackendTerminal, ClientTerminal as _, DefaultBackend, IrohConnector,
+use crate::client::{refusal, Admitted, DefaultBackend, IrohConnector, KohBackend as _, Refused};
+use crate::proto::Close;
+use crate::request::{
+    Answer, JobInfo, JobList, JobName, JobState, LogMsg, Pick, Presence, Problem, Request, Run,
+    SessionInfo, SessionList, SessionNum, Signal, Started, Until, Wait, Waited, MAX_LOG_CHUNK,
+    MAX_OUTPUT, MAX_REPLY,
 };
-use crate::request::{Pick, Presence, Request, SessionInfo, SessionList, MAX_REPLY};
-use crate::transport_iroh::{bind_on, close_endpoint, Network};
+use crate::transport_iroh::{bind_on, close_endpoint, Idle, Network};
 
 /// How long the first dial may take.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -55,7 +61,7 @@ pub struct ConnectConfig {
     pub pick: Pick,
     /// Let the server set the clipboard (OSC 52); on unless `--no-clipboard`.
     pub clipboard: bool,
-    /// Paint the server's hyperlinks (OSC 8); on unless `--no-hyperlinks`.
+    /// Show the server's hyperlinks (OSC 8); on unless `--no-hyperlinks`.
     pub hyperlinks: bool,
     /// Ask the user's terminal its colours and tell the server, which answers programs' colour
     /// queries with them; on unless `--no-colours`.
@@ -80,15 +86,13 @@ impl ConnectConfig {
 
 /// Runs a command (`sh -c`) when the remote bell rings (`--on-bell`), at most once a second.
 ///
-/// The command is detached, with its stdio on `/dev/null` (the TUI owns the terminal),
-/// `KOH_BELL_COUNT` and `KOH_TITLE` set and every other `KOH_*` variable scrubbed. The bell count
-/// is cumulative for the server session, so the first synced frame [`prime`](Self::prime)s it:
-/// bells from before the attach do not fire, bells during a reconnect do.
+/// The command is detached, with its stdio on `/dev/null`, `KOH_BELL_COUNT` and `KOH_TITLE` set
+/// and every other `KOH_*` variable scrubbed. Only bells that ring while the client is attached
+/// reach it, the ones during a reconnect included.
 #[derive(Debug, Clone)]
 pub struct BellHook {
     command: String,
-    /// The last count seen (by `prime` or `observe`), after which `prime` is a no-op.
-    last_count: Option<u64>,
+    last_count: u64,
     last_spawn: Option<Instant>,
 }
 
@@ -99,20 +103,20 @@ impl BellHook {
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into(),
-            last_count: None,
+            last_count: 0,
             last_spawn: None,
         }
     }
 
-    /// Take `count` as seen, without firing, unless a count was seen already.
-    pub fn prime(&mut self, count: u64) {
-        self.last_count.get_or_insert(count);
+    /// Take `count` as what was rung before: only rises past it ring.
+    pub const fn prime(&mut self, count: u64) {
+        self.last_count = count;
     }
 
     /// Note the bell count at `now`; whether to fire: it rose, and the last spawn was at least
     /// [`BELL_HOOK_MIN_INTERVAL`] ago. A rise within that is absorbed, not deferred.
     pub fn observe(&mut self, count: u64, now: Instant) -> bool {
-        let rose = count > self.last_count.replace(count).unwrap_or(0);
+        let rose = count > std::mem::replace(&mut self.last_count, count);
         let spaced = rose
             && self
                 .last_spawn
@@ -168,10 +172,12 @@ impl BellHook {
     }
 }
 
-/// Bind an endpoint to dial `remote` from, as `identity`, and the connector that dials it.
+/// Bind an endpoint to dial `remote` from, as `identity`, its connections idle at most as `idle`
+/// says, and the connector that dials it.
 async fn connector(
     remote: &Remote,
     identity: &crate::identity::Identity,
+    idle: Idle,
 ) -> anyhow::Result<(iroh::Endpoint, IrohConnector)> {
     let secret = identity.secret.clone();
     let server = remote.server;
@@ -186,38 +192,32 @@ async fn connector(
         ),
         (None, None) => (Network::N0, server.into()),
     };
-    let endpoint = bind_on(secret, false, &network, None).await?;
+    let endpoint = bind_on(secret, (false, idle), &network, None).await?;
     let connector = IrohConnector::new(endpoint.clone(), target);
     Ok((endpoint, connector))
 }
+
+/// `koh: could not reach the server`: the error for a dial that timed out.
+#[derive(Debug, thiserror::Error)]
+#[error("timed out connecting (server unreachable or not responding)")]
+pub struct Unreached;
 
 /// `future`, the first dial, within [`DIAL_TIMEOUT`]; failing, `endpoint` is closed.
 async fn first_dial<T>(
     endpoint: &iroh::Endpoint,
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    let first = tokio::time::timeout(DIAL_TIMEOUT, future)
-        .await
-        .context("timed out connecting (server unreachable or not responding)")
-        .and_then(std::convert::identity);
+    let first = match tokio::time::timeout(DIAL_TIMEOUT, future).await {
+        Ok(first) => first,
+        Err(_) => Err(Unreached.into()),
+    };
     if first.is_err() {
         let _ = close_endpoint(endpoint).await;
     }
     first
 }
 
-/// Bind an endpoint for `config` and make the first connection; the connector redials the same
-/// target.
-async fn dial(
-    config: &ConnectConfig,
-    identity: &crate::identity::Identity,
-) -> anyhow::Result<(iroh::Endpoint, IrohConnector, Admitted)> {
-    let (endpoint, connector) = connector(&config.remote, identity).await?;
-    let admitted = first_dial(&endpoint, connector.connect(config.pick)).await?;
-    Ok((endpoint, connector, admitted))
-}
-
-/// One connection to a server for one request: `koh exec`'s, `koh cp`'s or `koh sessions`'.
+/// One connection to a server for one request: a command's, a copy's or a question's.
 pub(crate) struct Opened {
     pub(crate) conn: Connection,
     /// The client's first stream, the request on it, open for what follows.
@@ -228,14 +228,15 @@ pub(crate) struct Opened {
 }
 
 impl Opened {
-    /// Dial `remote` as its client key and make `request`.
+    /// Dial `remote` as its client key and make `request`. Its connection is a command's: a
+    /// client killed where it stands is noticed within 20 seconds, and what it ran hung up.
     pub(crate) async fn dial(remote: &Remote, request: &Request) -> anyhow::Result<Self> {
         log_to_koh_log();
         let identity = crate::identity::load(&crate::identity::KeyFile::locate(
             remote.key_file.clone(),
             "client",
         )?)?;
-        let (endpoint, connector) = connector(remote, &identity).await?;
+        let (endpoint, connector) = connector(remote, &identity, Idle::Command).await?;
         let (conn, control) = first_dial(&endpoint, connector.open(request)).await?;
         Ok(Self {
             conn,
@@ -250,52 +251,198 @@ impl Opened {
         self.conn.close(0u32.into(), b"done");
         let _ = close_endpoint(&self.endpoint).await;
     }
+
+    /// The answer on the server's next stream, at most `max` bytes: what was asked, or why not.
+    async fn answer<T: DeserializeOwned>(&self, max: usize) -> anyhow::Result<T> {
+        let read = async {
+            let mut recv = self.conn.accept_uni().await?;
+            let bytes = recv.read_to_end(max.saturating_add(4)).await?;
+            anyhow::Ok(crate::request::decode_framed::<Answer<T>>(&bytes, max)?)
+        };
+        match read.await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(problem)) => Err(problem.into()),
+            Err(error) => Err(refusal(&self.conn, &error)),
+        }
+    }
+}
+
+/// Make `request` of `remote` and take its answer, at most `max` bytes.
+async fn ask<T: DeserializeOwned>(
+    remote: &Remote,
+    request: &Request,
+    max: usize,
+) -> anyhow::Result<T> {
+    let mut opened = Opened::dial(remote, request).await?;
+    opened.control.finish()?;
+    let answer = opened.answer(max).await;
+    opened.close().await;
+    answer
+}
+
+/// The exit status for a koh error: 3 the server was not reached, 4 it refused this client for
+/// good (or its key's scope), 1 anything else.
+pub fn exit_code(error: &anyhow::Error) -> u8 {
+    if error.is::<Unreached>() || error.downcast_ref::<Close>() == Some(&Close::AtCapacity) {
+        3
+    } else if error.is::<Refused>() {
+        4
+    } else {
+        1
+    }
+}
+
+/// What a koh error says in `--json` output: its kind, and its words.
+pub fn json_error(error: &anyhow::Error) -> String {
+    #[derive(Serialize)]
+    struct Inner<'a> {
+        kind: &'a str,
+        message: String,
+    }
+    #[derive(Serialize)]
+    struct View<'a> {
+        error: Inner<'a>,
+    }
+    let kind = if error.is::<Unreached>() {
+        "unreached"
+    } else if let Some(refused) = error.downcast_ref::<Refused>() {
+        match refused {
+            Refused::NotAuthorized => "not_authorized",
+            Refused::NoSuchSession => "no_such_session",
+            Refused::OutOfScope => "out_of_scope",
+            Refused::OtherProtocol => "other_protocol",
+        }
+    } else if let Some(problem) = error.downcast_ref::<Problem>() {
+        problem.kind.name()
+    } else if let Some(failure) = error.downcast_ref::<crate::sync::Failure>() {
+        failure.kind.name()
+    } else {
+        "failed"
+    };
+    let view = View {
+        error: Inner {
+            kind,
+            message: format!("{error:#}"),
+        },
+    };
+    serde_json::to_string(&view).unwrap_or_default()
+}
+
+/// How a command says what it heard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Format {
+    pub json: bool,
+}
+
+/// Write `value` as one line of JSON to `out`.
+fn json_line(out: &mut impl std::io::Write, value: &impl Serialize) -> anyhow::Result<()> {
+    serde_json::to_writer(&mut *out, value)?;
+    writeln!(out)?;
+    Ok(())
+}
+
+/// A session, as `koh sessions --json` says it.
+#[derive(Serialize)]
+struct SessionView {
+    session: u64,
+    attached: bool,
+    detached_secs: Option<u64>,
+    age_secs: u64,
+    rows: u16,
+    cols: u16,
+    title: String,
+    exited: Option<u32>,
+    activity: Option<&'static str>,
+    command_running: bool,
+    commands_finished: u64,
+    last_status: Option<i32>,
+}
+
+impl From<&SessionInfo> for SessionView {
+    fn from(info: &SessionInfo) -> Self {
+        let detached_secs = match info.presence {
+            Presence::Attached => None,
+            Presence::Detached { secs } => Some(secs),
+        };
+        Self {
+            session: info.session.0,
+            attached: detached_secs.is_none(),
+            detached_secs,
+            age_secs: info.age_secs,
+            rows: info.size.rows,
+            cols: info.size.cols,
+            title: info.title.clone(),
+            exited: info.exited,
+            activity: info.state.activity.map(crate::terminal::Activity::name),
+            command_running: info.state.running,
+            commands_finished: info.state.finished,
+            last_status: info.state.last_status,
+        }
+    }
 }
 
 /// `koh sessions`: this client's sessions on `remote`, one a line, to `out`.
-pub async fn sessions(remote: &Remote, out: &mut impl std::io::Write) -> anyhow::Result<()> {
-    let mut opened = Opened::dial(remote, &Request::Sessions).await?;
-    opened.control.finish()?;
-    let listed = async {
-        let mut recv = opened.conn.accept_uni().await?;
-        let bytes = recv.read_to_end(MAX_REPLY.saturating_add(4)).await?;
-        anyhow::Ok(crate::request::decode_framed::<SessionList>(
-            &bytes, MAX_REPLY,
-        )?)
-    };
-    let listed = listed.await.map_err(|e| refusal(&opened.conn, &e));
-    opened.close().await;
-    for info in listed?.0 {
+pub async fn sessions(
+    remote: &Remote,
+    format: Format,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    let SessionList(listed) = ask(remote, &Request::Sessions, MAX_REPLY).await?;
+    if format.json {
+        let views: Vec<SessionView> = listed.iter().map(SessionView::from).collect();
+        return json_line(out, &views);
+    }
+    if listed.is_empty() {
+        writeln!(out, "no sessions")?;
+    }
+    for info in listed {
         writeln!(out, "{}", listing(&info))?;
     }
     Ok(())
 }
 
+/// Text a program chose, safe to print on a line: nothing in it may move the cursor or reorder
+/// the line.
+fn escaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == ' ' || !(c.is_control() || c.is_whitespace() || crate::log::is_bidi(c)) {
+            out.push(c);
+        } else {
+            out.extend(c.escape_default());
+        }
+    }
+    out
+}
+
 /// One session as `koh sessions` lists it: space-separated fields, none holding a space, then the
-/// title, escaped, to the line's end: `3 detached=5m age=2h01m 80x24 running vim notes`.
+/// title, escaped, to the line's end: `3 detached=5m age=2h01m 80x24 reading done=1 vim notes`.
 fn listing(info: &SessionInfo) -> String {
     let presence = match info.presence {
         Presence::Attached => "attached".to_owned(),
         Presence::Detached { secs } => format!("detached={}", span(secs)),
     };
-    let program = info
-        .exited
-        .map_or_else(|| "running".to_owned(), |code| format!("exited={code}"));
-    // A program chose it: nothing in it may move the cursor or reorder the line.
-    let mut title = String::with_capacity(info.title.len());
-    for c in info.title.chars() {
-        if c == ' ' || !(c.is_control() || c.is_whitespace() || crate::log::is_bidi(c)) {
-            title.push(c);
-        } else {
-            title.extend(c.escape_default());
-        }
-    }
+    let program = match (info.exited, info.state.running, info.state.activity) {
+        (Some(code), _, _) => format!("exited={code}"),
+        (None, true, activity) => format!(
+            "running:{}",
+            activity.map_or("unknown", crate::terminal::Activity::name)
+        ),
+        (None, false, activity) => activity
+            .map_or("unknown", crate::terminal::Activity::name)
+            .to_owned(),
+    };
+    let last = info
+        .state
+        .last_status
+        .map_or_else(String::new, |status| format!(" last={status}"));
     format!(
-        "{} {presence} age={} {}x{} {program} {title}",
+        "{} {presence} age={} {}x{} {program}{last} {}",
         info.session,
         span(info.age_secs),
         info.size.cols,
         info.size.rows,
+        escaped(&info.title),
     )
     .trim_end()
     .to_owned()
@@ -319,6 +466,309 @@ fn span(secs: u64) -> String {
     }
 }
 
+/// `koh output`: session `session`'s screen, or the last command's output if `last`, to `out`.
+pub async fn output(
+    remote: &Remote,
+    (session, last): (SessionNum, bool),
+    format: Format,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    let text: String = ask(remote, &Request::Output { session, last }, MAX_OUTPUT).await?;
+    if format.json {
+        #[derive(Serialize)]
+        struct View<'a> {
+            session: u64,
+            text: &'a str,
+        }
+        return json_line(
+            out,
+            &View {
+                session: session.0,
+                text: &text,
+            },
+        );
+    }
+    out.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+/// A job, as `koh jobs --json` says it.
+#[derive(Serialize)]
+struct JobView<'a> {
+    name: &'a str,
+    command: &'a str,
+    running: bool,
+    status: Option<u32>,
+    age_secs: u64,
+    ran_secs: Option<u64>,
+    output_bytes: u64,
+    dropped_bytes: u64,
+}
+
+impl<'a> From<&'a JobInfo> for JobView<'a> {
+    fn from(job: &'a JobInfo) -> Self {
+        let status = match job.state {
+            JobState::Running => None,
+            JobState::Exited(code) => Some(code),
+        };
+        Self {
+            name: job.name.as_str(),
+            command: &job.command,
+            running: status.is_none(),
+            status,
+            age_secs: job.age_secs,
+            ran_secs: job.ran_secs,
+            output_bytes: job.output_bytes,
+            dropped_bytes: job.dropped_bytes,
+        }
+    }
+}
+
+/// `koh run`: start `run` as job `name` on `remote`; its name, to `out`.
+pub async fn run(
+    remote: &Remote,
+    (name, run): (Option<JobName>, Run),
+    format: Format,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    let Started { name } = ask(remote, &Request::Start { name, run }, MAX_REPLY).await?;
+    if format.json {
+        #[derive(Serialize)]
+        struct View<'a> {
+            job: &'a str,
+        }
+        return json_line(out, &View { job: name.as_str() });
+    }
+    writeln!(out, "{name}")?;
+    Ok(())
+}
+
+/// `koh jobs`: this client's jobs on `remote`, one a line, to `out`.
+pub async fn jobs(
+    remote: &Remote,
+    format: Format,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    let JobList(jobs) = ask(remote, &Request::Jobs, MAX_REPLY).await?;
+    if format.json {
+        let views: Vec<JobView<'_>> = jobs.iter().map(JobView::from).collect();
+        return json_line(out, &views);
+    }
+    if jobs.is_empty() {
+        writeln!(out, "no jobs")?;
+    }
+    for job in &jobs {
+        let state = match job.state {
+            JobState::Running => format!("running {}", span(job.age_secs)),
+            JobState::Exited(code) => format!(
+                "exited={code} after {} ({} ago)",
+                span(job.ran_secs.unwrap_or_default()),
+                span(
+                    job.age_secs
+                        .saturating_sub(job.ran_secs.unwrap_or_default())
+                )
+            ),
+        };
+        let dropped = if job.dropped_bytes > 0 {
+            format!(", {} dropped", bytes(job.dropped_bytes))
+        } else {
+            String::new()
+        };
+        writeln!(
+            out,
+            "{} {state} output={}{dropped} {}",
+            job.name,
+            bytes(job.output_bytes),
+            escaped(&job.command)
+        )?;
+    }
+    Ok(())
+}
+
+/// `bytes` for a person: `41 KB`, `1.2 MB`.
+pub fn bytes(n: u64) -> String {
+    let n = u128::from(n);
+    let (unit, scale) = match n {
+        0..=999 => return format!("{n} B"),
+        1_000..=999_999 => ("KB", 1_000),
+        1_000_000..=999_999_999 => ("MB", 1_000_000),
+        _ => ("GB", 1_000_000_000),
+    };
+    let tenths = n.saturating_mul(10).checked_div(scale).unwrap_or(0);
+    let (whole, tenth) = (tenths.div_euclid(10), tenths.rem_euclid(10));
+    if whole >= 10 || tenth == 0 {
+        format!("{whole} {unit}")
+    } else {
+        format!("{whole}.{tenth} {unit}")
+    }
+}
+
+/// `koh logs`: job `job`'s output to `out`, and with `follow` what it writes until it ends; its
+/// status if it ended (then koh exits with it), `None` if it runs on.
+pub async fn logs(remote: &Remote, job: JobName, follow: bool) -> anyhow::Result<Option<u32>> {
+    let interrupted = CancellationToken::new();
+    crate::cancel_on_signals(&interrupted)?;
+    let mut opened = Opened::dial(remote, &Request::Logs { job, follow }).await?;
+    opened.control.finish()?;
+    let read = async {
+        let mut recv = opened.conn.accept_uni().await?;
+        let mut stdout = tokio::io::stdout();
+        loop {
+            let body =
+                crate::transport_iroh::read_framed(&mut recv, MAX_LOG_CHUNK.saturating_add(64))
+                    .await?;
+            // A job the server does not have answers as a problem instead.
+            if let Ok(Err(problem)) = crate::request::decode::<Answer<()>>(&body) {
+                return Err(problem.into());
+            }
+            match crate::request::decode::<LogMsg>(&body)? {
+                LogMsg::Dropped(n) => crate::log::stderr(format_args!(
+                    "koh: {} of the job's output were dropped before this (the log keeps its newest)",
+                    bytes(n)
+                )),
+                LogMsg::Data(data) => {
+                    use tokio::io::AsyncWriteExt as _;
+                    stdout.write_all(&data).await?;
+                    stdout.flush().await?;
+                }
+                LogMsg::End(status) => return anyhow::Ok(status),
+            }
+        }
+    };
+    let status = tokio::select! {
+        status = read => status.map_err(|e| match e.downcast::<Problem>() {
+            Ok(problem) => problem.into(),
+            Err(e) => refusal(&opened.conn, &e),
+        }),
+        () = interrupted.cancelled() => Ok(None),
+    };
+    opened.close().await;
+    status
+}
+
+/// `koh kill`: send job `job` on `remote` `signal`.
+pub async fn kill(
+    remote: &Remote,
+    (job, signal): (JobName, Signal),
+    format: Format,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    ask::<()>(
+        remote,
+        &Request::Kill {
+            job: job.clone(),
+            signal,
+        },
+        MAX_REPLY,
+    )
+    .await?;
+    if format.json {
+        #[derive(Serialize)]
+        struct View<'a> {
+            job: &'a str,
+            signalled: bool,
+        }
+        return json_line(
+            out,
+            &View {
+                job: job.as_str(),
+                signalled: true,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// The status `koh wait` exits with when it gave up waiting: `timeout`'s.
+pub const TIMED_OUT: u32 = 124;
+
+/// `koh wait`: wait on `remote` as `wait` says, at most `timeout`.
+///
+/// The status to exit with: the job's or the command's for an end, 0 for what was waited for, 1 if
+/// the job ended without it, [`TIMED_OUT`] past the time. On a terminal it reports `busy` while it
+/// waits.
+pub async fn wait(
+    remote: &Remote,
+    (wait, timeout): (Wait, Option<Duration>),
+    format: Format,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<u32> {
+    let interrupted = CancellationToken::new();
+    crate::cancel_on_signals(&interrupted)?;
+    let until = wait.until.clone();
+    report_busy();
+    let waited = async { ask::<Waited>(remote, &Request::Wait(wait), MAX_REPLY).await };
+    let waited = tokio::select! {
+        waited = waited => Some(waited?),
+        () = sleep_for(timeout) => None,
+        () = interrupted.cancelled() => anyhow::bail!("interrupted"),
+    };
+    let (status, said) = match (waited, &until) {
+        (None, _) => (TIMED_OUT, "timed out".to_owned()),
+        (Some(Waited::Ended(status)), Until::End) => {
+            let code = status.map_or(0, |s| u32::try_from(s & 0xff).unwrap_or(1));
+            (
+                code,
+                status.map_or_else(|| "ended".to_owned(), |s| format!("ended with status {s}")),
+            )
+        }
+        (Some(Waited::Ended(status)), Until::Text(_) | Until::File(_) | Until::Reading) => (
+            1,
+            status.map_or_else(
+                || "ended before it came".to_owned(),
+                |s| format!("ended with status {s} before it came"),
+            ),
+        ),
+        (Some(Waited::Text), _) => (0, "the text appeared".to_owned()),
+        (Some(Waited::File), _) => (0, "the file appeared".to_owned()),
+        (Some(Waited::Reading), _) => (0, "reading its terminal".to_owned()),
+    };
+    if format.json {
+        #[derive(Serialize)]
+        struct View<'a> {
+            status: u32,
+            waited: &'a str,
+            timed_out: bool,
+        }
+        json_line(
+            out,
+            &View {
+                status,
+                waited: &said,
+                timed_out: status == TIMED_OUT,
+            },
+        )?;
+    } else if status == TIMED_OUT || (status == 1 && !matches!(until, Until::End)) {
+        crate::log::stderr(format_args!("koh: {said}"));
+    }
+    Ok(status)
+}
+
+async fn sleep_for(timeout: Option<Duration>) {
+    match timeout {
+        Some(timeout) => tokio::time::sleep(timeout).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Tell a terminal that reads state reports (fux) that koh is busy: it waits on the server, not
+/// on input. Only when stdout is a terminal, with the nonce the terminal asks for.
+pub fn report_busy() {
+    use std::io::IsTerminal as _;
+    let stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return;
+    }
+    let nonce = crate::client::backend::MarkNonce::from_env();
+    let report = match nonce {
+        Some(nonce) => format!("\x1b]133;S;activity=busy;nonce={}\x07", nonce.as_str()),
+        None => "\x1b]133;S;activity=busy\x07".to_owned(),
+    };
+    let mut stdout = stdout.lock();
+    let _ = stdout.write_all(report.as_bytes());
+    let _ = stdout.flush();
+}
+
 /// Warn if the locale does not look UTF-8, which koh assumes; mosh refuses to run instead.
 fn warn_if_locale_not_utf8() {
     // In POSIX's order of precedence.
@@ -338,9 +788,9 @@ fn warn_if_locale_not_utf8() {
     }
 }
 
-/// With `$KOH_LOG` set, log to that file at debug level (the TUI owns the terminal). It must be
-/// a private file of this user's (see [`crate::identity::open_private_log`]), as debug logs can be
-/// sensitive; failing that, nothing is logged. An empty `$KOH_LOG` is off, silently.
+/// With `$KOH_LOG` set, log to that file at debug level (the terminal is the session's). It must
+/// be a private file of this user's (see [`crate::identity::open_private_log`]), as debug logs
+/// can be sensitive; failing that, nothing is logged. An empty `$KOH_LOG` is off, silently.
 fn log_to_koh_log() {
     let Some(path) = std::env::var_os("KOH_LOG").filter(|path| !path.is_empty()) else {
         return;
@@ -359,14 +809,13 @@ fn log_to_koh_log() {
 /// and signal handlers for the session.
 pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     log_to_koh_log();
-
     warn_if_locale_not_utf8();
-
     // Before dialing, so a run with no terminal (a script's, an agent's) starts nothing there.
-    let backend = DefaultBackend::new().map_err(|error| {
+    let mut backend = DefaultBackend::new().map_err(|error| {
         anyhow::anyhow!(
             "`koh connect` needs a terminal, and there is none here ({error}); \
-             `koh exec SERVER -- COMMAND` runs a command without one, and `koh cp` copies files"
+             `koh exec SERVER -- COMMAND` runs a command without one, `koh run` a job, and \
+             `koh cp` copies files"
         )
     })?;
     // Held for the session: its lease stops `koh key reset` while it may redial.
@@ -374,7 +823,9 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
         args.remote.key_file.clone(),
         "client",
     )?)?;
-    let (endpoint, connector, channel) = dial(&args, &identity).await?;
+    let size = backend.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
+    let (endpoint, connector) = connector(&args.remote, &identity, Idle::Shell).await?;
+    let admitted: Admitted = first_dial(&endpoint, connector.connect(args.pick, size)).await?;
     // For the menu's "last connected"; failing to note it never stops the session.
     let noted = crate::identity::KeyFile::path_for(args.remote.key_file.clone(), "client")
         .map_err(anyhow::Error::from)
@@ -387,25 +838,23 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     // Armed before raw mode is entered, so an install error surfaces while the terminal is cooked.
     crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
     let (channels, tasks) = super::spawn_client_io()?;
-    let result = async {
-        let mut terminal = BackendTerminal::enter(backend, args.clipboard)
-            .context("entering raw mode / alt screen")?;
-        terminal.set_hyperlinks(args.hyperlinks);
-        let size = terminal.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
-        crate::client::run_client(
-            channel,
-            dialed_at,
-            connector,
-            size,
-            args.colours,
-            channels.input_rx,
-            channels.resize_rx,
-            terminal,
-            shutdown,
-            args.bell_command.map(BellHook::new),
-        )
-        .await
-    }
+    backend.enter_raw_mode().context("entering raw mode")?;
+    let run = super::Run {
+        backend,
+        size,
+        colours: args.colours,
+        clipboard: args.clipboard,
+        links: args.hyperlinks,
+        bell: args.bell_command.map(BellHook::new),
+    };
+    let result = crate::client::run_client(
+        admitted,
+        dialed_at,
+        connector,
+        run,
+        (channels.input_rx, channels.resize_rx),
+        shutdown,
+    )
     .await;
     let _ = close_endpoint(&endpoint).await;
     drop(identity);
@@ -415,59 +864,6 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn redial_reuses_the_loaded_identity_without_touching_the_key_file() -> anyhow::Result<()> {
-        crate::test_runtime::current_thread().block_on(async {
-            use crate::transport_iroh::{bind_endpoint_local, generate_secret_key};
-            let server = bind_endpoint_local(generate_secret_key()?, true).await?;
-            let identity = crate::identity::Identity::generate()?;
-            let expected = identity.secret.public();
-            let socket = server
-                .bound_sockets()
-                .into_iter()
-                .find(std::net::SocketAddr::is_ipv4)
-                .context("server IPv4 socket")?;
-            let config = ConnectConfig {
-                remote: Remote {
-                    // Any attempt to reload instead of reusing `identity` would fail here.
-                    key_file: Some("/nonexistent/koh-redial-test.key".into()),
-                    direct: Some(([127, 0, 0, 1], socket.port()).into()),
-                    ..Remote::new(server.id())
-                },
-                ..ConnectConfig::new(server.id())
-            };
-            let peer = server.clone();
-            let accept = async move {
-                for _ in 0..2 {
-                    let connection = peer.accept().await.context("accept connection")?.await?;
-                    anyhow::ensure!(
-                        connection.remote_id() == expected,
-                        "client identity changed"
-                    );
-                    let _control = crate::client::admit(&connection).await?;
-                    connection.closed().await;
-                }
-                Ok::<_, anyhow::Error>(())
-            };
-            let client = async {
-                let (endpoint, connector, channel) = dial(&config, &identity).await?;
-                channel.conn.close(0u32.into(), b"test reconnect");
-                // The same connector `run_client` redials with after a link loss.
-                let channel = connector.connect(Pick::Resume(channel.at)).await?;
-                channel.conn.close(0u32.into(), b"test done");
-                endpoint.close().await;
-                Ok::<_, anyhow::Error>(())
-            };
-            tokio::time::timeout(
-                Duration::from_secs(15),
-                Box::pin(async { tokio::try_join!(accept, client) }),
-            )
-            .await??;
-            server.close().await;
-            Ok(())
-        })
-    }
 
     #[test]
     fn bell_hook_fires_on_a_rise_and_rate_limits_a_burst() {
@@ -490,16 +886,13 @@ mod tests {
 
     #[test]
     fn bell_hook_command_scrubs_parent_koh_vars_and_exports_its_own() {
-        // Given a parent environment holding KOH_* vars, the hook's child sees none of them,
-        // keeps the rest (PATH, HOME), and gets KOH_BELL_COUNT / KOH_TITLE. The command builder takes the parent env explicitly, so
-        // this needs no process-global `set_var`.
         use std::ffi::OsString;
         let dir = crate::test_runtime::scratch("bell-env");
         let out = dir.join("env.txt");
         let hook = BellHook::new(format!("env > '{}'", out.display()));
         let parent_env = [
             ("KOH_DNS", "1.1.1.1"),
-            ("KOH_LOG", "/tmp/x"),
+            ("KOH_LOG", "/x"),
             ("PATH", "/usr/bin:/bin"),
             ("HOME", "/nonexistent"),
         ]
@@ -514,35 +907,16 @@ mod tests {
         assert!(content.contains("KOH_BELL_COUNT=42"), "{content}");
         assert!(content.contains("KOH_TITLE=a title"), "{content}");
         assert!(content.contains("PATH=/usr/bin:/bin"), "{content}");
-        assert!(
-            !content.contains("KOH_DNS"),
-            "a parent KOH_* var leaked into the hook's env: {content}"
-        );
+        assert!(!content.contains("KOH_DNS"), "{content}");
         assert!(!content.contains("KOH_LOG"), "{content}");
     }
 
     #[test]
-    fn bell_hook_prime_swallows_the_count_it_is_seeded_with_but_not_later_rises() {
-        // The first synced frame's cumulative count is not a new bell; a later rise is.
-        // Priming again is a no-op (a reconnect keeps counting from where it was).
-        let t0 = Instant::now();
-        let later = t0 + Duration::from_secs(5);
-        let mut h = BellHook::new("true");
-        h.prime(5);
-        assert!(!h.observe(5, t0), "the primed count is not a rise");
-        assert!(h.observe(6, t0), "a rise past the primed count fires");
-        h.prime(100);
-        assert!(
-            h.observe(7, later),
-            "a second prime is ignored once a count was seen"
-        );
-        // observe() alone also primes: a hook that never saw prime() keeps today's behaviour.
-        let mut g = BellHook::new("true");
-        assert!(
-            g.observe(3, t0),
-            "with no prime, the first rise from 0 fires"
-        );
-        g.prime(50);
-        assert!(g.observe(4, later), "prime after observe is a no-op");
+    fn sizes_read_as_a_person_reads_them() {
+        assert_eq!(bytes(0), "0 B");
+        assert_eq!(bytes(999), "999 B");
+        assert_eq!(bytes(41_000), "41 KB");
+        assert_eq!(bytes(1_234_567), "1.2 MB");
+        assert_eq!(bytes(u64::MAX), "18446744073 GB");
     }
 }

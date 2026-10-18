@@ -12,11 +12,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
-use koh::client::{run_client, BackendTerminal, ClientTerminal, IrohConnector, KohBackend};
-use koh::predict::Overlay;
+use koh::client::{run_client, IrohConnector, KohBackend, Run};
 use koh::pty::{Home, Pty};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
-use koh::terminal::{Size, TerminalScreen};
+use koh::terminal::Size;
 use koh::transport_iroh::generate_secret_key;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -82,8 +81,8 @@ impl Shown {
 pub struct Remote {
     pub system: System,
     pub shown: Shown,
-    /// koh's synced screen, without its predictions, as the client last painted it.
-    pub synced: Option<Arc<Mutex<Option<TerminalScreen>>>>,
+    /// The glyphs koh's client predicted and painted over the program's output, now.
+    pub predicted: Option<Arc<Mutex<String>>>,
     inner: Inner,
 }
 
@@ -107,32 +106,37 @@ enum Inner {
     },
 }
 
-/// koh's client terminal: koh's own `BackendTerminal`, painting into a buffer that goes to the
-/// user's terminal after every frame.
+/// koh's client terminal: what the client writes, buffered, goes to the user's terminal at each
+/// flush, as a real terminal takes it.
 struct Readback {
-    terminal: BackendTerminal<Buffer>,
-    buffer: Buffer,
+    painted: Vec<u8>,
+    size: Arc<Mutex<Size>>,
     written: Arc<std::sync::atomic::AtomicU64>,
     shown: Arc<Mutex<fux_vt::Parser>>,
-    synced: Arc<Mutex<Option<TerminalScreen>>>,
+    predicted: Arc<Mutex<String>>,
     paints: watch::Sender<u64>,
 }
 
-#[derive(Clone)]
-struct Buffer {
-    painted: Arc<Mutex<Vec<u8>>>,
-    size: Arc<Mutex<Size>>,
-}
-
-impl KohBackend for Buffer {
+impl KohBackend for Readback {
     fn write_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.painted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(bytes);
+        self.painted.extend_from_slice(bytes);
         Ok(())
     }
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.painted.is_empty() {
+            return Ok(());
+        }
+        let painted = std::mem::take(&mut self.painted);
+        self.written.fetch_add(
+            u64::try_from(painted.len()).unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.shown
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .process(&painted)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.paints.send_modify(|n| *n = n.wrapping_add(1));
         Ok(())
     }
     fn enter_raw_mode(&mut self) -> std::io::Result<()> {
@@ -144,43 +148,13 @@ impl KohBackend for Buffer {
     fn size(&self) -> std::io::Result<Size> {
         Ok(*self.size.lock().unwrap_or_else(PoisonError::into_inner))
     }
-}
-
-impl ClientTerminal for Readback {
-    fn render(
-        &mut self,
-        state: &TerminalScreen,
-        overlay: &Overlay,
-        status: Option<&str>,
-    ) -> std::io::Result<()> {
-        self.terminal.render(state, overlay, status)?;
-        let painted = std::mem::take(
-            &mut *self
-                .buffer
-                .painted
+    fn overlay(&mut self, predicted: &str, _status: Option<&str>) {
+        predicted.clone_into(
+            &mut self
+                .predicted
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
-        self.written.fetch_add(
-            u64::try_from(painted.len()).unwrap_or(0),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        self.shown
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .process(&painted)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        *self.synced.lock().unwrap_or_else(PoisonError::into_inner) = Some(state.clone());
-        self.paints.send_modify(|n| *n = n.wrapping_add(1));
-        Ok(())
-    }
-
-    fn size(&self) -> std::io::Result<Size> {
-        self.buffer.size()
-    }
-
-    fn window_resized(&mut self) {
-        self.terminal.window_resized();
     }
 }
 
@@ -342,22 +316,19 @@ impl Remote {
         let server = tokio::spawn(serve_endpoint(server_endpoint, hosting, shutdown.clone()));
         let endpoint = net.endpoint(client_secret, false).await?;
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server_id));
-        let channel = connector.connect(koh::request::Pick::Latest).await?;
         let start = Size::new(rows, cols);
-        let buffer = Buffer {
-            painted: Arc::default(),
-            size: Arc::new(Mutex::new(start)),
-        };
+        let channel = connector.connect(koh::request::Pick::Latest, start).await?;
+        let size = Arc::new(Mutex::new(start));
         let shown = Arc::new(Mutex::new(parser(rows, cols)?));
-        let synced = Arc::new(Mutex::new(None));
+        let predicted = Arc::new(Mutex::new(String::new()));
         let (paints_tx, paints) = watch::channel(0u64);
         let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let terminal = Readback {
-            terminal: BackendTerminal::enter(buffer.clone(), false)?,
-            buffer: buffer.clone(),
+            painted: Vec::new(),
+            size: size.clone(),
             written: written.clone(),
             shown: shown.clone(),
-            synced: synced.clone(),
+            predicted: predicted.clone(),
             paints: paints_tx,
         };
         let (input, input_rx) = mpsc::channel(1024);
@@ -366,13 +337,16 @@ impl Remote {
             channel,
             std::time::SystemTime::now(),
             connector,
-            start,
-            false,
-            input_rx,
-            resize_rx,
-            terminal,
+            Run {
+                backend: terminal,
+                size: start,
+                colours: false,
+                clipboard: false,
+                links: false,
+                bell: None,
+            },
+            (input_rx, resize_rx),
             CancellationToken::new(),
-            None,
         ));
         Ok(Self {
             system: System::Koh,
@@ -381,14 +355,14 @@ impl Remote {
                 paints,
                 written,
             },
-            synced: Some(synced),
+            predicted: Some(predicted),
             inner: Inner::Koh {
                 net,
                 server_id,
                 client_id,
                 input,
                 resize,
-                size: buffer.size,
+                size,
                 task,
                 shutdown,
                 server,
@@ -500,7 +474,7 @@ impl Remote {
         Ok(Self {
             system: System::Mosh,
             shown,
-            synced: None,
+            predicted: None,
             inner,
         })
     }
@@ -545,7 +519,7 @@ impl Remote {
         Ok(Self {
             system: System::Ssh,
             shown,
-            synced: None,
+            predicted: None,
             inner,
         })
     }

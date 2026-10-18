@@ -51,16 +51,23 @@ pub async fn connected(
     Ok((client, seen, at))
 }
 
-/// An in-process loopback server hosting `sh` for the client `allow`, as `koh serve` does: its
-/// endpoint id, its IPv4 port, and its task.
+/// An in-process loopback server hosting bash (marked, as `koh serve` marks it) for the client
+/// `allow`, as `koh serve` does: its endpoint id, its IPv4 port, and its task.
 pub async fn loopback_server(allow: &str) -> anyhow::Result<(String, u16, JoinHandle<()>)> {
     let config = koh::server::ServeConfig {
         allow: vec![koh::transport_iroh::parse_endpoint_id(allow)?],
-        command: vec!["sh".to_owned()],
+        command: vec!["bash".to_owned()],
         home: home(),
         ..koh::server::ServeConfig::default()
     };
-    let hosting = koh::server::cli::Hosting::from_config(&config)?;
+    serve_in_process(&config).await
+}
+
+/// Serve `config` in process on a loopback endpoint: its id, its IPv4 port, and its task.
+pub async fn serve_in_process(
+    config: &koh::server::ServeConfig,
+) -> anyhow::Result<(String, u16, JoinHandle<()>)> {
+    let hosting = koh::server::cli::Hosting::from_config(config)?;
     let endpoint = bind_endpoint_local(generate_secret_key()?, true).await?;
     let id = endpoint.id().to_string();
     let port = endpoint

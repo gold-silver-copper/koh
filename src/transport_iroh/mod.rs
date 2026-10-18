@@ -8,47 +8,49 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use iroh::endpoint::{
-    presets, AckFrequencyConfig, BindOpts, Connection, IdleTimeout, PathId, QuicTransportConfig,
-    VarInt,
+    presets, BindOpts, Connection, IdleTimeout, PathId, QuicTransportConfig, VarInt,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 
 use crate::proto::Close;
 
-/// The connection idle timeout is 5 minutes, not iroh's ~30 s, so a short suspend (Android
-/// freezing the process, so keepalives stop) is ridden out on the same connection; the client
-/// redials after a longer one.
+/// How long a connection lives with nothing heard.
 ///
-/// The server accepts only the client's two message streams, input and control; the client, a few
-/// frame streams (superseded ones are reset, so few are ever open), and no bi-stream on either
-/// side.
-fn koh_transport_config(accept: bool) -> QuicTransportConfig {
-    // From a `u32` of milliseconds, unlike from a `Duration`, it cannot fail.
-    const IDLE_TIMEOUT_MS: u32 = 300_000;
-    let uni = if accept { 2 } else { 8 };
-    let config = QuicTransportConfig::builder()
-        .keep_alive_interval(Duration::from_secs(5))
-        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))))
-        .max_concurrent_uni_streams(VarInt::from_u32(uni))
-        .max_concurrent_bidi_streams(VarInt::from_u32(0));
-    // The server takes a frame's delivery as its acknowledgement, so it asks the client to
-    // acknowledge within a couple of milliseconds rather than QUIC's 25: the next frame is then
-    // diffed against the newest screen, and a frame is not resent while its acknowledgement waits.
-    // Every other packet is still acknowledged together, as by default.
-    if accept {
-        let mut frequency = AckFrequencyConfig::default();
-        frequency.max_ack_delay(Some(CLIENT_ACK_DELAY));
-        config.ack_frequency_config(Some(frequency)).build()
-    } else {
-        config.build()
+/// For a shell, 5 minutes, not iroh's ~30 s, so a
+/// short suspend (Android freezing the process, so keepalives stop) is ridden out on the same
+/// connection, and the client redials after a longer one; for a command, a copy or a wait, 20
+/// seconds, so a client killed where it stood (SIGKILL) has its command hung up within that. A
+/// connection lives as long as the shorter of its two ends' says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Idle {
+    Shell,
+    Command,
+}
+
+impl Idle {
+    const fn millis(self) -> u32 {
+        match self {
+            Self::Shell => 300_000,
+            Self::Command => 20_000,
+        }
     }
 }
 
-/// How soon the server asks the client's QUIC stack to acknowledge what it got.
-const CLIENT_ACK_DELAY: Duration = Duration::from_millis(2);
+/// The server accepts only the client's two message streams, input and control; the client, a few
+/// streams of the server's (an epoch's, superseded ones reset, and answers), and no bi-stream on
+/// either side.
+fn koh_transport_config(accept: bool, idle: Idle) -> QuicTransportConfig {
+    let uni = if accept { 2 } else { 8 };
+    QuicTransportConfig::builder()
+        .keep_alive_interval(Duration::from_secs(5))
+        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(idle.millis()))))
+        .max_concurrent_uni_streams(VarInt::from_u32(uni))
+        .max_concurrent_bidi_streams(VarInt::from_u32(0))
+        .build()
+}
 
 /// The protocol's name and version ([`crate::proto`]), its ALPN.
-pub const PROTOCOL: &str = "koh/7";
+pub const PROTOCOL: &str = "koh/8";
 
 /// The ALPN, [`PROTOCOL`]: a peer on another fails the TLS handshake instead of misparsing
 /// mid-session.
@@ -202,13 +204,15 @@ pub enum Network {
 }
 
 /// Bind an endpoint on `network`, [`configure`]d, on UDP `port` for IPv4 and, where the host has
-/// it, IPv6; `None` binds ephemeral ports. `accept` lets it accept connections (the server).
+/// it, IPv6; `None` binds ephemeral ports.
+///
+/// `accept` lets it accept connections (the server); its connections live `idle` without a word.
 ///
 /// A fixed port lets a client dialing an address find a restarted server where it was. A port in
 /// use is [`SetupError::PortInUse`].
 pub async fn bind_on(
     secret: SecretKey,
-    accept: bool,
+    (accept, idle): (bool, Idle),
     network: &Network,
     port: Option<u16>,
 ) -> Result<Endpoint, SetupError> {
@@ -233,7 +237,7 @@ pub async fn bind_on(
             .map_err(|e| SetupError::Other(anyhow::Error::new(e)))?,
         None => builder,
     };
-    configure(builder, secret, accept)
+    configure(builder, secret, accept, idle)
         .bind()
         .await
         .map_err(|e| {
@@ -256,10 +260,11 @@ pub fn configure(
     builder: iroh::endpoint::Builder,
     secret: SecretKey,
     accept: bool,
+    idle: Idle,
 ) -> iroh::endpoint::Builder {
     let mut builder = builder
         .secret_key(secret)
-        .transport_config(koh_transport_config(accept));
+        .transport_config(koh_transport_config(accept, idle));
     if let Some(resolver) = discovery_dns_resolver() {
         builder = builder.dns_resolver(resolver);
     }
@@ -272,7 +277,7 @@ pub fn configure(
 /// Bind an endpoint with no relay and no discovery, dialed by id and socket address (LAN,
 /// loopback, tests).
 pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
-    bind_on(secret, accept, &Network::Local, None).await
+    bind_on(secret, (accept, Idle::Shell), &Network::Local, None).await
 }
 
 /// `ep`'s address on the IPv4 loopback interface.
@@ -399,7 +404,13 @@ mod tests {
                     .and_then(|socket| socket.local_addr())
                     .expect("a free port")
                     .port();
-                if let Ok(first) = bind_on(secret.clone(), true, &Network::Local, Some(port)).await
+                if let Ok(first) = bind_on(
+                    secret.clone(),
+                    (true, Idle::Shell),
+                    &Network::Local,
+                    Some(port),
+                )
+                .await
                 {
                     found = Some((port, first));
                     break;
@@ -419,7 +430,7 @@ mod tests {
                 "{bound:?}"
             );
             // The same port again, as a second server would: a clear error, not a random port.
-            match bind_on(secret, true, &Network::Local, Some(port)).await {
+            match bind_on(secret, (true, Idle::Shell), &Network::Local, Some(port)).await {
                 Err(SetupError::PortInUse(p)) => assert_eq!(p, port),
                 Err(e) => panic!("expected PortInUse, got {e}"),
                 Ok(_) => panic!("a taken port must not bind"),

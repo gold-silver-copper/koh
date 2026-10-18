@@ -36,7 +36,7 @@ step does, types, waits for the script to log the step, and waits for the link t
 300 ms. The redraw workload is timed instead: the script writes a frame every 33 ms by itself.
 
 - **koh** runs as its real server and client loops (`serve_endpoint`, `run_client`) in the
-  harness, its client painting with koh's own `BackendTerminal`, over the fault link of koh's tests
+  harness, its client writing to a terminal of the harness's (a fux-vt parser), over the fault link of koh's tests
   (`tests/net/link.rs`, included by path). The link is the endpoints' only path, so every packet
   is counted: UDP payload bytes delivered, each way.
 - **mosh** runs as `mosh-server new` hosting the script and `mosh-client` on a koh PTY, through a
@@ -47,7 +47,7 @@ step does, types, waits for the script to log the step, and waits for the link t
 No IP, UDP or TCP header is counted, for any of them.
 
 **What the user's terminal is given:** the bytes each client wrote to the user's terminal (koh's
-`BackendTerminal`, the PTY mosh-client and ssh write to), and for koh how many times it painted a
+its terminal, the PTY mosh-client and ssh write to), and for koh how many times it painted a
 second. A remote shell that sends few bytes but repaints the user's terminal heavily still costs
 the user: a slow terminal, or one over a serial line, shows it.
 
@@ -88,19 +88,19 @@ in the same namespaces as latency:
 
 The median repeat is the run's figure.
 
-## Scrollback
+## Redraw on an attach
 
-Each workload played into a server emulator keeping the default 8 MiB, then every row of its
-history fetched as koh's scrollback view fetches them (`Ctrl-^ [`, requests of up to 256 rows):
-the compressed history streams' bytes. In process, with no link. mosh keeps no history; ssh's is
-the user's terminal's, which the output's bytes already paid for, and a reconnect loses.
+Each workload played into a server emulator keeping the default 8 MiB, then the redraw a client
+attaching afresh is sent (the screen and up to 1000 rows of history above it, into the user's
+terminal's own scrollback): the bytes of its messages. In process, with no link. mosh keeps no
+history; ssh's is the user's terminal's, which the output's bytes already paid for, and a
+reconnect loses.
 
 ## Server memory per session
 
 A child process (`--footprint-child`) makes server emulators at 40x120 with the given scrollback,
-fills them (or not) with enough lines of text to fill the scrollback and the screen, takes a
-snapshot of each as a session holds one, and reports how much its resident memory (`VmRSS`) grew,
-per session. It counts the terminal and its screens, not the session's PTY, threads or
+fills them (or not) with enough lines of text to fill the scrollback and the screen, and reports
+how much its resident memory (`VmRSS`) grew, per session. It counts the terminal and its screens, not the session's PTY, threads or
 connection.
 
 ## Instructions
@@ -111,10 +111,10 @@ three runs, less the fewest of three baseline runs that make the same inputs and
 them. Instructions retired do not change with the machine's load.
 
 - **Emulator, per byte:** the output fed to the server's emulator in 4 KiB reads.
-- **Server, per byte:** the same, with the snapshot, diff and encoded frame after every read: an
-  interactive program's pace, and more than a flood costs a real session, which takes one
-  snapshot per burst of up to 65 reads and sends frames at most once per frame interval.
-- **Client, per frame:** those frames decoded, applied and painted.
+- **Server, per byte:** the same, each read also filtered and its messages encoded, as a
+  session sends them.
+- **Client, per message:** those messages decoded and written to the user's terminal, its mirror
+  fed and the overlay painted.
 
 ## When to run it
 

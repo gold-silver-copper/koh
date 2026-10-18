@@ -86,13 +86,16 @@ fn a_name_is_a_short_word_never_an_id_or_a_flag() {
 #[test]
 fn add_rm_and_rename_keep_names_and_ids_unique() {
     let mut names = Names::default();
-    names.add("laptop", id(1), None).unwrap();
-    assert!(names.add("laptop", id(2), None).is_err(), "a name taken");
+    names.add("laptop", id(1), None, Scope::default()).unwrap();
     assert!(
-        names.add("other", id(1), None).is_err(),
+        names.add("laptop", id(2), None, Scope::default()).is_err(),
+        "a name taken"
+    );
+    assert!(
+        names.add("other", id(1), None, Scope::default()).is_err(),
         "an id saved twice"
     );
-    names.add("desk", id(2), None).unwrap();
+    names.add("desk", id(2), None, Scope::default()).unwrap();
     assert!(
         names.rename("desk", "laptop").is_err(),
         "a rename onto a name"
@@ -110,11 +113,11 @@ fn a_missing_list_is_empty_and_a_saved_one_is_read_back() {
     let places = dir.places();
     assert!(load(&places, List::Servers).unwrap().is_empty());
     update(&places, List::Servers, |names| {
-        names.add("laptop", id(1), None)
+        names.add("laptop", id(1), None, Scope::default())
     })
     .unwrap();
     update(&places, List::Clients, |names| {
-        names.add("phone", id(2), None)
+        names.add("phone", id(2), None, Scope::default())
     })
     .unwrap();
     assert_eq!(
@@ -140,7 +143,8 @@ fn a_missing_list_is_empty_and_a_saved_one_is_read_back() {
     assert!(update(&places, List::Servers, |names| names.add(
         "laptop",
         id(2),
-        None
+        None,
+        Scope::default()
     ))
     .is_err());
     assert_eq!(
@@ -163,7 +167,13 @@ fn a_symlinked_list_is_refused_and_its_target_left_alone() {
         load(&places, List::Clients).is_err(),
         "a symlinked clients file is not trusted"
     );
-    assert!(update(&places, List::Clients, |names| names.add("x", id(1), None)).is_err());
+    assert!(update(&places, List::Clients, |names| names.add(
+        "x",
+        id(1),
+        None,
+        Scope::default()
+    ))
+    .is_err());
     assert_eq!(
         std::fs::read_to_string(&target).unwrap(),
         format!("evil {A}\n")

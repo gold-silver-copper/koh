@@ -5,14 +5,20 @@ internals. Pair it with the [threat model](THREAT_MODEL.md).
 
 ## The one idea
 
-koh keeps a **copy of the server's screen** on the client, not a byte stream from the shell. The
-server runs the terminal emulator; the client only ever receives screens, as diffs against a screen
-it already holds, and a newer screen replaces an older one. If the screen changed 100 times in
-40 ms, the client gets the latest, not 100 updates. That gives instant re-sync after a drop (never a
-backlog), responsiveness on lossy links, and no head-of-line blocking of the screen behind stale
-output. Keystrokes are the opposite: every byte matters and order matters, so they travel on one
-reliable, ordered stream. QUIC (through iroh) provides both, plus encryption, authentication, loss
-recovery, congestion control, RTT estimates, roaming and NAT traversal.
+koh relays the program's **output** to the user's terminal, as ssh does, and keeps the **screen**
+on the server, as mosh does. The server runs the program on a PTY and feeds its output to a
+terminal emulator of its own, which answers every question the program asks its terminal (device
+attributes, cursor reports, colours), so the user's terminal is never asked; what the program wrote
+otherwise goes to the client as it wrote it, and the client writes it to the user's terminal. The
+user's terminal does the drawing, the scrollback, the search, the selection; nothing is drawn twice.
+
+The screen on the server is what makes the link not matter: a client that attaches, redials or
+falls behind is sent a **redraw** of the screen as it is, painted from the server's emulator, never
+the backlog, so a drop costs a screen, not the minutes of output the link missed. And it is what
+lets a script ask how a session stands (`koh sessions`, `koh wait --session`, `koh output`) with
+no terminal at all. Keystrokes travel the other way on one reliable, ordered stream, as decoded
+events the server encodes for the program. QUIC (through iroh) provides both, plus encryption,
+authentication, loss recovery, congestion control, roaming and NAT traversal.
 
 ## Module layout
 
@@ -23,329 +29,217 @@ clap's builder API rather than its derive, and tests build their tokio runtimes 
 
 ```
 src/
-├── main.rs          the binary: serve / connect / sessions / exec / cp / id / key dispatch
-├── args.rs          the command line (clap's builder API) and the config structs it produces
-├── lib.rs           crate root: module declarations + the architecture overview
+├── main.rs          the binary: dispatch, exit codes, --json errors
+├── args.rs          the command line (clap's builder API), `koh help-agents`
+├── lib.rs           crate root: module declarations
 ├── request.rs       the opening request (what a connection is for) and the replies sent whole
-├── proto.rs         the koh/7 shell protocol: client messages, screen frames, caps, pacing
-├── copy.rs          `koh cp`'s item stream: a tree walked and sent, landed staged, either end
+├── proto.rs         the koh/8 shell protocol: client messages, what the program shows, caps
+├── stream.rs        the output filter both ends run: questions out, marks apart, bounds
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
-├── terminal/        TerminalScreen (a cell grid + structured diff) + ServerTerminal (fux-vt)
-│   └── history.rs   scrollback rows, named for the wire
+├── terminal/        the server's emulator (ServerTerminal, fux-vt), Activity, sizes
+│   └── redraw.rs    a screen painted for a terminal that shows nothing of it yet
 ├── predict.rs       local-echo prediction engine (overlays, epochs)
-├── transport_iroh/  iroh endpoint setup, the default key path, path RTT
+├── sync/            `koh cp`: a sync of trees, either way (send, receive, fsat, glob)
+├── transport_iroh/  iroh endpoint setup, the default key path, idle timeouts
 ├── pty.rs           PTYs over fuxix: the session leader on each, its pumps, reaping
-├── server/          session tasks + registry, the per-connection loop (ServerConn), `serve`
-│   ├── held.rs      the frames the server takes the client to hold
+├── server/          `serve`: the gate, the registry and sessions, one task per connection
+│   ├── cli.rs       the accept loop, the allowlist and scopes, the request's dispatch
+│   ├── session.rs   detachable sessions and their registry; session/reports.rs, sessions.rs
+│   ├── attach.rs    one connection to a session: input in, epochs of what is shown out, pacing
 │   ├── exec.rs      `koh exec`'s command: a process group with no terminal, its pipes
-│   ├── copy.rs      `koh cp` on the server: remote paths resolved, items sent or landed
+│   ├── jobs.rs      `koh run`'s jobs, their logs, `koh logs`, `kill` and `jobs`
+│   ├── wait.rs      `koh wait`: a job's end or text, a session's command or state, a file
+│   ├── copy.rs      `koh cp` on the server
+│   ├── place.rs     where a request's paths are, and a scoped key's directory
+│   ├── marks.rs     the startup files that mark a shell's commands
 │   └── audit.rs     admission decisions as structured `koh::auth` events
-├── client/          the connection loop + ClientSession core + predictor + render + `connect`
+├── client/          `koh connect`'s loop and the commands that dial
+│   ├── display.rs   the user's terminal: output, marks, reports, the overlay
+│   ├── input.rs     what the user's terminal sends, decoded; the escape prefix
+│   ├── cli.rs       sessions, output, run, jobs, logs, kill, wait, connect; exit codes
 │   ├── exec.rs      `koh exec`: stdin to the command, its output back apart, its status
-│   ├── copy.rs      `koh cp` at this end
-│   ├── scrollback.rs the scrollback view (`Ctrl-^ [`)
+│   ├── copy.rs      `koh cp` at this end, and its summary
 │   ├── probe.rs     the start-up questions to the user's terminal
-│   └── backend/     KohBackend (escape emission) + Tty (raw mode and size through fuxix::terminal)
+│   └── backend/     KohBackend (raw mode, size, bytes, marks) + Tty (through fuxix::terminal)
 ├── identity.rs      unlocked identities + the key lease `koh key reset` respects
 │   └── key_file.rs  KeyFile, the one owner of trust in a key path, its lock and $KOH_LOG
 ├── log.rs           the `RUST_LOG` filter `serve` and `connect` install (`target=level` directives)
 ├── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identities, reset one
-├── names.rs         names for ids: `servers` and `clients` beside the keys, through `KeyFile`
+├── names.rs         names for ids: `servers` and `clients` beside the keys, and client scopes
 ├── menu.rs          the menu `koh` alone opens on a terminal, over a reader and a writer
 └── test_runtime.rs  unit tests' runtime and scratch directories, through koh-testkit
 tests/net/           koh over a fault-injecting link between real iroh endpoints
-tests/               PTYs, sessions, scrollback, the binary on a PTY, exec, cp and
-                     sessions, names, key creation races, wire goldens and the corpus
+tests/               PTYs, sessions, the binary on a PTY, commands, jobs and copies, names,
+                     key creation races, wire goldens and the corpus
 testkit/             koh-testkit: what the tests share (starting programs, tasks, scratch dirs)
 testing/corpus/      113 real programs' output (from fux), replayed by tests and bench
 testing/bench/       the scoreboard: koh beside mosh and ssh (`testing/scoreboard.sh`)
+testing/agentbench/  coding agents driving koh on task sets, scored
 ```
 
-Dependency direction is strict: `proto` sits on `terminal`; `server` and `client` (+ the `koh`
-binary) build on both. The protocol cores (`proto`, `terminal`, `predict`, `server::ServerConn`,
-`client::ClientSession`) do no I/O and are tested with no network at all. `predict` imports nothing
-from `crate::` (CI checks it), so it is a standalone terminal-prediction library.
+`predict` imports nothing from `crate::` (CI checks it), so it is a standalone
+terminal-prediction library; `stream`, `proto`, `request` and `sync`'s item types are pure.
 
-## The protocol (koh/7)
+## The protocol (koh/8)
 
-The ALPN `koh/7` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/8` is the version check: a peer on another version fails the TLS handshake with a
 clear error. After the handshake the server checks the allowlist and takes a connection permit;
 then the client says what the connection is for, as the first message on its first uni stream
 (`src/request.rs`), a 4-byte length and its postcard encoding, at most 1 MiB, and the server
 attaches or starts nothing before it. A client that makes no request within 10 s (the handshake's
 deadline) is closed as breaking the protocol, and so is one whose request does not decode: a
-path holding a NUL, a command over 256 KiB, no sources or more than 1024 are refused as they are
-decoded. The request is one of:
+path holding a NUL, a command over 256 KiB or 4096 words, no sources or more than 1024 are refused
+as they are decoded. The request is one of:
 
-- `Shell(Pick)`: a session. `Pick::Latest` is the peer's session attached last, else a new one;
-  `New` always a new one; `Id(n)` that one, if it is the peer's; `Resume { run, session }` that
-  one of that server run, which is how a client redials. The rest of the stream is the session's
-  control stream. The server's first stream carries `Attached { at: Resume }`, which admits the
-  client and says which session it reached, and frames follow, so "admitted, then refused" cannot
-  happen.
-- `Sessions`: the peer's sessions, answered as one `SessionList` on a stream; then the client
-  closes the connection.
-- `Exec(CommandLine)`: a command, with no terminal ([below](#commands-and-copies)); the rest of
-  the stream is its stdin.
-- `Copy(Get(sources) | Put { dest, arity })`: a copy from or to the server; a `Put`'s items
-  follow on the stream.
+- `Shell { pick, size }`: a session, at the client's window size. `Pick::Latest` is the peer's
+  session attached last, else a new one; `New` always a new one; `Id(n)` that one, if it is the
+  peer's; `Resume { run, session }` that one of that server run, which is how a client redials.
+  The rest of the stream is the session's control stream. The server's first stream carries
+  `Attached { at: Resume }`, which admits the client and says which session it reached.
+- `Sessions`, `Output { session, last }`: the peer's sessions with how each stands, or one's text;
+  answered whole on a stream.
+- `Exec(Run)`, `Start { name, run }`: a command, with no terminal, for the connection's life or as
+  a job ([below](#commands-jobs-and-copies)); `Run` is its `Command` (`Argv`, words passed as they
+  are, or `Shell`, a line for `$SHELL -c`) and the directory it starts in.
+- `Jobs`, `Logs { job, follow }`, `Kill { job, signal }`, `Wait(Wait)`: on the peer's jobs, and a
+  wait on the server (a job, a session, a file).
+- `Copy(Get { sources, opts } | Put { dest, sources, opts })`: a sync from or to the server.
 
+Each answer is an `Answer<T>`: the reply, or a `Problem` (a kind, `ProblemKind`, and a message),
+which the client says as text or as `{"error":{"kind","message"}}`, and maps to its exit code.
 A refusal is a close code, never prose to match (`proto::Close`: `NotAuthorized` 1, `ProtocolError`
-2, `SessionEnded` 3, `AtCapacity` 4, `CouldNotStart` 5, `NoSuchSession` 6). Only `NotAuthorized`
-and `NoSuchSession` make a shell's client give up; on the others it redials and its banner says
-why. Then, for a shell (`src/proto.rs`):
+2, `SessionEnded` 3, `AtCapacity` 4, `CouldNotStart` 5, `NoSuchSession` 6, `OutOfScope` 7). Only
+`NotAuthorized`, `NoSuchSession` and `OutOfScope` make a shell's client give up; on the others it
+redials and its status line says why. Then, for a shell (`src/proto.rs`):
 
 - **Client to server: two uni streams** of length-prefixed postcard `ClientMsg`s, one for control
   (the first, its request's: `ClientMsg::stream` says which messages) and one for input (`Keys` and
   `Colours`), so a control message never waits behind input a program has not read: `Keys { seq,
   events }`, the input the client decoded (`src/events.rs`: keys, mouse events, focus changes and
-  whole pastes of at most 1 MiB, at most 512 events a message), `Resize`, `Resync` when a frame's
-  base is unknown, `History { id, newest, count }` for scrollback rows, `Ack { frame }`, now only a nudge
-  (below), and `Colours`, the user's terminal's colours, on each connection unless `--no-colours`.
-  `seq` numbers each input on the connection.
+  whole pastes of at most 1 MiB, at most 512 events a message), `Resize`, `Read { epoch, bytes }`,
+  how much of the server's stream the client has read, `Redraw`, when it wants the screen afresh,
+  and `Colours`, the user's terminal's colours, on each connection unless `--no-colours`. `seq`
+  numbers each input on the connection.
 - **Input is decoded on the client and encoded on the server.** The client reads what the user's
   terminal sends with fux-vt's decoder (legacy bytes, xterm's modifiers, the kitty keyboard
-  protocol, which it pushes in a terminal that speaks it, SGR mouse reports, focus changes,
-  bracketed pastes) and sends events; the session encodes each with fux-vt for the program's modes
-  at that moment (`ServerTerminal::encode_input`: the kitty flags, modifyOtherKeys and cursor keys;
-  the mouse tracking mode and encoding; mode 1004; bracketed paste, a whole paste framed in one go
-  with every end marker removed, so no paste is ever left open). A program gets what it asked for from any terminal, and a
-  reattach from another terminal changes nothing for it. The client keeps the user's terminal in
-  the modes it decodes in rather than mirroring the program's: bracketed paste and focus reporting
-  on, normal cursor keys and keypad, SGR mouse reports while the program wants the mouse.
+  protocol, SGR mouse reports, focus changes, bracketed pastes) and sends events; the session
+  encodes each with fux-vt for the program's modes at that moment (`ServerTerminal::encode_input`:
+  the kitty flags, modifyOtherKeys and cursor keys; the mouse tracking mode and encoding; mode 1004;
+  bracketed paste, a whole paste framed in one go with every end marker removed, so no paste is
+  ever left open). The program's modes reach the user's terminal with its output, so the terminal
+  sends what the program asked for; a reattach from another terminal is sent them in the redraw,
+  and changes nothing for the program.
 - **Colours.** The client asks its terminal's foreground, background, palette 0–15 and scheme at
   start-up (and again when the terminal reports a new scheme, mode 2031) and tells the server; the
   server's terminal answers programs' OSC 10, OSC 11, OSC 4 for entries 0–15 and `CSI ? 996 n`
-  from them, and sends a
-  program that subscribed to mode 2031 the new scheme when a client brings one.
-- **Server to client: one uni stream per message**: a tag byte, then for a frame its base's number
-  and the frame (`num`, `base`, `echo_ack` and a `ScreenDiff` from frame `base` to frame `num`)
-  DEFLATE-compressed against the base screen's dictionary; for history rows, the rows compressed.
-  Either inflates with a 16 MiB limit. Frame 0 is the blank default screen, which both ends always
-  hold; real frames count from 1.
-- **Compressed against the base.** Both ends hold a frame's base screen, so the compressor starts
-  from a dictionary made of it (`TerminalScreen::dictionary`): the base's rows encoded as a frame
-  encodes them, those nearest the cursor last, at most DEFLATE's 32 KiB window. A row the frame
-  changes then compresses against what it was: a typed character or a ticking clock costs a few
-  bytes. The client refuses a frame whose base it lacks, so the dictionaries cannot disagree.
-- **Rows as runs of text.** A row is runs: identical cells as one run with a count, and
-  same-looking characters as one run of their text (`CellKind::Chars`, `CellKind::WideChars`), so
-  text costs about a byte a cell before compression.
-- **Delivery is the acknowledgement.** The client sends no acknowledgement per frame: when QUIC
-  reports a frame's stream wholly delivered (`stopped` with no code), the server takes it as
-  acknowledged. The client applies every frame it gets on a base it holds, and keeps a frame that
-  arrives after a newer one as a base, so the server may diff against any delivered frame. A
-  `Resync` makes the server forget every frame it took as delivered (`ClientHolds`, in
-  `src/server/held.rs`), so a delivery heard after it, of a frame sent before it, is not found; the
-  client asks again for each base it lacks newer than the last it asked for, and owes at most one
-  `Resync` at a time, held with its connection's frames (`Link`, in `src/client/link.rs`). The
-  server asks the client's QUIC stack to acknowledge within 2 ms (the ACK-frequency extension)
-  rather than 25. A superseded frame that was wholly written gets a round trip and that delay to
-  report its delivery before its stream is reset.
-- **Scrollback by name.** The server names each row as it enters its history with the next number
-  of a session counter, so the history's rows always carry consecutive names (a resize, which
-  reflows the history, names every row afresh). Each screen carries a `HistoryMark`: the newest
-  row's name and how many rows the history holds. The client asks for the rows it lacks, by the
-  newest name and a count (at most 256 rows), under an id; the server answers every request, with no
-  rows if it has none, and the reply names its id, so a lost or late reply shifts nothing. It
-  answers one request at a time, each on a stream below frames in priority, the next only once the
-  last is delivered, so history never delays a frame or outruns the link. A named row's cells never
-  change, so a row the client holds is never sent again. The client keeps only rows a request it
-  has outstanding asked for, at most `HISTORY_CACHE_BYTES` (64 MiB, fux-vt's own storage and links
-  included), dropping the rows farthest from its view but never the rows the view shows or a reply
-  just brought; the server queues at most 8 requests, and one more is a protocol error.
-- **Bases are acknowledged frames.** The server diffs against the newest frame delivered, so a lost
-  frame only delays the screen until the next one. When the server sends a
-  frame it resets the streams of older unacknowledged frames, so QUIC never retransmits a screen a
-  newer one has replaced.
-- **Pacing by what the link takes:** never more than about a round trip of frame bytes in flight.
-  The server tracks the frames sent and not yet delivered, and judges the link's rate by recent
-  deliveries (the quickest delivery is near the round trip alone, so what a frame took beyond it is
-  its bytes' time); the budget is that rate times the round trip. A changed screen goes once the
-  frame floor (`FRAME_FLOOR`, 5 ms, which only batches a burst) has passed and the bytes in flight
-  are under the budget, or none are in flight. While frames would queue, the screens between are
-  skipped for the newest. A small change (at most four rows) while typed input awaits its echo
-  goes at once, room or not, at most a millisecond apart: the program's echo is never stuck behind
-  a flood. A heartbeat frame goes at least every 3 s so the client can tell a quiet session from a
-  dead link.
-- **Retries without QUIC's backoff:** on a lossy, jittery path QUIC's probe timeout is several
-  round trips and doubles on each loss. So an unacknowledged newest frame is resent, as a new frame
-  that supersedes it, after a round trip, the frame floor and QUIC's acknowledgement delay; and
-  input the echo-ack has not confirmed after the same wait makes the client send an `Ack`, a later
-  packet that lets QUIC detect the loss and retransmit at once.
-- **Bounded state:** each end keeps at most `FRAME_WINDOW` (16) recent screens — the client its
-  last applied frames, the server the frames sent since the last acknowledged one. A count alone is
-  not a memory bound when a screen can be a million cells (about 32 MB at the 1000×1000 a client may
-  ask for, 32 bytes a cell), so both ends also bound the cells their window holds at
-  `WINDOW_CELLS`, one screen of that size, counting each row once however many screens share it:
-  the server's unacknowledged frames together, the client's older frames beyond the current one.
-  Past it the oldest are dropped, which only costs the peer a base (a frame on a dropped base makes
-  the client ask for a resync). Screens are shared, not copied — a resent frame holds the session's
-  own snapshot, a client screen shares every row a frame did not carry with its base — and the
-  session takes one snapshot per burst of program output rather than per read. That, plus QUIC flow
-  control and the stream limits (the server accepts two client streams; the client a handful of
-  frame streams), bounds memory; a peer cannot make either end accumulate.
+  from them, and sends a program that subscribed to mode 2031 the new scheme when a client brings
+  one.
+- **Server to client: a uni stream per epoch**, a tag byte (`SHOWN_TAG`) and the epoch's number,
+  then length-prefixed `Shown` messages: `Out`, the program's output as the filter passed it, in
+  pieces of at most 16 KiB that end where a sequence and a UTF-8 character end; `Mark`, a shell
+  mark relayed apart; `Report`, the program's state; `Tty`, the PTY's echo and line modes, before
+  the output they apply to; `Echo(seq)`, that the input up to `seq` had its time to show; `Bell`,
+  the session's bell count; `Title`; `Exit`, the program's status; and `Beat`, at least every 3 s,
+  so the client can tell a quiet session from a dead link.
+- **An epoch begins with a redraw.** `terminal::redraw` paints the server's screen for a terminal
+  that shows nothing of it yet: from a reset, the primary screen (with as much history above it as
+  asked, as lines that scroll into the terminal's own scrollback), the alternate screen if it is
+  shown, then the scroll region and margins, origin mode, the cursor and its shape, the pen and
+  the open link, the input modes, the kitty keyboard flags, the title, and marks on the rows that
+  start a prompt. What it cannot put back (character sets, tab stops, a cursor saved with DECSC, a
+  palette the program set) comes right again once the program redraws. A client attaching afresh
+  is sent 1000 rows of history; a redial none, as its terminal has them.
+- **Pacing by what the client read.** The server writes an epoch no further than a budget past
+  what the client said it read (`Read`): 256 KiB until the client's rate is known, then the rate
+  it reads at times about a round trip, between 64 KiB and 4 MiB. So what the server has written
+  is never far behind the program, and a slow link holds no backlog in QUIC's buffers.
+- **A client too far behind is sent a new epoch.** The session publishes what the program shows
+  as events on a broadcast channel of 128 (each event at most an `Out` of 16 KiB, so at most
+  2 MiB of output a session); a connection that falls further behind than that, or whose client
+  asks (`Redraw`), resets the epoch's stream, so QUIC stops sending what it missed, and opens the
+  next with a redraw. The client takes an epoch's stream only if it is newer than the one it
+  reads, and resets its mirror of the terminal with it.
+- **Echo and the predictor.** The session tells each connection when its input had its time to
+  show (`Echo`): once the program read it and its output since was relayed, or 50 ms after, as an
+  echo-ack. The PTY's modes (`Tty`) go before the output they apply to, read from the PTY with
+  `tcgetattr` at each read and every 100 ms while a client is attached. A resize waits until the
+  program has read what was typed before it.
 - **Backpressure:** PTY input goes through a writer queue of at most 1 MiB, and the session's
   input queue holds a bounded number of messages. While they are full the connection stops reading
-  the client's input stream, and only that: it goes on reading the control stream (resizes,
-  acknowledgements, history requests), sending frames and heartbeats and seeing the connection
-  close. QUIC flow control stops the client's writes, and the client keeps at most
-  1 MiB of typing before dropping it with an "input paused" status line. The keyboard loop never
-  waits on the network, so `Ctrl-^ .` always works.
+  the client's input stream, and only that: it goes on reading the control stream, sending what is
+  shown and seeing the connection close. The client keeps at most 1 MiB of typing behind its
+  writer with an "input paused" status line, and its keyboard loop never waits on the network, so
+  `Ctrl-^ .` always works.
 - **Every queue is bounded** (`src/bounded.rs`): `clippy.toml` bans `VecDeque` and unbounded
   channels outside it, and every task spawned says, in an `#[expect]`, what bounds how many run.
-  The wire's sequences (rows, runs, links, history rows, events, palette entries) are refused as
+  The wire's sequences (events, palette entries, words, sources, listed entries) are refused as
   they are decoded once past their bound, before anything is allocated for them.
-- **The scrollback view** (`Ctrl-^ [`, `client::scrollback`): the server's history above the live
-  screen, fetched as the user scrolls with the arrows, Page Up/Down, `k`/`j`, `b`/`f`, `u`/`d`,
-  `g`/`G` or the mouse wheel (the view turns mouse reporting on), and `q` or Escape to leave. `/`
-  searches the history for text, older from the view's top, fetching rows as it goes (a search
-  waits on the rows it needs first); `n` goes to the next older match, `N` to the next newer. The
-  view is anchored to its rows: output that scrolls into history moves it up with them, so what
-  is being read stays still while the live screen goes on below. Out of the view, a client idle for
-  2 s fetches the newest screenful ahead, so opening the view shows rows at once.
-- **Shutdown:** when the shell exits, the server sends the final frame (carrying the exit code)
-  and resends it as any frame until it is acknowledged, at least 1 s (two retries on a slow link).
-  Acknowledged, the session ends and the connection closes with `Close::SessionEnded` (3) once the
-  client has read it; unacknowledged, it closes as a lost link and the session keeps the end for
-  the client's redial.
+- **Shutdown:** when the shell exits, the session drains its output and sends `Exit`; the server
+  closes with `Close::SessionEnded` (3) once the client has read it. A session whose end no client
+  was told keeps it for the client's redial, until the TTL.
 
-`TerminalScreen` is a plain `Grid` of rows stored as `fux_vt::Cells` (with a cursor, per-row flags
-(soft wrap, and whether a shell's prompt starts on it) and the input modes the client mirrors) plus
-the side channels: title, icon, OSC 52 clipboard, bell count, exit code and the shell's commands
-(below). The grid stores each row as its own reference-counted slice of cells, shared by every
-screen that holds the row unchanged: a snapshot shares the rows the program left alone (found by
-fux-vt's row ids, so rows that scrolled are shared too) with the snapshot before it, and a client
-screen shares every row a diff did not carry with the base it was applied to. So a screen costs the
-rows that changed, two screens compare and diff by skipping the rows they share, and each end's
-memory for its recent screens is counted in distinct rows. The list of rows is itself shared by
-every screen holding all of them, and copied only when a row is replaced, so copying a screen
-touches no row. A snapshot reads each live row's fux-vt id and version, which fux-vt changes only
-when an edit changes the row: a row at the id and version the last snapshot saw at its place is
-taken as it was, one seen elsewhere is found by id, and if no row changed the snapshot shares the
-last one's list whole. Counting a window's memory looks only at the rows that differ from the
-newest screen's at the same place. The server's live emulator is `fux_vt::Parser` (`ServerTerminal`), with the options in
-`terminal::OPTIONS`, each for what koh carries: events (title, icon, bell, clipboard), extended
-replies (DECRQM, DECXCPR, secondary DA), in-band resize and the size query, the palette (a
-program's colours, drawn as RGB in snapshots, so the user's palette never changes), reflow, the
-shell's marks (OSC 133), and koh's identity for device attributes and XTVERSION. A frame a program draws with synchronized
-output is not sent half drawn (`FrameHold`): while it is drawn the screen from before it goes out,
-and it is let go after 150 ms. The diff (`ScreenDiff`) carries every changed row whole as run-length-encoded cells, the
-cursor and the modes; after a resize the client starts from a blank grid and receives every
-non-blank row.
+### The filter
 
-Rows that only moved are moved, not sent. A scroll, of the whole screen or inside a scroll region,
-and an inserted or deleted line leave the rows they move holding the same cells, so the server finds
-them by the cells they share with the base, in runs that moved by the same offset, and sends each
-run as a `Shift { top, len, by }`: rows `top..top + len` of the base go to `top + by`. All shifts
-read the base, no two share a source or a destination row, and a row a shift left and none filled
-is blank, which is what a scroll brings in. The client moves those rows' cells (shared, not copied)
-before replacing the rows the diff carries, so a one-line scroll sends the shift (4 bytes on a
-24-row screen) and the new line, not the screen. Decoding checks what needs no screen size (at
-most 32 shifts, no zero length or offset, both ranges within 1000 rows, no shared rows); `apply`
-checks the ranges against the screen and refuses shifts with a resize, and drops the frame whole
-if anything is wrong. What a shift cannot say is sent as rows: a row moved and changed, a row that
-appears twice, a horizontal shift inside a row, and the shortest runs past the 32nd.
+The program's output goes through `stream::Filter` twice: in the session, so that its clients
+never see a question its emulator answered nor a mark the shell did not sign, and in the client,
+so that a hostile server cannot make the user's terminal answer it either. The filter reads
+output however it is split, and judges each escape sequence whole: questions (device attributes,
+DSR and DECXCPR, DECRQM, XTVERSION, the kitty flags query, XTSMGRAPHICS, DECREQTPARM, the
+locator, window reports, DECRQSS and XTGETTCAP, colour and palette queries, clipboard reads,
+ENQ, DECID) are dropped; OSC 133 is taken out, relayed as a `Piece::Mark` (the session's nonce
+removed, a state report never) or dropped; clipboard writes pass only as base64 of at most 16 KiB
+and titles cut to 256 characters with no control; the clipboard and links are dropped when the
+user turned them off. Everything else passes as the program wrote it. A control string longer
+than 1 MiB, or a control sequence longer than 256 bytes, is dropped to its end, so a filter
+holds at most that.
 
-A program may also scroll only some columns, between left and right margins (DECLRMM, DECSLRM),
-which fux-vt has and the server's terminal says it has when asked (DECRQM of mode 69): nvim then
-scrolls a split window between margins. A shift moves whole rows, so those rows go as rows. That
-costs nothing measurable: nvim run under koh, splitting a window and scrolling in both halves at
-40x120, sent 92.9 KB to the client with mode 69 answered as known and 92.8 KB with it answered as
-unknown (three runs each, 0.3% apart), so the server answers it as known.
+### The display
 
-The client validates and copies cells and never runs a terminal parser, so server
-bytes never reach one. That includes the user's terminal, which the client prints a cell's text to
-as is: decoding refuses a cell whose text holds a control character, so no escape sequence can
-ride in one.
-
-A cell is one grapheme cluster, as fux-vt segments output (UAX #29): a ZWJ emoji sequence, a
-flag or a base with its marks stays in one cell, whose width is the cluster's. A cluster of up to 17
-bytes is held in the cell; a longer one, up to 128, in its row's text (`fux_vt::Cells`), which the
-client rebuilds as it decodes the row. On the wire a cell carries its cluster (at most 128 bytes),
-its kind, its colours, its underline colour and its style bits: bold, dim, italic, underline
-and the underline's style (single, double, curly, dotted, dashed), inverse, hidden, strikeout and
-a slow or rapid blink. The client paints an underline's style (`4:n`) only if the user's terminal
-draws them, which it asks the terminal once at start-up (XTGETTCAP for `Smulx`, and the pen with a
-curly underline through DECRQSS, before primary device attributes; `client::probe`); otherwise
-it paints a plain underline, as a terminal that does not know `4:n` would draw none.
-
-A row also carries its hyperlinks (OSC 8): its distinct links once (at most 64, each URI and id
-within fux-vt's limits), and each cell the index of its link, so a row moved or shared keeps its
-links with it and needs no screen-wide table. A diff carries at most 1 MiB of links; the server
-leaves off a row's links past that and holds the screen as the client will have it, so the frames
-after carry them and both ends' compression dictionaries stay the same; the client drops a frame
-over it, and refuses one malformed for its base as it refuses one on a base it lacks. The client paints a
-link with OSC 8 (with the program's id, if it gave one) unless `--no-hyperlinks`, after checking
-it again, and closes it before any cell without it and at the frame's end.
+`client::Display` writes to the user's terminal. It feeds what it writes to a mirror, a fux-vt
+parser with no history, which says where the cursor is, which screen is shown, what is under a
+cell; the predictor reads the mirror (`predict::ScreenView` is implemented for `fux_vt::Screen`).
+Over the program's output it paints an overlay: the predicted echo of what was typed, and the
+status line on the last row. The overlay is taken back before anything else is written (the cells
+it covered painted again from the mirror, the pen and the cursor put back), so the terminal is
+always where the program left it, and it is painted only where that can be done: on the primary
+screen, the cursor not waiting to wrap, no origin or insert mode, no link open, no synchronized
+frame under way, and between two sequences. On leaving and on a suspend, the display puts back
+every mode the program set and resets the palette and the dynamic colours.
 
 ### The shell's marks (OSC 133)
 
 A shell with shell integration marks where each prompt starts (`OSC 133 ; A`), where a command's
 output starts (`C`) and where it ends, with its status (`D ; status`), so a terminal (or fux, which
 answers `· done STATUS` and `last-output` by them) knows when a command typed into it ended, how, and
-which output was its. The server's emulator keeps them (fux-vt's `Feature::PromptMarks`), and
-since control sequences never reach the user's terminal, the client writes them again, from the
-synced screen:
-
-- **A prompt's start is a row's.** Each row carries a flag, beside its wrap flag, in one byte
-  (`RowFlags`, any other bit refused), in frames and in history rows alike: the mark moves with its
-  row through scrolls, history and reflow, as fux-vt keeps it. A mark changes no row's fux-vt
-  version, so a snapshot compares each live row's flag apart from its cells. The client marks a row
-  (`133;A` with the cursor in its first column) when it paints one that came to start a prompt, and
-  blanks a painted row that no longer does (DL then IL, the rows below put back), as a terminal's
-  mark goes only with its row.
-- **Commands are the screen's side channel.** A screen carries `Commands`: fux-vt's count of the
-  commands ended (`finished`), the last one's status, where its output began and ended, and where
-  the running one's output began, each placed on the screen (a place the screen does not show,
-  scrolled into history or on the main screen under the alternate one, is the top left). A frame
-  carries them when they changed. Once the run's first frame came, whose ended commands are from
-  before the client and not told, the painter tells, after a frame's rows: for a frame whose count
-  is above the count it last saw, one `C` at the start of the last command's output and one
-  `D;status` at its end; a `C` where the running command's output starts, again whenever that place
-  moves on what it painted (a repaint, a scroll, a blanked row); and a `D` with no status if the
-  command it told running is not running and the count did not grow (the redial reached another
-  shell). A count lower than the last is a new shell's: taken, not told.
-
-What a terminal can rely on through koh: every row it shows that starts a prompt is marked, and no
-other (prediction paints cells, never marks); when a frame shows that commands ended, it is told
-one end, with the status and output of the last of them, so commands that end between two frames
-end as one (a count of ends counts the frames that brought them, not the commands); an end is told
-once, never again on a repaint, a resize, a redial or a reattach to the same shell; while a command
-runs, it is told where its output starts on the screen. What it cannot rely on: output that
-scrolled above the screen before a frame showed it (the output then starts at the screen's top, and
-the client paints on the alternate screen, which keeps no history); the status of each of several
-commands that ended between two frames; telling a new shell's count from the old one's, as the
-session's identity is not on the wire (a count above the last after a redial to a new shell tells
-that shell's last command). As through ssh, the remote shell's marks are the local terminal's: a
-local shell's own mark for the `koh` command it ran is overridden (fux, which gives the shells it
-starts a nonce their marks must carry, ignores koh's marks in such a pane; run `koh connect` as the
-pane's program for fux to read them).
+which output was its. The server's emulator keeps them (fux-vt's `Feature::PromptMarks`), for
+`koh sessions`, `koh wait --session` and `koh output --last`, and its filter relays them to the
+client as `Shown::Mark`, apart from the output, at the place in the output they came: the client
+writes each again where the output before it left the cursor, with the nonce the user's terminal
+asks for (`FUX_MARK_NONCE`). So every mark the shell wrote reaches the terminal once, in order,
+at its place, however the commands came: two commands ending between two of the client's reads
+are two ends, each with its status. The redraw a client is sent on attaching marks the rows the
+screen shows that start a prompt, and where a running command's output began, if it shows.
 
 **The state report** (`OSC 133 ; S ; activity=STATE`, the contract fux wrote with koh) tells a
 terminal what the remote program is doing, which it cannot see itself: locally it sees only `koh
 connect` waiting on the network. The session probes its PTY's foreground program (`Pty::activity`,
 fuxix's `terminal_activity`, the probe fux runs on its own panes): `reading` its terminal with no
 time limit, `polling` it with one, `waiting` on something else, `busy`, `idle` (macOS) or
-`unknown`. A screen carries the session's last `Report`, its state and its number, and a frame
-carries it when it is new; the session makes one (`server/session/reports.rs`, time passed in)
-once input is written to the program, though the state is unchanged; on a change, probed every
-20 ms while a client is attached; after the shell's `C` or `D` (fux-vt's commands changed), on the
-very screen that carries the mark; and after a resize. An unchanged state is reported again no
-sooner than 10 ms after the last, but after a mark; a report owed sooner waits. The client writes
-the report at the end of the paint of the frame that brought it, after every mark of that paint,
-and writes the last one again after any mark it writes (fux forgets a report at a mark).
+`unknown`. The session makes a report (`server/session/reports.rs`, time passed in) once input is
+written to the program, though the state is unchanged; on a change, probed every 20 ms while a
+client is attached; after the shell's `C` or `D`, right behind the mark on the stream; and after a
+resize. An unchanged state is reported again no sooner than 10 ms after the last, but after a
+mark. The report goes as `Shown::Report` in its place among the output; the client writes it, and
+writes the last one again after any mark (fux forgets a report at a mark). A program that polls
+its terminal while it prints is told `polling`: it may draw on its own.
 
 What a terminal can rely on: a report written after its own last input to `koh connect` was probed
-after that input was written to the remote program's terminal (the server makes one then, and
-numbers every report, so the client writes each); a report follows every mark koh writes, so no
-mark leaves it without one; and every report carries the terminal's nonce as the marks do. What it
-cannot: a state from between two frames, as the client paints only the newest (a program that was
-`busy` for a moment and is `reading` again may be told only `reading`); a report as soon as the
-state changes, for it is probed every 20 ms and goes with the next frame the link has room for.
-The probe is fuxix's `terminal_activity`, the one fux runs on its own panes; on macOS it says only
-`busy`, `idle` or `unknown`.
+after that input was written to the remote program's terminal; a report follows every mark koh
+writes; and every report and mark carries the terminal's nonce. What it cannot: a state from
+between two probes. On macOS the probe says only `busy`, `idle` or `unknown`. `koh sessions` says
+each session's last report and whether a command runs, so a script sees the same state without a
+terminal.
 
 **koh marks the shells it starts** (`server/marks.rs`), as fux marks its own, so that this works on
 a server nobody set up: a session's bash, zsh or fish, started plainly (`$SHELL`, or a lone
@@ -366,90 +260,26 @@ starts the shells as they are, for a user with an integration of their own or a 
 misreads.
 
 Each marked shell is given a nonce (`__koh_k`, 64 random bits, a new one for every session, not
-exported to what the shell runs), its marks carry it (`133;D;1;nonce=…`), and its session's
-emulator counts only marks that do (fux-vt's `require_mark_nonce`). So a program the shell runs
-cannot end or start a command: not `cat` of a file holding marks, not a shell of its own (ssh, a
-nested koh, a terminal multiplexer's shells), and not a shell's own integration, which is how
-fish 4 (which marks natively) or a user's own bash integration is not counted twice. For a
-program koh does not mark, and with `--no-shell-marks`, every mark counts, as before: then the
-marks are whatever the program and what it runs send. The marks a client writes to the user's
-terminal never carry the session's nonce; they are koh's, from the screen, and carry the user's
-terminal's own nonce if it asks for one (`FUX_MARK_NONCE`).
-
-## Headless drivers (the protocol is I/O-free; the shells are thin)
-
-Both ends split into a synchronous, I/O-free core and a thin async shell. The client's
-**`ClientSession`** (`client/session.rs`) holds the recent screens, the predictor and the
-escape/render state, and exposes pure steps: `on_input` (the `Ctrl-^`-prefix machine, prediction
-seeding, input queueing), `on_frame`, `on_resize` and `on_tick` (the link-down and input-paused
-banners), with the outgoing messages taken from a queue. The server's **`ServerConn`**
-(`server/mod.rs`) decodes the client's streams, tracks the echo-ack, and decides which frame to
-send against which base. None of it touches tokio, iroh or a terminal, and time is an argument, so
-both are deterministically unit-testable. The shells own the `tokio::select!` (unbiased, so a flood of
-keystrokes or of frames starves neither), a writer task for each of the client's streams, a task per frame stream, and
-the rendering.
-
-On the server side, **PTY writes are non-blocking**: a dedicated `koh-pty-writer` thread drains a
-queue of at most 1 MiB, so forwarding a keystroke (or a synthesized DSR/DA reply) only enqueues and
-never blocks a tokio worker on a slow child; a write that does not fit keeps its buffer for a retry.
-The PTY master itself is non-blocking and both pump threads wait in `poll`: on Linux and Android a
-write blocked on a program's full input queue is never woken, not even once the program dies, so
-the writer gives up unread input as soon as the session is torn down instead of wedging the
-teardown. The session task owns the PTY, and keystrokes and query replies go through it in order,
-so a query reply can't overtake the keystroke that triggered it.
-
-**A session's lifecycle.** The registry never waits on a session: a new one forks and execs its
-program on a blocking worker and answers the attach itself, so one slow start holds up no other
-peer, and a program that cannot start is refused as such, not as a full server. Once the PTY's
-output ends, the session looks for its program's exit at each tick for up to a second, never
-waiting on it. The
-program (`pty::Running`) is the only holder of its pid; teardown hangs it up and hands it to a
-reaper thread, which kills it only if it outlives a second's grace, so a shell saves its history.
-
-## Rendering
-
-The client paints the synced grid, the predictions over it and an optional status line through
-`KohBackend`, whose provided methods write the ANSI. Each frame is a diff of the whole terminal: the
-painter builds what the terminal is to show (the screen clipped to the terminal's size, read once a
-frame; blank where the screen does not reach; the predictions over it; the status line on the
-terminal's last row) and compares it with what it painted last, row by row (rows compare whole,
-links and flags included; a row shared with the last paint is skipped unread), then cell by cell,
-moving the cursor only to reach a changed cell. So a keystroke's echo writes a few bytes, and the
-status line is painted only where it changed.
-
-Every frame is wrapped in synchronized output (DEC 2026) with autowrap off (`?7l` … `?7h`), so
-nothing painted wraps or scrolls, the bottom-right cell included. A glyph is painted only where it
-fills exactly its cells; one that cannot (a hostile wide glyph in the last column) is a blank. After
-a glyph whose width a terminal may judge otherwise (ambiguous-width characters, multi-codepoint
-clusters), the next is placed with a cursor move, and such a wide glyph's cells are blanked first.
-A frame that cannot be a diff (the first, after a resume or a resize, or when the screen's or the
-terminal's size changed) clears the terminal and runs the same loop against a blank one, so nothing
-outside the screen survives. A new mouse mode turns the old one off first, and the window title is
-saved on entering the alternate screen and restored on leaving it.
-
-Rows that only moved since the last paint (the painted grid's rows, shared with the new screen at
-other indices) are moved on the terminal, not repainted: in a scroll region (`CSI t;b r`), `CSI n S`
-scrolls up and `CSI n T` down, and `CSI r` resets the region. The painter finds these moves itself,
-by the cells the rows share with the grid it painted, because that grid may be several frames
-behind; each scroll's region must overlap no other. A row that moved is moved even where painting
-it in place would write less, so what the terminal keeps of a row (the shell's marks on it) moves
-with it. SGR is reset first, so the rows a scroll brings in have the default background. It
-scrolls only on a terminal exactly the screen's size, and never the status line's row. A property
-test feeds incremental and whole paints, on terminals of the screen's size and smaller and with
-hyperlinks and the shell's marks, into a fux-vt terminal and checks it shows the same after every
-frame, marks the screen's prompt rows and no other, and was told of the shell's commands what the
-screen says.
+exported to what the shell runs), its marks carry it (`133;D;1;nonce=…`), and its session counts
+and relays only marks that do (fux-vt's `require_mark_nonce`, and the filter's `Marks::Signed`).
+So a program the shell runs cannot end or start a command: not `cat` of a file holding marks, not
+a shell of its own (ssh, a nested koh, a terminal multiplexer's shells), and not a shell's own
+integration, which is how fish 4 (which marks natively) or a user's own bash integration is not
+counted twice. For a program koh does not mark, and with `--no-shell-marks`, every mark counts:
+then the marks are whatever the program and what it runs send. The marks a client writes never
+carry the session's nonce, and the client drops every mark in the output itself, so only the
+relayed ones reach the user's terminal.
 
 ## The predictor
 
-The client guesses what each keystroke does to the screen and shows it immediately, then confirms
-or corrects when the authoritative server frame arrives. Confirmation
-is driven by the server's **echo-ack** (a 50 ms-debounced "your input up to frame N is now on
-screen"), not the raw network ack.
+The client guesses what each keystroke does to the screen and shows it immediately, as the
+overlay, then confirms or corrects it against the mirror once the program's echo came. Confirmation
+is driven by the server's **echo-ack** (`Echo(seq)`: "your input up to `seq` had its time to
+show"), not the raw network ack.
 
 **The PTY's modes.** Each screen carries how the program's PTY takes typed keys (`TtyModes`: the
-kernel's echo and line mode, read with `tcgetattr` through fuxix at every snapshot and every 100 ms
-while a client is attached, as a program may turn echo off without writing). Line mode without
+kernel's echo and line mode, read with `tcgetattr` through fuxix at every read and every 100 ms
+while a client is attached, as a program may turn echo off without writing; `Shown::Tty`). Line mode without
 echo is a password prompt (`getpass`, `read -s`, sudo, ssh, passwd): nothing typed is predicted
 and every prediction is dropped, however trusted the session was. The modes the client holds
 can lag the PTY's by a read interval (a program that prints its prompt, then turns echo off), so a
@@ -459,7 +289,7 @@ row's index, the history's newest row and the rows the frame moved, so it engage
 a full screen, where Enter scrolls. Kernel echo is trusted
 from the first key otherwise. Otherwise (a line editor, a full-screen program) the epoch logic decides: the first key
 of an epoch stays hidden until the server's echo confirms it, and a mispredict kills its epoch. A
-reconnect to the same session carries the trust it had, given once the first frame shows no
+reconnect to the same session carries the trust it had, given once the first output shows no
 password prompt, and only once the modes are known.
 
 The predictor takes edit keys only (focus changes never reach it), and predicts only in a
@@ -487,7 +317,8 @@ moves each wide glyph with its right half; one the shift splits (at the right ed
 inside) becomes unknown rather than half drawn. Backspace over a wide glyph, which a line editor
 takes back two cells, is not modelled. Control/escape sequences it doesn't model open a fresh epoch
 but make no concrete guess (they fall back to the server's real echo). A wrong or unconfirmed guess
-is always reconciled away — it never corrupts the display.
+is always reconciled away — it never corrupts the display: the overlay is taken back before
+the program's output is written.
 
 ## Reconnect & detachable sessions
 
@@ -498,31 +329,25 @@ another, `--session N` picks one, and `koh connect` alone the one attached last 
 has none); `koh sessions` lists them. Numbers are server-wide and only rise during a server's run,
 and `--max-sessions` bounds all peers' together; a reattach is always allowed. A detached session
 is reaped after `--session-ttl-secs` (default 24 h).
-One whose shell exited is kept until a client acknowledges its final frame (or the TTL ends), so a
+One whose shell exited is kept until a client was told its end (or the TTL ends), so a
 reconnect after the exit sees the exit and its status, not a fresh shell.
 
 The reconnect is **automatic and in-process**: the client doesn't exit when the link drops. A brief
 outage (e.g. a phone screen-off — Android freezes the process, so QUIC keepalives stop) is ridden
 out on the same connection thanks to a 5-minute connection idle timeout. A longer outage times the
 connection out; the client then transparently re-dials and reattaches to the same server session,
-holding the last screen under a `reconnecting…` banner in the meantime. One `ClientSession` lives
-for the whole run and one loop drives it, connected or not: only what belongs to a connection (its
-frames, echo-ack and acknowledgements) is dropped (`detach`) and made anew (`attach`), so the
-escape keys, the scrollback view, the window size and the colours work during the outage and carry
-across it. Typed input does not: what is typed while the link is down (and the banner stays up until
-the new connection's first frame shows which shell it reached) is not taken (nor predicted), what was not yet
-sent when the link dropped is dropped, and the banner says so; it also says when input handed to the
-lost connection was never confirmed, as what follows may run without it. The outage (`Outage`, from the
-first drop to that first frame; a drop meanwhile is the same outage) holds these as facts, and only the
-status line puts them in words, for the whole outage and a few seconds after. A notice on the status line
-can be given, retired and shown but not read (`notice::Notices`), so what it says decides nothing; a new outage retires what the last one lost. A redial asks
+holding the last screen under a `reconnecting…` status line in the meantime. One display and
+one input machine live for the whole run and one loop drives them, connected or not: only what
+belongs to a connection (its streams, epoch and echo-ack) is made anew, so the escape keys, the
+window size and the colours work during the outage and carry across it; the redial's epoch begins
+with a redraw of the screen as it is. Typed input does not: what is typed while the link is down is not taken (nor predicted),
+and the status line says so. A redial asks
 for the session the first connection reached, by its number in that server's run
 (`Pick::Resume`), never for another: if it is gone (it expired, its shell's end was seen, or the
 server restarted) the server says `NoSuchSession` and the client ends saying so, rather than
 landing in a new shell where keys typed at the old screen would run. Typing is still not carried
 across the drop: the end of a line whose start was lost with the link must not run alone
-(`false && rm …` typed across the drop must not run `rm …`). The history rows held are dropped
-by `attach` all the same, and the new connection's frames say the history again. A **wall-clock freeze
+(`false && rm …` typed across the drop must not run `rm …`). A **wall-clock freeze
 detector** turns a multi-minute wake-up hang into a ~1–2 s reattach: if real time jumps more than
 20 s between two (≤50 ms-cadence) loop iterations, the client concludes the process was suspended,
 drops the (almost certainly dead) connection, and re-dials immediately. The first iteration
@@ -534,10 +359,10 @@ The client loop's `select!` is the only place it waits: each writer task opens i
 a redial is a polled future, and a closed resize channel is disabled, so a server that grants no
 stream cannot block quitting or signals. The session's first phase asks the user's terminal its
 start-up questions on stdin's one decoder, with answers expected, so a late answer is still an
-answer and never reaches the program as keys. On a `SessionEnded` close, frames in flight are
-applied first, so the exit status is not lost. A suspend waits for SIGCONT (or a key, or a fatal
+answer and never reaches the program as keys. On a `SessionEnded` close, what is in flight is
+written first, so the exit status is not lost. A suspend waits for SIGCONT (or a key, or a fatal
 signal) before taking the terminal back. A refused redial (`NotAuthorized`, `NoSuchSession`) ends
-the client with the reason; any other close is redialed, the banner saying why.
+the client with the reason; any other close is redialed, the status line saying why.
 
 > **`--direct` and server restarts:** transparent re-dial targets the *same* address it first
 > dialed. By default `koh serve` binds an ephemeral UDP port, so a restarted server is elsewhere and
@@ -561,29 +386,28 @@ same peer can briefly share it, when a reconnect races the old connection's tear
 per-connection state never lives in the session:
 
 - **Echo-ack is per connection.** Input sequence numbers are the client's (one client's rise
-  across its reconnects; two clients' have nothing in common), so the input history and the 50 ms
-  debounce live in the per-connection `ServerConn` (`server::EchoAck`), not in the session, and
-  each frame carries its connection's own echo-ack. A session-global ack would hand one
-  connection another's numbers, and its predictor would treat every keystroke as already acked.
-- **A change wakes every connection.** The session task publishes each new screen on a
-  `tokio::sync::watch`; each connection holds a receiver and `select!`s on it. Every connection
-  wakes on one change; a burst coalesces into the latest screen; and a change landing between a
-  connection's read and its wait is never lost, because the receiver keeps the latest value.
-- **Detach on drop.** A connection holds a `SessionClient`, whose screen receiver is its
-  attachment: the session counts its clients as its `watch` sender's receivers, so dropping one
-  (on return **or** panic) detaches with no message to lose. The session starts the TTL when the
-  last receiver drops and tears itself down at the TTL. Input comes only from the newest
-  attachment, and only while the program runs; history has its own path (`Ask`) the session always
-  answers. `Registry::end(peer)` ends all of a peer's sessions, as revoking it does.
+  across its reconnects; two clients' have nothing in common), so each input's echo is told only
+  to the connection that sent it (`Event::Echo { attach, seq }`). A session-global ack would hand
+  one connection another's numbers, and its predictor would treat every keystroke as already
+  acked.
+- **What is shown goes to every connection.** The session task publishes what the program shows
+  on a `tokio::sync::broadcast` of 128 events; each connection holds a receiver, and one that lags
+  past it is sent a new epoch (a redraw), so no connection holds the session back.
+- **Detach on drop.** A connection holds a `SessionClient`, whose presence receiver is its
+  attachment, so dropping one (on return **or** panic) detaches with no message to lose. The
+  session starts the TTL when the last one drops and tears itself down at the TTL. Input comes only
+  from the newest attachment, and only while the program runs. `Registry::end(peer)` ends all of a
+  peer's sessions, as revoking it does.
 - **A listing asks each session.** `Registry::sessions(peer)` takes the peer's sessions from the
-  registry, which never waits on one, then asks each how it stands (an `Ask::Describe` beside
-  history requests: attached or since when not, its size, title and exit), waiting 2 s at most.
+  registry, which never waits on one, then asks each how it stands (attached or since when not,
+  its size, title, exit, its program's state, whether a command runs and the last one's status),
+  waiting 2 s at most.
 - **How a session ends.** Its program's exit is looked for at every tick. It ends once the exit is
   known and its output drained; after a 1 s grace if the program closed its terminal and ran on
   (as hung up, 129, which teardown makes true); or 5 s after the exit if a job left in the
-  background keeps writing. Its final frame goes, then up to max(1 s, two retries) for its
-  delivery: delivered, the session ends and the server closes with `SessionEnded`; not delivered,
-  the connection closes as a lost link and the session is kept for the reconnect. Teardown is
+  background keeps writing. Its `Exit` goes to every client attached; once one has read it, the
+  session ends and the server closes with `SessionEnded`; else the session is kept, with its end,
+  for the reconnect. Teardown is
   awaited, the reaper is drained, and the registry's `Sessions` forgets a session only once its task
   has ended, so a late end cannot unregister the session that replaced it.
 - **The bell hook.** `--on-bell <cmd>` / `ConnectConfig::bell_command` runs `sh -c` when
@@ -594,58 +418,88 @@ per-connection state never lives in the session:
   parent_env)` builds the child from an explicit parent environment (`env_clear`, then everything
   but `KOH_*`, sharing `pty::is_koh_env_key` with the PTY spawn), so the scrub is tested with a
   synthetic environment rather than assumed. The bell count is cumulative per server session, so
-  the first synced frame `prime`s the hook: bells from before this attach do not fire it. The hook
+  the first count the run hears (`Shown::Bell`, in each epoch's start) `prime`s the hook: bells
+  from before this attach do not fire it. The hook
   outlives a reconnect and is not re-primed, so bells during an outage do.
 
-## Commands and copies
+## Commands, jobs and copies
 
-`koh exec` and `koh cp` are a connection each, with no session and no terminal, through the same
-gate, permits and request as a shell.
+`koh exec`, `koh run` and the requests on jobs, `koh wait` and `koh cp` are a connection each,
+with no session and no terminal, through the same gate, permits and request as a shell. Where a
+request's paths are is `server::Place`: as the server user's shell takes them (`~`, `~/x`,
+relative in the home, unglobbed), or, for a scoped key, beneath its directory.
 
-- **`koh exec`** (`server::exec`, `client::exec`) runs the words joined with spaces as
-  `$SHELL -c LINE` (else the platform's `sh`) in the server user's home, with a session's
-  environment but `TERM`, as the leader of a session of its own (`fuxix::process::lead_session`,
-  which also closes every inherited descriptor), so it has no controlling terminal. It starts at
-  once: the rest of the client's stream is its stdin, read by the client from its own stdin on a
-  thread (`client::io::spawn_stdin`), whose end is the command's. Its stdout and stderr go back on a
+- **`koh exec`** (`server::exec`, `client::exec`) runs its words as they are, the program found
+  on the server's `PATH`, or with `--sh` a line by `$SHELL -c` (else the platform's `sh`), in the
+  server user's home or the directory asked (`-C`), with a session's environment but `TERM`, as
+  the leader of a session of its own (`fuxix::process::lead_session`, which also closes every
+  inherited descriptor), so it has no controlling terminal. It starts at once: the rest of the
+  client's stream is its stdin, read by the client from its own stdin on a thread
+  (`client::io::spawn_stdin`), whose end is the command's. Its stdout and stderr go back on a
   stream each, tagged (`request::ExecStream`), a chunk at a time, flushed as they come; then its
-  `ExitStatus` (its code, or 128 plus the signal) on a third, once both have ended, or, once it
-  exited, gone quiet for 100 ms (a job it left in the background holds the pipes). The client
-  writes its stdin and reads its output apart, so a command that never reads stdin never holds up
-  its output; a slow reader on either end holds the other back through the pipes and QUIC's flow
-  control. A lost connection, revocation, the server's shutdown or the client's signal hangs the
-  command up: SIGHUP to its process group, and the reaper sends SIGKILL to the group after a
-  second's grace, reaping the leader only then, so the group's id cannot have been reused. The
-  client exits with the status (141 if its own stdout closed, as SIGPIPE would), or 255 on its own
-  errors, as ssh does. No PTY mode: a command that wants a terminal wants a session.
-- **`koh cp`** (`copy`, `server::copy`, `client::copy`) moves a stream of items, each a framed
-  postcard `copy::Item` of at most 8 KiB, a file's bytes in `Data` chunks of at most 64 KiB, `End`
-  closing a file or directory and `Done` the stream: `Dir`, `File` and `Symlink` carry a `Name`
-  (no `/`, NUL, `.` or `..`), a mode (`0o7777` at most) and a modification time. The sender walks
-  each source (followed if it is a symlink, as `cp` follows its arguments), its tree as it is
-  (symlinks as symlinks, fifos, sockets and devices said `Skipped`), at most 128 directories deep,
-  each holding a descriptor. The receiver lands each top-level item beside its target as
-  `.koh-<random>.part`, creating every entry anew (`O_EXCL`, `mkdir`) and only inside directories
-  it created, so no name reaches outside the target or through a symlink; a directory's mode and
-  time are set at its `End`, after what is in it; at the item's end it is renamed into place,
-  which replaces a file but never a directory (`AlreadyExists`: a copy never merges). A stream that
-  ends before `Done`, a malformed item or an `Item::Failed` from the sender removes what was staged,
-  read-only directories made writable first. Each end runs on a blocking thread over `Read` or
-  `Write`, joined to the stream's task by a channel of at most 8 chunks. The destination is
-  resolved as `cp` would: inside it if it is a directory, else as it for one source. Remote paths
-  are the server user's shell's (`~`, `~/x`, relative in their home), unglobbed; a `Put`'s outcome
-  comes back as `Result<(), Failure>`, a failure as a kind (`copy::FailKind`) and a path, so it
-  reads the same whatever systems the ends run.
+  `ExitStatus` on a third (its code, or 128 plus the signal; or that it did not start, which the
+  client says as 127 for no such program and 126 for the rest), once both have ended, or, once it
+  exited, gone quiet for 100 ms (a job it left in the background holds the pipes). A slow reader
+  on either end holds the other back through the pipes and QUIC's flow control. A lost connection
+  (the command connection's idle timeout is 20 s, so a killed client is found within it),
+  revocation, the server's shutdown or the client's signal hangs the command up: SIGHUP to its
+  process group, and the reaper sends SIGKILL to the group after a second's grace, reaping the
+  leader only then, so the group's id cannot have been reused. The client exits with the status
+  (141 if its own stdout closed, as SIGPIPE would), or 255 on its own errors, as ssh does.
+- **Jobs** (`server::jobs`): `koh run` starts a command as `koh exec` does, with stdin
+  `/dev/null`, its stdout and stderr together into a log of the newest `--job-log-bytes` (4 MiB
+  by default; the oldest dropped and counted), and answers with its name at once; the job runs
+  until it exits, is signalled (`koh kill`, to its process group), or the server stops, which
+  hangs it up (129). A job is its peer's, by name (given, or the next number; one that ended is
+  replaced by a new one of its name); at most 64 are kept, an ended one given up first for a new
+  one, and an ended one is forgotten after the session TTL. `koh logs` sends the log, and with
+  `--follow` what comes until the job ends, then its status (`LogMsg::Dropped`, `Data`, `End`);
+  `koh jobs` lists them.
+- **`koh wait`** (`server::wait`) waits on the server, for as long as its connection lasts: for a
+  job to end (its status), its log to hold a text, or a file to exist; for a session's running
+  command to end (the one running as the wait began: at once if none), its program to read its
+  terminal (the state report's `reading`), or a text on its screen. A file under a scoped key is
+  looked for through no symlink. The client gives up at `--timeout` (124).
+- **`koh cp`** (`sync`, `server::copy`, `client::copy`) is a sync, the same whichever end is the
+  server. The sender walks its sources (each followed if it is a symlink, as `cp` follows its
+  arguments, but not under a scoped key), its tree as it is (symlinks as symlinks, fifos, sockets
+  and devices said `Skipped`), at most 128 directories deep, and sends a header for each entry
+  (`sync::Item`: `Dir`, `File`, `Symlink`, with a `Name`, no `/`, NUL, `.` or `..`, a mode of at
+  most `0o7777` and a time), each at most 8 KiB, running ahead of the answers by 64 files. The
+  receiver answers each file (`sync::Answer`): `Want { have, prefix }`, all of it or the rest of
+  a part it kept (whose start's hash the sender checks), or `Check { hash }`, the blake3 hash of
+  a file of the same size it has, which the sender answers with the bytes or `Same`. A file's
+  bytes go in chunks of at most 64 KiB to `.koh-HASH.part` beside it and are renamed over it once
+  whole; `--atomic` holds every rename and removal until the whole copy came. Every entry is
+  reached from the directory above it by its descriptor with `O_NOFOLLOW` (`sync::fsat`), so no
+  name reaches outside the destination or through a symlink. Directories merge; the destination's
+  missing parents are made; a file written gets its arrival time unless `-p`, and modes land less
+  setuid and setgid. `--delete` removes what the source does not have from each directory it
+  merges into, once the source said all it holds; `--exclude` patterns (`sync::glob`) match a name,
+  or a path from the source's top when they hold a `/`. The receiver ends with a `Summary`
+  (files new and replaced, unchanged, links, dirs, deleted, skipped, bytes), which the client says
+  in one line or as JSON. Each end runs on a blocking thread, joined to the stream's task by a
+  channel of at most 8 chunks.
+- **Scoped keys** (`names::Scope`, `server::cli::permitted`): a client saved with `cp=DIR` gets
+  copies beneath `DIR` and waits for a file there; with `exec=DIR`, commands and jobs started in
+  `DIR`; with no scope, everything. Any other request closes with `OutOfScope`. A scope changed
+  in `clients` closes the client's connections, as a removal does.
 
-The client renders through `client::ClientTerminal`, so tests can capture frames instead of
-driving a real terminal, and the predictor reads screens through `predict::ScreenView`
-(implemented for the client `Grid` and for `fux_vt::Screen`), which keeps `predict.rs` free of
-`crate::` imports.
+## Output for scripts
+
+Every command but `connect` works with no terminal. `--json` makes a command say one JSON value on
+stdout (`client::cli::Format`), and a failure `{"error":{"kind","message"}}`, its `kind` the
+`ProblemKind`'s name. Exit codes are one table (`main.rs`): 0 ok, 1 failed, 2 usage, 3 not
+reached, 4 refused or out of scope, 124 a wait timed out; `exec`, `wait` and `logs --follow` pass
+the remote status through (255 for koh's own error). `koh help-agents` is the page a script or an
+agent needs, kept short. While `exec` or `wait` runs inside a terminal that reads state reports,
+the client reports `busy` (`report_busy`), so the terminal does not take the wait for a program
+waiting for input.
 
 ## Security internals
 
 The trust boundaries and the defenses at each are in the [threat model](THREAT_MODEL.md); each
-finding fixed, with the tests that guard it, is in [SECURITY.md](../SECURITY.md). Two rules hold by
+finding fixed, with the tests that guard it, is in [SECURITY.md](../SECURITY.md). These hold by
 construction rather than by care at each call:
 
 - **What a peer chose is escaped where it is written.** koh writes outside the session only to one
@@ -657,12 +511,10 @@ construction rather than by care at each call:
   later, agrees, so neither a typo nor an editor saving the file (missing or empty a moment)
   disconnects anyone. A client added or removed is seen within 2 s. Removing one closes its
   connection and ends its session, and the registry attaches no peer the list no longer allows.
-- **What a server makes the client keep is bounded by bytes, and asked for.** The history cache
-  counts fux-vt's storage against `HISTORY_CACHE_BYTES` and keeps only rows a request it has
-  outstanding (by id) asked for. A frame's rows are strictly ascending, and its dictionary is built
-  from the end, stopping at its window. Server streams over 256 KiB need one of two turns, so the
-  client holds about 40 MiB of them, compressed, at most; history replies are inflated one at a
-  time in its loop, no further than `MAX_HISTORY_REPLY`, the most a legal reply holds.
+- **What a server makes the client keep is bounded.** The client reads one epoch's stream at a
+  time, a message at a time (at most 17 KiB), into a filter that holds at most one sequence and a
+  mirror with no history; a reply is read whole only up to its bound (`MAX_REPLY`, `MAX_OUTPUT`
+  for a session's text).
 - **Shutdown and handshakes.** One task counts SIGTERM, SIGINT and SIGHUP (unless SIGHUP was ignored at start,
   as `nohup` does): the first drains, a
   repeat within 1 s (a double SIGHUP on a terminal's close) is the same, and a later one forces an
@@ -683,25 +535,25 @@ second *container*. The verification is layered cheapest-first; everything but T
 The protocol, diff/apply, predictor and session registry need no network or TTY, so they're tested
 deterministically:
 
-- **State round-trip** — `apply(diff(base→target))` over `base` equals `target`, for screens (incl.
-  wide chars / emoji / combining marks).
-- **Protocol cores** — `ClientSession` and `ServerConn` driven with synthesized frames and
-  messages: bases, acknowledgements, resyncs, the frame window, pacing, retries, heartbeats,
-  backpressure and shutdown; `proto` round-trips, size caps, truncation and inflate bombs.
-- **Terminal / predictor** — diff+resize, predict→confirm→clear, predict→no-echo→suppress.
+- **The filter and the redraw** — questions dropped and marks relayed however the output is
+  split, bounds, titles and the clipboard; a redrawn terminal shows what the program drew, in its
+  modes, history and prompts included.
+- **Protocol cores** — `proto` and `request` round-trips and size caps; the pacing budget; the
+  display's overlay painted and taken back; a sync cut anywhere resumes, merges, deletes and
+  excludes, and lands nothing through a symlink or outside a scoped directory.
+- **Predictor** — predict→confirm→clear, predict→no-echo→suppress.
 - **Property tests and fuzzing** on the attacker-reachable parsers — assert never-panic and bounded.
-  Coverage-guided fuzz targets (`fuzz/fuzz_targets/`): `screen_apply` (the structured diff),
-  `history_apply` (scrollback), `proto_decode` (both directions of the wire), `request_decode`
-  (the opening request, the replies sent whole and a copy's items), `server_process`
-  (the hosted program's output), `server_input` and `client_input` (the user's input on each side)
-  and `client_input` (the terminal's start-up answers, read by the session's decoder).
+  Coverage-guided fuzz targets (`fuzz/fuzz_targets/`): `proto_decode` (both directions of the
+  wire), `request_decode` (the opening request, the replies sent whole and a copy's items),
+  `server_process` (the hosted program's output, through the emulator and the filter, redrawn),
+  `server_input` (the client's input, encoded for the program) and `client_input` (what the
+  user's terminal sends, start-up answers included, read by the session's decoder).
 - **The corpus** (`tests/corpus.rs`) — 113 recordings of real programs (`testing/corpus/`, from
   fux: shells, editors, pagers, TUIs, compilers, claude) through the whole pipeline in PTY-sized
-  pieces with their resizes: snapshot, frame, encoder and decoder, `ClientSession`, koh's own
-  `BackendTerminal`. After every frame, a fux-vt terminal reading every painted byte must show
-  what a fux-vt parser fed the same output shows; over a lossy link too, where it must converge on
-  every step. The recordings known to show otherwise are listed with the reason
-  (`testing/corpus/recording.rs`).
+  pieces with their resizes: the server's emulator and filter, the wire's encoding, the client's
+  display. A fux-vt terminal reading every byte the client wrote must show what a fux-vt parser
+  fed the program's output shows, and so must one fed the redraw of the server's screen at every
+  step.
 
 ### Tier 1 — real iroh endpoints on one machine (`cargo test`)
 
@@ -710,9 +562,10 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
 - **`tests/net/`** — a real `koh serve` accept loop and a real `koh connect` client loop on iroh
   endpoints whose only path is an in-process fault-injecting link (`tests/net/link.rs`, an iroh
   custom transport): loss, delay, jitter, duplication, reordering and outages under real QUIC. It
-  covers screen convergence (and that a stale screen is never shown), exactly-once ordered input,
-  reattach, a forced mid-session drop, exit status, resize, XON/XOFF, input backpressure, the bell
-  hook, prediction and the no-echo property, and hostile clients and servers. The corpus runs
+  covers screen convergence, exactly-once ordered input, reattach, a forced mid-session drop,
+  scrollback in the user's terminal, exit status, resize, XON/XOFF, input backpressure, a program
+  that stops reading, the bell hook, prediction and the no-echo property, and hostile clients and
+  servers. The corpus runs
   here too, through a real server and client under loss (eleven recordings by default, every one
   with `KOH_NET_CORPUS=all`).
 - **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs: output
@@ -729,10 +582,11 @@ A second host is just a second endpoint, and a TTY is just an allocated PTY.
   frames read back from the master, connected with `--direct` to an in-process server; the
   `Ctrl-^ Ctrl-Z` suspend under a job-control bash; and a `koh serve --local --port` process
   restarted under a connected client, which finds it again and hears its session is gone.
-- **`tests/commands.rs`** — the real binary's `koh exec` (output apart, statuses, stdin, the
-  hang-up), `koh cp` both ways (a tree with a mode, an odd name and a symlink, and a copy failing
-  partway landing nothing either way) and `koh sessions` beside `koh connect --new` and
-  `--session`, against an in-process server.
+- **`tests/commands.rs`** — the real binary's `koh exec` (words as they are, output apart,
+  statuses, stdin, the hang-up of a client stopped or killed), jobs (outliving their client,
+  waited for, followed and killed), `koh cp` both ways as a sync (changed files only, arrival
+  times, `--delete`), a scoped key, and `koh sessions`, `output` and `wait --session` beside `koh
+  connect --new` and `--session`, against an in-process server.
 
 The rules the tests keep are in their structure, not in lint lists a file can lift. Every test
 crate starts with `#![forbid(clippy::disallowed_methods)]`, so none can start a program, spawn a
@@ -749,9 +603,8 @@ The scoreboard sits beside the tests, in its own Cargo workspace:
   keystroke latency beside a flood on three links, server memory per session and instructions
   retired.
 
-Terminal I/O is behind `ClientTerminal`, so the same session loop runs against the real terminal
-(binary) or a capturing mock (tests). One layer down, `client::backend::KohBackend`'s provided
-methods emit all the ANSI, so the bytes are pinned by tests against a capturing backend.
+Terminal I/O is behind `client::backend::KohBackend`, so the same loop runs against the real
+terminal (binary) or a capturing one (tests), which can also be told what the overlay painted.
 
 ### Tier 2 — Android emulator: runtime, network realism, resilience ([`testing/android/`](../testing/android/))
 
@@ -779,12 +632,12 @@ prove correctness; only a real two-device run over a real radio proves *feel* an
 
 | Property | How koh delivers it |
 |---|---|
-| Keystrokes appear instantly on every link | predictor (shows once the server proves it echoes; confirmed by later frames) |
-| Survives suspend/resume + IP change, re-syncs to current screen | QUIC connection migration + a fresh frame against an acknowledged base (no backlog) |
-| A burst of superseded output never delays the current screen | one stream per frame, older frames reset; only the latest screen is sent |
+| Keystrokes appear instantly on every link | predictor (shows once the server proves it echoes; confirmed by its echo) |
+| Survives suspend/resume + IP change, re-syncs to current screen | QUIC connection migration + a redraw of the screen as it is (no backlog) |
+| A burst of output on a slow link never delays the current screen | pacing by what the client read; a client too far behind gets a new epoch, the old stream reset |
 | Password prompts show no predicted echo | emergent no-echo suppression in the predictor |
-| Reconnect lands you where the screen is *now* | a new connection starts from the blank screen and gets the current one |
+| Reconnect lands you where the screen is *now* | a redial's epoch starts with a redraw of the current screen |
 | Detach and reattach later, shell still running | server-side detachable sessions keyed by client id (reattach test) |
 | Interactive apps (vim/htop/fzf) that probe the terminal work | server synthesizes DSR/DA/DECRQM replies |
-| Client exits with the remote shell's status | exit code rides the final frame (`tests/net` session test) |
+| Client exits with the remote shell's status | `Shown::Exit` (`tests/net` session test) |
 | `Ctrl-^ Ctrl-Z` suspends like a terminal's suspend key | the client sends itself SIGTSTP, so the shell reports it "Stopped" and `fg` resumes (`tests/e2e_pty_binary.rs`) |

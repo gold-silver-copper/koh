@@ -1,41 +1,26 @@
-//! The server's live emulator: a `fux_vt::Parser` fed by the PTY, the title, icon, bell and
-//! clipboard it reports, and the replies to the program's queries.
+//! The server's live emulator: a `fux_vt::Parser` fed by the PTY, which answers the program's
+//! questions, encodes the client's input as the program asked, and keeps the screen a client is
+//! redrawn from, the shell's commands and the window title.
 
-use crate::terminal::grid::{Palette, RowCache};
-use crate::terminal::history::HistoryNames;
-use crate::terminal::{
-    Commands, Grid, HistoryMark, HistoryReply, HistoryRequest, Size, TerminalScreen, TtyModes,
-    MAXIMUM_CLIPBOARD_SIZE, MAX_TITLE_LEN,
-};
-use std::time::{Duration, Instant};
+use crate::terminal::{Size, MAX_TITLE_LEN};
 
 use crate::events::{InputEvent, WireColours};
 use fux_vt::keys::colour::Colours;
 use fux_vt::keys::encode::{key_bytes, paste};
 use fux_vt::{Event, Options, Parser, Sink, Unhandled};
 
-/// Decode an OSC title/icon payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
+/// Decode an OSC title payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
 fn title_from(bytes: &[u8]) -> String {
-    super::capped_chars(&String::from_utf8_lossy(bytes), MAX_TITLE_LEN)
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .take(MAX_TITLE_LEN)
+        .collect()
 }
 
-/// Whether `data` is base64: its alphabet, then at most two `=` of padding.
-fn is_base64(data: &[u8]) -> bool {
-    let text = data
-        .strip_suffix(b"==")
-        .or_else(|| data.strip_suffix(b"="))
-        .unwrap_or(data);
-    text.iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
-}
-
-/// What the emulator reports beside the grid: fux-vt's [`Event`]s and the replies to queries.
+/// What the emulator reports beside the screen: fux-vt's [`Event`]s and the replies to queries.
 #[derive(Default)]
 struct Observed {
     title: String,
-    icon: String,
-    /// The remote-set clipboard payload (OSC 52, base64), capped at [`MAXIMUM_CLIPBOARD_SIZE`].
-    clipboard: String,
     bell_count: u64,
     /// Query answers for the program's input, never part of the screen.
     host_replies: Vec<u8>,
@@ -52,15 +37,7 @@ impl Sink for Observed {
     fn event(&mut self, event: Event<'_>) {
         match event {
             Event::Title(t) => self.title = title_from(t),
-            Event::IconName(n) => self.icon = title_from(n),
             Event::Bell => self.bell_count = self.bell_count.saturating_add(1),
-            // Kept only as base64 within its cap, as the client checks it, so both ends hold the
-            // same: a query (`?`), which asks for the clipboard koh never reads, is not one.
-            Event::Clipboard { data, .. }
-                if data.len() <= MAXIMUM_CLIPBOARD_SIZE && is_base64(data) =>
-            {
-                self.clipboard = data.iter().copied().map(char::from).collect();
-            }
             // A colour no program set: the user's terminal's, if the client said it; else
             // unanswered, as a terminal that does not know it would leave it.
             Event::ColorQuery { number, bel } => {
@@ -68,9 +45,8 @@ impl Sink for Observed {
                     self.host_replies.extend_from_slice(&answer);
                 }
             }
-            // An oversized clipboard is dropped; desktop notifications (OSC 9, 777, 99) koh does
-            // not carry.
-            Event::Clipboard { .. } | Event::Notification(_) => {}
+            // The clipboard and notifications reach the user's terminal as the program wrote them.
+            Event::IconName(_) | Event::Clipboard { .. } | Event::Notification(_) => {}
         }
     }
     fn unhandled(&mut self, sequence: Unhandled<'_>) {
@@ -100,30 +76,25 @@ pub const IDENTITY: fux_vt::Identity = fux_vt::Identity {
     version: env!("CARGO_PKG_VERSION"),
 };
 
-/// What the server's terminal does beyond fux-vt's defaults, each because koh carries it to the
-/// user:
+/// What the server's terminal does beyond fux-vt's defaults.
 ///
-/// - events: the title, icon, bell and clipboard, which the client mirrors;
+/// It answers every question a program asks (the user's terminal never sees one,
+/// `crate::stream`), so it says what a terminal koh relays to can be asked:
+///
+/// - events: the title and the bell, for listings and the bell hook;
 /// - extended replies: DECRQM, DECXCPR and secondary DA, as a terminal answers them;
 /// - in-band resize (mode 2048) and the size query (`CSI 18 t`): koh knows the size, and tells a
 ///   program that asks, after a resize too;
-/// - the palette: a program's colours (OSC 4, 10, 11 and the rest) are kept and answered, and
-///   snapshots draw them as RGB, so the user's own palette never changes and nothing is left
-///   changed when they detach;
+/// - the palette: a program's colours (OSC 4, 10, 11 and the rest) are kept and answered;
 /// - reflow: a resize re-wraps the primary screen and its history, as the user's terminal would;
-/// - setting reports (DECRQSS) for the pen, the cursor shape and the margins: neovim draws its
-///   diagnostics' curly underline only if the pen it set comes back with `4:3`, and koh carries
-///   underline styles;
-/// - hyperlinks (OSC 8): each cell's link goes in its row on the wire, and the client paints it,
-///   unless the user turns links off;
+/// - setting reports (DECRQSS) for the pen, the cursor shape and the margins;
+/// - hyperlinks (OSC 8), which a redraw paints again;
 /// - the kitty keyboard protocol: the client sends decoded keys and the server encodes each as
 ///   the program asked ([`ServerTerminal::encode_input`]), so a program that pushed flags gets
 ///   kitty's keys from any terminal;
 /// - colour scheme updates (mode 2031): a program that subscribes hears when the user's terminal
 ///   reports a new scheme;
-/// - the shell's marks (OSC 133): each row, history's too, says whether a prompt starts on it,
-///   and the screen what the marks say of the shell's commands, so the client marks what it
-///   paints for the user's terminal;
+/// - the shell's marks (OSC 133), for `koh wait`, `koh output --last` and the state report;
 /// - koh's [`IDENTITY`].
 ///
 /// Left off: rectangle checksums (a program reading back its screen, which xterm refuses by
@@ -142,26 +113,13 @@ pub const OPTIONS: Options = Options::new()
     .with(fux_vt::Feature::PromptMarks)
     .with_identity(Some(IDENTITY));
 
-/// The server's terminal: the live parser, and the [`TerminalScreen`] snapshots it sends.
+/// The server's terminal: the live parser and what it observed.
 ///
 /// fux-vt is panic-free and bounded: it keeps no control-string payload beyond the OSC
 /// strings it reports, which it caps.
 pub struct ServerTerminal {
     parser: Parser,
     observed: Observed,
-    /// The program's exit code once it exited.
-    exit_code: Option<u32>,
-    /// The last snapshot's rows, which the next one shares where they are unchanged.
-    rows: RowCache,
-    /// The screen as it was when the program last began a frame (synchronized output), a whole
-    /// one, until taken.
-    frame_start: Option<TerminalScreen>,
-    /// Whether the program began a frame since this was last asked.
-    frame_began: bool,
-    /// The names of the history's rows on the wire.
-    names: HistoryNames,
-    /// How the PTY takes typed keys, as last read.
-    tty: Option<TtyModes>,
 }
 
 impl ServerTerminal {
@@ -172,12 +130,6 @@ impl ServerTerminal {
         Ok(Self {
             parser: Parser::with_options(size, history_bytes, OPTIONS)?,
             observed: Observed::default(),
-            exit_code: None,
-            rows: RowCache::default(),
-            frame_start: None,
-            frame_began: false,
-            names: HistoryNames::default(),
-            tty: None,
         })
     }
 
@@ -232,8 +184,7 @@ impl ServerTerminal {
         }
     }
 
-    /// The program's screen as it is now, its modes among it: what
-    /// [`encode_input`](Self::encode_input) encodes for.
+    /// The program's screen as it is now, its modes among it.
     pub fn live(&self) -> &fux_vt::Screen {
         self.parser.screen()
     }
@@ -244,61 +195,27 @@ impl ServerTerminal {
         self.parser.require_mark_nonce(nonce, None);
     }
 
-    /// Record the shell's exit code; the next snapshot carries it to the client.
-    pub fn set_exit_code(&mut self, code: u32) {
-        self.exit_code = Some(code);
-    }
-
     /// Feed the program's output. A failure (allocation or identity exhaustion) keeps what was
     /// applied and is logged.
-    ///
-    /// Where the program begins a frame (synchronized output, `CSI ? 2026 h`), the screen as it was
-    /// is kept, for [`FrameHold`] to send while the frame is drawn.
     pub fn process(&mut self, bytes: &[u8]) {
-        // The parser stops where a frame begins or ends, as it judges it (ESU, XTRESTORE, DECSTR
-        // or RIS end one), so the screen from before a frame is caught as the frame begins.
-        let mut rest = bytes;
-        loop {
-            let drawing = self.synchronized();
-            match self.parser.process_until_frame(rest, &mut self.observed) {
-                Ok(Some((taken, frame))) => {
-                    match frame {
-                        // A BSU while a frame is drawn begins none.
-                        fux_vt::Frame::Begun if drawing => {}
-                        fux_vt::Frame::Begun => {
-                            self.frame_began = true;
-                            self.frame_start = Some(self.snapshot());
-                        }
-                        fux_vt::Frame::Ended => self.frame_start = None,
-                    }
-                    rest = rest.get(taken..).unwrap_or_default();
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::warn!(error = %e, "terminal emulator refused shell output");
-                    break;
-                }
-            }
+        if let Err(e) = self.parser.process_with(bytes, &mut self.observed) {
+            tracing::warn!(error = %e, "terminal emulator refused shell output");
         }
-    }
-
-    /// Whether the program is drawing a frame it wants shown whole (synchronized output).
-    pub fn synchronized(&self) -> bool {
-        self.parser.screen().mode(fux_vt::Mode::SynchronizedOutput)
-    }
-
-    /// Whether the program began a frame since this was last asked, and the screen as it was
-    /// when it began the last one, if that one may still be drawn.
-    pub fn take_frame_start(&mut self) -> (bool, Option<TerminalScreen>) {
-        (
-            std::mem::take(&mut self.frame_began),
-            self.frame_start.take(),
-        )
     }
 
     /// Take the replies to the program's queries, which the caller must write to its input.
     pub fn take_host_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.observed.host_replies)
+    }
+
+    /// The window title the program set last.
+    pub fn title(&self) -> &str {
+        &self.observed.title
+    }
+
+    /// How often the bell rang.
+    pub const fn bell_count(&self) -> u64 {
+        self.observed.bell_count
     }
 
     /// Resize to `size`, clamped: it comes from the peer. Whether that changed the size; a
@@ -312,49 +229,7 @@ impl ServerTerminal {
             tracing::warn!(error = %e, rows = size.rows(), cols = size.cols(), "terminal emulator refused a resize");
             return false;
         }
-        // A resize ends a frame being drawn, as fux-vt turns synchronized output off.
-        self.frame_start = None;
-        // A reflow lays the history out afresh, its rows with new cells.
-        self.names.renew();
         true
-    }
-
-    /// The PTY's modes, read by its owner, for the next snapshot; whether they changed. Once known
-    /// they stay known: a diff cannot say "unknown again", so a client would keep the old ones.
-    pub fn set_tty(&mut self, tty: TtyModes) -> bool {
-        self.tty.replace(tty) != Some(tty)
-    }
-
-    /// The screen scrolled `offset` rows back into history, as this emulator shows it: what a
-    /// client's scrollback view at `offset` must show. For tests.
-    pub fn window(&self, offset: usize) -> TerminalScreen {
-        let grid = Grid::window_of(self.parser.screen(), offset);
-        self.screen(grid, HistoryMark::default(), Commands::default())
-    }
-
-    /// `grid`, `history` and `commands` with the side channels and modes as they are now.
-    fn screen(&self, grid: Grid, history: HistoryMark, commands: Commands) -> TerminalScreen {
-        TerminalScreen {
-            grid,
-            title: self.observed.title.clone(),
-            icon: self.observed.icon.clone(),
-            clipboard: self.observed.clipboard.clone(),
-            bell_count: self.observed.bell_count,
-            exit_code: self.exit_code,
-            history,
-            tty: self.tty,
-            commands,
-            // The session's, which it puts on each screen it publishes.
-            report: None,
-        }
-    }
-
-    /// The history rows `request` asks for that the history still holds, drawn in the last
-    /// snapshot's palette, the one their names are for (a program drawing a frame may change it a
-    /// moment, and change it back before the next snapshot).
-    pub fn history(&mut self, request: HistoryRequest) -> HistoryReply {
-        self.names
-            .reply(self.parser.screen(), self.rows.palette(), request)
     }
 
     /// The report a program that set in-band resize (mode 2048) is sent after a resize, for its
@@ -363,198 +238,64 @@ impl ServerTerminal {
         self.parser.resize_report()
     }
 
-    /// A snapshot of the current screen. Rows unchanged since the last snapshot share its cells.
-    /// A new palette that draws a row of the history otherwise names the history afresh: a client's
-    /// copies, in the old one, are then rows the history no longer holds. One that changes no row
-    /// of it (a colour the history never used) leaves the names, and the client's copies, alone.
-    pub fn snapshot(&mut self) -> TerminalScreen {
-        let palette = Palette::of(self.parser.screen());
-        if self.names.redrawn(self.rows.palette(), palette.as_ref()) {
-            tracing::debug!("a new palette redraws the history: it is named afresh");
-            self.names.renew();
-        }
-        let grid = Grid::of(self.parser.screen(), palette, &mut self.rows);
-        let history = self.names.mark(self.parser.screen());
-        let commands = Commands::of(self.parser.screen(), |id| self.rows.index_of(id));
-        self.screen(grid, history, commands)
+    /// The text the screen shows, soft-wrapped rows joined, at most `max` bytes.
+    pub fn screen_text(&self, max: usize) -> String {
+        let screen = self.parser.screen();
+        super::text_of(screen.rows().skip(screen.history_len()), 0, None, max)
     }
-}
 
-/// The longest a program's frame is held before its screen is sent anyway, so that a program that
-/// stopped mid-frame cannot freeze the screen. Terminals bound it between 100 and 200 ms.
-pub const FRAME_HOLD: Duration = Duration::from_millis(150);
-
-/// Which screen a session sends while a program draws a frame it wants shown whole: not the
-/// half-drawn one.
-///
-/// A program asks for it with synchronized output (DEC 2026). While the frame is drawn, the screen as it was when
-/// the frame began goes out, once; at its end (ESU, a resize or a reset), the screen. A frame held
-/// longer than [`FRAME_HOLD`] is let go, and the screen goes out as if the program had ended it.
-/// Without I/O: the session gives it the time.
-#[derive(Debug, Default)]
-pub struct FrameHold(Held);
-
-/// Where the program's frame stands.
-#[derive(Clone, Copy, Debug, Default)]
-enum Held {
-    /// No frame is drawn.
-    #[default]
-    Not,
-    /// The frame drawn was first seen then.
-    Since(Instant),
-    /// The frame drawn was let go after [`FRAME_HOLD`].
-    Released,
-}
-
-impl FrameHold {
-    /// After the program's output was fed to `emu`, at `now`: the screen to send, if any.
-    pub fn after_output(
-        &mut self,
-        emu: &mut ServerTerminal,
-        now: Instant,
-    ) -> Option<TerminalScreen> {
-        let (began, started) = emu.take_frame_start();
-        if !emu.synchronized() {
-            self.0 = Held::Not;
-            return Some(emu.snapshot());
-        }
-        match self.0 {
-            // A frame began in this output, so any before it ended: hold this one from now, even
-            // if the one before was let go and ended within the same output.
-            _ if began => self.0 = Held::Since(now),
-            Held::Not => self.0 = Held::Since(now),
-            Held::Since(since) if now.saturating_duration_since(since) < FRAME_HOLD => {}
-            Held::Since(_) | Held::Released => {
-                self.0 = Held::Released;
-                return Some(emu.snapshot());
+    /// The output of the last command the shell finished, as the primary screen and its history
+    /// still hold it, at most `max` bytes (its end); `None` if no command finished, or its output
+    /// scrolled out of the history.
+    pub fn last_output(&self, max: usize) -> Option<String> {
+        let screen = self.parser.screen();
+        let (start, end) = screen.commands().last_output?;
+        let rows: Vec<fux_vt::Row<'_>> = screen.main_rows().collect();
+        let from = rows.iter().position(|row| row.id() == start.row)?;
+        let to = rows.iter().position(|row| row.id() == end.row)?;
+        let span = rows.get(from..=to)?;
+        // The output ends where the end mark was: a mark at a row's first column ends it on the
+        // row before.
+        let (span, to_col) = match (span.split_last(), end.col) {
+            (Some((_, before)), 0) if !before.is_empty() => {
+                (before, before.last().map(fux_vt::Row::len))
             }
-        }
-        started
-    }
-
-    /// When the frame held is let go, if one is held.
-    pub fn deadline(&self) -> Option<Instant> {
-        match self.0 {
-            Held::Since(since) => since.checked_add(FRAME_HOLD),
-            Held::Not | Held::Released => None,
-        }
-    }
-
-    /// At `now`, past [`FrameHold::deadline`]: the screen to send, if a frame is still held.
-    pub fn expire(&mut self, emu: &mut ServerTerminal, now: Instant) -> Option<TerminalScreen> {
-        if !emu.synchronized() {
-            self.0 = Held::Not;
-            return None;
-        }
-        self.deadline().filter(|&deadline| now >= deadline)?;
-        self.0 = Held::Released;
-        Some(emu.snapshot())
-    }
-
-    /// Whether a frame is held: the screen sent is the one from before it began.
-    pub const fn holding(&self) -> bool {
-        matches!(self.0, Held::Since(_))
+            _ => (span, Some(usize::from(end.col).saturating_sub(1))),
+        };
+        Some(super::text_of(
+            span.iter().copied(),
+            usize::from(start.col),
+            to_col,
+            max,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::Grid;
-    use std::time::{Duration, Instant};
 
     #[test]
-    fn history_served_while_a_frame_is_drawn_is_drawn_in_the_palette_its_names_are_for() {
-        // The program sets colour 1 for a moment inside a frame, and back before it ends: the
-        // names stand, so the rows served meanwhile must be drawn as they were named.
-        let mut emu = ServerTerminal::new(4, 20, 1 << 20).unwrap();
-        for n in 0..10 {
-            emu.process(format!("\x1b[31mline {n}\x1b[m\r\n").as_bytes());
-        }
-        let mark = emu.snapshot().history();
-        emu.process(b"\x1b[?2026h\x1b]4;1;rgb:00/00/00\x07");
-        let reply = emu.history(HistoryRequest {
-            id: 0,
-            newest: mark.newest,
-            count: 1,
-        });
-        emu.process(b"\x1b]104;1\x07\x1b[?2026l");
-        assert_eq!(emu.snapshot().history(), mark);
-        assert_eq!(
-            reply.rows[0].runs[0].cell.fg,
-            crate::terminal::WireColor::Idx(1)
+    fn the_last_commands_output_and_the_screens_text() {
+        let mut t = ServerTerminal::new(4, 20, 1 << 20).expect("emulator");
+        t.process(
+            b"$ ls\r\n\x1b]133;C\x07one\r\n0123456789abcdefghijklmn\r\n\x1b]133;D;0\x07\
+              \x1b]133;A\x07$ ",
         );
-    }
-
-    #[test]
-    fn a_palette_change_names_the_history_afresh_only_if_it_redraws_it() {
-        // A client's copies of history rows were drawn in the old palette: new names make them
-        // rows the history no longer holds, so the client asks again. A colour the history never
-        // used changes none of them, so they keep their names, and the client its copies.
-        let mut emu = ServerTerminal::new(4, 20, 1 << 20).unwrap();
-        for n in 0..10 {
-            emu.process(format!("\x1b[31mline {n}\x1b[m\r\n").as_bytes());
-        }
-        let before = emu.snapshot().history();
-        emu.process(b"\x1b]4;5;rgb:00/00/00\x07");
         assert_eq!(
-            emu.snapshot().history(),
-            before,
-            "colour 5 draws no history row"
+            t.last_output(1 << 20).as_deref(),
+            Some("one\n0123456789abcdefghijklmn\n")
         );
-        emu.process(b"\x1b]4;1;rgb:00/00/00\x07");
-        let after = emu.snapshot().history();
-        assert_eq!(after.len, before.len);
-        assert!(after.oldest() > Some(before.newest), "{before:?} {after:?}");
-        assert_eq!(emu.snapshot().history(), after, "named once per palette");
-    }
-
-    /// Output that changes rows in every way: text, rewriting a row the same, erasing, scrolling,
-    /// inserted and deleted lines, the alternate screen, a reset.
-    const PIECES: [&str; 12] = [
-        "text",
-        "\r\n",
-        "\x1b[H",
-        "\x1b[Htext",
-        "\x1b[2J",
-        "\x1b[K",
-        "\x1b[2;4r\x1b[4;1H\n\x1b[r",
-        "\x1b[2L",
-        "\x1b[M",
-        "\x1b[?1049h",
-        "\x1b[?1049l",
-        "\x1bc",
-    ];
-
-    proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
-
-        /// A snapshot that reuses the last one's rows (by fux-vt row id and version) shows exactly
-        /// what one built from nothing does.
-        #[test]
-        fn a_snapshot_reusing_rows_shows_the_emulator_exactly(
-            steps in proptest::collection::vec(
-                (
-                    proptest::collection::vec(0..PIECES.len(), 0..4),
-                    proptest::option::of((2u16..8, 2u16..12)),
-                ),
-                1..16,
-            ),
-        ) {
-            let mut t = ServerTerminal::new(5, 10, 256).expect("emulator");
-            for (pieces, resize) in steps {
-                for piece in pieces {
-                    t.process(PIECES[piece].as_bytes());
-                }
-                if let Some((rows, cols)) = resize {
-                    t.resize(Size::new(rows, cols));
-                }
-                let reused = t.snapshot();
-                let palette = Palette::of(t.parser.screen());
-                let fresh = Grid::of(t.parser.screen(), palette, &mut RowCache::default());
-                proptest::prop_assert_eq!(reused.screen(), &fresh);
-            }
-        }
+        assert_eq!(
+            t.last_output(5).as_deref(),
+            Some("klmn\n"),
+            "its end, within the bound"
+        );
+        assert_eq!(t.screen_text(1 << 20), "one\n0123456789abcdefghijklmn\n$\n");
+        // Scrolled out of a history that keeps nothing: gone.
+        let mut t = ServerTerminal::new(2, 20, 0).expect("emulator");
+        t.process(b"\x1b]133;C\x07a\r\nb\r\nc\r\n\x1b]133;D;0\x07");
+        assert_eq!(t.last_output(1 << 20), None);
     }
 
     #[test]
@@ -614,298 +355,6 @@ mod tests {
             t.resize_report().as_deref(),
             Some(&b"\x1b[48;20;60;0;0t"[..])
         );
-    }
-
-    #[test]
-    fn a_programs_colours_are_drawn_as_rgb_until_it_resets_them() {
-        use fux_vt::Color;
-        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
-        t.process(b"\x1b[31mR\x1b[39mD");
-        let colours = |t: &mut ServerTerminal, col: u16| {
-            let snapshot = t.snapshot();
-            let cell = snapshot.screen().cell(0, col).expect("a cell");
-            (cell.fgcolor(), cell.bgcolor())
-        };
-        assert_eq!(colours(&mut t, 0), (Color::Idx(1), Color::Default));
-        // The row's cells do not change, only how they are drawn: the snapshot draws them anew.
-        t.process(b"\x1b]4;1;#ff0000\x1b\\\x1b]10;rgb:11/22/33\x07\x1b]11;#000080\x07");
-        let rgb = |r, g, b| Color::Rgb(fux_vt::Rgb { r, g, b });
-        let navy = rgb(0, 0, 0x80);
-        assert_eq!(colours(&mut t, 0), (rgb(0xff, 0, 0), navy));
-        assert_eq!(colours(&mut t, 1), (rgb(0x11, 0x22, 0x33), navy));
-        assert_eq!(
-            colours(&mut t, 7).1,
-            navy,
-            "a blank cell is in the background set"
-        );
-        // Reset, each colour is the user's terminal's again.
-        t.process(b"\x1b]104;1\x07\x1b]110\x07\x1b]111\x07");
-        assert_eq!(colours(&mut t, 0), (Color::Idx(1), Color::Default));
-        assert_eq!(colours(&mut t, 1), (Color::Default, Color::Default));
-        // The program is answered with the colours it set.
-        t.process(b"\x1b]4;1;#00ff00\x07\x1b]4;1;?\x07");
-        assert_eq!(t.take_host_replies(), b"\x1b]4;1;rgb:0000/ffff/0000\x07");
-    }
-
-    /// The text of row 0 of `screen`.
-    fn top(screen: &TerminalScreen) -> String {
-        screen
-            .screen()
-            .contents()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim_end()
-            .to_owned()
-    }
-
-    #[test]
-    fn a_frame_being_drawn_is_not_sent_half_drawn() {
-        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
-        let mut hold = FrameHold::default();
-        let start = Instant::now();
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        t.process(b"old frame");
-        assert_eq!(top(&hold.after_output(&mut t, at(0)).unwrap()), "old frame");
-        // The program begins a frame and draws half of it: the screen from before goes out, once.
-        t.process(b"\x1b[?2026h\x1b[H\x1b[2Knew");
-        assert_eq!(
-            top(&hold.after_output(&mut t, at(10)).unwrap()),
-            "old frame"
-        );
-        assert!(hold.holding());
-        t.process(b" fra");
-        assert!(
-            hold.after_output(&mut t, at(20)).is_none(),
-            "nothing while it draws"
-        );
-        // It ends the frame: the whole of it goes out.
-        t.process(b"me\x1b[?2026l");
-        assert_eq!(
-            top(&hold.after_output(&mut t, at(30)).unwrap()),
-            "new frame"
-        );
-        assert!(!hold.holding() && hold.deadline().is_none());
-        // A whole frame in one read is sent as it is.
-        t.process(b"\x1b[?2026h\x1b[H\x1b[2Kthird\x1b[?2026l");
-        assert_eq!(top(&hold.after_output(&mut t, at(40)).unwrap()), "third");
-    }
-
-    #[test]
-    fn a_frame_never_ended_is_let_go_after_the_hold() {
-        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
-        let mut hold = FrameHold::default();
-        let start = Instant::now();
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        t.process(b"before\x1b[?2026h\x1b[H\x1b[2Kstuck");
-        assert_eq!(top(&hold.after_output(&mut t, at(0)).unwrap()), "before");
-        assert_eq!(hold.deadline(), Some(at(0) + FRAME_HOLD));
-        assert!(
-            hold.expire(&mut t, at(100)).is_none(),
-            "not before the deadline"
-        );
-        assert_eq!(top(&hold.expire(&mut t, at(150)).unwrap()), "stuck");
-        assert!(hold.deadline().is_none() && !hold.holding());
-        // Let go, later output goes out as it comes, until the frame ends.
-        t.process(b"!");
-        assert_eq!(top(&hold.after_output(&mut t, at(160)).unwrap()), "stuck!");
-        t.process(b"\x1b[?2026l\x1b[?2026h");
-        assert!(hold.after_output(&mut t, at(170)).is_some());
-        assert!(hold.holding(), "a new frame is held again");
-    }
-
-    #[test]
-    fn a_frame_end_split_between_reads_is_found() {
-        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
-        t.process(b"\x1b[?2026h\x1b[2Kone");
-        let _ = t.take_frame_start();
-        // The ESU in two reads, then the next frame begins: it starts from the frame ended.
-        t.process(b"\x1b[?20");
-        t.process(b"26l\x1b[?2026h\x1b[H\x1b[2Ktw");
-        let (began, started) = t.take_frame_start();
-        assert!(began);
-        assert_eq!(top(&started.expect("a frame began")), "one");
-        // A BSU again while the frame is drawn begins none.
-        t.process(b"o\x1b[?2026h");
-        assert_eq!(t.take_frame_start(), (false, None));
-    }
-
-    #[test]
-    fn a_resize_ends_the_frame_held() {
-        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
-        let mut hold = FrameHold::default();
-        let now = Instant::now();
-        t.process(b"a\x1b[?2026hb");
-        assert!(hold.after_output(&mut t, now).is_some());
-        t.resize(Size::new(5, 20));
-        assert!(!t.synchronized());
-        assert!(hold.expire(&mut t, now + FRAME_HOLD).is_none());
-        assert!(!hold.holding());
-    }
-
-    #[test]
-    fn only_base64_sets_the_clipboard_and_a_query_sets_nothing() {
-        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
-        // Bytes no base64 holds, which lossy UTF-8 would have tripled.
-        t.process(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07\x1b]52;c;\xff\xfe=x\x07");
-        assert_eq!(t.snapshot().clipboard(), "aGVsbG8=");
-        assert_eq!(t.take_host_replies(), b"", "nor is it answered");
-        // Nor does one over the cap (anti-amplification).
-        let big = "A".repeat(MAXIMUM_CLIPBOARD_SIZE + 1);
-        t.process(format!("\x1b]52;c;{big}\x07").as_bytes());
-        assert_eq!(
-            t.snapshot().clipboard(),
-            "aGVsbG8=",
-            "oversized one dropped"
-        );
-    }
-
-    #[test]
-    fn tells_neovim_it_keeps_underline_styles() {
-        // neovim sets a curly underline and asks for the pen (DECRQSS); it draws its diagnostics
-        // curly only if `4:3` comes back.
-        let mut t = ServerTerminal::new(4, 20, 0).expect("emulator");
-        t.process(b"\x1b[4:3m\x1bP$qm\x1b\\");
-        let reply = t.take_host_replies();
-        assert!(
-            reply.starts_with(b"\x1bP1$r") && reply.windows(3).any(|w| w == b"4:3"),
-            "{:?}",
-            String::from_utf8_lossy(&reply)
-        );
-        // And the style reaches the screen sent.
-        t.process(b"x");
-        let snapshot = t.snapshot();
-        let cell = snapshot.screen().cell(0, 0).expect("a cell");
-        assert_eq!(cell.underline_style(), fux_vt::UnderlineStyle::Curly);
-    }
-
-    /// A prompt's mark changes no row's version, yet reaches the next snapshot, the client's
-    /// screen and the history; the shell's commands are placed on the screen, at its top left
-    /// once their row went into history.
-    #[test]
-    fn the_shells_marks_reach_the_snapshot_the_client_and_the_history() {
-        let mut t = ServerTerminal::new(4, 20, 1 << 20).expect("emulator");
-        t.process(b"$ ");
-        let before = t.snapshot();
-        // `P` marks the row the cursor is on, written already, with no fresh line.
-        t.process(b"\x1b]133;P\x07");
-        let marked = t.snapshot();
-        assert!(!before.screen().row_prompt(0) && marked.screen().row_prompt(0));
-        let mut client = before.clone();
-        client.apply(&marked.diff_from(&before)).expect("applies");
-        assert_eq!(client, marked);
-
-        t.process(b"ls\x1b]133;C\x07\r\nout\r\n\x1b]133;D;2\x07\x1b]133;A\x07$ \x1b]133;C\x07");
-        let commands = t.snapshot().commands();
-        assert_eq!(
-            (commands.finished, commands.status),
-            (1, Some(2)),
-            "{commands:?}"
-        );
-        assert_eq!(commands.output, Some(((0, 4), (2, 0))));
-        assert_eq!(commands.running, Some((2, 2)));
-        // Scrolled off: the first prompt's row is history, the running output's start too.
-        t.process(b"\r\n1\r\n2\r\n3\r\n4");
-        let scrolled = t.snapshot();
-        assert_eq!(scrolled.commands().running, Some((0, 0)));
-        assert_eq!(scrolled.commands().output, Some(((0, 0), (0, 0))));
-        let mark = scrolled.history();
-        let reply = t.history(HistoryRequest {
-            id: 0,
-            newest: mark.newest,
-            count: 4,
-        });
-        let prompts: Vec<bool> = reply.rows.iter().map(|row| row.flags.prompt).collect();
-        assert_eq!(prompts, [true, false, true]);
-    }
-
-    #[test]
-    fn a_resize_rewraps_the_primary_screen() {
-        let mut t = ServerTerminal::new(4, 20, 1 << 20).expect("emulator");
-        t.process(b"0123456789abcdefghijKLMNO");
-        t.resize(Size::new(4, 30));
-        let snapshot = t.snapshot();
-        let first = (0..30)
-            .filter_map(|col| snapshot.screen().cell(0, col))
-            .map(|c| c.contents().to_owned())
-            .collect::<String>();
-        assert_eq!(
-            first, "0123456789abcdefghijKLMNO",
-            "the wrapped line is one row again"
-        );
-    }
-
-    /// The emulator clamps a resize itself, behind the clamp at the protocol: a hostile size
-    /// never reaches fux-vt. The largest screen takes the most scrollback; the smallest takes wide
-    /// glyphs.
-    #[test]
-    fn a_resize_is_clamped_and_the_largest_fits_the_most_scrollback() {
-        use crate::terminal::{MAX_DIM, MIN_DIM};
-        let history =
-            usize::try_from(crate::server::cli::MAX_SCROLLBACK_BYTES).expect("fits usize");
-        let mut t = ServerTerminal::new(24, 80, history).expect("default size at max scrollback");
-        assert!(t.resize(Size::new(65000, 65000)));
-        assert_eq!(t.snapshot().size(), Size::new(MAX_DIM, MAX_DIM));
-        assert!(ServerTerminal::new(MAX_DIM, MAX_DIM, history).is_ok());
-        t.resize(Size::new(0, 0));
-        t.process("日本語\u{1f468}\u{200d}\u{1f469}x\r\n日".as_bytes());
-        assert_eq!(t.snapshot().size(), Size::new(MIN_DIM, MIN_DIM));
-    }
-
-    #[test]
-    fn unterminated_control_strings_are_bounded_and_recover() {
-        // fux-vt retains no DCS/APC/PM/SOS payload and caps a pending OSC at its payload limit, so
-        // a runaway string can't grow memory; terminating it resumes normal output.
-        let mut terminal = ServerTerminal::new(24, 80, 0).expect("emulator");
-        for introducer in [&b"\x1b]2;"[..], b"\x1bP", b"\x1bX", b"\x1b_", b"\x1b^"] {
-            terminal.process(b"before");
-            terminal.process(introducer);
-            for _ in 0..32 {
-                terminal.process(&[b'x'; 16 * 1024]);
-            }
-            terminal.process(b"\x1b\\after\r\n");
-        }
-        let contents = terminal.snapshot().screen().contents();
-        assert_eq!(contents.matches("beforeafter").count(), 5, "{contents:?}");
-        assert_eq!(
-            terminal.snapshot().title(),
-            "",
-            "an over-limit title is dropped, not truncated"
-        );
-    }
-
-    #[test]
-    fn split_osc_and_csi_keep_their_meaning() {
-        let mut terminal = ServerTerminal::new(24, 80, 0).expect("emulator");
-        for chunk in [
-            &b"\x1b"[..],
-            &b"]2;split"[..],
-            &b" title\x1b"[..],
-            &b"\\\x1b"[..],
-            &b"[5;3Hok"[..],
-        ] {
-            terminal.process(chunk);
-        }
-        assert_eq!(terminal.snapshot().title(), "split title");
-        assert!(terminal.snapshot().screen().contents().contains("ok"));
-    }
-
-    /// The bytes a program that wrote `setup` gets for `events`, as the client decoded them from
-    /// what the user's terminal sent (`sent`).
-    fn program_gets(setup: &[u8], sent: &[u8]) -> Vec<u8> {
-        let mut t = ServerTerminal::new(24, 300, 0).expect("emulator");
-        t.process(setup);
-        let mut inputs = Vec::new();
-        let mut decoder = fux_vt::keys::decode::Decoder::default();
-        decoder.bytes(sent, &mut inputs);
-        decoder.timeout(&mut inputs);
-        let events: Vec<InputEvent> = inputs
-            .into_iter()
-            .filter_map(InputEvent::from_input)
-            .collect();
-        let mut out = Vec::new();
-        t.encode_input(&events, &mut out);
-        out
     }
 
     #[test]
@@ -1073,30 +522,58 @@ mod tests {
     }
 
     #[test]
-    fn history_keeps_its_names_through_the_alternate_screen_and_a_resize_to_the_same_size() {
-        // The client caches history rows by name: a visit to the alternate screen (which has no
-        // history), or a resize that changes nothing, must not rename them all.
-        let mut t = ServerTerminal::new(24, 80, 1 << 20).expect("emulator");
-        for n in 0..300 {
-            t.process(format!("line {n}\r\n").as_bytes());
+    fn unterminated_control_strings_are_bounded_and_recover() {
+        // fux-vt retains no DCS/APC/PM/SOS payload and caps a pending OSC at its payload limit, so
+        // a runaway string can't grow memory; terminating it resumes normal output.
+        let mut terminal = ServerTerminal::new(24, 80, 0).expect("emulator");
+        for introducer in [&b"\x1b]2;"[..], b"\x1bP", b"\x1bX", b"\x1b_", b"\x1b^"] {
+            terminal.process(b"before");
+            terminal.process(introducer);
+            for _ in 0..32 {
+                terminal.process(&[b'x'; 16 * 1024]);
+            }
+            terminal.process(b"\x1b\\after\r\n");
         }
-        let before = t.snapshot().history();
-        assert!(before.len > 200, "{before:?}");
-        t.process(b"\x1b[?1049h");
-        t.snapshot();
-        t.process(b"\x1b[?1049l");
-        assert_eq!(t.snapshot().history(), before, "after the alternate screen");
-        assert!(!t.resize(Size::new(24, 80)));
+        let contents = terminal.screen_text(1 << 20);
+        assert_eq!(contents.matches("beforeafter").count(), 5, "{contents:?}");
         assert_eq!(
-            t.snapshot().history(),
-            before,
-            "after a resize to the same size"
+            terminal.title(),
+            "",
+            "an over-limit title is dropped, not truncated"
         );
-        assert!(t.resize(Size::new(24, 60)));
-        assert_ne!(
-            t.snapshot().history().newest,
-            before.newest,
-            "a reflow renames"
-        );
+    }
+
+    #[test]
+    fn split_osc_and_csi_keep_their_meaning() {
+        let mut terminal = ServerTerminal::new(24, 80, 0).expect("emulator");
+        for chunk in [
+            &b"\x1b"[..],
+            &b"]2;split"[..],
+            &b" title\x1b"[..],
+            &b"\\\x1b"[..],
+            &b"[5;3Hok"[..],
+        ] {
+            terminal.process(chunk);
+        }
+        assert_eq!(terminal.title(), "split title");
+        assert!(terminal.screen_text(1 << 20).contains("ok"));
+    }
+
+    /// The bytes a program that wrote `setup` gets for `events`, as the client decoded them from
+    /// what the user's terminal sent (`sent`).
+    fn program_gets(setup: &[u8], sent: &[u8]) -> Vec<u8> {
+        let mut t = ServerTerminal::new(24, 300, 0).expect("emulator");
+        t.process(setup);
+        let mut inputs = Vec::new();
+        let mut decoder = fux_vt::keys::decode::Decoder::default();
+        decoder.bytes(sent, &mut inputs);
+        decoder.timeout(&mut inputs);
+        let events: Vec<InputEvent> = inputs
+            .into_iter()
+            .filter_map(InputEvent::from_input)
+            .collect();
+        let mut out = Vec::new();
+        t.encode_input(&events, &mut out);
+        out
     }
 }

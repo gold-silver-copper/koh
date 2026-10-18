@@ -401,7 +401,7 @@ struct Results {
     latency: Vec<(&'static str, Vec<(System, LatencyRuns)>)>,
     /// By action, by profile, by system: each run's p50.
     settle: Vec<(Action, Vec<SettleProfile>)>,
-    /// Each workload's history, and what fetching it all costs koh.
+    /// Each workload's history, and what koh's redraw on an attach costs.
     scrollback: Vec<(String, usize, scrollback::History)>,
 }
 
@@ -466,7 +466,7 @@ async fn run(args: &Args) -> anyhow::Result<String> {
                         .scrollback
                         .push((workload.name.clone(), workload.bytes(), history));
                 }
-                Err(e) => eprintln!("scrollback {}: {e:#}", workload.name),
+                Err(e) => eprintln!("redraw {}: {e:#}", workload.name),
             }
         }
         for (seed, workload) in (1u64..).zip(&list) {
@@ -604,8 +604,8 @@ async fn run(args: &Args) -> anyhow::Result<String> {
         out.push_str(
             "What a session's terminal costs the server: a child process makes server emulators \
              at 40x120 with the scrollback given, fills them (or not) with enough lines of text \
-             to fill the scrollback and the screen, takes a snapshot of each as a session holds \
-             one, and reports how much its resident memory grew, per session. A session also \
+             to fill the scrollback and the screen, and reports how much its resident memory \
+             grew, per session. A session also \
              holds a PTY, two threads and its connection, which this does not count.\n\n\
              | Scrollback | Sessions | Idle | Full |\n| ---: | ---: | ---: | ---: |\n",
         );
@@ -768,8 +768,8 @@ fn summary(out: &mut String, systems: &[System], results: &Results) {
     for s in systems {
         let v = match s {
             System::Koh if rows > 0 => format!(
-                "the server's, in full colour, kept across reconnects ({rows} rows of the \
-                 workloads in {} KiB)",
+                "the terminal's own, its last 1000 rows sent again on an attach ({rows} rows of \
+                 the workloads in {} KiB)",
                 kib(bytes)
             ),
             System::Koh | System::Mosh => "none".to_owned(),
@@ -789,17 +789,18 @@ fn scrollback_section(out: &mut String, systems: &[System], results: &Results) {
     if kept.is_empty() {
         return;
     }
-    out.push_str("\n## Scrollback\n\n");
+    out.push_str("\n## Redraw on an attach\n\n");
     out.push_str(
-        "Each workload played into a server emulator keeping the default 8 MiB, then \
-         every row of its history fetched as koh's scrollback view (`Ctrl-^ [`) fetches them: \
-         the bytes of the compressed history streams, in KiB. koh fetches a row only when the \
-         user scrolls to it (and the newest screenful when idle), and never twice. mosh keeps \
+        "Each workload played into a server emulator keeping the default 8 MiB, then the \
+         redraw a client attaching afresh is sent: the screen and up to 1000 rows of history \
+         above it, written into the user's terminal's own scrollback, in KiB as the messages \
+         carry it. koh's output goes to the user's terminal as the program wrote it, so its \
+         scrollback is the terminal's; the redraw puts it back on another terminal. mosh keeps \
          no history; ssh's is the user's terminal's, which every byte of output already paid \
          for, and which a reconnect loses. Workloads that leave no history (those on the \
          alternate screen) are left out.\n\n",
     );
-    out.push_str("| Workload | Output KiB | History rows |");
+    out.push_str("| Workload | Output KiB | History rows sent |");
     for system in systems {
         let _ = write!(out, " {} |", system.name());
     }
@@ -1104,12 +1105,10 @@ fn instructions_section(out: &mut String) {
                  child process of its own, the fewest of three runs less the fewest of three \
                  baseline runs (making the same inputs, doing nothing with them). *Emulator*: \
                  the output fed to the server's emulator in 4 KiB reads, per byte. *Server*: \
-                 the same, with the snapshot, diff and encoded frame a session's burst takes \
-                 after every read, per byte: an interactive program's pace, and more than a \
-                 flood costs, since a session takes one snapshot per burst of up to 65 reads \
-                 and sends frames at most once per frame interval. *Client*: those frames \
-                 decoded, applied and painted, per frame.\n\n\
-                 | Workload | Emulator, per byte | Server, per byte | Client, per frame |\n\
+                 the same, each read also filtered and its messages encoded, per byte. \
+                 *Client*: those messages decoded and written to the user's terminal, its \
+                 mirror fed and the overlay painted, per message.\n\n\
+                 | Workload | Emulator, per byte | Server, per byte | Client, per message |\n\
                  | --- | ---: | ---: | ---: |",
                 counter.name()
             );

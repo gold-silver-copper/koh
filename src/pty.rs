@@ -299,6 +299,13 @@ impl Running {
         .map_err(io::Error::from)
     }
 
+    /// Send `signal` to what it reaches: its group, for a command with no terminal.
+    pub(crate) fn kill(&self, signal: Signal) {
+        if let Err(error) = self.signal(signal) {
+            tracing::debug!(%error, "signalling a command failed");
+        }
+    }
+
     /// How it ended, if it has; reaped then.
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<Exit>> {
         let Some(status) = self.child.try_wait()? else {

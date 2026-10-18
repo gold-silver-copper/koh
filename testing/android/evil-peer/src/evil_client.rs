@@ -106,7 +106,10 @@ async fn main() -> Result<()> {
     // A shell, asked for on the first stream, kept open as the control stream; the server's first
     // stream admits us.
     let mut control = conn.open_uni().await?;
-    let shell = koh::request::Request::Shell(koh::request::Pick::Latest);
+    let shell = koh::request::Request::Shell {
+        pick: koh::request::Pick::Latest,
+        size: koh::terminal::Size::new(24, 80),
+    };
     control
         .write_all(&koh::request::encode(&shell, koh::request::MAX_REQUEST)?)
         .await?;

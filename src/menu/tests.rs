@@ -43,11 +43,20 @@ fn the_overview_shows_both_keys_and_both_lists() {
         crate::identity::load(&crate::identity::KeyFile::open(&places.client_key).unwrap())
             .unwrap()
             .endpoint_id();
-    names::update(&places, List::Servers, |n| n.add("laptop", id(1), None)).unwrap();
+    names::update(&places, List::Servers, |n| {
+        n.add("laptop", id(1), None, names::Scope::default())
+    })
+    .unwrap();
     names::record_connected(&places.client_key, id(1)).unwrap();
     let direct = Some(names::Route::Direct(([10, 0, 0, 2], 4433).into()));
-    names::update(&places, List::Servers, |n| n.add("desk", id(2), direct)).unwrap();
-    names::update(&places, List::Clients, |n| n.add("phone", id(3), None)).unwrap();
+    names::update(&places, List::Servers, |n| {
+        n.add("desk", id(2), direct, names::Scope::default())
+    })
+    .unwrap();
+    names::update(&places, List::Clients, |n| {
+        n.add("phone", id(3), None, names::Scope::default())
+    })
+    .unwrap();
     let (_, shown) = menu(&places, "q\n");
     assert!(shown.contains(&names::short(client)), "{shown}");
     assert!(
@@ -77,7 +86,10 @@ fn the_overview_shows_both_keys_and_both_lists() {
 fn one_entry_is_picked_as_1() {
     let dir = Scratch::new("one");
     let places = dir.places();
-    names::update(&places, List::Clients, |n| n.add("phone", id(3), None)).unwrap();
+    names::update(&places, List::Clients, |n| {
+        n.add("phone", id(3), None, names::Scope::default())
+    })
+    .unwrap();
     let (_, shown) = menu(&places, "q\n");
     assert!(
         shown.contains("1 pick") && !shown.contains("[1-1]"),
@@ -102,8 +114,14 @@ fn a_server_added_is_saved_and_connected_to() {
 fn with_several_servers_connect_asks_which() {
     let dir = Scratch::new("connect-which");
     let places = dir.places();
-    names::update(&places, List::Servers, |n| n.add("laptop", id(1), None)).unwrap();
-    names::update(&places, List::Servers, |n| n.add("desk", id(2), None)).unwrap();
+    names::update(&places, List::Servers, |n| {
+        n.add("laptop", id(1), None, names::Scope::default())
+    })
+    .unwrap();
+    names::update(&places, List::Servers, |n| {
+        n.add("desk", id(2), None, names::Scope::default())
+    })
+    .unwrap();
     assert_eq!(
         menu(&places, "c\ndesk\n").0,
         Choice::Connect("desk".to_owned())
@@ -145,7 +163,10 @@ fn a_bad_name_or_id_is_refused_and_nothing_saved() {
 fn delete_asks_first() {
     let dir = Scratch::new("delete");
     let places = dir.places();
-    names::update(&places, List::Servers, |n| n.add("laptop", id(1), None)).unwrap();
+    names::update(&places, List::Servers, |n| {
+        n.add("laptop", id(1), None, names::Scope::default())
+    })
+    .unwrap();
     let (_, shown) = menu(&places, "1\nd\nn\nq\n");
     assert!(
         shown.contains("delete server laptop? [y/N]") && shown.contains("kept"),
@@ -160,7 +181,10 @@ fn delete_asks_first() {
 fn rename_and_show_the_full_id() {
     let dir = Scratch::new("rename");
     let places = dir.places();
-    names::update(&places, List::Clients, |n| n.add("phone", id(3), None)).unwrap();
+    names::update(&places, List::Clients, |n| {
+        n.add("phone", id(3), None, names::Scope::default())
+    })
+    .unwrap();
     let (_, shown) = menu(&places, "1\ni\n1\nr\ntablet\nq\n");
     assert!(shown.contains(&id(3).to_string()), "the full id: {shown}");
     assert_eq!(
@@ -173,7 +197,10 @@ fn rename_and_show_the_full_id() {
 fn overwriting_a_name_asks_first() {
     let dir = Scratch::new("overwrite");
     let places = dir.places();
-    names::update(&places, List::Servers, |n| n.add("laptop", id(1), None)).unwrap();
+    names::update(&places, List::Servers, |n| {
+        n.add("laptop", id(1), None, names::Scope::default())
+    })
+    .unwrap();
     let typed = format!("a\ns\nlaptop\n{}\nn\nq\n", id(2));
     let (_, shown) = menu(&places, &typed);
     assert!(
@@ -191,7 +218,10 @@ fn overwriting_a_name_asks_first() {
         [("laptop".to_owned(), id(2))]
     );
     // A replacement that cannot be saved (the id is another name's) leaves the old one.
-    names::update(&places, List::Servers, |n| n.add("desk", id(3), None)).unwrap();
+    names::update(&places, List::Servers, |n| {
+        n.add("desk", id(3), None, names::Scope::default())
+    })
+    .unwrap();
     let typed = format!("a\ns\nlaptop\n{}\ny\nq\n", id(3));
     let (_, shown) = menu(&places, &typed);
     assert!(shown.contains("already saved as"), "{shown}");
@@ -207,7 +237,10 @@ fn a_reset_says_who_loses_access_and_needs_the_keys_name_typed() {
     let places = dir.places();
     let key = crate::identity::KeyFile::open(&places.client_key).unwrap();
     drop(crate::identity::load(&key).unwrap());
-    names::update(&places, List::Servers, |n| n.add("laptop", id(1), None)).unwrap();
+    names::update(&places, List::Servers, |n| {
+        n.add("laptop", id(1), None, names::Scope::default())
+    })
+    .unwrap();
     let (_, shown) = menu(&places, "k\nr\nclient\nyes\nq\n");
     assert!(
         shown.contains("servers that allow you now: laptop"),

@@ -29,22 +29,32 @@ fn the_docs_state_the_limits_the_code_enforces() {
         ),
         (
             &threat_model,
-            format!("inflated with a {} limit", mib(koh::proto::MAX_FRAME)),
+            format!(
+                "a control string of at most {}, a control sequence of at most {} bytes",
+                mib(koh::stream::MAX_STRING),
+                koh::stream::MAX_CSI,
+            ),
         ),
         (
             &architecture,
+            format!("pieces of at most {} KiB", koh::stream::MAX_OUT >> 10),
+        ),
+        (
+            &threat_model,
             format!(
-                "`HISTORY_CACHE_BYTES` ({},",
-                mib(koh::terminal::HISTORY_CACHE_BYTES)
+                "a job's log of {} by default and at most {}",
+                mib(usize::try_from(koh::server::cli::DEFAULT_JOB_LOG_BYTES).unwrap()),
+                mib(usize::try_from(koh::server::cli::MAX_JOB_LOG_BYTES).unwrap()),
             ),
         ),
         (
             &threat_model,
             format!(
-                "an opening request of at most {}, a command line of at most {} KiB with no NUL, \
-                 paths of at most {} bytes with no NUL, at most {} sources",
+                "an opening request of at most {}, a command of at most {} KiB and {} words with \
+                 no NUL, paths of at most {} bytes with no NUL, at most {} sources",
                 mib(koh::request::MAX_REQUEST),
                 koh::request::MAX_COMMAND >> 10,
+                koh::request::MAX_ARGS,
                 koh::request::MAX_PATH,
                 koh::request::MAX_SOURCES,
             ),
@@ -53,13 +63,13 @@ fn the_docs_state_the_limits_the_code_enforces() {
             &threat_model,
             format!(
                 "a chunk of {} KiB, an item of at most {} KiB",
-                koh::copy::CHUNK >> 10,
-                koh::copy::MAX_ITEM >> 10,
+                koh::sync::CHUNK >> 10,
+                koh::sync::MAX_ITEM >> 10,
             ),
         ),
         (
             &threat_model,
-            format!("at most {} directories deep", koh::copy::MAX_DEPTH),
+            format!("at most {} directories deep", koh::sync::MAX_DEPTH),
         ),
         (
             &threat_model,

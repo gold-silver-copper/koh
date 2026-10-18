@@ -2,8 +2,8 @@
 //!
 //! `servers`, the servers this machine connects to, sits beside the client key; `clients`, the
 //! clients allowed to connect to it, beside the server key. Each line is `name id`, and a server's
-//! may end with how to dial it, `direct=IP:PORT` or `relay=URL`; `#` lines and blank lines are kept
-//! as they are. Both files go through [`KeyFile`]'s rules, as the key does:
+//! may end with how to dial it, `direct=IP:PORT` or `relay=URL`, a client's with its scope
+//! (`cp=DIR`, `exec=DIR`, [`Scope`]); `#` lines and blank lines are kept as they are. Both files go through [`KeyFile`]'s rules, as the key does:
 //! `clients` decides who may open a shell here.
 //!
 //! When each server was last reached is kept apart, in `connected` beside the client key (`id
@@ -136,6 +136,67 @@ impl std::fmt::Display for Route {
     }
 }
 
+/// What a client may do on the server: everything, or only what its words name.
+///
+/// - `cp=DIR`: copies to and from DIR and what is in it, and nowhere else: a path is taken from
+///   DIR, and none reaches out of it, by `..`, `~` or a symlink.
+/// - `exec=DIR`: commands and jobs (`koh exec`, `run`, `jobs`, `logs`, `kill`, `wait` on a job or
+///   for a file in DIR), started in DIR or a directory in it. A command is no sandbox: it can do
+///   whatever the server user can.
+///
+/// A scoped client gets no shell session, no session list and no session's text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub cp: Option<PathBuf>,
+    pub exec: Option<PathBuf>,
+}
+
+impl Scope {
+    /// Whether the client may do everything.
+    pub const fn is_full(&self) -> bool {
+        self.cp.is_none() && self.exec.is_none()
+    }
+
+    /// A directory a scope names: absolute, holding no whitespace or `..`.
+    pub fn dir(text: &str) -> anyhow::Result<PathBuf> {
+        let path = PathBuf::from(text);
+        anyhow::ensure!(
+            path.is_absolute()
+                && !text.contains(char::is_whitespace)
+                && !path
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir),
+            "a scope's directory is an absolute path with no spaces or `..`, not {text:?}"
+        );
+        Ok(path)
+    }
+
+    /// Add the word `word` (`cp=DIR` or `exec=DIR`), refused if it is another or said twice.
+    fn take(&mut self, word: &str) -> anyhow::Result<()> {
+        let (slot, dir) = match word.split_once('=') {
+            Some(("cp", dir)) => (&mut self.cp, dir),
+            Some(("exec", dir)) => (&mut self.exec, dir),
+            _ => anyhow::bail!("expected `cp=DIR` or `exec=DIR`, found {word:?}"),
+        };
+        anyhow::ensure!(slot.is_none(), "{word:?} is said twice");
+        *slot = Some(Self::dir(dir)?);
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for Scope {
+    /// The scope as the file holds it, each word after a space.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(dir) = &self.cp {
+            write!(f, " cp={}", dir.display())?;
+        }
+        if let Some(dir) = &self.exec {
+            write!(f, " exec={}", dir.display())?;
+        }
+        Ok(())
+    }
+}
+
 /// A saved name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -143,16 +204,18 @@ pub struct Entry {
     pub id: EndpointId,
     /// How to dial it, for a server saved with one.
     pub route: Option<Route>,
+    /// What it may do, for a client.
+    pub scope: Scope,
 }
 
 impl std::fmt::Display for Entry {
     /// The entry as its file holds it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.name, self.id)?;
-        match &self.route {
-            Some(route) => write!(f, " {route}"),
-            None => Ok(()),
+        if let Some(route) = &self.route {
+            write!(f, " {route}")?;
         }
+        write!(f, "{}", self.scope)
     }
 }
 
@@ -179,22 +242,25 @@ impl Names {
             let mut words = trimmed.split_whitespace();
             let expected = match list {
                 List::Servers => "`name id`, or `name id direct=IP:PORT` or `name id relay=URL`",
-                List::Clients => "`name id`",
+                List::Clients => "`name id`, then perhaps `cp=DIR` and `exec=DIR`",
             };
-            let (Some(name), Some(id), route, None) =
-                (words.next(), words.next(), words.next(), words.next())
-            else {
+            let (Some(name), Some(id)) = (words.next(), words.next()) else {
                 anyhow::bail!("{}: expected {expected}, found {trimmed:?}", at());
             };
             check_name(name).with_context(at)?;
             let id = parse_endpoint_id(id).with_context(at)?;
-            let route = match (route, list) {
-                (None, _) => None,
-                (Some(route), List::Servers) => Some(Route::parse(route).with_context(at)?),
-                (Some(_), List::Clients) => {
-                    anyhow::bail!("{}: expected {expected}, found {trimmed:?}", at())
+            let (mut route, mut scope) = (None, Scope::default());
+            for word in words {
+                match list {
+                    List::Servers if route.is_none() => {
+                        route = Some(Route::parse(word).with_context(at)?);
+                    }
+                    List::Servers => {
+                        anyhow::bail!("{}: expected {expected}, found {trimmed:?}", at())
+                    }
+                    List::Clients => scope.take(word).with_context(at)?,
                 }
-            };
+            }
             if names.get(name).is_some() {
                 anyhow::bail!("{}: {name:?} is named twice", at());
             }
@@ -202,6 +268,7 @@ impl Names {
                 name: name.to_owned(),
                 id,
                 route,
+                scope,
             }));
         }
         Ok(names)
@@ -244,9 +311,15 @@ impl Names {
             .map(|entry| entry.name.as_str())
     }
 
-    /// Save `id` as `name`, dialed by `route` if given: refused if the name is taken or the id is
-    /// saved under another name.
-    pub fn add(&mut self, name: &str, id: EndpointId, route: Option<Route>) -> anyhow::Result<()> {
+    /// Save `id` as `name`, dialed by `route` if given, scoped to `scope`: refused if the name is
+    /// taken or the id is saved under another name.
+    pub fn add(
+        &mut self,
+        name: &str,
+        id: EndpointId,
+        route: Option<Route>,
+        scope: Scope,
+    ) -> anyhow::Result<()> {
         check_name(name)?;
         if self.get(name).is_some() {
             anyhow::bail!("{name:?} is already saved; remove or rename it first");
@@ -258,6 +331,7 @@ impl Names {
             name: name.to_owned(),
             id,
             route,
+            scope,
         }));
         Ok(())
     }
@@ -373,6 +447,8 @@ pub enum Op {
         id: EndpointId,
         /// How to dial it: only a server has one.
         route: Option<Route>,
+        /// What it may do: only a client has one.
+        scope: Scope,
     },
     Remove {
         name: String,
@@ -406,11 +482,23 @@ pub fn run(
                 writeln!(out, "{entry}")?;
             }
         }
-        Op::Add { name, id, route } => {
+        Op::Add {
+            name,
+            id,
+            route,
+            scope,
+        } => {
             let dialed = route
                 .as_ref()
                 .map_or_else(String::new, |route| format!(", {route}"));
-            update(places, list, |names| names.add(&name, id, route))?;
+            let scoped = scope.to_string();
+            let scoped = if scoped.is_empty() {
+                String::new()
+            } else {
+                format!(", scoped to{scoped}")
+            };
+            let dialed = format!("{dialed}{scoped}");
+            update(places, list, |names| names.add(&name, id, route, scope))?;
             writeln!(
                 out,
                 "saved {} {name} ({}{dialed}) in {file}",

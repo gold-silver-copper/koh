@@ -4,7 +4,7 @@
 //! request asks: a session, the peer's sessions, a command or a copy. There is no "accept any
 //! peer" mode.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,11 +18,14 @@ use tokio_util::sync::CancellationToken;
 use crate::bounded::Bounded;
 use crate::identity::KeyFile;
 use crate::log::Peer;
-use crate::names::List;
+use crate::names::{List, Scope};
 use crate::proto::Close;
-use crate::request::{Attached, Pick, Request, Resume, SessionList, MAX_LISTED, MAX_REQUEST};
+use crate::request::{
+    Answer, Attached, On, Pick, Problem, ProblemKind, Request, Resume, SessionList, Until,
+    MAX_LISTED, MAX_OUTPUT, MAX_REQUEST,
+};
 use crate::server::audit::{auth_event, Outcome, Throttle};
-use crate::server::run_attached;
+use crate::server::place::Place;
 use crate::server::session::{AttachKind, Registry, SessionSpec};
 use crate::transport_iroh::{bind_on, close, Network, PROTOCOL};
 use tracing::{debug, info, warn};
@@ -69,6 +72,8 @@ pub struct ServeConfig {
     pub home: crate::pty::Home,
     /// Start a session's bash, zsh or fish so that it marks its commands (OSC 133).
     pub shell_marks: bool,
+    /// Bytes of output each job keeps, at most [`MAX_JOB_LOG_BYTES`].
+    pub job_log_bytes: u64,
 }
 
 /// The CLI's default for `--scrollback-bytes`: 8 MiB, as fux keeps.
@@ -82,6 +87,10 @@ pub const DEFAULT_MAX_SESSIONS: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
 /// Upper bound on `scrollback_bytes`, 1 GiB: past what fux-vt's history holds whatever its budget
 /// (64 Mi cells at 8 bytes, and their text).
 pub const MAX_SCROLLBACK_BYTES: u64 = 1 << 30;
+/// The CLI's default for `--job-log-bytes`: 4 MiB.
+pub const DEFAULT_JOB_LOG_BYTES: u64 = 4 << 20;
+/// Upper bound on `job_log_bytes`: each of [`super::jobs::MAX_JOBS`] jobs may hold twice it.
+pub const MAX_JOB_LOG_BYTES: u64 = 64 << 20;
 
 impl Default for ServeConfig {
     fn default() -> Self {
@@ -99,6 +108,7 @@ impl Default for ServeConfig {
             max_sessions: DEFAULT_MAX_SESSIONS,
             home: crate::pty::Home::user(),
             shell_marks: true,
+            job_log_bytes: DEFAULT_JOB_LOG_BYTES,
         }
     }
 }
@@ -136,9 +146,14 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
         (None, true) => Network::Local,
         (None, false) => Network::N0,
     };
-    let endpoint = bind_on(secret, true, &network, args.port)
-        .await
-        .context("binding endpoint")?;
+    let endpoint = bind_on(
+        secret,
+        (true, crate::transport_iroh::Idle::Shell),
+        &network,
+        args.port,
+    )
+    .await
+    .context("binding endpoint")?;
     let my_id = endpoint.id();
     let id_str = my_id.to_string();
     let port = endpoint
@@ -209,33 +224,43 @@ pub const REVOKE_CHECK: Duration = Duration::from_secs(2);
 /// How long after a read that drops a client the list is read again, to confirm it.
 const CONFIRM: Duration = Duration::from_millis(500);
 
+/// Who may connect, each with its scope.
+type Clients = HashMap<EndpointId, Scope>;
+
 /// Who may connect: the ids given for this run, and the clients saved beside the server key.
 pub struct Allowlist {
-    given: HashSet<EndpointId>,
+    given: Clients,
     /// The key the saved list sits beside, its directory judged once, and the list's path for
     /// messages.
     saved: Option<(KeyFile, String)>,
 }
 
 /// Who may connect now, as [`watch_allowlist`] publishes it.
-type Allowed = watch::Receiver<Arc<HashSet<EndpointId>>>;
+type Allowed = watch::Receiver<Arc<Clients>>;
 
-/// Return once `peer` is no longer allowed. Never if the list stops being published: the server is
-/// then shutting down, which ends the connection anyway.
-async fn revoked(mut allowed: Allowed, peer: EndpointId) {
-    if allowed.wait_for(|now| !now.contains(&peer)).await.is_err() {
+/// Return once `peer` is no longer allowed with `scope`: removed, or its scope changed. Never if
+/// the list stops being published: the server is then shutting down, which ends the connection
+/// anyway.
+async fn revoked(mut allowed: Allowed, peer: EndpointId, scope: Scope) {
+    if allowed
+        .wait_for(|now| now.get(&peer) != Some(&scope))
+        .await
+        .is_err()
+    {
         std::future::pending::<()>().await;
     }
 }
 
 impl Allowlist {
-    /// The clients who may connect as the saved list says now.
-    fn read(&self) -> anyhow::Result<HashSet<EndpointId>> {
-        let mut allowed = self.given.clone();
+    /// The clients who may connect as the saved list says now, and their scopes: one given for
+    /// this run may do everything.
+    fn read(&self) -> anyhow::Result<Clients> {
+        let mut allowed = Clients::new();
         if let Some((key, shown)) = &self.saved {
             let saved = crate::names::read(key, List::Clients, shown)?;
-            allowed.extend(saved.entries().map(|entry| entry.id));
+            allowed.extend(saved.entries().map(|entry| (entry.id, entry.scope.clone())));
         }
+        allowed.extend(self.given.iter().map(|(id, scope)| (*id, scope.clone())));
         Ok(allowed)
     }
 }
@@ -246,7 +271,7 @@ impl Allowlist {
 #[derive(Default)]
 struct Settling {
     /// A read that dropped a client, waiting for the next to agree.
-    dropping: Option<HashSet<EndpointId>>,
+    dropping: Option<Clients>,
     /// The last read failed, and said so.
     failing: bool,
 }
@@ -254,17 +279,15 @@ struct Settling {
 impl Settling {
     /// What the list allowing `now` is to become after `read`, if it changes. A failure is warned
     /// of once until a read succeeds again.
-    fn settle(
-        &mut self,
-        now: &HashSet<EndpointId>,
-        read: anyhow::Result<HashSet<EndpointId>>,
-    ) -> Option<HashSet<EndpointId>> {
+    fn settle(&mut self, now: &Clients, read: anyhow::Result<Clients>) -> Option<Clients> {
         if let Some(error) = read.as_ref().err().filter(|_| !self.failing) {
             warn!(error = %format!("{error:#}"), "could not read the saved clients; keeping the list last read");
         }
         self.failing = read.is_err();
         let (read, dropping) = (read.ok()?, self.dropping.take());
-        if !now.is_subset(&read) && dropping.as_ref() != Some(&read) {
+        // A client removed, or its scope changed: what it may do is less, or other.
+        let drops = now.iter().any(|(id, scope)| read.get(id) != Some(scope));
+        if drops && dropping.as_ref() != Some(&read) {
             self.dropping = Some(read);
             return None;
         }
@@ -277,7 +300,7 @@ impl Settling {
 /// list: every [`REVOKE_CHECK`], [`CONFIRM`] included, so a removal is seen within it.
 async fn watch_allowlist(
     list: Allowlist,
-    allowed: watch::Sender<Arc<HashSet<EndpointId>>>,
+    allowed: watch::Sender<Arc<Clients>>,
     registry: Registry,
 ) {
     let list = Arc::new(list);
@@ -299,7 +322,12 @@ async fn watch_allowlist(
             .and_then(|read| read);
         let now = allowed.borrow().clone();
         if let Some(next) = settling.settle(&now, read) {
-            let gone: Vec<_> = now.difference(&next).copied().collect();
+            // Removed, or scoped where it was not: its sessions end.
+            let gone: Vec<EndpointId> = now
+                .keys()
+                .filter(|id| next.get(*id).is_none_or(|scope| !scope.is_full()))
+                .copied()
+                .collect();
             // Published first: the registry refuses an attach the list no longer allows, so none
             // can start a session after the end below.
             allowed.send_replace(Arc::new(next));
@@ -314,9 +342,10 @@ async fn watch_allowlist(
 pub struct Hosting {
     allow: Allowlist,
     /// Who may connect, as first read.
-    allowed: HashSet<EndpointId>,
+    allowed: Clients,
     spec: SessionSpec,
     max_connections: usize,
+    job_log_bytes: usize,
 }
 
 impl Hosting {
@@ -335,8 +364,17 @@ impl Hosting {
                 anyhow::Ok((key, crate::names::shown(places, List::Clients)))
             })
             .transpose()?;
+        anyhow::ensure!(
+            args.job_log_bytes <= MAX_JOB_LOG_BYTES,
+            "a job log of {} bytes exceeds the maximum of {MAX_JOB_LOG_BYTES}",
+            args.job_log_bytes
+        );
         let allow = Allowlist {
-            given: args.allow.iter().copied().collect(),
+            given: args
+                .allow
+                .iter()
+                .map(|id| (*id, Scope::default()))
+                .collect(),
             saved,
         };
         let allowed = allow.read()?;
@@ -364,6 +402,8 @@ impl Hosting {
             },
             max_connections: usize::try_from(args.max_connections.get())
                 .context("max_connections does not fit in usize")?,
+            job_log_bytes: usize::try_from(args.job_log_bytes)
+                .context("job_log_bytes does not fit in usize")?,
         })
     }
 }
@@ -434,6 +474,7 @@ pub(super) struct Host {
     pub(super) home: crate::pty::Home,
     pub(super) reaper: crate::pty::Reaper,
     pub(super) shutdown: CancellationToken,
+    pub(super) jobs: super::jobs::Jobs,
 }
 
 /// What a finished handshake needs to be admitted, cloned for each.
@@ -454,29 +495,31 @@ impl Gate {
     /// id) and there is room for it; else close it saying why.
     fn admit(self, conn: iroh::endpoint::Connection) {
         let peer = conn.remote_id();
-        let why = if !self.allowed.borrow().contains(&peer) {
-            if self.turned_away.ready() {
-                auth_event(Outcome::Rejected, &peer, "not on allowlist");
+        let scope = self.allowed.borrow().get(&peer).cloned();
+        let why = if let Some(scope) = scope {
+            if let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a task a connection, each holding a permit"
+                )]
+                drop(tokio::spawn(serve_connection(
+                    conn,
+                    (self.allowed, scope),
+                    self.registry,
+                    self.host,
+                    permit,
+                )));
+                return;
             }
-            Close::NotAuthorized
-        } else if let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "a task a connection, each holding a permit"
-            )]
-            drop(tokio::spawn(serve_connection(
-                conn,
-                self.allowed,
-                self.registry,
-                self.host,
-                permit,
-            )));
-            return;
-        } else {
             if self.turned_away.ready() {
                 warn!(peer = %peer, "refusing connection: at max-connections capacity");
             }
             Close::AtCapacity
+        } else {
+            if self.turned_away.ready() {
+                auth_event(Outcome::Rejected, &peer, "not on allowlist");
+            }
+            Close::NotAuthorized
         };
         close(&conn, why);
     }
@@ -488,7 +531,7 @@ impl Gate {
 /// for the request included.
 async fn serve_connection(
     conn: iroh::endpoint::Connection,
-    allowed: Allowed,
+    (allowed, scope): (Allowed, Scope),
     registry: Registry,
     host: Arc<Host>,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -499,32 +542,105 @@ async fn serve_connection(
         let Some((request, control)) = opening(&conn).await else {
             return;
         };
-        match request {
-            Request::Shell(pick) => shell(&conn, &registry, pick, control).await,
-            Request::Sessions => {
-                auth_event(Outcome::Accepted, &peer, "authorized; listing sessions");
-                let mut sessions = registry.sessions(peer).await;
-                sessions.truncate(MAX_LISTED);
-                if super::reply(&conn, &SessionList(sessions)).await.is_ok() {
-                    super::linger(&conn).await;
-                }
-            }
-            Request::Exec(line) => {
-                auth_event(Outcome::Accepted, &peer, "authorized; running a command");
-                super::exec::serve(&conn, control, line, &host).await;
-            }
-            Request::Copy(copy) => {
-                auth_event(Outcome::Accepted, &peer, "authorized; copying");
-                super::copy::serve(&conn, control, copy, &host).await;
-            }
-        }
+        let Some(place) = permitted(&request, &scope, &host) else {
+            auth_event(Outcome::Rejected, &peer, "out of its scope");
+            info!(peer = %peer, asked = request.what(), "a scoped key asked for more than its scope");
+            close(&conn, Close::OutOfScope);
+            return;
+        };
+        auth_event(Outcome::Accepted, &peer, request.what());
+        dispatch(&conn, request, control, (&registry, &host, &place)).await;
     };
     tokio::select! {
         () = served => {}
-        () = revoked(allowed, peer) => {
-            auth_event(Outcome::Rejected, &peer, "removed from the allowlist");
+        () = revoked(allowed, peer, scope.clone()) => {
+            auth_event(Outcome::Rejected, &peer, "removed from the allowlist, or its scope changed");
             close(&conn, Close::NotAuthorized);
         }
+    }
+}
+
+/// Where `request`'s paths are for a key of `scope`, if the scope allows it at all: a full key's
+/// in the server user's home; a scoped one's in the directory its scope names for what it asks.
+fn permitted(request: &Request, scope: &Scope, host: &Host) -> Option<Place> {
+    let home = host.home.dir();
+    if scope.is_full() {
+        return Some(Place::new(home, None));
+    }
+    let root = match request {
+        Request::Exec(_)
+        | Request::Start { .. }
+        | Request::Jobs
+        | Request::Logs { .. }
+        | Request::Kill { .. } => scope.exec.clone(),
+        Request::Wait(wait) => match (&wait.on, &wait.until) {
+            (Some(On::Job(_)), _) => scope.exec.clone(),
+            (None, Until::File(_)) => scope.exec.clone().or_else(|| scope.cp.clone()),
+            (Some(On::Session(_)) | None, _) => None,
+        },
+        Request::Copy(_) => scope.cp.clone(),
+        Request::Shell { .. } | Request::Sessions | Request::Output { .. } => None,
+    };
+    root.map(|root| Place::new(home, Some(root)))
+}
+
+/// Serve `request` for `conn`'s client at `place`; `control` is the rest of its first stream.
+async fn dispatch(
+    conn: &iroh::endpoint::Connection,
+    request: Request,
+    control: iroh::endpoint::RecvStream,
+    (registry, host, place): (&Registry, &Host, &Place),
+) {
+    let peer = conn.remote_id();
+    match request {
+        Request::Shell { pick, size } => shell(conn, registry, (pick, size), control).await,
+        Request::Sessions => {
+            let mut sessions = registry.sessions(peer).await;
+            sessions.truncate(MAX_LISTED);
+            super::answer(conn, &Answer::Ok(SessionList(sessions))).await;
+        }
+        Request::Output { session, last } => {
+            let text: Answer<String> = match registry.find(peer, session).await {
+                Some(found) => found.text(last).await.ok_or_else(|| {
+                    Problem::new(
+                        ProblemKind::NotFound,
+                        "no command finished whose output is still kept",
+                    )
+                }),
+                None => Err(Problem::new(ProblemKind::NoSuchSession, session)),
+            };
+            if super::reply_at_most(conn, &text, MAX_OUTPUT).await.is_ok() {
+                super::linger(conn).await;
+            }
+        }
+        Request::Exec(run) => super::exec::serve(conn, control, &run, host, place).await,
+        Request::Start { name, run } => {
+            let started = host.jobs.start(peer, name, &run, host, place);
+            if let Ok(started) = &started {
+                info!(peer = %peer, job = %started.name, "started a job");
+            }
+            super::answer(conn, &started).await;
+        }
+        Request::Jobs => {
+            let mut jobs = host.jobs.list(peer);
+            jobs.0.truncate(MAX_LISTED);
+            super::answer(conn, &Answer::Ok(jobs)).await;
+        }
+        Request::Logs { job, follow } => {
+            if let Some(found) = host.jobs.get(peer, &job) {
+                super::jobs::logs(conn, &found, follow).await;
+            } else {
+                let none: Answer<()> = Err(Problem::new(ProblemKind::NoSuchJob, &job));
+                super::answer(conn, &none).await;
+            }
+        }
+        Request::Kill { job, signal } => {
+            super::answer(conn, &host.jobs.kill(peer, &job, signal)).await;
+        }
+        Request::Wait(wait) => {
+            super::wait::serve(conn, peer, &wait, (registry, &host.jobs), place).await;
+        }
+        Request::Copy(copy) => super::copy::serve(conn, control, copy, place).await,
     }
 }
 
@@ -559,11 +675,11 @@ async fn opening(
 async fn shell(
     conn: &iroh::endpoint::Connection,
     registry: &Registry,
-    pick: Pick,
+    (pick, size): (Pick, crate::terminal::Size),
     control: iroh::endpoint::RecvStream,
 ) {
     let peer = conn.remote_id();
-    let (client, attach_kind) = match registry.attach(peer, pick).await {
+    let (client, start, attach_kind) = match registry.attach(peer, pick, size).await {
         Ok(attached) => attached,
         Err(refused) => {
             warn!(peer = %peer, reason = %refused, "refusing session");
@@ -572,7 +688,6 @@ async fn shell(
         }
     };
     let session = client.session();
-    auth_event(Outcome::Accepted, &peer, "authorized; session attached");
     match attach_kind {
         AttachKind::Created => info!(peer = %peer, %session, "started a new session"),
         AttachKind::Reattached { detached_for } => info!(
@@ -591,7 +706,7 @@ async fn shell(
         },
     };
     if super::reply(conn, &attached).await.is_ok() {
-        run_attached(conn, client, control).await;
+        super::attach::serve(conn, client, start, control).await;
     }
 }
 
@@ -605,12 +720,17 @@ pub async fn serve_endpoint(
     let (allowed_tx, allowed) = watch::channel(Arc::new(hosting.allowed));
     let allows = allowed.clone();
     let home = hosting.spec.home.clone();
-    let registry = Registry::spawn(hosting.spec, move |peer| allows.borrow().contains(peer))
-        .context("starting the child reaper")?;
+    // Only a key that may do everything gets a session.
+    let ttl = hosting.spec.ttl;
+    let registry = Registry::spawn(hosting.spec, move |peer| {
+        allows.borrow().get(peer).is_some_and(Scope::is_full)
+    })
+    .context("starting the child reaper")?;
     let host = Arc::new(Host {
         home,
         reaper: registry.reaper(),
         shutdown: shutdown.clone(),
+        jobs: super::jobs::Jobs::new(hosting.job_log_bytes, ttl),
     });
     #[expect(clippy::disallowed_methods, reason = "one allowlist reader a server")]
     tokio::spawn(watch_allowlist(hosting.allow, allowed_tx, registry.clone()));
@@ -712,7 +832,11 @@ mod tests {
                 None => std::fs::remove_file(&clients).unwrap(),
             }
             let next = settling.settle(&allowed, hosting.allow.read())?;
-            let gone: Vec<_> = allowed.difference(&next).copied().collect();
+            let gone: Vec<_> = allowed
+                .keys()
+                .filter(|id| !next.contains_key(*id))
+                .copied()
+                .collect();
             allowed = next;
             Some(gone)
         };

@@ -1,13 +1,15 @@
 //! The library behind the `koh` remote shell: `koh serve` hosts PTYs for allowlisted peers and
-//! `koh connect` renders one with predictive local echo, reconnecting transparently; `koh exec`
-//! runs a command there and `koh cp` copies files.
+//! `koh connect` relays one to the user's terminal with predictive local echo, reconnecting
+//! transparently; `koh exec` runs a command there, `koh run` a job that outlives the connection,
+//! and `koh cp` brings files into line.
 //!
 //! [`transport_iroh`] sets up endpoints; [`identity`] loads identities
 //! and their reset leases; [`keycmd`] is `koh id` and `koh key`; [`names`] names the servers and clients
 //! a machine knows. [`request`] is what a connection opens with, [`proto`] a shell's wire
-//! protocol, [`events`] the input it carries, [`copy`] a copy's; [`terminal`], [`predict`] and
-//! [`pty`] the screen, the prediction and the PTY; [`server`] hosts sessions and commands and
-//! [`client`] renders them. [`bounded`] holds every queue.
+//! protocol, [`stream`] what of a program's output reaches the user's terminal, [`events`] the
+//! input it carries, [`sync`] a copy's; [`terminal`], [`predict`] and [`pty`] the server's
+//! emulator, the prediction and the PTY; [`server`] hosts sessions, commands and jobs and
+//! [`client`] drives them. [`bounded`] holds every queue.
 //!
 //! Production code is panic-free by construction: `Cargo.toml` forbids the panic lints, lossy casts
 //! and unchecked arithmetic, and a `forbid` cannot be lifted locally. Tests may panic.
@@ -16,7 +18,6 @@
 
 pub mod bounded;
 pub mod client;
-pub mod copy;
 pub mod events;
 pub mod identity;
 pub mod keycmd;
@@ -28,6 +29,8 @@ pub mod proto;
 pub mod pty;
 pub mod request;
 pub mod server;
+pub mod stream;
+pub mod sync;
 pub mod terminal;
 pub mod transport_iroh;
 

@@ -282,7 +282,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
                 Some(true) => {
                     let replaced = names::update(self.places, list, |names| {
                         names.remove(&name)?;
-                        names.add(&name, id, None)
+                        names.add(&name, id, None, crate::names::Scope::default())
                     });
                     return match replaced {
                         Ok(()) => self.say(&format!("replaced {name} ({})", names::short(id))),
@@ -297,6 +297,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
                 name,
                 id,
                 route: None,
+                scope: names::Scope::default(),
             },
         )
     }

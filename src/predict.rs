@@ -53,7 +53,8 @@ impl Size {
     }
 }
 
-/// The screen the predictor reconciles against: the client's grid, or a test's. A trait, so
+/// The screen the predictor reconciles against: the client's mirror of the user's terminal, or a
+/// test's. A trait, so
 /// `predict` imports nothing from `crate::` (CI checks).
 pub trait ScreenView {
     fn size(&self) -> Size;
@@ -63,6 +64,23 @@ pub trait ScreenView {
     fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>>;
     /// Whether the alternate screen is shown, as full-screen programs (and tmux, screen) show it.
     fn alternate(&self) -> bool;
+}
+
+/// A fux-vt screen, as the client's mirror of the user's terminal holds it.
+impl ScreenView for fux_vt::Screen {
+    fn size(&self) -> Size {
+        let (rows, cols) = Self::size(self).into();
+        Size { rows, cols }
+    }
+    fn cursor_position(&self) -> (u16, u16) {
+        Self::cursor_position(self)
+    }
+    fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>> {
+        Self::cell(self, row, col)
+    }
+    fn alternate(&self) -> bool {
+        self.mode(fux_vt::Mode::AlternateScreen)
+    }
 }
 
 /// Which part of a glyph a cell holds.
@@ -137,36 +155,6 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    /// An overlay of exactly `cells` (their texts, wide if `wide`, in `attributes`; each wide one
-    /// covering the next cell when `covering`) and `cursor`, for tests of what draws it.
-    #[cfg(test)]
-    pub(crate) fn of<'t>(
-        cells: impl IntoIterator<Item = ((u16, u16), &'t str, Attributes, bool)>,
-        cursor: Option<(u16, u16)>,
-    ) -> Self {
-        let mut out = Self {
-            cells: BTreeMap::new(),
-            cursor,
-        };
-        for ((row, col), text, attributes, covering) in cells {
-            let wide = text.width() == 2;
-            let half = if wide && covering {
-                Half::Wide
-            } else {
-                Half::Narrow
-            };
-            let cell = |text: &str, half| Cell {
-                text: text.to_owned(),
-                attributes,
-                half,
-            };
-            out.cells.insert((row, col), cell(text, half));
-            if let Some(next) = col.checked_add(1).filter(|_| half == Half::Wide) {
-                out.cells.insert((row, next), cell("", Half::Covered));
-            }
-        }
-        out
-    }
     /// The predicted cell at `(row, col)`, if any.
     pub fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
         self.cells.get(&(row, col))
@@ -1098,22 +1086,6 @@ mod tests {
     use super::*;
 
     use fux_vt::{Color, Screen};
-
-    impl ScreenView for Screen {
-        fn size(&self) -> Size {
-            let (rows, cols) = Self::size(self).into();
-            Size { rows, cols }
-        }
-        fn cursor_position(&self) -> (u16, u16) {
-            Self::cursor_position(self)
-        }
-        fn cell(&self, row: u16, col: u16) -> Option<CellRef<'_>> {
-            Self::cell(self, row, col)
-        }
-        fn alternate(&self) -> bool {
-            self.mode(fux_vt::Mode::AlternateScreen)
-        }
-    }
 
     /// The PTY's modes under a line editor (readline): it echoes for itself, a key at a time.
     const EDITOR: TtyModes = TtyModes {

@@ -8,8 +8,8 @@
 //!   trusts a report only if it came after its own last input;
 //! - when the state changes, probed every [`POLL`] while a client is attached;
 //! - after the shell marks a command's start or end (OSC 133 `C`, `D`) and after a resize, so a
-//!   fresh state rides with every command boundary. One after a mark goes on the screen that
-//!   carries the mark, at once: the client tells the report after the marks it paints.
+//!   fresh state rides with every command boundary. One after a mark follows the mark on the
+//!   client's stream, at once.
 //!
 //! An unchanged state is never reported again within [`SPACING`] of the last report, but after
 //! a mark: one owed sooner waits for it.
@@ -18,7 +18,16 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::terminal::{Activity, Report};
+use crate::terminal::Activity;
+
+/// A report of the program's [`Activity`], numbered: each report is a new number, even of an
+/// unchanged state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Report {
+    /// Which report it is: the session's count of them, from 1.
+    pub(super) n: u64,
+    pub(super) activity: Activity,
+}
 
 /// How often the program is probed for a change while a client is attached: about as often as
 /// fux probes a local program.
@@ -97,7 +106,7 @@ mod tests {
         let t0 = Instant::now();
         let ms = |n| t0 + std::time::Duration::from_millis(n);
         let mut r = Reports::default();
-        let n = |report: Option<crate::terminal::Report>| report.map(|r| r.n);
+        let n = |report: Option<super::Report>| report.map(|r| r.n);
         assert_eq!(r.due(t0), None, "nothing owed");
         // The first probe reports, whatever it says; an unchanged poll then reports nothing.
         assert_eq!(n(r.probed(t0, Probe::Poll, Activity::Reading)), Some(1));

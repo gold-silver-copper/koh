@@ -72,6 +72,9 @@ PORT_BASE = 47200
 CONFIGS = {
     "koh-master": {"tool": "koh", "bin": os.path.join(BINS, "koh-master")},
     "koh-branch": {"tool": "koh", "bin": os.path.join(BINS, "koh-branch")},
+    # koh-next (the rewrite) and the commit it was measured against.
+    "koh-156dbe4": {"tool": "koh", "bin": os.path.join(BINS, "koh-156dbe4")},
+    "koh-next": {"tool": "koh", "bin": os.path.join(BINS, "koh-next")},
     "ssh": {"tool": "ssh"},
 }
 
@@ -376,7 +379,8 @@ class Run:
         while not stop.is_set():
             if os.path.exists(path):
                 time.sleep(float(self.task["drop"].get("after", 0.5)))
-                names = {"koh", "koh-master", "koh-branch"} if self.tool == "koh" else {"ssh", "scp", "sftp"}
+                bins = {os.path.basename(c["bin"]) for c in CONFIGS.values() if "bin" in c}
+                names = {"koh"} | bins if self.tool == "koh" else {"ssh", "scp", "sftp"}
                 # The local side's clients only: the server (`koh-master serve`) has the same name.
                 self.dropped = kill_marked(self.marker + "-local", only=names)
                 return

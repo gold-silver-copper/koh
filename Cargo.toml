@@ -46,7 +46,7 @@ unicode-width = "0.2.2"
 # the leader of a session of its own between `fork` and `exec`, so koh needs no launcher binary,
 # and reads a terminal's modes as one struct; 0.6 has fux's activity probe (`terminal_activity`),
 # which the server reports to the client. koh writes its own ANSI and reads raw stdin itself.
-fuxix = "0.6.0"
+fuxix = "0.6.1"
 # serialization. default-features = false drops postcard's `heapless-cas` default, whose
 # `atomic-polyfill` transitive dep is unmaintained (RUSTSEC-2023-0089); we only need `use-std`
 # (which pulls `alloc`) for `to_allocvec`/`from_bytes`.
@@ -60,6 +60,14 @@ tokio-util = { version = "0.7.19", features = ["rt"] }
 # render the endpoint id as a terminal QR on `koh serve` (always printed); default-features = false drops the
 # heavy image/svg/pic renderers (we only use the built-in unicode half-block renderer).
 qrcode = { version = "=0.14.1", default-features = false }
+# Files beneath a directory, by its descriptor (`openat` and its kin): `koh cp` lands what a peer
+# names without following a symlink out of the tree it writes, and a scoped key's paths stay in its
+# directory.
+rustix = { version = "1.1.5", features = ["fs"] }
+# Whole-file hashes: `koh cp` sends only the files that changed. Already in the tree through iroh.
+blake3 = "1.8.7"
+# `--json` output.
+serde_json = "1.0.154"
 # utility
 anyhow = "1.0.104"
 thiserror = "2.0.21"

@@ -1,0 +1,11 @@
+id = "TB-0059"
+title = "Bisect a regression with untestable commits"
+cat = "multi"
+difficulty = "hard"
+goal = """
+On the remote machine, `~/project.bundle` is a git bundle of a project's history (branch `main`).
+Clone it to `~/project`. The project's `./run-tests` passes on the oldest commit and fails on the
+newest one. Find the first commit at which `./run-tests` fails. Some commits cannot be tested at all
+(`run-tests` says so and exits with status 125); they are neither good nor bad. Write the full
+40-character hash of the first failing commit to `answer.txt` in your local directory.
+"""

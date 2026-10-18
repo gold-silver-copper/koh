@@ -1,0 +1,9 @@
+report 2026 Q3/nested dir/deep/  leading spaces.txt
+row 0: 0.03883
+row 1: 0.01802
+row 2: 0.32646
+row 3: 0.40890
+row 4: 0.42842
+row 5: 0.47005
+row 6: 0.94060
+row 7: 0.31146

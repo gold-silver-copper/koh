@@ -1,0 +1,13 @@
+id = "TB-0018"
+title = "A long job that goes quiet"
+cat = "wait"
+difficulty = "hard"
+goal = """
+On the remote machine, run `~/bin/rebuild-catalog` once. It takes a few minutes. Partway through
+it goes completely silent for a long stretch while it compacts; that is normal, and it must not be
+interrupted or started a second time (a restart throws its work away and counts as a failure).
+When it finishes it prints `rebuild complete: digest=...`. Write the digest (only the hex string
+after `digest=`) to `digest.txt` in your local directory.
+"""
+timeout = 1500
+solve_timeout = 420

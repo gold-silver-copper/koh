@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""The nightly pipeline: fetch, build, upload, report."""
+import os, random, sys, time
+home = os.path.expanduser("~")
+rng = random.Random(606)
+out, err = sys.stdout, sys.stderr
+stages = ["fetch", "build", "package", "upload", "report"]
+for st in stages:
+    for i in range(rng.randint(8, 14)):
+        time.sleep(0.04)
+        out.write(f"[{st}] step {i + 1} ok\n"); out.flush()
+        if rng.random() < 0.15:
+            err.write(f"warning: {st}: slow step {i + 1} ({rng.randint(2, 9)}s)\n"); err.flush()
+    if st == "upload":
+        err.write("error: upload: 2 of 41 artifacts rejected by the registry (HTTP 413)\n"); err.flush()
+out.write("nightly finished: 1 stage failed\n")
+os.makedirs(os.path.join(home, ".nightly"), exist_ok=True)
+open(os.path.join(home, ".nightly", "ran"), "w").write("2\n")
+sys.exit(2)

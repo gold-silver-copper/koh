@@ -1,0 +1,9 @@
+id = "TB-0012"
+title = "Count deprecation warnings on stderr"
+cat = "output"
+difficulty = "easy"
+goal = """
+On the remote machine, run `~/bin/lint-legacy`. Count the warnings it reports of the kind
+`warning[deprecated]` (each such warning is one line that starts with `warning[deprecated]:`).
+Write the count (only the number) to `answer.txt` in your local directory.
+"""

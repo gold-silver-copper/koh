@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Issues a fresh challenge every 20 seconds and answers gatekeeper's checks. Stops cleanly on
+Ctrl-C (SIGINT) or SIGTERM."""
+import json, os, random, signal, socket, sys, time
+home = os.path.expanduser("~")
+d = os.path.join(home, ".tokens")
+os.makedirs(d, exist_ok=True)
+os.chdir(d)
+if os.path.exists("sock"):
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.connect("sock")
+        sys.exit("token-server: already running")
+    except OSError:
+        os.unlink("sock")
+for f in ("stopped",):
+    if os.path.exists(f):
+        os.unlink(f)
+open("pid", "w").write(f"{os.getpid()}\n")
+srv = socket.socket(socket.AF_UNIX)
+srv.bind("sock")
+srv.listen(4)
+srv.settimeout(0.2)
+t0 = time.time()
+WORDS = ["amber", "basalt", "cobalt", "dune", "ember", "fjord", "garnet", "harbor", "indigo", "juniper"]
+
+
+def challenge(k):
+    r = random.Random(f"5353-{k}")
+    return f"{r.choice(WORDS)}-{r.randint(1000, 9999)}"
+
+
+def stop(sig, frame):
+    print(f"\nserver stopped ({signal.Signals(sig).name})", flush=True)
+    open(os.path.join(d, "stopped"), "w").write(signal.Signals(sig).name + "\n")
+    os.unlink(os.path.join(d, "sock"))
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+shown = 0
+print("token-server: a new challenge every 20s; Ctrl-C to stop", flush=True)
+while True:
+    k = int((time.time() - t0) // 20) + 1
+    if k != shown:
+        shown = k
+        print(f"challenge #{k}: {challenge(k)}", flush=True)
+    try:
+        c, _ = srv.accept()
+    except socket.timeout:
+        continue
+    with c:
+        got = c.recv(200).decode(errors="replace").strip()
+        if got == challenge(k):
+            c.sendall(f"ok {k}".encode())
+        elif k > 1 and got == challenge(k - 1):
+            c.sendall(f"ok {k - 1}".encode())
+        else:
+            c.sendall(b"no")

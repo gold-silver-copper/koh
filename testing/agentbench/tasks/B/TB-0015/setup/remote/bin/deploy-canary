@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Watches the canary for build 8812 and promotes or rolls it back."""
+import os, random, sys, time
+home = os.path.expanduser("~")
+rng = random.Random(1515)
+print("canary build 8812 at 5% of traffic; watching p99 latency and error rate", flush=True)
+p99s = []
+for i in range(1, 25):
+    time.sleep(rng.uniform(0.9, 1.9))
+    p99 = rng.randint(610, 760) if i < 15 else rng.randint(820, 990)
+    p99s.append(p99)
+    err = rng.uniform(0.1, 0.6)
+    print(f"sample {i:2d}: p99={p99}ms errors={err:.2f}% {'ok' if p99 <= 800 else 'OVER BUDGET'}", flush=True)
+worst = sorted(p99s[-6:])[3]
+verdict = f"ROLLED BACK: p99 latency {worst}ms over the 800ms budget for 6 consecutive samples"
+print(verdict, flush=True)
+os.makedirs(os.path.join(home, ".canary"), exist_ok=True)
+open(os.path.join(home, ".canary", "verdict"), "w").write(verdict + "\n")
+sys.exit(1)

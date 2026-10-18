@@ -1,0 +1,10 @@
+id = "TB-0084"
+title = "Flash a firmware image through standard input"
+cat = "stdin"
+difficulty = "moderate"
+goal = """
+Your local directory has `firmware.img`, a binary image. On the remote machine,
+`~/bin/flash-device` reads an image on its standard input and flashes the (simulated) device.
+Flash the device with your local `firmware.img`, fed to `flash-device` as its standard input. The
+device must end up flashed with that exact image (flash-device reports `flashed OK`).
+"""

@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""A live view of the batch jobs, like top. Up/Down (or j/k) select, K kills, q quits."""
+import json, os, random, select, sys, termios, time, tty
+home = os.path.expanduser("~")
+state = os.path.join(home, ".jobtop")
+os.makedirs(state, exist_ok=True)
+jobs_path = os.path.join(state, "jobs.json")
+if not os.path.exists(jobs_path):
+    rng = random.Random(3838)
+    names = ["etl-orders", "etl-customers", "thumbnailer", "report-weekly", "reindex-search",
+             "backup-s3", "ml-features", "invoice-pdf", "log-compactor"]
+    now = time.time()
+    jobs = []
+    for i, n in enumerate(names):
+        jid = "j-" + "".join(rng.choice("0123456789abcdef") for _ in range(4))
+        stuck = n == "reindex-search"
+        jobs.append({"id": jid, "name": n, "started": now - rng.randint(900, 3000),
+                     "base": rng.randint(5, 40), "rate": 0 if stuck else rng.uniform(0.02, 0.08),
+                     "stuck_at": rng.randint(30, 60), "killed": False, "stuck": stuck})
+    json.dump(jobs, open(jobs_path, "w"))
+jobs = json.load(open(jobs_path))
+if not (os.isatty(0) and os.isatty(1)):
+    sys.exit("jobtop: needs an interactive terminal")
+t0 = time.time()
+out = sys.stdout
+
+
+def view(j, now):
+    if j["killed"]:
+        return "killed", j.get("pct", 0), "-"
+    if j["stuck"]:
+        return "running", j["stuck_at"], f"{int((now - j['started']) // 60 - 3)}m ago"
+    pct = min(99, int(j["base"] + j["rate"] * (now - t0) + (now - j["started"]) / 120))
+    return "running", pct, f"{int(now * 7 + j['base']) % 3}s ago"
+
+
+def draw(sel, msg=""):
+    now = time.time()
+    out.write("\x1b[H\x1b[2J")
+    out.write(f"jobtop - {time.strftime('%H:%M:%S')}  {len(jobs)} jobs   (Up/Down select, K kill, q quit)\r\n\r\n")
+    out.write(f"   {'ID':<8}{'NAME':<16}{'STATE':<9}{'PROGRESS':>9}  {'LAST OUTPUT':>12}\r\n")
+    for i, j in enumerate(jobs):
+        st, pct, last = view(j, now)
+        line = f"{j['id']:<8}{j['name']:<16}{st:<9}{pct:>8}%  {last:>12}"
+        out.write((" > \x1b[7m" + line + "\x1b[0m" if i == sel else "   " + line) + "\r\n")
+    if msg:
+        out.write("\r\n" + msg)
+    out.flush()
+
+
+pending = []
+
+
+def getkey(timeout=None):
+    """The next key the terminal sent (escape sequences kept whole), or None after TIMEOUT."""
+    if not pending:
+        r, _, _ = select.select([0], [], [], timeout)
+        if not r:
+            return None
+        data, i = os.read(0, 64), 0
+        while i < len(data):
+            if data[i:i + 1] == b"\x1b" and data[i + 1:i + 2] in (b"[", b"O"):
+                j = i + 2
+                while j < len(data) and not (0x40 <= data[j] <= 0x7e):
+                    j += 1
+                pending.append(data[i:j + 1])
+                i = j + 1
+            else:
+                pending.append(data[i:i + 1])
+                i += 1
+    return pending.pop(0) if pending else None
+
+
+old = termios.tcgetattr(0)
+tty.setraw(0)
+sel = 0
+try:
+    while True:
+        draw(sel)
+        k = getkey(1.0)
+        if k is None:
+            continue
+        if k in (b"\x1b[A", b"\x1bOA", b"k"):
+            sel = max(0, sel - 1)
+        elif k in (b"\x1b[B", b"\x1bOB", b"j"):
+            sel = min(len(jobs) - 1, sel + 1)
+        elif k == b"K":
+            j = jobs[sel]
+            draw(sel, f"Kill job {j['id']} ({j['name']})? [y/n] ")
+            if (getkey() or b"").lower() == b"y" and not j["killed"]:
+                j["pct"] = view(j, time.time())[1]
+                j["killed"] = True
+                json.dump(jobs, open(jobs_path, "w"))
+                with open(os.path.join(state, "actions.log"), "a") as f:
+                    f.write(f"kill {j['id']} {j['name']}\n")
+        elif k in (b"q", b"\x03"):
+            break
+finally:
+    termios.tcsetattr(0, termios.TCSADRAIN, old)
+    out.write("\x1b[H\x1b[2J")

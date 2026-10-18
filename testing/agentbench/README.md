@@ -1,7 +1,8 @@
 # koh's agent benchmark
 
 How well can an AI agent work on a remote machine through koh? Each task is a job on a "remote
-machine", given to a fresh agent (`claude -p --model haiku`) that reaches the remote only through
+machine", given to a fresh agent (`--model`: `codex-sol` or `codex-sol-fast`, `codex exec` with
+gpt-6.1-sol at the standard or fast tier; or `haiku`, `claude -p`) that reaches the remote only through
 the tool under test. The same tasks run over ssh as the control.
 
 ```sh
@@ -13,7 +14,9 @@ python3 -I report.py ~/.cache/claude-tmp/koh-agentbench/results/a-master.json
 
 Configurations (`bench.py`'s `CONFIGS`): `koh-master` and `koh-branch` (release binaries built
 once into `~/.cache/claude-tmp/koh-agentbench/bins/`, each with its README in `docs/<config>/`),
-and `ssh` (OpenSSH, a private `sshd`). At most 4 agents run at once.
+and `ssh` (OpenSSH, a private `sshd`). At most 12 agents run at once (`--workers`); run it in a
+memory-capped scope (`systemd-run --user --scope -p MemoryMax=32G -- python3 -I bench.py run …`), so
+a runaway is killed alone. Two runners can go side by side with distinct `--slot-base`s (ports).
 
 ## The setting
 
@@ -29,8 +32,15 @@ Both "machines" are this computer, kept apart:
   config (koh's key and a saved server `bench`; or an `ssh_config` with a host `bench`). The
   agent's tool calls go through wrappers that log each `koh`, `ssh`, `scp`, `sftp`, `rsync`,
   `fux` and `sleep`.
+- **The remote runs in bubblewrap too**, in a process namespace of its own under `remote_init.py`
+  (process 1, which also runs the checker, so the checker sees the remote's processes as it does):
+  the user's home is hidden but for the toolchain and the binaries, `/tmp` is its own, and the server
+  and what it runs see neither the run's local side nor the tasks. A remote `pkill` reaches nothing
+  else.
 - **The agent runs in bubblewrap**: every remote side, the task sets, this repository and the
-  results are hidden from it, and it has a process namespace of its own. Its fux server runs in
+  results are hidden from it, it has a process namespace and a `/tmp` of its own, and a shell it
+  starts reads a `~/.bashrc` of the run's (the wrappers first in PATH, no history), with the user's
+  `~/.cargo/bin` hidden. Its fux server runs in
   the same view. So the remote's files and processes are reachable only through koh or ssh.
 
 The agent is told: how to reach the remote with the tool (`--direct 127.0.0.1:PORT` for koh),

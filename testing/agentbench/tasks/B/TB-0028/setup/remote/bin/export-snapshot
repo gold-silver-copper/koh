@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Exports a consistent snapshot of the orders database."""
+import hashlib, os, random, time
+home = os.path.expanduser("~")
+d = os.path.join(home, "exports")
+os.makedirs(d, exist_ok=True)
+path = os.path.join(d, "orders-snapshot-20261017.bin")
+rng = random.Random(2828)
+h = hashlib.sha256()
+print("exporting orders: 40 chunks", flush=True)
+with open(path + ".part", "wb") as f:
+    for i in range(40):
+        chunk = rng.randbytes(1 << 20)
+        h.update(chunk)
+        f.write(chunk)
+        if i % 8 == 7:
+            print(f"  {i + 1}/40 chunks", flush=True)
+            time.sleep(0.1)
+os.rename(path + ".part", path)
+print(f"snapshot: {path}")
+print(f"sha256: {h.hexdigest()}")

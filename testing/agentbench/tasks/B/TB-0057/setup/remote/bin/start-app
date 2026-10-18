@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Starts the app daemon (appd) in the background."""
+import os, subprocess, sys, time
+home = os.path.expanduser("~")
+for d in ("app", "app/logs", ".app"):
+    os.makedirs(os.path.join(home, d), exist_ok=True)
+log = open(os.path.join(home, "app", "logs", "appd.log"), "a")
+p = subprocess.Popen([os.path.join(home, "bin", "appd")], stdin=subprocess.DEVNULL, stdout=log,
+                     stderr=subprocess.STDOUT, start_new_session=True)
+time.sleep(1.0)
+print(f"appd started (pid {p.pid}); `app-ping` checks that it answers")

@@ -1,0 +1,11 @@
+id = "TB-0057"
+title = "Stop a runaway log writer, keep the app up"
+cat = "process"
+difficulty = "hard"
+goal = """
+On the remote machine, start the app with `~/bin/start-app`. Something it runs is writing
+`~/app/logs/debug.log` out of control (it grows by megabytes a second). Stop whatever is writing
+that log, without stopping the app daemon itself (`~/bin/app-ping` must keep reporting it up), and
+then free the space: `~/app/logs/debug.log` must end up smaller than 1 MB (empty or removed is
+fine) with nothing writing to it any more.
+"""

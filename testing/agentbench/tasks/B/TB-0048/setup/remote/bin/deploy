@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Two-phase deploys of the release in ~/deploy/incoming/.
+
+  deploy stage    copy the incoming release into ~/deploy/releases/ (slow; holds a lock)
+  deploy commit   make the staged release current (needs a completed stage)
+  deploy unlock   remove a stale stage lock (only when no stage is running)
+  deploy status
+"""
+import os, random, shutil, sys, time
+home = os.path.expanduser("~")
+d = os.path.join(home, "deploy")
+REL = "2.4.0"
+lock = os.path.join(d, "stage.lock")
+src, dst = os.path.join(d, "incoming", REL), os.path.join(d, "releases", REL)
+
+
+def lock_pid():
+    try:
+        return int(open(lock).read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def running(pid):
+    try:
+        return b"deploy" in open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        return False
+
+
+def log(msg):
+    with open(os.path.join(d, "deploy.log"), "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
+
+
+cmd = sys.argv[1:2]
+if cmd == ["stage"]:
+    if os.path.exists(lock):
+        pid = lock_pid()
+        if running(pid):
+            sys.exit(f"deploy: another stage is running (pid {pid}); wait for it to finish")
+        sys.exit(f"deploy: stale stage lock left by pid {pid}, which is not running. "
+                 "Make sure no stage is running, then run `deploy unlock`.")
+    open(lock, "w").write(f"{os.getpid()}\n")
+    if os.path.exists(dst):
+        print(f"removing incomplete {dst}", flush=True)
+        shutil.rmtree(dst)
+    files = sorted(os.path.relpath(os.path.join(r, f), src) for r, _, fs in os.walk(src) for f in fs)
+    rng = random.Random(48)
+    print(f"staging {REL}: {len(files)} files", flush=True)
+    for i, f in enumerate(files):
+        os.makedirs(os.path.dirname(os.path.join(dst, f)), exist_ok=True)
+        shutil.copy2(os.path.join(src, f), os.path.join(dst, f))
+        time.sleep(rng.uniform(1.0, 1.8))
+        print(f"  [{i + 1}/{len(files)}] {f}", flush=True)
+    open(os.path.join(dst, ".complete"), "w").write(REL + "\n")
+    log(f"staged {REL}")
+    os.unlink(lock)
+    print(f"staged {REL}; run `deploy commit` to make it current", flush=True)
+elif cmd == ["commit"]:
+    if os.path.exists(lock):
+        sys.exit("deploy: a stage lock is held; the stage is running or was interrupted (see `deploy status`)")
+    if not os.path.exists(os.path.join(dst, ".complete")):
+        sys.exit(f"deploy: {REL} is not staged; run `deploy stage` first")
+    open(os.path.join(d, "CURRENT.tmp"), "w").write(REL + "\n")
+    os.replace(os.path.join(d, "CURRENT.tmp"), os.path.join(d, "CURRENT"))
+    log(f"committed {REL}")
+    print(f"{REL} is now current")
+elif cmd == ["unlock"]:
+    pid = lock_pid()
+    if not os.path.exists(lock):
+        print("no stage lock")
+    elif running(pid):
+        sys.exit(f"deploy: pid {pid} is still staging; not removing its lock")
+    else:
+        os.unlink(lock)
+        log(f"removed stale lock of pid {pid}")
+        print(f"removed the stale lock of pid {pid}")
+elif cmd == ["status"]:
+    print(f"current: {open(os.path.join(d, 'CURRENT')).read().strip()}")
+    if os.path.exists(lock):
+        pid = lock_pid()
+        print(f"stage lock: pid {pid} ({'running' if running(pid) else 'NOT running: stale'})")
+    print(f"{REL}: {'staged' if os.path.exists(os.path.join(dst, '.complete')) else 'not staged'}")
+else:
+    print(__doc__.strip())
+    sys.exit(2)

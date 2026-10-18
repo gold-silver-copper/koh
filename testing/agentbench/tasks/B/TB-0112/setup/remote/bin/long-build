@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+import json, os, random, time
+home = os.path.expanduser("~")
+rng = random.Random(112)
+lock = f"{home}/.build.lock"
+open(lock, "w").write(f"{os.getpid()} {int(time.time())}\n")
+try:
+    for stage in ["fetch", "codegen", "compile", "compile", "compile", "link", "package", "sign"]:
+        for k in range(rng.randint(3, 6)):
+            time.sleep(rng.uniform(0.4, 1.2))
+            print(f"[{stage}] unit {k + 1}", flush=True)
+finally:
+    os.remove(lock)
+os.makedirs(f"{home}/.bench", exist_ok=True)
+json.dump({"pid": os.getpid()}, open(f"{home}/.bench/build.json", "w"))
+print("build finished", flush=True)

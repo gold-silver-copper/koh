@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+import json, os, random, time
+rng = random.Random(762)
+os.makedirs(os.path.expanduser("~/.bench"), exist_ok=True)
+start = time.time()
+ok = bad = 0
+for batch in range(1, 21):
+    time.sleep(rng.uniform(0.6, 1.6))
+    n = rng.randint(10, 24)
+    f = 1 if rng.random() < 0.15 else 0
+    ok += n - f
+    bad += f
+    print(f"batch {batch:2d}: {n - f} variants ok" + (f", {f} failed" if f else ""), flush=True)
+print(f"compiled {ok} shader variants, {bad} failed (variants total {ok + bad})", flush=True)
+with open(os.path.expanduser("~/.bench/shaders.json"), "w") as f:
+    json.dump({"start": start, "end": time.time(), "compiled": ok}, f)

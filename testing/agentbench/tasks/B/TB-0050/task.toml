@@ -1,0 +1,14 @@
+id = "TB-0050"
+title = "Finish an interactive import after a drop"
+cat = "drop"
+difficulty = "hard"
+goal = """
+On the remote machine, use the interactive `~/bin/import-wizard` to import `~/incoming/customers.csv`
+into the table `customers` (its default) and commit the import when it asks. The import itself
+takes about a minute, and the connection to the remote machine will drop while it is importing.
+The task is done when the import has been committed, exactly once, with no import left unfinished
+and no `import-wizard` left running.
+"""
+[drop]
+when = ".import-wizard/importing"
+after = 5.0

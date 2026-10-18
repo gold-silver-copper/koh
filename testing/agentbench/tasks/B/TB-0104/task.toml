@@ -1,0 +1,9 @@
+id = "TB-0104"
+title = "Unlock the keystore at its passphrase prompt"
+cat = "prompt"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/unlock-keystore` and answer its prompts: the keystore's
+passphrase is the single line in your local file `passphrase.txt` (without its line ending). Unlock
+the keystore for 45 minutes, and do not unlock the release signing key.
+"""

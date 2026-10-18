@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+import hashlib, json, os, random, signal, sys, time
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+home = os.path.expanduser("~")
+ck = f"{home}/ckpt"
+os.makedirs(ck, exist_ok=True)
+open(f"{home}/train.started", "w").write(str(os.getpid()))
+epoch, w = 0, hashlib.sha256(b"init").hexdigest()
+if "--resume" in sys.argv:
+    have = sorted(int(n[6:-5]) for n in os.listdir(ck) if n.startswith("epoch-") and n.endswith(".json"))
+    if have:
+        epoch = have[-1]
+        w = json.load(open(f"{ck}/epoch-{epoch}.json"))["weights"]
+        print(f"resuming from epoch {epoch}", flush=True)
+    else:
+        print("no checkpoint; starting from scratch", flush=True)
+elif os.listdir(ck):
+    print("train-model: checkpoints exist in ~/ckpt; use --resume to continue", file=sys.stderr)
+    sys.exit(2)
+while epoch < 12:
+    epoch += 1
+    rng = random.Random(1070 + epoch)
+    for step in range(10):
+        time.sleep(rng.uniform(0.2, 0.4))
+        print(f"epoch {epoch} step {step + 1}/10 loss={1 / (epoch + step / 10):.4f}", flush=True)
+    w = hashlib.sha256(f"{w}:{epoch}".encode()).hexdigest()
+    with open(f"{ck}/epoch-{epoch}.json.tmp", "w") as f:
+        json.dump({"epoch": epoch, "weights": w}, f)
+    os.replace(f"{ck}/epoch-{epoch}.json.tmp", f"{ck}/epoch-{epoch}.json")
+    print(f"checkpoint saved: ~/ckpt/epoch-{epoch}.json", flush=True)
+os.makedirs(f"{home}/model", exist_ok=True)
+json.dump({"epochs": 12, "weights": w}, open(f"{home}/model/final.json", "w"))
+print("training complete: ~/model/final.json", flush=True)

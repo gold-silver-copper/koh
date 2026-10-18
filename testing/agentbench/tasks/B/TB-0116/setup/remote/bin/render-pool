@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+import os, signal, sys, time
+home = os.path.expanduser("~")
+os.makedirs(f"{home}/.bench", exist_ok=True)
+log = f"{home}/.bench/pool.pids"
+
+
+def note(role):
+    with open(log, "a") as f:
+        f.write(f"{os.getpid()} {role}\n")
+
+
+def grandchild(n, k):
+    note(f"render-{n}.{k}")
+    while True:
+        time.sleep(1)
+
+
+def child(n):
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    note(f"slot-{n}")
+    for k in range(2):
+        if os.fork() == 0:
+            grandchild(n, k)
+    while True:
+        try:
+            os.wait()
+        except ChildProcessError:
+            pass
+        time.sleep(1)
+
+
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+note("render-pool")
+slots = {}
+
+
+def spawn(n):
+    pid = os.fork()
+    if pid == 0:
+        fd = os.open(os.devnull, os.O_RDWR)
+        for i in (0, 1, 2):
+            os.dup2(fd, i)
+        child(n)
+    slots[n] = pid
+
+
+for n in range(3):
+    spawn(n)
+time.sleep(1)
+print(f"pool ready: render-pool (pid {os.getpid()}) supervising 3 slots with 2 renderers each", flush=True)
+while True:
+    time.sleep(0.5)
+    for n, pid in list(slots.items()):
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            done = pid
+        if done:
+            print(f"slot {n} died; respawning", flush=True)
+            spawn(n)

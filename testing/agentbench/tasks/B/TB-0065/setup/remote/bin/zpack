@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+import sys, zlib
+if len(sys.argv) != 2:
+    print("usage: zpack OUTFILE", file=sys.stderr)
+    sys.exit(2)
+data = sys.stdin.buffer.read()
+with open(sys.argv[1], "wb") as f:
+    f.write(zlib.compress(data, 9))
+print(f"zpack: {len(data)} bytes in", file=sys.stderr)

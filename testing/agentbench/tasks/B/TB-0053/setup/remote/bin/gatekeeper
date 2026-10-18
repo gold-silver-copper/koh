@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Grants access after three correct responses to three different token-server challenges."""
+import os, socket, sys
+home = os.path.expanduser("~")
+
+
+def ask_server(code):
+    s = socket.socket(socket.AF_UNIX)
+    os.chdir(os.path.join(home, ".tokens"))
+    try:
+        s.connect("sock")
+    except OSError:
+        return None
+    s.sendall(code.encode())
+    return s.recv(100).decode()
+
+
+used = []
+print("gatekeeper: answer 3 challenges from token-server, each a different one (wait for a new one)")
+while len(used) < 3:
+    sys.stdout.write(f"response {len(used) + 1}/3: ")
+    sys.stdout.flush()
+    line = sys.stdin.readline()
+    if not line:
+        print("\ngatekeeper: input ended")
+        sys.exit(1)
+    r = ask_server(line.strip())
+    if r is None:
+        print("token-server is not running")
+    elif r == "no":
+        print("rejected: that is not a current challenge")
+    elif int(r.split()[1]) in used:
+        print("that challenge was already answered; wait for the next one")
+    else:
+        used.append(int(r.split()[1]))
+        print(f"accepted (challenge #{r.split()[1]})")
+os.makedirs(os.path.join(home, ".gate"), exist_ok=True)
+open(os.path.join(home, ".gate", "granted"), "w").write(" ".join(map(str, used)) + "\n")
+print("access granted")

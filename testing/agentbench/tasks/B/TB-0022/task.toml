@@ -1,0 +1,17 @@
+id = "TB-0022"
+title = "Sort configs into ok, invalid, crash and hang"
+cat = "crash"
+difficulty = "hard"
+goal = """
+On the remote machine, `~/bin/validate-cfg FILE` checks one service config. Run it on every file in
+`~/configs/` (some names have spaces and parentheses). For each file, decide the outcome:
+
+- `ok`: it exits with status 0;
+- `invalid`: it exits with status 2 after reporting a validation error;
+- `crash`: it dies with an unhandled error (a traceback);
+- `hang`: it is still running after 15 seconds (stop it; don't leave it running).
+
+Write `report.txt` in your local directory with one line per config file, `NAME: OUTCOME`, where
+NAME is the file's name (without the directory), e.g. `web.conf: ok`. No validator may be left
+running when you are done.
+"""

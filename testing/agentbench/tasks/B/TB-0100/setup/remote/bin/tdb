@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""tdb: a debugger for the toy VM."""
+import os, re, sys
+
+HELP = """commands:
+  break LINE     stop when execution reaches LINE (b LINE)
+  delete         remove all breakpoints
+  run            start the program from the beginning (r)
+  continue       run until the next breakpoint or the end (c)
+  step           execute one instruction (s)
+  print REG      show a register, e.g. print r3 (p)
+  regs           show all registers
+  list [LINE]    show the source around LINE or the current line (l)
+  quit           leave (q)"""
+
+
+def load(path):
+    src = open(path).read().split("\n")
+    labels, code = {}, {}
+    for n, line in enumerate(src, 1):
+        s = line.split(";", 1)[0].strip()
+        m = re.match(r"(\w+):\s*(.*)$", s)
+        if m:
+            labels[m.group(1)] = n
+            s = m.group(2)
+        if s:
+            op, _, rest = s.partition(" ")
+            code[n] = (op, [a.strip() for a in rest.split(",")] if rest.strip() else [])
+    return src, labels, code
+
+
+class VM:
+    def __init__(self, src, labels, code):
+        self.src, self.labels, self.code = src, labels, code
+        self.lines = sorted(code)
+        self.reset()
+
+    def reset(self):
+        self.r = [0] * 8
+        self.pc = self.lines[0]
+        self.done = False
+
+    def val(self, a):
+        return self.r[int(a[1:])] if a.startswith("r") else int(a)
+
+    def next_line(self, n):
+        later = [l for l in self.lines if l > n]
+        return later[0] if later else None
+
+    def target(self, label):
+        n = self.labels[label]
+        return n if n in self.code else self.next_line(n)
+
+    def step(self):
+        op, a = self.code[self.pc]
+        nxt = self.next_line(self.pc)
+        if op == "halt":
+            self.done = True
+            return
+        d = int(a[0][1:]) if a and a[0].startswith("r") else None
+        if op == "set": self.r[d] = self.val(a[1])
+        elif op == "add": self.r[d] += self.val(a[1])
+        elif op == "sub": self.r[d] -= self.val(a[1])
+        elif op == "mul": self.r[d] *= self.val(a[1])
+        elif op == "mod": self.r[d] %= self.val(a[1])
+        elif op == "xor": self.r[d] ^= self.val(a[1])
+        elif op == "jz" and self.r[d] == 0: nxt = self.target(a[1])
+        elif op == "jnz" and self.r[d] != 0: nxt = self.target(a[1])
+        self.pc = nxt
+        if nxt is None:
+            self.done = True
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("usage: tdb PROGRAM", file=sys.stderr)
+        sys.exit(2)
+    vm = VM(*load(sys.argv[1]))
+    bps = set()
+    started = False
+    print(f"tdb 0.4: {sys.argv[1]} loaded ({len(vm.code)} instructions); `help` for commands")
+
+    def where():
+        print(f"line {vm.pc}: {vm.src[vm.pc - 1].strip()}")
+
+    def go(first):
+        while True:
+            if not first and vm.pc in bps:
+                print("breakpoint hit, ", end="")
+                where()
+                return
+            first = False
+            vm.step()
+            if vm.done:
+                print("program halted")
+                return
+
+    while True:
+        try:
+            line = input("(tdb) ").strip()
+        except EOFError:
+            print()
+            return
+        if not line:
+            continue
+        cmd, _, arg = line.partition(" ")
+        arg = arg.strip()
+        if cmd in ("q", "quit"):
+            return
+        if cmd == "help":
+            print(HELP)
+        elif cmd in ("b", "break"):
+            if not arg.isdigit() or int(arg) not in vm.code:
+                print(f"no instruction at line {arg!r}")
+            else:
+                bps.add(int(arg))
+                print(f"breakpoint at line {arg}")
+        elif cmd == "delete":
+            bps.clear()
+            print("breakpoints deleted")
+        elif cmd in ("r", "run"):
+            vm.reset()
+            started = True
+            go(False)
+        elif cmd in ("c", "continue"):
+            if not started or vm.done:
+                print("the program is not running")
+            else:
+                go(True)
+        elif cmd in ("s", "step"):
+            if not started or vm.done:
+                print("the program is not running")
+            else:
+                vm.step()
+                print("program halted") if vm.done else where()
+        elif cmd in ("p", "print"):
+            if re.fullmatch(r"r[0-7]", arg):
+                print(f"{arg} = {vm.r[int(arg[1:])]}")
+            else:
+                print("usage: print rN")
+        elif cmd == "regs":
+            print("  ".join(f"r{i}={v}" for i, v in enumerate(vm.r)))
+        elif cmd in ("l", "list"):
+            c = int(arg) if arg.isdigit() else vm.pc
+            for n in range(max(1, c - 4), min(len(vm.src), c + 5) + 1):
+                print(f"{'=>' if n == vm.pc and started else '  '} {n:3d}  {vm.src[n - 1]}")
+        else:
+            print(f"unknown command {cmd!r}; try `help`")
+
+
+if __name__ == "__main__":
+    main()

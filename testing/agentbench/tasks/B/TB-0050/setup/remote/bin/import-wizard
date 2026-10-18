@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Interactive import of a CSV file into the warehouse."""
+import csv, json, os, sys, time
+home = os.path.expanduser("~")
+st = os.path.join(home, ".import-wizard")
+os.makedirs(st, exist_ok=True)
+pending = os.path.join(st, "importing")
+
+
+def ask(q):
+    sys.stdout.write(q)
+    sys.stdout.flush()
+    a = sys.stdin.readline()
+    if not a:
+        print("\nimport-wizard: input ended; nothing committed")
+        sys.exit(3)
+    return a.strip()
+
+
+def alive(pid):
+    try:
+        return b"import-wizard" in open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        return False
+
+
+print("import-wizard 1.3")
+if os.path.exists(pending):
+    old = json.load(open(pending))
+    if alive(old["pid"]):
+        sys.exit(f"import-wizard: another import is running (pid {old['pid']}); finish it there")
+    a = ask(f"Found an unfinished import of {old['source']} from an earlier session (pid {old['pid']}, "
+            "no longer running). Discard it and start over? [y/N]: ")
+    if a.lower() not in ("y", "yes"):
+        sys.exit("import-wizard: leaving the unfinished import alone")
+    os.unlink(pending)
+    print("discarded the unfinished import")
+src = os.path.expanduser(ask("Source file: "))
+if not os.path.isfile(src):
+    sys.exit(f"import-wizard: no such file {src!r}")
+table = ask("Target table [customers]: ") or "customers"
+json.dump({"pid": os.getpid(), "source": src, "table": table}, open(pending, "w"))
+rows = list(csv.DictReader(open(src)))
+good = [r for r in rows if r.get("email")]
+print(f"importing {len(rows)} rows into {table} ...", flush=True)
+for i in range(0, len(rows), 50):
+    time.sleep(1.1)
+    print(f"  {min(i + 50, len(rows))}/{len(rows)}", flush=True)
+a = ask(f"Imported {len(good)} rows ({len(rows) - len(good)} rejected: no email). Commit? [y/N]: ")
+if a.lower() not in ("y", "yes"):
+    os.unlink(pending)
+    sys.exit("import-wizard: rolled back; nothing committed")
+os.makedirs(os.path.join(home, "warehouse"), exist_ok=True)
+json.dump(good, open(os.path.join(home, "warehouse", f"{table}.json"), "w"))
+with open(os.path.join(st, "commits.log"), "a") as f:
+    f.write(f"{table} {len(good)}\n")
+os.unlink(pending)
+print(f"committed {len(good)} rows to {table}")

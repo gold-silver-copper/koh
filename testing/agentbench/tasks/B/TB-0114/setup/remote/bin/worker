@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+import os, sys, time
+home = os.path.expanduser("~")
+shard = int(sys.argv[2])
+open(f"{home}/.bench/worker-{shard}.pid", "w").write(str(os.getpid()))
+n = 0
+while True:
+    n += 1
+    if shard == 2:
+        end = time.time() + 0.35
+        x = 0
+        while time.time() < end:
+            x += 1
+        time.sleep(0.65)
+    else:
+        time.sleep(1)
+    if n % 10 == 0:
+        print(f"shard {shard}: heartbeat {n}", flush=True)

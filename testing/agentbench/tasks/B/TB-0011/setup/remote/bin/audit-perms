@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Audits file permissions across the shared volumes."""
+import random
+rng = random.Random(1111)
+owners = ["root", "www-data", "nobody", "backup", "postgres", "nobody2", "deploy"]
+groups = ["root", "nogroup", "nobody", "staff", "adm", "www-data"]
+def perm():
+    t = rng.choice("--------d-l")
+    bits = ""
+    for _ in range(3):
+        bits += rng.choice("r-") + rng.choice("ww--") + rng.choice("x-")
+    if rng.random() < 0.05:
+        bits = bits[:8] + ("t" if bits[8] == "x" else "T")
+    return t + bits
+print(f"{'mode':<11} {'owner':<9} {'group':<9} {'size':>12} {'modified':<20} path")
+for i in range(3600):
+    depth = rng.randint(3, 11)
+    path = "/srv/" + "/".join(rng.choice(["shared", "media", "exports", "tmp", "cache", "uploads", "archive",
+                                         "projects", "2024", "2025", "q1", "q2", "raw", "final", "drafts"]) +
+                              f"-{rng.randint(0, 999)}" for _ in range(depth)) + f"/file-{i:05d}.dat"
+    print(f"{perm():<11} {rng.choice(owners):<9} {rng.choice(groups):<9} {rng.randint(0, 10**11):>12} "
+          f"2025-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d} {rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:00  {path}")
+print("audit complete: 3600 entries")

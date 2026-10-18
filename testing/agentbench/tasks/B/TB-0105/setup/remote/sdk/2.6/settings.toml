@@ -1,0 +1,5 @@
+[compiler]
+opt_level = 2
+lto = "thin"
+[debugger]
+symbol_server = "https://symbols.studio.invalid"

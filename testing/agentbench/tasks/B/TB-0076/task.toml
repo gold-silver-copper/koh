@@ -1,0 +1,12 @@
+id = "TB-0076"
+title = "Two long jobs at once"
+cat = "wait"
+difficulty = "hard"
+goal = """
+On the remote machine, two jobs must both run to completion, and at the same time (start the
+second before the first has finished): `~/bin/bake-lighting` and `~/bin/compile-shaders`. When both
+are done, write two lines to `answer.txt` in your local directory:
+
+    lighting: <the lightmap checksum bake-lighting reports at the end>
+    shaders: <the number of shader variants compile-shaders reports as compiled>
+"""

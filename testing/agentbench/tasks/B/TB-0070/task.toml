@@ -1,0 +1,11 @@
+id = "TB-0070"
+title = "Frames that never rendered"
+cat = "output"
+difficulty = "hard"
+goal = """
+On the remote machine, run `~/bin/render-farm`. Eight workers render frames 1 to 3000 and their
+log lines are interleaved. A frame can fail and be retried later, possibly by another worker; a
+frame counts as rendered once any worker reports it `ok`. Write the numbers of the frames that
+failed and were never rendered by the end of the run to `answer.txt` in your local directory, one
+number per line, in increasing order.
+"""

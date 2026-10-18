@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Renders the intro sequence, frame by frame, under a watchdog."""
+import os, random, signal, time
+home = os.path.expanduser("~")
+os.makedirs(os.path.join(home, ".render"), exist_ok=True)
+open(os.path.join(home, ".render", "started"), "w").write("1\n")
+rng = random.Random(2020)
+signal.alarm(13)
+print("rendering intro: 240 frames at 1920x1080", flush=True)
+for frame in range(1, 241):
+    cost = rng.uniform(0.05, 0.12) if frame < 70 else rng.uniform(0.4, 0.9)
+    time.sleep(cost)
+    print(f"frame {frame:3d} rendered in {cost * 1000:.0f} ms", flush=True)
+    with open(os.path.join(home, ".render", "last"), "w") as f:
+        f.write(f"{frame}\n")
+print("done")

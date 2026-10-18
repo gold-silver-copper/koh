@@ -1,0 +1,10 @@
+id = "TB-0020"
+title = "How the renderer died"
+cat = "crash"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/render-frames`. After a while it dies without an error message.
+Write to `answer.txt` in your local directory two lines: first the exit status the shell reports
+for it (only the number), then the number of the last frame it reported as rendered (only the
+number).
+"""

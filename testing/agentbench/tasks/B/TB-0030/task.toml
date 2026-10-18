@@ -1,0 +1,10 @@
+id = "TB-0030"
+title = "Download a folder of oddly named files"
+cat = "files"
+difficulty = "easy"
+goal = """
+On the remote machine, the directory `~/inbox/` holds files with awkward names: leading dashes and
+spaces, quotes, `*`, `?`, `$`, backslashes, non-ASCII letters, a hidden file, and a subdirectory.
+Copy the whole directory into your local directory as `inbox/`, so that it has exactly the same
+names (every character kept) and the same contents.
+"""

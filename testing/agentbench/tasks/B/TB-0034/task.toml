@@ -1,0 +1,10 @@
+id = "TB-0034"
+title = "Pick a boot entry in a menu"
+cat = "tui"
+difficulty = "moderate"
+goal = """
+On the remote machine, `~/bin/bootmenu` is an interactive boot menu (it needs a terminal; move with
+the arrow keys, Enter to choose). Use it to make `Arch Linux (linux-lts 6.6.54, fallback initramfs)`
+the default boot entry, confirming when it asks. The menu saves the choice in
+`~/boot/default.conf`; the task is done when that file names this entry as the default.
+"""

@@ -34,6 +34,10 @@ def calls(stream_path):
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
+        item = msg.get("item") or {}
+        if msg.get("type") == "item.completed" and item.get("type") == "command_execution":
+            out.append(("call", item.get("command") or ""))
+            out.append(("result", f"[exit {item.get('exit_code')}] " + (item.get("aggregated_output") or "")))
         if msg.get("type") == "assistant":
             for part in msg.get("message", {}).get("content", []):
                 if part.get("type") == "tool_use":
@@ -61,7 +65,8 @@ def batches(results, out_dir, size):
             parts.append(f"\n---\n\n## {key}\n\n**Tool:** {r['config']}  **Checker:** {'pass' if r['ok'] else 'FAIL'} ({r['why']})  "
                          f"**Timed out:** {r.get('timed_out')}  **Seconds:** {r.get('seconds')}\n\n**Goal:**\n\n{goal}\n\n**Transcript:**\n")
             for kind, text in calls(os.path.join(r["root"], "state", "stream.jsonl")):
-                text = text if len(text) < 2500 else text[:1200] + f"\n… [{len(text) - 2400} bytes cut] …\n" + text[-1200:]
+                limit = 4000 if kind == "call" else 1000
+                text = text if len(text) < limit else text[:limit // 2] + f"\n… [{len(text) - limit} bytes cut] …\n" + text[-limit // 2:]
                 parts.append(f"\n{'$' if kind == 'call' else '>'} " + text.replace("\n", "\n  ") + "\n")
             parts.append(f"\n**Final message:**\n\n{(r.get('final') or '')[-1500:]}\n")
         with open(os.path.join(out_dir, f"batch-{n // size + 1:03d}.md"), "w") as f:

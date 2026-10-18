@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Files a note read from standard input into ~/notes/inbox/NNNN.txt."""
+import os, sys
+inbox = os.path.join(os.path.expanduser("~"), "notes", "inbox")
+os.makedirs(inbox, exist_ok=True)
+if sys.stdin.isatty():
+    print("file-note: type the note; end it with Ctrl-D on a line of its own", file=sys.stderr)
+data = sys.stdin.buffer.read()
+n = len(os.listdir(inbox)) + 1
+path = os.path.join(inbox, f"{n:04d}.txt")
+open(path, "wb").write(data)
+print(f"filed as {n:04d} ({len(data)} bytes)")

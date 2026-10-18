@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+import hashlib, json, os, random, sys, time
+rng = random.Random(65)
+h = hashlib.sha256()
+for i in range(500):
+    row = f"{i},{rng.choice(['alice','bob','chen','dara','eve'])},{rng.randint(1, 99999)},{rng.random():.6f}\n"
+    sys.stdout.write(row)
+    h.update(row.encode())
+    if i % 100 == 99:
+        sys.stdout.flush()
+        time.sleep(0.1)
+sys.stdout.flush()
+os.makedirs(os.path.expanduser("~/.bench"), exist_ok=True)
+with open(os.path.expanduser("~/.bench/export.json"), "w") as f:
+    json.dump({"sha256": h.hexdigest(), "status": 5}, f)
+print("export-db: lost connection to replica db-3 after 500 rows", file=sys.stderr)
+sys.exit(5)

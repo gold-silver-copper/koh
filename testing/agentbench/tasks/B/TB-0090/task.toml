@@ -1,0 +1,10 @@
+id = "TB-0090"
+title = "Upload deploy scripts with their modes"
+cat = "files"
+difficulty = "easy"
+goal = """
+Your local directory has a deploy bundle, `deploy/`. Put it on the remote machine as
+`~/srv/deploy/` (the same tree: same files, same contents), with the same file permissions:
+files that are executable locally must be executable there, and files that are not executable
+locally must not be executable there.
+"""

@@ -1,0 +1,9 @@
+id = "TB-0073"
+title = "Wait for the asset export"
+cat = "wait"
+difficulty = "easy"
+goal = """
+On the remote machine, run `~/bin/export-assets` and let it finish (it takes a while). When it is
+done it reports how many assets it exported. Write that number (only the number) to `answer.txt` in
+your local directory.
+"""

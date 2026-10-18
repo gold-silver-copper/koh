@@ -1,0 +1,9 @@
+id = "TB-0004"
+title = "Find the fullest mount"
+cat = "run"
+difficulty = "easy"
+goal = """
+On the remote machine, run `~/bin/disk-report --all`. It prints a table of mounts. Write the mount
+point (the path in the `Mounted on` column) with the highest `Use%` to `answer.txt` in your local
+directory, and nothing else.
+"""

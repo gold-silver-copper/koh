@@ -1,0 +1,10 @@
+id = "TB-0078"
+title = "A job in the batch queue"
+cat = "wait"
+difficulty = "moderate"
+goal = """
+The remote machine has a small batch queue: `~/bin/qsub SPEC` submits a job and prints its id,
+and `~/bin/qstat` reports on jobs. Submit `~/jobs/retarget.spec`, wait until that job has
+finished, and write the result `qstat` reports for it (the text after `result=`) to `answer.txt`
+in your local directory.
+"""

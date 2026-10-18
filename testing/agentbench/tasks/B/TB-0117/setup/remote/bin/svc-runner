@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+import json, os, socket, sys, threading
+home = os.path.expanduser("~")
+name = sys.argv[1]
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(16)
+port = s.getsockname()[1]
+json.dump({"pid": os.getpid(), "port": port}, open(f"{home}/.bench/svc-{name}.json", "w"))
+print(f"svc-runner: service up on {port}", flush=True)
+while True:
+    c, _ = s.accept()
+    try:
+        c.recv(4096)
+        c.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 8\r\n\r\nservice\n")
+    finally:
+        c.close()

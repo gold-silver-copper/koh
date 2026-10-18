@@ -1,0 +1,9 @@
+id = "TB-0027"
+title = "Fetch a report with an awkward name"
+cat = "files"
+difficulty = "easy"
+goal = """
+On the remote machine, the directory `~/reports/` holds a few PDF reports. Copy the final version
+2 of the Q3 summary, the file named `Q3 summary (final) – v2.pdf` (the dash is an en dash, `–`),
+into your local directory under the same name, byte for byte.
+"""

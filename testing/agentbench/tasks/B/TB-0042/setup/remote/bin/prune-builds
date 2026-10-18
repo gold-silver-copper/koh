@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""Deletes builds in ~/builds older than 30 days (by the date in their names), after asking."""
+import datetime, os, re, shutil, sys
+home = os.path.expanduser("~")
+d = os.path.join(home, "builds")
+today = datetime.date(2026, 10, 17)
+old = []
+for n in sorted(os.listdir(d)):
+    m = re.match(r"build-(\d{4}-\d{2}-\d{2})-\d+$", n)
+    if m and (today - datetime.date.fromisoformat(m.group(1))).days > 30:
+        old.append(n)
+if not old:
+    print("nothing to prune")
+    sys.exit(0)
+print(f"{len(old)} builds are older than 30 days:")
+for n in old:
+    print(f"  {n}")
+sys.stdout.write(f"Delete these {len(old)} builds? [y/N] ")
+sys.stdout.flush()
+a = sys.stdin.readline().strip().lower()
+if a not in ("y", "yes"):
+    print("aborted; nothing deleted")
+    sys.exit(1)
+for n in old:
+    shutil.rmtree(os.path.join(d, n))
+open(os.path.join(d, ".pruned"), "w").write("\n".join(old) + "\n")
+print(f"deleted {len(old)} builds")

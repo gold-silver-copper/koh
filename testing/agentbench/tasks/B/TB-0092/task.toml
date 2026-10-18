@@ -1,0 +1,11 @@
+id = "TB-0092"
+title = "An exact backup of a project tree"
+cat = "files"
+difficulty = "hard"
+goal = """
+On the remote machine, run `~/bin/checkout-project`; it sets up `~/project`, a release tree with
+symbolic links (one of them dangling), empty directories, executable scripts and a large binary
+blob. Make an exact backup of it in your local directory as `backup/project/`: every file
+byte-identical with the same executable bits, every symbolic link copied as a symbolic link with
+the same target (not followed), every directory present (empty ones too), and nothing else.
+"""

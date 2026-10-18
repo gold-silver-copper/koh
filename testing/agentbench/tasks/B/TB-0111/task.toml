@@ -1,0 +1,11 @@
+id = "TB-0111"
+title = "Probe a dev server from a second shell"
+cat = "sessions"
+difficulty = "moderate"
+goal = """
+On the remote machine, `~/bin/api-dev` runs the API's development server in the foreground of a
+terminal: it shows the address it listens on and quits cleanly when you press `q` in it. While it
+runs, fetch the path `/token` from it with `~/bin/api-client PORT PATH` (run on the remote) and
+write the token it returns (only the token) to `answer.txt` in your local directory. Then quit
+`api-dev` with its `q` key.
+"""

@@ -1,0 +1,9 @@
+id = "TB-0067"
+title = "The one error in a huge build log"
+cat = "output"
+difficulty = "easy"
+goal = """
+On the remote machine, run `~/bin/build-engine`. It prints a very long build log with thousands of
+warnings and exactly one error. Write the source location of that error as `path:line` (for example
+`src/foo.rs:10`, without the column) to `answer.txt` in your local directory.
+"""

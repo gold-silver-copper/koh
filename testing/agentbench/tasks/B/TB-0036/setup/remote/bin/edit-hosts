@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Edits ~/etc/hosts safely: opens a copy in $EDITOR (vim by default), checks it, installs it.
+
+Edit ~/etc/hosts only with this tool: it stamps the installed file with a checksum and refuses
+to work on a file that was changed behind its back.
+"""
+import hashlib, ipaddress, os, shlex, subprocess, sys
+home = os.path.expanduser("~")
+hosts = os.path.join(home, "etc", "hosts")
+work = os.path.join(home, "etc", ".hosts.edit")
+HEADER = "# managed by edit-hosts; checksum="
+
+
+def split(text):
+    lines = text.splitlines()
+    if not lines or not lines[0].startswith(HEADER):
+        return None, lines
+    return lines[0][len(HEADER):], lines[1:]
+
+
+def digest(body):
+    return hashlib.sha256(("\n".join(body) + "\n").encode()).hexdigest()[:16]
+
+
+stamp, body = split(open(hosts).read())
+if stamp is None or stamp != digest(body):
+    sys.exit("edit-hosts: ~/etc/hosts was modified outside edit-hosts; restore it from ~/etc/hosts.orig")
+if os.path.exists(work):
+    sys.exit("edit-hosts: an edit is already in progress (~/etc/.hosts.edit); finish or remove it")
+open(work, "w").write("\n".join(body) + "\n")
+try:
+    while True:
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vim"
+        rc = subprocess.call(f"{editor} {shlex.quote(work)}", shell=True)
+        if rc != 0:
+            sys.exit(f"edit-hosts: the editor exited with status {rc}; nothing installed")
+        new = [l.rstrip() for l in open(work).read().splitlines()]
+        bad = []
+        for n, l in enumerate(new, 1):
+            if not l.strip() or l.lstrip().startswith("#"):
+                continue
+            parts = l.split()
+            try:
+                ipaddress.ip_address(parts[0])
+            except ValueError:
+                bad.append(f"line {n}: {parts[0]!r} is not an IP address")
+                continue
+            if len(parts) < 2:
+                bad.append(f"line {n}: no host name")
+        if not bad:
+            break
+        print("edit-hosts: the edited file has errors:\n  " + "\n  ".join(bad))
+        if not sys.stdin.isatty() or input("edit again? [Y/n] ").strip().lower().startswith("n"):
+            sys.exit("edit-hosts: nothing installed")
+    open(hosts, "w").write(HEADER + digest(new) + "\n" + "\n".join(new) + "\n")
+    with open(os.path.join(home, "etc", ".edit-hosts.log"), "a") as f:
+        f.write(f"installed {digest(new)}\n")
+    print(f"edit-hosts: installed ~/etc/hosts ({len(new)} lines)")
+finally:
+    if os.path.exists(work):
+        os.unlink(work)

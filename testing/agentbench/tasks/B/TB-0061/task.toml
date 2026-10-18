@@ -1,0 +1,8 @@
+id = "TB-0061"
+title = "Exit status of a test shard"
+cat = "run"
+difficulty = "easy"
+goal = """
+On the remote machine, run the test shard `~/bin/shard-test 7`. Write its exit status (only the
+number) to `answer.txt` in your local directory.
+"""

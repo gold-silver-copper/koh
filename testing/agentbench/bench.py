@@ -50,6 +50,19 @@ BINS = os.path.join(SCRATCH, "bins")
 DOCS = os.path.join(SCRATCH, "docs")
 NOTES = os.path.expanduser("~/code/notes/projects/koh")
 CLAUDE = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+CODEX = shutil.which("codex") or os.path.expanduser("~/.local/bin/codex")
+
+
+def agent_argv(agent, prompt, local):
+    """The agent's command line: a fresh `claude -p` with a small model, or `codex exec` with
+    gpt-6.1-sol at the standard tier, both told to act without asking (bubblewrap is the sandbox)."""
+    if agent in ("codex-sol", "codex-sol-fast"):
+        tier = "fast" if agent.endswith("-fast") else "default"
+        return [CODEX, "exec", "-m", "gpt-6.1-sol", "-c", f'service_tier="{tier}"',
+                "-c", 'model_reasoning_effort="high"', "--dangerously-bypass-approvals-and-sandbox",
+                "--ephemeral", "--skip-git-repo-check", "--ignore-rules", "-C", local, "--json", prompt]
+    return [CLAUDE, "-p", "--model", agent, "--output-format", "stream-json", "--verbose",
+            "--permission-mode", "bypassPermissions", "--max-turns", "80", prompt]
 FUX = os.path.join(BINS, "fux")  # a copy: ~/.cargo/bin is hidden from the agent
 LOGGED = ["koh", "ssh", "scp", "sftp", "rsync", "fux", "sleep"]
 SPOILERS = ["FUX_SOCKET", "FUX_PANE", "FUX_SERVER", "TMUX", "TMUX_PANE", "SSH_AUTH_SOCK",
@@ -213,7 +226,8 @@ class Run:
             XDG_RUNTIME_DIR=rt, FUX_SOCKET=os.path.join(rt, "fux.sock"),
             XDG_CONFIG_HOME=os.path.join(self.state, "config"), KOHBENCH=self.marker + "-local",
             TERM="xterm-256color", LANG="C.UTF-8", PYTHONDONTWRITEBYTECODE="1", SHELL="/bin/bash",
-            PATH=":".join([os.path.join(self.state, "bin"), os.path.dirname(CLAUDE), "/usr/local/bin", "/usr/bin", "/bin"]),
+            PATH=":".join([os.path.join(self.state, "bin"), os.path.dirname(CLAUDE), os.path.dirname(CODEX),
+                           "/usr/local/bin", "/usr/bin", "/bin"]),
         )
         return env
 
@@ -331,7 +345,8 @@ class Run:
         # PATH (the user's own koh is hidden with ~/.cargo/bin), and no history written.
         rc = os.path.join(self.state, "bashrc")
         with open(rc, "w") as f:
-            f.write(f"PATH={os.path.join(self.state, 'bin')}:{os.path.dirname(CLAUDE)}:/usr/local/bin:/usr/bin:/bin\n"
+            f.write(f"PATH={os.path.join(self.state, 'bin')}:{os.path.dirname(CLAUDE)}:{os.path.dirname(CODEX)}"
+                    ":/usr/local/bin:/usr/bin:/bin\n"
                     "HISTFILE=/dev/null\nPS1='\\w\\$ '\n")
         home = os.path.expanduser("~")
         box = ["bwrap", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-pid", "--die-with-parent",
@@ -400,11 +415,11 @@ class Run:
             watcher = threading.Thread(target=self.drop_watch, args=(stop,), daemon=True)
             watcher.start()
             started = time.time()
-            argv = [CLAUDE, "-p", "--model", model, "--output-format", "stream-json", "--verbose",
-                    "--permission-mode", "bypassPermissions", "--max-turns", "80", prompt]
+            argv = agent_argv(model, prompt, self.local)
+            record["agent"] = model
             stream_path = os.path.join(self.state, "stream.jsonl")
-            with open(stream_path, "w") as out:
-                agent = subprocess.Popen(self.sandbox(argv), env=env, stdout=out, stderr=subprocess.STDOUT,
+            with open(stream_path, "w") as out, open(os.path.join(self.state, "agent.err"), "w") as err:
+                agent = subprocess.Popen(self.sandbox(argv), env=env, stdout=out, stderr=err,
                                          stdin=subprocess.DEVNULL, start_new_session=True)
                 try:
                     agent.wait(timeout=self.task.get("timeout", timeout))
@@ -433,6 +448,16 @@ def read_stream(path, tool):
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
+        # codex exec --json: items, and the turn's usage.
+        item = msg.get("item") or {}
+        if msg.get("type") == "item.completed" and item.get("type") == "command_execution":
+            commands.append(item.get("command") or "")
+        if msg.get("type") == "item.completed" and item.get("type") == "agent_message":
+            final = item.get("text") or ""
+        if msg.get("type") == "turn.completed":
+            u = msg.get("usage") or {}
+            usage = {"tokens_in": u.get("input_tokens"), "tokens_out": u.get("output_tokens")}
+        # claude -p --output-format stream-json.
         if msg.get("type") == "assistant":
             for part in msg.get("message", {}).get("content", []):
                 if part.get("type") == "tool_use":
@@ -512,7 +537,7 @@ def main():
     r.add_argument("--repeats", type=int, default=1)
     r.add_argument("--workers", type=int, default=4)
     r.add_argument("--slot-base", type=int, default=0)
-    r.add_argument("--model", default="haiku")
+    r.add_argument("--model", default="haiku", help="haiku (claude -p), or codex-sol / codex-sol-fast (codex exec, gpt-6.1-sol, standard or fast tier)")
     r.add_argument("--timeout", type=int, default=1200)
     r.add_argument("--out", required=True)
     v = sub.add_parser("validate")
@@ -545,7 +570,7 @@ def main():
                 bad += not ok
                 print(f"{'ok ' if ok else 'BAD'} {futs[fut]['id']:<8} {why}", flush=True)
         sys.exit(1 if bad else 0)
-    assert args.workers <= 4, "at most 4 agents at once"
+    assert args.workers <= 12, "at most 12 agents at once"
     for config in args.configs.split(","):
         c = CONFIGS[config]
         if "bin" in c:

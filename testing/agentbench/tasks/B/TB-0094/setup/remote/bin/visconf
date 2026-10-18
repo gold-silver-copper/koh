@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""visconf: edit ~/srv/app.conf safely (like visudo)."""
+import hashlib, json, os, shlex, shutil, subprocess, sys
+home = os.path.expanduser("~")
+conf = f"{home}/srv/app.conf"
+KEYS = {"listen": str, "workers": int, "log_level": ("error", "warn", "info", "debug", "trace"),
+        "cache_mb": int, "tick_rate": int, "max_sessions": int}
+if not (os.isatty(0) and os.isatty(1)):
+    print("visconf: needs a terminal (it runs an editor)", file=sys.stderr)
+    sys.exit(2)
+lines = open(conf).read().splitlines(True)
+body = "".join(l for l in lines if not l.startswith("# managed by visconf"))
+work = f"{home}/.cache/visconf"
+os.makedirs(work, exist_ok=True)
+edit = f"{work}/app.conf"
+with open(edit, "w") as f:
+    f.write(body)
+
+
+def problems(text):
+    out, seen = [], set()
+    for n, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if "=" not in s:
+            out.append(f"line {n}: expected `key = value`")
+            continue
+        k, v = (x.strip() for x in s.split("=", 1))
+        if k not in KEYS:
+            out.append(f"line {n}: unknown key {k!r}")
+        elif k in seen:
+            out.append(f"line {n}: duplicate key {k!r}")
+        elif KEYS[k] is int and not v.isdigit():
+            out.append(f"line {n}: {k} must be a number")
+        elif isinstance(KEYS[k], tuple) and v not in KEYS[k]:
+            out.append(f"line {n}: {k} must be one of {', '.join(KEYS[k])}")
+        seen.add(k)
+    out += [f"missing key {k!r}" for k in KEYS if k not in seen]
+    return out
+
+
+editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vim")
+while True:
+    subprocess.call(editor + [edit])
+    text = open(edit).read()
+    bad = problems(text)
+    if not bad:
+        break
+    print("visconf: the config has problems:\n  " + "\n  ".join(bad))
+    ans = input("What now? (e)dit again, (a)bort without saving: ").strip().lower()
+    if ans.startswith("a"):
+        print("visconf: aborted, ~/srv/app.conf unchanged")
+        sys.exit(1)
+if text == body:
+    print("visconf: no changes")
+    sys.exit(0)
+out = f"# managed by visconf; checksum: {hashlib.sha256(text.encode()).hexdigest()[:16]}\n" + text
+with open(conf + ".new", "w") as f:
+    f.write(out)
+os.replace(conf + ".new", conf)
+os.makedirs(f"{home}/.bench", exist_ok=True)
+with open(f"{home}/.bench/visconf.json", "a") as f:
+    f.write(json.dumps({"sha256": hashlib.sha256(out.encode()).hexdigest()}) + "\n")
+print("visconf: installed ~/srv/app.conf")

@@ -1,0 +1,10 @@
+id = "TB-0094"
+title = "Change settings through visconf"
+cat = "tui"
+difficulty = "moderate"
+goal = """
+On the remote machine, the game server's config `~/srv/app.conf` may only be changed with
+`~/bin/visconf`, which opens it in a text editor (vim by default, or `$EDITOR`), checks it when
+the editor exits, and installs it. Using `visconf`, set `workers` to `12` and `log_level` to
+`debug`, and leave every other setting unchanged.
+"""

@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""The app daemon. Serves requests and keeps a helper that flushes debug logs."""
+import os, signal, subprocess, sys, time
+home = os.path.expanduser("~")
+open(os.path.join(home, ".app", "appd.pid"), "w").write(f"{os.getpid()}\n")
+flusher = subprocess.Popen([os.path.join(home, "libexec", "app-flusher")], stdin=subprocess.DEVNULL)
+open(os.path.join(home, ".app", "flusher.pid"), "w").write(f"{flusher.pid}\n")
+print(f"appd: serving; debug flusher pid {flusher.pid}", flush=True)
+warned = False
+while True:
+    time.sleep(1)
+    open(os.path.join(home, "app", "health"), "w").write(f"{time.time():.0f}\n")
+    if flusher.poll() is not None and not warned:
+        warned = True
+        print(f"appd: debug flusher exited ({flusher.returncode}); continuing without debug logs", flush=True)

@@ -1,0 +1,23 @@
+; checksum.vm - mixes a pseudo-random stream into r3
+        set r1, 7
+        set r2, 0
+        set r3, 1
+        set r4, 24          ; iterations
+loop:
+        mul r1, 1103
+        add r1, 12345
+        mod r1, 65521
+        set r5, r1
+        mod r5, 7
+        jz r5, skip         ; every so often skip the mix
+mix:
+        xor r3, r1
+        mul r3, 31
+        add r3, r2
+        mod r3, 1000003
+skip:
+        add r2, r1
+        mod r2, 99991
+        dec r4
+        jnz r4, loop
+        halt

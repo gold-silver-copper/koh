@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+import os, random
+root = os.path.expanduser("~/project")
+rng = random.Random(92)
+def put(rel, data, mode=0o644):
+    p = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "wb") as f:
+        f.write(data if isinstance(data, bytes) else data.encode())
+    os.chmod(p, mode)
+put("bin/launch", "#!/bin/sh\nexec \"$(dirname \"$0\")/../current/app.bin\" \"$@\"\n", 0o755)
+put("scripts/deploy.sh", "#!/bin/sh\necho deploying\n", 0o755)
+put("scripts/notes.txt", "deploy.sh is the only script\n")
+put("releases/v2/app.bin", rng.randbytes(40000), 0o755)
+put("releases/v3/app.bin", rng.randbytes(42000), 0o755)
+put("releases/v3/CHANGES", "v3: faster loading\n")
+put("blobs/b6.bin", rng.randbytes(9000))
+big = b"".join(random.Random(9200 + i).randbytes(1 << 20) for i in range(12))
+put("blobs/b7 world cache.bin", big)
+put("config/settings with spaces.ini", "[game]\nfov = 90\n")
+os.makedirs(os.path.join(root, "logs"), exist_ok=True)
+os.makedirs(os.path.join(root, "tmp/cache/shaders"), exist_ok=True)
+os.makedirs(os.path.join(root, "data"), exist_ok=True)
+for link, target in (("current", "releases/v3"), ("data/latest.bin", "../blobs/b7 world cache.bin"),
+                     ("old", "releases/v1"), ("config/active.ini", "settings with spaces.ini")):
+    p = os.path.join(root, link)
+    if not os.path.lexists(p):
+        os.symlink(target, p)
+print("checked out ~/project (release v3)")

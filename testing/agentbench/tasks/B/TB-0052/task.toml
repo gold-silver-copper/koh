@@ -1,0 +1,10 @@
+id = "TB-0052"
+title = "Raise a limit while a job keeps running"
+cat = "sessions"
+difficulty = "easy"
+goal = """
+On the remote machine, start `~/bin/warm-cache`; it runs for about a minute and a half. While it is
+still running (don't stop or restart it), change `max_entries` in `~/cache/limits.conf` to `50000`;
+the job picks the change up on its own. When it finishes it prints `warmed N entries`; write that
+number to `answer.txt` in your local directory.
+"""

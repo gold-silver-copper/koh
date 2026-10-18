@@ -1,0 +1,9 @@
+id = "TB-0062"
+title = "The line on standard error"
+cat = "run"
+difficulty = "easy"
+goal = """
+On the remote machine, `~/bin/toolchain-info` prints a report about the build box's compilers.
+Most of it goes to standard output; exactly one line goes to standard error. Write that one line
+(exactly as printed, nothing else) to `answer.txt` in your local directory.
+"""

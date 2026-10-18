@@ -1,0 +1,10 @@
+id = "TB-0024"
+title = "Flash a binary image through stdin"
+cat = "stdin"
+difficulty = "moderate"
+goal = """
+Your local directory has `firmware.bin`, a binary image. On the remote machine,
+`~/bin/flash --stdin` reads an image from its standard input and flashes it; it checks the image
+and prints `flashed: id=...` when it was received intact. Flash the local `firmware.bin` this way
+and write the id it prints (only the text after `id=`) to `answer.txt` in your local directory.
+"""

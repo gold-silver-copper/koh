@@ -1,0 +1,13 @@
+id = "TB-0110"
+title = "Keep the asset server up through a drop"
+cat = "drop"
+difficulty = "easy"
+goal = """
+On the remote machine, start `~/bin/asset-server`, the team's asset server. It must keep running
+and serving after you are done, even though the connection to the remote will drop shortly after
+it starts. It listens on a port of its own choosing on 127.0.0.1 and logs each request it
+serves. Write that port number (only the number) to `answer.txt` in your local directory.
+"""
+[drop]
+when = "asset-server.port"
+after = 2

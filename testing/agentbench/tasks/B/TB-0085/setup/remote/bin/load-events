@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+import hashlib, json, os, sys
+data = sys.stdin.buffer.read()
+home = os.path.expanduser("~")
+n = sum(1 for l in data.splitlines() if l.strip())
+os.makedirs(f"{home}/.bench", exist_ok=True)
+with open(f"{home}/.bench/load.json", "a") as f:
+    f.write(json.dumps({"sha256": hashlib.sha256(data).hexdigest(), "events": n}) + "\n")
+print(f"loaded {n} events")

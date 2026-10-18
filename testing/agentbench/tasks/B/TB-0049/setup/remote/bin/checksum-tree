@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Computes the content digest of ~/data (slowly: it rate-limits its reads). Prints the digest."""
+import hashlib, os, time
+home = os.path.expanduser("~")
+root = os.path.join(home, "data")
+open(os.path.join(home, ".checksum-tree.running"), "w").write(f"{os.getpid()}\n")
+files = sorted(os.path.relpath(os.path.join(r, f), root) for r, _, fs in os.walk(root) for f in fs)
+h = hashlib.sha256()
+print(f"checksumming {len(files)} files under ~/data", flush=True)
+for i, f in enumerate(files):
+    h.update(f.encode() + b"\0" + hashlib.sha256(open(os.path.join(root, f), "rb").read()).digest())
+    time.sleep(0.5)
+    if i % 10 == 9:
+        print(f"  {i + 1}/{len(files)}", flush=True)
+print(f"tree digest: {h.hexdigest()}", flush=True)
+open(os.path.join(home, ".checksum-tree.finished"), "w").write(f"{len(files)}\n")

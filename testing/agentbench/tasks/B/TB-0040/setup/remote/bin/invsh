@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""The inventory shell: SQL against the inventory database (~/inventory.db).
+
+Statements end with `;`. Dot commands: .tables, .schema [TABLE], .quit
+"""
+import os, random, sqlite3, sys
+home = os.path.expanduser("~")
+path = os.path.join(home, "inventory.db")
+fresh = not os.path.exists(path)
+db = sqlite3.connect(path)
+if fresh:
+    rng = random.Random(4040)
+    db.executescript("""
+    create table warehouses (id integer primary key, code text, city text);
+    create table items (sku text primary key, title text, reorder_level integer);
+    create table stock (warehouse_id integer references warehouses(id), sku text references items(sku), qty integer);
+    """)
+    whs = [(1, "north", "Oslo"), (2, "east", "Tallinn"), (3, "west", "Dublin"), (4, "east-annex", "Tartu")]
+    db.executemany("insert into warehouses values (?, ?, ?)", whs)
+    items = []
+    for i in range(400):
+        sku = f"SKU-{rng.randint(10000, 99999)}-{i:03d}"
+        items.append((sku, f"{rng.choice(['bolt', 'cable', 'fan', 'panel', 'relay', 'valve'])} {rng.randint(1, 90)}",
+                      rng.randint(5, 60)))
+    db.executemany("insert into items values (?, ?, ?)", items)
+    rows = []
+    for sku, _, lvl in items:
+        for wid, _, _ in whs:
+            if rng.random() < 0.7:
+                rows.append((wid, sku, max(0, int(lvl * rng.uniform(0.3, 2.5)))))
+    db.executemany("insert into stock values (?, ?, ?)", rows)
+    db.commit()
+db.execute("pragma query_only = on")
+tty = sys.stdin.isatty()
+print(f"invsh 1.2 on {path}. End statements with ';'. Try .tables or .schema.")
+buf = ""
+while True:
+    try:
+        line = input("inv> " if not buf else "...> ")
+    except EOFError:
+        print()
+        break
+    if not buf and line.strip().startswith("."):
+        cmd = line.split()
+        if cmd[0] in (".quit", ".exit"):
+            break
+        if cmd[0] == ".tables":
+            print("  ".join(r[0] for r in db.execute("select name from sqlite_master where type='table' order by name")))
+        elif cmd[0] == ".schema":
+            q = "select sql from sqlite_master where type='table'" + (" and name=?" if len(cmd) > 1 else "")
+            for (s,) in db.execute(q, cmd[1:2]):
+                print(s.strip() + ";")
+        else:
+            print(f"error: unknown command {cmd[0]}")
+        continue
+    buf += line + "\n"
+    if not buf.strip().endswith(";"):
+        continue
+    try:
+        cur = db.execute(buf)
+        if cur.description:
+            print(" | ".join(d[0] for d in cur.description))
+            for row in cur.fetchall():
+                print(" | ".join("NULL" if v is None else str(v) for v in row))
+    except sqlite3.Error as e:
+        print(f"error: {e}")
+    buf = ""

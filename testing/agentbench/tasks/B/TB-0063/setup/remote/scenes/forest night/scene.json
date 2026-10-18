@@ -1,0 +1,2 @@
+{"name": "forest night", "sun": {"elevation": -12.0, "color": [0.1, 0.12, 0.3]}, "fog": 0.42,
+ "props": ["oak_a", "oak_b", "lantern", "campfire", "owl"], "camera": {"fov": 54, "path": "dolly_03"}}

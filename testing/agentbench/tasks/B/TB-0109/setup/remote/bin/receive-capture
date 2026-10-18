@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+import hashlib, json, os, signal, struct, sys, time
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+home = os.path.expanduser("~")
+os.makedirs(f"{home}/captures", exist_ok=True)
+os.makedirs(f"{home}/.bench", exist_ok=True)
+open(f"{home}/receive.started", "w").write(str(os.getpid()))
+part = f"{home}/captures/cap.bin.part"
+got = 0
+with open(part, "wb") as f:
+    while True:
+        chunk = sys.stdin.buffer.read(256 * 1024)
+        if not chunk:
+            break
+        f.write(chunk)
+        got += len(chunk)
+        if got % (1 << 20) < 256 * 1024:
+            sys.stderr.write(f"received {got >> 20} MiB\n")
+            sys.stderr.flush()
+        time.sleep(0.04)
+data = open(part, "rb").read()
+ok = len(data) >= 44 and data[:4] == b"CAPT" and struct.unpack("<Q", data[4:12])[0] == len(data) - 44 \
+    and hashlib.sha256(data[44:]).digest() == data[12:44]
+with open(f"{home}/.bench/receive.json", "a") as f:
+    f.write(json.dumps({"bytes": len(data), "ok": ok}) + "\n")
+if not ok:
+    print(f"receive-capture: incomplete or corrupt capture ({len(data)} bytes); not stored", file=sys.stderr)
+    sys.exit(1)
+os.replace(part, f"{home}/captures/cap.bin")
+print(f"receive-capture: stored ~/captures/cap.bin ({len(data)} bytes)")

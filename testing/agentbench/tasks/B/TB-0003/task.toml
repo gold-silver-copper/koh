@@ -1,0 +1,13 @@
+id = "TB-0003"
+title = "Pass one tricky argument"
+cat = "run"
+difficulty = "moderate"
+goal = """
+On the remote machine, run `~/bin/tagger` with exactly one argument, whose text is the following
+line exactly (an apostrophe, double quotes, a dollar sign, spaces and an asterisk, all literal):
+
+    it's "v2.0" $HOME *
+
+It prints a line `tag: ...`. Write the tag (the text after `tag: `) to `answer.txt` in your local
+directory.
+"""

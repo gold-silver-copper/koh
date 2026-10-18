@@ -1,0 +1,10 @@
+id = "TB-0068"
+title = "A value inside one very long line"
+cat = "output"
+difficulty = "moderate"
+goal = """
+On the remote machine, `~/bin/describe-checkpoint` prints a description of a training checkpoint:
+a few short lines, then the whole manifest as one very long line of JSON. Write the value of the
+manifest's `resume_token` field (only the value, without quotes) to `answer.txt` in your local
+directory.
+"""

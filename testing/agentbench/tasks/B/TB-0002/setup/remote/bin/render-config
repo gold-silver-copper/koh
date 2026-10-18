@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Renders the service config for $STAGE from ./vars.ini."""
+import configparser, hashlib, os, sys
+stage = os.environ.get("STAGE")
+if not stage:
+    sys.exit("render-config: STAGE is not set (dev or prod)")
+if not os.path.exists("vars.ini"):
+    sys.exit(f"render-config: no vars.ini in {os.getcwd()}")
+cp = configparser.ConfigParser()
+cp.read("vars.ini")
+if stage not in cp:
+    sys.exit(f"render-config: unknown stage {stage!r}")
+c, s = cp["common"], cp[stage]
+print("warning: key 'timeout' is deprecated, use 'request_timeout_s'", file=sys.stderr)
+out = []
+out.append(f"# {c['service']} config for {stage} (generated; do not edit)")
+out.append(f"[server]\n\tworkers = {int(c['workers']) * (3 if stage == 'prod' else 1)}\n\tlog_format = \"{c['log_format']}\"")
+out.append(f"[database]\n\thost = \"{s['db_host']}\"\n\tpool = {s['db_pool']}\n\trequest_timeout_s = {s['timeout']}")
+flags = [f for f in s["feature_flags"].split(",") if f]
+out.append("[features]\n" + "\n".join(f"\t{f} = true" for f in flags))
+if stage == "prod":
+    print("warning: debug-toolbar dropped for prod", file=sys.stderr)
+body = "\n\n".join(out) + "\n"
+digest = hashlib.sha256(body.encode()).hexdigest()[:16]
+sys.stdout.write(body + f"# render digest {digest}  \n")

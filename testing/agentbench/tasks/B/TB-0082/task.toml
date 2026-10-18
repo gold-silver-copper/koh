@@ -1,0 +1,12 @@
+id = "TB-0082"
+title = "Bisect the crash to its commit"
+cat = "crash"
+difficulty = "hard"
+goal = """
+On the remote machine, run `~/bin/clone-engine` once: it creates the engine's git repository at
+`~/engine` (branch `main`, 64 commits). `~/bin/run-case` runs a crash reproduction against whatever
+is checked out in `~/engine`: it passes (exit status 0) on the oldest commit and crashes on the
+newest. Find the first commit on `main` at which `run-case` crashes, and write its full
+40-character commit hash to `answer.txt` in your local directory.
+"""
+solve_timeout = 400

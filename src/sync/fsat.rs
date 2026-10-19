@@ -179,8 +179,9 @@ pub(super) fn names(dir: impl AsFd) -> io::Result<Vec<Vec<u8>>> {
 }
 
 /// Remove entry `name` of `dir`, a directory with all it holds, never following a symlink; at
-/// most [`MAX_DEPTH`] directories deep.
-pub(super) fn remove(dir: impl AsFd, name: &OsStr, depth: usize) -> io::Result<u64> {
+/// most [`MAX_DEPTH`] directories deep. How many entries went; only counted, none removed, if
+/// `dry`.
+pub(super) fn remove(dir: impl AsFd, name: &OsStr, depth: usize, dry: bool) -> io::Result<u64> {
     let dir = dir.as_fd();
     match stat(dir, name)?.map(|e| e.kind) {
         None => Ok(0),
@@ -190,23 +191,47 @@ pub(super) fn remove(dir: impl AsFd, name: &OsStr, depth: usize) -> io::Result<u
             }
             let sub = open_dir(dir, name)?;
             // A read-only directory is made writable first, so what is in it can go.
-            let _ = chmod(&sub, 0o700);
+            if !dry {
+                let _ = chmod(&sub, 0o700);
+            }
             let mut removed: u64 = 0;
             for entry in names(&sub)? {
                 removed = removed.saturating_add(remove(
                     &sub,
                     OsStr::from_bytes(&entry),
                     depth.saturating_add(1),
+                    dry,
                 )?);
             }
-            rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?;
+            if !dry {
+                rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?;
+            }
             Ok(removed.saturating_add(1))
         }
         Some(Kind::File | Kind::Link | Kind::Other) => {
-            rustix::fs::unlinkat(dir, name, AtFlags::empty())?;
+            if !dry {
+                rustix::fs::unlinkat(dir, name, AtFlags::empty())?;
+            }
             Ok(1)
         }
     }
+}
+
+/// As [`walk`], making nothing: the directory, or `None` from the first that is missing, and
+/// how many it and those below it are, which a walk would make.
+pub(super) fn walk_dry(dir: OwnedFd, names: &[Name]) -> io::Result<(Option<OwnedFd>, u64)> {
+    let mut at = dir;
+    for (n, name) in names.iter().enumerate() {
+        at = match open_dir(&at, name.os()) {
+            Ok(next) => next,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let missing = u64::try_from(names.len().saturating_sub(n)).unwrap_or(u64::MAX);
+                return Ok((None, missing));
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    Ok((Some(at), 0))
 }
 
 /// The directory `names` reach from `dir`, each opened from the last, none a symlink; made where

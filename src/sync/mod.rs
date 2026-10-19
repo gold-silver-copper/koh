@@ -50,6 +50,9 @@ pub use send::{send, Source};
 /// Most bytes of an item's encoding.
 pub const MAX_ITEM: usize = 8 * 1024;
 
+/// Most bytes of a reply's encoding: the end's [`Summary`] lists a dry run's changes.
+pub const MAX_REPLY_ITEM: usize = 512 * 1024;
+
 /// Most bytes one [`Item::Chunk`] brings.
 pub const CHUNK: usize = 64 * 1024;
 
@@ -71,6 +74,11 @@ const MAX_LINK: usize = MAX_PATH - 1;
 
 /// How many skipped names a summary keeps to say; the rest are counted.
 const SKIPPED_SHOWN: usize = 16;
+
+/// How many of a dry run's changes a summary keeps to say, and how many bytes of their paths at
+/// most (past either, the rest are counted): within [`MAX_REPLY_ITEM`].
+const CHANGES_SHOWN: usize = 1000;
+const CHANGES_SHOWN_BYTES: usize = 256 * 1024;
 
 /// One name in a directory: not empty, `.` or `..`, and holding no `/` or NUL, so it names an
 /// entry of the directory it is in and nothing else.
@@ -221,6 +229,9 @@ pub struct Opts {
     pub delete: bool,
     /// Rename no file into place, and remove nothing, until the whole copy came.
     pub atomic: bool,
+    /// Change nothing and send no file's bytes: the receiver says what the copy would do
+    /// ([`Summary::changes`]), the sender each file's hash agreeing or not ([`Item::Differs`]).
+    pub dry_run: bool,
     /// Entries neither sent nor removed.
     pub excludes: glob::Excludes,
 }
@@ -308,6 +319,12 @@ pub enum Item {
     Failed(Failure),
     /// Everything was sent.
     Done,
+    /// In a dry run, in place of its bytes: file `id` is not the receiver's, and would be sent
+    /// from byte `from`.
+    Differs {
+        id: FileId,
+        from: u64,
+    },
 }
 
 /// The receiver's answer to a file's header.
@@ -360,6 +377,58 @@ pub struct Summary {
     /// landed as the destination itself, or its contents did (`dir/.`).
     #[serde(deserialize_with = "inside")]
     pub inside: Option<String>,
+    /// A dry run's changes, in the order they would be made, the first few of them; the rest
+    /// are counted.
+    #[serde(deserialize_with = "changes")]
+    pub changes: Vec<Change>,
+    pub changes_unshown: u64,
+}
+
+/// What a dry run would do to one entry of the destination.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Change {
+    pub kind: ChangeKind,
+    /// From the destination, as [`Summary::inside`] names it.
+    #[serde(deserialize_with = "change_path")]
+    pub path: String,
+}
+
+/// What a change is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    /// A file sent where there was none.
+    New,
+    /// A file sent over one that differs.
+    Replaced,
+    /// An entry removed (`--delete`), with what is in it.
+    Deleted,
+    /// A directory made.
+    Dir,
+    /// A symlink made or replaced.
+    Link,
+}
+
+impl ChangeKind {
+    /// Its word, as a dry run lists it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Replaced => "replaced",
+            Self::Deleted => "deleted",
+            Self::Dir => "dir",
+            Self::Link => "link",
+        }
+    }
+}
+
+fn change_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let bytes = at_most::<MAX_PATH, D, u8>(deserializer)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn changes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Change>, D::Error> {
+    at_most::<CHANGES_SHOWN, D, Change>(deserializer)
 }
 
 fn inside<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
@@ -383,6 +452,23 @@ impl Summary {
     /// Files written, new and replaced.
     pub const fn written(&self) -> u64 {
         self.new.saturating_add(self.replaced)
+    }
+
+    /// Note a dry run's change of `path`.
+    fn change(&mut self, kind: ChangeKind, path: &Path) {
+        let shown = path.to_string_lossy();
+        let shown = shown
+            .get(..shown.floor_char_boundary(MAX_PATH))
+            .unwrap_or_default();
+        let bytes: usize = self.changes.iter().map(|c| c.path.len()).sum();
+        if self.changes.len() < CHANGES_SHOWN && bytes < CHANGES_SHOWN_BYTES {
+            self.changes.push(Change {
+                kind,
+                path: shown.to_owned(),
+            });
+        } else {
+            self.changes_unshown = self.changes_unshown.saturating_add(1);
+        }
     }
 
     fn skip(&mut self, path: &Path) {
@@ -669,7 +755,7 @@ pub async fn to_stream(
 /// not decode.
 pub async fn replies_from(mut recv: iroh::endpoint::RecvStream, tx: mpsc::Sender<Reply>) {
     loop {
-        let Ok(body) = crate::transport_iroh::read_framed(&mut recv, MAX_ITEM).await else {
+        let Ok(body) = crate::transport_iroh::read_framed(&mut recv, MAX_REPLY_ITEM).await else {
             return;
         };
         let Ok(reply) = crate::request::decode::<Reply>(&body) else {
@@ -685,7 +771,7 @@ pub async fn replies_from(mut recv: iroh::endpoint::RecvStream, tx: mpsc::Sender
 /// finished.
 pub async fn replies_to(mut rx: mpsc::Receiver<Reply>, send: &mut iroh::endpoint::SendStream) {
     while let Some(reply) = rx.recv().await {
-        let Ok(bytes) = crate::request::encode(&reply, MAX_ITEM) else {
+        let Ok(bytes) = crate::request::encode(&reply, MAX_REPLY_ITEM) else {
             return;
         };
         if send.write_all(&bytes).await.is_err() {

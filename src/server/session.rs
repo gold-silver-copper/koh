@@ -11,6 +11,7 @@
 //! attachment, so dropping it detaches; its input reaches the program only while it is the newest
 //! attachment and the program runs.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -186,13 +187,17 @@ struct PtyHost {
 }
 
 impl PtyHost {
-    /// Start `command` (empty for `$SHELL`) in `home` at `size`, left to `reaper` once closed, a
+    /// Start `command` (empty for `$SHELL`) in `home` at `size`, in `cwd` if given, left to `reaper` once closed, a
     /// shell `marks` knows started so that it marks its commands, and only its marks counted; the
     /// host and a receiver of its output. Blocks until the program starts.
     fn spawn(
         command: &[String],
         (size, scrollback_bytes): (Size, usize),
-        (home, marks): (&crate::pty::Home, Option<&super::marks::MarksDir>),
+        (home, cwd, marks): (
+            &crate::pty::Home,
+            Option<&std::path::Path>,
+            Option<&super::marks::MarksDir>,
+        ),
         reaper: &crate::pty::Reaper,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let size = crate::terminal::clamp_dims(size);
@@ -205,7 +210,7 @@ impl PtyHost {
             .as_ref()
             .map_or((&argv[..], &[][..]), |m| (&m.argv[..], &m.env[..]));
         let (pty, pty_rx) =
-            crate::pty::Pty::spawn(rows, cols, argv, env, "xterm-256color", home, reaper)
+            crate::pty::Pty::spawn(rows, cols, argv, env, ("xterm-256color", home, cwd), reaper)
                 .context("spawning shell")?;
         let nonce = marked.as_ref().map(|m| m.nonce.as_bytes().to_vec());
         emu.require_mark_nonce(nonce.as_deref());
@@ -472,6 +477,8 @@ struct Attach {
     history: usize,
     /// What a new session runs in place of the spec's command.
     program: Option<Arc<[String]>>,
+    /// Where a new session starts, in place of the server user's home.
+    cwd: Option<PathBuf>,
     reply: oneshot::Sender<Attached>,
 }
 
@@ -505,6 +512,7 @@ fn start(
         .clone()
         .unwrap_or_else(|| Arc::clone(&spec.command));
     let (scrollback_bytes, ttl, home) = (spec.scrollback_bytes, spec.ttl, spec.home.clone());
+    let cwd = first.cwd.clone();
     let marks = spec.marks.clone();
     let reaper = reaper.clone();
     let task = async move {
@@ -514,7 +522,7 @@ fn start(
             PtyHost::spawn(
                 &command,
                 (size, scrollback_bytes),
-                (&home, marks.as_deref()),
+                (&home, cwd.as_deref(), marks.as_deref()),
                 &reaper,
             )
         })
@@ -1120,15 +1128,15 @@ impl Registry {
     }
 
     /// Attach `peer` to the session `pick` names, at window `size`: its latest (or a new one if it
-    /// has none), a new one, or one by number, which must be the peer's; with a `program`, a new
-    /// one running it. A client that attaches afresh (not redialing) is sent [`ATTACH_HISTORY`]
+    /// has none), a new one, or one by number, which must be the peer's; with a `program` or a
+    /// `cwd`, a new one running it, or starting there. A client that attaches afresh (not redialing) is sent [`ATTACH_HISTORY`]
     /// rows of history above the screen.
     pub async fn attach(
         &self,
         peer: EndpointId,
         pick: Pick,
         size: Size,
-        program: Option<Arc<[String]>>,
+        (program, cwd): (Option<Arc<[String]>>, Option<PathBuf>),
     ) -> Attached {
         let history = if matches!(pick, Pick::Resume(_)) {
             0
@@ -1141,6 +1149,7 @@ impl Registry {
                 size,
                 history,
                 program: program.clone(),
+                cwd: cwd.clone(),
                 reply,
             };
             self.tx

@@ -1,4 +1,4 @@
-//! The koh/10 shell protocol: what a session's connection carries after its opening request
+//! The koh/11 shell protocol: what a session's connection carries after its opening request
 //! ([`crate::request`]).
 //!
 //! The client writes [`ClientMsg`]s on two uni streams, its first (the request's) for control
@@ -85,6 +85,8 @@ pub enum Close {
     /// The server has `--max-connections` connections, and as many waiting for one: nothing was
     /// done, and a retry may get in.
     Busy = 8,
+    /// The directory a new session was to start in is not there, or is not a directory.
+    NoSuchDir = 9,
 }
 
 impl Close {
@@ -103,6 +105,7 @@ impl Close {
             6 => Self::NoSuchSession,
             7 => Self::OutOfScope,
             8 => Self::Busy,
+            9 => Self::NoSuchDir,
             _ => return None,
         })
     }
@@ -121,6 +124,7 @@ impl Close {
                  that"
             }
             Self::Busy => "server busy: too many connections at once; retry",
+            Self::NoSuchDir => crate::request::ProblemKind::NoSuchDir.text(),
         }
     }
 }
@@ -388,13 +392,14 @@ mod tests {
             Close::NoSuchSession,
             Close::OutOfScope,
             Close::Busy,
+            Close::NoSuchDir,
         ];
         for close in all {
             assert_eq!(Close::from_code(u64::from(close.code())), Some(close));
             assert!(close.text().is_ascii() && !close.text().contains('\n'));
         }
         assert_eq!(Close::from_code(0), None);
-        assert_eq!(Close::from_code(9), None);
+        assert_eq!(Close::from_code(10), None);
     }
 
     #[test]

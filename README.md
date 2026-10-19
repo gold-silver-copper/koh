@@ -54,12 +54,14 @@ koh serve                 # host shells, commands, jobs and copies for the saved
 koh connect <name|id>     # a shell there: your session attached last, else a new one
 koh connect <name> --new  # a new session beside your others; --session N picks one by number
 koh connect <name> -- PROG ARG...  # a new session running PROG on a terminal in place of the
-                          # shell (an editor, a debugger, a TUI); ends with its status
+                          # shell (an editor, a debugger, a TUI); ends with its status; -C DIR
+                          # starts it (or a new shell) in DIR
 koh sessions <name>       # your sessions: number, attached or not, age, size, what its program
                           # is doing (reading, busy, ...), the last command's status, title
 koh output <name> --session N [--last]  # a session's screen, or its last command's output
 koh exec <name> -- PROG ARG...  # run PROG with no terminal, each word as it is (no shell), and
                           # exit with its status; --sh 'LINE' runs a shell line; -C DIR
+                          # (quote a ~: -C '~/proj', or -C proj, relative to the home)
 koh run <name> [--name N] -- PROG ARG...  # start a job; koh jobs, logs, wait and kill find it
 koh wait <name> JOB       # until the job ends, then its last 200 lines (--tail N); or --text T,
                           # --file PATH; --session N [--reading]
@@ -97,7 +99,9 @@ hidden `.koh-….part` name and renamed into place once whole, so a cut copy lea
 half-written that looks complete, and the next copy resumes the part. A file written gets the
 time it arrived (so `make` and `cargo` see it changed) unless `-p` keeps the source's. `dir/.`
 copies what is in `dir`. `--delete` removes what the source does not have, `--exclude PAT`
-leaves entries alone, and `--atomic` lands nothing until the whole copy came. It ends with one
+leaves entries alone, and `--atomic` lands nothing until the whole copy came. `--dry-run` (`-n`)
+changes nothing and sends no file's bytes: it lists each change it would make (`new`,
+`replaced`, `deleted`, `dir`, `link`, and the path), then the summary. It ends with one
 line saying where it landed: `3 files sent, 41 KB → laptop:proj/src (1 new, 2 replaced; 120 unchanged)`, or
 `--json`. A tree is not nested in a directory of its own name that is there already (`koh cp -r
 src laptop:src` run twice, which `cp` would land as `src/src`): `src/.` brings it into line. A
@@ -111,8 +115,9 @@ reached, 4 refused (not allowed, or out of the key's scope), 75 the server was b
 connections at once than `--max-connections`, and as many waiting: nothing ran, so a retry is
 safe), 124 a wait timed out. `exec`, `wait` and `logs --follow` exit with the remote command's
 status (75 too when busy), and 255 on koh's other errors,
-as ssh does; `exec` exits 127 when there is no such program and 126 when it could not start
-(no `-C` directory there, say).
+as ssh does. A command that did not start exits 127 when there is no such program and 126 when
+it could not start (no `-C` directory there, say), from `exec` and `run` alike; `connect -C`
+with no such directory exits 126 too.
 
 **Scoped keys.** `koh clients add ci <id> --cp /srv/drop` lets that client copy to and from
 `/srv/drop` and below only, and nothing else: no shell, no commands. `--exec DIR` lets it run

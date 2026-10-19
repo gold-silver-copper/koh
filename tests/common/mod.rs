@@ -29,7 +29,14 @@ pub fn endpoint_id(key: &std::path::Path) -> anyhow::Result<String> {
 /// `argv` on a 24×80 PTY, and what it prints.
 pub fn on_pty(argv: &[String]) -> anyhow::Result<(Pty, Capture)> {
     let reaper = koh::pty::Reaper::start()?;
-    let (pty, output) = Pty::spawn(24, 80, argv, &[], "xterm-256color", &home(), &reaper)?;
+    let (pty, output) = Pty::spawn(
+        24,
+        80,
+        argv,
+        &[],
+        ("xterm-256color", &home(), None),
+        &reaper,
+    )?;
     Ok((pty, Capture::new(output)))
 }
 

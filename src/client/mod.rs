@@ -26,7 +26,7 @@ use crate::log::Peer;
 use crate::proto::{
     encode_client, ClientMsg, Close, InputSeq, Shown, ShownDecoder, HEARTBEAT, SHOWN_TAG,
 };
-use crate::request::{Argv, Attached, Pick, Request, Resume, MAX_REPLY, MAX_REQUEST};
+use crate::request::{Argv, Attached, Pick, RemotePath, Request, Resume, MAX_REPLY, MAX_REQUEST};
 use crate::terminal::Size;
 use crate::transport_iroh::{closed_because, ALPN, PROTOCOL};
 use display::Display;
@@ -65,9 +65,6 @@ const PROMPT_HOLD: Duration = crate::proto::TTY_TICK.saturating_mul(2);
 
 /// How long notices stay on the status line.
 const NOTICE_FOR: Duration = Duration::from_secs(3);
-
-/// How long the client waits, once it has the program's end, for the server to close.
-const END_WAIT: Duration = Duration::from_secs(2);
 
 /// Dials the server and makes the opening request ([`crate::request`]).
 ///
@@ -114,7 +111,7 @@ impl IrohConnector {
         }
     }
 
-    /// Connect to the session `pick` names (a new one running `program`, if given), for a
+    /// Connect to the session `pick` names (a new one running `program` in `cwd`, if given), for a
     /// terminal of `size`, and await the server's first stream, which admits the client and says which session it reached. A server that
     /// will not have us for good closes the connection instead, a [`Refused`] error; one that
     /// cannot have us now (at capacity, say) closes it saying so, an error that is its [`Close`].
@@ -122,12 +119,13 @@ impl IrohConnector {
         &self,
         pick: Pick,
         size: Size,
-        program: Option<Argv>,
+        (program, cwd): (Option<Argv>, Option<RemotePath>),
     ) -> anyhow::Result<Admitted> {
         let request = Request::Shell {
             pick,
             size,
             program,
+            cwd,
         };
         let (conn, control) = self.open(&request).await?;
         let attached = async {
@@ -460,7 +458,7 @@ fn dial(connector: &IrohConnector, attempt: u32, pick: Pick, size: Size) -> Dial
         tokio::time::sleep(wait).await;
         tokio::time::timeout(
             RECONNECT_CONNECT_TIMEOUT,
-            connector.connect(pick, size, None),
+            connector.connect(pick, size, (None, None)),
         )
         .await
     })
@@ -682,8 +680,9 @@ pub async fn run_client<B: KohBackend>(
                             Shown::Exit(code) => {
                                 display.leave(&mut backend)?;
                                 backend.flush()?;
-                                // The server closes once it knows the end is here.
-                                let _ = tokio::time::timeout(END_WAIT, wire.conn.closed()).await;
+                                // The end is here, which this close tells the server: it waits
+                                // for nothing more, and neither does the client.
+                                wire.conn.close(Close::SessionEnded.code().into(), b"");
                                 return Ok(Some(code));
                             }
                             Shown::Beat => {}

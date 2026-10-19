@@ -371,7 +371,7 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
                 .connect(
                     koh::request::Pick::Latest,
                     koh::terminal::Size::new(24, 80),
-                    None,
+                    (None, None),
                 )
                 .await?;
             anyhow::Ok((endpoint, admitted))

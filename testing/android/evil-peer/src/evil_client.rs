@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
         pick: koh::request::Pick::Latest,
         size: koh::terminal::Size::new(24, 80),
         program: None,
+        cwd: None,
     };
     control
         .write_all(&koh::request::encode(&shell, koh::request::MAX_REQUEST)?)

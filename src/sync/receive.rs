@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use super::fsat::{self, Kind};
 use super::{
     hash_of, Answer, ChangeKind, DataLen, FailKind, Failure, FileId, Item, LinkTarget, Mode, Name,
-    Opts, Reply, Summary, Time, MAX_DEPTH, MAX_ITEM,
+    Opts, Reply, Summary, Time, DIFF_MAX, MAX_DEPTH, MAX_ITEM,
 };
 
 /// Most names `--delete` keeps of what the sender sent, all open directories' together.
@@ -611,11 +611,16 @@ impl<R: Read> Receiver<'_, R> {
         let io = |error: io::Error| Failure::io(&rel, &error);
         self.saw(name.as_bytes())?;
         let there = stat_in(dir.as_ref(), &name).map_err(io)?;
+        // A dry run's diff compares any two files small enough, sizes alike or not.
+        let small = |size| usize::try_from(size).is_ok_and(|size| size <= DIFF_MAX);
+        let compared = |there| self.opts.dry_run && self.opts.diff && small(there) && small(size);
         let answer = match (there, &dir) {
             (Some(e), _) if e.kind == Kind::Dir => {
                 return Err(Failure::new(FailKind::IsADirectory, &rel))
             }
-            (Some(e), Some(dir)) if e.kind == Kind::File && e.size == size => {
+            (Some(e), Some(dir))
+                if e.kind == Kind::File && (e.size == size || compared(e.size)) =>
+            {
                 let file = fsat::open_file(dir, name.os()).map_err(io)?;
                 Answer::Check {
                     id,
@@ -665,13 +670,40 @@ impl<R: Read> Receiver<'_, R> {
         Ok(())
     }
 
+    /// The next of a file's chunks, into `buf`, its length; `None` once it is all sent.
+    fn chunk(&mut self) -> Result<Option<u64>, Failure> {
+        match self.next()? {
+            Item::Chunk(len) => {
+                let len: DataLen = len;
+                self.buf.resize(len.get(), 0);
+                self.input.read_exact(&mut self.buf).map_err(|_cut| cut())?;
+                let n = u64::try_from(len.get()).unwrap_or(u64::MAX);
+                self.summary.bytes = self.summary.bytes.saturating_add(n);
+                Ok(Some(n))
+            }
+            Item::Sent => Ok(None),
+            Item::Dir { .. }
+            | Item::Contents { .. }
+            | Item::File { .. }
+            | Item::Symlink { .. }
+            | Item::End
+            | Item::Skipped(_)
+            | Item::Data { .. }
+            | Item::Same(_)
+            | Item::Differs { .. }
+            | Item::Failed(_)
+            | Item::Done => Err(malformed()),
+        }
+    }
+
     /// File `id`'s bytes from `from`: into its part, then it into place.
     fn data(&mut self, id: FileId, from: u64) -> Result<(), Failure> {
-        // A dry run is sent no bytes.
+        if self.opts.dry_run {
+            return self.compare(id, from);
+        }
         let Some((p, dir)) = self
             .pending
             .remove(&id)
-            .filter(|_| !self.opts.dry_run)
             .and_then(|mut p| p.dir.take().map(|dir| (p, dir)))
         else {
             return Err(malformed());
@@ -681,30 +713,9 @@ impl<R: Read> Receiver<'_, R> {
         let file: File = fsat::create(&dir, part.os(), from == 0).map_err(io)?;
         file.set_len(from).map_err(io)?;
         let mut at = from;
-        loop {
-            match self.next()? {
-                Item::Chunk(len) => {
-                    let len: DataLen = len;
-                    self.buf.resize(len.get(), 0);
-                    self.input.read_exact(&mut self.buf).map_err(|_cut| cut())?;
-                    file.write_all_at(&self.buf, at).map_err(io)?;
-                    let n = u64::try_from(len.get()).unwrap_or(u64::MAX);
-                    at = at.saturating_add(n);
-                    self.summary.bytes = self.summary.bytes.saturating_add(n);
-                }
-                Item::Sent => break,
-                Item::Dir { .. }
-                | Item::Contents { .. }
-                | Item::File { .. }
-                | Item::Symlink { .. }
-                | Item::End
-                | Item::Skipped(_)
-                | Item::Data { .. }
-                | Item::Same(_)
-                | Item::Differs { .. }
-                | Item::Failed(_)
-                | Item::Done => return Err(malformed()),
-            }
+        while let Some(n) = self.chunk()? {
+            file.write_all_at(&self.buf, at).map_err(io)?;
+            at = at.saturating_add(n);
         }
         file.set_permissions(std::fs::Permissions::from_mode(p.mode.landed()))
             .map_err(io)?;
@@ -720,12 +731,47 @@ impl<R: Read> Receiver<'_, R> {
         } else {
             fsat::rename(&dir, part.os(), p.name.os()).map_err(io)?;
         }
-        self.written(&p, from);
+        self.written(&p, from, None);
         Ok(())
     }
 
-    /// File `p` was written, from byte `from` on (or would be, in a dry run).
-    fn written(&mut self, p: &Pending, from: u64) {
+    /// In a dry run with `--diff`, file `id`'s bytes, sent whole to compare with the one here:
+    /// it would replace it, differing as the diff says.
+    fn compare(&mut self, id: FileId, from: u64) -> Result<(), Failure> {
+        let Some(p) = self
+            .pending
+            .remove(&id)
+            .filter(|_| self.opts.diff && from == 0)
+        else {
+            return Err(malformed());
+        };
+        let mut sent = Vec::new();
+        while self.chunk()?.is_some() {
+            if sent.len().saturating_add(self.buf.len()) <= DIFF_MAX {
+                sent.extend_from_slice(&self.buf);
+            }
+        }
+        let mut here = Vec::new();
+        let read = p.dir.as_ref().map(|dir| {
+            let file = fsat::open_file(dir, p.name.os())?;
+            let max = u64::try_from(DIFF_MAX).unwrap_or(u64::MAX);
+            file.take(max).read_to_end(&mut here)
+        });
+        let diff = match read {
+            Some(Ok(_)) if u64::try_from(sent.len()).is_ok_and(|n| n == p.size) => {
+                super::text_diff(&here, &sent, &p.rel)
+            }
+            Some(Ok(_)) => "no diff: it changed while it was read\n".to_owned(),
+            Some(Err(error)) => return Err(Failure::io(&p.rel, &error)),
+            None => return Err(malformed()),
+        };
+        self.written(&p, 0, Some(diff));
+        Ok(())
+    }
+
+    /// File `p` was written, from byte `from` on (or would be, in a dry run, differing from the
+    /// one there as `diff` says).
+    fn written(&mut self, p: &Pending, from: u64, diff: Option<String>) {
         let kind = if p.existed {
             self.summary.replaced = self.summary.replaced.saturating_add(1);
             ChangeKind::Replaced
@@ -738,7 +784,7 @@ impl<R: Read> Receiver<'_, R> {
         }
         if self.opts.dry_run {
             self.summary
-                .change_sized(kind, &p.rel, (Some(p.size), p.was));
+                .change_sized(kind, &p.rel, (Some(p.size), p.was), diff);
         }
     }
 
@@ -750,7 +796,8 @@ impl<R: Read> Receiver<'_, R> {
         };
         let bytes = p.size.saturating_sub(from);
         self.summary.bytes = self.summary.bytes.saturating_add(bytes);
-        self.written(&p, from);
+        let diff = (self.opts.diff && p.was.is_some()).then(|| "no diff: over 1 MiB\n".to_owned());
+        self.written(&p, from, diff);
         Ok(())
     }
 

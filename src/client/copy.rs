@@ -124,6 +124,11 @@ fn say(
             change.kind.name(),
             escaped(&change.path)
         )?;
+        // The other end's text, escaped as its paths are, but for its tabs.
+        for line in change.diff.iter().flat_map(|diff| diff.lines()) {
+            let shown: Vec<String> = line.split('\t').map(escaped).collect();
+            writeln!(out, "{}", shown.join("\t"))?;
+        }
     }
     if summary.changes_unshown > 0 {
         writeln!(out, "… {} more", summary.changes_unshown)?;

@@ -238,10 +238,21 @@ impl ServerTerminal {
         self.parser.resize_report()
     }
 
-    /// The text the screen shows, soft-wrapped rows joined, at most `max` bytes.
+    /// The text the screen shows, soft-wrapped rows joined, at most `max` bytes: none of the
+    /// blank rows below the last that shows anything (a glyph, or a colour).
     pub fn screen_text(&self, max: usize) -> String {
         let screen = self.parser.screen();
-        super::text_of(screen.rows().skip(screen.history_len()), 0, None, max)
+        let mut rows: Vec<fux_vt::Row<'_>> = screen.rows().skip(screen.history_len()).collect();
+        let blank = |row: &fux_vt::Row<'_>| {
+            row.cells()
+                .all(|c| !c.has_contents() && c.attributes() == fux_vt::Attributes::default())
+        };
+        let shown = rows
+            .iter()
+            .rposition(|row| !blank(row))
+            .map_or(0, |n| n.saturating_add(1));
+        rows.truncate(shown);
+        super::text_of(rows.into_iter(), 0, None, max)
     }
 
     /// The output of the last command the shell finished, as the primary screen and its history
@@ -292,6 +303,12 @@ mod tests {
             "its end, within the bound"
         );
         assert_eq!(t.screen_text(1 << 20), "one\n0123456789abcdefghijklmn\n$\n");
+        // The blank rows below what shows are left out, but not one painted in a colour.
+        let mut t = ServerTerminal::new(24, 20, 0).expect("emulator");
+        t.process(b"$ ls\r\none\r\n\r\n$ ");
+        assert_eq!(t.screen_text(1 << 20), "$ ls\none\n\n$\n");
+        t.process(b"\x1b[6;1H\x1b[44m\x1b[K\x1b[0m");
+        assert_eq!(t.screen_text(1 << 20), "$ ls\none\n\n$\n\n\n");
         // Scrolled out of a history that keeps nothing: gone.
         let mut t = ServerTerminal::new(2, 20, 0).expect("emulator");
         t.process(b"\x1b]133;C\x07a\r\nb\r\nc\r\n\x1b]133;D;0\x07");

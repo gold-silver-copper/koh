@@ -35,7 +35,7 @@ service.
    request of at most 1 MiB, a command of at most 256 KiB and 4096 words with no NUL, paths of at
    most 4096 bytes with no NUL, at most 1024 sources, a job's name a short word, a wait's text at
    most 4 KiB, each refused as it is decoded, before anything is allocated for it. A shell reaches
-   the koh/13 data plane: it sends input, resizes, colours, its reads of the output (`Read`, which
+   the koh/14 data plane: it sends input, resizes, colours, its reads of the output (`Read`, which
    pace what the server sends) and redraw requests. Input comes as decoded events (`Keys`: keys,
    mouse events, focus changes, whole pastes); decoding refuses what no terminal sends (a modifier
    bit no key has, a function key past F12, a kitty code that is no Unicode scalar, a paste over
@@ -148,7 +148,10 @@ service.
    left them on, as any program the user runs can. `koh output` prints a session's text, which
    the server's emulator made: printable characters and line breaks only. Nothing else of the
    server's reaches them raw: a listing's titles and commands are escaped, `--json` escapes what
-   it says, and a server's error is a kind and an escaped message.
+   it says, a server's error is a kind and an escaped message, and `koh cp --diff`'s diffs are
+   escaped but for their tabs and line breaks. With `--diff`, a file the copy would replace goes
+   to the end that has it, as the copy would send it, and comes back only as a diff of the two,
+   each at most 1 MiB, held in memory there.
    **`koh cp` from a server** lands what the server sends under the rules a server lands a
    client's copy by (above): only beneath the destination the user named, through no symlink,
    with no setuid or setgid bit, each file whole. The server chooses the names, modes and symlink

@@ -67,11 +67,17 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (`terminal_activity`, fux's own); on macOS it says only `busy`, `idle` or `unknown`.
 
 ### Changed
-- **Protocol `koh/13`**: `koh connect SERVER -- PROG ARG...` and `-C DIR`, `koh logs --tail`,
+- **Protocol `koh/14`**: `koh connect SERVER -- PROG ARG...` and `-C DIR`, `koh logs --tail`,
   the end of a log saying how the job stands, a command's stdout and stderr on one pipe, `koh cp
   --dry-run`, the problem `NoSuchProgram`, the close codes `Busy` and `NoSuchDir`, a running
   job's processes and CPU time in `koh jobs`, what a copy kept and a dry run's sizes, and a tree copied to a directory of its own name
-  updating it (the copy failure `nests` is gone).
+  updating it (the copy failure `nests` is gone), and `koh cp --diff` (koh/14).
+- **`koh logs` on a running job points at following it**: it ends `` · running 34s: `koh logs
+  laptop build --follow` follows it to its end ``, where it named `koh wait`, which prints
+  nothing more until the end.
+- **`koh output` leaves out the blank rows below what the screen shows** (a row painted in a
+  colour shows something), text and `--json` alike: a 3-line screen on a 50-row terminal came
+  back as 3 lines and 47 empty ones.
 - **A `koh wait` on a job that times out says how the job stands**: `koh: timed out after 30s:
   build running 41s processes=3 cpu=12.4s output=2 KB`, then its last lines (`--tail`), then
   `· running 41s: ...`, where it said only `timed out` and agents took a job at work for a hung one.
@@ -106,6 +112,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (which the server takes as the end delivered), not after waiting up to 2 s for the server.
 - **Leaving puts the cursor back after resetting the scroll margins** (`CSI r`, which sends it
   home): the local prompt comes below the session's output, not over its top row.
+- **`koh cp --diff`**: a dry run that says, under each file it would replace, how its text
+  differs, as a unified diff (`a/` the destination's file, `b/` the source's; `diff` in
+  `--json`), for files up to 1 MiB; a binary or larger one says why it has none. The source's
+  file goes to the end with the destination's to be compared there, and only the diff comes
+  back. Which files differ was already the dry run's `replaced` list, by hash.
 - **`koh cp --dry-run`** changes nothing and sends no file's bytes: it lists each change
   (`new`, `replaced`, `deleted`, `dir`, `link`) and the summary it would make.
 - **A burst of commands from one client is all served** (an agent's parallel reads): a full
@@ -222,8 +233,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - **A character split across reads of `koh connect`'s input arrives whole**: its first bytes wait
   for the rest however long that takes, where 35 ms later (the decoder's wait for a lone Escape)
   each byte went on as `�` (`é世😀` typed a byte at a time arrived as nine of them).
-- **`koh logs` on a running job names the server as it was given**: `` `koh wait laptop build`
-  waits for its end ``, no longer `koh wait SERVER build`.
+- **`koh logs` on a running job names the server as it was given**: `` `koh logs laptop build
+  --follow` ``, no longer `SERVER`.
 - **A client that fell behind keeps what scrolled off meanwhile**: its new epoch's redraw has
   above it the history that scrolled off since the top row of what it read, into its terminal's
   scrollback, where it had the screen alone and lost the rest (a slow link under a burst of

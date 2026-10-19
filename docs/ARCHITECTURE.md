@@ -33,7 +33,7 @@ src/
 ├── args.rs          the command line (clap's builder API), `koh help-agents`
 ├── lib.rs           crate root: module declarations
 ├── request.rs       the opening request (what a connection is for) and the replies sent whole
-├── proto.rs         the koh/13 shell protocol: client messages, what the program shows, caps
+├── proto.rs         the koh/14 shell protocol: client messages, what the program shows, caps
 ├── stream.rs        the output filter both ends run: questions out, marks apart, bounds
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
@@ -81,9 +81,9 @@ testing/agentbench/  coding agents driving koh on task sets, scored
 `predict` imports nothing from `crate::` (CI checks it), so it is a standalone
 terminal-prediction library; `stream`, `proto`, `request` and `sync`'s item types are pure.
 
-## The protocol (koh/13)
+## The protocol (koh/14)
 
-The ALPN `koh/13` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/14` is the version check: a peer on another version fails the TLS handshake with a
 clear error. After the handshake the server checks the allowlist and takes a connection permit;
 then the client says what the connection is for, as the first message on its first uni stream
 (`src/request.rs`), a 4-byte length and its postcard encoding, at most 1 MiB, and the server
@@ -489,7 +489,11 @@ relative in the home, unglobbed), or, for a scoped key, beneath its directory.
   whole; `--atomic` holds every rename and removal until the whole copy came. In a dry run
   (`Opts::dry_run`) the receiver makes, writes and removes nothing, and the sender answers each
   file it would send with `Differs { id, from }` in place of its bytes; the receiver lists each
-  change in its `Summary` (`changes`, the first 1000, the rest counted). Every entry is
+  change in its `Summary` (`changes`, the first 1000, the rest counted). With `Opts::diff`
+  (`--diff`) the receiver answers `Check` for any file it has of at most 1 MiB, whatever its
+  size, and the sender answers a differing one of at most 1 MiB with its bytes, which the
+  receiver holds in memory and compares with its own, giving the change a unified diff
+  (`Change::diff`, all of them together at most 128 KiB, a second spent on each). Every entry is
   reached from the directory above it by its descriptor with `O_NOFOLLOW` (`sync::fsat`), so no
   name reaches outside the destination or through a symlink. Directories merge; the destination's
   missing parents are made; a file written gets its arrival time unless `-p`, and modes land less

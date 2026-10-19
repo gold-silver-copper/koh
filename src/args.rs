@@ -242,6 +242,7 @@ pub struct ConnectArgs {
     pub remote: RemoteArgs,
     pub pick: Pick,
     pub program: Option<Argv>,
+    pub cwd: Option<RemotePath>,
     pub clipboard: bool,
     pub hyperlinks: bool,
     pub colours: bool,
@@ -255,6 +256,7 @@ impl ConnectArgs {
             remote: self.remote.into_remote(server, saved),
             pick: self.pick,
             program: self.program,
+            cwd: self.cwd,
             clipboard: self.clipboard,
             hyperlinks: self.hyperlinks,
             colours: self.colours,
@@ -272,16 +274,19 @@ Run something:
   koh exec SERVER -- PROG ARG...       words passed as they are, no shell; ~/x is in the home
   koh exec SERVER --sh 'cd src && make'  a shell line, on purpose: one word, quoted whole
   koh exec SERVER -- sh -s < script.sh  a longer script, or one with quotes in it, on stdin
-  koh exec SERVER -C DIR -- PROG ...   start in DIR (relative: in the home)
+  koh exec SERVER -C proj -- PROG ...  start in DIR (relative: in the home). Not an unquoted
+                                       -C ~/proj: your shell makes that this machine's home
   stdin goes to the command; stdout and stderr come back apart (sent to one file here, as
   2>&1 or a terminal does, in the order it wrote them); exits with its status (127 no such
   program, 126 could not start: no -C DIR there, 255 koh's own error). A killed koh hangs it up
   at once (SIGTERM, SIGHUP, SIGINT), within 10 s if SIGKILLed.
-  koh connect SERVER -- gdb ./prog     one program on a terminal of its own (an editor, a
-                                       debugger, a TUI), in a terminal; ends with its status
+  koh connect SERVER -C proj -- gdb ./prog  one program on a terminal of its own (an editor, a
+                                       debugger, a TUI), in a terminal, started in DIR (else
+                                       the home); ends with its status
 
 Jobs (survive koh exiting and the link dropping; output and status kept):
-  koh run SERVER [--name build] -- make -j4   prints the job's name
+  koh run SERVER [--name build] [-C DIR] -- make -j4   prints the job's name; 127 no such
+                                        program, 126 could not start (no -C DIR there)
   koh wait SERVER build                 until it ends: prints its last 200 lines (--tail N, 0 for
                                         none), exits with its status
   koh wait SERVER build --text listening  until its output has the text (1 if it ended first)
@@ -298,7 +303,9 @@ Copy (a sync: merges, makes parents, sends only files that changed, by hash):
                                         in itself, as cp does: koh refuses that)
   koh cp SERVER:proj/out.txt .          the other way
   --delete removes what the source lacks; --exclude PAT (repeat); -p keeps mtimes (default:
-  arrival time, so builds see changes); --atomic lands nothing until all came. Prints one line,
+  arrival time, so builds see changes); --atomic lands nothing until all came; --dry-run (-n)
+  changes nothing and sends no file, listing each change (`new`, `replaced`, `deleted`, `dir`,
+  `link` and its path) before the summary. Prints one line,
   where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`. A cut copy
   resumes when rerun.
 
@@ -312,7 +319,8 @@ Shell sessions (`koh connect SERVER` in a terminal, or fux):
 failure {\"error\":{\"kind\":...,\"message\":...}}. --timeout SECS on wait (exit 124).
 Exit codes: 0 ok, 1 failed, 2 usage, 3 server not reached, 4 refused (not allowed, or out of
 the key's scope), 75 server busy (too many connections at once: nothing ran, so retry), 124 wait
-timed out; exec, wait and logs --follow exit with the remote status (75 too when busy).
+timed out, 126 a command or session could not start (no -C DIR there), 127 no such program
+(exec, run); exec, wait and logs --follow exit with the remote status (75 too when busy).
 ";
 
 /// `koh`'s command line.
@@ -476,6 +484,7 @@ fn connect() -> Command {
     remote(Command::new("connect").about("Open a shell on a server, in this terminal: your session there attached last, else a new one; with `-- PROG ARG...`, a new session running that program on a terminal of its own (an editor, a debugger, a TUI) in place of the shell, ending when it does with its status. Ctrl-^ . detaches, Ctrl-^ Ctrl-Z suspends"))
         .arg(flag("new", "new").conflicts_with("session").help("A new session, beside your others"))
         .arg(session(false))
+        .arg(cwd().conflicts_with("session").help("A new session, starting in DIR (relative: in the server user's home)"))
         .arg(
             Arg::new("program")
                 .value_name("PROG")
@@ -505,6 +514,15 @@ fn output() -> Command {
     .arg(json())
 }
 
+/// `-C DIR`: where a command, or a new session, starts on the server.
+fn cwd() -> Arg {
+    Arg::new("cwd")
+        .short('C')
+        .long("cd")
+        .value_name("DIR")
+        .value_parser(value_parser!(OsString))
+}
+
 /// What `exec` and `run` take: the command and where it starts.
 fn command_args(cmd: Command) -> Command {
     cmd.arg(
@@ -515,14 +533,7 @@ fn command_args(cmd: Command) -> Command {
             .required_unless_present("command")
             .help("Run LINE with the server user's shell ($SHELL -c)"),
     )
-    .arg(
-        Arg::new("cwd")
-            .short('C')
-            .long("cd")
-            .value_name("DIR")
-            .value_parser(value_parser!(OsString))
-            .help("Start in DIR (relative: in the server user's home)"),
-    )
+    .arg(cwd().help("Start in DIR (relative: in the server user's home)"))
     .arg(
         Arg::new("command")
             .value_name("PROG")
@@ -624,6 +635,7 @@ fn cp() -> Command {
         .arg(flag("preserve", "preserve").short('p').help("Keep the source's modification times"))
         .arg(flag("delete", "delete").help("Remove from the destination's directories what the source does not have"))
         .arg(flag("atomic", "atomic").help("Rename nothing into place, and remove nothing, until all of the copy came"))
+        .arg(flag("dry_run", "dry-run").short('n').help("Change nothing and send no file's bytes: list what would be sent (new or replaced), deleted, made or linked, then the summary"))
         .arg(Arg::new("exclude").long("exclude").value_name("PATTERN").action(ArgAction::Append).value_parser(value_parser!(OsString)).help("Neither send nor remove entries matching it: `*.o`, `target`, `src/gen/*` (repeatable)"))
         .arg(json())
 }
@@ -775,12 +787,18 @@ fn run_of(m: &ArgMatches) -> Result<Run, clap::Error> {
             Cmdline::Argv(Argv::new(words).map_err(|why| invalid(&format!("the command: {why}")))?)
         }
     };
-    let cwd = m
-        .get_one::<OsString>("cwd")
+    Ok(Run {
+        command,
+        cwd: cwd_of(m)?,
+    })
+}
+
+/// The directory `-C` names, if given.
+fn cwd_of(m: &ArgMatches) -> Result<Option<RemotePath>, clap::Error> {
+    m.get_one::<OsString>("cwd")
         .map(|dir| RemotePath::new(dir.as_bytes().to_vec()))
         .transpose()
-        .map_err(|why| invalid(&format!("--cd: {why}")))?;
-    Ok(Run { command, cwd })
+        .map_err(|why| invalid(&format!("--cd: {why}")))
 }
 
 /// The config `matches` asks for. clap has already enforced the required subcommands and
@@ -816,7 +834,9 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             remote: remote_args(m)?,
             pick: match m.get_one::<u64>("session") {
                 Some(&n) => Pick::Id(SessionNum(n)),
-                None if m.get_flag("new") || m.contains_id("program") => Pick::New,
+                None if m.get_flag("new") || m.contains_id("program") || m.contains_id("cwd") => {
+                    Pick::New
+                }
                 None => Pick::Latest,
             },
             program: m
@@ -824,6 +844,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                 .map(|words| Argv::new(words.map(|word| word.as_bytes().to_vec()).collect()))
                 .transpose()
                 .map_err(|why| invalid(&format!("the program: {why}")))?,
+            cwd: cwd_of(m)?,
             clipboard: !m.get_flag("no_clipboard"),
             hyperlinks: !m.get_flag("no_hyperlinks"),
             colours: !m.get_flag("no_colours"),
@@ -922,6 +943,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                 keep_times: m.get_flag("preserve"),
                 delete: m.get_flag("delete"),
                 atomic: m.get_flag("atomic"),
+                dry_run: m.get_flag("dry_run"),
                 excludes,
             };
             let shown = paths

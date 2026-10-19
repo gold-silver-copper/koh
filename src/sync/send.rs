@@ -1,5 +1,6 @@
 //! The sending end of a copy: walk the sources, send each entry's header, answer each file's
-//! answer with its bytes or with [`Item::Same`].
+//! answer with its bytes or with [`Item::Same`] (in a dry run, [`Item::Differs`] in place of
+//! the bytes).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -300,6 +301,9 @@ impl<W: Write> Sender<'_, W> {
                 Err(error) => return Ok(Err(Failure::io(&path, &error))),
             },
         };
+        if self.opts.dry_run {
+            return write_item(&mut self.out, &Item::Differs { id, from }, &[]).map(Ok);
+        }
         self.data(id, &file, from, &path)
     }
 

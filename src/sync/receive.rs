@@ -1,5 +1,8 @@
 //! The receiving end of a copy: land each entry where it goes, answer each file's header, and
-//! count what was done.
+//! count what was done; in a dry run, count and list it, changing nothing.
+//!
+//! A directory is a descriptor, or, in a dry run, `None` where one would be made: nothing is in
+//! it.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -12,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use super::fsat::{self, Kind};
 use super::{
-    hash_of, Answer, DataLen, FailKind, Failure, FileId, Item, LinkTarget, Mode, Name, Opts, Reply,
-    Summary, Time, MAX_DEPTH, MAX_ITEM,
+    hash_of, Answer, ChangeKind, DataLen, FailKind, Failure, FileId, Item, LinkTarget, Mode, Name,
+    Opts, Reply, Summary, Time, MAX_DEPTH, MAX_ITEM,
 };
 
 /// Most names `--delete` keeps of what the sender sent, all open directories' together.
@@ -29,13 +32,13 @@ pub enum Target {
     /// and nothing else said to copy into it (a `/` at its end, several sources): `cp`'s rule
     /// puts a tree of that name inside it, which is refused, as one copied there again would be.
     Into {
-        dir: OwnedFd,
+        dir: Option<OwnedFd>,
         shown: PathBuf,
         nest: Option<Name>,
     },
     /// The one item, as `name` in this directory.
     As {
-        dir: OwnedFd,
+        dir: Option<OwnedFd>,
         name: Name,
         shown: PathBuf,
     },
@@ -57,8 +60,8 @@ pub enum Dest {
 impl Target {
     /// Where `count` items for `dest` land, as `cp` would take it: inside it if it is a directory
     /// (or `/` ends it, or there are several, and it is made), else as it, its parents made where
-    /// missing; with the directories made.
-    pub fn resolve(dest: &Dest, count: usize) -> Result<(Self, u64), Failure> {
+    /// missing; with the directories made (only counted, if `dry`).
+    pub fn resolve(dest: &Dest, count: usize, dry: bool) -> Result<(Self, u64), Failure> {
         let mut made = 0;
         let target = match dest {
             Dest::Path(path) => {
@@ -66,7 +69,7 @@ impl Target {
                 let io = |error: io::Error| Failure::io(path, &error);
                 match std::fs::metadata(path) {
                     Ok(meta) if meta.is_dir() => Self::Into {
-                        dir: fsat::open_dir_path(path).map_err(io)?,
+                        dir: Some(fsat::open_dir_path(path).map_err(io)?),
                         shown: path.clone(),
                         nest: path
                             .file_name()
@@ -78,9 +81,8 @@ impl Target {
                     Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(io(error)),
                     _ if names_dir => {
                         made = made_dirs(path);
-                        std::fs::create_dir_all(path).map_err(io)?;
                         Self::Into {
-                            dir: fsat::open_dir_path(path).map_err(io)?,
+                            dir: made_path(path, dry).map_err(io)?,
                             shown: path.clone(),
                             nest: None,
                         }
@@ -95,9 +97,8 @@ impl Target {
                             .filter(|p| !p.as_os_str().is_empty())
                             .unwrap_or_else(|| Path::new("."));
                         made = made_dirs(parent);
-                        std::fs::create_dir_all(parent).map_err(io)?;
                         Self::As {
-                            dir: fsat::open_dir_path(parent).map_err(io)?,
+                            dir: made_path(parent, dry && made > 0).map_err(io)?,
                             name,
                             shown: path.clone(),
                         }
@@ -111,15 +112,25 @@ impl Target {
                 let names_dir = *dir || count > 1;
                 match path.split_last() {
                     None => Self::Into {
-                        dir: root_fd,
+                        dir: Some(root_fd),
                         shown,
                         nest: None,
                     },
                     Some((last, parents)) => {
-                        let parent = fsat::walk(root_fd, parents, true, &mut made).map_err(io)?;
-                        match fsat::stat(&parent, last.os()).map_err(io)?.map(|e| e.kind) {
+                        let parent = if dry {
+                            let (parent, missing) = fsat::walk_dry(root_fd, parents).map_err(io)?;
+                            made = missing;
+                            parent
+                        } else {
+                            Some(fsat::walk(root_fd, parents, true, &mut made).map_err(io)?)
+                        };
+                        match stat_in(parent.as_ref(), last).map_err(io)?.map(|e| e.kind) {
                             Some(Kind::Dir) => Self::Into {
-                                dir: fsat::open_dir(&parent, last.os()).map_err(io)?,
+                                dir: parent
+                                    .as_ref()
+                                    .map(|parent| fsat::open_dir(parent, last.os()))
+                                    .transpose()
+                                    .map_err(io)?,
                                 shown,
                                 nest: (!names_dir).then(|| last.clone()),
                             },
@@ -133,9 +144,21 @@ impl Target {
                                 return Err(Failure::new(FailKind::NotADirectory, &shown))
                             }
                             None if names_dir => {
-                                let dir =
-                                    fsat::walk(parent, std::slice::from_ref(last), true, &mut made)
-                                        .map_err(io)?;
+                                let dir = match parent {
+                                    Some(parent) if !dry => Some(
+                                        fsat::walk(
+                                            parent,
+                                            std::slice::from_ref(last),
+                                            true,
+                                            &mut made,
+                                        )
+                                        .map_err(io)?,
+                                    ),
+                                    _ => {
+                                        made = made.saturating_add(1);
+                                        None
+                                    }
+                                };
                                 Self::Into {
                                     dir,
                                     shown,
@@ -154,6 +177,28 @@ impl Target {
         };
         Ok((target, made))
     }
+}
+
+/// The directory at `path`, made with its parents where missing; `None` if `dry`, which makes
+/// nothing.
+fn made_path(path: &Path, dry: bool) -> io::Result<Option<OwnedFd>> {
+    if dry {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(path)?;
+    fsat::open_dir_path(path).map(Some)
+}
+
+/// Entry `name` of `dir`, if it has one: a dry run's directory to be made has none.
+fn stat_in(dir: Option<&OwnedFd>, name: &Name) -> io::Result<Option<fsat::Entry>> {
+    dir.map_or(Ok(None), |dir| fsat::stat(dir, name.os()))
+}
+
+/// Another descriptor of `dir`, if it is one.
+fn dup(dir: Option<&OwnedFd>, shown: &Path) -> Result<Option<OwnedFd>, Failure> {
+    dir.map(OwnedFd::try_clone)
+        .transpose()
+        .map_err(|e| Failure::io(shown, &e))
 }
 
 /// How many of `path` and its parents are missing, which making it makes.
@@ -186,7 +231,7 @@ fn part_name(name: &Name) -> Name {
 
 /// A directory open for what is copied into it.
 struct Open {
-    fd: OwnedFd,
+    fd: Option<OwnedFd>,
     /// Its path from the target, to say.
     rel: PathBuf,
     /// Its names from the target's directory, for `--atomic`'s renames at the end.
@@ -200,12 +245,13 @@ struct Open {
 
 /// A file whose header came, awaiting its bytes or [`Item::Same`].
 struct Pending {
-    dir: OwnedFd,
+    dir: Option<OwnedFd>,
     names: Vec<Name>,
     name: Name,
     rel: PathBuf,
     mode: Mode,
     mtime: Option<Time>,
+    size: u64,
     /// A file was there, which this replaces.
     existed: bool,
 }
@@ -292,12 +338,11 @@ impl<R: Read> Receiver<'_, R> {
     }
 
     fn run(&mut self, target: &Target) -> Result<Summary, Failure> {
-        let top_dir = match target {
+        self.top = match target {
             Target::Into { dir, shown, .. } | Target::As { dir, shown, .. } => {
-                dir.try_clone().map_err(|e| Failure::io(shown, &e))?
+                dup(dir.as_ref(), shown)?
             }
         };
-        self.top = Some(top_dir);
         let mut placed: usize = 0;
         loop {
             let item = self.next()?;
@@ -309,6 +354,8 @@ impl<R: Read> Receiver<'_, R> {
                         return Err(malformed());
                     }
                     self.finish()?;
+                    // A file's change is known when its answer is: listed in order of path.
+                    self.summary.changes.sort_by(|a, b| a.path.cmp(&b.path));
                     return Ok(std::mem::take(&mut self.summary));
                 }
                 Item::Failed(failure) => return Err(failure),
@@ -320,11 +367,12 @@ impl<R: Read> Receiver<'_, R> {
                 }
                 Item::Data { id, from } => self.data(id, from)?,
                 Item::Same(id) => self.same(id)?,
+                Item::Differs { id, from } => self.differs(id, from)?,
                 Item::Contents { mode, mtime } if at_top => {
                     placed = placed.saturating_add(1);
                     match target {
                         Target::Into { dir, shown, .. } => {
-                            let fd = dir.try_clone().map_err(|e| Failure::io(shown, &e))?;
+                            let fd = dup(dir.as_ref(), shown)?;
                             self.open.push(Open {
                                 fd,
                                 rel: PathBuf::new(),
@@ -335,8 +383,8 @@ impl<R: Read> Receiver<'_, R> {
                             });
                         }
                         Target::As { dir, name, shown } => {
-                            let dir = dir.try_clone().map_err(|e| Failure::io(shown, &e))?;
-                            self.enter(&dir, name, mode, mtime)?;
+                            let dir = dup(dir.as_ref(), shown)?;
+                            self.enter(dir.as_ref(), name, mode, mtime)?;
                         }
                     }
                 }
@@ -355,7 +403,7 @@ impl<R: Read> Receiver<'_, R> {
                         }
                     }
                     let (dir, name) = self.place(target, name, &mut placed)?;
-                    self.enter(&dir, &name, mode, mtime)?;
+                    self.enter(dir.as_ref(), &name, mode, mtime)?;
                 }
                 Item::File {
                     id,
@@ -369,7 +417,7 @@ impl<R: Read> Receiver<'_, R> {
                 }
                 Item::Symlink { name, target: link } => {
                     let (dir, name) = self.place(target, name, &mut placed)?;
-                    self.symlink(&dir, &name, &link)?;
+                    self.symlink(dir.as_ref(), &name, &link)?;
                 }
                 Item::End
                 | Item::Skipped(_)
@@ -387,25 +435,20 @@ impl<R: Read> Receiver<'_, R> {
         target: &Target,
         name: Name,
         placed: &mut usize,
-    ) -> Result<(OwnedFd, Name), Failure> {
+    ) -> Result<(Option<OwnedFd>, Name), Failure> {
         if let Some(open) = self.open.last() {
-            let fd = open
-                .fd
-                .try_clone()
-                .map_err(|e| Failure::io(&open.rel, &e))?;
-            return Ok((fd, name));
+            return Ok((dup(open.fd.as_ref(), &open.rel)?, name));
         }
         let nth = *placed;
         *placed = placed.saturating_add(1);
         match target {
             Target::Into { dir, shown, .. } => {
                 self.summary.inside = Some(String::from_utf8_lossy(name.as_bytes()).into_owned());
-                Ok((dir.try_clone().map_err(|e| Failure::io(shown, &e))?, name))
+                Ok((dup(dir.as_ref(), shown)?, name))
             }
-            Target::As { dir, name, shown } if nth == 0 => Ok((
-                dir.try_clone().map_err(|e| Failure::io(shown, &e))?,
-                name.clone(),
-            )),
+            Target::As { dir, name, shown } if nth == 0 => {
+                Ok((dup(dir.as_ref(), shown)?, name.clone()))
+            }
             Target::As { shown, .. } => Err(Failure::new(FailKind::SeveralIntoOne, shown)),
         }
     }
@@ -428,7 +471,7 @@ impl<R: Read> Receiver<'_, R> {
     /// Open directory `name` of `dir` for what follows, made if it is not there.
     fn enter(
         &mut self,
-        dir: &OwnedFd,
+        dir: Option<&OwnedFd>,
         name: &Name,
         mode: Mode,
         mtime: Option<Time>,
@@ -439,13 +482,19 @@ impl<R: Read> Receiver<'_, R> {
         }
         self.saw(name.as_bytes())?;
         let io = |error: io::Error| Failure::io(&rel, &error);
-        let made = match fsat::stat(dir, name.os()).map_err(io)?.map(|e| e.kind) {
+        let dry = self.opts.dry_run;
+        let made = match stat_in(dir, name).map_err(io)?.map(|e| e.kind) {
             None => true,
             Some(Kind::Dir) => false,
             Some(Kind::Link) => return Err(Failure::new(FailKind::IsASymlink, &rel)),
             Some(Kind::File | Kind::Other) if self.opts.delete => {
-                let removed = fsat::remove(dir, name.os(), 0).map_err(io)?;
-                self.summary.deleted = self.summary.deleted.saturating_add(removed);
+                if let Some(dir) = dir {
+                    let removed = fsat::remove(dir, name.os(), 0, dry).map_err(io)?;
+                    self.summary.deleted = self.summary.deleted.saturating_add(removed);
+                }
+                if dry {
+                    self.summary.change(ChangeKind::Deleted, &rel);
+                }
                 true
             }
             Some(Kind::File | Kind::Other) => {
@@ -453,10 +502,17 @@ impl<R: Read> Receiver<'_, R> {
             }
         };
         if made {
-            fsat::make_dir(dir, name.os()).map_err(io)?;
+            if dry {
+                self.summary.change(ChangeKind::Dir, &rel);
+            } else if let Some(dir) = dir {
+                fsat::make_dir(dir, name.os()).map_err(io)?;
+            }
             self.summary.dirs = self.summary.dirs.saturating_add(1);
         }
-        let fd = fsat::open_dir(dir, name.os()).map_err(io)?;
+        let fd = match dir {
+            Some(dir) if !(dry && made) => Some(fsat::open_dir(dir, name.os()).map_err(io)?),
+            _ => None,
+        };
         let names = self.names(name);
         self.open.push(Open {
             fd,
@@ -476,9 +532,17 @@ impl<R: Read> Receiver<'_, R> {
             return Err(malformed());
         };
         let io = |error: io::Error| Failure::io(&open.rel, &error);
+        let dry = self.opts.dry_run;
+        // A dry run's directory to be made holds nothing to remove, and takes no mode.
+        let Some(fd) = &open.fd else {
+            if let Some(seen) = &open.seen {
+                self.seen = self.seen.saturating_sub(seen.len());
+            }
+            return Ok(());
+        };
         if let Some(seen) = &open.seen {
             self.seen = self.seen.saturating_sub(seen.len());
-            for entry in fsat::names(&open.fd).map_err(io)? {
+            for entry in fsat::names(fd).map_err(io)? {
                 let path = open.rel.join(OsStr::from_bytes(&entry));
                 let excluded = self
                     .opts
@@ -488,20 +552,26 @@ impl<R: Read> Receiver<'_, R> {
                     continue;
                 }
                 let Ok(name) = Name::new(entry) else { continue };
-                if self.opts.atomic {
+                if self.opts.atomic && !dry {
                     self.defer()?;
                     self.removals.push((open.names.clone(), name));
                 } else {
-                    let removed = fsat::remove(&open.fd, name.os(), 0).map_err(io)?;
+                    let removed = fsat::remove(fd, name.os(), 0, dry).map_err(io)?;
                     self.summary.deleted = self.summary.deleted.saturating_add(removed);
+                    if dry {
+                        self.summary.change(ChangeKind::Deleted, &path);
+                    }
                 }
             }
         }
+        if dry {
+            return Ok(());
+        }
         if let Some(mode) = open.mode {
-            fsat::chmod(&open.fd, mode.landed()).map_err(io)?;
+            fsat::chmod(fd, mode.landed()).map_err(io)?;
         }
         if let Some(time) = open.mtime {
-            fsat::set_mtime(&open.fd, time).map_err(io)?;
+            fsat::set_mtime(fd, time).map_err(io)?;
         }
         Ok(())
     }
@@ -517,7 +587,7 @@ impl<R: Read> Receiver<'_, R> {
     /// A file's header: answer it.
     fn file(
         &mut self,
-        dir: OwnedFd,
+        dir: Option<OwnedFd>,
         id: FileId,
         name: Name,
         (mode, mtime, size): (Mode, Option<Time>, u64),
@@ -525,27 +595,28 @@ impl<R: Read> Receiver<'_, R> {
         let rel = self.rel(&name);
         let io = |error: io::Error| Failure::io(&rel, &error);
         self.saw(name.as_bytes())?;
-        let there = fsat::stat(&dir, name.os()).map_err(io)?;
-        let answer = match there {
-            Some(e) if e.kind == Kind::Dir => {
+        let there = stat_in(dir.as_ref(), &name).map_err(io)?;
+        let answer = match (there, &dir) {
+            (Some(e), _) if e.kind == Kind::Dir => {
                 return Err(Failure::new(FailKind::IsADirectory, &rel))
             }
-            Some(e) if e.kind == Kind::File && e.size == size => {
-                let file = fsat::open_file(&dir, name.os()).map_err(io)?;
+            (Some(e), Some(dir)) if e.kind == Kind::File && e.size == size => {
+                let file = fsat::open_file(dir, name.os()).map_err(io)?;
                 Answer::Check {
                     id,
                     hash: hash_of(&file, None).map_err(io)?,
                 }
             }
-            Some(_) | None => {
+            _ => {
                 let part = part_name(&name);
                 self.saw(part.as_bytes())?;
-                let kept = fsat::stat(&dir, part.os())
+                let kept = stat_in(dir.as_ref(), &part)
                     .map_err(io)?
-                    .filter(|p| p.kind == Kind::File && p.size > 0 && p.size <= size);
+                    .filter(|p| p.kind == Kind::File && p.size > 0 && p.size <= size)
+                    .zip(dir.as_ref());
                 match kept {
-                    Some(p) => {
-                        let file = fsat::open_file(&dir, part.os()).map_err(io)?;
+                    Some((p, dir)) => {
+                        let file = fsat::open_file(dir, part.os()).map_err(io)?;
                         Answer::Want {
                             id,
                             have: p.size,
@@ -570,6 +641,7 @@ impl<R: Read> Receiver<'_, R> {
                 rel,
                 mode,
                 mtime,
+                size,
                 existed: there.is_some(),
             },
         );
@@ -578,12 +650,18 @@ impl<R: Read> Receiver<'_, R> {
 
     /// File `id`'s bytes from `from`: into its part, then it into place.
     fn data(&mut self, id: FileId, from: u64) -> Result<(), Failure> {
-        let Some(p) = self.pending.remove(&id) else {
+        // A dry run is sent no bytes.
+        let Some((p, dir)) = self
+            .pending
+            .remove(&id)
+            .filter(|_| !self.opts.dry_run)
+            .and_then(|mut p| p.dir.take().map(|dir| (p, dir)))
+        else {
             return Err(malformed());
         };
         let io = |error: io::Error| Failure::io(&p.rel, &error);
         let part = part_name(&p.name);
-        let file: File = fsat::create(&p.dir, part.os(), from == 0).map_err(io)?;
+        let file: File = fsat::create(&dir, part.os(), from == 0).map_err(io)?;
         file.set_len(from).map_err(io)?;
         let mut at = from;
         loop {
@@ -606,6 +684,7 @@ impl<R: Read> Receiver<'_, R> {
                 | Item::Skipped(_)
                 | Item::Data { .. }
                 | Item::Same(_)
+                | Item::Differs { .. }
                 | Item::Failed(_)
                 | Item::Done => return Err(malformed()),
             }
@@ -622,16 +701,38 @@ impl<R: Read> Receiver<'_, R> {
             dir_names.pop();
             self.renames.push((dir_names, part, p.name.clone()));
         } else {
-            fsat::rename(&p.dir, part.os(), p.name.os()).map_err(io)?;
+            fsat::rename(&dir, part.os(), p.name.os()).map_err(io)?;
         }
-        if p.existed {
+        self.written(&p, from);
+        Ok(())
+    }
+
+    /// File `p` was written, from byte `from` on (or would be, in a dry run).
+    fn written(&mut self, p: &Pending, from: u64) {
+        let kind = if p.existed {
             self.summary.replaced = self.summary.replaced.saturating_add(1);
+            ChangeKind::Replaced
         } else {
             self.summary.new = self.summary.new.saturating_add(1);
-        }
+            ChangeKind::New
+        };
         if from > 0 {
             self.summary.resumed = self.summary.resumed.saturating_add(1);
         }
+        if self.opts.dry_run {
+            self.summary.change(kind, &p.rel);
+        }
+    }
+
+    /// In a dry run, file `id` differs from the one here, or there is none: it would be sent from
+    /// byte `from`.
+    fn differs(&mut self, id: FileId, from: u64) -> Result<(), Failure> {
+        let Some(p) = self.pending.remove(&id).filter(|_| self.opts.dry_run) else {
+            return Err(malformed());
+        };
+        let bytes = p.size.saturating_sub(from);
+        self.summary.bytes = self.summary.bytes.saturating_add(bytes);
+        self.written(&p, from);
         Ok(())
     }
 
@@ -641,8 +742,15 @@ impl<R: Read> Receiver<'_, R> {
         let Some(p) = self.pending.remove(&id) else {
             return Err(malformed());
         };
+        self.summary.unchanged = self.summary.unchanged.saturating_add(1);
+        if self.opts.dry_run {
+            return Ok(());
+        }
+        let Some(dir) = &p.dir else {
+            return Err(malformed());
+        };
         let io = |error: io::Error| Failure::io(&p.rel, &error);
-        let file = fsat::open_file(&p.dir, p.name.os()).map_err(io)?;
+        let file = fsat::open_file(dir, p.name.os()).map_err(io)?;
         let here = fsat::stat_of(&file).map_err(io)?;
         if here.mode != p.mode.landed() {
             file.set_permissions(std::fs::Permissions::from_mode(p.mode.landed()))
@@ -654,28 +762,37 @@ impl<R: Read> Receiver<'_, R> {
         {
             fsat::set_mtime(&file, time).map_err(io)?;
         }
-        self.summary.unchanged = self.summary.unchanged.saturating_add(1);
         Ok(())
     }
 
     /// A symlink, made or put in place of what is there, unless it is the same already.
-    fn symlink(&mut self, dir: &OwnedFd, name: &Name, link: &LinkTarget) -> Result<(), Failure> {
+    fn symlink(
+        &mut self,
+        dir: Option<&OwnedFd>,
+        name: &Name,
+        link: &LinkTarget,
+    ) -> Result<(), Failure> {
         let rel = self.rel(name);
         let io = |error: io::Error| Failure::io(&rel, &error);
         self.saw(name.as_bytes())?;
-        match fsat::stat(dir, name.os()).map_err(io)?.map(|e| e.kind) {
-            None => fsat::symlink(&link.0, dir, name.os()).map_err(io)?,
-            Some(Kind::Dir) => return Err(Failure::new(FailKind::IsADirectory, &rel)),
+        let dry = self.opts.dry_run;
+        match (stat_in(dir, name).map_err(io)?.map(|e| e.kind), dir) {
+            (Some(Kind::Dir), _) => return Err(Failure::new(FailKind::IsADirectory, &rel)),
             // The same already: not a file, so not counted among those unchanged.
-            Some(Kind::Link) if fsat::read_link(dir, name.os()).map_err(io)? == link.0 => {
+            (Some(Kind::Link), Some(dir))
+                if fsat::read_link(dir, name.os()).map_err(io)? == link.0 =>
+            {
                 return Ok(());
             }
-            Some(Kind::Link | Kind::File | Kind::Other) => {
+            _ if dry => self.summary.change(ChangeKind::Link, &rel),
+            (None, Some(dir)) => fsat::symlink(&link.0, dir, name.os()).map_err(io)?,
+            (Some(Kind::Link | Kind::File | Kind::Other), Some(dir)) => {
                 let part = part_name(name);
-                let _ = fsat::remove(dir, part.os(), MAX_DEPTH);
+                let _ = fsat::remove(dir, part.os(), MAX_DEPTH, false);
                 fsat::symlink(&link.0, dir, part.os()).map_err(io)?;
                 fsat::rename(dir, part.os(), name.os()).map_err(io)?;
             }
+            (_, None) => return Err(malformed()),
         }
         self.summary.links = self.summary.links.saturating_add(1);
         Ok(())
@@ -698,7 +815,7 @@ impl<R: Read> Receiver<'_, R> {
             let io = |error: io::Error| Failure::io(&rel, &error);
             let from = top.try_clone().map_err(io)?;
             let dir = fsat::walk(from, &names, false, &mut 0).map_err(io)?;
-            let removed = fsat::remove(&dir, name.os(), 0).map_err(io)?;
+            let removed = fsat::remove(&dir, name.os(), 0, false).map_err(io)?;
             self.summary.deleted = self.summary.deleted.saturating_add(removed);
         }
         Ok(())

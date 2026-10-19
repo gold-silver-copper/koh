@@ -50,7 +50,8 @@ fn failure(path: &RemotePath, problem: &crate::request::Problem) -> Failure {
         | crate::request::ProblemKind::CouldNotStart
         | crate::request::ProblemKind::NotFound
         | crate::request::ProblemKind::Failed
-        | crate::request::ProblemKind::NoSuchDir => FailKind::Other,
+        | crate::request::ProblemKind::NoSuchDir
+        | crate::request::ProblemKind::NoSuchProgram => FailKind::Other,
     };
     Failure::new(
         kind,
@@ -139,7 +140,7 @@ async fn put(
     let end_tx = reply_tx.clone();
     let mut landing = pin!(tokio::task::spawn_blocking(
         move || -> Result<Summary, Failure> {
-            let (target, made): (Target, u64) = Target::resolve(&dest?, count)?;
+            let (target, made): (Target, u64) = Target::resolve(&dest?, count, opts.dry_run)?;
             let mut answer = |reply: Reply| reply_tx.try_send(reply).is_ok();
             let mut summary = sync::receive(ChannelReader::new(rx), &target, &opts, &mut answer)?;
             summary.dirs = summary.dirs.saturating_add(made);

@@ -318,7 +318,7 @@ impl Remote {
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server_id));
         let start = Size::new(rows, cols);
         let channel = connector
-            .connect(koh::request::Pick::Latest, start, None)
+            .connect(koh::request::Pick::Latest, start, (None, None))
             .await?;
         let size = Arc::new(Mutex::new(start));
         let shown = Arc::new(Mutex::new(parser(rows, cols)?));
@@ -386,8 +386,7 @@ impl Remote {
             cols,
             argv,
             &[],
-            "xterm-256color",
-            &Home::isolated(&setup.home),
+            ("xterm-256color", &Home::isolated(&setup.home), None),
             &koh::pty::Reaper::start()?,
         )
         .map_err(|e| anyhow!("{e}"))?;

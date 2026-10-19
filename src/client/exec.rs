@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::cli::{Format, Opened, Remote};
-use crate::request::{ExecStream, ExitStatus, ProblemKind, Request, Run, MAX_REPLY};
+use crate::request::{ExecStream, ExitStatus, RemotePath, Request, Run, MAX_REPLY};
 
 /// Most bytes moved at once from a stream.
 const CHUNK: usize = 64 * 1024;
@@ -38,6 +38,7 @@ pub async fn exec(remote: &Remote, run: Run, format: Format) -> anyhow::Result<u
     // Apart, its stdout and stderr could come back in another order than it wrote them: when they
     // go to one file here (`2>&1`, a terminal), they are one pipe there.
     let together = !format.json && one_file();
+    let cwd = run.cwd.clone();
     let mut opened = Opened::dial(remote, &Request::Exec { run, together }).await?;
     super::cli::report_busy();
     let (stdin, reading) = super::io::spawn_stdin()?;
@@ -45,7 +46,7 @@ pub async fn exec(remote: &Remote, run: Run, format: Format) -> anyhow::Result<u
         &opened.conn,
         &mut opened.control,
         stdin,
-        &interrupted,
+        (&interrupted, cwd.as_ref()),
         format,
     )
     .await;
@@ -102,12 +103,12 @@ impl Sink {
 }
 
 /// Feed `stdin` to the command on `conn`, through `control`, and its output to the user, until
-/// its status comes.
+/// its status comes; `cwd` is where it was to start.
 async fn drive(
     conn: &Connection,
     control: &mut SendStream,
     stdin: mpsc::Receiver<Vec<u8>>,
-    interrupted: &CancellationToken,
+    (interrupted, cwd): (&CancellationToken, Option<&RemotePath>),
     format: Format,
 ) -> anyhow::Result<u32> {
     // Apart, so a command that does not read its stdin never holds up its output.
@@ -141,6 +142,7 @@ async fn drive(
     let code = match status {
         Ok(ExitStatus::Exited(code)) => Ok(code),
         Ok(ExitStatus::NotStarted(problem)) => {
+            let problem = super::cli::hint_problem(problem, cwd);
             if !format.json {
                 crate::log::stderr(format_args!("koh: {problem}"));
             }
@@ -151,8 +153,7 @@ async fn drive(
     };
     let status = match &code {
         Ok(code) => *code,
-        Err(problem) if problem.kind == ProblemKind::NotFound => 127,
-        Err(_) => 126,
+        Err(problem) => problem.kind.not_started_status().map_or(126, u32::from),
     };
     if let (Sink::Kept(stdout, out_dropped), Sink::Kept(stderr, err_dropped)) = (out, err) {
         #[derive(Serialize)]

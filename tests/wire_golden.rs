@@ -1,4 +1,4 @@
-//! The koh/10 encoding.
+//! The koh/11 encoding.
 //!
 //! Messages built here by hand from the wire types, both ways, are pinned: the expected bytes were
 //! captured by running the encoder, and a change to the wire must change them in the same commit,
@@ -41,11 +41,13 @@ fn requests() -> Option<Vec<Request>> {
             }),
             size: Size::new(24, 80),
             program: None,
+            cwd: None,
         },
         Request::Shell {
             pick: Pick::New,
             size: Size::new(24, 80),
             program: Argv::new(vec![b"gdb".to_vec()]).ok(),
+            cwd: Some(path("proj")?),
         },
         Request::Exec {
             run: Run {
@@ -78,6 +80,7 @@ fn requests() -> Option<Vec<Request>> {
             sources: SourceCount::new(2)?,
             opts: Opts {
                 delete: true,
+                dry_run: true,
                 ..Opts::default()
             },
         }),
@@ -150,6 +153,10 @@ fn items() -> Option<Vec<Item>> {
         },
         Item::Sent,
         Item::Same(FileId(2)),
+        Item::Differs {
+            id: FileId(3),
+            from: 0,
+        },
         Item::Done,
     ])
 }
@@ -162,6 +169,14 @@ fn replies() -> Vec<Reply> {
             prefix: None,
         }),
         Reply::End(Ok(koh::sync::Summary::default())),
+        Reply::End(Ok(koh::sync::Summary {
+            new: 1,
+            changes: vec![koh::sync::Change {
+                kind: koh::sync::ChangeKind::New,
+                path: "src/a.rs".into(),
+            }],
+            ..koh::sync::Summary::default()
+        })),
     ]
 }
 
@@ -219,7 +234,7 @@ fn framed() -> Option<Vec<(String, Vec<u8>)>> {
 
 #[test]
 fn the_wire_is_pinned() {
-    assert_eq!(koh::transport_iroh::PROTOCOL, "koh/10");
+    assert_eq!(koh::transport_iroh::PROTOCOL, "koh/11");
     let got: Vec<String> = framed()
         .unwrap()
         .iter()
@@ -288,13 +303,13 @@ fn the_wire_messages_seed_the_fuzzers() {
 
 /// Captured by running the encoder; see the module's doc.
 const PINNED: &[&str] = &[
-    "0000000700030902185000",
-    "0000000a00011850010103676462",
+    "000000080003090218500000",
+    "0000001000011850010103676462010470726f6a",
     "00000012030002046d616b65032d6a34010373726300",
     "000000170401056275696c64010c63642078202626206d616b6500",
     "0000000b06056275696c640101c801",
     "00000014080100056275696c6401096c697374656e696e67",
-    "0000000d09010570726f6a2f0200010000",
+    "0000000e09010570726f6a2f020001000100",
     "000000110103020000016104000306706173746564",
     "0000000400011e64",
     "00000009020101020300000100",
@@ -313,9 +328,11 @@ const PINNED: &[&str] = &[
     "00000003060100",
     "0000000108",
     "000000020902",
+    "000000030c0300",
     "000000010b",
     "000000050000010000",
-    "0000000d01000000000000000000000000",
+    "0000000f010000000000000000000000000000",
+    "00000019010001000000000000000000000100087372632f612e727300",
     "000000020902",
     "00000003008901",
     "000000080100056275696c64",

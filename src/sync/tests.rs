@@ -15,7 +15,7 @@ fn copy_with(
     let (cut_tx, cut_rx) = mpsc::channel::<Vec<u8>>(PIPE_DEPTH);
     let (reply_tx, mut reply_rx) = mpsc::channel::<Reply>(REPLY_DEPTH);
     let count = sources.len();
-    let target = Target::resolve(dest, count);
+    let target = Target::resolve(dest, count, opts.dry_run);
     let sources = sources.to_vec();
     let send_opts = opts.clone();
     let sender = std::thread::spawn(move || {
@@ -301,4 +301,79 @@ fn nothing_lands_through_a_symlink_or_outside_a_scoped_directory() {
     for bad in [&b""[..], b".", b"..", b"a/b", b"a\0"] {
         assert!(Name::new(bad.to_vec()).is_err(), "{bad:?}");
     }
+}
+
+/// A dry run changes nothing and sends no file's bytes, and says what the copy would do: the
+/// same counts the copy then makes, and each change.
+#[test]
+fn a_dry_run_says_what_the_copy_would_do_and_changes_nothing() {
+    let scratch = crate::test_runtime::scratch("sync-dry");
+    let src = scratch.join("src");
+    fs::create_dir_all(src.join("new_dir")).unwrap();
+    fs::write(src.join("same"), b"same").unwrap();
+    fs::write(src.join("edited"), b"edit").unwrap();
+    fs::write(src.join("grown"), b"grown longer").unwrap();
+    fs::write(src.join("new_dir/fresh"), b"fresh").unwrap();
+    std::os::unix::fs::symlink("same", src.join("link")).unwrap();
+    let dest = scratch.join("dest");
+    copy(&[&src.join(".")], &dest, &Opts::default()).unwrap();
+    fs::remove_dir_all(dest.join("new_dir")).unwrap();
+    fs::remove_file(dest.join("link")).unwrap();
+    fs::write(dest.join("edited"), b"EDIT").unwrap();
+    fs::write(dest.join("grown"), b"short").unwrap();
+    fs::write(dest.join("stale"), b"x").unwrap();
+    let before = tree(&dest);
+    let opts = |dry_run| Opts {
+        delete: true,
+        dry_run,
+        ..Opts::default()
+    };
+    let dry = copy(&[&src.join(".")], &dest, &opts(true)).unwrap();
+    assert_eq!(tree(&dest), before, "a dry run changed the destination");
+    let said: Vec<(&str, ChangeKind)> = dry
+        .changes
+        .iter()
+        .map(|c| (c.path.as_str(), c.kind))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("edited", ChangeKind::Replaced),
+            ("grown", ChangeKind::Replaced),
+            ("link", ChangeKind::Link),
+            ("new_dir", ChangeKind::Dir),
+            ("new_dir/fresh", ChangeKind::New),
+            ("stale", ChangeKind::Deleted),
+        ],
+        "{dry:?}"
+    );
+    // What it said is what the copy does.
+    let done = copy(&[&src.join(".")], &dest, &opts(false)).unwrap();
+    let counts = |s: &Summary| {
+        (
+            s.new,
+            s.replaced,
+            s.unchanged,
+            s.deleted,
+            s.dirs,
+            s.links,
+            s.bytes,
+        )
+    };
+    assert_eq!(counts(&dry), counts(&done), "{dry:?} {done:?}");
+    assert_eq!(done.changes, []);
+    // Into a destination that is not there, beneath a scoped key's directory too: nothing made.
+    for (missing, dirs) in [("gone/deeper/", 4), ("gone/deeper", 3)] {
+        let dry = copy(&[&src], &scratch.join(missing), &opts(true)).unwrap();
+        assert_eq!((dry.new, dry.dirs), (4, dirs), "{missing}: {dry:?}");
+    }
+    let name = |n: &str| Name::new(n.as_bytes().to_vec()).unwrap();
+    let beneath = Dest::Beneath {
+        root: scratch.to_path_buf(),
+        path: vec![name("gone"), name("deeper")],
+        dir: true,
+    };
+    let dry = copy_with(&[Source::Path(src)], &beneath, &opts(true), None).unwrap();
+    assert_eq!((dry.new, dry.dirs), (4, 4), "{dry:?}");
+    assert!(!scratch.join("gone").exists());
 }

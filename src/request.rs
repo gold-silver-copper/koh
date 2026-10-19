@@ -111,11 +111,13 @@ pub enum Pick {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     /// A detachable shell session, for a terminal of `size`: the stream goes on as the shell's
-    /// input. With a `program`, a new session running it in place of the shell.
+    /// input. With a `program`, a new session running it in place of the shell; with a `cwd`, a
+    /// new session starting there (else in the server user's home).
     Shell {
         pick: Pick,
         size: Size,
         program: Option<Argv>,
+        cwd: Option<RemotePath>,
     },
     /// The peer's sessions, answered as an [`Answer<SessionList>`].
     Sessions,
@@ -474,6 +476,9 @@ pub struct Problem {
     pub kind: ProblemKind,
     #[serde(deserialize_with = "detail")]
     pub detail: String,
+    /// What the client adds, said after the rest: never sent.
+    #[serde(skip)]
+    pub hint: Option<String>,
 }
 
 fn detail<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -491,16 +496,24 @@ impl Problem {
             }
             detail.truncate(end);
         }
-        Self { kind, detail }
+        Self {
+            kind,
+            detail,
+            hint: None,
+        }
     }
 
-    /// What it says, for a person: the kind's words, then the detail, escaped.
+    /// What it says, for a person: the detail, escaped, then the kind's words, then the hint.
     pub fn text(&self) -> String {
         let said = self.kind.text();
-        if self.detail.is_empty() {
+        let text = if self.detail.is_empty() {
             said.to_owned()
         } else {
             format!("{}: {said}", crate::log::Peer(&self.detail))
+        };
+        match &self.hint {
+            Some(hint) => format!("{text}; {hint}"),
+            None => text,
         }
     }
 }
@@ -528,9 +541,28 @@ pub enum ProblemKind {
     Failed,
     /// The directory a command was to start in is not there, or is not a directory.
     NoSuchDir,
+    /// The program to run is not there (its directory to start in was).
+    NoSuchProgram,
 }
 
 impl ProblemKind {
+    /// The status a command that did not start for this exits with, as a shell's: 127 no such
+    /// program, 126 it could not start (no such directory to start in, say).
+    pub const fn not_started_status(self) -> Option<u8> {
+        match self {
+            Self::NoSuchProgram => Some(127),
+            Self::NoSuchDir | Self::CouldNotStart => Some(126),
+            Self::NoSuchJob
+            | Self::NoSuchSession
+            | Self::NameTaken
+            | Self::TooManyJobs
+            | Self::OutOfScope
+            | Self::NoHome
+            | Self::NotFound
+            | Self::Failed => None,
+        }
+    }
+
     /// Its name in `--json` output.
     pub const fn name(self) -> &'static str {
         match self {
@@ -544,6 +576,7 @@ impl ProblemKind {
             Self::NotFound => "not_found",
             Self::Failed => "failed",
             Self::NoSuchDir => "no_such_dir",
+            Self::NoSuchProgram => "no_such_program",
         }
     }
 
@@ -562,6 +595,7 @@ impl ProblemKind {
                 "no such directory on the server to start in (-C takes the server's path; a \
                  relative one is in its home)"
             }
+            Self::NoSuchProgram => "no such program",
         }
     }
 }
@@ -822,11 +856,13 @@ mod tests {
                 }),
                 size: Size::new(24, 80),
                 program: None,
+                cwd: None,
             },
             Request::Shell {
                 pick: Pick::New,
                 size: Size::new(24, 80),
                 program: Some(Argv::new(vec![b"gdb".to_vec(), b"./a.out".to_vec()]).unwrap()),
+                cwd: Some(path(b"proj")),
             },
             Request::Exec {
                 run: Run {

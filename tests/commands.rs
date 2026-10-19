@@ -147,6 +147,17 @@ fn exec_passes_its_words_as_they_are_and_exits_with_the_commands_status() {
             let said = String::from_utf8_lossy(&out.stderr);
             assert_eq!(out.status.code(), Some(126), "{out:?}");
             assert!(said.contains("/no/such/dir: no such directory"), "{said}");
+            // One in this machine's home, as an unquoted `-C ~/x` reaches koh, is said to be so.
+            let local = koh_testkit::home!().join("no-such-proj");
+            let out = remote
+                .run("exec", &["-C", &local.to_string_lossy(), "--", "pwd"])
+                .expect("exec");
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(126), "{out:?}");
+            assert!(
+                said.contains("this machine's home") && said.contains("-C '~/no-such-proj'"),
+                "{said}"
+            );
             // Killed by a signal: 128 plus it, as a shell says, and nothing else on stderr.
             let out = remote.exec("kill -9 $$", b"").expect("exec");
             assert_eq!((out.status.code(), &out.stderr[..]), (Some(137), &b""[..]));
@@ -394,6 +405,14 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
                 .run("run", &["--name", "build", "--", "true"])
                 .expect("run");
             assert_eq!(again.status.code(), Some(1), "{again:?}");
+            // A job that cannot start says so as `exec` does: 126 no such directory, 127 no such
+            // program.
+            let nowhere = remote
+                .run("run", &["-C", "/no/such/dir", "--", "true"])
+                .expect("run");
+            assert_eq!(nowhere.status.code(), Some(126), "{nowhere:?}");
+            let missing = remote.run("run", &["--", "no-such-program"]).expect("run");
+            assert_eq!(missing.status.code(), Some(127), "{missing:?}");
             // The text comes before the end: the wait ends at it.
             let waited = remote
                 .run("wait", &["build", "--text", "listening", "--json"])
@@ -632,6 +651,30 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             // --delete takes away what the source lacks, but what is excluded.
             std::fs::write(there.join("a tree/stray"), b"s").expect("a stray file");
             std::fs::write(there.join("a tree/kept.o"), b"o").expect("an excluded file");
+            // A dry run says what would change, one a line, and changes nothing, either way.
+            let exclude = || ["--exclude".into(), "*.o".into()];
+            let mut args: Vec<OsString> = vec!["--dry-run".into(), "--delete".into()];
+            args.extend(exclude());
+            let out = cp(&[&args[..], &[from.clone().into(), into.clone()]].concat());
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                said.starts_with("deleted  a tree/stray\ndry run: 0 files would be sent, 0 B"),
+                "{out:?}"
+            );
+            assert!(
+                said.contains("1 deleted") && said.contains("nothing changed"),
+                "{said}"
+            );
+            assert!(there.join("a tree/stray").exists());
+            let mut from_there = remote.at(&there.join("a tree"));
+            from_there.push("/.");
+            let out = cp(&[&args[..], &[from_there, back.clone().into()]].concat());
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                said.starts_with("new      stray\ndry run: 1 file would be sent, 1 B"),
+                "{out:?}"
+            );
+            assert!(!back.join("stray").exists());
             let out = cp(&[
                 "--delete".into(),
                 "--exclude".into(),
@@ -759,8 +802,9 @@ fn a_scoped_key_copies_only_in_its_directory_and_runs_no_shell() {
         });
 }
 
-/// `koh connect SERVER -- PROG ARG...`: a new session running the program on a terminal of its
-/// own, in place of the shell; the client ends when it does, with its status.
+/// `koh connect SERVER -C DIR -- PROG ARG...`: a new session running the program on a terminal
+/// of its own, in place of the shell, started in DIR; the client ends when it does, with its
+/// status. A DIR not there starts nothing: 126, as `exec` says it.
 #[test]
 fn connect_runs_one_program_on_a_terminal_and_exits_with_its_status() {
     koh_testkit::multi_thread(2)
@@ -774,10 +818,18 @@ fn connect_runs_one_program_on_a_terminal_and_exits_with_its_status() {
                     .into_iter()
                     .map(|a| a.to_string_lossy().into_owned()),
             );
-            let program = "[ -t 0 ] && [ -t 1 ] && echo \"tty_$(stty size | tr ' ' x)\"; \
+            let program = "[ -t 0 ] && [ -t 1 ] && echo \"tty_$(stty size | tr ' ' x)_in_$PWD\"; \
                            read line; echo \"got_${line}_$((6*7))\"; exit 3";
+            let nowhere = {
+                let mut argv = argv.clone();
+                argv.extend([remote.id.clone(), "-C".into(), "/no/such/dir".into()]);
+                argv.extend(["--".into(), "true".into()]);
+                argv
+            };
             argv.extend([
                 remote.id.clone(),
+                "-C".into(),
+                "/".into(),
                 "--".into(),
                 "sh".into(),
                 "-c".into(),
@@ -787,29 +839,45 @@ fn connect_runs_one_program_on_a_terminal_and_exits_with_its_status() {
                 .await
                 .expect("the program's answer");
             assert!(
-                seen.text_from(0).contains("tty_24x80"),
+                seen.text_from(0).contains("tty_24x80_in_/\r"),
                 "{}",
                 seen.text_from(0)
             );
-            let mut status = None;
-            for _ in 0..100 {
-                status = client.try_wait().expect("the client");
-                if status.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
             assert_eq!(
-                status.map(koh::pty::Exit::code),
+                exit_of(&mut client).await,
                 Some(3),
                 "{}",
                 seen.text_from(at)
+            );
+            let (mut client, seen) = on_pty(&nowhere).expect("koh connect");
+            assert_eq!(
+                exit_of(&mut client).await,
+                Some(126),
+                "{}",
+                seen.text_from(0)
+            );
+            assert!(
+                seen.text_from(0)
+                    .contains("/no/such/dir: no such directory"),
+                "{}",
+                seen.text_from(0)
             );
             // It was a session of its own, now ended: none is left.
             let out = remote.run("sessions", &["--json"]).expect("sessions");
             let listed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
             assert_eq!(listed.as_array().map(Vec::len), Some(0), "{listed}");
         });
+}
+
+/// How `client` exited, waited for up to 10 s.
+async fn exit_of(client: &mut koh::pty::Pty) -> Option<u32> {
+    for _ in 0..100 {
+        if let Ok(Some(status)) = client.try_wait() {
+            return Some(status.code());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
 }
 
 #[test]

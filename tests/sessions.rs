@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/10 client.
+//! loopback iroh with a minimal koh/11 client.
 #![forbid(clippy::disallowed_methods)]
 
 use std::time::Duration;
@@ -194,7 +194,7 @@ fn registry(
 
 /// Attach `peer` and say how.
 async fn attach_kind(reg: &Registry, peer: iroh::EndpointId) -> Option<AttachKind> {
-    reg.attach(peer, Pick::Latest, WINDOW, None)
+    reg.attach(peer, Pick::Latest, WINDOW, (None, None))
         .await
         .ok()
         .map(|(_, _, kind)| kind)
@@ -203,7 +203,7 @@ async fn attach_kind(reg: &Registry, peer: iroh::EndpointId) -> Option<AttachKin
 /// Attach `peer`, and watch what it is shown.
 async fn watch(reg: &Registry, peer: iroh::EndpointId) -> anyhow::Result<(Watched, AttachKind)> {
     let (client, start, kind) = reg
-        .attach(peer, Pick::Latest, WINDOW, None)
+        .attach(peer, Pick::Latest, WINDOW, (None, None))
         .await
         .map_err(|close| anyhow::anyhow!("refused: {close}"))?;
     Ok((Watched::new((client, start))?, kind))
@@ -241,7 +241,7 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
             .context("A creates the one allowed session")?;
         anyhow::ensure!(
             matches!(
-                reg.attach(b, Pick::Latest, WINDOW, None).await,
+                reg.attach(b, Pick::Latest, WINDOW, (None, None)).await,
                 Err(Close::AtCapacity)
             ),
             "a second distinct peer is refused at the cap, for now"
@@ -305,7 +305,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-/// A bare koh/10 client: writes messages, and reads what the server shows on its newest epoch.
+/// A bare koh/11 client: writes messages, and reads what the server shows on its newest epoch.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -328,6 +328,7 @@ impl RawClient {
             pick: Pick::Latest,
             size: WINDOW,
             program: None,
+            cwd: None,
         };
         send.write_all(&koh::request::encode(&request, MAX_REQUEST)?)
             .await?;
@@ -785,7 +786,10 @@ fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
         let a = peer()?;
         let (mut client, _) = watch(&reg, a).await.context("attach")?;
         allowed.store(false, Relaxed);
-        let refused = reg.attach(a, Pick::Latest, WINDOW, None).await.err();
+        let refused = reg
+            .attach(a, Pick::Latest, WINDOW, (None, None))
+            .await
+            .err();
         anyhow::ensure!(refused == Some(Close::NotAuthorized), "{refused:?}");
         reg.end(a).await;
         allowed.store(true, Relaxed);
@@ -1003,7 +1007,11 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
         let endpoint = bind_endpoint_local(secret, false).await?;
         let dialed = tokio::time::timeout(
             Duration::from_secs(10),
-            koh::client::IrohConnector::new(endpoint, addr).connect(Pick::Latest, WINDOW, None),
+            koh::client::IrohConnector::new(endpoint, addr).connect(
+                Pick::Latest,
+                WINDOW,
+                (None, None),
+            ),
         )
         .await;
         shutdown.cancel();
@@ -1111,6 +1119,7 @@ fn an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes() ->
                             pick: Pick::Latest,
                             size: WINDOW,
                             program: None,
+                            cwd: None,
                         },
                         MAX_REQUEST,
                     );

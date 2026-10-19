@@ -67,9 +67,18 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (`terminal_activity`, fux's own); on macOS it says only `busy`, `idle` or `unknown`.
 
 ### Changed
-- **Protocol `koh/10`**: `koh connect SERVER -- PROG ARG...`, `koh logs --tail`, the end of a
-  log saying how the job stands, a command's stdout and stderr on one pipe, and the close code
-  `Busy`.
+- **Protocol `koh/11`**: `koh connect SERVER -- PROG ARG...` and `-C DIR`, `koh logs --tail`,
+  the end of a log saying how the job stands, a command's stdout and stderr on one pipe, `koh cp
+  --dry-run`, the problem `NoSuchProgram`, and the close codes `Busy` and `NoSuchDir`.
+- **`koh connect SERVER -C DIR [-- PROG ARG...]`** starts the new session, its program or a
+  shell, in DIR; one not there exits 126, as `exec` does.
+- **A command that did not start exits the same from `exec` and `run`**: 127 no such program,
+  126 could not start (no `-C` directory there); `koh run` exited 1 for both.
+- **A `-C` directory in this machine's home that the server lacks** (an unquoted `-C ~/proj`,
+  which the local shell expands) is said to be so, with how to name the server's: `-C '~/proj'`
+  or `-C proj`.
+- **`koh cp --dry-run` (`-n`)** changes nothing and sends no file's bytes: it lists each change
+  (`new`, `replaced`, `deleted`, `dir`, `link`) and the summary it would make.
 - **A burst of commands from one client is all served** (an agent's parallel reads): a full
   table of pending handshakes gives up the oldest of the address holding the most, no longer any
   address's third, and a connection past `--max-connections` waits up to 10 s for room, among at

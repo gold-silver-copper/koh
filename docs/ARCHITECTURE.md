@@ -33,7 +33,7 @@ src/
 ├── args.rs          the command line (clap's builder API), `koh help-agents`
 ├── lib.rs           crate root: module declarations
 ├── request.rs       the opening request (what a connection is for) and the replies sent whole
-├── proto.rs         the koh/10 shell protocol: client messages, what the program shows, caps
+├── proto.rs         the koh/11 shell protocol: client messages, what the program shows, caps
 ├── stream.rs        the output filter both ends run: questions out, marks apart, bounds
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
@@ -81,9 +81,9 @@ testing/agentbench/  coding agents driving koh on task sets, scored
 `predict` imports nothing from `crate::` (CI checks it), so it is a standalone
 terminal-prediction library; `stream`, `proto`, `request` and `sync`'s item types are pure.
 
-## The protocol (koh/10)
+## The protocol (koh/11)
 
-The ALPN `koh/10` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/11` is the version check: a peer on another version fails the TLS handshake with a
 clear error. After the handshake the server checks the allowlist and takes a connection permit;
 then the client says what the connection is for, as the first message on its first uni stream
 (`src/request.rs`), a 4-byte length and its postcard encoding, at most 1 MiB, and the server
@@ -92,8 +92,10 @@ deadline) is closed as breaking the protocol, and so is one whose request does n
 path holding a NUL, a command over 256 KiB or 4096 words, no sources or more than 1024 are refused
 as they are decoded. The request is one of:
 
-- `Shell { pick, size, program }`: a session, at the client's window size; with a `program`
-  (`koh connect SERVER -- PROG ARG...`), a new one running it in place of the shell. `Pick::Latest` is the peer's
+- `Shell { pick, size, program, cwd }`: a session, at the client's window size; with a `program`
+  (`koh connect SERVER -- PROG ARG...`), a new one running it in place of the shell; with a
+  `cwd` (`-C DIR`), a new one starting there, refused with the close code `NoSuchDir` if it is
+  not a directory. `Pick::Latest` is the peer's
   session attached last, else a new one; `New` always a new one; `Id(n)` that one, if it is the
   peer's; `Resume { run, session }` that one of that server run, which is how a client redials.
   The rest of the stream is the session's control stream. The server's first stream carries
@@ -448,7 +450,8 @@ relative in the home, unglobbed), or, for a scoped key, beneath its directory.
   client's stdout and stderr are one file (`2>&1`, a terminal) it asks for them `together`: the
   command's stderr is its stdout's pipe, all of it sent as its stdout, in its order. Then its
   `ExitStatus` on a third (its code, or 128 plus the signal; or that it did not start, which the
-  client says as 127 for no such program and 126 for the rest), once both have ended, or, once it
+  client says as 127 for no such program and 126 for the rest, as `koh run` says a job that did
+  not start), once both have ended, or, once it
   exited, gone quiet for 100 ms (a job it left in the background holds the pipes). A slow reader
   on either end holds the other back through the pipes and QUIC's flow control. A lost connection
   (the command connection's idle timeout is 10 s, so a killed client is found within it),
@@ -483,7 +486,10 @@ relative in the home, unglobbed), or, for a scoped key, beneath its directory.
   a part it kept (whose start's hash the sender checks), or `Check { hash }`, the blake3 hash of
   a file of the same size it has, which the sender answers with the bytes or `Same`. A file's
   bytes go in chunks of at most 64 KiB to `.koh-HASH.part` beside it and are renamed over it once
-  whole; `--atomic` holds every rename and removal until the whole copy came. Every entry is
+  whole; `--atomic` holds every rename and removal until the whole copy came. In a dry run
+  (`Opts::dry_run`) the receiver makes, writes and removes nothing, and the sender answers each
+  file it would send with `Differs { id, from }` in place of its bytes; the receiver lists each
+  change in its `Summary` (`changes`, the first 1000, the rest counted). Every entry is
   reached from the directory above it by its descriptor with `O_NOFOLLOW` (`sync::fsat`), so no
   name reaches outside the destination or through a symlink. Directories merge; the destination's
   missing parents are made; a file written gets its arrival time unless `-p`, and modes land less

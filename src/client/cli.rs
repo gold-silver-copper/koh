@@ -20,8 +20,8 @@ use crate::client::{refusal, Admitted, DefaultBackend, IrohConnector, KohBackend
 use crate::proto::Close;
 use crate::request::{
     Answer, Argv, JobInfo, JobList, JobName, JobState, LogMsg, On, Pick, Presence, Problem,
-    Request, Run, SessionInfo, SessionList, SessionNum, Signal, Started, Until, Wait, Waited,
-    MAX_LOG_CHUNK, MAX_OUTPUT, MAX_REPLY,
+    ProblemKind, RemotePath, Request, Run, SessionInfo, SessionList, SessionNum, Signal, Started,
+    Until, Wait, Waited, MAX_LOG_CHUNK, MAX_OUTPUT, MAX_REPLY,
 };
 use crate::transport_iroh::{bind_on, close_endpoint, Idle, Network};
 
@@ -61,6 +61,8 @@ pub struct ConnectConfig {
     pub pick: Pick,
     /// A program a new session runs in place of the shell.
     pub program: Option<Argv>,
+    /// Where a new session starts (`-C DIR`); `None` for the server user's home.
+    pub cwd: Option<RemotePath>,
     /// Let the server set the clipboard (OSC 52); on unless `--no-clipboard`.
     pub clipboard: bool,
     /// Show the server's hyperlinks (OSC 8); on unless `--no-hyperlinks`.
@@ -79,6 +81,7 @@ impl ConnectConfig {
             remote: Remote::new(server),
             pick: Pick::Latest,
             program: None,
+            cwd: None,
             clipboard: true,
             hyperlinks: true,
             colours: true,
@@ -283,11 +286,19 @@ async fn ask<T: DeserializeOwned>(
     answer
 }
 
-/// The exit status for a koh error: [`BUSY`] the server had no room for it now, 3 the server was
-/// not reached, 4 it refused this client for good (or its key's scope), 1 anything else.
+/// The exit status for a koh error.
+///
+/// [`BUSY`] the server had no room for it now, 3 the server was not reached, 4 it refused this
+/// client for good (or its key's scope), 127 or 126 a command did not start (no such program; no
+/// such directory to start in, or another reason), 1 anything else.
 pub fn exit_code(error: &anyhow::Error) -> u8 {
     if busy(error) {
         BUSY
+    } else if let Some(status) = error
+        .downcast_ref::<Problem>()
+        .and_then(|problem| problem.kind.not_started_status())
+    {
+        status
     } else if error.is::<Unreached>() || error.downcast_ref::<Close>() == Some(&Close::AtCapacity) {
         3
     } else if error.is::<Refused>() {
@@ -415,6 +426,55 @@ pub async fn sessions(
         writeln!(out, "{}", listing(&info))?;
     }
     Ok(())
+}
+
+/// `error`, with a hint if it is that `cwd`, a directory to start in, is not on the server, and
+/// it looks like this machine's home expanded by the user's shell before koh saw it.
+pub(crate) fn hinted(error: anyhow::Error, cwd: Option<&RemotePath>) -> anyhow::Error {
+    match error.downcast::<Problem>() {
+        Ok(problem) => hint_problem(problem, cwd).into(),
+        Err(error) => error,
+    }
+}
+
+/// [`hinted`], of a [`Problem`].
+pub(crate) fn hint_problem(mut problem: Problem, cwd: Option<&RemotePath>) -> Problem {
+    if problem.kind == ProblemKind::NoSuchDir {
+        // This machine's home, only to tell a path the shell expanded from it.
+        let home = std::env::var_os("HOME");
+        problem.hint = cwd.zip(home).and_then(|(cwd, home)| {
+            use std::os::unix::ffi::OsStrExt as _;
+            local_home_hint(cwd.as_bytes(), home.as_bytes())
+        });
+    }
+    problem
+}
+
+/// What to say of a directory to start in, `cwd`, that is this machine's `home` or in it: the
+/// user's shell most likely expanded an unquoted `~` here, so the server looked in a path of
+/// this machine's.
+fn local_home_hint(cwd: &[u8], home: &[u8]) -> Option<String> {
+    let home = home.strip_suffix(b"/").unwrap_or(home);
+    if home.is_empty() {
+        return None;
+    }
+    let rest = cwd.strip_prefix(home)?;
+    let rest = match rest {
+        [] => &[][..],
+        [b'/', rest @ ..] => rest,
+        _ => return None,
+    };
+    let rest = escaped(&String::from_utf8_lossy(
+        rest.strip_suffix(b"/").unwrap_or(rest),
+    ));
+    let fix = if rest.is_empty() {
+        "quote it (-C '~') or leave -C out".to_owned()
+    } else {
+        format!("quote it (-C '~/{rest}') or name it from the server's home (-C {rest})")
+    };
+    Some(format!(
+        "it is in this machine's home: if your shell expanded ~ before koh saw it, {fix}"
+    ))
 }
 
 /// Text a program chose, safe to print on a line: nothing in it may move the cursor or reorder
@@ -547,7 +607,10 @@ pub async fn run(
     format: Format,
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
-    let Started { name } = ask(remote, &Request::Start { name, run }, MAX_REPLY).await?;
+    let cwd = run.cwd.clone();
+    let Started { name } = ask(remote, &Request::Start { name, run }, MAX_REPLY)
+        .await
+        .map_err(|error| hinted(error, cwd.as_ref()))?;
     if format.json {
         #[derive(Serialize)]
         struct View<'a> {
@@ -888,8 +951,25 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     )?)?;
     let size = backend.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
     let (endpoint, connector) = connector(&args.remote, &identity, Idle::Shell).await?;
-    let admitted: Admitted =
-        first_dial(&endpoint, connector.connect(args.pick, size, args.program)).await?;
+    let admitted: Admitted = first_dial(
+        &endpoint,
+        connector.connect(args.pick, size, (args.program, args.cwd.clone())),
+    )
+    .await
+    .map_err(|error| match error.downcast_ref::<Close>() {
+        // The server says no more than that: the path is this end's to say.
+        Some(Close::NoSuchDir) => {
+            let shown = args.cwd.as_ref().map_or_else(String::new, |cwd| {
+                String::from_utf8_lossy(cwd.as_bytes()).into_owned()
+            });
+            hint_problem(
+                Problem::new(ProblemKind::NoSuchDir, shown),
+                args.cwd.as_ref(),
+            )
+            .into()
+        }
+        _ => error,
+    })?;
     // For the menu's "last connected"; failing to note it never stops the session.
     let noted = crate::identity::KeyFile::path_for(args.remote.key_file.clone(), "client")
         .map_err(anyhow::Error::from)
@@ -928,6 +1008,23 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-C ~/proj` unquoted reaches koh as this machine's `$HOME/proj`: a path the server lacks,
+    /// said with how to name the server's.
+    #[test]
+    fn a_dir_in_this_machines_home_is_said_to_be_expanded_here() {
+        let hint = |cwd: &str, home: &str| local_home_hint(cwd.as_bytes(), home.as_bytes());
+        let said = hint("/home/me/proj/src", "/home/me").unwrap();
+        assert!(
+            said.contains("-C '~/proj/src'") && said.contains("-C proj/src"),
+            "{said}"
+        );
+        assert!(hint("/home/me/", "/home/me/").unwrap().contains("-C '~'"));
+        for elsewhere in ["/home/meg/proj", "/srv/proj", "proj", "~/proj"] {
+            assert_eq!(hint(elsewhere, "/home/me"), None, "{elsewhere}");
+        }
+        assert_eq!(hint("/proj", "/"), None);
+    }
 
     #[test]
     fn bell_hook_fires_on_a_rise_and_rate_limits_a_burst() {

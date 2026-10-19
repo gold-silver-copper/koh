@@ -180,7 +180,7 @@ fn not_started(run: &Run, cwd: Option<&Path>, error: &std::io::Error) -> Problem
     let place = cwd.map_or_else(String::new, |dir| format!(" (in {})", dir.display()));
     if error.kind() == std::io::ErrorKind::NotFound {
         // No such program: the directory to start in was there.
-        return Problem::new(ProblemKind::NotFound, format!("{what}{place}"));
+        return Problem::new(ProblemKind::NoSuchProgram, format!("{what}{place}"));
     }
     Problem::new(
         ProblemKind::CouldNotStart,

@@ -627,7 +627,24 @@ async fn dispatch(
             pick,
             size,
             program,
-        } => shell(conn, registry, (pick, size, program), control).await,
+            cwd,
+        } => {
+            // Where a new session starts: refused here, before any session, if it is not there.
+            let cwd = match cwd.map(|cwd| place.cwd(Some(&cwd))).transpose() {
+                Ok(cwd) => cwd.flatten(),
+                Err(problem) => {
+                    info!(peer = %peer, %problem, "refusing a session");
+                    let why = if problem.kind == ProblemKind::NoSuchDir {
+                        Close::NoSuchDir
+                    } else {
+                        Close::CouldNotStart
+                    };
+                    close(conn, why);
+                    return;
+                }
+            };
+            shell(conn, registry, (pick, size, program, cwd), control).await;
+        }
         Request::Sessions => {
             let mut sessions = registry.sessions(peer).await;
             sessions.truncate(MAX_LISTED);
@@ -708,13 +725,18 @@ async fn opening(
     }
 }
 
-/// Attach `conn`'s peer to the session `pick` names (a new one running `program`, if given) and
-/// serve it until it detaches; the rest of the client's first stream, `control`, is the
-/// session's control stream.
+/// Attach `conn`'s peer to the session `pick` names (a new one running `program`, or starting in
+/// `cwd`, if given) and serve it until it detaches; the rest of the client's first stream,
+/// `control`, is the session's control stream.
 async fn shell(
     conn: &iroh::endpoint::Connection,
     registry: &Registry,
-    (pick, size, program): (Pick, crate::terminal::Size, Option<crate::request::Argv>),
+    (pick, size, program, cwd): (
+        Pick,
+        crate::terminal::Size,
+        Option<crate::request::Argv>,
+        Option<std::path::PathBuf>,
+    ),
     control: iroh::endpoint::RecvStream,
 ) {
     let peer = conn.remote_id();
@@ -733,7 +755,8 @@ async fn shell(
         Some(Ok(words)) => Some(words),
         None => None,
     };
-    let (client, start, attach_kind) = match registry.attach(peer, pick, size, program).await {
+    let (client, start, attach_kind) = match registry.attach(peer, pick, size, (program, cwd)).await
+    {
         Ok(attached) => attached,
         Err(refused) => {
             warn!(peer = %peer, reason = %refused, "refusing session");

@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -454,15 +454,14 @@ pub struct Pty {
 
 impl Pty {
     /// Allocate a `rows`×`cols` PTY and start `command` (argv, verbatim; empty for `$SHELL`)
-    /// on it in `home`, with `TERM` and `env` set. Returns it and a receiver of its output, which
-    /// ends when the program closes the PTY.
+    /// on it in `home` (in `cwd`, if given), with `TERM` and `env` set. Returns it and a receiver
+    /// of its output, which ends when the program closes the PTY.
     pub fn spawn(
         rows: u16,
         cols: u16,
         command: &[String],
         env: &[(String, String)],
-        term: &str,
-        home: &Home,
+        (term, home, cwd): (&str, &Home, Option<&Path>),
         reaper: &Reaper,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
         let size = pty_size(rows, cols).map_err(PtyError::OpenPty)?;
@@ -546,6 +545,9 @@ impl Pty {
                 cmd.env("TERM", term);
                 scrub_koh_env(cmd, std::env::vars_os().map(|(key, _)| key));
                 home.apply(cmd);
+                if let Some(cwd) = cwd {
+                    cmd.current_dir(cwd);
+                }
                 cmd.envs(env.iter().map(|(key, value)| (key, value)));
             })
             .map_err(|error| {

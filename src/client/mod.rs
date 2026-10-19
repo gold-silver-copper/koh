@@ -26,7 +26,7 @@ use crate::log::Peer;
 use crate::proto::{
     encode_client, ClientMsg, Close, InputSeq, Shown, ShownDecoder, HEARTBEAT, SHOWN_TAG,
 };
-use crate::request::{Argv, Attached, Pick, Request, Resume, MAX_REPLY, MAX_REQUEST};
+use crate::request::{Argv, Attached, Pick, RemotePath, Request, Resume, MAX_REPLY, MAX_REQUEST};
 use crate::terminal::Size;
 use crate::transport_iroh::{closed_because, ALPN, PROTOCOL};
 use display::Display;
@@ -114,7 +114,7 @@ impl IrohConnector {
         }
     }
 
-    /// Connect to the session `pick` names (a new one running `program`, if given), for a
+    /// Connect to the session `pick` names (a new one running `program` in `cwd`, if given), for a
     /// terminal of `size`, and await the server's first stream, which admits the client and says which session it reached. A server that
     /// will not have us for good closes the connection instead, a [`Refused`] error; one that
     /// cannot have us now (at capacity, say) closes it saying so, an error that is its [`Close`].
@@ -122,12 +122,13 @@ impl IrohConnector {
         &self,
         pick: Pick,
         size: Size,
-        program: Option<Argv>,
+        (program, cwd): (Option<Argv>, Option<RemotePath>),
     ) -> anyhow::Result<Admitted> {
         let request = Request::Shell {
             pick,
             size,
             program,
+            cwd,
         };
         let (conn, control) = self.open(&request).await?;
         let attached = async {
@@ -460,7 +461,7 @@ fn dial(connector: &IrohConnector, attempt: u32, pick: Pick, size: Size) -> Dial
         tokio::time::sleep(wait).await;
         tokio::time::timeout(
             RECONNECT_CONNECT_TIMEOUT,
-            connector.connect(pick, size, None),
+            connector.connect(pick, size, (None, None)),
         )
         .await
     })

@@ -42,6 +42,7 @@ pub async fn copy(
 ) -> anyhow::Result<()> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
+    let dry = opts.dry_run;
     let (summary, several) = match job {
         CopyJob::Get { sources, dest } => {
             let several = sources.paths().len() > 1;
@@ -58,7 +59,7 @@ pub async fn copy(
             )
         }
     };
-    say(&summary, &landed(&summary, shown, several), format)
+    say(&summary, (&landed(&summary, shown, several), dry), format)
 }
 
 /// Where a copy to `shown` landed: inside it, as its one source's name, if the summary says so;
@@ -76,20 +77,33 @@ fn landed(summary: &Summary, shown: &str, several: bool) -> String {
     }
 }
 
-/// Say `summary` of a copy that landed at `landed`: one line, or one JSON value.
-fn say(summary: &Summary, landed: &str, format: Format) -> anyhow::Result<()> {
+/// Say `summary` of a copy that landed at `landed` (or would have, if `dry`): one line, after a
+/// dry run's changes one a line, or one JSON value.
+fn say(summary: &Summary, (landed, dry): (&str, bool), format: Format) -> anyhow::Result<()> {
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
     if format.json {
         #[derive(Serialize)]
         struct View<'a> {
             landed: &'a str,
+            dry_run: bool,
             #[serde(flatten)]
             summary: &'a Summary,
         }
-        serde_json::to_writer(&mut out, &View { landed, summary })?;
+        let view = View {
+            landed,
+            dry_run: dry,
+            summary,
+        };
+        serde_json::to_writer(&mut out, &view)?;
         writeln!(out)?;
         return Ok(());
+    }
+    for change in &summary.changes {
+        writeln!(out, "{:<8} {}", change.kind.name(), escaped(&change.path))?;
+    }
+    if summary.changes_unshown > 0 {
+        writeln!(out, "… {} more", summary.changes_unshown)?;
     }
     // What was sent, split into new and replaced, which add up to it; then the rest.
     let mut sent = Vec::new();
@@ -124,9 +138,12 @@ fn say(summary: &Summary, landed: &str, format: Format) -> anyhow::Result<()> {
     let written = summary.written();
     writeln!(
         out,
-        "{written} file{} sent, {} → {landed}{more}",
+        "{}{written} file{} {}, {} → {landed}{more}{}",
+        if dry { "dry run: " } else { "" },
         if written == 1 { "" } else { "s" },
+        if dry { "would be sent" } else { "sent" },
         bytes(summary.bytes),
+        if dry { "; nothing changed" } else { "" },
     )?;
     if summary.skipped > 0 {
         crate::log::stderr(format_args!(
@@ -151,7 +168,7 @@ async fn get(
     interrupted: &CancellationToken,
 ) -> anyhow::Result<Summary> {
     // Where they land is known before the server is asked anything.
-    let (target, made) = Target::resolve(&Dest::Path(dest), sources.paths().len())?;
+    let (target, made) = Target::resolve(&Dest::Path(dest), sources.paths().len(), opts.dry_run)?;
     let request = Request::Copy(Copy::Get {
         sources,
         opts: opts.clone(),

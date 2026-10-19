@@ -43,6 +43,11 @@ pub async fn copy(
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
     let dry = opts.dry_run;
+    // Said by direction: a download is received here, an upload sent from here.
+    let verb = match &job {
+        CopyJob::Get { .. } => "received",
+        CopyJob::Put { .. } => "sent",
+    };
     let (summary, several) = match job {
         CopyJob::Get { sources, dest } => {
             let several = sources.paths().len() > 1;
@@ -59,7 +64,11 @@ pub async fn copy(
             )
         }
     };
-    say(&summary, (&landed(&summary, shown, several), dry), format)
+    say(
+        &summary,
+        (&landed(&summary, shown, several), dry, verb),
+        format,
+    )
 }
 
 /// Where a copy to `shown` landed: inside it, as its one source's name, if the summary says so;
@@ -77,9 +86,13 @@ fn landed(summary: &Summary, shown: &str, several: bool) -> String {
     }
 }
 
-/// Say `summary` of a copy that landed at `landed` (or would have, if `dry`): one line, after a
-/// dry run's changes one a line, or one JSON value.
-fn say(summary: &Summary, (landed, dry): (&str, bool), format: Format) -> anyhow::Result<()> {
+/// Say `summary` of a copy that landed at `landed` (or would have, if `dry`), its files `verb`
+/// (sent, received): one line, after a dry run's changes one a line, or one JSON value.
+fn say(
+    summary: &Summary,
+    (landed, dry, verb): (&str, bool, &str),
+    format: Format,
+) -> anyhow::Result<()> {
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
     if format.json {
@@ -105,7 +118,7 @@ fn say(summary: &Summary, (landed, dry): (&str, bool), format: Format) -> anyhow
     if summary.changes_unshown > 0 {
         writeln!(out, "… {} more", summary.changes_unshown)?;
     }
-    // What was sent, split into new and replaced, which add up to it; then the rest.
+    // What came across, split into new and replaced, which add up to it; then the rest.
     let mut sent = Vec::new();
     if summary.new > 0 {
         sent.push(format!("{} new", summary.new));
@@ -138,10 +151,11 @@ fn say(summary: &Summary, (landed, dry): (&str, bool), format: Format) -> anyhow
     let written = summary.written();
     writeln!(
         out,
-        "{}{written} file{} {}, {} → {landed}{more}{}",
+        "{}{written} file{} {}{}, {} → {landed}{more}{}",
         if dry { "dry run: " } else { "" },
         if written == 1 { "" } else { "s" },
-        if dry { "would be sent" } else { "sent" },
+        if dry { "would be " } else { "" },
+        verb,
         bytes(summary.bytes),
         if dry { "; nothing changed" } else { "" },
     )?;

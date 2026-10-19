@@ -374,7 +374,7 @@ fn a_command_whose_client_is_stopped_or_killed_is_hung_up() {
                     .expect("koh")
                     .args([&remote.id, "--sh", "echo $$; exec sleep 100"])
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
+                    .stderr(Stdio::piped())
                     .spawn()
                     .expect("exec");
                 let mut line = String::new();
@@ -392,8 +392,80 @@ fn a_command_whose_client_is_stopped_or_killed_is_hung_up() {
                     !runs(pid),
                     "the command outlived its client by {within:?} ({signal:?})"
                 );
-                let _ = child.wait();
+                let out = child.wait_with_output().expect("the client's end");
+                // Stopped by a signal it can take, it says which, what became of the command, and
+                // how to run one past it.
+                if signal != fuxix::process::Signal::Kill {
+                    let said = String::from_utf8_lossy(&out.stderr);
+                    let name = format!("stopped by SIG{} after ", signal.name());
+                    assert!(said.contains(&name), "{said}");
+                    assert!(
+                        said.contains("hung up") && said.contains("koh run"),
+                        "{said}"
+                    );
+                }
             }
+        });
+}
+
+/// A `koh serve` started ignoring signals (a script's `&` ignores SIGINT and SIGQUIT, `nohup`
+/// SIGHUP) starts its programs with them at their defaults, as from a login: an ignored signal
+/// stays ignored across `exec` unless koh catches it. It is started as a job of the in-process
+/// server, by a shell that ignores them; its own command reads what it ignores (Linux says).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_started_ignoring_signals_starts_its_programs_with_their_defaults() {
+    use fuxix::process::Signal::{Hup, Int, Quit, Tstp};
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let remote = Remote::start("ignored-signals").await.expect("the server");
+            let client = endpoint_id(&remote.key).expect("the client's id");
+            let line = format!(
+                "trap '' HUP INT QUIT TSTP; exec '{}' serve --local --allow {client} --shell sh \
+                 --key-file '{}'",
+                env!("CARGO_BIN_EXE_koh"),
+                remote.key.with_file_name("inner.key").display()
+            );
+            let started = remote
+                .run("run", &["--name", "inner", "--sh", &line])
+                .expect("run");
+            assert!(started.status.success(), "{started:?}");
+            let up = remote
+                .run("wait", &["inner", "--text", "udp port", "--timeout", "20"])
+                .expect("wait");
+            assert!(up.status.success(), "{up:?}");
+            let logs = remote.run("logs", &["inner"]).expect("logs");
+            let banner = String::from_utf8_lossy(&logs.stdout).into_owned();
+            let after = |label: &str| {
+                banner
+                    .lines()
+                    .find_map(|l| l.split_once(label))
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .map_or_else(|| panic!("no {label:?} in {banner}"), str::to_owned)
+            };
+            let (id, port) = (after("endpoint id : "), after("udp port    : "));
+            let mut exec = koh_testkit::command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
+                .expect("koh");
+            exec.arg("exec")
+                .arg("--key-file")
+                .arg(&remote.key)
+                .args(["--direct", &format!("127.0.0.1:{port}"), &id, "--sh"])
+                .arg("grep '^SigIgn:' /proc/self/status");
+            let out = exec.output().expect("exec");
+            let _ = remote.run("kill", &["inner"]);
+            let said = String::from_utf8_lossy(&out.stdout);
+            let mask = said
+                .trim()
+                .strip_prefix("SigIgn:")
+                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+                .unwrap_or_else(|| panic!("{out:?}"));
+            let bit = |signal: fuxix::process::Signal| 1_u64 << (signal.raw() - 1);
+            let wanted = [Hup, Int, Quit, Tstp]
+                .map(bit)
+                .iter()
+                .fold(0, |all, b| all | b);
+            assert_eq!(mask & wanted, 0, "ignored: {mask:#x}");
         });
 }
 
@@ -478,6 +550,42 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
             assert_eq!(listed.lines().count(), 2, "{listed}");
             let one = ok(&remote.run("jobs", &["lines"]).expect("jobs"));
             assert!(one.ends_with("\n  echo one\n  echo two\n"), "{one}");
+            // At work though it writes nothing koh sees: its processes and CPU time say so, where
+            // the server has a `/proc` to read them from.
+            ok(&remote
+                .run(
+                    "run",
+                    &[
+                        "--name",
+                        "quiet",
+                        "--sh",
+                        "i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done > quiet.log; \
+                         : > quiet.done; sleep 300",
+                    ],
+                )
+                .expect("run"));
+            ok(&remote
+                .run("wait", &["--file", "quiet.done", "--timeout", "60"])
+                .expect("wait"));
+            let listed = ok(&remote.run("jobs", &[]).expect("jobs"));
+            let line = listed
+                .lines()
+                .find(|l| l.starts_with("quiet "))
+                .expect("listed");
+            let json = remote.run("jobs", &["quiet", "--json"]).expect("jobs");
+            let quiet: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+            if cfg!(target_os = "linux") {
+                assert!(
+                    line.contains(" processes=") && line.contains(" cpu="),
+                    "{line}"
+                );
+                assert!(line.contains(" output=0 B "), "{line}");
+                assert!(quiet[0]["processes"].as_u64() >= Some(1), "{quiet}");
+                assert!(quiet[0]["cpu_ms"].as_u64() > Some(0), "{quiet}");
+            } else {
+                assert!(quiet[0]["processes"].is_null(), "{quiet}");
+            }
+            ok(&remote.run("kill", &["quiet"]).expect("kill"));
             // Unnamed, it takes the next number; killed, it ends by the signal.
             let sleeper = remote.run("run", &["--", "sleep", "300"]).expect("run");
             assert_eq!(ok(&sleeper), "1\n");
@@ -666,6 +774,12 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             let back = dir.join("back");
             let out = cp(&[remote.at(&there.join("a tree")), back.clone().into()]);
             assert!(out.status.success(), "{out:?}");
+            // Said by its direction: received here.
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                said.contains(" files received, ") && !said.contains("sent"),
+                "{said}"
+            );
             assert_eq!(tree(&back).expect("back"), tree(&from).expect("the tree"));
             // --delete takes away what the source lacks, but what is excluded.
             std::fs::write(there.join("a tree/stray"), b"s").expect("a stray file");
@@ -690,7 +804,7 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             let out = cp(&[&args[..], &[from_there, back.clone().into()]].concat());
             let said = String::from_utf8_lossy(&out.stdout);
             assert!(
-                said.starts_with("new      stray\ndry run: 1 file would be sent, 1 B"),
+                said.starts_with("new      stray\ndry run: 1 file would be received, 1 B"),
                 "{out:?}"
             );
             assert!(!back.join("stray").exists());

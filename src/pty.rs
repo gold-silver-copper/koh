@@ -299,6 +299,11 @@ impl Running {
         .map_err(io::Error::from)
     }
 
+    /// Its pid: for a command with no terminal, its process group's and session's too.
+    pub(crate) const fn pid(&self) -> Pid {
+        self.pid
+    }
+
     /// Send `signal` to what it reaches: its group, for a command with no terminal.
     pub(crate) fn kill(&self, signal: Signal) {
         if let Err(error) = self.signal(signal) {

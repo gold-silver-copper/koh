@@ -10,8 +10,9 @@
 //! command runs, so a terminal that reads reports does not take it for one waiting for input.
 
 use std::pin::pin;
+use std::time::{Duration, Instant};
 
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
 use serde::Serialize;
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::mpsc;
@@ -111,6 +112,7 @@ async fn drive(
     (interrupted, cwd): (&CancellationToken, Option<&RemotePath>),
     format: Format,
 ) -> anyhow::Result<u32> {
+    let started = Instant::now();
     // Apart, so a command that does not read its stdin never holds up its output.
     let mut feeding = pin!(feed(stdin, control));
     let (mut out, mut err) = if format.json {
@@ -134,7 +136,7 @@ async fn drive(
                 () = &mut feeding, if !fed => fed = true,
                 done = &mut output => break done,
                 () = interrupted.cancelled() => {
-                    anyhow::bail!("interrupted: the command was hung up");
+                    anyhow::bail!("{}", stopped(crate::stopped_by(), started.elapsed()));
                 }
             }
         }
@@ -149,7 +151,10 @@ async fn drive(
             Err(problem)
         }
         Err(Stop::Broken) => Ok(BROKEN_PIPE),
-        Err(Stop::Failed(error)) => return Err(super::refusal(conn, &error)),
+        Err(Stop::Failed(error)) => {
+            return Err(cut_short(conn.close_reason().as_ref(), started.elapsed())
+                .map_or_else(|| super::refusal(conn, &error), anyhow::Error::msg));
+        }
     };
     let status = match &code {
         Ok(code) => *code,
@@ -181,6 +186,52 @@ async fn drive(
         stdout.flush().await?;
     }
     Ok(status)
+}
+
+/// What to do about a command that must outlive this connection.
+const AS_A_JOB: &str =
+    "a command that must outlive koh exec runs as a job: koh run SERVER -- ARGS, then koh wait \
+     SERVER NAME";
+
+/// Why a command that ran for `ran` was cut off when this koh was stopped by `signal`: what
+/// became of it, and what to do.
+fn stopped(signal: Option<&str>, ran: Duration) -> String {
+    format!(
+        "stopped by {} after {}: the command was hung up on the server (SIGHUP to its process \
+         group, SIGKILL a second later); if a time limit stopped it, {AS_A_JOB}",
+        signal.unwrap_or("a signal"),
+        super::cli::span(ran.as_secs()),
+    )
+}
+
+/// Why a command that ran for `ran` was cut off when its connection ended for `reason`, as a
+/// person acts on it: the link went quiet, or the server went away. `None` for a close the server
+/// gave a reason for, which [`super::refusal`] says.
+fn cut_short(reason: Option<&ConnectionError>, ran: Duration) -> Option<String> {
+    let ran = super::cli::span(ran.as_secs());
+    match reason? {
+        ConnectionError::TimedOut => Some(format!(
+            "cut off after {ran}: the link went quiet for 10s (the network dropped, or the server \
+             went away); a server still up hangs the command up once it sees the link gone, \
+             within 10s; {AS_A_JOB}"
+        )),
+        ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == 0 => {
+            Some(format!(
+                "cut off after {ran}: the server shut down, and hung the command up; run it again \
+                 once the server is back"
+            ))
+        }
+        ConnectionError::Reset => Some(format!(
+            "cut off after {ran}: the server restarted, and the command was hung up with it; run \
+             it again"
+        )),
+        ConnectionError::VersionMismatch
+        | ConnectionError::TransportError(_)
+        | ConnectionError::ConnectionClosed(_)
+        | ConnectionError::ApplicationClosed(_)
+        | ConnectionError::LocallyClosed
+        | ConnectionError::CidsExhausted => None,
+    }
 }
 
 /// Send what `stdin` reads on `control` until it ends, then end `control`: the command reads its
@@ -240,4 +291,32 @@ async fn copy(mut recv: RecvStream, to: &mut Sink) -> Result<(), Stop> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use iroh::endpoint::ConnectionError;
+
+    #[test]
+    fn a_cut_off_command_is_said_by_what_cut_it_off() {
+        let ran = Duration::from_secs(120);
+        let said = super::stopped(Some("SIGTERM"), ran);
+        assert!(said.starts_with("stopped by SIGTERM after 2m00s: the command was hung up"));
+        assert!(said.contains("koh run SERVER"), "{said}");
+        let quiet = super::cut_short(Some(&ConnectionError::TimedOut), ran).unwrap_or_default();
+        assert!(
+            quiet.starts_with("cut off after 2m00s: the link went quiet"),
+            "{quiet}"
+        );
+        assert!(quiet.contains("koh run SERVER"), "{quiet}");
+        let reset = super::cut_short(Some(&ConnectionError::Reset), ran).unwrap_or_default();
+        assert!(reset.contains("restarted"), "{reset}");
+        assert_eq!(super::cut_short(None, ran), None);
+        assert_eq!(
+            super::cut_short(Some(&ConnectionError::LocallyClosed), ran),
+            None
+        );
+    }
 }

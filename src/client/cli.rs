@@ -525,7 +525,7 @@ fn listing(info: &SessionInfo) -> String {
 }
 
 /// `secs` in its two largest units: `45s`, `3m12s`, `2h05m`, `4d03h`.
-fn span(secs: u64) -> String {
+pub(super) fn span(secs: u64) -> String {
     let (m, h, d) = (
         secs.div_euclid(60),
         secs.div_euclid(3600),
@@ -539,6 +539,19 @@ fn span(secs: u64) -> String {
         format!("{m}m{:02}s", secs.rem_euclid(60))
     } else {
         format!("{secs}s")
+    }
+}
+
+/// CPU time for a person: tenths of a second under a minute (`0.4s`), else as [`span`] says.
+fn cpu(ms: u64) -> String {
+    if ms < 60_000 {
+        format!(
+            "{}.{}s",
+            ms.div_euclid(1000),
+            ms.rem_euclid(1000).div_euclid(100)
+        )
+    } else {
+        span(ms.div_euclid(1000))
     }
 }
 
@@ -579,6 +592,9 @@ struct JobView<'a> {
     ran_secs: Option<u64>,
     output_bytes: u64,
     dropped_bytes: u64,
+    /// While it runs, where the server says: its processes, and the CPU time they used.
+    processes: Option<u32>,
+    cpu_ms: Option<u64>,
 }
 
 impl<'a> From<&'a JobInfo> for JobView<'a> {
@@ -596,6 +612,8 @@ impl<'a> From<&'a JobInfo> for JobView<'a> {
             ran_secs: job.ran_secs,
             output_bytes: job.output_bytes,
             dropped_bytes: job.dropped_bytes,
+            processes: job.usage.map(|u| u.processes),
+            cpu_ms: job.usage.map(|u| u.cpu_ms),
         }
     }
 }
@@ -640,7 +658,17 @@ pub async fn jobs(
     }
     for job in &jobs {
         let state = match job.state {
-            JobState::Running => format!("running {}", span(job.age_secs)),
+            // At work though it writes nothing koh sees (to a file of its own, say): its processes
+            // and their CPU time say so.
+            JobState::Running => match job.usage {
+                Some(usage) => format!(
+                    "running {} processes={} cpu={}",
+                    span(job.age_secs),
+                    usage.processes,
+                    cpu(usage.cpu_ms)
+                ),
+                None => format!("running {}", span(job.age_secs)),
+            },
             JobState::Exited(code) => format!(
                 "exited={code} after {} ({} ago)",
                 span(job.ran_secs.unwrap_or_default()),

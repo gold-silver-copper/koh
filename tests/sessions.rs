@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/11 client.
+//! loopback iroh with a minimal koh/12 client.
 #![forbid(clippy::disallowed_methods)]
 
 use std::time::Duration;
@@ -101,13 +101,14 @@ impl Watched {
     async fn next(&mut self) -> anyhow::Result<bool> {
         match self.events.recv().await {
             Ok(Event::Show(shown)) => self.shown.take(&shown)?,
+            Ok(Event::Top(_)) => {}
             Ok(Event::Echo { attach, seq }) => {
                 if attach == self.client.attachment() {
                     self.shown.echo = self.shown.echo.max(seq);
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                let start = self.client.redraw().await.context("a redraw")?;
+                let start = self.client.redraw(None).await.context("a redraw")?;
                 self.shown = Shownness::new()?;
                 for s in &start.shown {
                     self.shown.take(s)?;
@@ -305,7 +306,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-/// A bare koh/11 client: writes messages, and reads what the server shows on its newest epoch.
+/// A bare koh/12 client: writes messages, and reads what the server shows on its newest epoch.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,

@@ -280,6 +280,7 @@ Run something:
   koh exec SERVER -- sh -s < script.sh  a longer script, or one with quotes in it, on stdin
   koh exec SERVER -C proj -- PROG ...  start in DIR (relative: in the home). Not an unquoted
                                        -C ~/proj: your shell makes that this machine's home
+  koh cp -r src/. SERVER:x/src && koh exec SERVER -C x -- cargo test  edit here, build there
   stdin goes to the command; stdout and stderr come back apart (sent to one file here, as
   2>&1 or a terminal does, in the order it wrote them); exits with its status (127 no such
   program, 126 could not start: no -C DIR there, 255 koh's own error). A killed koh hangs it up

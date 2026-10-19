@@ -34,6 +34,7 @@ koh run laptop --name build -- cargo build   # a job: it outlives koh and the li
 koh wait laptop build                 # until it ends: its last lines, then its status
 koh cp -r ./site laptop:              # a tree into the server user's home, as a sync
 koh cp laptop:notes.md laptop:todo .  # back here, into the current directory
+koh cp -r src/. laptop:x/src && koh exec laptop -C x -- cargo test  # edit here, build there
 ```
 
 Or run `koh` alone on a terminal for a menu of this machine's keys, the servers it connects to

@@ -751,7 +751,7 @@ pub async fn logs(
 ) -> anyhow::Result<Option<u32>> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
-    let hint = format!("koh wait {} {job}", remote.named);
+    let hint = format!("koh logs {} {job} --follow", remote.named);
     let mut opened = Opened::dial(remote, &Request::Logs { job, follow, tail }).await?;
     opened.control.finish()?;
     let read = async {
@@ -783,7 +783,7 @@ pub async fn logs(
                     crate::log::stderr(match exit {
                         Some(status) => format!("· exited {status} after {secs}s"),
                         None => format!(
-                            "· running {secs}s: `{hint}` waits for its end"
+                            "· running {secs}s: `{hint}` follows it to its end"
                         ),
                     });
                     return anyhow::Ok(exit);

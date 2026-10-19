@@ -102,7 +102,9 @@ copies what is in `dir`. `--delete` removes what the source does not have, `--ex
 leaves entries alone, and `--atomic` lands nothing until the whole copy came. `--dry-run`
 changes nothing and sends no file's bytes: it lists each change it would make (`new`,
 `replaced`, `deleted`, `dir`, `link`, and the path, with a file's size and that of the one it
-replaces), then the summary. Without `--delete`, what the destination has that the source lacks
+replaces), then the summary; `--diff` is that dry run, each replaced text file (up to 1 MiB)
+followed by a unified diff of it (`a/` the destination's, `b/` the source's), for which the
+source's file goes to the destination's end, nothing else coming back but the diff. Without `--delete`, what the destination has that the source lacks
 is kept, and the summary counts it (`2 there not in the source, kept: --delete removes them`). It ends with one
 line saying where it landed: `3 files sent, 41 KB → laptop:proj/src (1 new, 2 replaced; 120 unchanged)` (`files received` for a download), or
 `--json`. A tree copied to a directory of its own name that is there already updates it, as `src/.` does
@@ -172,7 +174,7 @@ koh run box --name srv -- python3 -m http.server 8000
 koh wait box srv --text 'Serving HTTP' --timeout 30   # past 30s: exit 124, how the job
                                       # stands (processes, CPU time) and its last lines
 koh logs box srv                      # its last 200 lines so far, then `· running 12s`;
-                                      # --follow until it ends
+koh logs box srv --follow             # and on as it writes, until it ends: its status
 koh kill box srv
 ```
 
@@ -181,6 +183,15 @@ Copy files and trees either way, sending only what changed:
 ```sh
 koh cp -r ./src box:app/              # here to there: lands as app/src
 koh cp box:app/target/report.json .   # there to here
+koh cp --diff -r ./src box:app/       # change nothing: which files differ, and how
+```
+
+To build there what you edit here, sync in the same call as the build: an unchanged tree costs
+only hashes, and the build never sees stale code. koh has no watch mode, since a build started
+right after an edit could still beat its sync.
+
+```sh
+koh cp -r ./src/. box:app/src && koh exec box -C app -- cargo build
 ```
 
 Shell sessions, opened with `koh connect` (in fux, or any terminal), can be read and waited on

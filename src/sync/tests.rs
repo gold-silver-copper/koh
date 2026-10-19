@@ -377,3 +377,55 @@ fn a_dry_run_says_what_the_copy_would_do_and_changes_nothing() {
     assert_eq!((dry.new, dry.dirs), (4, 4), "{dry:?}");
     assert!(!scratch.join("gone").exists());
 }
+
+/// A dry run with `diff` says how each file it would replace differs, if both are text, and
+/// changes nothing; it counts what the dry run does.
+#[test]
+fn a_diff_says_how_each_replaced_text_file_differs() {
+    let scratch = crate::test_runtime::scratch("sync-diff");
+    let (src, dest) = (scratch.join("src"), scratch.join("dest"));
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    for (name, ours, theirs) in [
+        ("edited", &b"one\n2\nthree\n"[..], &b"one\ntwo\nthree\n"[..]),
+        ("grown", b"a\n", b"a\nb\n"),
+        ("bin", b"\0x", b"\0y"),
+        ("same", b"s", b"s"),
+    ] {
+        fs::write(dest.join(name), ours).unwrap();
+        fs::write(src.join(name), theirs).unwrap();
+    }
+    fs::write(src.join("fresh"), b"new\n").unwrap();
+    let before = tree(&dest);
+    let opts = |diff| Opts {
+        dry_run: true,
+        diff,
+        ..Opts::default()
+    };
+    let diffed = copy(&[&src.join(".")], &dest, &opts(true)).unwrap();
+    assert_eq!(tree(&dest), before, "a diff changed the destination");
+    let said: Vec<(&str, Option<&str>)> = diffed
+        .changes
+        .iter()
+        .map(|c| (c.path.as_str(), c.diff.as_deref()))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("bin", Some("no diff: not text\n")),
+            (
+                "edited",
+                Some("--- a/edited\n+++ b/edited\n@@ -1,3 +1,3 @@\n one\n-2\n+two\n three\n")
+            ),
+            ("fresh", None),
+            (
+                "grown",
+                Some("--- a/grown\n+++ b/grown\n@@ -1 +1,2 @@\n a\n+b\n")
+            ),
+        ],
+        "{diffed:?}"
+    );
+    let dry = copy(&[&src.join(".")], &dest, &opts(false)).unwrap();
+    let counts = |s: &Summary| (s.new, s.replaced, s.unchanged, s.bytes);
+    assert_eq!(counts(&diffed), counts(&dry), "{diffed:?} {dry:?}");
+}

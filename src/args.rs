@@ -298,8 +298,9 @@ Jobs (survive koh exiting and the link dropping; output and status kept):
                                         stands (processes, CPU time) and its last lines
   koh wait SERVER --file out/done.txt   until the file exists
   koh logs SERVER build [--follow]      its last 200 lines (--tail N, --all), then on stderr
-                                        `· running 34s` or `· exited 101 after 34s`; with
-                                        --follow on until it ends, then exits with its status
+                                        `· running 34s: ...` or `· exited 101 after 34s`; with
+                                        --follow on as it writes until it ends, then that line,
+                                        and exits with its status
   koh jobs SERVER [build]               one line a job; with a name, its command whole; a
                                         running one's processes and CPU time (Linux servers)
   koh kill SERVER build [--signal KILL]
@@ -313,15 +314,21 @@ Copy (a sync: merges, makes parents, sends only files that changed, by hash):
   arrival time, so builds see changes); --atomic lands nothing until all came; --dry-run
   changes nothing and sends no file, listing each change (`new`, `replaced`, `deleted`, `dir`,
   `link` and its path; a file's size, and the size of the one it replaces) before the summary.
+  --diff is that dry run, each replaced text file (to 1 MiB) followed by its unified diff
+  (a/ the destination's, b/ the source's): which files differ by content, and how.
   Without --delete, what the source lacks is kept and counted. Prints one line,
   where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`
   (`received` for a download). A cut copy resumes when rerun.
+  To build there what you edit here, sync in the same call as the build, so it never sees stale
+  code (an unchanged tree costs only hashes): `koh cp -r ./src/. SERVER:proj/src && koh exec
+  SERVER -C proj -- make`. There is no watch mode, whose sync a build can still overtake.
 
 Shell sessions (`koh connect SERVER` in a terminal, or fux):
   koh sessions SERVER                   number, attached, state (reading/busy/...), last status
   koh wait SERVER --session N           until its running command ends; exits with its status
   koh wait SERVER --session N --reading until its program waits for input
-  koh output SERVER --session N [--last]  its screen, or the last command's output
+  koh output SERVER --session N [--last]  its screen (no blank rows below what it shows), or
+                                        the last command's output
 
 --json on sessions, output, exec, run, jobs, kill, wait and cp: one JSON value on stdout, and on
 failure {\"error\":{\"kind\":...,\"message\":...}}. --timeout SECS on wait (exit 124).
@@ -515,7 +522,7 @@ fn sessions() -> Command {
 
 fn output() -> Command {
     remote(Command::new("output").about(
-        "Print a session's screen as text, or the output of the last command its shell finished",
+        "Print a session's screen as text (no blank rows below the last that shows anything), or the output of the last command its shell finished",
     ))
     .arg(session(true))
     .arg(flag("last", "last").help("The last finished command's output, not the screen"))
@@ -644,6 +651,7 @@ fn cp() -> Command {
         .arg(flag("delete", "delete").help("Remove from the destination's directories what the source does not have"))
         .arg(flag("atomic", "atomic").help("Rename nothing into place, and remove nothing, until all of the copy came"))
         .arg(flag("dry_run", "dry-run").help("Change nothing and send no file's bytes: list what would be sent (new or replaced), deleted, made or linked, then the summary"))
+        .arg(flag("diff", "diff").help("A dry run that also shows how each replaced text file differs (a unified diff, a/ the destination's, b/ the source's; files up to 1 MiB): the source's file goes to the destination's end to be compared, nothing changed"))
         .arg(Arg::new("exclude").long("exclude").value_name("PATTERN").action(ArgAction::Append).value_parser(value_parser!(OsString)).help("Neither send nor remove entries matching it: `*.o`, `target`, `src/gen/*` (repeatable)"))
         .arg(json())
 }
@@ -951,7 +959,8 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                 keep_times: m.get_flag("preserve"),
                 delete: m.get_flag("delete"),
                 atomic: m.get_flag("atomic"),
-                dry_run: m.get_flag("dry_run"),
+                dry_run: m.get_flag("dry_run") || m.get_flag("diff"),
+                diff: m.get_flag("diff"),
                 excludes,
             };
             let shown = paths

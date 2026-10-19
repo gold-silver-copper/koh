@@ -1,6 +1,6 @@
 //! The sending end of a copy: walk the sources, send each entry's header, answer each file's
 //! answer with its bytes or with [`Item::Same`] (in a dry run, [`Item::Differs`] in place of
-//! the bytes).
+//! the bytes, but with [`super::Opts::diff`] a file the receiver has one of to compare).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -301,7 +301,13 @@ impl<W: Write> Sender<'_, W> {
                 Err(error) => return Ok(Err(Failure::io(&path, &error))),
             },
         };
-        if self.opts.dry_run {
+        // A dry run sends a file only for its end to compare it with the one there (`Check`).
+        let compared = self.opts.diff
+            && matches!(answer, Answer::Check { .. })
+            && file
+                .metadata()
+                .is_ok_and(|m| u64::try_from(super::DIFF_MAX).is_ok_and(|max| m.len() <= max));
+        if self.opts.dry_run && !compared {
             return write_item(&mut self.out, &Item::Differs { id, from }, &[]).map(Ok);
         }
         self.data(id, &file, from, &path)

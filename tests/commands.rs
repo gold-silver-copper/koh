@@ -596,7 +596,7 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
             ok(&running);
             let said = String::from_utf8_lossy(&running.stderr);
             assert!(said.starts_with("· running "), "{said}");
-            let hint = format!("`koh wait {} 1` waits for its end", remote.id);
+            let hint = format!("`koh logs {} 1 --follow` follows it to its end", remote.id);
             assert!(said.contains(&hint), "{said}");
             // A wait that gives up says the job runs on, and what it last wrote.
             let gave_up = remote
@@ -824,6 +824,21 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
                 "{out:?}"
             );
             assert!(!back.join("stray").exists());
+            // --diff says how a file it would replace differs, the other end's text escaped but
+            // for its tabs, and changes nothing.
+            let note = dir.join("note");
+            std::fs::write(&note, b"a\tb\x1b\n").expect("a note");
+            std::fs::write(there.join("note"), b"a\n").expect("the note there");
+            let out = cp(&["--diff".into(), note.into(), remote.at(&there.join("note"))]);
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                said.starts_with(
+                    "replaced note (5 B, was 2 B)\n--- a/note\n+++ b/note\n@@ -1 +1 @@\n-a\n+a\tb\\u{1b}\n"
+                ),
+                "{out:?}"
+            );
+            assert!(said.contains("nothing changed"), "{said}");
+            assert_eq!(std::fs::read(there.join("note")).expect("there"), b"a\n");
             let out = cp(&[
                 "--delete".into(),
                 "--exclude".into(),

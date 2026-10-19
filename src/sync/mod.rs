@@ -5,7 +5,9 @@
 //! end answers each file's ([`Answer`]): send it all (or the rest of a copy cut short before, whose
 //! start it holds), or here is the hash of a file of the same size it has. The sender then sends
 //! the file's bytes, or [`Item::Same`] if the hashes agree. So a copy sends only the files that
-//! changed, and one run again after a cut sends only what did not arrive. Headers run ahead of
+//! changed, and one run again after a cut sends only what did not arrive. A dry run sends no
+//! file's bytes, but one with [`Opts::diff`] sends a text file's to the end that has an older one,
+//! which says how they differ. Headers run ahead of
 //! the answers by [`WINDOW`] files, so a tree of small files costs no round trip each.
 //!
 //! What lands, and how:
@@ -79,6 +81,12 @@ const SKIPPED_SHOWN: usize = 16;
 /// most (past either, the rest are counted): within [`MAX_REPLY_ITEM`].
 const CHANGES_SHOWN: usize = 1000;
 const CHANGES_SHOWN_BYTES: usize = 256 * 1024;
+
+/// Most bytes of a file [`Opts::diff`] compares, and of the diffs a summary keeps (within
+/// [`MAX_REPLY_ITEM`]); how long it spends on one.
+pub const DIFF_MAX: usize = 1 << 20;
+const DIFFS_SHOWN_BYTES: usize = 128 * 1024;
+const DIFF_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// One name in a directory: not empty, `.` or `..`, and holding no `/` or NUL, so it names an
 /// entry of the directory it is in and nothing else.
@@ -232,6 +240,9 @@ pub struct Opts {
     /// Change nothing and send no file's bytes: the receiver says what the copy would do
     /// ([`Summary::changes`]), the sender each file's hash agreeing or not ([`Item::Differs`]).
     pub dry_run: bool,
+    /// In a dry run, send each file that differs from one there, both at most [`DIFF_MAX`], to
+    /// the receiver, which says how their text differs ([`Change::diff`]).
+    pub diff: bool,
     /// Entries neither sent nor removed.
     pub excludes: glob::Excludes,
 }
@@ -398,6 +409,10 @@ pub struct Change {
     pub size: Option<u64>,
     /// The size of the file it would replace.
     pub was: Option<u64>,
+    /// With [`Opts::diff`], how a replaced file's text differs: a unified diff, `a/` the file
+    /// there and `b/` the one sent, or a line saying why there is none.
+    #[serde(deserialize_with = "diff")]
+    pub diff: Option<String>,
 }
 
 /// What a change is.
@@ -434,6 +449,13 @@ fn change_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+fn diff<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    struct Diff(#[serde(deserialize_with = "at_most::<DIFFS_SHOWN_BYTES, _, _>")] Vec<u8>);
+    let diff = Option::<Diff>::deserialize(deserializer)?;
+    Ok(diff.map(|Diff(d)| String::from_utf8_lossy(&d).into_owned()))
+}
+
 fn changes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Change>, D::Error> {
     at_most::<CHANGES_SHOWN, D, Change>(deserializer)
 }
@@ -463,27 +485,43 @@ impl Summary {
 
     /// Note a dry run's change of `path`.
     fn change(&mut self, kind: ChangeKind, path: &Path) {
-        self.change_sized(kind, path, (None, None));
+        self.change_sized(kind, path, (None, None), None);
     }
 
-    /// As [`Self::change`], of a file `size` bytes long, over one of `was` bytes.
+    /// As [`Self::change`], of a file `size` bytes long, over one of `was` bytes, differing from
+    /// it as `diff` says.
     fn change_sized(
         &mut self,
         kind: ChangeKind,
         path: &Path,
         (size, was): (Option<u64>, Option<u64>),
+        diff: Option<String>,
     ) {
         let shown = path.to_string_lossy();
         let shown = shown
             .get(..shown.floor_char_boundary(MAX_PATH))
             .unwrap_or_default();
         let bytes: usize = self.changes.iter().map(|c| c.path.len()).sum();
+        let diffs: usize = self
+            .changes
+            .iter()
+            .filter_map(|c| c.diff.as_ref())
+            .map(String::len)
+            .sum();
+        let diff = diff.map(|diff| {
+            if diffs.saturating_add(diff.len()) > DIFFS_SHOWN_BYTES {
+                "no diff: the diffs shown came to 128 KiB\n".to_owned()
+            } else {
+                diff
+            }
+        });
         if self.changes.len() < CHANGES_SHOWN && bytes < CHANGES_SHOWN_BYTES {
             self.changes.push(Change {
                 kind,
                 path: shown.to_owned(),
                 size,
                 was,
+                diff,
             });
         } else {
             self.changes_unshown = self.changes_unshown.saturating_add(1);
@@ -655,6 +693,26 @@ fn write_item(out: &mut impl io::Write, item: &Item, data: &[u8]) -> io::Result<
     let bytes = crate::request::encode(item, MAX_ITEM).map_err(io::Error::other)?;
     out.write_all(&bytes)?;
     out.write_all(data)
+}
+
+/// How `theirs`, the file sent, differs from `ours`, the one at `path` it would replace: a
+/// unified diff, or why there is none.
+fn text_diff(ours: &[u8], theirs: &[u8], path: &Path) -> String {
+    let text = |bytes| {
+        std::str::from_utf8(bytes)
+            .ok()
+            .filter(|t| !t.contains('\0'))
+    };
+    let (Some(old), Some(new)) = (text(ours), text(theirs)) else {
+        return "no diff: not text\n".to_owned();
+    };
+    let path = path.to_string_lossy();
+    similar::TextDiff::configure()
+        .timeout(DIFF_TIME)
+        .diff_lines(old, new)
+        .unified_diff()
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string()
 }
 
 /// The hash of `file`'s first `len` bytes (all of them if `None`).

@@ -229,6 +229,10 @@ impl RemoteArgs {
         };
         Remote {
             server,
+            named: match self.server {
+                ServerRef::Id(id) => id.to_string(),
+                ServerRef::Name(name) => name,
+            },
             key_file: self.key_file,
             direct,
             relay_url,
@@ -290,6 +294,8 @@ Jobs (survive koh exiting and the link dropping; output and status kept):
   koh wait SERVER build                 until it ends: prints its last 200 lines (--tail N, 0 for
                                         none), exits with its status
   koh wait SERVER build --text listening  until its output has the text (1 if it ended first)
+  koh wait SERVER build --timeout 60    gives up after 60s (exit 124), saying how the job
+                                        stands (processes, CPU time) and its last lines
   koh wait SERVER --file out/done.txt   until the file exists
   koh logs SERVER build [--follow]      its last 200 lines (--tail N, --all), then on stderr
                                         `· running 34s` or `· exited 101 after 34s`; with
@@ -300,13 +306,14 @@ Jobs (survive koh exiting and the link dropping; output and status kept):
 
 Copy (a sync: merges, makes parents, sends only files that changed, by hash):
   koh cp -r ./src SERVER:proj/          src lands as proj/src; `./src/.` lands its contents
-  koh cp -r ./src/. SERVER:proj/src     updates proj/src (`./src SERVER:proj/src` would nest it
-                                        in itself, as cp does: koh refuses that)
+  koh cp -r ./src SERVER:proj/src       updates proj/src, there already (as `./src/.` does; cp
+                                        would nest it as proj/src/src: name that, or end in /)
   koh cp SERVER:proj/out.txt .          the other way
   --delete removes what the source lacks; --exclude PAT (repeat); -p keeps mtimes (default:
-  arrival time, so builds see changes); --atomic lands nothing until all came; --dry-run (-n)
+  arrival time, so builds see changes); --atomic lands nothing until all came; --dry-run
   changes nothing and sends no file, listing each change (`new`, `replaced`, `deleted`, `dir`,
-  `link` and its path) before the summary. Prints one line,
+  `link` and its path; a file's size, and the size of the one it replaces) before the summary.
+  Without --delete, what the source lacks is kept and counted. Prints one line,
   where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`
   (`received` for a download). A cut copy resumes when rerun.
 
@@ -623,7 +630,7 @@ fn wait() -> Command {
 }
 
 fn cp() -> Command {
-    dialing(Command::new("cp").about("Copy files and trees between here and a server, as a sync: `koh cp SRC... SERVER:DST` or `koh cp SERVER:SRC... DST`. Into DST if it is a directory (or ends in /, or there are several SRC: it is made), else as DST, its parents made. Directories merge; only files that changed are sent (by hash); a cut copy resumes when run again. A file written gets its arrival time unless -p. `dir/.` copies what is in dir. A tree is not nested in a directory of its own name that is there (`koh cp -r X S:X` again): `X/.` updates it. Prints what it did and where it landed"))
+    dialing(Command::new("cp").about("Copy files and trees between here and a server, as a sync: `koh cp SRC... SERVER:DST` or `koh cp SERVER:SRC... DST`. Into DST if it is a directory (or ends in /, or there are several SRC: it is made), else as DST, its parents made. Directories merge; only files that changed are sent (by hash); a cut copy resumes when run again. A file written gets its arrival time unless -p. `dir/.` copies what is in dir. A tree copied to a directory of its own name that is there updates it, as `X/.` does (`koh cp -r X S:X` again), where cp would nest it: `S:X/` or `S:X/X` nests it. Prints what it did and where it landed"))
         .arg(
             Arg::new("paths")
                 .value_name("PATH")
@@ -636,7 +643,7 @@ fn cp() -> Command {
         .arg(flag("preserve", "preserve").short('p').help("Keep the source's modification times"))
         .arg(flag("delete", "delete").help("Remove from the destination's directories what the source does not have"))
         .arg(flag("atomic", "atomic").help("Rename nothing into place, and remove nothing, until all of the copy came"))
-        .arg(flag("dry_run", "dry-run").short('n').help("Change nothing and send no file's bytes: list what would be sent (new or replaced), deleted, made or linked, then the summary"))
+        .arg(flag("dry_run", "dry-run").help("Change nothing and send no file's bytes: list what would be sent (new or replaced), deleted, made or linked, then the summary"))
         .arg(Arg::new("exclude").long("exclude").value_name("PATTERN").action(ArgAction::Append).value_parser(value_parser!(OsString)).help("Neither send nor remove entries matching it: `*.o`, `target`, `src/gen/*` (repeatable)"))
         .arg(json())
 }
@@ -1535,9 +1542,11 @@ mod tests {
             .collect();
         assert_eq!(paths, [&b"/etc/hosts"[..], b""]);
         assert_eq!(dest, PathBuf::from("."));
-        // Both sides here, both there, or two servers: refused.
+        // Both sides here, both there, or two servers: refused. So is `-n`, which `cp` reads as
+        // "no clobber", where a dry run is spelled out.
         for argv in [
-            &["koh", "cp", "a", "b"][..],
+            &["koh", "cp", "-n", "a", "laptop:b"][..],
+            &["koh", "cp", "a", "b"],
             &["koh", "cp", "laptop:a", "laptop:b"],
             &["koh", "cp", "laptop:a", "phone:b"],
             &["koh", "cp", "phone:a", "laptop:b", "here"],

@@ -28,13 +28,14 @@ const MAX_DEFERRED: usize = 1_000_000;
 /// Where what is copied lands.
 #[derive(Debug)]
 pub enum Target {
-    /// Each item inside this directory, under its own name. `nest` is its name when it was there
-    /// and nothing else said to copy into it (a `/` at its end, several sources): `cp`'s rule
-    /// puts a tree of that name inside it, which is refused, as one copied there again would be.
+    /// Each item inside this directory, under its own name. `named` is its name when it was there
+    /// and nothing else said to copy into it (a `/` at its end, several sources): a tree of that
+    /// name is brought into line with it, as the tree's contents (`X/.`) would be, rather than
+    /// nested in it as `cp`'s rule would (`koh cp -r X S:X` run again).
     Into {
         dir: Option<OwnedFd>,
         shown: PathBuf,
-        nest: Option<Name>,
+        named: Option<Name>,
     },
     /// The one item, as `name` in this directory.
     As {
@@ -71,7 +72,7 @@ impl Target {
                     Ok(meta) if meta.is_dir() => Self::Into {
                         dir: Some(fsat::open_dir_path(path).map_err(io)?),
                         shown: path.clone(),
-                        nest: path
+                        named: path
                             .file_name()
                             .and_then(|name| Name::new(name.as_bytes().to_vec()).ok())
                             .filter(|_| !names_dir),
@@ -84,7 +85,7 @@ impl Target {
                         Self::Into {
                             dir: made_path(path, dry).map_err(io)?,
                             shown: path.clone(),
-                            nest: None,
+                            named: None,
                         }
                     }
                     _ => {
@@ -114,7 +115,7 @@ impl Target {
                     None => Self::Into {
                         dir: Some(root_fd),
                         shown,
-                        nest: None,
+                        named: None,
                     },
                     Some((last, parents)) => {
                         let parent = if dry {
@@ -132,7 +133,7 @@ impl Target {
                                     .transpose()
                                     .map_err(io)?,
                                 shown,
-                                nest: (!names_dir).then(|| last.clone()),
+                                named: (!names_dir).then(|| last.clone()),
                             },
                             Some(Kind::Link) => {
                                 return Err(Failure::new(FailKind::IsASymlink, &shown))
@@ -162,7 +163,7 @@ impl Target {
                                 Self::Into {
                                     dir,
                                     shown,
-                                    nest: None,
+                                    named: None,
                                 }
                             }
                             Some(_) | None => Self::As {
@@ -236,7 +237,8 @@ struct Open {
     rel: PathBuf,
     /// Its names from the target's directory, for `--atomic`'s renames at the end.
     names: Vec<Name>,
-    /// The names the sender sent into it (and the parts of files under way), for `--delete`.
+    /// The names the sender sent into it (and the parts of files under way): what is not among
+    /// them is removed (`--delete`) or counted as kept. None past [`MAX_SEEN`] without `--delete`.
     seen: Option<HashSet<Vec<u8>>>,
     /// The mode and time it gets at its end.
     mode: Option<Mode>,
@@ -254,6 +256,8 @@ struct Pending {
     size: u64,
     /// A file was there, which this replaces.
     existed: bool,
+    /// Its size, if it was a file.
+    was: Option<u64>,
 }
 
 struct Receiver<'a, R: Read> {
@@ -326,11 +330,20 @@ impl<R: Read> Receiver<'_, R> {
 
     /// Note `name` as sent into the open directory, for `--delete`.
     fn saw(&mut self, name: &[u8]) -> Result<(), Failure> {
-        if let Some(seen) = self.open.last_mut().and_then(|open| open.seen.as_mut()) {
+        let delete = self.opts.delete;
+        let Some(open) = self.open.last_mut() else {
+            return Ok(());
+        };
+        if let Some(seen) = open.seen.as_mut() {
             if seen.insert(name.to_vec()) {
                 self.seen = self.seen.saturating_add(1);
                 if self.seen > MAX_SEEN {
-                    return Err(Failure::new(FailKind::TooMany, Path::new("")));
+                    if delete {
+                        return Err(Failure::new(FailKind::TooMany, Path::new("")));
+                    }
+                    // Only counted: what is kept goes uncounted here.
+                    self.seen = self.seen.saturating_sub(seen.len());
+                    open.seen = None;
                 }
             }
         }
@@ -345,7 +358,18 @@ impl<R: Read> Receiver<'_, R> {
         };
         let mut placed: usize = 0;
         loop {
-            let item = self.next()?;
+            let mut item = self.next()?;
+            // A tree named as the directory it is copied to is that directory: its contents.
+            if let Item::Dir { name, mode, mtime } = &item {
+                if self.open.is_empty()
+                    && matches!(target, Target::Into { named: Some(named), .. } if named == name)
+                {
+                    item = Item::Contents {
+                        mode: *mode,
+                        mtime: *mtime,
+                    };
+                }
+            }
             // Where an entry goes: in the open directory, or at the top, where the target says.
             let at_top = self.open.is_empty();
             match item {
@@ -377,7 +401,7 @@ impl<R: Read> Receiver<'_, R> {
                                 fd,
                                 rel: PathBuf::new(),
                                 names: Vec::new(),
-                                seen: self.opts.delete.then(HashSet::new),
+                                seen: Some(HashSet::new()),
                                 mode: None,
                                 mtime: mtime.filter(|_| self.opts.keep_times),
                             });
@@ -389,19 +413,6 @@ impl<R: Read> Receiver<'_, R> {
                     }
                 }
                 Item::Dir { name, mode, mtime } => {
-                    if let (
-                        true,
-                        Target::Into {
-                            nest: Some(nest),
-                            shown,
-                            ..
-                        },
-                    ) = (at_top, target)
-                    {
-                        if *nest == name {
-                            return Err(Failure::new(FailKind::Nests, shown));
-                        }
-                    }
                     let (dir, name) = self.place(target, name, &mut placed)?;
                     self.enter(dir.as_ref(), &name, mode, mtime)?;
                 }
@@ -518,7 +529,7 @@ impl<R: Read> Receiver<'_, R> {
             fd,
             rel,
             names,
-            seen: self.opts.delete.then(HashSet::new),
+            seen: Some(HashSet::new()),
             mode: (made || self.opts.keep_times).then_some(mode),
             mtime: mtime.filter(|_| self.opts.keep_times),
         });
@@ -549,6 +560,10 @@ impl<R: Read> Receiver<'_, R> {
                     .excludes
                     .excludes(&entry, path.as_os_str().as_bytes());
                 if seen.contains(&entry) || excluded {
+                    continue;
+                }
+                if !self.opts.delete {
+                    self.summary.kept = self.summary.kept.saturating_add(1);
                     continue;
                 }
                 let Ok(name) = Name::new(entry) else { continue };
@@ -643,6 +658,7 @@ impl<R: Read> Receiver<'_, R> {
                 mtime,
                 size,
                 existed: there.is_some(),
+                was: there.filter(|e| e.kind == Kind::File).map(|e| e.size),
             },
         );
         self.tell(answer);
@@ -721,7 +737,8 @@ impl<R: Read> Receiver<'_, R> {
             self.summary.resumed = self.summary.resumed.saturating_add(1);
         }
         if self.opts.dry_run {
-            self.summary.change(kind, &p.rel);
+            self.summary
+                .change_sized(kind, &p.rel, (Some(p.size), p.was));
         }
     }
 

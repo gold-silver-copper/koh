@@ -67,10 +67,24 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (`terminal_activity`, fux's own); on macOS it says only `busy`, `idle` or `unknown`.
 
 ### Changed
-- **Protocol `koh/12`**: `koh connect SERVER -- PROG ARG...` and `-C DIR`, `koh logs --tail`,
+- **Protocol `koh/13`**: `koh connect SERVER -- PROG ARG...` and `-C DIR`, `koh logs --tail`,
   the end of a log saying how the job stands, a command's stdout and stderr on one pipe, `koh cp
-  --dry-run`, the problem `NoSuchProgram`, the close codes `Busy` and `NoSuchDir`, and a running
-  job's processes and CPU time in `koh jobs`.
+  --dry-run`, the problem `NoSuchProgram`, the close codes `Busy` and `NoSuchDir`, a running
+  job's processes and CPU time in `koh jobs`, what a copy kept and a dry run's sizes, and a tree copied to a directory of its own name
+  updating it (the copy failure `nests` is gone).
+- **A `koh wait` on a job that times out says how the job stands**: `koh: timed out after 30s:
+  build running 41s processes=3 cpu=12.4s output=2 KB`, then its last lines (`--tail`), then
+  `· running 41s: ...`, where it said only `timed out` and agents took a job at work for a hung one.
+- **`koh cp` has no `-n`**: coreutils `cp -n` means "no clobber", so a dry run is spelled
+  `--dry-run`.
+- **`koh cp` counts what the destination has that the source lacks**, kept without `--delete`:
+  `(...; 2 there not in the source, kept: --delete removes them)` (`kept` in `--json`).
+- **A dry run gives each file's size**, and the size of the one it would replace:
+  `replaced src/lib.rs (4.1 KB, was 3.9 KB)` (`size`, `was` in `--json`).
+- **`koh cp -r X SERVER:X` run again updates `X`**, as `X/.` does, where it was refused (`cp`'s
+  rule would land it as `X/X`): the copy is a sync, and every agent that ran it meant that, then
+  had to learn `X/.` from the refusal. A destination ending in `/` (`SERVER:X/`) or naming
+  `SERVER:X/X` still nests it.
 - **`koh jobs` shows a running job at work**: `build running 41s processes=3 cpu=12.4s
   output=0 B ./build.sh` (`--json`: `processes`, `cpu_ms`), counting the processes in the
   session the job leads and the CPU time they and their ended children used, so a job that
@@ -92,7 +106,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (which the server takes as the end delivered), not after waiting up to 2 s for the server.
 - **Leaving puts the cursor back after resetting the scroll margins** (`CSI r`, which sends it
   home): the local prompt comes below the session's output, not over its top row.
-- **`koh cp --dry-run` (`-n`)** changes nothing and sends no file's bytes: it lists each change
+- **`koh cp --dry-run`** changes nothing and sends no file's bytes: it lists each change
   (`new`, `replaced`, `deleted`, `dir`, `link`) and the summary it would make.
 - **A burst of commands from one client is all served** (an agent's parallel reads): a full
   table of pending handshakes gives up the oldest of the address holding the most, no longer any
@@ -205,6 +219,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
   only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
+- **A character split across reads of `koh connect`'s input arrives whole**: its first bytes wait
+  for the rest however long that takes, where 35 ms later (the decoder's wait for a lone Escape)
+  each byte went on as `�` (`é世😀` typed a byte at a time arrived as nine of them).
+- **`koh logs` on a running job names the server as it was given**: `` `koh wait laptop build`
+  waits for its end ``, no longer `koh wait SERVER build`.
 - **A client that fell behind keeps what scrolled off meanwhile**: its new epoch's redraw has
   above it the history that scrolled off since the top row of what it read, into its terminal's
   scrollback, where it had the screen alone and lost the rest (a slow link under a burst of

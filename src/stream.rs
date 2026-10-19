@@ -308,7 +308,7 @@ impl Filter {
 }
 
 /// How many bytes at the end of `bytes` begin a UTF-8 character whose end has not come.
-fn incomplete_utf8(bytes: &[u8]) -> usize {
+pub(crate) fn incomplete_utf8(bytes: &[u8]) -> usize {
     for back in 1..=3_usize.min(bytes.len()) {
         let Some(&b) = bytes.get(bytes.len().saturating_sub(back)) else {
             return 0;

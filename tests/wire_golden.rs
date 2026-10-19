@@ -1,4 +1,4 @@
-//! The koh/12 encoding.
+//! The koh/13 encoding.
 //!
 //! Messages built here by hand from the wire types, both ways, are pinned: the expected bytes were
 //! captured by running the encoder, and a change to the wire must change them in the same commit,
@@ -174,6 +174,8 @@ fn replies() -> Vec<Reply> {
             changes: vec![koh::sync::Change {
                 kind: koh::sync::ChangeKind::New,
                 path: "src/a.rs".into(),
+                size: Some(12),
+                was: None,
             }],
             ..koh::sync::Summary::default()
         })),
@@ -234,7 +236,7 @@ fn framed() -> Option<Vec<(String, Vec<u8>)>> {
 
 #[test]
 fn the_wire_is_pinned() {
-    assert_eq!(koh::transport_iroh::PROTOCOL, "koh/12");
+    assert_eq!(koh::transport_iroh::PROTOCOL, "koh/13");
     let got: Vec<String> = framed()
         .unwrap()
         .iter()
@@ -331,8 +333,8 @@ const PINNED: &[&str] = &[
     "000000030c0300",
     "000000010b",
     "000000050000010000",
-    "0000000f010000000000000000000000000000",
-    "00000019010001000000000000000000000100087372632f612e727300",
+    "0000001001000000000000000000000000000000",
+    "0000001d01000100000000000000000000000100087372632f612e7273010c0000",
     "000000020902",
     "00000003008901",
     "000000080100056275696c64",

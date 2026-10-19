@@ -587,17 +587,29 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
             }
             ok(&remote.run("kill", &["quiet"]).expect("kill"));
             // Unnamed, it takes the next number; killed, it ends by the signal.
-            let sleeper = remote.run("run", &["--", "sleep", "300"]).expect("run");
+            let sleeper = remote
+                .run("run", &["--sh", "echo up; exec sleep 300"])
+                .expect("run");
             assert_eq!(ok(&sleeper), "1\n");
             // Running, it is said to run on, and what waits for it.
             let running = remote.run("logs", &["1"]).expect("logs");
             ok(&running);
             let said = String::from_utf8_lossy(&running.stderr);
             assert!(said.starts_with("· running "), "{said}");
+            let hint = format!("`koh wait {} 1` waits for its end", remote.id);
+            assert!(said.contains(&hint), "{said}");
+            // A wait that gives up says the job runs on, and what it last wrote.
+            let gave_up = remote
+                .run("wait", &["1", "--timeout", "0.3"])
+                .expect("wait");
+            assert_eq!(gave_up.status.code(), Some(124), "{gave_up:?}");
+            assert_eq!(String::from_utf8_lossy(&gave_up.stdout), "up\n");
+            let said = String::from_utf8_lossy(&gave_up.stderr);
             assert!(
-                said.contains("`koh wait SERVER 1` waits for its end"),
+                said.starts_with("koh: timed out after 0s: 1 running "),
                 "{said}"
             );
+            assert!(said.contains(&hint), "{said}");
             ok(&remote.run("kill", &["1"]).expect("kill"));
             let killed = remote.run("wait", &["1", "--timeout", "10"]).expect("wait");
             assert_eq!(killed.status.code(), Some(128 + 15), "{killed:?}");
@@ -711,15 +723,12 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             );
             let want = tree(&from).expect("the tree");
             assert_eq!(tree(&there.join("a tree")).expect("there"), want);
-            // Named as the tree, which is there now, it would nest inside it (cp's rule): refused,
-            // saying how to bring it into line, which `a tree/.` does.
+            // Named as the tree, which is there now: it is brought into line, as `a tree/.` would
+            // be, not nested inside it as cp's rule would.
             let same = remote.at(&there.join("a tree"));
             let out = cp(&["-r".into(), from.clone().into(), same.clone()]);
-            assert_eq!(out.status.code(), Some(1), "{out:?}");
-            let said = String::from_utf8_lossy(&out.stderr);
-            assert!(said.contains("nested") && said.contains("DIR/."), "{said}");
+            assert!(out.status.success(), "{out:?}");
             assert!(!there.join("a tree/a tree").exists());
-            let out = cp(&[from.join(".").into(), same.clone()]);
             let said = String::from_utf8_lossy(&out.stdout);
             assert!(
                 said.starts_with(&format!(
@@ -784,6 +793,13 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             // --delete takes away what the source lacks, but what is excluded.
             std::fs::write(there.join("a tree/stray"), b"s").expect("a stray file");
             std::fs::write(there.join("a tree/kept.o"), b"o").expect("an excluded file");
+            // Without it, what the source lacks is kept, and said so.
+            let out = cp(&[from.clone().into(), into.clone()]);
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                said.contains("2 there not in the source, kept: --delete removes them"),
+                "{said}"
+            );
             // A dry run says what would change, one a line, and changes nothing, either way.
             let exclude = || ["--exclude".into(), "*.o".into()];
             let mut args: Vec<OsString> = vec!["--dry-run".into(), "--delete".into()];
@@ -804,7 +820,7 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             let out = cp(&[&args[..], &[from_there, back.clone().into()]].concat());
             let said = String::from_utf8_lossy(&out.stdout);
             assert!(
-                said.starts_with("new      stray\ndry run: 1 file would be received, 1 B"),
+                said.starts_with("new      stray (1 B)\ndry run: 1 file would be received, 1 B"),
                 "{out:?}"
             );
             assert!(!back.join("stray").exists());

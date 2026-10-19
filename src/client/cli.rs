@@ -33,6 +33,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct Remote {
     /// Server endpoint id to connect to.
     pub server: EndpointId,
+    /// The server as the user named it (a saved name, or the id), for the commands koh suggests.
+    pub named: String,
     /// The secret-key file; `None` for the default client key path.
     pub key_file: Option<PathBuf>,
     /// Dial this socket address directly, with no relay or discovery; wins over `relay_url`.
@@ -43,9 +45,10 @@ pub struct Remote {
 
 impl Remote {
     /// `server`, dialed through n0's relays and discovery, as the default client key.
-    pub const fn new(server: EndpointId) -> Self {
+    pub fn new(server: EndpointId) -> Self {
         Self {
             server,
+            named: server.to_string(),
             key_file: None,
             direct: None,
             relay_url: None,
@@ -76,7 +79,7 @@ pub struct ConnectConfig {
 
 impl ConnectConfig {
     /// A config for dialing `server` with every other option at the CLI default.
-    pub const fn new(server: EndpointId) -> Self {
+    pub fn new(server: EndpointId) -> Self {
         Self {
             remote: Remote::new(server),
             pick: Pick::Latest,
@@ -657,37 +660,7 @@ pub async fn jobs(
         writeln!(out, "no jobs")?;
     }
     for job in &jobs {
-        let state = match job.state {
-            // At work though it writes nothing koh sees (to a file of its own, say): its processes
-            // and their CPU time say so.
-            JobState::Running => match job.usage {
-                Some(usage) => format!(
-                    "running {} processes={} cpu={}",
-                    span(job.age_secs),
-                    usage.processes,
-                    cpu(usage.cpu_ms)
-                ),
-                None => format!("running {}", span(job.age_secs)),
-            },
-            JobState::Exited(code) => format!(
-                "exited={code} after {} ({} ago)",
-                span(job.ran_secs.unwrap_or_default()),
-                span(
-                    job.age_secs
-                        .saturating_sub(job.ran_secs.unwrap_or_default())
-                )
-            ),
-        };
-        let dropped = if job.dropped_bytes > 0 {
-            format!(", {} dropped", bytes(job.dropped_bytes))
-        } else {
-            String::new()
-        };
-        let head = format!(
-            "{} {state} output={}{dropped}",
-            job.name,
-            bytes(job.output_bytes)
-        );
+        let head = job_line(job);
         if by_name {
             // The command whole, on the lines after, as it was given.
             writeln!(out, "{head}")?;
@@ -699,6 +672,42 @@ pub async fn jobs(
         }
     }
     Ok(())
+}
+
+/// A job as `koh jobs` lists it, but its command: `build running 41s processes=3 cpu=12.4s
+/// output=0 B`.
+fn job_line(job: &JobInfo) -> String {
+    let state = match job.state {
+        // At work though it writes nothing koh sees (to a file of its own, say): its processes
+        // and their CPU time say so.
+        JobState::Running => match job.usage {
+            Some(usage) => format!(
+                "running {} processes={} cpu={}",
+                span(job.age_secs),
+                usage.processes,
+                cpu(usage.cpu_ms)
+            ),
+            None => format!("running {}", span(job.age_secs)),
+        },
+        JobState::Exited(code) => format!(
+            "exited={code} after {} ({} ago)",
+            span(job.ran_secs.unwrap_or_default()),
+            span(
+                job.age_secs
+                    .saturating_sub(job.ran_secs.unwrap_or_default())
+            )
+        ),
+    };
+    let dropped = if job.dropped_bytes > 0 {
+        format!(", {} dropped", bytes(job.dropped_bytes))
+    } else {
+        String::new()
+    };
+    format!(
+        "{} {state} output={}{dropped}",
+        job.name,
+        bytes(job.output_bytes)
+    )
 }
 
 /// Most characters of a command a job listing shows.
@@ -742,7 +751,7 @@ pub async fn logs(
 ) -> anyhow::Result<Option<u32>> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
-    let shown = job.clone();
+    let hint = format!("koh wait {} {job}", remote.named);
     let mut opened = Opened::dial(remote, &Request::Logs { job, follow, tail }).await?;
     opened.control.finish()?;
     let read = async {
@@ -774,7 +783,7 @@ pub async fn logs(
                     crate::log::stderr(match exit {
                         Some(status) => format!("· exited {status} after {secs}s"),
                         None => format!(
-                            "· running {secs}s: `koh wait SERVER {shown}` waits for its end"
+                            "· running {secs}s: `{hint}` waits for its end"
                         ),
                     });
                     return anyhow::Ok(exit);
@@ -848,6 +857,10 @@ pub async fn wait(
         (Some(On::Job(job)), Until::End) if tail > 0 && !format.json => Some(job.clone()),
         _ => None,
     };
+    let job = match &wait.on {
+        Some(On::Job(job)) if !format.json => Some(job.clone()),
+        _ => None,
+    };
     report_busy();
     let waited = async { ask::<Waited>(remote, &Request::Wait(wait), MAX_REPLY).await };
     let waited = tokio::select! {
@@ -856,7 +869,13 @@ pub async fn wait(
         () = interrupted.cancelled() => anyhow::bail!("interrupted"),
     };
     let (status, said) = match (waited, &until) {
-        (None, _) => (TIMED_OUT, "timed out".to_owned()),
+        (None, _) => (
+            TIMED_OUT,
+            format!(
+                "timed out after {}",
+                span(timeout.unwrap_or_default().as_secs())
+            ),
+        ),
         (Some(Waited::Ended(status)), Until::End) => {
             let code = status.map_or(0, |s| u32::try_from(s & 0xff).unwrap_or(1));
             (
@@ -890,12 +909,32 @@ pub async fn wait(
                 timed_out: status == TIMED_OUT,
             },
         )?;
+    } else if let (TIMED_OUT, Some(job)) = (status, job) {
+        timed_out(remote, &said, job, tail).await?;
     } else if status == TIMED_OUT || (status == 1 && !matches!(until, Until::End)) {
         crate::log::stderr(format_args!("koh: {said}"));
     } else if let Some(job) = shown {
         logs(remote, job, (false, Some(tail))).await?;
     }
     Ok(status)
+}
+
+/// A wait on `job` that timed out: how the job stands (running on, its processes and CPU time),
+/// then its last `tail` lines, so that a job at work is not taken for a hung one.
+async fn timed_out(remote: &Remote, said: &str, job: JobName, tail: u32) -> anyhow::Result<()> {
+    let JobList(jobs) = ask(
+        remote,
+        &Request::Jobs {
+            job: Some(job.clone()),
+        },
+        MAX_REPLY,
+    )
+    .await?;
+    match jobs.first() {
+        Some(info) => crate::log::stderr(format_args!("koh: {said}: {}", job_line(info))),
+        None => crate::log::stderr(format_args!("koh: {said}")),
+    }
+    logs(remote, job, (false, Some(tail))).await.map(|_| ())
 }
 
 async fn sleep_for(timeout: Option<Duration>) {
